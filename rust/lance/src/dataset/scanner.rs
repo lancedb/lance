@@ -10,7 +10,6 @@ use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
 use std::task::{Context, Poll};
 
-use crate::index::DatasetIndexExt;
 use arrow::array::AsArray;
 use arrow_array::{Array, Float32Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef, SortOptions};
@@ -78,19 +77,19 @@ use lance_io::stream::RecordBatchStream;
 use lance_linalg::distance::MetricType;
 use lance_select::{IndexExprResult, RowAddrMask, RowAddrTreeMap};
 use lance_table::format::{Fragment, IndexMetadata};
-use roaring::RoaringBitmap;
+use roaring::{RoaringBitmap, RoaringTreemap};
 use tracing::{Span, info_span, instrument};
 use uuid::Uuid;
 
 use super::Dataset;
 use crate::dataset::row_offsets_to_row_addresses;
 use crate::dataset::utils::SchemaAdapter;
-use crate::index::DatasetIndexInternalExt;
 use crate::index::scalar::inverted::{load_segment_details, load_segments};
 use crate::index::scalar_logical::scalar_index_fragment_bitmap;
 use crate::index::vector::utils::{
     default_distance_type_for, get_vector_dim, get_vector_type, validate_distance_type_for,
 };
+use crate::index::{DatasetIndexExt, DatasetIndexInternalExt, logical_index_coverage_is_current};
 use crate::io::exec::filtered_read::{FilteredReadExec, FilteredReadOptions};
 use crate::io::exec::fts::{
     BoostQueryExec, FlatMatchFilterExec, FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec,
@@ -99,7 +98,8 @@ use crate::io::exec::knn::MultivectorScoringExec;
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
 use crate::io::exec::{
     AddRowAddrExec, FilterPlan as ExprFilterPlan, KNNVectorDistanceExec, LancePushdownScanExec,
-    LanceScanExec, Planner, PreFilterSource, ScanConfig, TakeExec,
+    LanceScanExec, LogicalCoverageFilterExec, LogicalCoverageGroup, Planner, PreFilterSource,
+    ScanConfig, TakeExec,
     knn::{
         KnnBatchParams, QUERY_INDEX_COL, knn_empty_result_schema, new_knn_exec, query_index_field,
     },
@@ -2099,20 +2099,6 @@ impl Scanner {
         .boxed()
     }
 
-    pub(crate) async fn try_into_dfstream(
-        &self,
-        mut options: LanceExecutionOptions,
-    ) -> Result<SendableRecordBatchStream> {
-        let plan = self.create_plan().await?;
-
-        // Use the scan stats callback if the user didn't set an execution stats callback
-        if options.execution_stats_callback.is_none() {
-            options.execution_stats_callback = self.scan_stats_callback.clone();
-        }
-
-        execute_plan(plan, options)
-    }
-
     pub(crate) fn execution_options(&self) -> LanceExecutionOptions {
         LanceExecutionOptions {
             batch_size: self.batch_size,
@@ -3326,7 +3312,7 @@ impl Scanner {
                     .await?
             }
             FtsQuery::Phrase(query) => {
-                self.plan_phrase_query(query, params, prefilter_source)
+                self.plan_phrase_query(query, params, filter_plan, prefilter_source)
                     .await?
             }
 
@@ -3480,6 +3466,7 @@ impl Scanner {
         &self,
         query: &PhraseQuery,
         params: &FtsSearchParams,
+        filter_plan: &ExprFilterPlan,
         prefilter_source: &PreFilterSource,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let column = query.column.clone().ok_or(Error::invalid_input(
@@ -3499,12 +3486,46 @@ impl Scanner {
                 .to_string()));
         }
 
-        Ok(Arc::new(PhraseQueryExec::new(
+        let phrase_plan: Arc<dyn ExecutionPlan> = Arc::new(PhraseQueryExec::new_with_segments(
             self.dataset.clone(),
             query.clone(),
             params.clone(),
             prefilter_source.clone(),
-        )))
+            segments.clone(),
+        ));
+        if !self.dataset.manifest.uses_stable_logical_row_addresses() || self.fast_search {
+            return Ok(phrase_plan);
+        }
+
+        let target_fragments = self
+            .fragments
+            .clone()
+            .unwrap_or_else(|| self.dataset.fragments().to_vec());
+        let coverage_group = self.logical_coverage_group_for_indices(&segments).await?;
+        if self.logical_coverage_covers_all_live_rows(
+            std::slice::from_ref(&coverage_group),
+            &target_fragments,
+        )? {
+            return Ok(phrase_plan);
+        }
+        let fallback_fragments = self
+            .logical_fallback_fragments(std::slice::from_ref(&coverage_group), &target_fragments)
+            .await?;
+        if fallback_fragments.is_empty() {
+            return Ok(phrase_plan);
+        }
+
+        let flat_phrase_plan = self
+            .plan_flat_phrase_query(
+                fallback_fragments,
+                query,
+                params,
+                filter_plan,
+                coverage_group,
+                segments,
+            )
+            .await?;
+        self.combine_fts_index_and_flat(phrase_plan, flat_phrase_plan, params.limit)
     }
 
     async fn plan_match_query(
@@ -3535,36 +3556,103 @@ impl Scanner {
 
         let (match_plan, flat_match_plan) = match &index {
             Some(index) => {
-                // Get unindexed fragments and filter to target fragments
-                let unindexed_fragments = self
-                    .retain_target_fragments(self.dataset.unindexed_fragments(&index.name).await?);
-
-                // If all target fragments are unindexed, skip index entirely
-                if unindexed_fragments.len() == target_fragments.len() {
-                    if self.fast_search {
-                        return Ok(Arc::new(EmptyExec::new(FTS_SCHEMA.clone())));
+                if self.dataset.manifest.uses_stable_logical_row_addresses() {
+                    let segments =
+                        load_segments(&self.dataset, &column)
+                            .await?
+                            .ok_or_else(|| {
+                                Error::internal(format!(
+                                    "FTS index '{}' for column '{}' has no committed segments",
+                                    index.name, column
+                                ))
+                            })?;
+                    let coverage_group = self.logical_coverage_group_for_indices(&segments).await?;
+                    let match_plan: Arc<dyn ExecutionPlan> =
+                        Arc::new(MatchQueryExec::new_with_segments(
+                            self.dataset.clone(),
+                            query.clone(),
+                            params.clone(),
+                            prefilter_source.clone(),
+                            segments.clone(),
+                        ));
+                    if self.fast_search
+                        || self.logical_coverage_covers_all_live_rows(
+                            std::slice::from_ref(&coverage_group),
+                            &target_fragments,
+                        )?
+                    {
+                        (Some(match_plan), None)
+                    } else {
+                        let fallback_fragments = self
+                            .logical_fallback_fragments(
+                                std::slice::from_ref(&coverage_group),
+                                &target_fragments,
+                            )
+                            .await?;
+                        let flat_match_plan = if fallback_fragments.is_empty() {
+                            None
+                        } else {
+                            Some(
+                                self.plan_flat_match_query(
+                                    fallback_fragments,
+                                    query,
+                                    params,
+                                    filter_plan,
+                                    Some(coverage_group),
+                                    Some(segments),
+                                )
+                                .await?,
+                            )
+                        };
+                        (Some(match_plan), flat_match_plan)
                     }
-                    let flat_match_plan = self
-                        .plan_flat_match_query(unindexed_fragments, query, params, filter_plan)
-                        .await?;
-                    return Ok(flat_match_plan);
-                }
-
-                // Mixed case: use index + flat search for unindexed
-                let match_plan: Arc<dyn ExecutionPlan> = Arc::new(MatchQueryExec::new(
-                    self.dataset.clone(),
-                    query.clone(),
-                    params.clone(),
-                    prefilter_source.clone(),
-                ));
-
-                if self.fast_search || unindexed_fragments.is_empty() {
-                    (Some(match_plan), None)
                 } else {
-                    let flat_match_plan = self
-                        .plan_flat_match_query(unindexed_fragments, query, params, filter_plan)
-                        .await?;
-                    (Some(match_plan), Some(flat_match_plan))
+                    // Get unindexed fragments and filter to target fragments
+                    let unindexed_fragments = self.retain_target_fragments(
+                        self.dataset.unindexed_fragments(&index.name).await?,
+                    );
+
+                    // If all target fragments are unindexed, skip index entirely
+                    if unindexed_fragments.len() == target_fragments.len() {
+                        if self.fast_search {
+                            return Ok(Arc::new(EmptyExec::new(FTS_SCHEMA.clone())));
+                        }
+                        let flat_match_plan = self
+                            .plan_flat_match_query(
+                                unindexed_fragments,
+                                query,
+                                params,
+                                filter_plan,
+                                None,
+                                None,
+                            )
+                            .await?;
+                        return Ok(flat_match_plan);
+                    }
+
+                    // Mixed case: use index + flat search for unindexed
+                    let match_plan: Arc<dyn ExecutionPlan> = Arc::new(MatchQueryExec::new(
+                        self.dataset.clone(),
+                        query.clone(),
+                        params.clone(),
+                        prefilter_source.clone(),
+                    ));
+
+                    if self.fast_search || unindexed_fragments.is_empty() {
+                        (Some(match_plan), None)
+                    } else {
+                        let flat_match_plan = self
+                            .plan_flat_match_query(
+                                unindexed_fragments,
+                                query,
+                                params,
+                                filter_plan,
+                                None,
+                                None,
+                            )
+                            .await?;
+                        (Some(match_plan), Some(flat_match_plan))
+                    }
                 }
             }
             None => {
@@ -3573,7 +3661,14 @@ impl Scanner {
                 }
                 // No index: flat search all target fragments
                 let flat_match_plan = self
-                    .plan_flat_match_query(target_fragments.clone(), query, params, filter_plan)
+                    .plan_flat_match_query(
+                        target_fragments.clone(),
+                        query,
+                        params,
+                        filter_plan,
+                        None,
+                        None,
+                    )
                     .await?;
                 (None, Some(flat_match_plan))
             }
@@ -3582,19 +3677,7 @@ impl Scanner {
         // Combine plans
         let plan = match (match_plan, flat_match_plan) {
             (Some(match_plan), Some(flat_match_plan)) => {
-                let match_plan = UnionExec::try_new(vec![match_plan, flat_match_plan])?;
-                let match_plan = Arc::new(RepartitionExec::try_new(
-                    match_plan,
-                    Partitioning::RoundRobinBatch(1),
-                )?);
-                let sort_expr = PhysicalSortExpr {
-                    expr: expressions::col(SCORE_COL, match_plan.schema().as_ref())?,
-                    options: SortOptions {
-                        descending: true,
-                        nulls_first: false,
-                    },
-                };
-                Arc::new(SortExec::new([sort_expr].into(), match_plan).with_fetch(params.limit))
+                self.combine_fts_index_and_flat(match_plan, flat_match_plan, params.limit)?
             }
             (Some(match_plan), None) => match_plan,
             (None, Some(flat_match_plan)) => flat_match_plan,
@@ -3604,6 +3687,29 @@ impl Scanner {
         Ok(plan)
     }
 
+    fn combine_fts_index_and_flat(
+        &self,
+        index_plan: Arc<dyn ExecutionPlan>,
+        flat_plan: Arc<dyn ExecutionPlan>,
+        limit: Option<usize>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let plan = UnionExec::try_new(vec![index_plan, flat_plan])?;
+        let plan = Arc::new(RepartitionExec::try_new(
+            plan,
+            Partitioning::RoundRobinBatch(1),
+        )?);
+        let sort_expr = PhysicalSortExpr {
+            expr: expressions::col(SCORE_COL, plan.schema().as_ref())?,
+            options: SortOptions {
+                descending: true,
+                nulls_first: false,
+            },
+        };
+        Ok(Arc::new(
+            SortExec::new([sort_expr].into(), plan).with_fetch(limit),
+        ))
+    }
+
     /// Plan match query on unindexed fragments
     async fn plan_flat_match_query(
         &self,
@@ -3611,6 +3717,8 @@ impl Scanner {
         query: &MatchQuery,
         params: &FtsSearchParams,
         filter_plan: &ExprFilterPlan,
+        logical_coverage_group: Option<LogicalCoverageGroup>,
+        segments: Option<Vec<IndexMetadata>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let column = query
             .column
@@ -3641,18 +3749,96 @@ impl Scanner {
             )
             .await?;
 
+        if let Some(coverage_group) = logical_coverage_group {
+            plan = Arc::new(LogicalCoverageFilterExec::try_new_effective_groups(
+                plan,
+                vec![coverage_group],
+                false,
+            )?);
+        }
+
         if let Some(refine_expr) = filter_plan.refine_expr.as_ref() {
             plan = Arc::new(LanceFilterExec::try_new(refine_expr.clone(), plan)?);
         }
         plan = self.ensure_column_alias(plan, &column)?;
 
-        let flat_match_plan = Arc::new(FlatMatchQueryExec::new(
+        let flat_match_plan = match segments {
+            Some(segments) => Arc::new(FlatMatchQueryExec::new_with_segments(
+                self.dataset.clone(),
+                query.clone(),
+                params.clone(),
+                plan,
+                segments,
+            )),
+            None => Arc::new(FlatMatchQueryExec::new(
+                self.dataset.clone(),
+                query.clone(),
+                params.clone(),
+                plan,
+            )),
+        };
+        Ok(flat_match_plan)
+    }
+
+    async fn plan_flat_phrase_query(
+        &self,
+        fragments: Vec<Fragment>,
+        query: &PhraseQuery,
+        params: &FtsSearchParams,
+        filter_plan: &ExprFilterPlan,
+        logical_coverage_group: LogicalCoverageGroup,
+        segments: Vec<IndexMetadata>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let column = query
+            .column
+            .as_ref()
+            .ok_or_else(|| {
+                Error::invalid_input("the column must be specified in the query".to_string())
+            })?
+            .clone();
+        let mut columns = vec![column.clone()];
+        if let Some(refine_expr) = filter_plan.refine_expr.as_ref() {
+            columns.extend(Planner::column_names_in_expr(refine_expr));
+        }
+        let scan_projection = self
+            .dataset
+            .empty_projection()
+            .with_row_id()
+            .union_columns(&columns, OnMissing::Error)?;
+        let PlannedFilteredScan { mut plan, .. } = self
+            .filtered_read(
+                filter_plan,
+                scan_projection,
+                false,
+                Some(Arc::new(fragments)),
+                None,
+                true,
+            )
+            .await?;
+        plan = Arc::new(LogicalCoverageFilterExec::try_new_effective_groups(
+            plan,
+            vec![logical_coverage_group],
+            false,
+        )?);
+        if let Some(refine_expr) = filter_plan.refine_expr.as_ref() {
+            plan = Arc::new(LanceFilterExec::try_new(refine_expr.clone(), plan)?);
+        }
+        plan = self.ensure_column_alias(plan, &column)?;
+        plan = Arc::new(FlatMatchFilterExec::new_phrase_with_segments(
+            plan,
             self.dataset.clone(),
             query.clone(),
             params.clone(),
-            plan,
+            segments.clone(),
         ));
-        Ok(flat_match_plan)
+        let match_query = MatchQuery::new(query.terms.clone()).with_column(query.column.clone());
+        Ok(Arc::new(FlatMatchQueryExec::new_with_segments(
+            self.dataset.clone(),
+            match_query,
+            params.clone(),
+            plan,
+            segments,
+        )))
     }
 
     // ANN/KNN search execution node with optional prefilter
@@ -3720,7 +3906,7 @@ impl Scanner {
                 }
 
                 let selected_index_segments =
-                    self.retain_relevant_index_segments(requested_index_segments);
+                    self.retain_relevant_index_segments(requested_index_segments)?;
                 if selected_index_segments.is_empty() {
                     None
                 } else {
@@ -3786,7 +3972,7 @@ impl Scanner {
                 if use_this_index {
                     let index_segments = self.retain_relevant_index_segments(
                         self.dataset.load_indices_by_name(&index.name).await?,
-                    );
+                    )?;
                     let index_frags = self.get_indexed_frags(&index_segments);
                     if !index_segments.is_empty() && !index_frags.is_empty() {
                         Some((index.name.clone(), index_segments, index_metric))
@@ -3976,7 +4162,25 @@ impl Scanner {
         mut knn_node: Arc<dyn ExecutionPlan>,
         filter_plan: &ExprFilterPlan,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let fallback_fragments = if let Some(target_fragments) = &self.fragments {
+        let logical_coverage_groups = if self.dataset.manifest.uses_stable_logical_row_addresses() {
+            Some(vec![
+                self.logical_coverage_group_for_indices(indexed_segments)
+                    .await?,
+            ])
+        } else {
+            None
+        };
+        let fallback_fragments = if let Some(groups) = logical_coverage_groups.as_ref() {
+            let target = self
+                .fragments
+                .as_deref()
+                .unwrap_or_else(|| self.dataset.fragments().as_ref());
+            if self.logical_coverage_covers_all_live_rows(groups, target)? {
+                Vec::new()
+            } else {
+                self.logical_fallback_fragments(groups, target).await?
+            }
+        } else if let Some(target_fragments) = &self.fragments {
             let indexed_fragments = self.get_indexed_frags(indexed_segments);
             target_fragments
                 .iter()
@@ -4027,6 +4231,12 @@ impl Scanner {
                 // in a deterministic order.
                 false,
             );
+
+            if let Some(groups) = logical_coverage_groups.clone() {
+                scan_node = Arc::new(LogicalCoverageFilterExec::try_new_effective_groups(
+                    scan_node, groups, false,
+                )?);
+            }
 
             if let Some(expr) = filter_plan.full_expr.as_ref() {
                 // If there is a prefilter we need to manually apply it to the new data
@@ -4086,6 +4296,269 @@ impl Scanner {
         }
     }
 
+    #[async_recursion]
+    async fn logical_coverage_groups(
+        &self,
+        index_expr: &ScalarIndexExpr,
+    ) -> Result<Vec<LogicalCoverageGroup>> {
+        match index_expr {
+            ScalarIndexExpr::And(left, right) | ScalarIndexExpr::Or(left, right) => {
+                let mut groups = self.logical_coverage_groups(left).await?;
+                groups.extend(self.logical_coverage_groups(right).await?);
+                Ok(groups)
+            }
+            ScalarIndexExpr::Not(inner) => self.logical_coverage_groups(inner).await,
+            ScalarIndexExpr::Query(search) => {
+                let mut indices = Vec::new();
+                for index in self
+                    .dataset
+                    .load_indices_by_name(&search.index_name)
+                    .await?
+                {
+                    if !logical_index_coverage_is_current(&self.dataset, &index)? {
+                        continue;
+                    }
+                    indices.push(index);
+                }
+                Ok(vec![
+                    self.logical_coverage_group_for_indices(&indices).await?,
+                ])
+            }
+        }
+    }
+
+    async fn logical_coverage_group_for_indices(
+        &self,
+        indices: &[IndexMetadata],
+    ) -> Result<LogicalCoverageGroup> {
+        let mut indices = indices.to_vec();
+        for index in &mut indices {
+            if index
+                .logical_coverage
+                .as_ref()
+                .is_some_and(|coverage| coverage.requires_authoritative_resolution())
+            {
+                index.logical_coverage = Some(
+                    crate::index::resolve_logical_index_coverage(self.dataset.as_ref(), index)
+                        .await?,
+                );
+            }
+        }
+        crate::index::validate_resolved_logical_index_overlaps(&indices)?;
+        let mut base = Vec::new();
+        let mut invalidated = Vec::new();
+        let layout = self
+            .dataset
+            .manifest
+            .row_address_layout
+            .as_ref()
+            .ok_or_else(|| {
+                Error::internal("storage-version-2.3 manifest is missing RowAddressLayout")
+            })?;
+        for index in &indices {
+            let coverage = index.logical_coverage.as_ref().ok_or_else(|| {
+                Error::internal(format!(
+                    "v2.3 index segment {} is missing exact logical coverage",
+                    index.uuid
+                ))
+            })?;
+            for shard in &coverage.shards {
+                let selection = shard.selection.as_ref().ok_or_else(|| {
+                    Error::internal(format!(
+                        "logical index {} coverage detail was not resolved",
+                        index.uuid
+                    ))
+                })?;
+                for watermark in &shard.validated_through {
+                    // A floor rejects an incoming build that predates retired
+                    // invalidation detail.  It cannot invalidate an existing
+                    // disjoint shard in the current catalog.
+                    if layout
+                        .field_default_generations
+                        .binary_search_by_key(&watermark.field_id, |generation| generation.field_id)
+                        .ok()
+                        .is_none_or(|position| {
+                            layout.field_default_generations[position].generation
+                                > watermark.generation
+                        })
+                    {
+                        invalidated.push(selection.clone());
+                    }
+                    invalidated.extend(
+                        layout
+                            .generation_regions
+                            .iter()
+                            .filter(|region| {
+                                region.generation > watermark.generation
+                                    && region.field_ids.binary_search(&watermark.field_id).is_ok()
+                            })
+                            .map(|region| region.selection.as_ref().clone()),
+                    );
+                }
+                base.push(selection.clone());
+            }
+        }
+        Ok(LogicalCoverageGroup { base, invalidated })
+    }
+
+    fn logical_coverage_covers_all_live_rows(
+        &self,
+        groups: &[LogicalCoverageGroup],
+        fragments: &[Fragment],
+    ) -> Result<bool> {
+        let Some(layout) = self.dataset.manifest.row_address_layout.as_ref() else {
+            return Ok(false);
+        };
+        let current_slots = Self::current_logical_slots(layout, fragments)?;
+        for group in groups {
+            if !group.invalidated.is_empty() {
+                return Ok(false);
+            }
+            let covered_slots = Self::logical_selection_union(&group.base)?;
+            if !current_slots.is_subset(&covered_slots) {
+                return Ok(false);
+            }
+        }
+        Ok(!groups.is_empty())
+    }
+
+    fn logical_selection_union(
+        selections: &[lance_table::format::LogicalRowAddressSelection],
+    ) -> Result<RoaringTreemap> {
+        let mut slots = RoaringTreemap::new();
+        for selection in selections {
+            for range in selection.to_ranges()? {
+                let start = (range.logical_fragment_id as u64) << 32 | range.start_slot as u64;
+                let end = (range.logical_fragment_id as u64) << 32 | range.end_slot as u64;
+                slots.insert_range(start..end);
+            }
+        }
+        Ok(slots)
+    }
+
+    fn current_logical_slots(
+        layout: &lance_table::format::RowAddressLayout,
+        fragments: &[Fragment],
+    ) -> Result<RoaringTreemap> {
+        let mut slots = RoaringTreemap::new();
+        for logical_fragment_id in layout.current_logical_fragment_bitmap(fragments)? {
+            let domain = layout
+                .logical_domain(fragments, logical_fragment_id)?
+                .ok_or_else(|| {
+                    Error::internal(format!(
+                        "current logical domain {logical_fragment_id} is missing metadata"
+                    ))
+                })?;
+            let start = (logical_fragment_id as u64) << 32;
+            slots.insert_range(start..start + domain.slot_count as u64);
+        }
+        for retired in &layout.retired_rows {
+            match &retired.membership {
+                lance_table::format::RetiredLogicalRowMembership::AllRows => {
+                    for ordinal in 0..retired.domains.domain_count() {
+                        let domain = retired.domains.domain_at(ordinal)?;
+                        let start = (domain.logical_fragment_id as u64) << 32;
+                        slots.remove_range(start..start + domain.slot_count as u64);
+                    }
+                }
+                lance_table::format::RetiredLogicalRowMembership::Selection(selection) => {
+                    for range in selection.to_ranges()? {
+                        let start =
+                            (range.logical_fragment_id as u64) << 32 | range.start_slot as u64;
+                        let end = (range.logical_fragment_id as u64) << 32 | range.end_slot as u64;
+                        slots.remove_range(start..end);
+                    }
+                }
+            }
+        }
+        Ok(slots)
+    }
+
+    async fn logical_fallback_fragments(
+        &self,
+        groups: &[LogicalCoverageGroup],
+        fragments: &[Fragment],
+    ) -> Result<Vec<Fragment>> {
+        let layout = self
+            .dataset
+            .manifest
+            .row_address_layout
+            .as_ref()
+            .ok_or_else(|| {
+                Error::internal("storage-version-2.3 manifest is missing RowAddressLayout")
+            })?;
+        let current_slots = Self::current_logical_slots(layout, fragments)?;
+        let router = self.dataset.row_address_router()?;
+        let mut fallback_logical_fragments = RoaringBitmap::new();
+        let mut physical_fragments = RoaringBitmap::new();
+        for group in groups {
+            let covered_slots = Self::logical_selection_union(&group.base)?;
+            let missing_slots = &current_slots - &covered_slots;
+            fallback_logical_fragments.extend(
+                missing_slots
+                    .bitmaps()
+                    .map(|(logical_fragment_id, _)| logical_fragment_id),
+            );
+            for invalidated in &group.invalidated {
+                const RESOLVE_BATCH_SIZE: usize = 64 * 1024;
+                let mut row_ids = Vec::with_capacity(RESOLVE_BATCH_SIZE);
+                for address in invalidated.iter() {
+                    row_ids.push(address?.raw());
+                    if row_ids.len() == RESOLVE_BATCH_SIZE {
+                        for physical in self
+                            .dataset
+                            .resolve_logical_row_ids_async(&row_ids)
+                            .await?
+                            .into_iter()
+                            .flatten()
+                        {
+                            physical_fragments.insert(physical.fragment_id());
+                        }
+                        row_ids.clear();
+                    }
+                }
+                if !row_ids.is_empty() {
+                    for physical in self
+                        .dataset
+                        .resolve_logical_row_ids_async(&row_ids)
+                        .await?
+                        .into_iter()
+                        .flatten()
+                    {
+                        physical_fragments.insert(physical.fragment_id());
+                    }
+                }
+            }
+        }
+        for logical_fragment_id in fallback_logical_fragments {
+            for destination in router.logical_domain_destination_ranges(logical_fragment_id)? {
+                match destination {
+                    lance_table::format::LogicalDomainDestination::Inline(range) => {
+                        physical_fragments.insert(range.physical_fragment_id);
+                    }
+                    lance_table::format::LogicalDomainDestination::ExplicitMap {
+                        placement_index,
+                    } => {
+                        let placement = layout
+                            .placements
+                            .get(placement_index as usize)
+                            .ok_or_else(|| {
+                                Error::internal("ExplicitMap placement index is out of bounds")
+                            })?;
+                        for (fragment_id, _, _) in placement.destination_ranges() {
+                            physical_fragments.insert(fragment_id);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(fragments
+            .iter()
+            .filter(|fragment| physical_fragments.contains(fragment.id as u32))
+            .cloned()
+            .collect())
+    }
+
     /// Given an index query, split the fragments into two sets
     ///
     /// The first set is the relevant fragments, which are covered by ALL indices in the query
@@ -4130,10 +4603,29 @@ impl Scanner {
 
         let needs_recheck = index_expr.needs_recheck();
 
-        // Figure out which fragments are covered by ALL indices
-        let (relevant_frags, missing_frags) = self
-            .partition_frags_by_coverage(index_expr, fragments)
-            .await?;
+        // Figure out which rows are covered by ALL indices. In v2.3 this is an
+        // exact logical selection, not a physical-fragment property: one packed
+        // physical fragment may contain both indexed and fallback rows.
+        let logical_coverage_groups = if self.dataset.manifest.uses_stable_logical_row_addresses() {
+            Some(self.logical_coverage_groups(index_expr).await?)
+        } else {
+            None
+        };
+        let (relevant_frags, missing_frags) = if let Some(groups) = logical_coverage_groups.as_ref()
+        {
+            let relevant = fragments.as_ref().clone();
+            let missing =
+                if self.logical_coverage_covers_all_live_rows(groups, fragments.as_ref())? {
+                    Vec::new()
+                } else {
+                    self.logical_fallback_fragments(groups, fragments.as_ref())
+                        .await?
+                };
+            (relevant, missing)
+        } else {
+            self.partition_frags_by_coverage(index_expr, fragments)
+                .await?
+        };
 
         let mut plan: Arc<dyn ExecutionPlan> = Arc::new(MaterializeIndexExec::new(
             self.dataset.clone(),
@@ -4228,7 +4720,15 @@ impl Scanner {
                 None,
                 false,
             );
-            let filtered = Arc::new(LanceFilterExec::try_new(optimized_filter, new_data_scan)?);
+            let filtered: Arc<dyn ExecutionPlan> =
+                Arc::new(LanceFilterExec::try_new(optimized_filter, new_data_scan)?);
+            let filtered = if let Some(groups) = logical_coverage_groups.clone() {
+                Arc::new(LogicalCoverageFilterExec::try_new_effective_groups(
+                    filtered, groups, false,
+                )?) as Arc<dyn ExecutionPlan>
+            } else {
+                filtered
+            };
             Some(Arc::new(project(filtered, plan.schema().as_ref())?))
         } else {
             log::trace!("scalar_indexed_scan will not need full scan of any missing fragments");
@@ -4629,19 +5129,31 @@ impl Scanner {
     fn retain_relevant_index_segments(
         &self,
         index_segments: Vec<IndexMetadata>,
-    ) -> Vec<IndexMetadata> {
+    ) -> Result<Vec<IndexMetadata>> {
+        let mut current_segments = Vec::with_capacity(index_segments.len());
+        for index in index_segments {
+            if logical_index_coverage_is_current(&self.dataset, &index)? {
+                current_segments.push(index);
+            }
+        }
         if let Some(fragments) = &self.fragments {
+            if self.dataset.manifest.uses_stable_logical_row_addresses() {
+                // Exact logical coverage is projected through placement by the
+                // v2.3 prefilter. A physical fragment bitmap cannot represent a
+                // packed fragment containing several logical domains.
+                return Ok(current_segments);
+            }
             let target_fragments = RoaringBitmap::from_iter(fragments.iter().map(|f| f.id as u32));
-            index_segments
+            Ok(current_segments
                 .into_iter()
                 .filter(|idx| {
                     idx.fragment_bitmap
                         .as_ref()
                         .is_some_and(|fragmap| !(fragmap & &target_fragments).is_empty())
                 })
-                .collect()
+                .collect())
         } else {
-            index_segments
+            Ok(current_segments)
         }
     }
 
@@ -5307,6 +5819,7 @@ mod test {
     use lance_file::version::LanceFileVersion;
     use lance_index::optimize::OptimizeOptions;
     use lance_index::scalar::inverted::query::{MatchQuery, PhraseQuery};
+    use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::pq::PQBuildParams;
@@ -5321,10 +5834,9 @@ mod test {
     use rstest::rstest;
 
     use super::*;
-    use crate::dataset::WriteMode;
-    use crate::dataset::WriteParams;
     use crate::dataset::optimize::{CompactionOptions, compact_files};
     use crate::dataset::scanner::test_dataset::TestVectorDataset;
+    use crate::dataset::{UpdateBuilder, WriteMode, WriteParams};
     use crate::index::vector::{StageParams, VectorIndexParams};
     use crate::utils::test::{
         DatagenExt, FragmentCount, FragmentRowCount, ThrottledStoreWrapper, assert_plan_node_equals,
@@ -6017,6 +6529,45 @@ mod test {
             .as_primitive::<Int32Type>()
             .values();
         assert_eq!(ids, &(10..20).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn test_v2_3_limit_offset_after_row_rewrite() {
+        let test_dir = TempStrDir::default();
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..32))],
+        )
+        .unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            &test_dir,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_3),
+                max_rows_per_file: 8,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let dataset = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("id < 12")
+            .unwrap()
+            .set("id", "id + 100")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap()
+            .new_dataset;
+
+        limit_offset_equivalency_test(&dataset.scan()).await;
     }
 
     #[test_log::test(tokio::test)]
@@ -11569,6 +12120,129 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             .await
             .unwrap();
         assert_eq!(returned, total);
+    }
+
+    #[tokio::test]
+    async fn test_v2_3_fts_partial_logical_domain_uses_exact_fallback() {
+        let test_dir = TempStrDir::default();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("text", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..10)),
+                Arc::new(StringArray::from(vec!["indexed phrase"; 10])),
+            ],
+        )
+        .unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            &test_dir,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_3),
+                max_rows_per_file: 10,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let dataset = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("id = 0")
+            .unwrap()
+            .set("text", "'needle exact phrase'")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap()
+            .new_dataset;
+        let dataset = UpdateBuilder::new(dataset)
+            .update_where("id = 1")
+            .unwrap()
+            .set("text", "'exact needle phrase'")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap()
+            .new_dataset;
+        let mut dataset = dataset.as_ref().clone();
+
+        let original_fragment_id = dataset
+            .fragments()
+            .iter()
+            .find(|fragment| fragment.deletion_file.is_some())
+            .expect("sparse updates must leave a deletion vector on the original fragment")
+            .id as u32;
+        let params = InvertedIndexParams::default()
+            .with_position(true)
+            .remove_stop_words(false);
+        let segment = dataset
+            .create_index_builder(&["text"], IndexType::Inverted, &params)
+            .name("text_idx".to_string())
+            .fragments(vec![original_fragment_id])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        let coverage = segment.logical_coverage.as_ref().unwrap();
+        assert_eq!(
+            coverage
+                .shards
+                .iter()
+                .map(|shard| shard.row_count)
+                .sum::<u64>(),
+            8
+        );
+        assert_eq!(
+            coverage.shards[0].logical_fragment_bitmap().unwrap().len(),
+            1,
+            "the indexed and fallback rows must share one logical domain"
+        );
+        dataset
+            .commit_existing_index_segments("text_idx", "text", vec![segment])
+            .await
+            .unwrap();
+
+        async fn search_ids(dataset: &Dataset, query: FullTextSearchQuery) -> Vec<i32> {
+            let mut scanner = dataset.scan();
+            scanner.project(&["id"]).unwrap();
+            scanner.full_text_search(query).unwrap();
+            let batch = scanner.try_into_batch().await.unwrap();
+            let mut ids = batch["id"]
+                .as_primitive::<arrow_array::types::Int32Type>()
+                .values()
+                .to_vec();
+            ids.sort_unstable();
+            ids
+        }
+
+        let match_query =
+            MatchQuery::new("needle".to_string()).with_column(Some("text".to_string()));
+        assert_eq!(
+            search_ids(&dataset, FullTextSearchQuery::new_query(match_query.into())).await,
+            vec![0, 1]
+        );
+        assert_eq!(
+            search_ids(&dataset, FullTextSearchQuery::new("phrase".to_string())).await,
+            (0..10).collect::<Vec<_>>(),
+            "the index and exact fallback branches must cover every live row once"
+        );
+
+        let phrase_query =
+            PhraseQuery::new("needle exact".to_string()).with_column(Some("text".to_string()));
+        assert_eq!(
+            search_ids(
+                &dataset,
+                FullTextSearchQuery::new_query(phrase_query.into())
+            )
+            .await,
+            vec![0],
+            "phrase fallback must reject the same tokens in reverse order"
+        );
     }
 
     #[rstest]

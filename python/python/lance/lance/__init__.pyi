@@ -81,6 +81,12 @@ from .optimize import (
 from .optimize import (
     RewriteResult as RewriteResult,
 )
+from .optimize import (
+    RowAddressMaintenance as RowAddressMaintenance,
+)
+from .optimize import (
+    RowAddressMaintenanceMetrics as RowAddressMaintenanceMetrics,
+)
 from .schema import LanceSchema as LanceSchema
 from .trace import TraceEvent as TraceEvent
 from .trace import capture_trace_events as capture_trace_events

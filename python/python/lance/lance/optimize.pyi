@@ -12,17 +12,43 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 from lance import LanceDataset
+from lance.dataset import ColumnOrdering
 from lance.fragment import FragmentMetadata
 from lance.optimize import CompactionOptions
 
 class CompactionMetrics:
+    groups_planned: int
+    groups_admitted: int
+    groups_not_admitted: int
     fragments_removed: int
     fragments_added: int
     files_removed: int
     files_added: int
+
+class RowAddressMaintenanceMetrics:
+    fragments_removed: int
+    fragments_added: int
+    data_files_written: int
+    locator_objects_written: int
+    locator_bytes_written: int
+    rows_rewritten: int
+
+class RowAddressMaintenance:
+    @staticmethod
+    def execute(
+        dataset: "LanceDataset",
+        mode: str,
+        *,
+        ordering: Optional[Sequence[ColumnOrdering]] = None,
+        target_rows_per_fragment: Optional[int] = None,
+        max_rows_per_group: Optional[int] = None,
+        max_bytes_per_file: Optional[int] = None,
+        batch_size: Optional[int] = None,
+        io_buffer_size: Optional[int] = None,
+    ) -> RowAddressMaintenanceMetrics: ...
 
 class RewriteResult:
     read_version: int

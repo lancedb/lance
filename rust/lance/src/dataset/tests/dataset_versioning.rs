@@ -285,7 +285,11 @@ async fn test_stale_checks_cover_fast_successor_and_latest_version(
 #[rstest]
 #[tokio::test]
 async fn test_restore(
-    #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+    #[values(
+        LanceFileVersion::Legacy,
+        LanceFileVersion::Stable,
+        LanceFileVersion::V2_3
+    )]
     data_storage_version: LanceFileVersion,
 ) {
     // Create a table

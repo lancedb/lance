@@ -44,6 +44,7 @@ use dataset::cleanup::{
 use dataset::io_stats::IoStats;
 use dataset::optimize::{
     PyCompaction, PyCompactionMetrics, PyCompactionPlan, PyCompactionTask, PyRewriteResult,
+    PyRowAddressMaintenance, PyRowAddressMaintenanceMetrics,
 };
 use dataset::{DatasetBasePath, MergeInsertBuilder, PyFullTextQuery, PySearchFilter};
 use env_logger::{Builder, Env};
@@ -287,6 +288,8 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyCompactionPlan>()?;
     m.add_class::<PyRewriteResult>()?;
     m.add_class::<PyCompactionMetrics>()?;
+    m.add_class::<PyRowAddressMaintenance>()?;
+    m.add_class::<PyRowAddressMaintenanceMetrics>()?;
     m.add_class::<ScanStatistics>()?;
     m.add_class::<Session>()?;
     m.add_class::<PyTraceEvent>()?;

@@ -1759,6 +1759,74 @@ pub(crate) async fn open_vector_index_v2(
 /// This will reuse the centroids from the source dataset,
 /// making the new indices basically a "delta index" of the source dataset,
 /// until the new dataset fully retains the index.
+pub(crate) fn derive_vector_index_params(
+    source_vector_index: &dyn VectorIndex,
+) -> Result<VectorIndexParams> {
+    let metric_type = source_vector_index.metric_type();
+    let ivf_params = derive_ivf_params(source_vector_index.ivf_model());
+    let quantizer = source_vector_index.quantizer();
+    let (sub_index_type, quantization_type) = source_vector_index.sub_index_type();
+    match (sub_index_type, quantization_type) {
+        (SubIndexType::Flat, QuantizationType::Flat)
+        | (SubIndexType::Flat, QuantizationType::FlatBin) => Ok(
+            VectorIndexParams::with_ivf_flat_params(metric_type, ivf_params),
+        ),
+        (SubIndexType::Flat, QuantizationType::Product) => {
+            let pq_quantizer: ProductQuantizer = quantizer.try_into()?;
+            Ok(VectorIndexParams::with_ivf_pq_params(
+                metric_type,
+                ivf_params,
+                derive_pq_params(&pq_quantizer),
+            ))
+        }
+        (SubIndexType::Flat, QuantizationType::Scalar) => {
+            let sq_quantizer: ScalarQuantizer = quantizer.try_into()?;
+            Ok(VectorIndexParams::with_ivf_sq_params(
+                metric_type,
+                ivf_params,
+                derive_sq_params(&sq_quantizer),
+            ))
+        }
+        (SubIndexType::Flat, QuantizationType::Rabit) => {
+            let rabit_quantizer: RabitQuantizer = quantizer.try_into()?;
+            Ok(VectorIndexParams::with_ivf_rq_params(
+                metric_type,
+                ivf_params,
+                derive_rabit_params(&rabit_quantizer),
+            ))
+        }
+        (SubIndexType::Hnsw, quantization_type) => {
+            let hnsw_params = derive_hnsw_params(source_vector_index);
+            match quantization_type {
+                QuantizationType::Flat | QuantizationType::FlatBin => Ok(
+                    VectorIndexParams::ivf_hnsw(metric_type, ivf_params, hnsw_params),
+                ),
+                QuantizationType::Product => {
+                    let pq_quantizer: ProductQuantizer = quantizer.try_into()?;
+                    Ok(VectorIndexParams::with_ivf_hnsw_pq_params(
+                        metric_type,
+                        ivf_params,
+                        hnsw_params,
+                        derive_pq_params(&pq_quantizer),
+                    ))
+                }
+                QuantizationType::Scalar => {
+                    let sq_quantizer: ScalarQuantizer = quantizer.try_into()?;
+                    Ok(VectorIndexParams::with_ivf_hnsw_sq_params(
+                        metric_type,
+                        ivf_params,
+                        hnsw_params,
+                        derive_sq_params(&sq_quantizer),
+                    ))
+                }
+                QuantizationType::Rabit => Err(Error::index(
+                    "Rabit quantization is not supported for HNSW index".to_string(),
+                )),
+            }
+        }
+    }
+}
+
 pub async fn initialize_vector_index(
     target_dataset: &mut Dataset,
     source_dataset: &Dataset,
@@ -1779,66 +1847,7 @@ pub async fn initialize_vector_index(
         .open_vector_index(column_name, &source_index.uuid, &NoOpMetricsCollector)
         .await?;
 
-    let metric_type = source_vector_index.metric_type();
-    let ivf_model = source_vector_index.ivf_model();
-    let quantizer = source_vector_index.quantizer();
-    let (sub_index_type, quantization_type) = source_vector_index.sub_index_type();
-    let ivf_params = derive_ivf_params(ivf_model);
-
-    let params = match (sub_index_type, quantization_type) {
-        (SubIndexType::Flat, QuantizationType::Flat)
-        | (SubIndexType::Flat, QuantizationType::FlatBin) => {
-            VectorIndexParams::with_ivf_flat_params(metric_type, ivf_params)
-        }
-        (SubIndexType::Flat, QuantizationType::Product) => {
-            let pq_quantizer: ProductQuantizer = quantizer.try_into()?;
-            let pq_params = derive_pq_params(&pq_quantizer);
-            VectorIndexParams::with_ivf_pq_params(metric_type, ivf_params, pq_params)
-        }
-        (SubIndexType::Flat, QuantizationType::Scalar) => {
-            let sq_quantizer: ScalarQuantizer = quantizer.try_into()?;
-            let sq_params = derive_sq_params(&sq_quantizer);
-            VectorIndexParams::with_ivf_sq_params(metric_type, ivf_params, sq_params)
-        }
-        (SubIndexType::Flat, QuantizationType::Rabit) => {
-            let rabit_quantizer: RabitQuantizer = quantizer.try_into()?;
-            let rabit_params = derive_rabit_params(&rabit_quantizer);
-            VectorIndexParams::with_ivf_rq_params(metric_type, ivf_params, rabit_params)
-        }
-        (SubIndexType::Hnsw, quantization_type) => {
-            let hnsw_params = derive_hnsw_params(source_vector_index.as_ref());
-            match quantization_type {
-                QuantizationType::Flat | QuantizationType::FlatBin => {
-                    VectorIndexParams::ivf_hnsw(metric_type, ivf_params, hnsw_params)
-                }
-                QuantizationType::Product => {
-                    let pq_quantizer: ProductQuantizer = quantizer.try_into()?;
-                    let pq_params = derive_pq_params(&pq_quantizer);
-                    VectorIndexParams::with_ivf_hnsw_pq_params(
-                        metric_type,
-                        ivf_params,
-                        hnsw_params,
-                        pq_params,
-                    )
-                }
-                QuantizationType::Scalar => {
-                    let sq_quantizer: ScalarQuantizer = quantizer.try_into()?;
-                    let sq_params = derive_sq_params(&sq_quantizer);
-                    VectorIndexParams::with_ivf_hnsw_sq_params(
-                        metric_type,
-                        ivf_params,
-                        hnsw_params,
-                        sq_params,
-                    )
-                }
-                QuantizationType::Rabit => {
-                    return Err(Error::index(
-                        "Rabit quantization is not supported for HNSW index".to_string(),
-                    ));
-                }
-            }
-        }
-    };
+    let params = derive_vector_index_params(source_vector_index.as_ref())?;
 
     let new_uuid = Uuid::new_v4();
     let frag_reuse_index = target_dataset
@@ -1876,6 +1885,8 @@ pub async fn initialize_vector_index(
         created_at: Some(chrono::Utc::now()),
         base_id: None,
         files: Some(summary.files),
+        row_reference_domain: None,
+        logical_coverage: None,
     };
 
     let transaction = Transaction::new(

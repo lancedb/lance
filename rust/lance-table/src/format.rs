@@ -7,18 +7,23 @@ use uuid::Uuid;
 mod fragment;
 mod index;
 mod manifest;
+mod row_address;
 mod transaction;
 
 pub use crate::rowids::version::{
     RowDatasetVersionMeta, RowDatasetVersionRun, RowDatasetVersionSequence,
 };
 pub use fragment::*;
-pub use index::{IndexFile, IndexMetadata, index_metadata_codec, list_index_files_with_sizes};
+pub use index::{
+    IndexFile, IndexMetadata, LOGICAL_INDEX_COVERAGE_ARTIFACT_ENCODING_VERSION,
+    LogicalIndexCoverageArtifact, index_metadata_codec, list_index_files_with_sizes,
+};
 
 pub use manifest::{
     BasePath, DETACHED_VERSION_MASK, DataStorageFormat, Manifest, SelfDescribingFileReader,
     WriterVersion, is_detached_version,
 };
+pub use row_address::*;
 pub use transaction::Transaction;
 
 use lance_core::{Error, Result};

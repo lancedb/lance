@@ -27,6 +27,36 @@ use crate::format::{DataStorageFormat, IndexMetadata, MAGIC, Manifest, Transacti
 
 use super::commit::ManifestLocation;
 
+/// Tail bytes fetched by the manifest reader before the 2.3 row-address layout.
+pub const BASE_MANIFEST_TAIL_PREFETCH_SIZE: u64 = 64 * 1024;
+
+/// Provisional inline row-address metadata budget used to size manifest prefetch.
+///
+/// This must be frozen or lowered using real S3 cold-open measurements before
+/// file format 2.3 is released.
+pub const PROVISIONAL_ROW_ADDRESS_B_FAST: u64 = 2 * 1024 * 1024;
+
+/// Manifest-only tail prefetch; data and index readers retain their block sizes.
+///
+/// If row-address-only metadata is at most [`PROVISIONAL_ROW_ADDRESS_B_FAST`],
+/// adding it cannot increase the manifest GET count over the previous 64-KiB
+/// reader: a core manifest at most 64 KiB still needs one GET, while a larger
+/// core manifest already needed two and this reader needs at most two. When a
+/// second GET is needed its range ends where this tail starts, so bytes are not
+/// fetched twice.
+pub const MANIFEST_TAIL_PREFETCH_SIZE: u64 =
+    BASE_MANIFEST_TAIL_PREFETCH_SIZE + PROVISIONAL_ROW_ADDRESS_B_FAST;
+
+/// A decoded manifest together with the bytes fetched by its initial tail GET.
+///
+/// Dataset open uses the tail to opportunistically decode adjacent index and
+/// transaction sections without issuing another request.
+pub struct ManifestReadResult {
+    pub manifest: Manifest,
+    pub prefetched_tail: Bytes,
+    pub file_size: usize,
+}
+
 /// Read Manifest on URI.
 ///
 /// This only reads manifest files. It does not read data files.
@@ -36,76 +66,136 @@ pub async fn read_manifest(
     path: &Path,
     known_size: Option<u64>,
 ) -> Result<Manifest> {
+    Ok(
+        read_manifest_with_prefetched_tail(object_store, path, known_size)
+            .await?
+            .manifest,
+    )
+}
+
+/// Read a manifest and retain its initial manifest-specific tail prefetch.
+#[instrument(level = "debug", skip(object_store))]
+pub async fn read_manifest_with_prefetched_tail(
+    object_store: &ObjectStore,
+    path: &Path,
+    known_size: Option<u64>,
+) -> Result<ManifestReadResult> {
     let file_size = if let Some(known_size) = known_size {
         known_size
     } else {
         object_store.inner.head(path).await?.size
     };
-    const PREFETCH_SIZE: u64 = 64 * 1024;
-    let initial_start = file_size.saturating_sub(PREFETCH_SIZE);
+    let initial_start = file_size.saturating_sub(MANIFEST_TAIL_PREFETCH_SIZE);
     let range = Range {
         start: initial_start,
         end: file_size,
     };
-    let buf = object_store.inner.get_range(path, range).await?;
+    let prefetched_tail = match object_store.inner.get_range(path, range).await {
+        Ok(buf) => buf,
+        // A cached size can be larger than the object, causing the range GET
+        // itself to fail before a footer can be inspected. Retry once using HEAD.
+        Err(_) if known_size.is_some() => {
+            return Box::pin(read_manifest_with_prefetched_tail(object_store, path, None)).await;
+        }
+        Err(error) => return Err(error.into()),
+    };
+
+    // S3 may satisfy a range whose end is past EOF with a short response
+    // instead of returning an error.  When the size came from a cache, a short
+    // response means that size cannot be trusted even if the bytes happen to
+    // end in a valid manifest footer.
+    let expected_prefetch_len = file_size.saturating_sub(initial_start);
+    if known_size.is_some() && prefetched_tail.len() as u64 != expected_prefetch_len {
+        return Box::pin(read_manifest_with_prefetched_tail(object_store, path, None)).await;
+    }
 
     // In case of corruption, the known_size might be wrong. We can retry without
     // the size to be more robust.
-    if (buf.len() < 16 || !buf.ends_with(MAGIC)) && known_size.is_some() {
-        return Box::pin(read_manifest(object_store, path, None)).await;
+    if (prefetched_tail.len() < 16 || !prefetched_tail.ends_with(MAGIC)) && known_size.is_some() {
+        return Box::pin(read_manifest_with_prefetched_tail(object_store, path, None)).await;
     }
 
-    if buf.len() < 16 {
+    if file_size < 20 || prefetched_tail.len() < 20 {
         return Err(Error::corrupt_file(
             path.clone(),
-            "Invalid format: file size is smaller than 16 bytes".to_string(),
+            "Invalid format: file size is smaller than the 4-byte length and 16-byte footer"
+                .to_string(),
         ));
     }
-    if !buf.ends_with(MAGIC) {
+    if !prefetched_tail.ends_with(MAGIC) {
         return Err(Error::corrupt_file(
             path.clone(),
             "Invalid format: magic number does not match".to_string(),
         ));
     }
-    let manifest_pos = LittleEndian::read_i64(&buf[buf.len() - 16..buf.len() - 8]) as usize;
-    let manifest_len = file_size as usize - manifest_pos;
+    let manifest_pos = LittleEndian::read_i64(
+        &prefetched_tail[prefetched_tail.len() - 16..prefetched_tail.len() - 8],
+    );
+    if manifest_pos < 0 || manifest_pos as u64 > file_size.saturating_sub(20) {
+        return Err(Error::corrupt_file(
+            path.clone(),
+            format!(
+                "Invalid format: manifest offset {} is outside file size {}",
+                manifest_pos, file_size
+            ),
+        ));
+    }
+    let manifest_pos = manifest_pos as u64;
 
-    let buf: Bytes = if manifest_len <= buf.len() {
+    let manifest_bytes: Bytes = if manifest_pos >= initial_start {
         // The prefetch captured the entire manifest. We just need to trim the buffer.
-        buf.slice(buf.len() - manifest_len..buf.len())
+        prefetched_tail.slice((manifest_pos - initial_start) as usize..)
     } else {
         // The prefetch only captured part of the manifest. We need to make an
-        // additional range request to read the remainder.
-        let mut buf2: BytesMut = object_store
+        // additional, non-overlapping range request to read the remainder.
+        let prefix = object_store
             .inner
             .get_range(
                 path,
                 Range {
-                    start: manifest_pos as u64,
-                    end: file_size - PREFETCH_SIZE,
+                    start: manifest_pos,
+                    end: initial_start,
                 },
             )
-            .await?
-            .into_iter()
-            .collect();
-        buf2.extend_from_slice(&buf);
-        buf2.freeze()
+            .await?;
+        let mut combined = BytesMut::with_capacity(prefix.len() + prefetched_tail.len());
+        combined.extend_from_slice(&prefix);
+        combined.extend_from_slice(&prefetched_tail);
+        combined.freeze()
     };
 
-    let recorded_length = LittleEndian::read_u32(&buf[0..4]) as usize;
+    if manifest_bytes.len() < 20 {
+        return Err(Error::corrupt_file(
+            path.clone(),
+            "Invalid format: manifest section is smaller than its length prefix and footer"
+                .to_string(),
+        ));
+    }
+    let recorded_length = LittleEndian::read_u32(&manifest_bytes[0..4]) as usize;
     // Need to trim the magic number at end and message length at beginning
-    let buf = buf.slice(4..buf.len() - 16);
+    let message = manifest_bytes.slice(4..manifest_bytes.len() - 16);
 
-    if buf.len() != recorded_length {
+    if message.len() != recorded_length {
         return Err(Error::invalid_input(format!(
             "Invalid format: manifest length does not match. Expected {}, got {}",
             recorded_length,
-            buf.len()
+            message.len()
         )));
     }
 
-    let proto = pb::Manifest::decode(buf)?;
-    Manifest::try_from(proto)
+    let proto = pb::Manifest::decode(message)?;
+    let manifest = Manifest::try_from(proto)?;
+    let file_size = usize::try_from(file_size).map_err(|_| {
+        Error::not_supported(format!(
+            "manifest file size {} does not fit in usize",
+            file_size
+        ))
+    })?;
+    Ok(ManifestReadResult {
+        manifest,
+        prefetched_tail,
+        file_size,
+    })
 }
 
 #[instrument(level = "debug", skip(object_store, manifest))]
@@ -256,6 +346,7 @@ impl PreviousManifestProvider for ManifestDescribing {
 #[cfg(test)]
 mod test {
     use arrow_array::{Int32Array, RecordBatch};
+    use rstest::rstest;
     use std::collections::HashMap;
 
     use crate::format::SelfDescribingFileReader;
@@ -268,6 +359,60 @@ mod test {
     use tokio::io::AsyncWriteExt;
 
     use super::*;
+
+    const TEST_ROW_ADDRESS_DELTA_FIELD: u64 = 50_000;
+
+    fn append_varint(mut value: u64, output: &mut Vec<u8>) {
+        while value >= 0x80 {
+            output.push((value as u8) | 0x80);
+            value >>= 7;
+        }
+        output.push(value as u8);
+    }
+
+    async fn write_sized_manifest(
+        store: &ObjectStore,
+        path: &Path,
+        core_payload_size: usize,
+        delta_size: usize,
+    ) -> (Manifest, u64, u64) {
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new("value", DataType::Int64, false)]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let mut manifest = Manifest::new(
+            schema,
+            Arc::new(vec![]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        manifest
+            .config
+            .insert("core-payload".to_string(), "c".repeat(core_payload_size));
+
+        let mut encoded = pb::Manifest::from(&manifest).encode_to_vec();
+        let core_file_size = (encoded.len() + 4 + 16) as u64;
+        if delta_size > 0 {
+            // Append a length-delimited unknown protobuf field to model the 2.3
+            // row-address layout without depending on its provisional schema.
+            append_varint((TEST_ROW_ADDRESS_DELTA_FIELD << 3) | 2, &mut encoded);
+            append_varint(delta_size as u64, &mut encoded);
+            encoded.resize(encoded.len() + delta_size, 0);
+        }
+
+        let mut writer = store.create(path).await.unwrap();
+        writer
+            .write_all(&(encoded.len() as u32).to_le_bytes())
+            .await
+            .unwrap();
+        writer.write_all(&encoded).await.unwrap();
+        writer
+            .write_magics(0, MAJOR_VERSION, MINOR_VERSION, MAGIC)
+            .await
+            .unwrap();
+        Writer::shutdown(writer.as_mut()).await.unwrap();
+
+        let file_size = store.inner.head(path).await.unwrap().size;
+        (manifest, core_file_size, file_size)
+    }
 
     async fn test_roundtrip_manifest(prefix_size: usize, manifest_min_size: usize) {
         let store = ObjectStore::memory();
@@ -322,6 +467,100 @@ mod test {
         test_roundtrip_manifest(0, 100_000).await;
         test_roundtrip_manifest(1000, 100_000).await;
         test_roundtrip_manifest(1000, 1000).await;
+    }
+
+    #[rstest]
+    #[case::small_core(32 * 1024, 1024 * 1024, 1)]
+    #[case::medium_core(100 * 1024, 1024 * 1024, 1)]
+    #[case::large_core(3 * 1024 * 1024, 1024 * 1024, 2)]
+    #[tokio::test]
+    async fn test_manifest_tail_prefetch_request_bound(
+        #[case] core_payload_size: usize,
+        #[case] delta_size: usize,
+        #[case] expected_candidate_gets: u64,
+    ) {
+        let store = ObjectStore::memory();
+        let path = Path::from("/manifest_tail_prefetch");
+        let (expected, core_file_size, file_size) =
+            write_sized_manifest(&store, &path, core_payload_size, delta_size).await;
+        store.io_stats_incremental();
+
+        let actual = read_manifest(&store, &path, Some(file_size)).await.unwrap();
+        let stats = store.io_stats_incremental();
+
+        assert_eq!(actual, expected);
+        assert_eq!(stats.read_iops, expected_candidate_gets);
+        assert_eq!(stats.read_bytes, file_size);
+
+        let baseline_gets = if core_file_size <= BASE_MANIFEST_TAIL_PREFETCH_SIZE {
+            1
+        } else {
+            2
+        };
+        assert!(
+            stats.read_iops <= baseline_gets,
+            "candidate GETs={} exceeded 64-KiB baseline GETs={} for core_file_size={} and delta_size={}",
+            stats.read_iops,
+            baseline_gets,
+            core_file_size,
+            delta_size
+        );
+    }
+
+    #[tokio::test]
+    async fn test_manifest_tail_prefetch_retries_stale_known_size() {
+        let store = ObjectStore::memory();
+        let path = Path::from("/manifest_tail_prefetch_stale_size");
+        let (expected, _, file_size) =
+            write_sized_manifest(&store, &path, 32 * 1024, 1024 * 1024).await;
+        let stale_size = file_size - 1;
+        store.io_stats_incremental();
+
+        let actual = read_manifest_with_prefetched_tail(&store, &path, Some(stale_size))
+            .await
+            .unwrap();
+        let stats = store.io_stats_incremental();
+
+        assert_eq!(actual.manifest, expected);
+        assert_eq!(actual.file_size as u64, file_size);
+        assert_eq!(stats.read_iops, 3);
+        assert_eq!(stats.read_bytes, stale_size + file_size);
+    }
+
+    #[tokio::test]
+    async fn test_manifest_tail_prefetch_retries_oversized_known_size() {
+        let store = ObjectStore::memory();
+        let path = Path::from("/manifest_tail_prefetch_oversized_stale_size");
+        let (expected, _, file_size) =
+            write_sized_manifest(&store, &path, 32 * 1024, 1024 * 1024).await;
+        let stale_size = file_size + 1;
+        store.io_stats_incremental();
+
+        let actual = read_manifest_with_prefetched_tail(&store, &path, Some(stale_size))
+            .await
+            .unwrap();
+
+        assert_eq!(actual.manifest, expected);
+        assert_eq!(actual.file_size as u64, file_size);
+        assert!(store.io_stats_incremental().read_iops >= 2);
+    }
+
+    #[tokio::test]
+    async fn test_manifest_tail_prefetch_rejects_footer_without_length_prefix() {
+        let store = ObjectStore::memory();
+        let path = Path::from("/manifest_footer_without_length_prefix");
+        let mut bytes = vec![0_u8; 16];
+        bytes[12..].copy_from_slice(MAGIC);
+        let mut writer = store.create(&path).await.unwrap();
+        writer.write_all(&bytes).await.unwrap();
+        Writer::shutdown(writer.as_mut()).await.unwrap();
+
+        let error = read_manifest(&store, &path, Some(bytes.len() as u64))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, Error::CorruptFile { .. }));
+        assert!(error.to_string().contains("4-byte length"));
     }
 
     #[tokio::test]

@@ -21,7 +21,7 @@ use serde_json::json;
 
 use crate::dataset::Dataset;
 use crate::index::scalar::fetch_index_details;
-use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
+use crate::index::{DatasetIndexExt, DatasetIndexInternalExt, logical_index_coverage_is_current};
 
 #[derive(Debug)]
 pub struct LogicalScalarIndex {
@@ -213,11 +213,18 @@ fn combine_search_results(results: Vec<SearchResult>) -> Result<SearchResult> {
     })
 }
 
-fn index_intersects_dataset(index: &IndexMetadata, dataset: &Dataset) -> bool {
-    index
+fn index_intersects_dataset(index: &IndexMetadata, dataset: &Dataset) -> Result<bool> {
+    if dataset.manifest.uses_stable_logical_row_addresses() {
+        return Ok(logical_index_coverage_is_current(dataset, index)?
+            && index
+                .logical_coverage
+                .as_ref()
+                .is_some_and(|coverage| coverage.shards.iter().any(|shard| shard.row_count > 0)));
+    }
+    Ok(index
         .fragment_bitmap
         .as_ref()
-        .is_some_and(|index_bitmap| index_bitmap.intersection_len(&dataset.fragment_bitmap) > 0)
+        .is_some_and(|index_bitmap| index_bitmap.intersection_len(&dataset.fragment_bitmap) > 0))
 }
 
 /// List the committed, dataset-intersecting segments of a named scalar index.
@@ -232,12 +239,12 @@ pub async fn load_named_scalar_segments(
     column: &str,
     index_name: &str,
 ) -> Result<Vec<IndexMetadata>> {
-    let usable_indices = dataset
-        .load_indices_by_name(index_name)
-        .await?
-        .into_iter()
-        .filter(|index| index_intersects_dataset(index, dataset))
-        .collect::<Vec<_>>();
+    let mut usable_indices = Vec::new();
+    for index in dataset.load_indices_by_name(index_name).await? {
+        if index_intersects_dataset(&index, dataset)? {
+            usable_indices.push(index);
+        }
+    }
 
     let mut index_type_url = None::<String>;
     for index in &usable_indices {
@@ -286,6 +293,17 @@ pub async fn scalar_index_fragment_bitmap(
     index_name: &str,
 ) -> Result<Option<RoaringBitmap>> {
     let indices = load_named_scalar_segments(dataset, column, index_name).await?;
+    if dataset.manifest.uses_stable_logical_row_addresses() {
+        if indices.is_empty() {
+            return Ok(None);
+        }
+        let indices = crate::index::resolve_logical_index_metadata(dataset, &indices).await?;
+        return crate::index::fully_covered_logical_domains(
+            dataset,
+            &indices.iter().collect::<Vec<_>>(),
+        )
+        .map(Some);
+    }
     match indices.len() {
         0 => Ok(None),
         1 => Ok(indices
@@ -353,6 +371,173 @@ mod tests {
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
 
     use super::*;
+
+    #[tokio::test]
+    async fn test_v23_external_btree_coverage_prunes_after_compact_and_repack() {
+        use crate::dataset::optimize::{RowAddressMaintenanceOptions, maintain_row_addresses};
+        use crate::dataset::transaction::{Operation, TransactionBuilder};
+        use lance_core::ROW_ID;
+        use lance_datagen::{BatchCount, ByteCount, RowCount};
+        use lance_file::version::LanceFileVersion;
+        use lance_table::format::RowAddressPlacement;
+
+        let test_dir = TempStrDir::default();
+        let reader = lance_datagen::gen_batch()
+            .col("value", array::step::<Int32Type>())
+            .col(
+                "payload",
+                array::rand_fixedbin(ByteCount::from(4096), false),
+            )
+            .into_reader_rows(RowCount::from(256), BatchCount::from(16));
+        let mut dataset = Dataset::write(
+            reader,
+            test_dir.as_str(),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_3),
+                max_rows_per_file: 16,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        let mut segment =
+            CreateIndexBuilder::new(&mut dataset, &["value"], IndexType::BTree, &params)
+                .name("value_btree_external".to_owned())
+                .execute_uncommitted()
+                .await
+                .unwrap();
+        segment
+            .logical_coverage
+            .as_mut()
+            .unwrap()
+            .externalize_detail_over(0)
+            .unwrap();
+        assert!(
+            segment
+                .logical_coverage
+                .as_ref()
+                .unwrap()
+                .requires_authoritative_resolution()
+        );
+        let transaction = TransactionBuilder::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![segment],
+                removed_indices: Vec::new(),
+            },
+        )
+        .build();
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 64,
+                max_rows_per_group: 64,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        maintain_row_addresses(
+            &mut dataset,
+            RowAddressMaintenanceOptions {
+                target_rows_per_fragment: 32,
+                max_rows_per_group: 32,
+                ..RowAddressMaintenanceOptions::repack()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            dataset
+                .manifest
+                .row_address_layout
+                .as_ref()
+                .unwrap()
+                .placements
+                .iter()
+                .any(|placement| matches!(placement, RowAddressPlacement::ExplicitMap(_)))
+        );
+
+        let dataset = Dataset::open(test_dir.as_str()).await.unwrap();
+        let committed = dataset
+            .load_indices_by_name("value_btree_external")
+            .await
+            .unwrap();
+        assert_eq!(committed.len(), 1);
+        assert!(
+            committed[0]
+                .logical_coverage
+                .as_ref()
+                .unwrap()
+                .requires_authoritative_resolution()
+        );
+        let expected_domains = dataset
+            .manifest
+            .row_address_layout
+            .as_ref()
+            .unwrap()
+            .current_logical_fragment_bitmap(dataset.manifest.fragments.as_ref())
+            .unwrap();
+        assert_eq!(
+            scalar_index_fragment_bitmap(&dataset, "value", "value_btree_external")
+                .await
+                .unwrap()
+                .unwrap(),
+            expected_domains
+        );
+
+        async fn query(dataset: &Dataset, use_index: bool) -> arrow_array::RecordBatch {
+            let mut scanner = dataset.scan();
+            scanner.use_scalar_index(use_index);
+            scanner.project(&["payload", ROW_ID]).unwrap();
+            scanner.filter("value = 137").unwrap();
+            scanner.try_into_batch().await.unwrap()
+        }
+
+        let mut indexed_plan = dataset.scan();
+        indexed_plan.project(&["payload", ROW_ID]).unwrap();
+        indexed_plan.filter("value = 137").unwrap();
+        let plan = indexed_plan.explain_plan(false).await.unwrap();
+        assert!(
+            plan.contains("ScalarIndexQuery") && plan.contains("value_btree_external"),
+            "external coverage must keep the scalar-index plan:\n{plan}"
+        );
+        let indexed = query(&dataset, true).await;
+        let flat = query(&dataset, false).await;
+        assert_eq!(indexed, flat);
+        assert_eq!(indexed.num_rows(), 1);
+
+        let _ = dataset.object_store.as_ref().io_stats_incremental();
+        let mut full_scan = dataset.scan();
+        full_scan.project(&["payload"]).unwrap();
+        full_scan.try_into_batch().await.unwrap();
+        let full_scan_bytes = dataset
+            .object_store
+            .as_ref()
+            .io_stats_incremental()
+            .read_bytes;
+
+        query(&dataset, true).await;
+        let _ = dataset.object_store.as_ref().io_stats_incremental();
+        query(&dataset, true).await;
+        let indexed_bytes = dataset
+            .object_store
+            .as_ref()
+            .io_stats_incremental()
+            .read_bytes;
+        assert!(
+            indexed_bytes < full_scan_bytes,
+            "indexed query read {indexed_bytes} bytes, full scan read {full_scan_bytes} bytes"
+        );
+    }
 
     #[tokio::test]
     async fn test_open_named_scalar_index_uses_all_zonemap_segments() {

@@ -110,7 +110,7 @@ use lance_io::{
 };
 use lance_linalg::distance::{DistanceType, Dot, L2, MetricType};
 use lance_linalg::{distance::Normalize, kernels::normalize_fsl_owned};
-use lance_table::format::{IndexFile, IndexMetadata as TableIndexMetadata};
+use lance_table::format::{IndexFile, IndexMetadata as TableIndexMetadata, RowReferenceDomain};
 use log::{info, warn};
 use object_store::path::Path;
 use prost::Message;
@@ -2204,14 +2204,31 @@ pub(crate) async fn merge_segments_with_progress(
 
     let mut merged_segment = segments[0].clone();
     let mut fragment_bitmap = RoaringBitmap::new();
+    let logical = segments.iter().all(|segment| {
+        segment.row_reference_domain == Some(RowReferenceDomain::StableLogicalRowAddress)
+            && segment.fragment_bitmap.is_none()
+            && segment.logical_coverage.is_some()
+    });
+    if !logical
+        && segments.iter().any(|segment| {
+            segment.row_reference_domain == Some(RowReferenceDomain::StableLogicalRowAddress)
+                || segment.logical_coverage.is_some()
+        })
+    {
+        return Err(Error::invalid_input(
+            "vector segment merge cannot mix physical and logical coverage",
+        ));
+    }
     for segment in &segments {
-        let source_fragment_bitmap = segment.fragment_bitmap.as_ref().ok_or_else(|| {
-            Error::index(format!(
-                "Segment '{}' is missing fragment coverage",
-                segment.uuid
-            ))
-        })?;
-        fragment_bitmap |= source_fragment_bitmap.clone();
+        if !logical {
+            let source_fragment_bitmap = segment.fragment_bitmap.as_ref().ok_or_else(|| {
+                Error::index(format!(
+                    "Segment '{}' is missing fragment coverage",
+                    segment.uuid
+                ))
+            })?;
+            fragment_bitmap |= source_fragment_bitmap.clone();
+        }
     }
 
     let index_version = infer_source_index_version(&segments)?;
@@ -2229,7 +2246,7 @@ pub(crate) async fn merge_segments_with_progress(
 
     merged_segment = TableIndexMetadata {
         uuid: segment_uuid,
-        fragment_bitmap: Some(fragment_bitmap),
+        fragment_bitmap: (!logical).then_some(fragment_bitmap),
         index_details: Some(Arc::new(crate::index::vector_index_details_default())),
         index_version,
         created_at: Some(chrono::Utc::now()),
@@ -5077,6 +5094,8 @@ mod tests {
             created_at: Some(chrono::Utc::now()),
             base_id: None,
             files: None,
+            row_reference_domain: None,
+            logical_coverage: None,
         };
 
         // We need to commit this index to the dataset so that it can be found
@@ -5116,6 +5135,8 @@ mod tests {
             created_at: None, // Test index, not setting timestamp
             base_id: None,
             files: None,
+            row_reference_domain: None,
+            logical_coverage: None,
         };
 
         let prefilter = Arc::new(DatasetPreFilter::new(dataset.clone(), &[index_meta], None));
@@ -5175,6 +5196,8 @@ mod tests {
             created_at: Some(chrono::Utc::now()),
             base_id: None,
             files: None,
+            row_reference_domain: None,
+            logical_coverage: None,
         };
 
         // We need to commit this new index to the dataset so it can be found

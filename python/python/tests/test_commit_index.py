@@ -4,6 +4,7 @@
 import random
 import shutil
 import string
+from dataclasses import replace
 from pathlib import Path
 
 import lance
@@ -224,3 +225,34 @@ def test_commit_index_with_index_details(dataset_with_index, test_table, tmp_pat
     committed_txn = dataset_without_index.get_transactions(1)[0]
     committed_index = committed_txn.operation.new_indices[0]
     assert committed_index.index_details == original_index.index_details
+
+
+def test_commit_v2_3_index_logical_coverage_round_trip(tmp_path):
+    """V2.3 index provenance survives Python transaction conversion."""
+    dataset = lance.write_dataset(
+        pa.table({"value": [1, 2, 3]}),
+        tmp_path / "v2_3_index",
+        data_storage_version="2.3",
+    )
+    dataset.create_scalar_index("value", index_type="BTREE", name="source")
+
+    original = dataset.get_transactions(1)[0].operation.new_indices[0]
+    assert original.fragment_ids is None
+    assert original.row_reference_domain == "stable_logical_row_address"
+    assert original.logical_coverage
+
+    copied = replace(original, name="copied")
+    dataset = lance.LanceDataset.commit(
+        dataset.uri,
+        lance.LanceOperation.CreateIndex(
+            new_indices=[copied],
+            removed_indices=[],
+        ),
+        read_version=dataset.version,
+    )
+
+    committed = dataset.get_transactions(1)[0].operation.new_indices[0]
+    assert committed.name == "copied"
+    assert committed.fragment_ids is None
+    assert committed.row_reference_domain == original.row_reference_domain
+    assert committed.logical_coverage == original.logical_coverage

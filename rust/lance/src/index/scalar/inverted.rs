@@ -14,7 +14,7 @@ use lance_index::pbold::InvertedIndexDetails;
 use lance_index::scalar::inverted::InvertedIndex;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::registry::VALUE_COLUMN_NAME;
-use lance_table::format::IndexMetadata;
+use lance_table::format::{IndexMetadata, RowReferenceDomain};
 use prost::Message;
 use roaring::RoaringBitmap;
 use uuid::Uuid;
@@ -62,9 +62,13 @@ pub(crate) async fn finalize_segment_files_if_needed(
         return Ok(());
     }
 
-    let store = Arc::new(LanceIndexStore::from_dataset_for_new(
+    let store = Arc::new(super::configure_logical_coverage_artifact_from_exact(
         dataset,
-        &segment.uuid,
+        segment.uuid,
+        &segment.fields,
+        segment.logical_coverage.as_ref(),
+        "inverted",
+        LanceIndexStore::from_dataset_for_new(dataset, &segment.uuid)?,
     )?);
     lance_index::scalar::inverted::builder::merge_index_files(
         dataset.object_store.as_ref(),
@@ -94,14 +98,22 @@ pub(crate) async fn merge_segments(
 
     let mut source_indices = Vec::with_capacity(segments.len());
     let mut fragment_bitmap = RoaringBitmap::new();
+    let segment_refs = segments.iter().collect::<Vec<_>>();
+    let logical_coverage = dataset
+        .manifest
+        .uses_stable_logical_row_addresses()
+        .then(|| crate::index::merge_logical_index_coverage(dataset, &segment_refs))
+        .transpose()?;
     for segment in &segments {
         finalize_segment_files_if_needed(dataset, segment).await?;
-        fragment_bitmap |= segment.fragment_bitmap.as_ref().cloned().ok_or_else(|| {
-            Error::invalid_input(format!(
-                "CreateIndex: segment {} is missing fragment coverage",
-                segment.uuid
-            ))
-        })?;
+        if logical_coverage.is_none() {
+            fragment_bitmap |= segment.fragment_bitmap.as_ref().cloned().ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "CreateIndex: segment {} is missing fragment coverage",
+                    segment.uuid
+                ))
+            })?;
+        }
         let scalar_index =
             super::open_scalar_index(dataset, &field_path, segment, &NoOpMetricsCollector).await?;
         let inverted_index = scalar_index
@@ -118,7 +130,14 @@ pub(crate) async fn merge_segments(
     }
 
     let new_uuid = Uuid::new_v4();
-    let new_store = LanceIndexStore::from_dataset_for_new(dataset, &new_uuid)?;
+    let new_store = super::configure_logical_coverage_artifact_from_exact(
+        dataset,
+        new_uuid,
+        &[field_id],
+        logical_coverage.as_ref(),
+        "inverted",
+        LanceIndexStore::from_dataset_for_new(dataset, &new_uuid)?,
+    )?;
     let created_index = InvertedIndex::merge_segments(
         &source_indices,
         empty_inverted_update_stream(dataset, field_id)?,
@@ -132,12 +151,16 @@ pub(crate) async fn merge_segments(
         uuid: new_uuid,
         fields: vec![field_id],
         dataset_version: dataset.manifest.version,
-        fragment_bitmap: Some(fragment_bitmap),
+        fragment_bitmap: logical_coverage.is_none().then_some(fragment_bitmap),
         index_details: Some(Arc::new(created_index.index_details)),
         index_version: created_index.index_version as i32,
         created_at: Some(chrono::Utc::now()),
         base_id: None,
         files: Some(created_index.files),
+        row_reference_domain: logical_coverage
+            .as_ref()
+            .map(|_| RowReferenceDomain::StableLogicalRowAddress),
+        logical_coverage,
         ..segments[0].clone()
     })
 }

@@ -18,7 +18,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use either::Either;
 use futures::stream::FuturesUnordered;
 use futures::{Future, StreamExt, TryStreamExt};
-use lance_table::format::IndexMetadata;
+use lance_table::format::{IndexMetadata, RowAddressPlacement};
 use lance_table::utils::LanceIteratorExtension;
 use object_store::path::Path;
 use uuid::Uuid;
@@ -104,6 +104,16 @@ fn manifest_file_rows<'a>(
             files += 1;
         }
     }
+    if let Some(layout) = &manifest.row_address_layout {
+        files += layout
+            .placements
+            .iter()
+            .filter_map(|placement| match placement {
+                RowAddressPlacement::ExplicitMap(explicit) => Some(explicit.destinations.len() + 1),
+                _ => None,
+            })
+            .sum::<usize>();
+    }
 
     let data_files = manifest.fragments.iter().flat_map(move |fragment| {
         fragment.files.iter().map(move |data_file| {
@@ -126,9 +136,36 @@ fn manifest_file_rows<'a>(
         })
     });
 
+    let explicit_map_files = manifest
+        .row_address_layout
+        .iter()
+        .flat_map(|layout| layout.placements.iter())
+        .filter_map(|placement| match placement {
+            RowAddressPlacement::ExplicitMap(explicit) => Some(explicit),
+            _ => None,
+        })
+        .flat_map(move |explicit| {
+            let effective_base_uri = resolve_base_uri(manifest, explicit.base_id, base_uri);
+            let locator = FileRow {
+                version: manifest.version,
+                base_uri: Cow::Borrowed(effective_base_uri),
+                path: Cow::Borrowed(explicit.object_path.as_str()),
+                file_type: FileType::DataFile,
+            };
+            std::iter::once(locator).chain(explicit.destinations.iter().map(move |destination| {
+                FileRow {
+                    version: manifest.version,
+                    base_uri: Cow::Borrowed(effective_base_uri),
+                    path: Cow::Borrowed(destination.row_id_file_path.as_str()),
+                    file_type: FileType::DataFile,
+                }
+            }))
+        });
+
     Box::new(
         iter.chain(data_files)
             .chain(deletion_files)
+            .chain(explicit_map_files)
             .exact_size(files),
     )
 }
@@ -1049,6 +1086,7 @@ mod tests {
             physical_rows: Some(3),
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            native_logical_domain: None,
         };
 
         let mut base_paths = HashMap::new();

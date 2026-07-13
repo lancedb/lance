@@ -174,5 +174,7 @@ pub(crate) async fn build_frag_reuse_index_metadata(
         base_id: None,
         // Fragment reuse index is inline (no files)
         files: None,
+        row_reference_domain: None,
+        logical_coverage: None,
     })
 }

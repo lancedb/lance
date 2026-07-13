@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::HashSet;
+use std::num::NonZero;
 use std::sync::Arc;
 use std::time::Duration;
 use std::vec;
@@ -36,8 +37,10 @@ use lance_core::utils::tempfile::{TempDir, TempStrDir};
 use lance_datafusion::utils::reader_to_stream;
 use lance_datagen::{BatchCount, RowCount, array, gen_batch};
 use lance_file::version::LanceFileVersion;
-use lance_file::writer::FileWriter;
+use lance_file::writer::{FileWriter, FileWriterOptions};
+use lance_io::object_store::WrappingObjectStore;
 use lance_io::utils::CachedFileSize;
+use lance_io::utils::tracking_store::{IOTracker, IoOperation};
 use lance_table::format::{BasePath, DataFile, Fragment};
 
 use crate::dataset::write::merge_insert::{WhenMatched, WhenNotMatched};
@@ -2282,6 +2285,359 @@ async fn index_consistent_values(dataset: &Dataset, col: &str, predicate: &str) 
         "index-served `{predicate}` disagrees with a flat scan"
     );
     indexed_vals
+}
+
+async fn write_v2_3_replacement_file(
+    dataset: &Dataset,
+    path: &str,
+    schema: Arc<ArrowSchema>,
+    batch: &RecordBatch,
+) -> DataFile {
+    let object_writer = dataset
+        .object_store
+        .create(&dataset.data_dir().join(path))
+        .await
+        .unwrap();
+    let mut writer = FileWriter::try_new(
+        object_writer,
+        schema.as_ref().try_into().unwrap(),
+        FileWriterOptions {
+            format_version: Some(LanceFileVersion::V2_3),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    writer.write_batch(batch).await.unwrap();
+    let summary = writer.finish().await.unwrap();
+    let mut data_file = dataset.manifest.fragments[0].files[0].clone();
+    data_file.path = path.to_owned();
+    data_file.file_size_bytes = CachedFileSize::new(summary.size_bytes);
+    data_file
+}
+
+async fn write_v2_3_projected_file(
+    dataset: &Dataset,
+    path: &str,
+    schema: lance_core::datatypes::Schema,
+    batch: &RecordBatch,
+) -> DataFile {
+    let object_writer = dataset
+        .object_store
+        .create(&dataset.data_dir().join(path))
+        .await
+        .unwrap();
+    let mut writer = FileWriter::try_new(
+        object_writer,
+        schema,
+        FileWriterOptions {
+            format_version: Some(LanceFileVersion::V2_3),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    writer.write_batch(batch).await.unwrap();
+    let field_id_to_column_indices = writer.field_id_to_column_indices().to_vec();
+    let (major, minor) = writer.version().to_numbers();
+    let summary = writer.finish().await.unwrap();
+    DataFile::new(
+        path,
+        field_id_to_column_indices
+            .iter()
+            .map(|(field_id, _)| *field_id as i32)
+            .collect(),
+        field_id_to_column_indices
+            .iter()
+            .map(|(_, column_index)| *column_index as i32)
+            .collect(),
+        major,
+        minor,
+        NonZero::new(summary.size_bytes),
+        None,
+    )
+}
+
+#[rstest]
+#[case::data_replacement(false)]
+#[case::generic_merge(true)]
+#[tokio::test]
+async fn test_v2_3_row_aligned_existing_field_rewrite_advances_generation(#[case] is_merge: bool) {
+    let uri = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "value",
+        DataType::Int32,
+        false,
+    )]));
+    let initial = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![10, 20, 30]))],
+    )
+    .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(initial)], schema.clone()),
+        uri.as_str(),
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_3),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["value"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+
+    let replacement = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![40, 50, 60]))],
+    )
+    .unwrap();
+    let new_file = write_v2_3_replacement_file(
+        &dataset,
+        if is_merge {
+            "merge-replacement.lance"
+        } else {
+            "data-replacement.lance"
+        },
+        schema,
+        &replacement,
+    )
+    .await;
+    let operation = if is_merge {
+        let mut successor = dataset.manifest.fragments[0].clone();
+        successor.files[0] = new_file;
+        Operation::Merge {
+            fragments: vec![successor],
+            schema: dataset.schema().clone(),
+        }
+    } else {
+        Operation::DataReplacement {
+            replacements: vec![DataReplacementGroup(0, new_file)],
+        }
+    };
+    let read_version = dataset.version_id();
+    let dataset = Dataset::commit(
+        WriteDestination::Dataset(Arc::new(dataset)),
+        operation,
+        Some(read_version),
+        None,
+        None,
+        Arc::new(Default::default()),
+        false,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        index_consistent_values(&dataset, "value", "value >= 40").await,
+        vec![40, 50, 60]
+    );
+    assert!(
+        index_consistent_values(&dataset, "value", "value < 40")
+            .await
+            .is_empty()
+    );
+    let layout = dataset.manifest.row_address_layout.as_ref().unwrap();
+    assert!(layout.generation_regions.iter().any(|region| {
+        region.generation == dataset.version_id()
+            && region.field_ids == vec![0]
+            && region.selection.cardinality() == 3
+    }));
+}
+
+#[tokio::test]
+async fn test_v2_3_row_aligned_preflight_reads_only_rewritten_files() {
+    let uri = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("left", DataType::Int32, false),
+        ArrowField::new("right", DataType::Int32, false),
+    ]));
+    let initial = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![10, 20, 30])),
+            Arc::new(Int32Array::from(vec![100, 200, 300])),
+        ],
+    )
+    .unwrap();
+    Dataset::write(
+        RecordBatchIterator::new([Ok(initial)], schema.clone()),
+        uri.as_str(),
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_3),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    // Reopen with a fresh metadata cache so opening the existing physical file
+    // after its field metadata is tombstoned remains observable in the tracker.
+    let dataset = Dataset::open(uri.as_str()).await.unwrap();
+    let original_file_path = dataset.manifest.fragments[0].files[0].path.clone();
+    let replacement_batch = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "left",
+            DataType::Int32,
+            false,
+        )])),
+        vec![Arc::new(Int32Array::from(vec![40, 50, 60]))],
+    )
+    .unwrap();
+    let replacement_file = write_v2_3_projected_file(
+        &dataset,
+        "replacement-left.lance",
+        dataset.schema().project(&["left"]).unwrap(),
+        &replacement_batch,
+    )
+    .await;
+    let mut successor = dataset.manifest.fragments[0].clone();
+    let mut retained_file = successor.files[0].clone();
+    retained_file.fields = vec![-2, 1].into();
+    successor.files = vec![retained_file, replacement_file];
+    let merge_schema = dataset.schema().clone();
+    let tracker = Arc::new(IOTracker::default());
+    let dataset =
+        dataset.with_object_store_wrappers(vec![tracker.clone() as Arc<dyn WrappingObjectStore>]);
+    let _ = tracker.incremental_stats();
+    let read_version = dataset.version_id();
+    let committed = Dataset::commit(
+        WriteDestination::Dataset(Arc::new(dataset)),
+        Operation::Merge {
+            fragments: vec![successor],
+            schema: merge_schema,
+        },
+        Some(read_version),
+        None,
+        None,
+        Arc::new(Default::default()),
+        false,
+    )
+    .await
+    .unwrap();
+    let stats = tracker.incremental_stats();
+    let data_read_paths = stats
+        .requests
+        .iter()
+        .filter(|request| {
+            matches!(request.operation, IoOperation::Get | IoOperation::Head)
+                && request.path.to_string().ends_with(".lance")
+        })
+        .map(|request| request.path.to_string())
+        .collect::<Vec<_>>();
+    assert!(
+        data_read_paths
+            .iter()
+            .any(|path| path.ends_with("replacement-left.lance")),
+        "rewritten footer was not read: {stats}"
+    );
+    assert!(
+        data_read_paths
+            .iter()
+            .all(|path| !path.ends_with(&original_file_path)),
+        "unchanged data files were opened during preflight: {stats}"
+    );
+    assert_eq!(committed.manifest.fragments[0].files.len(), 2);
+    let layout = committed.manifest.row_address_layout.as_ref().unwrap();
+    // With no queryable index on `left`, the generation frontier is retired
+    // in the same commit and represented by the field floor instead of a
+    // persistent row-selection region.
+    let generation_floor = |field_id| {
+        layout
+            .index_commit_floors
+            .iter()
+            .find(|floor| floor.field_id == field_id)
+            .unwrap()
+            .generation
+    };
+    assert_eq!(generation_floor(0), committed.version_id());
+    assert!(generation_floor(1) < committed.version_id());
+    assert!(
+        layout
+            .generation_regions
+            .iter()
+            .all(|region| { region.generation != committed.version_id() })
+    );
+    let batch = committed.scan().try_into_batch().await.unwrap();
+    assert_eq!(
+        batch["left"]
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .values(),
+        &[40, 50, 60]
+    );
+    assert_eq!(
+        batch["right"]
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .values(),
+        &[100, 200, 300]
+    );
+}
+
+#[tokio::test]
+async fn test_v2_3_data_replacement_rejects_misaligned_footer_before_commit_put() {
+    let uri = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "value",
+        DataType::Int32,
+        false,
+    )]));
+    let initial = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![10, 20, 30]))],
+    )
+    .unwrap();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(initial)], schema.clone()),
+        uri.as_str(),
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_3),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let replacement = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![40, 50]))],
+    )
+    .unwrap();
+    let new_file =
+        write_v2_3_replacement_file(&dataset, "short-replacement.lance", schema, &replacement)
+            .await;
+    let tracker = Arc::new(IOTracker::default());
+    let dataset =
+        dataset.with_object_store_wrappers(vec![tracker.clone() as Arc<dyn WrappingObjectStore>]);
+    let _ = tracker.incremental_stats();
+    let error = Dataset::commit(
+        WriteDestination::Dataset(Arc::new(dataset)),
+        Operation::DataReplacement {
+            replacements: vec![DataReplacementGroup(0, new_file)],
+        },
+        Some(1),
+        None,
+        None,
+        Arc::new(Default::default()),
+        false,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("incorrect physical_rows")
+            || error.to_string().contains("incorrect length"),
+        "unexpected error: {error}"
+    );
+    assert_eq!(tracker.incremental_stats().write_iops, 0);
+    assert_eq!(Dataset::open(uri.as_str()).await.unwrap().version_id(), 1);
 }
 
 /// Build a Merge overlay fragment that rewrites a single `field_id` in place: tombstone

@@ -19,9 +19,11 @@
 //!    threshold.
 //!
 //! In addition to the rules above there may be restrictions due to indexes.
-//! When a fragment is compacted its row ids change and any index that contained
-//! that fragment will be remapped.  However, we cannot combine indexed fragments
-//! with unindexed fragments.
+//! Before storage version 2.3, compaction changes physical row addresses and
+//! indices that contain those addresses must be remapped. Storage version 2.3
+//! indices store stable logical row addresses and are reused without rewriting
+//! their postings. However, indexed and unindexed fragments still cannot be
+//! combined for older index coverage contracts.
 //!
 //! ```rust
 //! # use std::sync::Arc;
@@ -82,16 +84,17 @@
 //! they can be committed in any order.
 use lance_core::utils::row_addr_remap::{GroupInput, RowAddrRemap};
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Cursor;
 use std::ops::{AddAssign, Range};
 use std::sync::Arc;
 
 use super::fragment::FileFragment;
 use super::index::DatasetIndexRemapperOptions;
-use super::rowids::load_row_id_sequences;
+use super::rowids::{load_row_id_sequences, resolve_logical_row_version_sequences};
 use super::transaction::{
-    Operation, RewriteGroup, RewrittenIndex, Transaction, TransactionBuilder,
+    Operation, RewriteGroup, RewrittenIndex, RowAddressManifestApplyContext, Transaction,
+    TransactionBuilder,
 };
 use super::utils::make_rowid_capture_stream;
 use super::{WriteMode, WriteParams, cleanup_data_fragments, write_fragments_internal};
@@ -107,27 +110,47 @@ use arrow_array::RecordBatch;
 use arrow_array::StructArray;
 use arrow_array::builder::{LargeBinaryBuilder, PrimitiveBuilder, StringBuilder};
 use arrow_buffer::NullBuffer;
+use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr, expressions};
 use datafusion::physical_plan::SendableRecordBatchStream;
+use datafusion::physical_plan::sorts::sort::SortExec;
+use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::union::UnionExec;
+use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use futures::{StreamExt, TryStreamExt};
 use lance_core::Error;
 use lance_core::datatypes::{BlobHandling, BlobKind};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::{DATASET_COMPACTING_EVENT, TRACE_DATASET_EVENTS};
+use lance_datafusion::exec::execute_plan;
 use lance_index::frag_reuse::FragReuseGroup;
 use lance_index::is_system_index;
-use lance_table::format::{Fragment, RowIdMeta};
+use lance_table::format::{
+    Fragment, IndexMetadata, PlacementMaintenanceRequired, RowAddressLayoutDelta, RowIdMeta,
+};
+use lance_table::rowids::read_row_ids;
 use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 mod binary_copy;
+mod explicit_maintenance;
+mod logical_row_addresses;
 pub mod remapping;
 
 use crate::index::frag_reuse::build_new_frag_reuse_index;
 use crate::io::deletion::read_dataset_deletion_file;
-use binary_copy::rewrite_files_binary_copy;
+use binary_copy::{BinaryCopyPlan, rewrite_files_binary_copy};
+pub use explicit_maintenance::{
+    RowAddressMaintenanceMetrics, RowAddressMaintenanceMode, RowAddressMaintenanceOptions,
+    maintain_row_addresses,
+};
+#[cfg(test)]
+use logical_row_addresses::validate_default_compaction_logical_order;
+use logical_row_addresses::{add_rewrite_provenance, plan_default_compaction_rows};
 pub use remapping::{IgnoreRemap, IndexRemapper, IndexRemapperOptions, RemappedIndex};
+
+type RewriteRowProvenance = (Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>);
 
 /// Controls how data is rewritten during compaction.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -233,9 +256,11 @@ pub struct CompactionOptions {
     /// Increasing this can avoid a deadlock that occurs when a single batch of
     /// data is larger than the I/O buffer size.
     pub io_buffer_size: Option<u64>,
-    /// Whether to defer remapping indices during compaction. If true, indices will
-    /// not be remapped during this compaction operation. Instead, the fragment reuse index
-    /// is updated and will be used to perform remapping later.
+    /// Whether to defer remapping physical-address indices during compaction. If true,
+    /// indices will not be remapped during this compaction operation. Instead, the fragment
+    /// reuse index is updated and will be used to perform remapping later. This is a no-op for
+    /// storage version 2.3, whose indices use stable logical row addresses, and is rejected for
+    /// the legacy stable-row-id mode.
     pub defer_index_remap: bool,
     /// How the old-to-new row-address mapping used to remap indices is built.
     /// Defaults to [`IndexRemapMode::Direct`].
@@ -475,31 +500,35 @@ impl CompactionOptions {
 ///   TODO: Need to support schema evolution case like add column and drop column
 /// - All data files share identical schema mappings (`fields`, `column_indices`)
 /// - Input data files must not contain extra global buffers (beyond schema / file descriptor)
+#[cfg(test)]
 async fn can_use_binary_copy(
     dataset: &Dataset,
     options: &CompactionOptions,
     fragments: &[Fragment],
 ) -> bool {
-    can_use_binary_copy_impl(dataset, options, fragments)
+    plan_binary_copy_impl(dataset, options, fragments)
         .await
+        .map(|plan| plan.is_some())
         .unwrap_or_else(|err| {
             log::warn!("Binary copy disabled due to error: {}", err);
             false
         })
 }
 
-async fn can_use_binary_copy_impl(
+async fn plan_binary_copy_impl(
     dataset: &Dataset,
     options: &CompactionOptions,
     fragments: &[Fragment],
-) -> Result<bool> {
+) -> Result<Option<BinaryCopyPlan>> {
     use lance_file::reader::FileReader as LFReader;
     use lance_file::version::LanceFileVersion;
     use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+    use prost::Message;
+    use prost_types::Any;
 
     if matches!(options.compaction_mode(), CompactionMode::Reencode) {
         log::debug!("Binary copy disabled: compaction mode is Reencode");
-        return Ok(false);
+        return Ok(None);
     }
 
     let has_blob_columns = dataset
@@ -508,7 +537,7 @@ async fn can_use_binary_copy_impl(
         .any(|field| field.is_blob());
     if has_blob_columns {
         log::debug!("Binary copy disabled: dataset contains blob columns");
-        return Ok(false);
+        return Ok(None);
     }
 
     let storage_ok = dataset
@@ -519,12 +548,12 @@ async fn can_use_binary_copy_impl(
         .unwrap_or(false);
     if !storage_ok {
         log::debug!("Binary copy disabled: dataset uses legacy storage format");
-        return Ok(false);
+        return Ok(None);
     }
 
     if fragments.is_empty() {
         log::debug!("Binary copy disabled: no fragments to compact");
-        return Ok(false);
+        return Ok(None);
     }
 
     let storage_file_version = dataset
@@ -533,16 +562,18 @@ async fn can_use_binary_copy_impl(
         .lance_file_version()?
         .resolve();
 
-    if fragments[0].files.is_empty() {
+    if fragments[0].files.len() != 1 {
         log::debug!(
-            "Binary copy disabled: fragment {} has no data files",
+            "Binary copy disabled: fragment {} does not have exactly one data file",
             fragments[0].id
         );
-        return Ok(false);
+        return Ok(None);
     }
     let ref_fields = &fragments[0].files[0].fields;
     let ref_cols = &fragments[0].files[0].column_indices;
-    let mut is_same_version = true;
+    let mut source_file_row_counts = Vec::with_capacity(fragments.len());
+    let mut source_file_size_bytes = Vec::with_capacity(fragments.len());
+    let mut baseline_column_encodings: Option<Vec<Vec<u8>>> = None;
 
     for fragment in fragments {
         if fragment.deletion_file.is_some() {
@@ -550,67 +581,123 @@ async fn can_use_binary_copy_impl(
                 "Binary copy disabled: fragment {} has a deletion file",
                 fragment.id
             );
-            return Ok(false);
+            return Ok(None);
         }
-
-        for data_file in &fragment.files {
-            let version_ok = LanceFileVersion::try_from_major_minor(
-                data_file.file_major_version,
-                data_file.file_minor_version,
-            )
-            .map(|v| v.resolve())
-            .is_ok_and(|v| v == storage_file_version);
-
-            if !version_ok {
-                is_same_version = false;
-            }
-            if data_file.fields != *ref_fields || data_file.column_indices != *ref_cols {
-                return Ok(false);
-            }
-
-            // check file global buffer
-            let object_store = match data_file.base_id {
-                Some(base_id) => dataset.object_store(Some(base_id)).await?,
-                None => dataset.object_store.clone(),
-            };
-            let full_path = dataset
-                .data_file_dir(data_file)?
-                .clone()
-                .join(data_file.path.as_str());
-            let scan_scheduler = ScanScheduler::new(
-                object_store.clone(),
-                SchedulerConfig::max_bandwidth(&object_store),
+        if fragment.files.len() != 1 {
+            log::debug!(
+                "Binary copy disabled: fragment {} does not have exactly one data file",
+                fragment.id
             );
-            let file_scheduler = scan_scheduler
-                .open_file_with_priority(&full_path, 0, &data_file.file_size_bytes)
-                .await?;
-            let file_meta = LFReader::read_all_metadata(&file_scheduler).await?;
-            // Binary copy only preserves page and column-buffer bytes. The output file's footer
-            // (including global buffers) is re-generated, not copied from inputs.
-            //
-            // Therefore, we reject input files that contain any additional global buffers beyond
-            // the required schema / file descriptor global buffer (global buffer index 0).
-            if file_meta.file_buffers.len() > 1 {
-                log::debug!(
-                    "Binary copy disabled: data file has extra global buffers (len={})",
-                    file_meta.file_buffers.len()
-                );
-                return Ok(false);
-            }
+            return Ok(None);
         }
+        let data_file = &fragment.files[0];
+        let version_ok = LanceFileVersion::try_from_major_minor(
+            data_file.file_major_version,
+            data_file.file_minor_version,
+        )
+        .map(|version| version.resolve())
+        .is_ok_and(|version| version == storage_file_version);
+        if !version_ok {
+            log::debug!("Binary copy disabled: data files use different file versions");
+            return Ok(None);
+        }
+        if data_file.fields != *ref_fields || data_file.column_indices != *ref_cols {
+            log::debug!("Binary copy disabled: data files use different schema mappings");
+            return Ok(None);
+        }
+
+        let object_store = match data_file.base_id {
+            Some(base_id) => dataset.object_store(Some(base_id)).await?,
+            None => dataset.object_store.clone(),
+        };
+        let full_path = dataset
+            .data_file_dir(data_file)?
+            .clone()
+            .join(data_file.path.as_str());
+        let scan_scheduler = ScanScheduler::new(
+            object_store.clone(),
+            SchedulerConfig::max_bandwidth(&object_store),
+        );
+        let file_scheduler = scan_scheduler
+            .open_file_with_priority(&full_path, 0, &data_file.file_size_bytes)
+            .await?;
+        let file_meta = LFReader::read_all_metadata(&file_scheduler).await?;
+        // Binary copy regenerates the footer, so user global buffers cannot be
+        // carried into the output without a format-specific merge operation.
+        if file_meta.file_buffers.len() > 1 {
+            log::debug!(
+                "Binary copy disabled: data file has extra global buffers (len={})",
+                file_meta.file_buffers.len()
+            );
+            return Ok(None);
+        }
+        let metadata_version = LanceFileVersion::try_from_major_minor(
+            file_meta.major_version as u32,
+            file_meta.minor_version as u32,
+        )?
+        .resolve();
+        if metadata_version != storage_file_version {
+            log::debug!("Binary copy disabled: file footer version differs from the dataset");
+            return Ok(None);
+        }
+        if file_meta.file_schema.as_ref() != dataset.schema() {
+            log::debug!("Binary copy disabled: file footer schema differs from the dataset");
+            return Ok(None);
+        }
+        let row_count = u32::try_from(file_meta.num_rows).map_err(|_| {
+            Error::format_capacity_exceeded(format!(
+                "binary-copy source file {} rows {} exceed u32 capacity",
+                data_file.path, file_meta.num_rows
+            ))
+        })?;
+        if row_count == 0 {
+            log::debug!("Binary copy disabled: source data file contains no rows");
+            return Ok(None);
+        }
+        if fragment
+            .physical_rows
+            .is_some_and(|rows| rows != row_count as usize)
+        {
+            log::debug!(
+                "Binary copy disabled: fragment {} physical_rows disagrees with its data file",
+                fragment.id
+            );
+            return Ok(None);
+        }
+        let column_encodings = file_meta
+            .column_infos
+            .iter()
+            .map(|column| Ok(Any::from_msg(&column.encoding)?.encode_to_vec()))
+            .collect::<Result<Vec<_>>>()?;
+        if let Some(baseline) = &baseline_column_encodings {
+            if baseline != &column_encodings {
+                log::debug!("Binary copy disabled: column encodings differ between data files");
+                return Ok(None);
+            }
+        } else {
+            baseline_column_encodings = Some(column_encodings);
+        }
+        source_file_row_counts.push(row_count);
+        source_file_size_bytes.push(file_meta.file_size_bytes);
     }
 
-    if !is_same_version {
-        log::debug!("Binary copy disabled: data files use different file versions");
-        return Ok(false);
-    }
-
-    Ok(true)
+    Ok(Some(BinaryCopyPlan::try_new(
+        source_file_row_counts,
+        source_file_size_bytes,
+        options.target_rows_per_fragment,
+        options.max_bytes_per_file,
+    )?))
 }
 
 /// Metrics returned by [compact_files].
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompactionMetrics {
+    /// The number of non-empty rewrite groups considered for execution.
+    pub groups_planned: usize,
+    /// The number of groups admitted before reading data pages or writing data files.
+    pub groups_admitted: usize,
+    /// The number of groups rejected before reading or writing data files.
+    pub groups_not_admitted: usize,
     /// The number of fragments that have been overwritten.
     pub fragments_removed: usize,
     /// The number of new fragments that have been added.
@@ -624,6 +711,9 @@ pub struct CompactionMetrics {
 
 impl AddAssign for CompactionMetrics {
     fn add_assign(&mut self, rhs: Self) {
+        self.groups_planned += rhs.groups_planned;
+        self.groups_admitted += rhs.groups_admitted;
+        self.groups_not_admitted += rhs.groups_not_admitted;
         self.fragments_removed += rhs.fragments_removed;
         self.fragments_added += rhs.fragments_added;
         self.files_removed += rhs.files_removed;
@@ -671,11 +761,11 @@ impl DefaultCompactionPlanner {
 #[async_trait::async_trait]
 impl CompactionPlanner for DefaultCompactionPlanner {
     async fn plan(&self, dataset: &Dataset) -> Result<CompactionPlan> {
-        if self.options.defer_index_remap && dataset.manifest.uses_stable_row_ids() {
+        if self.options.defer_index_remap && dataset.manifest.uses_legacy_stable_row_ids() {
             return Err(Error::invalid_input(
-                "defer_index_remap=true is not supported on datasets with stable row IDs: \
-                 stable row IDs do not require index remapping during compaction, so there \
-                 is nothing to defer."
+                "defer_index_remap=true is not supported on datasets with legacy stable row IDs: \
+                 legacy stable row IDs do not require index remapping during compaction, so \
+                 there is nothing to defer."
                     .to_string(),
             ));
         }
@@ -782,6 +872,7 @@ impl CompactionPlanner for DefaultCompactionPlanner {
             .flat_map(|bin| bin.split_for_size(self.options.target_rows_per_fragment))
             .map(|bin| TaskData {
                 fragments: bin.fragments,
+                v2_3_plan: None,
             })
             .collect();
 
@@ -800,7 +891,56 @@ impl CompactionPlanner for DefaultCompactionPlanner {
 
         let mut compaction_plan =
             CompactionPlan::new(dataset.manifest.version, self.options.clone());
-        compaction_plan.extend_tasks(tasks);
+        if dataset.manifest.uses_stable_logical_row_addresses() {
+            let mut prepared_tasks = Vec::with_capacity(tasks.len());
+            for task in tasks {
+                match preflight_v2_3_compaction_task(dataset, &task.fragments, &self.options)
+                    .await?
+                {
+                    V2_3CompactionAdmission::Admitted(prepared) => {
+                        prepared_tasks.push((task, prepared));
+                    }
+                    V2_3CompactionAdmission::NotAdmitted(reason) => {
+                        compaction_plan.planning_metrics.groups_planned += 1;
+                        compaction_plan.planning_metrics.groups_not_admitted += 1;
+                        warn!(
+                            "Skipping storage-version-2.3 compaction group before page reads or data writes: {reason}"
+                        );
+                    }
+                }
+            }
+
+            if prepared_tasks.len() > 1 {
+                let indices = dataset.load_indices().await?;
+                while let Some(reason) = preflight_prepared_v2_3_compaction_tasks(
+                    dataset,
+                    &prepared_tasks,
+                    indices.as_ref(),
+                )? {
+                    let (task, _) = prepared_tasks.pop().expect("prepared tasks is non-empty");
+                    compaction_plan.planning_metrics.groups_planned += 1;
+                    compaction_plan.planning_metrics.groups_not_admitted += 1;
+                    warn!(
+                        "Skipping storage-version-2.3 compaction group {:?} because the combined transaction was not admitted before page reads or data writes: {reason}",
+                        task.fragments
+                            .iter()
+                            .map(|fragment| fragment.id)
+                            .collect::<Vec<_>>()
+                    );
+                    if prepared_tasks.is_empty() {
+                        break;
+                    }
+                }
+            }
+            compaction_plan
+                .tasks
+                .extend(prepared_tasks.into_iter().map(|(mut task, prepared)| {
+                    task.v2_3_plan = Some(prepared.plan);
+                    task
+                }));
+        } else {
+            compaction_plan.extend_tasks(tasks);
+        }
 
         Ok(compaction_plan)
     }
@@ -835,10 +975,11 @@ pub async fn compact_files_with_planner(
 
     // If nothing to compact, don't make a commit.
     if compaction_plan.tasks().is_empty() {
-        return Ok(CompactionMetrics::default());
+        return Ok(compaction_plan.planning_metrics);
     }
 
     let dataset_ref = &dataset.clone();
+    let planning_metrics = compaction_plan.planning_metrics.clone();
 
     let result_stream = futures::stream::iter(compaction_plan.tasks)
         .map(|task| rewrite_files(Cow::Borrowed(dataset_ref), task, &compaction_plan.options))
@@ -851,13 +992,14 @@ pub async fn compact_files_with_planner(
 
     let completed_tasks: Vec<RewriteResult> = result_stream.try_collect().await?;
     let remap_options = remap_options.unwrap_or(Arc::new(DatasetIndexRemapperOptions::default()));
-    let metrics = commit_compaction(
+    let mut metrics = commit_compaction(
         dataset,
         completed_tasks,
         remap_options,
         &compaction_plan.options,
     )
     .await?;
+    metrics += planning_metrics;
 
     Ok(metrics)
 }
@@ -898,6 +1040,337 @@ async fn collect_metrics(fragment: &FileFragment) -> Result<FragmentMetrics> {
     })
 }
 
+enum V2_3CompactionAdmission {
+    Admitted(PreparedV2_3CompactionTask),
+    NotAdmitted(String),
+}
+
+struct PreparedV2_3CompactionTask {
+    plan: V2_3CompactionTaskPlan,
+    current_deletion_vectors: BTreeMap<u32, RoaringBitmap>,
+}
+
+fn planned_output_row_counts(row_count: u64, rows_per_fragment: usize) -> Result<Vec<u32>> {
+    let rows_per_fragment = u32::try_from(rows_per_fragment).map_err(|_| {
+        Error::invalid_input("storage-version-2.3 target_rows_per_fragment must fit in u32")
+    })?;
+    if rows_per_fragment == 0 {
+        return Err(Error::invalid_input(
+            "storage-version-2.3 target_rows_per_fragment must be greater than zero",
+        ));
+    }
+    let mut remaining = row_count;
+    let fragment_count = usize::try_from(row_count.div_ceil(rows_per_fragment as u64))
+        .map_err(|_| Error::invalid_input("planned output fragment count exceeds usize"))?;
+    let mut counts = Vec::with_capacity(fragment_count);
+    while remaining > 0 {
+        let count = remaining.min(rows_per_fragment as u64) as u32;
+        counts.push(count);
+        remaining -= count as u64;
+    }
+    Ok(counts)
+}
+
+async fn planned_reencode_output_row_counts(
+    dataset: &Dataset,
+    fragments: &[Fragment],
+    output_row_count: u64,
+    options: &CompactionOptions,
+) -> Result<Vec<u32>> {
+    let Some(max_bytes_per_file) = options.max_bytes_per_file else {
+        return planned_output_row_counts(output_row_count, options.target_rows_per_fragment);
+    };
+    if max_bytes_per_file == 0 {
+        return Err(Error::invalid_input(
+            "storage-version-2.3 max_bytes_per_file must be greater than zero",
+        ));
+    }
+
+    let mut source_physical_rows = 0_u64;
+    let mut source_size_bytes = 0_u64;
+    for fragment in fragments {
+        let physical_rows = u64::try_from(fragment.physical_rows.ok_or_else(|| {
+            Error::invalid_input(format!(
+                "storage-version-2.3 compaction source fragment {} is missing physical_rows",
+                fragment.id
+            ))
+        })?)
+        .map_err(|_| Error::format_capacity_exceeded("source physical_rows exceed u64"))?;
+        source_physical_rows = source_physical_rows
+            .checked_add(physical_rows)
+            .ok_or_else(|| Error::format_capacity_exceeded("source row count exceeds u64"))?;
+        for data_file in &fragment.files {
+            let file_size = if let Some(file_size) = data_file.file_size_bytes.get() {
+                u64::from(file_size)
+            } else {
+                let object_store = match data_file.base_id {
+                    Some(base_id) => dataset.object_store(Some(base_id)).await?,
+                    None => dataset.object_store.clone(),
+                };
+                let path = dataset
+                    .data_file_dir(data_file)?
+                    .clone()
+                    .join(data_file.path.as_str());
+                object_store.size(&path).await?
+            };
+            source_size_bytes = source_size_bytes.checked_add(file_size).ok_or_else(|| {
+                Error::format_capacity_exceeded("source data-file bytes exceed u64")
+            })?;
+        }
+    }
+
+    let target_rows = u64::try_from(options.target_rows_per_fragment).map_err(|_| {
+        Error::invalid_input("storage-version-2.3 target_rows_per_fragment exceeds u64")
+    })?;
+    if target_rows == 0 {
+        return Err(Error::invalid_input(
+            "storage-version-2.3 target_rows_per_fragment must be greater than zero",
+        ));
+    }
+    let rows_by_bytes = if source_size_bytes == 0 || source_physical_rows == 0 {
+        target_rows
+    } else {
+        let estimated = (max_bytes_per_file as u128)
+            .checked_mul(u128::from(source_physical_rows))
+            .ok_or_else(|| {
+                Error::format_capacity_exceeded("estimated output byte boundary exceeds u128")
+            })?
+            / u128::from(source_size_bytes);
+        u64::try_from(estimated.max(1)).map_err(|_| {
+            Error::format_capacity_exceeded("estimated output row boundary exceeds u64")
+        })?
+    };
+    let rows_per_fragment = usize::try_from(target_rows.min(rows_by_bytes)).map_err(|_| {
+        Error::format_capacity_exceeded("estimated output row boundary exceeds usize")
+    })?;
+    planned_output_row_counts(output_row_count, rows_per_fragment)
+}
+
+async fn preflight_v2_3_compaction_task(
+    dataset: &Dataset,
+    fragments: &[Fragment],
+    options: &CompactionOptions,
+) -> Result<V2_3CompactionAdmission> {
+    let rows = match plan_default_compaction_rows(dataset, fragments).await {
+        Err(Error::NotSupported { source, .. })
+            if source
+                .downcast_ref::<PlacementMaintenanceRequired>()
+                .is_some() =>
+        {
+            return Ok(V2_3CompactionAdmission::NotAdmitted(source.to_string()));
+        }
+        other => other?,
+    };
+    let sequence = read_row_ids(&rows.logical_row_ids)?;
+    let physical_order_matches_logical = rows.current_deletion_vectors.is_empty()
+        && rows.logical_run_ends.is_empty()
+        && !rows.requires_full_logical_sort;
+    let mut binary_copy_plan = if !matches!(options.compaction_mode(), CompactionMode::Reencode)
+        && physical_order_matches_logical
+    {
+        plan_binary_copy_impl(dataset, options, fragments).await?
+    } else {
+        None
+    };
+    if binary_copy_plan.as_ref().is_some_and(|plan| {
+        plan.source_file_row_counts
+            .iter()
+            .map(|rows| u64::from(*rows))
+            .sum::<u64>()
+            != sequence.len()
+    }) {
+        log::debug!(
+            "Binary copy disabled: source file rows differ from the admitted logical sequence"
+        );
+        binary_copy_plan = None;
+    }
+    let rewrite_strategy = match (options.compaction_mode(), binary_copy_plan) {
+        (_, Some(plan)) => V2_3CompactionRewriteStrategy::BinaryCopy(plan),
+        (CompactionMode::ForceBinaryCopy, None) => {
+            let reason = if physical_order_matches_logical {
+                "source files are not binary-copy compatible"
+            } else {
+                "physical source order differs from the admitted logical row sequence"
+            };
+            return Err(Error::not_supported_source(
+                format!("storage-version-2.3 ForceBinaryCopy is not supported: {reason}").into(),
+            ));
+        }
+        (CompactionMode::TryBinaryCopy | CompactionMode::Reencode, None) => {
+            V2_3CompactionRewriteStrategy::Reencode
+        }
+    };
+    let output_row_counts = match &rewrite_strategy {
+        V2_3CompactionRewriteStrategy::BinaryCopy(plan) => plan.output_row_counts.clone(),
+        V2_3CompactionRewriteStrategy::Reencode => {
+            planned_reencode_output_row_counts(dataset, fragments, sequence.len(), options).await?
+        }
+    };
+    let planned_fragments = output_row_counts
+        .iter()
+        .map(|count| Fragment::new(0).with_physical_rows(*count as usize))
+        .collect::<Vec<_>>();
+
+    let layout = dataset
+        .manifest
+        .row_address_layout
+        .as_ref()
+        .ok_or_else(|| {
+            Error::internal("storage-version-2.3 manifest is missing RowAddressLayout")
+        })?;
+    let mut delta = RowAddressLayoutDelta {
+        expected_layout_fingerprint: layout.fingerprint.clone(),
+        ..RowAddressLayoutDelta::default()
+    };
+    let mut next_ordinal = 0_u32;
+    let mut source_domains = BTreeMap::new();
+    add_rewrite_provenance(
+        dataset,
+        &planned_fragments,
+        &rows.logical_row_ids,
+        rows.retired_logical_row_ids.as_deref(),
+        &mut next_ordinal,
+        &mut source_domains,
+        &mut delta,
+    )?;
+    delta.source_domains = source_domains.into_values().collect();
+
+    let transaction = TransactionBuilder::new(
+        dataset.manifest.version,
+        Operation::Rewrite {
+            groups: vec![RewriteGroup {
+                old_fragments: fragments.to_vec(),
+                new_fragments: planned_fragments,
+            }],
+            rewritten_indices: Vec::new(),
+            frag_reuse_index: None,
+        },
+    )
+    .row_address_layout_delta(Some(delta))
+    .build();
+    let context = RowAddressManifestApplyContext {
+        current_deletion_vectors: rows.current_deletion_vectors.clone(),
+        ..RowAddressManifestApplyContext::default()
+    };
+    let indices = dataset.load_indices().await?;
+    match transaction.build_manifest_with_row_address_context(
+        Some(dataset.manifest.as_ref()),
+        indices.as_ref().clone(),
+        "default-compaction-preflight.txn",
+        &Default::default(),
+        Some(&context),
+    ) {
+        Ok(_) => Ok(V2_3CompactionAdmission::Admitted(
+            PreparedV2_3CompactionTask {
+                plan: V2_3CompactionTaskPlan {
+                    logical_row_ids: rows.logical_row_ids,
+                    retired_logical_row_ids: rows.retired_logical_row_ids,
+                    output_row_counts,
+                    logical_run_ends: rows.logical_run_ends,
+                    requires_full_logical_sort: rows.requires_full_logical_sort,
+                    rewrite_strategy,
+                },
+                current_deletion_vectors: rows.current_deletion_vectors,
+            },
+        )),
+        Err(Error::NotSupported { source, .. })
+            if source
+                .downcast_ref::<PlacementMaintenanceRequired>()
+                .is_some() =>
+        {
+            Ok(V2_3CompactionAdmission::NotAdmitted(source.to_string()))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn preflight_prepared_v2_3_compaction_tasks(
+    dataset: &Dataset,
+    tasks: &[(TaskData, PreparedV2_3CompactionTask)],
+    indices: &[IndexMetadata],
+) -> Result<Option<String>> {
+    let layout = dataset
+        .manifest
+        .row_address_layout
+        .as_ref()
+        .ok_or_else(|| {
+            Error::internal("storage-version-2.3 manifest is missing RowAddressLayout")
+        })?;
+    let mut delta = RowAddressLayoutDelta {
+        expected_layout_fingerprint: layout.fingerprint.clone(),
+        ..RowAddressLayoutDelta::default()
+    };
+    let mut next_ordinal = 0_u32;
+    let mut source_domains = BTreeMap::new();
+    let mut groups = Vec::with_capacity(tasks.len());
+    let mut current_deletion_vectors = BTreeMap::new();
+
+    for (task, prepared) in tasks {
+        let planned_fragments = prepared
+            .plan
+            .output_row_counts
+            .iter()
+            .map(|count| Fragment::new(0).with_physical_rows(*count as usize))
+            .collect::<Vec<_>>();
+        add_rewrite_provenance(
+            dataset,
+            &planned_fragments,
+            &prepared.plan.logical_row_ids,
+            prepared.plan.retired_logical_row_ids.as_deref(),
+            &mut next_ordinal,
+            &mut source_domains,
+            &mut delta,
+        )?;
+        groups.push(RewriteGroup {
+            old_fragments: task.fragments.clone(),
+            new_fragments: planned_fragments,
+        });
+        for (fragment_id, deletions) in &prepared.current_deletion_vectors {
+            if current_deletion_vectors
+                .insert(*fragment_id, deletions.clone())
+                .is_some()
+            {
+                return Err(Error::internal(format!(
+                    "physical fragment {fragment_id} occurs in more than one compaction group"
+                )));
+            }
+        }
+    }
+    delta.source_domains = source_domains.into_values().collect();
+
+    let transaction = TransactionBuilder::new(
+        dataset.manifest.version,
+        Operation::Rewrite {
+            groups,
+            rewritten_indices: Vec::new(),
+            frag_reuse_index: None,
+        },
+    )
+    .row_address_layout_delta(Some(delta))
+    .build();
+    let context = RowAddressManifestApplyContext {
+        current_deletion_vectors,
+        ..RowAddressManifestApplyContext::default()
+    };
+    match transaction.build_manifest_with_row_address_context(
+        Some(dataset.manifest.as_ref()),
+        indices.to_vec(),
+        "default-compaction-combined-preflight.txn",
+        &Default::default(),
+        Some(&context),
+    ) {
+        Ok(_) => Ok(None),
+        Err(Error::NotSupported { source, .. })
+            if source
+                .downcast_ref::<PlacementMaintenanceRequired>()
+                .is_some() =>
+        {
+            Ok(Some(source.to_string()))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// A plan for what groups of fragments to compact.
 ///
 /// See [plan_compaction()] for more details.
@@ -906,6 +1379,8 @@ pub struct CompactionPlan {
     pub tasks: Vec<TaskData>,
     pub read_version: u64,
     pub options: CompactionOptions,
+    #[serde(default)]
+    pub planning_metrics: CompactionMetrics,
 }
 
 impl CompactionPlan {
@@ -1256,6 +1731,61 @@ async fn transform_blob_v2_batch(
     Ok(RecordBatch::try_new(new_schema, new_columns)?)
 }
 
+fn blob_v2_user_view_schema(
+    dataset: &Dataset,
+    input_schema: &arrow_schema::Schema,
+) -> Arc<arrow_schema::Schema> {
+    let fields = input_schema
+        .fields()
+        .iter()
+        .filter_map(|field| {
+            if field.name() == lance_core::ROW_ADDR {
+                return None;
+            }
+            let Some(lance_field) = dataset
+                .schema()
+                .field(field.name())
+                .filter(|field| field.is_blob_v2())
+            else {
+                return Some(field.clone());
+            };
+            let logical_field = arrow_schema::Field::from(lance_field);
+            Some(Arc::new(
+                arrow_schema::Field::new(
+                    field.name(),
+                    lance_core::datatypes::BLOB_V2_USER_TYPE.clone(),
+                    field.is_nullable(),
+                )
+                .with_metadata(logical_field.metadata().clone()),
+            ))
+        })
+        .collect::<Vec<_>>();
+    Arc::new(arrow_schema::Schema::new_with_metadata(
+        fields,
+        input_schema.metadata().clone(),
+    ))
+}
+
+fn transform_blob_v2_stream(
+    dataset: &Dataset,
+    stream: SendableRecordBatchStream,
+) -> SendableRecordBatchStream {
+    let output_schema = blob_v2_user_view_schema(dataset, stream.schema().as_ref());
+    let dataset = Arc::new(dataset.clone());
+    let dataset_schema = dataset.schema().clone();
+    let transformed = stream.then(move |batch_result| {
+        let dataset = dataset.clone();
+        let schema = dataset_schema.clone();
+        async move {
+            let batch = batch_result?;
+            transform_blob_v2_batch(&dataset, &schema, batch)
+                .await
+                .map_err(|error| datafusion::error::DataFusionError::External(Box::new(error)))
+        }
+    });
+    Box::pin(RecordBatchStreamAdapter::new(output_schema, transformed))
+}
+
 /// Build a scan reader for rewrite and optionally capture row IDs.
 ///
 /// Parameters:
@@ -1270,6 +1800,9 @@ async fn transform_blob_v2_batch(
 ///   in-order reading.
 /// - `capture_row_ids`: When index remapping is needed, include and capture the
 ///   `_rowid` column from the stream.
+/// - `v2_3_plan`: When physical placement is not globally ordered, merge its
+///   monotonic physical runs by `_rowid`, or use a full spillable sort only for
+///   an internally non-monotonic source fragment.
 ///
 /// Returns:
 /// - `SendableRecordBatchStream`: The batch stream (with `_rowid` removed if captured)
@@ -1284,6 +1817,7 @@ async fn prepare_reader(
     io_buffer_size: Option<u64>,
     with_frags: bool,
     capture_row_ids: bool,
+    v2_3_plan: Option<&V2_3CompactionTaskPlan>,
 ) -> Result<(
     SendableRecordBatchStream,
     Option<std::sync::mpsc::Receiver<CapturedRowIds>>,
@@ -1310,23 +1844,95 @@ async fn prepare_reader(
     if let Some(io_buffer_size) = io_buffer_size {
         scanner.io_buffer_size(io_buffer_size);
     }
-    if with_frags {
-        scanner
-            .with_fragments(fragments.to_vec())
-            .scan_in_order(true);
+    let needs_logical_reorder = v2_3_plan
+        .is_some_and(|plan| plan.requires_full_logical_sort || !plan.logical_run_ends.is_empty());
+    if needs_logical_reorder && !with_frags {
+        return Err(Error::internal(
+            "logical-order compaction requires an explicit source-fragment set",
+        ));
     }
-    if capture_row_ids {
+    if capture_row_ids || needs_logical_reorder {
         scanner.with_row_id();
-        let data = SendableRecordBatchStream::from(scanner.try_into_stream().await?);
+    }
+
+    let data = if let Some(plan) = v2_3_plan.filter(|_| needs_logical_reorder) {
+        let ordering_for = |plan: &Arc<dyn ExecutionPlan>| -> Result<LexOrdering> {
+            let row_id_sort = PhysicalSortExpr {
+                expr: expressions::col(lance_core::ROW_ID, plan.schema().as_ref())?,
+                options: arrow::compute::SortOptions {
+                    descending: false,
+                    nulls_first: false,
+                },
+            };
+            LexOrdering::new([row_id_sort])
+                .ok_or_else(|| Error::internal("logical row ordering cannot be empty"))
+        };
+
+        let physical_plan: Arc<dyn ExecutionPlan> = if plan.requires_full_logical_sort {
+            if !plan.logical_run_ends.is_empty() {
+                return Err(Error::internal(
+                    "full logical sort cannot also declare sort-preserving input runs",
+                ));
+            }
+            scanner
+                .with_fragments(fragments.to_vec())
+                .scan_in_order(false);
+            let input = scanner.create_plan().await?;
+            let ordering = ordering_for(&input)?;
+            Arc::new(SortExec::new(ordering, input))
+        } else {
+            let mut previous_end = 0_usize;
+            let mut inputs =
+                Vec::<Arc<dyn ExecutionPlan>>::with_capacity(plan.logical_run_ends.len());
+            for end in &plan.logical_run_ends {
+                let end = usize::try_from(*end)
+                    .map_err(|_| Error::internal("logical run boundary does not fit in usize"))?;
+                if end <= previous_end || end > fragments.len() {
+                    return Err(Error::internal(format!(
+                        "invalid logical run boundary {end} after {previous_end} for {} source fragments",
+                        fragments.len()
+                    )));
+                }
+                let mut run_scanner = scanner.clone();
+                run_scanner
+                    .with_fragments(fragments[previous_end..end].to_vec())
+                    .scan_in_order(true);
+                let input = run_scanner.create_plan().await?;
+                if input.output_partitioning().partition_count() != 1 {
+                    return Err(Error::internal(format!(
+                        "ordered compaction run produced {} partitions instead of one",
+                        input.output_partitioning().partition_count()
+                    )));
+                }
+                inputs.push(input);
+                previous_end = end;
+            }
+            if previous_end != fragments.len() {
+                return Err(Error::internal(format!(
+                    "logical run boundaries cover {previous_end} of {} source fragments",
+                    fragments.len()
+                )));
+            }
+            let union = UnionExec::try_new(inputs)?;
+            let ordering = ordering_for(&union)?;
+            Arc::new(SortPreservingMergeExec::new(ordering, union))
+        };
+        execute_plan(physical_plan, scanner.execution_options())?
+    } else {
+        if with_frags {
+            scanner
+                .with_fragments(fragments.to_vec())
+                .scan_in_order(true);
+        }
+        SendableRecordBatchStream::from(scanner.try_into_stream().await?)
+    };
+
+    if capture_row_ids || needs_logical_reorder {
         let (data_no_row_ids, rx) =
-            make_rowid_capture_stream(data, dataset.manifest.uses_stable_row_ids())?;
+            make_rowid_capture_stream(data, dataset.manifest.has_stable_row_identity())?;
         Ok((data_no_row_ids, Some(rx), has_blob_v2_columns))
     } else {
-        Ok((
-            SendableRecordBatchStream::from(scanner.try_into_stream().await?),
-            None,
-            has_blob_v2_columns,
-        ))
+        Ok((data, None, has_blob_v2_columns))
     }
 }
 
@@ -1337,6 +1943,36 @@ async fn prepare_reader(
 pub struct TaskData {
     /// The fragments to compact.
     pub fragments: Vec<Fragment>,
+    /// Exact storage-version-2.3 provenance and output row boundaries,
+    /// admitted from manifest/footer metadata before any page read or data-file PUT.
+    #[serde(default)]
+    pub v2_3_plan: Option<V2_3CompactionTaskPlan>,
+}
+
+/// Metadata-only plan for one storage-version-2.3 compaction task.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct V2_3CompactionTaskPlan {
+    logical_row_ids: Vec<u8>,
+    retired_logical_row_ids: Option<Vec<u8>>,
+    output_row_counts: Vec<u32>,
+    /// Exclusive source-fragment boundaries for already-sorted input runs.
+    /// Multiple runs are merged without sorting user columns.
+    #[serde(default)]
+    logical_run_ends: Vec<u32>,
+    /// A defensive fallback for a physical fragment whose own placement is
+    /// internally non-monotonic.
+    #[serde(default)]
+    requires_full_logical_sort: bool,
+    /// Data rewrite selected and admitted before any output object is created.
+    #[serde(default)]
+    rewrite_strategy: V2_3CompactionRewriteStrategy,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+enum V2_3CompactionRewriteStrategy {
+    #[default]
+    Reencode,
+    BinaryCopy(BinaryCopyPlan),
 }
 
 /// A standalone task that can be serialized and sent to another machine for
@@ -1373,6 +2009,7 @@ impl CompactionPlan {
             tasks: Vec::new(),
             read_version,
             options,
+            planning_metrics: CompactionMetrics::default(),
         }
     }
 
@@ -1452,6 +2089,12 @@ impl CandidateBin {
 }
 
 async fn load_index_fragmaps(dataset: &Dataset) -> Result<Vec<RoaringBitmap>> {
+    // Storage version 2.3 index coverage is expressed in the stable logical
+    // domain. Physical fragment movement neither changes that coverage nor
+    // requires posting remap, so it must not split physical compaction bins.
+    if dataset.manifest.uses_stable_logical_row_addresses() {
+        return Ok(Vec::new());
+    }
     let indices = dataset.load_indices().await?;
     let mut index_fragmaps = Vec::with_capacity(indices.len());
     // System indices (fragment-reuse, mem-wal) don't define data coverage and
@@ -1498,6 +2141,14 @@ pub struct RewriteResult {
     ///   deferred index remap post-processing, or (2) used with reserved
     ///   fragment IDs to build old-to-new mappings.
     pub row_addrs: Option<Vec<u8>>,
+    /// Actual logical row-address sequence emitted by a storage-version-2.3
+    /// rewrite, compressed with the stable RowIdSequence codec.
+    #[serde(default)]
+    pub logical_row_ids: Option<Vec<u8>>,
+    /// Logical identities whose already-deleted physical rows were reclaimed
+    /// by this rewrite.
+    #[serde(default)]
+    pub retired_logical_row_ids: Option<Vec<u8>>,
 }
 
 async fn reserve_fragment_ids(
@@ -1552,8 +2203,45 @@ async fn rewrite_files(
             read_version: dataset.manifest.version,
             original_fragments: task.fragments,
             row_addrs: None,
+            logical_row_ids: None,
+            retired_logical_row_ids: None,
         });
     }
+
+    metrics.groups_planned = 1;
+    let uses_v2_3_row_addresses = dataset.manifest.uses_stable_logical_row_addresses();
+    let v2_3_plan = if uses_v2_3_row_addresses {
+        if let Some(plan) = task.v2_3_plan.clone() {
+            metrics.groups_admitted = 1;
+            Some(plan)
+        } else {
+            match preflight_v2_3_compaction_task(dataset.as_ref(), &task.fragments, options).await?
+            {
+                V2_3CompactionAdmission::Admitted(prepared) => {
+                    metrics.groups_admitted = 1;
+                    Some(prepared.plan)
+                }
+                V2_3CompactionAdmission::NotAdmitted(reason) => {
+                    metrics.groups_not_admitted = 1;
+                    warn!(
+                        "Skipping storage-version-2.3 compaction group before page reads or data writes: {reason}"
+                    );
+                    return Ok(RewriteResult {
+                        metrics,
+                        new_fragments: Vec::new(),
+                        read_version: dataset.manifest.version,
+                        original_fragments: Vec::new(),
+                        row_addrs: None,
+                        logical_row_ids: None,
+                        retired_logical_row_ids: None,
+                    });
+                }
+            }
+        }
+    } else {
+        metrics.groups_admitted = 1;
+        None
+    };
 
     let previous_writer_version = &dataset.manifest.writer_version;
     // The versions of Lance prior to when we started writing the writer version
@@ -1570,8 +2258,8 @@ async fn rewrite_files(
         .iter()
         .map(|f| f.physical_rows.unwrap() as u64)
         .sum::<u64>();
-    // If we aren't using stable row ids, then we need to remap indices.
-    let needs_remapping = !dataset.manifest.uses_stable_row_ids();
+    // Physical-address indices need remapping. Stable logical postings do not.
+    let needs_remapping = !dataset.manifest.has_stable_row_identity();
     let mut new_fragments: Vec<Fragment>;
     let task_id = uuid::Uuid::new_v4();
     log::info!(
@@ -1581,8 +2269,15 @@ async fn rewrite_files(
         fragments.len()
     );
     let mode = options.compaction_mode();
-    let can_binary_copy = can_use_binary_copy(dataset.as_ref(), options, &fragments).await;
-    if !can_binary_copy && matches!(mode, CompactionMode::ForceBinaryCopy) {
+    let binary_copy_plan = if let Some(plan) = v2_3_plan.as_ref() {
+        match &plan.rewrite_strategy {
+            V2_3CompactionRewriteStrategy::Reencode => None,
+            V2_3CompactionRewriteStrategy::BinaryCopy(plan) => Some(plan.clone()),
+        }
+    } else {
+        plan_binary_copy_impl(dataset.as_ref(), options, &fragments).await?
+    };
+    if binary_copy_plan.is_none() && matches!(mode, CompactionMode::ForceBinaryCopy) {
         return Err(Error::not_supported_source(
             format!("compaction task {}: binary copy is not supported", task_id).into(),
         ));
@@ -1590,7 +2285,7 @@ async fn rewrite_files(
     let mut row_ids_rx: Option<std::sync::mpsc::Receiver<CapturedRowIds>> = None;
     let mut reader: Option<SendableRecordBatchStream> = None;
 
-    if !can_binary_copy {
+    if binary_copy_plan.is_none() {
         let (prepared_reader, rx_initial, has_blob_v2_columns) = prepare_reader(
             dataset.as_ref(),
             &fragments,
@@ -1598,6 +2293,7 @@ async fn rewrite_files(
             options.io_buffer_size,
             true,
             needs_remapping,
+            v2_3_plan.as_ref(),
         )
         .await?;
         row_ids_rx = rx_initial;
@@ -1615,51 +2311,9 @@ async fn rewrite_files(
         });
 
         if has_blob_v2_columns {
-            let dataset_arc = Arc::new(dataset.as_ref().clone());
-            let dataset_schema = dataset.schema().clone();
-            let transformed = reader_with_progress.then(move |batch_result| {
-                let dataset = dataset_arc.clone();
-                let schema = dataset_schema.clone();
-                async move {
-                    let batch = batch_result?;
-                    transform_blob_v2_batch(&dataset, &schema, batch)
-                        .await
-                        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))
-                }
-            });
-            let transformed_schema = {
-                let mut fields: Vec<Arc<arrow_schema::Field>> = Vec::new();
-                for field in schema.fields().iter() {
-                    if field.name() == lance_core::ROW_ADDR {
-                        continue;
-                    }
-                    let lance_field = dataset.schema().field(field.name());
-                    if let Some(lance_field) = lance_field.filter(|f| f.is_blob_v2()) {
-                        let logical_field = arrow_schema::Field::from(lance_field);
-                        fields.push(Arc::new(
-                            arrow_schema::Field::new(
-                                field.name(),
-                                lance_core::datatypes::BLOB_V2_USER_TYPE.clone(),
-                                field.is_nullable(),
-                            )
-                            .with_metadata(logical_field.metadata().clone()),
-                        ));
-                    } else {
-                        fields.push(field.clone());
-                    }
-                }
-                Arc::new(arrow_schema::Schema::new_with_metadata(
-                    fields
-                        .iter()
-                        .map(|f| f.as_ref().clone())
-                        .collect::<Vec<_>>(),
-                    schema.metadata().clone(),
-                ))
-            };
-            reader = Some(Box::pin(RecordBatchStreamAdapter::new(
-                transformed_schema,
-                transformed,
-            )));
+            let progress_stream =
+                Box::pin(RecordBatchStreamAdapter::new(schema, reader_with_progress));
+            reader = Some(transform_blob_v2_stream(dataset.as_ref(), progress_stream));
         } else {
             reader = Some(Box::pin(RecordBatchStreamAdapter::new(
                 schema,
@@ -1681,16 +2335,30 @@ async fn rewrite_files(
     if let Some(max_bytes_per_file) = options.max_bytes_per_file {
         params.max_bytes_per_file = max_bytes_per_file;
     }
+    if uses_v2_3_row_addresses {
+        if let Some(plan) = v2_3_plan.as_ref()
+            && matches!(
+                &plan.rewrite_strategy,
+                V2_3CompactionRewriteStrategy::Reencode
+            )
+            && let Some(rows_per_file) = plan.output_row_counts.first()
+        {
+            params.max_rows_per_file = *rows_per_file as usize;
+        }
+        // The byte target was converted into a deterministic row or source-file
+        // boundary during preflight. Runtime bytes cannot change that boundary.
+        params.max_bytes_per_file = usize::MAX;
+    }
 
     if dataset.manifest.uses_stable_row_ids() {
         params.enable_stable_row_ids = true;
     }
 
-    if can_binary_copy {
+    if let Some(binary_copy_plan) = binary_copy_plan.as_ref() {
         new_fragments = rewrite_files_binary_copy(
             dataset.as_ref(),
             &fragments,
-            &params,
+            binary_copy_plan,
             options.binary_copy_read_batch_bytes,
         )
         .await?;
@@ -1735,34 +2403,100 @@ async fn rewrite_files(
 
     log::info!("Compaction task {}: file written", task_id);
 
-    // Wrap in an async block so `?` returns into `row_addrs_result` and we can
+    // Wrap in an async block so `?` returns into `provenance_result` and we can
     // run cleanup before propagating the error.
-    let row_addrs_result: Result<Option<Vec<u8>>> = async {
-        if let Some(row_ids_rx) = row_ids_rx {
+    let provenance_result: Result<RewriteRowProvenance> = async {
+        let mut row_addrs = None;
+        let mut logical_row_ids = None;
+        let retired = if let Some(plan) = v2_3_plan.as_ref() {
+            if plan.requires_full_logical_sort || !plan.logical_run_ends.is_empty() {
+                let captured = row_ids_rx
+                    .take()
+                    .ok_or_else(|| {
+                        Error::internal(
+                            "logical-order compaction did not capture its emitted row addresses",
+                        )
+                    })?
+                    .try_recv()
+                    .map_err(|error| {
+                        Error::internal(format!(
+                            "logical-order compaction row-address capture did not complete: {error}"
+                        ))
+                    })?;
+                let CapturedRowIds::SequenceStyle(captured) = captured else {
+                    return Err(Error::internal(
+                        "logical-order compaction captured physical row addresses",
+                    ));
+                };
+                let planned = read_row_ids(&plan.logical_row_ids)?;
+                if captured.len() != planned.len() || !captured.iter().eq(planned.iter()) {
+                    return Err(Error::internal(
+                        "logical-order compaction output differs from its admitted row sequence",
+                    ));
+                }
+            }
+            let actual_row_counts = new_fragments
+                .iter()
+                .map(|fragment| {
+                    u32::try_from(fragment.physical_rows.ok_or_else(|| {
+                        Error::invalid_input(
+                            "storage-version-2.3 compaction output is missing physical_rows",
+                        )
+                    })?)
+                    .map_err(|_| {
+                        Error::invalid_input(
+                            "storage-version-2.3 compaction output rows exceed u32",
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if actual_row_counts != plan.output_row_counts {
+                return Err(Error::invalid_input(format!(
+                    "storage-version-2.3 compaction output boundaries changed after admission: planned {:?}, wrote {:?}",
+                    plan.output_row_counts, actual_row_counts
+                )));
+            }
+            logical_row_ids = Some(plan.logical_row_ids.clone());
+            plan.retired_logical_row_ids.clone()
+        } else if let Some(row_ids_rx) = row_ids_rx {
             let captured_ids = row_ids_rx
                 .try_recv()
                 .map_err(|err| Error::internal(format!("Failed to receive row ids: {}", err)))?;
-            let row_addrs = captured_ids.row_addrs(None).into_owned();
-            let mut serialized = Vec::with_capacity(row_addrs.serialized_size());
-            row_addrs.serialize_into(&mut serialized)?;
-            Ok(Some(serialized))
-        } else {
-            if dataset.manifest.uses_stable_row_ids() {
-                log::info!("Compaction task {}: rechunking stable row ids", task_id);
-                rechunk_stable_row_ids(dataset.as_ref(), &mut new_fragments, &fragments).await?;
-                recalc_versions_for_rewritten_fragments(
-                    dataset.as_ref(),
-                    &mut new_fragments,
-                    &fragments,
-                )
-                .await?;
+            match captured_ids {
+                CapturedRowIds::AddressStyle(addresses) if needs_remapping => {
+                    let mut serialized = Vec::with_capacity(addresses.serialized_size());
+                    addresses.serialize_into(&mut serialized)?;
+                    row_addrs = Some(serialized);
+                }
+                CapturedRowIds::SequenceStyle(_) | CapturedRowIds::AddressStyle(_) => {
+                    return Err(Error::internal(
+                        "compaction captured row identities using the wrong address domain",
+                    ));
+                }
             }
-            Ok(None)
+            None
+        } else if dataset.manifest.uses_legacy_stable_row_ids() {
+            log::info!("Compaction task {}: rechunking stable row ids", task_id);
+            rechunk_stable_row_ids(dataset.as_ref(), &mut new_fragments, &fragments).await?;
+            None
+        } else {
+            None
+        };
+
+        if dataset.manifest.has_stable_row_identity() {
+            recalc_versions_for_rewritten_fragments(
+                dataset.as_ref(),
+                &mut new_fragments,
+                &fragments,
+                logical_row_ids.as_deref(),
+            )
+            .await?;
         }
+        Ok((row_addrs, logical_row_ids, retired))
     }
     .await;
 
-    let row_addrs = match row_addrs_result {
+    let (row_addrs, logical_row_ids, retired_logical_row_ids) = match provenance_result {
         Ok(v) => v,
         Err(e) => {
             cleanup_data_fragments(&dataset.object_store, &dataset.base, None, &new_fragments)
@@ -1791,6 +2525,8 @@ async fn rewrite_files(
         read_version: dataset.manifest.version,
         original_fragments: fragments,
         row_addrs,
+        logical_row_ids,
+        retired_logical_row_ids,
     })
 }
 
@@ -1861,7 +2597,37 @@ async fn recalc_versions_for_rewritten_fragments(
     dataset: &Dataset,
     new_fragments: &mut [Fragment],
     old_fragments: &[Fragment],
+    logical_row_ids: Option<&[u8]>,
 ) -> Result<()> {
+    if dataset.manifest.uses_stable_logical_row_addresses() {
+        let logical_row_ids = logical_row_ids.ok_or_else(|| {
+            Error::internal("storage-version-2.3 compaction is missing its logical row sequence")
+        })?;
+        let logical_row_ids = read_row_ids(logical_row_ids)?.iter().collect::<Vec<_>>();
+        let (created, updated) =
+            resolve_logical_row_version_sequences(dataset, &logical_row_ids).await?;
+        let chunk_sizes = new_fragments
+            .iter()
+            .map(|fragment| fragment.physical_rows.unwrap_or_default() as u64)
+            .collect::<Vec<_>>();
+        let created = lance_table::rowids::version::rechunk_version_sequences(
+            [created],
+            chunk_sizes.clone(),
+            false,
+        )?;
+        let updated =
+            lance_table::rowids::version::rechunk_version_sequences([updated], chunk_sizes, false)?;
+        for ((fragment, created), updated) in new_fragments.iter_mut().zip(created).zip(updated) {
+            fragment.created_at_version_meta = Some(
+                lance_table::format::RowDatasetVersionMeta::from_sequence(&created)?,
+            );
+            fragment.last_updated_at_version_meta = Some(
+                lance_table::format::RowDatasetVersionMeta::from_sequence(&updated)?,
+            );
+        }
+        return Ok(());
+    }
+
     // Load old per-row last_updated_at version sequences
     let mut old_last_updated_sequences: Vec<lance_table::format::RowDatasetVersionSequence> =
         Vec::with_capacity(old_fragments.len());
@@ -1971,8 +2737,26 @@ pub async fn commit_compaction(
         return Ok(CompactionMetrics::default());
     }
 
-    // If we aren't using stable row ids, then we need to remap indices.
-    let needs_remapping = !dataset.manifest.uses_stable_row_ids() && !options.defer_index_remap;
+    let mut skipped_metrics = CompactionMetrics::default();
+    let mut completed_tasks = completed_tasks
+        .into_iter()
+        .filter_map(|task| {
+            if task.original_fragments.is_empty() && task.new_fragments.is_empty() {
+                skipped_metrics += task.metrics;
+                None
+            } else {
+                Some(task)
+            }
+        })
+        .collect::<Vec<_>>();
+    if completed_tasks.is_empty() {
+        return Ok(skipped_metrics);
+    }
+
+    let uses_v2_3_row_addresses = dataset.manifest.uses_stable_logical_row_addresses();
+    let has_stable_row_identity = dataset.manifest.has_stable_row_identity();
+    let needs_remapping = !has_stable_row_identity && !options.defer_index_remap;
+    let defers_remapping = !has_stable_row_identity && options.defer_index_remap;
 
     // Determine the earliest version at which compaction tasks were planned/executed.
     //
@@ -1993,8 +2777,6 @@ pub async fn commit_compaction(
         .min()
         .unwrap_or(dataset.manifest.version);
 
-    let mut completed_tasks = completed_tasks;
-
     // Single reserve_fragment_ids for all address-style tasks
     let has_address_style = completed_tasks.iter().any(|t| t.row_addrs.is_some());
     if has_address_style {
@@ -2007,15 +2789,48 @@ pub async fn commit_compaction(
     }
 
     let mut rewrite_groups = Vec::with_capacity(completed_tasks.len());
-    let mut metrics = CompactionMetrics::default();
+    let mut metrics = skipped_metrics;
 
     let mut remap_group_inputs: Vec<GroupInput> = Vec::new();
     let mut direct_row_id_map: HashMap<u64, Option<u64>> = HashMap::default();
     let mut frag_reuse_groups: Vec<FragReuseGroup> = Vec::new();
     let mut new_fragment_bitmap: RoaringBitmap = RoaringBitmap::new();
+    let mut next_new_fragment_ordinal = 0_u32;
+    let mut source_domains = BTreeMap::new();
+    let mut row_address_layout_delta = if uses_v2_3_row_addresses {
+        let layout = dataset
+            .manifest
+            .row_address_layout
+            .as_ref()
+            .ok_or_else(|| {
+                Error::internal("storage-version-2.3 manifest is missing RowAddressLayout")
+            })?;
+        Some(RowAddressLayoutDelta {
+            expected_layout_fingerprint: layout.fingerprint.clone(),
+            ..RowAddressLayoutDelta::default()
+        })
+    } else {
+        None
+    };
 
     for task in completed_tasks {
         metrics += task.metrics;
+        if let Some(delta) = row_address_layout_delta.as_mut() {
+            let logical_row_ids = task.logical_row_ids.as_deref().ok_or_else(|| {
+                Error::invalid_input(
+                    "storage-version-2.3 compaction result is missing logical output provenance",
+                )
+            })?;
+            add_rewrite_provenance(
+                dataset,
+                &task.new_fragments,
+                logical_row_ids,
+                task.retired_logical_row_ids.as_deref(),
+                &mut next_new_fragment_ordinal,
+                &mut source_domains,
+                delta,
+            )?;
+        }
         let rewrite_group = RewriteGroup {
             old_fragments: task.original_fragments.clone(),
             new_fragments: task.new_fragments.clone(),
@@ -2061,7 +2876,7 @@ pub async fn commit_compaction(
                     }
                 }
             }
-        } else if options.defer_index_remap {
+        } else if defers_remapping {
             let changed_row_addrs = task.row_addrs.ok_or_else(|| {
                 Error::internal(
                     "defer_index_remap requires row_addrs but none were provided".to_string(),
@@ -2078,6 +2893,9 @@ pub async fn commit_compaction(
             });
         }
         rewrite_groups.push(rewrite_group);
+    }
+    if let Some(delta) = row_address_layout_delta.as_mut() {
+        delta.source_domains = source_domains.into_values().collect();
     }
 
     let rewritten_indices = if needs_remapping {
@@ -2102,7 +2920,7 @@ pub async fn commit_compaction(
                 new_index_files: rewritten.files,
             })
             .collect()
-    } else if !options.defer_index_remap && !has_address_style {
+    } else if !options.defer_index_remap && !has_address_style && !uses_v2_3_row_addresses {
         // We need to reserve fragment ids here so that the fragment bitmap
         // can be updated for each index. Only needed for stable row IDs
         // since address-style IDs were already reserved above.
@@ -2116,7 +2934,7 @@ pub async fn commit_compaction(
         Vec::new()
     };
 
-    let frag_reuse_index = if options.defer_index_remap {
+    let frag_reuse_index = if defers_remapping {
         Some(build_new_frag_reuse_index(dataset, frag_reuse_groups, new_fragment_bitmap).await?)
     } else {
         None
@@ -2144,6 +2962,7 @@ pub async fn commit_compaction(
             frag_reuse_index,
         },
     )
+    .row_address_layout_delta(row_address_layout_delta)
     .transaction_properties(options.transaction_properties.clone())
     .build();
 
@@ -2170,9 +2989,9 @@ mod tests {
     mod binary_copy;
     use self::remapping::RemappedIndex;
     use super::*;
-    use crate::dataset::WriteDestination;
     use crate::dataset::index::frag_reuse::cleanup_frag_reuse_index;
     use crate::dataset::optimize::remapping::{transpose_row_addrs, transpose_row_ids_from_digest};
+    use crate::dataset::{UpdateBuilder, WriteDestination};
     use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
     use crate::index::vector::{StageParams, VectorIndexParams};
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
@@ -2187,7 +3006,7 @@ mod tests {
     use lance_arrow::BLOB_META_KEY;
     use lance_core::Error;
     use lance_core::ROW_ID;
-    use lance_core::utils::address::RowAddress;
+    use lance_core::utils::address::{LogicalRowAddress, RowAddress};
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::Dimension;
     use lance_file::version::LanceFileVersion;
@@ -2200,6 +3019,7 @@ mod tests {
     use lance_index::{Index, IndexType};
     use lance_linalg::distance::{DistanceType, MetricType};
     use lance_table::io::manifest::read_manifest_indexes;
+    use lance_table::rowids::RowIdSequence;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector};
     use rstest::rstest;
     use std::collections::HashSet;
@@ -2226,6 +3046,7 @@ mod tests {
             physical_rows: Some(0),
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            native_logical_domain: None,
         };
         let single_bin = CandidateBin {
             fragments: vec![fragment.clone()],
@@ -2261,6 +3082,19 @@ mod tests {
         assert_eq!(split[0].pos_range, 0..2);
         assert_eq!(split[1].pos_range, 2..5);
         assert_eq!(split[2].pos_range, 5..8);
+    }
+
+    #[test]
+    fn test_v2_3_default_compaction_rejects_cross_domain_reorder() {
+        let row_ids = [
+            LogicalRowAddress::try_new_from_parts(1, 0).unwrap().raw(),
+            LogicalRowAddress::try_new_from_parts(0, 0).unwrap().raw(),
+        ];
+        let error =
+            validate_default_compaction_logical_order(&RowIdSequence::from(row_ids.as_slice()))
+                .unwrap_err();
+        assert!(matches!(&error, Error::NotSupported { .. }));
+        assert!(error.to_string().contains("explicit Recluster"));
     }
 
     fn sample_data() -> RecordBatch {
@@ -2445,6 +3279,598 @@ mod tests {
         };
         let plan = plan_compaction(&dataset, &options).await.unwrap();
         assert_eq!(plan.tasks().len(), 0);
+    }
+
+    async fn scan_v2_3_rows(dataset: &Dataset) -> Vec<(i64, u64)> {
+        let mut scanner = dataset.scan();
+        scanner.with_row_id();
+        let batch = scanner.try_into_batch().await.unwrap();
+        let values = batch
+            .column_by_name("a")
+            .unwrap()
+            .as_primitive::<Int64Type>();
+        let row_ids = batch
+            .column_by_name(ROW_ID)
+            .unwrap()
+            .as_primitive::<UInt64Type>();
+        (0..batch.num_rows())
+            .map(|index| (values.value(index), row_ids.value(index)))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_v2_3_compaction_preserves_logical_ids_as_packed_run() {
+        let test_dir = TempStrDir::default();
+        let data = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)])),
+            vec![Arc::new(Int64Array::from_iter_values(0..20))],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(data.clone())], data.schema()),
+            &test_dir,
+            Some(WriteParams {
+                max_rows_per_file: 4,
+                data_storage_version: Some(LanceFileVersion::V2_3),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.manifest.fragments.len(), 5);
+        let before = scan_v2_3_rows(&dataset).await;
+
+        let options = CompactionOptions {
+            target_rows_per_fragment: 20,
+            max_rows_per_group: 20,
+            compaction_mode: Some(CompactionMode::TryBinaryCopy),
+            ..Default::default()
+        };
+        let plan = plan_compaction(&dataset, &options).await.unwrap();
+        assert_eq!(plan.num_tasks(), 1);
+        assert_eq!(
+            plan.tasks[0].v2_3_plan.as_ref().unwrap().output_row_counts,
+            vec![20]
+        );
+        assert!(matches!(
+            plan.tasks[0]
+                .v2_3_plan
+                .as_ref()
+                .map(|plan| &plan.rewrite_strategy),
+            Some(V2_3CompactionRewriteStrategy::BinaryCopy(_))
+        ));
+
+        let metrics = compact_files(
+            &mut dataset,
+            options,
+            Some(Arc::new(MockIndexRemapper::default())),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(metrics.groups_planned, 1);
+        assert_eq!(metrics.groups_admitted, 1);
+        assert_eq!(metrics.groups_not_admitted, 0);
+        assert_eq!(dataset.manifest.fragments.len(), 1);
+        assert_eq!(scan_v2_3_rows(&dataset).await, before);
+        let fragment = &dataset.manifest.fragments[0];
+        assert!(fragment.native_logical_domain.is_none());
+        assert!(fragment.row_id_meta.is_none());
+        let layout = dataset.manifest.row_address_layout.as_ref().unwrap();
+        assert_eq!(layout.placements.len(), 1);
+        assert!(matches!(
+            layout.placements[0],
+            lance_table::format::RowAddressPlacement::PackedRun(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_v2_3_force_binary_copy_rejects_incompatible_sources_before_writes() {
+        use lance_io::utils::tracking_store::{IOTracker, IoOperation};
+
+        let test_dir = TempStrDir::default();
+        let data = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)])),
+            vec![Arc::new(Int64Array::from_iter_values(0..20))],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(data.clone())], data.schema()),
+            &test_dir,
+            Some(WriteParams {
+                max_rows_per_file: 4,
+                data_storage_version: Some(LanceFileVersion::V2_3),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.delete("a = 1").await.unwrap();
+        let tracker = Arc::new(IOTracker::default());
+        dataset = dataset.with_object_store_wrappers([
+            tracker.clone() as Arc<dyn lance_io::object_store::WrappingObjectStore>
+        ]);
+        let version = dataset.version().version;
+        let data_files = count_data_files_in(test_dir.as_str());
+        tracker.incremental_stats();
+
+        let error = compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 20,
+                compaction_mode: Some(CompactionMode::ForceBinaryCopy),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(&error, Error::NotSupported { .. }));
+        assert!(error.to_string().contains("ForceBinaryCopy"));
+        assert_eq!(dataset.version().version, version);
+        assert_eq!(count_data_files_in(test_dir.as_str()), data_files);
+        let data_writes = tracker
+            .incremental_stats()
+            .requests
+            .into_iter()
+            .filter(|request| {
+                request.operation == IoOperation::Put
+                    && request.path.to_string().starts_with("data/")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            data_writes.is_empty(),
+            "incompatible ForceBinaryCopy must fail before data PUTs: {data_writes:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_v2_3_reencode_freezes_max_bytes_as_row_boundaries() {
+        let test_dir = TempStrDir::default();
+        let data = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)])),
+            vec![Arc::new(Int64Array::from_iter_values(0..20))],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(data.clone())], data.schema()),
+            &test_dir,
+            Some(WriteParams {
+                max_rows_per_file: 4,
+                data_storage_version: Some(LanceFileVersion::V2_3),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let options = CompactionOptions {
+            target_rows_per_fragment: 20,
+            max_bytes_per_file: Some(256),
+            compaction_mode: Some(CompactionMode::Reencode),
+            ..Default::default()
+        };
+        let plan = plan_compaction(&dataset, &options).await.unwrap();
+        let planned_counts = plan.tasks[0]
+            .v2_3_plan
+            .as_ref()
+            .unwrap()
+            .output_row_counts
+            .clone();
+        assert!(planned_counts.len() > 1);
+
+        compact_files(&mut dataset, options, None).await.unwrap();
+        let actual_counts = dataset
+            .manifest
+            .fragments
+            .iter()
+            .map(|fragment| fragment.physical_rows.unwrap() as u32)
+            .collect::<Vec<_>>();
+        assert_eq!(actual_counts, planned_counts);
+    }
+
+    #[tokio::test]
+    async fn test_v2_3_compaction_combines_group_admission_and_metrics() {
+        let test_dir = TempStrDir::default();
+        let data = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)])),
+            vec![Arc::new(Int64Array::from_iter_values(0..40))],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(data.clone())], data.schema()),
+            &test_dir,
+            Some(WriteParams {
+                max_rows_per_file: 4,
+                data_storage_version: Some(LanceFileVersion::V2_3),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let options = CompactionOptions {
+            target_rows_per_fragment: 8,
+            max_rows_per_group: 8,
+            num_threads: Some(2),
+            ..Default::default()
+        };
+
+        let plan = plan_compaction(&dataset, &options).await.unwrap();
+        assert_eq!(plan.num_tasks(), 5);
+        assert_eq!(plan.planning_metrics, CompactionMetrics::default());
+        assert!(plan.tasks.iter().all(|task| {
+            task.v2_3_plan
+                .as_ref()
+                .is_some_and(|plan| plan.output_row_counts == [8])
+        }));
+
+        let metrics = compact_files(&mut dataset, options, None).await.unwrap();
+        assert_eq!(metrics.groups_planned, 5);
+        assert_eq!(metrics.groups_admitted, 5);
+        assert_eq!(metrics.groups_not_admitted, 0);
+        assert_eq!(dataset.manifest.fragments.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn test_v2_3_not_admitted_result_does_not_commit_empty_rewrite() {
+        let test_dir = TempStrDir::default();
+        let data = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)])),
+            vec![Arc::new(Int64Array::from_iter_values(0..4))],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(data.clone())], data.schema()),
+            &test_dir,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_3),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let version = dataset.version().version;
+        let data_files = count_data_files_in(test_dir.as_str());
+        let metrics = CompactionMetrics {
+            groups_planned: 1,
+            groups_not_admitted: 1,
+            ..CompactionMetrics::default()
+        };
+        let skipped = RewriteResult {
+            metrics: metrics.clone(),
+            new_fragments: Vec::new(),
+            read_version: version,
+            original_fragments: Vec::new(),
+            row_addrs: None,
+            logical_row_ids: None,
+            retired_logical_row_ids: None,
+        };
+
+        let actual = commit_compaction(
+            &mut dataset,
+            vec![skipped],
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &CompactionOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(actual, metrics);
+        assert_eq!(dataset.version().version, version);
+        assert_eq!(count_data_files_in(test_dir.as_str()), data_files);
+    }
+
+    #[tokio::test]
+    async fn test_v2_3_update_stripe_n_to_one_merges_logical_runs() {
+        let test_dir = TempStrDir::default();
+        let data = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)])),
+            vec![Arc::new(Int64Array::from_iter_values(0..20))],
+        )
+        .unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(data.clone())], data.schema()),
+            &test_dir,
+            Some(WriteParams {
+                max_rows_per_file: 4,
+                data_storage_version: Some(LanceFileVersion::V2_3),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let updated = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("a = 1")
+            .unwrap()
+            .set("a", "101")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        let mut dataset = updated.new_dataset.as_ref().clone();
+        let mut expected = scan_v2_3_rows(&dataset).await;
+        expected.sort_by_key(|(_, row_id)| *row_id);
+        let options = CompactionOptions {
+            target_rows_per_fragment: 20,
+            ..Default::default()
+        };
+
+        let plan = plan_compaction(&dataset, &options).await.unwrap();
+        assert_eq!(plan.tasks.len(), 1);
+        let v2_3_plan = plan.tasks[0].v2_3_plan.as_ref().unwrap();
+        assert_eq!(v2_3_plan.logical_run_ends, vec![5, 6]);
+        assert!(!v2_3_plan.requires_full_logical_sort);
+
+        let metrics = compact_files(&mut dataset, options, None).await.unwrap();
+        assert_eq!(metrics.groups_planned, 1);
+        assert_eq!(metrics.groups_admitted, 1);
+        assert_eq!(metrics.groups_not_admitted, 0);
+        assert_eq!(dataset.manifest.fragments.len(), 1);
+        assert_eq!(scan_v2_3_rows(&dataset).await, expected);
+
+        let row_ids = expected
+            .iter()
+            .rev()
+            .map(|(_, row_id)| *row_id)
+            .collect::<Vec<_>>();
+        let taken = dataset
+            .take_rows(&row_ids, dataset.schema().clone())
+            .await
+            .unwrap();
+        let taken_values = taken["a"].as_primitive::<Int64Type>().values().to_vec();
+        assert_eq!(
+            taken_values,
+            expected
+                .iter()
+                .rev()
+                .map(|(value, _)| *value)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_v2_3_update_compaction_reuses_index_without_index_io() {
+        use lance_io::utils::tracking_store::IOTracker;
+
+        let test_dir = TempStrDir::default();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("key", DataType::Int64, false),
+        ]));
+        let data = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..20)),
+                Arc::new(Int64Array::from_iter_values(100..120)),
+            ],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(data)], schema),
+            &test_dir,
+            Some(WriteParams {
+                max_rows_per_file: 4,
+                data_storage_version: Some(LanceFileVersion::V2_3),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["key"],
+                IndexType::Scalar,
+                Some("key_idx".to_string()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let updated = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("a = 1")
+            .unwrap()
+            .set("a", "101")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        let before_indices = updated.new_dataset.load_indices().await.unwrap();
+        let tracker = Arc::new(IOTracker::default());
+        let mut dataset = updated.new_dataset.with_object_store_wrappers([
+            tracker.clone() as Arc<dyn lance_io::object_store::WrappingObjectStore>
+        ]);
+        tracker.incremental_stats();
+
+        let metrics = compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 20,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(metrics.groups_admitted, 1);
+        assert_eq!(dataset.manifest.fragments.len(), 1);
+        assert_eq!(dataset.load_indices().await.unwrap(), before_indices);
+
+        let stats = tracker.incremental_stats();
+        let index_requests = stats
+            .requests
+            .iter()
+            .filter(|request| request.path.to_string().contains("_indices"))
+            .collect::<Vec<_>>();
+        assert!(
+            index_requests.is_empty(),
+            "physical rewrite must not read or write logical index objects: {index_requests:?}"
+        );
+
+        let result = dataset
+            .scan()
+            .filter("key = 101")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(result.num_rows(), 1);
+        assert_eq!(result["a"].as_primitive::<Int64Type>().value(0), 101);
+    }
+
+    #[tokio::test]
+    async fn test_v2_3_compaction_not_admitted_writes_no_data_objects() {
+        use lance_io::utils::tracking_store::{IOTracker, IoOperation};
+
+        let test_dir = TempStrDir::default();
+        let data = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)])),
+            vec![Arc::new(Int64Array::from_iter_values(0..20))],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(data.clone())], data.schema()),
+            &test_dir,
+            Some(WriteParams {
+                max_rows_per_file: 4,
+                data_storage_version: Some(LanceFileVersion::V2_3),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let mut maintenance = RowAddressMaintenanceOptions::repack();
+        maintenance.target_rows_per_fragment = 4;
+        maintain_row_addresses(&mut dataset, maintenance)
+            .await
+            .unwrap();
+        assert_eq!(dataset.manifest.fragments.len(), 5);
+
+        let tracker = Arc::new(IOTracker::default());
+        dataset = dataset.with_object_store_wrappers([
+            tracker.clone() as Arc<dyn lance_io::object_store::WrappingObjectStore>
+        ]);
+        let version = dataset.version().version;
+        let data_files = count_data_files_in(test_dir.as_str());
+        tracker.incremental_stats();
+
+        let metrics = compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 20,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(metrics.groups_planned, 1);
+        assert_eq!(metrics.groups_admitted, 0);
+        assert_eq!(metrics.groups_not_admitted, 1);
+        assert_eq!(dataset.version().version, version);
+        assert_eq!(count_data_files_in(test_dir.as_str()), data_files);
+
+        let data_writes = tracker
+            .incremental_stats()
+            .requests
+            .into_iter()
+            .filter(|request| {
+                request.operation == IoOperation::Put
+                    && request.path.to_string().starts_with("data/")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            data_writes.is_empty(),
+            "not-admitted preflight must precede every data-object write: {data_writes:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_v2_3_compaction_retires_deleted_logical_ids() {
+        let test_dir = TempStrDir::default();
+        let data = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)])),
+            vec![Arc::new(Int64Array::from_iter_values(0..20))],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(data.clone())], data.schema()),
+            &test_dir,
+            Some(WriteParams {
+                max_rows_per_file: 4,
+                data_storage_version: Some(LanceFileVersion::V2_3),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let original = scan_v2_3_rows(&dataset).await;
+        let retired = original
+            .iter()
+            .filter(|(value, _)| *value == 1 || *value == 3)
+            .map(|(_, row_id)| *row_id)
+            .collect::<Vec<_>>();
+        dataset.delete("a = 1 OR a = 3").await.unwrap();
+        let before = scan_v2_3_rows(&dataset).await;
+
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 20,
+                max_rows_per_group: 20,
+                materialize_deletions: true,
+                materialize_deletions_threshold: 0.0,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(dataset.manifest.fragments.len(), 1);
+        assert_eq!(scan_v2_3_rows(&dataset).await, before);
+        assert!(dataset.manifest.fragments[0].deletion_file.is_none());
+        assert_eq!(
+            dataset.resolve_logical_row_ids(&retired).unwrap(),
+            vec![None; retired.len()]
+        );
+        let layout = dataset.manifest.row_address_layout.as_ref().unwrap();
+        let retired_addresses = retired
+            .iter()
+            .copied()
+            .map(LogicalRowAddress::try_from)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            dataset
+                .row_address_router()
+                .unwrap()
+                .resolve_many(&retired_addresses)
+                .unwrap(),
+            vec![lance_table::format::PlacementResolution::NotLive; retired.len()]
+        );
+        let mut sparse_block_ranges = Vec::new();
+        layout
+            .visit_retired_ranges(|range| sparse_block_ranges.push(range))
+            .unwrap();
+        assert!(!sparse_block_ranges.is_empty());
+        for address in retired_addresses {
+            assert!(sparse_block_ranges.iter().any(|range| {
+                range.logical_fragment_id == address.logical_fragment_id()
+                    && range.start_slot <= address.immutable_slot()
+                    && address.immutable_slot() < range.end_slot
+            }));
+        }
+        assert_eq!(layout.placements.len(), 1);
+        assert!(matches!(
+            layout.placements[0],
+            lance_table::format::RowAddressPlacement::SparseSelection(_)
+                | lance_table::format::RowAddressPlacement::Selected(_)
+        ));
     }
 
     #[tokio::test]

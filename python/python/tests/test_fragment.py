@@ -22,7 +22,7 @@ from lance import (
 )
 from lance.debug import format_fragment
 from lance.file import LanceFileWriter
-from lance.fragment import write_fragments
+from lance.fragment import NativeLogicalDomain, write_fragments
 from lance.progress import FileSystemFragmentWriteProgress
 
 
@@ -66,6 +66,39 @@ def test_write_fragment_two_phases(tmp_path: Path):
     pd.testing.assert_frame_equal(
         df, pd.DataFrame({"a": [i * 10 for i in range(num_files)]})
     )
+
+
+def test_write_v2_3_fragments_two_phases(tmp_path: Path):
+    first = pa.table({"a": [1, 2, 3]})
+    fragment = LanceFragment.create(tmp_path, first, data_storage_version="2.3")
+    dataset = LanceDataset.commit(
+        tmp_path, LanceOperation.Overwrite(first.schema, [fragment])
+    )
+
+    assert dataset.data_storage_version == "2.3"
+    initial_row_ids = dataset.scanner(columns=["_rowid"]).to_table()["_rowid"]
+    create_transaction = dataset.read_transaction(1)
+    assert create_transaction is not None
+    assert create_transaction.row_address_layout_delta is not None
+
+    second = pa.table({"a": [4, 5]})
+    fragment = LanceFragment.create(tmp_path, second, data_storage_version="2.3")
+    dataset = LanceDataset.commit(
+        dataset,
+        LanceOperation.Append([fragment]),
+        read_version=dataset.version,
+    )
+
+    assert dataset.to_table() == pa.concat_tables([first, second])
+    assert (
+        dataset.scanner(columns=["_rowid"])
+        .to_table()["_rowid"]
+        .slice(0, 3)
+        .equals(initial_row_ids)
+    )
+    append_transaction = dataset.read_transaction(2)
+    assert append_transaction is not None
+    assert append_transaction.row_address_layout_delta is not None
 
 
 def test_write_legacy_fragment(tmp_path: Path):
@@ -502,7 +535,13 @@ def test_deletion_file_with_base_id_serialization():
 
     # Create a FragmentMetadata with the deletion file
     metadata = FragmentMetadata(
-        id=1, files=[], physical_rows=1000, deletion_file=deletion_file
+        id=1,
+        files=[],
+        physical_rows=1000,
+        deletion_file=deletion_file,
+        native_logical_domain=NativeLogicalDomain(
+            logical_fragment_id=7, creation_version=3
+        ),
     )
 
     # Test pickle serialization/deserialization
@@ -512,15 +551,21 @@ def test_deletion_file_with_base_id_serialization():
     # Verify the deletion file was correctly deserialized
     assert unpickled.deletion_file is not None
     assert unpickled.deletion_file.base_id == 456
+    assert unpickled.native_logical_domain == metadata.native_logical_domain
     assert unpickled == metadata
 
     # Test JSON serialization/deserialization
     json_data = metadata.to_json()
     assert json_data["deletion_file"]["base_id"] == 456
+    assert json_data["native_logical_domain"] == {
+        "logical_fragment_id": 7,
+        "creation_version": 3,
+    }
 
     deserialized = FragmentMetadata.from_json(json.dumps(json_data))
     assert deserialized.deletion_file is not None
     assert deserialized.deletion_file.base_id == 456
+    assert deserialized.native_logical_domain == metadata.native_logical_domain
 
 
 def test_fragment_update_columns_basic(tmp_path):

@@ -9,6 +9,8 @@ from .lance import CompactionMetrics as CompactionMetrics
 from .lance import CompactionPlan as CompactionPlan
 from .lance import CompactionTask as CompactionTask
 from .lance import RewriteResult as RewriteResult
+from .lance import RowAddressMaintenance as RowAddressMaintenance
+from .lance import RowAddressMaintenanceMetrics as RowAddressMaintenanceMetrics
 
 # from .lance import CompactionPlan as CompactionPlan
 
@@ -97,3 +99,21 @@ class CompactionOptions(TypedDict):
     time). Fragments are processed oldest first.
     (default: None, no limit)
     """
+
+
+class RowAddressMaintenanceOptions(TypedDict, total=False):
+    """Shared rewrite options for storage-version-2.3 row-address maintenance."""
+
+    target_rows_per_fragment: int
+    """Maximum rows per output fragment. The default is 1,000,000."""
+    max_rows_per_group: int
+    """Maximum rows per writer batch group. The default is 1,024."""
+    max_bytes_per_file: int
+    """
+    Maximum physical bytes per output file. ``normalize_placement`` rejects
+    this option because its exact admission plan requires row-count boundaries.
+    """
+    batch_size: int
+    """Input scan batch size."""
+    io_buffer_size: int
+    """Input scan I/O buffer size in bytes."""

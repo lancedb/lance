@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
-use arrow_array::{BooleanArray, RecordBatch, RecordBatchOptions, UInt64Array, make_array};
+use arrow_array::{Array, BooleanArray, RecordBatch, RecordBatchOptions, UInt64Array, make_array};
 use arrow_buffer::NullBuffer;
 use futures::{
     FutureExt, Stream, StreamExt,
@@ -12,14 +12,20 @@ use futures::{
 };
 use lance_arrow::RecordBatchExt;
 use lance_core::{
-    ROW_ADDR, ROW_ADDR_FIELD, ROW_CREATED_AT_VERSION_FIELD, ROW_ID, ROW_ID_FIELD,
+    Error, ROW_ADDR, ROW_ADDR_FIELD, ROW_CREATED_AT_VERSION_FIELD, ROW_ID, ROW_ID_FIELD,
     ROW_LAST_UPDATED_AT_VERSION_FIELD, Result,
-    utils::{address::RowAddress, deletion::DeletionVector},
+    utils::{
+        address::{LogicalRowAddress, RowAddress},
+        deletion::DeletionVector,
+    },
 };
 use lance_io::ReadBatchParams;
 use tracing::instrument;
 
-use crate::rowids::RowIdSequence;
+use crate::{
+    format::{PhysicalToLogicalResolution, RowAddressRouter},
+    rowids::RowIdSequence,
+};
 
 pub type ReadBatchFut = BoxFuture<'static, Result<RecordBatch>>;
 /// A task, emitted by a file reader, that will produce a batch (of the
@@ -228,6 +234,12 @@ pub struct RowIdAndDeletesConfig {
     pub deletion_vector: Option<Arc<DeletionVector>>,
     /// An optional row id sequence to use for the row id column.
     pub row_id_sequence: Option<Arc<RowIdSequence>>,
+    /// The storage-version-2.3 logical row-id source for this physical fragment.
+    ///
+    /// This is consulted when `_rowid` is projected or when a projected row-version
+    /// column has no materialized base. Ordinary data scans do not route physical
+    /// rows through the placement layout.
+    pub logical_row_id_source: Option<LogicalRowIdSource>,
     /// The last_updated_at version sequence
     pub last_updated_at_sequence: Option<Arc<crate::rowids::version::RowDatasetVersionSequence>>,
     /// The created_at version sequence
@@ -238,6 +250,70 @@ pub struct RowIdAndDeletesConfig {
     ///
     /// This is needed to convert ReadbatchParams::RangeTo into a valid range
     pub total_num_rows: u32,
+}
+
+/// A storage-version-2.3 source for deriving logical row IDs from physical rows.
+#[derive(Debug, Clone)]
+pub enum LogicalRowIdSource {
+    /// Direct native ownership: logical slot equals physical row offset.
+    Native {
+        logical_fragment_id: u32,
+        creation_version: u64,
+    },
+    /// A non-native fragment whose inverse mapping is described by placement.
+    Placement(Arc<RowAddressRouter>),
+    /// Hidden destination-aligned `_rowid` values written by ExplicitMap
+    /// maintenance.  Loading is performed asynchronously when the fragment is
+    /// opened; batch projection remains a zero-I/O array take.
+    Materialized {
+        row_ids: Arc<UInt64Array>,
+        router: Arc<RowAddressRouter>,
+    },
+}
+
+fn logical_creation_versions(
+    source: &LogicalRowIdSource,
+    row_ids: Option<&UInt64Array>,
+    num_rows: usize,
+) -> Result<Vec<u64>> {
+    match source {
+        LogicalRowIdSource::Native {
+            creation_version, ..
+        } => Ok(vec![*creation_version; num_rows]),
+        LogicalRowIdSource::Placement(router) | LogicalRowIdSource::Materialized { router, .. } => {
+            let row_ids = row_ids.ok_or_else(|| {
+                Error::internal("logical row IDs are required to derive creation versions")
+            })?;
+            let mut versions = Vec::with_capacity(row_ids.len());
+            let mut domains = HashMap::<u32, u64>::new();
+            for row_id in row_ids.values() {
+                if *row_id == LogicalRowAddress::INVALID_RAW {
+                    // Unmapped rows are deleted before the batch is returned.
+                    versions.push(1);
+                    continue;
+                }
+                let logical = LogicalRowAddress::try_from(*row_id)?;
+                let creation_version =
+                    if let Some(version) = domains.get(&logical.logical_fragment_id()) {
+                        *version
+                    } else {
+                        let version = router
+                        .logical_domain(logical.logical_fragment_id())?
+                        .ok_or_else(|| {
+                            Error::internal(format!(
+                                "logical domain {} is missing while deriving row creation version",
+                                logical.logical_fragment_id()
+                            ))
+                        })?
+                        .creation_version;
+                        domains.insert(logical.logical_fragment_id(), version);
+                        version
+                    };
+                versions.push(creation_version);
+            }
+            Ok(versions)
+        }
+    }
 }
 
 impl RowIdAndDeletesConfig {
@@ -266,9 +342,26 @@ pub fn apply_row_id_and_deletes(
     let has_deletions = deletion_vector.is_some();
     debug_assert!(batch.num_columns() > 0 || config.has_system_cols() || has_deletions);
 
+    let needs_creation_base = (config.with_row_created_at_version
+        && config.created_at_sequence.is_none())
+        || (config.with_row_last_updated_at_version
+            && config.last_updated_at_sequence.is_none()
+            && config.created_at_sequence.is_none());
+    let needs_logical_row_ids = config.with_row_id
+        || (needs_creation_base
+            && config
+                .logical_row_id_source
+                .as_ref()
+                .is_some_and(|source| !matches!(source, LogicalRowIdSource::Native { .. })));
+
     // If row id sequence is None, then row id IS row address.
     let should_fetch_row_addr = config.with_row_addr
-        || (config.with_row_id && config.row_id_sequence.is_none())
+        || (needs_logical_row_ids
+            && config.row_id_sequence.is_none()
+            && !matches!(
+                config.logical_row_id_source,
+                Some(LogicalRowIdSource::Native { .. })
+            ))
         || has_deletions;
 
     let num_rows = batch.num_rows() as u32;
@@ -293,9 +386,90 @@ pub fn apply_row_id_and_deletes(
             None
         };
 
-    let row_ids = if config.with_row_id {
+    let row_ids = if needs_logical_row_ids {
         let _rowids = tracing::span!(tracing::Level::DEBUG, "fetch_row_ids").entered();
-        if let Some(row_id_sequence) = &config.row_id_sequence {
+        if let Some(source) = &config.logical_row_id_source {
+            let row_ids = match source {
+                LogicalRowIdSource::Native {
+                    logical_fragment_id,
+                    ..
+                } => {
+                    let mut row_ids = Vec::with_capacity(num_rows as usize);
+                    for offset_range in config
+                        .params
+                        .slice(batch_offset as usize, num_rows as usize)
+                        .unwrap()
+                        .iter_offset_ranges()?
+                    {
+                        for row_offset in offset_range {
+                            row_ids.push(
+                                LogicalRowAddress::try_new_from_parts(
+                                    *logical_fragment_id,
+                                    row_offset,
+                                )?
+                                .raw(),
+                            );
+                        }
+                    }
+                    row_ids
+                }
+                LogicalRowIdSource::Placement(router) => {
+                    let physical = row_addrs
+                        .as_ref()
+                        .expect("placement row IDs require physical row addresses")
+                        .values()
+                        .iter()
+                        .copied()
+                        .map(RowAddress::from)
+                        .collect::<Vec<_>>();
+                    router
+                        .physical_to_logical_many(&physical)?
+                        .into_iter()
+                        .zip(physical)
+                        .map(|(resolution, physical)| match resolution {
+                            PhysicalToLogicalResolution::Logical(logical) => Ok(logical.raw()),
+                            PhysicalToLogicalResolution::ExplicitMap { .. } => {
+                                Err(Error::not_supported(
+                                    "reading ExplicitMap row IDs requires the external locator reader",
+                                ))
+                            }
+                            PhysicalToLogicalResolution::Unmapped
+                                if deletion_vector
+                                    .is_some_and(|deletions| deletions.contains(physical.row_offset())) =>
+                            {
+                                Ok(LogicalRowAddress::INVALID_RAW)
+                            }
+                            PhysicalToLogicalResolution::Unmapped => Err(Error::internal(format!(
+                                "corrupt storage-version-2.3 row-address layout: live physical row {} is not owned by placement",
+                                u64::from(physical)
+                            ))),
+                        })
+                        .collect::<Result<Vec<_>>>()?
+                }
+                LogicalRowIdSource::Materialized { row_ids, .. } => {
+                    let mut values = Vec::with_capacity(num_rows as usize);
+                    for offset_range in config
+                        .params
+                        .slice(batch_offset as usize, num_rows as usize)
+                        .unwrap()
+                        .iter_offset_ranges()?
+                    {
+                        for row_offset in offset_range {
+                            let index = row_offset as usize;
+                            if index >= row_ids.len() || row_ids.is_null(index) {
+                                return Err(Error::invalid_input(format!(
+                                    "ExplicitMap hidden _rowid is missing physical offset {row_offset}"
+                                )));
+                            }
+                            let row_id = row_ids.value(index);
+                            values.push(row_id);
+                        }
+                    }
+                    values
+                }
+            };
+            Some(Arc::new(UInt64Array::from(row_ids)))
+        } else if let Some(row_id_sequence) = &config.row_id_sequence {
             let selection = config
                 .params
                 .slice(batch_offset as usize, num_rows as usize)
@@ -327,7 +501,10 @@ pub fn apply_row_id_and_deletes(
     });
 
     let batch = if config.with_row_id {
-        let row_id_arr = row_ids.unwrap();
+        let row_id_arr = row_ids
+            .as_ref()
+            .expect("projected logical row IDs were materialized")
+            .clone();
         batch.try_with_column(ROW_ID_FIELD.clone(), row_id_arr)?
     } else {
         batch
@@ -344,6 +521,31 @@ pub fn apply_row_id_and_deletes(
     let batch = if config.with_row_last_updated_at_version || config.with_row_created_at_version {
         let mut batch = batch;
 
+        let creation_base = if config.with_row_created_at_version
+            || (config.with_row_last_updated_at_version
+                && config.last_updated_at_sequence.is_none())
+        {
+            if let Some(sequence) = &config.created_at_sequence {
+                Some(version_values_for_selection(
+                    sequence,
+                    &config.params,
+                    batch_offset,
+                    num_rows,
+                )?)
+            } else if let Some(source) = &config.logical_row_id_source {
+                Some(logical_creation_versions(
+                    source,
+                    row_ids.as_deref(),
+                    num_rows as usize,
+                )?)
+            } else {
+                // Storage versions before 2.3 define the missing-metadata base as version 1.
+                Some(vec![1; num_rows as usize])
+            }
+        } else {
+            None
+        };
+
         if config.with_row_last_updated_at_version {
             let version_arr = if let Some(sequence) = &config.last_updated_at_sequence {
                 Arc::new(UInt64Array::from(version_values_for_selection(
@@ -353,25 +555,24 @@ pub fn apply_row_id_and_deletes(
                     num_rows,
                 )?))
             } else {
-                // Default to version 1 if sequence not provided
-                Arc::new(UInt64Array::from(vec![1u64; num_rows as usize]))
+                Arc::new(UInt64Array::from(
+                    creation_base
+                        .as_ref()
+                        .expect("last-updated fallback requires a creation base")
+                        .clone(),
+                ))
             };
             batch =
                 batch.try_with_column(ROW_LAST_UPDATED_AT_VERSION_FIELD.clone(), version_arr)?;
         }
 
         if config.with_row_created_at_version {
-            let version_arr = if let Some(sequence) = &config.created_at_sequence {
-                Arc::new(UInt64Array::from(version_values_for_selection(
-                    sequence,
-                    &config.params,
-                    batch_offset,
-                    num_rows,
-                )?))
-            } else {
-                // Default to version 1 if sequence not provided
-                Arc::new(UInt64Array::from(vec![1u64; num_rows as usize]))
-            };
+            let version_arr = Arc::new(UInt64Array::from(
+                creation_base
+                    .as_ref()
+                    .expect("created-at projection requires a creation base")
+                    .clone(),
+            ));
             batch = batch.try_with_column(ROW_CREATED_AT_VERSION_FIELD.clone(), version_arr)?;
         }
 
@@ -501,6 +702,7 @@ mod tests {
                     with_row_created_at_version: false,
                     deletion_vector: None,
                     row_id_sequence: None,
+                    logical_row_id_source: None,
                     last_updated_at_sequence: None,
                     created_at_sequence: None,
                     make_deletions_null: false,
@@ -601,6 +803,7 @@ mod tests {
                                 with_row_created_at_version: false,
                                 deletion_vector: deletion_vector.clone(),
                                 row_id_sequence: None,
+                                logical_row_id_source: None,
                                 last_updated_at_sequence: None,
                                 created_at_sequence: None,
                                 make_deletions_null,
@@ -703,6 +906,7 @@ mod tests {
                 0..35,
             )))),
             row_id_sequence: None,
+            logical_row_id_source: None,
             last_updated_at_sequence: None,
             created_at_sequence: Some(seq),
             make_deletions_null: false,
@@ -772,6 +976,7 @@ mod tests {
             with_row_created_at_version: true,
             deletion_vector: Some(Arc::new(DeletionVector::Bitmap(deletions))),
             row_id_sequence: None,
+            logical_row_id_source: None,
             last_updated_at_sequence: None,
             created_at_sequence: Some(seq),
             make_deletions_null: false,

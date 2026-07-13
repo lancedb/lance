@@ -18,6 +18,7 @@ import org.lance.operation.Operation;
 import com.google.common.base.MoreObjects;
 import org.apache.arrow.util.Preconditions;
 
+import java.util.Arrays;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -38,6 +39,7 @@ public class Transaction implements AutoCloseable {
   private final Operation operation;
   private final Optional<String> tag;
   private final Optional<Map<String, String>> transactionProperties;
+  private final Optional<byte[]> rowAddressLayoutDelta;
 
   /**
    * Constructor used by JNI when reading transactions from native code.
@@ -47,18 +49,22 @@ public class Transaction implements AutoCloseable {
    * @param operation the operation to perform
    * @param tag optional tag for the transaction
    * @param transactionProperties optional transaction properties
+   * @param rowAddressLayoutDelta opaque core-authored row-address provenance
    */
   private Transaction(
       long readVersion,
       String uuid,
       Operation operation,
       String tag,
-      Map<String, String> transactionProperties) {
+      Map<String, String> transactionProperties,
+      byte[] rowAddressLayoutDelta) {
     this.readVersion = readVersion;
     this.uuid = uuid;
     this.operation = operation;
     this.tag = Optional.ofNullable(tag);
     this.transactionProperties = Optional.ofNullable(transactionProperties);
+    this.rowAddressLayoutDelta =
+        Optional.ofNullable(rowAddressLayoutDelta).map(value -> value.clone());
   }
 
   /**
@@ -69,7 +75,7 @@ public class Transaction implements AutoCloseable {
    * @param operation the operation to perform
    */
   public Transaction(long readVersion, Operation operation) {
-    this(readVersion, UUID.randomUUID().toString(), operation, null, null);
+    this(readVersion, UUID.randomUUID().toString(), operation, null, null, null);
   }
 
   public long readVersion() {
@@ -91,6 +97,15 @@ public class Transaction implements AutoCloseable {
 
   public Optional<Map<String, String>> transactionProperties() {
     return transactionProperties;
+  }
+
+  /**
+   * Returns opaque core-authored row-address provenance for distributed format 2.3 writes.
+   *
+   * <p>The bytes must be preserved unchanged when a transaction is transported between workers.
+   */
+  public Optional<byte[]> rowAddressLayoutDelta() {
+    return rowAddressLayoutDelta.map(value -> value.clone());
   }
 
   /** Release native resources held by the operation (e.g. Arrow C schemas). */
@@ -123,12 +138,15 @@ public class Transaction implements AutoCloseable {
         && uuid.equals(that.uuid)
         && Objects.equals(operation, that.operation)
         && Objects.equals(tag, that.tag)
-        && Objects.equals(transactionProperties, that.transactionProperties);
+        && Objects.equals(transactionProperties, that.transactionProperties)
+        && Arrays.equals(
+            rowAddressLayoutDelta.orElse(null), that.rowAddressLayoutDelta.orElse(null));
   }
 
   @Override
   public int hashCode() {
-    return Objects.hash(readVersion, uuid, operation, tag, transactionProperties);
+    return 31 * Objects.hash(readVersion, uuid, operation, tag, transactionProperties)
+        + Arrays.hashCode(rowAddressLayoutDelta.orElse(null));
   }
 
   /** Builder for constructing {@link Transaction} instances. */
@@ -138,6 +156,7 @@ public class Transaction implements AutoCloseable {
     private Operation operation;
     private String tag;
     private Map<String, String> transactionProperties;
+    private byte[] rowAddressLayoutDelta;
 
     public Builder() {
       this.uuid = UUID.randomUUID().toString();
@@ -178,9 +197,17 @@ public class Transaction implements AutoCloseable {
       return this;
     }
 
+    /** Preserve opaque core-authored row-address provenance from another transaction. */
+    public Builder rowAddressLayoutDelta(byte[] rowAddressLayoutDelta) {
+      this.rowAddressLayoutDelta =
+          rowAddressLayoutDelta == null ? null : rowAddressLayoutDelta.clone();
+      return this;
+    }
+
     public Transaction build() {
       Preconditions.checkState(operation != null, "TransactionBuilder has no operations");
-      return new Transaction(readVersion, uuid, operation, tag, transactionProperties);
+      return new Transaction(
+          readVersion, uuid, operation, tag, transactionProperties, rowAddressLayoutDelta);
     }
   }
 }

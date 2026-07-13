@@ -50,8 +50,8 @@ use lance_table::format::{DataFile, DeletionFile, Fragment};
 use lance_table::io::deletion::{deletion_file_path, write_deletion_file};
 use lance_table::rowids::RowIdSequence;
 use lance_table::utils::stream::{
-    ReadBatchFutStream, ReadBatchTask, ReadBatchTaskStream, RowIdAndDeletesConfig,
-    wrap_with_row_id_and_delete,
+    LogicalRowIdSource, ReadBatchFutStream, ReadBatchTask, ReadBatchTaskStream,
+    RowIdAndDeletesConfig, wrap_with_row_id_and_delete,
 };
 use roaring::RoaringBitmap;
 
@@ -914,19 +914,57 @@ impl FileFragment {
         let open_files = self.open_readers(projection, &read_config);
         let deletion_vec_load = self.get_deletion_vector();
 
-        let row_id_load = if self.dataset.manifest.uses_stable_row_ids() {
+        let row_id_load = if self.dataset.manifest.uses_legacy_stable_row_ids() {
             futures::future::Either::Left(
                 load_row_id_sequence(&self.dataset, &self.metadata).map_ok(Some),
             )
         } else {
             futures::future::Either::Right(futures::future::ready(Ok(None)))
         };
+        let logical_row_id_source_load = async {
+            let needs_creation_base = (read_config.with_row_created_at_version
+                && self.metadata.created_at_version_meta.is_none())
+                || (read_config.with_row_last_updated_at_version
+                    && self.metadata.last_updated_at_version_meta.is_none()
+                    && self.metadata.created_at_version_meta.is_none());
+            if (!read_config.with_row_id && !needs_creation_base)
+                || !self.dataset.manifest.uses_stable_logical_row_addresses()
+            {
+                return Ok::<Option<LogicalRowIdSource>, Error>(None);
+            }
+            if let Some(native) = self.metadata.native_logical_domain.as_ref() {
+                return Ok::<Option<LogicalRowIdSource>, Error>(Some(LogicalRowIdSource::Native {
+                    logical_fragment_id: native.logical_fragment_id,
+                    creation_version: native.creation_version,
+                }));
+            }
+            if let Some(row_ids) = self
+                .dataset
+                .explicit_row_ids_for_fragment(u32::try_from(self.metadata.id).map_err(|_| {
+                    Error::invalid_input("physical fragment id exceeds row-address capacity")
+                })?)
+                .await?
+            {
+                return Ok(Some(LogicalRowIdSource::Materialized {
+                    row_ids,
+                    router: self.dataset.row_address_router()?,
+                }));
+            }
+            Ok(Some(LogicalRowIdSource::Placement(
+                self.dataset.row_address_router()?,
+            )))
+        };
 
-        let (opened_files, deletion_vec, row_id_sequence) =
-            join!(open_files, deletion_vec_load, row_id_load);
+        let (opened_files, deletion_vec, row_id_sequence, logical_row_id_source) = join!(
+            open_files,
+            deletion_vec_load,
+            row_id_load,
+            logical_row_id_source_load
+        );
         let opened_files = opened_files?;
         let deletion_vec = deletion_vec?;
         let row_id_sequence = row_id_sequence?;
+        let logical_row_id_source = logical_row_id_source?;
 
         if opened_files.is_empty() && !read_config.has_system_cols() {
             return Err(Error::not_found(format!(
@@ -942,6 +980,7 @@ impl FileFragment {
             self.id(),
             deletion_vec,
             row_id_sequence,
+            logical_row_id_source,
             opened_files,
             ArrowSchema::from(projection),
             self.count_rows(None).await?,
@@ -1388,32 +1427,31 @@ impl FileFragment {
         Ok(reader.len() as usize)
     }
 
-    /// Validate the fragment
-    ///
-    /// Verifies:
-    /// * All field ids in the fragment are distinct
-    /// * Within each data file, field ids are in increasing order
-    /// * All data files exist and have the same length
-    /// * Field ids are distinct between data files.
-    /// * Deletion file exists and has rowids in the correct range
-    /// * `Fragment.physical_rows` matches length of file
-    /// * `DeletionFile.num_deleted_rows` matches length of deletion vector
-    pub async fn validate(&self) -> Result<()> {
+    pub(crate) fn validate_data_file_metadata(&self) -> Result<()> {
+        if self.metadata.files.is_empty()
+            && self.metadata.physical_rows.is_some_and(|rows| rows != 0)
+        {
+            return Err(Error::invalid_input(format!(
+                "fragment {} has physical rows but no data files",
+                self.metadata.id
+            )));
+        }
         let mut seen_fields = HashSet::new();
         for data_file in &self.metadata.files {
-            let last = -1;
+            let mut has_live_field = false;
             for field_id in data_file.fields.iter() {
-                if *field_id <= last {
+                if *field_id == -2 {
+                    continue;
+                }
+                if *field_id < 0 {
                     return Err(Error::corrupt_file(
                         self.dataset
                             .data_file_dir(data_file)?
                             .join(data_file.path.as_str()),
-                        format!(
-                            "Field id {} is not in increasing order in fragment {:#?}",
-                            field_id, self
-                        ),
+                        format!("Field id {} is invalid in fragment {:#?}", field_id, self),
                     ));
                 }
+                has_live_field = true;
 
                 if !seen_fields.insert(field_id) {
                     return Err(Error::corrupt_file(
@@ -1426,6 +1464,14 @@ impl FileFragment {
                         ),
                     ));
                 }
+            }
+            if has_live_field && data_file.schema(self.dataset.schema()).fields.is_empty() {
+                return Err(Error::corrupt_file(
+                    self.dataset
+                        .data_file_dir(data_file)?
+                        .join(data_file.path.as_str()),
+                    "did not have any fields in common with the dataset schema",
+                ));
             }
         }
 
@@ -1443,6 +1489,22 @@ impl FileFragment {
         for data_file in &self.metadata.files {
             data_file.validate(&self.dataset.data_file_dir(data_file)?)?;
         }
+
+        Ok(())
+    }
+
+    /// Validate the fragment
+    ///
+    /// Verifies:
+    /// * All field ids in the fragment are distinct
+    /// * Legacy data files have strictly increasing field ids
+    /// * All data files exist and have the same length
+    /// * Field ids are distinct between data files.
+    /// * Deletion file exists and has rowids in the correct range
+    /// * `Fragment.physical_rows` matches length of file
+    /// * `DeletionFile.num_deleted_rows` matches length of deletion vector
+    pub async fn validate(&self) -> Result<()> {
+        self.validate_data_file_metadata()?;
 
         let get_lengths = self.metadata.files.iter().map(|data_file| async move {
             let data_file_dir = self.dataset.data_file_dir(data_file)?;
@@ -2221,6 +2283,9 @@ pub struct FragmentReader {
     /// Only populated if the stable row id feature is enabled.
     row_id_sequence: Option<Arc<RowIdSequence>>,
 
+    /// The version-2.3 logical row-id source, populated only when `_rowid` is requested.
+    logical_row_id_source: Option<LogicalRowIdSource>,
+
     /// ID of the fragment
     fragment_id: usize,
 
@@ -2271,6 +2336,7 @@ impl Clone for FragmentReader {
             output_schema: self.output_schema.clone(),
             deletion_vec: self.deletion_vec.clone(),
             row_id_sequence: self.row_id_sequence.clone(),
+            logical_row_id_source: self.logical_row_id_source.clone(),
             fragment_id: self.fragment_id,
             with_row_id: self.with_row_id,
             with_row_addr: self.with_row_addr,
@@ -2312,6 +2378,7 @@ impl FragmentReader {
         fragment_id: usize,
         deletion_vec: Option<Arc<DeletionVector>>,
         row_id_sequence: Option<Arc<RowIdSequence>>,
+        logical_row_id_source: Option<LogicalRowIdSource>,
         readers: Vec<Box<dyn GenericFileReader>>,
         output_schema: ArrowSchema,
         num_rows: usize,
@@ -2338,6 +2405,7 @@ impl FragmentReader {
             output_schema,
             deletion_vec,
             row_id_sequence,
+            logical_row_id_source,
             fragment_id,
             with_row_id: false,
             with_row_addr: false,
@@ -2581,6 +2649,7 @@ impl FragmentReader {
                 params: file_params,
                 deletion_vector: self.deletion_vec.clone(),
                 row_id_sequence: self.row_id_sequence.clone(),
+                logical_row_id_source: self.logical_row_id_source.clone(),
                 with_row_id: self.with_row_id,
                 with_row_addr: self.with_row_addr,
                 with_row_last_updated_at_version: self.with_row_last_updated_at_version,
@@ -2678,6 +2747,7 @@ impl FragmentReader {
         let config = RowIdAndDeletesConfig {
             deletion_vector: self.deletion_vec.clone(),
             row_id_sequence: self.row_id_sequence.clone(),
+            logical_row_id_source: self.logical_row_id_source.clone(),
             make_deletions_null: self.make_deletions_null,
             with_row_id: self.with_row_id,
             with_row_addr: self.with_row_addr,
@@ -2848,6 +2918,7 @@ impl FragmentReader {
         let config = RowIdAndDeletesConfig {
             deletion_vector: self.deletion_vec.clone(),
             row_id_sequence: self.row_id_sequence.clone(),
+            logical_row_id_source: self.logical_row_id_source.clone(),
             make_deletions_null: self.make_deletions_null,
             with_row_id: self.with_row_id,
             with_row_addr: self.with_row_addr,

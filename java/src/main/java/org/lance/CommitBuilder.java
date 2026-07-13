@@ -201,7 +201,7 @@ public class CommitBuilder {
    *
    * <p>This is only needed when creating a new empty table. If any data files are passed, the
    * storage format will be inferred from the data files. Valid values: "legacy", "v2_0", "stable",
-   * "v2_1", "next", "v2_2".
+   * "v2_1", "next", "v2_2", "2.3", "v2_3", or "v2.3".
    *
    * @param storageFormat the storage format name
    * @return this builder instance

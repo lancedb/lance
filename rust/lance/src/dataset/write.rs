@@ -15,6 +15,7 @@ use lance_core::datatypes::{
     NullabilityComparison, OnMissing, OnTypeMismatch, SchemaCompareOptions,
 };
 use lance_core::error::LanceOptionExt;
+use lance_core::utils::address::RowAddress;
 use lance_core::utils::tempfile::TempDir;
 use lance_core::utils::tracing::{AUDIT_MODE_CREATE, AUDIT_TYPE_DATA, TRACE_FILE_AUDIT};
 use lance_core::{Error, Result, datatypes::Schema};
@@ -29,12 +30,15 @@ use lance_file::writer::{self as current_writer, FileWriterOptions};
 use lance_io::object_store::{
     ObjectStore, ObjectStoreParams, ObjectStoreRegistry, parse_base_scoped_key,
 };
-use lance_table::format::{BasePath, DataFile, Fragment};
+use lance_table::format::{
+    BasePath, DataFile, Fragment, LogicalRowAddressSelection, RowAddressLayoutDelta,
+};
 use lance_table::io::commit::{CommitHandler, commit_handler_from_url};
 use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
+use roaring::{RoaringBitmap, RoaringTreemap};
 use std::borrow::Cow;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::num::NonZero;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
@@ -66,6 +70,87 @@ pub use super::progress::{WriteProgressFn, WriteStats};
 pub use commit::{CommitBuilder, DEFAULT_COMMIT_TIMEOUT};
 pub use delete::{DeleteBuilder, DeleteResult, UncommittedDelete};
 pub use insert::InsertBuilder;
+
+/// Add logical owners from an existing deletion vector when this transaction
+/// removes the vector's physical fragment. These rows were already invisible,
+/// but their identities still belong to the source layout until the physical
+/// owner disappears.
+pub(crate) async fn include_previous_deletions_in_v2_3_retirement(
+    dataset: &Dataset,
+    removed_fragment_ids: &[u64],
+    current_deletion_vectors: &BTreeMap<u32, RoaringBitmap>,
+    delta: &mut RowAddressLayoutDelta,
+) -> Result<()> {
+    let mut already_retired = RoaringTreemap::new();
+    for selection in &delta.retired_selections {
+        for address in selection.iter() {
+            already_retired.insert(address?.raw());
+        }
+    }
+
+    let mut added = RoaringTreemap::new();
+    let mut physical = Vec::with_capacity(4096);
+    for fragment_id in removed_fragment_ids {
+        let fragment_id = u32::try_from(*fragment_id).map_err(|_| {
+            Error::invalid_input(format!(
+                "fully removed fragment id {fragment_id} exceeds row-address capacity"
+            ))
+        })?;
+        let Some(deleted_offsets) = current_deletion_vectors.get(&fragment_id) else {
+            continue;
+        };
+        for offset in deleted_offsets {
+            physical.push(RowAddress::new_from_parts(fragment_id, offset));
+            if physical.len() == physical.capacity() {
+                for logical in dataset.resolve_physical_row_ids_async(&physical).await? {
+                    if let Some(logical) = logical
+                        && already_retired.insert(logical.raw())
+                    {
+                        added.insert(logical.raw());
+                    }
+                }
+                physical.clear();
+            }
+        }
+        if !physical.is_empty() {
+            for logical in dataset.resolve_physical_row_ids_async(&physical).await? {
+                if let Some(logical) = logical
+                    && already_retired.insert(logical.raw())
+                {
+                    added.insert(logical.raw());
+                }
+            }
+            physical.clear();
+        }
+    }
+    if added.is_empty() {
+        return Ok(());
+    }
+
+    let selection = LogicalRowAddressSelection::from_bitmap(added)?;
+    let declared_domains = delta
+        .source_domains
+        .iter()
+        .map(|domain| domain.logical_fragment_id)
+        .collect::<BTreeSet<_>>();
+    let router = dataset.row_address_router()?;
+    for logical_fragment_id in selection.logical_fragment_bitmap()? {
+        if !declared_domains.contains(&logical_fragment_id) {
+            delta
+                .source_domains
+                .push(router.logical_domain(logical_fragment_id)?.ok_or_else(|| {
+                    Error::internal(format!(
+                        "deleted logical domain {logical_fragment_id} is missing metadata"
+                    ))
+                })?);
+        }
+    }
+    delta
+        .source_domains
+        .sort_by_key(|domain| domain.logical_fragment_id);
+    delta.retired_selections.push(selection);
+    Ok(())
+}
 
 /// The destination to write data to.
 #[derive(Debug, Clone)]
@@ -328,10 +413,9 @@ pub struct WriteParams {
     /// If not specified then the latest stable version will be used.
     pub data_storage_version: Option<LanceFileVersion>,
 
-    /// Experimental: if set to true, the writer will use stable row ids.
-    /// These row ids are stable after compaction operations, but not after updates.
-    /// This makes compaction more efficient, since with stable row ids no
-    /// secondary indices need to be updated to point to new row ids.
+    /// Experimental: for storage versions through 2.2, enable the legacy stable
+    /// row-id representation. Storage version 2.3 always uses stable logical row
+    /// addresses, so this option has no effect there.
     pub enable_stable_row_ids: bool,
 
     /// If set to true, and this is a new dataset, uses the new v2 manifest paths.
@@ -605,6 +689,33 @@ pub async fn do_write_fragments(
     storage_version: LanceFileVersion,
     target_bases_info: Option<Vec<TargetBaseInfo>>,
 ) -> Result<Vec<Fragment>> {
+    do_write_fragments_with_fragment_limit(
+        dataset,
+        object_store,
+        base_dir,
+        schema,
+        data,
+        params,
+        storage_version,
+        target_bases_info,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn do_write_fragments_with_fragment_limit(
+    dataset: Option<&Dataset>,
+    object_store: Arc<ObjectStore>,
+    base_dir: &Path,
+    schema: &Schema,
+    data: SendableRecordBatchStream,
+    params: WriteParams,
+    storage_version: LanceFileVersion,
+    target_bases_info: Option<Vec<TargetBaseInfo>>,
+    max_output_fragments: Option<u64>,
+) -> Result<Vec<Fragment>> {
+    validate_max_rows_per_file(params.max_rows_per_file)?;
     let adapter = SchemaAdapter::new(data.schema());
     let data = adapter.to_physical_stream(data);
 
@@ -649,7 +760,7 @@ pub async fn do_write_fragments(
         params.blob_pack_file_size_threshold,
     );
     let mut writer: Option<Box<dyn GenericWriter>> = None;
-    let mut num_rows_in_current_file = 0;
+    let mut num_rows_in_current_file: u32 = 0;
     let mut fragments: Vec<Fragment> = Vec::new();
     let mut bytes_completed: u64 = 0;
     let mut rows_completed: u64 = 0;
@@ -662,6 +773,7 @@ pub async fn do_write_fragments(
             let batch_chunk = batch_chunk?;
 
             if writer.is_none() {
+                validate_next_output_fragment(fragments.len(), max_output_fragments)?;
                 let (new_writer, new_fragment) = writer_generator.new_writer().await?;
                 params.progress.begin(&new_fragment).await?;
                 writer = Some(new_writer);
@@ -670,14 +782,34 @@ pub async fn do_write_fragments(
 
             writer.as_mut().unwrap().write(&batch_chunk).await?;
             for batch in &batch_chunk {
-                num_rows_in_current_file += batch.num_rows() as u32;
+                let batch_rows = u32::try_from(batch.num_rows()).map_err(|_| {
+                    Error::format_capacity_exceeded(format!(
+                        "record batch row count {} exceeds the writer u32 row counter",
+                        batch.num_rows()
+                    ))
+                })?;
+                num_rows_in_current_file = num_rows_in_current_file
+                    .checked_add(batch_rows)
+                    .ok_or_else(|| {
+                        Error::format_capacity_exceeded(
+                            "rows in the current output fragment exceed u32 capacity",
+                        )
+                    })?;
             }
 
             if let Some(cb) = &params.write_progress {
                 let current_bytes = writer.as_mut().unwrap().tell().await?;
                 cb.call(WriteStats {
-                    bytes_written: bytes_completed + current_bytes,
-                    rows_written: rows_completed + num_rows_in_current_file as u64,
+                    bytes_written: checked_writer_counter_add(
+                        bytes_completed,
+                        current_bytes,
+                        "written bytes",
+                    )?,
+                    rows_written: checked_writer_counter_add(
+                        rows_completed,
+                        num_rows_in_current_file as u64,
+                        "written rows",
+                    )?,
                     files_written,
                 });
             }
@@ -688,15 +820,26 @@ pub async fn do_write_fragments(
                 let (num_rows, data_file) = writer.take().unwrap().finish().await?;
                 info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_DATA, path = &data_file.path);
                 debug_assert_eq!(num_rows, num_rows_in_current_file);
-                bytes_completed += data_file.file_size_bytes.get().map_or(0, |s| s.get());
-                rows_completed += num_rows as u64;
-                files_written += 1;
-                let last_fragment = fragments.last_mut().unwrap();
+                let data_file_bytes = data_file.file_size_bytes.get().map_or(0, |size| size.get());
+                let last_fragment = fragments.last_mut().ok_or_else(|| {
+                    Error::internal("finished writer has no output fragment metadata")
+                })?;
                 last_fragment.physical_rows = Some(num_rows as usize);
                 last_fragment.files.push(data_file);
+                bytes_completed = checked_writer_counter_add(
+                    bytes_completed,
+                    data_file_bytes,
+                    "written bytes",
+                )?;
+                rows_completed = checked_writer_counter_add(
+                    rows_completed,
+                    num_rows as u64,
+                    "written rows",
+                )?;
+                files_written = checked_writer_file_count(files_written)?;
                 // Notify after pushing the data file so it's tracked for cleanup
                 // if the callback fails.
-                params.progress.complete(fragments.last().unwrap()).await?;
+                params.progress.complete(last_fragment).await?;
                 if let Some(cb) = &params.write_progress {
                     cb.call(WriteStats {
                         bytes_written: bytes_completed,
@@ -705,6 +848,33 @@ pub async fn do_write_fragments(
                     });
                 }
                 num_rows_in_current_file = 0;
+            }
+        }
+
+        if let Some(mut final_writer) = writer.take() {
+            let (num_rows, data_file) = final_writer.finish().await?;
+            info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_DATA, path = &data_file.path);
+            let data_file_bytes = data_file.file_size_bytes.get().map_or(0, |size| size.get());
+            let last_fragment = fragments.last_mut().ok_or_else(|| {
+                Error::internal("finished writer has no output fragment metadata")
+            })?;
+            last_fragment.physical_rows = Some(num_rows as usize);
+            last_fragment.files.push(data_file);
+            bytes_completed = checked_writer_counter_add(
+                bytes_completed,
+                data_file_bytes,
+                "written bytes",
+            )?;
+            rows_completed =
+                checked_writer_counter_add(rows_completed, num_rows as u64, "written rows")?;
+            files_written = checked_writer_file_count(files_written)?;
+            params.progress.complete(last_fragment).await?;
+            if let Some(cb) = &params.write_progress {
+                cb.call(WriteStats {
+                    bytes_written: bytes_completed,
+                    rows_written: rows_completed,
+                    files_written,
+                });
             }
         }
         Ok(())
@@ -725,40 +895,55 @@ pub async fn do_write_fragments(
         return Err(e);
     }
 
-    // Complete the final writer
-    if let Some(mut writer) = writer.take() {
-        match writer.finish().await {
-            Ok((num_rows, data_file)) => {
-                info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_DATA, path = &data_file.path);
-                bytes_completed += data_file.file_size_bytes.get().map_or(0, |s| s.get());
-                rows_completed += num_rows as u64;
-                files_written += 1;
-                let last_fragment = fragments.last_mut().unwrap();
-                last_fragment.physical_rows = Some(num_rows as usize);
-                last_fragment.files.push(data_file);
-                if let Some(cb) = &params.write_progress {
-                    cb.call(WriteStats {
-                        bytes_written: bytes_completed,
-                        rows_written: rows_completed,
-                        files_written,
-                    });
-                }
-            }
-            Err(e) => {
-                drop(writer);
-                cleanup_data_fragments(
-                    &object_store,
-                    base_dir,
-                    cleanup_bases.as_deref(),
-                    &fragments,
-                )
-                .await;
-                return Err(e);
-            }
-        }
-    }
-
     Ok(fragments)
+}
+
+pub(crate) fn validate_max_rows_per_file(max_rows_per_file: usize) -> Result<()> {
+    if max_rows_per_file == 0 {
+        return Err(Error::invalid_input(
+            "max_rows_per_file must be greater than zero",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_next_output_fragment(
+    output_fragments: usize,
+    max_output_fragments: Option<u64>,
+) -> Result<()> {
+    let output_fragments = u64::try_from(output_fragments).map_err(|_| {
+        Error::format_capacity_exceeded(
+            "output fragment count exceeds the writer u64 fragment counter",
+        )
+    })?;
+    let next_output_fragment = output_fragments.checked_add(1).ok_or_else(|| {
+        Error::format_capacity_exceeded("output fragment count exceeds u64 capacity")
+    })?;
+    if next_output_fragment > u32::MAX as u64 {
+        return Err(Error::format_capacity_exceeded(format!(
+            "output fragment count {next_output_fragment} exceeds u32 capacity"
+        )));
+    }
+    if let Some(maximum) = max_output_fragments
+        && next_output_fragment > maximum
+    {
+        return Err(Error::format_capacity_exceeded(format!(
+            "storage-version-2.3 direct write requires output fragment {next_output_fragment}, but only {maximum} physical/logical fragment ids remain"
+        )));
+    }
+    Ok(())
+}
+
+fn checked_writer_counter_add(current: u64, added: u64, counter: &str) -> Result<u64> {
+    current
+        .checked_add(added)
+        .ok_or_else(|| Error::format_capacity_exceeded(format!("{counter} exceed u64 capacity")))
+}
+
+fn checked_writer_file_count(files_written: u32) -> Result<u32> {
+    files_written
+        .checked_add(1)
+        .ok_or_else(|| Error::format_capacity_exceeded("written file count exceeds u32 capacity"))
 }
 
 /// Best-effort cleanup of data files for fragments that were written but not committed.
@@ -1239,6 +1424,30 @@ pub async fn write_fragments_internal(
     params: WriteParams,
     target_bases_info: Option<Vec<TargetBaseInfo>>,
 ) -> Result<(Vec<Fragment>, Schema)> {
+    write_fragments_internal_with_fragment_limit(
+        dataset,
+        object_store,
+        base_dir,
+        schema,
+        data,
+        params,
+        target_bases_info,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn write_fragments_internal_with_fragment_limit(
+    dataset: Option<&Dataset>,
+    object_store: Arc<ObjectStore>,
+    base_dir: &Path,
+    schema: Schema,
+    data: SendableRecordBatchStream,
+    params: WriteParams,
+    target_bases_info: Option<Vec<TargetBaseInfo>>,
+    max_output_fragments: Option<u64>,
+) -> Result<(Vec<Fragment>, Schema)> {
     let mut params = params;
     let adapter = SchemaAdapter::new(data.schema());
 
@@ -1328,7 +1537,7 @@ pub async fn write_fragments_internal(
         )));
     }
 
-    let fragments = do_write_fragments(
+    let fragments = do_write_fragments_with_fragment_limit(
         dataset,
         object_store,
         base_dir,
@@ -1337,6 +1546,7 @@ pub async fn write_fragments_internal(
         params,
         storage_version,
         target_bases_info,
+        max_output_fragments,
     )
     .await?;
 
@@ -3985,6 +4195,7 @@ mod tests {
             physical_rows: Some(0),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
+            native_logical_domain: None,
         }];
 
         cleanup_data_fragments(&object_store, &base_dir, None, &fragments).await;
@@ -4065,6 +4276,7 @@ mod tests {
             physical_rows: Some(0),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
+            native_logical_domain: None,
         }];
 
         let target_bases = vec![
@@ -4478,5 +4690,27 @@ mod tests {
             .flat_map(|f| f.metadata.files.iter().map(|file| file.base_id))
             .collect();
         assert_eq!(file_bases, vec![None, Some(1), Some(2)]);
+    }
+
+    #[test]
+    fn writer_fragment_and_counter_overflow_are_typed() {
+        let mut errors = vec![
+            validate_next_output_fragment(1, Some(1)).unwrap_err(),
+            checked_writer_file_count(u32::MAX).unwrap_err(),
+            checked_writer_counter_add(u64::MAX, 1, "written rows").unwrap_err(),
+        ];
+        #[cfg(target_pointer_width = "64")]
+        errors.push(validate_next_output_fragment(u32::MAX as usize, None).unwrap_err());
+        for error in errors {
+            let Error::InvalidInput { source, .. } = error else {
+                panic!("expected InvalidInput, got {error:?}")
+            };
+            assert!(
+                source
+                    .downcast_ref::<lance_core::error::FormatCapacityExceeded>()
+                    .is_some(),
+                "expected FormatCapacityExceeded, got {source:?}"
+            );
+        }
     }
 }

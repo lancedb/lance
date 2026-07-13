@@ -19,6 +19,9 @@ import java.io.Serializable;
 
 /** The compaction metrics. */
 public class CompactionMetrics implements Serializable {
+  private final long groupsPlanned;
+  private final long groupsAdmitted;
+  private final long groupsNotAdmitted;
   private final long fragmentsRemoved;
   private final long fragmentsAdded;
   private final long filesRemoved;
@@ -26,10 +29,36 @@ public class CompactionMetrics implements Serializable {
 
   public CompactionMetrics(
       long fragmentsRemoved, long fragmentsAdded, long filesRemoved, long filesAdded) {
+    this(0, 0, 0, fragmentsRemoved, fragmentsAdded, filesRemoved, filesAdded);
+  }
+
+  public CompactionMetrics(
+      long groupsPlanned,
+      long groupsAdmitted,
+      long groupsNotAdmitted,
+      long fragmentsRemoved,
+      long fragmentsAdded,
+      long filesRemoved,
+      long filesAdded) {
+    this.groupsPlanned = groupsPlanned;
+    this.groupsAdmitted = groupsAdmitted;
+    this.groupsNotAdmitted = groupsNotAdmitted;
     this.filesRemoved = filesRemoved;
     this.fragmentsAdded = fragmentsAdded;
     this.fragmentsRemoved = fragmentsRemoved;
     this.filesAdded = filesAdded;
+  }
+
+  public long getGroupsPlanned() {
+    return groupsPlanned;
+  }
+
+  public long getGroupsAdmitted() {
+    return groupsAdmitted;
+  }
+
+  public long getGroupsNotAdmitted() {
+    return groupsNotAdmitted;
   }
 
   public long getFilesAdded() {
@@ -51,6 +80,9 @@ public class CompactionMetrics implements Serializable {
   @Override
   public String toString() {
     return MoreObjects.toStringHelper(this)
+        .add("groupsPlanned", groupsPlanned)
+        .add("groupsAdmitted", groupsAdmitted)
+        .add("groupsNotAdmitted", groupsNotAdmitted)
         .add("fragmentsRemoved", fragmentsRemoved)
         .add("fragmentsAdded", fragmentsAdded)
         .add("filesRemoved", filesRemoved)

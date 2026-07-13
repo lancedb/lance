@@ -19,13 +19,15 @@ use crate::index::DatasetIndexExt;
 use crate::session::caches::{DSMetadataCache, ManifestKey, TransactionKey};
 use crate::session::index_caches::DSIndexCache;
 use itertools::Itertools;
-use lance_core::ROW_ADDR;
 use lance_core::datatypes::{OnMissing, OnTypeMismatch, Projectable, Projection};
 use lance_core::traits::DatasetTakeRows;
+#[cfg(test)]
+use lance_core::utils::address::LogicalRowAddress;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tracing::{
     DATASET_DELETING_EVENT, DATASET_DROPPING_COLUMN_EVENT, TRACE_DATASET_EVENTS,
 };
+use lance_core::{ROW_ADDR, ROW_OFFSET};
 use lance_datafusion::projection::ProjectionPlan;
 use lance_file::datatypes::populate_schema_dictionary;
 use lance_file::reader::{FileReader, FileReaderOptions};
@@ -37,14 +39,14 @@ use lance_io::object_store::{
     WrappingObjectStore,
 };
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
-use lance_io::utils::{
-    CachedFileSize, read_last_block, read_message, read_metadata_offset, read_struct,
-};
+use lance_io::utils::{CachedFileSize, read_message};
 use lance_namespace::LanceNamespace;
 use lance_table::format::{
-    DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, MAGIC, Manifest, RowIdMeta,
-    pb,
+    DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, Manifest,
+    RowAddressLayoutDelta, RowAddressPlacement, RowAddressRouter, RowIdMeta, pb,
 };
+#[cfg(test)]
+use lance_table::format::{PhysicalRowLocator, PlacementResolution};
 use lance_table::io::commit::{
     CommitConfig, CommitError, CommitHandler, CommitLock, ManifestLocation, ManifestNamingScheme,
     VERSIONS_DIR, external_manifest::ExternalManifestCommitHandler, migrate_scheme_to_v2,
@@ -52,7 +54,9 @@ use lance_table::io::commit::{
 };
 
 use crate::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
-use lance_table::io::manifest::{read_manifest, read_manifest_indexes};
+use lance_table::io::manifest::{
+    read_manifest, read_manifest_indexes, read_manifest_with_prefetched_tail,
+};
 use object_store::ObjectStoreExt;
 use object_store::path::Path;
 use prost::Message;
@@ -65,7 +69,7 @@ use std::fmt::Debug;
 use std::num::NonZero;
 use std::ops::Range;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tracing::{info, instrument};
 
 pub(crate) mod blob;
@@ -73,6 +77,8 @@ pub(crate) mod branch_location;
 pub mod builder;
 pub mod cleanup;
 pub mod delta;
+mod explicit_row_addresses;
+use explicit_row_addresses::ExplicitRowAddressCache;
 pub mod files;
 pub mod fragment;
 mod hash_joiner;
@@ -85,6 +91,7 @@ pub mod refs;
 pub(crate) mod rowids;
 pub mod scanner;
 mod schema_evolution;
+mod shallow_clone_lease;
 pub mod sql;
 pub mod statistics;
 mod take;
@@ -98,9 +105,61 @@ pub(crate) use take::row_offsets_to_row_addresses;
 
 use self::builder::DatasetBuilder;
 use self::cleanup::RemovalStats;
+
+fn decode_message_from_prefetched_tail<M: Message + Default>(
+    prefetched_tail: &[u8],
+    file_size: usize,
+    message_offset: usize,
+    manifest_path: &Path,
+    section_name: &str,
+) -> Result<Option<M>> {
+    let corrupt = |detail: String| {
+        Error::corrupt_file(
+            manifest_path.clone(),
+            format!("Invalid prefetched {section_name} section: {detail}"),
+        )
+    };
+    let distance_from_end = file_size.checked_sub(message_offset).ok_or_else(|| {
+        corrupt(format!(
+            "offset {message_offset} exceeds manifest file size {file_size}"
+        ))
+    })?;
+    if distance_from_end > prefetched_tail.len() {
+        return Ok(None);
+    }
+
+    let prefix_start = prefetched_tail
+        .len()
+        .checked_sub(distance_from_end)
+        .ok_or_else(|| corrupt("length-prefix offset underflowed".to_string()))?;
+    let prefix_end = prefix_start
+        .checked_add(4)
+        .ok_or_else(|| corrupt("length-prefix offset overflowed".to_string()))?;
+    if prefix_end > prefetched_tail.len() {
+        return Err(corrupt(format!(
+            "length prefix at tail offset {prefix_start} is truncated"
+        )));
+    }
+
+    let message_len = LittleEndian::read_u32(&prefetched_tail[prefix_start..prefix_end]) as usize;
+    let message_end = prefix_end
+        .checked_add(message_len)
+        .ok_or_else(|| corrupt(format!("payload length {message_len} overflowed")))?;
+    if message_end > prefetched_tail.len() {
+        return Err(corrupt(format!(
+            "payload length {message_len} at tail offset {prefix_end} exceeds {} available bytes",
+            prefetched_tail.len() - prefix_end
+        )));
+    }
+
+    M::decode(&prefetched_tail[prefix_end..message_end])
+        .map(Some)
+        .map_err(|error| corrupt(format!("protobuf decode failed: {error}")))
+}
 use self::fragment::FileFragment;
 use self::refs::Refs;
 use self::scanner::{DatasetRecordBatchStream, Scanner};
+use self::shallow_clone_lease::{ShallowCloneLease, write_shallow_clone_lease};
 use self::statistics::DatasetStatistics;
 use self::transaction::{Operation, Transaction, TransactionBuilder, UpdateMapEntry};
 use self::write::{cleanup_data_fragments, write_fragments_internal};
@@ -178,6 +237,15 @@ pub struct Dataset {
 
     // Bitmap of fragment ids in this dataset.
     pub(crate) fragment_bitmap: Arc<RoaringBitmap>,
+
+    // Built only for logical-id scans or takes. Ordinary opens and scans never
+    // pay placement-router construction cost.
+    pub(crate) row_address_router: Arc<OnceLock<Arc<RowAddressRouter>>>,
+
+    // ExplicitMap is a disclosed cold path.  Cache immutable locator/hidden
+    // columns by manifest-root path so one take or fallback does not reread the
+    // same object for every routing batch.
+    pub(crate) explicit_row_address_cache: Arc<ExplicitRowAddressCache>,
 
     // These are references to session caches, but with the dataset URI as a prefix.
     pub(crate) index_cache: Arc<DSIndexCache>,
@@ -391,10 +459,10 @@ impl ProjectionRequest {
                     .iter()
                     .any(|f| lance_core::is_system_column(&f.name));
 
-                if system_columns_present {
+                let mut projection = if system_columns_present {
                     // If system columns are present, we can't use project_by_schema directly
                     // Just pass the schema to ProjectionPlan::from_schema which handles it
-                    ProjectionPlan::from_schema(dataset, schema.as_ref())
+                    ProjectionPlan::from_schema(dataset.clone(), schema.as_ref())
                 } else {
                     // No system columns, use normal path with validation
                     let projection = dataset.schema().project_by_schema(
@@ -402,8 +470,20 @@ impl ProjectionRequest {
                         OnMissing::Error,
                         OnTypeMismatch::Error,
                     )?;
-                    ProjectionPlan::from_schema(dataset, &projection)
+                    ProjectionPlan::from_schema(dataset.clone(), &projection)
+                }?;
+
+                // A 2.3 logical row ID is produced directly by the fragment read path.  The
+                // legacy schema projection unnecessarily requested a physical row offset as
+                // well, which adds read work and prevents take_rows from dropping deleted IDs.
+                // Keep physical row offsets opt-in through an explicit _rowoffset projection.
+                if dataset.manifest.uses_stable_logical_row_addresses()
+                    && schema.fields.iter().any(|field| field.name == ROW_ID)
+                    && !schema.fields.iter().any(|field| field.name == ROW_OFFSET)
+                {
+                    projection.must_add_row_offset = false;
                 }
+                Ok(projection)
             }
             Self::Sql(columns) => ProjectionPlan::from_expressions(dataset, &columns),
         }
@@ -423,6 +503,101 @@ impl From<Schema> for ProjectionRequest {
 }
 
 impl Dataset {
+    pub(crate) fn row_address_router(&self) -> Result<Arc<RowAddressRouter>> {
+        if !self.manifest.uses_stable_logical_row_addresses() {
+            return Err(Error::invalid_input(
+                "row-address routing is only available for storage version 2.3",
+            ));
+        }
+        if let Some(router) = self.row_address_router.get() {
+            return Ok(router.clone());
+        }
+
+        let layout = self.manifest.row_address_layout.clone().ok_or_else(|| {
+            Error::internal("storage-version-2.3 manifest is missing RowAddressLayout")
+        })?;
+        let router = Arc::new(RowAddressRouter::try_new(
+            layout,
+            &self.manifest.fragments,
+            self.manifest.max_logical_fragment_id,
+        )?);
+        let _ = self.row_address_router.set(router);
+        Ok(self
+            .row_address_router
+            .get()
+            .expect("row-address router was initialized")
+            .clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resolve_logical_row_ids(
+        &self,
+        row_ids: &[u64],
+    ) -> Result<Vec<Option<RowAddress>>> {
+        let logical = row_ids
+            .iter()
+            .copied()
+            .map(LogicalRowAddress::try_from)
+            .collect::<Result<Vec<_>>>()?;
+        self.row_address_router()?
+            .resolve_many(&logical)?
+            .into_iter()
+            .map(|resolution| match resolution {
+                PlacementResolution::Mapped {
+                    locator: PhysicalRowLocator::Physical(address),
+                } => Ok(Some(address)),
+                PlacementResolution::Mapped {
+                    locator: PhysicalRowLocator::ExplicitMap { .. },
+                } => Err(Error::not_supported(
+                    "resolving ExplicitMap row IDs requires the external locator reader",
+                )),
+                PlacementResolution::NotLive | PlacementResolution::Unmapped => Ok(None),
+            })
+            .collect()
+    }
+
+    pub(crate) async fn resolve_live_logical_row_ids(
+        &self,
+        row_ids: &[u64],
+    ) -> Result<Vec<Option<RowAddress>>> {
+        let resolved = self.resolve_logical_row_ids_async(row_ids).await?;
+        let mut mapped_ids = Vec::with_capacity(row_ids.len());
+        let mut addresses = Vec::with_capacity(row_ids.len());
+        for (row_id, address) in row_ids.iter().copied().zip(resolved.iter().copied()) {
+            if let Some(address) = address {
+                mapped_ids.push(row_id);
+                addresses.push(u64::from(address));
+            }
+        }
+        let live = self
+            .filter_addr_or_ids(&mapped_ids, &addresses)
+            .await?
+            .into_iter()
+            .collect::<HashSet<_>>();
+        Ok(row_ids
+            .iter()
+            .copied()
+            .zip(resolved)
+            .map(|(row_id, address)| address.filter(|_| live.contains(&row_id)))
+            .collect())
+    }
+
+    fn clone_row_address_layout_delta(
+        source_manifest: &Manifest,
+    ) -> Result<Option<RowAddressLayoutDelta>> {
+        if source_manifest
+            .data_storage_format
+            .lance_file_version()?
+            .resolve()
+            != LanceFileVersion::V2_3
+        {
+            return Ok(None);
+        }
+
+        source_manifest.validate_row_address_contract()?;
+        Ok(Some(RowAddressLayoutDelta::for_create(Uuid::new_v4())))
+    }
+
     /// Open an existing dataset.
     ///
     /// See also [DatasetBuilder].
@@ -470,6 +645,7 @@ impl Dataset {
         let (manifest, manifest_location) = self.latest_manifest().await?;
         self.manifest = manifest;
         self.manifest_location = manifest_location;
+        self.row_address_router = Arc::new(OnceLock::new());
         self.fragment_bitmap = Arc::new(
             self.manifest
                 .fragments
@@ -518,7 +694,11 @@ impl Dataset {
             ref_path: source_location.uri,
             branch_name: Some(branch.to_string()),
         };
-        let transaction = Transaction::new(version_number, clone_op, None);
+        let transaction = TransactionBuilder::new(version_number, clone_op)
+            .row_address_layout_delta(Self::clone_row_address_layout_delta(
+                self.manifest.as_ref(),
+            )?)
+            .build();
 
         let builder = CommitBuilder::new(WriteDestination::Uri(branch_location.uri.as_str()))
             // Fall back to the dataset's own store params
@@ -641,59 +821,19 @@ impl Dataset {
         uri: &str,
         session: &Session,
     ) -> Result<Manifest> {
-        let object_reader = if let Some(size) = manifest_location.size {
-            object_store
-                .open_with_size(&manifest_location.path, size as usize)
-                .await
-        } else {
-            object_store.open(&manifest_location.path).await
-        };
-        let object_reader = object_reader.map_err(|e| match &e {
+        let manifest_read = read_manifest_with_prefetched_tail(
+            object_store,
+            &manifest_location.path,
+            manifest_location.size,
+        )
+        .await
+        .map_err(|e| match &e {
             Error::NotFound { uri, .. } => Error::dataset_not_found(uri.clone(), box_error(e)),
             _ => e,
         })?;
-
-        let last_block =
-            read_last_block(object_reader.as_ref())
-                .await
-                .map_err(|err| match err {
-                    object_store::Error::NotFound { path, source } => {
-                        Error::dataset_not_found(path, source)
-                    }
-                    _ => Error::io_source(err.into()),
-                })?;
-
-        // A stale cached size yields a bogus footer offset. Detect it (the block
-        // lacks the trailing magic) and retry with the true size, like
-        // read_manifest.
-        if manifest_location.size.is_some() && !last_block.ends_with(MAGIC) {
-            let manifest_location = ManifestLocation {
-                size: None,
-                ..manifest_location.clone()
-            };
-            return Box::pin(Self::load_manifest(
-                object_store,
-                &manifest_location,
-                uri,
-                session,
-            ))
-            .await;
-        }
-
-        let offset = read_metadata_offset(&last_block)?;
-
-        // If manifest is in the last block, we can decode directly from memory.
-        let manifest_size = object_reader.size().await?;
-        let mut manifest = if manifest_size - offset <= last_block.len() {
-            let manifest_len = manifest_size - offset;
-            let offset_in_block = last_block.len() - manifest_len;
-            let message_len =
-                LittleEndian::read_u32(&last_block[offset_in_block..offset_in_block + 4]) as usize;
-            let message_data = &last_block[offset_in_block + 4..offset_in_block + 4 + message_len];
-            Manifest::try_from(lance_table::format::pb::Manifest::decode(message_data)?)
-        } else {
-            read_struct(object_reader.as_ref(), offset).await
-        }?;
+        let mut manifest = manifest_read.manifest;
+        let prefetched_tail = manifest_read.prefetched_tail;
+        let manifest_size = manifest_read.file_size;
 
         if !can_read_dataset(manifest.reader_feature_flags) {
             let message = format!(
@@ -704,16 +844,17 @@ impl Dataset {
             return Err(Error::not_supported_source(message.into()));
         }
 
-        // If indices were also in the last block, we can take the opportunity to
+        // If indices were also in the prefetched tail, take the opportunity to
         // decode them now and cache them.
         if let Some(index_offset) = manifest.index_section
-            && manifest_size - index_offset <= last_block.len()
+            && let Some(section) = decode_message_from_prefetched_tail::<pb::IndexSection>(
+                &prefetched_tail,
+                manifest_size,
+                index_offset,
+                &manifest_location.path,
+                "index",
+            )?
         {
-            let offset_in_block = last_block.len() - (manifest_size - index_offset);
-            let message_len =
-                LittleEndian::read_u32(&last_block[offset_in_block..offset_in_block + 4]) as usize;
-            let message_data = &last_block[offset_in_block + 4..offset_in_block + 4 + message_len];
-            let section = lance_table::format::pb::IndexSection::decode(message_data)?;
             let mut indices: Vec<IndexMetadata> = section
                 .indices
                 .into_iter()
@@ -729,17 +870,18 @@ impl Dataset {
                 .await;
         }
 
-        // If transaction is also in the last block, we can take the opportunity to
+        // If transaction is also in the prefetched tail, take the opportunity to
         // decode them now and cache them.
         if let Some(transaction_offset) = manifest.transaction_section
-            && manifest_size - transaction_offset <= last_block.len()
+            && let Some(transaction) = decode_message_from_prefetched_tail::<pb::Transaction>(
+                &prefetched_tail,
+                manifest_size,
+                transaction_offset,
+                &manifest_location.path,
+                "transaction",
+            )?
         {
-            let offset_in_block = last_block.len() - (manifest_size - transaction_offset);
-            let message_len =
-                LittleEndian::read_u32(&last_block[offset_in_block..offset_in_block + 4]) as usize;
-            let message_data = &last_block[offset_in_block + 4..offset_in_block + 4 + message_len];
-            let transaction: Transaction =
-                lance_table::format::pb::Transaction::decode(message_data)?.try_into()?;
+            let transaction: Transaction = transaction.try_into()?;
 
             let metadata_cache = session.metadata_cache.for_dataset(uri);
             let metadata_key = TransactionKey {
@@ -751,6 +893,9 @@ impl Dataset {
         }
 
         if manifest.should_use_legacy_format() {
+            let object_reader = object_store
+                .open_with_size(&manifest_location.path, manifest_size)
+                .await?;
             populate_schema_dictionary(&mut manifest.schema, object_reader.as_ref()).await?;
         }
 
@@ -826,6 +971,8 @@ impl Dataset {
             session,
             refs,
             fragment_bitmap,
+            row_address_router: Arc::new(OnceLock::new()),
+            explicit_row_address_cache: Arc::new(ExplicitRowAddressCache::default()),
             metadata_cache,
             index_cache,
             file_reader_options,
@@ -1501,6 +1648,7 @@ impl Dataset {
 
         self.manifest = Arc::new(manifest);
         self.manifest_location = manifest_location;
+        self.row_address_router = Arc::new(OnceLock::new());
         self.fragment_bitmap = Arc::new(
             self.manifest
                 .fragments
@@ -2642,7 +2790,9 @@ impl Dataset {
                         if next_addr.fragment_id() != *frag_id {
                             break;
                         }
-                        if next_addr.row_offset() == deleted {
+                        while next_addr.fragment_id() == *frag_id
+                            && next_addr.row_offset() == deleted
+                        {
                             filtered_sorted_addrs.push(None);
                             if let Some(next) = sorted_addr_iter.next() {
                                 next_addr = next;
@@ -2691,17 +2841,26 @@ impl Dataset {
     }
 
     pub(crate) async fn filter_deleted_ids(&self, ids: &[u64]) -> Result<Vec<u64>> {
-        let addresses = if let Some(row_id_index) = get_row_id_index(self).await? {
-            let addresses = ids
+        if self.manifest.uses_stable_logical_row_addresses() {
+            Ok(ids
                 .iter()
-                .filter_map(|id| row_id_index.get(*id).map(|address| address.into()))
-                .collect::<Vec<_>>();
-            Cow::Owned(addresses)
+                .copied()
+                .zip(self.resolve_live_logical_row_ids(ids).await?)
+                .filter_map(|(row_id, address)| address.map(|_| row_id))
+                .collect())
+        } else if let Some(row_id_index) = get_row_id_index(self).await? {
+            let mut mapped_ids = Vec::with_capacity(ids.len());
+            let mut addresses = Vec::with_capacity(ids.len());
+            for row_id in ids.iter().copied() {
+                if let Some(address) = row_id_index.get(row_id) {
+                    mapped_ids.push(row_id);
+                    addresses.push(u64::from(address));
+                }
+            }
+            self.filter_addr_or_ids(&mapped_ids, &addresses).await
         } else {
-            Cow::Borrowed(ids)
-        };
-
-        self.filter_addr_or_ids(ids, &addresses).await
+            self.filter_addr_or_ids(ids, ids).await
+        }
     }
 
     /// Gets the number of files that are so small they don't even have a full
@@ -2856,7 +3015,16 @@ impl Dataset {
         store_params: Option<ObjectStoreParams>,
     ) -> Result<Self> {
         let (ref_name, version_number) = self.resolve_reference(version.into()).await?;
+        let ref_name = if Branches::is_main_branch(ref_name.as_deref()) {
+            None
+        } else {
+            ref_name
+        };
         let source_location = self.branch_location().find_branch(ref_name.as_deref())?;
+        let source_dataset = self
+            .checkout_by_ref(Some(version_number), ref_name.as_deref())
+            .await?;
+        let source_branch = ref_name.clone();
         let clone_op = Operation::Clone {
             is_shallow: true,
             ref_name,
@@ -2864,7 +3032,93 @@ impl Dataset {
             ref_path: source_location.uri,
             branch_name: None,
         };
-        let transaction = Transaction::new(version_number, clone_op, None);
+        let transaction = TransactionBuilder::new(version_number, clone_op)
+            .row_address_layout_delta(Self::clone_row_address_layout_delta(
+                source_dataset.manifest.as_ref(),
+            )?)
+            .build();
+        let lease_id = transaction.uuid.clone();
+        let lease_root = self.refs.root()?.path;
+        let source_namespace_uuid = if source_dataset
+            .manifest
+            .data_storage_format
+            .lance_file_version()?
+            .resolve()
+            == LanceFileVersion::V2_3
+        {
+            Some(
+                source_dataset
+                    .manifest
+                    .row_address_layout
+                    .as_ref()
+                    .ok_or_else(|| {
+                        Error::internal("storage-version-2.3 manifest is missing RowAddressLayout")
+                    })?
+                    .namespace_uuid,
+            )
+        } else {
+            None
+        };
+        let mut leases = Vec::<(Arc<ObjectStore>, Path, String, ShallowCloneLease)>::new();
+        if let Some(source_namespace_uuid) = source_namespace_uuid {
+            leases.push((
+                self.object_store.clone(),
+                lease_root,
+                lease_id.clone(),
+                ShallowCloneLease::pending(
+                    source_namespace_uuid,
+                    source_branch,
+                    version_number,
+                    source_dataset.manifest_location.path.to_string(),
+                    target_path.to_string(),
+                    self.object_store.store_prefix.clone(),
+                ),
+            ));
+
+            // Every inherited dataset root receives its own descendant lease.
+            // The clone manifest intentionally keeps direct ancestor base paths,
+            // so this preserves their objects even if an intermediate clone
+            // prefix (and its immediate lease directory) is removed.
+            let ancestor_bases = source_dataset
+                .manifest
+                .base_paths
+                .values()
+                .filter(|base| base.is_dataset_root)
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut seen_ancestor_branches = HashSet::new();
+            for base in ancestor_bases {
+                let source_branch = if Branches::is_main_branch(base.name.as_deref()) {
+                    None
+                } else {
+                    base.name.clone()
+                };
+                let branch_path = base.extract_path(source_dataset.session.store_registry())?;
+                let root = BranchLocation {
+                    path: branch_path,
+                    uri: base.path.clone(),
+                    branch: source_branch.clone(),
+                }
+                .find_main()?;
+                if !seen_ancestor_branches.insert((root.uri.clone(), source_branch.clone())) {
+                    continue;
+                }
+                leases.push((
+                    source_dataset.object_store(Some(base.id)).await?,
+                    root.path.clone(),
+                    format!("{lease_id}-ancestor-{}", base.id),
+                    ShallowCloneLease::transitive_pending(
+                        source_branch,
+                        root.path.to_string(),
+                        target_path.to_string(),
+                        self.object_store.store_prefix.clone(),
+                    ),
+                ));
+            }
+        }
+        for (object_store, root, lease_id, lease) in &leases {
+            write_shallow_clone_lease(object_store.as_ref(), root, lease_id, lease).await?;
+        }
 
         let builder = CommitBuilder::new(WriteDestination::Uri(target_path))
             .with_store_params(
@@ -2872,8 +3126,38 @@ impl Dataset {
             )
             .with_object_store(Arc::new(self.object_store.as_ref().clone()))
             .with_commit_handler(self.commit_handler.clone())
-            .with_storage_format(self.manifest.data_storage_format.lance_file_version()?);
-        builder.execute(transaction).await
+            .with_storage_format(
+                source_dataset
+                    .manifest
+                    .data_storage_format
+                    .lance_file_version()?,
+            );
+        match builder.execute(transaction).await {
+            Ok(dataset) => {
+                for (object_store, root, lease_id, lease) in &mut leases {
+                    lease.complete(
+                        dataset.manifest_location.path.to_string(),
+                        dataset.base.to_string(),
+                    );
+                    if let Err(error) =
+                        write_shallow_clone_lease(object_store.as_ref(), root, lease_id, lease)
+                            .await
+                    {
+                        // The pending lease was durably written before the target
+                        // commit, so failure to add the target path leaks retention
+                        // but cannot expose a clone to source GC.
+                        log::warn!(
+                            "failed to finalize storage-version-2.3 shallow-clone lease {lease_id}: {error}"
+                        );
+                    }
+                }
+                Ok(dataset)
+            }
+            // A failed commit response is not proof that the target manifest is
+            // absent. Keep the pending lease so source cleanup cannot race an
+            // ambiguous target commit.
+            Err(error) => Err(error),
+        }
     }
 
     /// Deep clone the target version into a new dataset at target_path.
@@ -2893,8 +3177,20 @@ impl Dataset {
     ) -> Result<Self> {
         use futures::StreamExt;
 
+        let build_absolute_path = |relative_path: &str, base: &Path| -> Path {
+            let mut path = base.clone();
+            for segment in relative_path.split('/') {
+                if !segment.is_empty() {
+                    path = path.clone().join(segment);
+                }
+            }
+            path
+        };
+
         // Resolve source dataset and its manifest using checkout_version
         let src_ds = self.checkout_version(version).await?;
+        let row_address_layout_delta =
+            Self::clone_row_address_layout_delta(src_ds.manifest.as_ref())?;
         let src_paths = src_ds.collect_paths().await?;
 
         // Prepare target object store and base path
@@ -2915,16 +3211,6 @@ impl Dataset {
             return Err(Error::dataset_already_exists(target_path.to_string()));
         }
 
-        let build_absolute_path = |relative_path: &str, base: &Path| -> Path {
-            let mut path = base.clone();
-            for seg in relative_path.split('/') {
-                if !seg.is_empty() {
-                    path = path.clone().join(seg);
-                }
-            }
-            path
-        };
-
         // TODO: Leverage object store bulk copy for efficient deep_clone
         //
         // All cloud storage providers support batch copy APIs that would provide significant
@@ -2932,13 +3218,43 @@ impl Dataset {
         //
         // Tracked by: https://github.com/lance-format/lance/issues/5435
         let io_parallelism = self.object_store.io_parallelism();
-        let copy_futures = src_paths
-            .iter()
-            .map(|(relative_path, base)| {
+        let prepared_paths = src_paths
+            .into_iter()
+            .map(|(relative_path, base, source_store, local_source)| {
+                let src_path = build_absolute_path(&relative_path, &base);
+                let target_path = build_absolute_path(&relative_path, &target_base);
+                (
+                    src_path,
+                    target_path,
+                    Arc::clone(&source_store),
+                    local_source,
+                )
+            })
+            .collect::<Vec<_>>();
+        let copy_futures = prepared_paths.into_iter().map(
+            |(src_path, target_path, source_store, local_source)| {
                 let store = Arc::clone(&target_store);
-                let src_path = build_absolute_path(relative_path, base);
-                let target_path = build_absolute_path(relative_path, &target_base);
-                async move { store.copy(&src_path, &target_path).await.map(|_| ()) }
+                async move {
+                    if local_source.is_none() && store.copy(&src_path, &target_path).await.is_ok() {
+                        return Ok(());
+                    }
+                    let reader = match local_source {
+                        Some(reader) => reader,
+                        None => source_store.open(&src_path).await.map_err(|error| {
+                            Error::io(format!(
+                                "deep clone failed to open source {src_path} for {target_path}: {error}"
+                            ))
+                        })?,
+                    };
+                    let mut writer = store.create(&target_path).await?;
+                    lance_io::traits::WriteExt::copy_from_reader(
+                        writer.as_mut(),
+                        reader.as_ref(),
+                    )
+                    .await?;
+                    lance_io::traits::Writer::shutdown(writer.as_mut()).await?;
+                    Ok(())
+                }
             })
             .collect::<Vec<_>>();
 
@@ -2959,7 +3275,9 @@ impl Dataset {
             ref_path: src_ds.uri().to_string(),
             branch_name: None,
         };
-        let txn = Transaction::new(ref_version, clone_op, None);
+        let txn = TransactionBuilder::new(ref_version, clone_op)
+            .row_address_layout_delta(row_address_layout_delta)
+            .build();
         let builder = CommitBuilder::new(WriteDestination::Uri(target_path))
             .with_store_params(store_params.clone().unwrap_or_default())
             .with_object_store(target_store.clone())
@@ -2995,8 +3313,17 @@ impl Dataset {
     }
 
     /// Collect all (relative_path, path) of the dataset files.
-    async fn collect_paths(&self) -> Result<Vec<(String, Path)>> {
-        let mut file_paths: Vec<(String, Path)> = Vec::new();
+    async fn collect_paths(
+        &self,
+    ) -> Result<
+        Vec<(
+            String,
+            Path,
+            Arc<ObjectStore>,
+            Option<Box<dyn lance_io::traits::Reader>>,
+        )>,
+    > {
+        let mut file_paths: Vec<(String, Path, Arc<ObjectStore>)> = Vec::new();
         for fragment in self.manifest.fragments.iter() {
             if let Some(RowIdMeta::External(external_file)) = &fragment.row_id_meta {
                 return Err(Error::internal(format!(
@@ -3010,13 +3337,14 @@ impl Dataset {
                         self.manifest.base_paths.get(&base_id).ok_or_else(|| {
                             Error::internal(format!("base_id {} not found", base_id))
                         })?;
-                    Path::parse(base_path.path.as_str())?
+                    base_path.extract_path(self.session.store_registry())?
                 } else {
                     self.base.clone()
                 };
                 file_paths.push((
                     format!("{}/{}", DATA_DIR, data_file.path.clone()),
                     base_root,
+                    self.object_store(data_file.base_id).await?,
                 ));
             }
             if let Some(deletion_file) = &fragment.deletion_file {
@@ -3025,14 +3353,51 @@ impl Dataset {
                         self.manifest.base_paths.get(&base_id).ok_or_else(|| {
                             Error::internal(format!("base_id {} not found", base_id))
                         })?;
-                    Path::parse(base_path.path.as_str())?
+                    base_path.extract_path(self.session.store_registry())?
                 } else {
                     self.base.clone()
                 };
                 file_paths.push((
                     relative_deletion_file_path(fragment.id, deletion_file),
                     base_root,
+                    self.object_store(deletion_file.base_id).await?,
                 ));
+            }
+        }
+
+        if let Some(layout) = &self.manifest.row_address_layout {
+            for placement in &layout.placements {
+                let RowAddressPlacement::ExplicitMap(explicit) = placement else {
+                    continue;
+                };
+                let base_root = if let Some(base_id) = explicit.base_id {
+                    let base_path = self.manifest.base_paths.get(&base_id).ok_or_else(|| {
+                        Error::internal(format!(
+                            "ExplicitMap base_id {base_id} not found while collecting clone paths"
+                        ))
+                    })?;
+                    if !base_path.is_dataset_root {
+                        return Err(Error::invalid_input(format!(
+                            "ExplicitMap base_id {base_id} must reference a dataset root"
+                        )));
+                    }
+                    base_path.extract_path(self.session.store_registry())?
+                } else {
+                    self.base.clone()
+                };
+                let source_store = self.object_store(explicit.base_id).await?;
+                file_paths.push((
+                    explicit.object_path.clone(),
+                    base_root.clone(),
+                    source_store.clone(),
+                ));
+                file_paths.extend(explicit.destinations.iter().map(|destination| {
+                    (
+                        destination.row_id_file_path.clone(),
+                        base_root.clone(),
+                        source_store.clone(),
+                    )
+                }));
             }
         }
 
@@ -3050,7 +3415,7 @@ impl Dataset {
                     .base_paths
                     .get(&base_id)
                     .ok_or_else(|| Error::internal(format!("base_id {} not found", base_id)))?;
-                Path::parse(base_path.path.as_str())?
+                base_path.extract_path(self.session.store_registry())?
             } else {
                 self.base.clone()
             };
@@ -3058,17 +3423,36 @@ impl Dataset {
                 .clone()
                 .join(INDICES_DIR)
                 .join(index.uuid.to_string());
-            let mut stream = self.object_store.read_dir_all(&index_root, None);
+            let source_store = self.object_store(index.base_id).await?;
+            let mut stream = source_store.read_dir_all(&index_root, None);
             while let Some(meta) = stream.next().await.transpose()? {
                 if let Some(filename) = meta.location.filename() {
                     file_paths.push((
                         format!("{}/{}/{}", INDICES_DIR, index.uuid, filename),
                         base_root.clone(),
+                        source_store.clone(),
                     ));
                 }
             }
         }
-        Ok(file_paths)
+        let mut prepared = Vec::with_capacity(file_paths.len());
+        for (relative_path, base, source_store) in file_paths {
+            let local_source = if source_store.is_local() {
+                let source_path = relative_path
+                    .split('/')
+                    .filter(|segment| !segment.is_empty())
+                    .fold(base.clone(), |path, segment| path.join(segment));
+                Some(source_store.open(&source_path).await.map_err(|error| {
+                    Error::io(format!(
+                        "deep clone failed to open local source {source_path}: {error}"
+                    ))
+                })?)
+            } else {
+                None
+            };
+            prepared.push((relative_path, base, source_store, local_source));
+        }
+        Ok(prepared)
     }
 
     /// Run a SQL query against the dataset.
@@ -3678,7 +4062,8 @@ pub(crate) async fn write_manifest_file(
         // build_manifest may have already set FLAG_STABLE_ROW_IDS on the manifest.
         // Preserve it here so this second apply_feature_flags call does not clear it
         // when config.use_stable_row_ids is false (the ManifestWriteConfig default).
-        let use_stable_row_ids = config.use_stable_row_ids || manifest.uses_stable_row_ids();
+        let use_stable_row_ids = !manifest.uses_stable_logical_row_addresses()
+            && (config.use_stable_row_ids || manifest.uses_stable_row_ids());
         apply_feature_flags(
             manifest,
             use_stable_row_ids,

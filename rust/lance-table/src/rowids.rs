@@ -107,6 +107,65 @@ impl RowIdSequence {
         self.0.iter().flat_map(|segment| segment.iter())
     }
 
+    /// Return contiguous value ranges in sequence order without expanding
+    /// range-backed segments row by row.
+    pub fn contiguous_ranges(&self) -> Vec<Range<u64>> {
+        fn push_value(ranges: &mut Vec<Range<u64>>, value: u64) {
+            if let Some(last) = ranges.last_mut()
+                && last.end == value
+            {
+                last.end = value.saturating_add(1);
+            } else {
+                ranges.push(value..value.saturating_add(1));
+            }
+        }
+
+        fn push_range(ranges: &mut Vec<Range<u64>>, range: Range<u64>) {
+            if range.is_empty() {
+                return;
+            }
+            if let Some(last) = ranges.last_mut()
+                && last.end == range.start
+            {
+                last.end = range.end;
+            } else {
+                ranges.push(range);
+            }
+        }
+
+        let mut ranges = Vec::new();
+        for segment in &self.0 {
+            match segment {
+                U64Segment::Range(range) => push_range(&mut ranges, range.clone()),
+                U64Segment::RangeWithHoles { range, holes } => {
+                    let mut cursor = range.start;
+                    for hole in holes.iter() {
+                        if cursor < hole {
+                            push_range(&mut ranges, cursor..hole);
+                        }
+                        cursor = hole.saturating_add(1);
+                    }
+                    if cursor < range.end {
+                        push_range(&mut ranges, cursor..range.end);
+                    }
+                }
+                U64Segment::RangeWithBitmap { range, bitmap } => {
+                    for (offset, present) in bitmap.iter().enumerate() {
+                        if present {
+                            push_value(&mut ranges, range.start + offset as u64);
+                        }
+                    }
+                }
+                U64Segment::SortedArray(values) | U64Segment::Array(values) => {
+                    for value in values.iter() {
+                        push_value(&mut ranges, value);
+                    }
+                }
+            }
+        }
+        ranges
+    }
+
     pub fn len(&self) -> u64 {
         self.0.iter().map(|segment| segment.len() as u64).sum()
     }
@@ -1394,5 +1453,15 @@ mod test {
         let r = seq.row_id_range().unwrap();
         assert_eq!(*r.start(), 0);
         assert_eq!(*r.end(), 104);
+    }
+
+    #[test]
+    fn contiguous_ranges_do_not_expand_masked_ranges() {
+        let mut sequence = RowIdSequence::from(0_u64..100_000_000);
+        sequence.mask([1, 50_000_000, 99_999_999]).unwrap();
+        assert_eq!(
+            sequence.contiguous_ranges(),
+            vec![0..1, 2..50_000_000, 50_000_001..99_999_999]
+        );
     }
 }

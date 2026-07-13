@@ -173,30 +173,34 @@ impl TakeStream {
             Ok((row_addr_array.clone(), None))
         } else {
             let row_id_array = batch.column_by_name(ROW_ID).expect_ok()?;
-
-            if let Some(row_id_index) = get_row_id_index(&self.dataset).await? {
-                let row_id_array = row_id_array.as_primitive::<UInt64Type>();
-                let mut addresses = Vec::with_capacity(row_id_array.len());
-                let mut valid = Vec::with_capacity(row_id_array.len());
-
-                for id in row_id_array.values().iter() {
-                    if let Some(address) = row_id_index.get(*id) {
-                        addresses.push(u64::from(address));
-                        valid.push(true);
-                    } else {
-                        valid.push(false);
-                    }
-                }
-
-                let mask = if addresses.len() < row_id_array.len() {
-                    Some(BooleanArray::from(valid))
-                } else {
-                    None
-                };
-                Ok((Arc::new(UInt64Array::from(addresses)), mask))
+            let row_id_values = row_id_array.as_primitive::<UInt64Type>();
+            let resolved = if self.dataset.manifest.uses_stable_logical_row_addresses() {
+                Some(
+                    self.dataset
+                        .resolve_live_logical_row_ids(row_id_values.values())
+                        .await?,
+                )
             } else {
-                Ok((row_id_array.clone(), None))
+                get_row_id_index(&self.dataset).await?.map(|row_id_index| {
+                    row_id_values
+                        .values()
+                        .iter()
+                        .map(|id| row_id_index.get(*id))
+                        .collect()
+                })
+            };
+            let Some(resolved) = resolved else {
+                return Ok((row_id_array.clone(), None));
+            };
+
+            let mut addresses = Vec::with_capacity(row_id_values.len());
+            let mut valid = Vec::with_capacity(row_id_values.len());
+            for address in resolved {
+                valid.push(address.is_some());
+                addresses.extend(address.map(u64::from));
             }
+            let mask = (addresses.len() < row_id_values.len()).then(|| BooleanArray::from(valid));
+            Ok((Arc::new(UInt64Array::from(addresses)), mask))
         }
     }
 
@@ -690,9 +694,10 @@ mod tests {
     use datafusion::execution::TaskContext;
     use lance_arrow::SchemaExt;
     use lance_core::utils::tempfile::TempStrDir;
-    use lance_core::{ROW_ID, datatypes::OnMissing};
+    use lance_core::{ROW_ID, ROW_ID_FIELD, datatypes::OnMissing};
     use lance_datafusion::{datagen::DatafusionDatagenExt, exec::OneShotExec, utils::MetricsExt};
     use lance_datagen::{BatchCount, RowCount};
+    use lance_file::version::LanceFileVersion;
     use rstest::rstest;
 
     use crate::{
@@ -707,6 +712,10 @@ mod tests {
     }
 
     async fn test_fixture() -> TestFixture {
+        test_fixture_with_version(None).await
+    }
+
+    async fn test_fixture_with_version(version: Option<LanceFileVersion>) -> TestFixture {
         let struct_fields = Fields::from(vec![
             Arc::new(Field::new("x", DataType::Int32, false)),
             Arc::new(Field::new("y", DataType::Int32, false)),
@@ -748,6 +757,7 @@ mod tests {
         let test_uri = test_dir.as_str();
         let params = WriteParams {
             max_rows_per_file: 10,
+            data_storage_version: version,
             ..Default::default()
         };
         let reader =
@@ -760,6 +770,65 @@ mod tests {
             dataset: Arc::new(Dataset::open(test_uri).await.unwrap()),
             _tmp_dir_guard: test_dir,
         }
+    }
+
+    #[tokio::test]
+    async fn test_v23_take_exec_resolves_logical_ids_without_row_id_index() {
+        let TestFixture {
+            dataset,
+            _tmp_dir_guard,
+        } = test_fixture_with_version(Some(LanceFileVersion::V2_3)).await;
+        assert!(dataset.row_address_router.get().is_none());
+        assert!(
+            dataset
+                .manifest
+                .fragments
+                .iter()
+                .all(|fragment| fragment.row_id_meta.is_none())
+        );
+
+        let scanned = dataset.scan().with_row_id().try_into_batch().await.unwrap();
+        assert!(dataset.row_address_router.get().is_none());
+        let all_ids = scanned[ROW_ID].as_primitive::<UInt64Type>();
+        let missing = ((dataset.manifest.max_logical_fragment_id.unwrap() as u64 + 1) << 32) | 1;
+        let requested = UInt64Array::from(vec![
+            all_ids.value(12),
+            all_ids.value(1),
+            all_ids.value(12),
+            missing,
+        ]);
+        let input_batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![ROW_ID_FIELD.clone()])),
+            vec![Arc::new(requested)],
+        )
+        .unwrap();
+        let input = Arc::new(OneShotExec::from_batch(input_batch));
+        let projection = dataset
+            .empty_projection()
+            .union_column("s", OnMissing::Error)
+            .unwrap();
+        let take_exec = TakeExec::try_new(dataset.clone(), input, projection)
+            .unwrap()
+            .unwrap();
+        let batches = take_exec
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let output = concat_batches(&batches[0].schema(), &batches).unwrap();
+        assert_eq!(
+            output[ROW_ID]
+                .as_primitive::<UInt64Type>()
+                .values()
+                .as_ref(),
+            &[all_ids.value(12), all_ids.value(1), all_ids.value(12)]
+        );
+        assert_eq!(
+            output["s"].as_ref(),
+            &StringArray::from_iter_values(["str-12", "str-1", "str-12"]) as &dyn Array
+        );
+        assert!(dataset.row_address_router.get().is_some());
     }
 
     #[tokio::test]

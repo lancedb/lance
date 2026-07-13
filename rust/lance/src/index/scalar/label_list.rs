@@ -7,7 +7,7 @@ use lance_index::scalar::label_list::{
     BITMAP_LOOKUP_NAME, LABEL_LIST_NULLS_METADATA_KEY, LABEL_LIST_NULLS_MIN_VERSION, LabelListIndex,
 };
 use lance_index::scalar::lance_format::LanceIndexStore;
-use lance_table::format::IndexMetadata;
+use lance_table::format::{IndexMetadata, RowReferenceDomain};
 use roaring::RoaringBitmap;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -74,12 +74,18 @@ pub(in crate::index) async fn merge_segments(
         ))
     })?;
     let field_path = dataset.schema().field_path(field_id)?;
+    let segment_refs = segments.iter().collect::<Vec<_>>();
+    let logical_coverage = dataset
+        .manifest
+        .uses_stable_logical_row_addresses()
+        .then(|| crate::index::merge_logical_index_coverage(dataset, &segment_refs))
+        .transpose()?;
 
     let dataset_fragments = dataset.fragment_bitmap.as_ref();
     let mut effective_old_frags = RoaringBitmap::new();
     let mut deleted_old_frags = RoaringBitmap::new();
     for segment in &segments {
-        if segment.fragment_bitmap.is_none() {
+        if logical_coverage.is_none() && segment.fragment_bitmap.is_none() {
             return Err(Error::invalid_input(format!(
                 "CreateIndex: segment {} is missing fragment coverage",
                 segment.uuid
@@ -94,7 +100,7 @@ pub(in crate::index) async fn merge_segments(
     }
 
     let fragment_bitmap = effective_old_frags.clone();
-    let old_data_filter = if deleted_old_frags.is_empty() {
+    let old_data_filter = if logical_coverage.is_some() || deleted_old_frags.is_empty() {
         None
     } else {
         crate::index::append::build_old_data_filter(
@@ -124,7 +130,14 @@ pub(in crate::index) async fn merge_segments(
     }
 
     let new_uuid = Uuid::new_v4();
-    let new_store = LanceIndexStore::from_dataset_for_new(dataset, &new_uuid)?;
+    let new_store = super::configure_logical_coverage_artifact_from_exact(
+        dataset,
+        new_uuid,
+        &[field_id],
+        logical_coverage.as_ref(),
+        "labellist",
+        LanceIndexStore::from_dataset_for_new(dataset, &new_uuid)?,
+    )?;
     let created_index = lance_index::scalar::label_list::merge_label_list_indices(
         &source_indices,
         &new_store,
@@ -137,12 +150,16 @@ pub(in crate::index) async fn merge_segments(
         uuid: new_uuid,
         fields: vec![field_id],
         dataset_version: dataset.manifest.version,
-        fragment_bitmap: Some(fragment_bitmap),
+        fragment_bitmap: logical_coverage.is_none().then_some(fragment_bitmap),
         index_details: Some(Arc::new(created_index.index_details)),
         index_version: created_index.index_version as i32,
         created_at: Some(chrono::Utc::now()),
         base_id: None,
         files: Some(created_index.files),
+        row_reference_domain: logical_coverage
+            .as_ref()
+            .map(|_| RowReferenceDomain::StableLogicalRowAddress),
+        logical_coverage,
         ..segments[0].clone()
     })
 }

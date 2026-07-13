@@ -33,6 +33,111 @@ message Transaction {
   // __lance_commit_message is a reserved key
   map<string, string> transaction_properties = 4;
 
+  message RowAddressFieldChange {
+    LogicalRowAddressSelection selection = 1;
+    repeated int32 field_ids = 2 [packed = true];
+  }
+
+  message RowAddressSourceFloor {
+    int32 field_id = 1;
+    uint64 generation = 2;
+  }
+
+  message RowAddressTargetRange {
+    oneof fragment {
+      // Ordinal in the operation's new-fragment sequence. The commit builder
+      // replaces this with the physical id allocated for the attempt.
+      uint32 new_fragment_ordinal = 1;
+      // Existing physical fragment used by a row-aligned operation.
+      uint64 existing_fragment_id = 2;
+    }
+    uint32 start_offset = 3;
+    uint32 end_offset = 4;
+  }
+
+  enum RowAddressPlacementKind {
+    ROW_ADDRESS_PLACEMENT_KIND_UNSPECIFIED = 0;
+    ROW_ADDRESS_PLACEMENT_KIND_DIRECT = 1;
+    ROW_ADDRESS_PLACEMENT_KIND_PACKED_RUN = 2;
+    ROW_ADDRESS_PLACEMENT_KIND_SELECTED = 3;
+    ROW_ADDRESS_PLACEMENT_KIND_EXTENT_LIST = 4;
+    ROW_ADDRESS_PLACEMENT_KIND_SPARSE_SELECTION = 5;
+    ROW_ADDRESS_PLACEMENT_KIND_EXPLICIT_MAP = 6;
+  }
+
+  // Explicitly binds source identity/order to one transaction output range.
+  message RowAddressPlacementDelta {
+    repeated LogicalRowAddressSelection source_selections = 1;
+    RowAddressTargetRange target = 2;
+    RowAddressPlacementKind placement_kind = 3;
+    uint64 output_cardinality = 4;
+    // Digest produced from the actual emitted logical-address sequence and
+    // bound to target. Absent for Direct append, which creates identity order.
+    bytes output_row_sequence_fingerprint = 5;
+  }
+
+  message ReplacedContentGeneration {
+    LogicalRowAddressSelection selection = 1;
+    repeated int32 field_ids = 2 [packed = true];
+    uint64 generation = 3;
+  }
+
+  // Commit-time proof that an existing fragment's fields were replaced
+  // without changing its physical row alignment or logical ownership.
+  // Selection and field ids are referenced from field_changes so the exact
+  // logical membership is serialized only once.
+  message RowAlignedRewriteProof {
+    uint64 physical_fragment_id = 1;
+    uint64 physical_rows = 2;
+    // Fingerprint of physical offsets owned by the current logical layout.
+    bytes mapped_offsets_fingerprint = 3;
+    // Present when the source fragment has deletion metadata. The digest is
+    // computed from the exact deleted physical-offset ranges. Absent means the
+    // source fragment has no deletion metadata.
+    optional bytes deletion_offsets_fingerprint = 4;
+    uint32 field_change_index = 5;
+    // Indices into source_floors, one for every field in field_change_index.
+    repeated uint32 source_floor_indices = 6 [packed = true];
+  }
+
+  // Provenance required to apply or retry a storage-version-2.3 placement
+  // change without inferring row identity from output order.
+  message RowAddressLayoutDelta {
+    repeated RowAddressLogicalDomain source_domains = 1;
+    repeated RowAddressPlacementDelta placements = 2;
+    repeated RowAddressFieldChange field_changes = 3;
+    repeated RowAddressSourceFloor source_floors = 4;
+    bytes expected_layout_fingerprint = 5;
+    repeated ReplacedContentGeneration replaced_generations = 6;
+    repeated RowAlignedRewriteProof row_aligned_rewrite_proofs = 7;
+    reserved "row_sequence_fingerprint";
+    // Present for dataset creation and absent for ordinary successor commits.
+    // Persisting it in the transaction keeps ambiguous commit retries stable.
+    optional UUID create_namespace_uuid = 8;
+    // Logical identities that have no successor location because they were
+    // already not live in the source snapshot and maintenance reclaimed their
+    // physical rows. These identities must not appear in placement outputs.
+    repeated LogicalRowAddressSelection retired_selections = 9;
+    // External locator roots produced by explicit placement maintenance.  The
+    // index addresses the corresponding entry in `placements`.  Persisting
+    // this metadata in the transaction makes commit retries self-contained.
+    repeated ExplicitMapPlacementDelta explicit_map_placements = 10;
+  }
+
+  message ExplicitMapPlacementDelta {
+    uint32 placement_delta_index = 1;
+    repeated RowAddressLogicalDomain sources = 2;
+    string object_path = 3;
+    uint64 object_size = 4;
+    repeated ExplicitMapPage pages = 5;
+    repeated ExplicitMapDestination destinations = 6;
+    optional uint32 base_id = 7;
+  }
+
+  // Required for storage-version-2.3 operations that change row placement,
+  // identity, or indexed field generations. Absent for older storage versions.
+  optional RowAddressLayoutDelta row_address_layout_delta = 5;
+
   // Add new rows to the dataset.
   message Append {
     // The new fragments to append.

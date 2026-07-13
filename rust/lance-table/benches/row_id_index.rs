@@ -292,6 +292,7 @@ fn bench_apply_row_id(c: &mut Criterion) {
         with_row_created_at_version: false,
         deletion_vector: None,
         row_id_sequence: None,
+        logical_row_id_source: None,
         last_updated_at_sequence: None,
         created_at_sequence: None,
         make_deletions_null: false,

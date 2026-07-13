@@ -56,7 +56,7 @@ use crate::{
     datafusion::dataframe::SessionContextExt,
     dataset::{
         fragment::{FileFragment, FragReadConfig},
-        transaction::{Operation, Transaction},
+        transaction::{Operation, Transaction, TransactionBuilder},
         write::{merge_insert::logical_plan::MergeInsertPlanner, open_writer},
     },
     index::DatasetIndexInternalExt,
@@ -103,7 +103,7 @@ use futures::{
 use lance_arrow::json::{convert_json_columns, has_json_fields, is_arrow_json_field};
 use lance_arrow::{RecordBatchExt, SchemaExt, interleave_batches};
 use lance_core::datatypes::NullabilityComparison;
-use lance_core::utils::address::RowAddress;
+use lance_core::utils::address::{LogicalRowAddress, RowAddress};
 use lance_core::{
     Error, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD, Result,
     datatypes::{OnMissing, OnTypeMismatch, SchemaCompareOptions},
@@ -123,9 +123,14 @@ use lance_file::version::LanceFileVersion;
 use lance_index::IndexCriteria;
 use lance_index::mem_wal::MergedGeneration;
 use lance_select::RowAddrTreeMap;
-use lance_table::format::{Fragment, IndexMetadata, RowIdMeta};
+use lance_table::format::{
+    Fragment, IndexMetadata, LogicalRowAddressSelection, RowAddressFieldChange,
+    RowAddressLayoutDelta, RowAddressPlacementDelta, RowAddressPlacementKind,
+    RowAddressSourceFloor, RowAddressTargetFragment, RowAddressTargetRange, RowIdMeta,
+    fingerprint_row_sequence,
+};
 use log::info;
-use roaring::RoaringTreemap;
+use roaring::{RoaringBitmap, RoaringTreemap};
 use snafu::ResultExt;
 use std::collections::HashMap;
 use std::{
@@ -142,6 +147,335 @@ use tracing::error;
 mod assign_action;
 mod exec;
 mod logical_plan;
+
+pub(super) use exec::{
+    DeletionPlan, cleanup_planned_deletions, plan_deletions, plan_full_fragment_deletions,
+    preflight_v2_3_transaction, write_planned_deletions,
+};
+
+/// Build the storage-version-2.3 provenance for one merge output.
+///
+/// Source-backed fragments must come first in `Operation::Update::new_fragments`
+/// and contain rows in strictly increasing logical-address order. Direct fragments
+/// follow them and receive their logical domains at manifest commit time.
+pub(super) fn build_v2_3_merge_layout_delta(
+    dataset: &Dataset,
+    source_backed_fragments: &[Fragment],
+    source_row_ids: &[LogicalRowAddress],
+    direct_fragments: &[Fragment],
+    retired_row_ids: &[LogicalRowAddress],
+    changed_row_ids: &[LogicalRowAddress],
+    changed_field_ids: &[i32],
+) -> Result<RowAddressLayoutDelta> {
+    let layout = dataset
+        .manifest
+        .row_address_layout
+        .as_ref()
+        .ok_or_else(|| Error::internal("storage-version-2.3 merge is missing RowAddressLayout"))?;
+    if source_row_ids.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(Error::not_supported(
+            "storage-version-2.3 merge output rows must be strictly ordered by logical row address",
+        ));
+    }
+
+    let expected_source_rows =
+        source_backed_fragments
+            .iter()
+            .try_fold(0_usize, |total, fragment| {
+                total
+                    .checked_add(fragment.physical_rows.ok_or_else(|| {
+                        Error::internal("storage-version-2.3 merge output is missing physical_rows")
+                    })?)
+                    .ok_or_else(|| Error::invalid_input("merge output row count overflow"))
+            })?;
+    if expected_source_rows != source_row_ids.len() {
+        return Err(Error::internal(format!(
+            "captured {} logical row IDs for {} source-backed merge output rows",
+            source_row_ids.len(),
+            expected_source_rows
+        )));
+    }
+
+    let router = dataset.row_address_router()?;
+    let mut source_domain_ids = source_row_ids
+        .iter()
+        .chain(retired_row_ids)
+        .map(|address| address.logical_fragment_id())
+        .collect::<Vec<_>>();
+    source_domain_ids.sort_unstable();
+    source_domain_ids.dedup();
+    let source_domains = source_domain_ids
+        .into_iter()
+        .map(|logical_fragment_id| {
+            router.logical_domain(logical_fragment_id)?.ok_or_else(|| {
+                Error::internal(format!(
+                    "logical domain {logical_fragment_id} is missing from the merge source layout"
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut placements = Vec::with_capacity(source_backed_fragments.len() + direct_fragments.len());
+    let mut source_offset = 0_usize;
+    for (ordinal, fragment) in source_backed_fragments.iter().enumerate() {
+        let row_count = fragment.physical_rows.ok_or_else(|| {
+            Error::internal("storage-version-2.3 merge output is missing physical_rows")
+        })?;
+        let source_end = source_offset
+            .checked_add(row_count)
+            .ok_or_else(|| Error::invalid_input("merge source row range overflow"))?;
+        let output_row_ids = &source_row_ids[source_offset..source_end];
+        let target = RowAddressTargetRange {
+            fragment: RowAddressTargetFragment::NewFragmentOrdinal(
+                u32::try_from(ordinal)
+                    .map_err(|_| Error::invalid_input("too many merge output fragments"))?,
+            ),
+            start_offset: 0,
+            end_offset: u32::try_from(row_count)
+                .map_err(|_| Error::invalid_input("merge output exceeds u32 row capacity"))?,
+        };
+
+        let mut source_selections = Vec::new();
+        let mut domain_start = 0_usize;
+        while domain_start < output_row_ids.len() {
+            let logical_fragment_id = output_row_ids[domain_start].logical_fragment_id();
+            let domain_end = output_row_ids[domain_start..]
+                .partition_point(|address| address.logical_fragment_id() == logical_fragment_id)
+                + domain_start;
+            source_selections.push(LogicalRowAddressSelection::from_bitmap(
+                output_row_ids[domain_start..domain_end]
+                    .iter()
+                    .map(|address| address.raw())
+                    .collect::<RoaringTreemap>(),
+            )?);
+            domain_start = domain_end;
+        }
+        placements.push(RowAddressPlacementDelta {
+            placement_kind: if source_selections.len() == 1 {
+                RowAddressPlacementKind::Selected
+            } else {
+                RowAddressPlacementKind::SparseSelection
+            },
+            source_selections,
+            target,
+            output_cardinality: row_count as u64,
+            output_row_sequence_fingerprint: fingerprint_row_sequence(
+                target,
+                output_row_ids.iter().copied(),
+            )?,
+        });
+        source_offset = source_end;
+    }
+
+    for (direct_index, fragment) in direct_fragments.iter().enumerate() {
+        let physical_rows = fragment.physical_rows.ok_or_else(|| {
+            Error::internal("storage-version-2.3 Direct merge output is missing physical_rows")
+        })?;
+        let physical_rows = u32::try_from(physical_rows)
+            .map_err(|_| Error::invalid_input("Direct merge output exceeds u32 row capacity"))?;
+        if physical_rows == 0 {
+            return Err(Error::invalid_input(
+                "storage-version-2.3 Direct merge output must not be empty",
+            ));
+        }
+        let ordinal = source_backed_fragments
+            .len()
+            .checked_add(direct_index)
+            .ok_or_else(|| Error::invalid_input("merge output ordinal overflow"))?;
+        placements.push(RowAddressPlacementDelta {
+            source_selections: Vec::new(),
+            target: RowAddressTargetRange {
+                fragment: RowAddressTargetFragment::NewFragmentOrdinal(
+                    u32::try_from(ordinal)
+                        .map_err(|_| Error::invalid_input("too many merge output fragments"))?,
+                ),
+                start_offset: 0,
+                end_offset: physical_rows,
+            },
+            placement_kind: RowAddressPlacementKind::Direct,
+            output_cardinality: physical_rows as u64,
+            // Source-free Direct obtains its logical sequence from the commit-time
+            // allocator, so the format deliberately requires an empty digest here.
+            output_row_sequence_fingerprint: Vec::new(),
+        });
+    }
+
+    let mut field_ids = changed_field_ids.to_vec();
+    field_ids.sort_unstable();
+    field_ids.dedup();
+    if field_ids.iter().any(|field_id| *field_id < 0) {
+        return Err(Error::invalid_input(
+            "merge field changes contain a negative field id",
+        ));
+    }
+    let changed_selection = (!changed_row_ids.is_empty() && !field_ids.is_empty())
+        .then(|| {
+            LogicalRowAddressSelection::from_bitmap(
+                changed_row_ids
+                    .iter()
+                    .map(|address| address.raw())
+                    .collect::<RoaringTreemap>(),
+            )
+        })
+        .transpose()?;
+    let retired_selection = (!retired_row_ids.is_empty())
+        .then(|| {
+            LogicalRowAddressSelection::from_bitmap(
+                retired_row_ids
+                    .iter()
+                    .map(|address| address.raw())
+                    .collect::<RoaringTreemap>(),
+            )
+        })
+        .transpose()?;
+    let source_floors = if changed_selection.is_some() {
+        field_ids
+            .iter()
+            .map(|field_id| {
+                let generation = layout
+                    .index_commit_floors
+                    .iter()
+                    .find(|floor| floor.field_id == *field_id)
+                    .or_else(|| {
+                        layout
+                            .field_default_generations
+                            .iter()
+                            .find(|generation| generation.field_id == *field_id)
+                    })
+                    .map(|generation| generation.generation)
+                    .ok_or_else(|| {
+                        Error::internal(format!(
+                            "field {field_id} is missing a merge source generation floor"
+                        ))
+                    })?;
+                Ok(RowAddressSourceFloor {
+                    field_id: *field_id,
+                    generation,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        Vec::new()
+    };
+
+    Ok(RowAddressLayoutDelta {
+        source_domains,
+        placements,
+        retired_selections: retired_selection.into_iter().collect(),
+        field_changes: changed_selection
+            .map(|selection| RowAddressFieldChange {
+                selection,
+                field_ids,
+            })
+            .into_iter()
+            .collect(),
+        source_floors,
+        expected_layout_fingerprint: layout.fingerprint.clone(),
+        replaced_generations: Vec::new(),
+        row_aligned_rewrite_proofs: Vec::new(),
+        create_namespace_uuid: None,
+        explicit_map_placements: BTreeMap::new(),
+    })
+}
+
+async fn v2_3_row_aligned_column_rewrite_ids(
+    dataset: &Dataset,
+    fragment: &Fragment,
+    batches: &[RecordBatch],
+) -> Result<Vec<LogicalRowAddress>> {
+    let physical_rows = fragment.physical_rows.ok_or_else(|| {
+        Error::internal("storage-version-2.3 column rewrite fragment is missing physical_rows")
+    })?;
+    let fragment_id = u32::try_from(fragment.id).map_err(|_| {
+        Error::invalid_input(format!(
+            "storage-version-2.3 column rewrite fragment id {} exceeds u32",
+            fragment.id
+        ))
+    })?;
+    let mut physical = Vec::with_capacity(physical_rows);
+    for batch in batches {
+        let row_addrs = batch
+            .column_by_name(ROW_ADDR)
+            .ok_or_else(|| Error::internal("column rewrite batch is missing _rowaddr"))?
+            .as_primitive_opt::<UInt64Type>()
+            .ok_or_else(|| Error::internal("column rewrite _rowaddr is not UInt64"))?;
+        physical.extend(row_addrs.values().iter().copied().map(RowAddress::from));
+    }
+    if physical.len() != physical_rows
+        || physical.iter().enumerate().any(|(offset, address)| {
+            address.fragment_id() != fragment_id || address.row_offset() as usize != offset
+        })
+    {
+        return Err(Error::not_supported(format!(
+            "storage-version-2.3 sparse column update for fragment {} is not row-aligned; use a whole-row rewrite",
+            fragment.id
+        )));
+    }
+
+    dataset
+        .resolve_physical_row_ids_async(&physical)
+        .await?
+        .into_iter()
+        .zip(physical)
+        .map(|(resolution, physical)| match resolution {
+            Some(logical) => Ok(logical),
+            None => Err(Error::internal(format!(
+                "storage-version-2.3 row-aligned column rewrite found unmapped live physical row {}",
+                u64::from(physical)
+            ))),
+        })
+        .collect()
+}
+
+async fn v2_3_column_rewrite_is_row_aligned(
+    dataset: &Dataset,
+    logical_rows: &[LogicalRowAddress],
+) -> Result<bool> {
+    if logical_rows.is_empty() {
+        return Ok(true);
+    }
+    let raw_logical_rows = logical_rows
+        .iter()
+        .map(|address| address.raw())
+        .collect::<Vec<_>>();
+    let physical_rows = dataset
+        .resolve_logical_row_ids_async(&raw_logical_rows)
+        .await?;
+    let mut offsets_by_fragment = BTreeMap::<u32, RoaringBitmap>::new();
+    for (logical, physical) in logical_rows.iter().zip(physical_rows) {
+        let physical = physical.ok_or_else(|| {
+            Error::internal(format!(
+                "storage-version-2.3 partial merge logical row {} has no physical placement",
+                logical.raw()
+            ))
+        })?;
+        offsets_by_fragment
+            .entry(physical.fragment_id())
+            .or_default()
+            .insert(physical.row_offset());
+    }
+    for (fragment_id, offsets) in offsets_by_fragment {
+        let fragment = dataset
+            .get_fragment(fragment_id as usize)
+            .ok_or_else(|| {
+                Error::internal(format!(
+                    "storage-version-2.3 partial merge resolved unknown fragment {fragment_id}"
+                ))
+            })?
+            .metadata;
+        let expected_rows = fragment.physical_rows.ok_or_else(|| {
+            Error::internal(format!(
+                "storage-version-2.3 partial merge fragment {fragment_id} is missing physical_rows"
+            ))
+        })?;
+        if offsets.len() != expected_rows as u64
+            || offsets.max().map(|offset| offset as usize + 1) != Some(expected_rows)
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
 
 // "update if" expressions typically compare fields from the source table to the target table.
 // These tables have the same schema and so filter expressions need to differentiate.  To do that
@@ -1089,7 +1423,12 @@ impl MergeInsertJob {
         source: SendableRecordBatchStream,
         current_version: u64,
         target_bases_info: Option<Vec<TargetBaseInfo>>,
-    ) -> Result<(Vec<Fragment>, Vec<Fragment>, Vec<u32>)> {
+    ) -> Result<(
+        Vec<Fragment>,
+        Vec<Fragment>,
+        Vec<u32>,
+        Vec<LogicalRowAddress>,
+    )> {
         // Shared across the per-group tasks spawned below; only new fragments
         // are routed to target bases, column patches stay in primary storage.
         let target_bases_info = Arc::new(target_bases_info);
@@ -1139,6 +1478,7 @@ impl MergeInsertJob {
         let task_limit = dataset.object_store.as_ref().io_parallelism();
         let reservation =
             MemoryConsumer::new("MergeInsert").register(session_ctx.task_ctx().memory_pool());
+        let mut changed_logical_rows = Vec::new();
 
         // Best-effort removal of uncommitted files after a mid-update failure.
         // Aborts in-flight tasks first, then deletes the new fragments written
@@ -1264,7 +1604,7 @@ impl MergeInsertJob {
 
                     metadata.files.push(data_file);
 
-                    if dataset.manifest.uses_stable_row_ids() {
+                    if dataset.manifest.has_stable_row_identity() {
                         // in-place frag override: refresh row-level latest update version meta
                         lance_table::rowids::version::refresh_row_latest_update_meta_for_full_frag_rewrite_cols(
                             &mut metadata,
@@ -1365,7 +1705,7 @@ impl MergeInsertJob {
 
                     let mut updated_fragment = updater.finish().await?;
 
-                    if dataset.manifest.uses_stable_row_ids() {
+                    if dataset.manifest.has_stable_row_identity() {
                         // in-place frag partial rows update, do the in-place refresh the frag's row_latest_update_version_meta
                         // via compute updated local row offsets and write row-level version meta
                         let mut updated_offsets: Vec<usize> = Vec::new();
@@ -1386,12 +1726,22 @@ impl MergeInsertJob {
                         updated_offsets.sort_unstable();
                         updated_offsets.dedup();
 
-                        lance_table::rowids::version::refresh_row_latest_update_meta_for_partial_frag_rewrite_cols(
-                            &mut updated_fragment,
-                            &updated_offsets,
-                            current_version,
-                            dataset.manifest.version,
-                        )?;
+                        if dataset.manifest.uses_stable_logical_row_addresses() {
+                            crate::dataset::rowids::refresh_v2_3_fragment_last_updated_at(
+                                dataset.as_ref(),
+                                &mut updated_fragment,
+                                &updated_offsets,
+                                current_version,
+                            )
+                            .await?;
+                        } else {
+                            lance_table::rowids::version::refresh_row_latest_update_meta_for_partial_frag_rewrite_cols(
+                                &mut updated_fragment,
+                                &updated_offsets,
+                                current_version,
+                                dataset.manifest.version,
+                            )?;
+                        }
                     }
 
                     updated_fragments.lock().unwrap().push(updated_fragment);
@@ -1510,6 +1860,28 @@ impl MergeInsertJob {
                     };
                     let metadata = fragment.metadata.clone();
 
+                    if dataset.manifest.uses_stable_logical_row_addresses() {
+                        match v2_3_row_aligned_column_rewrite_ids(
+                            dataset.as_ref(),
+                            &metadata,
+                            &batches,
+                        )
+                        .await
+                        {
+                            Ok(logical_rows) => changed_logical_rows.extend(logical_rows),
+                            Err(error) => {
+                                cleanup_on_failure(
+                                    &dataset,
+                                    &target_bases_info,
+                                    &new_fragments,
+                                    &mut tasks,
+                                )
+                                .await;
+                                return Err(error);
+                            }
+                        }
+                    }
+
                     let fut = handle_fragment(
                         dataset.clone(),
                         fragment,
@@ -1594,6 +1966,7 @@ impl MergeInsertJob {
             updated_fragments,
             new_fragments,
             all_fields_updated.into_iter().collect(),
+            changed_logical_rows,
         ))
     }
 
@@ -1719,6 +2092,13 @@ impl MergeInsertJob {
                     logical_expr::col(format!("target.\"{}\"", field.name())),
                 )?;
             }
+        }
+
+        if self.dataset.manifest.uses_stable_logical_row_addresses() {
+            // Source-backed output placement codecs preserve a logical sequence,
+            // not an arbitrary row permutation. NULL row IDs belong to unmatched
+            // inserts and sort last, creating a deterministic update/insert split.
+            df = df.sort(vec![logical_expr::col(ROW_ID).sort(true, false)])?;
         }
 
         let (session_state, logical_plan) = df.into_parts();
@@ -1891,7 +2271,16 @@ impl MergeInsertJob {
             && self.params.insert_not_matched
             && matches!(self.params.when_matched, WhenMatched::Delete);
 
+        // A 2.3 partial-schema merge is a row-aligned column backfill. Keep it
+        // on the column-rewrite path so unchanged fields and their exact index
+        // coverage are preserved. Sparse matches are rejected there instead of
+        // silently creating a placement/content-generation mismatch.
+        if self.dataset.manifest.uses_stable_logical_row_addresses() && is_subset_schema {
+            return Ok(false);
+        }
+
         let would_use_scalar_index = if self.params.use_index
+            && !self.dataset.manifest.uses_stable_logical_row_addresses()
             && !is_partial_delete_with_insert
             && matches!(
                 self.params.delete_not_matched_by_source,
@@ -1972,12 +2361,20 @@ impl MergeInsertJob {
                 ..Default::default()
             },
         );
+        let (source, v2_3_partial_source) =
+            if self.dataset.manifest.uses_stable_logical_row_addresses() && !is_full_schema {
+                let spill = exec::spool_for_replay(source, "v2-3-partial-source.arrow").await?;
+                let replay = spill.replay()?;
+                (replay, Some(spill))
+            } else {
+                (source, None)
+            };
         let joined = self.create_joined_stream(source).await?;
         let merger = Merger::try_new(
             self.params.clone(),
-            source_schema,
+            source_schema.clone(),
             !is_full_schema,
-            self.dataset.manifest.uses_stable_row_ids(),
+            self.dataset.manifest.has_stable_row_identity(),
         )?;
         let merge_statistics = merger.merge_stats.clone();
         let deleted_rows = merger.deleted_rows.clone();
@@ -2005,26 +2402,75 @@ impl MergeInsertJob {
         let is_delete_only = matches!(self.params.when_matched, WhenMatched::Delete)
             && !self.params.insert_not_matched;
 
-        let (operation, affected_rows) = if is_delete_only {
+        let (operation, affected_rows, row_address_layout_delta) = if is_delete_only {
             // Consume the stream so the merger records the matched row ids in
             // `deleted_rows`; it produces no batches.
             let drained: Vec<RecordBatch> = Box::pin(stream).try_collect().await?;
             debug_assert!(drained.is_empty(), "delete-only merge must not emit rows");
 
             let removed_row_ids = Arc::into_inner(deleted_rows).unwrap().into_inner().unwrap();
-            let removed_row_addr_vec =
-                if let Some(row_id_index) = get_row_id_index(&self.dataset).await? {
+            let uses_logical_row_addresses =
+                self.dataset.manifest.uses_stable_logical_row_addresses();
+            let retired_row_ids = uses_logical_row_addresses
+                .then(|| {
                     removed_row_ids
                         .iter()
-                        .filter_map(|id| row_id_index.get(*id).map(|address| address.into()))
-                        .collect::<Vec<_>>()
-                } else {
-                    removed_row_ids
-                };
+                        .copied()
+                        .map(LogicalRowAddress::try_from)
+                        .collect::<Result<Vec<_>>>()
+                })
+                .transpose()?;
+            let removed_row_addr_vec = if uses_logical_row_addresses {
+                let resolved = self
+                    .dataset
+                    .resolve_logical_row_ids_async(&removed_row_ids)
+                    .await?;
+                removed_row_ids
+                    .iter()
+                    .copied()
+                    .zip(resolved)
+                    .map(|(row_id, address)| {
+                        address.map(u64::from).ok_or_else(|| {
+                            Error::internal(format!(
+                                "merge delete logical row id {row_id} has no physical placement"
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            } else if let Some(row_id_index) = get_row_id_index(&self.dataset).await? {
+                removed_row_ids
+                    .iter()
+                    .filter_map(|id| row_id_index.get(*id).map(|address| address.into()))
+                    .collect::<Vec<_>>()
+            } else {
+                removed_row_ids
+            };
             let removed_row_addrs = RoaringTreemap::from_iter(removed_row_addr_vec);
-
-            let (updated_fragments, removed_fragment_ids) =
-                Self::apply_deletions(&self.dataset, &removed_row_addrs).await?;
+            let (updated_fragments, removed_fragment_ids, row_address_layout_delta) =
+                if let Some(retired_row_ids) = retired_row_ids {
+                    let plan = exec::plan_deletions(&self.dataset, &removed_row_addrs).await?;
+                    let delta = exec::preflight_v2_3_merge(
+                        &self.dataset,
+                        &[],
+                        &[],
+                        &[],
+                        &retired_row_ids,
+                        &plan,
+                        &self.params.merged_generations,
+                        None,
+                    )
+                    .await?;
+                    exec::write_planned_deletions(&self.dataset, &plan).await?;
+                    (
+                        plan.updated_fragments,
+                        plan.removed_fragment_ids,
+                        Some(delta),
+                    )
+                } else {
+                    let (updated, removed) =
+                        Self::apply_deletions(&self.dataset, &removed_row_addrs).await?;
+                    (updated, removed, None)
+                };
 
             let operation = Operation::Update {
                 removed_fragment_ids,
@@ -2043,7 +2489,7 @@ impl MergeInsertJob {
             };
 
             let affected_rows = Some(RowAddrTreeMap::from(removed_row_addrs));
-            (operation, affected_rows)
+            (operation, affected_rows, row_address_layout_delta)
         } else if !is_full_schema {
             // Non-delete partial-schema merge: patch the provided columns into
             // existing fragments in place. (Delete is handled above; a wider
@@ -2055,15 +2501,141 @@ impl MergeInsertJob {
                 return Err(Error::not_supported_source("Deleting rows from the target table when there is no match in the source table is not supported when the source data has a different schema than the target data".into()));
             }
 
+            if self.dataset.manifest.uses_stable_logical_row_addresses()
+                && self.params.insert_not_matched
+            {
+                return Err(Error::not_supported(
+                    "storage-version-2.3 partial-schema merge inserts require a full-schema source so Direct output can be preflighted",
+                ));
+            }
+
+            let mut preflighted_layout_delta = None;
+            let stream: SendableRecordBatchStream = if self
+                .dataset
+                .manifest
+                .uses_stable_logical_row_addresses()
+            {
+                let spill = exec::spool_for_replay(Box::pin(stream), "partial-merge.arrow").await?;
+                let changed_logical_rows = updating_row_ids
+                    .lock()
+                    .map_err(|error| {
+                        Error::internal(format!("failed to lock merge row IDs: {error}"))
+                    })?
+                    .row_id_sequence()
+                    .ok_or_else(|| {
+                        Error::internal("storage-version-2.3 partial merge captured physical IDs")
+                    })?
+                    .iter()
+                    .map(LogicalRowAddress::try_from)
+                    .collect::<Result<Vec<_>>>()?;
+                if !v2_3_column_rewrite_is_row_aligned(self.dataset.as_ref(), &changed_logical_rows)
+                    .await?
+                {
+                    let source = v2_3_partial_source
+                        .as_ref()
+                        .ok_or_else(|| {
+                            Error::internal(
+                                "storage-version-2.3 partial merge source was not retained for whole-row promotion",
+                            )
+                        })?
+                        .replay()?;
+                    let (transaction, stats, affected_rows, inserted_rows_filter) =
+                        self.execute_uncommitted_v2(source).await?;
+                    return Ok(UncommittedMergeInsert {
+                        transaction,
+                        affected_rows,
+                        stats,
+                        inserted_rows_filter,
+                    });
+                }
+                let planned_fields_modified = source_schema
+                    .fields()
+                    .iter()
+                    .filter_map(|field| self.dataset.schema().field(field.name()))
+                    .map(|field| field.id as u32)
+                    .collect::<Vec<_>>();
+                let changed_field_ids = planned_fields_modified
+                    .iter()
+                    .map(|field_id| {
+                        i32::try_from(*field_id)
+                            .map_err(|_| Error::invalid_input("merge field id exceeds i32"))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let delta = build_v2_3_merge_layout_delta(
+                    self.dataset.as_ref(),
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &changed_logical_rows,
+                    &changed_field_ids,
+                )?;
+                let deletion_plan =
+                    exec::plan_deletions(&self.dataset, &RoaringTreemap::new()).await?;
+                let operation = Operation::Update {
+                    removed_fragment_ids: Vec::new(),
+                    updated_fragments: Vec::new(),
+                    new_fragments: Vec::new(),
+                    fields_modified: planned_fields_modified,
+                    merged_generations: self.params.merged_generations.clone(),
+                    fields_for_preserving_frag_bitmap: Vec::new(),
+                    update_mode: Some(RewriteColumns),
+                    inserted_rows_filter: None,
+                    updated_fragment_offsets: None,
+                };
+                exec::preflight_v2_3_transaction(
+                    &self.dataset,
+                    operation,
+                    delta.clone(),
+                    &deletion_plan,
+                )
+                .await?;
+                preflighted_layout_delta = Some(delta);
+                spill.replay()?
+            } else {
+                Box::pin(stream)
+            };
+
             // We will have a different commit path here too, as we are modifying
             // fragments rather than writing new ones
-            let (updated_fragments, new_fragments, fields_modified) = Self::update_fragments(
-                self.dataset.clone(),
-                Box::pin(stream),
-                self.dataset.manifest.version + 1,
-                target_bases_info,
-            )
-            .await?;
+            let (updated_fragments, new_fragments, fields_modified, changed_logical_rows) =
+                Self::update_fragments(
+                    self.dataset.clone(),
+                    stream,
+                    self.dataset.manifest.version + 1,
+                    target_bases_info,
+                )
+                .await?;
+
+            let row_address_layout_delta = if let Some(delta) = preflighted_layout_delta {
+                Some(delta)
+            } else {
+                self.dataset
+                    .manifest
+                    .uses_stable_logical_row_addresses()
+                    .then(|| {
+                        let field_ids = fields_modified
+                            .iter()
+                            .map(|field_id| {
+                                i32::try_from(*field_id).map_err(|_| {
+                                    Error::invalid_input(format!(
+                                        "merge field id {field_id} exceeds i32"
+                                    ))
+                                })
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        build_v2_3_merge_layout_delta(
+                            self.dataset.as_ref(),
+                            &[],
+                            &[],
+                            &new_fragments,
+                            &[],
+                            &changed_logical_rows,
+                            &field_ids,
+                        )
+                    })
+                    .transpose()?
+            };
 
             let operation = Operation::Update {
                 removed_fragment_ids: Vec::new(),
@@ -2078,8 +2650,13 @@ impl MergeInsertJob {
             };
             // We have rewritten the fragments, not just the deletion files, so
             // we can't use affected rows here.
-            (operation, None)
+            (operation, None, row_address_layout_delta)
         } else {
+            if self.dataset.manifest.uses_stable_logical_row_addresses() {
+                return Err(Error::internal(
+                    "storage-version-2.3 full-schema merge unexpectedly left the provenance-aware execution path",
+                ));
+            }
             let cleanup_bases = target_bases_info.clone();
             let (mut new_fragments, _) = write_fragments_internal(
                 Some(&self.dataset),
@@ -2184,7 +2761,7 @@ impl MergeInsertJob {
             };
 
             let affected_rows = Some(RowAddrTreeMap::from(removed_row_addrs));
-            (operation, affected_rows)
+            (operation, affected_rows, None)
         };
 
         let stats = Arc::into_inner(merge_statistics)
@@ -2192,7 +2769,9 @@ impl MergeInsertJob {
             .into_inner()
             .unwrap();
 
-        let transaction = Transaction::new(self.dataset.manifest.version, operation, None);
+        let transaction = TransactionBuilder::new(self.dataset.manifest.version, operation)
+            .row_address_layout_delta(row_address_layout_delta)
+            .build();
 
         Ok(UncommittedMergeInsert {
             transaction,
@@ -2863,7 +3442,10 @@ mod tests {
     use crate::index::vector::VectorIndexParams;
     use crate::io::commit::read_transaction_file;
     use crate::{
-        dataset::{InsertBuilder, ReadParams, WriteMode, WriteParams, builder::DatasetBuilder},
+        dataset::{
+            InsertBuilder, ReadParams, UpdateBuilder, WriteMode, WriteParams,
+            builder::DatasetBuilder,
+        },
         session::Session,
         utils::test::{
             DatagenExt, FragmentCount, FragmentRowCount, ThrottledStoreWrapper,
@@ -2901,6 +3483,803 @@ mod tests {
     // Used to validate that futures returned are Send.
     fn assert_send<T: Send>(t: T) -> T {
         t
+    }
+
+    async fn write_v2_3_merge_dataset() -> (TempStrDir, Dataset) {
+        let directory = TempStrDir::default();
+        let initial = record_batch!(
+            ("id", Int32, [0, 1, 2, 3, 4, 5]),
+            ("value", Int32, [10, 11, 12, 13, 14, 15]),
+            ("stable", Int32, [100, 101, 102, 103, 104, 105])
+        )
+        .unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(initial.clone())], initial.schema()),
+            directory.as_str(),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_3),
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        (directory, dataset)
+    }
+
+    async fn v2_3_row_ids_by_id(dataset: &Dataset) -> HashMap<i32, u64> {
+        let mut scan = dataset.scan();
+        scan.project(&["id", ROW_ID]).unwrap();
+        let batch = scan.try_into_batch().await.unwrap();
+        let ids = batch["id"].as_primitive::<Int32Type>();
+        let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
+        ids.values()
+            .iter()
+            .copied()
+            .zip(row_ids.values().iter().copied())
+            .collect()
+    }
+
+    fn dataset_data_objects(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        fn visit(path: &std::path::Path, objects: &mut Vec<std::path::PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(path) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    visit(&path, objects);
+                } else if path
+                    .extension()
+                    .is_some_and(|extension| extension == "lance" || extension == "arrow")
+                    || path.to_string_lossy().contains("_deletions")
+                {
+                    objects.push(path);
+                }
+            }
+        }
+        let mut objects = Vec::new();
+        visit(root, &mut objects);
+        objects.sort();
+        objects
+    }
+
+    #[tokio::test]
+    async fn test_v2_3_merge_pmr_preflight_writes_no_dataset_objects() {
+        let (directory, mut dataset) = write_v2_3_merge_dataset().await;
+        let manifest = Arc::make_mut(&mut dataset.manifest);
+        let fragments = manifest.fragments.clone();
+        let max_logical_fragment_id = manifest.max_logical_fragment_id;
+        let layout = Arc::make_mut(manifest.row_address_layout.as_mut().unwrap());
+        layout.debt_summary.metadata_bytes_written_since_maintenance =
+            lance_table::format::ROW_ADDRESS_W_FAST;
+        layout.refresh_fingerprint_with_fragments(fragments.as_ref(), max_logical_fragment_id);
+        let before = dataset_data_objects(std::path::Path::new(directory.as_ref()));
+        let source = record_batch!(
+            ("id", Int32, [1]),
+            ("value", Int32, [1011]),
+            ("stable", Int32, [101])
+        )
+        .unwrap();
+        let result = MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .try_build()
+            .unwrap()
+            .execute_uncommitted(RecordBatchIterator::new(
+                [Ok(source.clone())],
+                source.schema(),
+            ))
+            .await;
+        let Err(error) = result else {
+            panic!("merge should require placement maintenance during preflight")
+        };
+        assert!(error.to_string().contains("ProjectedEpochBytes"));
+        assert_eq!(
+            dataset_data_objects(std::path::Path::new(directory.as_ref())),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn test_v2_3_merge_unsorted_matched_source_preserves_identity() {
+        let (_directory, dataset) = write_v2_3_merge_dataset().await;
+        let before = v2_3_row_ids_by_id(&dataset).await;
+        let source = record_batch!(
+            ("id", Int32, [4, 1, 3]),
+            ("value", Int32, [1004, 1001, 1003]),
+            ("stable", Int32, [104, 101, 103])
+        )
+        .unwrap();
+        let uncommitted =
+            MergeInsertBuilder::try_new(Arc::new(dataset.clone()), vec!["id".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::DoNothing)
+                .try_build()
+                .unwrap()
+                .execute_uncommitted(RecordBatchIterator::new(
+                    [Ok(source.clone())],
+                    source.schema(),
+                ))
+                .await
+                .unwrap();
+        let delta = uncommitted
+            .transaction
+            .row_address_layout_delta
+            .as_ref()
+            .unwrap();
+        assert!(delta.placements[0].verify_output_row_sequence().is_ok());
+        let committed = CommitBuilder::new(Arc::new(dataset))
+            .execute(uncommitted.transaction)
+            .await
+            .unwrap();
+        let after = v2_3_row_ids_by_id(&committed).await;
+        for id in 0..6 {
+            assert_eq!(after[&id], before[&id]);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_v2_3_merge_delete_retires_fully_removed_fragment() {
+        let (_directory, dataset) = write_v2_3_merge_dataset().await;
+        let before = v2_3_row_ids_by_id(&dataset).await;
+        let source = record_batch!(("id", Int32, [1, 0])).unwrap();
+        let uncommitted =
+            MergeInsertBuilder::try_new(Arc::new(dataset.clone()), vec!["id".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::Delete)
+                .when_not_matched(WhenNotMatched::DoNothing)
+                .try_build()
+                .unwrap()
+                .execute_uncommitted(RecordBatchIterator::new(
+                    [Ok(source.clone())],
+                    source.schema(),
+                ))
+                .await
+                .unwrap();
+        let Operation::Update {
+            removed_fragment_ids,
+            ..
+        } = &uncommitted.transaction.operation
+        else {
+            panic!("expected merge update transaction")
+        };
+        assert_eq!(removed_fragment_ids.len(), 1);
+        let delta = uncommitted
+            .transaction
+            .row_address_layout_delta
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            delta
+                .retired_selections
+                .iter()
+                .map(LogicalRowAddressSelection::cardinality)
+                .sum::<u64>(),
+            2
+        );
+        let committed = CommitBuilder::new(Arc::new(dataset))
+            .execute(uncommitted.transaction)
+            .await
+            .unwrap();
+        let after = v2_3_row_ids_by_id(&committed).await;
+        assert!(!after.contains_key(&0));
+        assert!(!after.contains_key(&1));
+        for id in 2..6 {
+            assert_eq!(after[&id], before[&id]);
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::update(false)]
+    #[case::delete(true)]
+    #[tokio::test]
+    async fn test_v2_3_merge_retires_prior_deleted_owner_with_fragment(
+        #[case] delete_matched: bool,
+    ) {
+        let (_directory, mut dataset) = write_v2_3_merge_dataset().await;
+        let before = v2_3_row_ids_by_id(&dataset).await;
+        dataset.delete("id = 0").await.unwrap();
+
+        let committed = if delete_matched {
+            let source = record_batch!(("id", Int32, [1])).unwrap();
+            MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::Delete)
+                .when_not_matched(WhenNotMatched::DoNothing)
+                .try_build()
+                .unwrap()
+                .execute_reader(RecordBatchIterator::new(
+                    [Ok(source.clone())],
+                    source.schema(),
+                ))
+                .await
+                .unwrap()
+                .0
+        } else {
+            let source = record_batch!(
+                ("id", Int32, [1]),
+                ("value", Int32, [1011]),
+                ("stable", Int32, [101])
+            )
+            .unwrap();
+            MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::DoNothing)
+                .try_build()
+                .unwrap()
+                .execute_reader(RecordBatchIterator::new(
+                    [Ok(source.clone())],
+                    source.schema(),
+                ))
+                .await
+                .unwrap()
+                .0
+        };
+
+        let logical = [before[&0], before[&1]]
+            .into_iter()
+            .map(LogicalRowAddress::try_from)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let resolutions = committed
+            .row_address_router()
+            .unwrap()
+            .resolve_many(&logical)
+            .unwrap();
+        assert!(matches!(
+            resolutions[0],
+            lance_table::format::PlacementResolution::NotLive
+        ));
+        if delete_matched {
+            assert!(matches!(
+                resolutions[1],
+                lance_table::format::PlacementResolution::NotLive
+            ));
+        } else {
+            assert!(matches!(
+                resolutions[1],
+                lance_table::format::PlacementResolution::Mapped { .. }
+            ));
+            assert_eq!(v2_3_row_ids_by_id(&committed).await[&1], before[&1]);
+        }
+        committed.manifest.validate_row_address_contract().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_v2_3_merge_rebase_partial_deletions_to_full_fragment() {
+        let (_directory, dataset) = write_v2_3_merge_dataset().await;
+        let before = v2_3_row_ids_by_id(&dataset).await;
+        let source = record_batch!(
+            ("id", Int32, [1]),
+            ("value", Int32, [1011]),
+            ("stable", Int32, [101])
+        )
+        .unwrap();
+        let uncommitted =
+            MergeInsertBuilder::try_new(Arc::new(dataset.clone()), vec!["id".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::DoNothing)
+                .try_build()
+                .unwrap()
+                .execute_uncommitted(RecordBatchIterator::new(
+                    [Ok(source.clone())],
+                    source.schema(),
+                ))
+                .await
+                .unwrap();
+
+        let mut current = dataset;
+        current.delete("id = 0").await.unwrap();
+        let committed = CommitBuilder::new(Arc::new(current))
+            .with_affected_rows(uncommitted.affected_rows.unwrap())
+            .execute(uncommitted.transaction)
+            .await
+            .unwrap();
+
+        let logical = [before[&0], before[&1]]
+            .into_iter()
+            .map(LogicalRowAddress::try_from)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let resolutions = committed
+            .row_address_router()
+            .unwrap()
+            .resolve_many(&logical)
+            .unwrap();
+        assert!(matches!(
+            resolutions[0],
+            lance_table::format::PlacementResolution::NotLive
+        ));
+        assert!(matches!(
+            resolutions[1],
+            lance_table::format::PlacementResolution::Mapped { .. }
+        ));
+        assert_eq!(v2_3_row_ids_by_id(&committed).await[&1], before[&1]);
+        committed.manifest.validate_row_address_contract().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_v2_3_merge_preserves_matched_ids_and_assigns_direct_insert_domains() {
+        let (_directory, dataset) = write_v2_3_merge_dataset().await;
+        let before = v2_3_row_ids_by_id(&dataset).await;
+        let previous_max_fragment_id = dataset.manifest.max_fragment_id().unwrap();
+
+        let source = record_batch!(
+            ("id", Int32, [1, 4, 6, 7]),
+            ("value", Int32, [1011, 1014, 1016, 1017]),
+            ("stable", Int32, [101, 104, 106, 107])
+        )
+        .unwrap();
+        let uncommitted =
+            MergeInsertBuilder::try_new(Arc::new(dataset.clone()), vec!["id".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .try_build()
+                .unwrap()
+                .execute_uncommitted(RecordBatchIterator::new(
+                    [Ok(source.clone())],
+                    source.schema(),
+                ))
+                .await
+                .unwrap();
+
+        assert_eq!(uncommitted.stats.num_updated_rows, 2);
+        assert_eq!(uncommitted.stats.num_inserted_rows, 2);
+        let Operation::Update { new_fragments, .. } = &uncommitted.transaction.operation else {
+            panic!("expected merge update transaction");
+        };
+        assert_eq!(
+            new_fragments.len(),
+            2,
+            "update and insert need distinct fragments"
+        );
+        let delta = uncommitted
+            .transaction
+            .row_address_layout_delta
+            .as_ref()
+            .unwrap();
+        assert_eq!(delta.placements.len(), 2);
+        assert_eq!(delta.source_domains.len(), 2);
+        assert_eq!(delta.field_changes.len(), 1);
+        assert_eq!(delta.field_changes[0].selection.cardinality(), 2);
+        let source_placement = &delta.placements[0];
+        assert_ne!(
+            source_placement.placement_kind,
+            RowAddressPlacementKind::Direct
+        );
+        assert_eq!(source_placement.output_row_sequence_fingerprint.len(), 16);
+        source_placement.verify_output_row_sequence().unwrap();
+        let direct_placement = &delta.placements[1];
+        assert_eq!(
+            direct_placement.placement_kind,
+            RowAddressPlacementKind::Direct
+        );
+        assert!(direct_placement.source_selections.is_empty());
+        assert!(direct_placement.output_row_sequence_fingerprint.is_empty());
+
+        let committed = CommitBuilder::new(Arc::new(dataset))
+            .execute(uncommitted.transaction)
+            .await
+            .unwrap();
+        let after = v2_3_row_ids_by_id(&committed).await;
+        for id in 0..6 {
+            assert_eq!(after[&id], before[&id], "logical id changed for row {id}");
+        }
+        assert!(!before.values().any(|row_id| *row_id == after[&6]));
+        assert!(!before.values().any(|row_id| *row_id == after[&7]));
+
+        let mut new_fragments = committed
+            .manifest
+            .fragments
+            .iter()
+            .filter(|fragment| fragment.id > previous_max_fragment_id)
+            .collect::<Vec<_>>();
+        new_fragments.sort_by_key(|fragment| fragment.id);
+        assert_eq!(new_fragments.len(), 2);
+        assert_eq!(
+            new_fragments
+                .iter()
+                .map(|fragment| fragment.physical_rows)
+                .collect::<Vec<_>>(),
+            vec![Some(2), Some(2)],
+            "actual writer boundaries must match the preflight plan"
+        );
+        assert!(new_fragments[0].native_logical_domain.is_none());
+        assert!(new_fragments[1].native_logical_domain.is_some());
+        assert!(
+            new_fragments
+                .iter()
+                .all(|fragment| fragment.row_id_meta.is_none())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_v2_3_merge_after_update_replaces_a_subset_of_selected_placement() {
+        let (_directory, dataset) = write_v2_3_merge_dataset().await;
+        let updated = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("id < 4")
+            .unwrap()
+            .set("value", "value + 100")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap()
+            .new_dataset;
+        let before = v2_3_row_ids_by_id(&updated).await;
+        let source = record_batch!(
+            ("id", Int32, [0, 1, 6, 7]),
+            ("value", Int32, [1000, 1001, 1006, 1007]),
+            ("stable", Int32, [100, 101, 106, 107])
+        )
+        .unwrap();
+        let uncommitted = MergeInsertBuilder::try_new(updated.clone(), vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap()
+            .execute_uncommitted(RecordBatchIterator::new(
+                [Ok(source.clone())],
+                source.schema(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(uncommitted.stats.num_updated_rows, 2);
+        assert_eq!(uncommitted.stats.num_inserted_rows, 2);
+        let committed = CommitBuilder::new(updated)
+            .execute(uncommitted.transaction)
+            .await
+            .unwrap();
+        let after = v2_3_row_ids_by_id(&committed).await;
+        for id in 0..6 {
+            assert_eq!(after[&id], before[&id], "logical id changed for row {id}");
+        }
+        assert!(!before.values().any(|row_id| *row_id == after[&6]));
+        assert!(!before.values().any(|row_id| *row_id == after[&7]));
+    }
+
+    #[tokio::test]
+    async fn test_v2_3_row_aligned_backfill_preserves_placement() {
+        let (_directory, mut dataset) = write_v2_3_merge_dataset().await;
+        let index_params = ScalarIndexParams::default();
+        dataset
+            .create_index(
+                &["stable"],
+                IndexType::BTree,
+                Some("stable_idx".to_string()),
+                &index_params,
+                false,
+            )
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["value"],
+                IndexType::BTree,
+                Some("value_idx".to_string()),
+                &index_params,
+                false,
+            )
+            .await
+            .unwrap();
+        let before_indices = dataset.load_indices().await.unwrap();
+        let stable_coverage_before = before_indices
+            .iter()
+            .find(|index| index.name == "stable_idx")
+            .unwrap()
+            .logical_coverage
+            .clone()
+            .unwrap();
+        let value_coverage_before = before_indices
+            .iter()
+            .find(|index| index.name == "value_idx")
+            .unwrap()
+            .logical_coverage
+            .clone()
+            .unwrap();
+        assert_eq!(
+            value_coverage_before
+                .shards
+                .iter()
+                .map(|shard| shard.row_count)
+                .sum::<u64>(),
+            6
+        );
+        let before_ids = v2_3_row_ids_by_id(&dataset).await;
+        let before_layout = dataset
+            .manifest
+            .row_address_layout
+            .as_ref()
+            .unwrap()
+            .clone();
+        let before_native = dataset
+            .manifest
+            .fragments
+            .iter()
+            .map(|fragment| (fragment.id, fragment.native_logical_domain))
+            .collect::<Vec<_>>();
+
+        let source = record_batch!(
+            ("id", Int32, [0, 1, 2, 3, 4, 5]),
+            ("value", Int32, [1000, 1001, 1002, 1003, 1004, 1005])
+        )
+        .unwrap();
+        let uncommitted =
+            MergeInsertBuilder::try_new(Arc::new(dataset.clone()), vec!["id".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::DoNothing)
+                .try_build()
+                .unwrap()
+                .execute_uncommitted(RecordBatchIterator::new(
+                    [Ok(source.clone())],
+                    source.schema(),
+                ))
+                .await
+                .unwrap();
+
+        let Operation::Update {
+            updated_fragments,
+            new_fragments,
+            fields_modified,
+            update_mode,
+            ..
+        } = &uncommitted.transaction.operation
+        else {
+            panic!("expected backfill update transaction");
+        };
+        assert_eq!(*update_mode, Some(RewriteColumns));
+        assert_eq!(updated_fragments.len(), 3);
+        assert!(new_fragments.is_empty());
+        let id_field = dataset.schema().field("id").unwrap().id as u32;
+        let value_field = dataset.schema().field("value").unwrap().id as u32;
+        assert!(fields_modified.contains(&id_field));
+        assert!(fields_modified.contains(&value_field));
+
+        let delta = uncommitted
+            .transaction
+            .row_address_layout_delta
+            .as_ref()
+            .unwrap();
+        assert!(delta.source_domains.is_empty());
+        assert!(delta.placements.is_empty());
+        assert_eq!(delta.field_changes.len(), 1);
+        assert_eq!(delta.field_changes[0].selection.cardinality(), 6);
+        assert_eq!(delta.source_floors.len(), 2);
+
+        let committed = CommitBuilder::new(Arc::new(dataset))
+            .execute(uncommitted.transaction)
+            .await
+            .unwrap();
+        let after_layout = committed.manifest.row_address_layout.as_ref().unwrap();
+        assert_eq!(after_layout.placements, before_layout.placements);
+        assert_eq!(
+            committed
+                .manifest
+                .fragments
+                .iter()
+                .map(|fragment| (fragment.id, fragment.native_logical_domain))
+                .collect::<Vec<_>>(),
+            before_native
+        );
+        assert_eq!(v2_3_row_ids_by_id(&committed).await, before_ids);
+
+        let batch = committed.scan().try_into_batch().await.unwrap();
+        let values = batch["value"].as_primitive::<Int32Type>();
+        assert_eq!(
+            values.values().as_ref(),
+            &[1000, 1001, 1002, 1003, 1004, 1005]
+        );
+        assert!(after_layout.generation_regions.iter().any(|region| {
+            region.selection.cardinality() == 6 && region.field_ids.contains(&(value_field as i32))
+        }));
+
+        let after_indices = committed.load_indices().await.unwrap();
+        let stable_coverage_after = after_indices
+            .iter()
+            .find(|index| index.name == "stable_idx")
+            .unwrap()
+            .logical_coverage
+            .as_ref()
+            .unwrap();
+        assert_eq!(stable_coverage_after, &stable_coverage_before);
+        let value_coverage_after = after_indices
+            .iter()
+            .find(|index| index.name == "value_idx")
+            .unwrap()
+            .logical_coverage
+            .as_ref()
+            .unwrap();
+        assert_eq!(value_coverage_after, &value_coverage_before);
+
+        // Base coverage remains reusable. The generation region above routes
+        // precisely the changed logical rows through fallback evaluation.
+        let mut indexed_scan = committed.scan();
+        indexed_scan.filter("value = 1004").unwrap();
+        let indexed_plan = indexed_scan.explain_plan(false).await.unwrap();
+        let indexed = indexed_scan.try_into_batch().await.unwrap();
+        assert_eq!(
+            indexed["id"].as_primitive::<Int32Type>().values().as_ref(),
+            &[4],
+            "indexed backfill plan:\n{indexed_plan}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_v2_3_sparse_column_merge_promotes_to_whole_row_rewrite() {
+        let (_directory, dataset) = write_v2_3_merge_dataset().await;
+        let before = v2_3_row_ids_by_id(&dataset).await;
+        let source = record_batch!(("id", Int32, [1]), ("value", Int32, [999])).unwrap();
+        let uncommitted =
+            MergeInsertBuilder::try_new(Arc::new(dataset.clone()), vec!["id".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::DoNothing)
+                .try_build()
+                .unwrap()
+                .execute_uncommitted(RecordBatchIterator::new(
+                    [Ok(source.clone())],
+                    source.schema(),
+                ))
+                .await
+                .unwrap();
+        let Operation::Update { update_mode, .. } = &uncommitted.transaction.operation else {
+            panic!("expected sparse partial merge to produce an update");
+        };
+        assert_eq!(*update_mode, Some(RewriteRows));
+        assert!(uncommitted.transaction.row_address_layout_delta.is_some());
+
+        let committed = CommitBuilder::new(Arc::new(dataset))
+            .execute(uncommitted.transaction)
+            .await
+            .unwrap();
+        let after = v2_3_row_ids_by_id(&committed).await;
+        assert_eq!(after, before);
+        let batch = committed.scan().try_into_batch().await.unwrap();
+        let ids = batch["id"].as_primitive::<Int32Type>();
+        let values = batch["value"].as_primitive::<Int32Type>();
+        let actual = ids
+            .values()
+            .iter()
+            .copied()
+            .zip(values.values().iter().copied())
+            .collect::<HashMap<_, _>>();
+        assert_eq!(actual[&1], 999);
+        assert_eq!(actual[&0], 10);
+        assert_eq!(actual[&5], 15);
+        committed.manifest.validate_row_address_contract().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_v2_3_live_row_backfill_with_deletion_promotes_to_whole_row_rewrite() {
+        let (_directory, mut dataset) = write_v2_3_merge_dataset().await;
+        dataset.delete("id = 0").await.unwrap();
+        let before = v2_3_row_ids_by_id(&dataset).await;
+        let source = record_batch!(("id", Int32, [1]), ("value", Int32, [999])).unwrap();
+        let uncommitted =
+            MergeInsertBuilder::try_new(Arc::new(dataset.clone()), vec!["id".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::DoNothing)
+                .try_build()
+                .unwrap()
+                .execute_uncommitted(RecordBatchIterator::new(
+                    [Ok(source.clone())],
+                    source.schema(),
+                ))
+                .await
+                .unwrap();
+        let Operation::Update { update_mode, .. } = &uncommitted.transaction.operation else {
+            panic!("expected deleted-fragment backfill to produce an update");
+        };
+        assert_eq!(*update_mode, Some(RewriteRows));
+
+        let committed = CommitBuilder::new(Arc::new(dataset))
+            .execute(uncommitted.transaction)
+            .await
+            .unwrap();
+        assert_eq!(v2_3_row_ids_by_id(&committed).await, before);
+        let batch = committed.scan().try_into_batch().await.unwrap();
+        let ids = batch["id"].as_primitive::<Int32Type>();
+        let values = batch["value"].as_primitive::<Int32Type>();
+        let actual = ids
+            .values()
+            .iter()
+            .copied()
+            .zip(values.values().iter().copied())
+            .collect::<HashMap<_, _>>();
+        assert!(!actual.contains_key(&0));
+        assert_eq!(actual[&1], 999);
+        committed.manifest.validate_row_address_contract().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_v2_3_merge_delta_rebase_uses_commit_time_direct_allocator() {
+        let (_directory, dataset) = write_v2_3_merge_dataset().await;
+        let source = record_batch!(
+            ("id", Int32, [1, 6]),
+            ("value", Int32, [2011, 2016]),
+            ("stable", Int32, [101, 106])
+        )
+        .unwrap();
+        let mut uncommitted =
+            MergeInsertBuilder::try_new(Arc::new(dataset.clone()), vec!["id".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .try_build()
+                .unwrap()
+                .execute_uncommitted(RecordBatchIterator::new(
+                    [Ok(source.clone())],
+                    source.schema(),
+                ))
+                .await
+                .unwrap();
+        let source_digest = uncommitted
+            .transaction
+            .row_address_layout_delta
+            .as_ref()
+            .unwrap()
+            .placements[0]
+            .output_row_sequence_fingerprint
+            .clone();
+
+        let appended = record_batch!(
+            ("id", Int32, [100]),
+            ("value", Int32, [1100]),
+            ("stable", Int32, [1100])
+        )
+        .unwrap();
+        let appended_dataset = InsertBuilder::new(Arc::new(dataset))
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            })
+            .execute(vec![appended])
+            .await
+            .unwrap();
+        let appended_max_logical = appended_dataset.manifest.max_logical_fragment_id.unwrap();
+        let appended_row_id = v2_3_row_ids_by_id(&appended_dataset).await[&100];
+
+        uncommitted
+            .transaction
+            .rebase_row_address_layout_delta(&appended_dataset.manifest)
+            .unwrap();
+        let rebased_delta = uncommitted
+            .transaction
+            .row_address_layout_delta
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            rebased_delta.expected_layout_fingerprint,
+            appended_dataset
+                .manifest
+                .row_address_layout
+                .as_ref()
+                .unwrap()
+                .fingerprint
+        );
+        assert_eq!(
+            rebased_delta.placements[0].output_row_sequence_fingerprint,
+            source_digest
+        );
+
+        let committed = CommitBuilder::new(Arc::new(appended_dataset))
+            .execute(uncommitted.transaction)
+            .await
+            .unwrap();
+        let row_ids = v2_3_row_ids_by_id(&committed).await;
+        assert_eq!(row_ids[&100], appended_row_id);
+        let inserted_domain = (row_ids[&6] >> 32) as u32;
+        assert!(inserted_domain > appended_max_logical);
     }
 
     // An update-style merge_insert leaves the source and new fragments with

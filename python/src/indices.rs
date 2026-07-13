@@ -10,10 +10,9 @@ use arrow_array::{Array, FixedSizeListArray};
 use arrow_data::ArrayData;
 use chrono::{DateTime, Utc};
 use lance::dataset::Dataset as LanceDataset;
-use lance::index::DatasetIndexExt;
-use lance::index::IndexSegment;
 use lance::index::vector::ivf::builder::write_vector_storage;
 use lance::index::vector::pq::build_pq_model_in_fragments;
+use lance::index::{DatasetIndexExt, IndexSegment};
 use lance::io::ObjectStore;
 use lance_index::progress::NoopIndexBuildProgress;
 use lance_index::vector::ivf::shuffler::{IvfShuffler, shuffle_vectors};
@@ -22,7 +21,6 @@ use lance_index::vector::{
     pq::{PQBuildParams, ProductQuantizer},
 };
 use lance_linalg::distance::DistanceType;
-use lance_table::format::{IndexMetadata, list_index_files_with_sizes};
 use pyo3::Bound;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -82,7 +80,10 @@ impl PyIndexSegment {
 
     #[getter]
     fn fragment_ids(&self) -> HashSet<u32> {
-        self.inner.fragment_bitmap().iter().collect()
+        self.inner
+            .fragment_bitmap()
+            .map(|bitmap| bitmap.iter().collect())
+            .unwrap_or_default()
     }
 
     #[getter]
@@ -520,39 +521,32 @@ async fn do_load_shuffled_vectors(
     .infer_error()?;
 
     let mut ds = dataset.ds.as_ref().clone();
-    let index_dir = ds.indices_dir().clone().join(index_id.to_string());
-    let object_store = ds.object_store(None).await.infer_error()?;
-    let files = list_index_files_with_sizes(object_store.as_ref(), &index_dir)
-        .await
-        .infer_error()?;
-    let metadata = IndexMetadata {
-        uuid: index_id,
-        name: index_name.to_string(),
-        fields: vec![ds.schema().field(column).unwrap().id],
-        dataset_version: ds.manifest.version,
-        fragment_bitmap: Some(ds.fragments().iter().map(|f| f.id as u32).collect()),
-        index_details: Some(Arc::new(
-            prost_types::Any::from_msg(&lance_index::pb::VectorIndexDetails::default()).unwrap(),
-        )),
-        index_version: IndexType::IvfPq.version(),
-        created_at: Some(Utc::now()),
-        base_id: None,
-        files: Some(files),
-    };
-    let segment = IndexSegment::new(
-        metadata.uuid,
-        metadata
-            .fragment_bitmap
-            .as_ref()
-            .expect("vector metadata should include fragment coverage")
-            .iter(),
-        metadata
-            .index_details
-            .as_ref()
-            .expect("vector metadata should include index details")
-            .clone(),
-        metadata.index_version,
+    let field_id = ds
+        .schema()
+        .field(column)
+        .ok_or_else(|| PyValueError::new_err(format!("Column {column:?} does not exist")))?
+        .id;
+    let fragments = ds
+        .fragments()
+        .iter()
+        .map(|fragment| fragment.id as u32)
+        .collect::<roaring::RoaringBitmap>();
+    let details = Arc::new(
+        prost_types::Any::from_msg(&lance_index::pb::VectorIndexDetails::default()).unwrap(),
     );
+    let segment = if ds.manifest.uses_stable_logical_row_addresses() {
+        let coverage = lance::index::build_logical_index_coverage(&ds, &[field_id], &fragments)
+            .await
+            .infer_error()?;
+        IndexSegment::new_logical(index_id, coverage, details, IndexType::IvfPq.version())
+    } else {
+        IndexSegment::new(
+            index_id,
+            fragments.iter(),
+            details,
+            IndexType::IvfPq.version(),
+        )
+    };
     ds.commit_existing_index_segments(index_name, column, vec![segment])
         .await
         .infer_error()?;

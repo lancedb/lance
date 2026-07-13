@@ -2818,6 +2818,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            row_reference_domain: None,
+            logical_coverage: None,
         };
         let prefilter = Arc::new(DatasetPreFilter::new(dataset, &[index], None));
         prefilter.wait_for_ready().await.unwrap();

@@ -27,7 +27,8 @@ use lance::dataset::{InsertBuilder, NewColumnTransform, WriteParams};
 use lance_core::datatypes::BlobHandling;
 use lance_io::utils::CachedFileSize;
 use lance_table::format::{
-    DataFile, DeletionFile, DeletionFileType, Fragment, RowDatasetVersionMeta, RowIdMeta,
+    DataFile, DeletionFile, DeletionFileType, Fragment, NativeLogicalDomain, RowDatasetVersionMeta,
+    RowIdMeta,
 };
 use lance_table::io::deletion::deletion_file_path;
 use object_store::path::Path;
@@ -816,6 +817,22 @@ impl FromPyObject<'_, '_> for PyLance<Fragment> {
         let created_at_version_meta: Option<PyRef<PyRowDatasetVersionMeta>> =
             ob.getattr("created_at_version_meta")?.extract()?;
         let created_at_version_meta = created_at_version_meta.map(|r| r.0.clone());
+        let native_logical_domain = ob.getattr("native_logical_domain")?;
+        let native_logical_domain = if native_logical_domain.is_none() {
+            None
+        } else {
+            Some(
+                NativeLogicalDomain::new(
+                    native_logical_domain
+                        .getattr("logical_fragment_id")?
+                        .extract()?,
+                    native_logical_domain
+                        .getattr("creation_version")?
+                        .extract()?,
+                )
+                .infer_error()?,
+            )
+        };
 
         Ok(Self(Fragment {
             id: ob.getattr("id")?.extract()?,
@@ -825,6 +842,7 @@ impl FromPyObject<'_, '_> for PyLance<Fragment> {
             row_id_meta,
             last_updated_at_version_meta,
             created_at_version_meta,
+            native_logical_domain,
         }))
     }
 }
@@ -857,6 +875,14 @@ impl<'py> IntoPyObject<'py> for PyLance<&Fragment> {
             .created_at_version_meta
             .as_ref()
             .map(|r| PyRowDatasetVersionMeta(r.clone()));
+        let native_logical_domain = match self.0.native_logical_domain {
+            Some(domain) => py
+                .import(intern!(py, "lance.fragment"))?
+                .getattr("NativeLogicalDomain")?
+                .call1((domain.logical_fragment_id, domain.creation_version))?
+                .into_any(),
+            None => py.None().into_bound(py),
+        };
 
         cls.call1((
             self.0.id,
@@ -866,6 +892,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Fragment> {
             row_id_meta,
             created_at_version_meta,
             last_updated_at_version_meta,
+            native_logical_domain,
         ))
     }
 }

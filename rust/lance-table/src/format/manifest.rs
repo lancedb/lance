@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 use std::sync::Arc;
 
-use super::Fragment;
+use super::{Fragment, RowAddressLayout};
 use crate::feature_flags::{FLAG_STABLE_ROW_IDS, has_deprecated_v2_feature_flag};
 use crate::format::fragment::DataFileFieldInterner;
 use crate::format::pb;
@@ -72,6 +72,12 @@ pub struct Manifest {
     /// The max fragment id used so far
     /// None means never set, Some(0) means max ID used so far is 0
     pub max_fragment_id: Option<u32>,
+
+    /// Stable logical row-address routing for storage version 2.3.
+    pub row_address_layout: Option<Arc<RowAddressLayout>>,
+
+    /// The highest logical fragment id allocated in this dataset history.
+    pub max_logical_fragment_id: Option<u32>,
 
     /// The path to the transaction file, relative to the root of the dataset
     pub transaction_file: Option<String>,
@@ -188,6 +194,8 @@ impl Manifest {
             reader_feature_flags: 0,
             writer_feature_flags: 0,
             max_fragment_id: None,
+            row_address_layout: None,
+            max_logical_fragment_id: None,
             transaction_file: None,
             transaction_section: None,
             fragment_offsets,
@@ -219,6 +227,8 @@ impl Manifest {
             reader_feature_flags: 0, // These will be set on commit
             writer_feature_flags: 0, // These will be set on commit
             max_fragment_id: previous.max_fragment_id,
+            row_address_layout: previous.row_address_layout.clone(),
+            max_logical_fragment_id: previous.max_logical_fragment_id,
             transaction_file: None,
             transaction_section: None,
             fragment_offsets,
@@ -262,6 +272,21 @@ impl Manifest {
                 cloned_fragment
             })
             .collect::<Vec<_>>();
+        let row_address_layout = self.row_address_layout.as_ref().map(|layout| {
+            let mut layout = layout.as_ref().clone();
+            for placement in &mut layout.placements {
+                if let crate::format::RowAddressPlacement::ExplicitMap(explicit) = placement
+                    && explicit.base_id.is_none()
+                {
+                    explicit.base_id = Some(ref_base_id);
+                }
+            }
+            layout.refresh_fingerprint_with_fragments(
+                &cloned_fragments,
+                self.max_logical_fragment_id,
+            );
+            Arc::new(layout)
+        });
 
         Self {
             schema: self.schema.clone(),
@@ -276,6 +301,8 @@ impl Manifest {
             reader_feature_flags: 0, // These will be set on commit
             writer_feature_flags: 0, // These will be set on commit
             max_fragment_id: self.max_fragment_id,
+            row_address_layout,
+            max_logical_fragment_id: self.max_logical_fragment_id,
             transaction_file: Some(transaction_file),
             transaction_section: None,
             fragment_offsets: self.fragment_offsets.clone(),
@@ -489,9 +516,115 @@ impl Manifest {
         fragments
     }
 
-    /// Whether the dataset uses stable row ids.
-    pub fn uses_stable_row_ids(&self) -> bool {
+    /// Whether the dataset uses the legacy stable-row-id sidecar representation.
+    pub fn uses_legacy_stable_row_ids(&self) -> bool {
         self.reader_feature_flags & FLAG_STABLE_ROW_IDS != 0
+    }
+
+    /// Whether the dataset uses the legacy stable-row-id sidecar representation.
+    ///
+    /// Storage version 2.3 callers must use
+    /// [`Self::uses_stable_logical_row_addresses`] instead of entering legacy
+    /// row-id sequence and reverse-index paths.
+    pub fn uses_stable_row_ids(&self) -> bool {
+        self.uses_legacy_stable_row_ids()
+    }
+
+    /// Whether row identity is stable under the storage version's native contract.
+    pub fn has_stable_row_identity(&self) -> bool {
+        self.uses_legacy_stable_row_ids() || self.uses_stable_logical_row_addresses()
+    }
+
+    /// Whether this manifest uses the storage-version-2.3 logical row-address contract.
+    pub fn uses_stable_logical_row_addresses(&self) -> bool {
+        self.data_storage_format.version == LanceFileVersion::V2_3.to_string()
+    }
+
+    /// Refresh the manifest-closure fingerprint after fragments or logical allocator
+    /// state change.
+    pub fn refresh_row_address_fingerprint(&mut self) -> Result<()> {
+        let layout = self.row_address_layout.as_mut().ok_or_else(|| {
+            Error::invalid_input("storage-version-2.3 manifest is missing RowAddressLayout")
+        })?;
+        Arc::make_mut(layout)
+            .refresh_fingerprint_with_fragments(&self.fragments, self.max_logical_fragment_id);
+        Ok(())
+    }
+
+    /// Validate the storage-version-specific row-address contract.
+    pub fn validate_row_address_contract(&self) -> Result<()> {
+        let storage_version = self.data_storage_format.lance_file_version()?;
+        if storage_version == LanceFileVersion::V2_3 {
+            if self.reader_feature_flags & FLAG_STABLE_ROW_IDS != 0
+                || self.writer_feature_flags & FLAG_STABLE_ROW_IDS != 0
+            {
+                return Err(Error::invalid_input(
+                    "storage version 2.3 must not set the legacy stable-row-id feature flag",
+                ));
+            }
+            if self
+                .fragments
+                .iter()
+                .any(|fragment| fragment.row_id_meta.is_some())
+            {
+                return Err(Error::invalid_input(
+                    "storage version 2.3 must not contain legacy fragment row_id_meta",
+                ));
+            }
+            let layout = self.row_address_layout.as_ref().ok_or_else(|| {
+                Error::invalid_input(
+                    "storage version 2.3 requires RowAddressLayout, including for an empty dataset",
+                )
+            })?;
+            if self.max_logical_fragment_id == Some(u32::MAX) {
+                return Err(Error::invalid_input(
+                    "max_logical_fragment_id uses the reserved logical fragment id",
+                ));
+            }
+            if let Some(current_maximum) = layout.max_current_logical_fragment_id(&self.fragments) {
+                let high_watermark = self.max_logical_fragment_id.ok_or_else(|| {
+                    Error::invalid_input(
+                        "storage version 2.3 has logical domains but no max_logical_fragment_id",
+                    )
+                })?;
+                if high_watermark < current_maximum {
+                    return Err(Error::invalid_input(format!(
+                        "max_logical_fragment_id {} is below current logical fragment id {}",
+                        high_watermark, current_maximum
+                    )));
+                }
+            }
+            for placement in &layout.placements {
+                let crate::format::RowAddressPlacement::ExplicitMap(explicit) = placement else {
+                    continue;
+                };
+                if let Some(base_id) = explicit.base_id {
+                    let base = self.base_paths.get(&base_id).ok_or_else(|| {
+                        Error::invalid_input(format!(
+                            "ExplicitMap base_id {base_id} is missing from manifest.base_paths"
+                        ))
+                    })?;
+                    if !base.is_dataset_root {
+                        return Err(Error::invalid_input(format!(
+                            "ExplicitMap base_id {base_id} must reference a dataset root"
+                        )));
+                    }
+                }
+            }
+            layout.validate_schema_fields(&self.schema.field_ids())?;
+            layout.validate_with_fragments(&self.fragments, self.max_logical_fragment_id)?;
+        } else if self.row_address_layout.is_some()
+            || self.max_logical_fragment_id.is_some()
+            || self
+                .fragments
+                .iter()
+                .any(|fragment| fragment.native_logical_domain.is_some())
+        {
+            return Err(Error::invalid_input(
+                "storage versions 2.2 and earlier must not contain 2.3 row-address metadata",
+            ));
+        }
+        Ok(())
     }
 
     /// Creates a serialized copy of the manifest, suitable for IPC or temp storage
@@ -877,12 +1010,6 @@ impl TryFrom<pb::Manifest> for Manifest {
             metadata: p.schema_metadata,
         };
 
-        if FLAG_STABLE_ROW_IDS & p.reader_feature_flags != 0
-            && !fragments.iter().all(|frag| frag.row_id_meta.is_some())
-        {
-            return Err(Error::internal("All fragments must have row ids"));
-        }
-
         let data_storage_format = match p.data_format {
             None => {
                 if let Some(inferred_version) = Fragment::try_infer_version(fragments.as_ref())? {
@@ -901,8 +1028,13 @@ impl TryFrom<pb::Manifest> for Manifest {
         };
 
         let schema = Schema::from(fields_with_meta);
+        let row_address_layout = p
+            .row_address_layout
+            .map(RowAddressLayout::try_from)
+            .transpose()?
+            .map(Arc::new);
 
-        Ok(Self {
+        let manifest = Self {
             schema,
             version: p.version,
             branch: p.branch,
@@ -914,6 +1046,8 @@ impl TryFrom<pb::Manifest> for Manifest {
             reader_feature_flags: p.reader_feature_flags,
             writer_feature_flags: p.writer_feature_flags,
             max_fragment_id: p.max_fragment_id,
+            row_address_layout,
+            max_logical_fragment_id: p.max_logical_fragment_id,
             fragments,
             transaction_file: if p.transaction_file.is_empty() {
                 None
@@ -931,7 +1065,18 @@ impl TryFrom<pb::Manifest> for Manifest {
                 .iter()
                 .map(|item| (item.id, item.clone().into()))
                 .collect(),
-        })
+        };
+        if manifest.data_storage_format.lance_file_version()? != LanceFileVersion::V2_3
+            && FLAG_STABLE_ROW_IDS & manifest.reader_feature_flags != 0
+            && !manifest
+                .fragments
+                .iter()
+                .all(|frag| frag.row_id_meta.is_some())
+        {
+            return Err(Error::internal("All fragments must have row ids"));
+        }
+        manifest.validate_row_address_contract()?;
+        Ok(manifest)
     }
 }
 
@@ -976,6 +1121,8 @@ impl From<&Manifest> for pb::Manifest {
             reader_feature_flags: m.reader_feature_flags,
             writer_feature_flags: m.writer_feature_flags,
             max_fragment_id: m.max_fragment_id,
+            row_address_layout: m.row_address_layout.as_deref().map(Into::into),
+            max_logical_fragment_id: m.max_logical_fragment_id,
             transaction_file: m.transaction_file.clone().unwrap_or_default(),
             next_row_id: m.next_row_id,
             data_format: Some(pb::manifest::DataStorageFormat {
@@ -1320,6 +1467,7 @@ mod tests {
                 row_id_meta: None,
                 physical_rows: None,
                 created_at_version_meta: None,
+                native_logical_domain: None,
                 last_updated_at_version_meta: None,
             },
             Fragment {
@@ -1332,6 +1480,7 @@ mod tests {
                 row_id_meta: None,
                 physical_rows: None,
                 created_at_version_meta: None,
+                native_logical_domain: None,
                 last_updated_at_version_meta: None,
             },
         ];

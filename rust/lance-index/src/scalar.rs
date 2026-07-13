@@ -209,6 +209,15 @@ pub trait IndexReader: Send + Sync {
             "global buffers are not supported by this index reader",
         ))
     }
+    /// Return the immutable byte range for a global buffer when exposed by the
+    /// underlying file footer without additional I/O.
+    fn global_buffer_range(&self, _index: u32) -> Option<std::ops::Range<u64>> {
+        None
+    }
+    /// Bytes retained from footer-prefetched global buffers.
+    fn retained_global_buffer_bytes(&self) -> usize {
+        0
+    }
     /// Read the range of rows from the file.
     /// If projection is Some, only return the columns in the projection,
     /// nested columns like Some(&["x.y"]) are not supported.

@@ -91,6 +91,29 @@ impl fmt::Display for FieldNotFoundError {
 
 impl std::error::Error for FieldNotFoundError {}
 
+/// A structural file-format limit was exceeded before a value could be encoded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FormatCapacityExceeded {
+    message: String,
+}
+
+impl FormatCapacityExceeded {
+    /// Create a structural capacity error with a precise limit description.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for FormatCapacityExceeded {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "FormatCapacityExceeded: {}", self.message)
+    }
+}
+
+impl std::error::Error for FormatCapacityExceeded {}
+
 /// Allocates error on the heap and then places `e` into it.
 #[inline]
 pub fn box_error(e: impl std::error::Error + Send + Sync + 'static) -> BoxedError {
@@ -448,6 +471,12 @@ impl Error {
     #[track_caller]
     pub fn invalid_input_source(source: BoxedError) -> Self {
         InvalidInputSnafu.into_error(source)
+    }
+
+    /// Report that a value cannot be represented by the current file format.
+    #[track_caller]
+    pub fn format_capacity_exceeded(message: impl Into<String>) -> Self {
+        Self::invalid_input_source(box_error(FormatCapacityExceeded::new(message)))
     }
 
     #[track_caller]

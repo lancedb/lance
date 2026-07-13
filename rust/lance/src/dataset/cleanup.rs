@@ -34,6 +34,8 @@
 //! happening at the same time)
 
 use super::refs::TagContents;
+use super::shallow_clone_lease::{ActiveShallowClonePins, active_shallow_clone_pins};
+use super::transaction::generation_region_can_retire;
 use crate::dataset::TRANSACTIONS_DIR;
 use crate::{Dataset, utils::temporal::utc_now};
 use chrono::{DateTime, TimeDelta, Utc};
@@ -321,6 +323,40 @@ const S3_DELETE_STREAM_BATCH_SIZE: u64 = 1_000;
 const AZURE_DELETE_STREAM_BATCH_SIZE: u64 = 256;
 const DEFAULT_EXPLANATION_MAX_CANDIDATE_FILES: usize = 1_000;
 
+/// Return the first transaction version needed to catch up a current index
+/// shard that still blocks a generation region.
+///
+/// The owner manifest must be retained with each transaction file in the
+/// returned range. A transaction filename contains its source version, which
+/// is not necessarily the committed version after a concurrent append, so a
+/// later cleanup cannot reconstruct the range from filenames alone.
+fn generation_blocked_transaction_start(
+    manifest: &Manifest,
+    indices: &[IndexMetadata],
+    manifest_path: &Path,
+) -> Result<Option<u64>> {
+    if !manifest.uses_stable_logical_row_addresses() {
+        return Ok(None);
+    }
+    let layout = manifest.row_address_layout.as_ref().ok_or_else(|| {
+        Error::corrupt_file(
+            manifest_path.clone(),
+            "storage-version-2.3 manifest is missing RowAddressLayout during cleanup",
+        )
+    })?;
+    let mut first_blocked = None;
+    for region in &layout.generation_regions {
+        if !generation_region_can_retire(region, indices)? {
+            first_blocked = Some(
+                first_blocked
+                    .map(|generation: u64| generation.min(region.generation))
+                    .unwrap_or(region.generation),
+            );
+        }
+    }
+    Ok(first_blocked)
+}
+
 /// Builder-style cleanup operation.
 ///
 /// Call [`Self::explain`] for a read-only explanation of what cleanup would
@@ -467,7 +503,34 @@ impl<'a> CleanupTask<'a> {
             .map(|tag_content| tag_content.version)
             .collect();
 
-        let mut inspection = self.process_manifests(&tagged_versions).await?;
+        let shallow_clone_pins = if self.dataset.manifest.uses_stable_logical_row_addresses() {
+            let root = self.dataset.refs.root()?.path;
+            let source_namespace_uuid = self
+                .dataset
+                .manifest
+                .row_address_layout
+                .as_ref()
+                .ok_or_else(|| {
+                    Error::internal(
+                        "storage-version-2.3 manifest is missing RowAddressLayout during cleanup",
+                    )
+                })?
+                .namespace_uuid;
+            active_shallow_clone_pins(
+                self.dataset.object_store.as_ref(),
+                &root,
+                source_namespace_uuid,
+                self.dataset.manifest.branch.as_deref(),
+                self.action.deletes_files(),
+            )
+            .await?
+        } else {
+            ActiveShallowClonePins::default()
+        };
+
+        let mut inspection = self
+            .process_manifests(&tagged_versions, &shallow_clone_pins)
+            .await?;
 
         if self.policy.error_if_tagged_old_versions && !inspection.tagged_old_versions.is_empty() {
             return Err(tagged_old_versions_cleanup_error(
@@ -498,14 +561,53 @@ impl<'a> CleanupTask<'a> {
     async fn process_manifests(
         &'a self,
         tagged_versions: &HashSet<u64>,
+        shallow_clone_pins: &ActiveShallowClonePins,
     ) -> Result<CleanupInspection> {
         let inspection = Mutex::new(CleanupInspection::default());
+        let current_indexes = read_manifest_indexes(
+            &self.dataset.object_store,
+            &self.dataset.manifest_location,
+            &self.dataset.manifest,
+        )
+        .await?;
+        let generation_blocked_transaction_start = generation_blocked_transaction_start(
+            &self.dataset.manifest,
+            &current_indexes,
+            &self.dataset.manifest_location.path,
+        )?;
+
+        // Process the already-open current manifest directly. Besides avoiding a
+        // duplicate manifest read, this freezes the generation pin against the
+        // snapshot that the cleanup operation was created from.
+        {
+            let mut inspection = inspection.lock().unwrap();
+            self.process_manifest(
+                &self.dataset.manifest,
+                &current_indexes,
+                true,
+                &mut inspection,
+            )?;
+            inspection.earliest_retained_manifest_time = Some(self.dataset.manifest.timestamp());
+        }
+
+        let current_manifest_path = &self.dataset.manifest_location.path;
         self.dataset
             .commit_handler
             .list_manifest_locations(&self.dataset.base, &self.dataset.object_store, false)
-            .try_filter(|location| future::ready(!self.ignored_manifests.contains(&location.path)))
+            .try_filter(|location| {
+                future::ready(
+                    location.path != *current_manifest_path
+                        && !self.ignored_manifests.contains(&location.path),
+                )
+            })
             .try_for_each_concurrent(self.dataset.object_store.io_parallelism(), |location| {
-                self.process_manifest_file(location, &inspection, tagged_versions)
+                self.process_manifest_file(
+                    location,
+                    &inspection,
+                    tagged_versions,
+                    shallow_clone_pins,
+                    generation_blocked_transaction_start,
+                )
             })
             .await?;
         Ok(inspection.into_inner().unwrap())
@@ -516,6 +618,8 @@ impl<'a> CleanupTask<'a> {
         location: ManifestLocation,
         inspection: &Mutex<CleanupInspection>,
         tagged_versions: &HashSet<u64>,
+        shallow_clone_pins: &ActiveShallowClonePins,
+        generation_blocked_transaction_start: Option<u64>,
     ) -> Result<()> {
         // TODO: We can't cleanup invalid manifests.  There is no way to distinguish
         // between an invalid manifest and a temporary I/O error.  It's also not safe
@@ -530,7 +634,15 @@ impl<'a> CleanupTask<'a> {
         // version.  These are either in-progress or newly added since we started.
         let is_latest = self.read_version <= manifest.version;
         let is_tagged = tagged_versions.contains(&manifest.version);
-        let in_working_set = is_latest || !self.policy.should_clean(&manifest) || is_tagged;
+        let is_shallow_clone_pinned = shallow_clone_pins.contains(manifest.version);
+        let is_generation_pinned = generation_blocked_transaction_start.is_some_and(|start| {
+            manifest.version >= start && manifest.version <= self.read_version
+        });
+        let in_working_set = is_latest
+            || !self.policy.should_clean(&manifest)
+            || is_tagged
+            || is_shallow_clone_pinned
+            || is_generation_pinned;
         let indexes =
             read_manifest_indexes(&self.dataset.object_store, &location, &manifest).await?;
 
@@ -588,6 +700,25 @@ impl<'a> CleanupTask<'a> {
             if let Some(delpath) = delpath {
                 let relative_path = remove_prefix(&delpath, &self.dataset.base);
                 referenced_files.delete_paths.insert(relative_path);
+            }
+        }
+        if let Some(layout) = manifest.row_address_layout.as_ref() {
+            for placement in &layout.placements {
+                let lance_table::format::RowAddressPlacement::ExplicitMap(explicit) = placement
+                else {
+                    continue;
+                };
+                if explicit.base_id.is_some() {
+                    continue;
+                }
+                referenced_files
+                    .data_paths
+                    .insert(Path::parse(&explicit.object_path)?);
+                for destination in &explicit.destinations {
+                    referenced_files
+                        .data_paths
+                        .insert(Path::parse(&destination.row_id_file_path)?);
+                }
             }
         }
         if let Some(relative_tx_path) = &manifest.transaction_file {
@@ -1189,6 +1320,35 @@ impl<'a> CleanupTask<'a> {
                 }
             }
         }
+        if let Some(layout) = manifest.row_address_layout.as_ref() {
+            for placement in &layout.placements {
+                let lance_table::format::RowAddressPlacement::ExplicitMap(explicit) = placement
+                else {
+                    continue;
+                };
+                let Some(base_id) = explicit.base_id else {
+                    continue;
+                };
+                let Some(base_path) = manifest.base_paths.get(&base_id) else {
+                    continue;
+                };
+                if base_path.path != self.dataset.uri {
+                    continue;
+                }
+                let paths = std::iter::once(explicit.object_path.as_str()).chain(
+                    explicit
+                        .destinations
+                        .iter()
+                        .map(|destination| destination.row_id_file_path.as_str()),
+                );
+                for path in paths {
+                    let path = Path::parse(path)?;
+                    inspection.verified_files.data_paths.remove(&path);
+                    inspection.referenced_files.data_paths.insert(path);
+                }
+                is_referenced = true;
+            }
+        }
         if is_referenced {
             inspection
                 .old_manifests
@@ -1538,7 +1698,10 @@ mod tests {
     use crate::index::DatasetIndexExt;
     use crate::{
         dataset::transaction::{Operation, Transaction},
-        dataset::{AutoCleanupParams, ReadParams, WriteMode, WriteParams, builder::DatasetBuilder},
+        dataset::{
+            AutoCleanupParams, ReadParams, UpdateBuilder, WriteMode, WriteParams,
+            builder::DatasetBuilder,
+        },
         index::vector::VectorIndexParams,
     };
     use all_asserts::{assert_gt, assert_lt};
@@ -1550,7 +1713,10 @@ mod tests {
     use datafusion::common::assert_contains;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_core::utils::testing::{ProxyObjectStore, ProxyObjectStorePolicy};
-    use lance_index::IndexType;
+    use lance_index::{
+        IndexType,
+        scalar::{BuiltinIndexType, ScalarIndexParams},
+    };
     use lance_io::object_store::{
         ObjectStore, ObjectStoreParams, ObjectStoreRegistry, WrappingObjectStore,
     };
@@ -1967,6 +2133,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            row_reference_domain: None,
+            logical_coverage: None,
         }
     }
 
@@ -2030,6 +2198,123 @@ mod tests {
         assert_gt!(after_count.num_data_files, 0);
         // We should keep referenced tx files
         assert_gt!(after_count.num_tx_files, 0);
+    }
+
+    #[tokio::test]
+    async fn cleanup_pins_generation_blocked_manifest_transaction_closure() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        let mut generator =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("value".to_owned())));
+        Dataset::write(
+            generator.batch(32),
+            &fixture.dataset_path,
+            Some(WriteParams {
+                store_params: Some(fixture.os_params()),
+                commit_handler: Some(Arc::new(RenameCommitHandler)),
+                data_storage_version: Some(lance_file::version::LanceFileVersion::V2_3),
+                max_rows_per_file: 32,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let mut dataset = fixture.open().await.unwrap();
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        dataset
+            .create_index(
+                &["value"],
+                IndexType::BTree,
+                Some("value_idx".to_owned()),
+                &params,
+                false,
+            )
+            .await
+            .unwrap();
+
+        let update = UpdateBuilder::new(Arc::new(*dataset))
+            .update_where("value = 0")
+            .unwrap()
+            .set("value", "100")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        let blocked_generation = update.new_dataset.version().version;
+        assert_eq!(blocked_generation, 3);
+
+        // Advance the head without catching up the index, making the update
+        // transaction and its owner manifest old enough to be collected.
+        fixture.append_data(generator.batch(4)).await.unwrap();
+        let dataset = fixture.open().await.unwrap();
+        assert_eq!(dataset.version().version, 4);
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(
+            generation_blocked_transaction_start(
+                &dataset.manifest,
+                &indices,
+                &dataset.manifest_location.path,
+            )
+            .unwrap(),
+            Some(blocked_generation)
+        );
+
+        let policy = CleanupPolicyBuilder::default()
+            .before_timestamp(utc_now() + TimeDelta::try_seconds(1).unwrap())
+            .delete_unverified(true)
+            .build();
+        let before_cleanup = fixture.count_files().await.unwrap();
+        assert_eq!(before_cleanup.num_manifest_files, 4);
+        assert_eq!(before_cleanup.num_tx_files, 4);
+
+        let first_cleanup = fixture
+            .run_cleanup_with_policy(policy.clone())
+            .await
+            .unwrap();
+        let after_first_cleanup = fixture.count_files().await.unwrap();
+        assert_eq!(first_cleanup.old_versions, 2);
+        assert_eq!(first_cleanup.transaction_files_removed, 2);
+        assert_eq!(after_first_cleanup.num_manifest_files, 2);
+        assert_eq!(after_first_cleanup.num_tx_files, 2);
+
+        // Re-running cleanup must retain the same closure. The transaction
+        // filename alone cannot reconstruct its committed version after the
+        // owner manifest has been removed.
+        let second_cleanup = fixture
+            .run_cleanup_with_policy(policy.clone())
+            .await
+            .unwrap();
+        assert_eq!(second_cleanup, RemovalStats::default());
+        assert_eq!(fixture.count_files().await.unwrap(), after_first_cleanup);
+
+        let mut dataset = fixture.open().await.unwrap();
+        dataset.drop_index("value_idx").await.unwrap();
+        assert!(
+            dataset
+                .manifest
+                .row_address_layout
+                .as_ref()
+                .unwrap()
+                .generation_regions
+                .is_empty()
+        );
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(
+            generation_blocked_transaction_start(
+                &dataset.manifest,
+                &indices,
+                &dataset.manifest_location.path,
+            )
+            .unwrap(),
+            None
+        );
+
+        fixture.run_cleanup_with_policy(policy).await.unwrap();
+        let after_unblock_cleanup = fixture.count_files().await.unwrap();
+        assert_eq!(after_unblock_cleanup.num_manifest_files, 1);
+        assert_eq!(after_unblock_cleanup.num_tx_files, 1);
     }
 
     #[tokio::test]

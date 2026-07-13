@@ -1,0 +1,101 @@
+{
+  "schema_version": 1,
+  "name": "stable_row_address_physical_maintenance",
+  "trigger": {
+    "semantics": "any",
+    "evaluation_boundary": "after_each_successful_commit",
+    "conditions": [
+      {
+        "metric": "live_byte_ratio",
+        "operator": "lt",
+        "threshold": 0.8,
+        "definition": "live_data_bytes / physical_data_bytes"
+      },
+      {
+        "metric": "physical_fragment_count_ratio",
+        "operator": "gt",
+        "threshold": 1.25,
+        "definition": "physical_fragment_count / max(1, ceil(live_data_bytes / target_file_size_bytes))"
+      },
+      {
+        "metric": "scan_byte_amplification",
+        "operator": "gt",
+        "threshold": 1.02,
+        "definition": "physical_scan_data_bytes / max(1, live_scan_data_bytes)"
+      }
+    ]
+  },
+  "fragment_order": {
+    "scope": "current_live_physical_fragments",
+    "keys": [
+      {
+        "field": "base_id_or_dataset_root",
+        "direction": "ascending",
+        "nulls": "first"
+      },
+      {
+        "field": "fragment_id",
+        "direction": "ascending",
+        "nulls": "forbidden"
+      }
+    ],
+    "tie_breaker": {
+      "field": "first_data_file_path_utf8_bytes",
+      "direction": "ascending"
+    },
+    "ambiguous_order": "fail"
+  },
+  "reclaim": {
+    "deleted_rows": "materialize_only_live_rows",
+    "unreferenced_objects": "eligible_after_committed_manifest_visibility",
+    "high_entropy_delete_action": "repack"
+  },
+  "target_topology": {
+    "grouping": "single_contiguous_current_fragment_order",
+    "target_file_size_bytes": 134217728,
+    "max_source_fragments_per_group": 1000000,
+    "output_count": "target_rows=max(1,floor(target_file_size_bytes*group_live_rows/group_live_bytes)); max(1,ceil(group_live_rows/target_rows))",
+    "last_output": "may_be_underfilled",
+    "row_order": "format_native_identity_preserving_order",
+    "allow_cross_logical_fragment_pack": true,
+    "allow_arbitrary_row_reorder": false
+  },
+  "action": {
+    "v22_no_stable": "compact_files_and_remap_physical_postings",
+    "v22_stable": "compact_files_preserving_stable_postings",
+    "v23_logical": "compact_files_and_normalize_placement",
+    "failure": "abort_maintenance_boundary"
+  },
+  "index_postcondition": {
+    "coverage": "identical_live_logical_rows",
+    "recall": "not_lower_than_pre_maintenance",
+    "v22_no_stable": "physical_postings_remapped_to_target_topology",
+    "v22_stable": "stable_postings_preserved_and_physical_coverage_refreshed",
+    "v23_logical": "logical_postings_preserved_and_physical_coverage_refreshed"
+  },
+  "concurrency": {
+    "maintenance_groups": 1,
+    "writers_per_group": 1
+  },
+  "execution": {
+    "mode": "blocking",
+    "tracks": {
+      "sustained": {
+        "boundary_source": "v22_no_stable_neutral_state",
+        "plan_application": "apply_identical_boundary_plan_to_all_formats",
+        "gate": "paired_release_gate"
+      },
+      "adversarial_natural": {
+        "boundary_source": "each_format_independent_natural_policy",
+        "plan_application": "format_local",
+        "gate": "indexed_net_benefit_gate"
+      },
+      "adversarial_aligned": {
+        "boundary_source": "v23_placement_maintenance_required",
+        "plan_application": "force_same_postcondition_all_formats",
+        "gate": "non_gate_diagnostic"
+      }
+    },
+    "retry": "none"
+  }
+}

@@ -19,20 +19,24 @@
 //! terms of a lock. The trait `CommitLock` can be implemented as a simpler
 //! alternative to [`CommitHandler`].
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::num::NonZero;
 use std::sync::Arc;
 use std::time::Instant;
 
 use conflict_resolver::TransactionRebase;
+use lance_core::utils::address::RowAddress;
 use lance_core::utils::backoff::{Backoff, SlotBackoff};
 use lance_file::version::LanceFileVersion;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_io::utils::CachedFileSize;
 use lance_select::RowAddrTreeMap;
 use lance_table::format::{
-    DETACHED_VERSION_MASK, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, Manifest,
-    WriterVersion, is_detached_version, list_index_files_with_sizes, pb,
+    DETACHED_VERSION_MASK, DataStorageFormat, DeletionFile, Fragment, IndexMetadata,
+    LogicalRowAddressSelection, Manifest, RowAddressFieldChange, RowAddressLayoutDelta,
+    RowAddressPlacementDelta, RowAddressPlacementKind, RowAddressSourceFloor,
+    RowAddressTargetFragment, RowAlignedRewriteProof, WriterVersion, fingerprint_deleted_offsets,
+    is_detached_version, list_index_files_with_sizes, pb,
 };
 use lance_table::io::commit::{
     CommitConfig, CommitError, CommitHandler, ManifestLocation, ManifestNamingScheme,
@@ -43,14 +47,17 @@ use super::ObjectStore;
 use crate::Dataset;
 use crate::dataset::cleanup::auto_cleanup_hook;
 use crate::dataset::fragment::FileFragment;
-use crate::dataset::transaction::{Operation, Transaction};
+use crate::dataset::transaction::{
+    Operation, RowAddressManifestApplyContext, Transaction, data_replacement_successor_fragment,
+    merge_rewritten_existing_field_ids, row_aligned_data_file_identity_eq,
+};
 use crate::dataset::{
     ManifestWriteConfig, NewTransactionResult, TRANSACTIONS_DIR, load_new_transactions,
     write_manifest_file,
 };
-use crate::index::DatasetIndexExt;
 use crate::index::DatasetIndexInternalExt;
 use crate::index::vector::details::infer_missing_vector_details;
+use crate::index::{DatasetIndexExt, validate_index_contract};
 use crate::io::deletion::read_dataset_deletion_file;
 use crate::session::Session;
 use crate::session::caches::DSMetadataCache;
@@ -61,10 +68,11 @@ use lance_core::{Error, Result};
 use lance_index::is_system_index;
 use lance_io::object_store::ObjectStoreRegistry;
 use log;
-#[cfg(test)]
 use object_store::ObjectStoreExt;
 use object_store::path::Path;
 use prost::Message;
+use roaring::{RoaringBitmap, RoaringTreemap};
+use uuid::Uuid;
 
 pub mod conflict_resolver;
 #[cfg(all(feature = "dynamodb_tests", test))]
@@ -76,7 +84,6 @@ pub mod namespace_manifest;
 mod s3_test;
 
 /// Read the transaction data from a transaction file.
-#[cfg(test)]
 pub(crate) async fn read_transaction_file(
     object_store: &ObjectStore,
     base_path: &Path,
@@ -118,23 +125,928 @@ async fn cleanup_transaction_file(
     }
 }
 
+fn transaction_file_name(transaction: &Transaction) -> String {
+    format!("{}-{}.txn", transaction.read_version, transaction.uuid)
+}
+
+fn check_protobuf_capacity(message: &impl Message, section: &str) -> Result<()> {
+    let encoded_len = message.encoded_len();
+    u32::try_from(encoded_len).map_err(|_| {
+        Error::format_capacity_exceeded(format!(
+            "{section} protobuf is {encoded_len} bytes but the Lance framing limit is {} bytes",
+            u32::MAX
+        ))
+    })?;
+    Ok(())
+}
+
+/// Validate every length-delimited protobuf before publishing any commit object.
+///
+/// Section offsets are populated by the manifest writer.  Use their largest
+/// wire representation here so the final manifest cannot cross the format
+/// boundary merely because those offsets were added after preflight.
+fn validate_manifest_write_capacity(
+    manifest: &Manifest,
+    indices: &[IndexMetadata],
+    transaction: &Transaction,
+) -> Result<()> {
+    if !indices.is_empty() {
+        check_protobuf_capacity(
+            &pb::IndexSection {
+                indices: indices.iter().map(Into::into).collect(),
+            },
+            "index section",
+        )?;
+    }
+    check_protobuf_capacity(&pb::Transaction::from(transaction), "transaction section")?;
+
+    let mut projected_manifest = manifest.clone();
+    projected_manifest.index_section = (!indices.is_empty()).then_some(usize::MAX);
+    projected_manifest.transaction_section = Some(usize::MAX);
+    check_protobuf_capacity(&pb::Manifest::from(&projected_manifest), "manifest section")
+}
+
+fn transaction_requires_row_address_context(transaction: &Transaction) -> bool {
+    transaction.row_address_layout_delta.is_some()
+}
+
+async fn load_row_address_deletion_bitmap(
+    dataset: &Dataset,
+    fragment: &Fragment,
+) -> Result<Option<(u32, RoaringBitmap)>> {
+    let Some(deletion_file) = fragment.deletion_file.as_ref() else {
+        return Ok(None);
+    };
+    let fragment_id = u32::try_from(fragment.id).map_err(|_| {
+        Error::invalid_input(format!(
+            "storage-version-2.3 fragment id {} exceeds row-address capacity",
+            fragment.id
+        ))
+    })?;
+    let deletion_vector = read_dataset_deletion_file(dataset, fragment.id, deletion_file).await?;
+    Ok(Some((
+        fragment_id,
+        RoaringBitmap::from(deletion_vector.as_ref()),
+    )))
+}
+
+async fn prepare_row_address_manifest_context(
+    dataset: &Dataset,
+    transaction: &Transaction,
+) -> Result<Option<RowAddressManifestApplyContext>> {
+    if !dataset.manifest.uses_stable_logical_row_addresses()
+        || !transaction_requires_row_address_context(transaction)
+    {
+        return Ok(None);
+    }
+    let delta = transaction
+        .row_address_layout_delta
+        .as_ref()
+        .expect("row-address context predicate requires a delta");
+    let mut current_fragment_ids = HashSet::<u32>::new();
+    let mut pending = Vec::<u64>::with_capacity(4096);
+    for selection in &delta.retired_selections {
+        for logical_address in selection.iter() {
+            pending.push(logical_address?.raw());
+            if pending.len() == 4096 {
+                for physical_address in dataset.resolve_logical_row_ids_async(&pending).await? {
+                    let physical_address = physical_address.ok_or_else(|| {
+                        Error::invalid_input(
+                            "retired logical selection contains an unmapped source address",
+                        )
+                    })?;
+                    current_fragment_ids.insert(physical_address.fragment_id());
+                }
+                pending.clear();
+            }
+        }
+    }
+    if !pending.is_empty() {
+        for physical_address in dataset.resolve_logical_row_ids_async(&pending).await? {
+            let physical_address = physical_address.ok_or_else(|| {
+                Error::invalid_input(
+                    "retired logical selection contains an unmapped source address",
+                )
+            })?;
+            current_fragment_ids.insert(physical_address.fragment_id());
+        }
+    }
+    current_fragment_ids.extend(
+        delta
+            .row_aligned_rewrite_proofs
+            .iter()
+            .map(|proof| proof.physical_fragment_id),
+    );
+
+    let mut context = RowAddressManifestApplyContext {
+        explicit_map_placements: delta.explicit_map_placements.clone(),
+        ..Default::default()
+    };
+    let mut record_fully_deleted_fragment = |fragment_id: u64| -> Result<()> {
+        context
+            .newly_fully_deleted_source_fragments
+            .insert(u32::try_from(fragment_id).map_err(|_| {
+                Error::invalid_input(format!(
+                    "fully deleted fragment id {fragment_id} exceeds row-address capacity"
+                ))
+            })?);
+        Ok(())
+    };
+    match &transaction.operation {
+        Operation::Delete {
+            deleted_fragment_ids,
+            ..
+        } => {
+            for fragment_id in deleted_fragment_ids {
+                record_fully_deleted_fragment(*fragment_id)?;
+            }
+        }
+        Operation::Update {
+            removed_fragment_ids,
+            ..
+        } => {
+            for fragment_id in removed_fragment_ids {
+                record_fully_deleted_fragment(*fragment_id)?;
+            }
+        }
+        Operation::Rewrite { groups, .. } => {
+            // Rewrite removes each source fragment as a physical object.  The
+            // format validator separately rejects treating a reused fragment
+            // ID as fully deleted when it is still present in the successor.
+            for fragment in groups.iter().flat_map(|group| &group.old_fragments) {
+                record_fully_deleted_fragment(fragment.id)?;
+            }
+        }
+        _ => {}
+    }
+    for fragment_id in current_fragment_ids {
+        if context
+            .newly_fully_deleted_source_fragments
+            .contains(&fragment_id)
+        {
+            continue;
+        }
+        let fragment = dataset
+            .manifest
+            .fragments
+            .iter()
+            .find(|fragment| fragment.id == fragment_id as u64)
+            .ok_or_else(|| {
+                Error::internal(format!(
+                    "retired row resolves to missing source fragment {fragment_id}"
+                ))
+            })?;
+        if let Some((fragment_id, bitmap)) =
+            load_row_address_deletion_bitmap(dataset, fragment).await?
+        {
+            context.current_deletion_vectors.insert(fragment_id, bitmap);
+        }
+    }
+
+    let successor_overrides: Vec<(Fragment, bool)> = match &transaction.operation {
+        Operation::Delete {
+            updated_fragments, ..
+        } => updated_fragments
+            .iter()
+            .cloned()
+            .map(|fragment| (fragment, false))
+            .collect(),
+        Operation::Update {
+            updated_fragments,
+            new_fragments,
+            ..
+        } => updated_fragments
+            .iter()
+            .cloned()
+            .map(|fragment| (fragment, false))
+            .chain(
+                new_fragments
+                    .iter()
+                    .cloned()
+                    .map(|fragment| (fragment, true)),
+            )
+            .collect(),
+        Operation::Rewrite { groups, .. } => groups
+            .iter()
+            .flat_map(|group| group.new_fragments.iter().cloned())
+            .map(|fragment| (fragment, true))
+            .collect(),
+        Operation::Merge { fragments, .. } => fragments
+            .iter()
+            .cloned()
+            .map(|fragment| (fragment, false))
+            .collect(),
+        Operation::Overwrite { fragments, .. } | Operation::Append { fragments } => fragments
+            .iter()
+            .cloned()
+            .map(|fragment| (fragment, true))
+            .collect(),
+        _ => Vec::new(),
+    };
+    for (fragment, speculative) in &successor_overrides {
+        if *speculative && fragment.id == 0 {
+            if fragment.deletion_file.is_some() {
+                return Err(Error::invalid_input(
+                    "a speculative storage-version-2.3 fragment cannot carry a deletion file",
+                ));
+            }
+            continue;
+        }
+        if let Some((fragment_id, bitmap)) =
+            load_row_address_deletion_bitmap(dataset, fragment).await?
+        {
+            context
+                .successor_deletion_vectors
+                .insert(fragment_id, bitmap);
+        }
+    }
+    Ok(Some(context))
+}
+
+#[derive(Debug)]
+struct RowAlignedRewriteTarget {
+    current: Fragment,
+    successor: Fragment,
+    field_ids: Vec<i32>,
+    rewritten_files: Vec<lance_table::format::DataFile>,
+}
+
+fn row_aligned_data_file_object_identity_eq(
+    left: &lance_table::format::DataFile,
+    right: &lance_table::format::DataFile,
+) -> bool {
+    left.path == right.path
+        && left.file_major_version == right.file_major_version
+        && left.file_minor_version == right.file_minor_version
+        && left.base_id == right.base_id
+}
+
+fn rewritten_data_files(
+    current: &Fragment,
+    successor: &Fragment,
+) -> Vec<lance_table::format::DataFile> {
+    successor
+        .files
+        .iter()
+        .filter(|successor_file| {
+            !current.files.iter().any(|current_file| {
+                row_aligned_data_file_object_identity_eq(current_file, successor_file)
+            })
+        })
+        .cloned()
+        .collect()
+}
+
+fn collect_row_aligned_rewrite_targets(
+    dataset: &Dataset,
+    transaction: &Transaction,
+) -> Result<Vec<RowAlignedRewriteTarget>> {
+    let current_by_id = dataset
+        .manifest
+        .fragments
+        .iter()
+        .map(|fragment| (fragment.id, fragment))
+        .collect::<HashMap<_, _>>();
+    match &transaction.operation {
+        Operation::DataReplacement { replacements } => {
+            let mut seen = HashSet::new();
+            replacements
+                .iter()
+                .map(|replacement| {
+                    if !seen.insert(replacement.0) {
+                        return Err(Error::invalid_input(format!(
+                            "DataReplacement contains duplicate fragment id {}",
+                            replacement.0
+                        )));
+                    }
+                    let current = current_by_id.get(&replacement.0).ok_or_else(|| {
+                        Error::commit_conflict_source(
+                            dataset.manifest.version,
+                            format!(
+                                "DataReplacement target fragment {} is absent from the current manifest",
+                                replacement.0
+                            )
+                            .into(),
+                        )
+                    })?;
+                    let successor =
+                        data_replacement_successor_fragment(current, &replacement.1)?;
+                    let mut field_ids = replacement
+                        .1
+                        .fields
+                        .iter()
+                        .copied()
+                        .filter(|field_id| {
+                            *field_id >= 0
+                                && dataset.manifest.schema.field_by_id(*field_id).is_some()
+                        })
+                        .collect::<Vec<_>>();
+                    field_ids.sort_unstable();
+                    field_ids.dedup();
+                    let rewritten_files = rewritten_data_files(current, &successor);
+                    Ok(RowAlignedRewriteTarget {
+                        current: (*current).clone(),
+                        successor,
+                        field_ids,
+                        rewritten_files,
+                    })
+                })
+                .collect()
+        }
+        Operation::Merge { fragments, .. } => {
+            let mut seen = HashSet::new();
+            let mut targets = Vec::new();
+            for successor in fragments {
+                if !seen.insert(successor.id) {
+                    return Err(Error::invalid_input(format!(
+                        "Merge contains duplicate fragment id {}",
+                        successor.id
+                    )));
+                }
+                let Some(current) = current_by_id.get(&successor.id) else {
+                    continue;
+                };
+                let field_ids = merge_rewritten_existing_field_ids(
+                    &dataset.manifest.schema,
+                    current,
+                    successor,
+                );
+                let is_physically_rewritten =
+                    current.files.len() != successor.files.len()
+                        || current.files.iter().zip(&successor.files).any(
+                            |(current, successor)| {
+                                !row_aligned_data_file_identity_eq(current, successor)
+                            },
+                        );
+                if is_physically_rewritten {
+                    let rewritten_files = rewritten_data_files(current, successor);
+                    targets.push(RowAlignedRewriteTarget {
+                        current: (*current).clone(),
+                        successor: successor.clone(),
+                        field_ids,
+                        rewritten_files,
+                    });
+                }
+            }
+            Ok(targets)
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+
+fn v2_3_merge_direct_placements(
+    dataset: &Dataset,
+    transaction: &Transaction,
+) -> Result<(Vec<Fragment>, Vec<RowAddressPlacementDelta>)> {
+    let Operation::Merge { fragments, .. } = &transaction.operation else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let current_ids = dataset
+        .manifest
+        .fragments
+        .iter()
+        .map(|fragment| fragment.id)
+        .collect::<HashSet<_>>();
+    let new_fragments = fragments
+        .iter()
+        .filter(|fragment| !current_ids.contains(&fragment.id))
+        .cloned()
+        .collect::<Vec<_>>();
+    let placements = transaction
+        .row_address_layout_delta
+        .as_ref()
+        .map(|delta| delta.placements.clone())
+        .unwrap_or_default();
+    if new_fragments.is_empty() {
+        if !placements.is_empty() {
+            return Err(Error::invalid_input(
+                "generic Merge has Direct provenance but no new physical fragment",
+            ));
+        }
+        return Ok((new_fragments, placements));
+    }
+    let maximum_fragment_id = dataset.manifest.max_fragment_id();
+    for fragment in &new_fragments {
+        if maximum_fragment_id.is_some_and(|maximum| fragment.id <= maximum)
+            || fragment.id >= u32::MAX as u64
+            || fragment.deletion_file.is_some()
+            || fragment.row_id_meta.is_some()
+            || fragment.native_logical_domain.is_some()
+        {
+            return Err(Error::invalid_input(format!(
+                "storage-version-2.3 generic Merge new fragment {} must advance the physical allocator and carry no preassigned row identity or deletion metadata",
+                fragment.id
+            )));
+        }
+    }
+    let mut by_ordinal = vec![None; new_fragments.len()];
+    for placement in &placements {
+        if placement.placement_kind != RowAddressPlacementKind::Direct
+            || !placement.source_selections.is_empty()
+            || !placement.output_row_sequence_fingerprint.is_empty()
+        {
+            return Err(Error::invalid_input(
+                "storage-version-2.3 generic Merge new fragments require source-free Direct provenance",
+            ));
+        }
+        let RowAddressTargetFragment::NewFragmentOrdinal(ordinal) = placement.target.fragment
+        else {
+            return Err(Error::invalid_input(
+                "generic Merge Direct provenance must target a new-fragment ordinal",
+            ));
+        };
+        let fragment = new_fragments.get(ordinal as usize).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "generic Merge Direct provenance references missing new-fragment ordinal {ordinal}"
+            ))
+        })?;
+        let physical_rows = u32::try_from(fragment.physical_rows.ok_or_else(|| {
+            Error::invalid_input(format!(
+                "generic Merge new fragment {} is missing physical_rows",
+                fragment.id
+            ))
+        })?)
+        .map_err(|_| {
+            Error::format_capacity_exceeded("generic Merge new fragment rows exceed u32")
+        })?;
+        if physical_rows == 0
+            || placement.target.start_offset != 0
+            || placement.target.end_offset != physical_rows
+            || placement.output_cardinality != physical_rows as u64
+            || by_ordinal[ordinal as usize].replace(()).is_some()
+        {
+            return Err(Error::invalid_input(format!(
+                "generic Merge Direct provenance does not exactly cover new-fragment ordinal {ordinal}"
+            )));
+        }
+    }
+    if by_ordinal.iter().any(Option::is_none) {
+        return Err(Error::invalid_input(
+            "storage-version-2.3 generic Merge has a new fragment without Direct row-address provenance",
+        ));
+    }
+    Ok((new_fragments, placements))
+}
+
+fn validate_row_aligned_rewrite_target(target: &RowAlignedRewriteTarget) -> Result<()> {
+    if target.current.physical_rows.is_none()
+        || target.current.physical_rows == Some(0)
+        || target.successor.id != target.current.id
+        || target.successor.physical_rows != target.current.physical_rows
+        || target.successor.deletion_file != target.current.deletion_file
+        || target.successor.row_id_meta != target.current.row_id_meta
+        || target.successor.native_logical_domain != target.current.native_logical_domain
+    {
+        return Err(Error::invalid_input(format!(
+            "storage-version-2.3 existing-field rewrite changed row alignment or ownership metadata for fragment {}",
+            target.current.id
+        )));
+    }
+    Ok(())
+}
+
+async fn validate_row_aligned_footer_files(
+    dataset: Arc<Dataset>,
+    successor: &Fragment,
+    rewritten_files: &[lance_table::format::DataFile],
+) -> Result<()> {
+    FileFragment::new(dataset.clone(), successor.clone()).validate_data_file_metadata()?;
+    if rewritten_files.is_empty() {
+        return Ok(());
+    }
+
+    let mut footer_fragment = successor.clone();
+    footer_fragment.files = rewritten_files.to_vec();
+    // The source deletion vector is verified once while constructing the row-
+    // aligned proof. Footer preflight must not reread it for every column file.
+    footer_fragment.deletion_file = None;
+    FileFragment::new(dataset, footer_fragment).validate().await
+}
+
+fn row_aligned_source_floor(
+    layout: &lance_table::format::RowAddressLayout,
+    field_id: i32,
+) -> Result<u64> {
+    layout
+        .index_commit_floors
+        .iter()
+        .find(|floor| floor.field_id == field_id)
+        .or_else(|| {
+            layout
+                .field_default_generations
+                .iter()
+                .find(|generation| generation.field_id == field_id)
+        })
+        .map(|generation| generation.generation)
+        .ok_or_else(|| {
+            Error::invalid_input(format!(
+                "storage-version-2.3 field {field_id} is missing its source generation floor"
+            ))
+        })
+}
+
+async fn row_aligned_rewrite_proof(
+    dataset: &Dataset,
+    target: &RowAlignedRewriteTarget,
+    field_change_index: usize,
+    source_floor_indices: Vec<usize>,
+) -> Result<(RowAddressFieldChange, RowAlignedRewriteProof)> {
+    let fragment_id = u32::try_from(target.current.id).map_err(|_| {
+        Error::invalid_input(format!(
+            "storage-version-2.3 fragment id {} exceeds row-address capacity",
+            target.current.id
+        ))
+    })?;
+    let physical_rows = u32::try_from(target.current.physical_rows.ok_or_else(|| {
+        Error::invalid_input(format!(
+            "storage-version-2.3 fragment {} is missing physical_rows",
+            target.current.id
+        ))
+    })?)
+    .map_err(|_| {
+        Error::format_capacity_exceeded(format!(
+            "storage-version-2.3 fragment {} exceeds row-address slot capacity",
+            target.current.id
+        ))
+    })?;
+    validate_row_aligned_rewrite_target(target)?;
+
+    let deleted_offsets = match target.current.deletion_file.as_ref() {
+        Some(deletion_file) => RoaringBitmap::from(
+            read_dataset_deletion_file(dataset, target.current.id, deletion_file)
+                .await?
+                .as_ref(),
+        ),
+        None => RoaringBitmap::new(),
+    };
+    if deleted_offsets
+        .max()
+        .is_some_and(|offset| offset >= physical_rows)
+        || deleted_offsets.len() >= physical_rows as u64
+    {
+        return Err(Error::invalid_input(format!(
+            "storage-version-2.3 row-aligned rewrite fragment {} has no valid live physical row set",
+            target.current.id
+        )));
+    }
+    let live_rows = physical_rows as u64 - deleted_offsets.len();
+    let layout = dataset
+        .manifest
+        .row_address_layout
+        .as_ref()
+        .ok_or_else(|| {
+            Error::invalid_input("storage-version-2.3 manifest is missing RowAddressLayout")
+        })?;
+    let compact_source = layout.row_aligned_rewrite_source(&target.current)?;
+    let (selection, mapped_offsets_fingerprint) =
+        if let Some((mapped, fingerprint)) = compact_source {
+            if deleted_offsets.is_empty() {
+                (mapped, fingerprint)
+            } else {
+                let mut deleted_logical = RoaringTreemap::new();
+                let mut physical = Vec::with_capacity(4096);
+                for offset in &deleted_offsets {
+                    physical.push(RowAddress::new_from_parts(fragment_id, offset));
+                    if physical.len() == physical.capacity() {
+                        for logical in dataset
+                            .resolve_physical_row_ids_async(&physical)
+                            .await?
+                            .into_iter()
+                            .flatten()
+                        {
+                            deleted_logical.insert(logical.raw());
+                        }
+                        physical.clear();
+                    }
+                }
+                if !physical.is_empty() {
+                    for logical in dataset
+                        .resolve_physical_row_ids_async(&physical)
+                        .await?
+                        .into_iter()
+                        .flatten()
+                    {
+                        deleted_logical.insert(logical.raw());
+                    }
+                }
+                let deleted = LogicalRowAddressSelection::from_bitmap(deleted_logical)?;
+                (mapped.difference(&deleted)?, fingerprint)
+            }
+        } else {
+            let summary = layout
+                .physical_row_ownership
+                .binary_search_by_key(&fragment_id, |summary| summary.physical_fragment_id)
+                .ok()
+                .map(|index| &layout.physical_row_ownership[index])
+                .ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "ExplicitMap fragment {fragment_id} is missing physical ownership metadata"
+                    ))
+                })?;
+            let mut live_logical = RoaringTreemap::new();
+            let mut physical = Vec::with_capacity(4096);
+            for offset in 0..physical_rows {
+                if deleted_offsets.contains(offset) {
+                    continue;
+                }
+                physical.push(RowAddress::new_from_parts(fragment_id, offset));
+                if physical.len() == physical.capacity() {
+                    for logical in dataset.resolve_physical_row_ids_async(&physical).await? {
+                        let logical = logical.ok_or_else(|| {
+                            Error::invalid_input(format!(
+                                "live physical row in fragment {} has no current logical owner",
+                                target.current.id
+                            ))
+                        })?;
+                        if !live_logical.insert(logical.raw()) {
+                            return Err(Error::invalid_input(
+                                "row-aligned rewrite source contains duplicate logical ownership",
+                            ));
+                        }
+                    }
+                    physical.clear();
+                }
+            }
+            if !physical.is_empty() {
+                for logical in dataset.resolve_physical_row_ids_async(&physical).await? {
+                    let logical = logical.ok_or_else(|| {
+                        Error::invalid_input(format!(
+                            "live physical row in fragment {} has no current logical owner",
+                            target.current.id
+                        ))
+                    })?;
+                    if !live_logical.insert(logical.raw()) {
+                        return Err(Error::invalid_input(
+                            "row-aligned rewrite source contains duplicate logical ownership",
+                        ));
+                    }
+                }
+            }
+            (
+                LogicalRowAddressSelection::from_bitmap(live_logical)?,
+                summary.mapped_offsets_fingerprint.clone(),
+            )
+        };
+    if selection.cardinality() != live_rows {
+        return Err(Error::invalid_input(
+            "row-aligned rewrite logical ownership cardinality changed during preflight",
+        ));
+    }
+    Ok((
+        RowAddressFieldChange {
+            selection,
+            field_ids: target.field_ids.clone(),
+        },
+        RowAlignedRewriteProof {
+            physical_fragment_id: fragment_id,
+            physical_rows,
+            mapped_offsets_fingerprint,
+            deletion_offsets_fingerprint: target
+                .current
+                .deletion_file
+                .as_ref()
+                .map(|_| fingerprint_deleted_offsets(&deleted_offsets)),
+            field_change_index,
+            source_floor_indices,
+        },
+    ))
+}
+
+async fn enrich_v2_3_row_aligned_rewrite(
+    dataset: &Dataset,
+    transaction: &mut Transaction,
+) -> Result<()> {
+    if !dataset.manifest.uses_stable_logical_row_addresses()
+        || !matches!(
+            transaction.operation,
+            Operation::DataReplacement { .. } | Operation::Merge { .. }
+        )
+    {
+        return Ok(());
+    }
+    let (new_fragments, direct_placements) = v2_3_merge_direct_placements(dataset, transaction)?;
+    let mut targets = collect_row_aligned_rewrite_targets(dataset, transaction)?;
+    targets.sort_by_key(|target| target.current.id);
+    let validation_schema = match &transaction.operation {
+        Operation::Merge { schema, .. } => Some(schema.clone()),
+        _ => None,
+    };
+    let mut validation_dataset = dataset.clone();
+    if let Some(schema) = validation_schema {
+        Arc::make_mut(&mut validation_dataset.manifest).schema = schema;
+    }
+    let validation_dataset = Arc::new(validation_dataset);
+    for target in &targets {
+        validate_row_aligned_rewrite_target(target)?;
+        validate_row_aligned_footer_files(
+            validation_dataset.clone(),
+            &target.successor,
+            &target.rewritten_files,
+        )
+        .await?;
+    }
+    for fragment in &new_fragments {
+        validate_row_aligned_footer_files(validation_dataset.clone(), fragment, &fragment.files)
+            .await?;
+    }
+    targets.retain(|target| !target.field_ids.is_empty());
+    if targets.is_empty() {
+        if transaction
+            .row_address_layout_delta
+            .as_ref()
+            .is_some_and(|delta| !delta.row_aligned_rewrite_proofs.is_empty())
+        {
+            return Err(Error::invalid_input(
+                "row-aligned rewrite proof does not correspond to an existing-field rewrite",
+            ));
+        }
+        if direct_placements.is_empty() {
+            return Ok(());
+        }
+    }
+
+    let layout = dataset
+        .manifest
+        .row_address_layout
+        .as_ref()
+        .ok_or_else(|| {
+            Error::invalid_input("storage-version-2.3 manifest is missing RowAddressLayout")
+        })?;
+    let field_ids = targets
+        .iter()
+        .flat_map(|target| target.field_ids.iter().copied())
+        .collect::<BTreeSet<_>>();
+    let source_floors = field_ids
+        .iter()
+        .map(|field_id| {
+            Ok(RowAddressSourceFloor {
+                field_id: *field_id,
+                generation: row_aligned_source_floor(layout, *field_id)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let source_floor_by_field = source_floors
+        .iter()
+        .enumerate()
+        .map(|(index, floor)| (floor.field_id, index))
+        .collect::<BTreeMap<_, _>>();
+    let mut canonical = RowAddressLayoutDelta {
+        placements: direct_placements,
+        source_floors,
+        expected_layout_fingerprint: layout.fingerprint.clone(),
+        ..RowAddressLayoutDelta::default()
+    };
+    for (field_change_index, target) in targets.iter().enumerate() {
+        let source_floor_indices = target
+            .field_ids
+            .iter()
+            .map(|field_id| source_floor_by_field[field_id])
+            .collect();
+        let (field_change, proof) =
+            row_aligned_rewrite_proof(dataset, target, field_change_index, source_floor_indices)
+                .await?;
+        canonical.field_changes.push(field_change);
+        canonical.row_aligned_rewrite_proofs.push(proof);
+    }
+    canonical.validate_row_aligned_rewrite_proofs()?;
+
+    if let Some(previous) = transaction.row_address_layout_delta.as_ref()
+        && !previous.row_aligned_rewrite_proofs.is_empty()
+        && (previous.row_aligned_rewrite_proofs != canonical.row_aligned_rewrite_proofs
+            || previous.field_changes != canonical.field_changes)
+    {
+        return Err(Error::retryable_commit_conflict_source(
+            dataset.manifest.version,
+            "row-aligned rewrite source ownership or deletion state changed during commit retry"
+                .into(),
+        ));
+    }
+    transaction.row_address_layout_delta = Some(canonical);
+    transaction.read_version = dataset.manifest.version;
+    Ok(())
+}
+
+fn apply_clone_row_address_namespace(
+    manifest: &mut Manifest,
+    transaction: &Transaction,
+) -> Result<()> {
+    let is_v2_3 =
+        manifest.data_storage_format.lance_file_version()?.resolve() == LanceFileVersion::V2_3;
+
+    if !is_v2_3 {
+        if transaction.row_address_layout_delta.is_some() {
+            return Err(Error::invalid_input(
+                "clone transactions for storage version 2.2 and earlier must not contain a row-address layout delta",
+            ));
+        }
+        return Ok(());
+    }
+
+    let source_namespace = manifest
+        .row_address_layout
+        .as_ref()
+        .ok_or_else(|| {
+            Error::invalid_input(
+                "storage-version-2.3 clone source is missing its row-address layout",
+            )
+        })?
+        .namespace_uuid;
+    let delta = transaction
+        .row_address_layout_delta
+        .as_ref()
+        .ok_or_else(|| {
+            Error::invalid_input(
+                "storage-version-2.3 clone requires a transaction-persisted namespace UUID",
+            )
+        })?;
+    let target_namespace = delta.create_namespace_uuid.ok_or_else(|| {
+        Error::invalid_input("storage-version-2.3 clone delta is missing its create_namespace_uuid")
+    })?;
+    if target_namespace.is_nil() || target_namespace == source_namespace {
+        return Err(Error::invalid_input(
+            "storage-version-2.3 clone must create a non-nil namespace distinct from its source",
+        ));
+    }
+    if !delta.source_domains.is_empty()
+        || !delta.placements.is_empty()
+        || !delta.retired_selections.is_empty()
+        || !delta.field_changes.is_empty()
+        || !delta.source_floors.is_empty()
+        || !delta.expected_layout_fingerprint.is_empty()
+        || !delta.replaced_generations.is_empty()
+        || !delta.row_aligned_rewrite_proofs.is_empty()
+        || !delta.explicit_map_placements.is_empty()
+    {
+        return Err(Error::invalid_input(
+            "storage-version-2.3 clone delta may only contain create_namespace_uuid",
+        ));
+    }
+
+    Arc::make_mut(manifest.row_address_layout.as_mut().unwrap()).namespace_uuid = target_namespace;
+    manifest.refresh_row_address_fingerprint()?;
+    manifest.validate_row_address_contract()?;
+    Ok(())
+}
+
 /// Write a transaction to a file and return the relative path.
 pub(crate) async fn write_transaction_file(
     object_store: &ObjectStore,
     base_path: &Path,
     transaction: &Transaction,
 ) -> Result<String> {
-    let file_name = format!("{}-{}.txn", transaction.read_version, transaction.uuid);
+    let file_name = transaction_file_name(transaction);
     let path = base_path
         .clone()
         .join(TRANSACTIONS_DIR)
         .join(file_name.as_str());
 
     let message = pb::Transaction::from(transaction);
+    check_protobuf_capacity(&message, "external transaction")?;
     let buf = message.encode_to_vec();
     object_store.put(&path, &buf).await?;
 
     Ok(file_name)
+}
+
+async fn reconcile_new_dataset_commit(
+    object_store: &ObjectStore,
+    commit_handler: &dyn CommitHandler,
+    base_path: &Path,
+    expected_version: u64,
+    requested: &Transaction,
+) -> Result<Option<(Manifest, ManifestLocation)>> {
+    let location = match commit_handler
+        .resolve_version_location(base_path, expected_version, &object_store.inner)
+        .await
+    {
+        Ok(location) => location,
+        Err(Error::DatasetNotFound { .. } | Error::NotFound { .. }) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let committed_manifest = Dataset::load_manifest(
+        object_store,
+        &location,
+        base_path.to_string().as_str(),
+        &Session::default(),
+    )
+    .await?;
+    let Some(transaction_section) = committed_manifest.transaction_section else {
+        return Ok(None);
+    };
+    let reader = object_store.open(&location.path).await?;
+    let committed: pb::Transaction =
+        lance_io::utils::read_message(reader.as_ref(), transaction_section).await?;
+    let committed = Transaction::try_from(committed)?;
+    if committed.uuid != requested.uuid {
+        return Ok(None);
+    }
+    if !same_transaction_request(requested, &committed) {
+        return Err(Error::invalid_input(format!(
+            "transaction UUID {} was already used to create this dataset with a different request",
+            requested.uuid
+        )));
+    }
+    Ok(Some((committed_manifest, location)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -149,12 +1061,12 @@ async fn do_commit_new_dataset(
     store_registry: Arc<ObjectStoreRegistry>,
 ) -> Result<(Manifest, ManifestLocation)> {
     let transaction_file = if !write_config.disable_transaction_file() {
-        write_transaction_file(object_store, base_path, transaction).await?
+        transaction_file_name(transaction)
     } else {
         String::new()
     };
 
-    let (mut manifest, indices) = if let Operation::Clone {
+    let (mut manifest, mut indices) = if let Operation::Clone {
         is_shallow,
         ref_name,
         ref_version,
@@ -175,6 +1087,7 @@ async fn do_commit_new_dataset(
             &Session::default(),
         )
         .await?;
+        source_manifest.validate_row_address_contract()?;
 
         if *is_shallow {
             let new_base_id = source_manifest
@@ -200,7 +1113,13 @@ async fn do_commit_new_dataset(
                     .into_iter()
                     .map(|index_pb| {
                         let mut index = IndexMetadata::try_from(index_pb)?;
-                        index.base_id = Some(new_base_id);
+                        // Preserve an already-external index base across clone
+                        // chains. Only index files local to the immediate
+                        // source dataset need to be rebound to the new source
+                        // base.
+                        if index.base_id.is_none() {
+                            index.base_id = Some(new_base_id);
+                        }
                         Ok(index)
                     })
                     .collect::<Result<Vec<_>>>()?
@@ -215,6 +1134,8 @@ async fn do_commit_new_dataset(
             new_manifest.branch = None;
             new_manifest.tag = None;
             new_manifest.index_section = None; // will be rewritten below
+            new_manifest.transaction_file = Some(transaction_file.clone());
+            new_manifest.transaction_section = None; // will be rewritten below
             let mut new_frags = new_manifest.fragments.as_ref().clone();
             for f in &mut new_frags {
                 for df in &mut f.files {
@@ -225,6 +1146,15 @@ async fn do_commit_new_dataset(
                 }
             }
             new_manifest.fragments = Arc::new(new_frags);
+            if let Some(layout) = new_manifest.row_address_layout.as_mut() {
+                for placement in &mut Arc::make_mut(layout).placements {
+                    if let lance_table::format::RowAddressPlacement::ExplicitMap(explicit) =
+                        placement
+                    {
+                        explicit.base_id = None;
+                    }
+                }
+            }
 
             // Indices: keep metadata but normalize base to local
             let mut updated_indices = Vec::new();
@@ -249,6 +1179,76 @@ async fn do_commit_new_dataset(
             transaction.build_manifest(None, vec![], &transaction_file, write_config)?;
         (manifest, indices)
     };
+
+    if matches!(&transaction.operation, Operation::Clone { .. }) {
+        let source_namespace_uuid = manifest
+            .row_address_layout
+            .as_ref()
+            .map(|layout| layout.namespace_uuid);
+        let source_manifest_version = manifest.version;
+        let clone_is_shallow = matches!(
+            &transaction.operation,
+            Operation::Clone {
+                is_shallow: true,
+                ..
+            }
+        );
+        apply_clone_row_address_namespace(&mut manifest, transaction)?;
+        if let Some(source_namespace_uuid) = source_namespace_uuid {
+            let target_namespace_uuid = manifest
+                .row_address_layout
+                .as_ref()
+                .ok_or_else(|| {
+                    Error::internal("storage-version-2.3 clone lost its target row-address layout")
+                })?
+                .namespace_uuid;
+            let transaction_uuid = Uuid::parse_str(&transaction.uuid).map_err(|error| {
+                Error::invalid_input(format!(
+                    "clone transaction UUID {} is invalid: {error}",
+                    transaction.uuid
+                ))
+            })?;
+            for index in &mut indices {
+                if is_system_index(index) {
+                    continue;
+                }
+                let files = index.files.as_ref().ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "storage-version-2.3 cloned index segment {} is missing files",
+                        index.uuid
+                    ))
+                })?;
+                let coverage = index.logical_coverage.as_mut().ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "storage-version-2.3 cloned index segment {} is missing logical coverage",
+                        index.uuid
+                    ))
+                })?;
+                coverage.rebind_for_clone(
+                    source_namespace_uuid,
+                    target_namespace_uuid,
+                    index.uuid,
+                    files,
+                    transaction_uuid,
+                    clone_is_shallow,
+                    source_manifest_version,
+                )?;
+            }
+        }
+        transaction.finalize_row_address_metadata_debt(
+            None,
+            &mut manifest,
+            &indices,
+            write_config,
+            false,
+        )?;
+    }
+
+    validate_manifest_write_capacity(&manifest, &indices, transaction)?;
+    if !write_config.disable_transaction_file() {
+        let written = write_transaction_file(object_store, base_path, transaction).await?;
+        debug_assert_eq!(written, transaction_file);
+    }
 
     let result = write_manifest_file(
         object_store,
@@ -287,12 +1287,40 @@ async fn do_commit_new_dataset(
             Ok((manifest, manifest_location))
         }
         Err(CommitError::CommitConflict) => {
-            cleanup_transaction_file(object_store, base_path, &transaction_file).await;
-            Err(crate::Error::dataset_already_exists(base_path.to_string()))
+            match reconcile_new_dataset_commit(
+                object_store,
+                commit_handler,
+                base_path,
+                manifest.version,
+                transaction,
+            )
+            .await
+            {
+                Ok(Some(committed)) => Ok(committed),
+                Ok(None) => {
+                    cleanup_transaction_file(object_store, base_path, &transaction_file).await;
+                    Err(crate::Error::dataset_already_exists(base_path.to_string()))
+                }
+                Err(error) => Err(error),
+            }
         }
         Err(CommitError::OtherError(err)) => {
-            cleanup_transaction_file(object_store, base_path, &transaction_file).await;
-            Err(err)
+            match reconcile_new_dataset_commit(
+                object_store,
+                commit_handler,
+                base_path,
+                manifest.version,
+                transaction,
+            )
+            .await
+            {
+                Ok(Some(committed)) => Ok(committed),
+                Ok(None) => {
+                    cleanup_transaction_file(object_store, base_path, &transaction_file).await;
+                    Err(err)
+                }
+                Err(error) => Err(error),
+            }
         }
     }
 }
@@ -676,6 +1704,13 @@ fn must_recalculate_fragment_bitmap(
 /// Indices might also be missing `files` (file sizes), so this function will collect them.
 async fn migrate_indices(dataset: &Dataset, indices: &mut [IndexMetadata]) -> Result<()> {
     infer_missing_vector_details(dataset, indices).await;
+    if dataset.manifest.uses_stable_logical_row_addresses() {
+        // v2.3 index coverage is a logical selection. Treating an intentionally
+        // absent physical fragment_bitmap as legacy metadata would try to open
+        // a newly-built index through the old manifest before it is committed.
+        validate_index_contract(dataset, indices)?;
+        return Ok(());
+    }
     let needs_recalculating = match detect_overlapping_fragments(indices) {
         Ok(()) => vec![],
         Err(BadFragmentBitmapError { bad_indices }) => {
@@ -783,13 +1818,14 @@ pub(crate) async fn do_commit_detached_transaction(
     write_config: &ManifestWriteConfig,
     commit_config: &CommitConfig,
 ) -> Result<(Manifest, ManifestLocation)> {
-    // We don't strictly need a transaction file but we go ahead and create one for
-    // record-keeping if nothing else.
+    let mut transaction = transaction.clone();
+    enrich_v2_3_row_aligned_rewrite(dataset, &mut transaction).await?;
     let transaction_file = if !write_config.disable_transaction_file() {
-        write_transaction_file(object_store, &dataset.base, transaction).await?
+        transaction_file_name(&transaction)
     } else {
         String::new()
     };
+    let mut transaction_file_written = false;
 
     // We still do a loop since we may have conflicts in the random version we pick
     let mut backoff = Backoff::default();
@@ -797,6 +1833,8 @@ pub(crate) async fn do_commit_detached_transaction(
         // Pick a random u64 with the highest bit set to indicate it is detached
         let random_version = rng().random::<u64>() | DETACHED_VERSION_MASK;
 
+        let row_address_context =
+            prepare_row_address_manifest_context(dataset, &transaction).await?;
         let (mut manifest, mut indices) = match transaction.operation {
             Operation::Restore { version } => {
                 Transaction::restore_old_manifest(
@@ -810,11 +1848,12 @@ pub(crate) async fn do_commit_detached_transaction(
                 )
                 .await?
             }
-            _ => transaction.build_manifest(
+            _ => transaction.build_manifest_with_row_address_context(
                 Some(dataset.manifest.as_ref()),
                 dataset.load_indices().await?.as_ref().clone(),
                 &transaction_file,
                 write_config,
+                row_address_context.as_ref(),
             )?,
         };
 
@@ -829,6 +1868,23 @@ pub(crate) async fn do_commit_detached_transaction(
         check_column_indices(&manifest)?;
         migrate_indices(dataset, &mut indices).await?;
 
+        if matches!(&transaction.operation, Operation::Restore { .. }) {
+            transaction.finalize_row_address_metadata_debt(
+                Some(dataset.manifest.as_ref()),
+                &mut manifest,
+                &indices,
+                write_config,
+                false,
+            )?;
+        }
+
+        validate_manifest_write_capacity(&manifest, &indices, &transaction)?;
+        if !write_config.disable_transaction_file() && !transaction_file_written {
+            let written = write_transaction_file(object_store, &dataset.base, &transaction).await?;
+            debug_assert_eq!(written, transaction_file);
+            transaction_file_written = true;
+        }
+
         // Try to commit the manifest
         let result = write_manifest_file(
             object_store,
@@ -842,7 +1898,7 @@ pub(crate) async fn do_commit_detached_transaction(
             },
             write_config,
             ManifestNamingScheme::V2,
-            Some(transaction),
+            Some(&transaction),
         )
         .await;
 
@@ -857,7 +1913,9 @@ pub(crate) async fn do_commit_detached_transaction(
             }
             Err(CommitError::OtherError(err)) => {
                 // If other error, return
-                cleanup_transaction_file(object_store, &dataset.base, &transaction_file).await;
+                if transaction_file_written {
+                    cleanup_transaction_file(object_store, &dataset.base, &transaction_file).await;
+                }
                 return Err(err);
             }
         }
@@ -865,7 +1923,9 @@ pub(crate) async fn do_commit_detached_transaction(
 
     // This should be extremely unlikely.  There should not be *that* many detached commits.  If
     // this happens then it seems more likely there is a bug in our random u64 generation.
-    cleanup_transaction_file(object_store, &dataset.base, &transaction_file).await;
+    if transaction_file_written {
+        cleanup_transaction_file(object_store, &dataset.base, &transaction_file).await;
+    }
     Err(crate::Error::commit_conflict_source(
         0,
         format!(
@@ -909,6 +1969,146 @@ async fn load_and_sort_new_transactions(
     Ok((new_ds, txns))
 }
 
+fn source_free_direct_enrichment_matches(
+    requested: &Transaction,
+    committed_delta: &RowAddressLayoutDelta,
+) -> bool {
+    let (Operation::Append { fragments } | Operation::Overwrite { fragments, .. }) =
+        &requested.operation
+    else {
+        return false;
+    };
+    if requested.row_address_layout_delta.is_some()
+        || !committed_delta.source_domains.is_empty()
+        || !committed_delta.retired_selections.is_empty()
+        || !committed_delta.field_changes.is_empty()
+        || !committed_delta.source_floors.is_empty()
+        || !committed_delta.replaced_generations.is_empty()
+        || !committed_delta.row_aligned_rewrite_proofs.is_empty()
+        || !committed_delta.explicit_map_placements.is_empty()
+        || committed_delta.placements.len() != fragments.len()
+    {
+        return false;
+    }
+    let create_metadata_is_valid = if matches!(requested.operation, Operation::Overwrite { .. })
+        && requested.read_version == 0
+    {
+        committed_delta.create_namespace_uuid.is_some()
+            == committed_delta.expected_layout_fingerprint.is_empty()
+    } else {
+        committed_delta.create_namespace_uuid.is_none()
+            && !committed_delta.expected_layout_fingerprint.is_empty()
+    };
+    create_metadata_is_valid
+        && fragments
+            .iter()
+            .zip(&committed_delta.placements)
+            .enumerate()
+            .all(|(ordinal, (fragment, placement))| {
+                let Some(physical_rows) = fragment
+                    .physical_rows
+                    .and_then(|rows| u32::try_from(rows).ok())
+                else {
+                    return false;
+                };
+                let Ok(ordinal) = u32::try_from(ordinal) else {
+                    return false;
+                };
+                placement.placement_kind == RowAddressPlacementKind::Direct
+                    && placement.source_selections.is_empty()
+                    && placement.output_row_sequence_fingerprint.is_empty()
+                    && placement.target.fragment
+                        == RowAddressTargetFragment::NewFragmentOrdinal(ordinal)
+                    && placement.target.start_offset == 0
+                    && placement.target.end_offset == physical_rows
+                    && placement.output_cardinality == u64::from(physical_rows)
+            })
+}
+
+pub(crate) fn same_transaction_request(requested: &Transaction, committed: &Transaction) -> bool {
+    let same_operation = match (&requested.operation, &committed.operation) {
+        (
+            Operation::Append {
+                fragments: requested,
+            },
+            Operation::Append {
+                fragments: committed,
+            },
+        ) => requested == committed,
+        (requested, committed) => requested == committed,
+    };
+    let allows_core_row_aligned_enrichment = matches!(
+        requested.operation,
+        Operation::DataReplacement { .. } | Operation::Merge { .. }
+    ) && committed
+        .row_address_layout_delta
+        .as_ref()
+        .is_some_and(|committed_delta| {
+            !committed_delta.row_aligned_rewrite_proofs.is_empty()
+                && requested.row_address_layout_delta.as_ref().map_or_else(
+                    || committed_delta.placements.is_empty(),
+                    |requested_delta| {
+                        requested_delta.row_aligned_rewrite_proofs.is_empty()
+                            && requested_delta.source_domains.is_empty()
+                            && requested_delta.retired_selections.is_empty()
+                            && requested_delta.field_changes.is_empty()
+                            && requested_delta.source_floors.is_empty()
+                            && requested_delta.replaced_generations.is_empty()
+                            && requested_delta.create_namespace_uuid.is_none()
+                            && requested_delta.explicit_map_placements.is_empty()
+                            && requested_delta.placements == committed_delta.placements
+                    },
+                )
+        });
+    let allows_core_direct_enrichment = committed
+        .row_address_layout_delta
+        .as_ref()
+        .is_some_and(|delta| source_free_direct_enrichment_matches(requested, delta));
+    (requested.read_version == committed.read_version || allows_core_row_aligned_enrichment)
+        && requested.tag == committed.tag
+        && requested.transaction_properties == committed.transaction_properties
+        && (requested.row_address_layout_delta == committed.row_address_layout_delta
+            || allows_core_row_aligned_enrichment
+            || allows_core_direct_enrichment)
+        && same_operation
+}
+
+fn committed_transaction_version(
+    requested: &Transaction,
+    transactions: &[(u64, Arc<Transaction>)],
+) -> Result<Option<u64>> {
+    let mut matches = transactions
+        .iter()
+        .filter(|(_, committed)| committed.uuid == requested.uuid);
+    let Some((version, committed)) = matches.next() else {
+        return Ok(None);
+    };
+    if matches.next().is_some() {
+        return Err(Error::internal(format!(
+            "transaction UUID {} was committed at multiple versions",
+            requested.uuid
+        )));
+    }
+    if !same_transaction_request(requested, committed) {
+        return Err(Error::invalid_input(format!(
+            "transaction UUID {} was already committed at version {} with a different request",
+            requested.uuid, version
+        )));
+    }
+    Ok(Some(*version))
+}
+
+async fn committed_transaction_result(
+    dataset: &Dataset,
+    version: u64,
+) -> Result<(Manifest, ManifestLocation)> {
+    let committed = dataset.checkout_version(version).await?;
+    Ok((
+        committed.manifest.as_ref().clone(),
+        committed.manifest_location,
+    ))
+}
+
 /// Attempt to commit a transaction, with retries and conflict resolution.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn commit_transaction(
@@ -942,7 +2142,9 @@ pub(crate) async fn commit_transaction(
             dataset.clone()
         };
 
+    let requested_transaction = transaction.clone();
     let mut transaction = transaction.clone();
+    let transaction_base_dataset = dataset.clone();
 
     let num_attempts = std::cmp::max(commit_config.num_retries, 1);
     let mut backoff = SlotBackoff::default();
@@ -966,6 +2168,12 @@ pub(crate) async fn commit_transaction(
         if !strict_overwrite {
             (dataset, other_transactions) = load_and_sort_new_transactions(&dataset).await?;
 
+            if let Some(version) =
+                committed_transaction_version(&requested_transaction, &other_transactions)?
+            {
+                return committed_transaction_result(&dataset, version).await;
+            }
+
             // See if we can retry the commit. Try to account for all
             // transactions that have been committed since the read_version.
             // Use small amount of backoff to handle transactions that all
@@ -981,8 +2189,10 @@ pub(crate) async fn commit_transaction(
             transaction = rebase.finish(&dataset).await?;
         }
 
+        enrich_v2_3_row_aligned_rewrite(&dataset, &mut transaction).await?;
+
         current_transaction_file = if !write_config.disable_transaction_file() {
-            write_transaction_file(object_store, &dataset.base, &transaction).await?
+            transaction_file_name(&transaction)
         } else {
             String::new()
         };
@@ -995,6 +2205,8 @@ pub(crate) async fn commit_transaction(
             ));
         }
         // Build an up-to-date manifest from the transaction and current manifest
+        let row_address_context =
+            prepare_row_address_manifest_context(&dataset, &transaction).await?;
         let (mut manifest, mut indices) = match transaction.operation {
             Operation::Restore { version } => {
                 Transaction::restore_old_manifest(
@@ -1008,11 +2220,12 @@ pub(crate) async fn commit_transaction(
                 )
                 .await?
             }
-            _ => transaction.build_manifest(
+            _ => transaction.build_manifest_with_row_address_context(
                 Some(dataset.manifest.as_ref()),
                 dataset.load_indices().await?.as_ref().clone(),
                 transaction_file,
                 write_config,
+                row_address_context.as_ref(),
             )?,
         };
 
@@ -1033,6 +2246,22 @@ pub(crate) async fn commit_transaction(
         check_column_indices(&manifest)?;
 
         migrate_indices(&dataset, &mut indices).await?;
+
+        if matches!(&transaction.operation, Operation::Restore { .. }) {
+            transaction.finalize_row_address_metadata_debt(
+                Some(dataset.manifest.as_ref()),
+                &mut manifest,
+                &indices,
+                write_config,
+                false,
+            )?;
+        }
+
+        validate_manifest_write_capacity(&manifest, &indices, &transaction)?;
+        if !write_config.disable_transaction_file() {
+            let written = write_transaction_file(object_store, &dataset.base, &transaction).await?;
+            debug_assert_eq!(written, current_transaction_file);
+        }
 
         // Try to commit the manifest
         let result = write_manifest_file(
@@ -1119,6 +2348,13 @@ pub(crate) async fn commit_transaction(
                 }
             }
             Err(CommitError::OtherError(err)) => {
+                if let Ok((latest, transactions)) =
+                    load_and_sort_new_transactions(&transaction_base_dataset).await
+                    && let Some(version) =
+                        committed_transaction_version(&requested_transaction, &transactions)?
+                {
+                    return committed_transaction_result(&latest, version).await;
+                }
                 cleanup_transaction_file(object_store, &dataset.base, &current_transaction_file)
                     .await;
                 return Err(err);
@@ -1149,18 +2385,24 @@ mod tests {
     use lance_core::datatypes::{Field, Schema};
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::{BatchCount, RowCount, array, gen_batch};
+    use lance_file::writer::{FileWriter, FileWriterOptions};
     use lance_index::IndexType;
     use lance_linalg::distance::MetricType;
-    use lance_table::format::{DataFile, DataStorageFormat};
+    use lance_table::format::{
+        DataFile, DataStorageFormat, NativeLogicalDomain, RowAddressLayout, RowAddressLayoutDelta,
+        RowAddressTargetRange,
+    };
     use lance_table::io::commit::{
         CommitLease, CommitLock, ManifestWriter, RenameCommitHandler, UnsafeCommitHandler,
     };
     use lance_testing::datagen::generate_random_array;
+    use uuid::Uuid;
 
     use super::*;
 
     use crate::Dataset;
-    use crate::dataset::{WriteMode, WriteParams};
+    use crate::dataset::transaction::{DataReplacementGroup, TransactionBuilder};
+    use crate::dataset::{CommitBuilder, InsertBuilder, WriteMode, WriteParams};
     use crate::index::vector::VectorIndexParams;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
 
@@ -1315,6 +2557,96 @@ mod tests {
             Operation::Append { .. }
         ));
         assert_eq!(transaction.tag, read_transaction.tag);
+    }
+
+    #[rstest::rstest]
+    #[case::v2_2_no_stable(LanceFileVersion::V2_2, false)]
+    #[case::v2_2_stable(LanceFileVersion::V2_2, true)]
+    #[case::v2_3(LanceFileVersion::V2_3, false)]
+    #[tokio::test]
+    async fn ambiguous_append_retry_returns_committed_version(
+        #[case] version: LanceFileVersion,
+        #[case] enable_stable_row_ids: bool,
+    ) {
+        let uri = TempStrDir::default();
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "value",
+            DataType::Int32,
+            false,
+        )]));
+        let initial =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1]))])
+                .unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(initial)], schema.clone()),
+            uri.as_str(),
+            Some(WriteParams {
+                data_storage_version: Some(version),
+                enable_stable_row_ids,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let appended =
+            RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![2]))]).unwrap();
+        let append_params = WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        };
+        let transaction = InsertBuilder::new(Arc::new(dataset.clone()))
+            .with_params(&append_params)
+            .execute_uncommitted(vec![appended])
+            .await
+            .unwrap();
+
+        let first = CommitBuilder::new(Arc::new(dataset.clone()))
+            .execute(transaction.clone())
+            .await
+            .unwrap();
+        let second = CommitBuilder::new(Arc::new(dataset))
+            .execute(transaction)
+            .await
+            .unwrap();
+
+        assert_eq!(first.version_id(), 2);
+        assert_eq!(second.version_id(), first.version_id());
+        assert_eq!(second.count_rows(None).await.unwrap(), 2);
+        assert_eq!(
+            second.manifest.max_fragment_id,
+            first.manifest.max_fragment_id
+        );
+        assert_eq!(
+            second.manifest.max_logical_fragment_id,
+            first.manifest.max_logical_fragment_id
+        );
+    }
+
+    #[test]
+    fn same_uuid_rejects_different_append_order() {
+        let first = Fragment::new(0).with_physical_rows(1);
+        let second = Fragment::new(0).with_physical_rows(2);
+        let requested = TransactionBuilder::new(
+            1,
+            Operation::Append {
+                fragments: vec![first.clone(), second.clone()],
+            },
+        )
+        .uuid("fixed-uuid".to_owned())
+        .build();
+        let committed = TransactionBuilder::new(
+            1,
+            Operation::Append {
+                fragments: vec![second, first],
+            },
+        )
+        .uuid(requested.uuid.clone())
+        .build();
+
+        let error =
+            committed_transaction_version(&requested, &[(2, Arc::new(committed))]).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("different request"));
     }
 
     #[tokio::test]
@@ -1695,6 +3027,7 @@ mod tests {
                 physical_rows: None,
                 last_updated_at_version_meta: None,
                 created_at_version_meta: None,
+                native_logical_domain: None,
             },
             Fragment {
                 id: 1,
@@ -1707,6 +3040,7 @@ mod tests {
                 physical_rows: None,
                 last_updated_at_version_meta: None,
                 created_at_version_meta: None,
+                native_logical_domain: None,
             },
         ];
 
@@ -1744,6 +3078,7 @@ mod tests {
                 physical_rows: None,
                 last_updated_at_version_meta: None,
                 created_at_version_meta: None,
+                native_logical_domain: None,
             },
             Fragment {
                 id: 1,
@@ -1756,6 +3091,7 @@ mod tests {
                 physical_rows: None,
                 last_updated_at_version_meta: None,
                 created_at_version_meta: None,
+                native_logical_domain: None,
             },
         ];
         assert_eq!(manifest.fragments.as_ref(), &expected_fragments);
@@ -1783,6 +3119,363 @@ mod tests {
                 "simulated commit failure",
             )))
         }
+    }
+
+    #[derive(Debug)]
+    struct CommitThenErrorHandler {
+        fail_once: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl CommitHandler for CommitThenErrorHandler {
+        async fn commit(
+            &self,
+            manifest: &mut Manifest,
+            indices: Option<Vec<IndexMetadata>>,
+            base_path: &Path,
+            object_store: &ObjectStore,
+            manifest_writer: ManifestWriter,
+            naming_scheme: ManifestNamingScheme,
+            transaction: Option<lance_table::format::Transaction>,
+        ) -> std::result::Result<ManifestLocation, CommitError> {
+            let location = RenameCommitHandler
+                .commit(
+                    manifest,
+                    indices,
+                    base_path,
+                    object_store,
+                    manifest_writer,
+                    naming_scheme,
+                    transaction,
+                )
+                .await?;
+            if self
+                .fail_once
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                Err(CommitError::OtherError(Error::io(format!(
+                    "simulated response loss after committing {}",
+                    location.version
+                ))))
+            } else {
+                Ok(location)
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn post_commit_other_error_is_reconciled_by_transaction_uuid() {
+        let uri = TempStrDir::default();
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "value",
+            DataType::Int32,
+            false,
+        )]));
+        let initial =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1]))])
+                .unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(initial)], schema.clone()),
+            uri.as_str(),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_3),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let appended =
+            RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![2]))]).unwrap();
+        let append_params = WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        };
+        let transaction = InsertBuilder::new(Arc::new(dataset.clone()))
+            .with_params(&append_params)
+            .execute_uncommitted(vec![appended])
+            .await
+            .unwrap();
+        let handler = Arc::new(CommitThenErrorHandler {
+            fail_once: std::sync::atomic::AtomicBool::new(true),
+        });
+
+        let committed = CommitBuilder::new(Arc::new(dataset))
+            .with_commit_handler(handler)
+            .execute(transaction)
+            .await
+            .unwrap();
+        assert_eq!(committed.version_id(), 2);
+        assert_eq!(committed.count_rows(None).await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn post_commit_other_error_is_reconciled_for_source_free_create() {
+        let uri = TempStrDir::default();
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new("value", DataType::Int32, false)]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let (major, minor) = LanceFileVersion::V2_3.to_numbers();
+        let mut fragment = Fragment::new(0).with_physical_rows(1);
+        fragment.files.push(DataFile::new(
+            "source-free-create.lance",
+            vec![0],
+            vec![0],
+            major,
+            minor,
+            None,
+            None,
+        ));
+        let transaction = TransactionBuilder::new(
+            0,
+            Operation::Overwrite {
+                fragments: vec![fragment],
+                schema,
+                config_upsert_values: None,
+                initial_bases: None,
+            },
+        )
+        .build();
+        let handler = Arc::new(CommitThenErrorHandler {
+            fail_once: std::sync::atomic::AtomicBool::new(true),
+        });
+
+        let committed = CommitBuilder::new(uri.as_str())
+            .with_storage_format(LanceFileVersion::V2_3)
+            .with_commit_handler(handler)
+            .execute(transaction.clone())
+            .await
+            .unwrap();
+        let retry = CommitBuilder::new(uri.as_str())
+            .with_storage_format(LanceFileVersion::V2_3)
+            .execute(transaction)
+            .await
+            .unwrap();
+
+        assert_eq!(committed.version_id(), 1);
+        assert_eq!(retry.version_id(), committed.version_id());
+        assert_eq!(
+            retry
+                .manifest
+                .row_address_layout
+                .as_ref()
+                .unwrap()
+                .namespace_uuid,
+            committed
+                .manifest
+                .row_address_layout
+                .as_ref()
+                .unwrap()
+                .namespace_uuid
+        );
+    }
+
+    #[tokio::test]
+    async fn v2_3_row_aligned_retry_rejects_changed_deletion_authority() {
+        let uri = TempStrDir::default();
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "value",
+            DataType::Int32,
+            false,
+        )]));
+        let initial = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![10, 20, 30]))],
+        )
+        .unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(initial)], schema.clone()),
+            uri.as_str(),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_3),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let replacement = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![40, 50, 60]))],
+        )
+        .unwrap();
+        let object_writer = dataset
+            .object_store
+            .create(&dataset.data_dir().join("retry-replacement.lance"))
+            .await
+            .unwrap();
+        let mut writer = FileWriter::try_new(
+            object_writer,
+            schema.as_ref().try_into().unwrap(),
+            FileWriterOptions {
+                format_version: Some(LanceFileVersion::V2_3),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        writer.write_batch(&replacement).await.unwrap();
+        let summary = writer.finish().await.unwrap();
+        let mut replacement_file = dataset.manifest.fragments[0].files[0].clone();
+        replacement_file.path = "retry-replacement.lance".to_owned();
+        replacement_file.file_size_bytes = CachedFileSize::new(summary.size_bytes);
+        let mut transaction = TransactionBuilder::new(
+            dataset.version_id(),
+            Operation::DataReplacement {
+                replacements: vec![DataReplacementGroup(0, replacement_file)],
+            },
+        )
+        .build();
+        enrich_v2_3_row_aligned_rewrite(&dataset, &mut transaction)
+            .await
+            .unwrap();
+        let first_proof = transaction
+            .row_address_layout_delta
+            .as_ref()
+            .unwrap()
+            .row_aligned_rewrite_proofs[0]
+            .clone();
+
+        let mut advanced = dataset;
+        advanced.delete("value = 20").await.unwrap();
+        let error = enrich_v2_3_row_aligned_rewrite(&advanced, &mut transaction)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::RetryableCommitConflict { .. }));
+        assert_eq!(first_proof.deletion_offsets_fingerprint, None);
+        assert!(error.to_string().contains("deletion state changed"));
+    }
+
+    #[tokio::test]
+    async fn v2_3_generic_merge_new_fragment_requires_and_preserves_direct_provenance() {
+        let uri = TempStrDir::default();
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "value",
+            DataType::Int32,
+            false,
+        )]));
+        let initial = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![10, 20, 30]))],
+        )
+        .unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(initial)], schema.clone()),
+            uri.as_str(),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_3),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let appended =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![40]))])
+                .unwrap();
+        let object_writer = dataset
+            .object_store
+            .create(&dataset.data_dir().join("merge-direct-new.lance"))
+            .await
+            .unwrap();
+        let mut writer = FileWriter::try_new(
+            object_writer,
+            schema.as_ref().try_into().unwrap(),
+            FileWriterOptions {
+                format_version: Some(LanceFileVersion::V2_3),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        writer.write_batch(&appended).await.unwrap();
+        let summary = writer.finish().await.unwrap();
+        let mut new_file = dataset.manifest.fragments[0].files[0].clone();
+        new_file.path = "merge-direct-new.lance".to_owned();
+        new_file.file_size_bytes = CachedFileSize::new(summary.size_bytes);
+        let mut new_fragment = Fragment::new(1).with_physical_rows(1);
+        new_fragment.files.push(new_file);
+        let rewritten = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![10, 20, 30]))],
+        )
+        .unwrap();
+        let object_writer = dataset
+            .object_store
+            .create(&dataset.data_dir().join("merge-direct-existing.lance"))
+            .await
+            .unwrap();
+        let mut writer = FileWriter::try_new(
+            object_writer,
+            schema.as_ref().try_into().unwrap(),
+            FileWriterOptions {
+                format_version: Some(LanceFileVersion::V2_3),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        writer.write_batch(&rewritten).await.unwrap();
+        let summary = writer.finish().await.unwrap();
+        let mut rewritten_fragment = dataset.manifest.fragments[0].clone();
+        rewritten_fragment.files[0].path = "merge-direct-existing.lance".to_owned();
+        rewritten_fragment.files[0].file_size_bytes = CachedFileSize::new(summary.size_bytes);
+        let operation = Operation::Merge {
+            fragments: vec![rewritten_fragment, new_fragment],
+            schema: dataset.schema().clone(),
+        };
+
+        let mut missing = TransactionBuilder::new(dataset.version_id(), operation.clone()).build();
+        let error = enrich_v2_3_row_aligned_rewrite(&dataset, &mut missing)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("without Direct row-address provenance")
+        );
+
+        let layout = dataset.manifest.row_address_layout.as_ref().unwrap();
+        let transaction = TransactionBuilder::new(dataset.version_id(), operation)
+            .row_address_layout_delta(Some(RowAddressLayoutDelta {
+                placements: vec![RowAddressPlacementDelta {
+                    source_selections: Vec::new(),
+                    target: RowAddressTargetRange {
+                        fragment: RowAddressTargetFragment::NewFragmentOrdinal(0),
+                        start_offset: 0,
+                        end_offset: 1,
+                    },
+                    placement_kind: RowAddressPlacementKind::Direct,
+                    output_cardinality: 1,
+                    output_row_sequence_fingerprint: Vec::new(),
+                }],
+                expected_layout_fingerprint: layout.fingerprint.clone(),
+                ..RowAddressLayoutDelta::default()
+            }))
+            .build();
+        let mut enriched = transaction.clone();
+        enrich_v2_3_row_aligned_rewrite(&dataset, &mut enriched)
+            .await
+            .unwrap();
+        assert!(same_transaction_request(&transaction, &enriched));
+        let mut missing_direct = transaction.clone();
+        missing_direct.row_address_layout_delta = None;
+        assert!(!same_transaction_request(&missing_direct, &enriched));
+
+        let committed = CommitBuilder::new(Arc::new(dataset))
+            .execute(transaction)
+            .await
+            .unwrap();
+        assert_eq!(committed.count_rows(None).await.unwrap(), 4);
+        assert_eq!(committed.manifest.fragments.len(), 2);
+        assert!(
+            committed.manifest.fragments[1]
+                .native_logical_domain
+                .is_some()
+        );
+        let committed_transaction = read_transaction_file(
+            committed.object_store.as_ref(),
+            &committed.base,
+            committed.manifest.transaction_file.as_deref().unwrap(),
+        )
+        .await
+        .unwrap();
+        let delta = committed_transaction.row_address_layout_delta.unwrap();
+        assert_eq!(delta.placements.len(), 1);
+        assert_eq!(delta.row_aligned_rewrite_proofs.len(), 1);
     }
 
     fn count_txn_files(uri: &str) -> usize {
@@ -1846,6 +3539,7 @@ mod tests {
             physical_rows: Some(100),
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            native_logical_domain: None,
         };
         Manifest::new(
             schema,
@@ -1853,6 +3547,204 @@ mod tests {
             DataStorageFormat::new(data_storage_version),
             HashMap::new(),
         )
+    }
+
+    fn make_direct_v23_manifest(namespace_uuid: Uuid) -> Manifest {
+        let mut field = Field::try_from(ArrowField::new("x", DataType::Int32, false)).unwrap();
+        field.set_id(-1, &mut 0);
+        let schema = Schema {
+            fields: vec![field],
+            metadata: Default::default(),
+        };
+        let data_file = DataFile::new("data.lance", vec![0], vec![0], 2, 1, None, None);
+        let mut manifest = make_manifest_with_file(schema, data_file, LanceFileVersion::V2_3);
+        Arc::make_mut(&mut manifest.fragments)[0].native_logical_domain =
+            Some(NativeLogicalDomain::new(0, 1).unwrap());
+        manifest.max_logical_fragment_id = Some(0);
+        let mut layout = RowAddressLayout::new(namespace_uuid);
+        let field_generation = lance_table::format::FieldGeneration {
+            field_id: 0,
+            generation: 1,
+        };
+        layout.field_default_generations = vec![field_generation];
+        layout.index_commit_floors = vec![field_generation];
+        manifest.row_address_layout = Some(Arc::new(layout));
+        manifest.refresh_row_address_fingerprint().unwrap();
+        manifest.validate_row_address_contract().unwrap();
+        manifest
+    }
+
+    fn clone_transaction(delta: Option<RowAddressLayoutDelta>) -> Transaction {
+        crate::dataset::transaction::TransactionBuilder::new(
+            1,
+            Operation::Clone {
+                is_shallow: true,
+                ref_name: None,
+                ref_version: 1,
+                ref_path: "memory://source".to_string(),
+                branch_name: None,
+            },
+        )
+        .row_address_layout_delta(delta)
+        .build()
+    }
+
+    #[test]
+    fn test_clone_namespace_retry_is_deterministic() {
+        let source = make_direct_v23_manifest(Uuid::new_v4());
+        let target_namespace = Uuid::new_v4();
+        let transaction =
+            clone_transaction(Some(RowAddressLayoutDelta::for_create(target_namespace)));
+        let mut first_attempt = source.clone();
+        let mut retried_attempt = source.clone();
+
+        apply_clone_row_address_namespace(&mut first_attempt, &transaction).unwrap();
+        apply_clone_row_address_namespace(&mut retried_attempt, &transaction).unwrap();
+
+        assert_eq!(
+            first_attempt
+                .row_address_layout
+                .as_ref()
+                .unwrap()
+                .namespace_uuid,
+            target_namespace
+        );
+        assert_eq!(
+            first_attempt.row_address_layout,
+            retried_attempt.row_address_layout
+        );
+        assert_eq!(first_attempt.fragments, source.fragments);
+        assert_eq!(
+            first_attempt.max_logical_fragment_id,
+            source.max_logical_fragment_id
+        );
+    }
+
+    #[test]
+    fn test_clone_namespace_delta_is_storage_version_specific() {
+        let source_namespace = Uuid::new_v4();
+        let source = make_direct_v23_manifest(source_namespace);
+        let mut missing = source.clone();
+        assert!(apply_clone_row_address_namespace(&mut missing, &clone_transaction(None)).is_err());
+
+        let mut reused = source;
+        assert!(
+            apply_clone_row_address_namespace(
+                &mut reused,
+                &clone_transaction(Some(RowAddressLayoutDelta::for_create(source_namespace))),
+            )
+            .is_err()
+        );
+
+        let schema = Schema::try_from(&ArrowSchema::new(vec![ArrowField::new(
+            "x",
+            DataType::Int32,
+            false,
+        )]))
+        .unwrap();
+        let data_file = DataFile::new("data.lance", vec![0], vec![0], 2, 1, None, None);
+        let mut v2_2 = make_manifest_with_file(schema, data_file, LanceFileVersion::V2_2);
+        let unchanged = v2_2.clone();
+        apply_clone_row_address_namespace(&mut v2_2, &clone_transaction(None)).unwrap();
+        assert_eq!(v2_2, unchanged);
+
+        assert!(
+            apply_clone_row_address_namespace(
+                &mut v2_2,
+                &clone_transaction(Some(RowAddressLayoutDelta::for_create(Uuid::new_v4()))),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn test_clone_finalization_recomputes_row_address_debt() {
+        let source = make_direct_v23_manifest(Uuid::new_v4());
+        let transaction =
+            clone_transaction(Some(RowAddressLayoutDelta::for_create(Uuid::new_v4())));
+        let mut cloned = source;
+        {
+            let debt = &mut Arc::make_mut(cloned.row_address_layout.as_mut().unwrap()).debt_summary;
+            debt.canonical_layout_bytes = 999_001;
+            debt.fast_delta_bytes = 999_002;
+            debt.metadata_bytes_written_since_maintenance = 999_003;
+            debt.generation_delta_bytes = 999_004;
+            debt.generation_metadata_bytes_written_since_maintenance = 999_005;
+        }
+        apply_clone_row_address_namespace(&mut cloned, &transaction).unwrap();
+
+        transaction
+            .finalize_row_address_metadata_debt(
+                None,
+                &mut cloned,
+                &[],
+                &ManifestWriteConfig::default(),
+                false,
+            )
+            .unwrap();
+        let first = cloned
+            .row_address_layout
+            .as_ref()
+            .unwrap()
+            .debt_summary
+            .clone();
+        assert_ne!(first.canonical_layout_bytes, 999_001);
+        assert_ne!(first.fast_delta_bytes, 999_002);
+        assert_ne!(first.metadata_bytes_written_since_maintenance, 999_003);
+        assert!(first.fast_delta_bytes > 0);
+
+        transaction
+            .finalize_row_address_metadata_debt(
+                None,
+                &mut cloned,
+                &[],
+                &ManifestWriteConfig::default(),
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            cloned.row_address_layout.as_ref().unwrap().debt_summary,
+            first
+        );
+    }
+
+    #[test]
+    fn test_restore_finalization_uses_current_epoch_and_restored_snapshot() {
+        let mut current = make_direct_v23_manifest(Uuid::new_v4());
+        current.version = 7;
+        {
+            let debt =
+                &mut Arc::make_mut(current.row_address_layout.as_mut().unwrap()).debt_summary;
+            debt.metadata_bytes_written_since_maintenance = 1_000;
+            debt.generation_metadata_bytes_written_since_maintenance = 100;
+        }
+        let mut restored = current.clone();
+        restored.version = 8;
+        {
+            let debt =
+                &mut Arc::make_mut(restored.row_address_layout.as_mut().unwrap()).debt_summary;
+            debt.fast_delta_bytes = 888_001;
+            debt.metadata_bytes_written_since_maintenance = 888_002;
+            debt.generation_delta_bytes = 888_003;
+            debt.generation_metadata_bytes_written_since_maintenance = 888_004;
+        }
+        let transaction = TransactionBuilder::new(7, Operation::Restore { version: 1 }).build();
+
+        transaction
+            .finalize_row_address_metadata_debt(
+                Some(&current),
+                &mut restored,
+                &[],
+                &ManifestWriteConfig::default(),
+                false,
+            )
+            .unwrap();
+        let debt = &restored.row_address_layout.as_ref().unwrap().debt_summary;
+        assert_ne!(debt.fast_delta_bytes, 888_001);
+        assert_ne!(debt.metadata_bytes_written_since_maintenance, 888_002);
+        assert!(debt.metadata_bytes_written_since_maintenance > 1_000);
+        assert!(debt.generation_metadata_bytes_written_since_maintenance >= 100);
+        assert!(debt.generation_delta_bytes <= debt.fast_delta_bytes);
     }
 
     #[test]

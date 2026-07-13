@@ -26,9 +26,12 @@ import org.lance.index.IndexParams;
 import org.lance.index.IndexType;
 import org.lance.index.OptimizeOptions;
 import org.lance.index.scalar.ZoneStats;
+import org.lance.ipc.ColumnOrdering;
 import org.lance.ipc.DataStatistics;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
+import org.lance.maintenance.RowAddressMaintenanceMetrics;
+import org.lance.maintenance.RowAddressMaintenanceOptions;
 import org.lance.memwal.InitializeMemWalParams;
 import org.lance.memwal.MemWalIndexDetails;
 import org.lance.memwal.ShardWriter;
@@ -1475,12 +1478,12 @@ public class Dataset implements Closeable {
   private native Map<String, String> nativeGetConfig();
 
   /**
-   * Check whether the dataset uses stable row IDs.
+   * Check whether the dataset has stable row identity.
    *
-   * <p>Stable row IDs remain constant when rows are moved during compaction. This reads the
-   * manifest feature flag directly rather than the user-facing config map.
+   * <p>Storage version 2.3 always uses stable logical row addresses. Earlier versions report the
+   * legacy stable-row-ID feature flag.
    *
-   * @return true if the dataset was created with stable row IDs enabled
+   * @return true if row identity is stable under the dataset's storage-version contract
    */
   public boolean hasStableRowIds() {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
@@ -1533,6 +1536,87 @@ public class Dataset implements Closeable {
   }
 
   private native void nativeCompact(CompactionOptions options);
+
+  /**
+   * Rewrite rows in logical-row-address order and publish an inline placement.
+   *
+   * <p>This read-optimized storage-version-2.3 operation performs exact placement admission before
+   * opening data writers. It rejects {@code maxBytesPerFile} because output boundaries must depend
+   * only on row counts.
+   *
+   * @param options rewrite options
+   * @return observable fragment, data-file, locator, byte, and row costs
+   */
+  public RowAddressMaintenanceMetrics normalizePlacement(RowAddressMaintenanceOptions options) {
+    return maintainRowAddresses("normalize_placement", List.of(), options);
+  }
+
+  /** Normalize placement with default rewrite options. */
+  public RowAddressMaintenanceMetrics normalizePlacement() {
+    return normalizePlacement(RowAddressMaintenanceOptions.builder().build());
+  }
+
+  /**
+   * Reclaim physical debt in logical-row-address order and publish an external locator.
+   *
+   * @param options rewrite options
+   * @return observable fragment, data-file, locator, byte, and row costs
+   */
+  public RowAddressMaintenanceMetrics repack(RowAddressMaintenanceOptions options) {
+    return maintainRowAddresses("repack", List.of(), options);
+  }
+
+  /** Repack with default rewrite options. */
+  public RowAddressMaintenanceMetrics repack() {
+    return repack(RowAddressMaintenanceOptions.builder().build());
+  }
+
+  /**
+   * Physically reorder rows and publish an external logical-row-address locator.
+   *
+   * <p>The ordering must contain user columns. The native implementation appends {@code _rowid} as
+   * a deterministic tie-breaker.
+   *
+   * @param ordering global physical ordering, from highest to lowest precedence
+   * @param options rewrite options
+   * @return observable fragment, data-file, locator, byte, and row costs
+   */
+  public RowAddressMaintenanceMetrics recluster(
+      List<ColumnOrdering> ordering, RowAddressMaintenanceOptions options) {
+    Preconditions.checkNotNull(ordering, "ordering cannot be null");
+    Preconditions.checkArgument(!ordering.isEmpty(), "ordering cannot be empty");
+    return maintainRowAddresses("recluster", ordering, options);
+  }
+
+  /** Recluster with default rewrite options. */
+  public RowAddressMaintenanceMetrics recluster(List<ColumnOrdering> ordering) {
+    return recluster(ordering, RowAddressMaintenanceOptions.builder().build());
+  }
+
+  /**
+   * Retire row-address generation metadata consumed by every covering index.
+   *
+   * <p>A stale covering index prevents retirement until it is optimized, rebuilt, or dropped. This
+   * metadata-only operation rewrites no user data.
+   *
+   * @return zero rewrite metrics
+   */
+  public RowAddressMaintenanceMetrics checkpointRowAddressGenerations() {
+    return maintainRowAddresses(
+        "checkpoint_generation", List.of(), RowAddressMaintenanceOptions.builder().build());
+  }
+
+  private RowAddressMaintenanceMetrics maintainRowAddresses(
+      String mode, List<ColumnOrdering> ordering, RowAddressMaintenanceOptions options) {
+    Preconditions.checkNotNull(options, "options cannot be null");
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeMaintainRowAddresses(mode, ordering, options);
+    }
+  }
+
+  private native RowAddressMaintenanceMetrics nativeMaintainRowAddresses(
+      String mode, List<ColumnOrdering> ordering, RowAddressMaintenanceOptions options);
 
   /**
    * Update the config of the dataset. This operation will only overwrite and NOT delete the

@@ -14,11 +14,11 @@ use lance_core::{Error, Result, utils::deletion::DeletionVector};
 use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use lance_index::mem_wal::{MEM_WAL_INDEX_NAME, MergedGeneration};
 use lance_select::{RowAddrTreeMap, RowSetOps};
-use lance_table::format::IndexMetadata;
+use lance_table::format::{IndexMetadata, RowReferenceDomain};
 use lance_table::{format::Fragment, io::deletion::write_deletion_file};
 use std::{
     borrow::Cow,
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
 };
 
@@ -565,6 +565,9 @@ impl<'a> TransactionRebase<'a> {
                     frag_reuse_index,
                     ..
                 } => {
+                    if indices_use_stable_logical_addresses(new_indices) {
+                        return Ok(());
+                    }
                     // if frag_reuse_index is available, index remapping is deferred and
                     // there is no conflict with concurrent CreateIndex of column indices.
                     // The only case that needs rebasing is when the frag_reuse_index cleanup
@@ -738,6 +741,9 @@ impl<'a> TransactionRebase<'a> {
                     removed_indices,
                     ..
                 } => {
+                    if indices_use_stable_logical_addresses(new_indices) {
+                        return Ok(());
+                    }
                     match (
                         new_indices
                             .iter()
@@ -1089,25 +1095,12 @@ impl<'a> TransactionRebase<'a> {
         other_transaction: &Transaction,
         other_version: u64,
     ) -> Result<()> {
-        match &other_transaction.operation {
-            Operation::Append { .. }
-            | Operation::Delete { .. }
-            | Operation::Overwrite { .. }
-            | Operation::CreateIndex { .. }
-            | Operation::Rewrite { .. }
-            | Operation::DataReplacement { .. }
-            | Operation::Merge { .. }
-            | Operation::Restore { .. }
-            | Operation::ReserveFragments { .. }
-            | Operation::UpdateBases { .. }
-            | Operation::Update { .. }
-            | Operation::Project { .. }
-            | Operation::Clone { .. }
-            | Operation::UpdateConfig { .. } => Ok(()),
-            Operation::UpdateMemWalState { .. } => {
-                Err(self.incompatible_conflict_err(other_transaction, other_version))
-            }
-        }
+        // Restore replaces the complete visible snapshot, including data,
+        // indices, schema, config, and row-address placement.  Rebasing it over
+        // any intervening commit would silently discard that committed state.
+        // Force the caller to restart from the new head and make the replacement
+        // decision again.
+        Err(self.retryable_conflict_err(other_transaction, other_version))
     }
 
     fn check_reserve_fragments_txn(
@@ -1442,9 +1435,11 @@ impl<'a> TransactionRebase<'a> {
 
                 // Check for row-level conflicts
                 let mut existing_deletions = RowAddrTreeMap::new();
+                let mut current_deletion_vectors = BTreeMap::new();
                 for (fragment_id, deletion_vec) in existing_deletion_vecs {
-                    existing_deletions
-                        .insert_bitmap(fragment_id as u32, deletion_vec.as_ref().into());
+                    let bitmap: roaring::RoaringBitmap = deletion_vec.as_ref().into();
+                    existing_deletions.insert_bitmap(fragment_id as u32, bitmap.clone());
+                    current_deletion_vectors.insert(fragment_id as u32, bitmap);
                 }
                 let conflicting_rows = existing_deletions.clone() & affected_rows.clone();
                 if conflicting_rows.len().map(|v| v > 0).unwrap_or(true) {
@@ -1465,6 +1460,7 @@ impl<'a> TransactionRebase<'a> {
                 let merged = existing_deletions.clone() | affected_rows.clone();
 
                 let mut new_deleted_frag_ids = Vec::new();
+                let mut rewritten_deletion_vectors = Vec::new();
                 let mut new_deletion_files = HashMap::with_capacity(fragments_ids_to_rewrite.len());
                 for fragment_id in fragments_ids_to_rewrite.iter() {
                     let dv = DeletionVector::from(
@@ -1487,9 +1483,23 @@ impl<'a> TransactionRebase<'a> {
                         continue;
                     }
 
+                    rewritten_deletion_vectors.push((*fragment_id, dv));
+                }
+
+                if let Some(delta) = self.transaction.row_address_layout_delta.as_mut() {
+                    crate::dataset::write::include_previous_deletions_in_v2_3_retirement(
+                        dataset,
+                        &new_deleted_frag_ids,
+                        &current_deletion_vectors,
+                        delta,
+                    )
+                    .await?;
+                }
+
+                for (fragment_id, dv) in rewritten_deletion_vectors {
                     let new_deletion_file = write_deletion_file(
                         &dataset.base,
-                        *fragment_id,
+                        fragment_id,
                         dataset.manifest.version,
                         &dv,
                         dataset.object_store.as_ref(),
@@ -1499,7 +1509,7 @@ impl<'a> TransactionRebase<'a> {
                     // Make sure this is available in the cache for future conflict resolution.
                     let deletion_file = new_deletion_file.as_ref().unwrap();
                     let key = crate::session::caches::DeletionFileKey {
-                        fragment_id: *fragment_id,
+                        fragment_id,
                         deletion_file,
                     };
                     dataset
@@ -1508,7 +1518,7 @@ impl<'a> TransactionRebase<'a> {
                         .await;
 
                     // TODO: also cleanup the old deletion file.
-                    new_deletion_files.insert(*fragment_id, new_deletion_file);
+                    new_deletion_files.insert(fragment_id, new_deletion_file);
                 }
 
                 match &mut self.transaction.operation {
@@ -1532,10 +1542,12 @@ impl<'a> TransactionRebase<'a> {
                     _ => {}
                 }
 
-                Ok(Transaction {
+                let mut transaction = Transaction {
                     read_version: dataset.manifest.version,
                     ..self.transaction
-                })
+                };
+                transaction.rebase_row_address_layout_delta(&dataset.manifest)?;
+                Ok(transaction)
             } else {
                 // We shouldn't hit this.
                 Err(crate::Error::internal(
@@ -1543,10 +1555,12 @@ impl<'a> TransactionRebase<'a> {
                 ))
             }
         } else {
-            Ok(Transaction {
+            let mut transaction = Transaction {
                 read_version: dataset.manifest.version,
                 ..self.transaction
-            })
+            };
+            transaction.rebase_row_address_layout_delta(&dataset.manifest)?;
+            Ok(transaction)
         }
     }
 
@@ -1556,6 +1570,8 @@ impl<'a> TransactionRebase<'a> {
             removed_indices,
         } = &mut self.transaction.operation
         {
+            validate_logical_index_generation_floors(dataset, new_indices)?;
+
             // Handle FRAG_REUSE_INDEX rebasing
             let has_frag_reuse = new_indices
                 .iter()
@@ -1669,6 +1685,8 @@ impl<'a> TransactionRebase<'a> {
         {
             if let Some(new_fri) = frag_reuse_index {
                 if self.conflicting_frag_reuse_indices.is_empty() {
+                    self.transaction
+                        .rebase_row_address_layout_delta(&dataset.manifest)?;
                     return Ok(self.transaction);
                 }
 
@@ -1733,8 +1751,12 @@ impl<'a> TransactionRebase<'a> {
                 .await?;
 
                 *frag_reuse_index = Some(new_frag_reuse_index_meta);
+                self.transaction
+                    .rebase_row_address_layout_delta(&dataset.manifest)?;
                 Ok(self.transaction)
             } else {
+                self.transaction
+                    .rebase_row_address_layout_delta(&dataset.manifest)?;
                 Ok(self.transaction)
             }
         } else {
@@ -1772,6 +1794,74 @@ async fn initial_fragments_for_rebase(
         })
         .map(|fragment| (fragment.id, (fragment.clone(), false)))
         .collect::<HashMap<_, _>>()
+}
+
+fn indices_use_stable_logical_addresses(indices: &[IndexMetadata]) -> bool {
+    !indices.is_empty()
+        && indices.iter().all(|index| {
+            index.row_reference_domain == Some(RowReferenceDomain::StableLogicalRowAddress)
+        })
+}
+
+/// A v2.3 field floor is the oldest content generation for which the manifest
+/// no longer retains row-level invalidation regions.  An index built from an
+/// older snapshot cannot be made correct at query time because the information
+/// needed to identify its stale postings has already been folded into the
+/// floor.  Reject the commit and force the caller to rebuild from the current
+/// snapshot.
+fn validate_logical_index_generation_floors(
+    dataset: &Dataset,
+    indices: &[IndexMetadata],
+) -> Result<()> {
+    if !dataset.manifest.uses_stable_logical_row_addresses() {
+        return Ok(());
+    }
+    let layout = dataset
+        .manifest
+        .row_address_layout
+        .as_ref()
+        .ok_or_else(|| {
+            Error::internal("storage-version-2.3 manifest is missing RowAddressLayout")
+        })?;
+    for index in indices.iter().filter(|index| {
+        index.row_reference_domain == Some(RowReferenceDomain::StableLogicalRowAddress)
+    }) {
+        let coverage = index.logical_coverage.as_ref().ok_or_else(|| {
+            Error::internal(format!(
+                "v2.3 index segment {} is missing exact logical coverage",
+                index.uuid
+            ))
+        })?;
+        for shard in coverage.shards.iter().filter(|shard| shard.row_count != 0) {
+            for field_id in &shard.field_ids {
+                let floor = layout
+                    .index_commit_floors
+                    .binary_search_by_key(field_id, |floor| floor.field_id)
+                    .ok()
+                    .map(|position| layout.index_commit_floors[position].generation)
+                    .unwrap_or(0);
+                let validated_through = shard
+                    .validated_through
+                    .iter()
+                    .find(|watermark| watermark.field_id == *field_id)
+                    .map(|watermark| watermark.generation)
+                    .unwrap_or(0);
+                if validated_through < floor {
+                    return Err(Error::retryable_commit_conflict_source(
+                        dataset.manifest.version,
+                        format!(
+                            "v2.3 index segment {} for field {} was built through generation {}, \
+                             below the current index commit floor {}; rebuild the index from the \
+                             current dataset snapshot",
+                            index.uuid, field_id, validated_through, floor
+                        )
+                        .into(),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn wrong_operation_err(op: &Operation) -> Error {
@@ -1947,6 +2037,52 @@ mod tests {
         let io_stats = dataset.object_store.as_ref().io_stats_incremental();
         assert_io_eq!(io_stats, read_iops, 0);
         assert_io_eq!(io_stats, write_iops, 0);
+    }
+
+    #[tokio::test]
+    async fn v2_3_restore_does_not_rebase_over_a_concurrent_data_commit() {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let batch = |value| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from(vec![value]))],
+            )
+            .unwrap()
+        };
+        let mut dataset = InsertBuilder::new("memory://v23-restore-conflict")
+            .with_params(&WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_3),
+                ..Default::default()
+            })
+            .execute(vec![batch(0)])
+            .await
+            .unwrap();
+        dataset
+            .append(
+                arrow_array::RecordBatchIterator::new([Ok(batch(1))], schema.clone()),
+                None,
+            )
+            .await
+            .unwrap();
+        let restore_read_version = dataset.version().version;
+        let restore =
+            Transaction::new_from_version(restore_read_version, Operation::Restore { version: 1 });
+
+        dataset
+            .append(
+                arrow_array::RecordBatchIterator::new([Ok(batch(2))], schema.clone()),
+                None,
+            )
+            .await
+            .unwrap();
+        let committed_version = dataset.version().version;
+        let error = dataset
+            .apply_commit(restore, &Default::default(), &Default::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::RetryableCommitConflict { .. }));
+        assert_eq!(dataset.version().version, committed_version);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 3);
     }
 
     async fn apply_deletion(
@@ -2292,6 +2428,8 @@ mod tests {
             created_at: None, // Test index, not setting timestamp
             base_id: None,
             files: None,
+            row_reference_domain: None,
+            logical_coverage: None,
         };
         let fragment0 = Fragment::new(0);
         let fragment1 = Fragment::new(1);
@@ -2794,6 +2932,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            row_reference_domain: None,
+            logical_coverage: None,
         };
         let index1 = IndexMetadata {
             uuid: uuid::Uuid::new_v4(),
@@ -2860,6 +3000,8 @@ mod tests {
                         created_at: None,
                         base_id: None,
                         files: None,
+                        row_reference_domain: None,
+                        logical_coverage: None,
                     }],
                     removed_indices: vec![],
                 },
@@ -2877,6 +3019,64 @@ mod tests {
             "Expected compatibility for different-name CreateIndex, got {:?}",
             different_name_result
         );
+    }
+
+    #[test]
+    fn test_logical_create_index_and_rewrite_are_compatible_without_fragment_bitmap() {
+        let logical_index = IndexMetadata {
+            uuid: Uuid::new_v4(),
+            name: "logical".to_string(),
+            fields: vec![0],
+            dataset_version: 1,
+            fragment_bitmap: None,
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+            row_reference_domain: Some(RowReferenceDomain::StableLogicalRowAddress),
+            logical_coverage: None,
+        };
+        let create_index = Transaction::new(
+            1,
+            Operation::CreateIndex {
+                new_indices: vec![logical_index],
+                removed_indices: Vec::new(),
+            },
+            None,
+        );
+        let rewrite = Transaction::new(
+            1,
+            Operation::Rewrite {
+                groups: vec![RewriteGroup {
+                    old_fragments: vec![Fragment::new(0)],
+                    new_fragments: vec![Fragment::new(1)],
+                }],
+                rewritten_indices: Vec::new(),
+                frag_reuse_index: None,
+            },
+            None,
+        );
+
+        let mut create_index_rebase = TransactionRebase {
+            transaction: create_index.clone(),
+            initial_fragments: HashMap::new(),
+            modified_fragment_ids: HashSet::new(),
+            affected_rows: None,
+            conflicting_frag_reuse_indices: Vec::new(),
+            conflicting_mem_wal_merged_gens: Vec::new(),
+        };
+        assert!(create_index_rebase.check_txn(&rewrite, 2).is_ok());
+
+        let mut rewrite_rebase = TransactionRebase {
+            transaction: rewrite,
+            initial_fragments: HashMap::new(),
+            modified_fragment_ids: HashSet::from([0]),
+            affected_rows: None,
+            conflicting_frag_reuse_indices: Vec::new(),
+            conflicting_mem_wal_merged_gens: Vec::new(),
+        };
+        assert!(rewrite_rebase.check_txn(&create_index, 2).is_ok());
     }
 
     #[tokio::test]

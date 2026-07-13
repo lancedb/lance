@@ -46,6 +46,74 @@ async fn do_test_binary_copy_merge_small_files(version: LanceFileVersion) {
 }
 
 #[tokio::test]
+async fn test_binary_copy_max_bytes_uses_same_frozen_postcondition_in_v2_2_and_v2_3() {
+    let mut postconditions = Vec::new();
+    for version in [LanceFileVersion::V2_2, LanceFileVersion::V2_3] {
+        let test_dir = TempStrDir::default();
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        let data = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![0; 10_000]))])
+            .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(data.clone())], data.schema()),
+            &test_dir,
+            Some(WriteParams {
+                max_rows_per_file: 1_000,
+                data_storage_version: Some(version),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let source_sizes = dataset
+            .manifest
+            .fragments
+            .iter()
+            .map(|fragment| fragment.files[0].file_size_bytes.get().unwrap().get())
+            .collect::<Vec<_>>();
+        assert!(source_sizes.iter().all(|size| *size == source_sizes[0]));
+        let max_bytes_per_file = usize::try_from(source_sizes[0] + source_sizes[1]).unwrap();
+        let expected = BinaryCopyPlan::try_new(
+            vec![1_000; source_sizes.len()],
+            source_sizes,
+            100_000,
+            Some(max_bytes_per_file),
+        )
+        .unwrap()
+        .output_row_counts;
+
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 100_000,
+                max_bytes_per_file: Some(max_bytes_per_file),
+                compaction_mode: Some(CompactionMode::ForceBinaryCopy),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let actual = dataset
+            .manifest
+            .fragments
+            .iter()
+            .map(|fragment| fragment.physical_rows.unwrap() as u32)
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+        assert!(
+            dataset
+                .manifest
+                .fragments
+                .iter()
+                .all(|fragment| { fragment.files[0].file_size_bytes.get().is_some() })
+        );
+        postconditions.push(actual);
+    }
+
+    assert_eq!(postconditions[0], postconditions[1]);
+}
+
+#[tokio::test]
 async fn test_binary_copy_empty_string_scalar_index() {
     for version in LanceFileVersion::iter_non_legacy() {
         do_test_binary_copy_empty_string_scalar_index(version).await;
@@ -101,7 +169,6 @@ async fn do_test_binary_copy_empty_string_scalar_index(version: LanceFileVersion
         )
         .await
         .unwrap();
-
     // The scalar index over the empty strings must also return the full set.
     let indexed = dataset
         .scan()
@@ -234,6 +301,7 @@ async fn do_binary_copy_preserves_stable_row_ids(version: LanceFileVersion) {
         )
         .await
         .unwrap();
+    let index_metadata_before = dataset.load_indices().await.unwrap();
 
     async fn index_set(dataset: &Dataset) -> HashSet<Uuid> {
         dataset
@@ -284,6 +352,9 @@ async fn do_binary_copy_preserves_stable_row_ids(version: LanceFileVersion) {
 
     let current_indices = index_set(&dataset).await;
     assert_eq!(indices, current_indices);
+    if version == LanceFileVersion::V2_3 {
+        assert_eq!(dataset.load_indices().await.unwrap(), index_metadata_before);
+    }
 
     let after_vec_result = vector_query(&dataset).await;
     assert_eq!(before_vec_result, after_vec_result);

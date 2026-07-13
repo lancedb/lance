@@ -1060,6 +1060,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            row_reference_domain: None,
+            logical_coverage: None,
         }
     }
 

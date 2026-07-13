@@ -2,17 +2,18 @@
 
 ## Overview
 
-Lance provides row identification and lineage tracking capabilities.
-Row addressing enables efficient random access to rows within the table through a physical location encoding.
-Stable row IDs provide persistent identifiers that remain constant throughout a row's lifetime, even as its physical location changes.
-Row version tracking records when rows were created and last modified, enabling incremental processing, change data capture, and time-travel queries.
+Lance distinguishes physical row locations from logical row identity. Physical
+addresses support direct I/O. Logical identifiers survive physical rewrites.
+Row version tracking records when rows were created and last modified.
 
 ## Row Identifier Forms
 
-A row in Lance has two forms of row identifiers:
+A row has two externally visible identifiers:
 
 - **Row address** - the current physical location of the row in the dataset.
-- **Row ID** - a logical identifier of the row. When stable row IDs are enabled, this remains stable for the lifetime of a logical row. When disabled (default mode), it is exactly equal to the row address.
+- **Row ID** - the row's logical identity. Storage version 2.3 always provides a
+  stable row ID. In earlier versions it is stable only when the legacy stable
+  row-ID feature is enabled; otherwise it equals the row address.
 
 
 ### Row Address
@@ -26,11 +27,8 @@ row_address = (fragment_id << 32) | local_row_offset
 This addressing scheme enables efficient random access: given a row address, the fragment and offset are extracted with bit operations.
 Row addresses change when data is reorganized through compaction or updates.
 
-Row address is currently the primary form of identifier used for indexing purposes.
-Secondary indices (vector indices, scalar indices, full-text search indices) reference rows by their row addresses.
-
-!!! note
-      Work to support stable row IDs in indices is in progress.
+`_rowaddr` and `_rowoffset` remain physical and unstable in storage version 2.3.
+They must not be persisted as logical identity.
 
 ### Row ID
 
@@ -38,9 +36,9 @@ Row ID is a logical identifier for a row.
 
 #### Stable Row ID
 
-When a dataset is created with stable row IDs enabled, each row is assigned a unique auto-incrementing `u64` identifier that remains constant throughout the row's lifetime, even when the row's physical location (row address) changes.
-The `_rowid` system column exposes this logical identifier to users.
-See the next section for more details on assignment and update semantics.
+The `_rowid` system column exposes logical identity. In storage version 2.3 its
+value is a stable logical row address. Earlier versions use either the legacy
+stable-row-ID representation or the current physical row address.
 
 #### Historical/unstable usage
 
@@ -50,7 +48,89 @@ Historically, the term "row id" was often used to refer to the physical row addr
       With the introduction of stable row IDs, there may still be places in code and documentation that mix the terms "row ID" and "row address" or "row ID" and "stable row ID".
       Please raise a PR if you find any place incorrect or confusing.
 
-## Stable Row ID
+## Storage Version 2.3 Stable Logical Row Addresses
+
+Storage version 2.3 has one row-identity mode. It is enabled for every newly
+created 2.3 dataset, does not use a feature flag, and cannot be disabled. A 2.2
+or earlier dataset cannot be migrated to 2.3 by overwrite, restore, or manifest
+rewriting.
+
+A stable logical row address is encoded as:
+
+```
+logical_row_address = (logical_fragment_id << 32) | immutable_slot
+```
+
+The dataset namespace UUID and the raw 64-bit address together form global
+identity. A clone creates a new namespace while preserving raw addresses.
+
+### Native Assignment
+
+An append allocates one logical fragment ID per new physical fragment. Slots are
+the physical offsets assigned at birth. The fragment stores one
+`NativeLogicalDomain`; it does not store a per-row mapping. Physical and logical
+fragment high-water marks never decrease, including across overwrite and
+restore.
+
+### Placement Root
+
+Physical rewrites preserve logical addresses by replacing native ownership with
+manifest-resident placement metadata. The placement root is canonical,
+fingerprinted, and has a destination-side index. Its inline codecs are:
+
+- `Direct` for one affine logical-to-physical extent;
+- `PackedRun` for many logical fragments packed in source order;
+- `Selected` for one exact selected source;
+- `ExtentList` for a bounded number of source-contiguous extents;
+- `SparseSelection` for selected rows from multiple logical fragments.
+
+These codecs resolve an address to one physical owner in memory. A reader never
+probes multiple fragments. `ExplicitMap` is reserved for explicit `Repack` and
+`Recluster`; it uses a manifest page directory and an external locator, so its
+cold lookup cost is part of those operations' public contract rather than the
+default read path.
+
+Every snapshot transitively owns the data, deletion, index, and placement
+objects reachable from its manifest. Before an independent 2.3 shallow clone
+publishes its target manifest, it writes a source-side lease under `_refs` for
+the cloned source version. Source cleanup treats that lease like a protected
+reference for as long as the target dataset prefix exists. This protects local
+data and `ExplicitMap` locator objects across target successor manifests. A
+descendant clone also writes a branch-wide lease at every inherited dataset
+root, so deleting an intermediate clone cannot break the reachability chain.
+Same-store cleanup releases a completed lease after the final target prefix is
+removed. Cross-store liveness and an ambiguous failed commit are retained
+conservatively; cleanup must never guess that the target is absent.
+
+### Mutation and Liveness
+
+Update and matched merge-insert rows retain `_rowid`, write a new physical row,
+and tombstone the old physical row. Inserts allocate new logical domains.
+Deletes first use deletion vectors. When maintenance removes the last physical
+copy, the corresponding logical addresses become retired. Restore restores the
+target snapshot's live relation but retains allocator high-water marks from the
+actual head.
+
+Content generations are tracked independently from identity and liveness. An
+indexed field update advances the generation for the exact logical selection.
+Generation regions can be retired only after every covering current index has
+validated through them.
+
+### Secondary Indices
+
+Storage version 2.3 index postings contain stable logical row addresses and
+carry exact logical coverage plus per-field generation watermarks. Default
+compaction and fragment reuse do not rewrite postings or add a read-time remap
+object. Query planning translates matched logical addresses through the inline
+placement root before data take. Stale postings for changed indexed content and
+retired rows are filtered in the logical domain before ranking results are
+returned.
+
+## Legacy Stable Row IDs (Storage Version 2.2 and Earlier)
+
+Earlier storage versions optionally assign monotonically increasing row IDs and
+persist per-fragment row-ID sequences. The remainder of this section specifies
+that legacy representation; it does not describe storage version 2.3.
 
 ### Row ID Assignment
 
@@ -76,7 +156,11 @@ Stable row IDs are a dataset-level feature recorded in the table manifest.
 - Currently, they **cannot be turned on later** for an existing dataset. Attempts to write with `enable_stable_row_ids = true` against a dataset that was created without stable row IDs will not change the dataset's configuration.
 - When stable row IDs are disabled, the `_rowid` column (if requested) is not stable and should not be used as a persistent identifier.
 
-Row-level version tracking (`_row_created_at_version`, `_row_last_updated_at_version`) and the row ID index described below are only available when stable row IDs are enabled.
+For storage versions through 2.2, row-level version tracking
+(`_row_created_at_version`, `_row_last_updated_at_version`) and the row ID index
+described below are only available when stable row IDs are enabled. Storage
+version 2.3 always uses stable logical row addresses, so these pseudo-columns
+are always available and there is no separate enablement mode.
 
 ### Row ID Behavior on Updates
 
@@ -304,6 +388,15 @@ When a row is created, `last_updated_at_version` equals `created_at_version`.
 
 When stable row IDs are enabled and a row is updated, Lance writes a new physical row for the same logical `_rowid` while tombstoning the old physical row. The `created_at_version` for that logical row is preserved from the original row, and `last_updated_at_version` is set to the current dataset version at the time of the update.
 
+In storage version 2.3, a logical domain's `creation_version` is the canonical
+base for both values when a fragment does not carry an explicit per-row version
+sequence. Directly appended domains use their commit version. Packed, selected,
+and explicit placements retain the source domain's base across compaction and
+placement maintenance. An update materializes only the exception needed to keep
+`created_at_version` unchanged and advance `last_updated_at_version` for the
+touched logical rows; absence of metadata must never be interpreted as version
+1.
+
 Example: Row created in version 3, updated in version 7:
 ```
 Old physical row (tombstoned):
@@ -360,4 +453,3 @@ WHERE _row_created_at_version <= {begin_version}
 ```
 
 This query excludes newly inserted rows by requiring `_row_created_at_version <= {begin_version}`, ensuring only pre-existing rows that were subsequently updated are returned.
-

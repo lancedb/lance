@@ -56,6 +56,14 @@ if TYPE_CHECKING:
 DEFAULT_MAX_BYTES_PER_FILE = 90 * 1024 * 1024 * 1024
 
 
+@dataclass(frozen=True)
+class NativeLogicalDomain:
+    """Stable logical domain created with a storage-version-2.3 fragment."""
+
+    logical_fragment_id: int
+    creation_version: int
+
+
 @dataclass
 class FragmentMetadata:
     """Metadata for a fragment.
@@ -78,6 +86,8 @@ class FragmentMetadata:
         The row created at version metadata, if any.
     last_updated_at_version_meta : Optional[RowDatasetVersionMeta]
         The row last updated at version metadata, if any.
+    native_logical_domain : Optional[NativeLogicalDomain]
+        The stable logical domain created with this fragment in storage version 2.3.
     """
 
     id: int
@@ -87,6 +97,9 @@ class FragmentMetadata:
     row_id_meta: Optional[RowIdMeta] = None
     created_at_version_meta: Optional[RowDatasetVersionMeta] = None
     last_updated_at_version_meta: Optional[RowDatasetVersionMeta] = None
+    native_logical_domain: Optional[NativeLogicalDomain] = field(
+        default=None, repr=False
+    )
 
     @property
     def num_deletions(self) -> int:
@@ -133,6 +146,11 @@ class FragmentMetadata:
                 if self.last_updated_at_version_meta is not None
                 else None
             ),
+            native_logical_domain=(
+                asdict(self.native_logical_domain)
+                if self.native_logical_domain is not None
+                else None
+            ),
         )
 
     @staticmethod
@@ -159,6 +177,10 @@ class FragmentMetadata:
                 json.dumps(last_updated_at_version_meta)
             )
 
+        native_logical_domain = json_data.get("native_logical_domain")
+        if native_logical_domain is not None:
+            native_logical_domain = NativeLogicalDomain(**native_logical_domain)
+
         return FragmentMetadata(
             id=json_data["id"],
             files=[DataFile(**f) for f in json_data["files"]],
@@ -167,6 +189,7 @@ class FragmentMetadata:
             row_id_meta=row_id_meta,
             created_at_version_meta=created_at_version_meta,
             last_updated_at_version_meta=last_updated_at_version_meta,
+            native_logical_domain=native_logical_domain,
         )
 
 

@@ -451,11 +451,11 @@ During compaction, Lance can also remove deleted rows. Rewritten fragments will
 not have deletion files. This can improve scan performance since the soft deleted
 rows don't have to be skipped during the scan.
 
-When files are rewritten, the original row addresses are invalidated. This means the
-affected files are no longer part of any ANN index if they were before. Because
-of this, it's recommended to rewrite files before re-building indices.
-
-<!-- TODO: remove this last comment once stable row ids are default. -->
+When files are rewritten, physical row addresses are invalidated. Storage
+version 2.3 indices store stable logical row addresses, so order-preserving
+compaction preserves index coverage without rewriting index objects. For
+storage version 2.2 and earlier, an index that stores physical addresses still
+requires remapping, a fragment-reuse index, or rebuilding.
 
 ### Cleanup old versions
 

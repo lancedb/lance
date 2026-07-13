@@ -6,7 +6,7 @@ use crate::traits::{IntoJava, export_vec};
 use jni::JNIEnv;
 use jni::objects::{JObject, JValue};
 use jni::sys::jbyte;
-use lance::table::format::IndexMetadata;
+use lance::table::format::{IndexMetadata, RowReferenceDomain, pb};
 use lance_index::IndexDescription;
 use prost::Message;
 use prost_types::Any;
@@ -127,11 +127,33 @@ impl IntoJava for &IndexMetadata {
 
         // Determine index type from index_details type_url
         let index_type = determine_index_type(env, &self.index_details)?;
+        let row_reference_domain = match self.row_reference_domain {
+            Some(domain) => {
+                let name = match domain {
+                    RowReferenceDomain::PhysicalRowAddress => "PHYSICAL_ROW_ADDRESS",
+                    RowReferenceDomain::LegacyStableRowId => "LEGACY_STABLE_ROW_ID",
+                    RowReferenceDomain::StableLogicalRowAddress => "STABLE_LOGICAL_ROW_ADDRESS",
+                };
+                env.get_static_field(
+                    "org/lance/index/RowReferenceDomain",
+                    name,
+                    "Lorg/lance/index/RowReferenceDomain;",
+                )?
+                .l()?
+            }
+            None => JObject::null(),
+        };
+        let logical_coverage = match &self.logical_coverage {
+            Some(coverage) => env
+                .byte_array_from_slice(&pb::LogicalIndexCoverage::from(coverage).encode_to_vec())?
+                .into(),
+            None => JObject::null(),
+        };
 
         // Create Index object
         Ok(env.new_object(
             "org/lance/index/Index",
-            "(Ljava/util/UUID;Ljava/util/List;Ljava/lang/String;JLjava/util/List;[BILjava/time/Instant;Ljava/lang/Integer;Lorg/lance/index/IndexType;)V",
+            "(Ljava/util/UUID;Ljava/util/List;Ljava/lang/String;JLjava/util/List;[BILjava/time/Instant;Ljava/lang/Integer;Lorg/lance/index/IndexType;Lorg/lance/index/RowReferenceDomain;[B)V",
             &[
                 JValue::Object(&uuid),
                 JValue::Object(&fields),
@@ -143,6 +165,8 @@ impl IntoJava for &IndexMetadata {
                 JValue::Object(&created_at),
                 JValue::Object(&base_id),
                 JValue::Object(&index_type),
+                JValue::Object(&row_reference_domain),
+                JValue::Object(&logical_coverage),
             ],
         )?)
     }

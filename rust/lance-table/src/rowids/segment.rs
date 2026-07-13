@@ -614,6 +614,56 @@ impl U64Segment {
             *self = Self::Range(0..0);
             return;
         }
+        if let Self::Range(range) = self {
+            let range_len_u64 = range
+                .end
+                .checked_sub(range.start)
+                .expect("row-id segment range end precedes start");
+            let range_len_u32 = u32::try_from(range_len_u64)
+                .expect("masked row-id segment length exceeds u32 position capacity");
+            let range_len =
+                usize::try_from(range_len_u64).expect("masked row-id segment length exceeds usize");
+            debug_assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+            debug_assert!(positions.last().is_some_and(|last| *last < range_len_u32));
+            let prefix = positions
+                .iter()
+                .enumerate()
+                .take_while(|(index, position)| **position as usize == *index)
+                .count();
+            let suffix = positions
+                .iter()
+                .rev()
+                .enumerate()
+                .take_while(|(index, position)| **position as usize + *index + 1 == range_len)
+                .count();
+            let next_start = range.start + prefix as u64;
+            let next_end = range.end - suffix as u64;
+            let interior = &positions[prefix..positions.len() - suffix];
+            if interior.is_empty() {
+                *self = Self::Range(next_start..next_end);
+                return;
+            }
+            let stats = SegmentStats {
+                min: next_start,
+                max: next_end - 1,
+                count: range_len_u64
+                    .checked_sub(positions.len() as u64)
+                    .expect("masked positions exceed row-id segment length"),
+                sorted: true,
+            };
+            let sizes = Self::sorted_sequence_sizes(&stats);
+            if sizes[0] == *sizes.iter().min().unwrap() {
+                let holes = interior
+                    .iter()
+                    .map(|position| range.start + *position as u64)
+                    .collect::<EncodedU64Array>();
+                *self = Self::RangeWithHoles {
+                    range: next_start..next_end,
+                    holes,
+                };
+                return;
+            }
+        }
         let count = (self.len() - positions.len()) as u64;
         let sorted = match self {
             Self::Range(_) => true,

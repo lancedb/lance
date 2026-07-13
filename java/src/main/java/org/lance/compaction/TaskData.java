@@ -15,18 +15,32 @@ package org.lance.compaction;
 
 import org.lance.FragmentMetadata;
 
+import javax.annotation.Nullable;
+
 import java.io.Serializable;
 import java.util.List;
 
 /** Data of compaction task. */
 public class TaskData implements Serializable {
   private final List<FragmentMetadata> fragments;
+  @Nullable private final byte[] v23Plan;
 
   public TaskData(List<FragmentMetadata> fragments) {
+    this(fragments, null);
+  }
+
+  public TaskData(List<FragmentMetadata> fragments, @Nullable byte[] v23Plan) {
     this.fragments = fragments;
+    this.v23Plan = v23Plan;
   }
 
   public List<FragmentMetadata> getFragments() {
     return fragments;
+  }
+
+  /** Opaque exact storage-version-2.3 compaction preflight plan. */
+  @Nullable
+  public byte[] getV23Plan() {
+    return v23Plan;
   }
 }

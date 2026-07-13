@@ -11,7 +11,11 @@ use lance::dataset::transaction::{
     UpdateMapEntry, UpdateMode,
 };
 use lance::datatypes::Schema;
-use lance_table::format::{BasePath, DataFile, Fragment, IndexFile, IndexMetadata};
+use lance_table::format::{
+    BasePath, DataFile, Fragment, IndexFile, IndexMetadata, LogicalIndexCoverage,
+    RowAddressLayoutDelta, RowReferenceDomain, pb,
+};
+use prost::Message;
 use pyo3::exceptions::PyValueError;
 use pyo3::types::PySet;
 use pyo3::{Bound, FromPyObject, PyAny, PyResult, Python};
@@ -70,13 +74,17 @@ impl FromPyObject<'_, '_> for PyLance<IndexMetadata> {
         let fragment_ids = ob.getattr("fragment_ids")?;
         let created_at = ob.getattr("created_at")?.extract()?;
 
-        let fragment_ids_ref: &Bound<'_, PySet> = fragment_ids.cast()?;
-        let fragment_bitmap = Some(
-            fragment_ids_ref
-                .into_iter()
-                .map(|id| id.extract::<u32>())
-                .collect::<PyResult<RoaringBitmap>>()?,
-        );
+        let fragment_bitmap = if fragment_ids.is_none() {
+            None
+        } else {
+            let fragment_ids_ref: &Bound<'_, PySet> = fragment_ids.cast()?;
+            Some(
+                fragment_ids_ref
+                    .into_iter()
+                    .map(|id| id.extract::<u32>())
+                    .collect::<PyResult<RoaringBitmap>>()?,
+            )
+        };
         let base_id: Option<u32> = ob
             .getattr("base_id")?
             .extract::<Option<i64>>()?
@@ -92,6 +100,36 @@ impl FromPyObject<'_, '_> for PyLance<IndexMetadata> {
                 .map(|(type_url, value)| Arc::new(prost_types::Any { type_url, value })),
             Err(_) => None,
         };
+        let row_reference_domain = match ob.getattr("row_reference_domain") {
+            Ok(domain) => match domain.extract::<Option<String>>()?.as_deref() {
+                Some("physical_row_address") => Some(RowReferenceDomain::PhysicalRowAddress),
+                Some("legacy_stable_row_id") => Some(RowReferenceDomain::LegacyStableRowId),
+                Some("stable_logical_row_address") => {
+                    Some(RowReferenceDomain::StableLogicalRowAddress)
+                }
+                Some(value) => {
+                    return Err(PyValueError::new_err(format!(
+                        "invalid index row_reference_domain: {value}"
+                    )));
+                }
+                None => None,
+            },
+            Err(_) => None,
+        };
+        let logical_coverage = match ob.getattr("logical_coverage") {
+            Ok(coverage) => coverage
+                .extract::<Option<Vec<u8>>>()?
+                .map(|bytes| {
+                    pb::LogicalIndexCoverage::decode(bytes.as_slice())
+                        .map_err(|error| PyValueError::new_err(error.to_string()))
+                        .and_then(|coverage| {
+                            LogicalIndexCoverage::try_from(coverage)
+                                .map_err(|error| PyValueError::new_err(error.to_string()))
+                        })
+                })
+                .transpose()?,
+            Err(_) => None,
+        };
 
         Ok(Self(IndexMetadata {
             uuid: Uuid::parse_str(&uuid).map_err(|e| PyValueError::new_err(e.to_string()))?,
@@ -104,6 +142,8 @@ impl FromPyObject<'_, '_> for PyLance<IndexMetadata> {
             created_at,
             base_id,
             files,
+            row_reference_domain,
+            logical_coverage,
         }))
     }
 }
@@ -123,16 +163,18 @@ impl<'py> IntoPyObject<'py> for PyLance<&IndexMetadata> {
         let fields = &self.0.fields;
         let dataset_version = self.0.dataset_version;
         let index_version = self.0.index_version;
-        let fragment_ids = self.0.fragment_bitmap.as_ref().map_or_else(
-            || PySet::empty(py).unwrap(),
-            |bitmap| {
-                let set = PySet::empty(py).unwrap();
+        let fragment_ids = self
+            .0
+            .fragment_bitmap
+            .as_ref()
+            .map(|bitmap| {
+                let set = PySet::empty(py)?;
                 for id in bitmap.iter() {
-                    set.add(id).unwrap();
+                    set.add(id)?;
                 }
-                set
-            },
-        );
+                Ok::<_, PyErr>(set)
+            })
+            .transpose()?;
         let created_at = self.0.created_at;
         let base_id = self.0.base_id.map(|id| id as i64);
         let files = self
@@ -146,6 +188,16 @@ impl<'py> IntoPyObject<'py> for PyLance<&IndexMetadata> {
             .index_details
             .as_ref()
             .map(|details| (details.type_url.clone(), details.value.clone()));
+        let row_reference_domain = self.0.row_reference_domain.map(|domain| match domain {
+            RowReferenceDomain::PhysicalRowAddress => "physical_row_address",
+            RowReferenceDomain::LegacyStableRowId => "legacy_stable_row_id",
+            RowReferenceDomain::StableLogicalRowAddress => "stable_logical_row_address",
+        });
+        let logical_coverage = self
+            .0
+            .logical_coverage
+            .as_ref()
+            .map(|coverage| pb::LogicalIndexCoverage::from(coverage).encode_to_vec());
 
         let cls = namespace
             .getattr("Index")
@@ -161,6 +213,8 @@ impl<'py> IntoPyObject<'py> for PyLance<&IndexMetadata> {
             base_id,
             files,
             index_details,
+            row_reference_domain,
+            logical_coverage,
         ))
     }
 }
@@ -611,12 +665,27 @@ impl FromPyObject<'_, '_> for PyLance<Transaction> {
             .extract::<Option<HashMap<String, String>>>()?
             .filter(|map| !map.is_empty())
             .map(Arc::new);
+        let row_address_layout_delta = match ob.getattr("row_address_layout_delta") {
+            Ok(value) => value
+                .extract::<Option<Vec<u8>>>()?
+                .map(|bytes| {
+                    pb::transaction::RowAddressLayoutDelta::decode(bytes.as_slice())
+                        .map_err(|error| PyValueError::new_err(error.to_string()))
+                        .and_then(|delta| {
+                            RowAddressLayoutDelta::try_from(delta)
+                                .map_err(|error| PyValueError::new_err(error.to_string()))
+                        })
+                })
+                .transpose()?,
+            Err(_) => None,
+        };
         Ok(Self(Transaction {
             read_version,
             uuid,
             operation,
             tag: None,
             transaction_properties,
+            row_address_layout_delta,
         }))
     }
 }
@@ -644,6 +713,10 @@ impl<'py> IntoPyObject<'py> for PyLance<&Transaction> {
         if let Some(transaction_properties_arc) = &self.0.transaction_properties {
             let py_dict = transaction_properties_arc.as_ref().into_pyobject(py)?;
             py_transaction.setattr("transaction_properties", py_dict)?;
+        }
+        if let Some(delta) = &self.0.row_address_layout_delta {
+            let bytes = pb::transaction::RowAddressLayoutDelta::from(delta).encode_to_vec();
+            py_transaction.setattr("row_address_layout_delta", bytes)?;
         }
         // Unwrap due to infallible
         Ok(py_transaction.into_pyobject(py).unwrap())

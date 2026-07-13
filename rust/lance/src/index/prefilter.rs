@@ -18,11 +18,13 @@ use futures::StreamExt;
 use futures::TryStreamExt;
 use futures::future::BoxFuture;
 use futures::stream;
+use lance_core::utils::address::RowAddress;
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::tokio::spawn_cpu;
 use lance_select::{RowAddrMask, RowAddrTreeMap};
-use lance_table::format::Fragment;
-use lance_table::format::IndexMetadata;
+use lance_table::format::{
+    Fragment, IndexMetadata, LogicalRowAddressSelection, RetiredLogicalRowMembership,
+};
 use lance_table::rowids::RowIdSequence;
 use roaring::RoaringBitmap;
 use tokio::join;
@@ -62,6 +64,21 @@ impl DatasetPreFilter {
         indices: &[IndexMetadata],
         filter: Option<Box<dyn FilterLoader>>,
     ) -> Self {
+        if dataset.manifest.uses_stable_logical_row_addresses() {
+            let indices = indices.to_vec();
+            let deleted_ids = Some(SharedPrerequisite::spawn(
+                Self::do_create_deletion_mask_logical(dataset, indices).boxed(),
+            ));
+            let filtered_ids = filter.map(|filtered_ids| {
+                SharedPrerequisite::spawn(filtered_ids.load().in_current_span())
+            });
+            return Self {
+                deleted_ids,
+                filtered_ids,
+                deleted_fragments: None,
+                final_mask: Mutex::new(OnceCell::new()),
+            };
+        }
         let mut fragments = RoaringBitmap::new();
         let all_have_bitmaps = indices.iter().all(|idx| idx.fragment_bitmap.is_some());
         if !all_have_bitmaps {
@@ -85,6 +102,161 @@ impl DatasetPreFilter {
             deleted_fragments: None,
             final_mask: Mutex::new(OnceCell::new()),
         }
+    }
+
+    pub(crate) async fn do_create_deletion_mask_logical(
+        dataset: Arc<Dataset>,
+        mut indices: Vec<IndexMetadata>,
+    ) -> Result<Arc<RowAddrMask>> {
+        fn insert_selection(
+            block_list: &mut RowAddrTreeMap,
+            selection: &LogicalRowAddressSelection,
+        ) -> Result<()> {
+            for range in selection.to_ranges()? {
+                let start = (range.logical_fragment_id as u64) << 32 | range.start_slot as u64;
+                let end = (range.logical_fragment_id as u64) << 32 | range.end_slot as u64;
+                block_list.insert_range(start..end);
+            }
+            Ok(())
+        }
+
+        async fn insert_current_owners(
+            dataset: &Dataset,
+            block_list: &mut RowAddrTreeMap,
+            physical: &[RowAddress],
+        ) -> Result<()> {
+            for logical in dataset
+                .resolve_current_physical_row_ids_async(physical)
+                .await?
+                .into_iter()
+                .flatten()
+            {
+                block_list.insert(logical.raw());
+            }
+            Ok(())
+        }
+
+        for index in &mut indices {
+            if index
+                .logical_coverage
+                .as_ref()
+                .is_some_and(|coverage| coverage.requires_authoritative_resolution())
+            {
+                index.logical_coverage = Some(
+                    crate::index::resolve_logical_index_coverage(dataset.as_ref(), index).await?,
+                );
+            }
+        }
+        crate::index::validate_resolved_logical_index_overlaps(&indices)?;
+
+        let layout = dataset
+            .manifest
+            .row_address_layout
+            .as_ref()
+            .ok_or_else(|| {
+                crate::Error::internal("storage-version-2.3 manifest is missing RowAddressLayout")
+            })?;
+        let mut block_list = RowAddrTreeMap::new();
+        let mut coverage_by_name = HashMap::<String, RowAddrTreeMap>::new();
+        for index in &indices {
+            let Some(coverage) = index.logical_coverage.as_ref() else {
+                continue;
+            };
+            for shard in &coverage.shards {
+                let covered = coverage_by_name.entry(index.name.clone()).or_default();
+                let selection = shard.selection.as_ref().ok_or_else(|| {
+                    crate::Error::internal(format!(
+                        "logical index {} coverage detail was not resolved",
+                        index.uuid
+                    ))
+                })?;
+                insert_selection(covered, selection)?;
+                for watermark in &shard.validated_through {
+                    // Commit floors fence incoming index builds after detailed
+                    // invalidation regions have been retired.  They do not
+                    // invalidate a shard already admitted to the current
+                    // catalog: that shard may cover a disjoint, unchanged
+                    // selection.  Current query validity is determined by the
+                    // field default and the retained intersecting regions.
+                    if layout
+                        .field_default_generations
+                        .binary_search_by_key(&watermark.field_id, |generation| generation.field_id)
+                        .ok()
+                        .is_none_or(|position| {
+                            layout.field_default_generations[position].generation
+                                > watermark.generation
+                        })
+                    {
+                        insert_selection(&mut block_list, selection)?;
+                    }
+                    for region in &layout.generation_regions {
+                        if region.generation > watermark.generation
+                            && region.field_ids.binary_search(&watermark.field_id).is_ok()
+                        {
+                            insert_selection(&mut block_list, &region.selection)?;
+                        }
+                    }
+                }
+            }
+        }
+        let allowed = coverage_by_name
+            .into_values()
+            .reduce(|left, right| left & right);
+
+        // Retired logical rows can remain in immutable index postings after a
+        // rewrite.  Keep this mask sparse and independent of physical
+        // placement so compaction never requires rewriting the postings.
+        for retired in &layout.retired_rows {
+            match &retired.membership {
+                RetiredLogicalRowMembership::AllRows => {
+                    for ordinal in 0..retired.domains.domain_count() {
+                        let domain = retired.domains.domain_at(ordinal)?;
+                        let start = (domain.logical_fragment_id as u64) << 32;
+                        block_list.insert_range(start..start + domain.slot_count as u64);
+                    }
+                }
+                RetiredLogicalRowMembership::Selection(selection) => {
+                    insert_selection(&mut block_list, selection)?;
+                }
+            }
+        }
+
+        let fragments_with_deletions = dataset
+            .get_fragments()
+            .into_iter()
+            .filter(|fragment| fragment.metadata().deletion_file.is_some())
+            .collect::<Vec<_>>();
+        let deletion_vectors = stream::iter(fragments_with_deletions)
+            .map(|fragment| async move {
+                let deletion_vector = fragment.get_deletion_vector().await?;
+                Ok::<_, crate::Error>((fragment, deletion_vector))
+            })
+            .buffer_unordered(dataset.object_store.io_parallelism())
+            .try_collect::<Vec<_>>()
+            .await?;
+        for (fragment, deletion_vector) in deletion_vectors {
+            let Some(deletion_vector) = deletion_vector else {
+                continue;
+            };
+            const RESOLVE_BATCH_SIZE: usize = 64 * 1024;
+            let mut deleted_addresses = Vec::with_capacity(RESOLVE_BATCH_SIZE);
+            for offset in deletion_vector.to_sorted_iter() {
+                deleted_addresses.push(RowAddress::new_from_parts(fragment.id() as u32, offset));
+                if deleted_addresses.len() == RESOLVE_BATCH_SIZE {
+                    insert_current_owners(dataset.as_ref(), &mut block_list, &deleted_addresses)
+                        .await?;
+                    deleted_addresses.clear();
+                }
+            }
+            if !deleted_addresses.is_empty() {
+                insert_current_owners(dataset.as_ref(), &mut block_list, &deleted_addresses)
+                    .await?;
+            }
+        }
+        Ok(Arc::new(match allowed {
+            Some(allowed) => RowAddrMask::from_allowed(allowed).also_block(block_list),
+            None => RowAddrMask::from_block(block_list),
+        }))
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -419,7 +591,9 @@ impl PreFilter for DatasetPreFilter {
 
 #[cfg(test)]
 mod test {
+    use lance_encoding::version::LanceFileVersion;
     use lance_select::RowSetOps;
+    use lance_table::format::RowReferenceDomain;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
 
     use crate::dataset::WriteParams;
@@ -568,6 +742,59 @@ mod test {
         assert!(mask.is_some());
         let mask = mask.unwrap().await.unwrap();
         assert_eq!(mask.allow_list().and_then(|x| x.len()), Some(3)); // There were three rows left over;
+    }
+
+    #[tokio::test]
+    async fn test_v23_full_coverage_without_deletions_does_not_initialize_router() {
+        let test_data = BatchGenerator::new()
+            .col(Box::new(IncrementingInt32::new().named("x")))
+            .batch(9);
+        let dataset = Arc::new(
+            Dataset::write(
+                test_data,
+                &format!("memory://v23-prefilter-{}", uuid::Uuid::new_v4()),
+                Some(WriteParams {
+                    max_rows_per_file: 3,
+                    data_storage_version: Some(LanceFileVersion::V2_3),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+        let fragments = RoaringBitmap::from_iter(
+            dataset
+                .get_fragments()
+                .iter()
+                .map(|fragment| fragment.id() as u32),
+        );
+        let field_id = dataset.schema().field("x").unwrap().id;
+        let coverage =
+            crate::index::build_logical_index_coverage(&dataset, &[field_id], &fragments)
+                .await
+                .unwrap();
+        let metadata = IndexMetadata {
+            uuid: uuid::Uuid::new_v4(),
+            fields: vec![field_id],
+            name: "x_idx".to_string(),
+            dataset_version: dataset.version().version,
+            fragment_bitmap: None,
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+            row_reference_domain: Some(RowReferenceDomain::StableLogicalRowAddress),
+            logical_coverage: Some(coverage),
+        };
+
+        assert!(dataset.row_address_router.get().is_none());
+        let mask =
+            DatasetPreFilter::do_create_deletion_mask_logical(dataset.clone(), vec![metadata])
+                .await
+                .unwrap();
+        assert_eq!(mask.allow_list().and_then(RowAddrTreeMap::len), Some(9));
+        assert!(dataset.row_address_router.get().is_none());
     }
 
     // Regression test for issue #6877.

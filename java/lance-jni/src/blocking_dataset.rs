@@ -33,8 +33,12 @@ use lance::dataset::cleanup::{
     CleanupCandidateFile, CleanupExplanation, CleanupFileKind, CleanupPolicy,
     CleanupReferencedBranch, RemovalStats,
 };
-use lance::dataset::optimize::{CompactionOptions as RustCompactionOptions, compact_files};
+use lance::dataset::optimize::{
+    CompactionOptions as RustCompactionOptions, RowAddressMaintenanceMetrics,
+    RowAddressMaintenanceMode, RowAddressMaintenanceOptions, compact_files, maintain_row_addresses,
+};
 use lance::dataset::refs::{Ref, TagContents};
+use lance::dataset::scanner::ColumnOrdering;
 use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt};
 use lance::dataset::transaction::{Operation, Transaction};
 use lance::dataset::{
@@ -411,6 +415,13 @@ impl BlockingDataset {
     pub fn compact(&mut self, options: RustCompactionOptions) -> Result<()> {
         RT.block_on(compact_files(&mut self.inner, options, None))?;
         Ok(())
+    }
+
+    pub fn maintain_row_addresses(
+        &mut self,
+        options: RowAddressMaintenanceOptions,
+    ) -> Result<RowAddressMaintenanceMetrics> {
+        Ok(RT.block_on(maintain_row_addresses(&mut self.inner, options))?)
     }
 
     pub fn cleanup_with_policy(&mut self, policy: CleanupPolicy) -> Result<RemovalStats> {
@@ -1954,7 +1965,7 @@ pub extern "system" fn Java_org_lance_Dataset_nativeHasStableRowIds(
 fn inner_has_stable_row_ids(env: &mut JNIEnv, java_dataset: JObject) -> Result<u8> {
     let dataset_guard =
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-    Ok(dataset_guard.inner.manifest().uses_stable_row_ids() as u8)
+    Ok(dataset_guard.inner.manifest().has_stable_row_identity() as u8)
 }
 
 #[unsafe(no_mangle)]
@@ -3062,6 +3073,102 @@ fn convert_java_compaction_options_to_rust(
         &max_source_fragments,
         config,
     )
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeMaintainRowAddresses<'local>(
+    mut env: JNIEnv<'local>,
+    java_dataset: JObject<'local>,
+    mode: JString<'local>,
+    ordering: JObject<'local>,
+    options: JObject<'local>,
+) -> JObject<'local> {
+    ok_or_throw!(
+        env,
+        inner_maintain_row_addresses(&mut env, java_dataset, mode, ordering, options)
+    )
+}
+
+fn inner_maintain_row_addresses<'local>(
+    env: &mut JNIEnv<'local>,
+    java_dataset: JObject<'local>,
+    mode: JString<'local>,
+    ordering: JObject<'local>,
+    options: JObject<'local>,
+) -> Result<JObject<'local>> {
+    let mode: String = env.get_string(&mode)?.into();
+    let ordering = import_vec_to_rust(env, &ordering, |env, item| {
+        Ok(ColumnOrdering {
+            column_name: env.get_string_from_method(&item, "getColumnName")?,
+            ascending: env.get_boolean_from_method(&item, "isAscending")?,
+            nulls_first: env.get_boolean_from_method(&item, "isNullFirst")?,
+        })
+    })?;
+    let maintenance_mode = match mode.as_str() {
+        "normalize_placement" => {
+            if !ordering.is_empty() {
+                return Err(Error::input_error(
+                    "ordering is only valid for recluster".to_owned(),
+                ));
+            }
+            RowAddressMaintenanceMode::NormalizePlacement
+        }
+        "repack" => {
+            if !ordering.is_empty() {
+                return Err(Error::input_error(
+                    "ordering is only valid for recluster".to_owned(),
+                ));
+            }
+            RowAddressMaintenanceMode::Repack
+        }
+        "recluster" => RowAddressMaintenanceMode::Recluster { ordering },
+        "checkpoint_generation" => {
+            if !ordering.is_empty() {
+                return Err(Error::input_error(
+                    "ordering is only valid for recluster".to_owned(),
+                ));
+            }
+            RowAddressMaintenanceMode::CheckpointGeneration
+        }
+        _ => {
+            return Err(Error::input_error(format!(
+                "invalid row-address maintenance mode: {mode}"
+            )));
+        }
+    };
+
+    let mut rust_options = RowAddressMaintenanceOptions {
+        mode: maintenance_mode,
+        ..RowAddressMaintenanceOptions::default()
+    };
+    if let Some(value) = env.get_optional_usize_from_method(&options, "getTargetRowsPerFragment")? {
+        rust_options.target_rows_per_fragment = value;
+    }
+    if let Some(value) = env.get_optional_usize_from_method(&options, "getMaxRowsPerGroup")? {
+        rust_options.max_rows_per_group = value;
+    }
+    rust_options.max_bytes_per_file =
+        env.get_optional_usize_from_method(&options, "getMaxBytesPerFile")?;
+    rust_options.batch_size = env.get_optional_usize_from_method(&options, "getBatchSize")?;
+    rust_options.io_buffer_size = env.get_optional_u64_from_method(&options, "getIoBufferSize")?;
+
+    let metrics = {
+        let mut dataset =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+        dataset.maintain_row_addresses(rust_options)?
+    };
+    Ok(env.new_object(
+        "org/lance/maintenance/RowAddressMaintenanceMetrics",
+        "(JJJJJJ)V",
+        &[
+            JValue::Long(metrics.fragments_removed as i64),
+            JValue::Long(metrics.fragments_added as i64),
+            JValue::Long(metrics.data_files_written as i64),
+            JValue::Long(metrics.locator_objects_written as i64),
+            JValue::Long(metrics.locator_bytes_written as i64),
+            JValue::Long(metrics.rows_rewritten as i64),
+        ],
+    )?)
 }
 
 #[unsafe(no_mangle)]

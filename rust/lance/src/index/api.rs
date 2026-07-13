@@ -6,7 +6,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use lance_index::{IndexParams, IndexType, PrewarmOptions, optimize::OptimizeOptions};
-use lance_table::format::IndexMetadata;
+use lance_table::format::{IndexMetadata, LogicalIndexCoverage, RowReferenceDomain};
 use roaring::RoaringBitmap;
 use uuid::Uuid;
 
@@ -22,7 +22,9 @@ pub struct IndexSegment {
     /// Unique ID of the physical segment.
     uuid: Uuid,
     /// The fragments covered by this segment.
-    fragment_bitmap: RoaringBitmap,
+    fragment_bitmap: Option<RoaringBitmap>,
+    /// Exact logical coverage for a storage-version-2.3 segment.
+    logical_coverage: Option<LogicalIndexCoverage>,
     /// Metadata specific to the index type.
     index_details: Arc<prost_types::Any>,
     /// The on-disk index version for this segment.
@@ -43,7 +45,25 @@ impl IndexSegment {
     {
         Self {
             uuid,
-            fragment_bitmap: fragment_bitmap.into_iter().collect(),
+            fragment_bitmap: Some(fragment_bitmap.into_iter().collect()),
+            logical_coverage: None,
+            index_details,
+            index_version,
+        }
+    }
+
+    /// Create a storage-version-2.3 segment whose postings contain stable
+    /// logical row addresses.
+    pub fn new_logical(
+        uuid: Uuid,
+        logical_coverage: LogicalIndexCoverage,
+        index_details: Arc<prost_types::Any>,
+        index_version: i32,
+    ) -> Self {
+        Self {
+            uuid,
+            fragment_bitmap: None,
+            logical_coverage: Some(logical_coverage),
             index_details,
             index_version,
         }
@@ -55,8 +75,13 @@ impl IndexSegment {
     }
 
     /// Return the fragment coverage of this segment.
-    pub fn fragment_bitmap(&self) -> &RoaringBitmap {
-        &self.fragment_bitmap
+    pub fn fragment_bitmap(&self) -> Option<&RoaringBitmap> {
+        self.fragment_bitmap.as_ref()
+    }
+
+    /// Return exact v2.3 logical coverage, when this is a logical segment.
+    pub fn logical_coverage(&self) -> Option<&LogicalIndexCoverage> {
+        self.logical_coverage.as_ref()
     }
 
     /// Return the serialized index details for this segment.
@@ -70,10 +95,19 @@ impl IndexSegment {
     }
 
     /// Consume the segment and return its component parts.
-    pub fn into_parts(self) -> (Uuid, RoaringBitmap, Arc<prost_types::Any>, i32) {
+    pub fn into_parts(
+        self,
+    ) -> (
+        Uuid,
+        Option<RoaringBitmap>,
+        Option<LogicalIndexCoverage>,
+        Arc<prost_types::Any>,
+        i32,
+    ) {
         (
             self.uuid,
             self.fragment_bitmap,
+            self.logical_coverage,
             self.index_details,
             self.index_version,
         )
@@ -94,25 +128,43 @@ impl IntoIndexSegment for IndexSegment {
 
 impl IntoIndexSegment for IndexMetadata {
     fn into_index_segment(self) -> Result<IndexSegment> {
-        let fragment_bitmap = self.fragment_bitmap.ok_or_else(|| {
-            Error::invalid_input(format!(
-                "CreateIndex: segment {} is missing fragment coverage",
+        let logical_coverage = match self.row_reference_domain {
+            Some(RowReferenceDomain::StableLogicalRowAddress) => {
+                Some(self.logical_coverage.ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "CreateIndex: logical segment {} is missing exact coverage",
+                        self.uuid
+                    ))
+                })?)
+            }
+            Some(domain) => {
+                return Err(Error::invalid_input(format!(
+                    "CreateIndex: segment {} uses unsupported row reference domain {:?}",
+                    self.uuid, domain
+                )));
+            }
+            None => None,
+        };
+        let fragment_bitmap = self.fragment_bitmap;
+        if fragment_bitmap.is_some() == logical_coverage.is_some() {
+            return Err(Error::invalid_input(format!(
+                "CreateIndex: segment {} must contain exactly one physical or logical coverage domain",
                 self.uuid
-            ))
-        })?;
+            )));
+        }
         let index_details = self.index_details.ok_or_else(|| {
             Error::invalid_input(format!(
                 "CreateIndex: segment {} is missing index details",
                 self.uuid
             ))
         })?;
-
-        Ok(IndexSegment::new(
-            self.uuid,
-            fragment_bitmap.iter(),
+        Ok(IndexSegment {
+            uuid: self.uuid,
+            fragment_bitmap,
+            logical_coverage,
             index_details,
-            self.index_version,
-        ))
+            index_version: self.index_version,
+        })
     }
 }
 

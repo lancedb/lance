@@ -37,6 +37,8 @@ public class Index {
   private final Instant createdAt;
   private final Integer baseId;
   private final IndexType indexType;
+  private final RowReferenceDomain rowReferenceDomain;
+  private final byte[] logicalCoverage;
 
   private Index(
       UUID uuid,
@@ -48,7 +50,9 @@ public class Index {
       int indexVersion,
       Instant createdAt,
       Integer baseId,
-      IndexType indexType) {
+      IndexType indexType,
+      RowReferenceDomain rowReferenceDomain,
+      byte[] logicalCoverage) {
     this.uuid = uuid;
     this.fields = fields;
     this.name = name;
@@ -59,6 +63,8 @@ public class Index {
     this.createdAt = createdAt;
     this.baseId = baseId;
     this.indexType = indexType;
+    this.rowReferenceDomain = rowReferenceDomain;
+    this.logicalCoverage = logicalCoverage;
   }
 
   public UUID uuid() {
@@ -131,6 +137,21 @@ public class Index {
     return indexType;
   }
 
+  /** Return the address domain stored in postings, when declared. */
+  public Optional<RowReferenceDomain> rowReferenceDomain() {
+    return Optional.ofNullable(rowReferenceDomain);
+  }
+
+  /** Return opaque exact logical coverage metadata for storage version 2.3. */
+  public Optional<byte[]> logicalCoverage() {
+    return Optional.ofNullable(logicalCoverage);
+  }
+
+  /** Return the protobuf value used by JNI without exposing enum naming conventions. */
+  public Optional<Integer> rowReferenceDomainValue() {
+    return rowReferenceDomain().map(RowReferenceDomain::getValue);
+  }
+
   @Override
   public boolean equals(Object o) {
     if (this == o) return true;
@@ -145,7 +166,9 @@ public class Index {
         && Arrays.equals(indexDetails, index.indexDetails)
         && Objects.equals(createdAt, index.createdAt)
         && Objects.equals(baseId, index.baseId)
-        && indexType == index.indexType;
+        && indexType == index.indexType
+        && rowReferenceDomain == index.rowReferenceDomain
+        && Arrays.equals(logicalCoverage, index.logicalCoverage);
   }
 
   @Override
@@ -160,8 +183,10 @@ public class Index {
             createdAt,
             baseId,
             fragments,
-            indexType);
+            indexType,
+            rowReferenceDomain);
     result = 31 * result + Arrays.hashCode(indexDetails);
+    result = 31 * result + Arrays.hashCode(logicalCoverage);
     return result;
   }
 
@@ -176,6 +201,7 @@ public class Index {
         .add("indexType", indexType)
         .add("createdAt", createdAt)
         .add("baseId", baseId)
+        .add("rowReferenceDomain", rowReferenceDomain)
         .toString();
   }
 
@@ -200,6 +226,8 @@ public class Index {
     private Instant createdAt;
     private Integer baseId;
     private IndexType indexType;
+    private RowReferenceDomain rowReferenceDomain;
+    private byte[] logicalCoverage;
 
     private Builder() {}
 
@@ -253,6 +281,16 @@ public class Index {
       return this;
     }
 
+    public Builder rowReferenceDomain(RowReferenceDomain rowReferenceDomain) {
+      this.rowReferenceDomain = rowReferenceDomain;
+      return this;
+    }
+
+    public Builder logicalCoverage(byte[] logicalCoverage) {
+      this.logicalCoverage = logicalCoverage;
+      return this;
+    }
+
     public Index build() {
       return new Index(
           uuid,
@@ -264,7 +302,9 @@ public class Index {
           indexVersion,
           createdAt,
           baseId,
-          indexType);
+          indexType,
+          rowReferenceDomain,
+          logicalCoverage);
     }
   }
 }

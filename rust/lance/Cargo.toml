@@ -127,6 +127,7 @@ tracing-chrome = "0.7.1"
 rstest = { workspace = true }
 serial_test = { workspace = true }
 tracking-allocator = { version = "0.4", features = ["tracing-compat"] }
+metrics-util = { workspace = true }
 # For S3 / DynamoDB tests
 aws-config = { workspace = true }
 aws-sdk-s3 = { workspace = true, default-features = false, features = ["default-https-client", "http-1x", "rt-tokio"] }
@@ -322,6 +323,16 @@ harness = false
 [[bench]]
 name = "hamming"
 harness = false
+
+[[bench]]
+name = "stable_row_address_e2e"
+path = "../../benchmarks/stable_row_address/e2e.rs"
+harness = false
+required-features = ["metrics"]
+
+[[test]]
+name = "stable_row_address_maintenance"
+path = "../../benchmarks/stable_row_address/maintenance_test.rs"
 
 [lints]
 workspace = true

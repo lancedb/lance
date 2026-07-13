@@ -24,8 +24,11 @@ import org.lance.index.OptimizeOptions;
 import org.lance.index.scalar.BTreeIndexParams;
 import org.lance.index.scalar.NGramIndexParams;
 import org.lance.index.scalar.ScalarIndexParams;
+import org.lance.ipc.ColumnOrdering;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
+import org.lance.maintenance.RowAddressMaintenanceMetrics;
+import org.lance.maintenance.RowAddressMaintenanceOptions;
 import org.lance.operation.Append;
 import org.lance.operation.Overwrite;
 import org.lance.operation.UpdateConfig;
@@ -1478,6 +1481,19 @@ public class DatasetTest {
         assertTrue(ds.hasStableRowIds());
       }
     }
+
+    String datasetPathV23 = tempDir.resolve("uses_stable_row_ids_v23").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPathV23);
+
+      // Storage version 2.3 has stable logical row addresses without the legacy flag.
+      try (Dataset ds =
+          testDataset.createDatasetWithWriteParams(
+              new WriteParams.Builder().withDataStorageVersion("2.3").build())) {
+        assertTrue(ds.hasStableRowIds());
+      }
+    }
   }
 
   @Test
@@ -1523,6 +1539,65 @@ public class DatasetTest {
         assertEquals(1024, customOptions.getMaxRowsPerGroup().get());
         assertEquals(0.1f, customOptions.getMaterializeDeletionsThreshold().get(), 0.001f);
         assertFalse(customOptions.getMaxBytesPerFile().isPresent());
+      }
+    }
+  }
+
+  @Test
+  void testExplicitRowAddressMaintenanceBindings(@TempDir Path tempDir) {
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset v23Fixture =
+          new TestUtils.SimpleTestDataset(allocator, tempDir.resolve("maintenance_v23").toString());
+      try (Dataset v23 =
+          v23Fixture.createDatasetWithWriteParams(
+              new WriteParams.Builder().withDataStorageVersion("2.3").build())) {
+        RowAddressMaintenanceOptions options =
+            RowAddressMaintenanceOptions.builder()
+                .withTargetRowsPerFragment(4)
+                .withMaxRowsPerGroup(2)
+                .withBatchSize(3)
+                .withIoBufferSize(1024 * 1024)
+                .build();
+        RowAddressMaintenanceMetrics normalized = v23.normalizePlacement(options);
+        assertEquals(0, normalized.getFragmentsRemoved());
+        assertEquals(0, normalized.getFragmentsAdded());
+        assertEquals(0, normalized.getDataFilesWritten());
+        assertEquals(0, normalized.getLocatorObjectsWritten());
+        assertEquals(0, normalized.getLocatorBytesWritten());
+        assertEquals(0, normalized.getRowsRewritten());
+
+        RowAddressMaintenanceMetrics repacked = v23.repack(options);
+        assertEquals(0, repacked.getRowsRewritten());
+
+        ColumnOrdering.Builder orderingBuilder = new ColumnOrdering.Builder();
+        orderingBuilder.setColumnName("id");
+        orderingBuilder.setAscending(false);
+        orderingBuilder.setNullFirst(false);
+        RowAddressMaintenanceMetrics reclustered =
+            v23.recluster(List.of(orderingBuilder.build()), options);
+        assertEquals(0, reclustered.getRowsRewritten());
+
+        RowAddressMaintenanceMetrics checkpointed = v23.checkpointRowAddressGenerations();
+        assertEquals(0, checkpointed.getRowsRewritten());
+
+        RowAddressMaintenanceOptions byteBoundaries =
+            RowAddressMaintenanceOptions.builder().withMaxBytesPerFile(1024).build();
+        assertThrows(IllegalArgumentException.class, () -> v23.normalizePlacement(byteBoundaries));
+      }
+
+      TestUtils.SimpleTestDataset v22Fixture =
+          new TestUtils.SimpleTestDataset(allocator, tempDir.resolve("maintenance_v22").toString());
+      try (Dataset v22 = v22Fixture.createEmptyDataset()) {
+        assertThrows(IllegalArgumentException.class, v22::normalizePlacement);
+        assertThrows(IllegalArgumentException.class, v22::repack);
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> {
+              ColumnOrdering.Builder orderingBuilder = new ColumnOrdering.Builder();
+              orderingBuilder.setColumnName("id");
+              v22.recluster(List.of(orderingBuilder.build()));
+            });
+        assertThrows(IllegalArgumentException.class, v22::checkpointRowAddressGenerations);
       }
     }
   }

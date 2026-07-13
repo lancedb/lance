@@ -41,9 +41,10 @@ use lance_file::reader::FileReaderOptions;
 use lance_index::scalar::expression::FilterPlan;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_select::{
-    IndexExprResult, RowAddrSelection, RowAddrTreeMap, bitmap_to_ranges, ranges_to_bitmap,
+    IndexExprResult, RowAddrMask, RowAddrSelection, RowAddrTreeMap, bitmap_to_ranges,
+    ranges_to_bitmap,
 };
-use lance_table::format::Fragment;
+use lance_table::format::{Fragment, LogicalDomainDestination};
 use lance_table::rowids::RowIdSequence;
 use lance_table::utils::stream::ReadBatchFut;
 use roaring::RoaringBitmap;
@@ -81,6 +82,186 @@ impl EvaluatedIndex {
     pub fn try_from_arrow(batch: &RecordBatch) -> Result<Self> {
         let (index_result, applicable_fragments) = IndexExprResult::deserialize(batch)?;
 
+        Ok(Self {
+            index_result,
+            applicable_fragments,
+        })
+    }
+
+    async fn translate_logical_mask(dataset: &Dataset, mask: &RowAddrMask) -> Result<RowAddrMask> {
+        let logical = match mask {
+            RowAddrMask::AllowList(logical) | RowAddrMask::BlockList(logical) => logical,
+        };
+        let mut physical = RowAddrTreeMap::new();
+        for (logical_fragment_id, selection) in logical.iter() {
+            match selection {
+                RowAddrSelection::Partial(slots) => {
+                    const RESOLVE_BATCH_SIZE: usize = 64 * 1024;
+                    let mut row_ids = Vec::with_capacity(RESOLVE_BATCH_SIZE);
+                    for slot in slots.iter() {
+                        row_ids.push((*logical_fragment_id as u64) << 32 | slot as u64);
+                        if row_ids.len() == RESOLVE_BATCH_SIZE {
+                            Self::resolve_logical_mask_batch(dataset, &row_ids, &mut physical)
+                                .await?;
+                            row_ids.clear();
+                        }
+                    }
+                    if !row_ids.is_empty() {
+                        Self::resolve_logical_mask_batch(dataset, &row_ids, &mut physical).await?;
+                    }
+                }
+                RowAddrSelection::Full => {
+                    for destination in dataset
+                        .row_address_router()?
+                        .logical_domain_destination_ranges(*logical_fragment_id)?
+                    {
+                        match destination {
+                            LogicalDomainDestination::Inline(range) => {
+                                let start = (range.physical_fragment_id as u64) << 32
+                                    | range.start_offset as u64;
+                                let end = (range.physical_fragment_id as u64) << 32
+                                    | range.end_offset as u64;
+                                physical.insert_range(start..end);
+                            }
+                            LogicalDomainDestination::ExplicitMap { placement_index } => {
+                                let domain = dataset
+                                    .row_address_router()?
+                                    .logical_domain(*logical_fragment_id)?
+                                    .ok_or_else(|| {
+                                        Error::internal(format!(
+                                            "ExplicitMap placement {placement_index} has no logical-domain metadata"
+                                        ))
+                                    })?;
+                                const RESOLVE_BATCH_SIZE: usize = 64 * 1024;
+                                let mut row_ids = Vec::with_capacity(RESOLVE_BATCH_SIZE);
+                                for slot in 0..domain.slot_count {
+                                    row_ids.push((*logical_fragment_id as u64) << 32 | slot as u64);
+                                    if row_ids.len() == RESOLVE_BATCH_SIZE {
+                                        Self::resolve_logical_mask_batch(
+                                            dataset,
+                                            &row_ids,
+                                            &mut physical,
+                                        )
+                                        .await?;
+                                        row_ids.clear();
+                                    }
+                                }
+                                if !row_ids.is_empty() {
+                                    Self::resolve_logical_mask_batch(
+                                        dataset,
+                                        &row_ids,
+                                        &mut physical,
+                                    )
+                                    .await?;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(match mask {
+            RowAddrMask::AllowList(_) => RowAddrMask::AllowList(physical),
+            RowAddrMask::BlockList(_) => RowAddrMask::BlockList(physical),
+        })
+    }
+
+    async fn resolve_logical_mask_batch(
+        dataset: &Dataset,
+        row_ids: &[u64],
+        physical: &mut RowAddrTreeMap,
+    ) -> Result<()> {
+        for address in dataset
+            .resolve_logical_row_ids_async(row_ids)
+            .await?
+            .into_iter()
+            .flatten()
+        {
+            physical.insert(u64::from(address));
+        }
+        Ok(())
+    }
+
+    async fn translate_logical(dataset: &Dataset, logical: Self) -> Result<Self> {
+        let index_result = if logical.index_result.is_exact() {
+            IndexExprResult::exact(
+                Self::translate_logical_mask(dataset, &logical.index_result.lower).await?,
+            )
+        } else if logical.index_result.is_at_least() {
+            IndexExprResult::at_least(
+                Self::translate_logical_mask(dataset, &logical.index_result.lower).await?,
+            )
+        } else if logical.index_result.is_at_most() {
+            IndexExprResult::at_most(
+                Self::translate_logical_mask(dataset, &logical.index_result.upper).await?,
+            )
+        } else {
+            IndexExprResult::new(
+                Self::translate_logical_mask(dataset, &logical.index_result.lower).await?,
+                Self::translate_logical_mask(dataset, &logical.index_result.upper).await?,
+            )
+        };
+        let mut applicable_fragments = RoaringBitmap::new();
+        let router = dataset.row_address_router()?;
+        let logical_applicable_fragments = logical.applicable_fragments;
+        for logical_fragment_id in logical_applicable_fragments.iter() {
+            for destination in router.logical_domain_destination_ranges(logical_fragment_id)? {
+                match destination {
+                    LogicalDomainDestination::Inline(range) => {
+                        applicable_fragments.insert(range.physical_fragment_id);
+                    }
+                    LogicalDomainDestination::ExplicitMap { placement_index } => {
+                        let layout = dataset
+                            .manifest
+                            .row_address_layout
+                            .as_ref()
+                            .ok_or_else(|| Error::internal("missing row-address layout"))?;
+                        for (fragment_id, _, _) in
+                            layout.placements[placement_index as usize].destination_ranges()
+                        {
+                            applicable_fragments.insert(fragment_id);
+                        }
+                    }
+                }
+            }
+        }
+
+        // A physical fragment can pack several logical domains after
+        // compaction.  It is safe to apply an exact index result only when
+        // every live domain in that physical fragment is covered; otherwise
+        // the uncovered domain must route the whole physical fragment through
+        // the full-filter fallback.
+        let layout = dataset
+            .manifest
+            .row_address_layout
+            .as_ref()
+            .ok_or_else(|| {
+                Error::internal("storage-version-2.3 manifest is missing RowAddressLayout")
+            })?;
+        let all_logical_fragments =
+            layout.current_logical_fragment_bitmap(&dataset.manifest.fragments)?;
+        let fallback_logical_fragments = &all_logical_fragments - &logical_applicable_fragments;
+        for logical_fragment_id in fallback_logical_fragments {
+            for destination in router.logical_domain_destination_ranges(logical_fragment_id)? {
+                match destination {
+                    LogicalDomainDestination::Inline(range) => {
+                        applicable_fragments.remove(range.physical_fragment_id);
+                    }
+                    LogicalDomainDestination::ExplicitMap { placement_index } => {
+                        let layout = dataset
+                            .manifest
+                            .row_address_layout
+                            .as_ref()
+                            .ok_or_else(|| Error::internal("missing row-address layout"))?;
+                        for (fragment_id, _, _) in
+                            layout.placements[placement_index as usize].destination_ranges()
+                        {
+                            applicable_fragments.remove(fragment_id);
+                        }
+                    }
+                }
+            }
+        }
         Ok(Self {
             index_result,
             applicable_fragments,
@@ -1675,9 +1856,14 @@ impl FilteredReadExec {
                     let index_search_result = index_search.next().await.ok_or_else(|| {
                         Error::internal("Index search did not yield any results".to_string())
                     })??;
-                    evaluated_index = Some(Arc::new(EvaluatedIndex::try_from_arrow(
-                        &index_search_result,
-                    )?));
+                    let decoded = EvaluatedIndex::try_from_arrow(&index_search_result)?;
+                    if dataset.manifest.uses_stable_logical_row_addresses() {
+                        evaluated_index = Some(Arc::new(
+                            EvaluatedIndex::translate_logical(dataset.as_ref(), decoded).await?,
+                        ));
+                    } else {
+                        evaluated_index = Some(Arc::new(decoded));
+                    }
                 }
 
                 // Load fragments to compute the plan
@@ -2143,13 +2329,16 @@ mod tests {
     use itertools::Itertools;
     use lance_core::datatypes::OnMissing;
     use lance_core::utils::tempfile::TempStrDir;
+    use lance_datafusion::exec::OneShotExec;
     use lance_datagen::{BatchCount, Dimension, RowCount, array, gen_batch};
+    use lance_file::version::LanceFileVersion;
     use lance_index::{
         IndexType,
         optimize::OptimizeOptions,
         scalar::{ScalarIndexParams, expression::PlannerIndexExt},
     };
     use lance_select::result::IndexExprResultWireFormat;
+    use std::sync::OnceLock as StdOnceLock;
 
     use crate::{
         dataset::{InsertBuilder, WriteDestination, WriteMode, WriteParams},
@@ -2374,6 +2563,134 @@ mod tests {
         Arc::new(UInt32Array::from_iter_values(
             ranges.into_iter().flat_map(|r| r.into_iter()),
         ))
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_v23_filtered_read_translates_logical_index_masks() {
+        let tmp_path = TempStrDir::default();
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "value",
+            arrow_schema::DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..10))],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            tmp_path.as_str(),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_3),
+                max_rows_per_file: 10,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Make logical and physical fragment IDs intentionally different so this
+        // test fails if the logical mask is treated as a physical RowIdSequence.
+        let mut manifest = dataset.manifest.as_ref().clone();
+        let mut fragments = manifest.fragments.as_ref().clone();
+        fragments[0]
+            .native_logical_domain
+            .as_mut()
+            .unwrap()
+            .logical_fragment_id = 42;
+        manifest.fragments = Arc::new(fragments);
+        manifest.max_logical_fragment_id = Some(42);
+        manifest.refresh_row_address_fingerprint().unwrap();
+        manifest.validate_row_address_contract().unwrap();
+        dataset.manifest = Arc::new(manifest);
+        dataset.row_address_router = Arc::new(StdOnceLock::new());
+        let dataset = Arc::new(dataset);
+
+        let projection = dataset.full_projection().with_row_id();
+        let no_index = FilteredReadExec::try_new(
+            dataset.clone(),
+            FilteredReadOptions::basic_full_read(&dataset).with_projection(projection.clone()),
+            None,
+        )
+        .unwrap();
+        let ordinary = no_index
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let ordinary = concat_batches(&ordinary[0].schema(), &ordinary).unwrap();
+        assert_eq!(ordinary.num_rows(), 10);
+        assert_eq!(
+            ordinary[lance_core::ROW_ID]
+                .as_primitive::<arrow_array::types::UInt64Type>()
+                .values()
+                .as_ref(),
+            (0..10)
+                .map(|slot| (42_u64 << 32) | slot)
+                .collect::<Vec<_>>()
+                .as_slice()
+        );
+        assert!(dataset.row_address_router.get().is_none());
+
+        let wanted_ids = [(42_u64 << 32) | 7, (42_u64 << 32) | 2];
+        let result = IndexExprResult::exact(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(
+            wanted_ids,
+        )));
+        let applicable = RoaringBitmap::from_iter([42]);
+        let index_batch = result
+            .serialize(&applicable, IndexExprResultWireFormat::default())
+            .unwrap();
+        let index_input: Arc<dyn ExecutionPlan> = Arc::new(OneShotExec::from_batch(index_batch));
+        let indexed = FilteredReadExec::try_new(
+            dataset.clone(),
+            FilteredReadOptions::basic_full_read(&dataset).with_projection(projection),
+            Some(index_input),
+        )
+        .unwrap();
+        let indexed = indexed
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let indexed = concat_batches(&indexed[0].schema(), &indexed).unwrap();
+        assert_eq!(
+            indexed["value"].as_primitive::<arrow_array::types::Int32Type>(),
+            &Int32Array::from_iter_values([2, 7])
+        );
+        assert_eq!(
+            indexed[lance_core::ROW_ID]
+                .as_primitive::<arrow_array::types::UInt64Type>()
+                .values()
+                .as_ref(),
+            &[(42_u64 << 32) | 2, (42_u64 << 32) | 7]
+        );
+        assert!(dataset.row_address_router.get().is_some());
+
+        let mut full_logical_domain = RowAddrTreeMap::new();
+        full_logical_domain.insert_fragment(42);
+        let full_allow = EvaluatedIndex::translate_logical_mask(
+            &dataset,
+            &RowAddrMask::from_allowed(full_logical_domain.clone()),
+        )
+        .await
+        .unwrap();
+        let physical_first = u64::from(lance_core::utils::address::RowAddress::new_from_parts(
+            dataset.manifest.fragments[0].id as u32,
+            0,
+        ));
+        assert!(full_allow.selected(physical_first));
+        assert!(!full_allow.selected(42_u64 << 32));
+
+        let full_block = EvaluatedIndex::translate_logical_mask(
+            &dataset,
+            &RowAddrMask::from_block(full_logical_domain),
+        )
+        .await
+        .unwrap();
+        assert!(!full_block.selected(physical_first));
     }
 
     /// Round-trip every interval shape through the arrow wire format and

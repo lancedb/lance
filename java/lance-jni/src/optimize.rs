@@ -302,25 +302,31 @@ fn inner_execute_task<'local>(
 }
 
 const TASK_DATA_CLASS: &str = "org/lance/compaction/TaskData";
-const TASK_DATA_CONSTRUCTOR_SIG: &str = "(Ljava/util/List;)V";
+const TASK_DATA_CONSTRUCTOR_SIG: &str = "(Ljava/util/List;[B)V";
 const COMPACTION_METRICS_CLASS: &str = "org/lance/compaction/CompactionMetrics";
-const COMPACTION_METRICS_CONSTRUCTOR_SIG: &str = "(JJJJ)V";
+const COMPACTION_METRICS_CONSTRUCTOR_SIG: &str = "(JJJJJJJ)V";
 const COMPACTION_PLAN_CLASS: &str = "org/lance/compaction/CompactionPlan";
 const COMPACTION_PLAN_CONSTRUCTOR_SIG: &str =
     "(Ljava/util/List;JLorg/lance/compaction/CompactionOptions;)V";
 const REWRITE_RESULT_CLASS: &str = "org/lance/compaction/RewriteResult";
 const REWRITE_RESULT_CONSTRUCTOR_SIG: &str =
-    "(Lorg/lance/compaction/CompactionMetrics;Ljava/util/List;Ljava/util/List;J[B)V";
+    "(Lorg/lance/compaction/CompactionMetrics;Ljava/util/List;Ljava/util/List;J[B[B[B)V";
 const COMPACTION_OPTIONS_CLASS: &str = "org/lance/compaction/CompactionOptions";
 const COMPACTION_OPTIONS_CONSTRUCTOR_SIG: &str = "(Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;)V";
 
 impl IntoJava for &TaskData {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
         let fragments = export_vec(env, &self.fragments)?;
+        let v2_3_plan: JObject<'_> = match &self.v2_3_plan {
+            Some(plan) => env
+                .byte_array_from_slice(&serde_json::to_vec(plan)?)?
+                .into(),
+            None => JObject::null(),
+        };
         Ok(env.new_object(
             TASK_DATA_CLASS,
             TASK_DATA_CONSTRUCTOR_SIG,
-            &[JValueGen::Object(&fragments)],
+            &[JValueGen::Object(&fragments), JValueGen::Object(&v2_3_plan)],
         )?)
     }
 }
@@ -331,6 +337,9 @@ impl IntoJava for &CompactionMetrics {
             COMPACTION_METRICS_CLASS,
             COMPACTION_METRICS_CONSTRUCTOR_SIG,
             &[
+                JValueGen::Long(self.groups_planned as i64),
+                JValueGen::Long(self.groups_admitted as i64),
+                JValueGen::Long(self.groups_not_admitted as i64),
                 JValueGen::Long(self.fragments_removed as i64),
                 JValueGen::Long(self.fragments_added as i64),
                 JValueGen::Long(self.files_removed as i64),
@@ -424,6 +433,14 @@ impl IntoJava for &RewriteResult {
         } else {
             JObject::null()
         };
+        let logical_row_ids: JObject<'_> = match &self.logical_row_ids {
+            Some(row_ids) => env.byte_array_from_slice(row_ids)?.into(),
+            None => JObject::null(),
+        };
+        let retired_logical_row_ids: JObject<'_> = match &self.retired_logical_row_ids {
+            Some(row_ids) => env.byte_array_from_slice(row_ids)?.into(),
+            None => JObject::null(),
+        };
         Ok(env.new_object(
             REWRITE_RESULT_CLASS,
             REWRITE_RESULT_CONSTRUCTOR_SIG,
@@ -433,6 +450,8 @@ impl IntoJava for &RewriteResult {
                 JValueGen::Object(&original_fragments),
                 JValueGen::Long(self.read_version as i64),
                 JValueGen::Object(&row_addrs),
+                JValueGen::Object(&logical_row_ids),
+                JValueGen::Object(&retired_logical_row_ids),
             ],
         )?)
     }
@@ -440,6 +459,13 @@ impl IntoJava for &RewriteResult {
 
 impl FromJObjectWithEnv<CompactionMetrics> for JObject<'_> {
     fn extract_object(&self, env: &mut JNIEnv<'_>) -> Result<CompactionMetrics> {
+        let groups_planned = env.call_method(self, "getGroupsPlanned", "()J", &[])?.j()? as usize;
+        let groups_admitted = env
+            .call_method(self, "getGroupsAdmitted", "()J", &[])?
+            .j()? as usize;
+        let groups_not_admitted = env
+            .call_method(self, "getGroupsNotAdmitted", "()J", &[])?
+            .j()? as usize;
         let fragments_removed = env
             .call_method(self, "getFragmentsRemoved", "()J", &[])?
             .j()? as usize;
@@ -449,6 +475,9 @@ impl FromJObjectWithEnv<CompactionMetrics> for JObject<'_> {
         let files_removed = env.call_method(self, "getFilesRemoved", "()J", &[])?.j()? as usize;
         let files_added = env.call_method(self, "getFilesAdded", "()J", &[])?.j()? as usize;
         Ok(CompactionMetrics {
+            groups_planned,
+            groups_admitted,
+            groups_not_admitted,
             fragments_removed,
             fragments_added,
             files_removed,
@@ -462,8 +491,12 @@ impl FromJObjectWithEnv<TaskData> for JObject<'_> {
         let task_data = import_vec_from_method(env, self, "getFragments", |env, fragment| {
             fragment.extract_object(env)
         })?;
+        let v2_3_plan = optional_byte_array_from_method(env, self, "getV23Plan")?
+            .map(|bytes| serde_json::from_slice(&bytes))
+            .transpose()?;
         Ok(TaskData {
             fragments: task_data,
+            v2_3_plan,
         })
     }
 }
@@ -497,12 +530,30 @@ impl FromJObjectWithEnv<RewriteResult> for JObject<'_> {
         } else {
             Some(env.convert_byte_array(row_addrs_obj)?)
         };
+        let logical_row_ids = optional_byte_array_from_method(env, self, "getLogicalRowIds")?;
+        let retired_logical_row_ids =
+            optional_byte_array_from_method(env, self, "getRetiredLogicalRowIds")?;
         Ok(RewriteResult {
             metrics,
             new_fragments,
             read_version,
             original_fragments,
             row_addrs,
+            logical_row_ids,
+            retired_logical_row_ids,
         })
+    }
+}
+
+fn optional_byte_array_from_method(
+    env: &mut JNIEnv<'_>,
+    object: &JObject<'_>,
+    method: &str,
+) -> Result<Option<Vec<u8>>> {
+    let bytes: JByteArray<'_> = env.call_method(object, method, "()[B", &[])?.l()?.into();
+    if bytes.is_null() {
+        Ok(None)
+    } else {
+        Ok(Some(env.convert_byte_array(bytes)?))
     }
 }

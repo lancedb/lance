@@ -15,6 +15,7 @@ package org.lance;
 
 import org.lance.fragment.DataFile;
 import org.lance.fragment.DeletionFile;
+import org.lance.fragment.NativeLogicalDomain;
 import org.lance.fragment.RowIdMeta;
 import org.lance.fragment.VersionMeta;
 
@@ -34,6 +35,7 @@ public class FragmentMetadata implements Serializable {
   private final RowIdMeta rowIdMeta;
   private final VersionMeta createdAtVersionMeta;
   private final VersionMeta lastUpdatedAtVersionMeta;
+  private final NativeLogicalDomain nativeLogicalDomain;
 
   public FragmentMetadata(
       int id,
@@ -41,7 +43,7 @@ public class FragmentMetadata implements Serializable {
       Long physicalRows,
       DeletionFile deletionFile,
       RowIdMeta rowIdMeta) {
-    this(id, files, physicalRows, deletionFile, rowIdMeta, null, null);
+    this(id, files, physicalRows, deletionFile, rowIdMeta, null, null, null);
   }
 
   public FragmentMetadata(
@@ -52,6 +54,26 @@ public class FragmentMetadata implements Serializable {
       RowIdMeta rowIdMeta,
       VersionMeta createdAtVersionMeta,
       VersionMeta lastUpdatedAtVersionMeta) {
+    this(
+        id,
+        files,
+        physicalRows,
+        deletionFile,
+        rowIdMeta,
+        createdAtVersionMeta,
+        lastUpdatedAtVersionMeta,
+        null);
+  }
+
+  public FragmentMetadata(
+      int id,
+      List<DataFile> files,
+      Long physicalRows,
+      DeletionFile deletionFile,
+      RowIdMeta rowIdMeta,
+      VersionMeta createdAtVersionMeta,
+      VersionMeta lastUpdatedAtVersionMeta,
+      NativeLogicalDomain nativeLogicalDomain) {
     this.id = id;
     this.files = files;
     this.physicalRows = physicalRows;
@@ -59,6 +81,7 @@ public class FragmentMetadata implements Serializable {
     this.rowIdMeta = rowIdMeta;
     this.createdAtVersionMeta = createdAtVersionMeta;
     this.lastUpdatedAtVersionMeta = lastUpdatedAtVersionMeta;
+    this.nativeLogicalDomain = nativeLogicalDomain;
   }
 
   public int getId() {
@@ -104,6 +127,10 @@ public class FragmentMetadata implements Serializable {
     return lastUpdatedAtVersionMeta;
   }
 
+  public NativeLogicalDomain getNativeLogicalDomain() {
+    return nativeLogicalDomain;
+  }
+
   @Override
   public boolean equals(Object o) {
     if (this == o) {
@@ -119,7 +146,8 @@ public class FragmentMetadata implements Serializable {
         && Objects.equals(deletionFile, that.deletionFile)
         && Objects.equals(rowIdMeta, that.rowIdMeta)
         && Objects.equals(createdAtVersionMeta, that.createdAtVersionMeta)
-        && Objects.equals(lastUpdatedAtVersionMeta, that.lastUpdatedAtVersionMeta);
+        && Objects.equals(lastUpdatedAtVersionMeta, that.lastUpdatedAtVersionMeta)
+        && Objects.equals(nativeLogicalDomain, that.nativeLogicalDomain);
   }
 
   @Override
@@ -131,7 +159,8 @@ public class FragmentMetadata implements Serializable {
         deletionFile,
         rowIdMeta,
         createdAtVersionMeta,
-        lastUpdatedAtVersionMeta);
+        lastUpdatedAtVersionMeta,
+        nativeLogicalDomain);
   }
 
   @Override
@@ -144,6 +173,7 @@ public class FragmentMetadata implements Serializable {
         .add("rowIdMeta", rowIdMeta)
         .add("createdAtVersionMeta", createdAtVersionMeta)
         .add("lastUpdatedAtVersionMeta", lastUpdatedAtVersionMeta)
+        .add("nativeLogicalDomain", nativeLogicalDomain)
         .toString();
   }
 }

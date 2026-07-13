@@ -4,7 +4,6 @@
 use crate::Dataset;
 use crate::Result;
 use crate::dataset::DATA_DIR;
-use crate::dataset::WriteParams;
 use crate::dataset::fragment::write::generate_random_filename;
 use crate::datatypes::Schema;
 use lance_arrow::DataTypeExt;
@@ -12,18 +11,209 @@ use lance_core::Error;
 use lance_encoding::decoder::{ColumnInfo, PageEncoding, PageInfo as DecPageInfo};
 use lance_encoding::version::LanceFileVersion;
 use lance_file::format::pbfile;
-use lance_file::reader::FileReader as LFReader;
+use lance_file::reader::{CachedFileMetadata, FileReader as LFReader};
 use lance_file::writer::{FileWriter, FileWriterOptions};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::traits::Writer;
 use lance_table::format::{DataFile, Fragment};
 use prost::Message;
 use prost_types::Any;
+use serde::{Deserialize, Serialize};
 use std::ops::Range;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 
 const ALIGN: usize = 64;
+
+/// Immutable source-file grouping admitted before a binary-copy rewrite starts.
+///
+/// Binary copy cannot split a source file without decoding its pages.  The plan
+/// therefore freezes output boundaries at source-file ends and records enough
+/// source metadata to reject a changed or corrupt input before creating an
+/// output object.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct BinaryCopyPlan {
+    pub source_file_row_counts: Vec<u32>,
+    pub source_file_size_bytes: Vec<u64>,
+    pub output_source_file_ends: Vec<u32>,
+    pub output_row_counts: Vec<u32>,
+}
+
+impl BinaryCopyPlan {
+    pub(super) fn try_new(
+        source_file_row_counts: Vec<u32>,
+        source_file_size_bytes: Vec<u64>,
+        max_rows_per_file: usize,
+        max_bytes_per_file: Option<usize>,
+    ) -> Result<Self> {
+        if source_file_row_counts.is_empty()
+            || source_file_row_counts.len() != source_file_size_bytes.len()
+        {
+            return Err(Error::invalid_input(
+                "binary-copy source rows and sizes must describe the same non-empty file set",
+            ));
+        }
+        if source_file_row_counts.contains(&0) {
+            return Err(Error::invalid_input(
+                "binary-copy source files must contain at least one row",
+            ));
+        }
+        let max_rows_per_file = u64::try_from(max_rows_per_file).map_err(|_| {
+            Error::invalid_input("binary-copy max_rows_per_file exceeds u64 capacity")
+        })?;
+        if max_rows_per_file == 0 {
+            return Err(Error::invalid_input(
+                "binary-copy max_rows_per_file must be greater than zero",
+            ));
+        }
+        let max_bytes_per_file = max_bytes_per_file
+            .map(|value| {
+                u64::try_from(value).map_err(|_| {
+                    Error::invalid_input("binary-copy max_bytes_per_file exceeds u64 capacity")
+                })
+            })
+            .transpose()?;
+        if max_bytes_per_file == Some(0) {
+            return Err(Error::invalid_input(
+                "binary-copy max_bytes_per_file must be greater than zero",
+            ));
+        }
+
+        let mut output_source_file_ends = Vec::new();
+        let mut output_row_counts = Vec::new();
+        let mut current_rows = 0_u64;
+        let mut current_bytes = 0_u64;
+        for (source_index, (&source_rows, &source_bytes)) in source_file_row_counts
+            .iter()
+            .zip(&source_file_size_bytes)
+            .enumerate()
+        {
+            let next_rows = current_rows
+                .checked_add(u64::from(source_rows))
+                .ok_or_else(|| {
+                    Error::format_capacity_exceeded("binary-copy output row count exceeds u64")
+                })?;
+            let next_bytes = current_bytes.checked_add(source_bytes).ok_or_else(|| {
+                Error::format_capacity_exceeded("binary-copy source byte count exceeds u64")
+            })?;
+            let exceeds_rows = current_rows > 0 && next_rows > max_rows_per_file;
+            let exceeds_bytes =
+                current_rows > 0 && max_bytes_per_file.is_some_and(|limit| next_bytes > limit);
+            if exceeds_rows || exceeds_bytes {
+                output_source_file_ends.push(u32::try_from(source_index).map_err(|_| {
+                    Error::format_capacity_exceeded(
+                        "binary-copy source file count exceeds u32 capacity",
+                    )
+                })?);
+                output_row_counts.push(u32::try_from(current_rows).map_err(|_| {
+                    Error::format_capacity_exceeded(
+                        "binary-copy output fragment rows exceed u32 capacity",
+                    )
+                })?);
+                current_rows = 0;
+                current_bytes = 0;
+            }
+
+            current_rows = current_rows
+                .checked_add(u64::from(source_rows))
+                .ok_or_else(|| {
+                    Error::format_capacity_exceeded("binary-copy output row count exceeds u64")
+                })?;
+            current_bytes = current_bytes.checked_add(source_bytes).ok_or_else(|| {
+                Error::format_capacity_exceeded("binary-copy source byte count exceeds u64")
+            })?;
+
+            let reaches_rows = current_rows >= max_rows_per_file;
+            let reaches_bytes = max_bytes_per_file.is_some_and(|limit| current_bytes >= limit);
+            if reaches_rows || reaches_bytes {
+                output_source_file_ends.push(u32::try_from(source_index + 1).map_err(|_| {
+                    Error::format_capacity_exceeded(
+                        "binary-copy source file count exceeds u32 capacity",
+                    )
+                })?);
+                output_row_counts.push(u32::try_from(current_rows).map_err(|_| {
+                    Error::format_capacity_exceeded(
+                        "binary-copy output fragment rows exceed u32 capacity",
+                    )
+                })?);
+                current_rows = 0;
+                current_bytes = 0;
+            }
+        }
+
+        if current_rows > 0 {
+            output_source_file_ends.push(u32::try_from(source_file_row_counts.len()).map_err(
+                |_| {
+                    Error::format_capacity_exceeded(
+                        "binary-copy source file count exceeds u32 capacity",
+                    )
+                },
+            )?);
+            output_row_counts.push(u32::try_from(current_rows).map_err(|_| {
+                Error::format_capacity_exceeded(
+                    "binary-copy output fragment rows exceed u32 capacity",
+                )
+            })?);
+        }
+
+        let plan = Self {
+            source_file_row_counts,
+            source_file_size_bytes,
+            output_source_file_ends,
+            output_row_counts,
+        };
+        plan.validate()?;
+        Ok(plan)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.source_file_row_counts.is_empty()
+            || self.source_file_row_counts.len() != self.source_file_size_bytes.len()
+            || self.output_source_file_ends.len() != self.output_row_counts.len()
+            || self.output_source_file_ends.is_empty()
+        {
+            return Err(Error::invalid_input(
+                "binary-copy plan has inconsistent source or output metadata",
+            ));
+        }
+        let source_count = u32::try_from(self.source_file_row_counts.len()).map_err(|_| {
+            Error::format_capacity_exceeded("binary-copy source file count exceeds u32 capacity")
+        })?;
+        let mut previous_end = 0_u32;
+        for (&end, &planned_rows) in self
+            .output_source_file_ends
+            .iter()
+            .zip(&self.output_row_counts)
+        {
+            if end <= previous_end || end > source_count {
+                return Err(Error::invalid_input(format!(
+                    "binary-copy plan has invalid source-file boundary {end} after {previous_end}"
+                )));
+            }
+            let actual_rows = self.source_file_row_counts[previous_end as usize..end as usize]
+                .iter()
+                .try_fold(0_u64, |total, rows| {
+                    total.checked_add(u64::from(*rows)).ok_or_else(|| {
+                        Error::format_capacity_exceeded(
+                            "binary-copy planned output row count exceeds u64",
+                        )
+                    })
+                })?;
+            if actual_rows != u64::from(planned_rows) {
+                return Err(Error::invalid_input(format!(
+                    "binary-copy plan output rows disagree at source boundary {end}: planned {planned_rows}, sources contain {actual_rows}"
+                )));
+            }
+            previous_end = end;
+        }
+        if previous_end != source_count {
+            return Err(Error::invalid_input(format!(
+                "binary-copy plan ends at source file {previous_end}, expected {source_count}"
+            )));
+        }
+        Ok(())
+    }
+}
 
 /// Apply 64-byte alignment padding for V2.1+ files.
 ///
@@ -131,7 +321,8 @@ async fn finalize_current_output_file(
         )));
     }
     let writer = current_writer.take().unwrap();
-    flush_footer(writer, schema, &final_cols, total_rows_in_current, version).await?;
+    let file_size_bytes =
+        flush_footer(writer, schema, &final_cols, total_rows_in_current, version).await?;
 
     // Register the newly closed output file as a fragment data file
     let (maj, min) = version.to_numbers();
@@ -140,6 +331,9 @@ async fn finalize_current_output_file(
     let mut data_file = DataFile::new_unstarted(current_filename.take().unwrap(), maj, min);
     data_file.fields = full_field_ids.to_vec().into();
     data_file.column_indices = field_column_indices.into();
+    if let Some(file_size_bytes) = std::num::NonZeroU64::new(file_size_bytes) {
+        data_file.file_size_bytes.set(file_size_bytes);
+    }
     fragment.files.push(data_file);
     fragment.physical_rows = Some(total_rows_in_current as usize);
     Ok(fragment)
@@ -162,23 +356,31 @@ async fn finalize_current_output_file(
 /// - Preserves stable row ids by concatenating row-id sequences when enabled.
 /// - Enforces 64-byte alignment for page and buffer writes in V2.1+ files (V2.0 does not require alignment).
 /// - For v2.0, preserves single-page structural headers and normalizes their row counts/priority.
-/// - Flushes an output file once `max_rows_per_file` rows are accumulated, then repeats.
+/// - Flushes only at the source-file boundaries frozen in `plan`.
 ///
 /// Parameters:
 /// - `dataset`: target dataset (for storage/config and schema).
 /// - `fragments`: fragments to merge via binary copy (assumed consistent versions).
-/// - `params`: write parameters (uses `max_rows_per_file`).
+/// - `plan`: source metadata and exact output boundaries admitted before writes.
 /// - `read_batch_bytes_opt`: optional I/O batch size when coalescing page reads.
 pub async fn rewrite_files_binary_copy(
     dataset: &Dataset,
     fragments: &[Fragment],
-    params: &WriteParams,
+    plan: &BinaryCopyPlan,
     read_batch_bytes_opt: Option<usize>,
 ) -> Result<Vec<Fragment>> {
-    if fragments.is_empty() || fragments.iter().any(|fragment| fragment.files.is_empty()) {
+    if fragments.is_empty() || fragments.iter().any(|fragment| fragment.files.len() != 1) {
         return Err(Error::invalid_input(
-            "binary copy requires at least one data file",
+            "binary copy requires exactly one data file per source fragment",
         ));
+    }
+    plan.validate()?;
+    if plan.source_file_row_counts.len() != fragments.len() {
+        return Err(Error::invalid_input(format!(
+            "binary-copy plan describes {} source files but the task contains {}",
+            plan.source_file_row_counts.len(),
+            fragments.len()
+        )));
     }
 
     // Binary copy algorithm overview:
@@ -196,8 +398,7 @@ pub async fn rewrite_files_binary_copy(
     let version = LanceFileVersion::try_from_major_minor(
         fragments[0].files[0].file_major_version,
         fragments[0].files[0].file_minor_version,
-    )
-    .unwrap()
+    )?
     .resolve();
     // v2.0 and v2.1+ handle structural headers differently during file writing:
     // - v2_0 materializes ALL fields in pre-order traversal (leaf fields + non-leaf struct headers),
@@ -229,14 +430,73 @@ pub async fn rewrite_files_binary_copy(
         }
     }
 
-    let mut out: Vec<Fragment> = Vec::new();
+    let mut prepared_sources = Vec::with_capacity(fragments.len());
+    for (source_index, fragment) in fragments.iter().enumerate() {
+        let data_file = &fragment.files[0];
+        let object_store = match data_file.base_id {
+            Some(base_id) => dataset.object_store(Some(base_id)).await?,
+            None => dataset.object_store.clone(),
+        };
+        let full_path = dataset
+            .data_file_dir(data_file)?
+            .clone()
+            .join(data_file.path.as_str());
+        let scan_scheduler = ScanScheduler::new(
+            object_store.clone(),
+            SchedulerConfig::max_bandwidth(&object_store),
+        );
+        let file_scheduler = scan_scheduler
+            .open_file_with_priority(&full_path, 0, &data_file.file_size_bytes)
+            .await?;
+        let file_metadata = LFReader::read_all_metadata(&file_scheduler).await?;
+        let actual_rows = u32::try_from(file_metadata.num_rows).map_err(|_| {
+            Error::format_capacity_exceeded(format!(
+                "binary-copy source file {} rows {} exceed u32 capacity",
+                data_file.path, file_metadata.num_rows
+            ))
+        })?;
+        if plan.source_file_row_counts.get(source_index) != Some(&actual_rows)
+            || plan.source_file_size_bytes.get(source_index) != Some(&file_metadata.file_size_bytes)
+        {
+            return Err(Error::invalid_input(format!(
+                "binary-copy source file {} metadata changed after admission: planned rows/bytes {:?}/{:?}, actual {}/{}",
+                data_file.path,
+                plan.source_file_row_counts.get(source_index),
+                plan.source_file_size_bytes.get(source_index),
+                actual_rows,
+                file_metadata.file_size_bytes
+            )));
+        }
+        let actual_version = LanceFileVersion::try_from_major_minor(
+            file_metadata.major_version as u32,
+            file_metadata.minor_version as u32,
+        )?
+        .resolve();
+        if actual_version != version
+            || file_metadata.file_buffers.len() > 1
+            || file_metadata.column_infos.len() != column_count
+            || file_metadata.file_schema.as_ref() != dataset.schema()
+        {
+            return Err(Error::not_supported_source(
+                format!(
+                    "binary-copy source file {} is no longer format-compatible with its admitted plan",
+                    data_file.path
+                )
+                .into(),
+            ));
+        }
+        prepared_sources.push((file_scheduler, file_metadata));
+    }
+
+    validate_source_column_encodings(&prepared_sources)?;
+
+    let mut out: Vec<Fragment> = Vec::with_capacity(plan.output_row_counts.len());
     let mut current_writer: Option<Box<dyn Writer>> = None;
     let mut current_filename: Option<String> = None;
     let mut current_pos: u64 = 0;
     let mut current_page_table: Vec<ColumnInfo> = Vec::new();
     // Baseline column encodings captured from the first source file; all subsequent
     // files must match per-column to safely concatenate column-level buffers.
-    let mut baseline_col_encoding_bytes: Vec<Vec<u8>> = Vec::new();
 
     // Column-list<Page-List<DecPageInfo>>
     let mut col_pages: Vec<Vec<DecPageInfo>> = std::iter::repeat_with(Vec::<DecPageInfo>::new)
@@ -244,268 +504,275 @@ pub async fn rewrite_files_binary_copy(
         .collect();
     let mut col_buffers: Vec<Vec<(u64, u64)>> = vec![Vec::new(); column_count];
     let mut total_rows_in_current: u64 = 0;
-    let max_rows_per_file = params.max_rows_per_file as u64;
+    let mut output_index = 0_usize;
 
-    // Visit each fragment and all of its data files (a fragment may contain multiple files)
-    for frag in fragments.iter() {
-        for df in frag.files.iter() {
-            let object_store = if let Some(base_id) = df.base_id {
-                dataset.object_store(Some(base_id)).await?
-            } else {
-                dataset.object_store.clone()
-            };
-            let full_path = dataset.data_file_dir(df)?.clone().join(df.path.as_str());
-            let scan_scheduler = ScanScheduler::new(
-                object_store.clone(),
-                SchedulerConfig::max_bandwidth(&object_store),
-            );
-            let file_scheduler = scan_scheduler
-                .open_file_with_priority(&full_path, 0, &df.file_size_bytes)
-                .await?;
-            let file_meta = LFReader::read_all_metadata(&file_scheduler).await?;
-            let src_column_infos = file_meta.column_infos.clone();
-            // Initialize current_page_table
-            if current_page_table.is_empty() {
-                current_page_table = src_column_infos
-                    .iter()
-                    .map(|column_index| ColumnInfo {
-                        index: column_index.index,
-                        buffer_offsets_and_sizes: Arc::from(
-                            Vec::<(u64, u64)>::new().into_boxed_slice(),
-                        ),
-                        page_infos: Arc::from(Vec::<DecPageInfo>::new().into_boxed_slice()),
-                        encoding: column_index.encoding.clone(),
-                    })
-                    .collect();
-                baseline_col_encoding_bytes = src_column_infos
-                    .iter()
-                    .map(|ci| Any::from_msg(&ci.encoding).unwrap().encode_to_vec())
-                    .collect();
+    // Source metadata is fully validated before this loop creates any output object.
+    for (source_index, (file_scheduler, file_meta)) in prepared_sources.into_iter().enumerate() {
+        let src_column_infos = file_meta.column_infos.clone();
+        // Initialize current_page_table
+        if current_page_table.is_empty() {
+            current_page_table = src_column_infos
+                .iter()
+                .map(|column_index| ColumnInfo {
+                    index: column_index.index,
+                    buffer_offsets_and_sizes: Arc::from(
+                        Vec::<(u64, u64)>::new().into_boxed_slice(),
+                    ),
+                    page_infos: Arc::from(Vec::<DecPageInfo>::new().into_boxed_slice()),
+                    encoding: column_index.encoding.clone(),
+                })
+                .collect();
+        }
+
+        // Iterate through each column of the current data file of the current fragment
+        for (col_idx, src_column_info) in src_column_infos.iter().enumerate() {
+            // v2_0 compatibility: special handling for non-leaf structural header columns
+            // - v2_0 expects structural header columns to have a SINGLE page; they carry layout
+            //   metadata only and are not true data carriers.
+            // - When merging multiple input files via binary copy, naively appending pages would
+            //   yield multiple pages for the same structural header column, violating v2_0 rules.
+            // - To preserve v2_0 invariants, we skip pages beyond the first one for these columns.
+            // - During finalization we also normalize the single remaining page’s `num_rows` to the
+            //   total number of rows in the output file and reset `priority` to 0.
+            // - For v2_1+ this logic does not apply because non-leaf headers are not stored as columns.
+            let is_non_leaf = col_idx < is_non_leaf_column.len() && is_non_leaf_column[col_idx];
+            if is_non_leaf && !col_pages[col_idx].is_empty() {
+                continue;
             }
 
-            // Iterate through each column of the current data file of the current fragment
-            for (col_idx, src_column_info) in src_column_infos.iter().enumerate() {
-                // v2_0 compatibility: special handling for non-leaf structural header columns
-                // - v2_0 expects structural header columns to have a SINGLE page; they carry layout
-                //   metadata only and are not true data carriers.
-                // - When merging multiple input files via binary copy, naively appending pages would
-                //   yield multiple pages for the same structural header column, violating v2_0 rules.
-                // - To preserve v2_0 invariants, we skip pages beyond the first one for these columns.
-                // - During finalization we also normalize the single remaining page’s `num_rows` to the
-                //   total number of rows in the output file and reset `priority` to 0.
-                // - For v2_1+ this logic does not apply because non-leaf headers are not stored as columns.
-                let is_non_leaf = col_idx < is_non_leaf_column.len() && is_non_leaf_column[col_idx];
-                if is_non_leaf && !col_pages[col_idx].is_empty() {
-                    continue;
-                }
+            if init_writer_if_necessary(dataset, &mut current_writer, &mut current_filename).await?
+            {
+                current_pos = 0;
+            }
 
-                if init_writer_if_necessary(dataset, &mut current_writer, &mut current_filename)
-                    .await?
-                {
-                    current_pos = 0;
-                }
+            let read_batch_bytes: u64 = read_batch_bytes_opt.unwrap_or(16 * 1024 * 1024) as u64;
 
-                let read_batch_bytes: u64 = read_batch_bytes_opt.unwrap_or(16 * 1024 * 1024) as u64;
+            let mut page_index = 0;
 
-                let mut page_index = 0;
-
-                // Iterate through each page of the current column in the current data file of the current fragment
-                while page_index < src_column_info.page_infos.len() {
-                    let mut batch_ranges: Vec<Range<u64>> = Vec::new();
-                    let mut batch_counts: Vec<usize> = Vec::new();
-                    let mut batch_bytes: u64 = 0;
-                    let mut batch_pages: usize = 0;
-                    // Build a single read batch by coalescing consecutive pages up to
-                    // `read_batch_bytes` budget:
-                    // - Accumulate total bytes (`batch_bytes`) and page count (`batch_pages`).
-                    // - For each page, append its buffer ranges to `batch_ranges` and record
-                    //   the number of buffers in `batch_counts` so returned bytes can be
-                    //   mapped back to page boundaries.
-                    // - Stop when adding the next page would exceed the byte budget, then
-                    //   issue one I/O request for the collected ranges.
-                    // - Advance `page_index` to reflect pages scheduled in this batch.
-                    for current_page in &src_column_info.page_infos[page_index..] {
-                        let page_bytes: u64 = current_page
-                            .buffer_offsets_and_sizes
-                            .iter()
-                            .map(|(_, size)| *size)
-                            .sum();
-                        let would_exceed =
-                            batch_pages > 0 && (batch_bytes + page_bytes > read_batch_bytes);
-                        if would_exceed {
-                            break;
-                        }
-                        batch_counts.push(current_page.buffer_offsets_and_sizes.len());
-                        for (offset, size) in current_page.buffer_offsets_and_sizes.iter() {
-                            if *size > 0 {
-                                batch_ranges.push((*offset)..(*offset + *size));
-                            }
-                        }
-                        batch_bytes += page_bytes;
-                        batch_pages += 1;
-                        page_index += 1;
-                    }
-
-                    let bytes_vec = if batch_ranges.is_empty() {
-                        Vec::new()
-                    } else {
-                        // read many buffers at once
-                        file_scheduler.submit_request(batch_ranges, 0).await?
-                    };
-                    let mut bytes_iter = bytes_vec.into_iter();
-
-                    for (local_idx, buffer_count) in batch_counts.iter().enumerate() {
-                        // Reconstruct the absolute page index within the source column:
-                        // - `page_index` now points to the page position
-                        // - `batch_pages` is how many pages we included in this batch
-                        // - `local_idx` enumerates pages inside the batch [0..batch_pages)
-                        // Therefore `page_index - batch_pages + local_idx` yields the exact
-                        // source page we are currently materializing, allowing us to access
-                        // its metadata (encoding, row count, buffers) for the new page entry.
-                        let page_idx = page_index - batch_pages + local_idx;
-                        let page = &src_column_info.page_infos[page_idx];
-                        let mut new_offsets = Vec::with_capacity(*buffer_count);
-                        for (buffer_idx, (_, size)) in
-                            page.buffer_offsets_and_sizes.iter().enumerate()
-                        {
-                            let writer = current_writer.as_mut().unwrap().as_mut();
-                            current_pos =
-                                apply_alignment_padding(writer, current_pos, version).await?;
-                            let start = current_pos;
-                            if *size == 0 {
-                                new_offsets.push((start, 0));
-                            } else {
-                                let bytes = bytes_iter.next().ok_or_else(|| {
-                                    Error::execution(format!(
-                                        "binary copy: missing page buffer bytes while rewriting data file \
-                                         (column {col_idx}, page {page_idx}, buffer {buffer_idx}, expected size {size})",
-                                    ))
-                                })?;
-                                writer.write_all(&bytes).await?;
-                                current_pos += bytes.len() as u64;
-                                new_offsets.push((start, bytes.len() as u64));
-                            }
-                        }
-
-                        // manual clone encoding
-                        let encoding = if page.encoding.is_structural() {
-                            PageEncoding::Structural(page.encoding.as_structural().clone())
-                        } else {
-                            PageEncoding::Legacy(page.encoding.as_legacy().clone())
-                        };
-                        // `priority` acts as the global row offset for this page, ensuring
-                        // downstream iterators maintain the correct logical order across
-                        // merged inputs.
-                        let new_page_info = DecPageInfo {
-                            num_rows: page.num_rows,
-                            priority: page.priority + total_rows_in_current,
-                            encoding,
-                            buffer_offsets_and_sizes: Arc::from(new_offsets.into_boxed_slice()),
-                        };
-                        col_pages[col_idx].push(new_page_info);
-                    }
-                } // finished scheduling & copying pages for this column in the current source file
-
-                if !src_column_info.buffer_offsets_and_sizes.is_empty() {
-                    // Validate column-level encoding compatibility before copying buffers
-                    let src_col_encoding_bytes = Any::from_msg(&src_column_info.encoding)
-                        .unwrap()
-                        .encode_to_vec();
-                    let baseline_bytes = &baseline_col_encoding_bytes[col_idx];
-                    if src_col_encoding_bytes != *baseline_bytes {
-                        return Err(Error::execution(format!(
-                            "binary copy: The ColumnEncoding of column {} is incompatible with the first file, \
-                            making it impossible to safely concatenate buffers",
-                            col_idx
-                        )));
-                    }
-                    let ranges: Vec<Range<u64>> = src_column_info
+            // Iterate through each page of the current column in the current data file of the current fragment
+            while page_index < src_column_info.page_infos.len() {
+                let mut batch_ranges: Vec<Range<u64>> = Vec::new();
+                let mut batch_counts: Vec<usize> = Vec::new();
+                let mut batch_bytes: u64 = 0;
+                let mut batch_pages: usize = 0;
+                // Build a single read batch by coalescing consecutive pages up to
+                // `read_batch_bytes` budget:
+                // - Accumulate total bytes (`batch_bytes`) and page count (`batch_pages`).
+                // - For each page, append its buffer ranges to `batch_ranges` and record
+                //   the number of buffers in `batch_counts` so returned bytes can be
+                //   mapped back to page boundaries.
+                // - Stop when adding the next page would exceed the byte budget, then
+                //   issue one I/O request for the collected ranges.
+                // - Advance `page_index` to reflect pages scheduled in this batch.
+                for current_page in &src_column_info.page_infos[page_index..] {
+                    let page_bytes: u64 = current_page
                         .buffer_offsets_and_sizes
                         .iter()
-                        .filter(|(_, size)| *size > 0)
-                        .map(|(offset, size)| (*offset)..(*offset + *size))
-                        .collect();
-                    let bytes_vec = if ranges.is_empty() {
-                        Vec::new()
-                    } else {
-                        file_scheduler.submit_request(ranges, 0).await?
-                    };
-                    let mut bytes_iter = bytes_vec.into_iter();
-                    for (buffer_idx, (_, size)) in
-                        src_column_info.buffer_offsets_and_sizes.iter().enumerate()
+                        .map(|(_, size)| *size)
+                        .sum();
+                    let would_exceed =
+                        batch_pages > 0 && (batch_bytes + page_bytes > read_batch_bytes);
+                    if would_exceed {
+                        break;
+                    }
+                    batch_counts.push(current_page.buffer_offsets_and_sizes.len());
+                    for (offset, size) in current_page.buffer_offsets_and_sizes.iter() {
+                        if *size > 0 {
+                            batch_ranges.push((*offset)..(*offset + *size));
+                        }
+                    }
+                    batch_bytes += page_bytes;
+                    batch_pages += 1;
+                    page_index += 1;
+                }
+
+                let bytes_vec = if batch_ranges.is_empty() {
+                    Vec::new()
+                } else {
+                    // read many buffers at once
+                    file_scheduler.submit_request(batch_ranges, 0).await?
+                };
+                let mut bytes_iter = bytes_vec.into_iter();
+
+                for (local_idx, buffer_count) in batch_counts.iter().enumerate() {
+                    // Reconstruct the absolute page index within the source column:
+                    // - `page_index` now points to the page position
+                    // - `batch_pages` is how many pages we included in this batch
+                    // - `local_idx` enumerates pages inside the batch [0..batch_pages)
+                    // Therefore `page_index - batch_pages + local_idx` yields the exact
+                    // source page we are currently materializing, allowing us to access
+                    // its metadata (encoding, row count, buffers) for the new page entry.
+                    let page_idx = page_index - batch_pages + local_idx;
+                    let page = &src_column_info.page_infos[page_idx];
+                    let mut new_offsets = Vec::with_capacity(*buffer_count);
+                    for (buffer_idx, (_, size)) in page.buffer_offsets_and_sizes.iter().enumerate()
                     {
                         let writer = current_writer.as_mut().unwrap().as_mut();
                         current_pos = apply_alignment_padding(writer, current_pos, version).await?;
                         let start = current_pos;
                         if *size == 0 {
-                            col_buffers[col_idx].push((start, 0));
+                            new_offsets.push((start, 0));
                         } else {
                             let bytes = bytes_iter.next().ok_or_else(|| {
+                                    Error::execution(format!(
+                                        "binary copy: missing page buffer bytes while rewriting data file \
+                                         (column {col_idx}, page {page_idx}, buffer {buffer_idx}, expected size {size})",
+                                    ))
+                                })?;
+                            writer.write_all(&bytes).await?;
+                            current_pos += bytes.len() as u64;
+                            new_offsets.push((start, bytes.len() as u64));
+                        }
+                    }
+
+                    // manual clone encoding
+                    let encoding = if page.encoding.is_structural() {
+                        PageEncoding::Structural(page.encoding.as_structural().clone())
+                    } else {
+                        PageEncoding::Legacy(page.encoding.as_legacy().clone())
+                    };
+                    // `priority` acts as the global row offset for this page, ensuring
+                    // downstream iterators maintain the correct logical order across
+                    // merged inputs.
+                    let new_page_info = DecPageInfo {
+                        num_rows: page.num_rows,
+                        priority: page.priority + total_rows_in_current,
+                        encoding,
+                        buffer_offsets_and_sizes: Arc::from(new_offsets.into_boxed_slice()),
+                    };
+                    col_pages[col_idx].push(new_page_info);
+                }
+            } // finished scheduling & copying pages for this column in the current source file
+
+            if !src_column_info.buffer_offsets_and_sizes.is_empty() {
+                let ranges: Vec<Range<u64>> = src_column_info
+                    .buffer_offsets_and_sizes
+                    .iter()
+                    .filter(|(_, size)| *size > 0)
+                    .map(|(offset, size)| (*offset)..(*offset + *size))
+                    .collect();
+                let bytes_vec = if ranges.is_empty() {
+                    Vec::new()
+                } else {
+                    file_scheduler.submit_request(ranges, 0).await?
+                };
+                let mut bytes_iter = bytes_vec.into_iter();
+                for (buffer_idx, (_, size)) in
+                    src_column_info.buffer_offsets_and_sizes.iter().enumerate()
+                {
+                    let writer = current_writer.as_mut().unwrap().as_mut();
+                    current_pos = apply_alignment_padding(writer, current_pos, version).await?;
+                    let start = current_pos;
+                    if *size == 0 {
+                        col_buffers[col_idx].push((start, 0));
+                    } else {
+                        let bytes = bytes_iter.next().ok_or_else(|| {
                                 Error::execution(format!(
                                     "binary copy: missing column buffer bytes while rewriting data file \
                                      (column {col_idx}, buffer {buffer_idx}, expected size {size})",
                                 ))
                             })?;
-                            writer.write_all(&bytes).await?;
-                            current_pos += bytes.len() as u64;
-                            col_buffers[col_idx].push((start, bytes.len() as u64));
-                        }
+                        writer.write_all(&bytes).await?;
+                        current_pos += bytes.len() as u64;
+                        col_buffers[col_idx].push((start, bytes.len() as u64));
                     }
                 }
-            } // finished all columns in the current source file
-
-            // Accumulate rows for the current output file and flush when reaching the threshold
-            total_rows_in_current += file_meta.num_rows;
-            if total_rows_in_current >= max_rows_per_file {
-                let fragment_out = finalize_current_output_file(
-                    &schema,
-                    &full_field_ids,
-                    &mut current_writer,
-                    &mut current_filename,
-                    &current_page_table,
-                    &mut col_pages,
-                    &mut col_buffers,
-                    &is_non_leaf_column,
-                    total_rows_in_current,
-                    version,
-                )
-                .await?;
-
-                // Reset state for next output file
-                current_writer = None;
-                current_pos = 0;
-                current_page_table.clear();
-                for v in col_pages.iter_mut() {
-                    v.clear();
-                }
-                for v in col_buffers.iter_mut() {
-                    v.clear();
-                }
-                out.push(fragment_out);
-                total_rows_in_current = 0;
             }
-        }
-    } // Finished writing all fragments; any remaining data in memory will be flushed below
+        } // finished all columns in the current source file
 
-    if total_rows_in_current > 0 {
-        // Flush remaining rows as a final output file
-        init_writer_if_necessary(dataset, &mut current_writer, &mut current_filename).await?;
-        let frag = finalize_current_output_file(
-            &schema,
-            &full_field_ids,
-            &mut current_writer,
-            &mut current_filename,
-            &current_page_table,
-            &mut col_pages,
-            &mut col_buffers,
-            &is_non_leaf_column,
-            total_rows_in_current,
-            version,
-        )
-        .await?;
-        out.push(frag);
+        total_rows_in_current = total_rows_in_current
+            .checked_add(file_meta.num_rows)
+            .ok_or_else(|| {
+                Error::format_capacity_exceeded(
+                    "binary-copy output fragment rows exceed u64 capacity",
+                )
+            })?;
+        let source_end = u32::try_from(source_index + 1).map_err(|_| {
+            Error::format_capacity_exceeded("binary-copy source file count exceeds u32 capacity")
+        })?;
+        if plan.output_source_file_ends.get(output_index) == Some(&source_end) {
+            let planned_rows = u64::from(plan.output_row_counts[output_index]);
+            if total_rows_in_current != planned_rows {
+                return Err(Error::invalid_input(format!(
+                    "binary-copy output boundary changed after admission: output {output_index} planned {planned_rows} rows, accumulated {total_rows_in_current}"
+                )));
+            }
+            let fragment_out = finalize_current_output_file(
+                &schema,
+                &full_field_ids,
+                &mut current_writer,
+                &mut current_filename,
+                &current_page_table,
+                &mut col_pages,
+                &mut col_buffers,
+                &is_non_leaf_column,
+                total_rows_in_current,
+                version,
+            )
+            .await?;
+
+            // Reset state for next output file
+            current_writer = None;
+            current_pos = 0;
+            current_page_table.clear();
+            for v in col_pages.iter_mut() {
+                v.clear();
+            }
+            for v in col_buffers.iter_mut() {
+                v.clear();
+            }
+            out.push(fragment_out);
+            total_rows_in_current = 0;
+            output_index += 1;
+        }
+    }
+    if total_rows_in_current != 0
+        || output_index != plan.output_row_counts.len()
+        || out
+            .iter()
+            .map(|fragment| fragment.physical_rows.unwrap_or_default() as u32)
+            .collect::<Vec<_>>()
+            != plan.output_row_counts
+    {
+        return Err(Error::invalid_input(
+            "binary-copy runtime output boundaries disagree with the admitted plan",
+        ));
     }
     Ok(out)
+}
+
+fn validate_source_column_encodings(
+    prepared_sources: &[(lance_io::scheduler::FileScheduler, CachedFileMetadata)],
+) -> Result<()> {
+    let baseline = prepared_sources
+        .first()
+        .ok_or_else(|| Error::invalid_input("binary copy requires at least one source file"))?
+        .1
+        .column_infos
+        .iter()
+        .map(|column| Ok(Any::from_msg(&column.encoding)?.encode_to_vec()))
+        .collect::<Result<Vec<_>>>()?;
+    for (_, metadata) in prepared_sources.iter().skip(1) {
+        if metadata.column_infos.len() != baseline.len() {
+            return Err(Error::not_supported_source(
+                "binary-copy source files have different column counts".into(),
+            ));
+        }
+        for (column_index, (column, expected)) in
+            metadata.column_infos.iter().zip(&baseline).enumerate()
+        {
+            let actual = Any::from_msg(&column.encoding)?.encode_to_vec();
+            if &actual != expected {
+                return Err(Error::not_supported_source(
+                    format!(
+                        "binary-copy source files have incompatible encoding for column {column_index}"
+                    )
+                    .into(),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Finalizes a compacted data file by writing the Lance footer via `FileWriter`.
@@ -531,7 +798,7 @@ async fn flush_footer(
     final_cols: &[Arc<ColumnInfo>],
     total_rows_in_current: u64,
     version: LanceFileVersion,
-) -> Result<()> {
+) -> Result<u64> {
     let pos = writer.tell().await? as u64;
     let _new_pos = apply_alignment_padding(writer.as_mut(), pos, version).await?;
 
@@ -597,6 +864,34 @@ async fn flush_footer(
         col_metadatas,
         total_rows_in_current,
     );
-    file_writer.finish().await?;
-    Ok(())
+    Ok(file_writer.finish().await?.size_bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn binary_copy_plan_freezes_source_file_boundaries() {
+        let plan = BinaryCopyPlan::try_new(
+            vec![4, 4, 4, 4, 4],
+            vec![100, 100, 100, 100, 100],
+            20,
+            Some(250),
+        )
+        .unwrap();
+
+        assert_eq!(plan.output_source_file_ends, vec![2, 4, 5]);
+        assert_eq!(plan.output_row_counts, vec![8, 8, 4]);
+        plan.validate().unwrap();
+    }
+
+    #[test]
+    fn binary_copy_plan_rejects_changed_output_counts() {
+        let mut plan = BinaryCopyPlan::try_new(vec![4, 4], vec![100, 100], 8, None).unwrap();
+        plan.output_row_counts[0] = 7;
+
+        let error = plan.validate().unwrap_err();
+        assert!(error.to_string().contains("output rows disagree"));
+    }
 }

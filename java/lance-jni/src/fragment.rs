@@ -13,7 +13,8 @@ use jni::{
 };
 use lance::datatypes::Schema;
 use lance::table::format::{
-    DataFile, DeletionFile, DeletionFileType, Fragment, RowDatasetVersionMeta, RowIdMeta,
+    DataFile, DeletionFile, DeletionFileType, Fragment, NativeLogicalDomain, RowDatasetVersionMeta,
+    RowIdMeta,
 };
 use lance_io::utils::CachedFileSize;
 use lance_table::rowids::{RowIdSequence, write_row_ids};
@@ -582,7 +583,9 @@ const DELETE_FILE_CONSTRUCTOR_SIG: &str =
     "(JJLjava/lang/Long;Lorg/lance/fragment/DeletionFileType;Ljava/lang/Integer;)V";
 const DELETE_FILE_TYPE_CLASS: &str = "org/lance/fragment/DeletionFileType";
 const FRAGMENT_METADATA_CLASS: &str = "org/lance/FragmentMetadata";
-const FRAGMENT_METADATA_CONSTRUCTOR_SIG: &str = "(ILjava/util/List;Ljava/lang/Long;Lorg/lance/fragment/DeletionFile;Lorg/lance/fragment/RowIdMeta;Lorg/lance/fragment/VersionMeta;Lorg/lance/fragment/VersionMeta;)V";
+const FRAGMENT_METADATA_CONSTRUCTOR_SIG: &str = "(ILjava/util/List;Ljava/lang/Long;Lorg/lance/fragment/DeletionFile;Lorg/lance/fragment/RowIdMeta;Lorg/lance/fragment/VersionMeta;Lorg/lance/fragment/VersionMeta;Lorg/lance/fragment/NativeLogicalDomain;)V";
+const NATIVE_LOGICAL_DOMAIN_CLASS: &str = "org/lance/fragment/NativeLogicalDomain";
+const NATIVE_LOGICAL_DOMAIN_CONSTRUCTOR_SIG: &str = "(IJ)V";
 const ROW_ID_META_CLASS: &str = "org/lance/fragment/RowIdMeta";
 const ROW_ID_META_CONSTRUCTOR_SIG: &str = "(Ljava/lang/String;)V";
 const VERSION_META_CLASS: &str = "org/lance/fragment/VersionMeta";
@@ -736,6 +739,17 @@ impl IntoJava for &Fragment {
             Some(m) => m.into_java(env)?,
             None => JObject::null(),
         };
+        let native_logical_domain = match &self.native_logical_domain {
+            Some(domain) => env.new_object(
+                NATIVE_LOGICAL_DOMAIN_CLASS,
+                NATIVE_LOGICAL_DOMAIN_CONSTRUCTOR_SIG,
+                &[
+                    JValueGen::Int(domain.logical_fragment_id as i32),
+                    JValueGen::Long(domain.creation_version as i64),
+                ],
+            )?,
+            None => JObject::null(),
+        };
 
         env.new_object(
             FRAGMENT_METADATA_CLASS,
@@ -748,6 +762,7 @@ impl IntoJava for &Fragment {
                 JValueGen::Object(&row_id_meta),
                 JValueGen::Object(&created_at),
                 JValueGen::Object(&last_updated_at),
+                JValueGen::Object(&native_logical_domain),
             ],
         )
         .map_err(|e| {
@@ -819,6 +834,12 @@ impl FromJObjectWithEnv<Fragment> for JObject<'_> {
             extract_nullable_field(env, self, "getCreatedAtVersionMeta", VERSION_META_CLASS)?;
         let last_updated_at_version_meta =
             extract_nullable_field(env, self, "getLastUpdatedAtVersionMeta", VERSION_META_CLASS)?;
+        let native_logical_domain = extract_nullable_field(
+            env,
+            self,
+            "getNativeLogicalDomain",
+            NATIVE_LOGICAL_DOMAIN_CLASS,
+        )?;
 
         Ok(Fragment {
             id,
@@ -828,7 +849,20 @@ impl FromJObjectWithEnv<Fragment> for JObject<'_> {
             row_id_meta,
             created_at_version_meta,
             last_updated_at_version_meta,
+            native_logical_domain,
         })
+    }
+}
+
+impl FromJObjectWithEnv<NativeLogicalDomain> for JObject<'_> {
+    fn extract_object(&self, env: &mut JNIEnv<'_>) -> Result<NativeLogicalDomain> {
+        NativeLogicalDomain::new(
+            env.call_method(self, "getLogicalFragmentId", "()I", &[])?
+                .i()? as u32,
+            env.call_method(self, "getCreationVersion", "()J", &[])?
+                .j()? as u64,
+        )
+        .map_err(Error::from)
     }
 }
 

@@ -14,9 +14,13 @@ use lance_datafusion::utils::StreamingWriteSource;
 use lance_file::version::LanceFileVersion;
 use lance_io::object_store::ObjectStore;
 use lance_table::feature_flags::can_write_dataset;
-use lance_table::format::Fragment;
+use lance_table::format::{
+    Fragment, RowAddressLayoutDelta, RowAddressPlacementDelta, RowAddressPlacementKind,
+    RowAddressTargetFragment, RowAddressTargetRange,
+};
 use lance_table::io::commit::CommitHandler;
 use object_store::path::Path;
+use uuid::Uuid;
 
 use crate::Dataset;
 use crate::blob::normalize_prepared_blob_schema;
@@ -24,7 +28,8 @@ use crate::dataset::ReadParams;
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::transaction::{Operation, Transaction, TransactionBuilder};
 use crate::dataset::write::{
-    validate_and_resolve_target_bases_with_primary, write_fragments_internal,
+    validate_and_resolve_target_bases_with_primary, validate_max_rows_per_file,
+    write_fragments_internal_with_fragment_limit,
 };
 use crate::{Error, Result};
 use tracing::info;
@@ -202,6 +207,7 @@ impl<'a> InsertBuilder<'a> {
         );
 
         self.validate_write(&mut context, &schema)?;
+        let max_output_fragments = Self::v2_3_output_fragment_limit(&context)?;
 
         let existing_base_paths = context.dest.dataset().map(|ds| &ds.manifest.base_paths);
         let target_base_info = validate_and_resolve_target_bases_with_primary(
@@ -213,7 +219,7 @@ impl<'a> InsertBuilder<'a> {
         )
         .await?;
 
-        let (written_fragments, written_schema) = write_fragments_internal(
+        let (written_fragments, written_schema) = write_fragments_internal_with_fragment_limit(
             context.dest.dataset(),
             context.object_store.clone(),
             &context.base_path,
@@ -221,6 +227,7 @@ impl<'a> InsertBuilder<'a> {
             stream,
             context.params.clone(),
             target_base_info,
+            max_output_fragments,
         )
         .await?;
 
@@ -274,6 +281,70 @@ impl<'a> InsertBuilder<'a> {
             WriteMode::Append => Operation::Append { fragments },
         };
 
+        let row_address_layout_delta = if context.storage_version.resolve()
+            == LanceFileVersion::V2_3
+        {
+            let mut delta = if matches!(context.params.mode, WriteMode::Create) {
+                RowAddressLayoutDelta::for_create(Uuid::new_v4())
+            } else {
+                let layout = context
+                    .dest
+                    .dataset()
+                    .and_then(|dataset| dataset.manifest.row_address_layout.as_ref())
+                    .ok_or_else(|| {
+                        Error::invalid_input(
+                            "storage-version-2.3 successor transaction requires a row-address layout",
+                        )
+                    })?;
+                RowAddressLayoutDelta {
+                    expected_layout_fingerprint: layout.fingerprint.clone(),
+                    ..Default::default()
+                }
+            };
+            let (Operation::Append {
+                fragments: new_fragments,
+            }
+            | Operation::Overwrite {
+                fragments: new_fragments,
+                ..
+            }) = &operation
+            else {
+                unreachable!("insert builder only produces append or overwrite operations")
+            };
+            delta.placements = new_fragments
+                .iter()
+                .enumerate()
+                .map(|(ordinal, fragment)| {
+                    let ordinal = checked_v2_3_output_fragment_ordinal(ordinal)?;
+                    let physical_rows = fragment.physical_rows.ok_or_else(|| {
+                        Error::invalid_input(
+                            "storage-version-2.3 output fragment is missing physical_rows",
+                        )
+                    })?;
+                    let physical_rows = checked_v2_3_output_fragment_rows(physical_rows)?;
+                    if physical_rows == 0 {
+                        return Err(Error::invalid_input(
+                            "storage-version-2.3 output fragments must not be empty",
+                        ));
+                    }
+                    Ok(RowAddressPlacementDelta {
+                        source_selections: Vec::new(),
+                        target: RowAddressTargetRange {
+                            fragment: RowAddressTargetFragment::NewFragmentOrdinal(ordinal),
+                            start_offset: 0,
+                            end_offset: physical_rows,
+                        },
+                        placement_kind: RowAddressPlacementKind::Direct,
+                        output_cardinality: physical_rows as u64,
+                        output_row_sequence_fingerprint: Vec::new(),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Some(delta)
+        } else {
+            None
+        };
+
         let transaction = TransactionBuilder::new(
             context
                 .dest
@@ -283,9 +354,28 @@ impl<'a> InsertBuilder<'a> {
             operation,
         )
         .transaction_properties(context.params.transaction_properties.clone())
+        .row_address_layout_delta(row_address_layout_delta)
         .build();
 
         Ok(transaction)
+    }
+
+    fn v2_3_output_fragment_limit(context: &WriteContext<'_>) -> Result<Option<u64>> {
+        if context.storage_version.resolve() != LanceFileVersion::V2_3 {
+            return Ok(None);
+        }
+
+        let Some(dataset) = context.dest.dataset() else {
+            // A new namespace can allocate every id except the reserved sentinel.
+            return Ok(Some(u32::MAX as u64));
+        };
+        let physical_remaining =
+            remaining_v2_3_fragment_ids(dataset.manifest.max_fragment_id(), "physical fragment")?;
+        let logical_remaining = remaining_v2_3_fragment_ids(
+            dataset.manifest.max_logical_fragment_id.map(u64::from),
+            "logical fragment",
+        )?;
+        Ok(Some(physical_remaining.min(logical_remaining)))
     }
 
     fn validate_write(&self, context: &mut WriteContext, data_schema: &Schema) -> Result<()> {
@@ -299,6 +389,17 @@ impl<'a> InsertBuilder<'a> {
                 context.params.mode = WriteMode::Create;
             }
             _ => {}
+        }
+
+        validate_max_rows_per_file(context.params.max_rows_per_file)?;
+        if context.storage_version.resolve() == LanceFileVersion::V2_3
+            && context.params.max_rows_per_file > u32::MAX as usize
+        {
+            return Err(Error::format_capacity_exceeded(format!(
+                "max_rows_per_file {} exceeds the storage-version-2.3 per-fragment slot limit {}",
+                context.params.max_rows_per_file,
+                u32::MAX
+            )));
         }
 
         // Validate schema
@@ -427,6 +528,35 @@ impl<'a> InsertBuilder<'a> {
             (_, WriteDestination::Uri(_)) => params.storage_version_or_default(),
         };
 
+        // Stable logical row identity is intrinsic to storage version 2.3.
+        // The legacy toggle controls row-id sidecars and must not make two
+        // different 2.3 formats (or leave legacy metadata behind when callers
+        // keep passing an old option).
+        if storage_version.resolve() == LanceFileVersion::V2_3 {
+            params.enable_stable_row_ids = false;
+        }
+
+        if let WriteDestination::Dataset(dataset) = &dest {
+            let current_version = dataset
+                .manifest
+                .data_storage_format
+                .lance_file_version()?
+                .resolve();
+            let requested_version = storage_version.resolve();
+            if current_version != requested_version
+                && (current_version == LanceFileVersion::V2_3
+                    || requested_version == LanceFileVersion::V2_3)
+            {
+                return Err(Error::not_supported_source(
+                    format!(
+                        "Cannot change an existing dataset between storage version {} and {}; storage version 2.3 is only supported for newly created datasets",
+                        current_version, requested_version
+                    )
+                    .into(),
+                ));
+            }
+        }
+
         Ok(WriteContext {
             params,
             dest,
@@ -436,6 +566,35 @@ impl<'a> InsertBuilder<'a> {
             storage_version,
         })
     }
+}
+
+fn remaining_v2_3_fragment_ids(maximum: Option<u64>, allocator: &str) -> Result<u64> {
+    let maximum_valid_id = u32::MAX as u64 - 1;
+    match maximum {
+        None => Ok(u32::MAX as u64),
+        Some(maximum) => maximum_valid_id.checked_sub(maximum).ok_or_else(|| {
+            Error::format_capacity_exceeded(format!(
+                "storage-version-2.3 {allocator} high-water mark {maximum} reaches the reserved id {}",
+                u32::MAX
+            ))
+        }),
+    }
+}
+
+fn checked_v2_3_output_fragment_ordinal(ordinal: usize) -> Result<u32> {
+    u32::try_from(ordinal).map_err(|_| {
+        Error::format_capacity_exceeded(format!(
+            "storage-version-2.3 output fragment ordinal {ordinal} exceeds u32 capacity"
+        ))
+    })
+}
+
+fn checked_v2_3_output_fragment_rows(physical_rows: usize) -> Result<u32> {
+    u32::try_from(physical_rows).map_err(|_| {
+        Error::format_capacity_exceeded(format!(
+            "storage-version-2.3 output fragment row count {physical_rows} exceeds u32 capacity"
+        ))
+    })
 }
 
 #[derive(Debug)]
@@ -454,11 +613,49 @@ mod test {
 
     use arrow_array::{ArrayRef, BinaryArray, Int32Array, RecordBatchReader, StructArray};
     use arrow_schema::{ArrowError, DataType, Field, Schema};
+    use futures::TryStreamExt;
     use lance_arrow::BLOB_META_KEY;
+    use lance_core::error::FormatCapacityExceeded;
+    use lance_io::utils::tracking_store::{IOTracker, IoOperation};
 
     use crate::session::Session;
 
     use super::*;
+
+    fn assert_format_capacity(error: &Error) {
+        let Error::InvalidInput { source, .. } = error else {
+            panic!("expected InvalidInput with FormatCapacityExceeded, got {error:?}")
+        };
+        assert!(
+            source.downcast_ref::<FormatCapacityExceeded>().is_some(),
+            "expected FormatCapacityExceeded, got {source:?}"
+        );
+    }
+
+    fn file_count(path: &std::path::Path) -> usize {
+        std::fs::read_dir(path)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| {
+                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    file_count(&entry.path())
+                } else {
+                    1
+                }
+            })
+            .sum()
+    }
+
+    async fn data_object_count(dataset: &Dataset) -> usize {
+        dataset
+            .object_store
+            .read_dir_all(&dataset.data_dir(), None)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .len()
+    }
 
     #[tokio::test]
     async fn test_pass_session() {
@@ -504,6 +701,204 @@ mod test {
                 .unwrap(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn v2_3_ignores_the_legacy_stable_row_id_toggle() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let dataset = InsertBuilder::new("memory://v23-legacy-row-id-toggle")
+            .with_params(&WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_3),
+                enable_stable_row_ids: true,
+                ..Default::default()
+            })
+            .execute_stream(RecordBatchIterator::new(vec![Ok(batch)], schema))
+            .await
+            .unwrap();
+
+        assert!(dataset.manifest.has_stable_row_identity());
+        assert!(dataset.manifest.uses_stable_logical_row_addresses());
+        assert!(
+            dataset
+                .manifest
+                .fragments
+                .iter()
+                .all(|fragment| fragment.row_id_meta.is_none())
+        );
+    }
+
+    #[tokio::test]
+    async fn v2_3_append_rejects_exhausted_allocators_before_data_writes() {
+        let test_dir = lance_core::utils::tempfile::TempStrDir::default();
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1]))])
+            .unwrap();
+        let mut dataset = InsertBuilder::new(test_dir.as_str())
+            .with_params(&WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_3),
+                ..Default::default()
+            })
+            .execute_stream(RecordBatchIterator::new(
+                vec![Ok(batch.clone())],
+                schema.clone(),
+            ))
+            .await
+            .unwrap();
+        let manifest = Arc::make_mut(&mut dataset.manifest);
+        manifest.max_fragment_id = Some(u32::MAX - 1);
+        manifest.max_logical_fragment_id = Some(u32::MAX - 1);
+
+        let before = file_count(std::path::Path::new(test_dir.as_str()));
+        let params = WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        };
+        let error = InsertBuilder::new(Arc::new(dataset))
+            .with_params(&params)
+            .execute_stream(RecordBatchIterator::new(vec![Ok(batch)], schema))
+            .await
+            .unwrap_err();
+        assert_format_capacity(&error);
+        assert_eq!(
+            file_count(std::path::Path::new(test_dir.as_str())),
+            before,
+            "allocator exhaustion must be rejected before speculative data writes"
+        );
+    }
+
+    #[tokio::test]
+    async fn v2_3_append_bounds_speculation_at_remaining_allocator_capacity() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let initial =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1]))])
+                .unwrap();
+        let mut dataset = InsertBuilder::new("memory://v23-bounded-speculation")
+            .with_params(&WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_3),
+                ..Default::default()
+            })
+            .execute_stream(RecordBatchIterator::new(vec![Ok(initial)], schema.clone()))
+            .await
+            .unwrap();
+        let manifest = Arc::make_mut(&mut dataset.manifest);
+        manifest.max_fragment_id = Some(u32::MAX - 2);
+        manifest.max_logical_fragment_id = Some(u32::MAX - 2);
+
+        let tracker = Arc::new(IOTracker::default());
+        dataset = dataset.with_object_store_wrappers([
+            tracker.clone() as Arc<dyn lance_io::object_store::WrappingObjectStore>
+        ]);
+        let original_version = dataset.version().version;
+        let dataset = Arc::new(dataset);
+        let data_objects_before = data_object_count(dataset.as_ref()).await;
+        tracker.incremental_stats();
+
+        let appended =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![2, 3]))])
+                .unwrap();
+        let error = InsertBuilder::new(dataset.clone())
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                max_rows_per_file: 1,
+                ..Default::default()
+            })
+            .execute_stream(RecordBatchIterator::new(vec![Ok(appended)], schema))
+            .await
+            .unwrap_err();
+        assert_format_capacity(&error);
+
+        let requests = tracker.incremental_stats().requests;
+        assert!(
+            requests.iter().any(|request| {
+                request.operation == IoOperation::Put && request.path.to_string().contains("data/")
+            }),
+            "the first fragment is allowed to be written speculatively: {requests:?}"
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.operation == IoOperation::Delete),
+            "the bounded speculative fragment must trigger cleanup: {requests:?}"
+        );
+        assert_eq!(
+            data_object_count(dataset.as_ref()).await,
+            data_objects_before
+        );
+        assert!(
+            requests.iter().all(|request| {
+                request.operation != IoOperation::Put
+                    || (!request.path.to_string().contains("_transactions/")
+                        && !request.path.to_string().contains("_versions/"))
+            }),
+            "allocator rejection must precede transaction and manifest publication: {requests:?}"
+        );
+        let mut latest = dataset.as_ref().clone();
+        latest.checkout_latest().await.unwrap();
+        assert_eq!(latest.version().version, original_version);
+    }
+
+    #[tokio::test]
+    async fn rejects_zero_max_rows_before_data_writes_for_all_v2_versions() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let initial =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1]))])
+                .unwrap();
+        for (storage_version, uri) in [
+            (LanceFileVersion::V2_2, "memory://v22-zero-max-rows"),
+            (LanceFileVersion::V2_3, "memory://v23-zero-max-rows"),
+        ] {
+            let mut dataset = InsertBuilder::new(uri)
+                .with_params(&WriteParams {
+                    data_storage_version: Some(storage_version),
+                    ..Default::default()
+                })
+                .execute_stream(RecordBatchIterator::new(
+                    vec![Ok(initial.clone())],
+                    schema.clone(),
+                ))
+                .await
+                .unwrap();
+            let tracker = Arc::new(IOTracker::default());
+            dataset = dataset.with_object_store_wrappers([
+                tracker.clone() as Arc<dyn lance_io::object_store::WrappingObjectStore>
+            ]);
+            tracker.incremental_stats();
+
+            let error = InsertBuilder::new(Arc::new(dataset))
+                .with_params(&WriteParams {
+                    mode: WriteMode::Append,
+                    max_rows_per_file: 0,
+                    ..Default::default()
+                })
+                .execute_stream(RecordBatchIterator::new(
+                    vec![Ok(initial.clone())],
+                    schema.clone(),
+                ))
+                .await
+                .unwrap_err();
+            assert!(matches!(&error, Error::InvalidInput { .. }));
+            assert!(error.to_string().contains("max_rows_per_file"));
+            assert!(
+                tracker.incremental_stats().requests.iter().all(|request| {
+                    request.operation != IoOperation::Put
+                        || !request.path.to_string().starts_with("data/")
+                }),
+                "zero max_rows_per_file must fail before data PUT for {storage_version}"
+            );
+        }
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn v2_3_output_shape_overflow_is_typed() {
+        let overflow = u32::MAX as usize + 1;
+        assert_format_capacity(&checked_v2_3_output_fragment_ordinal(overflow).unwrap_err());
+        assert_format_capacity(&checked_v2_3_output_fragment_rows(overflow).unwrap_err());
     }
 
     #[tokio::test]

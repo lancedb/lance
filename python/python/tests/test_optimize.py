@@ -10,8 +10,9 @@ import lance
 import numpy as np
 import pyarrow as pa
 import pytest
+from lance.dataset import ColumnOrdering
 from lance.lance import Compaction
-from lance.optimize import RewriteResult
+from lance.optimize import RewriteResult, RowAddressMaintenanceMetrics
 from lance.vector import vec_to_table
 
 
@@ -35,6 +36,124 @@ def test_dataset_optimize(tmp_path: Path):
     assert metrics.files_added == 1
 
     assert dataset.version == 3
+
+
+def _logical_row_ids(dataset):
+    table = dataset.to_table(columns=["id"], with_row_id=True)
+    return dict(zip(table["id"].to_pylist(), table["_rowid"].to_pylist()))
+
+
+def test_v2_3_explicit_row_address_maintenance_roundtrip_and_metrics(
+    tmp_path: Path,
+):
+    dataset = lance.write_dataset(
+        pa.table({"id": range(8), "value": [80 - value for value in range(8)]}),
+        tmp_path / "v2_3_maintenance",
+        data_storage_version="2.3",
+        max_rows_per_file=2,
+    )
+    original_row_ids = _logical_row_ids(dataset)
+
+    normalized = dataset.optimize.normalize_placement(
+        target_rows_per_fragment=4,
+        max_rows_per_group=2,
+        batch_size=3,
+        io_buffer_size=1024 * 1024,
+    )
+    assert isinstance(normalized, RowAddressMaintenanceMetrics)
+    assert normalized.fragments_removed == 4
+    assert normalized.fragments_added == 2
+    assert normalized.data_files_written == 2
+    assert normalized.locator_objects_written == 0
+    assert normalized.locator_bytes_written == 0
+    assert normalized.rows_rewritten == 8
+    assert _logical_row_ids(dataset) == original_row_ids
+
+    repacked = dataset.optimize.repack(
+        target_rows_per_fragment=3,
+        max_rows_per_group=2,
+        max_bytes_per_file=1024 * 1024,
+    )
+    assert repacked.fragments_removed == 2
+    assert repacked.fragments_added == 3
+    assert repacked.data_files_written == 3
+    assert repacked.locator_objects_written == 4
+    assert repacked.locator_bytes_written > 0
+    assert repacked.rows_rewritten == 8
+    assert _logical_row_ids(dataset) == original_row_ids
+
+    reclustered = dataset.optimize.recluster(
+        [ColumnOrdering("value", ascending=True)],
+        target_rows_per_fragment=4,
+        max_rows_per_group=2,
+    )
+    assert reclustered.fragments_removed == 3
+    assert reclustered.fragments_added == 2
+    assert reclustered.data_files_written == 2
+    assert reclustered.locator_objects_written == 3
+    assert reclustered.locator_bytes_written > 0
+    assert reclustered.rows_rewritten == 8
+    assert _logical_row_ids(dataset) == original_row_ids
+    assert dataset.to_table()["value"].to_pylist() == sorted(
+        dataset.to_table()["value"].to_pylist()
+    )
+
+    checkpointed = dataset.optimize.checkpoint_row_address_generations()
+    assert checkpointed.fragments_removed == 0
+    assert checkpointed.fragments_added == 0
+    assert checkpointed.data_files_written == 0
+    assert checkpointed.locator_objects_written == 0
+    assert checkpointed.locator_bytes_written == 0
+    assert checkpointed.rows_rewritten == 0
+    assert _logical_row_ids(dataset) == original_row_ids
+
+
+def test_normalize_placement_rejects_byte_boundaries(tmp_path: Path):
+    dataset = lance.write_dataset(
+        pa.table({"id": range(4)}),
+        tmp_path / "v2_3_normalize_bytes",
+        data_storage_version="2.3",
+    )
+    version = dataset.version
+
+    with pytest.raises(ValueError, match="max_bytes_per_file is not supported"):
+        dataset.optimize.normalize_placement(max_bytes_per_file=1024)
+
+    assert dataset.version == version
+    assert dataset.count_rows() == 4
+
+
+@pytest.mark.parametrize(
+    "mode",
+    ["normalize_placement", "repack", "recluster", "checkpoint_generation"],
+)
+def test_row_address_maintenance_rejects_v2_2(tmp_path: Path, mode: str):
+    dataset = lance.write_dataset(
+        pa.table({"id": range(4)}),
+        tmp_path / f"v2_2_{mode}",
+        data_storage_version="2.2",
+    )
+
+    with pytest.raises(ValueError, match="requires storage version 2.3"):
+        if mode == "recluster":
+            dataset.optimize.recluster([ColumnOrdering("id")])
+        elif mode == "checkpoint_generation":
+            dataset.optimize.checkpoint_row_address_generations()
+        else:
+            getattr(dataset.optimize, mode)()
+
+
+def test_recluster_requires_typed_ordering(tmp_path: Path):
+    dataset = lance.write_dataset(
+        pa.table({"id": range(4)}),
+        tmp_path / "v2_3_typed_recluster",
+        data_storage_version="2.3",
+    )
+
+    with pytest.raises(TypeError, match="only ColumnOrdering"):
+        dataset.optimize.recluster(["id"])  # type: ignore[list-item]
+    with pytest.raises(ValueError, match="at least one ordering column"):
+        dataset.optimize.recluster([])
 
 
 def test_blob_compaction(tmp_path: Path):

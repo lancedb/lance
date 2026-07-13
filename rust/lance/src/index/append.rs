@@ -16,7 +16,7 @@ use lance_index::{
     },
 };
 use lance_select::{RowAddrTreeMap, RowSetOps};
-use lance_table::format::{Fragment, IndexMetadata};
+use lance_table::format::{Fragment, IndexMetadata, LogicalIndexCoverage};
 use roaring::RoaringBitmap;
 use uuid::Uuid;
 
@@ -34,10 +34,114 @@ pub struct IndexMergeResults<'a> {
     pub new_uuid: Uuid,
     pub removed_indices: Vec<&'a IndexMetadata>,
     pub new_fragment_bitmap: RoaringBitmap,
+    /// Exact output coverage for storage-version-2.3.  When present the
+    /// manifest must omit `fragment_bitmap`.
+    pub new_logical_coverage: Option<LogicalIndexCoverage>,
     pub new_index_version: i32,
     pub new_index_details: prost_types::Any,
     /// List of files and their sizes for the merged index
     pub files: Vec<lance_table::format::IndexFile>,
+}
+
+fn coverage_has_same_canonical_selection(
+    left: &LogicalIndexCoverage,
+    right: &LogicalIndexCoverage,
+) -> bool {
+    left.shards.len() == right.shards.len()
+        && left
+            .shards
+            .iter()
+            .zip(&right.shards)
+            .all(|(left, right)| left.selection == right.selection)
+}
+
+async fn rebuild_v23_index<'a>(
+    dataset: Arc<Dataset>,
+    old_indices: &[&'a IndexMetadata],
+    options: &OptimizeOptions,
+) -> Result<Option<IndexMergeResults<'a>>> {
+    let field_id = old_indices[0].fields[0];
+    let field_path = dataset.schema().field_path(field_id)?;
+    let current_coverage = crate::index::build_logical_index_coverage(
+        dataset.as_ref(),
+        &[field_id],
+        dataset.fragment_bitmap.as_ref(),
+    )
+    .await?;
+    let old_metadata = old_indices
+        .iter()
+        .map(|index| (*index).clone())
+        .collect::<Vec<_>>();
+    let resolved_old =
+        crate::index::resolve_logical_index_metadata(dataset.as_ref(), &old_metadata).await?;
+    let resolved_refs = resolved_old.iter().collect::<Vec<_>>();
+    let effective_old =
+        crate::index::merge_logical_index_coverage(dataset.as_ref(), &resolved_refs)?;
+    let no_explicit_rebuild =
+        !options.retrain && options.num_indices_to_merge.is_none_or(|count| count == 0);
+    if no_explicit_rebuild
+        && coverage_has_same_canonical_selection(&current_coverage, &effective_old)
+        && old_indices.len() == 1
+    {
+        return Ok(None);
+    }
+
+    let first_is_vector = metadata_is_vector_index(dataset.as_ref(), old_indices[0]).await?;
+    let new_uuid = Uuid::new_v4();
+    let created_index = if first_is_vector {
+        let source_index = dataset
+            .open_vector_index(&field_path, &old_indices[0].uuid, &NoOpMetricsCollector)
+            .await?;
+        let params = super::vector::derive_vector_index_params(source_index.as_ref())?;
+        let files = super::vector::build_vector_index(
+            dataset.as_ref(),
+            &field_path,
+            &old_indices[0].name,
+            new_uuid,
+            &params,
+            dataset.open_frag_reuse_index(&NoOpMetricsCollector).await?,
+            options.progress.clone(),
+        )
+        .await?;
+        CreatedIndex {
+            index_details: old_indices
+                .iter()
+                .filter_map(|index| index.index_details.as_ref())
+                .find(|details| !details.value.is_empty())
+                .map(|details| details.as_ref().clone())
+                .unwrap_or_else(vector_index_details_default),
+            index_version: IndexType::Vector.version() as u32,
+            files,
+        }
+    } else {
+        let source_index = dataset
+            .open_scalar_index(&field_path, &old_indices[0].uuid, &NoOpMetricsCollector)
+            .await?;
+        rebuild_scalar_segment(
+            dataset.as_ref(),
+            &source_index,
+            &field_path,
+            dataset
+                .schema()
+                .field_by_id(field_id)
+                .ok_or_else(|| Error::index(format!("column {field_id} does not exist")))?
+                .name
+                .as_str(),
+            new_uuid,
+            dataset.fragment_bitmap.iter().collect(),
+        )
+        .await?
+    };
+
+    Ok(Some(IndexMergeResults {
+        new_uuid,
+        removed_indices: old_indices.to_vec(),
+        new_fragment_bitmap: RoaringBitmap::new(),
+        new_logical_coverage: Some(current_coverage),
+        new_index_version: created_index.index_version as i32,
+        new_index_details: created_index.index_details,
+        files: created_index.files,
+    }))
 }
 
 async fn build_stable_row_id_filter(
@@ -208,6 +312,41 @@ async fn rebuild_scalar_segment(
     fragment_ids: Vec<u32>,
 ) -> Result<CreatedIndex> {
     let params = reference_index.derive_index_params()?;
+    if reference_index.index_type() == IndexType::Bitmap
+        && !dataset.manifest.uses_stable_logical_row_addresses()
+    {
+        return super::scalar::build_bitmap_index_segment(
+            dataset,
+            column_name,
+            uuid,
+            fragment_ids,
+            Arc::new(NoopIndexBuildProgress),
+        )
+        .await;
+    }
+    if dataset.manifest.uses_stable_logical_row_addresses() {
+        let requested = fragment_ids.iter().copied().collect::<RoaringBitmap>();
+        if &requested != dataset.fragment_bitmap.as_ref() {
+            return Err(Error::internal(
+                "storage-version-2.3 index rebuild must cover the current physical snapshot",
+            ));
+        }
+        // V2.3 rebuilds exact logical coverage for the full snapshot. Passing
+        // fragment IDs selects distributed scalar build modes whose staged
+        // metadata files cannot own the single authoritative coverage anchor.
+        return super::scalar::build_scalar_index(
+            dataset,
+            column_name,
+            uuid,
+            &params,
+            true,
+            None,
+            None,
+            Arc::new(NoopIndexBuildProgress),
+        )
+        .await;
+    }
+
     let update_criteria = reference_index.update_criteria();
     let training_data = load_training_data(
         dataset,
@@ -434,6 +573,10 @@ pub async fn merge_indices<'a>(
             "Append index: no previous index found".to_string(),
         ));
     };
+
+    if dataset.manifest.uses_stable_logical_row_addresses() {
+        return rebuild_v23_index(dataset, old_indices, options).await;
+    }
 
     let unindexed = dataset.unindexed_fragments(&old_indices[0].name).await?;
     Box::pin(merge_indices_with_unindexed_frags(
@@ -732,6 +875,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                         new_uuid,
                         removed_indices: old_indices.to_vec(),
                         new_fragment_bitmap: dataset.fragment_bitmap.as_ref().clone(),
+                        new_logical_coverage: None,
                         new_index_version: created_index.index_version as i32,
                         new_index_details: created_index.index_details,
                         files: created_index.files,
@@ -848,6 +992,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
         new_uuid,
         removed_indices,
         new_fragment_bitmap,
+        new_logical_coverage: None,
         new_index_version: created_index.index_version as i32,
         new_index_details: created_index.index_details,
         files: created_index.files,
@@ -860,7 +1005,7 @@ mod tests {
 
     use crate::index::DatasetIndexExt;
     use crate::index::DatasetIndexInternalExt;
-    use arrow::datatypes::{Float32Type, UInt32Type};
+    use arrow::datatypes::{Float32Type, Int32Type, UInt32Type, UInt64Type};
     use arrow_array::cast::AsArray;
     use arrow_array::{
         FixedSizeListArray, Int32Array, RecordBatch, RecordBatchIterator, StringArray, UInt32Array,
@@ -870,7 +1015,7 @@ mod tests {
     use lance_arrow::FixedSizeListArrayExt;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datafusion::utils::reader_to_stream;
-    use lance_datagen::{Dimension, RowCount, array};
+    use lance_datagen::{BatchCount, Dimension, RowCount, array};
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::sq::builder::SQBuildParams;
     use lance_index::{
@@ -887,6 +1032,291 @@ mod tests {
     use crate::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode, WriteParams};
     use crate::index::vector::VectorIndexParams;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+
+    #[tokio::test]
+    async fn test_v23_scalar_optimize_rebuilds_logical_coverage() {
+        use lance_encoding::version::LanceFileVersion;
+
+        let test_dir = TempStrDir::default();
+        let reader = lance_datagen::gen_batch()
+            .col("value", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(16), BatchCount::from(1));
+        let mut dataset = Dataset::write(
+            reader,
+            test_dir.as_str(),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_3),
+                max_rows_per_file: 8,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        dataset
+            .create_index(&["value"], IndexType::BTree, None, &params, true)
+            .await
+            .unwrap();
+        let appended = lance_datagen::gen_batch()
+            .col("value", array::step_custom::<Int32Type>(16, 1))
+            .into_reader_rows(RowCount::from(8), BatchCount::from(1));
+        dataset.append(appended, None).await.unwrap();
+
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1);
+        assert!(indices[0].fragment_bitmap.is_none());
+        assert_eq!(
+            indices[0]
+                .logical_coverage
+                .as_ref()
+                .unwrap()
+                .shards
+                .iter()
+                .map(|shard| shard.row_count)
+                .sum::<u64>(),
+            24
+        );
+        let mut externalized = indices[0].clone();
+        externalized
+            .logical_coverage
+            .as_mut()
+            .unwrap()
+            .externalize_detail_over(0)
+            .unwrap();
+        crate::index::resolve_logical_index_coverage(&dataset, &externalized)
+            .await
+            .unwrap();
+        let result = dataset
+            .scan()
+            .filter("value >= 20")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(
+            result["value"].as_primitive::<Int32Type>().values(),
+            &[20, 21, 22, 23]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_v23_vector_optimize_rebuilds_logical_coverage() {
+        use lance_encoding::version::LanceFileVersion;
+
+        let test_dir = TempStrDir::default();
+        let reader = lance_datagen::gen_batch()
+            .col("vector", array::rand_vec::<Float32Type>(8.into()))
+            .into_reader_rows(RowCount::from(64), BatchCount::from(1));
+        let mut dataset = Dataset::write(
+            reader,
+            test_dir.as_str(),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_3),
+                max_rows_per_file: 32,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let params = VectorIndexParams::ivf_flat(2, MetricType::L2);
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+        let query_batch = dataset
+            .scan()
+            .project(&["vector"])
+            .unwrap()
+            .limit(Some(1), None)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let query = query_batch["vector"].as_fixed_size_list().value(0);
+        let initial = dataset.load_indices().await.unwrap();
+        assert_eq!(
+            initial[0]
+                .logical_coverage
+                .as_ref()
+                .unwrap()
+                .external
+                .as_ref()
+                .unwrap()
+                .path,
+            INDEX_FILE_NAME
+        );
+        let appended = lance_datagen::gen_batch()
+            .col("vector", array::rand_vec::<Float32Type>(8.into()))
+            .into_reader_rows(RowCount::from(16), BatchCount::from(1));
+        dataset.append(appended, None).await.unwrap();
+
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1);
+        assert!(indices[0].fragment_bitmap.is_none());
+        assert_eq!(
+            indices[0]
+                .logical_coverage
+                .as_ref()
+                .unwrap()
+                .shards
+                .iter()
+                .map(|shard| shard.row_count)
+                .sum::<u64>(),
+            80
+        );
+        assert_eq!(
+            indices[0]
+                .logical_coverage
+                .as_ref()
+                .unwrap()
+                .external
+                .as_ref()
+                .unwrap()
+                .path,
+            INDEX_FILE_NAME
+        );
+        let mut externalized = indices[0].clone();
+        externalized
+            .logical_coverage
+            .as_mut()
+            .unwrap()
+            .externalize_detail_over(0)
+            .unwrap();
+        crate::index::resolve_logical_index_coverage(&dataset, &externalized)
+            .await
+            .unwrap();
+
+        async fn nearest_row_ids(
+            dataset: &Dataset,
+            query: &arrow_array::Float32Array,
+            use_index: bool,
+        ) -> std::collections::HashSet<u64> {
+            let mut scanner = dataset.scan();
+            scanner
+                .nearest("vector", query, 10)
+                .unwrap()
+                .nprobes(2)
+                .with_row_id()
+                .use_index(use_index);
+            scanner.try_into_batch().await.unwrap()[lance_core::ROW_ID]
+                .as_primitive::<UInt64Type>()
+                .values()
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>()
+        }
+        let exact = nearest_row_ids(&dataset, query.as_primitive::<Float32Type>(), false).await;
+        let indexed = nearest_row_ids(&dataset, query.as_primitive::<Float32Type>(), true).await;
+        let recall = indexed.intersection(&exact).count() as f32 / exact.len() as f32;
+        assert!(recall >= 0.5, "vector optimize recall was {recall}");
+    }
+
+    #[tokio::test]
+    async fn test_v23_fts_optimize_rebuilds_logical_coverage() {
+        use lance_encoding::version::LanceFileVersion;
+        use lance_index::scalar::FullTextSearchQuery;
+        use lance_index::scalar::inverted::InvertedIndexParams;
+
+        let test_dir = TempStrDir::default();
+        let schema = Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, false)]));
+        let initial = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from_iter_values(
+                (0..16).map(|_| "alpha"),
+            ))],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(initial)], schema.clone());
+        let mut dataset = Dataset::write(
+            reader,
+            test_dir.as_str(),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_3),
+                max_rows_per_file: 8,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["text"],
+                IndexType::Inverted,
+                Some("text_idx".to_string()),
+                &InvertedIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let appended = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from_iter_values(
+                (0..8).map(|_| "quokka"),
+            ))],
+        )
+        .unwrap();
+        dataset
+            .append(RecordBatchIterator::new(vec![Ok(appended)], schema), None)
+            .await
+            .unwrap();
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+
+        let indices = dataset.load_indices_by_name("text_idx").await.unwrap();
+        assert_eq!(indices.len(), 1);
+        assert_eq!(
+            indices[0]
+                .logical_coverage
+                .as_ref()
+                .unwrap()
+                .shards
+                .iter()
+                .map(|shard| shard.row_count)
+                .sum::<u64>(),
+            24
+        );
+        assert_eq!(
+            indices[0]
+                .logical_coverage
+                .as_ref()
+                .unwrap()
+                .external
+                .as_ref()
+                .unwrap()
+                .path,
+            lance_index::scalar::inverted::METADATA_FILE
+        );
+        let mut externalized = indices[0].clone();
+        externalized
+            .logical_coverage
+            .as_mut()
+            .unwrap()
+            .externalize_detail_over(0)
+            .unwrap();
+        crate::index::resolve_logical_index_coverage(&dataset, &externalized)
+            .await
+            .unwrap();
+
+        let results = dataset
+            .scan()
+            .full_text_search(FullTextSearchQuery::new("quokka".to_string()))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(results.num_rows(), 8);
+    }
 
     #[tokio::test]
     async fn test_append_index() {
@@ -1592,6 +2022,50 @@ mod tests {
             covered, expected,
             "post-optimize segments should cover every dataset fragment"
         );
+    }
+
+    #[tokio::test]
+    async fn test_optimize_ngram_created_on_empty_dataset() {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let schema = Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, false)]));
+        let empty = RecordBatchIterator::new(vec![], schema.clone());
+        let mut dataset = Dataset::write(empty, test_uri, None).await.unwrap();
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::NGram);
+        dataset
+            .create_index(
+                &["text"],
+                IndexType::NGram,
+                Some("text_ngram".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let appended = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from_iter_values(["apple"]))],
+        )
+        .unwrap();
+        dataset
+            .append(RecordBatchIterator::new(vec![Ok(appended)], schema), None)
+            .await
+            .unwrap();
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+
+        let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        let result = dataset
+            .scan()
+            .filter("contains(text, 'apple')")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(result.num_rows(), 1);
     }
 
     #[tokio::test]

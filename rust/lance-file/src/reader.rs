@@ -448,6 +448,10 @@ pub struct FileReaderOptions {
     /// to provide a default for all scans, or at the scanner level (via
     /// `Scanner::batch_size_bytes`) to override per scan.
     pub batch_size_bytes: Option<u64>,
+    /// If set, expand the initial footer read backwards to include this byte
+    /// offset. Callers that already know a footer-owned global-buffer range can
+    /// co-fetch it without adding a later serial range request.
+    pub metadata_prefetch_start: Option<u64>,
 }
 
 impl Default for FileReaderOptions {
@@ -456,6 +460,7 @@ impl Default for FileReaderOptions {
             decoder_config: DecoderConfig::default(),
             read_chunk_size: DEFAULT_READ_CHUNK_SIZE,
             batch_size_bytes: None,
+            metadata_prefetch_start: None,
         }
     }
 }
@@ -722,13 +727,19 @@ impl FileReader {
         self.core.read_global_buffer(index).await
     }
 
-    async fn read_tail(scheduler: &FileScheduler) -> Result<(Bytes, u64)> {
+    async fn read_tail(
+        scheduler: &FileScheduler,
+        metadata_prefetch_start: Option<u64>,
+    ) -> Result<(Bytes, u64)> {
         let file_size = scheduler.reader().size().await? as u64;
-        let begin = if file_size < scheduler.reader().block_size() as u64 {
+        let default_begin = if file_size < scheduler.reader().block_size() as u64 {
             0
         } else {
             file_size - scheduler.reader().block_size() as u64
         };
+        let begin = metadata_prefetch_start
+            .map(|start| default_begin.min(start.min(file_size)))
+            .unwrap_or(default_begin);
         let tail_bytes = scheduler.submit_single(begin..file_size, 0).await?;
         Ok((tail_bytes, file_size))
     }
@@ -979,8 +990,15 @@ impl FileReader {
     // Also, if the number of columns is fairly small, it's faster to read them as a
     // single IOP, but we can fix this through coalescing.
     pub async fn read_all_metadata(scheduler: &FileScheduler) -> Result<CachedFileMetadata> {
+        Self::read_all_metadata_with_prefetch(scheduler, None).await
+    }
+
+    async fn read_all_metadata_with_prefetch(
+        scheduler: &FileScheduler,
+        metadata_prefetch_start: Option<u64>,
+    ) -> Result<CachedFileMetadata> {
         // 1. read the footer
-        let (tail_bytes, file_len) = Self::read_tail(scheduler).await?;
+        let (tail_bytes, file_len) = Self::read_tail(scheduler, metadata_prefetch_start).await?;
         let tail_offset = file_len - tail_bytes.len() as u64;
         let footer = Self::decode_footer(&tail_bytes)?;
 
@@ -1052,7 +1070,7 @@ impl FileReader {
         scheduler: &FileScheduler,
         known_schema: Option<(Arc<Schema>, u64)>,
     ) -> Result<FileMetadataIndex> {
-        let (tail_bytes, file_len) = Self::read_tail(scheduler).await?;
+        let (tail_bytes, file_len) = Self::read_tail(scheduler, None).await?;
         let tail_offset = file_len - tail_bytes.len() as u64;
         let footer = Self::decode_footer(&tail_bytes)?;
 
@@ -1255,7 +1273,10 @@ impl FileReader {
         cache: &LanceCache,
         options: FileReaderOptions,
     ) -> Result<Self> {
-        let file_metadata = Arc::new(Self::read_all_metadata(&scheduler).await?);
+        let file_metadata = Arc::new(
+            Self::read_all_metadata_with_prefetch(&scheduler, options.metadata_prefetch_start)
+                .await?,
+        );
         let path = scheduler.reader().path().clone();
 
         // Create LanceEncodingsIo with read chunk size from options
@@ -3713,6 +3734,44 @@ mod tests {
 
         let stats = fs.object_store.io_stats_incremental();
         assert_eq!(stats.read_iops, expected_read_iops);
+    }
+
+    #[tokio::test]
+    async fn test_metadata_prefetch_cofetches_large_global_buffer() {
+        let fs = FsFixture::default();
+        let buffer = Bytes::from(vec![9u8; 2 * fs.object_store.block_size()]);
+        write_file_with_global_buffer(&fs, buffer.clone()).await;
+
+        let scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let metadata = FileReader::read_all_metadata(&scheduler).await.unwrap();
+        let buffer_offset = metadata.file_buffers[1].position;
+
+        let scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let reader = FileReader::try_open(
+            scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &test_cache(),
+            FileReaderOptions {
+                metadata_prefetch_start: Some(buffer_offset),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(reader.metadata().retained_global_buffers.contains_key(&1));
+
+        fs.object_store.io_stats_incremental();
+        assert_eq!(reader.read_global_buffer(1).await.unwrap(), buffer);
+        assert_eq!(fs.object_store.io_stats_incremental().read_iops, 0);
     }
 
     /// A file whose only global buffer is the schema (i.e. a plain data file, the

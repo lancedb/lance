@@ -536,7 +536,15 @@ impl TakeBuilder {
                 .row_ids
                 .as_ref()
                 .expect("row_ids must be set if row_addrs is not");
-            let addrs = if let Some(row_id_index) = get_row_id_index(&self.dataset).await? {
+            let addrs = if self.dataset.manifest.uses_stable_logical_row_addresses() {
+                self.dataset
+                    .resolve_logical_row_ids_async(row_ids)
+                    .await?
+                    .into_iter()
+                    .flatten()
+                    .map(u64::from)
+                    .collect()
+            } else if let Some(row_id_index) = get_row_id_index(&self.dataset).await? {
                 row_id_index
                     .get_many(row_ids)
                     .into_iter()
@@ -596,11 +604,19 @@ mod test {
     use arrow_schema::{DataType, Fields, Schema as ArrowSchema};
     use lance_arrow::ARROW_EXT_NAME_KEY;
     use lance_arrow::json::{ARROW_JSON_EXT_NAME, is_arrow_json_field};
-    use lance_core::{ROW_ADDR_FIELD, ROW_ID_FIELD};
+    use lance_core::utils::address::LogicalRowAddress;
+    use lance_core::{ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD};
     use lance_file::version::LanceFileVersion;
+    use lance_table::format::{
+        LogicalRowAddressRange, LogicalRowAddressSelection, PackedRunRowAddressPlacement,
+        RowAddressLogicalDomain, RowAddressPlacement, SelectedRowAddressPlacement,
+    };
     use pretty_assertions::assert_eq;
+    use roaring::RoaringBitmap;
     use rstest::rstest;
     use std::collections::HashMap;
+    use std::sync::OnceLock;
+    use uuid::Uuid;
 
     use crate::dataset::{WriteParams, scanner::test_dataset::TestVectorDataset};
 
@@ -626,6 +642,391 @@ mod test {
             ],
         )
         .unwrap()
+    }
+
+    async fn write_v23_batch(rows: Range<i32>, max_rows_per_file: usize) -> Dataset {
+        let data = test_batch(rows);
+        let batches = RecordBatchIterator::new([Ok(data.clone())], data.schema());
+        Dataset::write(
+            batches,
+            &format!("memory://{}", Uuid::new_v4()),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_3),
+                max_rows_per_file,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+    }
+
+    fn logical(logical_fragment_id: u32, slot: u32) -> u64 {
+        LogicalRowAddress::try_new_from_parts(logical_fragment_id, slot)
+            .unwrap()
+            .raw()
+    }
+
+    fn selection(logical_fragment_id: u32, slots: &[u32]) -> Arc<LogicalRowAddressSelection> {
+        Arc::new(
+            LogicalRowAddressSelection::from_ranges(
+                slots
+                    .iter()
+                    .map(|slot| LogicalRowAddressRange {
+                        logical_fragment_id,
+                        start_slot: *slot,
+                        end_slot: slot + 1,
+                    })
+                    .collect(),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn install_test_layout(
+        dataset: &mut Dataset,
+        placements: Vec<RowAddressPlacement>,
+        max_logical_fragment_id: u32,
+        deleted_offsets: &RoaringBitmap,
+    ) {
+        assert_eq!(dataset.manifest.fragments.len(), 1);
+        let mut manifest = dataset.manifest.as_ref().clone();
+        let mut fragments = manifest.fragments.as_ref().clone();
+        fragments[0].native_logical_domain = None;
+        manifest.fragments = Arc::new(fragments);
+        manifest.max_logical_fragment_id = Some(max_logical_fragment_id);
+
+        let mut layout = manifest.row_address_layout.as_deref().unwrap().clone();
+        layout.placements = placements;
+        layout.physical_row_ownership.clear();
+        layout
+            .refresh_physical_ownership_summary(&manifest.fragments[0], deleted_offsets)
+            .unwrap();
+        layout.refresh_fingerprint_with_fragments(
+            &manifest.fragments,
+            manifest.max_logical_fragment_id,
+        );
+        manifest.row_address_layout = Some(Arc::new(layout));
+        manifest.validate_row_address_contract().unwrap();
+
+        dataset.manifest = Arc::new(manifest);
+        dataset.row_address_router = Arc::new(OnceLock::new());
+    }
+
+    #[tokio::test]
+    async fn test_v23_direct_scan_and_take_use_logical_ids_without_a_sidecar() {
+        let mut dataset = write_v23_batch(0..8, 4).await;
+        assert!(dataset.row_address_router.get().is_none());
+        assert!(
+            dataset
+                .manifest
+                .fragments
+                .iter()
+                .all(|fragment| fragment.row_id_meta.is_none())
+        );
+        assert!(
+            dataset
+                .manifest
+                .fragments
+                .iter()
+                .all(|fragment| fragment.native_logical_domain.is_some())
+        );
+
+        let ordinary = dataset.scan().try_into_batch().await.unwrap();
+        assert_eq!(
+            ordinary["i"].as_primitive::<arrow_array::types::Int32Type>(),
+            &Int32Array::from_iter_values(0..8)
+        );
+        assert!(dataset.row_address_router.get().is_none());
+
+        let fragments = dataset
+            .manifest
+            .fragments
+            .iter()
+            .map(|fragment| {
+                (
+                    fragment.id as u32,
+                    fragment
+                        .native_logical_domain
+                        .as_ref()
+                        .unwrap()
+                        .logical_fragment_id,
+                    fragment.physical_rows.unwrap() as u32,
+                )
+            })
+            .collect::<Vec<_>>();
+        let expected_row_ids = fragments
+            .iter()
+            .flat_map(|(_, logical_fragment_id, rows)| {
+                (0..*rows).map(|slot| logical(*logical_fragment_id, slot))
+            })
+            .collect::<Vec<_>>();
+        let expected_row_addrs = fragments
+            .iter()
+            .flat_map(|(physical_fragment_id, _, rows)| {
+                (0..*rows).map(|offset| {
+                    u64::from(RowAddress::new_from_parts(*physical_fragment_id, offset))
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let mut scan = dataset.scan();
+        scan.project(&["i", ROW_ID, ROW_ADDR, ROW_OFFSET]).unwrap();
+        let with_meta = scan.try_into_batch().await.unwrap();
+        assert_eq!(
+            with_meta[ROW_ID]
+                .as_primitive::<UInt64Type>()
+                .values()
+                .as_ref(),
+            expected_row_ids.as_slice()
+        );
+        assert_eq!(
+            with_meta[ROW_ADDR]
+                .as_primitive::<UInt64Type>()
+                .values()
+                .as_ref(),
+            expected_row_addrs.as_slice()
+        );
+        assert_eq!(
+            with_meta[ROW_OFFSET]
+                .as_primitive::<UInt64Type>()
+                .values()
+                .as_ref(),
+            (0_u64..8).collect::<Vec<_>>().as_slice()
+        );
+        assert!(
+            dataset.row_address_router.get().is_none(),
+            "native Direct scans must not construct the placement router"
+        );
+
+        dataset.delete("i IN (1, 6)").await.unwrap();
+        let first_logical = fragments[0].1;
+        let second_logical = fragments[1].1;
+        let row_id_2 = logical(first_logical, 2);
+        let row_id_6 = logical(second_logical, 2);
+        let row_id_7 = logical(second_logical, 3);
+        let missing_slot = logical(first_logical, 99);
+        let missing_domain = logical(dataset.manifest.max_logical_fragment_id.unwrap() + 1, 0);
+
+        let mut scan = dataset.scan();
+        scan.project(&[ROW_ID, "i"]).unwrap();
+        let live = scan.try_into_batch().await.unwrap();
+        assert_eq!(
+            live[ROW_ID].as_primitive::<UInt64Type>().values().as_ref(),
+            &[
+                logical(first_logical, 0),
+                row_id_2,
+                logical(first_logical, 3),
+                logical(second_logical, 0),
+                logical(second_logical, 1),
+                row_id_7,
+            ]
+        );
+        assert!(
+            dataset.row_address_router.get().is_none(),
+            "native Direct scans with deletions must not construct the placement router"
+        );
+
+        let projection = ProjectionRequest::from_columns([ROW_ID, "i"], dataset.schema());
+        let taken = dataset
+            .take_rows(
+                &[
+                    row_id_6,
+                    row_id_7,
+                    row_id_2,
+                    row_id_7,
+                    missing_slot,
+                    missing_domain,
+                ],
+                projection,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            taken["i"].as_primitive::<arrow_array::types::Int32Type>(),
+            &Int32Array::from_iter_values([7, 2, 7])
+        );
+        assert_eq!(
+            taken[ROW_ID].as_primitive::<UInt64Type>().values().as_ref(),
+            &[row_id_7, row_id_2, row_id_7]
+        );
+
+        let projection = ProjectionRequest::from_columns([ROW_ID, ROW_ADDR, "i"], dataset.schema());
+        let taken = dataset
+            .take_rows(&[row_id_7, row_id_2, row_id_7], projection)
+            .await
+            .unwrap();
+        assert_eq!(
+            taken[ROW_ADDR]
+                .as_primitive::<UInt64Type>()
+                .values()
+                .as_ref(),
+            &[
+                u64::from(RowAddress::new_from_parts(fragments[1].0, 3)),
+                u64::from(RowAddress::new_from_parts(fragments[0].0, 2)),
+                u64::from(RowAddress::new_from_parts(fragments[1].0, 3)),
+            ]
+        );
+        assert!(dataset.row_address_router.get().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_v23_packed_run_scan_and_take_inverse_placement() {
+        let mut dataset = write_v23_batch(0..6, 6).await;
+        let physical_fragment_id = dataset.manifest.fragments[0].id as u32;
+        install_test_layout(
+            &mut dataset,
+            vec![RowAddressPlacement::PackedRun(
+                PackedRunRowAddressPlacement::from_sources(
+                    vec![
+                        RowAddressLogicalDomain::new(4, 3, 1).unwrap(),
+                        RowAddressLogicalDomain::new(9, 3, 1).unwrap(),
+                    ],
+                    physical_fragment_id,
+                    0,
+                )
+                .unwrap(),
+            )],
+            9,
+            &RoaringBitmap::new(),
+        );
+
+        let mut scan = dataset.scan();
+        scan.project(&["i", ROW_ID, ROW_ADDR]).unwrap();
+        let scanned = scan.try_into_batch().await.unwrap();
+        let expected_ids = [
+            logical(4, 0),
+            logical(4, 1),
+            logical(4, 2),
+            logical(9, 0),
+            logical(9, 1),
+            logical(9, 2),
+        ];
+        assert_eq!(
+            scanned[ROW_ID]
+                .as_primitive::<UInt64Type>()
+                .values()
+                .as_ref(),
+            &expected_ids
+        );
+        let expected_addrs = (0..6)
+            .map(|offset| u64::from(RowAddress::new_from_parts(physical_fragment_id, offset)))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            scanned[ROW_ADDR]
+                .as_primitive::<UInt64Type>()
+                .values()
+                .as_ref(),
+            expected_addrs.as_slice()
+        );
+
+        let projection = ProjectionRequest::from_columns([ROW_ID, ROW_ADDR, "i"], dataset.schema());
+        let taken = dataset
+            .take_rows(
+                &[logical(9, 2), logical(4, 0), logical(9, 2), logical(4, 99)],
+                projection,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            taken["i"].as_primitive::<arrow_array::types::Int32Type>(),
+            &Int32Array::from_iter_values([5, 0, 5])
+        );
+        assert_eq!(
+            taken[ROW_ID].as_primitive::<UInt64Type>().values().as_ref(),
+            &[logical(9, 2), logical(4, 0), logical(9, 2)]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_v23_selected_allows_only_deletion_vector_owned_gaps() {
+        let mut dataset = write_v23_batch(0..4, 4).await;
+        dataset.delete("i >= 2").await.unwrap();
+        let physical_fragment_id = dataset.manifest.fragments[0].id as u32;
+        let deleted = RoaringBitmap::from_iter([2, 3]);
+        install_test_layout(
+            &mut dataset,
+            vec![RowAddressPlacement::Selected(SelectedRowAddressPlacement {
+                source: RowAddressLogicalDomain::new(7, 4, 1).unwrap(),
+                selection: selection(7, &[0, 2]),
+                destination_fragment_id: physical_fragment_id,
+                destination_start: 0,
+                excluded: None,
+            })],
+            7,
+            &deleted,
+        );
+
+        let mut scan = dataset.scan();
+        scan.project(&["i", ROW_ID, ROW_ADDR]).unwrap();
+        let scanned = scan.try_into_batch().await.unwrap();
+        assert_eq!(
+            scanned["i"].as_primitive::<arrow_array::types::Int32Type>(),
+            &Int32Array::from_iter_values([0, 1])
+        );
+        assert_eq!(
+            scanned[ROW_ID]
+                .as_primitive::<UInt64Type>()
+                .values()
+                .as_ref(),
+            &[logical(7, 0), logical(7, 2)]
+        );
+        assert_eq!(
+            scanned[ROW_ADDR]
+                .as_primitive::<UInt64Type>()
+                .values()
+                .as_ref(),
+            &[
+                u64::from(RowAddress::new_from_parts(physical_fragment_id, 0)),
+                u64::from(RowAddress::new_from_parts(physical_fragment_id, 1)),
+            ]
+        );
+
+        let projection = ProjectionRequest::from_columns([ROW_ID, "i"], dataset.schema());
+        let taken = dataset
+            .take_rows(
+                &[logical(7, 2), logical(7, 1), logical(7, 0), logical(7, 2)],
+                projection,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            taken["i"].as_primitive::<arrow_array::types::Int32Type>(),
+            &Int32Array::from_iter_values([1, 0, 1])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_v23_selected_rejects_a_live_unmapped_physical_row() {
+        let mut dataset = write_v23_batch(0..4, 4).await;
+        dataset.delete("i IN (1, 3)").await.unwrap();
+        let physical_fragment_id = dataset.manifest.fragments[0].id as u32;
+        install_test_layout(
+            &mut dataset,
+            vec![RowAddressPlacement::Selected(SelectedRowAddressPlacement {
+                source: RowAddressLogicalDomain::new(7, 4, 1).unwrap(),
+                selection: selection(7, &[0, 2]),
+                destination_fragment_id: physical_fragment_id,
+                destination_start: 0,
+                excluded: None,
+            })],
+            7,
+            // The manifest claims that the unowned destination offsets are deleted,
+            // but the persisted deletion vector contains offsets 1 and 3 instead.
+            &RoaringBitmap::from_iter([2, 3]),
+        );
+
+        let error = dataset
+            .scan()
+            .with_row_id()
+            .try_into_batch()
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("corrupt storage-version-2.3 row-address layout"),
+            "{error}"
+        );
     }
 
     fn nested_arrow_json_batch() -> RecordBatch {

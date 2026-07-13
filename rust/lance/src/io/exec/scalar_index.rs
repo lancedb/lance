@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::sync::{Arc, LazyLock};
+use std::{
+    collections::BTreeSet,
+    sync::{Arc, LazyLock},
+};
 
 use super::utils::{IndexMetrics, InstrumentedRecordBatchStreamAdapter};
 use crate::{
     Dataset,
     dataset::rowids::{load_row_id_sequence, load_row_id_sequences},
     index::{
+        DatasetIndexExt, PreFilter, logical_index_coverage_is_current,
         prefilter::DatasetPreFilter,
-        scalar_logical::{open_named_scalar_index, scalar_index_fragment_bitmap},
+        scalar_logical::{
+            load_named_scalar_segments, open_named_scalar_index, scalar_index_fragment_bitmap,
+        },
     },
 };
 use arrow_array::{Array, RecordBatch, UInt64Array};
@@ -26,7 +32,7 @@ use datafusion::{
     scalar::ScalarValue,
 };
 use datafusion_physical_expr::EquivalenceProperties;
-use futures::{StreamExt, TryFutureExt, TryStreamExt, stream::BoxStream};
+use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt, stream::BoxStream};
 use lance_core::{Error, ROW_ID_FIELD, Result, utils::address::RowAddress};
 use lance_datafusion::{
     chunker::break_stream,
@@ -64,9 +70,11 @@ impl ScalarIndexLoader for Dataset {
         &self,
         result: NullableIndexExprResult,
     ) -> Result<NullableIndexExprResult> {
-        // Addresses and row ids only diverge under stable row ids; otherwise the
-        // address is the row id and there is nothing to translate.
-        if !self.manifest.uses_stable_row_ids() {
+        // V2.3 address-oriented scalar plugins are trained with logical row
+        // addresses, which are already the row-id domain. Legacy stable-row-id
+        // indices still store physical addresses and need translation.
+        if !self.manifest.uses_stable_row_ids() || self.manifest.uses_stable_logical_row_addresses()
+        {
             return Ok(result);
         }
 
@@ -494,9 +502,21 @@ impl MapIndexExec {
             });
         }
         let fragment_bitmap = fragment_bitmap.expect("MapIndexExec built with no lookups");
-        let deletion_mask_fut =
-            DatasetPreFilter::create_restricted_deletion_mask(dataset.clone(), fragment_bitmap);
-        let deletion_mask = if let Some(fut) = deletion_mask_fut {
+        let deletion_mask = if dataset.manifest.uses_stable_logical_row_addresses() {
+            let mut index_metadata = Vec::new();
+            for lookup in &lookups {
+                for index in dataset.load_indices_by_name(&lookup.index_name).await? {
+                    if logical_index_coverage_is_current(&dataset, &index)? {
+                        index_metadata.push(index);
+                    }
+                }
+            }
+            let prefilter = DatasetPreFilter::new(dataset.clone(), &index_metadata, None);
+            prefilter.wait_for_ready().await?;
+            Some(prefilter.mask())
+        } else if let Some(fut) =
+            DatasetPreFilter::create_restricted_deletion_mask(dataset.clone(), fragment_bitmap)
+        {
             Some(fut.await?)
         } else {
             None
@@ -724,6 +744,37 @@ impl Iterator for FragIdIter<'_> {
     }
 }
 
+fn collect_scalar_index_queries(expr: &ScalarIndexExpr, queries: &mut BTreeSet<(String, String)>) {
+    match expr {
+        ScalarIndexExpr::And(left, right) | ScalarIndexExpr::Or(left, right) => {
+            collect_scalar_index_queries(left, queries);
+            collect_scalar_index_queries(right, queries);
+        }
+        ScalarIndexExpr::Not(expr) => collect_scalar_index_queries(expr, queries),
+        ScalarIndexExpr::Query(search) => {
+            queries.insert((search.column.clone(), search.index_name.clone()));
+        }
+    }
+}
+
+async fn logical_index_metadata_for_expr(
+    dataset: &Dataset,
+    expr: &ScalarIndexExpr,
+) -> Result<Vec<lance_table::format::IndexMetadata>> {
+    let mut queries = BTreeSet::new();
+    collect_scalar_index_queries(expr, &mut queries);
+    let mut seen = BTreeSet::new();
+    let mut indices = Vec::new();
+    for (column, index_name) in queries {
+        for index in load_named_scalar_segments(dataset, &column, &index_name).await? {
+            if seen.insert(index.uuid) {
+                indices.push(index);
+            }
+        }
+    }
+    Ok(indices)
+}
+
 impl MaterializeIndexExec {
     pub fn new(
         dataset: Arc<Dataset>,
@@ -752,16 +803,23 @@ impl MaterializeIndexExec {
         fragments: Arc<Vec<Fragment>>,
         metrics: Arc<IndexMetrics>,
     ) -> Result<RecordBatch> {
-        let expr_result = expr.evaluate(dataset.as_ref(), metrics.as_ref());
         let span = debug_span!("create_prefilter");
-        let prefilter = span.in_scope(|| {
+        let prefilter = if dataset.manifest.uses_stable_logical_row_addresses() {
+            let indices = logical_index_metadata_for_expr(dataset.as_ref(), &expr).await?;
+            Some(span.in_scope(|| {
+                DatasetPreFilter::do_create_deletion_mask_logical(dataset.clone(), indices).boxed()
+            }))
+        } else {
             let fragment_bitmap =
                 RoaringBitmap::from_iter(fragments.iter().map(|frag| frag.id as u32));
             // The user-requested `fragments` is guaranteed to be stricter than the index's fragment
             // bitmap.  This node only runs on indexed fragments and any fragments that were deleted
             // when the index was trained will still be deleted when the index is queried.
-            DatasetPreFilter::create_deletion_mask(dataset.clone(), fragment_bitmap)
-        });
+            span.in_scope(|| {
+                DatasetPreFilter::create_deletion_mask(dataset.clone(), fragment_bitmap)
+            })
+        };
+        let expr_result = expr.evaluate(dataset.as_ref(), metrics.as_ref());
         // MaterializeIndexExec emits a deterministic set of row ids. The
         // `upper` mask of the interval is the candidate set (the answer is
         // a subset of `upper`). For `Exact` results this is the exact
@@ -792,12 +850,83 @@ impl MaterializeIndexExec {
     }
 }
 
+async fn logical_row_ids_for_mask(
+    mask: &RowAddrMask,
+    dataset: &Dataset,
+    fragments: &[Fragment],
+) -> Result<Vec<u64>> {
+    const RESOLVE_BATCH_SIZE: usize = 64 * 1024;
+    let target_fragments = fragments
+        .iter()
+        .map(|fragment| u32::try_from(fragment.id))
+        .collect::<std::result::Result<RoaringBitmap, _>>()
+        .map_err(|_| Error::invalid_input("physical fragment id exceeds u32"))?;
+
+    // Positive index results are normally finite. Resolve only those logical
+    // candidates forward and keep rows whose current physical owner is in the
+    // scan's target fragments.
+    if let RowAddrMask::AllowList(allow_list) = mask
+        && let Some(row_addrs) = allow_list.row_addrs()
+    {
+        let candidates = row_addrs.map(u64::from).collect::<Vec<_>>();
+        let mut retained = Vec::with_capacity(candidates.len());
+        for candidate_batch in candidates.chunks(RESOLVE_BATCH_SIZE) {
+            let physical = dataset
+                .resolve_logical_row_ids_async(candidate_batch)
+                .await?;
+            retained.extend(candidate_batch.iter().zip(physical).filter_map(
+                |(logical, physical)| {
+                    physical
+                        .filter(|physical| target_fragments.contains(physical.fragment_id()))
+                        .map(|_| *logical)
+                },
+            ));
+        }
+        return Ok(retained);
+    }
+
+    // NOT / match-all can be represented as a block list. Enumerate only the
+    // requested physical fragments and verify each inverse candidate is the
+    // logical identity's current owner. This is proportional to the target
+    // scan, and never builds a table-wide reverse index.
+    let mut row_ids = Vec::new();
+    for fragment in fragments {
+        let fragment_id = u32::try_from(fragment.id)
+            .map_err(|_| Error::invalid_input("physical fragment id exceeds u32"))?;
+        let physical_rows = u32::try_from(
+            fragment
+                .physical_rows
+                .ok_or_else(|| Error::internal("fragment is missing physical row count"))?,
+        )
+        .map_err(|_| Error::invalid_input("physical fragment row count exceeds u32"))?;
+        for start in (0..physical_rows).step_by(RESOLVE_BATCH_SIZE) {
+            let end = physical_rows.min(start.saturating_add(RESOLVE_BATCH_SIZE as u32));
+            let physical = (start..end)
+                .map(|offset| RowAddress::new_from_parts(fragment_id, offset))
+                .collect::<Vec<_>>();
+            row_ids.extend(
+                dataset
+                    .resolve_current_physical_row_ids_async(&physical)
+                    .await?
+                    .into_iter()
+                    .flatten()
+                    .map(|logical| logical.raw())
+                    .filter(|logical| mask.selected(*logical)),
+            );
+        }
+    }
+    Ok(row_ids)
+}
+
 #[instrument(name = "make_row_ids", skip(mask, dataset, fragments))]
 async fn row_ids_for_mask(
     mask: RowAddrMask,
     dataset: &Dataset,
     fragments: &[Fragment],
 ) -> Result<Vec<u64>> {
+    if dataset.manifest.uses_stable_logical_row_addresses() {
+        return logical_row_ids_for_mask(&mask, dataset, fragments).await;
+    }
     match mask {
         RowAddrMask::BlockList(block_list) if block_list.is_empty() => {
             // Matches all row ids in the given fragments.

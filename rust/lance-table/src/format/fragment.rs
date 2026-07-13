@@ -14,6 +14,7 @@ use object_store::path::Path;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::format::pb;
+use crate::format::row_address::NativeLogicalDomain;
 
 use crate::rowids::version::{
     RowDatasetVersionMeta, created_at_version_meta_to_pb, last_updated_at_version_meta_to_pb,
@@ -380,6 +381,10 @@ impl DataFileFieldInterner {
             physical_rows,
             last_updated_at_version_meta,
             created_at_version_meta,
+            native_logical_domain: p
+                .native_logical_domain
+                .map(NativeLogicalDomain::try_from)
+                .transpose()?,
         })
     }
 }
@@ -503,6 +508,10 @@ pub struct Fragment {
     /// Created at version metadata
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at_version_meta: Option<RowDatasetVersionMeta>,
+
+    /// Native stable logical domain created with this physical fragment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_logical_domain: Option<NativeLogicalDomain>,
 }
 
 impl Fragment {
@@ -515,6 +524,7 @@ impl Fragment {
             physical_rows: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            native_logical_domain: None,
         }
     }
 
@@ -554,6 +564,7 @@ impl Fragment {
             row_id_meta: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            native_logical_domain: None,
         }
     }
 
@@ -680,6 +691,10 @@ impl TryFrom<pb::DataFragment> for Fragment {
                 .created_at_version_sequence
                 .map(RowDatasetVersionMeta::try_from)
                 .transpose()?,
+            native_logical_domain: p
+                .native_logical_domain
+                .map(NativeLogicalDomain::try_from)
+                .transpose()?,
         })
     }
 }
@@ -725,6 +740,7 @@ impl From<&Fragment> for pb::DataFragment {
             physical_rows: f.physical_rows.unwrap_or_default() as u64,
             last_updated_at_version_sequence,
             created_at_version_sequence,
+            native_logical_domain: f.native_logical_domain.as_ref().map(Into::into),
         }
     }
 }

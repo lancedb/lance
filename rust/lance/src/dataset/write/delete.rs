@@ -5,21 +5,28 @@ use crate::dataset::rowids::get_row_id_index;
 use crate::dataset::scanner::ExprFilter;
 use crate::{
     Dataset,
-    dataset::transaction::{Operation, Transaction},
+    dataset::transaction::{Operation, Transaction, TransactionBuilder},
     dataset::utils::make_rowid_capture_stream,
 };
 use datafusion::logical_expr::Expr;
 use datafusion::scalar::ScalarValue;
 use futures::{StreamExt, TryStreamExt};
+use lance_core::utils::address::RowAddress;
 use lance_core::{Error, ROW_ID, Result};
 use lance_select::RowAddrTreeMap;
-use lance_table::format::Fragment;
+use lance_table::format::{
+    Fragment, LogicalRowAddressSelection, PhysicalToLogicalResolution, RowAddressLayoutDelta,
+};
 use roaring::RoaringTreemap;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use super::CommitBuilder;
+use super::merge_insert::{
+    DeletionPlan, cleanup_planned_deletions, plan_deletions, plan_full_fragment_deletions,
+    write_planned_deletions,
+};
 use super::retry::{RetryConfig, RetryExecutor, execute_with_retry};
 
 /// Result of a delete operation.
@@ -210,12 +217,23 @@ impl DeleteBuilder {
             deleted_fragment_ids,
             affected_rows,
             num_deleted_rows,
+            v2_3_transaction,
+            v2_3_deletion_plan,
         } = data;
-        let transaction = job.build_transaction(
-            job.dataset.as_ref(),
-            updated_fragments,
-            deleted_fragment_ids,
-        );
+        let transaction = match v2_3_transaction {
+            Some(transaction) => transaction,
+            None => {
+                job.build_transaction(
+                    job.dataset.as_ref(),
+                    updated_fragments,
+                    deleted_fragment_ids,
+                )
+                .await?
+            }
+        };
+        if let Some(plan) = &v2_3_deletion_plan {
+            write_planned_deletions(job.dataset.as_ref(), plan).await?;
+        }
         Ok(UncommittedDelete {
             transaction,
             affected_rows,
@@ -237,15 +255,137 @@ struct DeleteData {
     deleted_fragment_ids: Vec<u64>,
     affected_rows: Option<RowAddrTreeMap>,
     num_deleted_rows: u64,
+    v2_3_transaction: Option<Transaction>,
+    v2_3_deletion_plan: Option<DeletionPlan>,
 }
 
 impl DeleteJob {
-    fn build_transaction(
+    async fn build_v2_3_retirement_delta(
+        dataset: &Dataset,
+        deleted_fragment_ids: &[u64],
+    ) -> Result<Option<RowAddressLayoutDelta>> {
+        if !dataset.manifest.uses_stable_logical_row_addresses() {
+            return Ok(None);
+        }
+        let expected_layout_fingerprint = dataset
+            .manifest
+            .row_address_layout
+            .as_ref()
+            .expect("validated v2.3 manifest has a row-address layout")
+            .fingerprint
+            .clone();
+        if deleted_fragment_ids.is_empty() {
+            return Ok(Some(RowAddressLayoutDelta {
+                expected_layout_fingerprint,
+                ..Default::default()
+            }));
+        }
+        let router = dataset.row_address_router()?;
+        let mut retired = RoaringTreemap::new();
+        for fragment_id in deleted_fragment_ids {
+            let physical_fragment_id = u32::try_from(*fragment_id).map_err(|_| {
+                Error::invalid_input(format!(
+                    "fully deleted fragment id {fragment_id} exceeds row-address capacity"
+                ))
+            })?;
+            let fragment = dataset
+                .manifest
+                .fragments
+                .iter()
+                .find(|fragment| fragment.id == *fragment_id)
+                .ok_or_else(|| {
+                    Error::commit_conflict_source(
+                        dataset.manifest.version,
+                        format!("fully deleted fragment {fragment_id} no longer exists").into(),
+                    )
+                })?;
+            let physical_rows = u32::try_from(fragment.physical_rows.ok_or_else(|| {
+                Error::internal(format!(
+                    "fully deleted fragment {fragment_id} is missing physical_rows"
+                ))
+            })?)
+            .map_err(|_| Error::invalid_input("fragment rows exceed row-address capacity"))?;
+            if let Some(row_ids) = dataset
+                .explicit_row_ids_for_fragment(physical_fragment_id)
+                .await?
+            {
+                if row_ids.len() != physical_rows as usize {
+                    return Err(Error::invalid_input(format!(
+                        "ExplicitMap fragment {fragment_id} declares {physical_rows} physical rows but its hidden _rowid file contains {}",
+                        row_ids.len()
+                    )));
+                }
+                let logical = row_ids.values();
+                for (row_id, resolved) in logical
+                    .iter()
+                    .zip(dataset.resolve_logical_row_ids_async(logical).await?)
+                {
+                    match resolved {
+                        Some(address) if address.fragment_id() == physical_fragment_id => {
+                            retired.insert(*row_id);
+                        }
+                        Some(address) => {
+                            return Err(Error::invalid_input(format!(
+                                "ExplicitMap hidden _rowid {} for fragment {fragment_id} resolves to physical fragment {}",
+                                row_id,
+                                address.fragment_id()
+                            )));
+                        }
+                        // The identity was retired by an earlier delete and is
+                        // no longer part of this fragment's live-row set.
+                        None => {}
+                    }
+                }
+                continue;
+            }
+            for start in (0..physical_rows).step_by(4096) {
+                let end = physical_rows.min(start.saturating_add(4096));
+                let physical = (start..end)
+                    .map(|offset| RowAddress::new_from_parts(physical_fragment_id, offset))
+                    .collect::<Vec<_>>();
+                for resolution in router.physical_to_logical_many(&physical)? {
+                    match resolution {
+                        PhysicalToLogicalResolution::Logical(address) => {
+                            retired.insert(address.raw());
+                        }
+                        PhysicalToLogicalResolution::Unmapped => {}
+                        PhysicalToLogicalResolution::ExplicitMap { .. } => unreachable!(
+                            "ExplicitMap destinations are handled from their hidden _rowid file"
+                        ),
+                    }
+                }
+            }
+        }
+        let retired_selection = (!retired.is_empty())
+            .then(|| LogicalRowAddressSelection::from_bitmap(retired))
+            .transpose()?;
+        let mut source_domains = Vec::new();
+        if let Some(selection) = &retired_selection {
+            for logical_fragment_id in selection.logical_fragment_bitmap()? {
+                source_domains.push(router.logical_domain(logical_fragment_id)?.ok_or_else(
+                    || {
+                        Error::internal(format!(
+                            "retired logical domain {logical_fragment_id} is missing metadata"
+                        ))
+                    },
+                )?);
+            }
+        }
+        source_domains.sort_by_key(|domain| domain.logical_fragment_id);
+        Ok(Some(RowAddressLayoutDelta {
+            source_domains,
+            retired_selections: retired_selection.into_iter().collect(),
+            expected_layout_fingerprint,
+            ..Default::default()
+        }))
+    }
+
+    async fn build_transaction(
         &self,
         dataset: &Dataset,
         updated_fragments: Vec<Fragment>,
         deleted_fragment_ids: Vec<u64>,
-    ) -> Transaction {
+    ) -> Result<Transaction> {
         let predicate = match &self.filter {
             ExprFilter::Sql(s) => s.clone(),
             ExprFilter::Datafusion(expr) => expr.to_string(),
@@ -253,12 +393,16 @@ impl DeleteJob {
                 unreachable!("Substrait filters are not supported in DeleteBuilder")
             }
         };
+        let row_address_layout_delta =
+            Self::build_v2_3_retirement_delta(dataset, &deleted_fragment_ids).await?;
         let operation = Operation::Delete {
             updated_fragments,
             deleted_fragment_ids,
             predicate,
         };
-        Transaction::new(dataset.manifest.version, operation, None)
+        Ok(TransactionBuilder::new(dataset.manifest.version, operation)
+            .row_address_layout_delta(row_address_layout_delta)
+            .build())
     }
 }
 
@@ -281,74 +425,172 @@ impl RetryExecutor for DeleteJob {
                 unreachable!("Substrait filters are not supported in DeleteBuilder")
             }
         }
+        let uses_logical_row_addresses = self.dataset.manifest.uses_stable_logical_row_addresses();
 
         // Check if the filter optimized to true (delete everything) or false (delete nothing)
-        let (updated_fragments, deleted_fragment_ids, affected_rows, num_deleted_rows) =
-            if let Some(filter_expr) = scanner.get_expr_filter()? {
-                if matches!(
-                    filter_expr,
-                    Expr::Literal(ScalarValue::Boolean(Some(false)), _)
-                ) {
-                    // Predicate evaluated to false - no deletions
-                    (Vec::new(), Vec::new(), Some(RowAddrTreeMap::new()), 0)
-                } else if matches!(
-                    filter_expr,
-                    Expr::Literal(ScalarValue::Boolean(Some(true)), _)
-                ) {
-                    // Predicate evaluated to true - delete all fragments
-                    let fragments = self.dataset.get_fragments();
-                    let num_deleted_rows: u64 = fragments
-                        .iter()
-                        .map(|f| f.metadata.num_rows().unwrap_or(0) as u64)
-                        .sum();
-                    let deleted_fragment_ids = fragments.iter().map(|f| f.id() as u64).collect();
+        let (
+            updated_fragments,
+            deleted_fragment_ids,
+            affected_rows,
+            num_deleted_rows,
+            v2_3_deletion_plan,
+        ) = if let Some(filter_expr) = scanner.get_expr_filter()? {
+            if matches!(
+                filter_expr,
+                Expr::Literal(ScalarValue::Boolean(Some(false)), _)
+            ) {
+                // Predicate evaluated to false - no deletions
+                (
+                    Vec::new(),
+                    Vec::new(),
+                    Some(RowAddrTreeMap::new()),
+                    0,
+                    uses_logical_row_addresses.then(DeletionPlan::default),
+                )
+            } else if matches!(
+                filter_expr,
+                Expr::Literal(ScalarValue::Boolean(Some(true)), _)
+            ) {
+                // Predicate evaluated to true - delete all fragments
+                let fragments = self.dataset.get_fragments();
+                let num_deleted_rows: u64 = fragments
+                    .iter()
+                    .map(|f| f.metadata.num_rows().unwrap_or(0) as u64)
+                    .sum();
+                let deleted_fragment_ids = fragments
+                    .iter()
+                    .map(|fragment| fragment.id() as u64)
+                    .collect::<Vec<_>>();
 
-                    // When deleting everything, we don't have specific row addresses,
-                    // so better not to emit affected rows.
-                    (Vec::new(), deleted_fragment_ids, None, num_deleted_rows)
+                // When deleting everything, we don't have specific row addresses,
+                // so better not to emit affected rows.
+                let plan = if uses_logical_row_addresses {
+                    Some(
+                        plan_full_fragment_deletions(self.dataset.as_ref(), &deleted_fragment_ids)
+                            .await?,
+                    )
                 } else {
-                    // Regular predicate - scan and collect row addresses to delete
-                    let stream = scanner.try_into_stream().await?.into();
-                    let (stream, row_id_rx) = make_rowid_capture_stream(
-                        stream,
-                        self.dataset.manifest.uses_stable_row_ids(),
-                    )?;
+                    None
+                };
+                (
+                    Vec::new(),
+                    deleted_fragment_ids,
+                    None,
+                    num_deleted_rows,
+                    plan,
+                )
+            } else {
+                // Regular predicate - scan and collect row addresses to delete
+                let stream = scanner.try_into_stream().await?.into();
+                let (stream, row_id_rx) = make_rowid_capture_stream(
+                    stream,
+                    self.dataset.manifest.uses_legacy_stable_row_ids()
+                        || uses_logical_row_addresses,
+                )?;
 
-                    // Process the stream to capture row addresses
-                    // We need to consume the stream to trigger the capture
-                    futures::pin_mut!(stream);
-                    while let Some(_batch) = stream.try_next().await? {
-                        // The row addresses are captured automatically by make_rowid_capture_stream
-                    }
+                // Process the stream to capture row addresses
+                // We need to consume the stream to trigger the capture
+                futures::pin_mut!(stream);
+                while let Some(_batch) = stream.try_next().await? {
+                    // The row addresses are captured automatically by make_rowid_capture_stream
+                }
 
-                    // Extract the row addresses from the receiver
-                    let removed_row_ids = row_id_rx.try_recv().map_err(|err| {
-                        Error::internal(format!("Failed to receive row ids: {}", err))
+                // Extract the row addresses from the receiver
+                let removed_row_ids = row_id_rx.try_recv().map_err(|err| {
+                    Error::internal(format!("Failed to receive row ids: {}", err))
+                })?;
+                let removed_row_addrs = if uses_logical_row_addresses {
+                    let logical_row_ids = removed_row_ids.row_id_sequence().ok_or_else(|| {
+                        Error::internal(
+                            "storage-version-2.3 delete captured physical row addresses",
+                        )
                     })?;
+                    let raw_ids = logical_row_ids.iter().collect::<Vec<_>>();
+                    let mut physical = RoaringTreemap::new();
+                    for (logical, resolved) in raw_ids
+                        .iter()
+                        .zip(self.dataset.resolve_logical_row_ids_async(&raw_ids).await?)
+                    {
+                        let resolved = resolved.ok_or_else(|| {
+                            Error::internal(format!(
+                                "delete selected non-live logical row address {logical}"
+                            ))
+                        })?;
+                        physical.insert(u64::from(resolved));
+                    }
+                    std::borrow::Cow::Owned(physical)
+                } else {
                     let row_id_index = get_row_id_index(&self.dataset).await?;
-                    let removed_row_addrs = removed_row_ids.row_addrs(row_id_index.as_deref());
+                    removed_row_ids.row_addrs(row_id_index.as_deref())
+                };
 
+                let (fragments, deleted_ids, plan) = if uses_logical_row_addresses {
+                    let plan = plan_deletions(&self.dataset, &removed_row_addrs).await?;
+                    (
+                        plan.updated_fragments.clone(),
+                        plan.removed_fragment_ids.clone(),
+                        Some(plan),
+                    )
+                } else {
                     let (fragments, deleted_ids) =
                         apply_deletions(&self.dataset, &removed_row_addrs).await?;
-                    let num_deleted_rows = removed_row_addrs.len();
-                    let affected_rows = RowAddrTreeMap::from(removed_row_addrs.as_ref().clone());
-                    (
-                        fragments,
-                        deleted_ids,
-                        Some(affected_rows),
-                        num_deleted_rows,
-                    )
-                }
-            } else {
-                // No filter was applied - this shouldn't happen but treat as delete nothing
-                (Vec::new(), Vec::new(), Some(RowAddrTreeMap::new()), 0)
-            };
+                    (fragments, deleted_ids, None)
+                };
+                let num_deleted_rows = removed_row_addrs.len();
+                let affected_rows = RowAddrTreeMap::from(removed_row_addrs.as_ref().clone());
+                (
+                    fragments,
+                    deleted_ids,
+                    Some(affected_rows),
+                    num_deleted_rows,
+                    plan,
+                )
+            }
+        } else {
+            // No filter was applied - this shouldn't happen but treat as delete nothing
+            (
+                Vec::new(),
+                Vec::new(),
+                Some(RowAddrTreeMap::new()),
+                0,
+                uses_logical_row_addresses.then(DeletionPlan::default),
+            )
+        };
+
+        let v2_3_transaction = if let Some(plan) = &v2_3_deletion_plan {
+            let transaction = self
+                .build_transaction(
+                    self.dataset.as_ref(),
+                    updated_fragments.clone(),
+                    deleted_fragment_ids.clone(),
+                )
+                .await?;
+            let delta = transaction
+                .row_address_layout_delta
+                .as_ref()
+                .ok_or_else(|| {
+                    Error::internal("storage-version-2.3 delete is missing its layout delta")
+                })?
+                .clone();
+            super::merge_insert::preflight_v2_3_transaction(
+                self.dataset.as_ref(),
+                transaction.operation.clone(),
+                delta,
+                plan,
+            )
+            .await?;
+            Some(transaction)
+        } else {
+            None
+        };
 
         Ok(DeleteData {
             updated_fragments,
             deleted_fragment_ids,
             affected_rows,
             num_deleted_rows,
+            v2_3_transaction,
+            v2_3_deletion_plan,
         })
     }
 
@@ -358,9 +600,16 @@ impl RetryExecutor for DeleteJob {
             deleted_fragment_ids,
             affected_rows,
             num_deleted_rows,
+            v2_3_transaction,
+            v2_3_deletion_plan,
         } = data;
-        let transaction =
-            self.build_transaction(dataset.as_ref(), updated_fragments, deleted_fragment_ids);
+        let transaction = match v2_3_transaction {
+            Some(transaction) => transaction,
+            None => {
+                self.build_transaction(dataset.as_ref(), updated_fragments, deleted_fragment_ids)
+                    .await?
+            }
+        };
 
         let mut builder = CommitBuilder::new(dataset);
 
@@ -368,7 +617,18 @@ impl RetryExecutor for DeleteJob {
             builder = builder.with_affected_rows(affected_rows);
         }
 
-        let new_dataset = builder.execute(transaction).await.map(Arc::new)?;
+        if let Some(plan) = &v2_3_deletion_plan {
+            write_planned_deletions(self.dataset.as_ref(), plan).await?;
+        }
+        let new_dataset = match builder.execute(transaction).await {
+            Ok(dataset) => Arc::new(dataset),
+            Err(error) => {
+                if let Some(plan) = &v2_3_deletion_plan {
+                    cleanup_planned_deletions(self.dataset.as_ref(), plan).await;
+                }
+                return Err(error);
+            }
+        };
         Ok(DeleteResult {
             new_dataset,
             num_deleted_rows,
@@ -400,7 +660,7 @@ mod tests {
     use crate::utils::test::TestDatasetGenerator;
     use arrow::array::AsArray;
     use arrow::datatypes::UInt32Type;
-    use arrow_array::{RecordBatch, UInt32Array};
+    use arrow_array::{RecordBatch, RecordBatchIterator, UInt32Array};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use futures::TryStreamExt;
     use lance_core::utils::tempfile::TempStrDir;
@@ -414,7 +674,11 @@ mod tests {
     #[rstest]
     #[tokio::test]
     async fn test_delete(
-        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        #[values(
+            LanceFileVersion::Legacy,
+            LanceFileVersion::Stable,
+            LanceFileVersion::V2_3
+        )]
         data_storage_version: LanceFileVersion,
         #[values(false, true)] with_scalar_index: bool,
     ) {
@@ -577,6 +841,68 @@ mod tests {
         assert_eq!(fragments[0].id(), 0);
         assert_eq!(fragments[1].id(), 2);
         assert_eq!(dataset.manifest.max_fragment_id(), Some(2));
+    }
+
+    #[tokio::test]
+    async fn test_v2_3_delete_admission_fails_before_writing_deletion_objects() {
+        fn file_count(path: &std::path::Path) -> usize {
+            std::fs::read_dir(path)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|entry| {
+                    if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                        file_count(&entry.path())
+                    } else {
+                        1
+                    }
+                })
+                .sum()
+        }
+
+        let test_dir = TempStrDir::default();
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::UInt32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(UInt32Array::from_iter_values(0..20))],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            &test_dir,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_3),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let fragments = dataset.manifest.fragments.clone();
+        let max_logical_fragment_id = dataset.manifest.max_logical_fragment_id;
+        let manifest = Arc::make_mut(&mut dataset.manifest);
+        let layout = Arc::make_mut(manifest.row_address_layout.as_mut().unwrap());
+        layout.debt_summary.metadata_bytes_written_since_maintenance =
+            lance_table::format::ROW_ADDRESS_W_FAST;
+        layout.refresh_fingerprint_with_fragments(fragments.as_ref(), max_logical_fragment_id);
+
+        let dataset = Arc::new(dataset);
+        let before_version = dataset.version().version;
+        let before_files = file_count(std::path::Path::new(test_dir.as_str()));
+        let error = DeleteBuilder::new(dataset.clone(), "id = 0")
+            .execute()
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("ProjectedEpochBytes"), "{error}");
+        assert_eq!(dataset.version().version, before_version);
+        assert_eq!(
+            file_count(std::path::Path::new(test_dir.as_str())),
+            before_files,
+            "placement admission must run before writing a deletion object"
+        );
     }
 
     #[tokio::test]

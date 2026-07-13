@@ -33,6 +33,8 @@ public class RewriteResult implements Serializable {
   // Serialized RoaringTreemap of row addresses read from the original fragments.
   // null for stable row IDs.
   @Nullable private final byte[] rowAddrs;
+  @Nullable private final byte[] logicalRowIds;
+  @Nullable private final byte[] retiredLogicalRowIds;
 
   public RewriteResult(
       CompactionMetrics metrics,
@@ -40,11 +42,24 @@ public class RewriteResult implements Serializable {
       List<FragmentMetadata> originalFragments,
       long readVersion,
       byte[] rowAddrs) {
+    this(metrics, newFragments, originalFragments, readVersion, rowAddrs, null, null);
+  }
+
+  public RewriteResult(
+      CompactionMetrics metrics,
+      List<FragmentMetadata> newFragments,
+      List<FragmentMetadata> originalFragments,
+      long readVersion,
+      @Nullable byte[] rowAddrs,
+      @Nullable byte[] logicalRowIds,
+      @Nullable byte[] retiredLogicalRowIds) {
     this.metrics = metrics;
     this.newFragments = newFragments;
     this.originalFragments = originalFragments;
     this.readVersion = readVersion;
     this.rowAddrs = rowAddrs;
+    this.logicalRowIds = logicalRowIds;
+    this.retiredLogicalRowIds = retiredLogicalRowIds;
   }
 
   public long getReadVersion() {
@@ -58,6 +73,18 @@ public class RewriteResult implements Serializable {
   @Nullable
   public byte[] getRowAddrs() {
     return rowAddrs;
+  }
+
+  /** Actual logical row-address sequence emitted by a storage-version-2.3 rewrite. */
+  @Nullable
+  public byte[] getLogicalRowIds() {
+    return logicalRowIds;
+  }
+
+  /** Logical identities whose deleted physical rows were reclaimed. */
+  @Nullable
+  public byte[] getRetiredLogicalRowIds() {
+    return retiredLogicalRowIds;
   }
 
   public List<FragmentMetadata> getNewFragments() {

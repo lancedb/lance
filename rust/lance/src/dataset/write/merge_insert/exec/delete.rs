@@ -16,18 +16,20 @@ use datafusion::{
 };
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
 use futures::StreamExt;
-use lance_core::ROW_ADDR;
+use lance_core::utils::address::LogicalRowAddress;
+use lance_core::{ROW_ADDR, ROW_ID};
 use roaring::RoaringTreemap;
 
 use crate::Dataset;
-use crate::dataset::transaction::{Operation, Transaction};
+use crate::dataset::transaction::{Operation, Transaction, TransactionBuilder};
 use crate::dataset::write::merge_insert::assign_action::Action;
 use crate::dataset::write::merge_insert::{
     MERGE_ACTION_COLUMN, MergeInsertParams, MergeStats, SourceDedupeBehavior,
     create_duplicate_row_error, resolve_target_bases,
 };
 
-use super::{MergeInsertMetrics, apply_deletions};
+use super::write::preflight_v2_3_merge;
+use super::{MergeInsertMetrics, apply_deletions, plan_deletions, write_planned_deletions};
 
 /// Specialized physical execution node for delete-only merge insert operations.
 ///
@@ -106,12 +108,17 @@ impl DeleteOnlyMergeInsertExec {
         metrics: MergeInsertMetrics,
         source_dedupe_behavior: SourceDedupeBehavior,
         on_columns: &[String],
-    ) -> DFResult<RoaringTreemap> {
+    ) -> DFResult<(RoaringTreemap, Vec<LogicalRowAddress>)> {
         let schema = input_stream.schema();
 
         let (rowaddr_idx, _) = schema.column_with_name(ROW_ADDR).ok_or_else(|| {
             datafusion::error::DataFusionError::Internal(
                 "Expected _rowaddr column in delete-only merge insert input".to_string(),
+            )
+        })?;
+        let (rowid_idx, _) = schema.column_with_name(ROW_ID).ok_or_else(|| {
+            datafusion::error::DataFusionError::Internal(
+                "Expected _rowid column in delete-only merge insert input".to_string(),
             )
         })?;
 
@@ -125,6 +132,7 @@ impl DeleteOnlyMergeInsertExec {
             })?;
 
         let mut delete_row_addrs = RoaringTreemap::new();
+        let mut retired_row_ids = Vec::new();
 
         while let Some(batch_result) = input_stream.next().await {
             let batch = batch_result?;
@@ -149,6 +157,15 @@ impl DeleteOnlyMergeInsertExec {
                         MERGE_ACTION_COLUMN
                     ))
                 })?;
+            let row_id_array = batch
+                .column(rowid_idx)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| {
+                    datafusion::error::DataFusionError::Internal(
+                        "Expected UInt64Array for _rowid column".to_string(),
+                    )
+                })?;
 
             for row_idx in 0..batch.num_rows() {
                 let action_code = action_array.value(row_idx);
@@ -168,6 +185,17 @@ impl DeleteOnlyMergeInsertExec {
                     // source match.)
                     if delete_row_addrs.insert(row_addr) {
                         metrics.num_deleted_rows.add(1);
+                        if !row_id_array.is_null(row_idx) {
+                            retired_row_ids.push(
+                                LogicalRowAddress::try_from(row_id_array.value(row_idx)).map_err(
+                                    |error| {
+                                        datafusion::error::DataFusionError::External(Box::new(
+                                            error,
+                                        ))
+                                    },
+                                )?,
+                            );
+                        }
                     } else {
                         match source_dedupe_behavior {
                             SourceDedupeBehavior::Fail => {
@@ -184,7 +212,7 @@ impl DeleteOnlyMergeInsertExec {
             }
         }
 
-        Ok(delete_row_addrs)
+        Ok((delete_row_addrs, retired_row_ids))
     }
 }
 
@@ -294,14 +322,36 @@ impl ExecutionPlan for DeleteOnlyMergeInsertExec {
             // `metrics` is moved into `collect_deletions`; keep a handle on the
             // skipped-duplicate counter so it can be folded into the stats below.
             let skipped_duplicates = metrics.num_skipped_duplicates.clone();
-            let delete_row_addrs =
+            let (delete_row_addrs, retired_row_ids) =
                 Self::collect_deletions(input_stream, metrics, source_dedupe_behavior, &on_columns)
                     .await?;
-
-            let (updated_fragments, removed_fragment_ids) =
-                apply_deletions(&dataset, &delete_row_addrs)
-                    .await
-                    .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+            let uses_logical_row_addresses = dataset.manifest.uses_stable_logical_row_addresses();
+            let (updated_fragments, removed_fragment_ids, row_address_layout_delta) =
+                if uses_logical_row_addresses {
+                    let plan = plan_deletions(&dataset, &delete_row_addrs).await?;
+                    let delta = preflight_v2_3_merge(
+                        &dataset,
+                        &[],
+                        &[],
+                        &[],
+                        &retired_row_ids,
+                        &plan,
+                        &merged_generations,
+                        None,
+                    )
+                    .await?;
+                    write_planned_deletions(&dataset, &plan).await?;
+                    (
+                        plan.updated_fragments,
+                        plan.removed_fragment_ids,
+                        Some(delta),
+                    )
+                } else {
+                    let (updated, removed) = apply_deletions(&dataset, &delete_row_addrs)
+                        .await
+                        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+                    (updated, removed, None)
+                };
 
             let operation = Operation::Update {
                 removed_fragment_ids,
@@ -320,7 +370,9 @@ impl ExecutionPlan for DeleteOnlyMergeInsertExec {
                 updated_fragment_offsets: None,
             };
 
-            let transaction = Transaction::new(dataset.manifest.version, operation, None);
+            let transaction = TransactionBuilder::new(dataset.manifest.version, operation)
+                .row_address_layout_delta(row_address_layout_delta)
+                .build();
 
             let num_deleted = delete_row_addrs.len();
             let stats = MergeStats {

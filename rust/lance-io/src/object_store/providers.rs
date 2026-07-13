@@ -262,6 +262,9 @@ impl ObjectStoreRegistry {
         self.misses.fetch_add(1, Ordering::Relaxed);
 
         let mut store = provider.new_store(base_path, params).await?;
+        if let Some(io_tracker) = &params.io_tracker {
+            store.io_tracker = io_tracker.as_ref().clone();
+        }
 
         store.inner = store.inner.traced();
 

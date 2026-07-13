@@ -33,6 +33,10 @@ use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::progress::{IndexBuildProgress, NoopIndexBuildProgress};
+use lance_index::scalar::lance_format::{
+    LOGICAL_INDEX_COVERAGE_BUFFER_INDEX_KEY, LOGICAL_INDEX_COVERAGE_LENGTH_KEY,
+    LOGICAL_INDEX_COVERAGE_OBJECT_ID_KEY, LOGICAL_INDEX_COVERAGE_OFFSET_KEY,
+};
 use lance_index::vector::bq::storage::{RABIT_CODE_COLUMN, unpack_codes};
 use lance_index::vector::kmeans::KMeansParams;
 use lance_index::vector::pq::storage::transpose;
@@ -70,10 +74,11 @@ use lance_io::stream::RecordBatchStream;
 use lance_io::{object_store::ObjectStore, stream::RecordBatchStreamAdapter};
 use lance_linalg::distance::{DistanceType, Dot, L2, Normalize};
 use lance_linalg::kernels::normalize_fsl;
-use lance_table::format::IndexFile;
+use lance_table::format::{IndexFile, pb as table_pb};
 use log::info;
 use object_store::path::Path;
 use prost::Message;
+use roaring::RoaringBitmap;
 use tracing::{Level, instrument, span};
 
 use crate::Dataset;
@@ -410,6 +415,53 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
     pub fn with_progress(&mut self, progress: Arc<dyn IndexBuildProgress>) -> &mut Self {
         self.progress = progress;
         self
+    }
+
+    async fn write_logical_coverage_artifact(&self, index_writer: &mut FileWriter) -> Result<()> {
+        let Some(dataset) = self.dataset.as_ref() else {
+            return Ok(());
+        };
+        if !dataset.manifest.uses_stable_logical_row_addresses() {
+            return Ok(());
+        }
+        let index_uuid = self
+            .index_dir
+            .filename()
+            .ok_or_else(|| Error::internal("vector index directory has no UUID component"))?
+            .parse::<uuid::Uuid>()
+            .map_err(|error| {
+                Error::internal(format!(
+                    "vector index directory does not end in a UUID: {error}"
+                ))
+            })?;
+        let field_id = dataset.schema().field_id(&self.column)?;
+        let physical_fragments = self
+            .fragment_filter
+            .as_ref()
+            .map(|fragments| RoaringBitmap::from_iter(fragments.iter().copied()))
+            .unwrap_or_else(|| dataset.fragment_bitmap.as_ref().clone());
+        let artifact = crate::index::build_logical_index_coverage_artifact(
+            dataset,
+            index_uuid,
+            &[field_id],
+            &physical_fragments,
+        )
+        .await?;
+        let object_id = artifact.object_id;
+        let payload = table_pb::LogicalIndexCoverageArtifact::from(&artifact).encode_to_vec();
+        let offset = index_writer.tell().await?;
+        let byte_length = payload.len() as u64;
+        let global_buffer_index = index_writer.add_global_buffer(payload.into()).await?;
+        index_writer.add_schema_metadata(
+            LOGICAL_INDEX_COVERAGE_BUFFER_INDEX_KEY,
+            global_buffer_index.to_string(),
+        );
+        index_writer.add_schema_metadata(LOGICAL_INDEX_COVERAGE_OFFSET_KEY, offset.to_string());
+        index_writer
+            .add_schema_metadata(LOGICAL_INDEX_COVERAGE_LENGTH_KEY, byte_length.to_string());
+        index_writer
+            .add_schema_metadata(LOGICAL_INDEX_COVERAGE_OBJECT_ID_KEY, object_id.to_string());
+        Ok(())
     }
 
     #[instrument(name = "load_or_build_ivf", level = "debug", skip_all)]
@@ -1359,6 +1411,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             S::metadata_key(),
             serde_json::to_string(&partition_index_metadata)?,
         );
+        self.write_logical_coverage_artifact(&mut index_writer)
+            .await?;
 
         let storage_summary = storage_writer.finish().await?;
         let index_summary = index_writer.finish().await?;

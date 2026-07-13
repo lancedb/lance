@@ -223,20 +223,33 @@ to existing row addresses. There are three ways to handle this:
    the index segments. This approach adds some IO and computation overhead during query
    execution, but avoids write amplification during compaction.
 
-## Stable Row ID for Index
+## Row References in Storage Version 2.3
 
-Indices can optionally use stable row IDs instead of row addresses. A stable row ID is a
-logical identifier that remains constant even when rows are moved during compaction.
+Every storage-version-2.3 index stores stable logical row addresses in its
+postings. This is the only 2.3 row-reference domain; it is not controlled by the
+legacy stable-row-ID feature flag.
 
-**Benefits:**
+Each index segment carries exact logical coverage and per-field content
+generation watermarks. Query planning first removes retired addresses and
+postings made stale by indexed-field updates, then translates surviving logical
+addresses through the manifest-resident placement root. Native, `Direct`,
+`PackedRun`, `Selected`, `ExtentList`, and `SparseSelection` placement requires
+no additional object-store request. The external lookup used by explicit
+`Repack` and `Recluster` is not part of the default path.
 
-- No remapping needed after compaction
-- Updates only invalidate the index if the indexed column data changes
+Order-preserving compaction changes only placement metadata. It does not rewrite
+index objects, remap postings, or create a fragment-reuse index. An update makes
+old postings stale only for fields whose content generation changed; unrelated
+indices retain their coverage.
 
-**Tradeoffs:**
+Branch, shallow-clone, and deep-clone commits create a new row-address namespace
+without rewriting immutable index objects. The clone commit verifies the source
+coverage binding, rebinds the manifest summary to the target namespace, and
+records a fixed-size provenance link to the namespace and layout fingerprint in
+the immutable coverage artifact. Staged-index admission cannot supply this
+provenance. Clone chains hash-link the previous bound summary instead of growing
+a per-generation mapping chain.
 
-- Requires an additional lookup to translate stable row IDs to physical row addresses
-  at query time
-
-This feature is currently experimental. Performance evaluation is ongoing to determine
-when the tradeoff is worthwhile.
+Storage version 2.2 and earlier may optionally use the legacy stable-row-ID
+representation. Those datasets retain their existing fragment row-ID sequences,
+reverse index, and feature-flag semantics.

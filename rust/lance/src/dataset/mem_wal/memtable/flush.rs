@@ -15,7 +15,7 @@ use lance_index::IndexType;
 use lance_index::mem_wal::{FlushedGeneration, ShardManifest};
 use lance_index::scalar::{IndexStore, ScalarIndexParams};
 use lance_io::object_store::ObjectStore;
-use lance_table::format::IndexMetadata;
+use lance_table::format::{IndexMetadata, RowReferenceDomain};
 use lance_table::io::commit::write_manifest_file_to_path;
 use lance_table::io::deletion::write_deletion_file;
 use log::{info, warn};
@@ -296,12 +296,13 @@ impl MemTableFlusher {
         let reader =
             RecordBatchIterator::new(batches.into_iter().map(Ok), memtable.schema().clone());
 
-        // Use very large max_rows_per_file to ensure 1 fragment per flushed memtable.
+        // Use the largest v2.3-valid fragment to keep each flushed memtable in
+        // one fragment without violating the logical-slot address width.
         // Inherit the base dataset's storage version so the flushed generation
         // matches it (a 2.2 base also fixes the v2.1 miniblock 32 KiB chunk cap
         // that the dense HNSW graph List columns overflow at scale).
         let write_params = WriteParams {
-            max_rows_per_file: usize::MAX,
+            max_rows_per_file: u32::MAX as usize,
             data_storage_version: Some(self.base_storage_version().await?),
             ..Default::default()
         };
@@ -344,6 +345,16 @@ impl MemTableFlusher {
             if let Some(fragment) = fragments.first_mut() {
                 fragment.deletion_file = deletion_file;
             }
+        }
+
+        if manifest.uses_stable_logical_row_addresses() {
+            let fragments = manifest.fragments.clone();
+            let max_logical_fragment_id = manifest.max_logical_fragment_id;
+            let layout = Arc::make_mut(manifest.row_address_layout.as_mut().ok_or_else(|| {
+                Error::internal("storage-version-2.3 generation is missing RowAddressLayout")
+            })?);
+            layout.refresh_fingerprint_with_fragments(fragments.as_ref(), max_logical_fragment_id);
+            layout.validate_with_fragments(fragments.as_ref(), max_logical_fragment_id)?;
         }
 
         // Clear stale section offsets from the v1 manifest since the rewritten
@@ -421,6 +432,15 @@ impl MemTableFlusher {
         // created a v1 manifest with the fragment data.
         let uri = self.path_to_uri(&gen_path);
         let mut dataset = Dataset::open(&uri).await?;
+        let separated_v23_deletion_commit =
+            dataset.manifest.uses_stable_logical_row_addresses() && !deleted.is_empty();
+        if separated_v23_deletion_commit {
+            // Coverage artifacts bind to the exact manifest-closure fingerprint.
+            // Publish the generation's deletion metadata first so every index
+            // built below anchors to the final row-address closure.
+            self.finalize_generation(&dataset, &deleted, None).await?;
+            dataset = Dataset::open(&uri).await?;
+        }
 
         // Collect all index metadata without committing individually.
         // We write a single manifest containing both data and all indexes.
@@ -445,8 +465,8 @@ impl MemTableFlusher {
                 {
                     // `None` → the generation has no indexable vectors (e.g. all
                     // tombstones); flush the data without an HNSW index for it.
-                    let Some(mut index_meta) = self
-                        .create_hnsw_index(&gen_path, hnsw_config, mem_index)
+                    let Some(index_meta) = self
+                        .create_hnsw_index(&dataset, &gen_path, hnsw_config, mem_index)
                         .await?
                     else {
                         info!(
@@ -456,21 +476,6 @@ impl MemTableFlusher {
                         continue;
                     };
 
-                    let schema = dataset.schema();
-                    let field_idx = schema
-                        .field(&hnsw_config.column)
-                        .map(|f| f.id)
-                        .ok_or_else(|| {
-                            Error::invalid_input(format!(
-                                "HNSW index '{}' references column '{}' which is not in the dataset schema",
-                                hnsw_config.name, hnsw_config.column
-                            ))
-                        })?;
-                    index_meta.fields = vec![field_idx];
-                    index_meta.dataset_version = dataset.version().version;
-                    let fragment_ids: roaring::RoaringBitmap =
-                        dataset.fragment_bitmap.as_ref().clone();
-                    index_meta.fragment_bitmap = Some(fragment_ids);
                     all_indexes.push(index_meta);
 
                     info!(
@@ -499,7 +504,12 @@ impl MemTableFlusher {
         // Write a single manifest that records the fragments, the
         // within-generation deletion vector, and all indexes, overwriting the
         // data-only v1 manifest created by Dataset::write.
-        self.finalize_generation(&dataset, &deleted, Some(all_indexes))
+        let remaining_deletions = if separated_v23_deletion_commit {
+            RoaringBitmap::new()
+        } else {
+            deleted
+        };
+        self.finalize_generation(&dataset, &remaining_deletions, Some(all_indexes))
             .await?;
 
         let bloom_path = gen_path.clone().join("bloom_filter.bin");
@@ -562,6 +572,7 @@ impl MemTableFlusher {
         }
 
         let mut created_indexes = Vec::new();
+        let uses_logical_addresses = dataset.manifest.uses_stable_logical_row_addresses();
 
         for btree_cfg in btree_configs {
             let params = ScalarIndexParams::default();
@@ -573,7 +584,8 @@ impl MemTableFlusher {
             )
             .name(btree_cfg.name.clone());
 
-            if let Some(registry) = mem_indexes
+            if !uses_logical_addresses
+                && let Some(registry) = mem_indexes
                 && let Some(btree_index) = registry.get_btree(&btree_cfg.name)
             {
                 // Forward-written data: index row positions line up 1:1 with
@@ -688,11 +700,39 @@ impl MemTableFlusher {
                 .clone()
                 .join("_indices")
                 .join(index_uuid.to_string());
+            let schema = dataset.schema();
+            let field_idx = schema.field(&fts_cfg.column).map(|f| f.id).ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "FTS index '{}' references column '{}' which is not in the dataset schema",
+                    fts_cfg.name, fts_cfg.column
+                ))
+            })?;
+            let physical_coverage = dataset.fragment_bitmap.as_ref().clone();
+            let logical_coverage = if dataset.manifest.uses_stable_logical_row_addresses() {
+                Some(
+                    crate::index::build_logical_index_coverage(
+                        dataset,
+                        &[field_idx],
+                        &physical_coverage,
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            };
             let index_store = LanceIndexStore::new(
                 self.object_store.clone(),
                 index_dir.clone(),
                 Arc::new(LanceCache::no_cache()),
             );
+            let index_store = crate::index::scalar::configure_logical_coverage_artifact_from_exact(
+                dataset,
+                index_uuid,
+                &[field_idx],
+                logical_coverage.as_ref(),
+                "inverted",
+                index_store,
+            )?;
 
             inner_builder.write(&index_store).await?;
 
@@ -703,29 +743,32 @@ impl MemTableFlusher {
             let index_details = prost_types::Any::from_msg(&details)
                 .map_err(|e| Error::io(format!("Failed to serialize index details: {}", e)))?;
 
-            let schema = dataset.schema();
-            let field_idx = schema.field(&fts_cfg.column).map(|f| f.id).ok_or_else(|| {
-                Error::invalid_input(format!(
-                    "FTS index '{}' references column '{}' which is not in the dataset schema",
-                    fts_cfg.name, fts_cfg.column
-                ))
-            })?;
-
-            let fragment_ids: roaring::RoaringBitmap = dataset.fragment_bitmap.as_ref().clone();
             let format_version = fts_cfg.params.resolved_format_version();
+            let files = lance_table::format::list_index_files_with_sizes(
+                &dataset.object_store,
+                &dataset.indices_dir().join(index_uuid.to_string()),
+            )
+            .await?;
 
-            let index_meta = IndexMetadata {
+            let mut index_meta = IndexMetadata {
                 uuid: index_uuid,
                 name: fts_cfg.name.clone(),
                 fields: vec![field_idx],
                 dataset_version: dataset.version().version,
-                fragment_bitmap: Some(fragment_ids),
+                fragment_bitmap: logical_coverage.is_none().then_some(physical_coverage),
                 index_details: Some(Arc::new(index_details)),
                 index_version: format_version.index_version() as i32,
                 created_at: None,
                 base_id: None,
-                files: None,
+                files: Some(files),
+                row_reference_domain: logical_coverage
+                    .as_ref()
+                    .map(|_| RowReferenceDomain::StableLogicalRowAddress),
+                logical_coverage,
             };
+            if dataset.manifest.uses_stable_logical_row_addresses() {
+                crate::index::finalize_v23_index_coverage(dataset, &mut index_meta).await?;
+            }
             created_indexes.push(index_meta);
 
             info!(
@@ -821,6 +864,7 @@ impl MemTableFlusher {
     /// Erroring here would fail the whole flush drain.
     async fn create_hnsw_index(
         &self,
+        dataset: &Dataset,
         gen_path: &Path,
         config: &super::super::index::HnswIndexConfig,
         mem_index: &super::super::index::HnswMemIndex,
@@ -833,6 +877,10 @@ impl MemTableFlusher {
         use lance_core::ROW_ID;
         use lance_file::writer::{FileWriter, FileWriterOptions};
         use lance_index::pb;
+        use lance_index::scalar::lance_format::{
+            LOGICAL_INDEX_COVERAGE_BUFFER_INDEX_KEY, LOGICAL_INDEX_COVERAGE_LENGTH_KEY,
+            LOGICAL_INDEX_COVERAGE_OBJECT_ID_KEY, LOGICAL_INDEX_COVERAGE_OFFSET_KEY,
+        };
         use lance_index::vector::DISTANCE_TYPE_KEY;
         use lance_index::vector::SQ_CODE_COLUMN;
         use lance_index::vector::hnsw::HNSW;
@@ -844,6 +892,7 @@ impl MemTableFlusher {
             INDEX_AUXILIARY_FILE_NAME, INDEX_FILE_NAME, INDEX_METADATA_SCHEMA_KEY,
             IndexMetadata as IndexMetaSchema,
         };
+        use lance_table::format::{IndexFile, pb as table_pb};
         use prost::Message;
         use std::ops::Range;
         use std::sync::Arc;
@@ -857,6 +906,28 @@ impl MemTableFlusher {
             .clone()
             .join("_indices")
             .join(index_uuid.to_string());
+        let field_id = dataset
+            .schema()
+            .field(&config.column)
+            .map(|field| field.id)
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "HNSW index '{}' references column '{}' which is not in the dataset schema",
+                    config.name, config.column
+                ))
+            })?;
+        let logical_coverage = if dataset.manifest.uses_stable_logical_row_addresses() {
+            Some(
+                crate::index::build_logical_index_coverage(
+                    dataset,
+                    &[field_id],
+                    dataset.fragment_bitmap.as_ref(),
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
 
         let distance_type = mem_index.distance_type();
         let dim = mem_index.dim();
@@ -958,7 +1029,7 @@ impl MemTableFlusher {
             lance_index::vector::sq::storage::SQ_METADATA_KEY,
             sq_meta_json,
         );
-        storage_writer.finish().await?;
+        let storage_summary = storage_writer.finish().await?;
 
         // Write the HNSW graph batch to index.idx. The graph file uses the
         // same single-partition IVF model with zero centroid for the same
@@ -1032,24 +1103,64 @@ impl MemTableFlusher {
             HNSW::metadata_key(),
             serde_json::to_string(&[hnsw_metadata_json])?,
         );
-        index_writer.finish().await?;
+        if let Some(coverage) = logical_coverage.as_ref() {
+            let artifact = crate::index::build_logical_index_coverage_artifact_from_exact(
+                dataset,
+                index_uuid,
+                &[field_id],
+                coverage.clone(),
+            )?;
+            let object_id = artifact.object_id;
+            let payload = table_pb::LogicalIndexCoverageArtifact::from(&artifact).encode_to_vec();
+            let offset = index_writer.tell().await?;
+            let byte_length = payload.len() as u64;
+            let global_buffer_index = index_writer.add_global_buffer(payload.into()).await?;
+            index_writer.add_schema_metadata(
+                LOGICAL_INDEX_COVERAGE_BUFFER_INDEX_KEY,
+                global_buffer_index.to_string(),
+            );
+            index_writer.add_schema_metadata(LOGICAL_INDEX_COVERAGE_OFFSET_KEY, offset.to_string());
+            index_writer
+                .add_schema_metadata(LOGICAL_INDEX_COVERAGE_LENGTH_KEY, byte_length.to_string());
+            index_writer
+                .add_schema_metadata(LOGICAL_INDEX_COVERAGE_OBJECT_ID_KEY, object_id.to_string());
+        }
+        let index_summary = index_writer.finish().await?;
 
         let index_details = Some(Arc::new(prost_types::Any {
             type_url: "type.googleapis.com/lance.index.VectorIndexDetails".to_string(),
             value: vec![],
         }));
-        let index_meta = IndexMetadata {
+        let mut index_meta = IndexMetadata {
             uuid: index_uuid,
             name: config.name.clone(),
-            fields: vec![0], // updated by caller
-            dataset_version: 0,
-            fragment_bitmap: None,
+            fields: vec![field_id],
+            dataset_version: dataset.version().version,
+            fragment_bitmap: logical_coverage
+                .is_none()
+                .then(|| dataset.fragment_bitmap.as_ref().clone()),
             index_details,
             base_id: None,
             created_at: Some(chrono::Utc::now()),
             index_version: 1,
-            files: None,
+            files: Some(vec![
+                IndexFile {
+                    path: INDEX_AUXILIARY_FILE_NAME.to_string(),
+                    size_bytes: storage_summary.size_bytes,
+                },
+                IndexFile {
+                    path: INDEX_FILE_NAME.to_string(),
+                    size_bytes: index_summary.size_bytes,
+                },
+            ]),
+            row_reference_domain: logical_coverage
+                .as_ref()
+                .map(|_| RowReferenceDomain::StableLogicalRowAddress),
+            logical_coverage,
         };
+        if dataset.manifest.uses_stable_logical_row_addresses() {
+            crate::index::finalize_v23_index_coverage(dataset, &mut index_meta).await?;
+        }
 
         Ok(Some(index_meta))
     }
@@ -1117,16 +1228,33 @@ impl std::fmt::Debug for TriggerMemTableFlush {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{Int32Array, RecordBatch, StringArray};
+    use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StringArray};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use lance_file::version::LanceFileVersion;
     use std::sync::Arc;
     use tempfile::TempDir;
+
+    use crate::dataset::WriteParams;
 
     async fn create_local_store() -> (Arc<ObjectStore>, Path, String, TempDir) {
         let temp_dir = tempfile::tempdir().unwrap();
         let uri = format!("file://{}", temp_dir.path().display());
         let (store, path) = ObjectStore::from_uri(&uri).await.unwrap();
         (store, path, uri, temp_dir)
+    }
+
+    async fn create_v23_base(uri: &str, batch: RecordBatch) {
+        let schema = batch.schema();
+        Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            uri,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_3),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
     }
 
     fn create_test_schema() -> Arc<ArrowSchema> {
@@ -1630,8 +1758,11 @@ mod tests {
     /// Covers `finalize_generation` writing both a deletion vector *and*
     /// indexes into the same manifest — the deletion-only and index-only
     /// paths are exercised by sibling tests.
+    #[rstest::rstest]
+    #[case::legacy(false)]
+    #[case::v23(true)]
     #[tokio::test]
-    async fn test_flush_with_indexes_and_dedup_deletion_vector() {
+    async fn test_flush_with_indexes_and_dedup_deletion_vector(#[case] use_v23: bool) {
         use super::super::super::index::{BTreeIndexConfig, IndexStore};
         use crate::index::DatasetIndexExt;
         use futures::TryStreamExt;
@@ -1667,6 +1798,9 @@ mod tests {
             ],
         )
         .unwrap();
+        if use_v23 {
+            create_v23_base(&base_uri, batch.slice(0, 1)).await;
+        }
         let frag_id = memtable.insert(batch).await.unwrap();
         memtable.mark_wal_flushed(&[frag_id], 1, &[0]);
 
@@ -1700,6 +1834,18 @@ mod tests {
         let indices = dataset.load_indices().await.unwrap();
         assert_eq!(indices.len(), 1);
         assert_eq!(indices[0].name, "name_btree");
+        if use_v23 {
+            assert_eq!(
+                indices[0].row_reference_domain,
+                Some(RowReferenceDomain::StableLogicalRowAddress)
+            );
+            assert!(indices[0].fragment_bitmap.is_none());
+            assert!(
+                crate::index::resolve_logical_index_coverage(&dataset, &indices[0])
+                    .await
+                    .is_ok()
+            );
+        }
 
         // Deletion-vector half: scan returns newest-per-PK.
         let batches: Vec<RecordBatch> = dataset
@@ -1763,8 +1909,11 @@ mod tests {
         assert_eq!(fresh_hits.num_rows(), 1);
     }
 
+    #[rstest::rstest]
+    #[case::legacy(false)]
+    #[case::v23(true)]
     #[tokio::test]
-    async fn test_flusher_with_btree_index() {
+    async fn test_flusher_with_btree_index(#[case] use_v23: bool) {
         use super::super::super::index::{BTreeIndexConfig, IndexStore};
         use crate::index::DatasetIndexExt;
 
@@ -1788,6 +1937,9 @@ mod tests {
         })];
 
         let schema = create_test_schema();
+        if use_v23 {
+            create_v23_base(&base_uri, create_test_batch(&schema, 1)).await;
+        }
         let mut memtable = MemTable::new(schema.clone(), 1, vec![]).unwrap();
 
         // Set up in-memory index registry so preprocessed data path is used
@@ -1832,6 +1984,18 @@ mod tests {
 
         assert_eq!(indices.len(), 1);
         assert_eq!(indices[0].name, "id_btree");
+        if use_v23 {
+            assert_eq!(
+                indices[0].row_reference_domain,
+                Some(RowReferenceDomain::StableLogicalRowAddress)
+            );
+            assert!(indices[0].fragment_bitmap.is_none());
+            assert!(
+                crate::index::resolve_logical_index_coverage(&dataset, &indices[0])
+                    .await
+                    .is_ok()
+            );
+        }
 
         // Verify query results are correct
         // The test data has ids 0-9, so querying for id = 5 should return 1 row
@@ -1865,8 +2029,11 @@ mod tests {
         .unwrap();
     }
 
+    #[rstest::rstest]
+    #[case::legacy(false)]
+    #[case::v23(true)]
     #[tokio::test]
-    async fn test_flusher_with_hnsw_index() {
+    async fn test_flusher_with_hnsw_index(#[case] use_v23: bool) {
         use super::super::super::index::IndexStore;
         use crate::index::DatasetIndexExt;
         use arrow_array::{FixedSizeListArray, Float32Array};
@@ -1934,6 +2101,10 @@ mod tests {
         )
         .unwrap();
 
+        if use_v23 {
+            create_v23_base(&base_uri, batch.slice(0, 1)).await;
+        }
+
         let frag_id = memtable.insert(batch).await.unwrap();
 
         // Simulate WAL flush
@@ -1969,6 +2140,18 @@ mod tests {
 
         assert_eq!(indices.len(), 1);
         assert_eq!(indices[0].name, "vector_hnsw");
+        if use_v23 {
+            assert_eq!(
+                indices[0].row_reference_domain,
+                Some(RowReferenceDomain::StableLogicalRowAddress)
+            );
+            assert!(indices[0].fragment_bitmap.is_none());
+            assert!(
+                crate::index::resolve_logical_index_coverage(&dataset, &indices[0])
+                    .await
+                    .is_ok()
+            );
+        }
 
         // End-to-end query: pick a row from the flushed dataset, query for
         // it, and verify the index path returns it as the nearest neighbor.
@@ -2031,8 +2214,11 @@ mod tests {
         );
     }
 
+    #[rstest::rstest]
+    #[case::legacy(false)]
+    #[case::v23(true)]
     #[tokio::test]
-    async fn test_flusher_with_fts_index() {
+    async fn test_flusher_with_fts_index(#[case] use_v23: bool) {
         use super::super::super::index::{FtsIndexConfig, IndexStore};
         use crate::index::DatasetIndexExt;
         use arrow_array::StringArray;
@@ -2084,6 +2270,10 @@ mod tests {
         )
         .unwrap();
 
+        if use_v23 {
+            create_v23_base(&base_uri, batch.slice(0, 1)).await;
+        }
+
         let frag_id = memtable.insert(batch).await.unwrap();
 
         // Simulate WAL flush
@@ -2119,6 +2309,18 @@ mod tests {
 
         assert_eq!(indices.len(), 1);
         assert_eq!(indices[0].name, "text_fts");
+        if use_v23 {
+            assert_eq!(
+                indices[0].row_reference_domain,
+                Some(RowReferenceDomain::StableLogicalRowAddress)
+            );
+            assert!(indices[0].fragment_bitmap.is_none());
+            assert!(
+                crate::index::resolve_logical_index_coverage(&dataset, &indices[0])
+                    .await
+                    .is_ok()
+            );
+        }
 
         // Verify FTS query returns correct results
         // Searching for "hello" should find the first document

@@ -508,25 +508,9 @@ impl MergeInsertBuilder {
 }
 
 fn index_metadata_to_segment(metadata: IndexMetadata) -> PyResult<IndexSegment> {
-    let fragment_bitmap = metadata.fragment_bitmap.ok_or_else(|| {
-        PyValueError::new_err(format!(
-            "Index metadata {} is missing fragment coverage",
-            metadata.uuid
-        ))
-    })?;
-    let index_details = metadata.index_details.ok_or_else(|| {
-        PyValueError::new_err(format!(
-            "Index metadata {} is missing index details",
-            metadata.uuid
-        ))
-    })?;
+    use lance::index::IntoIndexSegment;
 
-    Ok(IndexSegment::new(
-        metadata.uuid,
-        fragment_bitmap.iter(),
-        index_details,
-        metadata.index_version,
-    ))
+    metadata.into_index_segment().infer_error()
 }
 
 fn extract_index_segments(segments: &Bound<'_, PyAny>) -> PyResult<Vec<IndexSegment>> {
@@ -1024,7 +1008,7 @@ impl Dataset {
 
     #[getter(has_stable_row_ids)]
     fn has_stable_row_ids(&self) -> bool {
-        self.ds.manifest().uses_stable_row_ids()
+        self.ds.manifest().has_stable_row_identity()
     }
 
     /// Get index statistics

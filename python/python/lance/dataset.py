@@ -59,6 +59,8 @@ from .lance import (
     IOStats,
     LanceSchema,
     PySearchFilter,
+    RowAddressMaintenance,
+    RowAddressMaintenanceMetrics,
     ScanStatistics,
     _Dataset,
     _format_field_path,
@@ -1412,10 +1414,11 @@ class LanceDataset(pa.dataset.Dataset):
     @property
     def has_stable_row_ids(self) -> bool:
         """
-        Whether this dataset has stable row IDs enabled.
+        Whether this dataset has stable row identity.
 
-        This is based on the dataset manifest feature flag and does not depend on
-        whether the current version has any fragments.
+        For storage version 2.3 this is always true and uses stable logical row
+        addresses. Earlier versions report the legacy stable-row-ID feature flag.
+        The result does not depend on whether the current version has fragments.
         """
         return self._ds.has_stable_row_ids
 
@@ -4512,10 +4515,9 @@ class LanceDataset(pa.dataset.Dataset):
             A message to associate with this commit. This message will be stored in the
             dataset's metadata and can be retrieved using read_transaction().
         enable_stable_row_ids: bool, optional
-            If True, enables stable row IDs when creating a new dataset.  Stable
-            row IDs assign each row a monotonically increasing id that persists
-            across compaction and other maintenance operations.  This option is
-            ignored for existing datasets.
+            For storage versions through 2.2, enables legacy stable row IDs on
+            creation. Storage version 2.3 always uses stable logical row
+            addresses. This option is ignored for existing datasets.
         namespace_client : LanceNamespace, optional
             A namespace client. Must be provided together with table_id.
             Use lance.namespace.connect() to create a namespace.
@@ -5521,6 +5523,10 @@ class Transaction:
     transaction_properties: Optional[Dict[str, str]] = dataclasses.field(
         default_factory=dict
     )
+    # Core-authored provenance that must round-trip with distributed 2.3 writes.
+    row_address_layout_delta: Optional[bytes] = dataclasses.field(
+        default=None, repr=False
+    )
 
 
 class Tag(TypedDict):
@@ -5584,12 +5590,20 @@ class Index:
     name: str
     fields: List[int]
     dataset_version: int
-    fragment_ids: Set[int]
+    fragment_ids: Optional[Set[int]]
     index_version: int
     created_at: Optional[datetime] = None
     base_id: Optional[int] = None
     files: Optional[List["IndexFile"]] = None
     index_details: Optional[Tuple[str, bytes]] = None
+    row_reference_domain: Optional[
+        Literal[
+            "physical_row_address",
+            "legacy_stable_row_id",
+            "stable_logical_row_address",
+        ]
+    ] = None
+    logical_coverage: Optional[bytes] = None
 
 
 class IndexInformation(TypedDict):
@@ -6841,6 +6855,179 @@ class DatasetOptimizer:
     def __init__(self, dataset: LanceDataset):
         self._dataset = dataset
 
+    def _maintain_row_addresses(
+        self,
+        mode: Literal[
+            "normalize_placement", "repack", "recluster", "checkpoint_generation"
+        ],
+        *,
+        ordering: Optional[Sequence[ColumnOrdering]] = None,
+        target_rows_per_fragment: Optional[int] = None,
+        max_rows_per_group: Optional[int] = None,
+        max_bytes_per_file: Optional[int] = None,
+        batch_size: Optional[int] = None,
+        io_buffer_size: Optional[int] = None,
+    ) -> RowAddressMaintenanceMetrics:
+        return RowAddressMaintenance.execute(
+            self._dataset,
+            mode,
+            ordering=list(ordering) if ordering is not None else None,
+            target_rows_per_fragment=target_rows_per_fragment,
+            max_rows_per_group=max_rows_per_group,
+            max_bytes_per_file=max_bytes_per_file,
+            batch_size=batch_size,
+            io_buffer_size=io_buffer_size,
+        )
+
+    def normalize_placement(
+        self,
+        *,
+        target_rows_per_fragment: Optional[int] = None,
+        max_rows_per_group: Optional[int] = None,
+        max_bytes_per_file: Optional[int] = None,
+        batch_size: Optional[int] = None,
+        io_buffer_size: Optional[int] = None,
+    ) -> RowAddressMaintenanceMetrics:
+        """Rewrite a storage-version-2.3 dataset into an inline placement.
+
+        Rows are written in logical-row-address order. The operation performs
+        exact placement admission before opening data writers, so
+        ``max_bytes_per_file`` is rejected; output boundaries must depend only
+        on row counts. This is the read-optimized way to remove placement debt.
+
+        Parameters
+        ----------
+        target_rows_per_fragment : int, optional
+            Maximum rows per output fragment. The default is 1,000,000.
+        max_rows_per_group : int, optional
+            Maximum rows per writer batch group. The default is 1,024.
+        max_bytes_per_file : int, optional
+            Unsupported for normalization. Passing a value raises ``ValueError``.
+        batch_size : int, optional
+            Input scan batch size.
+        io_buffer_size : int, optional
+            Input scan I/O buffer size in bytes.
+
+        Returns
+        -------
+        RowAddressMaintenanceMetrics
+            Fragment, data-file, locator, byte, and row rewrite costs.
+        """
+        return self._maintain_row_addresses(
+            "normalize_placement",
+            target_rows_per_fragment=target_rows_per_fragment,
+            max_rows_per_group=max_rows_per_group,
+            max_bytes_per_file=max_bytes_per_file,
+            batch_size=batch_size,
+            io_buffer_size=io_buffer_size,
+        )
+
+    def repack(
+        self,
+        *,
+        target_rows_per_fragment: Optional[int] = None,
+        max_rows_per_group: Optional[int] = None,
+        max_bytes_per_file: Optional[int] = None,
+        batch_size: Optional[int] = None,
+        io_buffer_size: Optional[int] = None,
+    ) -> RowAddressMaintenanceMetrics:
+        """Reclaim physical debt while preserving stable logical row addresses.
+
+        Live rows are packed in logical-row-address order and an external
+        locator is published. Unlike :meth:`normalize_placement`, this explicit
+        operation accepts byte-driven file boundaries; its locator costs are
+        reported in the returned metrics.
+
+        Parameters
+        ----------
+        target_rows_per_fragment : int, optional
+            Maximum rows per output fragment. The default is 1,000,000.
+        max_rows_per_group : int, optional
+            Maximum rows per writer batch group. The default is 1,024.
+        max_bytes_per_file : int, optional
+            Maximum physical bytes per output file.
+        batch_size : int, optional
+            Input scan batch size.
+        io_buffer_size : int, optional
+            Input scan I/O buffer size in bytes.
+
+        Returns
+        -------
+        RowAddressMaintenanceMetrics
+            Fragment, data-file, locator, byte, and row rewrite costs.
+        """
+        return self._maintain_row_addresses(
+            "repack",
+            target_rows_per_fragment=target_rows_per_fragment,
+            max_rows_per_group=max_rows_per_group,
+            max_bytes_per_file=max_bytes_per_file,
+            batch_size=batch_size,
+            io_buffer_size=io_buffer_size,
+        )
+
+    def recluster(
+        self,
+        ordering: Sequence[ColumnOrdering],
+        *,
+        target_rows_per_fragment: Optional[int] = None,
+        max_rows_per_group: Optional[int] = None,
+        max_bytes_per_file: Optional[int] = None,
+        batch_size: Optional[int] = None,
+        io_buffer_size: Optional[int] = None,
+    ) -> RowAddressMaintenanceMetrics:
+        """Physically reorder rows and publish an external logical locator.
+
+        ``ordering`` must contain :class:`ColumnOrdering` values; shorthand
+        strings are intentionally not accepted. ``_rowid`` is appended as a
+        deterministic tie-breaker and cannot be specified as an ordering column.
+
+        Parameters
+        ----------
+        ordering : Sequence[ColumnOrdering]
+            Global physical ordering, from highest to lowest precedence.
+        target_rows_per_fragment : int, optional
+            Maximum rows per output fragment. The default is 1,000,000.
+        max_rows_per_group : int, optional
+            Maximum rows per writer batch group. The default is 1,024.
+        max_bytes_per_file : int, optional
+            Maximum physical bytes per output file.
+        batch_size : int, optional
+            Input scan batch size.
+        io_buffer_size : int, optional
+            Input scan I/O buffer size in bytes.
+
+        Returns
+        -------
+        RowAddressMaintenanceMetrics
+            Fragment, data-file, locator, byte, and row rewrite costs.
+        """
+        orderings = list(ordering)
+        if any(not isinstance(item, ColumnOrdering) for item in orderings):
+            raise TypeError("ordering must contain only ColumnOrdering values")
+        return self._maintain_row_addresses(
+            "recluster",
+            ordering=orderings,
+            target_rows_per_fragment=target_rows_per_fragment,
+            max_rows_per_group=max_rows_per_group,
+            max_bytes_per_file=max_bytes_per_file,
+            batch_size=batch_size,
+            io_buffer_size=io_buffer_size,
+        )
+
+    def checkpoint_row_address_generations(self) -> RowAddressMaintenanceMetrics:
+        """Retire generation metadata consumed by every covering index.
+
+        A stale covering index prevents retirement until it is optimized,
+        rebuilt, or dropped. The operation rewrites no user data and returns
+        zero rewrite metrics.
+
+        Returns
+        -------
+        RowAddressMaintenanceMetrics
+            Zero rewrite metrics for the metadata-only checkpoint.
+        """
+        return self._maintain_row_addresses("checkpoint_generation")
+
     def compact_files(
         self,
         *,
@@ -7332,10 +7519,9 @@ def write_dataset(
         already exists. To migrate an existing dataset, instead use the
         :meth:`LanceDataset.migrate_manifest_paths_v2` method. Default is True.
     enable_stable_row_ids : bool, optional
-        Experimental parameter: if set to true, the writer will use stable row ids.
-        These row ids are stable after compaction operations, but not after updates.
-        This makes compaction more efficient, since with stable row ids no
-        secondary indices need to be updated to point to new row ids.
+        For storage versions through 2.2, enables the legacy stable-row-ID
+        representation. Storage version 2.3 always uses stable logical row
+        addresses, so this option has no effect there.
     auto_cleanup_options: optional, AutoCleanupConfig
         Config options for automatic cleanup of the dataset.
         If set, and this is a new dataset, old dataset versions will be automatically

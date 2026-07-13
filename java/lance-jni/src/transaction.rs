@@ -23,7 +23,9 @@ use lance::dataset::transaction::{
 };
 use lance::io::ObjectStoreParams;
 use lance::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
-use lance::table::format::{Fragment, IndexMetadata};
+use lance::table::format::{
+    Fragment, IndexMetadata, LogicalIndexCoverage, RowAddressLayoutDelta, RowReferenceDomain, pb,
+};
 use lance_core::datatypes::Field;
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_file::version::LanceFileVersion;
@@ -203,6 +205,18 @@ impl FromJObjectWithEnv<IndexMetadata> for JObject<'_> {
                 Ok(DateTime::from_timestamp(seconds, nanos).unwrap())
             })?;
         let base_id = env.get_optional_u32_from_method(self, "baseId")?;
+        let row_reference_domain = env
+            .get_optional_i32_from_method(self, "rowReferenceDomainValue")?
+            .map(RowReferenceDomain::try_from)
+            .transpose()?;
+        let logical_coverage =
+            env.get_optional_from_method(self, "logicalCoverage", |env, coverage_obj| {
+                let bytes = env.convert_byte_array(JByteArray::from(coverage_obj))?;
+                let coverage = pb::LogicalIndexCoverage::decode(&bytes[..]).map_err(|error| {
+                    Error::input_error(format!("Invalid logical index coverage: {error}"))
+                })?;
+                LogicalIndexCoverage::try_from(coverage).map_err(Error::from)
+            })?;
 
         Ok(IndexMetadata {
             uuid,
@@ -215,6 +229,8 @@ impl FromJObjectWithEnv<IndexMetadata> for JObject<'_> {
             created_at,
             base_id,
             files: None,
+            row_reference_domain,
+            logical_coverage,
         })
     }
 }
@@ -317,17 +333,24 @@ pub(crate) fn convert_to_java_transaction<'local>(
         Some(properties) => to_java_map(env, &properties)?,
         _ => JObject::null(),
     };
+    let row_address_layout_delta = match transaction.row_address_layout_delta.as_ref() {
+        Some(delta) => JObject::from(env.byte_array_from_slice(
+            &pb::transaction::RowAddressLayoutDelta::from(delta).encode_to_vec(),
+        )?),
+        None => JObject::null(),
+    };
     let operation = convert_to_java_operation(env, Some(transaction.operation))?;
 
     let java_transaction = env.new_object(
         "org/lance/Transaction",
-        "(JLjava/lang/String;Lorg/lance/operation/Operation;Ljava/lang/String;Ljava/util/Map;)V",
+        "(JLjava/lang/String;Lorg/lance/operation/Operation;Ljava/lang/String;Ljava/util/Map;[B)V",
         &[
             JValue::Long(transaction.read_version as i64),
             JValue::Object(&uuid),
             JValue::Object(&operation),
             JValue::Object(&tag),
             JValue::Object(&transaction_properties),
+            JValue::Object(&row_address_layout_delta),
         ],
     )?;
     Ok(java_transaction)
@@ -602,6 +625,7 @@ fn parse_storage_format(name: &str) -> Result<LanceFileVersion> {
         "v2_1" | "v2.1" => Ok(LanceFileVersion::V2_1),
         "next" => Ok(LanceFileVersion::Next),
         "v2_2" | "v2.2" => Ok(LanceFileVersion::V2_2),
+        "2.3" | "v2_3" | "v2.3" => Ok(LanceFileVersion::V2_3),
         _ => Err(Error::input_error(format!(
             "Unknown storage format: {}",
             name
@@ -840,10 +864,25 @@ fn convert_to_rust_transaction(
             to_rust_map(env, &transaction_properties)
         },
     )?;
+    let row_address_layout_delta = env.get_optional_from_method(
+        &java_transaction,
+        "rowAddressLayoutDelta",
+        |env, row_address_layout_delta| {
+            let bytes = env.convert_byte_array(JByteArray::from(row_address_layout_delta))?;
+            let delta = pb::transaction::RowAddressLayoutDelta::decode(bytes.as_slice())
+                .map_err(|error| {
+                    Error::input_error(format!(
+                        "Invalid row address layout delta in Java transaction: {error}"
+                    ))
+                })?;
+            RowAddressLayoutDelta::try_from(delta).map_err(Into::into)
+        },
+    )?;
     Ok(TransactionBuilder::new(read_ver, op)
         .uuid(uuid)
         .tag(tag)
         .transaction_properties(transaction_properties.map(Arc::new))
+        .row_address_layout_delta(row_address_layout_delta)
         .build())
 }
 

@@ -1280,6 +1280,8 @@ impl ManifestNamespace {
             created_at: None,
             base_id: None,
             files: Some(trained_index.created_index.files),
+            row_reference_domain: None,
+            logical_coverage: None,
         })
     }
 

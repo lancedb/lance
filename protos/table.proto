@@ -32,6 +32,429 @@ message UUID {
   bytes uuid = 1;
 }
 
+// A contiguous range of immutable slots in one logical fragment.
+// `end_slot` is exclusive and must be greater than `start_slot`.
+message LogicalRowAddressRange {
+  uint32 logical_fragment_id = 1;
+  uint32 start_slot = 2;
+  uint32 end_slot = 3;
+}
+
+message LogicalRowAddressRangeList {
+  // Ranges must be sorted by (logical_fragment_id, start_slot), non-empty,
+  // and non-overlapping. Adjacent ranges are merged by canonical writers.
+  repeated LogicalRowAddressRange ranges = 1;
+}
+
+message DenseBitsetLogicalDomainSelection {
+  uint32 logical_fragment_id = 1;
+  // Number of addressable slots starting at slot zero.
+  uint32 universe = 2;
+  // Little-endian bits; unused high bits in the last byte must be zero.
+  bytes bits = 3;
+  // Cumulative set-bit counts at fixed-size bit boundaries.
+  uint32 rank_checkpoint_interval = 4;
+  repeated uint32 rank_checkpoints = 5 [packed = true];
+}
+
+message DenseBitsetLogicalRowAddressSelection {
+  repeated DenseBitsetLogicalDomainSelection domains = 1;
+}
+
+message EliasFanoLogicalDomainSelection {
+  uint32 logical_fragment_id = 1;
+  // Exclusive upper bound of immutable slots represented by this sequence.
+  uint32 universe = 2;
+  uint32 cardinality = 3;
+  uint32 low_bit_width = 4;
+  // Cardinality fixed-width low values, bit-packed little endian.
+  bytes low_bits = 5;
+  // Unary-coded high values: bit (high_value + ordinal) is set.
+  bytes high_bits = 6;
+  uint32 select_checkpoint_interval = 7;
+  // Bit position of every select_checkpoint_interval-th set bit.
+  repeated uint32 select_checkpoints = 8 [packed = true];
+}
+
+message EliasFanoLogicalRowAddressSelection {
+  repeated EliasFanoLogicalDomainSelection domains = 1;
+}
+
+message LogicalOrdinalDomainRun {
+  uint32 first_logical_fragment_id = 1;
+  uint32 domain_count = 2;
+  PackedLogicalFragmentIds logical_fragment_ids = 3;
+  // Exclusive slot universe for each logical fragment.
+  PackedSlotCounts slot_universes = 4;
+}
+
+// Elias-Fano over the concatenated ordinal universe described by domain_runs.
+// This avoids one protobuf message/checkpoint set per logical fragment when a
+// sparse selection touches many small, consecutive logical domains.
+message EliasFanoOrdinalLogicalRowAddressSelection {
+  repeated LogicalOrdinalDomainRun domain_runs = 1;
+  uint64 universe = 2;
+  uint64 cardinality = 3;
+  uint32 low_bit_width = 4;
+  bytes low_bits = 5;
+  bytes high_bits = 6;
+  uint32 select_checkpoint_interval = 7;
+  repeated uint64 select_checkpoints = 8 [packed = true];
+}
+
+// An exact set of stable logical row addresses.
+message LogicalRowAddressSelection {
+  oneof encoding {
+    // Preferred for a small number of contiguous source ranges.
+    LogicalRowAddressRangeList ranges = 1;
+    // A portable serialized RoaringTreemap containing raw u64 logical row
+    // addresses. Readers accept it, but writers choose the smallest canonical
+    // adaptive encoding and do not assume Roaring is efficient for sparse sets.
+    bytes roaring_treemap = 2;
+    // Preferred for dense selections.
+    DenseBitsetLogicalRowAddressSelection dense_bitset = 3;
+    // Preferred for high-universe sparse selections. This is Elias-Fano with
+    // periodic select checkpoints, supporting rank/select without row scans.
+    EliasFanoLogicalRowAddressSelection elias_fano = 4;
+    // Preferred when sparse membership spans many logical domains.
+    EliasFanoOrdinalLogicalRowAddressSelection ordinal_elias_fano = 5;
+  }
+  // Writers set this to 1 after choosing the canonical minimum-size codec.
+  // Readers validate and retain the chosen payload; they do not rerun codec
+  // selection on the read path.
+  uint32 canonical_encoding_version = 6;
+}
+
+// Identifies a logical fragment whose rows were born in this physical fragment.
+// The domain contains DataFragment.physical_rows immutable slots.
+message NativeLogicalDomain {
+  uint32 logical_fragment_id = 1;
+  uint64 creation_version = 2;
+}
+
+message RowAddressLogicalDomain {
+  uint32 logical_fragment_id = 1;
+  uint32 slot_count = 2;
+  // Manifest version in which this logical domain was first committed. This is
+  // retained after its native physical fragment is removed.
+  uint64 creation_version = 3;
+}
+
+// Direct affine placement. New appends normally use NativeLogicalDomain instead
+// so they do not add a placement-root entry.
+message DirectRowAddressPlacement {
+  RowAddressLogicalDomain source = 1;
+  uint64 destination_fragment_id = 2;
+  uint32 destination_start = 3;
+  // Source rows that no longer resolve through this affine placement. Their
+  // physical destination offsets remain holes covered by the fragment DV.
+  optional uint32 excluded_selection_index = 4;
+}
+
+message BitPackedU32Sequence {
+  uint32 value_count = 1;
+  uint32 bit_width = 2;
+  bytes values = 3;
+  uint32 prefix_checkpoint_interval = 4;
+  repeated uint64 prefix_checkpoints = 5 [packed = true];
+}
+
+message ConsecutiveLogicalFragmentIds {}
+
+message PackedLogicalFragmentIds {
+  oneof encoding {
+    ConsecutiveLogicalFragmentIds consecutive = 1;
+    // Positive deltas after first_logical_fragment_id.
+    BitPackedU32Sequence positive_deltas = 2;
+  }
+}
+
+message PackedSlotCounts {
+  oneof encoding {
+    uint32 uniform_slot_count = 1;
+    BitPackedU32Sequence bit_packed_slot_counts = 2;
+  }
+}
+
+message CreationVersionRun {
+  uint32 domain_count = 1;
+  uint64 creation_version = 2;
+}
+
+message CreationVersionRuns {
+  repeated CreationVersionRun runs = 1;
+}
+
+message PackedCreationVersions {
+  oneof encoding {
+    uint64 uniform_creation_version = 1;
+    CreationVersionRuns runs = 2;
+  }
+}
+
+// Packs logical fragments into one physical extent. Consecutive ids, uniform
+// row counts, and a shared creation version have constant-size payloads.
+message PackedRunRowAddressPlacement {
+  uint32 first_logical_fragment_id = 1;
+  uint32 domain_count = 2;
+  PackedLogicalFragmentIds logical_fragment_ids = 3;
+  PackedSlotCounts slot_counts = 4;
+  PackedCreationVersions creation_versions = 5;
+  uint64 destination_fragment_id = 6;
+  uint32 destination_start = 7;
+}
+
+message AllRetiredLogicalRows {}
+
+// Persistent liveness for logical rows whose physical storage was reclaimed.
+// Writers canonicalize this to at most one all-rows set and one selected set.
+message RetiredLogicalRowSet {
+  uint32 first_logical_fragment_id = 1;
+  uint32 domain_count = 2;
+  PackedLogicalFragmentIds logical_fragment_ids = 3;
+  PackedSlotCounts slot_counts = 4;
+  PackedCreationVersions creation_versions = 5;
+  oneof membership {
+    AllRetiredLogicalRows all_rows = 6;
+    uint32 selection_index = 7;
+  }
+}
+
+// Packs an exact, source-ordered subset of one logical fragment.
+message SelectedRowAddressPlacement {
+  RowAddressLogicalDomain source = 1;
+  optional uint32 selection_index = 2;
+  uint64 destination_fragment_id = 3;
+  uint32 destination_start = 4;
+  // Subset of selection whose original destination ranks are DV-covered holes.
+  optional uint32 excluded_selection_index = 5;
+}
+
+message RowAddressExtent {
+  uint32 source_start = 1;
+  uint32 length = 2;
+  uint64 destination_fragment_id = 3;
+  uint32 destination_start = 4;
+}
+
+// Maps a bounded number of source-contiguous extents from one logical fragment.
+message ExtentListRowAddressPlacement {
+  RowAddressLogicalDomain source = 1;
+  repeated RowAddressExtent extents = 2;
+}
+
+message SparseSelectionSource {
+  RowAddressLogicalDomain source = 1;
+  optional uint32 selection_index = 2;
+  // Subset of selection whose original destination ranks are DV-covered holes.
+  optional uint32 excluded_selection_index = 3;
+}
+
+// Packs sparse selections from multiple logical fragments, in source order,
+// into one contiguous physical extent.
+message SparseSelectionRowAddressPlacement {
+  repeated SparseSelectionSource sources = 1;
+  uint64 destination_fragment_id = 2;
+  uint32 destination_start = 3;
+}
+
+message ExplicitMapPage {
+  uint64 first_logical_address = 1;
+  uint64 last_logical_address = 2;
+  // Row range in the standard Lance locator file. The root already carries
+  // the object size, so a reader can open it without a HEAD and fetch only the
+  // page that can contain a requested logical address.
+  uint64 row_start = 3;
+  uint64 row_count = 4;
+}
+
+message ExplicitMapDestination {
+  uint64 physical_fragment_id = 1;
+  uint32 destination_start = 2;
+  uint32 row_count = 3;
+  // Standard Lance file containing the destination-aligned hidden _rowid
+  // column used for physical-to-logical inverse projection.
+  string row_id_file_path = 4;
+  uint64 row_id_file_size = 5;
+}
+
+// External inverse locator used only by explicit Repack/Recluster operations.
+// The root contains enough file and page information to avoid HEAD/LIST calls.
+message ExplicitMapRowAddressPlacement {
+  repeated SparseSelectionSource sources = 1;
+  string object_path = 2;
+  uint64 object_size = 3;
+  repeated ExplicitMapPage pages = 4;
+  repeated ExplicitMapDestination destinations = 5;
+  // Dataset-root base that owns the locator and all hidden _rowid files.
+  // Absent means the current dataset root.
+  optional uint32 base_id = 6;
+}
+
+message RowAddressPlacement {
+  oneof codec {
+    DirectRowAddressPlacement direct = 1;
+    PackedRunRowAddressPlacement packed_run = 2;
+    SelectedRowAddressPlacement selected = 3;
+    ExtentListRowAddressPlacement extent_list = 4;
+    SparseSelectionRowAddressPlacement sparse_selection = 5;
+    ExplicitMapRowAddressPlacement explicit_map = 6;
+  }
+}
+
+// Reverse index from one physical fragment to placement-root entry numbers.
+message RowAddressDestinationIndexEntry {
+  uint64 physical_fragment_id = 1;
+  repeated uint32 placement_indices = 2 [packed = true];
+}
+
+message FieldGeneration {
+  int32 field_id = 1;
+  uint64 generation = 2;
+}
+
+message ContentGenerationRegion {
+  optional uint32 selection_index = 1;
+  repeated int32 field_ids = 2 [packed = true];
+  uint64 generation = 3;
+}
+
+message RowAddressPlacementDebtSummary {
+  // Canonical inline bytes attributable to default-fast-path routing.
+  uint64 canonical_layout_bytes = 1;
+  // Default-fast-path row-address bytes written in the current physical epoch.
+  uint64 metadata_bytes_written_since_maintenance = 2;
+  uint32 max_extents_per_logical_fragment = 3;
+  uint64 live_physical_rows = 4;
+  uint64 total_physical_rows = 5;
+  // Disclosed ExplicitMap root bytes, excluded from default-fast admission.
+  uint64 explicit_layout_bytes = 6;
+  // Current manifest-file Delta split by admission tier.
+  uint64 fast_delta_bytes = 7;
+  uint64 explicit_delta_bytes = 8;
+  // ExplicitMap bytes rewritten in the current physical epoch. Reporting only.
+  uint64 explicit_metadata_bytes_written_since_maintenance = 9;
+  // Generation/index-validation subset of fast_delta_bytes.
+  uint64 generation_delta_bytes = 10;
+  // Generation/index-validation subset of fast metadata bytes written in the
+  // current physical epoch.
+  uint64 generation_metadata_bytes_written_since_maintenance = 11;
+}
+
+message PhysicalRowOwnershipSummary {
+  uint64 physical_fragment_id = 1;
+  uint64 mapped_row_count = 2;
+  // Fingerprint of canonical mapped physical-offset ranges derived from the
+  // current placement root.
+  bytes mapped_offsets_fingerprint = 3;
+  reserved 4;
+  reserved "deletion_file";
+  // Fingerprint of canonical deleted physical-offset ranges. Verified when the
+  // deletion vector is first loaded and by the committing writer.
+  bytes deletion_offsets_fingerprint = 5;
+  // Number of offsets not owned by the current placement root. These offsets
+  // must be a subset of the deletion vector; deleted offsets may remain mapped.
+  uint64 unowned_row_count = 6;
+}
+
+// Manifest-resident, single-hop routing for stable logical row addresses.
+message RowAddressLayout {
+  uint32 encoding_version = 1;
+  UUID namespace_uuid = 2;
+  repeated RowAddressPlacement placements = 3;
+  repeated RowAddressDestinationIndexEntry destination_index = 4;
+  repeated FieldGeneration field_default_generations = 5;
+  repeated ContentGenerationRegion generation_regions = 6;
+  repeated FieldGeneration index_commit_floors = 7;
+  RowAddressPlacementDebtSummary debt_summary = 8;
+  // Fingerprint of the canonical message with this field cleared.
+  bytes fingerprint = 9;
+  // Required for every non-native destination physical fragment.
+  repeated PhysicalRowOwnershipSummary physical_row_ownership = 10;
+  // Canonical encoded selections referenced by placement and generation
+  // metadata. Entries are sorted by encoded bytes and serialized once.
+  repeated LogicalRowAddressSelection selection_pool = 11;
+  repeated RetiredLogicalRowSet retired_rows = 12;
+}
+
+enum RowReferenceDomain {
+  ROW_REFERENCE_DOMAIN_UNSPECIFIED = 0;
+  ROW_REFERENCE_DOMAIN_PHYSICAL_ROW_ADDRESS = 1;
+  ROW_REFERENCE_DOMAIN_LEGACY_STABLE_ROW_ID = 2;
+  ROW_REFERENCE_DOMAIN_STABLE_LOGICAL_ROW_ADDRESS = 3;
+}
+
+message LogicalIndexCoverageShard {
+  // Present for small inline coverage. Absent only when LogicalIndexCoverage.external
+  // points at the authoritative selection payload in an existing index file.
+  LogicalRowAddressSelection selection = 1;
+  repeated int32 field_ids = 2 [packed = true];
+  repeated FieldGeneration validated_through = 3;
+  bytes fingerprint = 4;
+  uint64 row_count = 5;
+  // Portable RoaringBitmap of logical fragment ids touched by the exact
+  // selection. This conservative routing summary always remains inline.
+  bytes logical_fragment_bitmap = 6;
+}
+
+message LogicalIndexCoverageFile {
+  // Must name one of IndexMetadata.files.
+  string path = 1;
+  uint64 offset = 2;
+  uint64 byte_length = 3;
+  // Global-buffer ordinal recorded in the anchor Lance file footer.
+  optional uint32 global_buffer_index = 4;
+  // Exact anchor object size recorded in IndexMetadata.files.
+  optional uint64 object_size = 5;
+  // Writer-generated immutable identity stored in the anchor file footer.
+  UUID object_id = 6;
+  // Namespace that authored the immutable anchor artifact. This remains fixed
+  // when clone commits rebind the manifest summary to a new namespace.
+  UUID artifact_namespace_uuid = 7;
+  // Row-address layout fingerprint captured by the anchor artifact writer.
+  bytes artifact_layout_fingerprint = 8;
+}
+
+// Commit-derived proof that a clone reused an immutable index artifact while
+// rebinding its manifest summary to the target row-address namespace.
+message LogicalIndexCoverageCloneProvenance {
+  UUID source_namespace_uuid = 1;
+  UUID target_namespace_uuid = 2;
+  bytes source_coverage_fingerprint = 3;
+  UUID transaction_uuid = 4;
+  uint32 depth = 5;
+  bool is_shallow = 6;
+  uint64 source_manifest_version = 7;
+}
+
+// Exact logical coverage for an index segment. Shard summaries are always
+// inline. `external` binds the core-authored artifact in an already-declared
+// index file; large selections may omit inline detail and resolve it there.
+message LogicalIndexCoverage {
+  repeated LogicalIndexCoverageShard shards = 1;
+  optional LogicalIndexCoverageFile external = 2;
+  bytes fingerprint = 3;
+  optional LogicalIndexCoverageCloneProvenance clone_provenance = 4;
+}
+
+// Core-generated build provenance stored in an existing index Lance file.
+// Committers reconstruct authoritative coverage from this payload instead of
+// trusting coverage supplied by a caller of the staged-index API.
+message LogicalIndexCoverageArtifact {
+  uint32 encoding_version = 1;
+  UUID namespace_uuid = 2;
+  UUID index_uuid = 3;
+  uint64 build_dataset_version = 4;
+  bytes source_layout_fingerprint = 5;
+  repeated RowAddressLogicalDomain logical_domains = 6;
+  repeated FieldGeneration field_default_generations = 7;
+  repeated FieldGeneration index_commit_floors = 8;
+  LogicalIndexCoverage coverage = 9;
+  bytes fingerprint = 10;
+  UUID object_id = 11;
+  repeated int32 field_ids = 12 [packed = true];
+}
+
 // Manifest is a global section shared between all the files.
 message Manifest {
   // All fields of the dataset, including the nested fields.
@@ -210,6 +633,14 @@ message Manifest {
 
   // The branch of the dataset. None means main branch.
   optional string branch = 20;
+
+  // Required for storage version 2.3, including empty datasets. Absent for
+  // storage versions 2.2 and earlier.
+  optional RowAddressLayout row_address_layout = 22;
+
+  // Highest logical fragment id ever allocated in this dataset history.
+  // Absent only when no logical fragment id has ever been allocated.
+  optional uint32 max_logical_fragment_id = 23;
 } // Manifest
 
 // external dataset base path
@@ -291,6 +722,14 @@ message IndexMetadata {
   // of index sizes without extra IO.
   // If this is empty, the index files sizes are unknown.
   repeated IndexFile files = 10;
+
+  // Required and set to STABLE_LOGICAL_ROW_ADDRESS for storage version 2.3.
+  // Absent for index metadata written for storage versions 2.2 and earlier.
+  optional RowReferenceDomain row_reference_domain = 11;
+
+  // Exact stable-logical-address coverage for storage version 2.3 indices.
+  // Absent for index metadata written for storage versions 2.2 and earlier.
+  optional LogicalIndexCoverage logical_coverage = 12;
 }
 
 // Metadata about a single file within an index segment.
@@ -324,6 +763,11 @@ message DataFragment {
   // overlays cover the same (offset, field) and share a `committed_version`, the
   // later entry wins. See DataOverlayFile for the full resolution rules.
   repeated DataOverlayFile overlays = 11;
+
+  // Present only when this physical fragment is the native owner of a logical
+  // fragment created by a storage-version-2.3 append. Target-only fragments
+  // produced by relocation leave this absent.
+  optional NativeLogicalDomain native_logical_domain = 12;
 
   // File that indicates which rows, if any, should be considered deleted.
   DeletionFile deletion_file = 3;

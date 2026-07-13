@@ -12,14 +12,19 @@ use lance_arrow::RecordBatchExt;
 use lance_core::datatypes::Schema;
 use lance_datagen::{BatchCount, BatchGeneratorBuilder, ByteCount, RowCount};
 use lance_file::version::LanceFileVersion;
-use lance_table::format::Fragment;
+use lance_table::format::{
+    Fragment, RowAddressLayoutDelta, RowAddressPlacementDelta, RowAddressPlacementKind,
+    RowAddressTargetFragment, RowAddressTargetRange,
+};
 use rand::prelude::SliceRandom;
 use rand::{Rng, SeedableRng};
 
 use crate::Dataset;
 use crate::dataset::WriteParams;
 use crate::dataset::fragment::write::FragmentCreateBuilder;
-use crate::dataset::transaction::Operation;
+use crate::dataset::transaction::{Operation, TransactionBuilder};
+use crate::dataset::write::CommitBuilder;
+use uuid::Uuid;
 
 mod failing_store;
 mod throttle_store;
@@ -110,24 +115,47 @@ impl TestDatasetGenerator {
             }
         }
 
+        let row_address_layout_delta = if self.data_storage_version.resolve()
+            == LanceFileVersion::V2_3
+        {
+            let mut delta = RowAddressLayoutDelta::for_create(Uuid::new_v4());
+            delta.placements = fragments
+                .iter()
+                .enumerate()
+                .map(|(ordinal, fragment)| {
+                    let row_count = u32::try_from(
+                        fragment
+                            .physical_rows
+                            .expect("test fragments always record physical rows"),
+                    )
+                    .expect("test fragments fit in a logical fragment");
+                    RowAddressPlacementDelta {
+                        source_selections: Vec::new(),
+                        target: RowAddressTargetRange {
+                            fragment: RowAddressTargetFragment::NewFragmentOrdinal(ordinal as u32),
+                            start_offset: 0,
+                            end_offset: row_count,
+                        },
+                        placement_kind: RowAddressPlacementKind::Direct,
+                        output_cardinality: row_count as u64,
+                        output_row_sequence_fingerprint: Vec::new(),
+                    }
+                })
+                .collect();
+            Some(delta)
+        } else {
+            None
+        };
         let operation = Operation::Overwrite {
             fragments,
             schema,
             config_upsert_values: None,
             initial_bases: None,
         };
-
-        Dataset::commit(
-            uri,
-            operation,
-            None,
-            Default::default(),
-            None,
-            Default::default(),
-            false,
-        )
-        .await
-        .unwrap()
+        let transaction = TransactionBuilder::new(0, operation)
+            .row_address_layout_delta(row_address_layout_delta)
+            .build();
+        CommitBuilder::new(uri).execute(transaction).await.unwrap()
     }
 
     fn make_schema(&self, rng: &mut impl Rng) -> Schema {
@@ -248,6 +276,7 @@ impl TestDatasetGenerator {
             physical_rows: Some(batch.num_rows()),
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            native_logical_domain: None,
         }
     }
 }

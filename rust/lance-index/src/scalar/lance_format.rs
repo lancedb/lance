@@ -10,25 +10,85 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::TryStreamExt;
 use lance_core::deepsize::DeepSizeOf;
-use lance_core::{Error, Result, cache::LanceCache};
+use lance_core::{
+    Error, Result,
+    cache::{CacheKey, LanceCache},
+};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_encoding::version::LanceFileVersion;
 use lance_file::previous::{
     reader::FileReader as PreviousFileReader,
     writer::{FileWriter as PreviousFileWriter, ManifestProvider as PreviousManifestProvider},
 };
-use lance_file::reader::{self as current_reader, FileReaderOptions, ReaderProjection};
+use lance_file::reader::{
+    self as current_reader, CachedFileMetadata, FileReaderOptions, ReaderProjection,
+};
 use lance_file::writer as current_writer;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
 use lance_io::{ReadBatchParams, object_store::ObjectStore};
-use lance_table::format::SelfDescribingFileReader;
-use lance_table::format::list_index_files_with_sizes;
+use lance_table::format::{
+    LogicalIndexCoverageFile, SelfDescribingFileReader, list_index_files_with_sizes,
+};
 use object_store::path::Path;
+use std::borrow::Cow;
 use std::cmp::min;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::{any::Any, sync::Arc};
+use uuid::Uuid;
+
+pub const LOGICAL_INDEX_COVERAGE_BUFFER_INDEX_KEY: &str =
+    "lance:logical-index-coverage:buffer-index";
+pub const LOGICAL_INDEX_COVERAGE_OFFSET_KEY: &str = "lance:logical-index-coverage:offset";
+pub const LOGICAL_INDEX_COVERAGE_LENGTH_KEY: &str = "lance:logical-index-coverage:length";
+pub const LOGICAL_INDEX_COVERAGE_OBJECT_ID_KEY: &str = "lance:logical-index-coverage:object-id";
+
+#[derive(Debug)]
+struct LogicalIndexCoverageWrite {
+    anchor_path: String,
+    payload: Bytes,
+    object_id: Uuid,
+}
+
+struct OpenedCoverageAnchor(Arc<dyn IndexReader>);
+
+impl DeepSizeOf for OpenedCoverageAnchor {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+        4096 + self.0.schema().deep_size_of_children(context)
+            + self.0.retained_global_buffer_bytes()
+    }
+}
+
+struct OpenedCoverageAnchorKey {
+    path: String,
+}
+
+impl CacheKey for OpenedCoverageAnchorKey {
+    type ValueType = OpenedCoverageAnchor;
+
+    fn key(&self) -> Cow<'_, str> {
+        Cow::Borrowed(&self.path)
+    }
+
+    fn type_name() -> &'static str {
+        "LogicalIndexCoverageAnchorReader"
+    }
+}
+
+struct CoverageAnchorMetadataKey;
+
+impl CacheKey for CoverageAnchorMetadataKey {
+    type ValueType = CachedFileMetadata;
+
+    fn key(&self) -> Cow<'_, str> {
+        Cow::Borrowed("")
+    }
+
+    fn type_name() -> &'static str {
+        "CachedFileMetadata"
+    }
+}
 
 /// An index store that serializes scalar indices using the lance format
 ///
@@ -47,6 +107,8 @@ pub struct LanceIndexStore {
     format_version: LanceFileVersion,
     /// Base I/O priority for all requests this store submits to `scheduler`.
     io_priority: u64,
+    logical_coverage_write: Option<Arc<LogicalIndexCoverageWrite>>,
+    logical_coverage_read: Option<LogicalIndexCoverageFile>,
 }
 
 impl DeepSizeOf for LanceIndexStore {
@@ -94,7 +156,37 @@ impl LanceIndexStore {
             file_sizes: HashMap::new(),
             format_version,
             io_priority: 0,
+            logical_coverage_write: None,
+            logical_coverage_read: None,
         }
+    }
+
+    /// Attach core-generated v2.3 coverage provenance to an existing index
+    /// Lance file. The payload is written as the final user global buffer so a
+    /// reader can co-fetch it with the normal file tail.
+    pub fn with_logical_index_coverage_artifact(
+        mut self,
+        anchor_path: impl Into<String>,
+        payload: Bytes,
+        object_id: Uuid,
+    ) -> Self {
+        self.logical_coverage_write = Some(Arc::new(LogicalIndexCoverageWrite {
+            anchor_path: anchor_path.into(),
+            payload,
+            object_id,
+        }));
+        self
+    }
+
+    /// Configure the immutable coverage anchor declared by the owning index
+    /// metadata. Opening this path co-fetches the artifact with the footer and
+    /// single-flights the reader through the session metadata cache.
+    pub fn with_logical_index_coverage_reference(
+        mut self,
+        reference: LogicalIndexCoverageFile,
+    ) -> Self {
+        self.logical_coverage_read = Some(reference);
+        self
     }
 
     /// Set cached file sizes to avoid HEAD calls when opening files.
@@ -127,6 +219,58 @@ impl LanceIndexStore {
             relative_path.as_ref()
         ))
         .map_err(|err| Error::invalid_input(format!("invalid index file path {name:?}: {err}")))
+    }
+
+    async fn open_index_file_uncached(&self, name: &str) -> Result<Arc<dyn IndexReader>> {
+        let path = self.index_file_path(name)?;
+        let cached_size = self
+            .file_sizes
+            .get(name)
+            .map(|&size| CachedFileSize::new(size))
+            .unwrap_or_else(CachedFileSize::unknown);
+        let file_scheduler = self
+            .scheduler
+            .open_file_with_priority(&path, self.io_priority, &cached_size)
+            .await?;
+        let mut options = FileReaderOptions::default();
+        if let Some(reference) = self
+            .logical_coverage_read
+            .as_ref()
+            .filter(|reference| reference.path == name)
+        {
+            options.metadata_prefetch_start = Some(reference.offset);
+        }
+        match current_reader::FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &self.metadata_cache,
+            options,
+        )
+        .await
+        {
+            Ok(reader) => {
+                self.metadata_cache
+                    .with_key_prefix(name)
+                    .insert_with_key(&CoverageAnchorMetadataKey, reader.metadata().clone())
+                    .await;
+                Ok(Arc::new(reader))
+            }
+            Err(e) => {
+                if let Error::VersionConflict { .. } = e {
+                    let path = self.index_file_path(name)?;
+                    let file_reader = PreviousFileReader::try_new_self_described(
+                        &self.object_store,
+                        &path,
+                        Some(&self.metadata_cache),
+                    )
+                    .await?;
+                    Ok(Arc::new(file_reader))
+                } else {
+                    Err(e)
+                }
+            }
+        }
     }
 }
 
@@ -161,6 +305,34 @@ impl<M: PreviousManifestProvider + Send + Sync> IndexWriter for PreviousFileWrit
 struct LanceIndexWriter {
     path: String,
     inner: current_writer::FileWriter,
+    logical_coverage_write: Option<Arc<LogicalIndexCoverageWrite>>,
+}
+
+impl LanceIndexWriter {
+    async fn write_logical_coverage_artifact(&mut self) -> Result<()> {
+        let Some(artifact) = self.logical_coverage_write.take() else {
+            return Ok(());
+        };
+        let offset = self.inner.tell().await?;
+        let byte_length = artifact.payload.len() as u64;
+        let global_buffer_index = self
+            .inner
+            .add_global_buffer(artifact.payload.clone())
+            .await?;
+        self.inner.add_schema_metadata(
+            LOGICAL_INDEX_COVERAGE_BUFFER_INDEX_KEY,
+            global_buffer_index.to_string(),
+        );
+        self.inner
+            .add_schema_metadata(LOGICAL_INDEX_COVERAGE_OFFSET_KEY, offset.to_string());
+        self.inner
+            .add_schema_metadata(LOGICAL_INDEX_COVERAGE_LENGTH_KEY, byte_length.to_string());
+        self.inner.add_schema_metadata(
+            LOGICAL_INDEX_COVERAGE_OBJECT_ID_KEY,
+            artifact.object_id.to_string(),
+        );
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -176,6 +348,7 @@ impl IndexWriter for LanceIndexWriter {
     }
 
     async fn finish(&mut self) -> Result<IndexFile> {
+        self.write_logical_coverage_artifact().await?;
         let summary = self.inner.finish().await?;
         Ok(IndexFile {
             path: self.path.clone(),
@@ -190,6 +363,7 @@ impl IndexWriter for LanceIndexWriter {
         metadata.into_iter().for_each(|(k, v)| {
             self.inner.add_schema_metadata(k, v);
         });
+        self.write_logical_coverage_artifact().await?;
         let summary = self.inner.finish().await?;
         Ok(IndexFile {
             path: self.path.clone(),
@@ -241,6 +415,26 @@ impl IndexReader for current_reader::FileReader {
 
     async fn read_global_buffer(&self, n: u32) -> Result<Bytes> {
         Self::read_global_buffer(self, n).await
+    }
+
+    fn global_buffer_range(&self, index: u32) -> Option<std::ops::Range<u64>> {
+        self.metadata()
+            .file_buffers
+            .get(index as usize)
+            .and_then(|buffer| {
+                buffer
+                    .position
+                    .checked_add(buffer.size)
+                    .map(|end| buffer.position..end)
+            })
+    }
+
+    fn retained_global_buffer_bytes(&self) -> usize {
+        self.metadata()
+            .retained_global_buffers
+            .values()
+            .map(bytes::Bytes::len)
+            .sum()
     }
 
     async fn read_range(
@@ -440,6 +634,11 @@ impl IndexStore for LanceIndexStore {
         Ok(Box::new(LanceIndexWriter {
             path: name.to_string(),
             inner: writer,
+            logical_coverage_write: self
+                .logical_coverage_write
+                .as_ref()
+                .filter(|artifact| artifact.anchor_path == name)
+                .cloned(),
         }))
     }
 
@@ -453,43 +652,27 @@ impl IndexStore for LanceIndexStore {
     }
 
     async fn open_index_file(&self, name: &str) -> Result<Arc<dyn IndexReader>> {
-        let path = self.index_file_path(name)?;
-        // Use cached file size if available, otherwise unknown (requires HEAD call)
-        let cached_size = self
-            .file_sizes
-            .get(name)
-            .map(|&size| CachedFileSize::new(size))
-            .unwrap_or_else(CachedFileSize::unknown);
-        let file_scheduler = self
-            .scheduler
-            .open_file_with_priority(&path, self.io_priority, &cached_size)
-            .await?;
-        match current_reader::FileReader::try_open(
-            file_scheduler,
-            None,
-            Arc::<DecoderPlugins>::default(),
-            &self.metadata_cache,
-            FileReaderOptions::default(),
-        )
-        .await
+        if self
+            .logical_coverage_read
+            .as_ref()
+            .is_some_and(|reference| reference.path == name)
         {
-            Ok(reader) => Ok(Arc::new(reader)),
-            Err(e) => {
-                // If the error is a version conflict we can try to read the file with v1 reader
-                if let Error::VersionConflict { .. } = e {
-                    let path = self.index_file_path(name)?;
-                    let file_reader = PreviousFileReader::try_new_self_described(
-                        &self.object_store,
-                        &path,
-                        Some(&self.metadata_cache),
-                    )
-                    .await?;
-                    Ok(Arc::new(file_reader))
-                } else {
-                    Err(e)
-                }
-            }
+            let cached = self
+                .metadata_cache
+                .get_or_insert_with_key(
+                    OpenedCoverageAnchorKey {
+                        path: name.to_string(),
+                    },
+                    || async {
+                        Ok(OpenedCoverageAnchor(
+                            self.open_index_file_uncached(name).await?,
+                        ))
+                    },
+                )
+                .await?;
+            return Ok(cached.0.clone());
         }
+        self.open_index_file_uncached(name).await
     }
 
     async fn copy_index_file(&self, name: &str, dest_store: &dyn IndexStore) -> Result<IndexFile> {
@@ -710,6 +893,71 @@ mod tests {
         let actual = reader.read_global_buffer(buffer_idx).await.unwrap();
 
         assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn test_logical_coverage_artifact_uses_existing_anchor_footer() {
+        let tempdir = TempDir::default();
+        let object_id = Uuid::new_v4();
+        let expected = Bytes::from_static(b"authoritative-logical-coverage");
+        let base_store = test_store(&tempdir);
+        let concrete = base_store
+            .as_any()
+            .downcast_ref::<LanceIndexStore>()
+            .unwrap()
+            .clone()
+            .with_logical_index_coverage_artifact("anchor.lance", expected.clone(), object_id);
+
+        let mut writer = concrete
+            .new_index_file("anchor.lance", Arc::new(Schema::empty()))
+            .await
+            .unwrap();
+        let file = writer.finish().await.unwrap();
+
+        let reader = concrete.open_index_file("anchor.lance").await.unwrap();
+        let metadata = &reader.schema().metadata;
+        let buffer_index = metadata[LOGICAL_INDEX_COVERAGE_BUFFER_INDEX_KEY]
+            .parse::<u32>()
+            .unwrap();
+        assert_eq!(
+            metadata[LOGICAL_INDEX_COVERAGE_OBJECT_ID_KEY],
+            object_id.to_string()
+        );
+        assert_eq!(
+            metadata[LOGICAL_INDEX_COVERAGE_LENGTH_KEY]
+                .parse::<u64>()
+                .unwrap(),
+            expected.len() as u64
+        );
+        assert_eq!(
+            reader.read_global_buffer(buffer_index).await.unwrap(),
+            expected
+        );
+
+        let reference = LogicalIndexCoverageFile {
+            path: "anchor.lance".to_string(),
+            offset: metadata[LOGICAL_INDEX_COVERAGE_OFFSET_KEY].parse().unwrap(),
+            byte_length: expected.len() as u64,
+            global_buffer_index: buffer_index,
+            object_size: file.size_bytes,
+            object_id,
+            artifact_namespace_uuid: Uuid::new_v4(),
+            artifact_layout_fingerprint: vec![1; 16],
+        };
+        let read_store = concrete
+            .clone()
+            .with_file_sizes(HashMap::from([(
+                "anchor.lance".to_string(),
+                file.size_bytes,
+            )]))
+            .with_logical_index_coverage_reference(reference);
+        let first = read_store.open_index_file("anchor.lance").await.unwrap();
+        let second = read_store
+            .clone()
+            .open_index_file("anchor.lance")
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
     }
 
     #[tokio::test]

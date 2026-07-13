@@ -3477,6 +3477,7 @@ mod tests {
             },
             tag: None,
             transaction_properties: None,
+            row_address_layout_delta: None,
         };
         let dataset = Arc::new(
             CommitBuilder::new(dataset)
@@ -3656,6 +3657,7 @@ mod tests {
             },
             tag: None,
             transaction_properties: None,
+            row_address_layout_delta: None,
         };
         let dataset = Arc::new(
             CommitBuilder::new(dataset)

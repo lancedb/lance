@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "name": "stable_logical_row_address_release_matrix",
+  "profiles": {
+    "smoke": {
+      "paired_repeats": 3,
+      "rows": 65536,
+      "schemas": ["narrow16", "wide128", "vector"],
+      "logical_fragment_counts": [8, 64],
+      "take_counts": [1, 32, 1024],
+      "delete_percentages": [1, 50, 90],
+      "update_percentages": [1, 50, 90],
+      "merge_match_percentages": [0, 50, 100],
+      "backfill_column_counts": [1, 32],
+      "repeated_compaction_rounds": [10],
+      "repeated_update_rounds": 10,
+      "hot_set_rows": 655,
+      "minimum_sustained_boundaries": 3
+    },
+    "release": {
+      "paired_repeats": 10,
+      "rows": 100000000,
+      "schemas": ["narrow16", "wide128", "vector"],
+      "logical_fragment_counts": [100, 10000, 100000],
+      "take_counts": [1, 32, 1024, 10000],
+      "delete_percentages": [1, 50, 90],
+      "update_percentages": [1, 50, 90],
+      "merge_match_percentages": [0, 50, 100],
+      "backfill_column_counts": [1, 32],
+      "repeated_compaction_rounds": [10, 100],
+      "repeated_update_rounds": 100,
+      "hot_set_rows": 1000000,
+      "minimum_sustained_boundaries": 3
+    }
+  },
+  "tracks": {
+    "matrix": {
+      "cases": [
+        "append",
+        "delete_clustered",
+        "delete_random",
+        "update_clustered",
+        "update_random",
+        "merge_insert",
+        "backfill",
+        "n_to_one_compaction",
+        "repeated_compaction",
+        "pack_random_mutation_chain",
+        "indexed_n_to_one_compaction",
+        "indexed_repeated_compaction",
+        "scalar_index",
+        "vector_index"
+      ]
+    },
+    "sustained": {
+      "selection": "fixed_uniform_without_replacement",
+      "selection_step": 0,
+      "maintenance_boundary_source": "v22_no_stable_physical_policy",
+      "variants": ["bare", "scalar", "vector"]
+    },
+    "adversarial_natural": {
+      "selection": "independent_uniform_without_replacement",
+      "maintenance_boundary_source": "format_local_physical_policy",
+      "variants": ["bare", "scalar", "vector"]
+    },
+    "adversarial_aligned": {
+      "selection": "independent_uniform_without_replacement",
+      "maintenance_boundary_source": "v23_placement_maintenance_required",
+      "variants": ["bare", "scalar", "vector"]
+    }
+  },
+  "measurement": {
+    "process_isolation": "one_worker_process_per_operation",
+    "cold_probe_order": ["open", "scan", "take", "index_take"],
+    "state_equivalence": "commutative_id_value_digest",
+    "logical_io": "path_aware_object_store_tracker",
+    "actual_attempts": "native_http_retry_boundary",
+    "rss": "getrusage_peak_rss",
+    "result_format": "one_strict_json_object_per_line"
+  }
+}

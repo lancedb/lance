@@ -26,15 +26,21 @@ use crate::{
     Dataset,
     dataset::{index::LanceIndexStoreExt, scanner::ColumnOrdering},
 };
+use arrow::compute::SortOptions;
 use arrow_schema::DataType;
+use datafusion::physical_expr::PhysicalSortExpr;
 use datafusion::physical_plan::SendableRecordBatchStream;
+use datafusion::physical_plan::expressions;
+use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion_physical_expr::LexOrdering;
 use futures::TryStreamExt;
 use itertools::Itertools;
+use lance_arrow::RecordBatchExt;
 use lance_core::datatypes::Field;
 use lance_core::utils::tracing::{IO_TYPE_OPEN_SCALAR, TRACE_IO_EVENTS};
-use lance_core::{Error, ROW_ADDR, ROW_ID, Result};
-use lance_datafusion::exec::LanceExecutionOptions;
+use lance_core::{Error, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, Result};
+use lance_datafusion::exec::{LanceExecutionOptions, execute_plan};
 use lance_index::metrics::{MetricsCollector, NoOpMetricsCollector};
 use lance_index::pbold::{
     BTreeIndexDetails, BitmapIndexDetails, InvertedIndexDetails, LabelListIndexDetails,
@@ -55,12 +61,93 @@ use lance_index::scalar::{
     inverted::INVERT_LIST_FILE, lance_format::LanceIndexStore,
 };
 use lance_index::{IndexCriteria, IndexType};
-use lance_table::format::{Fragment, IndexMetadata};
+use lance_table::format::{Fragment, IndexMetadata, pb as table_pb};
 use log::info;
+use prost::Message;
+use roaring::RoaringBitmap;
 use tracing::instrument;
 
 // Log an update every TRAINING_UPDATE_FREQ million rows processed
 const TRAINING_UPDATE_FREQ: usize = 1000000;
+
+fn logical_coverage_anchor_path(index_type: &str) -> Result<&'static str> {
+    match index_type.to_ascii_lowercase().as_str() {
+        "btree" => Ok("page_lookup.lance"),
+        "bitmap" | "labellist" => Ok("bitmap_page_lookup.lance"),
+        "ngram" => Ok("ngram_postings.lance"),
+        "zonemap" => Ok("zonemap.lance"),
+        "inverted" => Ok(METADATA_FILE),
+        "bloomfilter" => Ok("bloomfilter.lance"),
+        "rtree" => Ok("page_data.lance"),
+        "fm" => Ok("part_0_fm.lance"),
+        other => Err(Error::not_supported(format!(
+            "storage-version-2.3 scalar index type '{other}' must declare an existing Lance coverage anchor"
+        ))),
+    }
+}
+
+async fn configure_logical_coverage_artifact(
+    dataset: &Dataset,
+    column_field_id: i32,
+    index_uuid: Uuid,
+    fragment_ids: Option<&[u32]>,
+    train: bool,
+    index_type: &str,
+    store: LanceIndexStore,
+) -> Result<LanceIndexStore> {
+    if !dataset.manifest.uses_stable_logical_row_addresses() {
+        return Ok(store);
+    }
+    let physical_coverage = if train {
+        fragment_ids
+            .map(|fragment_ids| fragment_ids.iter().copied().collect())
+            .unwrap_or_else(|| dataset.fragment_bitmap.as_ref().clone())
+    } else {
+        RoaringBitmap::new()
+    };
+    let artifact = crate::index::build_logical_index_coverage_artifact(
+        dataset,
+        index_uuid,
+        &[column_field_id],
+        &physical_coverage,
+    )
+    .await?;
+    configure_logical_coverage_artifact_payload(index_type, store, artifact)
+}
+
+fn configure_logical_coverage_artifact_payload(
+    index_type: &str,
+    store: LanceIndexStore,
+    artifact: lance_table::format::LogicalIndexCoverageArtifact,
+) -> Result<LanceIndexStore> {
+    let object_id = artifact.object_id;
+    let payload = table_pb::LogicalIndexCoverageArtifact::from(&artifact).encode_to_vec();
+    Ok(store.with_logical_index_coverage_artifact(
+        logical_coverage_anchor_path(index_type)?,
+        payload.into(),
+        object_id,
+    ))
+}
+
+pub(crate) fn configure_logical_coverage_artifact_from_exact(
+    dataset: &Dataset,
+    index_uuid: Uuid,
+    field_ids: &[i32],
+    coverage: Option<&lance_table::format::LogicalIndexCoverage>,
+    index_type: &str,
+    store: LanceIndexStore,
+) -> Result<LanceIndexStore> {
+    let Some(coverage) = coverage else {
+        return Ok(store);
+    };
+    let artifact = crate::index::build_logical_index_coverage_artifact_from_exact(
+        dataset,
+        index_uuid,
+        field_ids,
+        coverage.clone(),
+    )?;
+    configure_logical_coverage_artifact_payload(index_type, store, artifact)
+}
 
 pub(crate) struct TrainingRequest {
     pub fragment_ids: Option<Vec<u32>>,
@@ -134,18 +221,21 @@ pub(crate) async fn scan_training_data(
     // Fragment filtering is now handled in load_training_data function
     // This function just processes the fragments passed to it
 
-    // Note: we don't need to sort for TrainingOrdering::Addresses because
-    // Lance will return data in the order of the row_address by default.
+    // Physical scans are naturally ordered by physical address. Logical row
+    // addresses are independent of placement, so V2.3 address-oriented
+    // trainers need an explicit maintenance-path sort.
     if TrainingOrdering::Values == criteria.ordering {
         scan.order_by(Some(vec![ColumnOrdering::asc_nulls_first(
             column.to_string(),
         )]))?;
     }
 
-    if criteria.needs_row_ids {
+    let use_logical_row_addrs =
+        dataset.manifest.uses_stable_logical_row_addresses() && criteria.needs_row_addrs;
+    if criteria.needs_row_ids || use_logical_row_addrs {
         scan.with_row_id();
     }
-    if criteria.needs_row_addrs {
+    if criteria.needs_row_addrs && !use_logical_row_addrs {
         scan.with_row_address();
     }
 
@@ -155,14 +245,48 @@ pub(crate) async fn scan_training_data(
         scan.with_fragments(fragments);
     }
 
-    let batches = scan
-        .try_into_dfstream(LanceExecutionOptions {
+    let mut plan = scan.create_plan().await?;
+    if use_logical_row_addrs && TrainingOrdering::Addresses == criteria.ordering {
+        let row_id_sort = PhysicalSortExpr {
+            expr: expressions::col(ROW_ID, plan.schema().as_ref())?,
+            options: SortOptions {
+                descending: false,
+                nulls_first: false,
+            },
+        };
+        plan = Arc::new(SortExec::new(
+            LexOrdering::new([row_id_sort])
+                .ok_or_else(|| Error::internal("logical row ordering cannot be empty"))?,
+            plan,
+        ));
+    }
+    let batches = execute_plan(
+        plan,
+        LanceExecutionOptions {
             use_spilling: true,
-            ..Default::default()
-        })
-        .await?;
+            ..scan.execution_options()
+        },
+    )?;
 
-    let schema = batches.schema();
+    let input_schema = batches.schema();
+    let row_id_position = use_logical_row_addrs
+        .then(|| input_schema.index_of(ROW_ID))
+        .transpose()?;
+    let schema = if let Some(row_id_position) = row_id_position {
+        let mut fields = input_schema.fields().to_vec();
+        if criteria.needs_row_ids {
+            fields.push(Arc::new(ROW_ADDR_FIELD.clone()));
+        } else {
+            fields[row_id_position] = Arc::new(ROW_ADDR_FIELD.clone());
+        }
+        Arc::new(arrow_schema::Schema::new_with_metadata(
+            fields,
+            input_schema.metadata().clone(),
+        ))
+    } else {
+        input_schema
+    };
+    let keep_logical_row_ids = criteria.needs_row_ids;
     let mut rows_processed = 0;
     let mut next_update = TRAINING_UPDATE_FREQ;
     let training_uuid = uuid::Uuid::new_v4().to_string();
@@ -171,7 +295,7 @@ pub(crate) async fn scan_training_data(
         training_uuid, column
     );
     info!("Training index (job_id={}): 0/{}", training_uuid, num_rows);
-    let batches = batches.map_ok(move |batch| {
+    let batches = batches.and_then(move |batch| {
         rows_processed += batch.num_rows();
         if rows_processed >= next_update {
             next_update += TRAINING_UPDATE_FREQ;
@@ -180,7 +304,20 @@ pub(crate) async fn scan_training_data(
                 training_uuid, rows_processed, num_rows
             );
         }
-        batch
+        futures::future::ready(if let Some(row_id_position) = row_id_position {
+            let logical_row_ids = batch.column(row_id_position).clone();
+            if keep_logical_row_ids {
+                batch
+                    .try_with_column(ROW_ADDR_FIELD.clone(), logical_row_ids)
+                    .map_err(Into::into)
+            } else {
+                batch
+                    .rename_column(row_id_position, ROW_ADDR)
+                    .map_err(Into::into)
+            }
+        } else {
+            Ok(batch)
+        })
     });
 
     Ok(Box::pin(RecordBatchStreamAdapter::new(schema, batches)))
@@ -292,9 +429,24 @@ pub(super) async fn build_scalar_index(
         .ok_or(Error::invalid_input_source(
             format!("No column with name {}", column).into(),
         ))?;
+    let field_id = field.id;
     let field: arrow_schema::Field = field.into();
 
-    let index_store = LanceIndexStore::from_dataset_for_new(dataset, &uuid)?;
+    if dataset.manifest.uses_stable_logical_row_addresses() && preprocessed_data.is_some() {
+        return Err(Error::not_supported(
+            "storage-version-2.3 preprocessed scalar builds require core-authored row provenance",
+        ));
+    }
+    let index_store = configure_logical_coverage_artifact(
+        dataset,
+        field_id,
+        uuid,
+        fragment_ids.as_deref(),
+        train,
+        &params.index_type,
+        LanceIndexStore::from_dataset_for_new(dataset, &uuid)?,
+    )
+    .await?;
 
     let plugin = SCALAR_INDEX_PLUGIN_REGISTRY.get_plugin_by_name(&params.index_type)?;
     let trainer = plugin.basic_trainer().ok_or_else(|| {
@@ -355,6 +507,7 @@ pub(super) async fn build_bitmap_index_segment(
         .ok_or(Error::invalid_input_source(
             format!("No column with name {}", column).into(),
         ))?;
+    let field_id = field.id;
     let field: arrow_schema::Field = field.into();
 
     let params = ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap);
@@ -368,12 +521,22 @@ pub(super) async fn build_bitmap_index_segment(
         trainer.new_training_request(params.params.as_deref().unwrap_or("{}"), &field)?;
     let criteria = training_request.criteria();
 
+    let index_store = configure_logical_coverage_artifact(
+        dataset,
+        field_id,
+        uuid,
+        Some(&fragment_ids),
+        true,
+        BuiltinIndexType::Bitmap.as_str(),
+        LanceIndexStore::from_dataset_for_new(dataset, &uuid)?,
+    )
+    .await?;
+
     progress.stage_start("load_data", None, "rows").await?;
     let training_data =
         load_training_data(dataset, column, criteria, None, true, Some(fragment_ids)).await?;
     progress.stage_complete("load_data").await?;
 
-    let index_store = LanceIndexStore::from_dataset_for_new(dataset, &uuid)?;
     trainer
         .train_index(
             training_data,
@@ -447,6 +610,13 @@ pub async fn open_scalar_index(
     index: &IndexMetadata,
     metrics: &dyn MetricsCollector,
 ) -> Result<Arc<dyn ScalarIndex>> {
+    if dataset.manifest.uses_stable_logical_row_addresses() {
+        let mut siblings = dataset.load_indices_by_name(&index.name).await?;
+        if siblings.iter().all(|sibling| sibling.uuid != index.uuid) {
+            siblings.push(index.clone());
+        }
+        crate::index::resolve_logical_index_metadata(dataset, &siblings).await?;
+    }
     let index_uuid = index.uuid;
     let index_store = Arc::new(LanceIndexStore::from_dataset_for_existing(dataset, index).await?);
 
@@ -733,6 +903,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            row_reference_domain: None,
+            logical_coverage: None,
         }
     }
 
@@ -1139,6 +1311,260 @@ mod tests {
             }
         }
         assert_eq!(max_frag_id_seen, 3);
+    }
+
+    #[tokio::test]
+    async fn test_v23_row_address_training_uses_logical_addresses() {
+        use crate::dataset::WriteParams;
+        use lance_file::version::LanceFileVersion;
+
+        let mut dataset = lance_datagen::gen_batch()
+            .col("values", array::step::<Int32Type>())
+            .into_ram_dataset_with_params(
+                FragmentCount::from(1),
+                FragmentRowCount::from(10),
+                Some(WriteParams {
+                    data_storage_version: Some(LanceFileVersion::V2_3),
+                    max_rows_per_file: 10,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+
+        // Deliberately separate the logical and physical fragment IDs. Scalar
+        // plugins that request `_rowaddr` must receive the former in v2.3.
+        let mut manifest = dataset.manifest.as_ref().clone();
+        Arc::make_mut(&mut manifest.fragments)[0]
+            .native_logical_domain
+            .as_mut()
+            .unwrap()
+            .logical_fragment_id = 42;
+        manifest.max_logical_fragment_id = Some(42);
+        manifest.refresh_row_address_fingerprint().unwrap();
+        manifest.validate_row_address_contract().unwrap();
+        dataset.manifest = Arc::new(manifest);
+
+        let stream = load_training_data(
+            &dataset,
+            "values",
+            &TrainingCriteria::new(TrainingOrdering::Addresses).with_row_addr(),
+            None,
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+        let row_addresses = stream
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .into_iter()
+            .flat_map(|batch| {
+                batch
+                    .column_by_name(ROW_ADDR)
+                    .unwrap()
+                    .as_primitive::<UInt64Type>()
+                    .values()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            row_addresses,
+            (0..10)
+                .map(|slot| (42_u64 << 32) | slot)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_v23_address_training_sorts_reclustered_logical_addresses() {
+        use crate::dataset::WriteParams;
+        use crate::dataset::optimize::{RowAddressMaintenanceOptions, maintain_row_addresses};
+        use lance_file::version::LanceFileVersion;
+        use lance_table::format::RowAddressPlacement;
+
+        let temp = TempStrDir::default();
+        let mut dataset = lance_datagen::gen_batch()
+            .col("values", array::step::<Int32Type>())
+            .into_dataset_with_params(
+                temp.as_str(),
+                FragmentCount::from(4),
+                FragmentRowCount::from(8),
+                Some(WriteParams {
+                    data_storage_version: Some(LanceFileVersion::V2_3),
+                    max_rows_per_file: 8,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        maintain_row_addresses(
+            &mut dataset,
+            RowAddressMaintenanceOptions {
+                target_rows_per_fragment: 8,
+                max_rows_per_group: 8,
+                ..RowAddressMaintenanceOptions::recluster(vec![ColumnOrdering::desc_nulls_last(
+                    "values".to_owned(),
+                )])
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            dataset
+                .manifest
+                .row_address_layout
+                .as_ref()
+                .unwrap()
+                .placements
+                .iter()
+                .any(|placement| matches!(placement, RowAddressPlacement::ExplicitMap(_)))
+        );
+
+        let stream = load_training_data(
+            &dataset,
+            "values",
+            &TrainingCriteria::new(TrainingOrdering::Addresses).with_row_addr(),
+            None,
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+        let row_addresses = stream
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .into_iter()
+            .flat_map(|batch| {
+                batch
+                    .column_by_name(ROW_ADDR)
+                    .unwrap()
+                    .as_primitive::<UInt64Type>()
+                    .values()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(row_addresses.len(), 32);
+        assert!(
+            row_addresses
+                .windows(2)
+                .all(|addresses| addresses[0] < addresses[1])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_v23_reclustered_address_indices_have_no_false_negatives() {
+        use crate::dataset::WriteParams;
+        use crate::dataset::optimize::{RowAddressMaintenanceOptions, maintain_row_addresses};
+        use lance_file::version::LanceFileVersion;
+        use lance_index::scalar::zonemap::ZoneMapIndexBuilderParams;
+
+        #[derive(serde::Serialize)]
+        struct BloomParams {
+            number_of_items: u64,
+            probability: f64,
+        }
+
+        async fn matching_row_ids(dataset: &Dataset, value: i32, use_index: bool) -> Vec<u64> {
+            let mut scanner = dataset.scan();
+            scanner.use_scalar_index(use_index);
+            scanner.project(&[ROW_ID]).unwrap();
+            let filter = format!("values = {value}");
+            scanner.filter(&filter).unwrap();
+            let mut row_ids = scanner.try_into_batch().await.unwrap()[ROW_ID]
+                .as_primitive::<UInt64Type>()
+                .values()
+                .to_vec();
+            row_ids.sort_unstable();
+            row_ids
+        }
+
+        async fn exercise(
+            uri: &str,
+            index_name: &str,
+            index_type: IndexType,
+            params: ScalarIndexParams,
+        ) {
+            let mut dataset = lance_datagen::gen_batch()
+                .col("values", array::step::<Int32Type>())
+                .into_dataset_with_params(
+                    uri,
+                    FragmentCount::from(4),
+                    FragmentRowCount::from(8),
+                    Some(WriteParams {
+                        data_storage_version: Some(LanceFileVersion::V2_3),
+                        max_rows_per_file: 8,
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap();
+            maintain_row_addresses(
+                &mut dataset,
+                RowAddressMaintenanceOptions {
+                    target_rows_per_fragment: 8,
+                    max_rows_per_group: 8,
+                    ..RowAddressMaintenanceOptions::recluster(vec![
+                        ColumnOrdering::desc_nulls_last("values".to_owned()),
+                    ])
+                },
+            )
+            .await
+            .unwrap();
+
+            for replace in [false, true] {
+                dataset
+                    .create_index(
+                        &["values"],
+                        index_type,
+                        Some(index_name.to_owned()),
+                        &params,
+                        replace,
+                    )
+                    .await
+                    .unwrap();
+                let mut indexed_plan = dataset.scan();
+                indexed_plan.filter("values = 15").unwrap();
+                let plan = indexed_plan.explain_plan(false).await.unwrap();
+                assert!(
+                    plan.contains("ScalarIndexQuery") && plan.contains(index_name),
+                    "{index_name} must participate in the indexed plan after replace={replace}:\n{plan}"
+                );
+                for value in [0, 7, 15, 24, 31] {
+                    let indexed = matching_row_ids(&dataset, value, true).await;
+                    let flat = matching_row_ids(&dataset, value, false).await;
+                    assert_eq!(
+                        indexed, flat,
+                        "{index_name} lost value {value} after replace={replace}"
+                    );
+                    assert_eq!(indexed.len(), 1);
+                }
+            }
+        }
+
+        let temp = TempStrDir::default();
+        let zonemap_params = serde_json::to_value(ZoneMapIndexBuilderParams::new(4)).unwrap();
+        exercise(
+            &format!("{}/zonemap", temp.as_str()),
+            "values_zonemap",
+            IndexType::ZoneMap,
+            ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap).with_params(&zonemap_params),
+        )
+        .await;
+        exercise(
+            &format!("{}/bloom", temp.as_str()),
+            "values_bloom",
+            IndexType::BloomFilter,
+            ScalarIndexParams::for_builtin(BuiltinIndexType::BloomFilter).with_params(
+                &BloomParams {
+                    number_of_items: 4,
+                    probability: 0.01,
+                },
+            ),
+        )
+        .await;
     }
 
     #[tokio::test]

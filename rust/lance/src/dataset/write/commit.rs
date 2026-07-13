@@ -9,7 +9,11 @@ use lance_file::version::LanceFileVersion;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_select::RowAddrTreeMap;
 use lance_table::{
-    format::{DataStorageFormat, is_detached_version},
+    format::{
+        DataStorageFormat, Fragment, RowAddressLayoutDelta, RowAddressPlacementDelta,
+        RowAddressPlacementKind, RowAddressTargetFragment, RowAddressTargetRange,
+        is_detached_version,
+    },
     io::commit::{CommitConfig, CommitHandler, ManifestNamingScheme},
 };
 
@@ -28,8 +32,10 @@ use crate::{
 use super::{WriteDestination, resolve_commit_handler};
 use crate::dataset::branch_location::BranchLocation;
 use crate::dataset::transaction::validate_operation;
+use crate::io::commit::{read_transaction_file, same_transaction_request};
 use lance_core::utils::tracing::{DATASET_COMMITTED_EVENT, TRACE_DATASET_EVENTS};
 use tracing::info;
+use uuid::Uuid;
 
 /// Create a new commit from a [`Transaction`].
 ///
@@ -53,6 +59,186 @@ pub struct CommitBuilder<'a> {
 
 /// Default timeout applied to [`CommitBuilder::execute`] when none is set.
 pub const DEFAULT_COMMIT_TIMEOUT: Duration = Duration::from_secs(1800);
+
+fn source_free_direct_placements(fragments: &[Fragment]) -> Result<Vec<RowAddressPlacementDelta>> {
+    fragments
+        .iter()
+        .enumerate()
+        .map(|(ordinal, fragment)| {
+            let row_count = u32::try_from(fragment.physical_rows.ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "storage-version-2.3 source-free fragment {} is missing physical_rows",
+                    fragment.id
+                ))
+            })?)
+            .map_err(|_| {
+                Error::format_capacity_exceeded(format!(
+                    "storage-version-2.3 fragment {} has more than u32::MAX physical rows",
+                    fragment.id
+                ))
+            })?;
+            Ok(RowAddressPlacementDelta {
+                source_selections: Vec::new(),
+                target: RowAddressTargetRange {
+                    fragment: RowAddressTargetFragment::NewFragmentOrdinal(
+                        u32::try_from(ordinal).map_err(|_| {
+                            Error::format_capacity_exceeded(
+                                "storage-version-2.3 transaction has more than u32::MAX fragments",
+                            )
+                        })?,
+                    ),
+                    start_offset: 0,
+                    end_offset: row_count,
+                },
+                placement_kind: RowAddressPlacementKind::Direct,
+                output_cardinality: u64::from(row_count),
+                output_row_sequence_fingerprint: Vec::new(),
+            })
+        })
+        .collect()
+}
+
+async fn prepare_v2_3_transaction(
+    transaction: &mut Transaction,
+    dataset: Option<&Dataset>,
+    requested_storage_format: Option<LanceFileVersion>,
+) -> Result<()> {
+    if dataset.is_none() && !matches!(transaction.operation, Operation::Overwrite { .. }) {
+        return Ok(());
+    }
+    let target_version = transaction.target_file_version(
+        dataset.map(|dataset| dataset.manifest.as_ref()),
+        requested_storage_format,
+    )?;
+    if target_version != LanceFileVersion::V2_3 {
+        return Ok(());
+    }
+    let source_manifest = match dataset {
+        Some(dataset)
+            if transaction.read_version != 0
+                && transaction.read_version != dataset.version().version =>
+        {
+            Some(
+                dataset
+                    .checkout_version(transaction.read_version)
+                    .await?
+                    .manifest,
+            )
+        }
+        Some(dataset) => Some(dataset.manifest.clone()),
+        None => None,
+    };
+
+    match &transaction.operation {
+        Operation::Append { fragments } | Operation::Overwrite { fragments, .. } => {
+            if transaction.row_address_layout_delta.is_none() {
+                let mut delta = if let Some(source_manifest) = &source_manifest {
+                    let layout = source_manifest.row_address_layout.as_ref().ok_or_else(|| {
+                        Error::invalid_input(
+                            "storage-version-2.3 manifest is missing RowAddressLayout",
+                        )
+                    })?;
+                    RowAddressLayoutDelta {
+                        expected_layout_fingerprint: layout.fingerprint.clone(),
+                        ..RowAddressLayoutDelta::default()
+                    }
+                } else {
+                    let namespace_uuid = Uuid::parse_str(&transaction.uuid).map_err(|error| {
+                        Error::invalid_input(format!(
+                            "storage-version-2.3 create transaction UUID {} is invalid: {error}",
+                            transaction.uuid
+                        ))
+                    })?;
+                    if namespace_uuid.is_nil() {
+                        return Err(Error::invalid_input(
+                            "storage-version-2.3 create transaction UUID must not be nil",
+                        ));
+                    }
+                    RowAddressLayoutDelta::for_create(namespace_uuid)
+                };
+                delta.placements = source_free_direct_placements(fragments)?;
+                transaction.row_address_layout_delta = Some(delta);
+            }
+        }
+        Operation::Merge { fragments, .. } => {
+            let source_manifest = source_manifest.as_ref().ok_or_else(|| {
+                Error::invalid_input("storage-version-2.3 Merge requires an existing dataset")
+            })?;
+            let current_fragment_ids = source_manifest
+                .fragments
+                .iter()
+                .map(|fragment| fragment.id)
+                .collect::<std::collections::HashSet<_>>();
+            let new_fragments = fragments
+                .iter()
+                .filter(|fragment| !current_fragment_ids.contains(&fragment.id))
+                .cloned()
+                .collect::<Vec<_>>();
+            if !new_fragments.is_empty()
+                && transaction
+                    .row_address_layout_delta
+                    .as_ref()
+                    .is_none_or(|delta| delta.placements.is_empty())
+            {
+                let layout = source_manifest.row_address_layout.as_ref().ok_or_else(|| {
+                    Error::invalid_input("storage-version-2.3 manifest is missing RowAddressLayout")
+                })?;
+                let delta = transaction
+                    .row_address_layout_delta
+                    .get_or_insert_with(RowAddressLayoutDelta::default);
+                delta.expected_layout_fingerprint = layout.fingerprint.clone();
+                delta.placements = source_free_direct_placements(&new_fragments)?;
+            }
+        }
+        Operation::Delete { .. } | Operation::Update { .. } | Operation::Rewrite { .. }
+            if transaction.row_address_layout_delta.is_none() =>
+        {
+            return Err(Error::invalid_input(format!(
+                "storage-version-2.3 {} requires core-authored row-address provenance; preserve the opaque transaction metadata returned by Lance or use the native dataset maintenance API",
+                transaction.operation.name()
+            )));
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+async fn reconcile_v2_3_sentinel_overwrite_retry(
+    dataset: &Dataset,
+    requested: &Transaction,
+) -> Result<Option<Dataset>> {
+    if requested.read_version != 0
+        || !matches!(requested.operation, Operation::Overwrite { .. })
+        || !dataset.manifest.uses_stable_logical_row_addresses()
+    {
+        return Ok(None);
+    }
+    let transaction_file = format!("0-{}.txn", requested.uuid);
+    let transaction_path = dataset.transactions_dir().join(transaction_file.as_str());
+    if !dataset.object_store.exists(&transaction_path).await? {
+        return Ok(None);
+    }
+    let persisted = read_transaction_file(
+        dataset.object_store.as_ref(),
+        &dataset.base,
+        &transaction_file,
+    )
+    .await?;
+    if !same_transaction_request(requested, &persisted) {
+        return Err(Error::invalid_input(format!(
+            "transaction UUID {} already names a different source-free overwrite request",
+            requested.uuid
+        )));
+    }
+
+    for version in (1..=dataset.version().version).rev() {
+        let candidate = dataset.checkout_version(version).await?;
+        if candidate.manifest.transaction_file.as_deref() == Some(transaction_file.as_str()) {
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
+}
 
 impl<'a> CommitBuilder<'a> {
     pub fn new(dest: impl Into<WriteDestination<'a>>) -> Self {
@@ -235,7 +421,7 @@ impl<'a> CommitBuilder<'a> {
         }
     }
 
-    async fn execute_inner(self, transaction: Transaction) -> Result<Dataset> {
+    async fn execute_inner(self, mut transaction: Transaction) -> Result<Dataset> {
         let session = self
             .session
             .or_else(|| self.dest.dataset().map(|ds| ds.session.clone()))
@@ -303,6 +489,15 @@ impl<'a> CommitBuilder<'a> {
                 }
             }
         };
+
+        if let Some(dataset) = dest.dataset()
+            && let Some(committed) =
+                reconcile_v2_3_sentinel_overwrite_retry(dataset, &transaction).await?
+        {
+            return Ok(committed);
+        }
+
+        prepare_v2_3_transaction(&mut transaction, dest.dataset(), self.storage_format).await?;
 
         if dest.dataset().is_none()
             && !matches!(
@@ -433,6 +628,8 @@ impl<'a> CommitBuilder<'a> {
                 manifest_location,
                 session,
                 fragment_bitmap,
+                row_address_router: Arc::new(std::sync::OnceLock::new()),
+                explicit_row_address_cache: Arc::new(Default::default()),
                 ..dataset.as_ref().clone()
             }),
             WriteDestination::Uri(uri) => {
@@ -457,6 +654,8 @@ impl<'a> CommitBuilder<'a> {
                     refs,
                     index_cache,
                     fragment_bitmap,
+                    row_address_router: Arc::new(std::sync::OnceLock::new()),
+                    explicit_row_address_cache: Arc::new(Default::default()),
                     metadata_cache,
                     file_reader_options: None,
                     store_params: self.store_params.clone().map(Box::new),
@@ -488,9 +687,23 @@ impl<'a> CommitBuilder<'a> {
         }
 
         let read_version = transactions.iter().map(|t| t.read_version).min().unwrap();
+        let row_address_layout_delta = merge_batch_append_row_address_deltas(&transactions)?;
 
+        let mut batch_request_name = b"lance-batch-commit-v1\0".to_vec();
+        for transaction in &transactions {
+            batch_request_name.extend_from_slice(
+                &u64::try_from(transaction.uuid.len())
+                    .map_err(|_| {
+                        Error::format_capacity_exceeded("batch transaction UUID is too long")
+                    })?
+                    .to_le_bytes(),
+            );
+            batch_request_name.extend_from_slice(transaction.uuid.as_bytes());
+        }
         let merged = Transaction {
-            uuid: uuid::Uuid::new_v4().hyphenated().to_string(),
+            uuid: uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, &batch_request_name)
+                .hyphenated()
+                .to_string(),
             operation: Operation::Append {
                 fragments: transactions
                     .iter()
@@ -503,10 +716,123 @@ impl<'a> CommitBuilder<'a> {
             read_version,
             tag: None,
             transaction_properties: None,
+            row_address_layout_delta,
         };
-        let dataset = self.execute(merged.clone()).await?;
+        let requested_uuid = merged.uuid.clone();
+        let dataset = self.execute(merged).await?;
+        let merged = dataset
+            .read_transaction()
+            .await?
+            .filter(|transaction| transaction.uuid == requested_uuid)
+            .ok_or_else(|| {
+                Error::internal(
+                    "batch commit did not persist the canonical merged transaction metadata",
+                )
+            })?;
         Ok(BatchCommitResult { dataset, merged })
     }
+}
+
+fn merge_batch_append_row_address_deltas(
+    transactions: &[Transaction],
+) -> Result<Option<RowAddressLayoutDelta>> {
+    let delta_count = transactions
+        .iter()
+        .filter(|transaction| transaction.row_address_layout_delta.is_some())
+        .count();
+    if delta_count == 0 {
+        return Ok(None);
+    }
+    if delta_count != transactions.len() {
+        return Err(Error::invalid_input(
+            "batch append cannot mix storage-version-2.3 and legacy transactions",
+        ));
+    }
+
+    let mut merged = RowAddressLayoutDelta::default();
+    let mut ordinal_base = 0_u32;
+    for transaction in transactions {
+        let Operation::Append { fragments } = &transaction.operation else {
+            unreachable!("batch append operations were validated by the caller");
+        };
+        let delta = transaction
+            .row_address_layout_delta
+            .as_ref()
+            .expect("delta presence was validated above");
+        if delta.create_namespace_uuid.is_some()
+            || !delta.source_domains.is_empty()
+            || !delta.retired_selections.is_empty()
+            || !delta.field_changes.is_empty()
+            || !delta.source_floors.is_empty()
+            || !delta.replaced_generations.is_empty()
+            || !delta.row_aligned_rewrite_proofs.is_empty()
+            || !delta.explicit_map_placements.is_empty()
+        {
+            return Err(Error::invalid_input(
+                "batch append requires source-free successor Direct row-address deltas",
+            ));
+        }
+        if merged.expected_layout_fingerprint.is_empty() {
+            merged.expected_layout_fingerprint = delta.expected_layout_fingerprint.clone();
+        }
+        if delta.expected_layout_fingerprint.is_empty() {
+            return Err(Error::invalid_input(
+                "storage-version-2.3 batch append transaction is missing its expected layout fingerprint",
+            ));
+        }
+
+        let fragment_count = checked_batch_append_fragment_count(fragments.len())?;
+        let next_ordinal_base = checked_batch_append_ordinal(ordinal_base, fragment_count)?;
+        if delta.placements.len() != fragments.len() {
+            return Err(Error::invalid_input(
+                "batch append Direct placement count does not match fragment count",
+            ));
+        }
+        for placement in &delta.placements {
+            if placement.placement_kind != RowAddressPlacementKind::Direct
+                || !placement.source_selections.is_empty()
+                || !placement.output_row_sequence_fingerprint.is_empty()
+            {
+                return Err(Error::invalid_input(
+                    "batch append only accepts source-free Direct placements",
+                ));
+            }
+            let RowAddressTargetFragment::NewFragmentOrdinal(ordinal) = placement.target.fragment
+            else {
+                return Err(Error::invalid_input(
+                    "batch append Direct placement must target a new fragment ordinal",
+                ));
+            };
+            if ordinal >= fragment_count {
+                return Err(Error::invalid_input(
+                    "batch append Direct placement references a missing transaction fragment",
+                ));
+            }
+            let mut placement = placement.clone();
+            placement.target.fragment = RowAddressTargetFragment::NewFragmentOrdinal(
+                checked_batch_append_ordinal(ordinal_base, ordinal)?,
+            );
+            merged.placements.push(placement);
+        }
+        ordinal_base = next_ordinal_base;
+    }
+    Ok(Some(merged))
+}
+
+fn checked_batch_append_fragment_count(fragment_count: usize) -> Result<u32> {
+    u32::try_from(fragment_count).map_err(|_| {
+        Error::format_capacity_exceeded(format!(
+            "batch append transaction fragment count {fragment_count} exceeds u32 capacity"
+        ))
+    })
+}
+
+fn checked_batch_append_ordinal(ordinal_base: u32, ordinal: u32) -> Result<u32> {
+    ordinal_base.checked_add(ordinal).ok_or_else(|| {
+        Error::format_capacity_exceeded(format!(
+            "batch append fragment ordinal {ordinal_base} + {ordinal} exceeds u32 capacity"
+        ))
+    })
 }
 
 pub struct BatchCommitResult {
@@ -523,18 +849,33 @@ mod tests {
     use arrow::array::{Int32Array, RecordBatch};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 
+    use lance_core::datatypes::Schema;
+    use lance_core::error::FormatCapacityExceeded;
+    use lance_core::utils::tempfile::TempStrDir;
     use lance_io::utils::CachedFileSize;
     use lance_io::{assert_io_eq, assert_io_gt};
-    use lance_table::format::{DataFile, Fragment};
+    use lance_table::format::{
+        DataFile, Fragment, RowAddressPlacementDelta, RowAddressTargetRange,
+    };
     use std::time::Duration;
 
     use object_store::throttle::ThrottleConfig;
 
     use crate::utils::test::ThrottledStoreWrapper;
 
-    use crate::dataset::{InsertBuilder, WriteParams};
+    use crate::dataset::{InsertBuilder, TransactionBuilder, WriteParams};
 
     use super::*;
+
+    fn assert_format_capacity(error: &Error) {
+        let Error::InvalidInput { source, .. } = error else {
+            panic!("expected InvalidInput with FormatCapacityExceeded, got {error:?}")
+        };
+        assert!(
+            source.downcast_ref::<FormatCapacityExceeded>().is_some(),
+            "expected FormatCapacityExceeded, got {source:?}"
+        );
+    }
 
     fn sample_fragment() -> Fragment {
         let (major_version, minor_version) = LanceFileVersion::Stable.to_numbers();
@@ -554,6 +895,7 @@ mod tests {
             physical_rows: Some(10),
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            native_logical_domain: None,
         }
     }
 
@@ -566,7 +908,248 @@ mod tests {
             read_version,
             tag: None,
             transaction_properties: None,
+            row_address_layout_delta: None,
         }
+    }
+
+    fn source_free_v2_3_fragment(path: &str, physical_rows: usize) -> Fragment {
+        let mut fragment = sample_fragment().with_physical_rows(physical_rows);
+        fragment.files[0].path = path.to_owned();
+        let (major, minor) = LanceFileVersion::V2_3.to_numbers();
+        fragment.files[0].file_major_version = major;
+        fragment.files[0].file_minor_version = minor;
+        fragment
+    }
+
+    #[tokio::test]
+    async fn v2_3_source_free_create_uses_transaction_uuid_as_namespace() {
+        let namespace_uuid = Uuid::new_v4();
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new("i", DataType::Int32, false)]);
+        let mut fragment = sample_fragment().with_physical_rows(7);
+        let (major, minor) = LanceFileVersion::V2_3.to_numbers();
+        fragment.files[0].file_major_version = major;
+        fragment.files[0].file_minor_version = minor;
+        let mut transaction = TransactionBuilder::new(
+            0,
+            Operation::Overwrite {
+                fragments: vec![fragment],
+                schema: Schema::try_from(&arrow_schema).unwrap(),
+                config_upsert_values: None,
+                initial_bases: None,
+            },
+        )
+        .uuid(namespace_uuid.to_string())
+        .build();
+
+        prepare_v2_3_transaction(&mut transaction, None, Some(LanceFileVersion::V2_3))
+            .await
+            .unwrap();
+
+        let delta = transaction.row_address_layout_delta.unwrap();
+        assert_eq!(delta.create_namespace_uuid, Some(namespace_uuid));
+        assert_eq!(delta.placements.len(), 1);
+        assert_eq!(delta.placements[0].output_cardinality, 7);
+        assert_eq!(
+            delta.placements[0].target.fragment,
+            RowAddressTargetFragment::NewFragmentOrdinal(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn v2_3_source_free_overwrite_and_batch_retries_are_idempotent() {
+        let uri = TempStrDir::default();
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new("i", DataType::Int32, false)]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let create = TransactionBuilder::new(
+            0,
+            Operation::Overwrite {
+                fragments: vec![source_free_v2_3_fragment("create.lance", 3)],
+                schema: schema.clone(),
+                config_upsert_values: None,
+                initial_bases: None,
+            },
+        )
+        .build();
+
+        let created = CommitBuilder::new(uri.as_str())
+            .with_storage_format(LanceFileVersion::V2_3)
+            .execute(create.clone())
+            .await
+            .unwrap();
+        let create_retry = CommitBuilder::new(uri.as_str())
+            .with_storage_format(LanceFileVersion::V2_3)
+            .execute(create)
+            .await
+            .unwrap();
+        assert_eq!(created.version_id(), 1);
+        assert_eq!(create_retry.version_id(), created.version_id());
+
+        let overwrite = TransactionBuilder::new(
+            0,
+            Operation::Overwrite {
+                fragments: vec![source_free_v2_3_fragment("overwrite.lance", 5)],
+                schema,
+                config_upsert_values: None,
+                initial_bases: None,
+            },
+        )
+        .build();
+        let overwritten = CommitBuilder::new(uri.as_str())
+            .execute(overwrite.clone())
+            .await
+            .unwrap();
+        let overwrite_retry = CommitBuilder::new(uri.as_str())
+            .execute(overwrite)
+            .await
+            .unwrap();
+        assert_eq!(overwritten.version_id(), 2);
+        assert_eq!(overwrite_retry.version_id(), overwritten.version_id());
+
+        let append = |path: &str| {
+            TransactionBuilder::new(
+                overwritten.version_id(),
+                Operation::Append {
+                    fragments: vec![source_free_v2_3_fragment(path, 2)],
+                },
+            )
+            .build()
+        };
+        let batch = vec![append("batch-1.lance"), append("batch-2.lance")];
+        let first = CommitBuilder::new(Arc::new(overwritten.clone()))
+            .execute_batch(batch.clone())
+            .await
+            .unwrap();
+        let retry = CommitBuilder::new(Arc::new(overwritten))
+            .execute_batch(batch.clone())
+            .await
+            .unwrap();
+        let uri_retry = CommitBuilder::new(uri.as_str())
+            .execute_batch(batch)
+            .await
+            .unwrap();
+        assert_eq!(first.dataset.version_id(), 3);
+        assert_eq!(retry.dataset.version_id(), first.dataset.version_id());
+        assert_eq!(retry.merged.uuid, first.merged.uuid);
+        assert_eq!(uri_retry.dataset.version_id(), first.dataset.version_id());
+        assert_eq!(uri_retry.merged.uuid, first.merged.uuid);
+        assert!(first.merged.row_address_layout_delta.is_some());
+        assert_eq!(retry.dataset.manifest.fragments.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn concurrent_source_free_create_with_same_uuid_converges() {
+        let uri = TempStrDir::default();
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new("i", DataType::Int32, false)]);
+        let transaction = TransactionBuilder::new(
+            0,
+            Operation::Overwrite {
+                fragments: vec![source_free_v2_3_fragment("create.lance", 3)],
+                schema: Schema::try_from(&arrow_schema).unwrap(),
+                config_upsert_values: None,
+                initial_bases: None,
+            },
+        )
+        .build();
+        let first = CommitBuilder::new(uri.as_str())
+            .with_storage_format(LanceFileVersion::V2_3)
+            .execute(transaction.clone());
+        let second = CommitBuilder::new(uri.as_str())
+            .with_storage_format(LanceFileVersion::V2_3)
+            .execute(transaction);
+
+        let (first, second) = tokio::join!(first, second);
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert_eq!(first.version_id(), 1);
+        assert_eq!(second.version_id(), first.version_id());
+        assert_eq!(
+            second
+                .manifest
+                .row_address_layout
+                .as_ref()
+                .unwrap()
+                .namespace_uuid,
+            first
+                .manifest
+                .row_address_layout
+                .as_ref()
+                .unwrap()
+                .namespace_uuid
+        );
+    }
+
+    fn sample_v2_3_append_transaction(read_version: u64, row_counts: &[u32]) -> Transaction {
+        let mut transaction = sample_transaction(read_version);
+        transaction.operation = Operation::Append {
+            fragments: row_counts
+                .iter()
+                .map(|row_count| sample_fragment().with_physical_rows(*row_count as usize))
+                .collect(),
+        };
+        transaction.row_address_layout_delta = Some(RowAddressLayoutDelta {
+            expected_layout_fingerprint: vec![read_version as u8; 16],
+            placements: row_counts
+                .iter()
+                .enumerate()
+                .map(|(ordinal, row_count)| RowAddressPlacementDelta {
+                    source_selections: Vec::new(),
+                    target: RowAddressTargetRange {
+                        fragment: RowAddressTargetFragment::NewFragmentOrdinal(ordinal as u32),
+                        start_offset: 0,
+                        end_offset: *row_count,
+                    },
+                    placement_kind: RowAddressPlacementKind::Direct,
+                    output_cardinality: *row_count as u64,
+                    output_row_sequence_fingerprint: Vec::new(),
+                })
+                .collect(),
+            ..Default::default()
+        });
+        transaction
+    }
+
+    #[test]
+    fn batch_append_rebases_v2_3_fragment_ordinals() {
+        let first = sample_v2_3_append_transaction(4, &[3, 5]);
+        let second = sample_v2_3_append_transaction(6, &[7]);
+
+        let merged = merge_batch_append_row_address_deltas(&[first, second])
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            merged
+                .placements
+                .iter()
+                .map(|placement| placement.target.fragment)
+                .collect::<Vec<_>>(),
+            vec![
+                RowAddressTargetFragment::NewFragmentOrdinal(0),
+                RowAddressTargetFragment::NewFragmentOrdinal(1),
+                RowAddressTargetFragment::NewFragmentOrdinal(2),
+            ]
+        );
+        assert_eq!(merged.expected_layout_fingerprint, vec![4; 16]);
+    }
+
+    #[test]
+    fn batch_append_rejects_mixed_row_address_contracts() {
+        let legacy = sample_transaction(4);
+        let logical = sample_v2_3_append_transaction(4, &[3]);
+        assert!(merge_batch_append_row_address_deltas(&[legacy, logical]).is_err());
+    }
+
+    #[test]
+    fn batch_append_ordinal_overflow_is_typed() {
+        assert_format_capacity(&checked_batch_append_ordinal(u32::MAX, 1).unwrap_err());
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn batch_append_fragment_count_overflow_is_typed() {
+        assert_format_capacity(
+            &checked_batch_append_fragment_count(u32::MAX as usize + 1).unwrap_err(),
+        );
     }
 
     #[tokio::test]
@@ -975,6 +1558,7 @@ mod tests {
             read_version: 1,
             tag: None,
             transaction_properties: None,
+            row_address_layout_delta: None,
         };
         let res = CommitBuilder::new(dataset.clone())
             .execute_batch(vec![update_transaction])

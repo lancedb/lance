@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::vec;
 
@@ -10,23 +10,30 @@ use super::dataset_common::{create_file, require_send};
 use crate::dataset::WriteDestination;
 use crate::dataset::WriteMode::Overwrite;
 use crate::dataset::builder::DatasetBuilder;
-use crate::dataset::{ManifestWriteConfig, write_manifest_file};
+use crate::dataset::cleanup::CleanupPolicyBuilder;
+use crate::dataset::{
+    ManifestWriteConfig, decode_message_from_prefetched_tail, write_manifest_file,
+};
 use crate::session::Session;
 use crate::session::caches::ManifestKey;
 use crate::{Dataset, Error, Result};
 use lance_table::format::DataStorageFormat;
 
+use crate::dataset::optimize::{
+    CompactionOptions, RowAddressMaintenanceOptions, compact_files, maintain_row_addresses,
+};
 use crate::dataset::write::{CommitBuilder, InsertBuilder, WriteMode, WriteParams};
 use arrow::array::as_struct_array;
 use arrow::compute::concat_batches;
 use arrow_array::RecordBatch;
 use arrow_array::RecordBatchReader;
+use arrow_array::cast::AsArray;
 use arrow_array::{Array, FixedSizeListArray, Int16Array, Int16DictionaryArray, StructArray};
 use arrow_array::{
     ArrayRef, BooleanArray, Int8Array, Int8DictionaryArray, Int32Array, Int64Array,
     RecordBatchIterator, StringArray,
     cast::as_string_array,
-    types::{Float32Type, Int32Type},
+    types::{Float32Type, Int32Type, UInt64Type},
 };
 use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
@@ -38,22 +45,26 @@ use lance_file::{
     version::LanceFileVersion,
     writer::{FileWriter, FileWriterOptions},
 };
+use lance_index::metrics::NoOpMetricsCollector;
 use lance_io::assert_io_eq;
 use lance_table::feature_flags;
 use lance_table::format::BasePath;
 use object_store::ObjectStoreExt;
 
-use crate::index::DatasetIndexExt;
+use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
 use futures::TryStreamExt;
 use lance_index::IndexType;
+use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::ScalarIndexParams;
 use lance_io::object_store::{
     ObjectStore, ObjectStoreParams, StorageOptionsAccessor, WrappingObjectStore,
 };
 use lance_io::utils::tracking_store::IOTracker;
 use lance_table::io::manifest::read_manifest;
+use mock_instant::thread_local::MockClock;
 use object_store::path::Path;
 use rstest::rstest;
+use uuid::Uuid;
 
 fn file_object_store_uri(path: &std::path::Path) -> String {
     let path = path.to_str().unwrap().replace('\\', "/");
@@ -99,6 +110,40 @@ async fn drain_scan(dataset: &Dataset) {
         .try_collect::<Vec<_>>()
         .await
         .unwrap();
+}
+
+async fn scan_raw_row_ids(dataset: &Dataset) -> Vec<u64> {
+    let batch = dataset.scan().with_row_id().try_into_batch().await.unwrap();
+    let mut row_ids = batch[lance_core::ROW_ID]
+        .as_primitive::<UInt64Type>()
+        .values()
+        .to_vec();
+    row_ids.sort_unstable();
+    row_ids
+}
+
+async fn persisted_clone_namespace(dataset: &Dataset) -> Option<Uuid> {
+    let transaction_file = dataset.manifest.transaction_file.as_deref().unwrap();
+    crate::io::commit::read_transaction_file(
+        dataset.object_store.as_ref(),
+        &dataset.base,
+        transaction_file,
+    )
+    .await
+    .unwrap()
+    .row_address_layout_delta
+    .and_then(|delta| delta.create_namespace_uuid)
+}
+
+async fn cleanup_all_but_latest(dataset: &Dataset) {
+    let policy = CleanupPolicyBuilder::default()
+        .retain_n_versions(dataset, 1)
+        .await
+        .unwrap()
+        .delete_unverified(true)
+        .error_if_tagged_old_versions(false)
+        .build();
+    dataset.cleanup_with_policy(policy).await.unwrap();
 }
 
 #[tokio::test]
@@ -1290,6 +1335,843 @@ async fn test_rle_v2_shallow_clone_preserves_v23_storage() {
     );
 }
 
+#[tokio::test]
+async fn test_v23_clones_rebind_namespace_without_remapping_rows() {
+    let source_uri = TempStrDir::default();
+    let shallow_uri = TempStrDir::default();
+    let deep_uri = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "id",
+        DataType::Int32,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from_iter_values(0..16))],
+    )
+    .unwrap();
+    let mut source = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema),
+        &source_uri,
+        Some(WriteParams {
+            max_rows_per_file: 4,
+            data_storage_version: Some(LanceFileVersion::V2_3),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    source
+        .create_index(
+            &["id"],
+            IndexType::Scalar,
+            Some("id_idx".to_string()),
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+
+    let source_version = source.version().version;
+    let branch = source
+        .create_branch("logical-clone", source_version, None)
+        .await
+        .unwrap();
+    let shallow = source
+        .shallow_clone(shallow_uri.as_str(), source_version, None)
+        .await
+        .unwrap();
+    let deep = source
+        .deep_clone(deep_uri.as_str(), source_version, None)
+        .await
+        .unwrap();
+
+    let source_row_ids = scan_raw_row_ids(&source).await;
+    let source_layout = source.manifest.row_address_layout.as_ref().unwrap();
+    let source_namespace = source_layout.namespace_uuid;
+    let source_fragments = source
+        .manifest
+        .fragments
+        .iter()
+        .map(|fragment| {
+            (
+                fragment.id,
+                fragment.physical_rows,
+                fragment.native_logical_domain,
+            )
+        })
+        .collect::<Vec<_>>();
+    let source_indices = source.load_indices().await.unwrap();
+    assert_eq!(source_indices.len(), 1);
+
+    let mut namespaces = HashSet::from([source_namespace]);
+    for cloned in [&branch, &shallow, &deep] {
+        cloned.manifest.validate_row_address_contract().unwrap();
+        assert_eq!(scan_raw_row_ids(cloned).await, source_row_ids);
+        assert_eq!(
+            cloned.manifest.max_logical_fragment_id,
+            source.manifest.max_logical_fragment_id
+        );
+        assert_eq!(
+            cloned
+                .manifest
+                .fragments
+                .iter()
+                .map(|fragment| {
+                    (
+                        fragment.id,
+                        fragment.physical_rows,
+                        fragment.native_logical_domain,
+                    )
+                })
+                .collect::<Vec<_>>(),
+            source_fragments
+        );
+
+        let cloned_layout = cloned.manifest.row_address_layout.as_ref().unwrap();
+        assert!(namespaces.insert(cloned_layout.namespace_uuid));
+        assert_ne!(cloned_layout.fingerprint, source_layout.fingerprint);
+        assert_eq!(
+            persisted_clone_namespace(cloned).await,
+            Some(cloned_layout.namespace_uuid)
+        );
+
+        let mut source_payload = source_layout.as_ref().clone();
+        source_payload.namespace_uuid = Uuid::nil();
+        source_payload.fingerprint.clear();
+        source_payload.debt_summary = Default::default();
+        let mut cloned_payload = cloned_layout.as_ref().clone();
+        cloned_payload.namespace_uuid = Uuid::nil();
+        cloned_payload.fingerprint.clear();
+        cloned_payload.debt_summary = Default::default();
+        assert_eq!(cloned_payload, source_payload);
+
+        let cloned_indices = cloned.load_indices().await.unwrap();
+        assert_eq!(cloned_indices.len(), 1);
+        assert_eq!(cloned_indices[0].uuid, source_indices[0].uuid);
+        assert_eq!(
+            cloned_indices[0].row_reference_domain,
+            source_indices[0].row_reference_domain
+        );
+        let source_coverage = source_indices[0].logical_coverage.as_ref().unwrap();
+        let cloned_coverage = cloned_indices[0].logical_coverage.as_ref().unwrap();
+        assert_eq!(cloned_coverage.shards, source_coverage.shards);
+        assert_eq!(cloned_coverage.external, source_coverage.external);
+        let provenance = cloned_coverage.clone_provenance.as_ref().unwrap();
+        assert_eq!(provenance.source_namespace_uuid, source_namespace);
+        assert_eq!(
+            provenance.target_namespace_uuid,
+            cloned_layout.namespace_uuid
+        );
+        assert_eq!(provenance.depth, 1);
+
+        let mut indexed = cloned.scan();
+        indexed.filter("id = 10").unwrap();
+        let indexed = indexed.try_into_batch().await.unwrap();
+        let mut flat = cloned.scan();
+        flat.use_scalar_index(false).filter("id = 10").unwrap();
+        let flat = flat.try_into_batch().await.unwrap();
+        assert_eq!(indexed.column_by_name("id"), flat.column_by_name("id"));
+    }
+}
+
+#[tokio::test]
+async fn test_v23_deep_clone_of_shallow_clone_copies_inherited_artifacts() {
+    let root = TempStdDir::default();
+    let source_uri = format!("file://{}", root.join("source").display());
+    let shallow_uri = format!("file://{}", root.join("shallow").display());
+    let deep_uri = format!("file://{}", root.join("deep").display());
+    let mut source = Dataset::write(
+        gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(32), BatchCount::from(1)),
+        &source_uri,
+        Some(WriteParams {
+            max_rows_per_file: 4,
+            data_storage_version: Some(LanceFileVersion::V2_3),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    maintain_row_addresses(
+        &mut source,
+        RowAddressMaintenanceOptions {
+            target_rows_per_fragment: 32,
+            max_rows_per_group: 32,
+            ..RowAddressMaintenanceOptions::repack()
+        },
+    )
+    .await
+    .unwrap();
+    source.delete("id IN (1, 9)").await.unwrap();
+    source
+        .create_index(
+            &["id"],
+            IndexType::Scalar,
+            Some("id_idx".to_string()),
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+    assert!(source.manifest.fragments[0].deletion_file.is_some());
+    assert!(
+        source
+            .manifest
+            .row_address_layout
+            .as_ref()
+            .unwrap()
+            .placements
+            .iter()
+            .any(|placement| matches!(
+                placement,
+                lance_table::format::RowAddressPlacement::ExplicitMap(_)
+            ))
+    );
+
+    let expected_row_ids = scan_raw_row_ids(&source).await;
+    let mut shallow = source
+        .shallow_clone(&shallow_uri, source.version().version, None)
+        .await
+        .unwrap();
+    let deep = shallow
+        .deep_clone(&deep_uri, shallow.version().version, None)
+        .await
+        .unwrap();
+
+    assert!(deep.manifest.base_paths.is_empty());
+    assert_eq!(scan_raw_row_ids(&deep).await, expected_row_ids);
+    for fragment in deep.manifest.fragments.iter() {
+        assert!(fragment.files.iter().all(|file| file.base_id.is_none()));
+        assert!(
+            fragment
+                .deletion_file
+                .as_ref()
+                .is_none_or(|deletion| deletion.base_id.is_none())
+        );
+    }
+    for placement in &deep
+        .manifest
+        .row_address_layout
+        .as_ref()
+        .unwrap()
+        .placements
+    {
+        if let lance_table::format::RowAddressPlacement::ExplicitMap(explicit) = placement {
+            assert!(explicit.base_id.is_none());
+        }
+    }
+    assert!(
+        deep.load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .all(|index| index.base_id.is_none())
+    );
+
+    let mut indexed = deep.scan();
+    indexed.filter("id = 10").unwrap();
+    let indexed = indexed.try_into_batch().await.unwrap();
+    let mut flat = deep.scan();
+    flat.use_scalar_index(false).filter("id = 10").unwrap();
+    let flat = flat.try_into_batch().await.unwrap();
+    assert_eq!(indexed.column_by_name("id"), flat.column_by_name("id"));
+    let taken = deep
+        .take_rows(&[expected_row_ids[0]], deep.schema().clone())
+        .await
+        .unwrap();
+    assert_eq!(taken.num_rows(), 1);
+}
+
+#[tokio::test]
+async fn test_v23_shallow_clone_lease_pins_explicit_snapshot_until_target_cleanup() {
+    let source_uri = TempStrDir::default();
+    let clone_uri = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "id",
+        DataType::Int32,
+        false,
+    )]));
+    let initial = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from_iter_values(0..16))],
+    )
+    .unwrap();
+    let mut source = Dataset::write(
+        RecordBatchIterator::new([Ok(initial)], schema.clone()),
+        &source_uri,
+        Some(WriteParams {
+            max_rows_per_file: 4,
+            data_storage_version: Some(LanceFileVersion::V2_3),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    maintain_row_addresses(
+        &mut source,
+        RowAddressMaintenanceOptions {
+            target_rows_per_fragment: 16,
+            max_rows_per_group: 16,
+            ..RowAddressMaintenanceOptions::repack()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        source
+            .manifest
+            .row_address_layout
+            .as_ref()
+            .unwrap()
+            .placements
+            .iter()
+            .any(|placement| matches!(
+                placement,
+                lance_table::format::RowAddressPlacement::ExplicitMap(_)
+            ))
+    );
+    let pinned_version = source.version().version;
+    let expected_row_ids = scan_raw_row_ids(&source).await;
+    let clone = source
+        .shallow_clone(clone_uri.as_str(), pinned_version, None)
+        .await
+        .unwrap();
+
+    maintain_row_addresses(
+        &mut source,
+        RowAddressMaintenanceOptions::normalize_placement(),
+    )
+    .await
+    .unwrap();
+    cleanup_all_but_latest(&source).await;
+    source.checkout_version(pinned_version).await.unwrap();
+    drop(clone);
+    let reopened = Dataset::open(clone_uri.as_str()).await.unwrap();
+    assert_eq!(scan_raw_row_ids(&reopened).await, expected_row_ids);
+    let clone_store = reopened.object_store.clone();
+    let clone_base = reopened.base.clone();
+    drop(reopened);
+    clone_store.remove_dir_all(clone_base).await.unwrap();
+    cleanup_all_but_latest(&source).await;
+    let reopened_source = Dataset::open(source_uri.as_str()).await.unwrap();
+    assert!(
+        reopened_source
+            .checkout_version(pinned_version)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn test_v23_transitive_shallow_clone_lease_survives_deleted_intermediate_clone() {
+    let source_uri = TempStrDir::default();
+    let first_clone_uri = TempStrDir::default();
+    let second_clone_uri = TempStrDir::default();
+    let mut source = Dataset::write(
+        gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(32), BatchCount::from(1)),
+        &source_uri,
+        Some(WriteParams {
+            max_rows_per_file: 4,
+            data_storage_version: Some(LanceFileVersion::V2_3),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    maintain_row_addresses(
+        &mut source,
+        RowAddressMaintenanceOptions {
+            target_rows_per_fragment: 32,
+            max_rows_per_group: 32,
+            ..RowAddressMaintenanceOptions::repack()
+        },
+    )
+    .await
+    .unwrap();
+    source
+        .create_index(
+            &["id"],
+            IndexType::Scalar,
+            Some("id_idx".to_string()),
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+
+    let pinned_version = source.version().version;
+    let expected_row_ids = scan_raw_row_ids(&source).await;
+    let source_index = source.load_indices().await.unwrap()[0].clone();
+    let source_index_paths = source_index
+        .files
+        .as_ref()
+        .unwrap()
+        .iter()
+        .map(|file| {
+            source
+                .indices_dir()
+                .join(source_index.uuid.to_string())
+                .join(file.path.as_str())
+        })
+        .collect::<Vec<_>>();
+    let explicit = source
+        .manifest
+        .row_address_layout
+        .as_ref()
+        .unwrap()
+        .placements
+        .iter()
+        .find_map(|placement| match placement {
+            lance_table::format::RowAddressPlacement::ExplicitMap(explicit) => {
+                Some(explicit.clone())
+            }
+            _ => None,
+        })
+        .unwrap();
+    let source_explicit_paths = std::iter::once(explicit.object_path.as_str())
+        .chain(
+            explicit
+                .destinations
+                .iter()
+                .map(|destination| destination.row_id_file_path.as_str()),
+        )
+        .map(|relative_path| {
+            relative_path
+                .split('/')
+                .filter(|segment| !segment.is_empty())
+                .fold(source.base.clone(), |path, segment| path.join(segment))
+        })
+        .collect::<Vec<_>>();
+    let source_data_paths = source
+        .manifest
+        .fragments
+        .iter()
+        .flat_map(|fragment| {
+            fragment
+                .files
+                .iter()
+                .map(|file| source.data_dir().join(file.path.as_str()))
+        })
+        .collect::<Vec<_>>();
+
+    let mut first_clone = source
+        .shallow_clone(first_clone_uri.as_str(), pinned_version, None)
+        .await
+        .unwrap();
+    let second_clone = first_clone
+        .shallow_clone(
+            second_clone_uri.as_str(),
+            first_clone.version().version,
+            None,
+        )
+        .await
+        .unwrap();
+    let first_clone_store = first_clone.object_store.clone();
+    let first_clone_base = first_clone.base.clone();
+    drop(first_clone);
+    drop(second_clone);
+    first_clone_store
+        .remove_dir_all(first_clone_base)
+        .await
+        .unwrap();
+
+    // Cleanup never removes objects newer than the earliest retained manifest,
+    // even with delete_unverified=true. Publish the replacement snapshot after
+    // the local object-store mtimes so the final cleanup can prove the old
+    // immutable objects are eligible once the descendant lease disappears.
+    MockClock::set_system_time(
+        std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap()
+            + std::time::Duration::from_secs(60),
+    );
+    maintain_row_addresses(
+        &mut source,
+        RowAddressMaintenanceOptions::normalize_placement(),
+    )
+    .await
+    .unwrap();
+    source.drop_index("id_idx").await.unwrap();
+    cleanup_all_but_latest(&source).await;
+    source.checkout_version(pinned_version).await.unwrap();
+
+    let reopened = Dataset::open(second_clone_uri.as_str()).await.unwrap();
+    assert_eq!(scan_raw_row_ids(&reopened).await, expected_row_ids);
+    let index = reopened.load_indices().await.unwrap()[0].clone();
+    assert_eq!(index.uuid, source_index.uuid);
+    reopened
+        .open_scalar_index("id", &index.uuid, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    let indexed = reopened
+        .scan()
+        .filter("id = 10")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(indexed.num_rows(), 1);
+    let taken = reopened
+        .take_rows(
+            &[expected_row_ids[0], expected_row_ids[15]],
+            reopened.schema().clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(taken.num_rows(), 2);
+    for path in source_data_paths
+        .iter()
+        .chain(&source_explicit_paths)
+        .chain(&source_index_paths)
+    {
+        assert!(source.object_store.exists(path).await.unwrap(), "{path}");
+    }
+
+    let second_clone_store = reopened.object_store.clone();
+    let second_clone_base = reopened.base.clone();
+    drop(reopened);
+    second_clone_store
+        .remove_dir_all(second_clone_base)
+        .await
+        .unwrap();
+    cleanup_all_but_latest(&source).await;
+    assert!(source.checkout_version(pinned_version).await.is_err());
+    for path in source_data_paths
+        .iter()
+        .chain(&source_explicit_paths)
+        .chain(&source_index_paths)
+    {
+        assert!(!source.object_store.exists(path).await.unwrap(), "{path}");
+    }
+}
+
+#[tokio::test]
+async fn test_v23_branch_shallow_clone_lease_uses_source_namespace() {
+    let source_uri = TempStrDir::default();
+    let clone_uri = TempStrDir::default();
+    let second_clone_uri = TempStrDir::default();
+    let mut root = Dataset::write(
+        gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(32), BatchCount::from(1)),
+        &source_uri,
+        Some(WriteParams {
+            max_rows_per_file: 4,
+            data_storage_version: Some(LanceFileVersion::V2_3),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let mut branch = root
+        .create_branch("lease-source", root.version().version, None)
+        .await
+        .unwrap();
+    maintain_row_addresses(
+        &mut branch,
+        RowAddressMaintenanceOptions {
+            target_rows_per_fragment: 32,
+            max_rows_per_group: 32,
+            ..RowAddressMaintenanceOptions::repack()
+        },
+    )
+    .await
+    .unwrap();
+    let pinned_version = branch.version().version;
+    let expected_row_ids = scan_raw_row_ids(&branch).await;
+    let mut clone = root
+        .shallow_clone(clone_uri.as_str(), ("lease-source", pinned_version), None)
+        .await
+        .unwrap();
+    let second_clone = clone
+        .shallow_clone(second_clone_uri.as_str(), clone.version().version, None)
+        .await
+        .unwrap();
+    let clone_store = clone.object_store.clone();
+    let clone_base = clone.base.clone();
+    drop(clone);
+    drop(second_clone);
+    clone_store.remove_dir_all(clone_base).await.unwrap();
+
+    maintain_row_addresses(
+        &mut branch,
+        RowAddressMaintenanceOptions::normalize_placement(),
+    )
+    .await
+    .unwrap();
+    cleanup_all_but_latest(&branch).await;
+    branch.checkout_version(pinned_version).await.unwrap();
+    let reopened = Dataset::open(second_clone_uri.as_str()).await.unwrap();
+    assert_eq!(scan_raw_row_ids(&reopened).await, expected_row_ids);
+    let second_clone_store = reopened.object_store.clone();
+    let second_clone_base = reopened.base.clone();
+    drop(reopened);
+    second_clone_store
+        .remove_dir_all(second_clone_base)
+        .await
+        .unwrap();
+
+    cleanup_all_but_latest(&branch).await;
+    let reopened_root = Dataset::open(source_uri.as_str()).await.unwrap();
+    let reopened_branch = reopened_root.checkout_branch("lease-source").await.unwrap();
+    assert!(
+        reopened_branch
+            .checkout_version(pinned_version)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn test_v23_indexed_shallow_clone_chain_reopens_and_compacts() {
+    async fn assert_indexed_matches_flat(dataset: &Dataset) {
+        let mut indexed = dataset.scan();
+        indexed
+            .project(&["id", lance_core::ROW_ID])
+            .unwrap()
+            .filter("id >= 10 AND id < 20")
+            .unwrap();
+        let indexed = indexed.try_into_batch().await.unwrap();
+        let mut flat = dataset.scan();
+        flat.use_scalar_index(false)
+            .project(&["id", lance_core::ROW_ID])
+            .unwrap()
+            .filter("id >= 10 AND id < 20")
+            .unwrap();
+        let flat = flat.try_into_batch().await.unwrap();
+        assert_eq!(indexed.num_rows(), 10);
+        assert_eq!(indexed.column_by_name("id"), flat.column_by_name("id"));
+        assert_eq!(
+            indexed.column_by_name(lance_core::ROW_ID),
+            flat.column_by_name(lance_core::ROW_ID)
+        );
+    }
+
+    let source_uri = TempStrDir::default();
+    let indexed_clone_uri = TempStrDir::default();
+    let second_clone_uri = TempStrDir::default();
+    let mut source = Dataset::write(
+        gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(64), BatchCount::from(1)),
+        &source_uri,
+        Some(WriteParams {
+            max_rows_per_file: 8,
+            data_storage_version: Some(LanceFileVersion::V2_3),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let source_row_ids = scan_raw_row_ids(&source).await;
+    source
+        .create_index(
+            &["id"],
+            IndexType::Scalar,
+            Some("id_idx".to_string()),
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+    let source_index_id = source.load_indices().await.unwrap()[0].uuid;
+    assert_indexed_matches_flat(&source).await;
+    let mut indexed_clone = source
+        .shallow_clone(indexed_clone_uri.as_str(), source.version().version, None)
+        .await
+        .unwrap();
+    let first_clone_index = indexed_clone.load_indices().await.unwrap()[0].clone();
+    assert_eq!(first_clone_index.uuid, source_index_id);
+    assert_eq!(
+        first_clone_index
+            .logical_coverage
+            .as_ref()
+            .unwrap()
+            .clone_provenance
+            .as_ref()
+            .unwrap()
+            .depth,
+        1
+    );
+    assert_indexed_matches_flat(&indexed_clone).await;
+    indexed_clone
+        .shallow_clone(
+            second_clone_uri.as_str(),
+            indexed_clone.version().version,
+            None,
+        )
+        .await
+        .unwrap();
+    drop(indexed_clone);
+    let mut second_clone = Dataset::open(second_clone_uri.as_str()).await.unwrap();
+    assert_eq!(
+        second_clone.load_indices().await.unwrap()[0]
+            .logical_coverage
+            .as_ref()
+            .unwrap()
+            .clone_provenance
+            .as_ref()
+            .unwrap()
+            .depth,
+        2
+    );
+    assert_indexed_matches_flat(&second_clone).await;
+
+    compact_files(
+        &mut second_clone,
+        CompactionOptions {
+            target_rows_per_fragment: 64,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(scan_raw_row_ids(&second_clone).await, source_row_ids);
+    let indices = second_clone.load_indices().await.unwrap();
+    assert_eq!(indices.len(), 1);
+    assert_eq!(indices[0].uuid, source_index_id);
+    assert_indexed_matches_flat(&second_clone).await;
+    second_clone
+        .optimize_indices(&OptimizeOptions::retrain())
+        .await
+        .unwrap();
+    let rebuilt_index = second_clone.load_indices().await.unwrap()[0].clone();
+    assert_ne!(rebuilt_index.uuid, source_index_id);
+    assert!(rebuilt_index.base_id.is_none());
+    assert!(
+        rebuilt_index
+            .logical_coverage
+            .as_ref()
+            .unwrap()
+            .clone_provenance
+            .is_none()
+    );
+    assert_indexed_matches_flat(&second_clone).await;
+}
+
+#[tokio::test]
+async fn test_v22_indexed_shallow_clone_chain_compaction_rebinds_index_files() {
+    let source_uri = TempStrDir::default();
+    let first_clone_uri = TempStrDir::default();
+    let second_clone_uri = TempStrDir::default();
+    let mut source = Dataset::write(
+        gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(64), BatchCount::from(1)),
+        &source_uri,
+        Some(WriteParams {
+            max_rows_per_file: 8,
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    source
+        .create_index(
+            &["id"],
+            IndexType::Scalar,
+            Some("id_idx".to_string()),
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+
+    let mut first_clone = source
+        .shallow_clone(first_clone_uri.as_str(), source.version().version, None)
+        .await
+        .unwrap();
+    let first_index = first_clone.load_indices().await.unwrap()[0].clone();
+    assert!(first_index.base_id.is_some());
+    let second_clone = first_clone
+        .shallow_clone(
+            second_clone_uri.as_str(),
+            first_clone.version().version,
+            None,
+        )
+        .await
+        .unwrap();
+    let second_index = second_clone.load_indices().await.unwrap()[0].clone();
+    assert_eq!(second_index.base_id, first_index.base_id);
+    second_clone
+        .open_scalar_index("id", &second_index.uuid, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+
+    drop(first_clone);
+    drop(second_clone);
+    let mut reopened = Dataset::open(second_clone_uri.as_str()).await.unwrap();
+    compact_files(
+        &mut reopened,
+        CompactionOptions {
+            target_rows_per_fragment: 64,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    drop(reopened);
+
+    let reopened = Dataset::open(second_clone_uri.as_str()).await.unwrap();
+    let remapped_index = reopened.load_indices().await.unwrap()[0].clone();
+    assert_ne!(remapped_index.uuid, second_index.uuid);
+    assert_eq!(remapped_index.base_id, None);
+    assert_eq!(remapped_index.dataset_version, reopened.version().version);
+    reopened
+        .open_scalar_index("id", &remapped_index.uuid, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    let result = reopened
+        .scan()
+        .filter("id = 10")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(result.num_rows(), 1);
+}
+
+#[tokio::test]
+async fn test_v22_clone_transaction_has_no_row_address_delta() {
+    let source_uri = TempStrDir::default();
+    let clone_uri = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "id",
+        DataType::Int32,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from_iter_values(0..4))],
+    )
+    .unwrap();
+    let mut source = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema),
+        &source_uri,
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let cloned = source
+        .shallow_clone(clone_uri.as_str(), source.version().version, None)
+        .await
+        .unwrap();
+
+    assert!(cloned.manifest.row_address_layout.is_none());
+    assert_eq!(persisted_clone_namespace(&cloned).await, None);
+}
+
 #[rstest]
 #[tokio::test]
 async fn append_dataset(
@@ -1378,7 +2260,11 @@ async fn append_dataset(
 #[rstest]
 #[tokio::test]
 async fn test_deep_clone(
-    #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+    #[values(
+        LanceFileVersion::Legacy,
+        LanceFileVersion::Stable,
+        LanceFileVersion::V2_3
+    )]
     data_storage_version: LanceFileVersion,
 ) {
     // Setup source and target dirs
@@ -1474,6 +2360,17 @@ async fn test_deep_clone(
     let cloned_indices = cloned_dataset.load_indices().await.unwrap();
     assert!(!cloned_indices.is_empty());
     assert_eq!(cloned_indices.first().unwrap().name, "id_idx");
+    let indexed = cloned_dataset
+        .scan()
+        .filter("id = 20")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let mut flat = cloned_dataset.scan();
+    flat.use_scalar_index(false).filter("id = 20").unwrap();
+    let flat = flat.try_into_batch().await.unwrap();
+    assert_eq!(indexed.column_by_name("id"), flat.column_by_name("id"));
 
     // Verify base_id cleared in cloned manifest and indices
     for frag in cloned_dataset.manifest().fragments.iter() {
@@ -2398,6 +3295,25 @@ async fn test_manifest_partially_fits() {
 
     let dataset = Dataset::open(&test_uri).await.unwrap();
     assert_eq!(1000, dataset.count_rows(None).await.unwrap());
+}
+
+#[test]
+fn test_prefetched_manifest_section_rejects_truncated_payload() {
+    let path = Path::from("/truncated-prefetched-section.manifest");
+    let mut prefetched_tail = vec![0_u8; 6];
+    prefetched_tail[..4].copy_from_slice(&8_u32.to_le_bytes());
+
+    let error = decode_message_from_prefetched_tail::<lance_table::format::pb::IndexSection>(
+        &prefetched_tail,
+        prefetched_tail.len(),
+        0,
+        &path,
+        "index",
+    )
+    .unwrap_err();
+
+    assert!(matches!(error, Error::CorruptFile { .. }));
+    assert!(error.to_string().contains("payload length 8"));
 }
 
 #[tokio::test]

@@ -16,7 +16,8 @@ use lance_index::scalar::btree::BTreeIndex;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::registry::VALUE_COLUMN_NAME;
 use lance_index::scalar::{CreatedIndex, OldIndexDataFilter};
-use lance_table::format::IndexMetadata;
+use lance_table::format::{IndexMetadata, RowReferenceDomain};
+use roaring::RoaringBitmap;
 use uuid::Uuid;
 
 use crate::{Dataset, Error, Result, dataset::index::LanceIndexStoreExt};
@@ -118,11 +119,26 @@ pub(crate) async fn merge_segments(
     let field_path = dataset.schema().field_path(field_id)?;
 
     let segment_refs: Vec<&IndexMetadata> = segments.iter().collect();
-    let (fragment_bitmap, old_data_filters) =
-        crate::index::append::build_per_segment_filters(dataset, &segment_refs).await?;
+    let logical_coverage = dataset
+        .manifest
+        .uses_stable_logical_row_addresses()
+        .then(|| crate::index::merge_logical_index_coverage(dataset, &segment_refs))
+        .transpose()?;
+    let (fragment_bitmap, old_data_filters) = if logical_coverage.is_some() {
+        (RoaringBitmap::new(), vec![None; segment_refs.len()])
+    } else {
+        crate::index::append::build_per_segment_filters(dataset, &segment_refs).await?
+    };
 
     let output_uuid = Uuid::new_v4();
-    let new_store = LanceIndexStore::from_dataset_for_new(dataset, &output_uuid)?;
+    let new_store = super::configure_logical_coverage_artifact_from_exact(
+        dataset,
+        output_uuid,
+        &[field_id],
+        logical_coverage.as_ref(),
+        "btree",
+        LanceIndexStore::from_dataset_for_new(dataset, &output_uuid)?,
+    )?;
     // Pure segment consolidation: no dataset scan, so `new_data` is an empty
     // stream and the merge is driven entirely by the source page data.
     let empty_new_data = empty_btree_update_stream(dataset, field_id)?;
@@ -156,11 +172,15 @@ pub(crate) async fn merge_segments(
         name: segments[0].name.clone(),
         fields: vec![field_id],
         dataset_version: dataset.manifest.version,
-        fragment_bitmap: Some(fragment_bitmap),
+        fragment_bitmap: logical_coverage.is_none().then_some(fragment_bitmap),
         index_details: Some(Arc::new(created_index.index_details)),
         index_version: created_index.index_version as i32,
         created_at: Some(chrono::Utc::now()),
         base_id: None,
         files: Some(created_index.files),
+        row_reference_domain: logical_coverage
+            .as_ref()
+            .map(|_| RowReferenceDomain::StableLogicalRowAddress),
+        logical_coverage,
     })
 }

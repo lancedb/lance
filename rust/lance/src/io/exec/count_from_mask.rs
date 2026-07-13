@@ -19,7 +19,7 @@
 //! support; the others (mask-to-answer, zone-aware, dimension-keyed) each
 //! need additional plumbing — see the corresponding design issue.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_array::{Array, BinaryArray, Int64Array, RecordBatch};
@@ -33,7 +33,7 @@ use datafusion_physical_expr::EquivalenceProperties;
 use datafusion_physical_expr::aggregate::AggregateFunctionExpr;
 use futures::{StreamExt, TryStreamExt, stream};
 use lance_core::{Error, Result};
-use lance_select::{RowAddrMask, RowAddrSelection, RowAddrTreeMap};
+use lance_select::{RowAddrMask, RowAddrSelection, RowAddrTreeMap, RowSetOps};
 use lance_table::format::Fragment;
 use roaring::RoaringBitmap;
 use tracing::instrument;
@@ -41,7 +41,8 @@ use tracing::instrument;
 use super::utils::InstrumentedRecordBatchStreamAdapter;
 use crate::Dataset;
 use crate::dataset::rowids::load_row_id_sequences;
-use crate::index::prefilter::DatasetPreFilter;
+use crate::index::prefilter::{DatasetPreFilter, PreFilter};
+use crate::index::{DatasetIndexExt, logical_index_coverage_is_current};
 
 /// An execution node that computes a `COUNT(*)`-style aggregate from an
 /// optional row-address mask supplied by an upstream scalar-index search,
@@ -333,6 +334,72 @@ impl CountFromMaskExec {
         Ok(universe)
     }
 
+    fn logical_address_universe(dataset: &Dataset) -> Result<RowAddrTreeMap> {
+        let layout = dataset
+            .manifest
+            .row_address_layout
+            .as_ref()
+            .ok_or_else(|| {
+                Error::internal("storage-version-2.3 manifest is missing RowAddressLayout")
+            })?;
+        let fragments = dataset.manifest.fragments.as_ref();
+        let mut universe = RowAddrTreeMap::new();
+        for logical_fragment_id in layout.current_logical_fragment_bitmap(fragments)? {
+            let domain = layout
+                .logical_domain(fragments, logical_fragment_id)?
+                .ok_or_else(|| {
+                    Error::internal(format!(
+                        "current logical domain {logical_fragment_id} is missing metadata"
+                    ))
+                })?;
+            let start = (logical_fragment_id as u64) << 32;
+            universe.insert_range(start..start + domain.slot_count as u64);
+        }
+        Ok(universe)
+    }
+
+    fn collect_index_names(
+        expr: &lance_index::scalar::expression::ScalarIndexExpr,
+        names: &mut HashSet<String>,
+    ) {
+        use lance_index::scalar::expression::ScalarIndexExpr;
+        match expr {
+            ScalarIndexExpr::Not(inner) => Self::collect_index_names(inner, names),
+            ScalarIndexExpr::And(left, right) | ScalarIndexExpr::Or(left, right) => {
+                Self::collect_index_names(left, names);
+                Self::collect_index_names(right, names);
+            }
+            ScalarIndexExpr::Query(search) => {
+                names.insert(search.index_name.clone());
+            }
+        }
+    }
+
+    async fn logical_index_mask(
+        dataset: Arc<Dataset>,
+        input: &Arc<dyn ExecutionPlan>,
+    ) -> Result<Arc<RowAddrMask>> {
+        let scalar = input
+            .as_any()
+            .downcast_ref::<super::scalar_index::ScalarIndexExec>()
+            .ok_or_else(|| {
+                Error::internal("CountFromMaskExec: v2.3 prefilter input is not ScalarIndexExec")
+            })?;
+        let mut names = HashSet::new();
+        Self::collect_index_names(scalar.expr(), &mut names);
+        let mut indices = Vec::new();
+        for name in names {
+            for index in dataset.load_indices_by_name(&name).await? {
+                if logical_index_coverage_is_current(dataset.as_ref(), &index)? {
+                    indices.push(index);
+                }
+            }
+        }
+        let prefilter = DatasetPreFilter::new(dataset, &indices, None);
+        prefilter.wait_for_ready().await?;
+        Ok(prefilter.mask())
+    }
+
     #[instrument(name = "count_from_mask", skip_all, level = "debug")]
     async fn do_execute(
         dataset: Arc<Dataset>,
@@ -342,6 +409,14 @@ impl CountFromMaskExec {
         context: Arc<datafusion::execution::context::TaskContext>,
         schema: SchemaRef,
     ) -> Result<RecordBatch> {
+        let logical_index_mask = if dataset.manifest.uses_stable_logical_row_addresses() {
+            match prefilter_input.as_ref() {
+                Some(input) => Some(Self::logical_index_mask(dataset.clone(), input).await?),
+                None => None,
+            }
+        } else {
+            None
+        };
         let prefilter = match prefilter_input {
             None => None,
             Some(input) => Some(Self::load_prefilter(input, context.clone()).await?),
@@ -352,14 +427,39 @@ impl CountFromMaskExec {
         let dataset_fragments: RoaringBitmap =
             dataset.fragments().iter().map(|f| f.id as u32).collect();
         let fragments_covered = match restrict_to_fragments {
-            Some(restrict) => dataset_fragments & restrict,
-            None => dataset_fragments,
+            Some(restrict) => &dataset_fragments & restrict,
+            None => dataset_fragments.clone(),
         };
 
         // Under stable row ids the prefilter and deletion masks are in stable-id
         // space, so the universe must be too (see `stable_id_universe`); the
         // default path builds it in row-address space.
-        let count = if dataset.manifest.uses_stable_row_ids() {
+        let count = if dataset.manifest.uses_stable_logical_row_addresses() {
+            match prefilter {
+                None => Self::count_live_rows(&dataset, &fragments_covered).await?,
+                Some(prefilter) => {
+                    if fragments_covered != dataset_fragments {
+                        return Err(Error::internal(
+                            "CountFromMaskExec: partial physical coverage is invalid for a v2.3 logical index",
+                        ));
+                    }
+                    let universe = Self::logical_address_universe(dataset.as_ref())?;
+                    let combined =
+                        Self::combine_masks(universe, Some(prefilter), logical_index_mask);
+                    let count =
+                        combined
+                            .allow_list()
+                            .and_then(RowSetOps::len)
+                            .ok_or_else(|| {
+                                Error::internal(
+                                    "CountFromMaskExec: v2.3 combined mask is not countable",
+                                )
+                            })?;
+                    i64::try_from(count)
+                        .map_err(|_| Error::invalid_input("CountFromMaskExec result exceeds i64"))?
+                }
+            }
+        } else if dataset.manifest.uses_stable_row_ids() {
             match prefilter {
                 // No prefilter: just the live row count, from metadata.
                 None => Self::count_live_rows(&dataset, &fragments_covered).await?,

@@ -461,7 +461,24 @@ pub fn rechunk_version_sequences(
     Ok(chunked_sequences)
 }
 
-/// Build version metadata for a fragment if it has physical rows and no existing metadata.
+/// Build uniform version metadata for any fragment with physical rows.
+pub fn build_uniform_version_meta(
+    fragment: &Fragment,
+    current_version: u64,
+) -> Option<RowDatasetVersionMeta> {
+    fragment
+        .physical_rows
+        .filter(|physical_rows| *physical_rows > 0)
+        .map(|physical_rows| {
+            let version_sequence = RowDatasetVersionSequence::from_uniform_row_count(
+                physical_rows as u64,
+                current_version,
+            );
+            RowDatasetVersionMeta::from_sequence(&version_sequence).unwrap()
+        })
+}
+
+/// Build version metadata for a legacy stable-row-id fragment.
 pub fn build_version_meta(
     fragment: &Fragment,
     current_version: u64,
@@ -474,15 +491,7 @@ pub fn build_version_meta(
             panic!("Can not find row id meta, please make sure you have enabled stable row id.")
         }
 
-        // Use physical_rows directly as the authoritative row count
-        // This is correct even for compacted fragments where row_id_meta might
-        // have been partially copied
-        let version_sequence = RowDatasetVersionSequence::from_uniform_row_count(
-            physical_rows as u64,
-            current_version,
-        );
-
-        return Some(RowDatasetVersionMeta::from_sequence(&version_sequence).unwrap());
+        return build_uniform_version_meta(fragment, current_version);
     }
     None
 }
@@ -548,53 +557,72 @@ pub fn refresh_row_latest_update_meta_for_partial_frag_rewrite_cols(
         0
     };
 
-    if row_count_u64 > 0 {
-        // Build base version vector from existing meta or previous dataset version
-        let mut base_versions: Vec<u64> = Vec::with_capacity(row_count_u64 as usize);
-        if let Some(meta) = fragment.last_updated_at_version_meta.as_ref() {
-            if let Ok(base_seq) = meta.load_sequence() {
-                for pos in 0..(row_count_u64 as usize) {
-                    base_versions.push(base_seq.version_at(pos).unwrap_or(prev_version));
-                }
-            } else {
-                base_versions.resize(row_count_u64 as usize, prev_version);
-            }
-        } else {
-            base_versions.resize(row_count_u64 as usize, prev_version);
-        }
+    let base = RowDatasetVersionSequence::from_uniform_row_count(row_count_u64, prev_version);
+    refresh_row_latest_update_meta_for_partial_frag_rewrite_cols_with_base(
+        fragment,
+        updated_offsets,
+        current_version,
+        &base,
+    )
+}
 
-        // Apply updates to updated positions
-        for &pos in updated_offsets {
-            if pos < base_versions.len() {
-                base_versions[pos] = current_version;
-            }
-        }
+/// Refresh selected row offsets using an exact base sequence when metadata is absent.
+pub fn refresh_row_latest_update_meta_for_partial_frag_rewrite_cols_with_base(
+    fragment: &mut Fragment,
+    updated_offsets: &[usize],
+    current_version: u64,
+    missing_metadata_base: &RowDatasetVersionSequence,
+) -> Result<()> {
+    let row_count = fragment
+        .physical_rows
+        .unwrap_or_else(|| missing_metadata_base.len() as usize);
+    if row_count == 0 {
+        return Ok(());
+    }
+    let base_sequence = match fragment.last_updated_at_version_meta.as_ref() {
+        Some(metadata) => metadata.load_sequence()?,
+        None => missing_metadata_base.clone(),
+    };
+    if base_sequence.len() != row_count as u64 {
+        return Err(Error::internal(format!(
+            "row-version base has {} rows but fragment {} has {row_count}",
+            base_sequence.len(),
+            fragment.id
+        )));
+    }
+    let mut base_versions = base_sequence.versions().collect::<Vec<_>>();
 
-        // Compress into runs
-        let mut runs: Vec<RowDatasetVersionRun> = Vec::new();
-        if !base_versions.is_empty() {
-            let mut start = 0usize;
-            let mut curr_ver = base_versions[0];
-            for (idx, &ver) in base_versions.iter().enumerate().skip(1) {
-                if ver != curr_ver {
-                    runs.push(RowDatasetVersionRun {
-                        span: U64Segment::Range(start as u64..idx as u64),
-                        version: curr_ver,
-                    });
-                    start = idx;
-                    curr_ver = ver;
-                }
-            }
-            runs.push(RowDatasetVersionRun {
-                span: U64Segment::Range(start as u64..base_versions.len() as u64),
-                version: curr_ver,
-            });
-        }
-        let new_seq = RowDatasetVersionSequence { runs };
-        let new_meta = RowDatasetVersionMeta::from_sequence(&new_seq)?;
-        fragment.last_updated_at_version_meta = Some(new_meta);
+    for &position in updated_offsets {
+        let version = base_versions.get_mut(position).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "updated row offset {position} is outside fragment {} with {row_count} rows",
+                fragment.id
+            ))
+        })?;
+        *version = current_version;
     }
 
+    let mut runs: Vec<RowDatasetVersionRun> = Vec::new();
+    if !base_versions.is_empty() {
+        let mut start = 0usize;
+        let mut curr_ver = base_versions[0];
+        for (idx, &ver) in base_versions.iter().enumerate().skip(1) {
+            if ver != curr_ver {
+                runs.push(RowDatasetVersionRun {
+                    span: U64Segment::Range(start as u64..idx as u64),
+                    version: curr_ver,
+                });
+                start = idx;
+                curr_ver = ver;
+            }
+        }
+        runs.push(RowDatasetVersionRun {
+            span: U64Segment::Range(start as u64..base_versions.len() as u64),
+            version: curr_ver,
+        });
+    }
+    let new_seq = RowDatasetVersionSequence { runs };
+    fragment.last_updated_at_version_meta = Some(RowDatasetVersionMeta::from_sequence(&new_seq)?);
     Ok(())
 }
 
@@ -709,5 +737,44 @@ mod tests {
         assert_eq!(seq.get_version_for_row_id(&rows, 12), Some(9));
         assert_eq!(seq.get_version_for_row_id(&rows, 13), Some(9));
         assert_eq!(seq.get_version_for_row_id(&rows, 99), None);
+    }
+
+    #[test]
+    fn partial_column_update_only_advances_touched_offsets() {
+        let mut fragment = Fragment::new(7).with_physical_rows(5);
+        let base = RowDatasetVersionSequence {
+            runs: vec![
+                RowDatasetVersionRun {
+                    span: U64Segment::Range(0..2),
+                    version: 2,
+                },
+                RowDatasetVersionRun {
+                    span: U64Segment::Range(0..2),
+                    version: 1,
+                },
+                RowDatasetVersionRun {
+                    span: U64Segment::Range(0..1),
+                    version: 2,
+                },
+            ],
+        };
+        refresh_row_latest_update_meta_for_partial_frag_rewrite_cols_with_base(
+            &mut fragment,
+            &[1, 3],
+            4,
+            &base,
+        )
+        .unwrap();
+
+        let actual = fragment
+            .last_updated_at_version_meta
+            .as_ref()
+            .unwrap()
+            .load_sequence()
+            .unwrap()
+            .versions()
+            .collect::<Vec<_>>();
+        assert_eq!(actual, vec![2, 4, 1, 4, 2]);
+        assert!(fragment.created_at_version_meta.is_none());
     }
 }

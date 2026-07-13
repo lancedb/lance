@@ -34,6 +34,29 @@ use optimize::{
     ChainedNewColumnTransformOptimizer, NewColumnTransformOptimizer, SqlToAllNullsOptimizer,
 };
 
+async fn preflight_v2_3_add_columns(dataset: &Dataset, output_schema: &ArrowSchema) -> Result<()> {
+    if !dataset.manifest.uses_stable_logical_row_addresses() {
+        return Ok(());
+    }
+    let mut schema = dataset.schema().merge(output_schema)?;
+    schema.set_field_id(Some(dataset.manifest.max_field_id()));
+    let transaction = Transaction::new(
+        dataset.manifest.version,
+        Operation::Merge {
+            fragments: dataset.manifest.fragments.as_ref().clone(),
+            schema,
+        },
+        None,
+    );
+    transaction.build_manifest(
+        Some(dataset.manifest.as_ref()),
+        dataset.load_indices().await?.as_ref().clone(),
+        "row-address-add-columns-preflight.txn",
+        &Default::default(),
+    )?;
+    Ok(())
+}
+
 async fn validate_no_nulls_before_making_non_nullable(dataset: &Dataset, path: &str) -> Result<()> {
     let field = dataset.schema().field(path).ok_or_else(|| {
         Error::invalid_input(format!("Column \"{}\" does not exist in the dataset", path))
@@ -279,6 +302,7 @@ pub(super) async fn add_columns_to_fragments(
     let (output_schema, new_fragments, fragments_to_cleanup) = match transforms {
         NewColumnTransform::BatchUDF(udf) => {
             check_names(udf.output_schema.as_ref())?;
+            preflight_v2_3_add_columns(dataset, udf.output_schema.as_ref()).await?;
             let result = add_columns_impl(
                 fragments,
                 read_columns,
@@ -340,6 +364,7 @@ pub(super) async fn add_columns_to_fragments(
                     .collect::<Result<Vec<_>>>()?,
             ));
             check_names(output_schema.as_ref())?;
+            preflight_v2_3_add_columns(dataset, output_schema.as_ref()).await?;
 
             let schema_ref = output_schema.clone();
             let mapper = move |batch: &RecordBatch| {
@@ -362,18 +387,21 @@ pub(super) async fn add_columns_to_fragments(
         NewColumnTransform::Stream(stream) => {
             let output_schema = stream.schema();
             check_names(output_schema.as_ref())?;
+            preflight_v2_3_add_columns(dataset, output_schema.as_ref()).await?;
             let fragments = add_columns_from_stream(fragments, stream, None, batch_size).await?;
             Ok((output_schema, fragments.clone(), fragments))
         }
         NewColumnTransform::Reader(reader) => {
             let output_schema = reader.schema();
             check_names(output_schema.as_ref())?;
+            preflight_v2_3_add_columns(dataset, output_schema.as_ref()).await?;
             let stream = reader.into_stream();
             let fragments = add_columns_from_stream(fragments, stream, None, batch_size).await?;
             Ok((output_schema, fragments.clone(), fragments))
         }
         NewColumnTransform::AllNulls(output_schema) => {
             check_names(output_schema.as_ref())?;
+            preflight_v2_3_add_columns(dataset, output_schema.as_ref()).await?;
 
             // AllNulls is metadata-only; missing columns are synthesized as nulls at
             // read time, so only each new top-level column needs to be nullable.
@@ -1101,6 +1129,54 @@ mod test {
     }
 
     #[tokio::test]
+    async fn v2_3_add_columns_admission_fails_before_writing_data_files() -> Result<()> {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..8))],
+        )?;
+        let test_dir = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            &test_dir,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_3),
+                ..Default::default()
+            }),
+        )
+        .await?;
+        let fragments = dataset.manifest.fragments.clone();
+        let max_logical_fragment_id = dataset.manifest.max_logical_fragment_id;
+        let manifest = Arc::make_mut(&mut dataset.manifest);
+        let layout = Arc::make_mut(manifest.row_address_layout.as_mut().unwrap());
+        layout.debt_summary.metadata_bytes_written_since_maintenance =
+            lance_table::format::ROW_ADDRESS_W_FAST;
+        layout.refresh_fingerprint_with_fragments(fragments.as_ref(), max_logical_fragment_id);
+
+        let before_version = dataset.version().version;
+        let before_files = data_file_paths_in(test_dir.as_str());
+        let error = dataset
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![(
+                    "derived".to_owned(),
+                    "id + 1".to_owned(),
+                )]),
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("ProjectedEpochBytes"), "{error}");
+        assert_eq!(dataset.version().version, before_version);
+        assert_eq!(data_file_paths_in(test_dir.as_str()), before_files);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_add_columns_with_fully_deleted_batch() -> Result<()> {
         // Regression test: when an entire read batch has been deleted, the
         // updater yields a 0-row batch. The inner loop then never runs and
@@ -1783,7 +1859,11 @@ mod test {
     #[rstest]
     #[tokio::test]
     async fn test_append_columns_udf(
-        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        #[values(
+            LanceFileVersion::Legacy,
+            LanceFileVersion::Stable,
+            LanceFileVersion::V2_3
+        )]
         data_storage_version: LanceFileVersion,
     ) -> Result<()> {
         use arrow_array::Float64Array;
@@ -1962,6 +2042,7 @@ mod test {
                         physical_rows: Some(50),
                         last_updated_at_version_meta: None,
                         created_at_version_meta: None,
+                        native_logical_domain: None,
                     }))
                 } else {
                     Ok(None)
@@ -2478,7 +2559,11 @@ mod test {
     #[rstest]
     #[tokio::test]
     async fn test_rename_columns(
-        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        #[values(
+            LanceFileVersion::Legacy,
+            LanceFileVersion::Stable,
+            LanceFileVersion::V2_3
+        )]
         data_storage_version: LanceFileVersion,
     ) -> Result<()> {
         use std::collections::HashMap;
@@ -3294,7 +3379,11 @@ mod test {
     #[rstest]
     #[tokio::test]
     async fn test_drop_columns(
-        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        #[values(
+            LanceFileVersion::Legacy,
+            LanceFileVersion::Stable,
+            LanceFileVersion::V2_3
+        )]
         data_storage_version: LanceFileVersion,
     ) -> Result<()> {
         use std::collections::HashMap;
@@ -3388,10 +3477,93 @@ mod test {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn v2_3_drop_column_removes_index_and_generation_frontier() -> Result<()> {
+        use crate::dataset::UpdateBuilder;
+        use lance_index::{IndexType, scalar::ScalarIndexParams};
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("value", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..16)),
+                Arc::new(Int32Array::from_iter_values(0..16)),
+            ],
+        )?;
+        let test_dir = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            &test_dir,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_3),
+                ..Default::default()
+            }),
+        )
+        .await?;
+        dataset
+            .create_index(
+                &["value"],
+                IndexType::Scalar,
+                Some("value_idx".to_string()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await?;
+        let value_field_id = dataset.schema().field("value").unwrap().id;
+        let updated = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("id < 4")?
+            .set("value", "value + 100")?
+            .build()?
+            .execute()
+            .await?;
+        let mut dataset = updated.new_dataset.as_ref().clone();
+        assert!(
+            dataset
+                .manifest
+                .row_address_layout
+                .as_ref()
+                .unwrap()
+                .generation_regions
+                .iter()
+                .any(|region| region.field_ids.contains(&value_field_id))
+        );
+
+        dataset.drop_columns(&["value"]).await?;
+        dataset.validate().await?;
+        assert!(dataset.load_indices().await?.is_empty());
+        let layout = dataset.manifest.row_address_layout.as_ref().unwrap();
+        assert!(
+            layout
+                .field_default_generations
+                .iter()
+                .all(|generation| generation.field_id != value_field_id)
+        );
+        assert!(
+            layout
+                .index_commit_floors
+                .iter()
+                .all(|generation| generation.field_id != value_field_id)
+        );
+        assert!(
+            layout
+                .generation_regions
+                .iter()
+                .all(|region| !region.field_ids.contains(&value_field_id))
+        );
+        Ok(())
+    }
+
     #[rstest]
     #[tokio::test]
     async fn test_drop_add_columns(
-        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        #[values(
+            LanceFileVersion::Legacy,
+            LanceFileVersion::Stable,
+            LanceFileVersion::V2_3
+        )]
         data_storage_version: LanceFileVersion,
     ) -> Result<()> {
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(

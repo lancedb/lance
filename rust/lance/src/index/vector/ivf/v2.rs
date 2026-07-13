@@ -526,7 +526,7 @@ impl CacheKey for CachedIndexReadersKey {
 }
 
 /// Open a FileReader, reusing cached file metadata if available.
-async fn open_reader_cached(
+pub(crate) async fn open_reader_cached(
     scheduler: &Arc<ScanScheduler>,
     path: &Path,
     cache: &LanceCache,
@@ -552,14 +552,18 @@ async fn open_reader_cached(
         .await
     } else {
         let file_scheduler = scheduler.open_file(path, &cached_size).await?;
-        FileReader::try_open(
+        let reader = FileReader::try_open(
             file_scheduler,
             None,
             Arc::<DecoderPlugins>::default(),
             cache,
             FileReaderOptions::default(),
         )
-        .await
+        .await?;
+        file_cache
+            .insert_with_key(&FileMetadataCacheKey, reader.metadata().clone())
+            .await;
+        Ok(reader)
     }
 }
 
@@ -1012,23 +1016,18 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
     ) -> Result<Self> {
         let io_parallelism = object_store.io_parallelism();
         let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
-        let scheduler = ScanScheduler::new(object_store, scheduler_config);
+        let scheduler = Arc::new(ScanScheduler::new(object_store, scheduler_config));
 
         let uuid_str = uuid.to_string();
         let uri = index_dir
             .clone()
             .join(uuid_str.as_str())
             .join(INDEX_FILE_NAME);
-        let cached_size = file_sizes
-            .get(INDEX_FILE_NAME)
-            .map(|&size| CachedFileSize::new(size))
-            .unwrap_or_else(CachedFileSize::unknown);
-        let index_reader = FileReader::try_open(
-            scheduler.open_file(&uri, &cached_size).await?,
-            None,
-            Arc::<DecoderPlugins>::default(),
+        let index_reader = open_reader_cached(
+            &scheduler,
+            &uri,
             file_metadata_cache,
-            FileReaderOptions::default(),
+            file_sizes.get(INDEX_FILE_NAME).copied().unwrap_or(0),
         )
         .await?;
         let index_metadata: IndexMetadata = serde_json::from_str(
@@ -1058,24 +1057,18 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             .ok_or(Error::index(format!("{} not found", S::metadata_key())))?;
         let sub_index_metadata: Vec<String> = serde_json::from_str(sub_index_metadata)?;
 
-        let aux_cached_size = file_sizes
-            .get(INDEX_AUXILIARY_FILE_NAME)
-            .map(|&size| CachedFileSize::new(size))
-            .unwrap_or_else(CachedFileSize::unknown);
-        let storage_reader = FileReader::try_open(
-            scheduler
-                .open_file(
-                    &index_dir
-                        .clone()
-                        .join(uuid_str.as_str())
-                        .join(INDEX_AUXILIARY_FILE_NAME),
-                    &aux_cached_size,
-                )
-                .await?,
-            None,
-            Arc::<DecoderPlugins>::default(),
+        let aux_path = index_dir
+            .clone()
+            .join(uuid_str.as_str())
+            .join(INDEX_AUXILIARY_FILE_NAME);
+        let storage_reader = open_reader_cached(
+            &scheduler,
+            &aux_path,
             file_metadata_cache,
-            FileReaderOptions::default(),
+            file_sizes
+                .get(INDEX_AUXILIARY_FILE_NAME)
+                .copied()
+                .unwrap_or(0),
         )
         .await?;
         let storage =
@@ -1087,10 +1080,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             .with_key_prefix(uri.as_ref())
             .insert_with_key(&FileMetadataCacheKey, index_reader.metadata().clone())
             .await;
-        let aux_path = index_dir
-            .clone()
-            .join(uuid_str.as_str())
-            .join(INDEX_AUXILIARY_FILE_NAME);
         file_metadata_cache
             .with_key_prefix(aux_path.as_ref())
             .insert_with_key(&FileMetadataCacheKey, storage.reader().metadata().clone())

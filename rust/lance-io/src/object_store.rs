@@ -217,6 +217,11 @@ pub struct ObjectStoreParams {
     pub s3_credentials_refresh_offset: Duration,
     #[cfg(feature = "aws")]
     pub aws_credentials: Option<AwsCredentialProvider>,
+    /// Shared logical I/O tracker for this store and scoped base stores.
+    ///
+    /// Unlike an object-store wrapper, this also observes local readers and
+    /// writers that bypass the `object_store` trait for lower overhead.
+    pub io_tracker: Option<Arc<IOTracker>>,
     pub object_store_wrapper: Option<Arc<dyn WrappingObjectStore>>,
     /// Unified storage options accessor with caching and automatic refresh
     ///
@@ -241,6 +246,7 @@ impl Default for ObjectStoreParams {
             s3_credentials_refresh_offset: Duration::from_secs(60),
             #[cfg(feature = "aws")]
             aws_credentials: None,
+            io_tracker: None,
             object_store_wrapper: None,
             storage_options_accessor: None,
             use_constant_size_upload_parts: false,
@@ -301,6 +307,9 @@ impl std::hash::Hash for ObjectStoreParams {
         if let Some(aws_credentials) = &self.aws_credentials {
             Arc::as_ptr(aws_credentials).hash(state);
         }
+        if let Some(io_tracker) = &self.io_tracker {
+            Arc::as_ptr(io_tracker).hash(state);
+        }
         if let Some(wrapper) = &self.object_store_wrapper {
             Arc::as_ptr(wrapper).hash(state);
         }
@@ -334,6 +343,8 @@ impl PartialEq for ObjectStoreParams {
                     .as_ref()
                     .map(|(store, url)| (Arc::as_ptr(store), url))
             && self.s3_credentials_refresh_offset == other.s3_credentials_refresh_offset
+            && self.io_tracker.as_ref().map(Arc::as_ptr)
+                == other.io_tracker.as_ref().map(Arc::as_ptr)
             && self.object_store_wrapper.as_ref().map(Arc::as_ptr)
                 == other.object_store_wrapper.as_ref().map(Arc::as_ptr)
             && self
@@ -493,7 +504,7 @@ impl ObjectStore {
             }
 
             // Always wrap with IO tracking
-            let io_tracker = IOTracker::default();
+            let io_tracker = params.io_tracker.as_deref().cloned().unwrap_or_default();
             let tracked_store = io_tracker.wrap("", inner);
 
             let store = Self {
@@ -566,11 +577,16 @@ impl ObjectStore {
     /// Create a in-memory object store directly for testing.
     pub fn memory() -> Self {
         let provider = MemoryStoreProvider;
-        provider
+        let mut store = provider
             .new_store(Url::parse("memory:///").unwrap(), &Default::default())
             .now_or_never()
             .unwrap()
-            .unwrap()
+            .unwrap();
+
+        // This constructor bypasses ObjectStoreRegistry, which normally installs
+        // the tracking wrapper after a provider returns its raw store.
+        store.inner = store.io_tracker.wrap("", store.inner);
+        store
     }
 
     /// Returns true if the object store pointed to a local file system.
@@ -1252,6 +1268,56 @@ mod tests {
                 .unwrap();
             assert_eq!(contents, "TEST_CONTENT");
         }
+    }
+
+    #[tokio::test]
+    async fn supplied_io_tracker_observes_local_fast_paths() {
+        let directory = TempStrDir::default();
+        let tracker = Arc::new(IOTracker::default());
+        let params = ObjectStoreParams {
+            io_tracker: Some(tracker.clone()),
+            ..Default::default()
+        };
+        let (store, base) = ObjectStore::from_uri_and_params(
+            Arc::new(ObjectStoreRegistry::default()),
+            directory.as_str(),
+            &params,
+        )
+        .await
+        .unwrap();
+        let path = base.join("tracked");
+
+        store.put(&path, b"payload").await.unwrap();
+        let reader = store.open(&path).await.unwrap();
+        assert_eq!(reader.get_range(0..7).await.unwrap(), b"payload".as_slice());
+
+        let stats = tracker.stats();
+        assert_eq!(stats.write_iops, 1);
+        assert_eq!(stats.written_bytes, 7);
+        assert_eq!(stats.read_iops, 1);
+        assert_eq!(stats.read_bytes, 7);
+    }
+
+    #[tokio::test]
+    async fn direct_memory_store_tracks_inner_object_store_io() {
+        let store = ObjectStore::memory();
+        let path = Path::from("tracked");
+        store
+            .inner
+            .put(&path, PutPayload::from_static(b"payload"))
+            .await
+            .unwrap();
+        store.io_stats_incremental();
+
+        store.inner.head(&path).await.unwrap();
+        assert_eq!(
+            store.inner.get_range(&path, 0..7).await.unwrap(),
+            b"payload".as_slice()
+        );
+
+        let stats = store.io_stats_incremental();
+        assert_eq!(stats.read_iops, 2);
+        assert_eq!(stats.read_bytes, 7);
     }
 
     #[tokio::test]

@@ -124,14 +124,36 @@ impl AddRowAddrExec {
         })
     }
 
-    fn compute_row_addrs(
+    async fn compute_row_addrs(
         row_ids: &ArrayRef,
         row_id_index: Option<&RowIdIndex>,
+        logical_dataset: Option<&Dataset>,
     ) -> Result<ArrayRef> {
         let row_id_values = row_ids.as_primitive_opt::<UInt64Type>().ok_or_else(|| {
             DataFusionError::Internal("AddRowAddrExec: rowid column is not a UInt64Array".into())
         })?;
-        if let Some(row_id_index) = row_id_index {
+        if let Some(dataset) = logical_dataset {
+            let ids = row_id_values.iter().flatten().collect::<Vec<_>>();
+            let mut resolved = dataset
+                .resolve_logical_row_ids_async(&ids)
+                .await?
+                .into_iter();
+            let mut builder = arrow::array::UInt64Builder::with_capacity(row_id_values.len());
+            for row_id in row_id_values.iter() {
+                let Some(row_id) = row_id else {
+                    builder.append_null();
+                    continue;
+                };
+                let address = resolved.next().flatten().ok_or_else(|| {
+                    DataFusionError::Internal(format!(
+                        "AddRowAddrExec: logical rowid not found in placement: {row_id}"
+                    ))
+                })?;
+                builder.append_value(u64::from(address));
+            }
+            debug_assert!(resolved.next().is_none());
+            Ok(Arc::new(builder.finish()))
+        } else if let Some(row_id_index) = row_id_index {
             if row_id_values.null_count() > 0 {
                 let mut builder = arrow::array::UInt64Builder::with_capacity(row_id_values.len());
                 for rowid in row_id_values.iter() {
@@ -175,14 +197,20 @@ impl AddRowAddrExec {
         partition: usize,
         context: Arc<datafusion::execution::context::TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        let index_prereq = self
-            .row_id_index
-            .get_or_init(|| {
-                let dataset = self.dataset.clone();
-                let fut = async move { get_row_id_index(dataset.as_ref()).await };
-                SharedPrerequisite::spawn(fut)
-            })
-            .clone();
+        let logical_dataset = self
+            .dataset
+            .manifest
+            .uses_stable_logical_row_addresses()
+            .then(|| self.dataset.clone());
+        let index_prereq = logical_dataset.is_none().then(|| {
+            self.row_id_index
+                .get_or_init(|| {
+                    let dataset = self.dataset.clone();
+                    let fut = async move { get_row_id_index(dataset.as_ref()).await };
+                    SharedPrerequisite::spawn(fut)
+                })
+                .clone()
+        });
 
         let input_stream = self.input.execute(partition, context)?;
 
@@ -194,15 +222,24 @@ impl AddRowAddrExec {
         let stream = input_stream.then(move |batch_result| {
             let output_schema = output_schema.clone();
             let index_prereq = index_prereq.clone();
+            let logical_dataset = logical_dataset.clone();
             let elapsed_compute = elapsed_compute.clone();
             async move {
                 let batch = batch_result?;
-                index_prereq.wait_ready().await?;
-                let row_id_index = index_prereq.get_ready();
-                let index_ref = row_id_index.as_deref();
+                let row_id_index = if let Some(index_prereq) = index_prereq {
+                    index_prereq.wait_ready().await?;
+                    index_prereq.get_ready()
+                } else {
+                    None
+                };
 
                 let _t = elapsed_compute.timer();
-                let row_addr = Self::compute_row_addrs(batch.column(rowid_pos), index_ref)?;
+                let row_addr = Self::compute_row_addrs(
+                    batch.column(rowid_pos),
+                    row_id_index.as_deref(),
+                    logical_dataset.as_deref(),
+                )
+                .await?;
 
                 let mut columns = Vec::with_capacity(batch.num_columns() + 1);
                 let existing_columns = batch.columns();
@@ -591,6 +628,8 @@ mod test {
     use futures::TryStreamExt;
     use lance_core::{ROW_ADDR, ROW_ID_FIELD};
     use lance_datafusion::exec::OneShotExec;
+    use lance_file::version::LanceFileVersion;
+    use uuid::Uuid;
 
     use crate::dataset::WriteParams;
 
@@ -662,6 +701,63 @@ mod test {
         .unwrap();
         assert_eq!(dataset.get_fragments().len(), 3);
         Arc::new(dataset)
+    }
+
+    #[tokio::test]
+    async fn test_v23_logical_ids_use_placement_instead_of_row_id_index() {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let dataset = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new([Ok(batch)], schema),
+                &format!("memory://{}", Uuid::new_v4()),
+                Some(WriteParams {
+                    data_storage_version: Some(LanceFileVersion::V2_3),
+                    max_rows_per_file: 1,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(dataset.row_address_router.get().is_none());
+        assert!(
+            dataset
+                .manifest
+                .fragments
+                .iter()
+                .all(|fragment| fragment.row_id_meta.is_none())
+        );
+
+        let first = &dataset.manifest.fragments[0];
+        let third = &dataset.manifest.fragments[2];
+        let first_row_id = (first.native_logical_domain.unwrap().logical_fragment_id as u64) << 32;
+        let third_row_id = (third.native_logical_domain.unwrap().logical_fragment_id as u64) << 32;
+        let row_ids = Arc::new(UInt64Array::from(vec![
+            Some(third_row_id),
+            None,
+            Some(first_row_id),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![ROW_ID_FIELD.clone()])),
+            vec![row_ids],
+        )
+        .unwrap();
+
+        let result = apply_to_batch(batch, dataset.clone()).await.unwrap();
+        assert_eq!(
+            result[ROW_ADDR].as_primitive::<UInt64Type>(),
+            &UInt64Array::from(vec![
+                Some(u64::from(RowAddress::new_from_parts(third.id as u32, 0))),
+                None,
+                Some(u64::from(RowAddress::new_from_parts(first.id as u32, 0))),
+            ])
+        );
+        assert!(dataset.row_address_router.get().is_some());
     }
 
     #[tokio::test]

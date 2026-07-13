@@ -10,12 +10,12 @@
 //!     │    │
 //!     └────┴──► Index-specific cache (prefixed by index UUID and FRI UUID)
 
-use std::{borrow::Cow, ops::Deref, sync::Arc};
+use std::{borrow::Cow, fmt::Write as _, ops::Deref, sync::Arc};
 
 use lance_core::cache::{CacheKey, LanceCache};
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_index::frag_reuse::FragReuseIndex;
-use lance_table::format::IndexMetadata;
+use lance_table::format::{IndexMetadata, LogicalIndexCoverageArtifact};
 use uuid::Uuid;
 
 /// A type-safe wrapper around a LanceCache that enforces namespaces for index data.
@@ -91,6 +91,30 @@ impl CacheKey for FragReuseIndexKey<'_> {
 
     fn type_name() -> &'static str {
         "FragReuseIndex"
+    }
+}
+
+#[derive(Debug)]
+pub struct LogicalIndexCoverageArtifactKey<'a> {
+    pub uuid: &'a Uuid,
+    pub summary_fingerprint: &'a [u8],
+}
+
+impl CacheKey for LogicalIndexCoverageArtifactKey<'_> {
+    type ValueType = LogicalIndexCoverageArtifact;
+
+    fn key(&self) -> Cow<'_, str> {
+        let mut key = String::with_capacity(54 + self.summary_fingerprint.len() * 2);
+        write!(&mut key, "logical_coverage/{}/", self.uuid)
+            .expect("writing to a String cannot fail");
+        for byte in self.summary_fingerprint {
+            write!(&mut key, "{byte:02x}").expect("writing to a String cannot fail");
+        }
+        Cow::Owned(key)
+    }
+
+    fn type_name() -> &'static str {
+        "LogicalIndexCoverageArtifact"
     }
 }
 

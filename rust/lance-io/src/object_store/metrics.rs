@@ -10,10 +10,10 @@
 //!   number of requests currently in flight. It works for every store
 //!   regardless of backend.
 //! * [`MeteringHttpConnector`] wraps the HTTP client used by the native cloud
-//!   stores (S3 / GCS / Azure) and records throttle / retryable responses per
-//!   attempt. Because `object_store`'s retry loop re-issues each request
-//!   through the [`HttpService`](object_store::client::HttpService), this sees
-//!   every retried response, which a store-level wrapper cannot observe.
+//!   stores (S3 / GCS / Azure) and records every HTTP attempt plus throttle /
+//!   retryable responses. Because `object_store`'s retry loop re-issues each
+//!   request through the [`HttpService`](object_store::client::HttpService),
+//!   this sees retries that a store-level wrapper cannot observe.
 //!
 //! The two layers have different coverage: every store gets the request-level
 //! metrics from [`MeteredObjectStore`], but only the native cloud stores get
@@ -59,6 +59,12 @@ pub const METRIC_BYTES: &str = "lance_object_store_request_bytes_total";
 pub const METRIC_DURATION: &str = "lance_object_store_request_duration_seconds";
 /// Total number of failed object store requests, labelled by `operation` and `base`.
 pub const METRIC_ERRORS: &str = "lance_object_store_errors_total";
+/// Total HTTP attempts made by native cloud stores, labelled by semantic
+/// `method` (`get`, `head`, `list`, `put`, `delete`, or `other`) and `base`.
+///
+/// Unlike [`METRIC_REQUESTS`], this counter is below `object_store`'s retry
+/// loop. One logical request can therefore increment it more than once.
+pub const METRIC_HTTP_ATTEMPTS: &str = "lance_object_store_http_attempts_total";
 /// Total number of throttle responses (HTTP 429 / 503) seen at the HTTP layer,
 /// labelled by `status` and `base`. Counts every attempt, including retries.
 pub const METRIC_THROTTLE: &str = "lance_object_store_throttle_total";
@@ -167,6 +173,11 @@ pub fn describe_metrics() {
         METRIC_ERRORS,
         metrics::Unit::Count,
         "Total number of failed object store requests, by operation and scheme."
+    );
+    metrics::describe_counter!(
+        METRIC_HTTP_ATTEMPTS,
+        metrics::Unit::Count,
+        "Total native-cloud HTTP attempts, including retries, by semantic method and scheme."
     );
     metrics::describe_counter!(
         METRIC_THROTTLE,
@@ -619,6 +630,8 @@ mod http {
     #[async_trait::async_trait]
     impl HttpService for MeteringHttpService {
         async fn call(&self, req: HttpRequest) -> Result<HttpResponse, HttpError> {
+            let method = classify_http_attempt(&req);
+            metrics::counter!(METRIC_HTTP_ATTEMPTS, method_labels(&self.base, method)).increment(1);
             let response = self.inner.execute(req).await?;
             let status = response.status().as_u16();
             // Each attempt that object_store may retry is recorded with its
@@ -636,6 +649,75 @@ mod http {
             }
             Ok(response)
         }
+    }
+
+    /// Classify native-cloud HTTP requests into the storage operations needed
+    /// for I/O accounting. LIST and S3's batched delete are encoded as GET and
+    /// POST requests respectively, so method alone is insufficient.
+    fn classify_http_attempt(request: &HttpRequest) -> &'static str {
+        match request.method().as_str() {
+            "HEAD" => "head",
+            "GET" if is_list_request(request.uri()) => "list",
+            "GET" => "get",
+            "PUT" | "PATCH" => "put",
+            "DELETE" => "delete",
+            "POST" if has_query_key(request.uri(), "delete") => "delete",
+            // Multipart create/complete requests use POST but are writes.
+            "POST" => "put",
+            _ => "other",
+        }
+    }
+
+    fn is_list_request(uri: &::http::Uri) -> bool {
+        // S3 ListObjectsV2.
+        if has_query_key(uri, "list-type") {
+            return true;
+        }
+
+        // Azure container listing (`restype=container&comp=list`).
+        if has_query_value(uri, "comp", "list") {
+            return true;
+        }
+
+        // GCS JSON object listing ends at `/o`; object GETs append the encoded
+        // object name. Requiring a pagination/filter key avoids classifying an
+        // unrelated GET to an `/o` path as LIST.
+        uri.path().ends_with("/o")
+            && [
+                "prefix",
+                "delimiter",
+                "pageToken",
+                "startOffset",
+                "endOffset",
+            ]
+            .iter()
+            .any(|key| has_query_key(uri, key))
+    }
+
+    fn has_query_key(uri: &::http::Uri, expected: &str) -> bool {
+        uri.query().is_some_and(|query| {
+            query.split('&').any(|parameter| {
+                parameter.split_once('=').map_or(parameter, |(key, _)| key) == expected
+            })
+        })
+    }
+
+    fn has_query_value(uri: &::http::Uri, expected_key: &str, expected_value: &str) -> bool {
+        uri.query().is_some_and(|query| {
+            query.split('&').any(|parameter| {
+                parameter
+                    .split_once('=')
+                    .is_some_and(|(key, value)| key == expected_key && value == expected_value)
+            })
+        })
+    }
+
+    fn method_labels(base: &str, method: &'static str) -> Vec<metrics::Label> {
+        let mut labels = vec![metrics::Label::new("method", method)];
+        if let Some(base) = scoped_base(base_label_mode(), base) {
+            labels.push(metrics::Label::new("base", base));
+        }
+        labels
     }
 
     /// Build the `status` (+ optional `base`) label set for HTTP-layer metrics,
@@ -671,9 +753,13 @@ mod http {
         }
 
         fn request() -> HttpRequest {
+            request_with("GET", "http://example.com/obj")
+        }
+
+        fn request_with(method: &str, uri: &str) -> HttpRequest {
             ::http::Request::builder()
-                .method("GET")
-                .uri("http://example.com/obj")
+                .method(method)
+                .uri(uri)
                 .body(HttpRequestBody::empty())
                 .unwrap()
         }
@@ -698,6 +784,107 @@ mod http {
                 }
             }
             0
+        }
+
+        fn attempt_count(metrics: &[(metrics::Key, DebugValue)], base: &str, method: &str) -> u64 {
+            for (key, value) in metrics {
+                if key.name() != METRIC_HTTP_ATTEMPTS {
+                    continue;
+                }
+                let labels: std::collections::HashMap<&str, &str> = key
+                    .labels()
+                    .map(|label| (label.key(), label.value()))
+                    .collect();
+                if labels.get("base") == Some(&base)
+                    && labels.get("method") == Some(&method)
+                    && let DebugValue::Counter(value) = value
+                {
+                    return *value;
+                }
+            }
+            0
+        }
+
+        #[test]
+        fn test_http_attempt_classification() {
+            for (method, uri, expected) in [
+                ("GET", "https://bucket.s3.amazonaws.com/key", "get"),
+                ("HEAD", "https://bucket.s3.amazonaws.com/key", "head"),
+                (
+                    "GET",
+                    "https://bucket.s3.amazonaws.com/?list-type=2&prefix=data%2F",
+                    "list",
+                ),
+                (
+                    "GET",
+                    "https://account.blob.core.windows.net/container?restype=container&comp=list",
+                    "list",
+                ),
+                (
+                    "GET",
+                    "https://storage.googleapis.com/storage/v1/b/bucket/o?prefix=data%2F",
+                    "list",
+                ),
+                ("PUT", "https://bucket.s3.amazonaws.com/key", "put"),
+                ("POST", "https://bucket.s3.amazonaws.com/key?uploads", "put"),
+                ("POST", "https://bucket.s3.amazonaws.com/?delete", "delete"),
+                ("DELETE", "https://bucket.s3.amazonaws.com/key", "delete"),
+                ("OPTIONS", "https://bucket.s3.amazonaws.com/key", "other"),
+            ] {
+                assert_eq!(classify_http_attempt(&request_with(method, uri)), expected);
+            }
+        }
+
+        #[test]
+        fn test_http_attempts_count_every_service_call() {
+            let recorder = DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            metrics::with_local_recorder(&recorder, || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap();
+                rt.block_on(async {
+                    let service = MeteringHttpService {
+                        base: "s3".into(),
+                        inner: HttpClient::new(StaticStatusService { status: 200 }),
+                    };
+                    // Repeating the GET models object_store issuing a retry. Each
+                    // pass through this HTTP boundary is an actual attempt.
+                    service.call(request()).await.unwrap();
+                    service.call(request()).await.unwrap();
+                    service
+                        .call(request_with("HEAD", "http://example.com/obj"))
+                        .await
+                        .unwrap();
+                    service
+                        .call(request_with(
+                            "GET",
+                            "http://example.com/?list-type=2&prefix=data",
+                        ))
+                        .await
+                        .unwrap();
+                    service
+                        .call(request_with("PUT", "http://example.com/obj"))
+                        .await
+                        .unwrap();
+                    service
+                        .call(request_with("POST", "http://example.com/?delete"))
+                        .await
+                        .unwrap();
+                });
+            });
+
+            let recorded = snapshotter
+                .snapshot()
+                .into_vec()
+                .into_iter()
+                .map(|(key, _unit, _description, value)| (key.key().clone(), value))
+                .collect::<Vec<_>>();
+            assert_eq!(attempt_count(&recorded, "s3", "get"), 2);
+            assert_eq!(attempt_count(&recorded, "s3", "head"), 1);
+            assert_eq!(attempt_count(&recorded, "s3", "list"), 1);
+            assert_eq!(attempt_count(&recorded, "s3", "put"), 1);
+            assert_eq!(attempt_count(&recorded, "s3", "delete"), 1);
         }
 
         #[test]

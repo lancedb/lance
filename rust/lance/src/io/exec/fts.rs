@@ -26,6 +26,7 @@ use futures::future::try_join_all;
 use futures::stream::{self};
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use itertools::Itertools;
+use lance_arrow::iter_str_array;
 use lance_core::{
     Error, ROW_ID, Result,
     utils::{tokio::get_num_compute_intensive_cpus, tracing::StreamTracingExt},
@@ -585,6 +586,7 @@ pub struct FlatMatchFilterExec {
     dataset: Arc<Dataset>,
     input: Arc<dyn ExecutionPlan>,
     query: MatchQuery,
+    phrase_slop: Option<u32>,
     params: FtsSearchParams,
     /// Optional pre-resolved segment list. See
     /// [`MatchQueryExec::new_with_segments`]. `FlatMatchFilterExec` only
@@ -593,6 +595,13 @@ pub struct FlatMatchFilterExec {
     preset_segments: Option<Vec<IndexMetadata>>,
 
     metrics: ExecutionPlanMetricsSet,
+}
+
+struct FlatMatchFilterStreamContext {
+    dataset: Arc<Dataset>,
+    query: MatchQuery,
+    phrase_slop: Option<u32>,
+    preset_segments: Option<Vec<IndexMetadata>>,
 }
 
 impl DisplayAs for FlatMatchFilterExec {
@@ -662,6 +671,28 @@ impl FlatMatchFilterExec {
             dataset,
             input,
             query,
+            phrase_slop: None,
+            params,
+            preset_segments: None,
+            metrics: ExecutionPlanMetricsSet::new(),
+        }
+    }
+
+    /// Build an exact phrase filter for rows that cannot be served by an
+    /// immutable inverted-index segment.
+    pub fn new_phrase(
+        input: Arc<dyn ExecutionPlan>,
+        dataset: Arc<Dataset>,
+        query: PhraseQuery,
+        params: FtsSearchParams,
+    ) -> Self {
+        let phrase_slop = query.slop;
+        let query = MatchQuery::new(query.terms).with_column(query.column);
+        Self {
+            dataset,
+            input,
+            query,
+            phrase_slop: Some(phrase_slop),
             params,
             preset_segments: None,
             metrics: ExecutionPlanMetricsSet::new(),
@@ -682,6 +713,29 @@ impl FlatMatchFilterExec {
             dataset,
             input,
             query,
+            phrase_slop: None,
+            params,
+            preset_segments: Some(segments),
+            metrics: ExecutionPlanMetricsSet::new(),
+        }
+    }
+
+    /// Build an exact phrase filter using a pre-resolved segment list for the
+    /// analyzer configuration.
+    pub fn new_phrase_with_segments(
+        input: Arc<dyn ExecutionPlan>,
+        dataset: Arc<Dataset>,
+        query: PhraseQuery,
+        params: FtsSearchParams,
+        segments: Vec<IndexMetadata>,
+    ) -> Self {
+        let phrase_slop = query.slop;
+        let query = MatchQuery::new(query.terms).with_column(query.column);
+        Self {
+            dataset,
+            input,
+            query,
+            phrase_slop: Some(phrase_slop),
             params,
             preset_segments: Some(segments),
             metrics: ExecutionPlanMetricsSet::new(),
@@ -704,29 +758,154 @@ impl FlatMatchFilterExec {
         self.preset_segments.as_deref()
     }
 
+    fn has_phrase(
+        text: &str,
+        tokenizer: &mut Box<dyn LanceTokenizer>,
+        query_tokens: &Tokens,
+        slop: u32,
+    ) -> bool {
+        if query_tokens.is_empty() {
+            return false;
+        }
+
+        let mut document_positions = vec![Vec::new(); query_tokens.len()];
+        let mut stream = tokenizer.token_stream_for_doc(text);
+        while let Some(token) = stream.next() {
+            for (query_index, positions) in document_positions.iter_mut().enumerate() {
+                if token.text == query_tokens.get_token(query_index) {
+                    positions.push(token.position as i64);
+                }
+            }
+        }
+        if document_positions.iter().any(Vec::is_empty) {
+            return false;
+        }
+
+        let first_query_position = query_tokens.position(0) as i64;
+        let mut relative_positions = document_positions[0]
+            .iter()
+            .map(|position| position - first_query_position)
+            .collect::<Vec<_>>();
+        let slop = slop as i64;
+        for (query_index, positions) in document_positions.iter().enumerate().skip(1) {
+            let query_position = query_tokens.position(query_index) as i64;
+            let mut next_relative_positions = Vec::with_capacity(positions.len());
+            for position in positions {
+                let relative_position = position - query_position;
+                if relative_positions.iter().any(|previous| {
+                    *previous <= relative_position && relative_position <= *previous + slop
+                }) {
+                    next_relative_positions.push(relative_position);
+                }
+            }
+            if next_relative_positions.is_empty() {
+                return false;
+            }
+            relative_positions = next_relative_positions;
+        }
+        true
+    }
+
+    fn text_matches(
+        text: &str,
+        tokenizer: &mut Box<dyn LanceTokenizer>,
+        query_tokens: &Tokens,
+        phrase_slop: Option<u32>,
+    ) -> bool {
+        match phrase_slop {
+            Some(slop) => Self::has_phrase(text, tokenizer, query_tokens, slop),
+            None => has_query_token(text, tokenizer, query_tokens),
+        }
+    }
+
     fn find_matches<O: OffsetSizeTrait>(
         text_col: &dyn Array,
         tokenizer: &mut Box<dyn LanceTokenizer>,
         query_tokens: &Tokens,
+        phrase_slop: Option<u32>,
     ) -> BooleanArray {
         let text_col = text_col.as_string::<O>();
         let mut predicate = BooleanBuilder::with_capacity(text_col.len());
         for idx in 0..text_col.len() {
-            let value = text_col.value(idx);
-            predicate.append_value(has_query_token(value, tokenizer, query_tokens));
+            let is_match = !text_col.is_null(idx)
+                && Self::text_matches(text_col.value(idx), tokenizer, query_tokens, phrase_slop);
+            predicate.append_value(is_match);
         }
         predicate.finish()
+    }
+
+    fn find_list_matches<O: OffsetSizeTrait>(
+        text_col: &dyn Array,
+        tokenizer: &mut Box<dyn LanceTokenizer>,
+        query_tokens: &Tokens,
+        phrase_slop: Option<u32>,
+    ) -> DataFusionResult<BooleanArray> {
+        let text_col = text_col.as_list::<O>();
+        let mut predicate = BooleanBuilder::with_capacity(text_col.len());
+        for idx in 0..text_col.len() {
+            if text_col.is_null(idx) {
+                predicate.append_value(false);
+                continue;
+            }
+            let elements = text_col.value(idx);
+            let mut document = String::new();
+            for element in iter_str_array(elements.as_ref()).flatten() {
+                if !document.is_empty() {
+                    document.push(' ');
+                }
+                document.push_str(element);
+            }
+            predicate.append_value(Self::text_matches(
+                &document,
+                tokenizer,
+                query_tokens,
+                phrase_slop,
+            ));
+        }
+        Ok(predicate.finish())
+    }
+
+    fn find_json_matches(
+        text_col: &dyn Array,
+        tokenizer: &mut Box<dyn LanceTokenizer>,
+        query_tokens: &Tokens,
+        phrase_slop: Option<u32>,
+    ) -> DataFusionResult<BooleanArray> {
+        let text_col = text_col.as_binary::<i64>();
+        let mut predicate = BooleanBuilder::with_capacity(text_col.len());
+        for idx in 0..text_col.len() {
+            if text_col.is_null(idx) {
+                predicate.append_value(false);
+                continue;
+            }
+            let document = std::str::from_utf8(text_col.value(idx)).map_err(|error| {
+                DataFusionError::Execution(format!(
+                    "JSON full-text document at row {idx} is not UTF-8: {error}"
+                ))
+            })?;
+            predicate.append_value(Self::text_matches(
+                document,
+                tokenizer,
+                query_tokens,
+                phrase_slop,
+            ));
+        }
+        Ok(predicate.finish())
     }
 
     async fn build_filter_stream(
         input: SendableRecordBatchStream,
         partition: usize,
         schema: SchemaRef,
-        dataset: Arc<Dataset>,
-        query: MatchQuery,
-        preset_segments: Option<Vec<IndexMetadata>>,
+        context: FlatMatchFilterStreamContext,
         metrics_set: ExecutionPlanMetricsSet,
     ) -> DataFusionResult<SendableRecordBatchStream> {
+        let FlatMatchFilterStreamContext {
+            dataset,
+            query,
+            phrase_slop,
+            preset_segments,
+        } = context;
         let metrics = Arc::new(FtsIndexMetrics::new(&metrics_set, partition));
         let column = query
             .column
@@ -763,12 +942,36 @@ impl FlatMatchFilterExec {
                     DataFusionError::Execution(format!("Column {} not found in batch", column,))
                 })?;
                 let predicate = match text_column.data_type() {
-                    DataType::Utf8 => {
-                        Self::find_matches::<i32>(text_column, &mut tokenizer, &query_tokens)
-                    }
-                    DataType::LargeUtf8 => {
-                        Self::find_matches::<i64>(text_column, &mut tokenizer, &query_tokens)
-                    }
+                    DataType::Utf8 => Self::find_matches::<i32>(
+                        text_column,
+                        &mut tokenizer,
+                        &query_tokens,
+                        phrase_slop,
+                    ),
+                    DataType::LargeUtf8 => Self::find_matches::<i64>(
+                        text_column,
+                        &mut tokenizer,
+                        &query_tokens,
+                        phrase_slop,
+                    ),
+                    DataType::List(_) => Self::find_list_matches::<i32>(
+                        text_column,
+                        &mut tokenizer,
+                        &query_tokens,
+                        phrase_slop,
+                    )?,
+                    DataType::LargeList(_) => Self::find_list_matches::<i64>(
+                        text_column,
+                        &mut tokenizer,
+                        &query_tokens,
+                        phrase_slop,
+                    )?,
+                    DataType::LargeBinary => Self::find_json_matches(
+                        text_column,
+                        &mut tokenizer,
+                        &query_tokens,
+                        phrase_slop,
+                    )?,
                     _ => {
                         return Err(DataFusionError::Execution(format!(
                             "Column {} is not a string",
@@ -820,6 +1023,7 @@ impl ExecutionPlan for FlatMatchFilterExec {
             dataset: self.dataset.clone(),
             input,
             query: self.query.clone(),
+            phrase_slop: self.phrase_slop,
             params: self.params.clone(),
             preset_segments: self.preset_segments.clone(),
             metrics: ExecutionPlanMetricsSet::new(),
@@ -838,9 +1042,12 @@ impl ExecutionPlan for FlatMatchFilterExec {
             input,
             partition,
             schema.clone(),
-            self.dataset.clone(),
-            self.query.clone(),
-            self.preset_segments.clone(),
+            FlatMatchFilterStreamContext {
+                dataset: self.dataset.clone(),
+                query: self.query.clone(),
+                phrase_slop: self.phrase_slop,
+                preset_segments: self.preset_segments.clone(),
+            },
             self.metrics.clone(),
         );
         let stream = stream::once(stream_fut)
@@ -2129,13 +2336,63 @@ mod tests {
         let text_col =
             LargeStringArray::from(vec!["hello world", "no match here", "say hello there"]);
 
-        let result =
-            FlatMatchFilterExec::find_matches::<i64>(&text_col, &mut tokenizer, &query_tokens);
+        let result = FlatMatchFilterExec::find_matches::<i64>(
+            &text_col,
+            &mut tokenizer,
+            &query_tokens,
+            None,
+        );
 
         assert_eq!(result.len(), 3);
         assert!(result.value(0), "expected match in 'hello world'");
         assert!(!result.value(1), "expected no match in 'no match here'");
         assert!(result.value(2), "expected match in 'say hello there'");
+    }
+
+    #[test]
+    fn test_flat_phrase_filter_respects_order_repetition_and_slop() {
+        use super::default_text_tokenizer;
+
+        let mut tokenizer = default_text_tokenizer();
+        let query_tokens = collect_query_tokens("hello world", &mut tokenizer);
+        assert!(FlatMatchFilterExec::has_phrase(
+            "say hello world today",
+            &mut tokenizer,
+            &query_tokens,
+            0,
+        ));
+        assert!(!FlatMatchFilterExec::has_phrase(
+            "say world hello today",
+            &mut tokenizer,
+            &query_tokens,
+            0,
+        ));
+        assert!(!FlatMatchFilterExec::has_phrase(
+            "say hello brave world today",
+            &mut tokenizer,
+            &query_tokens,
+            0,
+        ));
+        assert!(FlatMatchFilterExec::has_phrase(
+            "say hello brave world today",
+            &mut tokenizer,
+            &query_tokens,
+            1,
+        ));
+
+        let repeated = collect_query_tokens("hello hello", &mut tokenizer);
+        assert!(FlatMatchFilterExec::has_phrase(
+            "hello hello",
+            &mut tokenizer,
+            &repeated,
+            0,
+        ));
+        assert!(!FlatMatchFilterExec::has_phrase(
+            "hello world",
+            &mut tokenizer,
+            &repeated,
+            0,
+        ));
     }
 
     #[tokio::test]

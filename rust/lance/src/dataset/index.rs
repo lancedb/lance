@@ -168,9 +168,17 @@ impl LanceIndexStoreExt for LanceIndexStore {
         let cache = dataset.metadata_cache.file_metadata_cache(&index_dir);
         let format_version = dataset_format_version(dataset);
         let object_store = dataset.object_store_for_index(index).await?;
-        let store =
+        let mut store =
             Self::with_format_version(object_store, index_dir, Arc::new(cache), format_version);
-        Ok(store.with_file_sizes(index.file_size_map()))
+        store = store.with_file_sizes(index.file_size_map());
+        if let Some(reference) = index
+            .logical_coverage
+            .as_ref()
+            .and_then(|coverage| coverage.external.clone())
+        {
+            store = store.with_logical_index_coverage_reference(reference);
+        }
+        Ok(store)
     }
 }
 

@@ -466,6 +466,23 @@ def test_has_stable_row_ids_property(tmp_path: Path, enable_stable_row_ids: bool
     assert ds.has_stable_row_ids is enable_stable_row_ids
 
 
+@pytest.mark.parametrize("enable_stable_row_ids", [False, True])
+def test_storage_v2_3_always_has_stable_row_ids(
+    tmp_path: Path, enable_stable_row_ids: bool
+):
+    path = tmp_path / f"stable_logical_row_addresses_{enable_stable_row_ids}"
+    lance.write_dataset(
+        pa.table({"a": [1, 2]}),
+        path,
+        data_storage_version="2.3",
+        enable_stable_row_ids=enable_stable_row_ids,
+    )
+
+    ds = lance.dataset(path)
+    assert ds.data_storage_version == "2.3"
+    assert ds.has_stable_row_ids
+
+
 def _list_manifests(versions_dir):
     # Ignore the version hint file, which is not a manifest.
     return [
@@ -1909,9 +1926,14 @@ def test_restore_with_commit(tmp_path: Path):
     assert tbl == table
 
 
-def test_merge_insert_with_commit():
+@pytest.mark.parametrize("data_storage_version", ["stable", "2.3"])
+def test_merge_insert_with_commit(tmp_path: Path, data_storage_version: str):
     table = pa.table({"id": range(10), "updated": [False] * 10})
-    dataset = lance.write_dataset(table, "memory://test")
+    dataset = lance.write_dataset(
+        table,
+        tmp_path / data_storage_version,
+        data_storage_version=data_storage_version,
+    )
 
     updates = pa.Table.from_pylist([{"id": 1, "updated": True}])
     transaction, stats = (
@@ -1927,6 +1949,9 @@ def test_merge_insert_with_commit():
 
     assert isinstance(transaction, lance.Transaction)
     assert isinstance(transaction.operation, lance.LanceOperation.Update)
+    assert (transaction.row_address_layout_delta is not None) == (
+        data_storage_version == "2.3"
+    )
 
     dataset = lance.LanceDataset.commit(dataset, transaction)
     assert dataset.to_table().sort_by("id") == pa.table(

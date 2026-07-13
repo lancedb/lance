@@ -5,12 +5,17 @@ use super::Dataset;
 use crate::session::caches::{RowIdIndexKey, RowIdSequenceKey};
 use crate::{Error, Result};
 use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt};
+use lance_core::utils::address::{LogicalRowAddress, RowAddress};
 use lance_core::utils::deletion::DeletionVector;
+use lance_table::rowids::segment::U64Segment;
 use lance_table::{
-    format::{Fragment, RowIdMeta},
+    format::{Fragment, RowDatasetVersionRun, RowDatasetVersionSequence, RowIdMeta},
     rowids::{FragmentRowIdIndex, RowIdIndex, RowIdSequence, read_row_ids},
 };
-use std::sync::Arc;
+use std::{
+    collections::{HashMap, hash_map::Entry},
+    sync::Arc,
+};
 
 /// Load a row id sequence from the given dataset and fragment.
 pub async fn load_row_id_sequence(
@@ -70,10 +75,212 @@ pub fn load_row_id_sequences<'a>(
         .buffer_unordered(dataset.object_store.io_parallelism())
 }
 
+fn version_sequence(values: &[u64]) -> RowDatasetVersionSequence {
+    let mut runs = Vec::new();
+    let mut start = 0_u64;
+    while start < values.len() as u64 {
+        let version = values[start as usize];
+        let mut end = start + 1;
+        while end < values.len() as u64 && values[end as usize] == version {
+            end += 1;
+        }
+        runs.push(RowDatasetVersionRun {
+            span: U64Segment::Range(start..end),
+            version,
+        });
+        start = end;
+    }
+    RowDatasetVersionSequence { runs }
+}
+
+/// Resolve row-version values in the same order as a list of live logical row IDs.
+///
+/// Storage version 2.3 defines a logical domain's `creation_version` as the
+/// base value whenever per-row version metadata is absent.  Existing metadata,
+/// when present, overrides that base for the addressed physical row.
+pub async fn resolve_logical_row_version_sequences(
+    dataset: &Dataset,
+    row_ids: &[u64],
+) -> Result<(RowDatasetVersionSequence, RowDatasetVersionSequence)> {
+    if !dataset.manifest.uses_stable_logical_row_addresses() {
+        return Err(Error::invalid_input(
+            "logical row-version resolution requires storage version 2.3",
+        ));
+    }
+    let physical = dataset.resolve_logical_row_ids_async(row_ids).await?;
+    let fragments = dataset
+        .manifest
+        .fragments
+        .iter()
+        .map(|fragment| (fragment.id as u32, fragment))
+        .collect::<HashMap<_, _>>();
+    let router = dataset.row_address_router()?;
+    let mut domain_versions = HashMap::<u32, u64>::new();
+    let mut metadata = HashMap::<
+        u32,
+        (
+            Option<RowDatasetVersionSequence>,
+            Option<RowDatasetVersionSequence>,
+        ),
+    >::new();
+    let mut created = Vec::with_capacity(row_ids.len());
+    let mut updated = Vec::with_capacity(row_ids.len());
+
+    for (row_id, physical) in row_ids.iter().copied().zip(physical) {
+        let logical = LogicalRowAddress::try_from(row_id)?;
+        let domain_version =
+            if let Some(version) = domain_versions.get(&logical.logical_fragment_id()) {
+                *version
+            } else {
+                let version = router
+                    .logical_domain(logical.logical_fragment_id())?
+                    .ok_or_else(|| {
+                        Error::internal(format!(
+                            "logical domain {} is missing while preserving row versions",
+                            logical.logical_fragment_id()
+                        ))
+                    })?
+                    .creation_version;
+                domain_versions.insert(logical.logical_fragment_id(), version);
+                version
+            };
+        let physical = physical.ok_or_else(|| {
+            Error::invalid_input(format!(
+                "row-version source contains non-live logical row ID {row_id}"
+            ))
+        })?;
+        let fragment = fragments.get(&physical.fragment_id()).ok_or_else(|| {
+            Error::internal("row-version source fragment is absent from the manifest")
+        })?;
+        if let Entry::Vacant(entry) = metadata.entry(physical.fragment_id()) {
+            let created = fragment
+                .created_at_version_meta
+                .as_ref()
+                .map(|value| value.load_sequence())
+                .transpose()?;
+            let updated = fragment
+                .last_updated_at_version_meta
+                .as_ref()
+                .map(|value| value.load_sequence())
+                .transpose()?;
+            entry.insert((created, updated));
+        }
+        let sequences = metadata
+            .get(&physical.fragment_id())
+            .expect("row-version metadata cache was populated");
+        let offset = physical.row_offset() as usize;
+        let created_version = match &sequences.0 {
+            Some(sequence) => sequence.version_at(offset).ok_or_else(|| {
+                Error::internal(format!(
+                    "created-at metadata for fragment {} does not cover row offset {offset}",
+                    fragment.id
+                ))
+            })?,
+            None => domain_version,
+        };
+        let updated_version = match &sequences.1 {
+            Some(sequence) => sequence.version_at(offset).ok_or_else(|| {
+                Error::internal(format!(
+                    "last-updated metadata for fragment {} does not cover row offset {offset}",
+                    fragment.id
+                ))
+            })?,
+            None => created_version,
+        };
+        created.push(created_version);
+        updated.push(updated_version);
+    }
+
+    Ok((version_sequence(&created), version_sequence(&updated)))
+}
+
+/// Update selected physical row offsets while preserving every other row's
+/// last-updated value under the storage-version-2.3 domain contract.
+pub async fn refresh_v2_3_fragment_last_updated_at(
+    dataset: &Dataset,
+    fragment: &mut Fragment,
+    updated_offsets: &[usize],
+    current_version: u64,
+) -> Result<()> {
+    if !dataset.manifest.uses_stable_logical_row_addresses() {
+        return Err(Error::invalid_input(
+            "storage-version-2.3 row-version refresh requires logical row addresses",
+        ));
+    }
+    let row_count = fragment.physical_rows.unwrap_or_default();
+    if row_count == 0 {
+        return Ok(());
+    }
+    let base = if let Some(metadata) = fragment.last_updated_at_version_meta.as_ref() {
+        metadata.load_sequence()?
+    } else if let Some(metadata) = fragment.created_at_version_meta.as_ref() {
+        metadata.load_sequence()?
+    } else if let Some(native) = fragment.native_logical_domain.as_ref() {
+        RowDatasetVersionSequence::from_uniform_row_count(row_count as u64, native.creation_version)
+    } else {
+        let fragment_id = u32::try_from(fragment.id)
+            .map_err(|_| Error::invalid_input("physical fragment id exceeds u32"))?;
+        let deletion_vector = dataset
+            .get_fragment(fragment.id as usize)
+            .ok_or_else(|| Error::internal("row-version source fragment is missing"))?
+            .get_deletion_vector()
+            .await?
+            .unwrap_or_else(|| Arc::new(DeletionVector::NoDeletions));
+        let router = dataset.row_address_router()?;
+        let mut domains = HashMap::<u32, u64>::new();
+        let mut versions = Vec::with_capacity(row_count);
+        const RESOLVE_BATCH_SIZE: usize = 65_536;
+        for start in (0..row_count).step_by(RESOLVE_BATCH_SIZE) {
+            let end = (start + RESOLVE_BATCH_SIZE).min(row_count);
+            let physical = (start..end)
+                .map(|offset| RowAddress::new_from_parts(fragment_id, offset as u32))
+                .collect::<Vec<_>>();
+            let logical = dataset.resolve_physical_row_ids_async(&physical).await?;
+            for (offset, logical) in (start..end).zip(logical) {
+                let Some(logical) = logical else {
+                    if deletion_vector.contains(offset as u32) {
+                        // Deleted slots are removed before any version value is observable.
+                        versions.push(dataset.manifest.version);
+                        continue;
+                    }
+                    return Err(Error::internal(format!(
+                        "live physical row {}:{} has no logical owner while preserving row versions",
+                        fragment.id, offset
+                    )));
+                };
+                let version = if let Some(version) = domains.get(&logical.logical_fragment_id()) {
+                    *version
+                } else {
+                    let version = router
+                        .logical_domain(logical.logical_fragment_id())?
+                        .ok_or_else(|| {
+                            Error::internal(format!(
+                                "logical domain {} is missing while preserving row versions",
+                                logical.logical_fragment_id()
+                            ))
+                        })?
+                        .creation_version;
+                    domains.insert(logical.logical_fragment_id(), version);
+                    version
+                };
+                versions.push(version);
+            }
+        }
+        version_sequence(&versions)
+    };
+
+    lance_table::rowids::version::refresh_row_latest_update_meta_for_partial_frag_rewrite_cols_with_base(
+        fragment,
+        updated_offsets,
+        current_version,
+        &base,
+    )
+}
+
 pub async fn get_row_id_index(
     dataset: &Dataset,
 ) -> Result<Option<Arc<lance_table::rowids::RowIdIndex>>> {
-    if dataset.manifest.uses_stable_row_ids() {
+    if dataset.manifest.uses_legacy_stable_row_ids() {
         let key = RowIdIndexKey {
             version: dataset.manifest.version,
         };

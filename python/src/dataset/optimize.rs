@@ -16,7 +16,9 @@ use lance::dataset::{
     index::DatasetIndexRemapperOptions,
     optimize::{
         CompactionMetrics, CompactionMode, CompactionOptions, CompactionPlan, CompactionTask,
-        RewriteResult, commit_compaction, compact_files, plan_compaction,
+        RewriteResult, RowAddressMaintenanceMetrics, RowAddressMaintenanceMode,
+        RowAddressMaintenanceOptions, commit_compaction, compact_files, maintain_row_addresses,
+        plan_compaction,
     },
 };
 use pyo3::{exceptions::PyNotImplementedError, pyclass::CompareOp, types::PyTuple};
@@ -104,6 +106,15 @@ fn wrap_fragment<'py>(py: Python<'py>, fragment: &Fragment) -> PyResult<Bound<'p
 
 #[pyclass(name = "CompactionMetrics", module = "lance.optimize")]
 pub struct PyCompactionMetrics {
+    /// int : The number of non-empty rewrite groups considered.
+    #[pyo3(get)]
+    pub groups_planned: usize,
+    /// int : The number of groups admitted before data-file I/O.
+    #[pyo3(get)]
+    pub groups_admitted: usize,
+    /// int : The number of groups rejected before data-file I/O.
+    #[pyo3(get)]
+    pub groups_not_admitted: usize,
     /// int : The number of fragments that have been overwritten.
     #[pyo3(get)]
     pub fragments_removed: usize,
@@ -123,8 +134,14 @@ pub struct PyCompactionMetrics {
 impl PyCompactionMetrics {
     fn __repr__(&self) -> PyResult<String> {
         Ok(format!(
-            "CompactionMetrics(fragments_removed={}, fragments_added={}, files_removed={}, files_added={})",
-            self.fragments_removed, self.fragments_added, self.files_removed, self.files_added
+            "CompactionMetrics(groups_planned={}, groups_admitted={}, groups_not_admitted={}, fragments_removed={}, fragments_added={}, files_removed={}, files_added={})",
+            self.groups_planned,
+            self.groups_admitted,
+            self.groups_not_admitted,
+            self.fragments_removed,
+            self.fragments_added,
+            self.files_removed,
+            self.files_added,
         ))
     }
 }
@@ -132,10 +149,64 @@ impl PyCompactionMetrics {
 impl From<CompactionMetrics> for PyCompactionMetrics {
     fn from(metrics: CompactionMetrics) -> Self {
         Self {
+            groups_planned: metrics.groups_planned,
+            groups_admitted: metrics.groups_admitted,
+            groups_not_admitted: metrics.groups_not_admitted,
             fragments_removed: metrics.fragments_removed,
             fragments_added: metrics.fragments_added,
             files_removed: metrics.files_removed,
             files_added: metrics.files_added,
+        }
+    }
+}
+
+/// Observable cost of explicit storage-version-2.3 row-address maintenance.
+#[pyclass(name = "RowAddressMaintenanceMetrics", module = "lance.optimize")]
+pub struct PyRowAddressMaintenanceMetrics {
+    /// int : The number of physical fragments replaced.
+    #[pyo3(get)]
+    pub fragments_removed: usize,
+    /// int : The number of physical fragments created.
+    #[pyo3(get)]
+    pub fragments_added: usize,
+    /// int : The number of user-data files written.
+    #[pyo3(get)]
+    pub data_files_written: usize,
+    /// int : The number of locator and hidden ``_rowid`` objects written.
+    #[pyo3(get)]
+    pub locator_objects_written: usize,
+    /// int : The total bytes written to locator and hidden ``_rowid`` objects.
+    #[pyo3(get)]
+    pub locator_bytes_written: u64,
+    /// int : The number of live rows physically rewritten.
+    #[pyo3(get)]
+    pub rows_rewritten: u64,
+}
+
+#[pymethods]
+impl PyRowAddressMaintenanceMetrics {
+    fn __repr__(&self) -> String {
+        format!(
+            "RowAddressMaintenanceMetrics(fragments_removed={}, fragments_added={}, data_files_written={}, locator_objects_written={}, locator_bytes_written={}, rows_rewritten={})",
+            self.fragments_removed,
+            self.fragments_added,
+            self.data_files_written,
+            self.locator_objects_written,
+            self.locator_bytes_written,
+            self.rows_rewritten,
+        )
+    }
+}
+
+impl From<RowAddressMaintenanceMetrics> for PyRowAddressMaintenanceMetrics {
+    fn from(metrics: RowAddressMaintenanceMetrics) -> Self {
+        Self {
+            fragments_removed: metrics.fragments_removed,
+            fragments_added: metrics.fragments_added,
+            data_files_written: metrics.data_files_written,
+            locator_objects_written: metrics.locator_objects_written,
+            locator_bytes_written: metrics.locator_bytes_written,
+            rows_rewritten: metrics.rows_rewritten,
         }
     }
 }
@@ -587,6 +658,130 @@ impl PyCompaction {
             .block_on(None, fut)?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
         dataset_ref.borrow_mut().ds = Arc::new(new_ds);
+        Ok(metrics.into())
+    }
+}
+
+/// Execute explicit storage-version-2.3 row-address maintenance.
+///
+/// This native entry point backs the Pythonic methods on
+/// :py:class:`lance.dataset.DatasetOptimizer`.
+#[pyclass(name = "RowAddressMaintenance", module = "lance.optimize")]
+pub struct PyRowAddressMaintenance;
+
+#[pymethods]
+impl PyRowAddressMaintenance {
+    /// Execute one explicit row-address maintenance operation.
+    ///
+    /// Parameters
+    /// ----------
+    /// dataset : lance.Dataset
+    ///     The dataset to maintain. It must use storage version 2.3.
+    /// mode : str
+    ///     One of ``normalize_placement``, ``repack``, ``recluster``, or
+    ///     ``checkpoint_generation``.
+    /// ordering : Sequence[ColumnOrdering], optional
+    ///     Required by ``recluster`` and rejected by every other mode.
+    /// target_rows_per_fragment : int, optional
+    ///     Maximum rows written to one destination fragment.
+    /// max_rows_per_group : int, optional
+    ///     Maximum rows in one writer batch group.
+    /// max_bytes_per_file : int, optional
+    ///     Optional physical file-size limit. ``normalize_placement`` rejects
+    ///     this option because its admission preflight requires deterministic
+    ///     row-count boundaries.
+    /// batch_size : int, optional
+    ///     Input scan batch size.
+    /// io_buffer_size : int, optional
+    ///     Input scan I/O buffer size in bytes.
+    ///
+    /// Returns
+    /// -------
+    /// RowAddressMaintenanceMetrics
+    ///     Observable rewrite and locator costs.
+    #[staticmethod]
+    #[pyo3(signature = (
+        dataset,
+        mode,
+        *,
+        ordering = None,
+        target_rows_per_fragment = None,
+        max_rows_per_group = None,
+        max_bytes_per_file = None,
+        batch_size = None,
+        io_buffer_size = None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute(
+        dataset: Bound<PyAny>,
+        mode: &str,
+        ordering: Option<Vec<PyLance<ColumnOrdering>>>,
+        target_rows_per_fragment: Option<usize>,
+        max_rows_per_group: Option<usize>,
+        max_bytes_per_file: Option<usize>,
+        batch_size: Option<usize>,
+        io_buffer_size: Option<u64>,
+    ) -> PyResult<PyRowAddressMaintenanceMetrics> {
+        let ordering =
+            ordering.map(|items| items.into_iter().map(|item| item.0).collect::<Vec<_>>());
+        let maintenance_mode = match mode {
+            "normalize_placement" => {
+                if ordering.is_some() {
+                    return Err(PyValueError::new_err(
+                        "ordering is only valid for recluster",
+                    ));
+                }
+                RowAddressMaintenanceMode::NormalizePlacement
+            }
+            "repack" => {
+                if ordering.is_some() {
+                    return Err(PyValueError::new_err(
+                        "ordering is only valid for recluster",
+                    ));
+                }
+                RowAddressMaintenanceMode::Repack
+            }
+            "recluster" => RowAddressMaintenanceMode::Recluster {
+                ordering: ordering.ok_or_else(|| {
+                    PyValueError::new_err("recluster requires at least one ColumnOrdering")
+                })?,
+            },
+            "checkpoint_generation" => {
+                if ordering.is_some() {
+                    return Err(PyValueError::new_err(
+                        "ordering is only valid for recluster",
+                    ));
+                }
+                RowAddressMaintenanceMode::CheckpointGeneration
+            }
+            _ => {
+                return Err(PyValueError::new_err(format!(
+                    "invalid row-address maintenance mode: {mode}"
+                )));
+            }
+        };
+
+        let mut options = RowAddressMaintenanceOptions {
+            mode: maintenance_mode,
+            ..RowAddressMaintenanceOptions::default()
+        };
+        if let Some(value) = target_rows_per_fragment {
+            options.target_rows_per_fragment = value;
+        }
+        if let Some(value) = max_rows_per_group {
+            options.max_rows_per_group = value;
+        }
+        options.max_bytes_per_file = max_bytes_per_file;
+        options.batch_size = batch_size;
+        options.io_buffer_size = io_buffer_size;
+
+        let dataset_ref = unwrap_dataset(dataset)?;
+        let dataset = dataset_ref.borrow().clone();
+        let mut new_dataset = dataset.ds.as_ref().clone();
+        let metrics = rt()
+            .block_on(None, maintain_row_addresses(&mut new_dataset, options))?
+            .infer_error()?;
+        dataset_ref.borrow_mut().ds = Arc::new(new_dataset);
         Ok(metrics.into())
     }
 }

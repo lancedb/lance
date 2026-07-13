@@ -24,6 +24,8 @@ import org.lance.ipc.LanceScanner;
 
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.BigIntVector;
+import org.apache.arrow.vector.IntVector;
+import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
@@ -31,6 +33,7 @@ import org.apache.arrow.vector.types.pojo.Schema;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Collections;
@@ -41,6 +44,70 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class OverwriteTest extends OperationTestBase {
+
+  private static List<FragmentMetadata> createV23Fragment(
+      String datasetPath, RootAllocator allocator, Schema schema, int startId, int rowCount) {
+    try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+      root.allocateNew();
+      IntVector idVector = (IntVector) root.getVector("id");
+      VarCharVector nameVector = (VarCharVector) root.getVector("name");
+      for (int index = 0; index < rowCount; index++) {
+        int id = startId + index;
+        idVector.setSafe(index, id);
+        nameVector.setSafe(index, ("Person " + id).getBytes(StandardCharsets.UTF_8));
+      }
+      root.setRowCount(rowCount);
+      return Fragment.create(
+          datasetPath,
+          allocator,
+          root,
+          new WriteParams.Builder().withDataStorageVersion("2.3").build());
+    }
+  }
+
+  @Test
+  void testV23DistributedOverwriteAndAppend(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("testV23DistributedOverwriteAndAppend").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      List<FragmentMetadata> initial =
+          createV23Fragment(datasetPath, allocator, testDataset.getSchema(), 0, 3);
+      try (Transaction overwrite =
+              new Transaction.Builder()
+                  .readVersion(0)
+                  .operation(
+                      Overwrite.builder()
+                          .fragments(initial)
+                          .schema(testDataset.getSchema())
+                          .build())
+                  .build();
+          Dataset created =
+              new CommitBuilder(datasetPath, allocator).storageFormat("2.3").execute(overwrite)) {
+        assertEquals(3, created.countRows());
+        Transaction persistedCreate = created.readTransaction().orElseThrow();
+        assertTrue(persistedCreate.rowAddressLayoutDelta().isPresent());
+
+        List<FragmentMetadata> appended =
+            createV23Fragment(datasetPath, allocator, testDataset.getSchema(), 3, 2);
+        try (Transaction append =
+                new Transaction.Builder()
+                    .readVersion(created.version())
+                    .operation(Append.builder().fragments(appended).build())
+                    .build();
+            Dataset committed = new CommitBuilder(created).storageFormat("v2.3").execute(append)) {
+          assertEquals(5, committed.countRows());
+          try (Transaction persistedAppend = committed.readTransaction().orElseThrow();
+              Dataset retried =
+                  new CommitBuilder(created).storageFormat("2.3").execute(persistedAppend)) {
+            assertTrue(persistedAppend.rowAddressLayoutDelta().isPresent());
+            assertEquals(committed.version(), retried.version());
+            assertEquals(5, retried.countRows());
+          }
+        }
+      }
+    }
+  }
 
   @Test
   void testOverwrite(@TempDir Path tempDir) throws Exception {

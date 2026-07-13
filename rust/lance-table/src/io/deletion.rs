@@ -69,67 +69,101 @@ pub async fn write_deletion_file(
     removed_rows: &DeletionVector,
     object_store: &ObjectStore,
 ) -> Result<Option<DeletionFile>> {
-    let deletion_file = match removed_rows {
+    let deletion_file = plan_deletion_file(read_version, removed_rows);
+    if let Some(deletion_file) = &deletion_file {
+        write_deletion_file_with_metadata(
+            base,
+            fragment_id,
+            deletion_file,
+            removed_rows,
+            object_store,
+        )
+        .await?;
+    }
+    Ok(deletion_file)
+}
+
+/// Allocate deterministic-shape deletion metadata without writing its object.
+///
+/// Callers use this to dry-run a successor manifest before the first PUT and
+/// later pass the returned metadata to [`write_deletion_file_with_metadata`].
+pub fn plan_deletion_file(
+    read_version: u64,
+    removed_rows: &DeletionVector,
+) -> Option<DeletionFile> {
+    match removed_rows {
         DeletionVector::NoDeletions => None,
         DeletionVector::Set(set) => {
             let id = rand::rng().random::<u64>();
-            let deletion_file = DeletionFile {
+            Some(DeletionFile {
                 read_version,
                 id,
                 file_type: DeletionFileType::Array,
                 num_deleted_rows: Some(set.len()),
                 base_id: None,
-            };
-            let path = deletion_file_path(base, fragment_id, &deletion_file);
-
-            let array = UInt32Array::from_iter(set.iter().copied());
-            let array = Arc::new(array);
-
-            let schema = deletion_arrow_schema();
-            let batch = RecordBatch::try_new(schema.clone(), vec![array])?;
-
-            let mut out: Vec<u8> = Vec::new();
-            let write_options =
-                IpcWriteOptions::default().try_with_compression(Some(CompressionType::ZSTD))?;
-            {
-                let mut writer = ArrowFileWriter::try_new_with_options(
-                    &mut out,
-                    schema.as_ref(),
-                    write_options,
-                )?;
-                writer.write(&batch)?;
-                writer.finish()?;
-                // Drop writer so out is no longer borrowed.
-            }
-
-            object_store.put(&path, &out).await?;
-
-            info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_DELETION, path = path.to_string());
-
-            Some(deletion_file)
+            })
         }
         DeletionVector::Bitmap(bitmap) => {
             let id = rand::rng().random::<u64>();
-            let deletion_file = DeletionFile {
+            Some(DeletionFile {
                 read_version,
                 id,
                 file_type: DeletionFileType::Bitmap,
                 num_deleted_rows: Some(bitmap.len() as usize),
                 base_id: None,
-            };
-            let path = deletion_file_path(base, fragment_id, &deletion_file);
-
-            let mut out: Vec<u8> = Vec::new();
-            bitmap.serialize_into(&mut out)?;
-
-            object_store.put(&path, &out).await?;
-
-            info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_DELETION, path = path.to_string());
-
-            Some(deletion_file)
+            })
         }
+    }
+}
+
+/// Write a deletion vector using metadata allocated by a transaction preflight.
+///
+/// This keeps the manifest metadata identical between a dry-run and the later
+/// object write. The supplied type and cardinality must match `removed_rows`.
+pub async fn write_deletion_file_with_metadata(
+    base: &Path,
+    fragment_id: u64,
+    deletion_file: &DeletionFile,
+    removed_rows: &DeletionVector,
+    object_store: &ObjectStore,
+) -> Result<()> {
+    let expected_type = match removed_rows {
+        DeletionVector::NoDeletions => {
+            return Err(Error::invalid_input(
+                "planned deletion metadata cannot write an empty deletion vector",
+            ));
+        }
+        DeletionVector::Set(_) => DeletionFileType::Array,
+        DeletionVector::Bitmap(_) => DeletionFileType::Bitmap,
     };
-    Ok(deletion_file)
+    if deletion_file.file_type != expected_type
+        || deletion_file.num_deleted_rows != Some(removed_rows.len())
+    {
+        return Err(Error::invalid_input(
+            "planned deletion metadata does not match its deletion vector",
+        ));
+    }
+
+    let path = deletion_file_path(base, fragment_id, deletion_file);
+    let mut out = Vec::new();
+    match removed_rows {
+        DeletionVector::NoDeletions => unreachable!(),
+        DeletionVector::Set(set) => {
+            let array = Arc::new(UInt32Array::from_iter(set.iter().copied()));
+            let schema = deletion_arrow_schema();
+            let batch = RecordBatch::try_new(schema.clone(), vec![array])?;
+            let write_options =
+                IpcWriteOptions::default().try_with_compression(Some(CompressionType::ZSTD))?;
+            let mut writer =
+                ArrowFileWriter::try_new_with_options(&mut out, schema.as_ref(), write_options)?;
+            writer.write(&batch)?;
+            writer.finish()?;
+        }
+        DeletionVector::Bitmap(bitmap) => bitmap.serialize_into(&mut out)?,
+    }
+    object_store.put(&path, &out).await?;
+    info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_DELETION, path = path.to_string());
+    Ok(())
 }
 
 #[instrument(

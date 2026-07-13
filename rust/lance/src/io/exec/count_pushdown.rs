@@ -732,6 +732,126 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn v2_3_indexed_count_uses_exact_scan_after_compaction_update_and_delete() {
+        use crate::dataset::optimize::{CompactionOptions, compact_files};
+        use crate::dataset::{UpdateBuilder, WriteParams};
+        use lance_file::version::LanceFileVersion;
+
+        let tmp = TempStrDir::default();
+        let mut dataset = gen_batch()
+            .col("ordered", lance_datagen::array::step::<UInt64Type>())
+            .into_dataset_with_params(
+                tmp.as_str(),
+                FragmentCount::from(4),
+                FragmentRowCount::from(10),
+                Some(WriteParams {
+                    max_rows_per_file: 10,
+                    data_storage_version: Some(LanceFileVersion::V2_3),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["ordered"],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 40,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let updated = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("ordered = 1")
+            .unwrap()
+            .set("ordered", "101")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        let mut dataset = updated.new_dataset.as_ref().clone();
+        dataset.delete("ordered = 2").await.unwrap();
+        let dataset = Arc::new(dataset);
+
+        let mut scanner = dataset.scan();
+        scanner.filter("ordered >= 0").unwrap();
+        let (plan, count) = run_count(&mut scanner).await;
+        assert_eq!(count, 39);
+        assert!(
+            !plan_contains_pushdown(&plan),
+            "V2.3 indexed count must stay on the exact scan path until CountFromMaskExec has a logical-address universe: {}",
+            displayable(plan.as_ref()).indent(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn v2_3_fully_covered_index_count_pushes_down_after_compaction_and_delete() {
+        use crate::dataset::WriteParams;
+        use crate::dataset::optimize::{CompactionOptions, compact_files};
+        use lance_file::version::LanceFileVersion;
+
+        let tmp = TempStrDir::default();
+        let mut dataset = gen_batch()
+            .col("ordered", lance_datagen::array::step::<UInt64Type>())
+            .into_dataset_with_params(
+                tmp.as_str(),
+                FragmentCount::from(4),
+                FragmentRowCount::from(10),
+                Some(WriteParams {
+                    max_rows_per_file: 10,
+                    data_storage_version: Some(LanceFileVersion::V2_3),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["ordered"],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 40,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        dataset.delete("ordered = 2").await.unwrap();
+
+        let mut scanner = Arc::new(dataset).scan();
+        scanner.filter("ordered < 25").unwrap();
+        let (plan, count) = run_count(&mut scanner).await;
+        assert_eq!(count, 24);
+        assert!(
+            plan_contains_pushdown(&plan),
+            "fully covered V2.3 logical indices must retain metadata-only count pushdown: {}",
+            displayable(plan.as_ref()).indent(true)
+        );
+    }
+
+    #[tokio::test]
     async fn rule_skips_when_filter_needs_refine() {
         let tmp = TempStrDir::default();
         let mut dataset = gen_batch()

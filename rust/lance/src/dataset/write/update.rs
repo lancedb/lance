@@ -8,10 +8,12 @@ use std::time::Duration;
 use super::cleanup_data_fragments;
 use super::retry::{RetryConfig, RetryExecutor, execute_with_retry};
 use super::{CommitBuilder, WriteParams, write_fragments_internal};
+use crate::dataset::ManifestWriteConfig;
 use crate::dataset::rowids::get_row_id_index;
 use crate::dataset::transaction::UpdateMode::RewriteRows;
-use crate::dataset::transaction::{Operation, Transaction};
+use crate::dataset::transaction::{Operation, RowAddressManifestApplyContext, TransactionBuilder};
 use crate::dataset::utils::make_rowid_capture_stream;
+use crate::index::DatasetIndexExt;
 use crate::{Dataset, io::exec::Planner};
 use crate::{Error, Result};
 use arrow_array::RecordBatch;
@@ -19,20 +21,33 @@ use arrow_schema::{ArrowError, DataType, Schema as ArrowSchema};
 use datafusion::common::DFSchema;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::ExprSchemable;
-use datafusion::physical_plan::PhysicalExpr;
+use datafusion::physical_expr::PhysicalSortExpr;
+use datafusion::physical_plan::expressions;
+use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::{PhysicalExpr, RecordBatchStream};
 use datafusion::prelude::Expr;
 use datafusion::scalar::ScalarValue;
+use datafusion_physical_expr::LexOrdering;
 use futures::StreamExt;
 use lance_arrow::RecordBatchExt;
 use lance_core::datatypes::BlobHandling;
 use lance_core::error::{InvalidInputSnafu, box_error};
+use lance_core::utils::address::LogicalRowAddress;
+use lance_core::utils::tempfile::TempDir;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR_FIELD, ROW_ID_FIELD, ROW_OFFSET_FIELD};
+use lance_datafusion::exec::execute_plan;
 use lance_datafusion::expr::safe_coerce_scalar;
+use lance_datafusion::spill::{SpillSender, create_replay_spill};
 use lance_select::RowAddrTreeMap;
-use lance_table::format::{Fragment, RowIdMeta};
-use roaring::RoaringTreemap;
+use lance_table::format::{
+    DeletionFile, DeletionFileType, Fragment, LogicalRowAddressSelection, RowAddressFieldChange,
+    RowAddressLayoutDelta, RowAddressPlacementDelta, RowAddressPlacementKind,
+    RowAddressSourceFloor, RowAddressTargetFragment, RowAddressTargetRange, RowIdMeta,
+    fingerprint_row_sequence,
+};
+use roaring::{RoaringBitmap, RoaringTreemap};
 use snafu::ResultExt;
 
 /// Collect a field id and all of its descendant field ids (pre-order). A struct
@@ -43,6 +58,306 @@ fn collect_subtree_field_ids(field: &lance_core::datatypes::Field, out: &mut Vec
     for child in &field.children {
         collect_subtree_field_ids(child, out);
     }
+}
+
+fn build_v2_3_update_delta(
+    dataset: &Dataset,
+    logical_row_ids: &lance_table::rowids::RowIdSequence,
+    new_fragments: &[Fragment],
+    field_ids: &[i32],
+) -> Result<RowAddressLayoutDelta> {
+    let layout = dataset
+        .manifest
+        .row_address_layout
+        .as_ref()
+        .ok_or_else(|| Error::internal("storage-version-2.3 update is missing RowAddressLayout"))?;
+    let addresses = logical_row_ids
+        .iter()
+        .map(LogicalRowAddress::try_from)
+        .collect::<Result<Vec<_>>>()?;
+    if addresses.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(Error::not_supported(
+            "storage-version-2.3 default update output must be strictly ordered by logical row address",
+        ));
+    }
+    let expected_rows = new_fragments.iter().try_fold(0_usize, |count, fragment| {
+        count
+            .checked_add(fragment.physical_rows.ok_or_else(|| {
+                Error::internal("storage-version-2.3 update output is missing physical_rows")
+            })?)
+            .ok_or_else(|| Error::invalid_input("update output row count overflow"))
+    })?;
+    if addresses.len() != expected_rows {
+        return Err(Error::internal(format!(
+            "captured {} logical row IDs for {} update output rows",
+            addresses.len(),
+            expected_rows
+        )));
+    }
+
+    let router = dataset.row_address_router()?;
+    let mut source_domains = addresses
+        .iter()
+        .map(|address| address.logical_fragment_id())
+        .collect::<Vec<_>>();
+    source_domains.sort_unstable();
+    source_domains.dedup();
+    let source_domains = source_domains
+        .into_iter()
+        .map(|logical_fragment_id| {
+            router.logical_domain(logical_fragment_id)?.ok_or_else(|| {
+                Error::internal(format!(
+                    "logical domain {logical_fragment_id} is missing from the source layout"
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut placements = Vec::with_capacity(new_fragments.len());
+    let mut offset = 0_usize;
+    for (ordinal, fragment) in new_fragments.iter().enumerate() {
+        let row_count = fragment.physical_rows.ok_or_else(|| {
+            Error::internal("storage-version-2.3 update output is missing physical_rows")
+        })?;
+        let end = offset + row_count;
+        let output_addresses = &addresses[offset..end];
+        let target = RowAddressTargetRange {
+            fragment: RowAddressTargetFragment::NewFragmentOrdinal(
+                u32::try_from(ordinal)
+                    .map_err(|_| Error::invalid_input("too many update output fragments"))?,
+            ),
+            start_offset: 0,
+            end_offset: u32::try_from(row_count)
+                .map_err(|_| Error::invalid_input("update output exceeds u32 row capacity"))?,
+        };
+
+        let mut source_selections = Vec::new();
+        let mut domain_start = 0_usize;
+        while domain_start < output_addresses.len() {
+            let logical_fragment_id = output_addresses[domain_start].logical_fragment_id();
+            let domain_end = output_addresses[domain_start..]
+                .partition_point(|address| address.logical_fragment_id() == logical_fragment_id)
+                + domain_start;
+            let bitmap = output_addresses[domain_start..domain_end]
+                .iter()
+                .map(|address| address.raw())
+                .collect::<RoaringTreemap>();
+            source_selections.push(LogicalRowAddressSelection::from_bitmap(bitmap)?);
+            domain_start = domain_end;
+        }
+        let placement_kind = if source_selections.len() == 1 {
+            RowAddressPlacementKind::Selected
+        } else {
+            RowAddressPlacementKind::SparseSelection
+        };
+        placements.push(RowAddressPlacementDelta {
+            source_selections,
+            target,
+            placement_kind,
+            output_cardinality: row_count as u64,
+            output_row_sequence_fingerprint: fingerprint_row_sequence(
+                target,
+                output_addresses.iter().copied(),
+            )?,
+        });
+        offset = end;
+    }
+
+    let all_selection = LogicalRowAddressSelection::from_bitmap(
+        addresses
+            .iter()
+            .map(|address| address.raw())
+            .collect::<RoaringTreemap>(),
+    )?;
+    let source_floors = field_ids
+        .iter()
+        .map(|field_id| {
+            let generation = layout
+                .index_commit_floors
+                .iter()
+                .find(|floor| floor.field_id == *field_id)
+                .or_else(|| {
+                    layout
+                        .field_default_generations
+                        .iter()
+                        .find(|generation| generation.field_id == *field_id)
+                })
+                .map(|generation| generation.generation)
+                .ok_or_else(|| {
+                    Error::internal(format!(
+                        "field {field_id} is missing a source generation floor"
+                    ))
+                })?;
+            Ok(RowAddressSourceFloor {
+                field_id: *field_id,
+                generation,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(RowAddressLayoutDelta {
+        source_domains,
+        placements,
+        retired_selections: Vec::new(),
+        field_changes: (!field_ids.is_empty())
+            .then(|| RowAddressFieldChange {
+                selection: all_selection,
+                field_ids: field_ids.to_vec(),
+            })
+            .into_iter()
+            .collect(),
+        source_floors,
+        expected_layout_fingerprint: layout.fingerprint.clone(),
+        replaced_generations: Vec::new(),
+        row_aligned_rewrite_proofs: Vec::new(),
+        create_namespace_uuid: None,
+        explicit_map_placements: BTreeMap::new(),
+    })
+}
+
+fn v2_3_update_output_fragments(row_count: usize, max_rows_per_file: usize) -> Vec<Fragment> {
+    let mut remaining = row_count;
+    let mut fragments = Vec::new();
+    while remaining != 0 {
+        let rows = remaining.min(max_rows_per_file);
+        fragments.push(Fragment {
+            id: 0,
+            files: Vec::new(),
+            deletion_file: None,
+            row_id_meta: None,
+            physical_rows: Some(rows),
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+            native_logical_domain: None,
+        });
+        remaining -= rows;
+    }
+    fragments
+}
+
+async fn preflight_v2_3_update(
+    dataset: &Dataset,
+    logical_row_ids: &lance_table::rowids::RowIdSequence,
+    field_ids: &[u32],
+    max_rows_per_file: usize,
+) -> Result<RowAddressLayoutDelta> {
+    if logical_row_ids.is_empty() {
+        let layout = dataset
+            .manifest
+            .row_address_layout
+            .as_ref()
+            .ok_or_else(|| {
+                Error::internal("storage-version-2.3 update is missing RowAddressLayout")
+            })?;
+        return Ok(RowAddressLayoutDelta {
+            expected_layout_fingerprint: layout.fingerprint.clone(),
+            ..RowAddressLayoutDelta::default()
+        });
+    }
+    let row_count = usize::try_from(logical_row_ids.len())
+        .map_err(|_| Error::invalid_input("update row count exceeds platform capacity"))?;
+    let new_fragments = v2_3_update_output_fragments(row_count, max_rows_per_file);
+    let signed_field_ids = field_ids
+        .iter()
+        .map(|field_id| {
+            i32::try_from(*field_id).map_err(|_| {
+                Error::invalid_input(format!("updated field id {field_id} exceeds i32"))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut row_address_layout_delta =
+        build_v2_3_update_delta(dataset, logical_row_ids, &new_fragments, &signed_field_ids)?;
+
+    let raw_ids = logical_row_ids.iter().collect::<Vec<_>>();
+    let resolved = dataset.resolve_logical_row_ids_async(&raw_ids).await?;
+    let mut new_deletions = BTreeMap::<u32, RoaringBitmap>::new();
+    for (row_id, address) in raw_ids.into_iter().zip(resolved) {
+        let address = address.ok_or_else(|| {
+            Error::internal(format!(
+                "updated logical row id {row_id} has no current physical placement"
+            ))
+        })?;
+        new_deletions
+            .entry(address.fragment_id())
+            .or_default()
+            .insert(address.row_offset());
+    }
+
+    let mut updated_fragments = Vec::new();
+    let mut removed_fragment_ids = Vec::new();
+    let mut context = RowAddressManifestApplyContext::default();
+    for (fragment_id, additions) in new_deletions {
+        let fragment = dataset.get_fragment(fragment_id as usize).ok_or_else(|| {
+            Error::internal(format!("missing update source fragment {fragment_id}"))
+        })?;
+        let current = fragment
+            .get_deletion_vector()
+            .await?
+            .map(|deletions| deletions.to_sorted_iter().collect::<RoaringBitmap>())
+            .unwrap_or_default();
+        context
+            .current_deletion_vectors
+            .insert(fragment_id, current.clone());
+        let mut successor = current;
+        successor |= additions;
+        let physical_rows = u32::try_from(fragment.metadata.physical_rows.ok_or_else(|| {
+            Error::internal(format!(
+                "source fragment {fragment_id} is missing physical_rows"
+            ))
+        })?)
+        .map_err(|_| Error::invalid_input("update source fragment exceeds u32 rows"))?;
+        if successor.len() == physical_rows as u64 && successor.contains_range(0..physical_rows) {
+            removed_fragment_ids.push(fragment_id as u64);
+            context
+                .newly_fully_deleted_source_fragments
+                .insert(fragment_id);
+        } else {
+            let mut metadata = fragment.metadata.clone();
+            metadata.deletion_file = Some(DeletionFile {
+                read_version: dataset.manifest.version + 1,
+                id: 0,
+                file_type: DeletionFileType::Bitmap,
+                num_deleted_rows: Some(successor.len() as usize),
+                base_id: None,
+            });
+            updated_fragments.push(metadata);
+            context
+                .successor_deletion_vectors
+                .insert(fragment_id, successor);
+        }
+    }
+
+    super::include_previous_deletions_in_v2_3_retirement(
+        dataset,
+        &removed_fragment_ids,
+        &context.current_deletion_vectors,
+        &mut row_address_layout_delta,
+    )
+    .await?;
+
+    let operation = Operation::Update {
+        removed_fragment_ids,
+        updated_fragments,
+        new_fragments,
+        fields_modified: field_ids.to_vec(),
+        merged_generations: Vec::new(),
+        fields_for_preserving_frag_bitmap: field_ids.to_vec(),
+        update_mode: Some(RewriteRows),
+        inserted_rows_filter: None,
+        updated_fragment_offsets: None,
+    };
+    let transaction = TransactionBuilder::new(dataset.manifest.version, operation)
+        .row_address_layout_delta(Some(row_address_layout_delta.clone()))
+        .build();
+    let indices = dataset.load_indices().await?;
+    transaction.build_manifest_with_row_address_context(
+        Some(dataset.manifest.as_ref()),
+        indices.as_ref().clone(),
+        "row-address-update-preflight.txn",
+        &ManifestWriteConfig::default(),
+        Some(&context),
+    )?;
+    Ok(row_address_layout_delta)
 }
 
 /// Build an update operation.
@@ -255,6 +570,7 @@ pub struct UpdateData {
     old_fragments: Vec<Fragment>,
     new_fragments: Vec<Fragment>,
     affected_rows: RowAddrTreeMap,
+    row_address_layout_delta: Option<RowAddressLayoutDelta>,
     num_updated_rows: u64,
 }
 
@@ -268,6 +584,18 @@ pub struct UpdateJob {
 }
 
 impl UpdateJob {
+    fn modified_field_ids(&self, dataset: &Dataset) -> Vec<u32> {
+        let mut field_ids = Vec::new();
+        for column_name in self.updates.keys() {
+            if let Some(field) = dataset.schema().field(column_name) {
+                collect_subtree_field_ids(field, &mut field_ids);
+            }
+        }
+        field_ids.sort_unstable();
+        field_ids.dedup();
+        field_ids
+    }
+
     pub async fn execute(self) -> Result<UpdateResult> {
         let dataset = self.dataset.clone();
         let config = RetryConfig {
@@ -287,14 +615,30 @@ impl UpdateJob {
             scanner.filter_expr(expr.clone());
         }
 
-        let stream = scanner
-            .try_into_dfstream(scanner.execution_options())
-            .await?;
+        let uses_logical_row_addresses = self.dataset.manifest.uses_stable_logical_row_addresses();
+        let mut plan = scanner.create_plan().await?;
+        if uses_logical_row_addresses {
+            let row_id_sort = PhysicalSortExpr {
+                expr: expressions::col(ROW_ID_FIELD.name(), plan.schema().as_ref())?,
+                options: arrow::compute::SortOptions {
+                    descending: false,
+                    nulls_first: false,
+                },
+            };
+            plan = Arc::new(SortExec::new(
+                LexOrdering::new([row_id_sort])
+                    .ok_or_else(|| Error::internal("logical row ordering cannot be empty"))?,
+                plan,
+            ));
+        }
+        let stream = execute_plan(plan, scanner.execution_options())?;
 
         // We keep track of seen row ids so we can delete them from the existing
         // fragments and then set the row id segments in the new fragments.
-        let (stream, row_id_rx) =
-            make_rowid_capture_stream(stream, self.dataset.manifest.uses_stable_row_ids())?;
+        let (stream, row_id_rx) = make_rowid_capture_stream(
+            stream,
+            self.dataset.manifest.uses_legacy_stable_row_ids() || uses_logical_row_addresses,
+        )?;
 
         let schema = stream.schema();
 
@@ -320,27 +664,81 @@ impl UpdateJob {
             });
         let stream = RecordBatchStreamAdapter::new(schema, stream);
 
-        let version = self
-            .dataset
-            .manifest()
-            .data_storage_format
-            .lance_file_version()?;
+        let mut write_params = WriteParams::with_storage_version(
+            self.dataset
+                .manifest()
+                .data_storage_format
+                .lance_file_version()?,
+        );
+        if uses_logical_row_addresses {
+            // The preflight freezes row-address target boundaries by row
+            // count. A byte-triggered early rollover would change the physical
+            // fragment plan after remote writes had started.
+            write_params.max_bytes_per_file = usize::MAX;
+        }
+        let mut captured_before_write = None;
+        let mut row_address_layout_delta = None;
+        let mut spill_guard: Option<(TempDir, SpillSender)> = None;
+        let stream: datafusion::physical_plan::SendableRecordBatchStream =
+            if uses_logical_row_addresses {
+                let temp_dir = tokio::task::spawn_blocking(TempDir::try_new)
+                    .await
+                    .map_err(|error| {
+                        Error::internal(format!("update preflight spill task failed: {error}"))
+                    })??;
+                let path = temp_dir.std_path().join("update-preflight.arrow");
+                let (mut sender, receiver) =
+                    create_replay_spill(path, stream.schema(), 100 * 1024 * 1024);
+                let mut stream = Box::pin(stream);
+                while let Some(batch) = stream.next().await {
+                    sender.write(batch?).await?;
+                }
+                sender.finish().await?;
+                let captured = row_id_rx.try_recv().map_err(|error| {
+                    Error::internal(format!("Failed to receive row ids: {error}"))
+                })?;
+                let logical_row_ids = captured.row_id_sequence().ok_or_else(|| {
+                    Error::internal("storage-version-2.3 update captured physical row addresses")
+                })?;
+                row_address_layout_delta = Some(
+                    preflight_v2_3_update(
+                        self.dataset.as_ref(),
+                        logical_row_ids,
+                        &self.modified_field_ids(self.dataset.as_ref()),
+                        write_params.max_rows_per_file,
+                    )
+                    .await?,
+                );
+                captured_before_write = Some(captured);
+                spill_guard = Some((temp_dir, sender));
+                receiver.read()
+            } else {
+                Box::pin(stream)
+            };
+
         let (mut new_fragments, _) = write_fragments_internal(
             Some(&self.dataset),
             self.dataset.object_store.clone(),
             &self.dataset.base,
             self.dataset.schema().clone(),
-            Box::pin(stream),
-            WriteParams::with_storage_version(version),
+            stream,
+            write_params,
             None, // TODO: support multiple bases for update
         )
         .await?;
 
-        let removed_row_ids = row_id_rx
-            .try_recv()
-            .map_err(|err| Error::internal(format!("Failed to receive row ids: {}", err)))?;
+        let removed_row_ids = if let Some(captured) = captured_before_write {
+            captured
+        } else {
+            row_id_rx
+                .try_recv()
+                .map_err(|err| Error::internal(format!("Failed to receive row ids: {}", err)))?
+        };
+        drop(spill_guard);
 
-        if let Some(row_id_sequence) = removed_row_ids.row_id_sequence() {
+        if !uses_logical_row_addresses
+            && let Some(row_id_sequence) = removed_row_ids.row_id_sequence()
+        {
             let fragment_sizes = new_fragments
                 .iter()
                 .map(|f| f.physical_rows.unwrap() as u64);
@@ -362,8 +760,26 @@ impl UpdateJob {
         }
 
         // Apply deletions
-        let row_id_index = get_row_id_index(&self.dataset).await?;
-        let row_addrs = removed_row_ids.row_addrs(row_id_index.as_deref());
+        let logical_row_ids = uses_logical_row_addresses
+            .then(|| removed_row_ids.row_id_sequence().cloned())
+            .flatten();
+        let row_addrs = if let Some(logical_row_ids) = &logical_row_ids {
+            let raw_ids = logical_row_ids.iter().collect::<Vec<_>>();
+            let resolved = self.dataset.resolve_logical_row_ids_async(&raw_ids).await?;
+            let mut addresses = RoaringTreemap::new();
+            for (row_id, address) in raw_ids.into_iter().zip(resolved) {
+                let address = address.ok_or_else(|| {
+                    Error::internal(format!(
+                        "updated logical row id {row_id} has no current physical placement"
+                    ))
+                })?;
+                addresses.insert(u64::from(address));
+            }
+            std::borrow::Cow::Owned(addresses)
+        } else {
+            let row_id_index = get_row_id_index(&self.dataset).await?;
+            removed_row_ids.row_addrs(row_id_index.as_deref())
+        };
         let deletions_result = self.apply_deletions(&row_addrs).await;
         let (old_fragments, removed_fragment_ids) = match deletions_result {
             Ok(v) => v,
@@ -390,6 +806,7 @@ impl UpdateJob {
             old_fragments,
             new_fragments,
             affected_rows,
+            row_address_layout_delta,
             num_updated_rows,
         })
     }
@@ -403,12 +820,13 @@ impl UpdateJob {
         // struct-column update rewrites all of its descendants. Collect the full field
         // subtree so an index on a nested child field is recognized as modified and not
         // wrongly extended over the rewritten fragment.
-        let mut fields_for_preserving_frag_bitmap = Vec::new();
-        for column_name in self.updates.keys() {
-            if let Some(field) = dataset.schema().field(column_name) {
-                collect_subtree_field_ids(field, &mut fields_for_preserving_frag_bitmap);
-            }
-        }
+        let fields_for_preserving_frag_bitmap = self.modified_field_ids(dataset.as_ref());
+
+        let row_address_layout_delta = update_data.row_address_layout_delta;
+        let fields_modified = row_address_layout_delta
+            .as_ref()
+            .map(|_| fields_for_preserving_frag_bitmap.clone())
+            .unwrap_or_default();
 
         // Commit updated and new fragments
         let operation = Operation::Update {
@@ -418,7 +836,7 @@ impl UpdateJob {
             // In "rewrite rows" mode, the rows that are updated in the fragment
             // are moved(deleted and appended).
             // so we do not need to handle the frag bitmap of the index about it.
-            fields_modified: vec![],
+            fields_modified,
             merged_generations: Vec::new(),
             fields_for_preserving_frag_bitmap,
             update_mode: Some(RewriteRows),
@@ -426,7 +844,9 @@ impl UpdateJob {
             updated_fragment_offsets: None,
         };
 
-        let transaction = Transaction::new(dataset.manifest.version, operation, None);
+        let transaction = TransactionBuilder::new(dataset.manifest.version, operation)
+            .row_address_layout_delta(row_address_layout_delta)
+            .build();
 
         let new_dataset = CommitBuilder::new(dataset)
             .with_affected_rows(update_data.affected_rows)
@@ -1773,5 +2193,251 @@ mod tests {
 
         let idx_foo = ids.values().iter().position(|&x| x == 0).unwrap();
         assert_eq!(blobs.value(idx_foo), b"foo");
+    }
+
+    #[tokio::test]
+    async fn test_v23_repeated_updates_preserve_logical_row_addresses() {
+        let test_dir = TempStrDir::default();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..20)),
+                Arc::new(Int64Array::from_iter_values(0..20)),
+            ],
+        )
+        .unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            &test_dir,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_3),
+                max_rows_per_file: 10,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        async fn addresses_by_id(dataset: &Dataset) -> HashMap<i64, u64> {
+            let mut scanner = dataset.scan();
+            scanner.project(&["id", ROW_ID]).unwrap();
+            let batch = scanner.try_into_batch().await.unwrap();
+            batch["id"]
+                .as_primitive::<Int64Type>()
+                .values()
+                .iter()
+                .copied()
+                .zip(
+                    batch[ROW_ID]
+                        .as_primitive::<arrow_array::types::UInt64Type>()
+                        .values()
+                        .iter()
+                        .copied(),
+                )
+                .collect()
+        }
+
+        let original_addresses = addresses_by_id(&dataset).await;
+        let first = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("id % 3 = 0")
+            .unwrap()
+            .set("value", "value + 100")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap()
+            .new_dataset;
+        assert_eq!(addresses_by_id(&first).await, original_addresses);
+
+        let second = UpdateBuilder::new(first)
+            .update_where("id % 3 = 0")
+            .unwrap()
+            .set("value", "value + 1000")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap()
+            .new_dataset;
+        assert_eq!(addresses_by_id(&second).await, original_addresses);
+        let layout = second.manifest.row_address_layout.as_ref().unwrap();
+        assert!(
+            layout.generation_regions.is_empty(),
+            "fields without queryable indices must not retain generation regions"
+        );
+        let value_field_id = second.schema().field("value").unwrap().id;
+        assert_eq!(
+            layout
+                .index_commit_floors
+                .iter()
+                .find(|floor| floor.field_id == value_field_id)
+                .unwrap()
+                .generation,
+            second.manifest.version
+        );
+
+        let mut scanner = second.scan();
+        scanner.project(&["id", "value"]).unwrap();
+        let batch = scanner.try_into_batch().await.unwrap();
+        let values = batch["id"]
+            .as_primitive::<Int64Type>()
+            .values()
+            .iter()
+            .copied()
+            .zip(
+                batch["value"]
+                    .as_primitive::<Int64Type>()
+                    .values()
+                    .iter()
+                    .copied(),
+            )
+            .collect::<HashMap<_, _>>();
+        for id in 0..20_i64 {
+            let expected =
+                id + if id % 3 == 0 { 100 } else { 0 } + if id % 3 == 0 { 1000 } else { 0 };
+            assert_eq!(values[&id], expected, "id={id}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_v23_update_retires_prior_deleted_owner_with_fragment() {
+        let test_dir = TempStrDir::default();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![0, 1])),
+                Arc::new(Int64Array::from(vec![10, 11])),
+            ],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            &test_dir,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_3),
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let mut scanner = dataset.scan();
+        scanner.project(&[ROW_ID]).unwrap();
+        let row_ids = scanner.try_into_batch().await.unwrap()[ROW_ID]
+            .as_primitive::<arrow_array::types::UInt64Type>()
+            .values()
+            .to_vec();
+
+        dataset.delete("id = 0").await.unwrap();
+        let updated = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("id = 1")
+            .unwrap()
+            .set("value", "value + 100")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap()
+            .new_dataset;
+
+        let logical = row_ids
+            .iter()
+            .copied()
+            .map(LogicalRowAddress::try_from)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let resolutions = updated
+            .row_address_router()
+            .unwrap()
+            .resolve_many(&logical)
+            .unwrap();
+        assert!(matches!(
+            resolutions[0],
+            lance_table::format::PlacementResolution::NotLive
+        ));
+        assert!(matches!(
+            resolutions[1],
+            lance_table::format::PlacementResolution::Mapped { .. }
+        ));
+        updated.manifest.validate_row_address_contract().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_v23_update_admission_fails_before_writing_data_objects() {
+        fn file_count(path: &std::path::Path) -> usize {
+            std::fs::read_dir(path)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|entry| {
+                    if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                        file_count(&entry.path())
+                    } else {
+                        1
+                    }
+                })
+                .sum()
+        }
+
+        let test_dir = TempStrDir::default();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..20)),
+                Arc::new(Int64Array::from_iter_values(0..20)),
+            ],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            &test_dir,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_3),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let fragments = dataset.manifest.fragments.clone();
+        let max_logical_fragment_id = dataset.manifest.max_logical_fragment_id;
+        let manifest = Arc::make_mut(&mut dataset.manifest);
+        let layout = Arc::make_mut(manifest.row_address_layout.as_mut().unwrap());
+        layout.debt_summary.metadata_bytes_written_since_maintenance =
+            lance_table::format::ROW_ADDRESS_W_FAST;
+        layout.refresh_fingerprint_with_fragments(fragments.as_ref(), max_logical_fragment_id);
+
+        let before = file_count(std::path::Path::new(test_dir.as_str()));
+        let error = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("id % 2 = 0")
+            .unwrap()
+            .set("value", "value + 1")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("ProjectedEpochBytes"));
+        assert_eq!(
+            file_count(std::path::Path::new(test_dir.as_str())),
+            before,
+            "placement admission must run before writing data or deletion objects"
+        );
     }
 }

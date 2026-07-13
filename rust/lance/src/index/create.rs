@@ -8,8 +8,7 @@ use crate::{
         transaction::{Operation, TransactionBuilder},
     },
     index::{
-        DatasetIndexExt, DatasetIndexInternalExt, IntoIndexSegment,
-        build_index_metadata_from_segments,
+        DatasetIndexExt, DatasetIndexInternalExt, build_index_metadata_from_segments,
         scalar::{build_bitmap_index_segment, build_scalar_index},
         vector::{
             LANCE_VECTOR_INDEX, VectorIndexParams, build_distributed_vector_index,
@@ -26,7 +25,7 @@ use lance_index::{
     metrics::NoOpMetricsCollector,
     scalar::{LANCE_SCALAR_INDEX, ScalarIndexParams, inverted::tokenizer::InvertedIndexParams},
 };
-use lance_table::format::{IndexMetadata, list_index_files_with_sizes};
+use lance_table::format::{IndexMetadata, RowReferenceDomain, list_index_files_with_sizes};
 use std::{collections::HashMap, future::IntoFuture, sync::Arc};
 use tracing::instrument;
 use uuid::Uuid;
@@ -466,26 +465,77 @@ impl<'a> CreateIndexBuilder<'a> {
             }
         };
 
-        Ok(IndexMetadata {
+        let physical_coverage = if train {
+            match &self.fragments {
+                Some(fragment_ids) => fragment_ids.iter().collect(),
+                None => self.dataset.fragment_bitmap.as_ref().clone(),
+            }
+        } else {
+            roaring::RoaringBitmap::new()
+        };
+        let logical_coverage = if self
+            .dataset
+            .manifest
+            .uses_stable_logical_row_addresses()
+        {
+            Some(
+                crate::index::build_logical_index_coverage(
+                    self.dataset,
+                    &[field.id],
+                    &physical_coverage,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        let mut metadata = IndexMetadata {
             uuid: output_index_uuid,
             name: index_name,
             fields: vec![field.id],
             dataset_version: self.dataset.manifest.version,
-            fragment_bitmap: if train {
-                match &self.fragments {
-                    Some(fragment_ids) => Some(fragment_ids.iter().collect()),
-                    None => Some(self.dataset.fragment_bitmap.as_ref().clone()),
-                }
+            fragment_bitmap: if logical_coverage.is_some() {
+                None
             } else {
-                // Empty bitmap for untrained indices
-                Some(roaring::RoaringBitmap::new())
+                Some(physical_coverage)
             },
             index_details: Some(Arc::new(created_index.index_details)),
             index_version: created_index.index_version as i32,
             created_at: Some(chrono::Utc::now()),
             base_id: None,
             files: Some(created_index.files),
-        })
+            row_reference_domain: logical_coverage
+                .as_ref()
+                .map(|_| RowReferenceDomain::StableLogicalRowAddress),
+            logical_coverage,
+        };
+        if self
+            .dataset
+            .manifest
+            .uses_stable_logical_row_addresses()
+        {
+            if metadata
+                .index_details
+                .as_ref()
+                .is_some_and(|details| details.type_url.ends_with("InvertedIndexDetails"))
+            {
+                crate::index::scalar::inverted::finalize_segment_files_if_needed(
+                    self.dataset,
+                    &metadata,
+                )
+                .await?;
+                let index_dir = self
+                    .dataset
+                    .indices_dir()
+                    .join(metadata.uuid.to_string());
+                let mut files =
+                    list_index_files_with_sizes(&self.dataset.object_store, &index_dir).await?;
+                files.retain(|file| !file.path.starts_with("staging/"));
+                metadata.files = Some(files);
+            }
+            crate::index::finalize_v23_index_coverage(self.dataset, &mut metadata).await?;
+        }
+        Ok(metadata)
         }
         .boxed()
     }
@@ -641,19 +691,29 @@ impl<'a> CreateIndexBuilder<'a> {
                 self.progress.clone(),
             )
             .await?;
-            let metadata = IndexMetadata {
-                uuid: segment_uuid,
-                name: index_name.clone(),
-                fields: vec![field.id],
-                dataset_version: self.dataset.manifest.version,
-                fragment_bitmap: Some(roaring::RoaringBitmap::new()),
-                index_details: Some(Arc::new(created_index.index_details)),
-                index_version: created_index.index_version as i32,
-                created_at: Some(chrono::Utc::now()),
-                base_id: None,
-                files: Some(created_index.files),
+            let physical_coverage = roaring::RoaringBitmap::new();
+            let segment = if self.dataset.manifest.uses_stable_logical_row_addresses() {
+                let logical_coverage = crate::index::build_logical_index_coverage(
+                    self.dataset,
+                    &[field.id],
+                    &physical_coverage,
+                )
+                .await?;
+                crate::index::IndexSegment::new_logical(
+                    segment_uuid,
+                    logical_coverage,
+                    Arc::new(created_index.index_details),
+                    created_index.index_version as i32,
+                )
+            } else {
+                crate::index::IndexSegment::new(
+                    segment_uuid,
+                    physical_coverage,
+                    Arc::new(created_index.index_details),
+                    created_index.index_version as i32,
+                )
             };
-            let segments = vec![metadata.into_index_segment()?];
+            let segments = vec![segment];
             let new_indices =
                 build_index_metadata_from_segments(self.dataset, &index_name, field.id, segments)
                     .await?;
@@ -694,7 +754,7 @@ impl<'a> CreateIndexBuilder<'a> {
         let num_segments = (num_segments as usize).min(all_fragment_ids.len()).max(1);
         let chunk_size = all_fragment_ids.len().div_ceil(num_segments);
 
-        let mut segment_metadatas = Vec::with_capacity(num_segments);
+        let mut segments = Vec::with_capacity(num_segments);
         for chunk in all_fragment_ids.chunks(chunk_size) {
             let fragment_ids = chunk.to_vec();
             let segment_uuid = Uuid::new_v4();
@@ -710,25 +770,30 @@ impl<'a> CreateIndexBuilder<'a> {
             )
             .await?;
 
-            segment_metadatas.push(IndexMetadata {
-                uuid: segment_uuid,
-                name: index_name.clone(),
-                fields: vec![field.id],
-                dataset_version: self.dataset.manifest.version,
-                fragment_bitmap: Some(fragment_ids.into_iter().collect()),
-                index_details: Some(Arc::new(created_index.index_details)),
-                index_version: created_index.index_version as i32,
-                created_at: Some(chrono::Utc::now()),
-                base_id: None,
-                files: Some(created_index.files),
-            });
+            if self.dataset.manifest.uses_stable_logical_row_addresses() {
+                let physical_coverage = fragment_ids.iter().copied().collect();
+                let logical_coverage = crate::index::build_logical_index_coverage(
+                    self.dataset,
+                    &[field.id],
+                    &physical_coverage,
+                )
+                .await?;
+                segments.push(crate::index::IndexSegment::new_logical(
+                    segment_uuid,
+                    logical_coverage,
+                    Arc::new(created_index.index_details),
+                    created_index.index_version as i32,
+                ));
+            } else {
+                segments.push(crate::index::IndexSegment::new(
+                    segment_uuid,
+                    fragment_ids,
+                    Arc::new(created_index.index_details),
+                    created_index.index_version as i32,
+                ));
+            }
         }
 
-        // Convert to IndexSegments and build proper transaction metadata
-        let segments = segment_metadatas
-            .into_iter()
-            .map(IntoIndexSegment::into_index_segment)
-            .collect::<Result<Vec<_>>>()?;
         let new_indices =
             build_index_metadata_from_segments(self.dataset, &index_name, field.id, segments)
                 .await?;
@@ -844,7 +909,7 @@ impl<'a> IntoFuture for CreateIndexBuilder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dataset::{WriteMode, WriteParams};
+    use crate::dataset::{UpdateBuilder, WriteMode, WriteParams};
     use crate::index::{DatasetIndexExt, IndexSegment};
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
     use arrow::datatypes::{Float32Type, Int32Type, Int64Type};
@@ -854,8 +919,10 @@ mod tests {
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use datafusion::common::ScalarValue;
     use lance_arrow::FixedSizeListArrayExt;
+    use lance_core::ROW_ID;
     use lance_core::utils::{address::RowAddress, tempfile::TempStrDir};
     use lance_datagen::{self, gen_batch};
+    use lance_file::version::LanceFileVersion;
     use lance_index::optimize::OptimizeOptions;
     use lance_index::progress::IndexBuildProgress;
     use lance_index::scalar::{
@@ -1046,6 +1113,554 @@ mod tests {
 
         let latest_indices = reader1.load_indices_by_name("a_idx").await.unwrap();
         assert_eq!(latest_indices.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_v23_btree_commits_exact_logical_coverage_and_filters_deletes() {
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+        let reader = gen_batch()
+            .col("a", lance_datagen::array::step::<Int32Type>())
+            .into_reader_rows(
+                lance_datagen::RowCount::from(32),
+                lance_datagen::BatchCount::from(1),
+            );
+        let mut dataset = Dataset::write(
+            reader,
+            &dataset_uri,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_3),
+                max_rows_per_file: 8,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let expected_rows = dataset.count_rows(None).await.unwrap() as u64;
+        let build_version = dataset.version().version;
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree);
+        let metadata = CreateIndexBuilder::new(&mut dataset, &["a"], IndexType::BTree, &params)
+            .name("a_idx".to_string())
+            .execute()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            metadata.row_reference_domain,
+            Some(RowReferenceDomain::StableLogicalRowAddress)
+        );
+        assert!(metadata.fragment_bitmap.is_none());
+        let coverage = metadata.logical_coverage.as_ref().unwrap();
+        assert_eq!(
+            coverage
+                .shards
+                .iter()
+                .map(|shard| shard.row_count)
+                .sum::<u64>(),
+            expected_rows
+        );
+        assert!(coverage.shards.iter().all(|shard| {
+            shard.validated_through
+                == [lance_table::format::FieldGeneration {
+                    field_id: metadata.fields[0],
+                    generation: build_version,
+                }]
+        }));
+
+        dataset.delete("a = 17").await.unwrap();
+        let result = dataset
+            .scan()
+            .filter("a >= 16")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let values = result["a"]
+            .as_primitive::<Int32Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            values,
+            (16..expected_rows as i32)
+                .filter(|value| *value != 17)
+                .collect::<Vec<_>>()
+        );
+
+        let append_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "a",
+            DataType::Int32,
+            false,
+        )]));
+        let append_batch = RecordBatch::try_new(
+            append_schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(32..40))],
+        )
+        .unwrap();
+        dataset
+            .append(
+                RecordBatchIterator::new([Ok(append_batch)], append_schema),
+                None,
+            )
+            .await
+            .unwrap();
+        let appended = dataset
+            .scan()
+            .filter("a >= 30")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(
+            appended["a"].as_primitive::<Int32Type>().values(),
+            &(30..40).collect::<Vec<_>>()
+        );
+
+        let mut id_scan = dataset.scan();
+        id_scan.project(&["a", ROW_ID]).unwrap();
+        id_scan.filter("a = 18").unwrap();
+        let id_batch = id_scan.try_into_batch().await.unwrap();
+        let updated_row_id = id_batch[ROW_ID]
+            .as_primitive::<arrow_array::types::UInt64Type>()
+            .value(0);
+        let update = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("a = 18")
+            .unwrap()
+            .set("a", "118")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        let dataset = update.new_dataset;
+        let metadata = dataset.load_index_by_name("a_idx").await.unwrap().unwrap();
+        assert!(
+            metadata
+                .logical_coverage
+                .as_ref()
+                .unwrap()
+                .shards
+                .iter()
+                .any(|shard| shard
+                    .selection
+                    .as_ref()
+                    .unwrap()
+                    .contains(updated_row_id.try_into().unwrap())
+                    .unwrap())
+        );
+        let effective = crate::index::merge_logical_index_coverage(&dataset, &[&metadata]).unwrap();
+        assert!(!effective.shards.iter().any(|shard| {
+            shard
+                .selection
+                .as_ref()
+                .unwrap()
+                .contains(updated_row_id.try_into().unwrap())
+                .unwrap()
+        }));
+        let mut flat_scan = dataset.scan();
+        flat_scan.use_scalar_index(false);
+        flat_scan.filter("a = 118").unwrap();
+        let flat_updated = flat_scan.try_into_batch().await.unwrap();
+        assert_eq!(
+            flat_updated["a"].as_primitive::<Int32Type>().values(),
+            &[118]
+        );
+        let updated = dataset
+            .scan()
+            .filter("a = 118")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(updated["a"].as_primitive::<Int32Type>().values(), &[118]);
+    }
+
+    #[tokio::test]
+    async fn test_v23_staged_btree_coverage_is_rebuilt_from_anchor_artifact() {
+        let tmpdir = TempStrDir::default();
+        let reader = gen_batch()
+            .col("a", lance_datagen::array::step::<Int32Type>())
+            .into_reader_rows(
+                lance_datagen::RowCount::from(32),
+                lance_datagen::BatchCount::from(1),
+            );
+        let mut dataset = Dataset::write(
+            reader,
+            tmpdir.as_str(),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_3),
+                max_rows_per_file: 8,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree);
+        let segment = CreateIndexBuilder::new(&mut dataset, &["a"], IndexType::BTree, &params)
+            .name("a_idx".to_string())
+            .execute_uncommitted()
+            .await
+            .unwrap();
+
+        let mut forged = segment.clone();
+        let requested = forged.logical_coverage.as_ref().unwrap();
+        let shard = &requested.shards[0];
+        let first = shard
+            .selection
+            .as_ref()
+            .unwrap()
+            .select(0)
+            .unwrap()
+            .unwrap();
+        let forged_selection = lance_table::format::LogicalRowAddressSelection::from_ranges(vec![
+            lance_table::format::LogicalRowAddressRange::new(
+                first.logical_fragment_id(),
+                first.immutable_slot(),
+                first.immutable_slot() + 1,
+            ),
+        ])
+        .unwrap();
+        forged.logical_coverage = Some(
+            lance_table::format::LogicalIndexCoverage::new_exact(vec![
+                lance_table::format::LogicalIndexCoverageShard::new_exact(
+                    forged_selection,
+                    shard.field_ids.clone(),
+                    shard.validated_through.clone(),
+                )
+                .unwrap(),
+            ])
+            .unwrap(),
+        );
+        let error = dataset
+            .commit_existing_index_segments("a_idx", "a", vec![forged])
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("differs from its core-authored artifact"),
+            "unexpected forged-coverage error: {error}"
+        );
+
+        dataset
+            .commit_existing_index_segments("a_idx", "a", vec![segment])
+            .await
+            .unwrap();
+        let committed = dataset.load_indices_by_name("a_idx").await.unwrap();
+        assert_eq!(committed.len(), 1);
+        let coverage = committed[0].logical_coverage.as_ref().unwrap();
+        let external = coverage.external.as_ref().unwrap();
+        assert_eq!(external.path, "page_lookup.lance");
+        assert_eq!(
+            external.object_size,
+            committed[0].file_size_map()[&external.path]
+        );
+        assert_eq!(
+            coverage
+                .shards
+                .iter()
+                .map(|shard| shard.row_count)
+                .sum::<u64>(),
+            32
+        );
+    }
+
+    #[tokio::test]
+    async fn test_v23_staged_external_segments_reject_exact_overlap() {
+        let tmpdir = TempStrDir::default();
+        let reader = gen_batch()
+            .col("a", lance_datagen::array::step::<Int32Type>())
+            .into_reader_rows(
+                lance_datagen::RowCount::from(32),
+                lance_datagen::BatchCount::from(1),
+            );
+        let mut dataset = Dataset::write(
+            reader,
+            tmpdir.as_str(),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_3),
+                max_rows_per_file: 8,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree);
+        let mut first = CreateIndexBuilder::new(&mut dataset, &["a"], IndexType::BTree, &params)
+            .name("a_idx".to_string())
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        let mut second = CreateIndexBuilder::new(&mut dataset, &["a"], IndexType::BTree, &params)
+            .name("a_idx".to_string())
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        first
+            .logical_coverage
+            .as_mut()
+            .unwrap()
+            .externalize_detail_over(0)
+            .unwrap();
+        second
+            .logical_coverage
+            .as_mut()
+            .unwrap()
+            .externalize_detail_over(0)
+            .unwrap();
+
+        let error = dataset
+            .commit_existing_index_segments("a_idx", "a", vec![first, second])
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("overlapping authoritative logical coverage")
+        );
+    }
+
+    #[tokio::test]
+    async fn v2_3_rejects_index_built_below_the_current_field_floor() {
+        use crate::dataset::UpdateBuilder;
+
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+        let reader = gen_batch()
+            .col("a", lance_datagen::array::step::<Int32Type>())
+            .into_reader_rows(
+                lance_datagen::RowCount::from(8),
+                lance_datagen::BatchCount::from(1),
+            );
+        let dataset = Dataset::write(
+            reader,
+            &dataset_uri,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_3),
+                max_rows_per_file: 8,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let build_version = dataset.version().version;
+        let mut build_snapshot = dataset.checkout_version(build_version).await.unwrap();
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree);
+        let stale = CreateIndexBuilder::new(&mut build_snapshot, &["a"], IndexType::BTree, &params)
+            .name("a_idx".to_owned())
+            .execute_uncommitted()
+            .await
+            .unwrap();
+
+        // No queryable index exists yet, so the update can retire its sparse
+        // generation region into the per-field commit floor.
+        let updated = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("a = 0")
+            .unwrap()
+            .set("a", "100")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        let mut dataset = updated.new_dataset.as_ref().clone();
+        let field_id = stale.fields[0];
+        let floor = dataset
+            .manifest
+            .row_address_layout
+            .as_ref()
+            .unwrap()
+            .index_commit_floors
+            .iter()
+            .find(|floor| floor.field_id == field_id)
+            .unwrap()
+            .generation;
+        assert!(floor > build_version);
+
+        let transaction = TransactionBuilder::new(
+            build_version,
+            Operation::CreateIndex {
+                new_indices: vec![stale],
+                removed_indices: Vec::new(),
+            },
+        )
+        .build();
+        let error = dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::RetryableCommitConflict { .. }));
+        assert!(error.to_string().contains("index commit floor"), "{error}");
+        assert!(
+            dataset
+                .load_indices_by_name("a_idx")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        CreateIndexBuilder::new(&mut dataset, &["a"], IndexType::BTree, &params)
+            .name("a_idx".to_owned())
+            .execute()
+            .await
+            .unwrap();
+        let result = dataset
+            .scan()
+            .filter("a = 100")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(result.num_rows(), 1);
+    }
+
+    #[tokio::test]
+    async fn v2_3_external_index_reopens_after_same_commit_floor_advance() {
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+        let reader = gen_batch()
+            .col("a", lance_datagen::array::step::<Int32Type>())
+            .into_reader_rows(
+                lance_datagen::RowCount::from(16),
+                lance_datagen::BatchCount::from(1),
+            );
+        let mut dataset = Dataset::write(
+            reader,
+            &dataset_uri,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_3),
+                max_rows_per_file: 8,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree);
+        CreateIndexBuilder::new(&mut dataset, &["a"], IndexType::BTree, &params)
+            .name("a_idx".to_owned())
+            .execute()
+            .await
+            .unwrap();
+
+        let updated = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("a = 0")
+            .unwrap()
+            .set("a", "100")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        let mut dataset = updated.new_dataset.as_ref().clone();
+        let field_id = dataset.schema().field("a").unwrap().id;
+        assert!(
+            !dataset
+                .manifest
+                .row_address_layout
+                .as_ref()
+                .unwrap()
+                .generation_regions
+                .is_empty(),
+            "the stale current index must keep the update region live"
+        );
+        let source_floor = dataset
+            .manifest
+            .row_address_layout
+            .as_ref()
+            .unwrap()
+            .index_commit_floors
+            .iter()
+            .find(|floor| floor.field_id == field_id)
+            .unwrap()
+            .generation;
+        let removed_indices = dataset.load_indices_by_name("a_idx").await.unwrap();
+
+        let mut fresh = CreateIndexBuilder::new(&mut dataset, &["a"], IndexType::BTree, &params)
+            .name("a_idx".to_owned())
+            .replace(true)
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        fresh
+            .logical_coverage
+            .as_mut()
+            .unwrap()
+            .externalize_detail_over(0)
+            .unwrap();
+        assert!(
+            fresh
+                .logical_coverage
+                .as_ref()
+                .unwrap()
+                .has_external_detail()
+        );
+        let transaction = TransactionBuilder::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![fresh],
+                removed_indices,
+            },
+        )
+        .build();
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+
+        let committed_floor = dataset
+            .manifest
+            .row_address_layout
+            .as_ref()
+            .unwrap()
+            .index_commit_floors
+            .iter()
+            .find(|floor| floor.field_id == field_id)
+            .unwrap()
+            .generation;
+        assert!(committed_floor > source_floor);
+        assert!(
+            dataset
+                .manifest
+                .row_address_layout
+                .as_ref()
+                .unwrap()
+                .generation_regions
+                .is_empty()
+        );
+
+        let reopened = Dataset::open(&dataset_uri).await.unwrap();
+        let committed = reopened.load_indices_by_name("a_idx").await.unwrap();
+        assert!(
+            committed[0]
+                .logical_coverage
+                .as_ref()
+                .unwrap()
+                .has_external_detail()
+        );
+        let first_resolution =
+            crate::index::resolve_logical_index_coverage(&reopened, &committed[0])
+                .await
+                .unwrap();
+        let cache_stats = reopened.session.index_cache_stats().await;
+        let second_resolution =
+            crate::index::resolve_logical_index_coverage(&reopened, &committed[0])
+                .await
+                .unwrap();
+        let cached_stats = reopened.session.index_cache_stats().await;
+        assert_eq!(first_resolution, second_resolution);
+        assert!(cached_stats.hits > cache_stats.hits);
+        let result = reopened
+            .scan()
+            .filter("a = 100")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(result.num_rows(), 1);
     }
 
     #[tokio::test]
@@ -2053,6 +2668,53 @@ mod tests {
                 .all(|file| !file.path.starts_with("staging/")),
             "stale staging files must not be committed in IndexMetadata.files"
         );
+    }
+
+    #[tokio::test]
+    async fn test_v23_fts_uses_core_authored_metadata_anchor() {
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+        let batches = RecordBatchIterator::new(
+            vec![Ok(create_text_batch(0, 10)), Ok(create_text_batch(10, 20))],
+            create_text_batch(0, 1).schema(),
+        );
+        let mut dataset = Dataset::write(
+            batches,
+            &dataset_uri,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_3),
+                max_rows_per_file: 10,
+                max_rows_per_group: 5,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        CreateIndexBuilder::new(
+            &mut dataset,
+            &["text"],
+            IndexType::Inverted,
+            &InvertedIndexParams::default(),
+        )
+        .name("text_idx".to_string())
+        .execute()
+        .await
+        .unwrap();
+
+        let committed = dataset.load_indices_by_name("text_idx").await.unwrap();
+        let coverage = committed[0].logical_coverage.as_ref().unwrap();
+        assert_eq!(coverage.external.as_ref().unwrap().path, "metadata.lance");
+        crate::index::resolve_logical_index_coverage(&dataset, &committed[0])
+            .await
+            .unwrap();
+        let results = dataset
+            .scan()
+            .full_text_search(FullTextSearchQuery::new("document".to_string()))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(results.num_rows(), 14);
     }
 
     #[tokio::test]
