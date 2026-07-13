@@ -1439,7 +1439,8 @@ impl FileFragment {
     /// * All referenced data files exist and have the same length.
     /// * Field ids are distinct between data files.
     /// * The deletion file exists and has row offsets in the correct range.
-    /// * [`Fragment::physical_rows`], when present, matches the data-file length.
+    /// * [`Fragment::physical_rows`], when present, matches the data-file length for
+    ///   manifests with writer-version metadata; legacy cached counts are ignored.
     /// * [`DeletionFile::num_deleted_rows`], when present, matches the deletion-vector length.
     ///
     /// File-less fragments are accepted when the dataset manifest contains
@@ -1557,7 +1558,8 @@ impl FileFragment {
                     ));
                 }
             }
-            if let Some(physical_rows) = self.metadata.physical_rows
+            if self.dataset.manifest.writer_version.is_some()
+                && let Some(physical_rows) = self.metadata.physical_rows
                 && physical_rows != *first_length
             {
                 let path = self
@@ -5589,6 +5591,31 @@ mod tests {
             fragment.metadata.deletion_file.unwrap().num_deleted_rows,
             Some(13)
         );
+    }
+
+    #[tokio::test]
+    async fn test_fragment_validate_ignores_legacy_physical_rows() {
+        let test_dir = TempStrDir::default();
+        let mut dataset = create_dataset(&test_dir, LanceFileVersion::Legacy).await;
+        assert!(dataset.manifest.writer_version.is_some());
+
+        let actual_physical_rows = dataset.get_fragments()[0].physical_rows().await.unwrap();
+        let incorrect_physical_rows = actual_physical_rows + 1;
+        Arc::make_mut(&mut Arc::make_mut(&mut dataset.manifest).fragments)[0].physical_rows =
+            Some(incorrect_physical_rows);
+
+        let fragment = dataset.get_fragments().remove(0);
+        let err = fragment.validate().await.unwrap_err();
+        assert!(matches!(err, Error::CorruptFile { .. }));
+        assert_error_contains(err, "Fragment metadata has incorrect physical_rows");
+
+        Arc::make_mut(&mut dataset.manifest).writer_version = None;
+        let fragment = dataset.get_fragments().remove(0);
+        assert_eq!(
+            fragment.physical_rows().await.unwrap(),
+            actual_physical_rows
+        );
+        fragment.validate().await.unwrap();
     }
 
     #[tokio::test]
