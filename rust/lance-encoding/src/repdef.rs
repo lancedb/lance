@@ -202,6 +202,143 @@ enum RawRepDef {
     Fsl(FslDesc),
 }
 
+/// A normalized Arrow structural layer shared by dense and sparse serializers.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum NormalizedStructuralLayer<'a> {
+    List {
+        offsets: &'a [i64],
+        validity: Option<&'a BooleanBuffer>,
+        num_slots: usize,
+    },
+    Validity {
+        validity: Option<&'a BooleanBuffer>,
+        num_slots: usize,
+    },
+    FixedSizeList {
+        validity: Option<&'a BooleanBuffer>,
+        dimension: usize,
+        num_slots: usize,
+    },
+}
+
+/// Structural layers concatenated across input batches exactly once.
+///
+/// Dense rep/def serialization and sparse metadata planning both consume this
+/// representation so the Arrow nesting is not independently reconstructed.
+#[derive(Debug)]
+pub(crate) struct NormalizedStructuralPlan {
+    layers: Vec<RawRepDef>,
+    dense_all_valid: bool,
+}
+
+impl NormalizedStructuralPlan {
+    pub(crate) fn layers(&self) -> impl ExactSizeIterator<Item = NormalizedStructuralLayer<'_>> {
+        self.layers.iter().map(|layer| match layer {
+            RawRepDef::Offsets(OffsetDesc {
+                offsets,
+                validity,
+                num_values,
+                ..
+            }) => NormalizedStructuralLayer::List {
+                offsets,
+                validity: validity.as_ref(),
+                num_slots: *num_values,
+            },
+            RawRepDef::Validity(ValidityDesc {
+                validity,
+                num_values,
+            }) => NormalizedStructuralLayer::Validity {
+                validity: validity.as_ref(),
+                num_slots: *num_values,
+            },
+            RawRepDef::Fsl(FslDesc {
+                validity,
+                dimension,
+                num_values,
+            }) => NormalizedStructuralLayer::FixedSizeList {
+                validity: validity.as_ref(),
+                dimension: *dimension,
+                num_slots: *num_values,
+            },
+        })
+    }
+
+    fn into_serializer(self) -> (SerializerContext, Option<u64>) {
+        if self.dense_all_valid {
+            let def_meaning = self
+                .layers
+                .iter()
+                .map(|_| DefinitionInterpretation::AllValidItem)
+                .collect::<Vec<_>>();
+            return (
+                SerializerContext {
+                    def_meaning,
+                    rep_levels: LevelBuffer::default(),
+                    spare_rep: LevelBuffer::default(),
+                    def_levels: LevelBuffer::default(),
+                    spare_def: LevelBuffer::default(),
+                    current_rep: 0,
+                    current_def: 0,
+                    current_len: 0,
+                    current_num_specials: 0,
+                    has_fsl: false,
+                },
+                None,
+            );
+        }
+
+        let total_len = self.layers.last().map_or(0, RawRepDef::num_values)
+            + self
+                .layers
+                .iter()
+                .map(RawRepDef::num_specials)
+                .sum::<usize>();
+        let max_rep = self.layers.iter().map(RawRepDef::max_rep).sum::<u16>();
+        let max_def = self.layers.iter().map(RawRepDef::max_def).sum::<u16>();
+        let bits_per_rep = if max_rep > 0 {
+            u64::from(u16::BITS - max_rep.leading_zeros())
+        } else {
+            0
+        };
+        let bits_per_def = if max_def > 0 {
+            u64::from(u16::BITS - max_def.leading_zeros())
+        } else {
+            0
+        };
+        let bits_per_level =
+            (bits_per_rep + bits_per_def > 0).then_some(bits_per_rep + bits_per_def);
+
+        let num_layers = self.layers.len();
+        let mut context = SerializerContext::new(total_len, num_layers, max_rep, max_def);
+        for layer in self.layers {
+            match layer {
+                RawRepDef::Validity(def) => context.record_validity(&def),
+                RawRepDef::Offsets(rep) => context.record_offsets(&rep),
+                RawRepDef::Fsl(fsl) => context.record_fsl(&fsl),
+            }
+        }
+        (context, bits_per_level)
+    }
+
+    pub(crate) fn serialize(self) -> SerializedRepDefs {
+        self.into_serializer().0.build()
+    }
+
+    pub(crate) fn serialize_with_structural_plan(
+        self,
+        max_levels_for_bits: impl FnOnce(u64) -> u64,
+        num_rows: u64,
+        num_values: u64,
+    ) -> Result<(SerializedRepDefs, StructuralPagePlan)> {
+        let (context, bits_per_level) = self.into_serializer();
+        context.build_with_structural_plan(
+            bits_per_level.map(max_levels_for_bits),
+            num_rows,
+            num_values,
+        )
+    }
+}
+
 impl RawRepDef {
     // Are there any nulls in this layer
     fn has_nulls(&self) -> bool {
@@ -1412,54 +1549,18 @@ impl RepDefBuilder {
     /// Converts the validity / offsets buffers that have been gathered so far
     /// into repetition and definition levels
     pub fn serialize(builders: Vec<Self>) -> SerializedRepDefs {
-        Self::serialize_builders(builders).0.build()
+        Self::normalize(builders).serialize()
     }
 
-    /// Converts gathered structural buffers into rep/def levels and an encode-time plan.
-    pub(crate) fn serialize_with_structural_plan(
-        builders: Vec<Self>,
-        max_levels_for_bits: impl FnOnce(u64) -> u64,
-        num_rows: u64,
-        num_values: u64,
-    ) -> Result<(SerializedRepDefs, StructuralPagePlan)> {
-        let (context, bits_per_level) = Self::serialize_builders(builders);
-        context.build_with_structural_plan(
-            bits_per_level.map(max_levels_for_bits),
-            num_rows,
-            num_values,
-        )
-    }
-
-    fn serialize_builders(builders: Vec<Self>) -> (SerializerContext, Option<u64>) {
+    pub(crate) fn normalize(builders: Vec<Self>) -> NormalizedStructuralPlan {
         assert!(!builders.is_empty());
-        if builders.iter().all(|b| b.is_empty()) {
-            // No repetition, all-valid
-            let def_meaning = builders
-                .first()
-                .unwrap()
-                .repdefs
-                .iter()
-                .map(|_| DefinitionInterpretation::AllValidItem)
-                .collect::<Vec<_>>();
-            return (
-                SerializerContext {
-                    def_meaning,
-                    rep_levels: LevelBuffer::default(),
-                    spare_rep: LevelBuffer::default(),
-                    def_levels: LevelBuffer::default(),
-                    spare_def: LevelBuffer::default(),
-                    current_rep: 0,
-                    current_def: 0,
-                    current_len: 0,
-                    current_num_specials: 0,
-                    has_fsl: false,
-                },
-                None,
-            );
-        }
-
         let num_layers = builders[0].num_layers();
-        let combined_layers = (0..num_layers)
+        debug_assert!(
+            builders
+                .iter()
+                .all(|builder| builder.num_layers() == num_layers)
+        );
+        let layers = (0..num_layers)
             .map(|layer_index| {
                 Self::concat_layers(
                     builders.iter().map(|b| &b.repdefs[layer_index]),
@@ -1467,47 +1568,10 @@ impl RepDefBuilder {
                 )
             })
             .collect::<Vec<_>>();
-        debug_assert!(
-            builders
-                .iter()
-                .all(|b| b.num_layers() == builders[0].num_layers())
-        );
-
-        let total_len = combined_layers.last().unwrap().num_values()
-            + combined_layers
-                .iter()
-                .map(|l| l.num_specials())
-                .sum::<usize>();
-        let max_rep = combined_layers.iter().map(|l| l.max_rep()).sum::<u16>();
-        let max_def = combined_layers.iter().map(|l| l.max_def()).sum::<u16>();
-        let bits_per_rep = if max_rep > 0 {
-            u64::from(u16::BITS - max_rep.leading_zeros())
-        } else {
-            0
-        };
-        let bits_per_def = if max_def > 0 {
-            u64::from(u16::BITS - max_def.leading_zeros())
-        } else {
-            0
-        };
-        let bits_per_level =
-            (bits_per_rep + bits_per_def > 0).then_some(bits_per_rep + bits_per_def);
-
-        let mut context = SerializerContext::new(total_len, num_layers, max_rep, max_def);
-        for layer in combined_layers.into_iter() {
-            match layer {
-                RawRepDef::Validity(def) => {
-                    context.record_validity(&def);
-                }
-                RawRepDef::Offsets(rep) => {
-                    context.record_offsets(&rep);
-                }
-                RawRepDef::Fsl(fsl) => {
-                    context.record_fsl(&fsl);
-                }
-            }
+        NormalizedStructuralPlan {
+            layers,
+            dense_all_valid: builders.iter().all(Self::is_empty),
         }
-        (context, bits_per_level)
     }
 }
 
