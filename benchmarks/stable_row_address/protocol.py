@@ -60,6 +60,14 @@ TRACK_FIELDS = {
         "variants",
     },
 }
+RELEASE_TRACK_ORDER = (
+    "matrix",
+    "sustained",
+    "adversarial_natural",
+    "adversarial_aligned",
+)
+RELEASE_VARIANT_ORDER = ("bare", "scalar", "vector")
+RELEASE_SEED = 0x4C414E43455F3233
 MEASUREMENT_FIELDS = {
     "process_isolation",
     "cold_probe_order",
@@ -2621,7 +2629,7 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--case-filter")
     parser.add_argument("--matrix", type=Path, default=DEFAULT_MATRIX)
     parser.add_argument("--policy", type=Path, default=run.DEFAULT_POLICY)
-    parser.add_argument("--seed", type=int, default=0x4C414E43455F3233)
+    parser.add_argument("--seed", type=int, default=RELEASE_SEED)
     parser.add_argument("--host")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--shard-count", type=int, default=1)
@@ -2647,6 +2655,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError("--shard-count must be positive")
     if args.shard_index < 0 or args.shard_index >= args.shard_count:
         raise ValueError("--shard-index must be in 0..shard-count")
+    if args.profile == "release" and args.shard_count != 9:
+        raise ValueError("release profile requires exactly nine canonical shards")
+    if args.profile == "release" and args.seed != RELEASE_SEED:
+        raise ValueError("release profile requires the canonical seed")
     if args.storage == "ebs" and args.dataset_root.startswith("s3://"):
         raise ValueError("--storage=ebs requires a local dataset root")
     if args.storage == "s3" and not args.dataset_root.startswith("s3://"):
@@ -2654,6 +2666,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.profile == "release" and args.storage != "s3":
         raise ValueError("release profile requires same-region S3; EBS is smoke-only")
     matrix, matrix_canonical, matrix_sha256 = load_matrix(args.matrix)
+    if args.profile == "release":
+        _, release_matrix_canonical, release_matrix_sha256 = load_matrix(DEFAULT_MATRIX)
+        if (
+            matrix_canonical != release_matrix_canonical
+            or matrix_sha256 != release_matrix_sha256
+        ):
+            raise ValueError("release profile requires the repository default matrix")
     if args.development_tiny:
         if args.development_executable is None or args.profile != "smoke":
             raise ValueError(
@@ -2676,11 +2695,34 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         matrix_sha256 = hashlib.sha256(matrix_canonical.encode()).hexdigest()
     policy, policy_bytes, policy_sha256 = run.canonical_policy(args.policy)
+    if args.profile == "release":
+        _, release_policy_bytes, release_policy_sha256 = run.canonical_policy(
+            run.DEFAULT_POLICY
+        )
+        if (
+            policy_bytes != release_policy_bytes
+            or policy_sha256 != release_policy_sha256
+        ):
+            raise ValueError("release profile requires the repository default policy")
     profile = matrix["profiles"][args.profile]
-    tracks = args.track or ["matrix"]
+    if args.profile == "release":
+        if args.track is not None and tuple(args.track) != RELEASE_TRACK_ORDER:
+            raise ValueError(
+                "release profile requires the canonical complete track order"
+            )
+        if args.variant is not None and tuple(args.variant) != RELEASE_VARIANT_ORDER:
+            raise ValueError(
+                "release profile requires the canonical complete variant order"
+            )
+        if args.case is not None or args.case_filter is not None:
+            raise ValueError("release profile does not allow focused matrix selection")
+        tracks = list(RELEASE_TRACK_ORDER)
+        variants = list(RELEASE_VARIANT_ORDER)
+    else:
+        tracks = args.track or ["matrix"]
+        variants = args.variant or list(RELEASE_VARIANT_ORDER)
     if len(set(tracks)) != len(tracks):
         raise ValueError("--track values must be unique")
-    variants = args.variant or ["bare", "scalar", "vector"]
     selected_matrix_cases = set(args.case or matrix["tracks"]["matrix"]["cases"])
     unknown_matrix_cases = selected_matrix_cases - set(
         matrix["tracks"]["matrix"]["cases"]
@@ -2694,6 +2736,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     ]
     if "matrix" in tracks and not matrix_cases:
         raise ValueError("matrix selection produced no cases")
+    if "matrix" not in tracks:
+        matrix_cases = []
     all_fixture_keys = sorted(
         fixture_keys_for_run(profile, tracks, variants, matrix_cases)
     )

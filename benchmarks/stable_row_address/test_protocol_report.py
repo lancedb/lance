@@ -43,11 +43,11 @@ def make_sidecar(
         "commit": COMMIT,
         "source_provenance": "clean-committed-source",
         "host": "host-1",
-        "seed": 7,
+        "seed": protocol.RELEASE_SEED if profile == "release" else 7,
         "profile": profile,
         "tracks": tracks,
-        "variants": variants or ["bare"],
-        "matrix_case_names": matrix_case_names or [],
+        "variants": ["bare"] if variants is None else variants,
+        "matrix_case_names": [] if matrix_case_names is None else matrix_case_names,
         "storage": "s3" if profile == "release" else "ebs",
         "dataset_root": "/tmp/data",
         "base_dataset_root": "/tmp/data",
@@ -112,6 +112,16 @@ def make_record(
     not_admitted: bool = False,
 ) -> dict[str, Any]:
     operation = operation or operation_from_pair(pair_id)
+    expected = protocol_report.expected_record_provenance(sidecar).get(
+        (pair_id, format_name)
+    )
+    if expected is not None:
+        operation = expected["operation"]
+        index_kind = {
+            "none": "none",
+            "scalar_btree": "scalar",
+            "vector_ivf_flat": "vector",
+        }[expected["index_kind"]]
     repeat_match = re.search(r"/repeat-(\d{3})/", pair_id)
     repeat = int(repeat_match.group(1)) if repeat_match else 0
     update_match = re.search(r"/(?:round|step)-(\d{3})/", pair_id)
@@ -322,8 +332,25 @@ def make_record(
         "status": "ok",
         "error": None,
     }
+    if expected is not None:
+        record.update(
+            {field: expected[field] for field in protocol_report.CORE_PROVENANCE_FIELDS}
+        )
     run.validate_record(record)
     return record
+
+
+def bind_exact_provenance(
+    sidecar: dict[str, Any], records: list[dict[str, Any]]
+) -> None:
+    expected, issues = protocol_report.exact_record_provenance(sidecar, records)
+    if issues:
+        raise AssertionError(issues)
+    for record in records:
+        provenance = expected.get((record["pair_id"], record["format"]))
+        if provenance is not None:
+            record.update(provenance)
+            run.validate_record(record)
 
 
 def complete_records(sidecar: dict[str, Any]) -> list[dict[str, Any]]:
@@ -352,6 +379,7 @@ def complete_records(sidecar: dict[str, Any]) -> list[dict[str, Any]]:
                     state_digest=("0" * 48 if pair_id.endswith("cold-scan") else None),
                 )
             )
+    bind_exact_provenance(sidecar, records)
     return records
 
 
@@ -378,10 +406,159 @@ def append_reclaim_preflights(
         )
         records.append(preflight)
         preflights.append(preflight)
+    bind_exact_provenance(sidecar, records)
     return preflights
 
 
 class ProtocolReportTests(unittest.TestCase):
+    def test_sidecar_cannot_redefine_the_frozen_workload(self) -> None:
+        sidecar = make_sidecar(["matrix"], matrix_case_names=["append/narrow16/take-1"])
+        sidecar["matrix"]["profiles"]["smoke"]["rows"] = 1024
+        canonical = json.dumps(
+            sidecar["matrix"],
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        )
+        sidecar["matrix_canonical_json"] = canonical
+        sidecar["matrix_sha256"] = hashlib.sha256(canonical.encode()).hexdigest()
+        with self.assertRaisesRegex(ValueError, "frozen workload matrix"):
+            protocol_report.validate_sidecar(sidecar)
+
+    def test_sidecar_dataset_root_is_derived_from_shard_identity(self) -> None:
+        single = make_sidecar(["sustained"])
+        single["dataset_root"] = "/tmp/arbitrary"
+        with self.assertRaisesRegex(ValueError, "dataset_root"):
+            protocol_report.expected_record_provenance(single)
+
+        sharded = make_sidecar(["sustained"])
+        sharded.update(
+            {
+                "base_dataset_root": "/tmp/data/",
+                "dataset_root": "/tmp/data/shard-001-of-004",
+                "shard_count": 4,
+                "shard_index": 1,
+                "shard_id": "shard-001-of-004",
+            }
+        )
+        self.assertTrue(protocol_report.expected_record_provenance(sharded))
+        sharded["dataset_root"] = "/tmp/data/another-shard"
+        with self.assertRaisesRegex(ValueError, "dataset_root"):
+            protocol_report.expected_record_provenance(sharded)
+
+        wrong_ebs_scheme = make_sidecar(["sustained"])
+        wrong_ebs_scheme.update(
+            {
+                "base_dataset_root": "s3://bucket/prefix",
+                "dataset_root": "s3://bucket/prefix",
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "storage=ebs"):
+            protocol_report.expected_record_provenance(wrong_ebs_scheme)
+
+        smoke_s3 = make_sidecar(["sustained"])
+        smoke_s3.update(
+            {
+                "storage": "s3",
+                "base_dataset_root": "s3://bucket/prefix",
+                "dataset_root": "s3://bucket/prefix",
+            }
+        )
+        self.assertTrue(protocol_report.expected_record_provenance(smoke_s3))
+
+    def test_matrix_track_and_case_names_are_atomic(self) -> None:
+        sidecar = make_sidecar(["sustained"])
+        sidecar["matrix_case_names"] = ["append/narrow16/take-1"]
+        with self.assertRaisesRegex(ValueError, "present together"):
+            protocol_report.expected_record_provenance(sidecar)
+
+    def test_release_selection_is_recomputed_from_the_frozen_shard(self) -> None:
+        standalone = make_sidecar(
+            ["matrix"],
+            matrix_case_names=["append/narrow16/take-1"],
+            profile="release",
+        )
+        standalone.update(
+            {
+                "base_dataset_root": "s3://bucket/prefix",
+                "dataset_root": "s3://bucket/prefix",
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "exactly nine canonical shards"):
+            protocol_report.expected_record_provenance(standalone)
+
+        tracks, variants, cases = protocol_report.frozen_release_shard_contract(9, 2)
+        self.assertEqual(
+            tracks,
+            (
+                "matrix",
+                "sustained",
+                "adversarial_natural",
+                "adversarial_aligned",
+            ),
+        )
+        self.assertEqual(variants, ("bare", "scalar"))
+        self.assertEqual(cases[0], "append/narrow16/take-1")
+        sidecar = make_sidecar(
+            list(tracks),
+            variants=list(variants),
+            matrix_case_names=list(cases),
+            profile="release",
+        )
+        sidecar.update(
+            {
+                "base_dataset_root": "s3://bucket/prefix",
+                "dataset_root": "s3://bucket/prefix/shard-002-of-009",
+                "shard_count": 9,
+                "shard_index": 2,
+                "shard_id": "shard-002-of-009",
+            }
+        )
+        protocol_report.validate_frozen_release_selection(sidecar)
+
+        wrong_release_scheme = dict(sidecar)
+        wrong_release_scheme.update(
+            {
+                "base_dataset_root": "/tmp/data",
+                "dataset_root": "/tmp/data/shard-002-of-009",
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "storage=s3"):
+            protocol_report.expected_record_provenance(wrong_release_scheme)
+
+        for field in ("tracks", "variants", "matrix_case_names"):
+            reordered = dict(sidecar)
+            reordered[field] = list(reversed(sidecar[field]))
+            with self.assertRaisesRegex(ValueError, f"release {field}"):
+                protocol_report.expected_record_provenance(reordered)
+
+        _, _, shard_zero_cases = protocol_report.frozen_release_shard_contract(9, 0)
+        moved = dict(sidecar)
+        moved["matrix_case_names"] = [shard_zero_cases[0], *cases[1:]]
+        with self.assertRaisesRegex(ValueError, "release matrix_case_names"):
+            protocol_report.expected_record_provenance(moved)
+
+        wrong_seed = dict(sidecar)
+        wrong_seed["seed"] = protocol.RELEASE_SEED + 1
+        with self.assertRaisesRegex(ValueError, "canonical seed"):
+            protocol_report.expected_record_provenance(wrong_seed)
+
+        wrong_policy = dict(sidecar)
+        wrong_policy["policy"] = json.loads(json.dumps(sidecar["policy"]))
+        wrong_policy["policy"]["trigger"]["conditions"][0]["threshold"] = 0.1
+        policy_canonical = json.dumps(
+            wrong_policy["policy"],
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        )
+        wrong_policy["policy_canonical_json"] = policy_canonical
+        wrong_policy["policy_sha256"] = hashlib.sha256(
+            policy_canonical.encode()
+        ).hexdigest()
+        with self.assertRaisesRegex(ValueError, "repository default policy"):
+            protocol_report.expected_record_provenance(wrong_policy)
+
     def test_maintenance_plan_hash_is_audited(self) -> None:
         sidecar = make_sidecar(["matrix"], matrix_case_names=["append/narrow16/take-1"])
         with tempfile.TemporaryDirectory() as directory:
@@ -482,6 +659,16 @@ class ProtocolReportTests(unittest.TestCase):
         profile = sidecar["matrix"]["profiles"]["smoke"]
         for repeat in range(profile["paired_repeats"]):
             for update_round in (2, 5, 8):
+                scan_pair_id = (
+                    f"run-1/sustained/bare/repeat-{repeat:03d}/"
+                    f"step-{update_round:03d}/cold-scan"
+                )
+                next(
+                    record
+                    for record in records
+                    if record["pair_id"] == scan_pair_id
+                    and record["format"] == "v22_no_stable"
+                )["fragments"] = 8
                 pair_id = (
                     f"run-1/sustained/bare/repeat-{repeat:03d}/"
                     f"round-{update_round:03d}/policy-maintenance"
@@ -495,6 +682,24 @@ class ProtocolReportTests(unittest.TestCase):
                             operation="default_compaction",
                         )
                     )
+                post_step = profile["repeated_update_rounds"] + update_round
+                for label in ("cold-open", "cold-scan", "cold-take"):
+                    post_pair_id = (
+                        f"run-1/sustained/bare/repeat-{repeat:03d}/"
+                        f"step-{post_step:03d}/{label}"
+                    )
+                    for format_name in run.FORMATS:
+                        records.append(
+                            make_record(
+                                sidecar,
+                                post_pair_id,
+                                format_name,
+                                state_digest=(
+                                    "0" * 48 if label == "cold-scan" else None
+                                ),
+                            )
+                        )
+        bind_exact_provenance(sidecar, records)
         result = protocol_report.analyze(sidecar, records, bootstrap_samples=101)
         self.assertEqual(result.verdict, "PASS")
         prefix_gates = [
@@ -551,12 +756,50 @@ class ProtocolReportTests(unittest.TestCase):
                     operation="default_compaction",
                 )
             )
+        bind_exact_provenance(sidecar, records)
         complete = protocol_report.analyze(sidecar, records, bootstrap_samples=101)
         self.assertEqual(complete.verdict, "PASS")
         observed = complete.machine["adversarial_natural"]["variants"]["bare"][0]
         self.assertEqual(
             observed["natural_maintenance_rounds"],
             {name: [0] for name in run.FORMATS},
+        )
+
+    def test_untriggered_dynamic_maintenance_is_rejected(self) -> None:
+        sidecar = make_sidecar(["adversarial_natural"], variants=["bare"])
+        records = complete_records(sidecar)
+        for format_name in run.FORMATS:
+            pair_id = (
+                "run-1/adversarial_natural/bare/repeat-000/round-000/"
+                f"natural-maintenance/{format_name}"
+            )
+            records.append(
+                make_record(
+                    sidecar,
+                    pair_id,
+                    format_name,
+                    operation="default_compaction",
+                )
+            )
+        result = protocol_report.analyze(sidecar, records, bootstrap_samples=101)
+        self.assertEqual(result.verdict, "FAIL")
+        self.assertTrue(
+            any(
+                "unexpected dynamic invocation" in failure
+                for failure in result.machine["failures"]
+            )
+        )
+
+    def test_order_index_is_replayed_from_the_frozen_phase_order(self) -> None:
+        sidecar = make_sidecar(["matrix"], matrix_case_names=["append/narrow16/take-1"])
+        records = complete_records(sidecar)
+        self.assertTrue(any(record["order_index"] != 0 for record in records))
+        for record in records:
+            record["order_index"] = 0
+        result = protocol_report.analyze(sidecar, records, bootstrap_samples=101)
+        self.assertEqual(result.verdict, "FAIL")
+        self.assertTrue(
+            any("order_index" in failure for failure in result.machine["failures"])
         )
 
     def test_no_stable_relocation_keeps_five_percent_baseline(self) -> None:
@@ -632,39 +875,125 @@ class ProtocolReportTests(unittest.TestCase):
 
     def test_random_delete_reclaim_preflight_accepts_profile_result(self) -> None:
         case_name = "delete-random-50/narrow16/take-1"
-        for profile, not_admitted in (("smoke", False), ("release", True)):
-            sidecar = make_sidecar(
-                ["matrix"], matrix_case_names=[case_name], profile=profile
+        sidecar = make_sidecar(["matrix"], matrix_case_names=[case_name])
+        records = complete_records(sidecar)
+        append_reclaim_preflights(
+            sidecar, records, case_name=case_name, not_admitted=False
+        )
+        result = protocol_report.analyze(
+            sidecar, records, bootstrap_samples=101, enforce_gates=False
+        )
+        self.assertEqual(result.verdict, "PASS")
+
+    def test_frozen_record_provenance_rejects_rows_and_path_tampering(self) -> None:
+        case_name = "delete-random-50/narrow16/take-1"
+        sidecar = make_sidecar(["matrix"], matrix_case_names=[case_name])
+        records = complete_records(sidecar)
+        append_reclaim_preflights(
+            sidecar, records, case_name=case_name, not_admitted=False
+        )
+        baseline = protocol_report.analyze(
+            sidecar, records, bootstrap_samples=101, enforce_gates=False
+        )
+        self.assertEqual(baseline.verdict, "PASS")
+        reclaim = next(
+            record
+            for record in records
+            if record["operation"] == "random_delete_reclaim"
+            and record["format"] == "v23_logical"
+        )
+        self.assertEqual(reclaim["rows"], 65_536)
+        self.assertEqual(reclaim["implementation_path"], "explicit_repack")
+
+        reclaim["rows"] = 12345
+        wrong_rows = protocol_report.analyze(
+            sidecar, records, bootstrap_samples=101, enforce_gates=False
+        )
+        self.assertEqual(wrong_rows.verdict, "FAIL")
+        self.assertTrue(
+            any("'rows':" in failure for failure in wrong_rows.machine["failures"])
+        )
+
+        reclaim["rows"] = 65_536
+        reclaim["implementation_path"] = "native_dataset_api"
+        wrong_path = protocol_report.analyze(
+            sidecar, records, bootstrap_samples=101, enforce_gates=False
+        )
+        self.assertEqual(wrong_path.verdict, "FAIL")
+        self.assertTrue(
+            any(
+                "'implementation_path':" in failure
+                for failure in wrong_path.machine["failures"]
             )
-            records = complete_records(sidecar)
-            append_reclaim_preflights(
-                sidecar,
-                records,
-                case_name=case_name,
-                not_admitted=not_admitted,
+        )
+
+    def test_frozen_provenance_covers_fixture_and_repeated_track_state(self) -> None:
+        sidecar = make_sidecar(
+            [
+                "matrix",
+                "sustained",
+                "adversarial_natural",
+                "adversarial_aligned",
+            ],
+            variants=["scalar"],
+            matrix_case_names=["append/narrow16/take-1"],
+        )
+        expected = protocol_report.expected_record_provenance(sidecar)
+        fixture_clone = expected[
+            (
+                "run-1/fixtures/narrow16/rows-65536/rows-per-fragment-8192/"
+                "index-scalar/fixture_clone",
+                "v23_logical",
             )
-            result = protocol_report.analyze(
-                sidecar, records, bootstrap_samples=101, enforce_gates=False
+        ]
+        self.assertEqual(fixture_clone["take_count"], 1)
+        self.assertEqual(fixture_clone["index_kind"], "none")
+
+        sustained = expected[
+            (
+                "run-1/sustained/scalar/repeat-000/round-003/update",
+                "v23_logical",
             )
-            self.assertEqual(result.verdict, "PASS", profile)
+        ]
+        self.assertEqual(sustained["mutation_count"], 655)
+        self.assertEqual(sustained["selection_step"], 0)
+        self.assertEqual(
+            sustained["implementation_path"], "exact_selection_matched_merge"
+        )
+
+        natural = expected[
+            (
+                "run-1/adversarial_natural/scalar/repeat-000/round-003/"
+                "natural-maintenance/v22_stable",
+                "v22_stable",
+            )
+        ]
+        self.assertEqual(natural["mutation_count"], 1)
+        self.assertEqual(natural["selection"], "range")
+
+        aligned = expected[
+            (
+                "run-1/adversarial_aligned/scalar/repeat-000/round-003/"
+                "forced-baseline-maintenance/v22_no_stable",
+                "v22_no_stable",
+            )
+        ]
+        self.assertEqual(aligned["mutation_count"], 655)
+        self.assertEqual(aligned["selection_step"], 3)
+        self.assertEqual(aligned["selection"], "uniform_without_replacement")
+        self.assertEqual(aligned["implementation_path"], "default_compaction")
 
     def test_random_delete_reclaim_preflight_rejects_inverse_result(self) -> None:
         case_name = "delete-random-50/narrow16/take-1"
-        for profile, not_admitted in (("smoke", True), ("release", False)):
-            sidecar = make_sidecar(
-                ["matrix"], matrix_case_names=[case_name], profile=profile
-            )
-            records = complete_records(sidecar)
-            append_reclaim_preflights(
-                sidecar,
-                records,
-                case_name=case_name,
-                not_admitted=not_admitted,
-            )
-            result = protocol_report.analyze(
-                sidecar, records, bootstrap_samples=101, enforce_gates=False
-            )
-            self.assertEqual(result.verdict, "FAIL", profile)
+        sidecar = make_sidecar(["matrix"], matrix_case_names=[case_name])
+        records = complete_records(sidecar)
+        append_reclaim_preflights(
+            sidecar, records, case_name=case_name, not_admitted=True
+        )
+        result = protocol_report.analyze(
+            sidecar, records, bootstrap_samples=101, enforce_gates=False
+        )
+        self.assertEqual(result.verdict, "FAIL")
 
     def test_random_delete_reclaim_preflight_missing_is_incomplete(self) -> None:
         case_name = "delete-random-50/narrow16/take-1"

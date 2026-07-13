@@ -641,7 +641,15 @@ fn path_io_metrics(stats: &IoStats) -> BTreeMap<String, PathIoMetrics> {
         ("other".to_string(), PathIoMetrics::default()),
     ]);
     for request in &stats.requests {
-        let category = path_category(request.path.as_ref());
+        // `delete_stream` is one aggregate control request over a stream of
+        // paths, so the tracker cannot attach one concrete object path. Keep
+        // the request and classify its zero-byte sentinel as metadata/control.
+        let category = maintenance::aggregate_control_path_category(
+            request.operation,
+            request.path.as_ref(),
+            request.num_bytes,
+        )
+        .unwrap_or_else(|| path_category(request.path.as_ref()));
         let totals = by_path.get_mut(category).expect("fixed path category");
         match request.operation {
             IoOperation::Get => totals.get_requests += 1,
@@ -2160,11 +2168,25 @@ async fn compact_files_with_observation(
 ) -> BenchResult<CompactionObservation> {
     let indices_before = dataset.load_indices().await?;
     let index_storage_bytes_before = index_storage_bytes(dataset).await?;
+    let mut layout_index_maintenance_ns = 0_u64;
     let plan = if let Some(maintenance_plan) = maintenance_plan {
         options.target_rows_per_fragment = maintenance_plan.execution_target_rows_per_fragment;
+        // Validate and bind the benchmark-owned physical plan before any
+        // maintenance write. A no-stable-row-address index remapper requires a
+        // contiguous rewrite group to be either fully indexed or fully
+        // unindexed. Repeated catch-up creates multiple complete same-name
+        // segments, so consolidate them inside this timed maintenance operation
+        // and then prove the physical source is byte-for-byte unchanged.
+        let tasks = validate_maintenance_plan(args, maintenance_plan, dataset)?;
+        if args.format == BenchFormat::V22NoStable
+            && let Some(elapsed) =
+                maintenance::consolidate_no_stable_index_segments(dataset, indices_before.as_ref())
+                    .await?
+        {
+            layout_index_maintenance_ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        }
         CompactionPlan {
-            // Re-validating here binds the exact TaskData to the measured snapshot.
-            tasks: validate_maintenance_plan(args, maintenance_plan, dataset)?,
+            tasks,
             read_version: dataset.version().version,
             options: options.clone(),
             planning_metrics: CompactionMetrics::default(),
@@ -2204,8 +2226,8 @@ async fn compact_files_with_observation(
         plan.options(),
     )
     .await?;
-    let layout_index_maintenance_ns =
-        u64::try_from(commit_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    layout_index_maintenance_ns = layout_index_maintenance_ns
+        .saturating_add(u64::try_from(commit_started.elapsed().as_nanos()).unwrap_or(u64::MAX));
     metrics += plan.planning_metrics;
     let indices_after = dataset.load_indices().await?;
     let index_coverage_reuse = if indices_before.is_empty() {

@@ -230,6 +230,114 @@ class ProtocolTests(unittest.TestCase):
             )
         )
 
+    def test_focused_sustained_sidecar_excludes_matrix_cases(self) -> None:
+        class FakeRunner:
+            records = 0
+            boundaries = 0
+            pmr_triggers = 0
+            failures: list[str] = []
+
+            def close(self) -> None:
+                pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            executable = root / "stable_row_address_e2e"
+            executable.touch()
+            output = root / "results.jsonl"
+            with (
+                mock.patch.object(
+                    protocol.subprocess,
+                    "run",
+                    return_value=type(
+                        "Result", (), {"stdout": "1" * 40, "returncode": 0}
+                    )(),
+                ),
+                mock.patch.object(
+                    protocol, "ProtocolRunner", return_value=FakeRunner()
+                ),
+                mock.patch.object(protocol, "run_sustained") as sustained,
+            ):
+                self.assertEqual(
+                    protocol.main(
+                        [
+                            "--dataset-root",
+                            str(root / "data"),
+                            "--output",
+                            str(output),
+                            "--track",
+                            "sustained",
+                            "--variant",
+                            "bare",
+                            "--development-executable",
+                            str(executable),
+                        ]
+                    ),
+                    0,
+                )
+            sustained.assert_called_once()
+            sidecar = json.loads(
+                Path(f"{output}.protocol.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(sidecar["tracks"], ["sustained"])
+            self.assertEqual(sidecar["matrix_case_names"], [])
+
+    def test_release_requires_canonical_shards_and_selection(self) -> None:
+        base = [
+            "--dataset-root",
+            "s3://bucket/prefix",
+            "--storage",
+            "s3",
+            "--output",
+            "/tmp/release.jsonl",
+            "--profile",
+            "release",
+        ]
+        with self.assertRaisesRegex(ValueError, "exactly nine canonical shards"):
+            protocol.main(base)
+        with self.assertRaisesRegex(ValueError, "canonical complete track order"):
+            protocol.main([*base, "--shard-count", "9", "--track", "sustained"])
+        with self.assertRaisesRegex(ValueError, "canonical seed"):
+            protocol.main(
+                [
+                    *base,
+                    "--shard-count",
+                    "9",
+                    "--seed",
+                    str(protocol.RELEASE_SEED + 1),
+                ]
+            )
+        with tempfile.TemporaryDirectory() as directory:
+            matrix = json.loads(protocol.DEFAULT_MATRIX.read_text(encoding="utf-8"))
+            matrix["name"] = "custom_release_matrix"
+            matrix_path = Path(directory) / "matrix.json"
+            matrix_path.write_text(json.dumps(matrix), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "repository default matrix"):
+                protocol.main(
+                    [
+                        *base,
+                        "--shard-count",
+                        "9",
+                        "--matrix",
+                        str(matrix_path),
+                    ]
+                )
+
+            policy = json.loads(run.DEFAULT_POLICY.read_text(encoding="utf-8"))
+            policy["trigger"]["conditions"][0]["threshold"] = 0.1
+            policy_path = Path(directory) / "policy.json"
+            policy_path.write_text(json.dumps(policy), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "repository default policy"):
+                protocol.main(
+                    [
+                        *base,
+                        "--shard-count",
+                        "9",
+                        "--policy",
+                        str(policy_path),
+                    ]
+                )
+
     def test_checkpoint_resume_is_exact_and_ambiguous_safe(self) -> None:
         policy, _, policy_sha = run.canonical_policy(run.DEFAULT_POLICY)
         with tempfile.TemporaryDirectory() as directory:
@@ -390,6 +498,80 @@ class ProtocolTests(unittest.TestCase):
             self.assertEqual(first, second)
             self.assertRegex(first[1], r"^[0-9a-f]{64}$")
             self.assertEqual(run_mock.call_count, 1)
+
+    def test_sustained_index_consolidation_stays_in_timed_maintenance(self) -> None:
+        policy, _, _ = run.canonical_policy(run.DEFAULT_POLICY)
+
+        class RecordingRunner:
+            def __init__(self) -> None:
+                self.policy = policy
+                self.events: list[tuple[object, ...]] = []
+                self.boundaries = 0
+                self.failures: list[str] = []
+
+            def clone_fixture_all(self, **_: object) -> dict[str, dict[str, object]]:
+                self.events.append(("fixture",))
+                return {name: {"status": "ok"} for name in run.FORMATS}
+
+            def invoke_all(
+                self, step: protocol.Step, **kwargs: object
+            ) -> dict[str, dict[str, object]]:
+                self.events.append(
+                    ("invoke", step.operation, kwargs.get("maintenance_plan"))
+                )
+                return {name: {"status": "ok"} for name in run.FORMATS}
+
+            def require_success(self, records: object, context: str) -> None:
+                self.events.append(("require", context))
+
+            def probes(self, **_: object) -> dict[str, dict[str, object]]:
+                self.events.append(("probes",))
+                triggered = {
+                    "physical_data_bytes": 1_000,
+                    "estimated_live_data_bytes": 500,
+                    "fragments": 2,
+                    "scan_byte_amplification": 2.0,
+                }
+                return {name: dict(triggered) for name in run.FORMATS}
+
+            def prepare_maintenance_plan(
+                self, step: protocol.Step, **_: object
+            ) -> tuple[Path, str]:
+                self.events.append(("prepare", step.operation))
+                return Path("/tmp/frozen-plan.json"), "a" * 64
+
+            def complete_unit(self, unit: str) -> None:
+                self.events.append(("complete", unit))
+
+        runner = RecordingRunner()
+        protocol.run_sustained(
+            runner,  # type: ignore[arg-type]
+            {
+                "rows": 100,
+                "hot_set_rows": 10,
+                "repeated_update_rounds": 1,
+                "logical_fragment_counts": [2],
+                "paired_repeats": 1,
+                "minimum_sustained_boundaries": 1,
+            },
+            ["vector"],
+        )
+        prepare_index = runner.events.index(("prepare", "default_compaction"))
+        maintenance_event = (
+            "invoke",
+            "default_compaction",
+            (Path("/tmp/frozen-plan.json"), "a" * 64),
+        )
+        maintenance_index = runner.events.index(maintenance_event)
+        self.assertLess(prepare_index, maintenance_index)
+        self.assertNotIn(
+            ("invoke", "index_optimize", None),
+            runner.events[prepare_index + 1 : maintenance_index],
+        )
+        self.assertEqual(
+            [event[1] for event in runner.events if event[0] == "invoke"],
+            ["update", "index_optimize", "default_compaction"],
+        )
 
     def test_sustained_and_adversarial_sampling_nonces_are_distinct(self) -> None:
         sustained = protocol.Step(

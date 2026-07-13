@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import functools
 import hashlib
 import json
 import math
@@ -14,7 +15,7 @@ import statistics
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -105,6 +106,66 @@ STANDARD_METRICS = (
     "head_requests",
     "list_requests",
 )
+PROVENANCE_FIELDS = (
+    "operation",
+    "timing_scope",
+    "round",
+    "order_index",
+    "dataset_uri",
+    "rows",
+    "rows_per_fragment",
+    "take_count",
+    "expected_rows",
+    "mutation_count",
+    "id_start",
+    "step",
+    "selection_step",
+    "match_percent",
+    "schema_kind",
+    "index_kind",
+    "selection",
+    "implementation_path",
+    "policy_version",
+)
+CORE_PROVENANCE_FIELDS = tuple(
+    field for field in PROVENANCE_FIELDS if field != "order_index"
+)
+TIMING_SCOPES = {
+    "create": "dataset_write_including_bounded_synthetic_stream_generation",
+    "fixture_clone": "cold_session_shallow_clone_of_canonical_fixture",
+    "append": "cold_session_open_and_append_including_bounded_synthetic_stream_generation",
+    "delete": "cold_session_open_and_delete_commit",
+    "update": "cold_session_open_and_update_commit_including_stream_generation_when_applicable",
+    "merge_insert": "cold_session_open_and_merge_insert_commit_including_bounded_synthetic_stream_generation",
+    "backfill": "cold_session_open_and_row_aligned_backfill_commit",
+    "default_compaction_preflight": "cold_session_open_and_default_compaction_plan_only",
+    "default_compaction": "cold_session_open_and_default_compaction_commit",
+    "random_delete_reclaim": "cold_session_open_and_same_postcondition_random_delete_reclaim_commit",
+    "normalize_placement": "cold_session_open_and_normalize_placement_commit",
+    "repack": "cold_session_open_and_repack_commit",
+    "recluster": "cold_session_open_and_recluster_commit",
+    "checkpoint_generation": "cold_session_open_and_generation_checkpoint_commit",
+    "index_build": "cold_session_open_and_index_build_commit",
+    "index_take": "cold_session_open_and_index_lookup_and_take",
+    "index_optimize": "cold_session_open_and_index_optimize_commit",
+    "open": "dataset_open_and_contract_validation",
+    "scan": "dataset_open_contract_validation_and_full_scan",
+    "take": "cold_session_open_and_take_rows_with_prepared_ids",
+}
+SCHEMA_NAMES = {
+    "narrow16": "narrow_16b",
+    "wide128": "wide_128b",
+    "vector": "vector_f32_128",
+}
+INDEX_NAMES = {
+    "none": "none",
+    "scalar": "scalar_btree",
+    "vector": "vector_ivf_flat",
+}
+SELECTION_NAMES = {
+    "range": "range",
+    "random": "uniform_without_replacement",
+}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -164,6 +225,148 @@ def _strict_object(value: Any, fields: set[str], context: str) -> dict[str, Any]
             f"{context} fields mismatch: missing={missing}, unknown={unknown}"
         )
     return value
+
+
+@functools.cache
+def frozen_matrix() -> tuple[dict[str, Any], str, str]:
+    matrix = json.loads(protocol.DEFAULT_MATRIX.read_text(encoding="utf-8"))
+    canonical = json.dumps(
+        matrix, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    )
+    return matrix, canonical, hashlib.sha256(canonical.encode()).hexdigest()
+
+
+@functools.cache
+def frozen_release_policy() -> tuple[str, str]:
+    policy = json.loads(run.DEFAULT_POLICY.read_text(encoding="utf-8"))
+    canonical = json.dumps(
+        policy, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    )
+    return canonical, hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def frozen_dataset_root(sidecar: dict[str, Any]) -> str:
+    base = sidecar["base_dataset_root"]
+    if sidecar["shard_count"] == 1:
+        return base
+    return f"{base.rstrip('/')}/{sidecar['shard_id']}"
+
+
+def validate_storage_roots(sidecar: dict[str, Any]) -> None:
+    storage = sidecar.get("storage")
+    roots = (sidecar.get("base_dataset_root"), sidecar.get("dataset_root"))
+    if storage == "s3" and any(
+        not isinstance(root, str) or not root.startswith("s3://") for root in roots
+    ):
+        raise ValueError("storage=s3 requires s3:// dataset roots")
+    if storage == "ebs" and any(
+        isinstance(root, str) and root.startswith("s3://") for root in roots
+    ):
+        raise ValueError("storage=ebs requires local dataset roots")
+
+
+@functools.cache
+def frozen_release_shard_contract(
+    shard_count: int, shard_index: int
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    if shard_count != 9 or shard_index not in range(9):
+        raise ValueError("release evidence requires exactly nine canonical shards")
+    matrix, _, _ = frozen_matrix()
+    profile = matrix["profiles"]["release"]
+    release_tracks = (
+        "matrix",
+        "sustained",
+        "adversarial_natural",
+        "adversarial_aligned",
+    )
+    release_variants = ("bare", "scalar", "vector")
+    cases = tuple(
+        protocol.iter_matrix_cases(profile, set(matrix["tracks"]["matrix"]["cases"]))
+    )
+    fixture_keys = {
+        (case.schema_kind, case.rows_per_fragment, case.fixture_index_kind)
+        for case in cases
+    }
+    repeated_rows_per_fragment = max(
+        1,
+        (profile["rows"] + profile["logical_fragment_counts"][0] - 1)
+        // profile["logical_fragment_counts"][0],
+    )
+    variant_layouts = {
+        "bare": ("narrow16", repeated_rows_per_fragment, "none"),
+        "scalar": ("narrow16", repeated_rows_per_fragment, "scalar"),
+        "vector": ("vector", repeated_rows_per_fragment, "vector"),
+    }
+    fixture_keys.update(variant_layouts.values())
+    data_layouts = sorted(
+        {
+            (schema_kind, rows_per_fragment)
+            for schema_kind, rows_per_fragment, _ in fixture_keys
+        }
+    )
+    selected_data_layouts = {
+        layout
+        for ordinal, layout in enumerate(data_layouts)
+        if ordinal % shard_count == shard_index
+    }
+    selected_fixture_keys = {
+        key for key in fixture_keys if (key[0], key[1]) in selected_data_layouts
+    }
+    matrix_case_names = tuple(
+        case.name
+        for case in cases
+        if (case.schema_kind, case.rows_per_fragment, case.fixture_index_kind)
+        in selected_fixture_keys
+    )
+    variants = tuple(
+        variant
+        for variant in release_variants
+        if variant_layouts[variant] in selected_fixture_keys
+    )
+    tracks = tuple(
+        track
+        for track in release_tracks
+        if (track == "matrix" and matrix_case_names) or (track != "matrix" and variants)
+    )
+    return tracks, variants, matrix_case_names
+
+
+def validate_frozen_release_selection(sidecar: dict[str, Any]) -> None:
+    if sidecar.get("profile") != "release":
+        return
+    expected_tracks, expected_variants, expected_cases = frozen_release_shard_contract(
+        sidecar["shard_count"], sidecar["shard_index"]
+    )
+    for field, expected in (
+        ("tracks", expected_tracks),
+        ("variants", expected_variants),
+        ("matrix_case_names", expected_cases),
+    ):
+        actual = sidecar.get(field)
+        if not isinstance(actual, list) or tuple(actual) != expected:
+            raise ValueError(
+                f"release {field} does not match the frozen shard allocation"
+            )
+
+
+def validate_frozen_release_identity(sidecar: dict[str, Any]) -> None:
+    if sidecar.get("profile") != "release":
+        return
+    if sidecar.get("seed") != 0x4C414E43455F3233:
+        raise ValueError("release evidence does not use the canonical seed")
+    canonical, sha256 = frozen_release_policy()
+    actual = json.dumps(
+        sidecar.get("policy"),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    if (
+        actual != canonical
+        or sidecar.get("policy_canonical_json") != canonical
+        or sidecar.get("policy_sha256") != sha256
+    ):
+        raise ValueError("release evidence does not use the repository default policy")
 
 
 def validate_sidecar(value: Any) -> dict[str, Any]:
@@ -228,6 +431,9 @@ def validate_sidecar(value: Any) -> dict[str, Any]:
         raise ValueError("protocol sidecar shard specification is invalid")
     if value["shard_strategy"] != "schema_and_fragment_layout_fixture_locality":
         raise ValueError("protocol sidecar shard_strategy is unsupported")
+    if value["dataset_root"] != frozen_dataset_root(value):
+        raise ValueError("protocol sidecar dataset_root is inconsistent with its shard")
+    validate_storage_roots(value)
     if value["data_retention"] != "preserve":
         raise ValueError("protocol sidecar must preserve datasets")
     expected_scope = (
@@ -279,6 +485,8 @@ def validate_sidecar(value: Any) -> dict[str, Any]:
         not isinstance(case, str) or not case for case in value["matrix_case_names"]
     ):
         raise ValueError("protocol sidecar matrix_case_names are invalid")
+    if ("matrix" in value["tracks"]) != bool(value["matrix_case_names"]):
+        raise ValueError("matrix track and matrix_case_names must be present together")
 
     matrix_canonical = json.dumps(
         value["matrix"], sort_keys=True, separators=(",", ":"), ensure_ascii=True
@@ -287,8 +495,13 @@ def validate_sidecar(value: Any) -> dict[str, Any]:
         raise ValueError("matrix canonical JSON does not match sidecar object")
     if hashlib.sha256(matrix_canonical.encode()).hexdigest() != value["matrix_sha256"]:
         raise ValueError("matrix SHA-256 does not match canonical JSON")
-    # Re-run the complete matrix validator instead of trusting the embedded object.
-    temporary_matrix = value["matrix"]
+    frozen, frozen_canonical, frozen_sha256 = frozen_matrix()
+    if matrix_canonical != frozen_canonical or value["matrix_sha256"] != frozen_sha256:
+        raise ValueError("protocol sidecar does not contain the frozen workload matrix")
+    validate_frozen_release_selection(value)
+    validate_frozen_release_identity(value)
+    # Re-run the complete matrix validator against the repository-owned object.
+    temporary_matrix = frozen
     _strict_object(
         temporary_matrix,
         {"schema_version", "name", "profiles", "tracks", "measurement"},
@@ -739,6 +952,7 @@ def paired_ratio_ci(
     if statistic == "median":
         summarize = statistics.median
     elif statistic == "p95":
+
         def summarize(values: Sequence[float]) -> float:
             return percentile_nearest(values, 0.95)
     else:
@@ -825,6 +1039,793 @@ def group_by_pair(records: Iterable[dict[str, Any]]) -> dict[str, list[dict[str,
     for record in records:
         grouped[record["pair_id"]].append(record)
     return grouped
+
+
+def _implementation_path(
+    operation: str, format_name: str, index_kind: str, selection: str
+) -> str:
+    if operation == "update":
+        return (
+            "exact_selection_matched_merge"
+            if selection == "random"
+            else "native_update_builder"
+        )
+    if operation == "fixture_clone":
+        return "canonical_fixture_shallow_clone"
+    if operation in {
+        "normalize_placement",
+        "repack",
+        "recluster",
+        "checkpoint_generation",
+    }:
+        return "capability_gated_explicit_maintenance"
+    if operation == "default_compaction_preflight":
+        return "default_compaction_plan_only"
+    if operation == "default_compaction":
+        return "default_compaction"
+    if operation == "random_delete_reclaim":
+        return (
+            "explicit_repack"
+            if format_name == "v23_logical"
+            else "same_postcondition_default_compaction"
+        )
+    if operation in {"index_build", "index_take", "index_optimize"}:
+        return INDEX_NAMES[index_kind]
+    return "native_dataset_api"
+
+
+def _dataset_uri(root: str, suffix: str) -> str:
+    if root.startswith("s3://"):
+        return f"{root.rstrip('/')}/{suffix}"
+    return str((Path(root).expanduser().resolve() / suffix).resolve())
+
+
+def _expected_provenance(
+    *,
+    operation: str,
+    format_name: str,
+    dataset_uri: str,
+    repeat: int,
+    order_index: int,
+    rows: int,
+    rows_per_fragment: int,
+    take_count: int,
+    expected_rows: int,
+    mutation_count: int = 1,
+    id_start: int = 0,
+    step: int = 0,
+    selection_step: int = 0,
+    match_percent: int = 50,
+    schema_kind: str = "narrow16",
+    index_kind: str = "none",
+    selection: str = "range",
+) -> dict[str, Any]:
+    return {
+        "operation": operation,
+        "timing_scope": TIMING_SCOPES[operation],
+        "round": repeat,
+        "order_index": order_index,
+        "dataset_uri": dataset_uri,
+        "rows": rows,
+        "rows_per_fragment": rows_per_fragment,
+        "take_count": take_count,
+        "expected_rows": expected_rows,
+        "mutation_count": mutation_count,
+        "id_start": id_start,
+        "step": step,
+        "selection_step": selection_step,
+        "match_percent": match_percent,
+        "schema_kind": SCHEMA_NAMES[schema_kind],
+        "index_kind": INDEX_NAMES[index_kind],
+        "selection": SELECTION_NAMES[selection],
+        "implementation_path": _implementation_path(
+            operation, format_name, index_kind, selection
+        ),
+        "policy_version": 1,
+    }
+
+
+@functools.lru_cache(maxsize=None)
+def _expected_record_provenance(
+    run_id: str,
+    dataset_root: str,
+    profile_name: str,
+    tracks: tuple[str, ...],
+    variants: tuple[str, ...],
+    matrix_case_names: tuple[str, ...],
+    optional_pairs: frozenset[str] | None,
+) -> dict[tuple[str, str], dict[str, Any]]:
+    matrix, _, _ = frozen_matrix()
+    profile = matrix["profiles"][profile_name]
+    rows = profile["rows"]
+    repeats = profile["paired_repeats"]
+    expected: dict[tuple[str, str], dict[str, Any]] = {}
+    seen_fixtures: set[tuple[str, int, str]] = set()
+    current_take_count = profile["take_counts"][-1]
+    phase_index = 0
+
+    def paired_order(repeat: int) -> tuple[str, ...]:
+        nonlocal phase_index
+        order = run.format_order(repeat, phase_index)
+        phase_index += 1
+        return order
+
+    def include_optional(pair_id: str) -> bool:
+        return optional_pairs is None or pair_id in optional_pairs
+
+    def workload_uri(track: str, case: str, repeat: int, format_name: str) -> str:
+        suffix = (
+            f"{run_id}/{track}/{case.replace('/', '__')}/"
+            f"repeat-{repeat:03d}/{format_name}.lance"
+        )
+        return _dataset_uri(dataset_root, suffix)
+
+    def fixture_uri(
+        schema_kind: str,
+        rows_per_fragment: int,
+        index_kind: str,
+        format_name: str,
+    ) -> str:
+        suffix = (
+            f"{run_id}/fixtures/{schema_kind}/rows-{rows}/"
+            f"rows-per-fragment-{rows_per_fragment}/index-{index_kind}/"
+            f"{format_name}.lance"
+        )
+        return _dataset_uri(dataset_root, suffix)
+
+    def add(
+        pair_id: str,
+        formats: Sequence[str],
+        *,
+        operation: str,
+        repeat: int,
+        rows_per_fragment: int,
+        take_count: int,
+        expected_rows: int,
+        uri_for_format: Callable[[str], str],
+        mutation_count: int = 1,
+        id_start: int = 0,
+        step: int = 0,
+        selection_step: int = 0,
+        match_percent: int = 50,
+        schema_kind: str = "narrow16",
+        index_kind: str = "none",
+        selection: str = "range",
+        order_indices: Sequence[int] | None = None,
+    ) -> None:
+        if order_indices is None:
+            order_indices = range(len(formats))
+        if len(order_indices) != len(formats):
+            raise ValueError(f"invalid frozen order for {pair_id}")
+        for format_name, order_index in zip(formats, order_indices):
+            value = _expected_provenance(
+                operation=operation,
+                format_name=format_name,
+                dataset_uri=uri_for_format(format_name),
+                repeat=repeat,
+                order_index=order_index,
+                rows=rows,
+                rows_per_fragment=rows_per_fragment,
+                take_count=take_count,
+                expected_rows=expected_rows,
+                mutation_count=mutation_count,
+                id_start=id_start,
+                step=step,
+                selection_step=selection_step,
+                match_percent=match_percent,
+                schema_kind=schema_kind,
+                index_kind=index_kind,
+                selection=selection,
+            )
+            key = (pair_id, format_name)
+            previous = expected.setdefault(key, value)
+            if previous != value:
+                raise ValueError(f"conflicting frozen provenance for {key}")
+
+    def add_fixture(
+        schema_kind: str,
+        rows_per_fragment: int,
+        index_kind: str,
+        take_count: int,
+    ) -> None:
+        key = (schema_kind, rows_per_fragment, index_kind)
+        if key in seen_fixtures:
+            return
+        if index_kind != "none":
+            add_fixture(schema_kind, rows_per_fragment, "none", take_count)
+            prefix = (
+                f"{run_id}/fixtures/{schema_kind}/rows-{rows}/"
+                f"rows-per-fragment-{rows_per_fragment}/index-{index_kind}"
+            )
+            add(
+                f"{prefix}/fixture_clone",
+                paired_order(0),
+                operation="fixture_clone",
+                repeat=0,
+                rows_per_fragment=rows_per_fragment,
+                take_count=take_count,
+                expected_rows=rows,
+                schema_kind=schema_kind,
+                uri_for_format=lambda format_name: fixture_uri(
+                    schema_kind, rows_per_fragment, index_kind, format_name
+                ),
+            )
+            add(
+                f"{prefix}/index_build",
+                paired_order(0),
+                operation="index_build",
+                repeat=0,
+                rows_per_fragment=rows_per_fragment,
+                take_count=take_count,
+                expected_rows=rows,
+                schema_kind=schema_kind,
+                index_kind=index_kind,
+                uri_for_format=lambda format_name: fixture_uri(
+                    schema_kind, rows_per_fragment, index_kind, format_name
+                ),
+            )
+        else:
+            prefix = (
+                f"{run_id}/fixtures/{schema_kind}/rows-{rows}/"
+                f"rows-per-fragment-{rows_per_fragment}/index-none"
+            )
+            add(
+                f"{prefix}/create",
+                paired_order(0),
+                operation="create",
+                repeat=0,
+                rows_per_fragment=rows_per_fragment,
+                take_count=take_count,
+                expected_rows=rows,
+                schema_kind=schema_kind,
+                uri_for_format=lambda format_name: fixture_uri(
+                    schema_kind, rows_per_fragment, "none", format_name
+                ),
+            )
+        seen_fixtures.add(key)
+
+    def add_probes(
+        track: str,
+        case: str,
+        repeat: int,
+        *,
+        expected_rows: int,
+        rows_per_fragment: int,
+        take_count: int,
+        schema_kind: str,
+        index_kind: str,
+        step: int,
+    ) -> None:
+        prefix = f"{run_id}/{track}/{case}/repeat-{repeat:03d}/step-{step:03d}"
+        operations = [
+            ("cold-open", "open"),
+            ("cold-scan", "scan"),
+            ("cold-take", "take"),
+        ]
+        if index_kind != "none":
+            operations.append(("cold-index-take", "index_take"))
+        for label, operation in operations:
+            add(
+                f"{prefix}/{label}",
+                paired_order(repeat),
+                operation=operation,
+                repeat=repeat,
+                rows_per_fragment=rows_per_fragment,
+                take_count=take_count,
+                expected_rows=expected_rows,
+                step=step,
+                schema_kind=schema_kind,
+                index_kind=index_kind,
+                uri_for_format=lambda format_name: workload_uri(
+                    track, case, repeat, format_name
+                ),
+            )
+
+    def add_step(
+        pair_id: str,
+        formats: Sequence[str],
+        step_value: protocol.Step,
+        *,
+        operation: str | None,
+        repeat: int,
+        rows_per_fragment: int,
+        take_count: int,
+        track: str,
+        case: str,
+        step_number: int | None = None,
+    ) -> None:
+        add(
+            pair_id,
+            formats,
+            operation=operation or step_value.operation,
+            repeat=repeat,
+            rows_per_fragment=rows_per_fragment,
+            take_count=take_count,
+            expected_rows=step_value.expected_rows,
+            mutation_count=step_value.mutation_count,
+            id_start=step_value.id_start,
+            step=step_value.step if step_number is None else step_number,
+            selection_step=step_value.selection_step,
+            match_percent=step_value.match_percent,
+            schema_kind=step_value.schema_kind,
+            index_kind=step_value.index_kind,
+            selection=step_value.selection,
+            uri_for_format=lambda format_name: workload_uri(
+                track, case, repeat, format_name
+            ),
+        )
+
+    all_cases = {
+        case.name: case
+        for case in protocol.iter_matrix_cases(
+            profile, set(matrix["tracks"]["matrix"]["cases"])
+        )
+    }
+    repeated_fragments = profile["logical_fragment_counts"][0]
+    repeated_rows_per_fragment = max(
+        1, (rows + repeated_fragments - 1) // repeated_fragments
+    )
+    variant_config = {
+        "bare": ("narrow16", "none"),
+        "scalar": ("narrow16", "scalar"),
+        "vector": ("vector", "vector"),
+    }
+
+    for track in tracks:
+        if track == "matrix":
+            for case_name in matrix_case_names:
+                case = all_cases[case_name]
+                current_take_count = case.take_count
+                add_fixture(
+                    case.schema_kind,
+                    case.rows_per_fragment,
+                    case.fixture_index_kind,
+                    current_take_count,
+                )
+                for repeat in range(repeats):
+                    prefix = f"{run_id}/matrix/{case_name}/repeat-{repeat:03d}"
+                    add(
+                        f"{prefix}/step-000/fixture_clone",
+                        paired_order(repeat),
+                        operation="fixture_clone",
+                        repeat=repeat,
+                        rows_per_fragment=case.rows_per_fragment,
+                        take_count=current_take_count,
+                        expected_rows=rows,
+                        schema_kind=case.schema_kind,
+                        index_kind=case.fixture_index_kind,
+                        uri_for_format=lambda format_name, case_name=case_name, repeat=repeat: (
+                            workload_uri("matrix", case_name, repeat, format_name)
+                        ),
+                    )
+                    for step_index, step_value in enumerate(case.steps[1:], 1):
+                        if step_value.operation == "random_delete_reclaim":
+                            add_probes(
+                                "matrix",
+                                case_name,
+                                repeat,
+                                expected_rows=step_value.expected_rows,
+                                rows_per_fragment=case.rows_per_fragment,
+                                take_count=current_take_count,
+                                schema_kind=case.schema_kind,
+                                index_kind=step_value.index_kind,
+                                step=step_index,
+                            )
+                            add_step(
+                                f"{prefix}/step-{step_index:03d}/default-reclaim-preflight",
+                                ("v23_logical",),
+                                step_value,
+                                operation="default_compaction_preflight",
+                                repeat=repeat,
+                                rows_per_fragment=case.rows_per_fragment,
+                                take_count=current_take_count,
+                                track="matrix",
+                                case=case_name,
+                            )
+                        add_step(
+                            f"{prefix}/step-{step_index:03d}/{step_value.operation}",
+                            paired_order(repeat),
+                            step_value,
+                            operation=None,
+                            repeat=repeat,
+                            rows_per_fragment=case.rows_per_fragment,
+                            take_count=current_take_count,
+                            track="matrix",
+                            case=case_name,
+                            step_number=step_index,
+                        )
+                    final = case.steps[-1]
+                    add_probes(
+                        "matrix",
+                        case_name,
+                        repeat,
+                        expected_rows=final.expected_rows,
+                        rows_per_fragment=case.rows_per_fragment,
+                        take_count=current_take_count,
+                        schema_kind=case.schema_kind,
+                        index_kind=final.index_kind,
+                        step=len(case.steps),
+                    )
+            continue
+
+        if track not in {
+            "sustained",
+            "adversarial_natural",
+            "adversarial_aligned",
+        }:
+            continue
+        for variant in variants:
+            schema_kind, index_kind = variant_config[variant]
+            add_fixture(
+                schema_kind,
+                repeated_rows_per_fragment,
+                index_kind,
+                current_take_count,
+            )
+            for repeat in range(repeats):
+                prefix = f"{run_id}/{track}/{variant}/repeat-{repeat:03d}"
+                add(
+                    f"{prefix}/setup/fixture-clone",
+                    paired_order(repeat),
+                    operation="fixture_clone",
+                    repeat=repeat,
+                    rows_per_fragment=repeated_rows_per_fragment,
+                    take_count=current_take_count,
+                    expected_rows=rows,
+                    schema_kind=schema_kind,
+                    index_kind=index_kind,
+                    uri_for_format=lambda format_name, track=track, variant=variant, repeat=repeat: (
+                        workload_uri(track, variant, repeat, format_name)
+                    ),
+                )
+                for update_round in range(profile["repeated_update_rounds"]):
+                    update_selection_step = 0 if track == "sustained" else update_round
+                    update_kwargs = {
+                        "repeat": repeat,
+                        "rows_per_fragment": repeated_rows_per_fragment,
+                        "take_count": current_take_count,
+                        "expected_rows": rows,
+                        "mutation_count": profile["hot_set_rows"],
+                        "step": update_round,
+                        "selection_step": update_selection_step,
+                        "schema_kind": schema_kind,
+                        "index_kind": index_kind,
+                        "selection": "random",
+                        "uri_for_format": lambda format_name, track=track, variant=variant, repeat=repeat: (
+                            workload_uri(track, variant, repeat, format_name)
+                        ),
+                    }
+                    if track == "sustained":
+                        add(
+                            f"{prefix}/round-{update_round:03d}/update",
+                            paired_order(repeat),
+                            operation="update",
+                            **update_kwargs,
+                        )
+                    elif track == "adversarial_natural":
+                        add(
+                            f"{prefix}/round-{update_round:03d}/update-attempt",
+                            paired_order(repeat),
+                            operation="update",
+                            **update_kwargs,
+                        )
+                        pmr_pair = f"{prefix}/round-{update_round:03d}/pmr-maintenance"
+                        if include_optional(pmr_pair):
+                            add(
+                                pmr_pair,
+                                ("v23_logical",),
+                                operation="normalize_placement",
+                                **update_kwargs,
+                            )
+                            add(
+                                f"{prefix}/round-{update_round:03d}/update-retry",
+                                ("v23_logical",),
+                                operation="update",
+                                **update_kwargs,
+                            )
+                    else:
+                        add(
+                            f"{prefix}/round-{update_round:03d}/candidate-preflight",
+                            ("v23_logical",),
+                            operation="update",
+                            **update_kwargs,
+                        )
+                        normalize_pair = f"{prefix}/round-{update_round:03d}/normalize"
+                        if include_optional(normalize_pair):
+                            add(
+                                normalize_pair,
+                                ("v23_logical",),
+                                operation="normalize_placement",
+                                **update_kwargs,
+                            )
+                            for order_index, format_name in enumerate(
+                                ("v22_no_stable", "v22_stable")
+                            ):
+                                add(
+                                    f"{prefix}/round-{update_round:03d}/forced-baseline-maintenance/{format_name}",
+                                    (format_name,),
+                                    operation="default_compaction",
+                                    order_indices=(order_index,),
+                                    **update_kwargs,
+                                )
+                            add(
+                                f"{prefix}/round-{update_round:03d}/candidate-retry",
+                                ("v23_logical",),
+                                operation="update",
+                                **update_kwargs,
+                            )
+                        add(
+                            f"{prefix}/round-{update_round:03d}/baseline-update",
+                            ("v22_no_stable", "v22_stable"),
+                            operation="update",
+                            **update_kwargs,
+                        )
+                    if index_kind != "none":
+                        add(
+                            f"{prefix}/round-{update_round:03d}/index-catch-up",
+                            paired_order(repeat),
+                            operation="index_optimize",
+                            **update_kwargs,
+                        )
+                    add_probes(
+                        track,
+                        variant,
+                        repeat,
+                        expected_rows=rows,
+                        rows_per_fragment=repeated_rows_per_fragment,
+                        take_count=current_take_count,
+                        schema_kind=schema_kind,
+                        index_kind=index_kind,
+                        step=update_round,
+                    )
+                    if track == "sustained":
+                        maintenance_pair = (
+                            f"{prefix}/round-{update_round:03d}/policy-maintenance"
+                        )
+                        if include_optional(maintenance_pair):
+                            add(
+                                maintenance_pair,
+                                paired_order(repeat),
+                                operation="default_compaction",
+                                repeat=repeat,
+                                rows_per_fragment=repeated_rows_per_fragment,
+                                take_count=current_take_count,
+                                expected_rows=rows,
+                                step=update_round,
+                                schema_kind=schema_kind,
+                                index_kind=index_kind,
+                                uri_for_format=update_kwargs["uri_for_format"],
+                            )
+                            add_probes(
+                                track,
+                                variant,
+                                repeat,
+                                expected_rows=rows,
+                                rows_per_fragment=repeated_rows_per_fragment,
+                                take_count=current_take_count,
+                                schema_kind=schema_kind,
+                                index_kind=index_kind,
+                                step=profile["repeated_update_rounds"] + update_round,
+                            )
+                    elif track == "adversarial_natural":
+                        for format_name in run.FORMATS:
+                            maintenance_pair = (
+                                f"{prefix}/round-{update_round:03d}/"
+                                f"natural-maintenance/{format_name}"
+                            )
+                            if include_optional(maintenance_pair):
+                                add(
+                                    maintenance_pair,
+                                    (format_name,),
+                                    operation="default_compaction",
+                                    repeat=repeat,
+                                    rows_per_fragment=repeated_rows_per_fragment,
+                                    take_count=current_take_count,
+                                    expected_rows=rows,
+                                    step=update_round,
+                                    schema_kind=schema_kind,
+                                    index_kind=index_kind,
+                                    uri_for_format=update_kwargs["uri_for_format"],
+                                )
+                        add_probes(
+                            track,
+                            variant,
+                            repeat,
+                            expected_rows=rows,
+                            rows_per_fragment=repeated_rows_per_fragment,
+                            take_count=current_take_count,
+                            schema_kind=schema_kind,
+                            index_kind=index_kind,
+                            step=profile["repeated_update_rounds"] + update_round,
+                        )
+    return expected
+
+
+def _schedule_arguments(sidecar: dict[str, Any]) -> tuple[Any, ...]:
+    _, canonical, sha256 = frozen_matrix()
+    embedded = json.dumps(
+        sidecar.get("matrix"), sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    )
+    if (
+        embedded != canonical
+        or sidecar.get("matrix_canonical_json") != canonical
+        or sidecar.get("matrix_sha256") != sha256
+    ):
+        raise ValueError("sidecar workload does not match the frozen matrix")
+    profile_name = sidecar.get("profile")
+    if profile_name not in {"smoke", "release"}:
+        raise ValueError("sidecar profile is unsupported")
+    dataset_root = frozen_dataset_root(sidecar)
+    if sidecar.get("dataset_root") != dataset_root:
+        raise ValueError("sidecar dataset_root is inconsistent with its shard")
+    validate_storage_roots(sidecar)
+    if ("matrix" in sidecar["tracks"]) != bool(sidecar["matrix_case_names"]):
+        raise ValueError("matrix track and matrix_case_names must be present together")
+    validate_frozen_release_selection(sidecar)
+    validate_frozen_release_identity(sidecar)
+    return (
+        sidecar["run_id"],
+        dataset_root,
+        profile_name,
+        tuple(sidecar["tracks"]),
+        tuple(sidecar["variants"]),
+        tuple(sidecar["matrix_case_names"]),
+    )
+
+
+def expected_record_provenance(
+    sidecar: dict[str, Any],
+) -> dict[tuple[str, str], dict[str, Any]]:
+    return _expected_record_provenance(*_schedule_arguments(sidecar), None)
+
+
+def _derive_optional_pairs(
+    sidecar: dict[str, Any],
+    valid_records: dict[tuple[str, str], dict[str, Any]],
+) -> tuple[frozenset[str], list[str]]:
+    matrix, _, _ = frozen_matrix()
+    profile = matrix["profiles"][sidecar["profile"]]
+    repeats = profile["paired_repeats"]
+    rounds = profile["repeated_update_rounds"]
+    optional: set[str] = set()
+    issues: list[str] = []
+
+    def policy_triggered(pair_id: str, format_name: str) -> bool:
+        record = valid_records.get((pair_id, format_name))
+        if record is None:
+            return False
+        try:
+            triggered, _ = protocol.policy_triggers(record, sidecar["policy"])
+        except (KeyError, TypeError, ValueError) as error:
+            issues.append(
+                f"{pair_id}/{format_name}: cannot derive frozen maintenance boundary: "
+                f"{error}"
+            )
+            return False
+        return triggered
+
+    for track in sidecar["tracks"]:
+        if track not in {
+            "sustained",
+            "adversarial_natural",
+            "adversarial_aligned",
+        }:
+            continue
+        for variant in sidecar["variants"]:
+            for repeat in range(repeats):
+                prefix = f"{sidecar['run_id']}/{track}/{variant}/repeat-{repeat:03d}"
+                for update_round in range(rounds):
+                    round_prefix = f"{prefix}/round-{update_round:03d}"
+                    if track == "sustained":
+                        scan_pair = f"{prefix}/step-{update_round:03d}/cold-scan"
+                        if policy_triggered(scan_pair, "v22_no_stable"):
+                            optional.add(f"{round_prefix}/policy-maintenance")
+                        continue
+                    if track == "adversarial_natural":
+                        update_pair = f"{round_prefix}/update-attempt"
+                        candidate = valid_records.get((update_pair, "v23_logical"))
+                        if candidate is not None and (
+                            candidate["placement_maintenance_required"] is True
+                        ):
+                            optional.add(f"{round_prefix}/pmr-maintenance")
+                        scan_pair = f"{prefix}/step-{update_round:03d}/cold-scan"
+                        for format_name in run.FORMATS:
+                            if policy_triggered(scan_pair, format_name):
+                                optional.add(
+                                    f"{round_prefix}/natural-maintenance/{format_name}"
+                                )
+                        continue
+                    candidate_pair = f"{round_prefix}/candidate-preflight"
+                    candidate = valid_records.get((candidate_pair, "v23_logical"))
+                    if candidate is not None and (
+                        candidate["placement_maintenance_required"] is True
+                    ):
+                        optional.add(f"{round_prefix}/normalize")
+    return frozenset(optional), issues
+
+
+def exact_record_provenance(
+    sidecar: dict[str, Any], records: Sequence[dict[str, Any]]
+) -> tuple[dict[tuple[str, str], dict[str, Any]], list[str]]:
+    allowed = expected_record_provenance(sidecar)
+    valid: dict[tuple[str, str], dict[str, Any]] = {}
+    for record in records:
+        key = (record["pair_id"], record["format"])
+        record_expected = allowed.get(key)
+        if record_expected is None or any(
+            record.get(field) != record_expected[field]
+            for field in CORE_PROVENANCE_FIELDS
+        ):
+            continue
+        valid[key] = record
+    optional_pairs, issues = _derive_optional_pairs(sidecar, valid)
+    return (
+        _expected_record_provenance(*_schedule_arguments(sidecar), optional_pairs),
+        issues,
+    )
+
+
+def audit_record_provenance(
+    sidecar: dict[str, Any], records: Sequence[dict[str, Any]]
+) -> tuple[list[str], list[str]]:
+    try:
+        allowed = expected_record_provenance(sidecar)
+    except (KeyError, TypeError, ValueError) as error:
+        return [f"cannot derive frozen record provenance: {error}"], []
+    issues: list[str] = []
+    failures: list[str] = []
+    valid: dict[tuple[str, str], dict[str, Any]] = {}
+    actual_keys: set[tuple[str, str]] = set()
+    for record in records:
+        key = (record["pair_id"], record["format"])
+        if key in actual_keys:
+            issues.append(f"{record['pair_id']}/{record['format']}: duplicate record")
+            continue
+        actual_keys.add(key)
+        record_expected = allowed.get(key)
+        if record_expected is None:
+            issues.append(
+                f"{record['pair_id']}/{record['format']}: record is not a frozen invocation"
+            )
+            continue
+        mismatches = {
+            field: (record_expected[field], record.get(field))
+            for field in CORE_PROVENANCE_FIELDS
+            if record.get(field) != record_expected[field]
+        }
+        if mismatches:
+            failures.append(
+                f"{record['pair_id']}/{record['format']}: frozen provenance mismatch: "
+                f"{mismatches}"
+            )
+            continue
+        valid[key] = record
+    optional_pairs, decision_issues = _derive_optional_pairs(sidecar, valid)
+    issues.extend(decision_issues)
+    expected = _expected_record_provenance(
+        *_schedule_arguments(sidecar), optional_pairs
+    )
+    expected_keys = set(expected)
+    for pair_id, format_name in sorted(expected_keys - actual_keys):
+        issues.append(f"{pair_id}/{format_name}: frozen invocation is missing")
+    for pair_id, format_name in sorted(actual_keys - expected_keys):
+        failures.append(f"{pair_id}/{format_name}: unexpected dynamic invocation")
+    for key in sorted(actual_keys & expected_keys):
+        record = valid.get(key)
+        if record is None:
+            continue
+        record_expected = expected[key]
+        mismatches = {
+            field: (record_expected[field], record.get(field))
+            for field in PROVENANCE_FIELDS
+            if record.get(field) != record_expected[field]
+        }
+        if mismatches:
+            failures.append(
+                f"{record['pair_id']}/{record['format']}: frozen provenance mismatch: "
+                f"{mismatches}"
+            )
+    return issues, failures
 
 
 def expected_complete_pair_ids(sidecar: dict[str, Any]) -> set[str]:
@@ -951,8 +1952,7 @@ def expected_complete_pair_ids(sidecar: dict[str, Any]) -> set[str]:
 def audit_grid_and_correctness(
     sidecar: dict[str, Any], records: Sequence[dict[str, Any]]
 ) -> tuple[list[str], list[str], dict[str, dict[str, dict[str, Any]]]]:
-    issues: list[str] = []
-    failures: list[str] = []
+    issues, failures = audit_record_provenance(sidecar, records)
     grouped = group_by_pair(records)
     expected = expected_complete_pair_ids(sidecar)
     complete: dict[str, dict[str, dict[str, Any]]] = {}

@@ -94,9 +94,11 @@ benchmarks/stable_row_address/release_remote_systemd.sh install
 ```
 
 Use repeated `--case`, `--case-filter`, or `--variant` arguments for focused
-runs. Canonical unindexed and indexed fixtures are created once per
-format/schema/fragment layout and shallow-cloned for every case/repeat, sharing
-unchanged data and index objects. The immutable `.fixture_lineage.jsonl`
+smoke runs. Release evidence always uses the repository matrix, maintenance
+policy, seed, complete track and variant order, and exactly nine canonical
+fixture-local shards. Canonical unindexed and indexed fixtures are created once
+per format/schema/fragment layout and shallow-cloned for every case/repeat,
+sharing unchanged data and index objects. The immutable `.fixture_lineage.jsonl`
 records every source/target edge; the report verifies it against worker records.
 Dataset objects are intentionally preserved. The JSONL, `.protocol.json`,
 `.summary.json`, lineage, take-ID, and maintenance-plan artifacts are immutable
@@ -131,6 +133,12 @@ exact output row counts. All three formats validate and replay that group and
 those boundaries before the first data write; format-native identity order is
 allowed inside each output. The runner hashes the plan and the report
 independently recomputes its byte formula and hash.
+When the no-stable v2.2 baseline has multiple segments for one index name, its
+timed maintenance first merges every such segment. The worker validates the
+frozen plan before that index-only commit, then requires the complete fragment
+metadata and current index coverage to remain unchanged before replaying the
+single physical group. The merge's latency and index-object I/O remain in the
+maintenance record.
 
 ## Measurement contract
 
