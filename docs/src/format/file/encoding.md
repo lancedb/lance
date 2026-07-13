@@ -361,8 +361,7 @@ buffer. Every layer has a `SparseValiditySet` whose meaning is explicit:
 - `SPARSE_VALIDITY_VALID_POSITIONS`: stored positions are valid and all other positions are null
 
 The unspecified validity meaning is invalid. Both polarities are part of the wire contract and have identical Arrow
-semantics after normalization. The aggregate cardinality of all `explicit` position and count sets in one page must
-not exceed 8,388,608 `u64` values (64 MiB before allocator overhead); larger structures must be split across pages.
+semantics after normalization.
 
 #### Writer Selection
 
@@ -394,14 +393,14 @@ A sparse page contains the following physical buffers:
 | 2+ | One buffer for each explicit position or count set, in structural-layer field order |
 
 Each value chunk metadata entry stores `(chunk_size / 8) - 1` as little-endian `u32`, followed by its visible value
-count as little-endian `u32`. The sum of chunk sizes must equal buffer 1 exactly and the sum of chunk value counts must
-equal `num_visible_items`. A value chunk contains at most 32,768 visible values. `num_buffers` describes the number of
-value buffers inside every chunk and excludes the structural buffers.
+count as little-endian `u32`. Chunk sizes must be positive multiples of 8 and fit this representation. The sum of
+chunk sizes must equal buffer 1 exactly and the sum of chunk value counts must equal `num_visible_items`. A value chunk
+contains at most 32,768 visible values. `num_buffers` describes the number of value buffers inside every chunk and
+excludes the structural buffers.
 
-Buffer 0, each individual value chunk, each structural buffer, and all structural buffers combined are limited to
-64 MiB. General-compressed sparse buffers must use the length-prefixed LZ4 or Zstd representation, declare at most
-64 MiB of decompressed data, and must not contain another general-compression wrapper. Compression descriptor trees
-are limited to 32 levels and 256 nodes. These bounds are checked before the corresponding allocation or I/O request.
+General-compressed sparse buffers use the existing length-prefixed LZ4 or Zstd representation and must not contain
+another general-compression wrapper. SparseLayout does not impose additional size or descriptor-complexity limits on
+otherwise representable buffers.
 
 Readers normalize structural metadata once, project requested top-level ranges through each layer, and read only value
 chunks that intersect the resulting leaf ranges. When no leaf range remains, readers rebuild offsets and validity from
@@ -411,14 +410,14 @@ the structural plan without reading buffer 1.
 
 Readers must reject malformed sparse metadata instead of inferring or repairing it. Required checks include:
 
-- physical buffer count, chunk-count bounds, every checked offset/size range, and pre-I/O resource limits
+- physical buffer count, chunk-count bounds, and every checked offset/size range
 - first-layer row domain, adjacent parent/child domain chaining, and terminal visible-value domain
 - semantic set cardinality, explicit position ordering and bounds, and validity meaning
-- exact `num_items` and the aggregate explicit-value limit
+- exact `num_items`
 - list non-empty positions being valid, count cardinality, positive counts, and child-count sum
 - fixed-size-list dimension and checked child-domain multiplication
-- value chunk byte/value sums, per-chunk value limit, bounded decompression, descriptor buffer count, and complete
-  chunk consumption
+- value chunk byte/value sums, size representation and alignment, general-compression headers, descriptor buffer
+  count, and complete chunk consumption
 
 ```protobuf
 %%% proto.message.SparseLayout %%%

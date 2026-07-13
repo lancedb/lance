@@ -5,13 +5,6 @@ use super::*;
 use arrow_array::new_empty_array;
 use arrow_buffer::ArrowNativeType;
 
-/// Limits decoded sparse metadata to 64 MiB of explicit u64 values per page.
-const MAX_SPARSE_EXPLICIT_VALUES_PER_PAGE: u64 = 8 * 1024 * 1024;
-/// Bounds every sparse metadata allocation or independently decoded physical buffer.
-const MAX_SPARSE_BUFFER_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_SPARSE_ENCODING_DEPTH: usize = 32;
-const MAX_SPARSE_ENCODING_NODES: usize = 256;
-
 fn invalid_enum<T>(
     value: std::result::Result<T, prost::UnknownEnumValue>,
     label: &str,
@@ -141,13 +134,6 @@ impl SparsePositionSet {
     pub(crate) fn deep_size(&self) -> usize {
         match self {
             Self::Explicit(positions) => positions.len() * std::mem::size_of::<u64>(),
-            Self::Empty | Self::All { .. } | Self::Range { .. } => 0,
-        }
-    }
-
-    fn explicit_len(&self) -> u64 {
-        match self {
-            Self::Explicit(positions) => positions.len() as u64,
             Self::Empty | Self::All { .. } | Self::Range { .. } => 0,
         }
     }
@@ -588,13 +574,6 @@ impl SparseCountSet {
         }
         Ok(())
     }
-
-    fn explicit_len(&self) -> u64 {
-        match self {
-            Self::Explicit { counts, .. } => counts.len() as u64,
-            Self::Empty | Self::Constant { .. } => 0,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -644,36 +623,6 @@ impl SparseStructuralPlan {
         })
     }
 
-    fn explicit_value_count(&self) -> Result<u64> {
-        self.layers.iter().try_fold(0_u64, |total, layer| {
-            let additional = match layer {
-                SparseStructuralLayerPlan::Validity { validity, .. }
-                | SparseStructuralLayerPlan::FixedSizeList { validity, .. } => {
-                    validity.positions.explicit_len()
-                }
-                SparseStructuralLayerPlan::List {
-                    non_empty_positions,
-                    counts,
-                    validity,
-                    ..
-                } => non_empty_positions
-                    .explicit_len()
-                    .checked_add(counts.explicit_len())
-                    .and_then(|value| value.checked_add(validity.positions.explicit_len()))
-                    .ok_or_else(|| {
-                        Error::invalid_input_source(
-                            "Sparse structural explicit value count overflows".into(),
-                        )
-                    })?,
-            };
-            total.checked_add(additional).ok_or_else(|| {
-                Error::invalid_input_source(
-                    "Sparse structural explicit value count overflows".into(),
-                )
-            })
-        })
-    }
-
     fn validate(&self, row_domain: u64) -> Result<()> {
         usize_from_u64(self.num_visible_items, "visible item count")?;
         let expected_num_items = Self::expected_num_items(&self.layers, self.num_visible_items)?;
@@ -682,16 +631,6 @@ impl SparseStructuralPlan {
                 format!(
                     "Sparse structural item count {} does not match the {} items implied by its layers",
                     self.num_items, expected_num_items
-                )
-                .into(),
-            ));
-        }
-        let explicit_values = self.explicit_value_count()?;
-        if explicit_values > MAX_SPARSE_EXPLICIT_VALUES_PER_PAGE {
-            return Err(Error::invalid_input_source(
-                format!(
-                    "Sparse structural page has {} explicit values, exceeding the per-page limit {}",
-                    explicit_values, MAX_SPARSE_EXPLICIT_VALUES_PER_PAGE
                 )
                 .into(),
             ));
@@ -1243,7 +1182,6 @@ impl SparseStructuralScheduler {
         let value_compression = layout.value_compression.as_ref().ok_or_else(|| {
             Error::invalid_input_source("Sparse layout is missing value compression".into())
         })?;
-        Self::validate_encoding_complexity(value_compression, "value compression")?;
         let value_buffer_count = Self::validate_value_encoding(value_compression)?;
         if layout.num_buffers != value_buffer_count {
             return Err(Error::invalid_input_source(
@@ -1377,108 +1315,6 @@ impl SparseStructuralScheduler {
             pb21::CompressionScheme::CompressionAlgorithmLz4
             | pb21::CompressionScheme::CompressionAlgorithmZstd => Ok(()),
         }
-    }
-
-    fn validate_encoding_complexity(root: &CompressiveEncoding, label: &str) -> Result<()> {
-        use pb21::compressive_encoding::Compression;
-
-        let mut stack = vec![(root, 0_usize)];
-        let mut nodes = 0_usize;
-        while let Some((encoding, depth)) = stack.pop() {
-            if depth > MAX_SPARSE_ENCODING_DEPTH {
-                return Err(Error::invalid_input_source(
-                    format!(
-                        "Sparse structural {label} exceeds the maximum encoding depth {MAX_SPARSE_ENCODING_DEPTH}"
-                    )
-                    .into(),
-                ));
-            }
-            nodes = nodes.checked_add(1).ok_or_else(|| {
-                Error::invalid_input_source(
-                    format!("Sparse structural {label} encoding node count overflows").into(),
-                )
-            })?;
-            if nodes > MAX_SPARSE_ENCODING_NODES {
-                return Err(Error::invalid_input_source(
-                    format!(
-                        "Sparse structural {label} exceeds the maximum encoding node count {MAX_SPARSE_ENCODING_NODES}"
-                    )
-                    .into(),
-                ));
-            }
-            let Some(compression) = encoding.compression.as_ref() else {
-                continue;
-            };
-            let child_depth = depth.checked_add(1).ok_or_else(|| {
-                Error::invalid_input_source(
-                    format!("Sparse structural {label} encoding depth overflows").into(),
-                )
-            })?;
-            match compression {
-                Compression::Variable(variable) => {
-                    if let Some(offsets) = variable.offsets.as_deref() {
-                        stack.push((offsets, child_depth));
-                    }
-                }
-                Compression::OutOfLineBitpacking(bitpacking) => {
-                    if let Some(values) = bitpacking.values.as_deref() {
-                        stack.push((values, child_depth));
-                    }
-                }
-                Compression::Fsst(fsst) => {
-                    if let Some(values) = fsst.values.as_deref() {
-                        stack.push((values, child_depth));
-                    }
-                }
-                Compression::Dictionary(dictionary) => {
-                    if let Some(indices) = dictionary.indices.as_deref() {
-                        stack.push((indices, child_depth));
-                    }
-                    if let Some(items) = dictionary.items.as_deref() {
-                        stack.push((items, child_depth));
-                    }
-                }
-                Compression::Rle(rle) => {
-                    if let Some(values) = rle.values.as_deref() {
-                        stack.push((values, child_depth));
-                    }
-                    if let Some(run_lengths) = rle.run_lengths.as_deref() {
-                        stack.push((run_lengths, child_depth));
-                    }
-                }
-                Compression::ByteStreamSplit(split) => {
-                    if let Some(values) = split.values.as_deref() {
-                        stack.push((values, child_depth));
-                    }
-                }
-                Compression::General(general) => {
-                    if let Some(values) = general.values.as_deref() {
-                        stack.push((values, child_depth));
-                    }
-                }
-                Compression::FixedSizeList(fsl) => {
-                    if let Some(values) = fsl.values.as_deref() {
-                        stack.push((values, child_depth));
-                    }
-                }
-                Compression::PackedStruct(packed) => {
-                    if let Some(values) = packed.values.as_deref() {
-                        stack.push((values, child_depth));
-                    }
-                }
-                Compression::VariablePackedStruct(packed) => {
-                    for field in &packed.fields {
-                        if let Some(value) = field.value.as_ref() {
-                            stack.push((value, child_depth));
-                        }
-                    }
-                }
-                Compression::Flat(_)
-                | Compression::Constant(_)
-                | Compression::InlineBitpacking(_) => {}
-            }
-        }
-        Ok(())
     }
 
     fn encoding_contains_general(root: &CompressiveEncoding) -> bool {
@@ -1948,14 +1784,6 @@ impl SparseStructuralScheduler {
                 .into(),
             ));
         }
-        if metadata_size > MAX_SPARSE_BUFFER_BYTES {
-            return Err(Error::invalid_input_source(
-                format!(
-                    "Sparse layout metadata buffer has {metadata_size} bytes, exceeding the per-page limit {MAX_SPARSE_BUFFER_BYTES}"
-                )
-                .into(),
-            ));
-        }
         let chunk_count = metadata_size / 8;
         if num_visible_items == 0 {
             if chunk_count != 0 {
@@ -1988,30 +1816,8 @@ impl SparseStructuralScheduler {
             ));
         }
 
-        let mut structural_bytes = 0_u64;
         for (position, size) in buffer_offsets_and_sizes.iter().skip(2) {
             Self::checked_buffer_range(*position, *size, "structural")?;
-            if *size > MAX_SPARSE_BUFFER_BYTES {
-                return Err(Error::invalid_input_source(
-                    format!(
-                        "Sparse structural buffer has {size} bytes, exceeding the per-buffer limit {MAX_SPARSE_BUFFER_BYTES}"
-                    )
-                    .into(),
-                ));
-            }
-            structural_bytes = structural_bytes.checked_add(*size).ok_or_else(|| {
-                Error::invalid_input_source(
-                    "Sparse structural aggregate buffer size overflows".into(),
-                )
-            })?;
-        }
-        if structural_bytes > MAX_SPARSE_BUFFER_BYTES {
-            return Err(Error::invalid_input_source(
-                format!(
-                    "Sparse structural buffers contain {structural_bytes} bytes, exceeding the per-page limit {MAX_SPARSE_BUFFER_BYTES}"
-                )
-                .into(),
-            ));
         }
 
         for (position, size) in buffer_offsets_and_sizes.iter().take(2) {
@@ -2280,7 +2086,6 @@ impl SparseStructuralScheduler {
         label: &str,
         decompressors: &dyn DecompressionStrategy,
     ) -> Result<Arc<dyn BlockDecompressor>> {
-        Self::validate_encoding_complexity(compression, label)?;
         let compression = Self::validate_compression(compression, label)?;
         Self::validate_block_encoding(compression, label)?;
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -2422,24 +2227,10 @@ impl SparseStructuralScheduler {
         Ok(())
     }
 
-    fn add_explicit_values(
-        explicit_values: &mut u64,
-        buffer_count: usize,
-        cardinality: u64,
-    ) -> Result<()> {
-        if buffer_count == 0 {
-            return Ok(());
-        }
-        *explicit_values = explicit_values.checked_add(cardinality).ok_or_else(|| {
-            Error::invalid_input_source("Sparse structural explicit value count overflows".into())
-        })?;
-        Ok(())
-    }
-
     fn structural_buffer_count(layers: &[pb21::SparseStructuralLayer]) -> Result<usize> {
-        let (count, explicit_values) = layers.iter().try_fold(
-            (0_usize, 0_u64),
-            |(mut count, mut explicit_values), layer| -> Result<(usize, u64)> {
+        layers.iter().try_fold(
+            0_usize,
+            |mut count, layer| -> Result<usize> {
             let kind = invalid_enum(
                 pb21::sparse_structural_layer::Kind::try_from(layer.kind),
                 "layer kind",
@@ -2465,17 +2256,12 @@ impl SparseStructuralScheduler {
                         "validity non-empty positions",
                     )?;
                     Self::reject_count_set(&layer.counts, "validity counts")?;
-                    let (validity_buffers, _, validity_cardinality) = Self::validity_buffer_count(
+                    let (validity_buffers, _, _) = Self::validity_buffer_count(
                         Self::require_validity_set(&layer.validity, "validity")?,
                         layer.num_slots,
                         "validity positions",
                     )?;
                     Self::add_buffer_count(&mut count, validity_buffers)?;
-                    Self::add_explicit_values(
-                        &mut explicit_values,
-                        validity_buffers,
-                        validity_cardinality,
-                    )?;
                 }
                 pb21::sparse_structural_layer::Kind::SparseLayerList => {
                     if layer.fixed_size_list_dimension != 0 {
@@ -2496,11 +2282,6 @@ impl SparseStructuralScheduler {
                         "list non-empty positions",
                     )?;
                     Self::add_buffer_count(&mut count, non_empty_buffers)?;
-                    Self::add_explicit_values(
-                        &mut explicit_values,
-                        non_empty_buffers,
-                        num_non_empty,
-                    )?;
                     let (validity_buffers, validity_meaning, validity_cardinality) =
                         Self::validity_buffer_count(
                         Self::require_validity_set(&layer.validity, "list")?,
@@ -2508,11 +2289,6 @@ impl SparseStructuralScheduler {
                         "list validity positions",
                     )?;
                     Self::add_buffer_count(&mut count, validity_buffers)?;
-                    Self::add_explicit_values(
-                        &mut explicit_values,
-                        validity_buffers,
-                        validity_cardinality,
-                    )?;
                     let num_valid_slots = Self::num_valid_slots(
                         validity_meaning,
                         validity_cardinality,
@@ -2532,11 +2308,6 @@ impl SparseStructuralScheduler {
                     let count_buffers =
                         Self::count_buffer_count(counts, num_non_empty, "list counts")?;
                     Self::add_buffer_count(&mut count, count_buffers)?;
-                    Self::add_explicit_values(
-                        &mut explicit_values,
-                        count_buffers,
-                        num_non_empty,
-                    )?;
                     if let Some(child_slots) =
                         Self::count_set_child_slots(counts, num_non_empty, "list counts")?
                         && child_slots != layer.num_child_slots
@@ -2582,17 +2353,12 @@ impl SparseStructuralScheduler {
                             .into(),
                         ));
                     }
-                    let (validity_buffers, _, validity_cardinality) = Self::validity_buffer_count(
+                    let (validity_buffers, _, _) = Self::validity_buffer_count(
                         Self::require_validity_set(&layer.validity, "fixed-size-list")?,
                         layer.num_slots,
                         "fixed-size-list validity positions",
                     )?;
                     Self::add_buffer_count(&mut count, validity_buffers)?;
-                    Self::add_explicit_values(
-                        &mut explicit_values,
-                        validity_buffers,
-                        validity_cardinality,
-                    )?;
                 }
                 pb21::sparse_structural_layer::Kind::SparseLayerUnspecified => {
                     return Err(Error::invalid_input_source(
@@ -2600,18 +2366,8 @@ impl SparseStructuralScheduler {
                     ));
                 }
             }
-            Ok((count, explicit_values))
-        })?;
-        if explicit_values > MAX_SPARSE_EXPLICIT_VALUES_PER_PAGE {
-            return Err(Error::invalid_input_source(
-                format!(
-                    "Sparse structural page has {} explicit values, exceeding the per-page limit {}",
-                    explicit_values, MAX_SPARSE_EXPLICIT_VALUES_PER_PAGE
-                )
-                .into(),
-            ));
-        }
-        Ok(count)
+            Ok(count)
+        })
     }
 
     fn layer_decompressors(
@@ -2755,14 +2511,6 @@ impl SparseStructuralScheduler {
                         "Sparse layout value chunk byte size overflows".into(),
                     )
                 })?;
-            if num_bytes > MAX_SPARSE_BUFFER_BYTES {
-                return Err(Error::invalid_input_source(
-                    format!(
-                        "Sparse layout value chunk has {num_bytes} bytes, exceeding the per-chunk limit {MAX_SPARSE_BUFFER_BYTES}"
-                    )
-                    .into(),
-                ));
-            }
             rows_counter = rows_counter.checked_add(num_values).ok_or_else(|| {
                 Error::invalid_input_source("Sparse layout visible item count overflows".into())
             })?;
@@ -2809,7 +2557,6 @@ impl SparseStructuralScheduler {
         })?;
         Self::validate_buffer_compression(Some(compression), label)?;
         let values = Self::require_encoding(&general.values, label)?;
-        Self::validate_encoding_complexity(values, label)?;
         if Self::encoding_contains_general(values) {
             return Err(Error::invalid_input_source(
                 format!(
@@ -2823,46 +2570,26 @@ impl SparseStructuralScheduler {
             pb21::CompressionScheme::try_from(compression.scheme),
             "compression scheme",
         )?;
-        let declared_size = match scheme {
+        match scheme {
             pb21::CompressionScheme::CompressionAlgorithmLz4 => {
-                let bytes: [u8; 4] = data
-                    .get(..4)
-                    .ok_or_else(|| {
-                        Error::invalid_input_source(
-                            format!(
-                                "Sparse structural {label} LZ4 buffer is missing its length prefix"
-                            )
-                            .into(),
+                data.get(..4).ok_or_else(|| {
+                    Error::invalid_input_source(
+                        format!(
+                            "Sparse structural {label} LZ4 buffer is missing its length prefix"
                         )
-                    })?
-                    .try_into()
-                    .map_err(|_| {
-                        Error::invalid_input_source(
-                            format!("Sparse structural {label} LZ4 length prefix is malformed")
-                                .into(),
-                        )
-                    })?;
-                u64::from(u32::from_le_bytes(bytes))
+                        .into(),
+                    )
+                })?;
             }
             pb21::CompressionScheme::CompressionAlgorithmZstd => {
-                let bytes: [u8; 8] = data
-                    .get(..8)
-                    .ok_or_else(|| {
-                        Error::invalid_input_source(
-                            format!(
-                                "Sparse structural {label} Zstd buffer is missing its length prefix"
-                            )
-                            .into(),
+                data.get(..8).ok_or_else(|| {
+                    Error::invalid_input_source(
+                        format!(
+                            "Sparse structural {label} Zstd buffer is missing its length prefix"
                         )
-                    })?
-                    .try_into()
-                    .map_err(|_| {
-                        Error::invalid_input_source(
-                            format!("Sparse structural {label} Zstd length prefix is malformed")
-                                .into(),
-                        )
-                    })?;
-                u64::from_le_bytes(bytes)
+                        .into(),
+                    )
+                })?;
             }
             pb21::CompressionScheme::CompressionAlgorithmUnspecified => {
                 return Err(Error::invalid_input_source(
@@ -2870,14 +2597,6 @@ impl SparseStructuralScheduler {
                         .into(),
                 ));
             }
-        };
-        if declared_size > MAX_SPARSE_BUFFER_BYTES {
-            return Err(Error::invalid_input_source(
-                format!(
-                    "Sparse structural {label} declares {declared_size} decompressed bytes, exceeding the per-buffer limit {MAX_SPARSE_BUFFER_BYTES}"
-                )
-                .into(),
-            ));
         }
         Ok(())
     }
@@ -5107,7 +4826,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_enums_item_counts_and_oversized_explicit_sets() {
+    fn rejects_invalid_enums_and_item_count_mismatches() {
         let decompressors = DefaultDecompressionStrategy::default();
 
         let mut layout = sparse_layout();
@@ -5152,8 +4871,16 @@ mod tests {
         )
         .unwrap_err();
         assert_invalid_input_contains(err, "layers imply 1");
+    }
 
-        let explicit_values = MAX_SPARSE_EXPLICIT_VALUES_PER_PAGE + 1;
+    #[test]
+    fn accepts_large_structural_descriptors() {
+        let explicit_values = 8_u64 * 1024 * 1024 + 1;
+        let metadata_size = explicit_values * 8;
+        let value_position = metadata_size;
+        let value_size = explicit_values * 16;
+        let structural_position = value_position + value_size;
+        let structural_size = explicit_values * std::mem::size_of::<u64>() as u64;
         let mut layout = sparse_layout();
         layout.num_items = explicit_values;
         layout.num_visible_items = explicit_values;
@@ -5166,16 +4893,32 @@ mod tests {
             fixed_size_list_dimension: 0,
             validity: null_positions(position_explicit(explicit_values)),
         });
-        let err = SparseStructuralScheduler::try_new(
-            &[(0, 0), (0, 0), (0, 0)],
+
+        SparseStructuralScheduler::try_new(
+            &[
+                (0, metadata_size),
+                (value_position, value_size),
+                (structural_position, structural_size),
+            ],
             0,
             explicit_values,
             DataType::Int32,
             &layout,
-            &decompressors,
+            &DefaultDecompressionStrategy::default(),
         )
-        .unwrap_err();
-        assert_invalid_input_contains(err, "exceeding the per-page limit");
+        .unwrap();
+    }
+
+    #[test]
+    fn accepts_deep_supported_value_encodings() {
+        let encoding = (0..300).fold(ProtobufUtils21::flat(32, None), |values, _| {
+            ProtobufUtils21::fsl(1, false, values)
+        });
+
+        assert_eq!(
+            SparseStructuralScheduler::validate_value_encoding(&encoding).unwrap(),
+            1
+        );
     }
 
     fn null_set(positions: SparsePositionSet) -> SparseValiditySet {
@@ -5399,21 +5142,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_oversized_buffers_before_io() {
+    fn rejects_inconsistent_chunk_count_before_io() {
         let decompressors = DefaultDecompressionStrategy::default();
 
         let layout = sparse_layout();
-        let err = SparseStructuralScheduler::try_new(
-            &[(0, MAX_SPARSE_BUFFER_BYTES + 8), (0, 8)],
-            0,
-            1,
-            DataType::Int32,
-            &layout,
-            &decompressors,
-        )
-        .unwrap_err();
-        assert_invalid_input_contains(err, "metadata buffer");
-
         let err = SparseStructuralScheduler::try_new(
             &[(0, 16), (16, 8)],
             0,
@@ -5424,27 +5156,25 @@ mod tests {
         )
         .unwrap_err();
         assert_invalid_input_contains(err, "declares 2 chunks for 1 visible items");
+    }
 
-        let mut layout = sparse_layout();
-        layout.structural_layers.push(pb21::SparseStructuralLayer {
-            kind: pb21::sparse_structural_layer::Kind::SparseLayerValidity as i32,
-            num_slots: 1,
-            num_child_slots: 1,
-            non_empty_positions: None,
-            counts: None,
-            fixed_size_list_dimension: 0,
-            validity: null_positions(position_explicit(1)),
-        });
-        let err = SparseStructuralScheduler::try_new(
-            &[(0, 8), (8, 8), (16, MAX_SPARSE_BUFFER_BYTES + 1)],
-            0,
-            1,
-            DataType::Int32,
-            &layout,
-            &decompressors,
+    #[cfg(feature = "lz4")]
+    #[test]
+    fn accepts_large_general_decompression_headers() {
+        let encoding = general_lz4(ProtobufUtils21::flat(64, None));
+        let Some(pb21::compressive_encoding::Compression::General(general)) =
+            encoding.compression.as_ref()
+        else {
+            panic!("expected General compression");
+        };
+        let declared_size = 65_u32 * 1024 * 1024;
+
+        SparseStructuralScheduler::validate_general_buffer_header(
+            general,
+            &declared_size.to_le_bytes(),
+            "test",
         )
-        .unwrap_err();
-        assert_invalid_input_contains(err, "structural buffer");
+        .unwrap();
     }
 
     #[cfg(feature = "lz4")]
@@ -5466,26 +5196,6 @@ mod tests {
             )),
         });
         let decompressors = DefaultDecompressionStrategy::default();
-
-        let mut scheduler = SparseStructuralScheduler::try_new(
-            &[(0, 8), (8, 8), (16, 4)],
-            0,
-            1,
-            DataType::Int32,
-            &layout,
-            &decompressors,
-        )
-        .unwrap();
-        let mut data = Vec::new();
-        data.extend_from_slice(&0_u32.to_le_bytes());
-        data.extend_from_slice(&1_u32.to_le_bytes());
-        data.extend_from_slice(&[0; 8]);
-        data.extend_from_slice(&u32::MAX.to_le_bytes());
-        let io: Arc<dyn EncodingsIo> = Arc::new(SimulatedScheduler::new(Bytes::from(data)));
-        let Err(err) = scheduler.initialize(&io).await else {
-            panic!("expected oversized General buffer to be rejected");
-        };
-        assert_invalid_input_contains(err, "declares 4294967295 decompressed bytes");
 
         let mut scheduler = SparseStructuralScheduler::try_new(
             &[(0, 8), (8, 8), (16, 8)],
@@ -5511,12 +5221,12 @@ mod tests {
 
     #[cfg(feature = "lz4")]
     #[tokio::test]
-    async fn rejects_malformed_general_value_buffer_before_allocation() {
+    async fn rejects_malformed_general_value_buffer() {
         let mut layout = sparse_layout();
         layout.value_compression = Some(general_lz4(ProtobufUtils21::flat(32, None)));
         let decompressors = DefaultDecompressionStrategy::default();
         let mut scheduler = SparseStructuralScheduler::try_new(
-            &[(0, 8), (8, 16)],
+            &[(0, 8), (8, 8)],
             0,
             1,
             DataType::Int32,
@@ -5526,21 +5236,19 @@ mod tests {
         .unwrap();
 
         let mut data = Vec::new();
-        data.extend_from_slice(&1_u32.to_le_bytes());
+        data.extend_from_slice(&0_u32.to_le_bytes());
         data.extend_from_slice(&1_u32.to_le_bytes());
         data.extend_from_slice(&0_u16.to_le_bytes());
-        data.extend_from_slice(&4_u16.to_le_bytes());
-        data.extend_from_slice(&[0; 4]);
-        data.extend_from_slice(&u32::MAX.to_le_bytes());
+        data.extend_from_slice(&0_u16.to_le_bytes());
         data.extend_from_slice(&[0; 4]);
         let io: Arc<dyn EncodingsIo> = Arc::new(SimulatedScheduler::new(Bytes::from(data)));
         scheduler.initialize(&io).await.unwrap();
         let mut page_tasks = scheduler.schedule_ranges(&[0..1], &io).unwrap();
         let mut decoder = page_tasks.pop().unwrap().decoder_fut.await.unwrap();
         let Err(err) = decoder.drain(1).unwrap().decode() else {
-            panic!("expected oversized General value buffer to be rejected");
+            panic!("expected malformed General value buffer to be rejected");
         };
-        assert_invalid_input_contains(err, "declares 4294967295 decompressed bytes");
+        assert_invalid_input_contains(err, "missing its length prefix");
     }
 
     #[test]
@@ -5756,6 +5464,28 @@ mod tests {
             panic!("expected malformed value chunk to be rejected");
         };
         assert_invalid_input_contains(err, "flat values buffer has 0 bytes, expected 4");
+    }
+
+    #[tokio::test]
+    async fn accepts_value_chunks_larger_than_64_mib() {
+        let chunk_size = 65_u64 * 1024 * 1024;
+        let layout = sparse_layout();
+        let mut scheduler = SparseStructuralScheduler::try_new(
+            &[(0, 8), (8, chunk_size)],
+            0,
+            1,
+            DataType::Int32,
+            &layout,
+            &DefaultDecompressionStrategy::default(),
+        )
+        .unwrap();
+        let words_minus_one = u32::try_from(chunk_size / MINIBLOCK_ALIGNMENT as u64 - 1).unwrap();
+        let mut metadata = Vec::new();
+        metadata.extend_from_slice(&words_minus_one.to_le_bytes());
+        metadata.extend_from_slice(&1_u32.to_le_bytes());
+        let io: Arc<dyn EncodingsIo> = Arc::new(SimulatedScheduler::new(Bytes::from(metadata)));
+
+        scheduler.initialize(&io).await.unwrap();
     }
 
     #[tokio::test]

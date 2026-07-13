@@ -151,9 +151,7 @@ message FullZipLayout {
 // in layer-local slot domains instead of as dense repetition / definition events.
 //
 // Structural layers are ordered from outer-most to inner-most. Values remain mini-block
-// compressed and are split into independently readable chunks. Metadata, independently
-// decoded buffers, and compression descriptor trees are subject to the resource bounds in
-// the Lance 2.3 format specification.
+// compressed and are split into independently readable chunks.
 message SparseLayout {
   // Description of the compression of values.
   CompressiveEncoding value_compression = 3;
@@ -167,8 +165,7 @@ message SparseLayout {
   // If true, chunk-local value buffer sizes use u32. Otherwise they use u16.
   bool has_large_chunk = 9;
   // Structural layers ordered from outer-most to inner-most. This may be empty for a flat,
-  // non-nullable leaf page whose scheduling domain equals num_visible_items. Across all layers,
-  // the aggregate cardinality of explicit position and count sets must not exceed 8,388,608 u64 values.
+  // non-nullable leaf page whose scheduling domain equals num_visible_items.
   repeated SparseStructuralLayer structural_layers = 10;
 }
 
