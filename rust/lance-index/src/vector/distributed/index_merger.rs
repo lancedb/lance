@@ -154,6 +154,39 @@ fn fixed_size_list_almost_equal(a: &FixedSizeListArray, b: &FixedSizeListArray, 
     }
 }
 
+fn ensure_fixed_size_list_compatible(
+    what: &str,
+    reference: &FixedSizeListArray,
+    candidate: &FixedSizeListArray,
+) -> Result<()> {
+    if !fixed_size_list_equal(reference, candidate) {
+        const TOL: f32 = 1e-5;
+        if !fixed_size_list_almost_equal(reference, candidate, TOL) {
+            return Err(Error::index(format!("{what} mismatch across shards")));
+        }
+        log::warn!("{what} differs within tolerance; proceeding with first shard value");
+    }
+    Ok(())
+}
+
+async fn try_read_ivf_proto(reader: &V2Reader) -> Result<Option<pb::Ivf>> {
+    let Some(ivf_idx) = reader.metadata().file_schema.metadata.get(IVF_METADATA_KEY) else {
+        return Ok(None);
+    };
+    let ivf_idx = ivf_idx
+        .parse()
+        .map_err(|_| Error::index("IVF index parse error".to_string()))?;
+    let bytes = reader.read_global_buffer(ivf_idx).await?;
+    Ok(Some(pb::Ivf::decode(bytes)?))
+}
+
+fn ivf_centroids_from_proto(ivf: &pb::Ivf) -> Result<Option<FixedSizeListArray>> {
+    ivf.centroids_tensor
+        .as_ref()
+        .map(FixedSizeListArray::try_from)
+        .transpose()
+}
+
 /// Initialize schema-level metadata on a writer for a given storage.
 ///
 /// It writes the distance type and the storage metadata (as a vector payload),
@@ -771,6 +804,27 @@ pub async fn merge_partial_vector_auxiliary_files(
         )
         .await?;
         let meta = reader.metadata();
+        let idx_path = aux
+            .parent()
+            .unwrap_or_default()
+            .join(crate::INDEX_FILE_NAME);
+        let idx_reader = if object_store.exists(&idx_path).await.unwrap_or(false) {
+            let fh = sched
+                .open_file(&idx_path, &CachedFileSize::unknown())
+                .await?;
+            Some(
+                V2Reader::try_open(
+                    fh,
+                    None,
+                    Arc::default(),
+                    &lance_core::cache::LanceCache::no_cache(),
+                    V2ReaderOptions::default(),
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
 
         // Inherit format version from the first shard file
         if format_version.is_none() {
@@ -795,45 +849,29 @@ pub async fn merge_partial_vector_auxiliary_files(
         // Detect index type (first iteration only)
         if detected_index_type.is_none() {
             // Try to derive precise type from sibling partial index.idx metadata if available
-            let idx_path = aux
-                .parent()
-                .unwrap_or_default()
-                .join(crate::INDEX_FILE_NAME);
-            if object_store.exists(&idx_path).await.unwrap_or(false) {
-                let fh2 = sched
-                    .open_file(&idx_path, &CachedFileSize::unknown())
-                    .await?;
-                let idx_reader = V2Reader::try_open(
-                    fh2,
-                    None,
-                    Arc::default(),
-                    &lance_core::cache::LanceCache::no_cache(),
-                    V2ReaderOptions::default(),
-                )
-                .await?;
-                if let Some(idx_meta_json) = idx_reader
+            if let Some(idx_reader) = idx_reader.as_ref()
+                && let Some(idx_meta_json) = idx_reader
                     .metadata()
                     .file_schema
                     .metadata
                     .get(INDEX_METADATA_SCHEMA_KEY)
-                {
-                    let idx_meta: IndexMetaSchema = serde_json::from_str(idx_meta_json)?;
-                    detected_index_type = Some(match idx_meta.index_type.as_str() {
-                        "IVF_FLAT" => SupportedIvfIndexType::IvfFlat,
-                        "IVF_PQ" => SupportedIvfIndexType::IvfPq,
-                        "IVF_SQ" => SupportedIvfIndexType::IvfSq,
-                        "IVF_RQ" => SupportedIvfIndexType::IvfRq,
-                        "IVF_HNSW_FLAT" => SupportedIvfIndexType::IvfHnswFlat,
-                        "IVF_HNSW_PQ" => SupportedIvfIndexType::IvfHnswPq,
-                        "IVF_HNSW_SQ" => SupportedIvfIndexType::IvfHnswSq,
-                        other => {
-                            return Err(Error::index(format!(
-                                "Unsupported index type in shard index.idx: {}",
-                                other
-                            )));
-                        }
-                    });
-                }
+            {
+                let idx_meta: IndexMetaSchema = serde_json::from_str(idx_meta_json)?;
+                detected_index_type = Some(match idx_meta.index_type.as_str() {
+                    "IVF_FLAT" => SupportedIvfIndexType::IvfFlat,
+                    "IVF_PQ" => SupportedIvfIndexType::IvfPq,
+                    "IVF_SQ" => SupportedIvfIndexType::IvfSq,
+                    "IVF_RQ" => SupportedIvfIndexType::IvfRq,
+                    "IVF_HNSW_FLAT" => SupportedIvfIndexType::IvfHnswFlat,
+                    "IVF_HNSW_PQ" => SupportedIvfIndexType::IvfHnswPq,
+                    "IVF_HNSW_SQ" => SupportedIvfIndexType::IvfHnswSq,
+                    other => {
+                        return Err(Error::index(format!(
+                            "Unsupported index type in shard index.idx: {}",
+                            other
+                        )));
+                    }
+                });
             }
             // Fallback: infer from auxiliary schema
             if detected_index_type.is_none() {
@@ -843,35 +881,48 @@ pub async fn merge_partial_vector_auxiliary_files(
         }
 
         // Read IVF lengths from global buffer
-        let ivf_idx: u32 = reader
-            .metadata()
-            .file_schema
-            .metadata
-            .get(IVF_METADATA_KEY)
-            .ok_or_else(|| Error::index("IVF meta missing".to_string()))?
-            .parse()
-            .map_err(|_| Error::index("IVF index parse error".to_string()))?;
-        let bytes = reader.read_global_buffer(ivf_idx).await?;
-        let pb_ivf: pb::Ivf = prost::Message::decode(bytes)?;
+        let pb_ivf = try_read_ivf_proto(&reader)
+            .await?
+            .ok_or_else(|| Error::index("IVF meta missing".to_string()))?;
         let lengths = pb_ivf.lengths.clone();
         let nlist = lengths.len();
 
+        let mut current_centroids = ivf_centroids_from_proto(&pb_ivf)?;
+        if current_centroids.is_none()
+            && let Some(idx_reader) = idx_reader.as_ref()
+            && let Some(index_ivf) = try_read_ivf_proto(idx_reader).await?
+        {
+            current_centroids = ivf_centroids_from_proto(&index_ivf)?;
+        }
         if nlist_opt.is_none() {
             nlist_opt = Some(nlist);
             accumulated_lengths = vec![0; nlist];
-            // Try load centroids tensor if present
-            if let Some(tensor) = pb_ivf.centroids_tensor.as_ref() {
-                let arr = FixedSizeListArray::try_from(tensor)?;
-                first_centroids = Some(arr.clone());
+            if let Some(arr) = current_centroids {
                 let d0 = arr.value_length() as usize;
                 if dim.is_none() {
                     dim = Some(d0);
                 }
+                first_centroids = Some(arr);
             }
         } else if nlist_opt.as_ref().map(|v| *v != nlist).unwrap_or(false) {
             return Err(Error::index(
                 "IVF partition count mismatch across shards".to_string(),
             ));
+        } else {
+            match (&first_centroids, &current_centroids) {
+                (Some(reference), Some(candidate)) => {
+                    ensure_fixed_size_list_compatible("IVF centroids", reference, candidate)?;
+                }
+                (Some(_), None) => {
+                    return Err(Error::index("IVF centroids missing from shard".to_string()));
+                }
+                (None, Some(_)) => {
+                    return Err(Error::index(
+                        "IVF centroids missing from first shard".to_string(),
+                    ));
+                }
+                (None, None) => {}
+            }
         }
 
         // Handle logic based on detected index type
@@ -921,6 +972,13 @@ pub async fn merge_partial_vector_auxiliary_files(
 
                 let sq_meta_parsed: ScalarQuantizationMetadata = serde_json::from_str(&sq_json)
                     .map_err(|e| Error::index(format!("SQ metadata parse error: {}", e)))?;
+                if let Some(existing_sq) = sq_meta.as_ref()
+                    && existing_sq != &sq_meta_parsed
+                {
+                    return Err(Error::index(
+                        "SQ metadata mismatch across shards".to_string(),
+                    ));
+                }
 
                 let d0 = sq_meta_parsed.dim;
                 dim.get_or_insert(d0);
@@ -985,6 +1043,11 @@ pub async fn merge_partial_vector_auxiliary_files(
                     rq_meta_parsed.parse_buffer(rotate_mat_bytes)?;
                 }
                 validate_rq_num_bits(rq_meta_parsed.num_bits)?;
+                if rq_meta_parsed.packed {
+                    return Err(Error::index(
+                        "Distributed RQ merge: source shard stores packed RQ codes; expected row-major distributed shard".to_string(),
+                    ));
+                }
 
                 let d0 = rq_meta_parsed.rotated_dim();
                 if d0 == 0 {
@@ -1001,7 +1064,9 @@ pub async fn merge_partial_vector_auxiliary_files(
                 if let Some(existing_rq) = rq_meta.as_ref()
                     && (existing_rq.code_dim != rq_meta_parsed.code_dim
                         || existing_rq.num_bits != rq_meta_parsed.num_bits
-                        || existing_rq.rotation_type != rq_meta_parsed.rotation_type)
+                        || existing_rq.rotation_type != rq_meta_parsed.rotation_type
+                        || existing_rq.query_estimator != rq_meta_parsed.query_estimator
+                        || existing_rq.fast_rotation_signs != rq_meta_parsed.fast_rotation_signs)
                 {
                     return Err(Error::index(format!(
                         "Distributed RQ merge: structural mismatch across shards; first(code_dim={}, num_bits={}, rotation_type={:?}), current(code_dim={}, num_bits={}, rotation_type={:?})",
@@ -1012,6 +1077,24 @@ pub async fn merge_partial_vector_auxiliary_files(
                         rq_meta_parsed.num_bits,
                         rq_meta_parsed.rotation_type
                     )));
+                }
+                if let Some(existing_rq) = rq_meta.as_ref() {
+                    match (&existing_rq.rotate_mat, &rq_meta_parsed.rotate_mat) {
+                        (Some(reference), Some(candidate)) => {
+                            ensure_fixed_size_list_compatible(
+                                "RQ rotation matrix",
+                                reference,
+                                candidate,
+                            )?;
+                        }
+                        (Some(_), None) | (None, Some(_)) => {
+                            return Err(Error::index(
+                                "Distributed RQ merge: rotation matrix mismatch across shards"
+                                    .to_string(),
+                            ));
+                        }
+                        (None, None) => {}
+                    }
                 }
                 if rq_meta.is_none() {
                     rq_meta = Some(rq_meta_parsed.clone());
@@ -1061,6 +1144,11 @@ pub async fn merge_partial_vector_auxiliary_files(
                 };
                 let mut pm: ProductQuantizationMetadata = serde_json::from_str(&pm_json)
                     .map_err(|e| Error::index(format!("PQ metadata parse error: {}", e)))?;
+                if pm.transposed {
+                    return Err(Error::index(
+                        "Distributed PQ merge: source shard stores transposed PQ codes; expected row-major distributed shard".to_string(),
+                    ));
+                }
                 // Load codebook from global buffer if not present
                 if pm.codebook.is_none() {
                     let tensor_bytes = reader
@@ -1100,18 +1188,11 @@ pub async fn merge_partial_vector_auxiliary_files(
                         .codebook
                         .as_ref()
                         .ok_or_else(|| Error::index("PQ codebook missing in shard".to_string()))?;
-                    if !fixed_size_list_equal(existing_cb, current_cb) {
-                        const TOL: f32 = 1e-5;
-                        if !fixed_size_list_almost_equal(existing_cb, current_cb, TOL) {
-                            return Err(Error::index(
-                                "PQ codebook content mismatch across shards".to_string(),
-                            ));
-                        } else {
-                            log::warn!(
-                                "PQ codebook differs within tolerance; proceeding with first shard codebook"
-                            );
-                        }
-                    }
+                    ensure_fixed_size_list_compatible(
+                        "PQ codebook content",
+                        existing_cb,
+                        current_cb,
+                    )?;
                 }
                 if pq_meta.is_none() {
                     pq_meta = Some(pm.clone());
@@ -1222,6 +1303,11 @@ pub async fn merge_partial_vector_auxiliary_files(
                 };
                 let mut pm: ProductQuantizationMetadata = serde_json::from_str(&pm_json)
                     .map_err(|e| Error::index(format!("PQ metadata parse error: {}", e)))?;
+                if pm.transposed {
+                    return Err(Error::index(
+                        "Distributed PQ merge: source shard stores transposed PQ codes; expected row-major distributed shard".to_string(),
+                    ));
+                }
                 if pm.codebook.is_none() {
                     let tensor_bytes = reader
                         .read_global_buffer(pm.codebook_position as u32)
@@ -1260,18 +1346,11 @@ pub async fn merge_partial_vector_auxiliary_files(
                         .codebook
                         .as_ref()
                         .ok_or_else(|| Error::index("PQ codebook missing in shard".to_string()))?;
-                    if !fixed_size_list_equal(existing_cb, current_cb) {
-                        const TOL: f32 = 1e-5;
-                        if !fixed_size_list_almost_equal(existing_cb, current_cb, TOL) {
-                            return Err(Error::index(
-                                "PQ codebook content mismatch across shards".to_string(),
-                            ));
-                        } else {
-                            log::warn!(
-                                "PQ codebook differs within tolerance; proceeding with first shard codebook"
-                            );
-                        }
-                    }
+                    ensure_fixed_size_list_compatible(
+                        "PQ codebook content",
+                        existing_cb,
+                        current_cb,
+                    )?;
                 }
                 if pq_meta.is_none() {
                     pq_meta = Some(pm.clone());
@@ -1320,6 +1399,13 @@ pub async fn merge_partial_vector_auxiliary_files(
                 };
                 let sq_meta_parsed: ScalarQuantizationMetadata = serde_json::from_str(&sq_json)
                     .map_err(|e| Error::index(format!("SQ metadata parse error: {}", e)))?;
+                if let Some(existing_sq) = sq_meta.as_ref()
+                    && existing_sq != &sq_meta_parsed
+                {
+                    return Err(Error::index(
+                        "SQ metadata mismatch across shards".to_string(),
+                    ));
+                }
                 let d0 = sq_meta_parsed.dim;
                 dim.get_or_insert(d0);
                 if let Some(dprev) = dim
@@ -2014,7 +2100,7 @@ mod tests {
             dimension,
             codebook: Some(codebook.clone()),
             codebook_tensor: Vec::new(),
-            transposed: true,
+            transposed: false,
         };
 
         let codebook_tensor: pb::Tensor = pb::Tensor::try_from(codebook)?;
