@@ -307,6 +307,22 @@ pub enum WalFlushSource {
     /// `BatchStore` to the WAL. Append-only — the index apply runs on its own
     /// task, so a failed append can no longer publish rows through it.
     BatchStore { batch_store: Arc<BatchStore> },
+    /// Timer-driven: append whichever store still owes the WAL an append,
+    /// resolved when the message is *handled*, not when it is enqueued.
+    ///
+    /// Carries no store on purpose. `MessageFactory` is synchronous and cannot
+    /// take the async state lock, and capturing an `Arc<BatchStore>` once at
+    /// handler construction would pin the first memtable forever.
+    ///
+    /// Resolution walks the live stores **oldest first** and takes the first with
+    /// `global_end() > durable`. It must not simply take "the active memtable":
+    /// a tick enqueued before a freeze is handled *after* it, would resolve to
+    /// the new memtable, and would append its batches ahead of the outgoing
+    /// memtable's tail. WAL entry positions are assigned in append-call order,
+    /// replay walks them ascending, row positions follow, and primary-key recency
+    /// is "newest visible row position wins" — so an out-of-order append silently
+    /// inverts dedup after a crash: the stale row wins. A full scan looks fine.
+    NextPending,
     /// WAL-only mode: drain all pending batches from the shared
     /// `WalOnlyState`. There are no in-memory indexes to update.
     WalOnly { state: Arc<WalOnlyState> },
@@ -317,6 +333,7 @@ impl WalFlushSource {
         match self {
             Self::BatchStore { .. } => "BatchStore",
             Self::WalOnly { .. } => "WalOnly",
+            Self::NextPending => "NextPending",
         }
     }
 }
@@ -734,6 +751,11 @@ impl WalFlusher {
                     .await
             }
             WalFlushSource::WalOnly { state } => self.flush_from_wal_only(state).await,
+            // The handler resolves a tick to a concrete store before it gets
+            // here, because only it can take the async state lock.
+            WalFlushSource::NextPending => Err(Error::internal(
+                "WalFlushSource::NextPending must be resolved by the flush handler",
+            )),
         };
         // A terminal failure means the watermark can never advance; latch the
         // poison so waiters wake with the typed error and later writes fail fast.
