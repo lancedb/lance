@@ -114,7 +114,7 @@ use lance_core::Error;
 use lance_core::datatypes::{BlobHandling, BlobKind};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::{DATASET_COMPACTING_EVENT, TRACE_DATASET_EVENTS};
-use lance_index::frag_reuse::FragReuseGroup;
+use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragReuseGroup};
 use lance_index::is_system_index;
 use lance_table::format::{Fragment, RowIdMeta};
 use roaring::{RoaringBitmap, RoaringTreemap};
@@ -1463,7 +1463,12 @@ async fn load_index_fragmaps(dataset: &Dataset) -> Result<Vec<RoaringBitmap>> {
             index_fragmaps.push(fragment_bitmap.clone());
         } else {
             let dataset_at_index = dataset.checkout_version(index.dataset_version).await?;
-            let frags = 0..dataset_at_index.manifest.max_fragment_id.unwrap_or(0);
+            // max_fragment_id is inclusive (the highest id); +1 for an exclusive
+            // upper bound so the last fragment is covered (None => empty range).
+            let frags = 0..dataset_at_index
+                .manifest
+                .max_fragment_id
+                .map_or(0, |m| m + 1);
             index_fragmaps.push(RoaringBitmap::from_sorted_iter(frags).unwrap());
         }
     }
@@ -2014,6 +2019,31 @@ pub async fn commit_compaction(
     let mut frag_reuse_groups: Vec<FragReuseGroup> = Vec::new();
     let mut new_fragment_bitmap: RoaringBitmap = RoaringBitmap::new();
 
+    // Write an FRI only when the compaction touches data an index must later
+    // remap: a rewrite group covered by a data index, or by the existing FRI's new
+    // fragments (the composed remap chain). Compacting only not-yet-indexed data
+    // needs no FRI (one written for it is un-drainable). Decide all-or-nothing per
+    // compaction, never per group -- a partial FRI is unsound: a concurrent reindex
+    // can make a skipped fragment indexed and the conflict resolver's FRI-present
+    // path won't re-check it.
+    let indexed_frags: RoaringBitmap = if options.defer_index_remap {
+        let mut covered = RoaringBitmap::new();
+        for bm in load_index_fragmaps(dataset).await? {
+            covered |= bm;
+        }
+        if let Some(bm) = dataset
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await?
+            .and_then(|fri| fri.fragment_bitmap)
+        {
+            covered |= bm;
+        }
+        covered
+    } else {
+        RoaringBitmap::new()
+    };
+    let mut any_group_indexed = false;
+
     for task in completed_tasks {
         metrics += task.metrics;
         let rewrite_group = RewriteGroup {
@@ -2062,6 +2092,14 @@ pub async fn commit_compaction(
                 }
             }
         } else if options.defer_index_remap {
+            // Record every group; track whether any touches indexed/chain data.
+            if task
+                .original_fragments
+                .iter()
+                .any(|f| indexed_frags.contains(f.id as u32))
+            {
+                any_group_indexed = true;
+            }
             let changed_row_addrs = task.row_addrs.ok_or_else(|| {
                 Error::internal(
                     "defer_index_remap requires row_addrs but none were provided".to_string(),
@@ -2116,9 +2154,15 @@ pub async fn commit_compaction(
         Vec::new()
     };
 
-    let frag_reuse_index = if options.defer_index_remap {
+    // No indexed/chain data touched -> no FRI (all-or-nothing, see above).
+    let frag_reuse_index = if options.defer_index_remap && any_group_indexed {
         Some(build_new_frag_reuse_index(dataset, frag_reuse_groups, new_fragment_bitmap).await?)
     } else {
+        if options.defer_index_remap {
+            log::debug!(
+                "skipping fragment-reuse index: no rewritten fragments were covered by an index"
+            );
+        }
         None
     };
 
@@ -2272,6 +2316,20 @@ mod tests {
             vec![Arc::new(Int64Array::from_iter_values(0..10_000))],
         )
         .unwrap()
+    }
+
+    /// Build (or, with `replace`, rebuild) a scalar index named "scalar" on `col`.
+    async fn create_scalar_index(dataset: &mut Dataset, col: &str, replace: bool) {
+        dataset
+            .create_index(
+                &[col],
+                IndexType::Scalar,
+                Some("scalar".into()),
+                &ScalarIndexParams::default(),
+                replace,
+            )
+            .await
+            .unwrap();
     }
 
     #[derive(Debug, Default, Clone, PartialEq)]
@@ -3115,6 +3173,10 @@ mod tests {
 
         assert_eq!(dataset.get_fragments().len(), num_fragments);
 
+        // An FRI is only written for compactions that touch indexed data, so
+        // index the column being compacted.
+        create_scalar_index(&mut dataset, "i", false).await;
+
         // Delete a few rows from each fragment so compaction has something to do.
         dataset.delete("i % 1000 = 0").await.unwrap();
 
@@ -3429,6 +3491,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_defer_index_remap_skips_fri_when_no_indexed_data() {
+        // A deferred compaction touching no indexed data must write no FRI --
+        // such a version is un-drainable (remap no-ops, trim retains it forever).
+        let mut data_gen =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("i".to_owned())));
+
+        let mut dataset = Dataset::write(
+            data_gen.batch(600),
+            "memory://test/noindex",
+            Some(WriteParams {
+                max_rows_per_file: 100, // 6 small files -> compaction has work
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // No index at all: nothing covers any fragment.
+        assert!(dataset.load_indices().await.unwrap().is_empty());
+        let fragments_before = dataset.get_fragments().len();
+        assert!(fragments_before > 1, "need multiple fragments to compact");
+
+        let options = CompactionOptions {
+            target_rows_per_fragment: 100_000,
+            defer_index_remap: true,
+            ..Default::default()
+        };
+        compact_files(&mut dataset, options, None).await.unwrap();
+
+        // Compaction actually ran...
+        assert!(
+            dataset.get_fragments().len() < fragments_before,
+            "compaction should have merged fragments"
+        );
+        // ...but no fragment-reuse index was created.
+        assert!(
+            dataset
+                .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+                .await
+                .unwrap()
+                .is_none(),
+            "deferred compaction with no indexed data must not create an FRI"
+        );
+    }
+
+    #[tokio::test]
     async fn test_defer_index_remap_multiple_compactions() {
         let mut data_gen = BatchGenerator::new()
             .col(Box::new(
@@ -3446,6 +3554,10 @@ mod tests {
         )
         .await
         .unwrap();
+
+        // FRI is written only for compactions touching indexed data; index "i" so
+        // the successive deferred compactions build a chained fragment-reuse index.
+        create_scalar_index(&mut dataset, "i", false).await;
 
         let options = CompactionOptions {
             target_rows_per_fragment: 2_000,
@@ -3500,12 +3612,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_defer_index_remap_mixed_records_all_groups() {
+        // All-or-nothing: a compaction touching any indexed data records the full
+        // FRI, including the unindexed group (a per-group filter would drop it).
+        let mut data_gen =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("i".to_owned())));
+        let mut dataset = Dataset::write(
+            data_gen.batch(300),
+            "memory://test/mixed",
+            Some(WriteParams {
+                max_rows_per_file: 100, // 3 fragments
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Index the initial fragments, then append more that stay unindexed.
+        create_scalar_index(&mut dataset, "i", false).await;
+        Dataset::write(
+            data_gen.batch(300),
+            WriteDestination::Dataset(Arc::new(dataset.clone())),
+            Some(WriteParams {
+                max_rows_per_file: 100, // 3 more, unindexed
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.checkout_latest().await.unwrap();
+
+        // Fragments not covered by the scalar index are the "unindexed" ones.
+        let indexed: HashSet<u32> = dataset
+            .load_index_by_name("scalar")
+            .await
+            .unwrap()
+            .unwrap()
+            .fragment_bitmap
+            .unwrap()
+            .iter()
+            .collect();
+        let unindexed_frags: Vec<u64> = dataset
+            .fragments()
+            .iter()
+            .map(|f| f.id)
+            .filter(|id| !indexed.contains(&(*id as u32)))
+            .collect();
+        assert!(
+            !unindexed_frags.is_empty(),
+            "expected some unindexed fragments"
+        );
+
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 100_000,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        // All-or-nothing: because indexed fragments were compacted, the FRI is
+        // written AND records the unindexed group too (a per-group filter would
+        // have dropped it).
+        let fri_meta = dataset
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+            .expect("mixed compaction must write an FRI");
+        let details = load_frag_reuse_index_details(&dataset, &fri_meta)
+            .await
+            .unwrap();
+        let recorded_old: HashSet<u64> = details
+            .versions
+            .iter()
+            .flat_map(|v| v.old_frag_ids())
+            .collect();
+        for f in &unindexed_frags {
+            assert!(
+                recorded_old.contains(f),
+                "unindexed fragment {f} must be recorded in the FRI (all-or-nothing)"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn test_deferred_compaction_not_split_by_frag_reuse_index() {
-        // A deferred compaction creates a fragment-reuse index covering its
-        // output. Later small fragments must still compact together with that
-        // (FRI-covered) output: the FRI is a system index and must not split the
-        // compaction bin. Without the fix the FRI-covered fragment is isolated,
-        // so only the new fragments merge and the count never returns to one.
+        // The fragment-reuse index is a system index and must be excluded from
+        // compaction bin planning; otherwise its covered fragment is isolated and
+        // the small fragments never coalesce back to one.
         let data = sample_data();
         let test_dir = TempStrDir::default();
         let test_uri = &test_dir;
@@ -3527,6 +3726,11 @@ mod tests {
         )
         .await
         .unwrap();
+
+        // Index "a" so the deferred compaction records an FRI (only written for
+        // compactions touching indexed data). The FRI is a system index and must
+        // still not split later compaction bins -- the property this test guards.
+        create_scalar_index(&mut dataset, "a", false).await;
         compact_files(&mut dataset, options.clone(), None)
             .await
             .unwrap();
@@ -3554,11 +3758,16 @@ mod tests {
         .unwrap();
         assert_eq!(dataset.get_fragments().len(), 3);
 
+        // Reindex so every fragment is data-indexed -- then the FRI (a system
+        // index, correctly excluded from bin planning) is the only thing that
+        // could split the bin.
+        create_scalar_index(&mut dataset, "a", true).await;
+
         compact_files(&mut dataset, options, None).await.unwrap();
         assert_eq!(
             dataset.get_fragments().len(),
             1,
-            "FRI-covered fragment must compact together with the new fragments"
+            "FRI (a system index) must not split the compaction bin; all fragments coalesce"
         );
     }
 
@@ -3882,6 +4091,9 @@ mod tests {
             .await
             .unwrap();
 
+        // Index "i" so the deferred compaction touches indexed data and writes an FRI.
+        create_scalar_index(&mut dataset, "i", false).await;
+
         let options = CompactionOptions {
             target_rows_per_fragment: 2_000,
             defer_index_remap: true,
@@ -3978,9 +4190,13 @@ mod tests {
             .unwrap();
         let new_frags3 = frag_reuse_details3.versions.last().unwrap().new_frag_ids();
 
-        // Concurrently commit a frag_reuse_index cleanup operation.
-        // Because there is no index, it should remove the first version.
-        // but after rebase it should contain the new compaction versions.
+        // Concurrently commit a frag_reuse_index cleanup operation. dataset_clone
+        // only knows the first reuse version; catch its index up so the cleanup
+        // removes that version. After rebase onto the other compactions it should
+        // contain the new compaction versions.
+        remapping::remap_column_index(&mut dataset_clone, &["i"], Some("scalar".into()))
+            .await
+            .unwrap();
         cleanup_frag_reuse_index(&mut dataset_clone).await.unwrap();
 
         // Load and verify the fragment reuse index content
@@ -4020,6 +4236,9 @@ mod tests {
             .await
             .unwrap();
 
+        // Index "i" so the deferred compaction touches indexed data and writes an FRI.
+        create_scalar_index(&mut dataset, "i", false).await;
+
         let options = CompactionOptions {
             target_rows_per_fragment: 2_000,
             defer_index_remap: true,
@@ -4058,8 +4277,12 @@ mod tests {
             .unwrap();
         assert_eq!(frag_reuse_details.versions.len(), 1);
 
-        // First commit the frag_reuse_index cleanup
-        // Because there is no index, it should remove the first version.
+        // Catch the index up to the compaction (on `dataset` only; `dataset_clone`
+        // keeps the un-caught-up index for the concurrent rewrite below), then
+        // clean up: with the index caught up the trim removes the first version.
+        remapping::remap_column_index(&mut dataset, &["i"], Some("scalar".into()))
+            .await
+            .unwrap();
         cleanup_frag_reuse_index(&mut dataset).await.unwrap();
 
         // Load and verify the fragment reuse index content
@@ -4129,6 +4352,9 @@ mod tests {
             .into_ram_dataset(FragmentCount::from(6), FragmentRowCount::from(1000))
             .await
             .unwrap();
+
+        // Index "i" so the deferred compaction touches indexed data and writes an FRI.
+        create_scalar_index(&mut dataset, "i", false).await;
 
         let options = CompactionOptions {
             target_rows_per_fragment: 2_000,

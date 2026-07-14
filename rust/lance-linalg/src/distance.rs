@@ -25,6 +25,96 @@ pub mod l2;
 pub mod l2_u8;
 pub mod norm_l2;
 
+/// What a per-batch distance kernel yields.
+///
+/// The two batch paths produce different shapes: the build-baseline path maps
+/// lazily over the batch and allocates nothing, while a `#[target_feature]`
+/// kernel must collect eagerly because it cannot be inlined into a lazy
+/// closure. A concrete enum keeps both statically dispatched.
+///
+/// Only sub-AVX2 builds need this. On an AVX2-baseline build the batch methods
+/// return the bare `Map` instead, because any wrapper — trait object or enum —
+/// loses `TrustedLen` (so `.collect()` stops preallocating) and loses
+/// `Map::fold`'s inlined loop. Benchmarks showed that costing 2.5x on the dim-8
+/// batch, far more than the per-vector dispatch it was meant to remove.
+#[cfg(all(
+    target_arch = "x86_64",
+    not(all(target_feature = "avx2", target_feature = "fma"))
+))]
+pub(crate) enum BatchIter<L> {
+    /// Lazy per-vector map. No allocation.
+    Lazy(L),
+    /// Eagerly collected by a `#[target_feature]` kernel.
+    Eager(std::vec::IntoIter<f32>),
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    not(all(target_feature = "avx2", target_feature = "fma"))
+))]
+impl<L: Iterator<Item = f32>> Iterator for BatchIter<L> {
+    type Item = f32;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Lazy(iter) => iter.next(),
+            Self::Eager(iter) => iter.next(),
+        }
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            Self::Lazy(iter) => iter.size_hint(),
+            Self::Eager(iter) => iter.size_hint(),
+        }
+    }
+
+    /// Delegated, not defaulted. `Map` overrides `fold` to drive the underlying
+    /// `ChunksExact` in one inlined, auto-vectorized loop; the default `fold`
+    /// would instead call `next()` per element, paying an enum branch and
+    /// losing that loop. On the dim-8 batch that costs ~2.5x.
+    #[inline]
+    fn fold<B, F>(self, init: B, f: F) -> B
+    where
+        F: FnMut(B, Self::Item) -> B,
+    {
+        match self {
+            Self::Lazy(iter) => iter.fold(init, f),
+            Self::Eager(iter) => iter.fold(init, f),
+        }
+    }
+
+    /// `for_each`, `sum` and `collect` all route through `fold`, so delegating
+    /// it covers them too. (`try_fold` cannot be overridden on stable: its
+    /// `Try` bound is unstable.)
+    #[inline]
+    fn for_each<F>(self, f: F)
+    where
+        F: FnMut(Self::Item),
+    {
+        match self {
+            Self::Lazy(iter) => iter.for_each(f),
+            Self::Eager(iter) => iter.for_each(f),
+        }
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    not(all(target_feature = "avx2", target_feature = "fma"))
+))]
+impl<L: ExactSizeIterator<Item = f32>> ExactSizeIterator for BatchIter<L> {
+    #[inline]
+    fn len(&self) -> usize {
+        match self {
+            Self::Lazy(iter) => iter.len(),
+            Self::Eager(iter) => iter.len(),
+        }
+    }
+}
+
 pub use cosine::*;
 pub use dot::*;
 pub use hamming::{
