@@ -8141,50 +8141,30 @@ mod tests {
             ]
         );
     }
-}
-
-/// Tests for the `max_overlays_per_fragment` compaction trigger, which fully
-/// compacts a fragment carrying too many data overlay files into a fresh
-/// fragment with the overlays (and deletions) materialized into the base data.
-#[cfg(test)]
-mod overlay_compaction_tests {
-    use std::collections::BTreeMap;
-    use std::sync::Arc;
-
-    use arrow_array::{Array, ArrayRef, Int32Array, RecordBatch, RecordBatchIterator};
-    use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
-    use futures::TryStreamExt;
-    use lance_file::version::LanceFileVersion;
+    // ---- `max_overlays_per_fragment` compaction trigger ----
+    //
+    // Tests for the trigger that fully compacts a fragment carrying too many data
+    // overlay files into a fresh fragment with the overlays (and deletions)
+    // materialized into the base data.
+    use arrow_array::record_batch;
     use lance_file::writer::{FileWriter, FileWriterOptions};
-    use lance_index::IndexType;
-    use lance_index::scalar::ScalarIndexParams;
     use lance_io::utils::CachedFileSize;
     use lance_table::format::DataFile;
-    use lance_table::format::overlay::DataOverlayFile;
-    use lance_table::format::overlay::OverlayCoverage;
-    use roaring::RoaringBitmap;
-    use uuid::Uuid;
+    use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
+    use std::collections::BTreeMap;
 
-    use super::{CompactionOptions, WriteParams, compact_files};
-    use crate::dataset::transaction::{DataOverlayGroup, Operation};
-    use crate::dataset::{DATA_DIR, Dataset, WriteDestination};
-    use crate::index::DatasetIndexExt;
+    use crate::dataset::DATA_DIR;
+    use crate::dataset::transaction::DataOverlayGroup;
 
     /// Two-fragment Int32 dataset: `id` (field 0) = 0..12 and `val` (field 1) =
     /// id * 10, six rows per fragment (fragments 0 and 1).
     async fn create_base_dataset(uri: &str) -> Dataset {
-        let schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("id", DataType::Int32, true),
-            ArrowField::new("val", DataType::Int32, true),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int32Array::from_iter_values(0..12)),
-                Arc::new(Int32Array::from_iter_values((0..12).map(|v| v * 10))),
-            ],
+        let batch = record_batch!(
+            ("id", Int32, (0..12).collect::<Vec<_>>()),
+            ("val", Int32, (0..12).map(|v| v * 10).collect::<Vec<_>>())
         )
         .unwrap();
+        let schema = batch.schema();
         let write_params = WriteParams {
             max_rows_per_file: 6,
             max_rows_per_group: 6,
@@ -8303,33 +8283,25 @@ mod overlay_compaction_tests {
     async fn id_val_map(dataset: &Dataset) -> BTreeMap<i32, Option<i32>> {
         let mut scanner = dataset.scan();
         scanner.project(&["id", "val"]).unwrap();
-        let batches = scanner
-            .try_into_stream()
-            .await
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
+        let batch = scanner.try_into_batch().await.unwrap();
         let mut out = BTreeMap::new();
-        for batch in batches {
-            let ids = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .unwrap();
-            let vals = batch
-                .column(1)
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .unwrap();
-            for i in 0..batch.num_rows() {
-                let v = if vals.is_null(i) {
-                    None
-                } else {
-                    Some(vals.value(i))
-                };
-                out.insert(ids.value(i), v);
-            }
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let vals = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            let v = if vals.is_null(i) {
+                None
+            } else {
+                Some(vals.value(i))
+            };
+            out.insert(ids.value(i), v);
         }
         out
     }
