@@ -294,7 +294,7 @@ impl ImpactSkipData {
 
     /// Max score of the docs covered by the level1 entry of `group_idx`,
     /// answered from the scorer-specific cached bounds slab.
-    pub fn level1_score_cached<S: Scorer + ?Sized>(
+    pub(crate) fn level1_score_cached<S: Scorer + ?Sized>(
         &self,
         group_idx: usize,
         query_weight: f32,
