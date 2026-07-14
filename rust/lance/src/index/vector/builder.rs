@@ -2434,6 +2434,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn optimize_after_delete_with_stable_row_ids_joins_partitions() {
+        // Regression test for https://github.com/lancedb/lance/issues/7701
+        //
+        // With stable row ids enabled, deleting rows removes them from the
+        // row id index, so those ids no longer resolve to an address. When
+        // `optimize_indices` later joins undersized partitions it re-reads the
+        // stored (stable) row ids for a partition and asks the dataset to drop
+        // the deleted ones. If the surviving ids and their addresses get out of
+        // alignment, some deleted ids leak through and `take_rows` returns
+        // fewer rows than requested, tripping the
+        // `batch.num_rows() != chunk.len()` check. This exercises that path.
+        use crate::dataset::WriteParams;
+        use crate::index::DatasetIndexExt;
+        use crate::index::vector::VectorIndexParams;
+        use arrow_array::types::Int64Type;
+        use arrow_array::{Int64Array, RecordBatchIterator};
+        use arrow_schema::Schema as ArrowSchema;
+        use lance_index::optimize::OptimizeOptions;
+        use lance_linalg::distance::MetricType;
+
+        let dim = 32;
+        let num_rows = 5000usize;
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "vec",
+                DataType::FixedSizeList(item_field, dim as i32),
+                false,
+            ),
+        ]));
+
+        let mut values = Vec::with_capacity(num_rows * dim);
+        for i in 0..num_rows {
+            for j in 0..dim {
+                values.push(((i as f32) * 0.1 + (j as f32) * 0.3).sin());
+            }
+        }
+        let fsl = FixedSizeListArray::try_new_from_values(Float32Array::from(values), dim as i32)
+            .unwrap();
+        let ids = Int64Array::from((0..num_rows as i64).collect::<Vec<_>>());
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(fsl)]).unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = tmp.path().to_str().unwrap();
+
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let mut dataset = crate::Dataset::write(
+            reader,
+            uri,
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // 16 partitions over 5000 rows keeps every partition well under the
+        // IVF_FLAT join threshold (1024), so the optimize below takes the join
+        // path for every partition.
+        let params = VectorIndexParams::ivf_flat(16, MetricType::L2);
+        dataset
+            .create_index(
+                &["vec"],
+                IndexType::Vector,
+                Some("idx".into()),
+                &params,
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Delete 1/5 of the rows, spread across every partition, so each
+        // partition carries some now-unresolvable stable row ids.
+        dataset.delete("id % 5 == 0").await.unwrap();
+
+        // Before the fix this panicked with `batch.num_rows() != chunk.len()`.
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+
+        // The delete is intact and the data is untouched.
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 4000);
+
+        // The optimized index is still usable and only returns live rows.
+        let query = dataset
+            .scan()
+            .filter("id = 1")
+            .unwrap()
+            .project(&["vec"] as &[&str])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let q = query["vec"].as_fixed_size_list().value(0);
+        let result = dataset
+            .scan()
+            .project(&["id"] as &[&str])
+            .unwrap()
+            .nearest("vec", q.as_ref(), 10)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert!(
+            result.num_rows() > 0,
+            "search over optimized index returned nothing"
+        );
+        for id in result["id"].as_primitive::<Int64Type>().values() {
+            assert_ne!(id % 5, 0, "search returned a deleted row id {id}");
+        }
+    }
+
+    #[tokio::test]
     async fn take_partition_batches_preserves_partition_order_for_large_fixed_size_list() {
         let value_length = 1_073_741_824i32;
         let num_rows = 5usize;

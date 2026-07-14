@@ -2743,17 +2743,25 @@ impl Dataset {
     }
 
     pub(crate) async fn filter_deleted_ids(&self, ids: &[u64]) -> Result<Vec<u64>> {
-        let addresses = if let Some(row_id_index) = get_row_id_index(self).await? {
-            let addresses = ids
+        if let Some(row_id_index) = get_row_id_index(self).await? {
+            // Resolve each stable row id to its address. Some ids may no longer
+            // resolve (e.g. their rows were already removed), so we drop those
+            // and keep `ids` and `addresses` positionally aligned via unzip.
+            // `filter_addr_or_ids` relies on that correspondence; passing the
+            // full `ids` alongside a shorter, filter_map'd `addresses` would
+            // misalign the two and mis-filter the results.
+            let (ids, addresses): (Vec<u64>, Vec<u64>) = ids
                 .iter()
-                .filter_map(|id| row_id_index.get(*id).map(|address| address.into()))
-                .collect::<Vec<_>>();
-            Cow::Owned(addresses)
+                .filter_map(|id| {
+                    row_id_index
+                        .get(*id)
+                        .map(|address| (*id, u64::from(address)))
+                })
+                .unzip();
+            self.filter_addr_or_ids(&ids, &addresses).await
         } else {
-            Cow::Borrowed(ids)
-        };
-
-        self.filter_addr_or_ids(ids, &addresses).await
+            self.filter_addr_or_ids(ids, ids).await
+        }
     }
 
     /// Gets the number of files that are so small they don't even have a full
