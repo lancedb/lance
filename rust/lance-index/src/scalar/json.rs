@@ -8,22 +8,24 @@ use std::{
 };
 
 use arrow_array::{Array, LargeBinaryArray, RecordBatch, StructArray, UInt8Array};
-use arrow_schema::{DataType, Field, Field as ArrowField, Schema};
+use arrow_schema::{DataType, Field, Field as ArrowField, Schema, SortOptions};
 use async_trait::async_trait;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::{
     execution::SendableRecordBatchStream,
-    physical_plan::{ExecutionPlan, projection::ProjectionExec},
+    physical_plan::{ExecutionPlan, projection::ProjectionExec, sorts::sort::SortExec},
 };
 use datafusion_common::{ScalarValue, config::ConfigOptions};
 use datafusion_expr::{Expr, Operator, ScalarUDF};
 use datafusion_physical_expr::{
-    PhysicalExpr, ScalarFunctionExpr,
+    PhysicalExpr, PhysicalSortExpr, ScalarFunctionExpr,
     expressions::{Column, Literal},
 };
 use futures::StreamExt;
 use lance_core::deepsize::DeepSizeOf;
-use lance_datafusion::exec::{LanceExecutionOptions, OneShotExec, get_session_context};
+use lance_datafusion::exec::{
+    LanceExecutionOptions, OneShotExec, execute_plan, get_session_context,
+};
 use lance_datafusion::udf::json::JsonbType;
 use prost::Message;
 use roaring::RoaringBitmap;
@@ -40,7 +42,8 @@ use crate::{
         UpdateCriteria,
         expression::{IndexedExpression, ScalarIndexExpr, ScalarIndexSearch, ScalarQueryParser},
         registry::{
-            BasicTrainer, ScalarIndexPlugin, TrainingCriteria, TrainingRequest, VALUE_COLUMN_NAME,
+            BasicTrainer, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
+            VALUE_COLUMN_NAME,
         },
     },
 };
@@ -739,6 +742,41 @@ impl BasicTrainer for JsonIndexPlugin {
             &Field::new("", inferred_type, true),
         )?;
 
+        // The training data reaching this plugin is sorted by the raw JSONB bytes of
+        // the source JSON column (that is what the scanner can order on), not by the
+        // extracted value. For values whose byte order does not match their numeric
+        // order (e.g. non-exactly-representable floats such as 40.1 or -3.2), the
+        // extracted column handed to the target trainer would be out of order. Targets
+        // that assume value ordering (e.g. btree, whose per-page min/max come from the
+        // first/last row) would then record inverted statistics and silently return
+        // wrong query results. Re-sort by the extracted value here so the value-ordering
+        // contract is honored. Ordering-agnostic targets (e.g. bitmap) are left as-is.
+        let converted_stream = if target_request.criteria().ordering == TrainingOrdering::Values {
+            let input = Arc::new(OneShotExec::new(converted_stream));
+            let value_column_idx = input
+                .schema()
+                .column_with_name(VALUE_COLUMN_NAME)
+                .expect_ok()?
+                .0;
+            let sort_expr = PhysicalSortExpr {
+                expr: Arc::new(Column::new(VALUE_COLUMN_NAME, value_column_idx)),
+                options: SortOptions {
+                    descending: false,
+                    nulls_first: true,
+                },
+            };
+            let sorted = Arc::new(SortExec::new([sort_expr].into(), input));
+            execute_plan(
+                sorted,
+                LanceExecutionOptions {
+                    use_spilling: true,
+                    ..Default::default()
+                },
+            )?
+        } else {
+            converted_stream
+        };
+
         let target_index = target_trainer
             .train_index(
                 converted_stream,
@@ -837,6 +875,7 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scalar::SargableQuery;
     use arrow_array::{ArrayRef, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use std::sync::Arc;
@@ -977,5 +1016,171 @@ mod tests {
                 .unwrap();
 
         assert_eq!(inferred_type, DataType::Utf8);
+    }
+
+    /// Build a JSON-path btree index over the given `(json_doc, row_id)` pairs,
+    /// fed to the trainer in exactly the given order, then run `query` against it.
+    ///
+    /// This mirrors what the dataset layer does: it hands the JSON binary column to
+    /// the JSON plugin trainer. The caller controls the feed order so we can exercise
+    /// the case where the extracted values do not arrive in numeric order.
+    async fn train_and_search_json_float_index(
+        docs: &[(&str, u64)],
+        query: &SargableQuery,
+    ) -> SearchResult {
+        use crate::metrics::NoOpMetricsCollector;
+        use crate::progress::noop_progress;
+        use crate::registry::IndexPluginRegistry;
+        use crate::scalar::lance_format::LanceIndexStore;
+        use arrow_array::{LargeBinaryArray, UInt64Array};
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        use futures::stream;
+        use lance_core::cache::LanceCache;
+        use lance_core::utils::tempfile::TempObjDir;
+        use lance_io::object_store::ObjectStore;
+
+        let path = "$.latitude";
+
+        let jsonb: Vec<Option<Vec<u8>>> = docs
+            .iter()
+            .map(|(doc, _)| Some(doc.parse::<jsonb::OwnedJsonb>().unwrap().to_vec()))
+            .collect();
+        let row_ids: Vec<u64> = docs.iter().map(|(_, id)| *id).collect();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(VALUE_COLUMN_NAME, DataType::LargeBinary, true),
+            Field::new(ROW_ID, DataType::UInt64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(LargeBinaryArray::from(
+                    jsonb.iter().map(|v| v.as_deref()).collect::<Vec<_>>(),
+                )) as ArrayRef,
+                Arc::new(UInt64Array::from(row_ids)) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let data_stream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::iter(vec![Ok(batch)]),
+        )) as SendableRecordBatchStream;
+
+        // Keep the temp dir alive for the duration of the test.
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let registry = IndexPluginRegistry::with_default_plugins();
+        let plugin = registry.get_plugin_by_name("json").unwrap();
+        let trainer = plugin.basic_trainer().unwrap();
+
+        let params = format!(r#"{{"target_index_type": "btree", "path": "{path}"}}"#);
+        let request = trainer
+            .new_training_request(&params, &Field::new("", DataType::LargeBinary, true))
+            .unwrap();
+
+        let created = trainer
+            .train_index(data_stream, store.as_ref(), request, None, noop_progress())
+            .await
+            .unwrap();
+
+        let index = plugin
+            .load_index(
+                store.clone(),
+                &created.index_details,
+                None,
+                &LanceCache::no_cache(),
+            )
+            .await
+            .unwrap();
+
+        let json_query = JsonQuery::new(Arc::new(query.clone()), path.to_string());
+        index
+            .search(&json_query, &NoOpMetricsCollector)
+            .await
+            .unwrap()
+    }
+
+    /// Regression test for the JSON-path float index returning wrong results for
+    /// non-exactly-representable float64 values (issue #7485). The extracted value
+    /// column must be re-sorted numerically before it reaches the btree trainer;
+    /// otherwise the per-page min/max invert and range/equality searches miss rows.
+    #[tokio::test]
+    async fn test_json_float_btree_index_non_exact_floats() {
+        use lance_select::RowAddrTreeMap;
+        use std::ops::Bound;
+
+        let f64 = |v: f64| ScalarValue::Float64(Some(v));
+
+        // Case A: the three values from the issue's repro. We feed them sorted by the
+        // raw JSONB bytes to faithfully simulate `scan_training_data`'s asc_nulls_first
+        // sort over the raw binary column. row0=10.5, row1=40.1, row2=-3.2.
+        let docs_a = &[
+            (r#"{"latitude": 10.5}"#, 0u64),
+            (r#"{"latitude": 40.1}"#, 1u64),
+            (r#"{"latitude": -3.2}"#, 2u64),
+        ][..];
+        let byte_key = |doc: &str| doc.parse::<jsonb::OwnedJsonb>().unwrap().to_vec();
+        let mut sorted_a = docs_a.to_vec();
+        sorted_a.sort_by_key(|(doc, _)| byte_key(doc));
+
+        let cases_a: &[(SargableQuery, Vec<u64>)] = &[
+            // > 0 -> the two positive values
+            (
+                SargableQuery::Range(Bound::Excluded(f64(0.0)), Bound::Unbounded),
+                vec![0, 1],
+            ),
+            // >= 10.5 -> the two values at or above 10.5
+            (
+                SargableQuery::Range(Bound::Included(f64(10.5)), Bound::Unbounded),
+                vec![0, 1],
+            ),
+            // = 40.1 (non-exact) -> row1 only
+            (SargableQuery::Equals(f64(40.1)), vec![1]),
+            // = 10.5 (exact) -> row0; guards against silent all-null extraction
+            (SargableQuery::Equals(f64(10.5)), vec![0]),
+            // < 100 -> all three rows
+            (
+                SargableQuery::Range(Bound::Unbounded, Bound::Excluded(f64(100.0))),
+                vec![0, 1, 2],
+            ),
+        ];
+        for (query, expected) in cases_a {
+            let result = train_and_search_json_float_index(&sorted_a, query).await;
+            assert_eq!(
+                result,
+                SearchResult::exact(RowAddrTreeMap::from_iter(expected.iter().copied())),
+                "case A query {query:?}"
+            );
+        }
+
+        // Case B: a deterministic inversion that fails regardless of the exact JSONB
+        // byte encoding. Feeding [40.1 -> row0, -3.2 -> row1] in that order records an
+        // inverted page min/max (min=40.1 > max=-3.2) unless the value column is
+        // re-sorted before training.
+        let docs_b = &[
+            (r#"{"latitude": 40.1}"#, 0u64),
+            (r#"{"latitude": -3.2}"#, 1u64),
+        ][..];
+        let cases_b: &[(SargableQuery, Vec<u64>)] = &[
+            (
+                SargableQuery::Range(Bound::Excluded(f64(0.0)), Bound::Unbounded),
+                vec![0],
+            ),
+            (SargableQuery::Equals(f64(40.1)), vec![0]),
+            (SargableQuery::Equals(f64(-3.2)), vec![1]),
+        ];
+        for (query, expected) in cases_b {
+            let result = train_and_search_json_float_index(docs_b, query).await;
+            assert_eq!(
+                result,
+                SearchResult::exact(RowAddrTreeMap::from_iter(expected.iter().copied())),
+                "case B query {query:?}"
+            );
+        }
     }
 }
