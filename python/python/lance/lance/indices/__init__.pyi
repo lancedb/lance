@@ -17,6 +17,8 @@ from typing import Optional
 
 import pyarrow as pa
 
+from .. import _Fragment
+
 class IndexConfig:
     index_type: str
     config: str
@@ -59,7 +61,7 @@ def transform_vectors(
     ivf_centroids: pa.Array,
     pq_codebook: pa.Array,
     dst_uri: str,
-    fragments: list,
+    fragments: list[_Fragment],
     partitions_ds_uri: Optional[str] = None,
     num_bits: int = 8,
 ): ...
