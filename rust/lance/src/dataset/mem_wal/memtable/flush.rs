@@ -219,6 +219,7 @@ impl MemTableFlusher {
         memtable: &MemTable,
         epoch: u64,
         covered_wal_entry_position: u64,
+        durable: usize,
     ) -> Result<FlushResult> {
         self.manifest_store.check_fenced(epoch).await?;
 
@@ -226,7 +227,7 @@ impl MemTableFlusher {
             return Err(Error::invalid_input("Cannot flush empty MemTable"));
         }
 
-        if !memtable.all_flushed_to_wal() {
+        if !memtable.all_flushed_to_wal(durable) {
             return Err(Error::invalid_input(
                 "MemTable has unflushed fragments - WAL flush required first",
             ));
@@ -452,6 +453,7 @@ impl MemTableFlusher {
         epoch: u64,
         index_configs: &[MemIndexConfig],
         covered_wal_entry_position: u64,
+        durable: usize,
     ) -> Result<FlushResult> {
         self.manifest_store.check_fenced(epoch).await?;
 
@@ -459,7 +461,7 @@ impl MemTableFlusher {
             return Err(Error::invalid_input("Cannot flush empty MemTable"));
         }
 
-        if !memtable.all_flushed_to_wal() {
+        if !memtable.all_flushed_to_wal(durable) {
             return Err(Error::invalid_input(
                 "MemTable has unflushed fragments - WAL flush required first",
             ));
@@ -1258,11 +1260,12 @@ mod tests {
             .await
             .unwrap();
 
-        // Not flushed to WAL yet
-        assert!(!memtable.all_flushed_to_wal());
+        // Nothing is durable yet, so the L0 flush must refuse.
+        let durable = 0;
+        assert!(!memtable.all_flushed_to_wal(durable));
 
         let flusher = MemTableFlusher::new(store, base_path, base_uri, shard_id, manifest_store);
-        let result = flusher.flush(&memtable, epoch, 0).await;
+        let result = flusher.flush(&memtable, epoch, 0, 0).await;
 
         assert!(result.is_err());
         assert!(
@@ -1291,7 +1294,7 @@ mod tests {
         let memtable = MemTable::new(schema, 1, vec![]).unwrap();
 
         let flusher = MemTableFlusher::new(store, base_path, base_uri, shard_id, manifest_store);
-        let result = flusher.flush(&memtable, epoch, 0).await;
+        let result = flusher.flush(&memtable, epoch, 0, 0).await;
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("empty MemTable"));
@@ -1319,10 +1322,8 @@ mod tests {
             .unwrap();
 
         // Simulate WAL flush
-        memtable
-            .batch_store()
-            .set_max_flushed_batch_position(frag_id);
-        assert!(memtable.all_flushed_to_wal());
+        let durable = frag_id + 1;
+        assert!(memtable.all_flushed_to_wal(durable));
 
         let flusher = MemTableFlusher::new(
             store.clone(),
@@ -1331,7 +1332,7 @@ mod tests {
             shard_id,
             manifest_store.clone(),
         );
-        let result = flusher.flush(&memtable, epoch, 1).await.unwrap();
+        let result = flusher.flush(&memtable, epoch, 1, durable).await.unwrap();
 
         assert_eq!(result.generation.generation, 1);
         assert_eq!(result.rows_flushed, 10);
@@ -1385,9 +1386,7 @@ mod tests {
             .insert(create_test_batch(&schema, 10))
             .await
             .unwrap();
-        memtable
-            .batch_store()
-            .set_max_flushed_batch_position(frag_id);
+        let durable = frag_id + 1;
 
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let warmer: Arc<dyn GenerationWarmer> = Arc::new(CountingWarmer {
@@ -1404,7 +1403,7 @@ mod tests {
         )
         .with_warmer(Some(warmer));
         // Flush must succeed despite the warmer erroring.
-        let result = flusher.flush(&memtable, epoch, 1).await.unwrap();
+        let result = flusher.flush(&memtable, epoch, 1, durable).await.unwrap();
 
         assert_eq!(result.generation.generation, 1);
         assert_eq!(
@@ -1448,9 +1447,7 @@ mod tests {
         )
         .unwrap();
         let frag_id = memtable.insert(batch).await.unwrap();
-        memtable
-            .batch_store()
-            .set_max_flushed_batch_position(frag_id);
+        let durable = frag_id + 1;
 
         let flusher = MemTableFlusher::new(
             store.clone(),
@@ -1459,7 +1456,7 @@ mod tests {
             shard_id,
             manifest_store,
         );
-        let result = flusher.flush(&memtable, epoch, 1).await.unwrap();
+        let result = flusher.flush(&memtable, epoch, 1, durable).await.unwrap();
         assert_eq!(result.rows_flushed, 5, "all physical rows are written");
 
         // Scanning the flushed generation must honor the deletion vector and
@@ -1553,9 +1550,7 @@ mod tests {
         )
         .unwrap();
         let frag_id = memtable.insert(batch).await.unwrap();
-        memtable
-            .batch_store()
-            .set_max_flushed_batch_position(frag_id);
+        let durable = frag_id + 1;
 
         let flusher = MemTableFlusher::new(
             store.clone(),
@@ -1565,7 +1560,7 @@ mod tests {
             manifest_store.clone(),
         );
         let result = flusher
-            .flush_with_indexes(&memtable, epoch, &[], 1)
+            .flush_with_indexes(&memtable, epoch, &[], 1, durable)
             .await
             .unwrap();
 
@@ -1655,9 +1650,7 @@ mod tests {
         )
         .unwrap();
         let frag_id = memtable.insert(batch).await.unwrap();
-        memtable
-            .batch_store()
-            .set_max_flushed_batch_position(frag_id);
+        let durable = frag_id + 1;
 
         let flusher = MemTableFlusher::new(
             store.clone(),
@@ -1667,7 +1660,7 @@ mod tests {
             manifest_store.clone(),
         );
         // The plain-flush path — what the writer dispatches to with no indexes.
-        let result = flusher.flush(&memtable, epoch, 1).await.unwrap();
+        let result = flusher.flush(&memtable, epoch, 1, durable).await.unwrap();
 
         let gen_path = base_path
             .clone()
@@ -1751,9 +1744,7 @@ mod tests {
         )
         .unwrap();
         let frag_id = memtable.insert(batch).await.unwrap();
-        memtable
-            .batch_store()
-            .set_max_flushed_batch_position(frag_id);
+        let durable = frag_id + 1;
 
         let flusher = MemTableFlusher::new(
             store.clone(),
@@ -1763,7 +1754,7 @@ mod tests {
             manifest_store.clone(),
         );
         let result = flusher
-            .flush_with_indexes(&memtable, epoch, &index_configs, 1)
+            .flush_with_indexes(&memtable, epoch, &index_configs, 1, durable)
             .await
             .unwrap();
         assert_eq!(result.rows_flushed, 5, "all physical rows are written");
@@ -1885,9 +1876,7 @@ mod tests {
             .unwrap();
 
         // Simulate WAL flush
-        memtable
-            .batch_store()
-            .set_max_flushed_batch_position(frag_id);
+        let durable = frag_id + 1;
 
         let flusher = MemTableFlusher::new(
             store.clone(),
@@ -1897,7 +1886,7 @@ mod tests {
             manifest_store.clone(),
         );
         let result = flusher
-            .flush_with_indexes(&memtable, epoch, &index_configs, 1)
+            .flush_with_indexes(&memtable, epoch, &index_configs, 1, durable)
             .await
             .unwrap();
 
@@ -2024,9 +2013,7 @@ mod tests {
         let frag_id = memtable.insert(batch).await.unwrap();
 
         // Simulate WAL flush
-        memtable
-            .batch_store()
-            .set_max_flushed_batch_position(frag_id);
+        let durable = frag_id + 1;
 
         let flusher = MemTableFlusher::new(
             store.clone(),
@@ -2036,7 +2023,7 @@ mod tests {
             manifest_store.clone(),
         );
         let result = flusher
-            .flush_with_indexes(&memtable, epoch, &index_configs, 1)
+            .flush_with_indexes(&memtable, epoch, &index_configs, 1, durable)
             .await
             .unwrap();
 
@@ -2176,9 +2163,7 @@ mod tests {
         let frag_id = memtable.insert(batch).await.unwrap();
 
         // Simulate WAL flush
-        memtable
-            .batch_store()
-            .set_max_flushed_batch_position(frag_id);
+        let durable = frag_id + 1;
 
         let flusher = MemTableFlusher::new(
             store.clone(),
@@ -2188,7 +2173,7 @@ mod tests {
             manifest_store.clone(),
         );
         let result = flusher
-            .flush_with_indexes(&memtable, epoch, &index_configs, 1)
+            .flush_with_indexes(&memtable, epoch, &index_configs, 1, durable)
             .await
             .unwrap();
 

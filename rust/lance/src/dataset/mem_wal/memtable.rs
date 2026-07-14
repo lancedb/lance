@@ -180,6 +180,29 @@ impl MemTable {
         cache_config: CacheConfig,
         batch_capacity: usize,
     ) -> Result<Self> {
+        Self::with_capacity_at(
+            schema,
+            generation,
+            pk_field_ids,
+            cache_config,
+            batch_capacity,
+            0,
+        )
+    }
+
+    /// Create a memtable whose batch 0 sits at `global_offset` in the writer's
+    /// batch sequence. Every memtable after the writer's first is rotated in by
+    /// `freeze_memtable`, which stamps the outgoing memtable's `global_end()`
+    /// here so writer-global cursors stay mappable onto local batch positions.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_capacity_at(
+        schema: Arc<ArrowSchema>,
+        generation: u64,
+        pk_field_ids: Vec<i32>,
+        cache_config: CacheConfig,
+        batch_capacity: usize,
+        global_offset: usize,
+    ) -> Result<Self> {
         let lance_schema = Schema::try_from(schema.as_ref())?;
 
         // Initialize bloom filter for primary key staleness detection.
@@ -197,7 +220,7 @@ impl MemTable {
         let dataset_uri = format!("memory://{}", Uuid::new_v4());
 
         // Create lock-free batch store
-        let batch_store = Arc::new(BatchStore::with_capacity(batch_capacity));
+        let batch_store = Arc::new(BatchStore::with_capacity_at(batch_capacity, global_offset));
 
         // Create memtable_flush_completion cell immediately so backpressure can
         // wait on it even before the memtable is frozen. Every memtable will
@@ -712,9 +735,15 @@ impl MemTable {
         self.indexes.take()
     }
 
-    /// Check if all batches have been flushed to WAL.
-    pub fn all_flushed_to_wal(&self) -> bool {
-        self.batch_store.pending_wal_flush_count() == 0
+    /// Whether every committed batch in this memtable is WAL-durable, given the
+    /// writer-global durability cursor. The L0 flush's precondition.
+    pub fn all_flushed_to_wal(&self, durable: usize) -> bool {
+        self.batch_store.pending_wal_flush_count(durable) == 0
+    }
+
+    /// Writer-global coordinate one past this memtable's last committed batch.
+    pub fn global_end(&self) -> usize {
+        self.batch_store.global_end()
     }
 
     /// Get cache configuration.
@@ -878,7 +907,7 @@ mod tests {
         assert_eq!(total_rows, 15);
     }
 
-    /// `all_flushed_to_wal()` is the L0 flush's precondition (`flush.rs:171`):
+    /// `all_flushed_to_wal(durable)` is the L0 flush's precondition (`flush.rs:171`):
     /// false while any committed batch is still un-appended, true once the
     /// durability watermark covers every one of them.
     #[tokio::test]
@@ -894,20 +923,16 @@ mod tests {
             .insert(create_test_batch(&schema, 5))
             .await
             .unwrap();
-        assert!(!memtable.all_flushed_to_wal());
+        assert!(!memtable.all_flushed_to_wal(0), "nothing is durable yet");
 
-        memtable
-            .batch_store()
-            .set_max_flushed_batch_position(batch1);
+        let durable = batch1 + 1;
         assert!(
-            !memtable.all_flushed_to_wal(),
+            !memtable.all_flushed_to_wal(durable),
             "batch2 is still waiting on its WAL append"
         );
 
-        memtable
-            .batch_store()
-            .set_max_flushed_batch_position(batch2);
-        assert!(memtable.all_flushed_to_wal());
+        let durable = batch2 + 1;
+        assert!(memtable.all_flushed_to_wal(durable));
     }
 
     #[tokio::test]

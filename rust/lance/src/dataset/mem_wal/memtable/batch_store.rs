@@ -195,10 +195,14 @@ pub struct BatchStore {
     /// Estimated size in bytes (for flush threshold).
     estimated_bytes: AtomicUsize,
 
-    /// WAL flush watermark: the last batch ID that has been flushed to WAL (inclusive).
-    /// Uses usize::MAX as sentinel for "nothing flushed yet".
-    /// This is per-memtable tracking, not global.
-    max_flushed_batch_position: AtomicUsize,
+    /// Writer-global coordinate of this store's batch 0.
+    ///
+    /// A *coordinate*, not a cursor: stamped once at construction and never
+    /// moved. `global_position = global_offset + local_position`. Batch
+    /// positions restart at 0 in every memtable, so this is the only thing that
+    /// lets a writer-global cursor (the WAL durability count) be mapped onto a
+    /// particular store.
+    global_offset: usize,
 }
 
 // SAFETY: Safe to share across threads because:
@@ -221,6 +225,13 @@ impl BatchStore {
     ///
     /// Panics if capacity is 0.
     pub fn with_capacity(capacity: usize) -> Self {
+        Self::with_capacity_at(capacity, 0)
+    }
+
+    /// Create a store whose batch 0 sits at `global_offset` in the writer's
+    /// batch sequence. Used by `freeze_memtable` for every memtable after the
+    /// first; the first starts at 0.
+    pub fn with_capacity_at(capacity: usize, global_offset: usize) -> Self {
         assert!(capacity > 0, "capacity must be > 0");
 
         // Allocate uninitialized storage
@@ -235,7 +246,7 @@ impl BatchStore {
             capacity,
             total_rows: AtomicUsize::new(0),
             estimated_bytes: AtomicUsize::new(0),
-            max_flushed_batch_position: AtomicUsize::new(usize::MAX), // Nothing flushed yet
+            global_offset,
         }
     }
 
@@ -437,68 +448,54 @@ impl BatchStore {
     // WAL Flush Tracking API
     // =========================================================================
 
-    /// Get the WAL flush watermark (the last batch ID that was flushed, inclusive).
-    /// Returns None if nothing has been flushed yet.
+    /// Writer-global coordinate one past this store's last committed batch.
     #[inline]
-    pub fn max_flushed_batch_position(&self) -> Option<usize> {
-        let watermark = self.max_flushed_batch_position.load(Ordering::Acquire);
-        if watermark == usize::MAX {
-            None
-        } else {
-            Some(watermark)
-        }
+    pub fn global_end(&self) -> usize {
+        self.global_offset + self.committed_len.load(Ordering::Acquire)
     }
 
-    /// Update the WAL flush watermark after successful WAL flush.
+    /// This store's writer-global coordinate for batch 0.
+    #[inline]
+    pub fn global_offset(&self) -> usize {
+        self.global_offset
+    }
+
+    /// The local exclusive end of this store covered by a writer-global cursor.
     ///
-    /// # Arguments
+    /// Saturating in both directions, and both directions are reachable in
+    /// normal operation: a cursor *below* this store's offset means "nothing
+    /// here yet" (the store was rotated in after the cursor last advanced —
+    /// the ordinary state of a fresh memtable), and a cursor beyond its end
+    /// clamps to what is committed.
     ///
-    /// * `batch_position` - The last batch ID that was flushed (inclusive)
+    /// This is the **only** place the global-to-local subtraction is written.
+    /// Open-coding it underflows on every memtable rotation, which in release
+    /// wraps to a huge end and makes the whole new memtable instantly visible.
     #[inline]
-    pub fn set_max_flushed_batch_position(&self, batch_position: usize) {
-        debug_assert!(
-            batch_position != usize::MAX,
-            "batch_position cannot be usize::MAX (reserved as sentinel)"
-        );
-        self.max_flushed_batch_position
-            .store(batch_position, Ordering::Release);
+    pub fn local_end(&self, global_cursor: usize) -> usize {
+        global_cursor
+            .saturating_sub(self.global_offset)
+            .min(self.committed_len.load(Ordering::Acquire))
     }
 
-    /// Get the number of batches pending WAL flush.
+    /// Batches in this store still waiting on their WAL append.
     #[inline]
-    pub fn pending_wal_flush_count(&self) -> usize {
-        let committed = self.committed_len.load(Ordering::Acquire);
-        let watermark = self.max_flushed_batch_position.load(Ordering::Acquire);
-        if watermark == usize::MAX {
-            // Nothing flushed yet, all committed batches are pending
-            committed
-        } else {
-            // Batches [0, watermark] are flushed, so pending = committed - (watermark + 1)
-            committed.saturating_sub(watermark + 1)
-        }
+    pub fn pending_wal_flush_count(&self, durable: usize) -> usize {
+        self.committed_len.load(Ordering::Acquire) - self.local_end(durable)
     }
 
-    /// Get the range of batch IDs pending WAL flush: [start, end).
-    /// Returns None if nothing pending.
+    /// Local range `[start, end)` of batches still waiting on their WAL append,
+    /// or `None` when the store is fully durable.
     #[inline]
-    pub fn pending_wal_flush_range(&self) -> Option<(usize, usize)> {
-        let committed = self.committed_len.load(Ordering::Acquire);
-        let watermark = self.max_flushed_batch_position.load(Ordering::Acquire);
-        let start = if watermark == usize::MAX {
-            0
-        } else {
-            watermark + 1
-        };
-        if committed > start {
-            Some((start, committed))
-        } else {
-            None
-        }
+    pub fn pending_wal_flush_range(&self, durable: usize) -> Option<(usize, usize)> {
+        let start = self.local_end(durable);
+        let end = self.committed_len.load(Ordering::Acquire);
+        (end > start).then_some((start, end))
     }
 
     /// Get a point-in-time summary of batches pending WAL flush.
-    pub fn pending_wal_flush_stats(&self) -> PendingWalFlushStats {
-        let Some((start, end)) = self.pending_wal_flush_range() else {
+    pub fn pending_wal_flush_stats(&self, durable: usize) -> PendingWalFlushStats {
+        let Some((start, end)) = self.pending_wal_flush_range(durable) else {
             return PendingWalFlushStats::default();
         };
 
