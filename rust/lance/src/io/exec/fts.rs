@@ -375,10 +375,6 @@ impl ExecutionPlan for MatchQueryExec {
         "MatchQueryExec"
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         match &self.prefilter_source {
             PreFilterSource::None => vec![],
@@ -795,10 +791,6 @@ impl ExecutionPlan for FlatMatchFilterExec {
         "FlatMatchFilterExec"
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.input]
     }
@@ -850,7 +842,7 @@ impl ExecutionPlan for FlatMatchFilterExec {
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> DataFusionResult<Statistics> {
+    fn partition_statistics(&self, partition: Option<usize>) -> DataFusionResult<Arc<Statistics>> {
         self.input.partition_statistics(partition)
     }
 
@@ -989,10 +981,6 @@ impl FlatMatchQueryExec {
 impl ExecutionPlan for FlatMatchQueryExec {
     fn name(&self) -> &str {
         "FlatMatchQueryExec"
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -1268,10 +1256,6 @@ impl ExecutionPlan for PhraseQueryExec {
         "PhraseQueryExec"
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         match &self.prefilter_source {
             PreFilterSource::None => vec![],
@@ -1519,10 +1503,6 @@ impl BoostQueryExec {
 impl ExecutionPlan for BoostQueryExec {
     fn name(&self) -> &str {
         "BoostQueryExec"
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -1787,10 +1767,6 @@ impl BooleanQueryExec {
 impl ExecutionPlan for BooleanQueryExec {
     fn name(&self) -> &str {
         "BooleanQueryExec"
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -2542,7 +2518,7 @@ mod tests {
             .unwrap()
             .expect("Should slot always returns Some");
         assert!(
-            plan.as_any().downcast_ref::<EmptyExec>().is_some(),
+            plan.downcast_ref::<EmptyExec>().is_some(),
             "expected EmptyExec for empty Should slot, got {plan:?}"
         );
     }
@@ -2570,12 +2546,10 @@ mod tests {
         .unwrap()
         .expect("Should slot always returns Some");
         let repartition = plan
-            .as_any()
             .downcast_ref::<RepartitionExec>()
             .expect("multi-child Should should be wrapped in RepartitionExec");
         let inner = repartition
             .input()
-            .as_any()
             .downcast_ref::<UnionExec>()
             .expect("RepartitionExec should wrap a UnionExec");
         assert_eq!(inner.children().len(), 2);
@@ -2614,7 +2588,7 @@ mod tests {
         // there are N-1 joins.
         let mut joins = 0usize;
         let mut current: Arc<dyn ExecutionPlan> = plan;
-        while let Some(join) = current.clone().as_any().downcast_ref::<HashJoinExec>() {
+        while let Some(join) = current.clone().downcast_ref::<HashJoinExec>() {
             joins += 1;
             current = join.children()[0].clone();
         }
@@ -2630,12 +2604,10 @@ mod tests {
         .unwrap()
         .expect("MustNot slot always returns Some");
         let repartition = plan
-            .as_any()
             .downcast_ref::<RepartitionExec>()
             .expect("multi-child MustNot should be wrapped in RepartitionExec");
         let inner = repartition
             .input()
-            .as_any()
             .downcast_ref::<UnionExec>()
             .expect("RepartitionExec should wrap a UnionExec");
         assert_eq!(inner.children().len(), 2);

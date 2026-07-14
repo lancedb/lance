@@ -2224,6 +2224,9 @@ impl Scanner {
     }
 
     #[allow(clippy::type_complexity)]
+    // TODO(datafusion-54): migrate off the deprecated
+    // create_aggregate_expr_and_maybe_filter to LoweredAggregateBuilder.
+    #[allow(deprecated)]
     fn build_physical_aggregate_expr(
         &self,
         expr: &Expr,
@@ -12691,7 +12694,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
     }
 
     fn find_filtered_read(plan: &dyn ExecutionPlan) -> Option<&FilteredReadExec> {
-        if let Some(f) = plan.as_any().downcast_ref::<FilteredReadExec>() {
+        if let Some(f) = plan.downcast_ref::<FilteredReadExec>() {
             return Some(f);
         }
         for child in plan.children() {

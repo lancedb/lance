@@ -126,7 +126,7 @@ criterion = { version = "0.8.2", features = [
 ] }
 crossbeam-queue = "0.3"
 crossbeam-skiplist = "0.1"
-datafusion = { version = "53.0.0", default-features = false, features = [
+datafusion = { version = "54.0.0", default-features = false, features = [
     "crypto_expressions",
     "datetime_expressions",
     "encoding_expressions",
@@ -136,14 +136,14 @@ datafusion = { version = "53.0.0", default-features = false, features = [
     "string_expressions",
     "unicode_expressions",
 ] }
-datafusion-common = "53.0.0"
-datafusion-functions = { version = "53.0.0", default-features = false, features = ["regex_expressions"] }
-datafusion-sql = "53.0.0"
-datafusion-expr = "53.0.0"
-datafusion-ffi = "53.0.0"
-datafusion-physical-expr = "53.0.0"
-datafusion-physical-plan = "53.0.0"
-datafusion-substrait = { version = "53.0.0", default-features = false }
+datafusion-common = "54.0.0"
+datafusion-functions = { version = "54.0.0", default-features = false, features = ["regex_expressions"] }
+datafusion-sql = "54.0.0"
+datafusion-expr = "54.0.0"
+datafusion-ffi = "54.0.0"
+datafusion-physical-expr = "54.0.0"
+datafusion-physical-plan = "54.0.0"
+datafusion-substrait = { version = "54.0.0", default-features = false }
 dirs = "6.0.0"
 either = "1.0"
 fst = { version = "0.4.7", features = ["levenshtein"] }
@@ -151,7 +151,7 @@ fsst = { version = "=9.0.0-beta.23", path = "./rust/compression/fsst" }
 futures = "0.3"
 geoarrow-array = "0.8"
 geoarrow-schema = "0.8"
-geodatafusion = "0.4.0"
+geodatafusion = "0.5.0"
 geo-traits = "0.3.0"
 geo-types = "0.7.16"
 http = "1.1.0"
