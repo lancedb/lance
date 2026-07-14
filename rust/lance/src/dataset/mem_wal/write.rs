@@ -935,6 +935,25 @@ async fn replay_memtable_from_wal(
         }
     }
 
+    // Mark the replayed batches durable. They came *from* the WAL, and
+    // `insert_batches` above just re-derived the indexes over them, so both
+    // cursors are satisfied — but only the index one advances itself.
+    //
+    // Without this stamp the durability cursor stays at "nothing flushed", so
+    // the next WAL flush re-covers [0, end): it re-appends already-durable rows
+    // to the WAL *and* re-inserts every replayed row into the indexes. None of
+    // the three in-memory indexes is idempotent (HNSW mints fresh node ids for
+    // the same row, FTS increments doc_count/df instead of recomputing them,
+    // BTree is a multiset), so a full scan keeps looking healthy while every
+    // index-accelerated query silently returns duplicates. It compounds, too:
+    // the WAL now holds those rows twice, so the next crash replays both copies.
+    let replayed_batches = memtable.batch_count();
+    if replayed_batches > 0 {
+        memtable
+            .batch_store()
+            .set_max_flushed_batch_position(replayed_batches - 1);
+    }
+
     Ok(position)
 }
 
@@ -5070,6 +5089,104 @@ mod tests {
             "expected replay to insert 2 batches, got {}",
             stats.batch_count
         );
+
+        writer_b.close().await.unwrap();
+    }
+
+    /// Replayed batches are already WAL-durable, so the first flush after a
+    /// reopen must not re-append them to the WAL or re-insert them into the
+    /// indexes. Before replay stamped the durability cursor it stayed at
+    /// "nothing flushed", so the next flush re-covered `[0, end)`: it appended
+    /// the already-durable rows a second time *and* re-indexed them. None of
+    /// the in-memory indexes is idempotent, so an indexed PK lookup returned
+    /// the row twice while a full scan still looked healthy.
+    #[tokio::test]
+    async fn test_replay_does_not_reappend_or_reindex() {
+        use crate::dataset::mem_wal::wal::WalTailer;
+
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = schema_with_pk();
+        let shard_id = Uuid::new_v4();
+
+        // Writer A: two durable batches (5 + 3 = 8 rows), dropped without close.
+        {
+            let writer_a = ShardWriter::open(
+                store.clone(),
+                base_path.clone(),
+                base_uri.clone(),
+                memtable_config_with_pk(shard_id),
+                schema.clone(),
+                vec![],
+            )
+            .await
+            .unwrap();
+            writer_a
+                .put(vec![create_test_batch(&schema, 0, 5)])
+                .await
+                .unwrap();
+            writer_a
+                .put(vec![create_test_batch(&schema, 100, 3)])
+                .await
+                .unwrap();
+        }
+
+        // Writer B reopens and replays A's two batches.
+        let writer_b = ShardWriter::open(
+            store.clone(),
+            base_path.clone(),
+            base_uri,
+            memtable_config_with_pk(shard_id),
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        let stats = writer_b.memtable_stats().await.unwrap();
+        assert_eq!(stats.batch_count, 2);
+        assert_eq!(
+            stats.durable_batch_count, 2,
+            "replayed batches came from the WAL, so the durability cursor must already cover them"
+        );
+
+        // One more durable put. Its flush must cover only the new batch.
+        writer_b
+            .put(vec![create_test_batch(&schema, 200, 2)])
+            .await
+            .unwrap();
+
+        let tailer = WalTailer::new(store, base_path, shard_id);
+        let first = tailer.first_position().await.unwrap();
+        let next = tailer.next_position().await.unwrap();
+        let mut wal_rows = 0;
+        for position in first..next {
+            if let Some(entry) = tailer.read_entry(position).await.unwrap() {
+                wal_rows += entry.batches.iter().map(|b| b.num_rows()).sum::<usize>();
+            }
+        }
+        assert_eq!(
+            wal_rows, 10,
+            "WAL must hold 8 replayed + 2 new rows; a re-covering flush re-appends the replayed 8"
+        );
+
+        // The indexed arm must not see a replayed row twice.
+        let mut scanner = writer_b.scan().await.unwrap();
+        scanner.filter("id = 0").unwrap();
+        let hit = scanner.try_into_batch().await.unwrap();
+        assert_eq!(
+            hit.num_rows(),
+            1,
+            "indexed PK lookup returned the replayed row more than once"
+        );
+
+        let all = writer_b
+            .scan()
+            .await
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(all.num_rows(), 10);
 
         writer_b.close().await.unwrap();
     }
