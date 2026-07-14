@@ -8,7 +8,7 @@ import lance
 import numpy as np
 import pyarrow as pa
 import pytest
-from lance.file import LanceFileReader
+from lance.file import LanceFileReader, LanceFileWriter
 from lance.indices import IndicesBuilder, IvfModel, PqModel
 
 NUM_ROWS_PER_FRAGMENT = 10000
@@ -220,6 +220,17 @@ def test_gen_pq(tmpdir, rand_dataset, rand_ivf):
     pq_4bit.save(str(tmpdir / "pq_4bit"))
     reloaded = PqModel.load(str(tmpdir / "pq_4bit"))
     assert reloaded.num_bits == 4
+
+    legacy_pq_uri = str(tmpdir / "legacy_pq")
+    with LanceFileWriter(
+        legacy_pq_uri,
+        pa.schema(
+            [pa.field("codebook", pq.codebook.type)],
+            metadata={b"num_subvectors": str(pq.num_subvectors).encode()},
+        ),
+    ) as writer:
+        writer.write_batch(pa.table([pq.codebook], names=["codebook"]))
+    assert PqModel.load(legacy_pq_uri).num_bits == 8
 
 
 def test_ivf_centroids_fragment_ids(tmpdir):
