@@ -328,7 +328,7 @@ fn in_memory_membership(
     batch_store: &Arc<BatchStore>,
     index_store: &Arc<IndexStore>,
 ) -> GenMembership {
-    let max_visible_row = batch_store.max_visible_row(index_store.indexed_count());
+    let max_visible_row = batch_store.max_visible_row(index_store.visible_count());
     GenMembership::InMemory {
         index_store: index_store.clone(),
         max_visible_row,

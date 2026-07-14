@@ -439,7 +439,7 @@ impl MemTableScanner {
         // Snapshot the visibility cursor at construction time. The cursor is
         // advanced by `flush_from_batch_store` after the WAL append succeeds,
         // so this snapshot reflects WAL-durable data.
-        let visible_count = indexes.indexed_count();
+        let visible_count = indexes.visible_count();
 
         Self {
             batch_store,

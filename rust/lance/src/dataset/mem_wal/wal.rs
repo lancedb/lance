@@ -593,6 +593,8 @@ impl WalFlusher {
             stored_batches.iter().map(|s| s.data.clone()).collect();
 
         let appender = self.wal_appender.clone();
+        // Kept for the publish below: the index arm consumes its own clone.
+        let publish_target = indexes.clone();
         let (append_result, index_result) = if let Some(idx_registry) = indexes {
             let wal_future = async move {
                 let start = Instant::now();
@@ -621,8 +623,52 @@ impl WalFlusher {
             )
         };
 
+        // `tokio::join!` runs both arms to completion; it does not cancel the
+        // index arm when the append fails. So on a failed append the index arm has
+        // still advanced `indexed_count` — which is exactly why readers key off
+        // `visible_count` instead, and why nothing is published until both `?`
+        // below have passed.
         let (append_result, wal_io_duration) = append_result?;
-        let (index_update_duration, index_update_duration_breakdown) = index_result?;
+
+        // An index-apply failure is terminal for the writer.
+        //
+        // `insert_batches` joins every index thread unconditionally, so a failure
+        // leaves the *other* indexes fully applied — FTS and BTree landed, HNSW
+        // did not — and none of them can be rolled back: HNSW has no delete (its
+        // nodes are already linked into their neighbours' adjacency lists), FTS
+        // has already incremented `doc_count`/`total_tokens`/`df`, and BTree has
+        // linked into an append-only arena skiplist. From a partial apply there is
+        // no coherent way to continue: retry and the next attempt re-covers the
+        // range, re-inserting into the indexes that *did* succeed (duplicate HNSW
+        // nodes, doubled BM25 statistics, a permanently spurious
+        // `pk_has_overrides`); skip it and the failed index is permanently short
+        // rows the others have, on a shard that reports healthy.
+        //
+        // So discard instead: poison the writer and let reopen rebuild the
+        // indexes from the WAL. The indexes are pure derived state and replay
+        // already re-derives them, so the rollback primitive exists — it is
+        // `open()`. This is safe only because a *deterministic* index failure is
+        // impossible on data that reached the batch store: `validate_index_configs`
+        // rejects a config that disagrees with the schema at open, and the
+        // memtable's schema-equality gate rejects a batch that disagrees with it.
+        // What is left is transient (allocation, a panicking thread), and that
+        // recovers on replay.
+        let (index_update_duration, index_update_duration_breakdown) =
+            index_result.map_err(|e| {
+                Error::writer_poisoned(format!(
+                    "in-memory index update failed and a partially-applied index cannot be \
+                     rolled back; reopen the shard to rebuild the indexes from the WAL: {e}"
+                ))
+            })?;
+
+        // Both arms succeeded: the range is indexed *and* durable. Publish it.
+        //
+        // This is the only place visibility advances, and it is downstream of both
+        // `?`s. A failed append therefore leaves the rows unreadable, so a reader
+        // can never observe a row that replay will not reproduce.
+        if let Some(indexes) = publish_target {
+            indexes.publish_visible(end_batch_position);
+        }
 
         // Advance the writer-global durability cursor and wake waiters. The
         // range we just appended was `[start, end)` *local to this store*, so it
@@ -2075,6 +2121,142 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// A failed WAL append must not publish rows to readers, even though the
+    /// index arm has already applied them.
+    ///
+    /// `tokio::join!` runs both arms to completion — it does not cancel the index
+    /// arm when the append fails — so `indexed_count` *does* advance on a failed
+    /// flush. That is fine, and unavoidable: the indexes are derived state, and
+    /// replay rebuilds them. What must not happen is for that to make the rows
+    /// readable, because they are not in the WAL and replay will not reproduce
+    /// them. A reader that saw them would be reading a row that no longer exists
+    /// after a reopen.
+    ///
+    /// Readers therefore key off `visible_count`, which the writer advances only
+    /// downstream of *both* arms succeeding.
+    #[tokio::test]
+    async fn test_failed_append_indexes_but_does_not_publish() {
+        let (store, base, controls) = failing_memory_store().await;
+        let shard_id = Uuid::new_v4();
+        controls.fail_wal_puts(usize::MAX);
+        let manifest_store = Arc::new(ShardManifestStore::new(store.clone(), &base, shard_id, 2));
+        let (epoch, _) = manifest_store.claim_epoch(0).await.unwrap();
+        let appender = Arc::new(WalAppender::with_claimed_epoch(
+            store,
+            base,
+            shard_id,
+            manifest_store,
+            epoch,
+            0,
+            WalRetryConfig {
+                max_retries: 1,
+                base_delay: Duration::from_millis(1),
+            },
+        ));
+        let flusher = WalFlusher::new(appender);
+
+        let schema = create_test_schema();
+        let batch_store = Arc::new(BatchStore::with_capacity(10));
+        batch_store.append(create_test_batch(&schema, 1)).unwrap();
+
+        let mut idx = IndexStore::new();
+        idx.add_btree("id_idx".to_string(), 0, "id".to_string());
+        let indexes = Arc::new(idx);
+
+        let source = batch_store_source_with_indexes(&batch_store, &indexes);
+        let err = flusher
+            .flush(&source, batch_store.len())
+            .await
+            .expect_err("the WAL PUT is failing, so the flush must fail");
+        assert_eq!(err.fence_reason(), Some(FenceReason::PersistenceFailure));
+
+        // The index arm ran to completion regardless — that is the join's nature.
+        assert_eq!(
+            indexes.indexed_count(),
+            1,
+            "the index arm applies even when the append fails"
+        );
+
+        // But nothing was published, so no reader can see the row.
+        assert_eq!(
+            indexes.visible_count(),
+            0,
+            "a row whose WAL append failed must never become readable"
+        );
+        assert_eq!(flusher.durable(), 0);
+    }
+
+    /// An index-apply failure poisons the writer.
+    ///
+    /// A partial apply cannot be rolled back (see the note at the `map_err` in
+    /// `flush_from_batch_store`), and continuing would re-cover the range on the
+    /// next flush and corrupt the indexes that *did* succeed. So the failure is
+    /// terminal: the writer poisons, reads and writes fail fast, and recovery is
+    /// reopen -> replay, which rebuilds the indexes from the WAL.
+    ///
+    /// The batches were WAL-durable before the index failed, so this is not data
+    /// loss — it is a rebuild.
+    #[tokio::test]
+    async fn test_index_failure_poisons_the_writer() {
+        let (store, base_path, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let manifest_store = Arc::new(ShardManifestStore::new(
+            store.clone(),
+            &base_path,
+            shard_id,
+            2,
+        ));
+        let (epoch, _) = manifest_store.claim_epoch(0).await.unwrap();
+        let appender = Arc::new(WalAppender::with_claimed_epoch(
+            store,
+            base_path,
+            shard_id,
+            manifest_store,
+            epoch,
+            0,
+            WalRetryConfig::default(),
+        ));
+        let flusher = WalFlusher::new(appender);
+
+        let schema = create_test_schema();
+        let batch_store = Arc::new(BatchStore::with_capacity(10));
+        batch_store.append(create_test_batch(&schema, 1)).unwrap();
+
+        // An HNSW index on `id`, which is an Int32 and not a vector. Every insert
+        // of this batch fails deterministically. (`validate_index_configs` rejects
+        // this at shard open — that is what makes poison-and-replay terminating —
+        // so we have to build the store by hand to reach the failure at all.)
+        let mut idx = IndexStore::new();
+        idx.add_hnsw(
+            "bad_hnsw".to_string(),
+            0,
+            "id".to_string(),
+            lance_linalg::distance::DistanceType::L2,
+            128,
+            8,
+        );
+        let indexes = Arc::new(idx);
+
+        let source = batch_store_source_with_indexes(&batch_store, &indexes);
+        let err = flusher
+            .flush(&source, batch_store.len())
+            .await
+            .expect_err("indexing an Int32 column as a vector must fail");
+
+        assert_eq!(
+            err.fence_reason(),
+            Some(FenceReason::PersistenceFailure),
+            "an index failure must be typed as terminal, not left as an ordinary error"
+        );
+        assert!(
+            flusher.check_poisoned().is_err(),
+            "the writer must be poisoned so it cannot limp on with a corrupt index"
+        );
+
+        // Nothing was published, even though the WAL append itself succeeded.
+        assert_eq!(indexes.visible_count(), 0);
     }
 
     // A persistence failure during flush latches the poison: the flush result,
