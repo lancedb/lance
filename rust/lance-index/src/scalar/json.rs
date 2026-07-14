@@ -751,30 +751,51 @@ impl BasicTrainer for JsonIndexPlugin {
         // first/last row) would then record inverted statistics and silently return
         // wrong query results. Re-sort by the extracted value here so the value-ordering
         // contract is honored. Ordering-agnostic targets (e.g. bitmap) are left as-is.
-        let converted_stream = if target_request.criteria().ordering == TrainingOrdering::Values {
-            let input = Arc::new(OneShotExec::new(converted_stream));
-            let value_column_idx = input
-                .schema()
-                .column_with_name(VALUE_COLUMN_NAME)
-                .expect_ok()?
-                .0;
-            let sort_expr = PhysicalSortExpr {
-                expr: Arc::new(Column::new(VALUE_COLUMN_NAME, value_column_idx)),
-                options: SortOptions {
-                    descending: false,
-                    nulls_first: true,
-                },
-            };
-            let sorted = Arc::new(SortExec::new([sort_expr].into(), input));
-            execute_plan(
-                sorted,
-                LanceExecutionOptions {
-                    use_spilling: true,
-                    ..Default::default()
-                },
-            )?
-        } else {
-            converted_stream
+        let converted_stream = match target_request.criteria().ordering {
+            TrainingOrdering::Values => {
+                let input = Arc::new(OneShotExec::new(converted_stream));
+                let value_column_idx = input
+                    .schema()
+                    .column_with_name(VALUE_COLUMN_NAME)
+                    .expect_ok()?
+                    .0;
+                let sort_expr = PhysicalSortExpr {
+                    expr: Arc::new(Column::new(VALUE_COLUMN_NAME, value_column_idx)),
+                    options: SortOptions {
+                        descending: false,
+                        nulls_first: true,
+                    },
+                };
+                let sorted = Arc::new(SortExec::new([sort_expr].into(), input));
+                // `use_spilling` only bounds this SortExec. It does not make training
+                // memory-bounded overall: `extract_json_with_type_info` and
+                // `convert_stream_by_type` already collect every batch into a Vec before
+                // re-streaming, so the extracted/converted data is fully materialized in
+                // memory upstream of this sort regardless of this flag.
+                execute_plan(
+                    sorted,
+                    LanceExecutionOptions {
+                        use_spilling: true,
+                        ..Default::default()
+                    },
+                )?
+            }
+            TrainingOrdering::Addresses => {
+                // `JsonTrainingRequest::criteria()` delegates the target's criteria
+                // verbatim, so when the target wants address ordering the scanner already
+                // supplies the raw JSON rows in address order, and the extraction
+                // (a ProjectionExec) and per-batch conversion preserve that row order.
+                // Re-sorting by value here would violate the Addresses contract, so pass
+                // the stream through untouched. (Note: address-ordered targets such as
+                // zonemap/bloomfilter additionally require a row-addr column that this
+                // pipeline does not yet project - only [value, row_id] - an orthogonal,
+                // pre-existing limitation independent of ordering.)
+                converted_stream
+            }
+            TrainingOrdering::None => {
+                // No ordering requested; leave the stream unsorted.
+                converted_stream
+            }
         };
 
         let target_index = target_trainer
@@ -878,6 +899,9 @@ mod tests {
     use crate::scalar::SargableQuery;
     use arrow_array::{ArrayRef, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
+    use lance_select::RowAddrTreeMap;
+    use rstest::rstest;
+    use std::ops::Bound;
     use std::sync::Arc;
 
     // Note: The old test_detect_json_value_type test has been removed as we now use
@@ -1105,82 +1129,105 @@ mod tests {
             .unwrap()
     }
 
+    /// Serializes the parameterized cases below. Each case runs a spilling `SortExec`
+    /// that reserves a non-spillable merge buffer from the process-wide cached DataFusion
+    /// memory pool (see `get_session_context`); running all cases in parallel would
+    /// contend for that shared pool and intermittently exhaust it. The original
+    /// single-`#[tokio::test]` version ran the cases sequentially, so hold this guard for
+    /// the duration of each case to preserve that one-at-a-time behavior.
+    static FLOAT_INDEX_CASE_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Case A docs: the three values from the issue's repro. Fed sorted by the raw
+    /// JSONB bytes (see the test body) to faithfully simulate `scan_training_data`'s
+    /// asc_nulls_first sort over the raw binary column. row0=10.5, row1=40.1, row2=-3.2.
+    const DOCS_A: &[(&str, u64)] = &[
+        (r#"{"latitude": 10.5}"#, 0u64),
+        (r#"{"latitude": 40.1}"#, 1u64),
+        (r#"{"latitude": -3.2}"#, 2u64),
+    ];
+
+    /// Case B docs: a deterministic inversion that fails regardless of the exact JSONB
+    /// byte encoding. Feeding [40.1 -> row0, -3.2 -> row1] in that order records an
+    /// inverted page min/max (min=40.1 > max=-3.2) unless the value column is re-sorted
+    /// before training. Fed unsorted on purpose - this asymmetry with case A is the
+    /// regression being covered.
+    const DOCS_B: &[(&str, u64)] = &[
+        (r#"{"latitude": 40.1}"#, 0u64),
+        (r#"{"latitude": -3.2}"#, 1u64),
+    ];
+
     /// Regression test for the JSON-path float index returning wrong results for
     /// non-exactly-representable float64 values (issue #7485). The extracted value
     /// column must be re-sorted numerically before it reaches the btree trainer;
     /// otherwise the per-page min/max invert and range/equality searches miss rows.
+    ///
+    /// Case A (`sort_by_raw_jsonb = true`) is fed byte-sorted to simulate the scanner;
+    /// case B is fed in raw order to force a page min/max inversion.
+    #[rstest]
+    // Case A: > 0 -> the two positive values
+    #[case::a_gt_zero(
+        DOCS_A,
+        true,
+        SargableQuery::Range(Bound::Excluded(ScalarValue::Float64(Some(0.0))), Bound::Unbounded),
+        vec![0, 1]
+    )]
+    // Case A: >= 10.5 -> the two values at or above 10.5
+    #[case::a_gte_10_5(
+        DOCS_A,
+        true,
+        SargableQuery::Range(Bound::Included(ScalarValue::Float64(Some(10.5))), Bound::Unbounded),
+        vec![0, 1]
+    )]
+    // Case A: = 40.1 (non-exact) -> row1 only
+    #[case::a_eq_40_1(DOCS_A, true, SargableQuery::Equals(ScalarValue::Float64(Some(40.1))), vec![1])]
+    // Case A: = 10.5 (exact) -> row0; guards against silent all-null extraction
+    #[case::a_eq_10_5(DOCS_A, true, SargableQuery::Equals(ScalarValue::Float64(Some(10.5))), vec![0])]
+    // Case A: < 100 -> all three rows
+    #[case::a_lt_100(
+        DOCS_A,
+        true,
+        SargableQuery::Range(Bound::Unbounded, Bound::Excluded(ScalarValue::Float64(Some(100.0)))),
+        vec![0, 1, 2]
+    )]
+    // Case B: > 0 -> row0 only
+    #[case::b_gt_zero(
+        DOCS_B,
+        false,
+        SargableQuery::Range(Bound::Excluded(ScalarValue::Float64(Some(0.0))), Bound::Unbounded),
+        vec![0]
+    )]
+    // Case B: = 40.1 (non-exact) -> row0
+    #[case::b_eq_40_1(DOCS_B, false, SargableQuery::Equals(ScalarValue::Float64(Some(40.1))), vec![0])]
+    // Case B: = -3.2 (non-exact) -> row1
+    #[case::b_eq_neg_3_2(DOCS_B, false, SargableQuery::Equals(ScalarValue::Float64(Some(-3.2))), vec![1])]
     #[tokio::test]
-    async fn test_json_float_btree_index_non_exact_floats() {
-        use lance_select::RowAddrTreeMap;
-        use std::ops::Bound;
+    async fn test_json_float_btree_index_non_exact_floats(
+        #[case] docs: &'static [(&'static str, u64)],
+        #[case] sort_by_raw_jsonb: bool,
+        #[case] query: SargableQuery,
+        #[case] expected: Vec<u64>,
+    ) {
+        // Serialize the spilling sorts so they do not contend for the shared cached
+        // memory pool; held until the end of the test body.
+        let _guard = FLOAT_INDEX_CASE_GUARD.lock().await;
 
-        let f64 = |v: f64| ScalarValue::Float64(Some(v));
+        // Case A simulates `scan_training_data`'s asc_nulls_first sort over the raw JSONB
+        // bytes; case B is fed in raw order to force a page min/max inversion. Preserve
+        // that asymmetry - it is what exercises the #7485 regression.
+        let docs = if sort_by_raw_jsonb {
+            let byte_key = |doc: &str| doc.parse::<jsonb::OwnedJsonb>().unwrap().to_vec();
+            let mut sorted = docs.to_vec();
+            sorted.sort_by_key(|(doc, _)| byte_key(doc));
+            sorted
+        } else {
+            docs.to_vec()
+        };
 
-        // Case A: the three values from the issue's repro. We feed them sorted by the
-        // raw JSONB bytes to faithfully simulate `scan_training_data`'s asc_nulls_first
-        // sort over the raw binary column. row0=10.5, row1=40.1, row2=-3.2.
-        let docs_a = &[
-            (r#"{"latitude": 10.5}"#, 0u64),
-            (r#"{"latitude": 40.1}"#, 1u64),
-            (r#"{"latitude": -3.2}"#, 2u64),
-        ][..];
-        let byte_key = |doc: &str| doc.parse::<jsonb::OwnedJsonb>().unwrap().to_vec();
-        let mut sorted_a = docs_a.to_vec();
-        sorted_a.sort_by_key(|(doc, _)| byte_key(doc));
-
-        let cases_a: &[(SargableQuery, Vec<u64>)] = &[
-            // > 0 -> the two positive values
-            (
-                SargableQuery::Range(Bound::Excluded(f64(0.0)), Bound::Unbounded),
-                vec![0, 1],
-            ),
-            // >= 10.5 -> the two values at or above 10.5
-            (
-                SargableQuery::Range(Bound::Included(f64(10.5)), Bound::Unbounded),
-                vec![0, 1],
-            ),
-            // = 40.1 (non-exact) -> row1 only
-            (SargableQuery::Equals(f64(40.1)), vec![1]),
-            // = 10.5 (exact) -> row0; guards against silent all-null extraction
-            (SargableQuery::Equals(f64(10.5)), vec![0]),
-            // < 100 -> all three rows
-            (
-                SargableQuery::Range(Bound::Unbounded, Bound::Excluded(f64(100.0))),
-                vec![0, 1, 2],
-            ),
-        ];
-        for (query, expected) in cases_a {
-            let result = train_and_search_json_float_index(&sorted_a, query).await;
-            assert_eq!(
-                result,
-                SearchResult::exact(RowAddrTreeMap::from_iter(expected.iter().copied())),
-                "case A query {query:?}"
-            );
-        }
-
-        // Case B: a deterministic inversion that fails regardless of the exact JSONB
-        // byte encoding. Feeding [40.1 -> row0, -3.2 -> row1] in that order records an
-        // inverted page min/max (min=40.1 > max=-3.2) unless the value column is
-        // re-sorted before training.
-        let docs_b = &[
-            (r#"{"latitude": 40.1}"#, 0u64),
-            (r#"{"latitude": -3.2}"#, 1u64),
-        ][..];
-        let cases_b: &[(SargableQuery, Vec<u64>)] = &[
-            (
-                SargableQuery::Range(Bound::Excluded(f64(0.0)), Bound::Unbounded),
-                vec![0],
-            ),
-            (SargableQuery::Equals(f64(40.1)), vec![0]),
-            (SargableQuery::Equals(f64(-3.2)), vec![1]),
-        ];
-        for (query, expected) in cases_b {
-            let result = train_and_search_json_float_index(docs_b, query).await;
-            assert_eq!(
-                result,
-                SearchResult::exact(RowAddrTreeMap::from_iter(expected.iter().copied())),
-                "case B query {query:?}"
-            );
-        }
+        let result = train_and_search_json_float_index(&docs, &query).await;
+        assert_eq!(
+            result,
+            SearchResult::exact(RowAddrTreeMap::from_iter(expected.iter().copied())),
+            "query {query:?}"
+        );
     }
 }
