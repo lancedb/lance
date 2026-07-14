@@ -381,10 +381,7 @@ async fn measure_flush(
         let start = (i * batch_size) as i64;
         let rows = batch_size.min(cp - i * batch_size);
         let batch = make_batch(start, rows, dim);
-        let frag_id = memtable.insert(batch).await?;
-        memtable
-            .batch_store()
-            .set_max_flushed_batch_position(frag_id);
+        let _frag_id = memtable.insert(batch).await?;
     }
 
     let temp_dir =
@@ -412,9 +409,17 @@ async fn measure_flush(
     // total_batches WAL entries were stamped at positions 1..=total_batches
     // by the loop above (1-based positions).
     let covered_wal_entry_position = total_batches as u64;
+    // Every batch was appended above, so the writer-global durable count is all of them.
+    let durable = total_batches;
     let t = Instant::now();
     let _result = flusher
-        .flush_with_indexes(&memtable, epoch, index_configs, covered_wal_entry_position)
+        .flush_with_indexes(
+            &memtable,
+            epoch,
+            index_configs,
+            covered_wal_entry_position,
+            durable,
+        )
         .await?;
     let elapsed = t.elapsed();
 

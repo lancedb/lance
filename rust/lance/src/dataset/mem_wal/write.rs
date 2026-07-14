@@ -935,25 +935,6 @@ async fn replay_memtable_from_wal(
         }
     }
 
-    // Mark the replayed batches durable. They came *from* the WAL, and
-    // `insert_batches` above just re-derived the indexes over them, so both
-    // cursors are satisfied — but only the index one advances itself.
-    //
-    // Without this stamp the durability cursor stays at "nothing flushed", so
-    // the next WAL flush re-covers [0, end): it re-appends already-durable rows
-    // to the WAL *and* re-inserts every replayed row into the indexes. None of
-    // the three in-memory indexes is idempotent (HNSW mints fresh node ids for
-    // the same row, FTS increments doc_count/df instead of recomputing them,
-    // BTree is a multiset), so a full scan keeps looking healthy while every
-    // index-accelerated query silently returns duplicates. It compounds, too:
-    // the WAL now holds those rows twice, so the next crash replays both copies.
-    let replayed_batches = memtable.batch_count();
-    if replayed_batches > 0 {
-        memtable
-            .batch_store()
-            .set_max_flushed_batch_position(replayed_batches - 1);
-    }
-
     Ok(position)
 }
 
@@ -1081,19 +1062,29 @@ impl SharedWriterState {
     ///
     /// Takes `&mut WriterState` directly since caller already holds the lock.
     fn freeze_memtable(&self, state: &mut WriterState) -> Result<u64> {
-        let pending_wal_range = state.memtable.batch_store().pending_wal_flush_range();
+        let durable = self.wal_flusher.durable();
+        let pending_wal_range = state
+            .memtable
+            .batch_store()
+            .pending_wal_flush_range(durable);
         let last_wal_entry_position = state.last_flushed_wal_entry_position;
 
         let old_batch_store = state.memtable.batch_store();
         let old_indexes = state.memtable.indexes_arc();
 
         let next_generation = state.memtable.generation() + 1;
-        let mut new_memtable = MemTable::with_capacity(
+        // The incoming memtable's batch 0 continues the writer's batch sequence
+        // where the outgoing one ends. Without this coordinate, local positions
+        // (which restart at 0 every rotation) cannot be mapped onto the
+        // writer-global durability cursor.
+        let next_global_offset = old_batch_store.global_end();
+        let mut new_memtable = MemTable::with_capacity_at(
             self.schema.clone(),
             next_generation,
             self.pk_field_ids.clone(),
             CacheConfig::default(),
             self.max_memtable_batches,
+            next_global_offset,
         )?;
 
         // Build an IndexStore when there are user indexes *or* a primary key:
@@ -1165,9 +1156,13 @@ impl SharedWriterState {
         Ok(next_generation)
     }
 
-    /// Track batch for WAL durability.
-    fn track_batch_for_wal(&self, batch_position: usize) -> super::wal::BatchDurableWatcher {
-        self.wal_flusher.track_batch(batch_position)
+    /// Watch for a write to become WAL-durable.
+    ///
+    /// `target_durable_count` is a writer-global, exclusive batch count — not a
+    /// memtable-local position. See the caller for why that distinction is
+    /// load-bearing.
+    fn track_batch_for_wal(&self, target_durable_count: usize) -> super::wal::BatchDurableWatcher {
+        self.wal_flusher.track_batch(target_durable_count)
     }
 
     /// Check if memtable flush is needed and trigger if so.
@@ -1201,7 +1196,7 @@ impl SharedWriterState {
         let indexes = state.memtable.indexes_arc();
 
         // Check if there are any unflushed batches
-        let has_pending = batch_store.pending_wal_flush_count() > 0;
+        let has_pending = batch_store.pending_wal_flush_count(self.wal_flusher.durable()) > 0;
 
         // Check time-based trigger first
         let time_trigger = if let Some(interval) = self.config.max_wal_flush_interval {
@@ -1542,6 +1537,23 @@ impl ShardWriter {
             &mut memtable,
         )
         .await?;
+
+        // Mark the replayed batches durable. They came *from* the WAL, and the
+        // replay above has already re-derived the indexes over them.
+        //
+        // Without this the durability cursor stays at 0, so the next WAL flush
+        // re-covers [0, end): it re-appends the already-durable rows *and*
+        // re-inserts every replayed row into the indexes. None of the three
+        // in-memory indexes is idempotent (HNSW mints fresh node ids for the
+        // same row, FTS increments doc_count/df rather than recomputing them,
+        // BTree is a multiset), so a full scan keeps looking healthy while every
+        // index-accelerated query silently returns duplicates — and it compounds,
+        // because the WAL now holds those rows twice.
+        //
+        // The replayed memtable is the writer's first, so its `global_offset` is
+        // 0 and the durable count is just its batch count.
+        wal_flusher.advance_durable(memtable.batch_count());
+
         wal_flusher
             .wal_appender()
             .seed_next_position(next_wal_position)
@@ -1594,6 +1606,7 @@ impl ShardWriter {
         let memtable_handler = MemTableFlushHandler::new(
             state.clone(),
             flusher,
+            wal_flusher.clone(),
             epoch,
             index_configs.to_vec(),
             stats,
@@ -1892,25 +1905,35 @@ impl ShardWriter {
             // 1. Insert all batches into memtable atomically
             let results = state.memtable.insert_batches_only(batches).await?;
 
-            // Get batch position range
+            // 2. Capture the store the batches actually landed in, *before* step
+            //    4 below can freeze and swap the active memtable. Reading it
+            //    afterwards hands the flush trigger the **new** store paired with
+            //    the **old** store's end position, so the new store's watermark
+            //    jumps past batches that were never appended.
+            let batch_store = state.memtable.batch_store();
+            let indexes = state.memtable.indexes_arc();
+
             let start_pos = results.first().map(|(pos, _, _)| *pos).unwrap_or(0);
             let end_pos = results.last().map(|(pos, _, _)| pos + 1).unwrap_or(0);
             let batch_positions = start_pos..end_pos;
 
-            // 2. Track last batch for WAL durability
-            let durable_watcher = writer_state.track_batch_for_wal(end_pos.saturating_sub(1));
+            // 3. Track this write for WAL durability. The target is writer-global
+            //    and exclusive. It must not be a memtable-local position: batch
+            //    positions restart at 0 in every memtable, while the durability
+            //    channel spans the writer's whole life. A local target is
+            //    therefore already satisfied by a *previous* memtable's appends,
+            //    so the first N puts into every post-rotation memtable would ack
+            //    as durable without a WAL append ever happening.
+            let durable_watcher =
+                writer_state.track_batch_for_wal(batch_store.global_offset() + end_pos);
 
-            // 3. Check if WAL flush should be triggered
+            // 4. Check if WAL flush should be triggered
             writer_state.maybe_trigger_wal_flush(&mut state);
 
-            // 4. Check if memtable flush is needed
+            // 5. Check if memtable flush is needed (may freeze and rotate)
             if let Err(e) = writer_state.maybe_trigger_memtable_flush(&mut state) {
                 warn!("Failed to trigger memtable flush: {}", e);
             }
-
-            // Get batch_store and indexes while we have the lock (for durable_write case)
-            let batch_store = state.memtable.batch_store();
-            let indexes = state.memtable.indexes_arc();
 
             (batch_positions, durable_watcher, batch_store, indexes)
         }; // Lock released here
@@ -2117,14 +2140,16 @@ impl ShardWriter {
         let state_lock = self.memtable_state_lock()?;
         let state = state_lock.read().await;
         let batch_store = state.memtable.batch_store();
-        let pending_wal = batch_store.pending_wal_flush_stats();
+        let durable = self.wal_flusher.durable();
+        let pending_wal = batch_store.pending_wal_flush_stats(durable);
         Ok(MemTableStats {
             row_count: state.memtable.row_count(),
             batch_count: state.memtable.batch_count(),
             estimated_size: state.memtable.estimated_size(),
             generation: state.memtable.generation(),
             max_buffered_batch_position: batch_store.max_buffered_batch_position(),
-            max_flushed_batch_position: batch_store.max_flushed_batch_position(),
+            durable_batch_count: durable,
+            global_offset: batch_store.global_offset(),
             pending_wal_start_batch_position: pending_wal.start_batch_position,
             pending_wal_end_batch_position: pending_wal.end_batch_position,
             pending_wal_batch_count: pending_wal.batch_count,
@@ -2497,7 +2522,12 @@ pub struct MemTableStats {
     pub estimated_size: usize,
     pub generation: u64,
     pub max_buffered_batch_position: Option<usize>,
-    pub max_flushed_batch_position: Option<usize>,
+    /// Writer-global count of WAL-durable batches. Exclusive: 0 means none.
+    /// Compare against `global_offset + batch_count` to see what this memtable
+    /// still owes the WAL.
+    pub durable_batch_count: usize,
+    /// Writer-global coordinate of this memtable's batch 0.
+    pub global_offset: usize,
     pub pending_wal_start_batch_position: Option<usize>,
     pub pending_wal_end_batch_position: Option<usize>,
     pub pending_wal_batch_count: usize,
@@ -2616,8 +2646,7 @@ impl WalFlushHandler {
         // BatchStore source, so the early-out simplifies to the watermark
         // comparison.
         if let WalFlushSource::BatchStore { batch_store, .. } = &source {
-            let max_flushed = batch_store.max_flushed_batch_position();
-            let flushed_up_to = max_flushed.map(|p| p + 1).unwrap_or(0);
+            let flushed_up_to = batch_store.local_end(self.wal_flusher.durable());
             let is_frozen_flush = if let Some(state_lock) = &self.memtable_state {
                 let state = state_lock.read().await;
                 !Arc::ptr_eq(batch_store, &state.memtable.batch_store())
@@ -2663,6 +2692,9 @@ impl WalFlushHandler {
 struct MemTableFlushHandler {
     state: Arc<RwLock<WriterState>>,
     flusher: Arc<MemTableFlusher>,
+    /// Source of the writer-global durability cursor, which the L0 flush asserts
+    /// covers the whole frozen memtable before it writes a generation.
+    wal_flusher: Arc<WalFlusher>,
     epoch: u64,
     /// Secondary index configs to rebuild on each flushed generation. When
     /// non-empty the handler flushes via [`MemTableFlusher::flush_with_indexes`]
@@ -2677,9 +2709,11 @@ struct MemTableFlushHandler {
 }
 
 impl MemTableFlushHandler {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         state: Arc<RwLock<WriterState>>,
         flusher: Arc<MemTableFlusher>,
+        wal_flusher: Arc<WalFlusher>,
         epoch: u64,
         index_configs: Vec<MemIndexConfig>,
         stats: SharedWriteStats,
@@ -2688,6 +2722,7 @@ impl MemTableFlushHandler {
         Self {
             state,
             flusher,
+            wal_flusher,
             epoch,
             index_configs,
             stats,
@@ -2799,9 +2834,15 @@ impl MemTableFlushHandler {
             // dataset open when there are no indexes to build. The indexed
             // path's future is boxed to keep this async block's nesting
             // under the type-layout recursion limit.
+            // Read the durability cursor *after* the WAL-append completion above,
+            // not before: the append that makes this memtable durable is the very
+            // thing we just waited on, so a cursor sampled earlier would still be
+            // short of it and trip the flush precondition.
+            let durable = self.wal_flusher.durable();
+
             if self.index_configs.is_empty() {
                 self.flusher
-                    .flush(&memtable, self.epoch, covered_wal_entry_position)
+                    .flush(&memtable, self.epoch, covered_wal_entry_position, durable)
                     .await
             } else {
                 Box::pin(self.flusher.flush_with_indexes(
@@ -2809,6 +2850,7 @@ impl MemTableFlushHandler {
                     self.epoch,
                     &self.index_configs,
                     covered_wal_entry_position,
+                    durable,
                 ))
                 .await
             }
@@ -5189,6 +5231,89 @@ mod tests {
         assert_eq!(all.num_rows(), 10);
 
         writer_b.close().await.unwrap();
+    }
+
+    /// The durability cursor is writer-global, so a put into a *post-rotation*
+    /// memtable must still wait for its own WAL append.
+    ///
+    /// Batch positions restart at 0 in every memtable, but the durability watch
+    /// channel spans the writer's whole life and is never reset. When the put
+    /// path targeted a memtable-local position, the first N puts into every
+    /// memtable after the first were already "satisfied" by the *previous*
+    /// memtable's N appends: they acked instantly, with no WAL append, and
+    /// `durable_write: true` silently degraded to non-durable. Worse, the next
+    /// append then sent a *smaller* value, walking the watermark backwards and
+    /// hanging any watcher still waiting on the old, higher one.
+    ///
+    /// The cursor is now a writer-global exclusive count and every target is
+    /// lifted through the store's `global_offset`, so it only ever moves forward
+    /// and a post-rotation put can only be acked by its own append.
+    #[tokio::test]
+    async fn test_durable_ack_after_rotation_requires_its_own_wal_append() {
+        use crate::dataset::mem_wal::wal::WalTailer;
+
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = schema_with_pk();
+        let shard_id = Uuid::new_v4();
+
+        // A two-batch memtable, so the third put forces a freeze + rotation.
+        let config = ShardWriterConfig {
+            max_memtable_batches: 2,
+            ..memtable_config_with_pk(shard_id)
+        };
+
+        let writer = ShardWriter::open(
+            store.clone(),
+            base_path.clone(),
+            base_uri,
+            config,
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        // Fill and rotate the first memtable.
+        for i in 0..3 {
+            writer
+                .put(vec![create_test_batch(&schema, i * 5, 5)])
+                .await
+                .unwrap();
+        }
+        let stats = writer.memtable_stats().await.unwrap();
+        assert!(
+            stats.global_offset > 0,
+            "expected a rotation; the active memtable is still the writer's first"
+        );
+
+        // Every batch acked so far must be genuinely durable, and the cursor must
+        // cover the active memtable's entire prefix rather than lagging inside it.
+        let stats = writer.memtable_stats().await.unwrap();
+        assert!(
+            stats.durable_batch_count >= stats.global_offset + stats.batch_count,
+            "durable_write acked a put the WAL never received: durable={} but the active \
+             memtable spans [{}, {})",
+            stats.durable_batch_count,
+            stats.global_offset,
+            stats.global_offset + stats.batch_count
+        );
+
+        // And the WAL really holds every row we acked (3 puts x 5 rows).
+        writer.close().await.unwrap();
+        let tailer = WalTailer::new(store, base_path, shard_id);
+        let first = tailer.first_position().await.unwrap();
+        let next = tailer.next_position().await.unwrap();
+        let mut wal_rows = 0;
+        for position in first..next {
+            if let Some(entry) = tailer.read_entry(position).await.unwrap() {
+                wal_rows += entry.batches.iter().map(|b| b.num_rows()).sum::<usize>();
+            }
+        }
+        assert_eq!(
+            wal_rows, 15,
+            "every acked row must be in the WAL; a post-rotation put that acked without an \
+             append would leave rows missing"
+        );
     }
 
     /// An index config that disagrees with the schema fails `open()` outright.

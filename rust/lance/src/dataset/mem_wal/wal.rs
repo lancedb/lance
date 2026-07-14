@@ -198,15 +198,10 @@ pub enum WalFlushSource {
 }
 
 impl WalFlushSource {
-    fn pending_count(&self) -> usize {
+    fn kind(&self) -> &'static str {
         match self {
-            Self::BatchStore { batch_store, .. } => batch_store.pending_wal_flush_count(),
-            Self::WalOnly { state } => state
-                .pending
-                .lock()
-                .ok()
-                .map(|p| p.batches.len())
-                .unwrap_or(0),
+            Self::BatchStore { .. } => "BatchStore",
+            Self::WalOnly { .. } => "WalOnly",
         }
     }
 }
@@ -232,7 +227,7 @@ pub struct TriggerWalFlush {
 impl std::fmt::Debug for TriggerWalFlush {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TriggerWalFlush")
-            .field("pending_batches", &self.source.pending_count())
+            .field("source", &self.source.kind())
             .field("end_batch_position", &self.end_batch_position)
             .finish()
     }
@@ -420,14 +415,31 @@ impl WalFlusher {
     ///
     /// Returns a `BatchDurableWatcher` that can be awaited for durability.
     /// The actual batch data is stored in the BatchStore.
-    pub fn track_batch(&self, batch_position: usize) -> BatchDurableWatcher {
-        // Return a watcher that waits for this batch to become durable
-        // batch_position is 0-indexed, so we wait for watermark > batch_position (i.e., >= batch_position + 1)
+    pub fn track_batch(&self, target_durable_count: usize) -> BatchDurableWatcher {
+        // `target_durable_count` is writer-global and exclusive: "N batches into
+        // this writer's batch sequence are durable". It must NOT be a memtable-
+        // local batch position — positions restart at 0 in every memtable, while
+        // this channel spans the writer's whole life, so a local target would be
+        // satisfied by a *previous* memtable's appends and ack a write that was
+        // never persisted. Callers globalize via `BatchStore::global_offset`.
         BatchDurableWatcher::new(
             self.durable_watermark_rx.clone(),
-            batch_position + 1,
+            target_durable_count,
             Arc::clone(&self.terminal_error),
         )
+    }
+
+    /// The writer-global WAL durability cursor: how many batches of this
+    /// writer's batch sequence are durable. Exclusive count; 0 means none.
+    pub fn durable(&self) -> usize {
+        *self.durable_watermark_rx.borrow()
+    }
+
+    /// Advance the durability cursor and wake waiters. Monotonic: a stale or
+    /// out-of-order completion can never walk the cursor backwards.
+    pub(crate) fn advance_durable(&self, global_count: usize) {
+        self.durable_watermark_tx
+            .send_modify(|current| *current = (*current).max(global_count));
     }
 
     /// Latch a terminal flush failure and wake every durability waiter (the
@@ -552,12 +564,10 @@ impl WalFlusher {
         indexes: Option<Arc<IndexStore>>,
         end_batch_position: usize,
     ) -> Result<WalFlushResult> {
-        // Get current flush position from per-memtable watermark (inclusive)
-        // start_batch_position is the first batch to flush
-        let start_batch_position = batch_store
-            .max_flushed_batch_position()
-            .map(|w| w + 1)
-            .unwrap_or(0);
+        // Where this store's un-appended suffix begins, derived from the
+        // writer-global durability cursor. `local_end` clamps a cursor that
+        // predates this memtable to 0 and one past its end to `committed_len`.
+        let start_batch_position = batch_store.local_end(self.durable());
 
         // If we've already flushed past this end, nothing to do
         if start_batch_position >= end_batch_position {
@@ -614,11 +624,12 @@ impl WalFlusher {
         let (append_result, wal_io_duration) = append_result?;
         let (index_update_duration, index_update_duration_breakdown) = index_result?;
 
-        // Update per-memtable watermark (inclusive: last batch ID that was flushed)
-        batch_store.set_max_flushed_batch_position(end_batch_position - 1);
-
-        // Notify durability waiters (global channel)
-        let _ = self.durable_watermark_tx.send(end_batch_position);
+        // Advance the writer-global durability cursor and wake waiters. The
+        // range we just appended was `[start, end)` *local to this store*, so it
+        // must be lifted into the writer's coordinate space before it is
+        // published — otherwise a fresh memtable's small local end would be
+        // compared against a channel carrying a previous memtable's larger one.
+        self.advance_durable(batch_store.global_offset() + end_batch_position);
         // Signal WAL flush completion for backpressure waiters
         self.signal_wal_flush_complete();
 
@@ -1576,7 +1587,7 @@ mod tests {
         let buffer = build_test_flusher(store, &base_path, shard_id, 1);
 
         // Track a batch
-        let watcher = buffer.track_batch(0);
+        let watcher = buffer.track_batch(1);
 
         // Watcher should not be durable yet
         assert!(!watcher.is_durable());
@@ -1595,7 +1606,7 @@ mod tests {
         let batch_store = Arc::new(BatchStore::with_capacity(10));
         batch_store.append(create_test_batch(&schema, 10)).unwrap();
 
-        let mut watcher = flusher.track_batch(0);
+        let mut watcher = flusher.track_batch(1);
 
         // wait() must NOT resolve before the flush happens
         let result =
@@ -1628,13 +1639,13 @@ mod tests {
         batch_store.append(batch2).unwrap();
 
         // Track batch IDs in WAL flusher
-        let mut watcher1 = buffer.track_batch(0);
-        let mut watcher2 = buffer.track_batch(1);
+        let mut watcher1 = buffer.track_batch(1);
+        let mut watcher2 = buffer.track_batch(2);
 
         // Verify initial state
         assert!(!watcher1.is_durable());
         assert!(!watcher2.is_durable());
-        assert!(batch_store.max_flushed_batch_position().is_none());
+        assert_eq!(buffer.durable(), 0);
 
         // Flush all pending batches
         let source = batch_store_source(&batch_store);
@@ -1646,8 +1657,8 @@ mod tests {
         assert_eq!(entry.position, FIRST_WAL_ENTRY_POSITION);
         assert_eq!(entry.writer_epoch, 1);
         assert_eq!(entry.num_batches, 2);
-        // After flushing 2 batches (positions 0 and 1), max flushed position is 1 (inclusive)
-        assert_eq!(batch_store.max_flushed_batch_position(), Some(1));
+        // Two batches appended => the writer-global durable count is 2 (exclusive).
+        assert_eq!(buffer.durable(), 2);
 
         // Watchers should be notified
         watcher1.wait().await.unwrap();
@@ -1684,7 +1695,7 @@ mod tests {
         // Cursor must advance to the highest flushed batch position (2),
         // making all three batches visible to scanners.
         assert_eq!(indexes.max_visible_batch_position(), 2);
-        assert_eq!(batch_store.max_flushed_batch_position(), Some(2));
+        assert_eq!(flusher.durable(), 3);
     }
 
     // Regression guard for the indexed path: with at least one BTree index
@@ -1710,7 +1721,7 @@ mod tests {
         flusher.flush(&source, batch_store.len()).await.unwrap();
 
         assert_eq!(indexes.max_visible_batch_position(), 2);
-        assert_eq!(batch_store.max_flushed_batch_position(), Some(2));
+        assert_eq!(flusher.durable(), 3);
     }
 
     #[tokio::test]
@@ -1726,8 +1737,8 @@ mod tests {
         batch_store.append(create_test_batch(&schema, 5)).unwrap();
 
         // Track batch IDs and flush all pending batches
-        let _watcher1 = buffer.track_batch(0);
-        let _watcher2 = buffer.track_batch(1);
+        let _watcher1 = buffer.track_batch(1);
+        let _watcher2 = buffer.track_batch(2);
         let source = batch_store_source(&batch_store);
         let result = buffer.flush(&source, batch_store.len()).await.unwrap();
         let entry = result.entry.unwrap();
@@ -1905,7 +1916,7 @@ mod tests {
         // A durable put on the predecessor: stage a batch and track it.
         let batch_store = Arc::new(BatchStore::with_capacity(10));
         batch_store.append(create_test_batch(&schema, 1)).unwrap();
-        let mut watcher = flusher.track_batch(0);
+        let mut watcher = flusher.track_batch(1);
 
         // Flushing collides with the sentinel and fences. Both the flush result
         // and the watcher must report the fence — and the watcher must resolve
@@ -2094,7 +2105,7 @@ mod tests {
         let schema = create_test_schema();
         let batch_store = Arc::new(BatchStore::with_capacity(10));
         batch_store.append(create_test_batch(&schema, 1)).unwrap();
-        let mut watcher = flusher.track_batch(0);
+        let mut watcher = flusher.track_batch(1);
 
         let source = batch_store_source(&batch_store);
         let flush_err = flusher.flush(&source, batch_store.len()).await.unwrap_err();
