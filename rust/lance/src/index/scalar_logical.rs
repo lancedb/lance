@@ -23,6 +23,21 @@ use crate::dataset::Dataset;
 use crate::index::scalar::fetch_index_details;
 use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
 
+/// Query-time view that exposes several physical scalar index segments as a single [`ScalarIndex`].
+///
+/// A named scalar index can be built incrementally, producing multiple physical segments that
+/// each cover a disjoint set of fragments. When such an index is opened, the loader bundles
+/// the segments into a `LogicalScalarIndex` so the scanner can treat them as one index: queries
+/// are fanned out to every segment in parallel and the row-address results are unioned together.
+///
+/// All segments must share the same [`IndexType`]; mixing types is rejected at construction.
+/// Per-segment [`SearchResult`] precision is preserved when combining: a union of `Exact`
+/// results stays `Exact`, a union containing `AtMost` results yields `AtMost`, and a union
+/// containing `AtLeast` results yields `AtLeast`. Combining `AtMost` and `AtLeast` segments in
+/// the same query is not supported.
+///
+/// This is a read-only wrapper. [`ScalarIndex::remap`] and [`ScalarIndex::update`] both return
+/// an error — callers must rebuild the index to consolidate segments before mutating it.
 #[derive(Debug)]
 pub struct LogicalScalarIndex {
     name: String,
@@ -280,6 +295,11 @@ fn union_fragment_bitmaps(indices: &[IndexMetadata], index_name: &str) -> Result
     Ok(combined)
 }
 
+/// Return the union of fragment bitmaps across every usable segment of a named scalar index.
+///
+/// Only segments whose fragment bitmap intersects the dataset's current fragment set are
+/// considered. Returns `Ok(None)` when no such segment exists, `Ok(Some(bitmap))` otherwise.
+/// Errors if the segments disagree on their underlying index type.
 pub async fn scalar_index_fragment_bitmap(
     dataset: &Dataset,
     column: &str,
@@ -296,6 +316,13 @@ pub async fn scalar_index_fragment_bitmap(
     }
 }
 
+/// Open a named scalar index, transparently bundling multiple segments when present.
+///
+/// Loads every segment registered under `index_name` whose fragment bitmap intersects the
+/// dataset. If exactly one usable segment exists it is returned directly; if multiple exist
+/// they are wrapped in a [`LogicalScalarIndex`] so the caller sees a single [`ScalarIndex`].
+/// Errors if no usable segment exists (the scanner planned a query against an index that is
+/// not present) or if the segments mix incompatible types.
 pub async fn open_named_scalar_index(
     dataset: &Dataset,
     column: &str,
