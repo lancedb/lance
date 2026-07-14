@@ -2113,6 +2113,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
             .map(
                 |Reverse((doc, freqs, doc_length, posting_doc_id))| DocCandidate {
                     addr: to_addr(doc.row_id),
+                    doc_index: Vec::new(),
                     posting_doc_id,
                     freqs,
                     doc_length,
