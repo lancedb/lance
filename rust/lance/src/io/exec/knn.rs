@@ -1119,14 +1119,16 @@ pub fn new_knn_exec(
         query.clone(),
     )?;
 
-    let sub_index = ANNIvfSubIndexExec::try_new_with_overlay(
+    let mut sub_index = ANNIvfSubIndexExec::try_new(
         Arc::new(ivf_node),
         dataset,
         indices.to_vec(),
         query.clone(),
         prefilter_source,
-        overlay_block,
     )?;
+    if let Some(overlay_block) = overlay_block {
+        sub_index = sub_index.with_overlay_block(overlay_block);
+    }
 
     Ok(Arc::new(sub_index))
 }
@@ -1404,17 +1406,6 @@ impl ANNIvfSubIndexExec {
         query: Query,
         prefilter_source: PreFilterSource,
     ) -> Result<Self> {
-        Self::try_new_with_overlay(input, dataset, indices, query, prefilter_source, None)
-    }
-
-    pub fn try_new_with_overlay(
-        input: Arc<dyn ExecutionPlan>,
-        dataset: Arc<Dataset>,
-        indices: Vec<IndexMetadata>,
-        query: Query,
-        prefilter_source: PreFilterSource,
-        overlay_block: Option<RowAddrMask>,
-    ) -> Result<Self> {
         if input.schema().field_with_name(PART_ID_COLUMN).is_err() {
             return Err(Error::index(format!(
                 "ANNSubIndexExec node: input schema does not have \"{}\" column",
@@ -1433,10 +1424,17 @@ impl ANNIvfSubIndexExec {
             indices,
             query,
             prefilter_source,
-            overlay_block,
+            overlay_block: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         })
+    }
+
+    /// Block stale row addresses from index results — rows whose index entries may be stale due to
+    /// a newer data overlay. Applied at execution time via [`DatasetPreFilter::with_overlay_block`].
+    pub fn with_overlay_block(mut self, overlay_block: RowAddrMask) -> Self {
+        self.overlay_block = Some(overlay_block);
+        self
     }
 
     /// Returns a reference to the vector query.

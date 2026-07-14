@@ -106,8 +106,10 @@ impl EvaluatedIndex {
     /// the blocked rows are re-evaluated against their current (overlay-merged) values on a
     /// separate targeted take path built by the scanner.
     fn without_rows(mut self, block: &RowAddrMask) -> Self {
-        // `overlay_block` is always a block list; an empty one leaves the result unchanged.
-        if let Some(block_list) = block.block_list() {
+        // `overlay_block` is always constructed as a block list (see `Scanner::stale_rows_block_mask`).
+        let block_list = block.block_list();
+        debug_assert!(block_list.is_some(), "overlay_block must be a block list");
+        if let Some(block_list) = block_list {
             self.index_result.upper =
                 std::mem::take(&mut self.index_result.upper).also_block(block_list.clone());
             self.index_result.lower =

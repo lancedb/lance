@@ -86,28 +86,42 @@ pub fn overlay_exclusion_offsets(
 ///
 /// `overlaid_frags` holds only the fragments that actually carry overlays (rare), so the loop is
 /// `O(overlaid_frags)` rather than `O(fragments the segment covers)`.
+// Stale row offsets contributed by one fragment's overlays for a given index version.
+// Applies a cheap version gate first: if every overlay predates the segment it is already
+// incorporated by the index, so there is nothing stale and the field/bitmap work is skipped.
+fn stale_offsets_for_fragment(
+    fragment: &Fragment,
+    fields: &[i32],
+    index_version: u64,
+) -> Result<RoaringBitmap> {
+    if fragment
+        .overlays
+        .iter()
+        .all(|o| o.committed_version <= index_version)
+    {
+        return Ok(RoaringBitmap::new());
+    }
+    overlay_exclusion_offsets(&fragment.overlays, fields, index_version)
+}
+
+// A missing `fragment_bitmap` means the index predates fragment-bitmap tracking; treat it as
+// covering every fragment (matching `DatasetPreFilter::new`) so overlay-stale rows can't slip
+// through unmasked. Only skip fragments explicitly absent from a present bitmap.
+fn covers_fragment(coverage: Option<&RoaringBitmap>, frag_id: u32) -> bool {
+    coverage.is_none_or(|c| c.contains(frag_id))
+}
+
 pub fn collect_stale_overlay_frags(
     segment: &IndexMetadata,
     overlaid_frags: &HashMap<u32, &Fragment>,
     stale: &mut RoaringBitmap,
 ) -> Result<()> {
-    let Some(coverage) = segment.fragment_bitmap.as_ref() else {
-        return Ok(());
-    };
+    let coverage = segment.fragment_bitmap.as_ref();
     for (&frag_id, fragment) in overlaid_frags {
-        if stale.contains(frag_id) || !coverage.contains(frag_id) {
+        if stale.contains(frag_id) || !covers_fragment(coverage, frag_id) {
             continue;
         }
-        // Cheap version gate: skip the field/bitmap work if every overlay on this fragment
-        // predates the segment (already incorporated by the index).
-        if fragment
-            .overlays
-            .iter()
-            .all(|o| o.committed_version <= segment.dataset_version)
-        {
-            continue;
-        }
-        if !overlay_exclusion_offsets(&fragment.overlays, &segment.fields, segment.dataset_version)?
+        if !stale_offsets_for_fragment(fragment, &segment.fields, segment.dataset_version)?
             .is_empty()
         {
             stale.insert(frag_id);
@@ -128,25 +142,13 @@ pub fn collect_overlay_stale_rows_for_segment(
     overlaid_frags: &HashMap<u32, &Fragment>,
     stale: &mut HashMap<u32, RoaringBitmap>,
 ) -> Result<()> {
-    let Some(coverage) = segment.fragment_bitmap.as_ref() else {
-        return Ok(());
-    };
+    let coverage = segment.fragment_bitmap.as_ref();
     for (&frag_id, fragment) in overlaid_frags {
-        if !coverage.contains(frag_id) {
+        if !covers_fragment(coverage, frag_id) {
             continue;
         }
-        if fragment
-            .overlays
-            .iter()
-            .all(|o| o.committed_version <= segment.dataset_version)
-        {
-            continue;
-        }
-        let excluded = overlay_exclusion_offsets(
-            &fragment.overlays,
-            &segment.fields,
-            segment.dataset_version,
-        )?;
+        let excluded =
+            stale_offsets_for_fragment(fragment, &segment.fields, segment.dataset_version)?;
         if !excluded.is_empty() {
             *stale.entry(frag_id).or_default() |= &excluded;
         }
@@ -864,6 +866,7 @@ async fn fetch_overlay_values(
 mod tests {
     use super::*;
     use arrow_array::{Int32Array, StringArray, UInt32Array};
+    use lance_table::format::overlay::OverlayCoverage;
     use std::sync::Arc;
 
     fn i32_array(values: impl IntoIterator<Item = Option<i32>>) -> ArrayRef {
@@ -1173,8 +1176,6 @@ mod tests {
         offsets: impl IntoIterator<Item = u32>,
         version: u64,
     ) -> lance_table::format::overlay::DataOverlayFile {
-        use lance_table::format::DataFile;
-        use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
         DataOverlayFile {
             data_file: DataFile::new_legacy_from_fields("o.lance", field_ids, None),
             coverage: OverlayCoverage::dense(bitmap(offsets)),
@@ -1219,8 +1220,6 @@ mod tests {
 
     #[test]
     fn test_exclusion_offsets_sparse_per_field() {
-        use lance_table::format::DataFile;
-        use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
         // Sparse overlay: field 2 covers {2,3}, field 4 covers {1}.
         let overlay = DataOverlayFile {
             data_file: DataFile::new_legacy_from_fields("o.lance", vec![2, 4], None),

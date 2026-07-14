@@ -18,6 +18,7 @@ use lance_io::utils::CachedFileSize;
 use lance_table::format::DataFile;
 use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
 use roaring::RoaringBitmap;
+use rstest::rstest;
 
 use lance_file::writer::{FileWriter, FileWriterOptions};
 
@@ -30,6 +31,13 @@ use crate::index::DatasetIndexExt;
 /// six rows per file (fragments 0 and 1). In-memory store so overlay files can be written
 /// with a store-relative `data/<name>.lance` path and committed against the dataset.
 async fn create_base_dataset() -> Dataset {
+    create_base_dataset_with(false).await
+}
+
+/// Like [`create_base_dataset`] but lets a test enable stable row ids, under which `_rowid` is a
+/// logical id resolved through a separate mapping (not a physical row address). This exercises the
+/// address-based stale-row take path.
+async fn create_base_dataset_with(stable_row_ids: bool) -> Dataset {
     let schema = Arc::new(ArrowSchema::new(vec![
         ArrowField::new("id", DataType::Int32, true),
         ArrowField::new("age", DataType::Int32, true),
@@ -45,6 +53,7 @@ async fn create_base_dataset() -> Dataset {
     let write_params = WriteParams {
         max_rows_per_file: 6,
         max_rows_per_group: 6,
+        enable_stable_row_ids: stable_row_ids,
         ..Default::default()
     };
     let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
@@ -179,9 +188,13 @@ fn fsl(rows: Vec<Vec<f32>>, dim: i32) -> ArrayRef {
 /// A newer overlay on the indexed field drops stale index hits (the old value no longer
 /// matches) and surfaces new matches (the new value is found even though the index never
 /// saw it). Mirrors the spec's Bob 25 -> 26 worked example.
+///
+/// Parametrized over `stable_row_ids` to cover the address-based stale-Take path under both
+/// row-id schemes.
+#[rstest]
 #[tokio::test]
-async fn test_overlay_stale_drop_and_new_match() {
-    let mut dataset = create_base_dataset().await;
+async fn test_overlay_stale_drop_and_new_match(#[values(false, true)] stable_row_ids: bool) {
+    let mut dataset = create_base_dataset_with(stable_row_ids).await;
     build_age_index(&mut dataset).await;
 
     // Fragment 0, offset 1 is id=1, age=10. The overlay (committed after the index)
@@ -212,9 +225,13 @@ async fn test_overlay_stale_drop_and_new_match() {
 /// Setup: fragment 0 has id=5 → age=50 (not stale). Overlay id=1 → age=50 (stale).
 /// After the overlay two rows in fragment 0 have age=50. The row-level optimization must
 /// return both: id=5 from the index and id=1 from the stale-Take path.
+///
+/// Parametrized over `stable_row_ids`: with stable row ids enabled the stale-Take path must
+/// identify rows by physical address, not `_rowid`, or it would take the wrong rows.
+#[rstest]
 #[tokio::test]
-async fn test_btree_overlay_row_level_precision() {
-    let mut dataset = create_base_dataset().await;
+async fn test_btree_overlay_row_level_precision(#[values(false, true)] stable_row_ids: bool) {
+    let mut dataset = create_base_dataset_with(stable_row_ids).await;
     build_age_index(&mut dataset).await;
 
     // Fragment 0: ids 0-5, ages 0,10,20,30,40,50. Overlay offset 1 (id=1): age 10→50.
@@ -315,9 +332,14 @@ async fn test_overlay_null_override() {
 
 /// Overlays on a non-first fragment are masked correctly, and a query spanning both
 /// fragments returns the right rows.
+///
+/// Parametrized over `stable_row_ids`, and crucially overlays fragment 1 (ids 6..12), where a
+/// physical address diverges from the stable row id — so this exercises the address-vs-row-id
+/// distinction that a fragment-0 overlay cannot.
+#[rstest]
 #[tokio::test]
-async fn test_overlay_multi_fragment() {
-    let mut dataset = create_base_dataset().await;
+async fn test_overlay_multi_fragment(#[values(false, true)] stable_row_ids: bool) {
+    let mut dataset = create_base_dataset_with(stable_row_ids).await;
     build_age_index(&mut dataset).await;
 
     // Fragment 1 holds ids 6..12 (ages 60..110). Offset 2 within fragment 1 is id=8,
@@ -343,8 +365,13 @@ async fn test_overlay_multi_fragment() {
 /// A vector index masks overlays: a row whose vector was moved (by a newer overlay) away
 /// from the query is dropped from results, and a row moved *onto* the query is found by
 /// re-scoring its current vector on the flat path — even though the index never saw it.
+///
+/// Parametrized over `stable_row_ids`, overlaying fragment 1 (ids 32..64) where a physical address
+/// diverges from the stable row id, so both the ANN prefilter block and the flat re-score take must
+/// operate in the row-id domain.
+#[rstest]
 #[tokio::test]
-async fn test_vector_index_rescore_on_overlay() {
+async fn test_vector_index_rescore_on_overlay(#[values(false, true)] stable_row_ids: bool) {
     use arrow_array::cast::AsArray;
     use futures::TryStreamExt;
     use lance_index::IndexType;
@@ -392,6 +419,7 @@ async fn test_vector_index_rescore_on_overlay() {
     let write_params = WriteParams {
         max_rows_per_file: 32,
         max_rows_per_group: 32,
+        enable_stable_row_ids: stable_row_ids,
         ..Default::default()
     };
     let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());

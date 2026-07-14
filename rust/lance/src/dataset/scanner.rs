@@ -12,7 +12,7 @@ use std::task::{Context, Poll};
 
 use crate::index::DatasetIndexExt;
 use arrow::array::AsArray;
-use arrow_array::{Array, Float32Array, Int64Array, RecordBatch, UInt64Array};
+use arrow_array::{Array, Float32Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef, SortOptions};
 use arrow_select::concat::concat_batches;
 use async_recursion::async_recursion;
@@ -101,7 +101,9 @@ use crate::io::exec::fts::{
     BoostQueryExec, FlatMatchFilterExec, FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec,
 };
 use crate::io::exec::knn::MultivectorScoringExec;
-use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
+use crate::io::exec::scalar_index::{
+    MaterializeIndexExec, ScalarIndexExec, translate_addr_treemap_to_row_ids,
+};
 use crate::io::exec::{
     AddRowAddrExec, FilterPlan as ExprFilterPlan, KNNVectorDistanceExec, LancePushdownScanExec,
     LanceScanExec, Planner, PreFilterSource, ScanConfig, TakeExec,
@@ -2967,7 +2969,7 @@ impl Scanner {
             overlay_stale_rows = self
                 .overlay_stale_index_rows(index_query, &candidate_frags)
                 .await?;
-            if let Some(block) = Self::stale_rows_block_mask(&overlay_stale_rows) {
+            if let Some(block) = self.stale_rows_block_mask(&overlay_stale_rows).await? {
                 read_options = read_options.with_overlay_block(block);
             }
         }
@@ -2994,12 +2996,13 @@ impl Scanner {
         // Stale-Take path: take the stale rows' current (overlay-merged) values and re-apply the
         // full filter, then union with the indexed read. These rows were blocked from the index
         // result above, so this is the only path that can surface them.
-        let filter = filter_plan.full_expr.as_ref().unwrap();
+        let filter = filter_plan.full_expr.as_ref().expect_ok()?;
         let filter_cols = Planner::column_names_in_expr(filter);
         let take_projection = user_projection.union_columns(filter_cols, OnMissing::Error)?;
 
-        let stale_id_plan = Self::stale_rows_row_id_exec(&overlay_stale_rows)?;
-        let stale_node = self.take(stale_id_plan, take_projection)?;
+        let stale_node = self
+            .stale_rows_take(&overlay_stale_rows, take_projection)
+            .await?;
         let planner = Planner::new(stale_node.schema());
         let optimized_filter = planner.optimize_expr(filter.clone())?;
         let filtered = Arc::new(LanceFilterExec::try_new(optimized_filter, stale_node)?);
@@ -3959,7 +3962,7 @@ impl Scanner {
             // fragment, so sparse overlays incur near-zero overhead.
             let stale_rows = self.overlay_stale_vector_rows(&index_segments)?;
             // Build a prefilter block mask for stale rows (empty = no-op fast path).
-            let overlay_block = Self::stale_rows_block_mask(&stale_rows);
+            let overlay_block = self.stale_rows_block_mask(&stale_rows).await?;
 
             let ann_node = match vector_type {
                 DataType::FixedSizeList(_, _) => {
@@ -4161,8 +4164,7 @@ impl Scanner {
             let vector_projection = self
                 .dataset
                 .empty_projection()
-                .union_column(&q.column, OnMissing::Error)
-                .unwrap();
+                .union_column(&q.column, OnMissing::Error)?;
             knn_node = self.take(knn_node, vector_projection)?;
         }
 
@@ -4178,7 +4180,7 @@ impl Scanner {
 
         // Flat KNN for unindexed (new-data) fragments.
         if has_fallback {
-            let vector_scan_projection = Arc::new(self.dataset.schema().project(&columns).unwrap());
+            let vector_scan_projection = Arc::new(self.dataset.schema().project(&columns)?);
             // Note: we could try and use the scalar indices here to reduce the scope of this scan
             // but the most common case is that fragments newer than the vector index are also
             // newer than the scalar indices.
@@ -4206,18 +4208,18 @@ impl Scanner {
         // Only specific row addresses need re-scoring, not the whole fragment, so sparse overlays
         // incur near-zero overhead.
         if has_stale {
-            let stale_id_plan = Self::stale_rows_row_id_exec(stale_rows)?;
-
-            // Fetch vector + filter columns for the stale rows.
+            // Fetch vector + filter columns for the stale rows. `flat_knn` sorts by row id, so the
+            // take must carry it (the fallback scan above gets it via `scan_fragments`).
             let mut take_proj = self
                 .dataset
                 .empty_projection()
+                .with_row_id()
                 .union_column(&q.column, OnMissing::Error)?;
             if let Some(expr) = filter_plan.full_expr.as_ref() {
                 let filter_columns = Planner::column_names_in_expr(expr);
                 take_proj = take_proj.union_columns(filter_columns, OnMissing::Error)?;
             }
-            let mut stale_node = self.take(stale_id_plan, take_proj)?;
+            let mut stale_node = self.stale_rows_take(stale_rows, take_proj).await?;
             if let Some(expr) = filter_plan.full_expr.as_ref() {
                 stale_node = Arc::new(LanceFilterExec::try_new(expr.clone(), stale_node)?);
             }
@@ -4433,51 +4435,84 @@ impl Scanner {
                     flat_frag_ids |= bm;
                     // exclude this segment from the indexed path
                 }
-                _ => fresh_segments.push(seg),
+                Some(_) => fresh_segments.push(seg),
+                None => {
+                    // Coverage unknown (legacy segment without a fragment bitmap): we can neither
+                    // trust it to exclude overlay-stale rows nor tell which fragments it indexes.
+                    // Exclude it from the indexed path and route every target fragment to flat.
+                    flat_frag_ids.extend(target_fragments.iter().map(|f| f.id as u32));
+                }
             }
         }
 
         Ok((flat_frag_ids, Some(fresh_segments)))
     }
 
-    /// Build a block-list mask over stale row addresses, or `None` when there are none.
+    /// Build a block-list mask over stale rows, or `None` when there are none.
     ///
     /// The mask removes these rows from an index result so the index never emits them; they
     /// are re-evaluated against their current (overlay-merged) values on a targeted take path
-    /// (see [`Self::stale_rows_row_id_exec`]).
-    fn stale_rows_block_mask(stale_rows: &HashMap<u32, RoaringBitmap>) -> Option<RowAddrMask> {
+    /// (see [`Self::stale_rows_take`]).
+    ///
+    /// Index results are in the row-id domain (see `ScalarQuery::evaluate_nullable`), and a
+    /// physical row address equals its row id only when the dataset does not use stable row ids.
+    /// Under stable row ids the stale addresses are translated to their row ids so the block
+    /// lines up with the index results it is combined with.
+    async fn stale_rows_block_mask(
+        &self,
+        stale_rows: &HashMap<u32, RoaringBitmap>,
+    ) -> Result<Option<RowAddrMask>> {
         if stale_rows.is_empty() {
-            return None;
+            return Ok(None);
         }
         let mut tree_map = RowAddrTreeMap::new();
         for (&frag_id, offsets) in stale_rows {
             tree_map.insert_bitmap(frag_id, offsets.clone());
         }
-        Some(RowAddrMask::from_block(tree_map))
+        if self.dataset.manifest.uses_stable_row_ids() {
+            tree_map = translate_addr_treemap_to_row_ids(&self.dataset, &tree_map).await?;
+        }
+        Ok(Some(RowAddrMask::from_block(tree_map)))
     }
 
-    /// A `OneShotExec` emitting a single `ROW_ID` column of the stale row addresses — the input
-    /// to a targeted take that re-evaluates only those rows, rather than their whole fragments.
-    fn stale_rows_row_id_exec(
+    /// Take the stale rows by physical address, projecting `projection`, to re-evaluate only
+    /// those rows (rather than their whole fragments) against their current overlay-merged values.
+    ///
+    /// The rows are identified by an address allow list routed through `FilteredReadExec`, not a
+    /// `_rowid` column: `_rowid` and row address only coincide when the dataset does not use stable
+    /// row ids. For stable-row-id datasets `_rowid` is a logical id resolved through a separate
+    /// mapping, so feeding raw addresses under that name would take the wrong rows.
+    async fn stale_rows_take(
+        &self,
         stale_rows: &HashMap<u32, RoaringBitmap>,
+        projection: Projection,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let stale_addrs: Vec<u64> = stale_rows
-            .iter()
-            .flat_map(|(&frag_id, offsets)| {
-                offsets
-                    .iter()
-                    .map(move |offset| u64::from(RowAddress::new_from_parts(frag_id, offset)))
-            })
-            .collect();
-        let batch = RecordBatch::try_new(
-            Arc::new(ArrowSchema::new(vec![ArrowField::new(
-                ROW_ID,
-                DataType::UInt64,
-                true,
-            )])),
-            vec![Arc::new(UInt64Array::from(stale_addrs))],
-        )?;
-        Ok(Arc::new(OneShotExec::from_batch(batch)))
+        let mut addrs = RowAddrTreeMap::new();
+        for (&frag_id, offsets) in stale_rows {
+            addrs.insert_bitmap(frag_id, offsets.clone());
+        }
+        // The take input is an index result (row-id domain). A physical address equals its row id
+        // only without stable row ids; under stable row ids translate so the take reads the right
+        // rows (see [`Self::stale_rows_block_mask`]).
+        let take_id_map = if self.dataset.manifest.uses_stable_row_ids() {
+            translate_addr_treemap_to_row_ids(&self.dataset, &addrs).await?
+        } else {
+            addrs
+        };
+        let take_ids: Vec<u64> = take_id_map
+            .row_addrs()
+            .map(|it| it.map(u64::from).collect())
+            .unwrap_or_default();
+        let index_input = self.u64s_as_take_input(take_ids)?;
+        let mut read_options = FilteredReadOptions::new(projection);
+        if let Some(fragments) = self.fragments.as_ref() {
+            read_options = read_options.with_fragments(Arc::new(fragments.clone()));
+        }
+        Ok(Arc::new(FilteredReadExec::try_new(
+            self.dataset.clone(),
+            read_options,
+            Some(index_input),
+        )?))
     }
 
     // First perform a lookup in a scalar index for ids and then perform a take on the
@@ -4512,7 +4547,7 @@ impl Scanner {
             index_expr.clone(),
             Arc::new(relevant_frags),
         );
-        let mat_exec = match Self::stale_rows_block_mask(&stale_rows) {
+        let mat_exec = match self.stale_rows_block_mask(&stale_rows).await? {
             Some(block) => mat_exec.with_overlay_block(block),
             None => mat_exec,
         };
@@ -4566,7 +4601,7 @@ impl Scanner {
         // need the user's projection extended with any filter columns. Compute it once.
         let fallback_projection: Option<Projection> =
             if !missing_frags.is_empty() || !stale_rows.is_empty() {
-                let filter = filter_plan.full_expr.as_ref().unwrap();
+                let filter = filter_plan.full_expr.as_ref().expect_ok()?;
                 let filter_cols = Planner::column_names_in_expr(filter);
                 Some(
                     projection
@@ -4595,8 +4630,8 @@ impl Scanner {
             // If there were no extra columns then we still need the project
             // because Materialize -> Take puts the row id at the left and
             // Scan puts the row id at the right
-            let scan_projection = fallback_projection.clone().unwrap();
-            let filter = filter_plan.full_expr.as_ref().unwrap();
+            let scan_projection = fallback_projection.clone().expect_ok()?;
+            let filter = filter_plan.full_expr.as_ref().expect_ok()?;
             let scan_schema = Arc::new(scan_projection.to_bare_schema());
             let scan_arrow_schema = Arc::new(scan_schema.as_ref().into());
             let planner = Planner::new(scan_arrow_schema);
@@ -4632,11 +4667,10 @@ impl Scanner {
         let stale_take_path: Option<Arc<dyn ExecutionPlan>> = if stale_rows.is_empty() {
             None
         } else {
-            let filter = filter_plan.full_expr.as_ref().unwrap();
-            let take_projection = fallback_projection.unwrap();
+            let filter = filter_plan.full_expr.as_ref().expect_ok()?;
+            let take_projection = fallback_projection.expect_ok()?;
 
-            let stale_id_plan = Self::stale_rows_row_id_exec(&stale_rows)?;
-            let stale_node = self.take(stale_id_plan, take_projection)?;
+            let stale_node = self.stale_rows_take(&stale_rows, take_projection).await?;
 
             let planner = Planner::new(stale_node.schema());
             let optimized_filter = planner.optimize_expr(filter.clone())?;
@@ -5242,11 +5276,14 @@ impl Scanner {
         // are not in the fragments we are scanning.
         if filter_plan.is_exact_index_search() && self.fragments.is_none() {
             let index_query = filter_plan.index_query.as_ref().expect_ok()?;
-            let (_, missing_frags, _) = self
+            let (_, missing_frags, stale_rows) = self
                 .partition_frags_by_coverage(index_query, fragments.clone())
                 .await?;
 
-            if missing_frags.is_empty() || self.fast_search {
+            // Overlay-stale rows must never reach the direct ScalarIndexExec path: it would hand
+            // ANN/FTS a selection vector containing rows whose indexed values are now stale. When
+            // any exist, fall through to the filtered-read prefilter, which masks them.
+            if stale_rows.is_empty() && (missing_frags.is_empty() || self.fast_search) {
                 log::trace!("prefilter entirely satisfied by exact index search");
                 let result_format = self.index_expr_result_format();
                 // We can only avoid materializing the index for a prefilter if:

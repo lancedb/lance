@@ -113,7 +113,7 @@ async fn translate_addr_set_to_row_ids(
 /// `physical offset -> stable id` mapping. Addresses that point at deleted rows
 /// have no live counterpart and are dropped, which is correct: those rows are
 /// not part of the answer.
-async fn translate_addr_treemap_to_row_ids(
+pub(crate) async fn translate_addr_treemap_to_row_ids(
     dataset: &Dataset,
     addrs: &RowAddrTreeMap,
 ) -> Result<RowAddrTreeMap> {
