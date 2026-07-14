@@ -1714,6 +1714,7 @@ class ProtocolReportTests(unittest.TestCase):
             if record["operation"] == "default_compaction"
             and record["format"] == "v23_logical"
         )
+        candidate["index_storage_bytes_before"] = 99
         candidate["io_by_path"]["index"]["delete_requests"] = 1
         candidate["delete_requests"] += 1
         failures: list[str] = []
@@ -1735,7 +1736,7 @@ class ProtocolReportTests(unittest.TestCase):
         for record in records:
             if record["operation"] != "default_compaction":
                 continue
-            record["index_storage_bytes_before"] = 99
+            record["index_storage_bytes_before"] = 200
             record["compacted_data_bytes"] = 100
             if record["format"] == "v23_logical":
                 record["duration_ns"] = 5
@@ -1743,6 +1744,11 @@ class ProtocolReportTests(unittest.TestCase):
             else:
                 record["duration_ns"] = 100
                 record["layout_index_maintenance_ns"] = 100
+            if (
+                "/repeat-001/" in record["pair_id"]
+                and record["format"] == "v22_stable"
+            ):
+                record["index_storage_bytes_before"] = 99
 
         result = protocol_report.analyze(
             sidecar, records, bootstrap_samples=101, enforce_gates=True
