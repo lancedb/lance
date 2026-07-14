@@ -145,3 +145,29 @@ impl CacheKey for ScalarIndexDetailsKey<'_> {
         "ScalarIndexDetails"
     }
 }
+
+/// Cache key for the serialized `index_statistics` JSON for a single named index
+/// at a specific manifest version.
+///
+/// `index_statistics` is a pure function of `(dataset URI, manifest version, index name)`:
+/// the `DSIndexCache` already prefixes entries by dataset URI, and any mutation that can
+/// change the answer (append, delete, compaction, index create/optimize/drop) bumps the
+/// manifest version. Keying on the version therefore gives automatic invalidation — we
+/// never need to touch this cache from a write path.
+#[derive(Debug)]
+pub struct IndexStatisticsKey<'a> {
+    pub version: u64,
+    pub index_name: &'a str,
+}
+
+impl CacheKey for IndexStatisticsKey<'_> {
+    type ValueType = String;
+
+    fn key(&self) -> Cow<'_, str> {
+        Cow::Owned(format!("stats/{}/{}", self.version, self.index_name))
+    }
+
+    fn type_name() -> &'static str {
+        "IndexStatisticsJson"
+    }
+}

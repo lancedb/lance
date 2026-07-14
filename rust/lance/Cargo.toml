@@ -323,5 +323,9 @@ harness = false
 name = "hamming"
 harness = false
 
+[[bench]]
+name = "index_stats"
+harness = false
+
 [lints]
 workspace = true
