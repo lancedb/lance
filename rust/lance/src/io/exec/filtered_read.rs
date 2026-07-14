@@ -13,7 +13,7 @@ use datafusion::common::stats::Precision;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::stream::{RecordBatchReceiverStream, RecordBatchStreamAdapter};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
     execution_plan::{Boundedness, EmissionType},
@@ -334,6 +334,112 @@ struct FilteredReadStream {
     threading_mode: FilteredReadThreadingMode,
     /// Range to apply to the result stream if not already pushed down in planning phase
     scan_range_after_filter: Option<Range<u64>>,
+    /// Take-shaped plan (many fragments, few rows each); the output side
+    /// consolidates the tiny per-fragment batches
+    sparse_plan: bool,
+    /// Rows per output batch (explicit option → env default → 8192)
+    batch_target_rows: usize,
+}
+
+/// Below this many fragments there are too few handoffs to be worth
+/// consolidating
+const CONSOLIDATE_MIN_FRAGMENTS: usize = 8;
+
+/// Above this per-fragment average, batches are big enough to amortize
+/// their handoff
+const CONSOLIDATE_MAX_AVG_PLANNED_ROWS_PER_FRAGMENT: u64 = 1024;
+
+/// Pump a take-shaped read on a spawned task, handing the consumer
+/// consolidated batches. Inline polling would otherwise execute the
+/// per-batch pipeline work on the consumer, which serializes concurrent
+/// small reads.
+fn consolidated_stream(
+    inner: SendableRecordBatchStream,
+    target: usize,
+) -> SendableRecordBatchStream {
+    let mut builder = RecordBatchReceiverStream::builder(inner.schema(), 4);
+    let tx = builder.tx();
+    builder.spawn(async move {
+        let mut stream = coalesce_batches(inner, target).boxed();
+        while let Some(item) = stream.next().await {
+            if tx.send(item).await.is_err() {
+                // Receiver dropped: the query was cancelled
+                break;
+            }
+        }
+        Ok(())
+    });
+    builder.build()
+}
+
+/// Merge batches up to `target` rows; batches already at the target pass
+/// through whole (never split). Order is preserved.
+fn coalesce_batches(
+    input: SendableRecordBatchStream,
+    target: usize,
+) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
+    struct Coalescer {
+        input: SendableRecordBatchStream,
+        schema: SchemaRef,
+        target: usize,
+        buffered: Vec<RecordBatch>,
+        buffered_rows: usize,
+        exhausted: bool,
+    }
+
+    impl Coalescer {
+        fn ready_to_emit(&self) -> bool {
+            self.buffered_rows >= self.target || (self.exhausted && !self.buffered.is_empty())
+        }
+
+        fn buffer(&mut self, batch: RecordBatch) {
+            self.buffered_rows += batch.num_rows();
+            self.buffered.push(batch);
+        }
+
+        fn emit(&mut self) -> DataFusionResult<RecordBatch> {
+            self.buffered_rows = 0;
+            if self.buffered.len() == 1 {
+                Ok(self.buffered.pop().unwrap())
+            } else {
+                let batch = arrow::compute::concat_batches(&self.schema, self.buffered.iter())?;
+                self.buffered.clear();
+                Ok(batch)
+            }
+        }
+    }
+
+    let schema = input.schema();
+    let coalescer = Coalescer {
+        input,
+        schema,
+        target,
+        buffered: Vec::new(),
+        buffered_rows: 0,
+        exhausted: false,
+    };
+    futures::stream::try_unfold(coalescer, |mut this| async move {
+        loop {
+            if this.ready_to_emit() {
+                return Ok(Some((this.emit()?, this)));
+            }
+            if this.exhausted {
+                return Ok(None);
+            }
+            match this.input.try_next().await? {
+                Some(batch) if batch.num_rows() >= this.target && !this.buffered.is_empty() => {
+                    // Emit the partial buffer on its own; the large batch
+                    // then passes through whole on the next iteration
+                    let out = this.emit()?;
+                    this.buffer(batch);
+                    return Ok(Some((out, this)));
+                }
+                Some(batch) if batch.num_rows() > 0 => this.buffer(batch),
+                Some(_) => {}
+                None => this.exhausted = true,
+            }
+        }
+    })
 }
 
 impl std::fmt::Debug for FilteredReadStream {
@@ -438,6 +544,30 @@ impl FilteredReadStream {
             .buffered(fragment_readahead);
         let task_stream = fragment_streams.try_flatten().boxed();
 
+        // A batch never spans fragments, so a plan touching many fragments
+        // with few rows each emits one tiny batch per fragment. Fragments
+        // planned empty produce no batch and don't count. Filtered scans
+        // stay dense here: their planned rows are a pre-refine upper bound.
+        let (touched_fragments, planned_rows) =
+            plan.rows
+                .values()
+                .fold((0usize, 0u64), |(fragments, rows), ranges| {
+                    let fragment_rows: u64 =
+                        ranges.iter().map(|range| range.end - range.start).sum();
+                    if fragment_rows > 0 {
+                        (fragments + 1, rows + fragment_rows)
+                    } else {
+                        (fragments, rows)
+                    }
+                });
+        let sparse_plan = touched_fragments >= CONSOLIDATE_MIN_FRAGMENTS
+            && planned_rows
+                < touched_fragments as u64 * CONSOLIDATE_MAX_AVG_PLANNED_ROWS_PER_FRAGMENT;
+        let batch_target_rows = options
+            .batch_size
+            .map(|batch_size| batch_size as usize)
+            .unwrap_or_else(|| get_default_batch_size().unwrap_or(BATCH_SIZE_FALLBACK));
+
         Ok(Self {
             output_schema,
             task_stream: Arc::new(AsyncMutex::new(task_stream)),
@@ -446,6 +576,8 @@ impl FilteredReadStream {
             active_partitions_counter: Arc::new(AtomicUsize::new(0)),
             threading_mode,
             scan_range_after_filter,
+            sparse_plan,
+            batch_target_rows,
         })
     }
 
@@ -1846,8 +1978,20 @@ impl FilteredReadExec {
                 *running_stream = Some(new_running_stream);
                 first_stream
             };
-            let stream: SendableRecordBatchStream = match batch_size_bytes {
-                Some(target) => {
+            // Only masked reads consolidate; plain scans keep their batch
+            // boundaries, and the byte-based rechunk merges on its own
+            let consolidate = if index_input.is_some() && batch_size_bytes.is_none() {
+                running_stream
+                    .as_ref()
+                    .and_then(|running| running.sparse_plan.then_some(running.batch_target_rows))
+            } else {
+                None
+            };
+            drop(running_stream);
+
+            let stream = match (consolidate, batch_size_bytes) {
+                (Some(target), _) => consolidated_stream(inner, target),
+                (None, Some(bytes)) => {
                     let schema = inner.schema();
                     Box::pin(RecordBatchStreamAdapter::new(
                         schema.clone(),
@@ -1855,11 +1999,11 @@ impl FilteredReadExec {
                             inner,
                             schema,
                             0,
-                            target as usize,
+                            bytes as usize,
                         ),
                     ))
                 }
-                None => inner,
+                (None, None) => inner,
             };
             DataFusionResult::<SendableRecordBatchStream>::Ok(stream)
         })
@@ -2447,6 +2591,78 @@ mod tests {
 
     /// Round-trip every interval shape through the arrow wire format and
     /// confirm the endpoints survive. Exercises both
+    /// Take-shaped masked reads consolidate their tiny per-fragment batches;
+    /// few-fragment and dense masked reads keep per-fragment boundaries.
+    #[test_log::test(tokio::test)]
+    async fn test_take_shaped_mask_consolidation() {
+        use lance_datafusion::exec::OneShotExec;
+        use lance_select::{RowAddrMask, RowAddrTreeMap};
+
+        // 20 fragments x 2000 rows, value = global row number
+        let tmp_path = TempStrDir::default();
+        let data = gen_batch()
+            .col("value", array::step::<UInt32Type>())
+            .into_reader_rows(RowCount::from(2000), BatchCount::from(20));
+        let dataset = Arc::new(
+            Dataset::write(
+                data,
+                tmp_path.as_str(),
+                Some(WriteParams {
+                    max_rows_per_file: 2000,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+
+        let mask_input = |addrs: Vec<u64>| -> Arc<dyn ExecutionPlan> {
+            let covered: RoaringBitmap = dataset.fragments().iter().map(|f| f.id as u32).collect();
+            let batch =
+                IndexExprResult::exact(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(addrs)))
+                    .serialize(&covered, IndexExprResultWireFormat::default())
+                    .unwrap();
+            let schema = batch.schema();
+            let stream = futures::stream::once(async move { Ok(batch) });
+            Arc::new(OneShotExec::new(Box::pin(RecordBatchStreamAdapter::new(
+                schema, stream,
+            ))))
+        };
+        let run = |input: Arc<dyn ExecutionPlan>| {
+            let dataset = dataset.clone();
+            async move {
+                let options = FilteredReadOptions::basic_full_read(&dataset);
+                let plan =
+                    FilteredReadExec::try_new(dataset.clone(), options, Some(input)).unwrap();
+                let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
+                stream.try_collect::<Vec<_>>().await.unwrap()
+            }
+        };
+        let addr = |frag: u64, offset: u64| (frag << 32) | offset;
+
+        // Take shape: 20 fragments, 2 rows each -> one consolidated batch,
+        // rows in fragment order
+        let addrs: Vec<u64> = (0..20).flat_map(|f| [addr(f, 3), addr(f, 7)]).collect();
+        let batches = run(mask_input(addrs)).await;
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 40);
+        assert_eq!(batches.len(), 1);
+        let expected =
+            UInt32Array::from_iter_values((0..20u32).flat_map(|f| [f * 2000 + 3, f * 2000 + 7]));
+        assert_eq!(batches[0].column(0).as_ref(), &expected);
+
+        // Too few fragments -> inline path, one batch per fragment
+        let batches = run(mask_input(vec![addr(0, 3), addr(1, 7)])).await;
+        assert_eq!(batches.len(), 2);
+
+        // Dense (2000 planned rows per fragment) -> inline path
+        let addrs: Vec<u64> = (0..8)
+            .flat_map(|f| (0..2000).map(move |o| addr(f, o)))
+            .collect();
+        let batches = run(mask_input(addrs)).await;
+        assert_eq!(batches.len(), 8);
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 16000);
+    }
+
     /// `IndexExprResult::serialize` and `EvaluatedIndex::try_from_arrow`
     /// so the schema names stay in sync.
     #[test]
