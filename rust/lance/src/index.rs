@@ -732,7 +732,12 @@ pub(crate) fn coverage_anchor_tail_gets(
         .count()
 }
 
-pub(crate) async fn resolve_logical_index_metadata(
+/// Resolve external logical-coverage detail for a set of index segments.
+///
+/// This is exposed for format-contract verification tools. Query planning
+/// normally resolves coverage through its preopened index readers instead.
+#[doc(hidden)]
+pub async fn resolve_logical_index_metadata(
     dataset: &Dataset,
     indices: &[IndexMetadata],
 ) -> Result<Vec<IndexMetadata>> {

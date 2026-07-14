@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+mod evidence;
 mod maintenance;
 
 use std::num::NonZero;
@@ -17,10 +18,106 @@ use lance_datagen::{BatchCount, Dimension, RowCount, array, gen_batch};
 use lance_file::version::LanceFileVersion;
 use lance_index::IndexType;
 use lance_index::optimize::OptimizeOptions;
+use lance_index::scalar::ScalarIndexParams;
 use lance_io::utils::tracking_store::IoOperation;
 use lance_linalg::distance::MetricType;
 use lance_table::format::{DataFile, Fragment};
 use rstest::rstest;
+
+#[test]
+fn logical_coverage_evidence_intersects_liveness() {
+    let live = roaring::RoaringTreemap::from_iter([1, 3]);
+    let ownership = roaring::RoaringTreemap::from_iter([0, 1, 2, 3]);
+
+    assert_eq!(
+        evidence::covered_live_rows(&live, &ownership, &ownership).unwrap(),
+        2
+    );
+    assert_eq!(
+        evidence::covered_live_rows(
+            &live,
+            &ownership,
+            &roaring::RoaringTreemap::from_iter([0, 1, 2]),
+        )
+        .unwrap(),
+        1
+    );
+    assert!(
+        evidence::covered_live_rows(
+            &live,
+            &roaring::RoaringTreemap::from_iter([0, 1, 2]),
+            &ownership,
+        )
+        .unwrap_err()
+        .contains("missing 1 live rows")
+    );
+}
+
+#[tokio::test]
+async fn logical_coverage_evidence_accepts_tombstones_across_segments() {
+    let test_dir = lance_core::utils::tempfile::TempStrDir::default();
+    let reader = gen_batch()
+        .col("id", array::step::<arrow_array::types::Int32Type>())
+        .into_reader_rows(RowCount::from(1024), BatchCount::from(1));
+    let mut dataset = Dataset::write(
+        reader,
+        test_dir.as_str(),
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_3),
+            max_rows_per_file: 256,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            Some("id_idx".to_string()),
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    let appended = gen_batch()
+        .col(
+            "id",
+            array::step_custom::<arrow_array::types::Int32Type>(1024, 1),
+        )
+        .into_reader_rows(RowCount::from(256), BatchCount::from(1));
+    dataset.append(appended, None).await.unwrap();
+    dataset
+        .optimize_indices(&OptimizeOptions::append())
+        .await
+        .unwrap();
+    dataset.delete("id % 2 = 0").await.unwrap();
+
+    let mut metadata = dataset.load_indices_by_name("id_idx").await.unwrap();
+    assert_eq!(metadata.len(), 2);
+    for segment in &mut metadata {
+        segment
+            .logical_coverage
+            .as_mut()
+            .unwrap()
+            .externalize_detail_over(0)
+            .unwrap();
+        assert!(
+            segment
+                .logical_coverage
+                .as_ref()
+                .unwrap()
+                .has_external_detail()
+        );
+    }
+    let live_rows = u64::try_from(dataset.count_rows(None).await.unwrap()).unwrap();
+    assert_eq!(
+        evidence::effective_logical_index_covered_rows(&dataset, &metadata, live_rows)
+            .await
+            .unwrap(),
+        live_rows
+    );
+}
 
 fn fragment(id: u64, base_id: Option<u32>) -> Fragment {
     let mut fragment = Fragment::new(id);

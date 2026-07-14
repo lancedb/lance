@@ -160,19 +160,34 @@ report_all() {
   else
     status=2
   fi
-  if [[ ${status} -eq 0 ]]; then
-    local aggregate_hash
-    local marker
-    verify_checkout || return 2
-    aggregate_hash=$("${PYTHON}" -c 'import hashlib, pathlib, sys; print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())' "${RESULT_ROOT}/stable-row-address-release.aggregate.json") || return 2
-    marker="${RESULT_ROOT}/.stable-row-address-release.pass.tmp-$$"
-    {
-      echo "commit=${actual_commit}"
-      echo "aggregate_sha256=${aggregate_hash}"
-    } >"${marker}" || return 2
-    mv "${marker}" "${RESULT_ROOT}/stable-row-address-release.pass" || return 2
-  fi
   return "${status}"
+}
+
+write_pass_marker() {
+  local aggregate_hash
+  local aggregate_verdict
+  local execution_commit
+  local execution_lines
+  local marker
+  verify_checkout || return 2
+  aggregate_verdict=$("${PYTHON}" -c 'import json, pathlib, sys; print(json.loads(pathlib.Path(sys.argv[1]).read_text())["verdict"])' "${RESULT_ROOT}/stable-row-address-release.aggregate.json") || return 2
+  [[ ${aggregate_verdict} == PASS ]] || {
+    echo "release aggregate verdict is ${aggregate_verdict}, expected PASS" >&2
+    return 1
+  }
+  execution_commit=$(sed -n '1p' "${RESULT_ROOT}/stable-row-address-release.execution-complete") || return 2
+  execution_lines=$(wc -l <"${RESULT_ROOT}/stable-row-address-release.execution-complete") || return 2
+  [[ ${execution_lines} -eq 1 && ${execution_commit} == "${actual_commit}" ]] || {
+    echo "release execution-complete marker does not contain exactly ${actual_commit}" >&2
+    return 2
+  }
+  aggregate_hash=$("${PYTHON}" -c 'import hashlib, pathlib, sys; print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())' "${RESULT_ROOT}/stable-row-address-release.aggregate.json") || return 2
+  marker="${RESULT_ROOT}/.stable-row-address-release.pass.tmp-$$"
+  {
+    echo "commit=${actual_commit}"
+    echo "aggregate_sha256=${aggregate_hash}"
+  } >"${marker}" || return 2
+  mv "${marker}" "${RESULT_ROOT}/stable-row-address-release.pass" || return 2
 }
 
 release_all() {
@@ -188,9 +203,10 @@ release_all() {
     return 2
   fi
   if [[ ${report_status} -ne 0 || ${run_status} -ne 0 ]]; then
+    rm -f "${RESULT_ROOT}/stable-row-address-release.pass" || return 2
     return 2
   fi
-  return 0
+  write_pass_marker
 }
 
 case ${action} in

@@ -3,13 +3,13 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: DATASET_ROOT=s3://bucket/prefix RESULT_ROOT=/absolute/path AWS_REGION=region EXPECTED_COMMIT=<40-hex> [PYTHON=/usr/bin/python3.11] [CARGO_TARGET_DIR=/absolute/path] [UNIT_NAME=stable-row-address-release] $0 {install|status}" >&2
+  echo "usage: DATASET_ROOT=/absolute/path RESULT_ROOT=/absolute/path EXPECTED_COMMIT=<40-hex> [PYTHON=/usr/bin/python3.11] [CARGO_TARGET_DIR=/absolute/path] [UNIT_NAME=stable-row-address-smoke] $0 {install|status}" >&2
   exit 2
 }
 
 [[ $# -eq 1 ]] || usage
 action=$1
-UNIT_NAME=${UNIT_NAME:-stable-row-address-release}
+UNIT_NAME=${UNIT_NAME:-stable-row-address-smoke}
 [[ ${UNIT_NAME} =~ ^[a-zA-Z0-9_.@-]+$ ]] || {
   echo "UNIT_NAME contains unsupported characters" >&2
   exit 2
@@ -22,7 +22,6 @@ status_service() {
 install_service() {
   : "${DATASET_ROOT:?DATASET_ROOT is required}"
   : "${RESULT_ROOT:?RESULT_ROOT is required}"
-  : "${AWS_REGION:?AWS_REGION is required}"
   : "${EXPECTED_COMMIT:?EXPECTED_COMMIT is required}"
   PYTHON=${PYTHON:-/usr/bin/python3.11}
   CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-}
@@ -30,7 +29,7 @@ install_service() {
     echo "EXPECTED_COMMIT must be a lowercase full Git SHA" >&2
     exit 2
   }
-  for value in "${DATASET_ROOT}" "${RESULT_ROOT}" "${AWS_REGION}" "${EXPECTED_COMMIT}" "${PYTHON}"; do
+  for value in "${DATASET_ROOT}" "${RESULT_ROOT}" "${EXPECTED_COMMIT}" "${PYTHON}"; do
     [[ ${value} =~ ^[-_./:a-zA-Z0-9]+$ ]] || {
       echo "service environment contains unsupported characters: ${value}" >&2
       exit 2
@@ -81,7 +80,6 @@ install_service() {
   {
     printf 'DATASET_ROOT=%s\n' "${DATASET_ROOT}"
     printf 'RESULT_ROOT=%s\n' "${RESULT_ROOT}"
-    printf 'AWS_REGION=%s\n' "${AWS_REGION}"
     printf 'EXPECTED_COMMIT=%s\n' "${EXPECTED_COMMIT}"
     printf 'PYTHON=%s\n' "${PYTHON}"
     if [[ -n ${CARGO_TARGET_DIR} ]]; then
@@ -94,17 +92,15 @@ install_service() {
 
   {
     echo '[Unit]'
-    echo 'Description=Lance stable logical row-address release protocol'
-    echo 'Wants=network-online.target'
-    echo 'After=network-online.target'
-    printf 'RequiresMountsFor=%s %s\n' "${repository_root}" "${RESULT_ROOT}"
+    echo 'Description=Lance stable logical row-address smoke protocol'
+    printf 'RequiresMountsFor=%s %s %s\n' "${repository_root}" "${DATASET_ROOT}" "${RESULT_ROOT}"
     echo
     echo '[Service]'
     echo 'Type=oneshot'
     printf 'User=%s\n' "${service_user}"
     printf 'WorkingDirectory=%s\n' "${repository_root}"
     printf 'EnvironmentFile=%s\n' "${environment_file}"
-    printf 'ExecStart=/usr/bin/env bash %s/benchmarks/stable_row_address/release_remote.sh release-all\n' "${repository_root}"
+    printf 'ExecStart=/usr/bin/env bash %s/benchmarks/stable_row_address/smoke_remote.sh smoke-all\n' "${repository_root}"
     echo 'RemainAfterExit=yes'
     echo
     echo '[Install]'

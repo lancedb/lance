@@ -10,6 +10,7 @@
 
 #![allow(clippy::print_stdout)]
 
+mod evidence;
 mod maintenance;
 
 use std::collections::{BTreeMap, BinaryHeap, HashSet};
@@ -39,11 +40,8 @@ use lance::dataset::{
     MergeInsertBuilder, NewColumnTransform, ReadParams, UpdateBuilder, WhenMatched, WhenNotMatched,
     WriteMode, WriteParams,
 };
+use lance::index::DatasetIndexExt;
 use lance::index::vector::VectorIndexParams;
-use lance::index::{
-    DatasetIndexExt, build_logical_index_coverage, logical_index_coverage_is_current,
-    merge_logical_index_coverage,
-};
 use lance_core::ROW_ID;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_file::version::LanceFileVersion;
@@ -56,9 +54,7 @@ use lance_io::object_store::metrics::METRIC_HTTP_ATTEMPTS;
 use lance_io::utils::tracking_store::{IOTracker, IoOperation, IoStats};
 use lance_linalg::distance::MetricType;
 use lance_table::feature_flags::FLAG_STABLE_ROW_IDS;
-use lance_table::format::{
-    Fragment, LogicalIndexCoverage, LogicalRowAddressSelection, PlacementMaintenanceRequired, pb,
-};
+use lance_table::format::{Fragment, PlacementMaintenanceRequired, pb};
 use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
 use prost::Message;
 use rand::rngs::StdRng;
@@ -1282,6 +1278,9 @@ fn implementation_path(args: &Args) -> &'static str {
         Operation::FixtureClone => "canonical_fixture_shallow_clone",
         Operation::RandomDeleteReclaim => match args.format {
             BenchFormat::V23Logical => "explicit_repack",
+            BenchFormat::V22Stable if args.index_kind != IndexKind::None => {
+                "same_postcondition_default_compaction_full_index_rebuild"
+            }
             BenchFormat::V22NoStable | BenchFormat::V22Stable => {
                 "same_postcondition_default_compaction"
             }
@@ -2210,33 +2209,6 @@ fn covered_live_rows_for_fragments(
         })
 }
 
-fn logical_coverage_selection(
-    coverage: &LogicalIndexCoverage,
-) -> BenchResult<LogicalRowAddressSelection> {
-    let ranges = coverage
-        .shards
-        .iter()
-        .enumerate()
-        .map(|(shard_index, shard)| {
-            shard
-                .selection
-                .as_ref()
-                .ok_or_else(|| -> BenchError {
-                    format!(
-                        "logical index coverage shard {shard_index} is missing resolved selection detail"
-                    )
-                    .into()
-                })?
-                .to_ranges()
-                .map_err(|error| -> BenchError { error.into() })
-        })
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .flatten()
-        .collect();
-    Ok(LogicalRowAddressSelection::from_ranges(ranges)?)
-}
-
 async fn effective_index_coverage(dataset: &Dataset, index_kind: IndexKind) -> BenchResult<f64> {
     let live_rows = dataset
         .manifest()
@@ -2256,44 +2228,7 @@ async fn effective_index_coverage(dataset: &Dataset, index_kind: IndexKind) -> B
     }
     let metadata = dataset.load_indices_by_name(index_name).await?;
     let covered_rows = if dataset.manifest().uses_stable_logical_row_addresses() {
-        let fields = metadata
-            .first()
-            .ok_or_else(|| format!("benchmark index {index_name} has no catalog segments"))?
-            .fields
-            .clone();
-        if metadata.iter().any(|segment| segment.fields != fields) {
-            return Err(
-                format!("benchmark index {index_name} has inconsistent field coverage").into(),
-            );
-        }
-        let mut current = Vec::with_capacity(metadata.len());
-        for segment in &metadata {
-            if logical_index_coverage_is_current(dataset, segment)? {
-                current.push(segment);
-            }
-        }
-        let mut physical_fragments = roaring::RoaringBitmap::new();
-        for fragment in dataset.manifest().fragments.iter() {
-            physical_fragments.insert(u32::try_from(fragment.id).map_err(|_| {
-                format!(
-                    "physical fragment {} exceeds the coverage address space",
-                    fragment.id
-                )
-            })?);
-        }
-        let expected = logical_coverage_selection(
-            &build_logical_index_coverage(dataset, &fields, &physical_fragments).await?,
-        )?;
-        if expected.cardinality() != live_rows {
-            return Err(format!(
-                "exact live selection contains {} rows for a {live_rows}-row dataset",
-                expected.cardinality()
-            )
-            .into());
-        }
-        let effective =
-            logical_coverage_selection(&merge_logical_index_coverage(dataset, &current)?)?;
-        live_rows - expected.difference(&effective)?.cardinality()
+        evidence::effective_logical_index_covered_rows(dataset, &metadata, live_rows).await?
     } else {
         let mut covered_fragments = roaring::RoaringBitmap::new();
         for segment in &metadata {
@@ -2884,6 +2819,19 @@ async fn execute(
                     Some(observation.metrics.groups_admitted as u64);
                 outcome.compaction_groups_not_admitted =
                     Some(observation.metrics.groups_not_admitted as u64);
+                if args.format == BenchFormat::V22Stable && args.index_kind != IndexKind::None {
+                    let rebuild_started = Instant::now();
+                    rebuild_benchmark_indices(args, &mut dataset).await?;
+                    let rebuild_ns =
+                        u64::try_from(rebuild_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                    outcome.layout_index_maintenance_ns = Some(
+                        observation
+                            .layout_index_maintenance_ns
+                            .checked_add(rebuild_ns)
+                            .ok_or("legacy stable index maintenance duration overflow")?,
+                    );
+                    outcome.index_coverage_reuse = Some(0.0);
+                }
             }
             verify_maintenance_output(&dataset, maintenance_plan.as_ref())?;
             finish_outcome(args, &dataset, outcome).await
@@ -3038,51 +2986,7 @@ async fn execute(
         Operation::IndexBuild => {
             let mut dataset = open_dataset(args, tracker).await?;
             args.format.validate_dataset(&dataset)?;
-            let index_name = benchmark_index_name(args.index_kind);
-            match args.index_kind {
-                IndexKind::None => unreachable!("validated before execution"),
-                IndexKind::Scalar => {
-                    dataset
-                        .create_index(
-                            &["id"],
-                            IndexType::BTree,
-                            Some(index_name.to_string()),
-                            &ScalarIndexParams::default(),
-                            true,
-                        )
-                        .await?;
-                    dataset
-                        .create_index(
-                            &["value"],
-                            IndexType::BTree,
-                            Some("stable_row_address_scalar_value".to_string()),
-                            &ScalarIndexParams::default(),
-                            true,
-                        )
-                        .await?;
-                    dataset
-                        .create_index(
-                            &["id"],
-                            IndexType::BTree,
-                            Some("stable_row_address_scalar_id_secondary".to_string()),
-                            &ScalarIndexParams::default(),
-                            false,
-                        )
-                        .await?;
-                }
-                IndexKind::Vector => {
-                    let partitions = (args.expected_rows / 4096).clamp(1, 256);
-                    dataset
-                        .create_index(
-                            &["vector"],
-                            IndexType::Vector,
-                            Some(index_name.to_string()),
-                            &VectorIndexParams::ivf_flat(partitions, MetricType::L2),
-                            true,
-                        )
-                        .await?;
-                }
-            }
+            rebuild_benchmark_indices(args, &mut dataset).await?;
             finish_outcome(
                 args,
                 &dataset,
@@ -3285,6 +3189,45 @@ fn benchmark_index_name(kind: IndexKind) -> &'static str {
         IndexKind::Scalar => "stable_row_address_scalar",
         IndexKind::Vector => "stable_row_address_vector",
     }
+}
+
+async fn rebuild_benchmark_indices(args: &Args, dataset: &mut Dataset) -> BenchResult<()> {
+    let index_name = benchmark_index_name(args.index_kind);
+    match args.index_kind {
+        IndexKind::None => {
+            return Err("benchmark index rebuild requires an index kind".into());
+        }
+        IndexKind::Scalar => {
+            for (column, name) in [
+                ("id", index_name),
+                ("value", "stable_row_address_scalar_value"),
+                ("id", "stable_row_address_scalar_id_secondary"),
+            ] {
+                dataset
+                    .create_index(
+                        &[column],
+                        IndexType::BTree,
+                        Some(name.to_string()),
+                        &ScalarIndexParams::default(),
+                        true,
+                    )
+                    .await?;
+            }
+        }
+        IndexKind::Vector => {
+            let partitions = (args.expected_rows / 4096).clamp(1, 256);
+            dataset
+                .create_index(
+                    &["vector"],
+                    IndexType::Vector,
+                    Some(index_name.to_string()),
+                    &VectorIndexParams::ivf_flat(partitions, MetricType::L2),
+                    true,
+                )
+                .await?;
+        }
+    }
+    Ok(())
 }
 
 async fn exact_row_address_delta_bytes(dataset: &Dataset) -> BenchResult<u64> {

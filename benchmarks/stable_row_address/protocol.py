@@ -299,11 +299,11 @@ class Step:
         if format_name not in run.FORMATS:
             raise ValueError(f"unsupported benchmark format: {format_name}")
         if self.operation == "random_delete_reclaim":
-            return (
-                "explicit_repack"
-                if format_name == "v23_logical"
-                else "same_postcondition_default_compaction"
-            )
+            if format_name == "v23_logical":
+                return "explicit_repack"
+            if format_name == "v22_stable" and self.index_kind != "none":
+                return "same_postcondition_default_compaction_full_index_rebuild"
+            return "same_postcondition_default_compaction"
         if self.operation == "bounded_recluster":
             return (
                 "default_bounded_recluster_fast_path"
@@ -1668,6 +1668,40 @@ class ProtocolRunner:
             for order_index, format_name in enumerate(order)
         }
 
+    def invoke_all_with_take_ids(
+        self,
+        step: Step,
+        *,
+        track: str,
+        case: str,
+        repeat: int,
+        label: str,
+    ) -> dict[str, dict[str, Any]]:
+        pair_id = f"{self.run_id}/{track}/{case}/repeat-{repeat:03d}/{label}"
+        order = run.format_order(repeat, self.phase_index)
+        self.phase_index += 1
+        take_artifacts = self.prepare_paired_take_ids(
+            step,
+            track=track,
+            case=case,
+            repeat=repeat,
+            label=label,
+            formats=order,
+        )
+        return {
+            format_name: self.invoke_one(
+                step,
+                track=track,
+                case=case,
+                repeat=repeat,
+                format_name=format_name,
+                pair_id=pair_id,
+                order_index=order_index,
+                take_ids_input=take_artifacts[format_name],
+            )
+            for order_index, format_name in enumerate(order)
+        }
+
     def validate_maintenance_plan_formats(
         self,
         step: Step,
@@ -1756,6 +1790,40 @@ class ProtocolRunner:
                 f"status={result.returncode}, stdout={result.stdout!r}"
             )
         return output
+
+    def prepare_paired_take_ids(
+        self,
+        step: Step,
+        *,
+        track: str,
+        case: str,
+        repeat: int,
+        label: str,
+        formats: Sequence[str],
+    ) -> dict[str, Path]:
+        user_ids: dict[str, tuple[int, ...]] = {}
+        artifacts: dict[str, Path] = {}
+        for order_index, format_name in enumerate(formats):
+            artifact_path = self.prepare_take_ids(
+                step,
+                track=track,
+                case=case,
+                repeat=repeat,
+                format_name=format_name,
+                label=label,
+                order_index=order_index,
+            )
+            artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+            user_ids[format_name] = tuple(artifact["user_ids"])
+            artifacts[format_name] = artifact_path
+        if len(set(user_ids.values())) != 1:
+            failure = (
+                f"{track}/{case}/repeat-{repeat}/{label}: "
+                "paired take-ID setup selected different user rows"
+            )
+            self.failures.append(failure)
+            raise RuntimeError(failure)
+        return artifacts
 
     def prepare_maintenance_plan(
         self,
@@ -2002,28 +2070,14 @@ class ProtocolRunner:
         )
         order = run.format_order(repeat, self.phase_index)
         self.phase_index += 1
-        take_user_ids: dict[str, tuple[int, ...]] = {}
-        take_artifacts: dict[str, Path] = {}
-        for order_index, format_name in enumerate(order):
-            take_ids = self.prepare_take_ids(
-                take_step,
-                track=track,
-                case=case,
-                repeat=repeat,
-                format_name=format_name,
-                label=f"step-{step_index:03d}/cold-take",
-                order_index=order_index,
-            )
-            artifact = json.loads(take_ids.read_text(encoding="utf-8"))
-            take_user_ids[format_name] = tuple(artifact["user_ids"])
-            take_artifacts[format_name] = take_ids
-        if len(set(take_user_ids.values())) != 1:
-            failure = (
-                f"{track}/{case}/repeat-{repeat}/step-{step_index}: "
-                "paired cold takes selected different user rows"
-            )
-            self.failures.append(failure)
-            raise RuntimeError(failure)
+        take_artifacts = self.prepare_paired_take_ids(
+            take_step,
+            track=track,
+            case=case,
+            repeat=repeat,
+            label=f"step-{step_index:03d}/cold-take",
+            formats=order,
+        )
         for order_index, format_name in enumerate(order):
             self.invoke_one(
                 take_step,
@@ -2217,6 +2271,14 @@ def run_matrix(
                             target_file_size_bytes=target_file_size_bytes,
                         )
                     }
+                elif step.operation == "index_take":
+                    records = runner.invoke_all_with_take_ids(
+                        measured_step,
+                        track="matrix",
+                        case=case.name,
+                        repeat=repeat,
+                        label=f"step-{step_index:03d}/{step.operation}",
+                    )
                 else:
                     records = runner.invoke_all(
                         measured_step,

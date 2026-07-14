@@ -100,6 +100,18 @@ report_all() {
     echo "smoke report verdict is ${report_verdict}, expected PASS" >&2
     return 1
   }
+  [[ -f ${execution_marker} ]] || {
+    echo "smoke execution-complete marker is missing" >&2
+    return 2
+  }
+  local execution_commit
+  local execution_lines
+  execution_commit=$(sed -n '1p' "${execution_marker}") || return 2
+  execution_lines=$(wc -l <"${execution_marker}") || return 2
+  [[ ${execution_lines} -eq 1 && ${execution_commit} == "${EXPECTED_COMMIT}" ]] || {
+    echo "smoke execution-complete marker does not contain exactly ${EXPECTED_COMMIT}" >&2
+    return 2
+  }
   report_hash=$("${PYTHON}" -c 'import hashlib, pathlib, sys; print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())' "${report_json}") || return 2
   local marker="${RESULT_ROOT}/.stable-row-address-smoke.pass.tmp-$$"
   {
@@ -110,8 +122,14 @@ report_all() {
 }
 
 smoke_all() {
-  run_all
-  report_all
+  local run_status=0
+  local report_status=0
+  run_all || run_status=$?
+  report_all || report_status=$?
+  if [[ ${report_status} -ne 0 ]]; then
+    return "${report_status}"
+  fi
+  return "${run_status}"
 }
 
 case ${action} in

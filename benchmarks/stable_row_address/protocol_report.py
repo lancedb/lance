@@ -1202,11 +1202,11 @@ def _implementation_path(
     if operation == "default_compaction":
         return "default_compaction"
     if operation == "random_delete_reclaim":
-        return (
-            "explicit_repack"
-            if format_name == "v23_logical"
-            else "same_postcondition_default_compaction"
-        )
+        if format_name == "v23_logical":
+            return "explicit_repack"
+        if format_name == "v22_stable" and index_kind != "none":
+            return "same_postcondition_default_compaction_full_index_rebuild"
+        return "same_postcondition_default_compaction"
     if operation == "bounded_recluster":
         return (
             "default_bounded_recluster_fast_path"

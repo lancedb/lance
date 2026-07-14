@@ -118,7 +118,9 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(preflight.implementation_path, "default_compaction_plan_only")
 
     def test_random_delete_reclaim_provenance_is_format_specific(self) -> None:
-        reclaim = protocol.Step("random_delete_reclaim", expected_rows=50)
+        reclaim = protocol.Step(
+            "random_delete_reclaim", expected_rows=50, index_kind="vector"
+        )
         runner = object.__new__(protocol.ProtocolRunner)
         runner.run_id = "run-1"
         runner.commit = "1" * 40
@@ -133,7 +135,7 @@ class ProtocolTests(unittest.TestCase):
         runner.take_count = 1
         expected_paths = {
             "v22_no_stable": "same_postcondition_default_compaction",
-            "v22_stable": "same_postcondition_default_compaction",
+            "v22_stable": "same_postcondition_default_compaction_full_index_rebuild",
             "v23_logical": "explicit_repack",
         }
         for order_index, (format_name, implementation_path) in enumerate(
@@ -296,6 +298,167 @@ class ProtocolTests(unittest.TestCase):
             {format_name: artifact for _, format_name, artifact in indexed},
             artifacts,
         )
+
+    def test_direct_index_take_prepares_paired_format_artifacts(self) -> None:
+        runner = object.__new__(protocol.ProtocolRunner)
+        runner.run_id = "run-1"
+        runner.phase_index = 0
+        runner.failures = []
+        invocations: list[tuple[str, str, int, int, str, Path | None]] = []
+        preparations: list[tuple[str, int, int, str]] = []
+
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts: dict[str, Path] = {}
+            for format_name in run.FORMATS:
+                path = Path(directory) / f"{format_name}.json"
+                path.write_text(json.dumps({"user_ids": [7, 41]}), encoding="utf-8")
+                artifacts[format_name] = path
+
+            def prepare_take_ids(
+                step: protocol.Step,
+                *,
+                format_name: str,
+                label: str,
+                **_: object,
+            ) -> Path:
+                preparations.append((format_name, step.step, step.expected_rows, label))
+                return artifacts[format_name]
+
+            def invoke_one(
+                step: protocol.Step,
+                *,
+                format_name: str,
+                pair_id: str,
+                take_ids_input: Path | None = None,
+                **_: object,
+            ) -> dict[str, object]:
+                invocations.append(
+                    (
+                        format_name,
+                        step.index_kind,
+                        step.step,
+                        step.expected_rows,
+                        pair_id,
+                        take_ids_input,
+                    )
+                )
+                return {"status": "ok"}
+
+            runner.prepare_take_ids = prepare_take_ids
+            runner.invoke_one = invoke_one
+            for index_kind, step_index, expected_rows in (
+                ("scalar", 1, 100),
+                ("vector", 4, 101),
+            ):
+                step = protocol.Step(
+                    "index_take",
+                    expected_rows,
+                    step=step_index,
+                    schema_kind=("vector" if index_kind == "vector" else "narrow16"),
+                    index_kind=index_kind,
+                )
+                runner.invoke_all_with_take_ids(
+                    step,
+                    track="matrix",
+                    case=f"{index_kind}-index",
+                    repeat=0,
+                    label=f"step-{step_index:03d}/index_take",
+                )
+
+        self.assertEqual(len(preparations), 2 * len(run.FORMATS))
+        self.assertEqual(len(invocations), 2 * len(run.FORMATS))
+        for (
+            format_name,
+            index_kind,
+            step_index,
+            expected_rows,
+            pair_id,
+            artifact,
+        ) in invocations:
+            self.assertEqual(artifact, artifacts[format_name])
+            self.assertIn(index_kind, {"scalar", "vector"})
+            self.assertIn((step_index, expected_rows), {(1, 100), (4, 101)})
+            self.assertTrue(pair_id.endswith(f"step-{step_index:03d}/index_take"))
+        self.assertEqual(
+            {(step, rows, label) for _, step, rows, label in preparations},
+            {
+                (1, 100, "step-001/index_take"),
+                (4, 101, "step-004/index_take"),
+            },
+        )
+
+    def test_paired_take_ids_reject_different_user_rows_before_measurement(
+        self,
+    ) -> None:
+        runner = object.__new__(protocol.ProtocolRunner)
+        runner.run_id = "run-1"
+        runner.phase_index = 0
+        runner.failures = []
+
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts: dict[str, Path] = {}
+            for index, format_name in enumerate(run.FORMATS):
+                path = Path(directory) / f"{format_name}.json"
+                path.write_text(
+                    json.dumps({"user_ids": [7, 41 + index]}), encoding="utf-8"
+                )
+                artifacts[format_name] = path
+            runner.prepare_take_ids = mock.Mock(
+                side_effect=lambda _step, *, format_name, **__: artifacts[format_name]
+            )
+            runner.invoke_one = mock.Mock()
+
+            with self.assertRaisesRegex(RuntimeError, "different user rows"):
+                runner.invoke_all_with_take_ids(
+                    protocol.Step("index_take", 100, step=1, index_kind="scalar"),
+                    track="matrix",
+                    case="scalar-index",
+                    repeat=0,
+                    label="step-001/index_take",
+                )
+
+        runner.invoke_one.assert_not_called()
+        self.assertEqual(len(runner.failures), 1)
+
+    def test_matrix_index_take_uses_paired_artifact_path(self) -> None:
+        runner = mock.Mock(spec=protocol.ProtocolRunner)
+        runner.clone_fixture_all.return_value = {
+            format_name: {"status": "ok"} for format_name in run.FORMATS
+        }
+        runner.invoke_all_with_take_ids.return_value = {
+            format_name: {"status": "ok"} for format_name in run.FORMATS
+        }
+        runner.invoke_all.side_effect = AssertionError(
+            "index_take must not use the artifact-free matrix path"
+        )
+        case = protocol.MatrixCase(
+            name="direct-index-take/scalar",
+            schema_kind="narrow16",
+            rows_per_fragment=16,
+            take_count=4,
+            fixture_index_kind="scalar",
+            steps=(
+                protocol.Step("create", 32, index_kind="scalar"),
+                protocol.Step("index_take", 32, index_kind="scalar"),
+            ),
+        )
+        profile = {
+            "rows": 32,
+            "paired_repeats": 1,
+            "logical_fragment_counts": [2],
+        }
+
+        protocol.run_matrix(runner, profile, [case])
+
+        runner.invoke_all_with_take_ids.assert_called_once()
+        call = runner.invoke_all_with_take_ids.call_args
+        self.assertEqual(call.args[0].operation, "index_take")
+        self.assertEqual(call.args[0].step, 1)
+        self.assertEqual(
+            call.kwargs["label"],
+            "step-001/index_take",
+        )
+        runner.invoke_all.assert_not_called()
 
     def test_explicit_recluster_and_fragment_reuse_cases_are_frozen(self) -> None:
         matrix, _, _ = protocol.load_matrix(protocol.DEFAULT_MATRIX)

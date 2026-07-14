@@ -45,6 +45,11 @@ S3; EBS is intentionally smoke-only. Both protocol profiles build the worker
 with Cargo's optimized `release-with-debug` profile. Unoptimized binaries are
 valid only for correctness debugging and never produce performance evidence.
 
+When legacy stable-row-id compaction materializes indexed deletions, the paired
+v2.2 baseline rebuilds every benchmark index inside the measured maintenance
+operation. This is the minimum correct postcondition: immutable v2.2 postings
+otherwise retain deleted stable IDs after deletion vectors are reclaimed.
+
 ```bash
 python3 benchmarks/stable_row_address/protocol.py \
   --dataset-root /mnt/bench/stable-row-address \
@@ -61,6 +66,14 @@ EXPECTED_COMMIT=0123456789abcdef0123456789abcdef01234567 \
 PYTHON=/usr/bin/python3.11 \
 CARGO_TARGET_DIR=/mnt/bench/cargo-target \
 benchmarks/stable_row_address/smoke_remote.sh smoke-all
+
+# Persistent smoke execution on a remote host. The service survives SSH
+# disconnects and stops on every result so failures remain stable for review.
+DATASET_ROOT=/mnt/bench/stable-row-address-smoke \
+RESULT_ROOT=/mnt/results/stable-row-address-smoke \
+EXPECTED_COMMIT=$(git rev-parse HEAD) \
+CARGO_TARGET_DIR=/mnt/cargo-target \
+benchmarks/stable_row_address/smoke_remote_systemd.sh install
 
 # Run one fixture-local release shard. Run indices 0 through 8 on independent
 # workers; the runner adds the shard suffix to both the S3 and local paths.
@@ -101,7 +114,8 @@ python3 benchmarks/stable_row_address/protocol_aggregate.py \
   --json /mnt/results/stable-row-address-release.aggregate.json
 
 # Install a reboot-persistent serial nine-shard release service. The checkout
-# must exactly match EXPECTED_COMMIT; existing shard evidence is resumed.
+# must exactly match EXPECTED_COMMIT; existing shard evidence is resumed. The
+# service stops on failure so the result remains stable for diagnosis.
 DATASET_ROOT=s3://same-region-bucket/prefix \
 RESULT_ROOT=/mnt/results/stable-row-address-release \
 AWS_REGION=us-east-2 \

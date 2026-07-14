@@ -1523,11 +1523,11 @@ struct ANNIvfEarlySearchResults {
     deltas_remaining: AtomicUsize,
     all_deltas_done: Notify,
     took_no_rows_shortcut: AtomicBool,
-    allow_no_rows_shortcut: bool,
+    allow_shared_prefilter_shortcuts: bool,
 }
 
 impl ANNIvfEarlySearchResults {
-    fn new(deltas_remaining: usize, k: usize, allow_no_rows_shortcut: bool) -> Self {
+    fn new(deltas_remaining: usize, k: usize, allow_shared_prefilter_shortcuts: bool) -> Self {
         Self {
             k,
             initial_ids: Mutex::new(Vec::with_capacity(k)),
@@ -1535,7 +1535,7 @@ impl ANNIvfEarlySearchResults {
             deltas_remaining: AtomicUsize::new(deltas_remaining),
             all_deltas_done: Notify::new(),
             took_no_rows_shortcut: AtomicBool::new(false),
-            allow_no_rows_shortcut,
+            allow_shared_prefilter_shortcuts,
         }
     }
 
@@ -1552,9 +1552,12 @@ impl ANNIvfEarlySearchResults {
         );
     }
 
-    fn record_late_batch(&self, num_rows: usize) {
+    fn record_late_batch(&self, segment_results: Option<&AtomicUsize>, num_rows: usize) {
         self.num_results_found
             .fetch_add(num_rows, Ordering::Relaxed);
+        if let Some(segment_results) = segment_results {
+            segment_results.fetch_add(num_rows, Ordering::Relaxed);
+        }
     }
 
     async fn wait_for_minimum_to_finish(&self) -> usize {
@@ -1570,20 +1573,44 @@ impl ANNIvfEarlySearchResults {
         }
         self.num_results_found.load(Ordering::Relaxed)
     }
+
+    fn should_stop_late_search(
+        &self,
+        segment_results: Option<&AtomicUsize>,
+        mask_max_results: Option<usize>,
+    ) -> bool {
+        let global_limit = if self.allow_shared_prefilter_shortcuts {
+            mask_max_results.unwrap_or(self.k).min(self.k)
+        } else {
+            self.k
+        };
+        if self.num_results_found.load(Ordering::Relaxed) >= global_limit {
+            return true;
+        }
+        if self.allow_shared_prefilter_shortcuts {
+            return false;
+        }
+        let segment_results = segment_results
+            .expect("segment-local prefilter search must track segment-local results");
+        mask_max_results.is_some_and(|limit| segment_results.load(Ordering::Relaxed) >= limit)
+    }
 }
 
 struct LatePartitionSearchControl {
     state: Arc<ANNIvfEarlySearchResults>,
-    max_results: usize,
+    segment_results: Option<Arc<AtomicUsize>>,
+    mask_max_results: Option<usize>,
 }
 
 impl PartitionSearchControl for LatePartitionSearchControl {
     fn should_stop(&self) -> bool {
-        self.state.num_results_found.load(Ordering::Relaxed) >= self.max_results
+        self.state
+            .should_stop_late_search(self.segment_results.as_deref(), self.mask_max_results)
     }
 
     fn record_batch(&self, batch: &RecordBatch) {
-        self.state.record_late_batch(batch.num_rows());
+        self.state
+            .record_late_batch(self.segment_results.as_deref(), batch.num_rows());
     }
 }
 
@@ -1636,6 +1663,7 @@ impl ANNIvfSubIndexExec {
         stream: stream::BoxStream<'static, DataFusionResult<RecordBatch>>,
         metrics: Arc<AnnIndexMetrics>,
         state: Arc<ANNIvfEarlySearchResults>,
+        segment_results: Option<Arc<AtomicUsize>>,
         record_initial: bool,
         record_partition_per_batch: bool,
     ) -> stream::BoxStream<'static, DataFusionResult<RecordBatch>> {
@@ -1643,6 +1671,7 @@ impl ANNIvfSubIndexExec {
             .map(move |batch| {
                 let metrics = metrics.clone();
                 let state = state.clone();
+                let segment_results = segment_results.clone();
                 batch.inspect(move |batch| {
                     if record_partition_per_batch {
                         metrics.partitions_searched.add(1);
@@ -1650,6 +1679,9 @@ impl ANNIvfSubIndexExec {
                     metrics.baseline_metrics.record_output(batch.num_rows());
                     if record_initial {
                         state.record_batch(batch);
+                        if let Some(segment_results) = &segment_results {
+                            segment_results.fetch_add(batch.num_rows(), Ordering::Relaxed);
+                        }
                     }
                 })
             })
@@ -1665,6 +1697,7 @@ impl ANNIvfSubIndexExec {
         prefilter: Arc<DatasetPreFilter>,
         metrics: Arc<AnnIndexMetrics>,
         state: Arc<ANNIvfEarlySearchResults>,
+        segment_results: Option<Arc<AtomicUsize>>,
         target_partitions: usize,
     ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
         let stream = futures::stream::once(async move {
@@ -1688,9 +1721,13 @@ impl ANNIvfSubIndexExec {
             // need to call wait_for_ready
             let prefilter_mask = prefilter.mask();
 
-            let max_results = prefilter_mask.max_len().map(|x| x as usize);
+            let mask_max_results = prefilter_mask.max_len().map(|x| x as usize);
+            if state.should_stop_late_search(segment_results.as_deref(), mask_max_results) {
+                return futures::stream::empty().boxed();
+            }
 
-            if let Some(max_results) = max_results
+            if state.allow_shared_prefilter_shortcuts
+                && let Some(max_results) = mask_max_results
                 && found_so_far < max_results
                 && max_results <= query.k
             {
@@ -1698,9 +1735,7 @@ impl ANNIvfSubIndexExec {
                 // just return the prefilter ids and don't bother searching any further
 
                 // This next if check should be true, because we wouldn't get max_results otherwise
-                if state.allow_no_rows_shortcut
-                    && let Some(iter_addrs) = prefilter_mask.iter_addrs()
-                {
+                if let Some(iter_addrs) = prefilter_mask.iter_addrs() {
                     // We only run this on the first delta because the prefilter mask is shared
                     // by all deltas and we don't want to duplicate the rows.
                     if state
@@ -1731,11 +1766,8 @@ impl ANNIvfSubIndexExec {
                 }
             }
 
-            // Stop searching if we have k results or we've found all the results
-            // that could possible match the prefilter
-            let max_results = max_results.unwrap_or(usize::MAX).min(query.k);
-
             let state_clone = state.clone();
+            let segment_results_clone = segment_results.clone();
 
             let query_parallelism =
                 effective_query_parallelism(&query, index.as_ref(), target_partitions);
@@ -1754,7 +1786,8 @@ impl ANNIvfSubIndexExec {
                             prefilter,
                             Some(Arc::new(LatePartitionSearchControl {
                                 state: state.clone(),
-                                max_results,
+                                segment_results: segment_results.clone(),
+                                mask_max_results,
                             })),
                             index_metrics,
                         )
@@ -1767,6 +1800,7 @@ impl ANNIvfSubIndexExec {
                             stream.boxed(),
                             metrics,
                             state,
+                            segment_results,
                             false,
                             true,
                         ),
@@ -1784,6 +1818,7 @@ impl ANNIvfSubIndexExec {
                     let metrics = metrics.clone();
                     let pre_filter = prefilter.clone();
                     let state = state.clone();
+                    let segment_results = segment_results.clone();
                     let index = index.clone();
                     async move {
                         metrics.partitions_searched.add(1);
@@ -1795,13 +1830,15 @@ impl ANNIvfSubIndexExec {
                             metrics,
                         )
                         .await?;
-                        state.record_late_batch(batch.num_rows());
+                        state.record_late_batch(segment_results.as_deref(), batch.num_rows());
                         Ok(batch)
                     }
                 })
                 .take_while(move |_| {
-                    let found_so_far = state_clone.num_results_found.load(Ordering::Relaxed);
-                    std::future::ready(found_so_far < max_results)
+                    std::future::ready(!state_clone.should_stop_late_search(
+                        segment_results_clone.as_deref(),
+                        mask_max_results,
+                    ))
                 })
                 .buffered(query_parallelism)
                 .boxed()
@@ -1818,6 +1855,7 @@ impl ANNIvfSubIndexExec {
         prefilter: Arc<DatasetPreFilter>,
         metrics: Arc<AnnIndexMetrics>,
         state: Arc<ANNIvfEarlySearchResults>,
+        segment_results: Option<Arc<AtomicUsize>>,
         target_partitions: usize,
     ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
         let minimum_nprobes = query.minimum_nprobes.min(partitions.len());
@@ -1850,6 +1888,7 @@ impl ANNIvfSubIndexExec {
                         stream.boxed(),
                         metrics,
                         state,
+                        segment_results,
                         true,
                         false,
                     ),
@@ -1869,11 +1908,15 @@ impl ANNIvfSubIndexExec {
                 let index = index.clone();
                 let pre_filter = prefilter.clone();
                 let state = state.clone();
+                let segment_results = segment_results.clone();
                 async move {
                     let batch =
                         Self::search_partition(index, query, part_id as usize, pre_filter, metrics)
                             .await?;
                     state.record_batch(&batch);
+                    if let Some(segment_results) = &segment_results {
+                        segment_results.fetch_add(batch.num_rows(), Ordering::Relaxed);
+                    }
                     Ok(batch)
                 }
             })
@@ -2049,10 +2092,11 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
         };
         let pre_filters = Arc::new(pre_filters);
 
+        let allow_shared_prefilter_shortcuts = !uses_segment_filters;
         let state = Arc::new(ANNIvfEarlySearchResults::new(
             indices.len(),
             query.k,
-            !uses_segment_filters,
+            allow_shared_prefilter_shortcuts,
         ));
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
@@ -2086,6 +2130,8 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                             )
                             .await?;
                         let query = normalize_query_for_index(raw_index.as_ref(), query)?;
+                        let segment_results = (!state.allow_shared_prefilter_shortcuts)
+                            .then(|| Arc::new(AtomicUsize::new(0)));
 
                         let early_search = Self::initial_search(
                             raw_index.clone(),
@@ -2095,6 +2141,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                             pre_filter.clone(),
                             metrics.clone(),
                             state.clone(),
+                            segment_results.clone(),
                             target_partitions,
                         );
                         let late_search = Self::late_search(
@@ -2105,6 +2152,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                             pre_filter,
                             metrics,
                             state,
+                            segment_results,
                             target_partitions,
                         );
                         DataFusionResult::Ok(early_search.chain(late_search).boxed())
@@ -2401,6 +2449,7 @@ mod tests {
     use lance_index::{Index, IndexType};
     use lance_io::traits::Reader;
     use lance_linalg::distance::MetricType;
+    use lance_select::{RowAddrMask, RowAddrTreeMap};
     use lance_testing::datagen::generate_random_array;
     use roaring::RoaringBitmap;
     use rstest::rstest;
@@ -2866,7 +2915,16 @@ mod tests {
         }
     }
 
-    async fn empty_prefilter() -> Arc<DatasetPreFilter> {
+    struct StaticFilterLoader(RowAddrMask);
+
+    #[async_trait]
+    impl FilterLoader for StaticFilterLoader {
+        async fn load(self: Box<Self>) -> Result<RowAddrMask> {
+            Ok(self.0)
+        }
+    }
+
+    async fn test_prefilter(filter: Option<Box<dyn FilterLoader>>) -> Arc<DatasetPreFilter> {
         static NEXT_PREFILTER_DATASET_ID: AtomicUsize = AtomicUsize::new(0);
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "id",
@@ -2909,9 +2967,20 @@ mod tests {
             row_reference_domain: None,
             logical_coverage: None,
         };
-        let prefilter = Arc::new(DatasetPreFilter::new(dataset, &[index], None));
+        let prefilter = Arc::new(DatasetPreFilter::new(dataset, &[index], filter));
         prefilter.wait_for_ready().await.unwrap();
         prefilter
+    }
+
+    async fn empty_prefilter() -> Arc<DatasetPreFilter> {
+        test_prefilter(None).await
+    }
+
+    async fn allow_list_prefilter(row_ids: impl IntoIterator<Item = u64>) -> Arc<DatasetPreFilter> {
+        test_prefilter(Some(Box::new(StaticFilterLoader(
+            RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(row_ids)),
+        ))))
+        .await
     }
 
     fn prepared_metrics() -> Arc<AnnIndexMetrics> {
@@ -3019,6 +3088,7 @@ mod tests {
             empty_prefilter().await,
             prepared_metrics(),
             state,
+            None,
             usize::MAX,
         )
         .try_collect::<Vec<_>>()
@@ -3069,6 +3139,7 @@ mod tests {
             empty_prefilter().await,
             prepared_metrics(),
             state,
+            None,
             usize::MAX,
         )
         .try_collect::<Vec<_>>()
@@ -3115,6 +3186,7 @@ mod tests {
             empty_prefilter().await,
             prepared_metrics(),
             state.clone(),
+            None,
             usize::MAX,
         )
         .try_collect::<Vec<_>>()
@@ -3125,6 +3197,79 @@ mod tests {
         assert_eq!(*prepared_partitions.lock().unwrap(), vec![0, 1, 2]);
         assert_eq!(*searched_partitions.lock().unwrap(), vec![0]);
         assert_eq!(state.num_results_found.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn test_segment_local_mask_does_not_use_global_result_count_as_its_limit() {
+        let (index, _prepared_partitions, searched_partitions, _search_threads) =
+            prepared_index((21..33).collect());
+        let mut query = base_query();
+        query.k = 100;
+        query.minimum_nprobes = 0;
+        query.maximum_nprobes = Some(12);
+        let state = Arc::new(ANNIvfEarlySearchResults::new(1, query.k, false));
+        state.record_batch(
+            &RecordBatch::try_new(
+                KNN_INDEX_SCHEMA.clone(),
+                vec![
+                    Arc::new(Float32Array::from(vec![0.0; 20])),
+                    Arc::new(UInt64Array::from_iter_values(1000..1020)),
+                ],
+            )
+            .unwrap(),
+        );
+
+        let batches = ANNIvfSubIndexExec::late_search(
+            index,
+            query,
+            Arc::new(UInt32Array::from_iter_values(0..12)),
+            Arc::new(Float32Array::from_iter_values(
+                (0..12).map(|partition| partition as f32 / 10.0),
+            )),
+            allow_list_prefilter(0..3).await,
+            prepared_metrics(),
+            state,
+            Some(Arc::new(AtomicUsize::new(0))),
+            usize::MAX,
+        )
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+        assert_eq!(batches.len(), 3);
+        assert_eq!(*searched_partitions.lock().unwrap(), vec![0, 1, 2]);
+    }
+
+    #[tokio::test]
+    async fn test_segment_local_empty_mask_skips_partition_prepare() {
+        let (index, prepared_partitions, searched_partitions, _search_threads) =
+            prepared_index(vec![21, 22, 23]);
+        let mut query = base_query();
+        query.k = 100;
+        query.minimum_nprobes = 0;
+        query.maximum_nprobes = Some(3);
+        let state = Arc::new(ANNIvfEarlySearchResults::new(1, query.k, false));
+
+        let batches = ANNIvfSubIndexExec::late_search(
+            index,
+            query,
+            Arc::new(UInt32Array::from_iter_values(0..3)),
+            Arc::new(Float32Array::from_iter_values(
+                (0..3).map(|partition| partition as f32 / 10.0),
+            )),
+            allow_list_prefilter(std::iter::empty::<u64>()).await,
+            prepared_metrics(),
+            state,
+            Some(Arc::new(AtomicUsize::new(0))),
+            usize::MAX,
+        )
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+        assert!(batches.is_empty());
+        assert!(prepared_partitions.lock().unwrap().is_empty());
+        assert!(searched_partitions.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
