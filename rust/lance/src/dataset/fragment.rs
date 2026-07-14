@@ -3026,8 +3026,9 @@ mod tests {
     use arrow_arith::numeric::mul;
     use arrow_array::{
         ArrayRef, BooleanArray, Int32Array, Int64Array, RecordBatchIterator, StringArray,
+        StructArray, cast::AsArray, types::Int32Type,
     };
-    use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+    use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
     use lance_core::ROW_ID;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::{RowCount, array, gen_batch};
@@ -4432,6 +4433,138 @@ mod tests {
                 .contains("storage_stats requires full file metadata"),
             "expected storage_stats to reject projected metadata, got {err:?}"
         );
+    }
+
+    #[test]
+    fn test_indexed_metadata_heuristic_counts_selected_physical_columns() {
+        let schema = Schema::try_from(&ArrowSchema::new(vec![
+            ArrowField::new(
+                "s",
+                DataType::Struct(
+                    vec![
+                        ArrowField::new("x", DataType::Int32, true),
+                        ArrowField::new("y", DataType::Int32, true),
+                    ]
+                    .into(),
+                ),
+                true,
+            ),
+            ArrowField::new("a", DataType::Int32, true),
+            ArrowField::new("b", DataType::Int32, true),
+            ArrowField::new("c", DataType::Int32, true),
+        ]))
+        .unwrap();
+        let data_file = DataFile {
+            path: "wide.lance".to_string(),
+            fields: Arc::from([0, 1, 2, 3, 4, 5]),
+            column_indices: Arc::from([-1, 0, 1, 2, 3, 4]),
+            file_major_version: 2,
+            file_minor_version: 1,
+            file_size_bytes: CachedFileSize::unknown(),
+            base_id: None,
+        };
+
+        let full_struct =
+            ReaderProjection::from_column_names(LanceFileVersion::V2_1, &schema, &["s"]).unwrap();
+        assert_eq!(full_struct.column_indices.len(), 2);
+        assert!(!FileFragment::should_try_indexed_metadata(
+            &data_file,
+            &full_struct,
+            LanceFileVersion::V2_1
+        ));
+
+        let partial_struct =
+            ReaderProjection::from_column_names(LanceFileVersion::V2_1, &schema, &["s.x"]).unwrap();
+        assert_eq!(partial_struct.column_indices.len(), 1);
+        assert!(FileFragment::should_try_indexed_metadata(
+            &data_file,
+            &partial_struct,
+            LanceFileVersion::V2_1
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_packed_projection_falls_back_after_dropping_child() {
+        let packed_fields = Fields::from(vec![
+            ArrowField::new("x", DataType::Int32, false),
+            ArrowField::new("y", DataType::Int32, false),
+            ArrowField::new("z", DataType::Int32, false),
+        ]);
+        let packed = Arc::new(StructArray::new(
+            packed_fields.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..4)) as ArrayRef,
+                Arc::new(Int32Array::from_iter_values(100..104)) as ArrayRef,
+                Arc::new(Int32Array::from_iter_values(1000..1004)) as ArrayRef,
+            ],
+            None,
+        )) as ArrayRef;
+        let mut fields = vec![
+            ArrowField::new("packed", DataType::Struct(packed_fields), false).with_metadata(
+                HashMap::from([("lance-encoding:packed".to_string(), "true".to_string())]),
+            ),
+        ];
+        let mut columns = vec![packed];
+        for idx in 0..8 {
+            fields.push(ArrowField::new(
+                format!("scalar_{idx}"),
+                DataType::Int32,
+                false,
+            ));
+            columns.push(Arc::new(Int32Array::from_iter_values(idx..idx + 4)) as ArrayRef);
+        }
+        let schema = Arc::new(ArrowSchema::new(fields));
+        let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let test_dir = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            reader,
+            &test_dir,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        dataset.drop_columns(&["packed.y"]).await.unwrap();
+        let projection = dataset.schema().project(&["packed.z"]).unwrap();
+        let fragment = dataset.get_fragment(0).unwrap();
+        let data_file = &fragment.metadata.files[0];
+        let reader_projection = ReaderProjection::from_field_ids(
+            LanceFileVersion::V2_1,
+            &projection,
+            &BTreeMap::from_iter(
+                data_file
+                    .fields
+                    .iter()
+                    .copied()
+                    .zip(data_file.column_indices.iter().copied())
+                    .filter_map(|(field_id, column_index)| {
+                        (column_index >= 0).then_some((field_id as u32, column_index as u32))
+                    }),
+            ),
+        )
+        .unwrap();
+        assert!(!FileFragment::should_try_indexed_metadata(
+            data_file,
+            &reader_projection,
+            LanceFileVersion::V2_1
+        ));
+
+        let actual = dataset
+            .scan()
+            .project(&["packed.z"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let z = actual
+            .column_by_name("packed.z")
+            .unwrap()
+            .as_primitive::<Int32Type>();
+        assert_eq!(z.values(), &[1000, 1001, 1002, 1003]);
     }
 
     #[tokio::test]
