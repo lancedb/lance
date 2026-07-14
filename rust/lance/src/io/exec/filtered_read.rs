@@ -336,7 +336,7 @@ struct FilteredReadStream {
     scan_range_after_filter: Option<Range<u64>>,
     /// Take-shaped plan (many fragments, few rows each); the output side
     /// consolidates the tiny per-fragment batches
-    sparse_plan: bool,
+    is_sparse_plan: bool,
     /// Rows per output batch (explicit option → env default → 8192)
     batch_target_rows: usize,
 }
@@ -399,12 +399,16 @@ fn coalesce_batches(
 
         fn emit(&mut self) -> DataFusionResult<RecordBatch> {
             self.buffered_rows = 0;
-            if self.buffered.len() == 1 {
-                Ok(self.buffered.pop().unwrap())
-            } else {
+            if self.buffered.len() > 1 {
                 let batch = arrow::compute::concat_batches(&self.schema, self.buffered.iter())?;
                 self.buffered.clear();
                 Ok(batch)
+            } else {
+                self.buffered.pop().ok_or_else(|| {
+                    DataFusionError::Internal(
+                        "coalesce_batches emitted with an empty buffer".to_string(),
+                    )
+                })
             }
         }
     }
@@ -560,13 +564,14 @@ impl FilteredReadStream {
                         (fragments, rows)
                     }
                 });
-        let sparse_plan = touched_fragments >= CONSOLIDATE_MIN_FRAGMENTS
-            && planned_rows
-                < touched_fragments as u64 * CONSOLIDATE_MAX_AVG_PLANNED_ROWS_PER_FRAGMENT;
         let batch_target_rows = options
             .batch_size
             .map(|batch_size| batch_size as usize)
             .unwrap_or_else(|| get_default_batch_size().unwrap_or(BATCH_SIZE_FALLBACK));
+        let is_sparse_plan = batch_target_rows > 0
+            && touched_fragments >= CONSOLIDATE_MIN_FRAGMENTS
+            && planned_rows
+                < touched_fragments as u64 * CONSOLIDATE_MAX_AVG_PLANNED_ROWS_PER_FRAGMENT;
 
         Ok(Self {
             output_schema,
@@ -576,7 +581,7 @@ impl FilteredReadStream {
             active_partitions_counter: Arc::new(AtomicUsize::new(0)),
             threading_mode,
             scan_range_after_filter,
-            sparse_plan,
+            is_sparse_plan,
             batch_target_rows,
         })
     }
@@ -1983,7 +1988,7 @@ impl FilteredReadExec {
             let consolidate = if index_input.is_some() && batch_size_bytes.is_none() {
                 running_stream
                     .as_ref()
-                    .and_then(|running| running.sparse_plan.then_some(running.batch_target_rows))
+                    .and_then(|running| running.is_sparse_plan.then_some(running.batch_target_rows))
             } else {
                 None
             };
@@ -2355,7 +2360,9 @@ mod tests {
     };
     use itertools::Itertools;
     use lance_core::datatypes::OnMissing;
+    use lance_core::utils::address::RowAddress;
     use lance_core::utils::tempfile::TempStrDir;
+    use lance_datafusion::exec::OneShotExec;
     use lance_datagen::{BatchCount, Dimension, RowCount, array, gen_batch};
     use lance_index::{
         IndexType,
@@ -2363,6 +2370,7 @@ mod tests {
         scalar::{ScalarIndexParams, expression::PlannerIndexExt},
     };
     use lance_select::result::IndexExprResultWireFormat;
+    use lance_select::{RowAddrMask, RowAddrTreeMap};
 
     use crate::{
         dataset::{InsertBuilder, WriteDestination, WriteMode, WriteParams},
@@ -2589,15 +2597,10 @@ mod tests {
         ))
     }
 
-    /// Round-trip every interval shape through the arrow wire format and
-    /// confirm the endpoints survive. Exercises both
     /// Take-shaped masked reads consolidate their tiny per-fragment batches;
     /// few-fragment and dense masked reads keep per-fragment boundaries.
     #[test_log::test(tokio::test)]
     async fn test_take_shaped_mask_consolidation() {
-        use lance_datafusion::exec::OneShotExec;
-        use lance_select::{RowAddrMask, RowAddrTreeMap};
-
         // 20 fragments x 2000 rows, value = global row number
         let tmp_path = TempStrDir::default();
         let data = gen_batch()
@@ -2631,18 +2634,20 @@ mod tests {
         let run = |input: Arc<dyn ExecutionPlan>| {
             let dataset = dataset.clone();
             async move {
-                let options = FilteredReadOptions::basic_full_read(&dataset);
+                // Pin the batch size so batch-count assertions don't depend
+                // on LANCE_DEFAULT_BATCH_SIZE
+                let options = FilteredReadOptions::basic_full_read(&dataset).with_batch_size(2000);
                 let plan =
                     FilteredReadExec::try_new(dataset.clone(), options, Some(input)).unwrap();
                 let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
                 stream.try_collect::<Vec<_>>().await.unwrap()
             }
         };
-        let addr = |frag: u64, offset: u64| (frag << 32) | offset;
+        let addr = |frag: u32, offset: u32| u64::from(RowAddress::new_from_parts(frag, offset));
 
         // Take shape: 20 fragments, 2 rows each -> one consolidated batch,
         // rows in fragment order
-        let addrs: Vec<u64> = (0..20).flat_map(|f| [addr(f, 3), addr(f, 7)]).collect();
+        let addrs: Vec<u64> = (0..20u32).flat_map(|f| [addr(f, 3), addr(f, 7)]).collect();
         let batches = run(mask_input(addrs)).await;
         assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 40);
         assert_eq!(batches.len(), 1);
@@ -2655,14 +2660,16 @@ mod tests {
         assert_eq!(batches.len(), 2);
 
         // Dense (2000 planned rows per fragment) -> inline path
-        let addrs: Vec<u64> = (0..8)
-            .flat_map(|f| (0..2000).map(move |o| addr(f, o)))
+        let addrs: Vec<u64> = (0..8u32)
+            .flat_map(|f| (0..2000u32).map(move |o| addr(f, o)))
             .collect();
         let batches = run(mask_input(addrs)).await;
         assert_eq!(batches.len(), 8);
         assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 16000);
     }
 
+    /// Round-trip every interval shape through the arrow wire format and
+    /// confirm the endpoints survive. Exercises both
     /// `IndexExprResult::serialize` and `EvaluatedIndex::try_from_arrow`
     /// so the schema names stay in sync.
     #[test]
