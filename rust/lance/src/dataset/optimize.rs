@@ -267,7 +267,8 @@ pub struct CompactionOptions {
     /// is rewritten into a fresh fragment with its overlays (and deletions)
     /// materialized into the base data, dropping the fragment from any index
     /// left stale by those overlays.
-    /// Defaults to `None` (overlay count never triggers compaction).
+    /// Defaults to `Some(10)`. Set to `None` to disable the overlay-count
+    /// trigger entirely.
     pub max_overlays_per_fragment: Option<usize>,
     /// Transaction properties to store with this commit.
     ///
@@ -298,7 +299,7 @@ impl Default for CompactionOptions {
             enable_binary_copy_force: false,
             binary_copy_read_batch_bytes: Some(16 * 1024 * 1024),
             max_source_fragments: None,
-            max_overlays_per_fragment: None,
+            max_overlays_per_fragment: Some(10),
             transaction_properties: None,
         }
     }
