@@ -1320,7 +1320,9 @@ mod tests {
             .unwrap();
 
         // Simulate WAL flush
-        memtable.mark_wal_flushed(&[frag_id], 1, &[0]);
+        memtable
+            .batch_store()
+            .set_max_flushed_batch_position(frag_id);
         assert!(memtable.all_flushed_to_wal());
 
         let flusher = MemTableFlusher::new(
@@ -1384,7 +1386,9 @@ mod tests {
             .insert(create_test_batch(&schema, 10))
             .await
             .unwrap();
-        memtable.mark_wal_flushed(&[frag_id], 1, &[0]);
+        memtable
+            .batch_store()
+            .set_max_flushed_batch_position(frag_id);
 
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let warmer: Arc<dyn GenerationWarmer> = Arc::new(CountingWarmer {
@@ -1445,7 +1449,9 @@ mod tests {
         )
         .unwrap();
         let frag_id = memtable.insert(batch).await.unwrap();
-        memtable.mark_wal_flushed(&[frag_id], 1, &[0]);
+        memtable
+            .batch_store()
+            .set_max_flushed_batch_position(frag_id);
 
         let flusher = MemTableFlusher::new(
             store.clone(),
@@ -1548,7 +1554,9 @@ mod tests {
         )
         .unwrap();
         let frag_id = memtable.insert(batch).await.unwrap();
-        memtable.mark_wal_flushed(&[frag_id], 1, &[0]);
+        memtable
+            .batch_store()
+            .set_max_flushed_batch_position(frag_id);
 
         let flusher = MemTableFlusher::new(
             store.clone(),
@@ -1648,7 +1656,9 @@ mod tests {
         )
         .unwrap();
         let frag_id = memtable.insert(batch).await.unwrap();
-        memtable.mark_wal_flushed(&[frag_id], 1, &[0]);
+        memtable
+            .batch_store()
+            .set_max_flushed_batch_position(frag_id);
 
         let flusher = MemTableFlusher::new(
             store.clone(),
@@ -1742,7 +1752,9 @@ mod tests {
         )
         .unwrap();
         let frag_id = memtable.insert(batch).await.unwrap();
-        memtable.mark_wal_flushed(&[frag_id], 1, &[0]);
+        memtable
+            .batch_store()
+            .set_max_flushed_batch_position(frag_id);
 
         let flusher = MemTableFlusher::new(
             store.clone(),
@@ -1874,7 +1886,9 @@ mod tests {
             .unwrap();
 
         // Simulate WAL flush
-        memtable.mark_wal_flushed(&[frag_id], 1, &[0]);
+        memtable
+            .batch_store()
+            .set_max_flushed_batch_position(frag_id);
 
         let flusher = MemTableFlusher::new(
             store.clone(),
@@ -2011,7 +2025,9 @@ mod tests {
         let frag_id = memtable.insert(batch).await.unwrap();
 
         // Simulate WAL flush
-        memtable.mark_wal_flushed(&[frag_id], 1, &[0]);
+        memtable
+            .batch_store()
+            .set_max_flushed_batch_position(frag_id);
 
         let flusher = MemTableFlusher::new(
             store.clone(),
@@ -2161,7 +2177,9 @@ mod tests {
         let frag_id = memtable.insert(batch).await.unwrap();
 
         // Simulate WAL flush
-        memtable.mark_wal_flushed(&[frag_id], 1, &[0]);
+        memtable
+            .batch_store()
+            .set_max_flushed_batch_position(frag_id);
 
         let flusher = MemTableFlusher::new(
             store.clone(),

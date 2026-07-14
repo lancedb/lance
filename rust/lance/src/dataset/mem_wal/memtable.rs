@@ -7,7 +7,6 @@ pub mod batch_store;
 pub mod flush;
 pub mod scanner;
 
-use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -78,13 +77,6 @@ pub struct MemTable {
 
     /// Generation number (incremented on flush).
     generation: u64,
-
-    /// WAL batch mapping: batch_position -> (wal_entry_position, position within WAL entry).
-    wal_batch_mapping: HashMap<usize, (u64, usize)>,
-    /// Last WAL entry position that has been flushed.
-    last_flushed_wal_entry_position: u64,
-    /// Set of batch IDs that have been flushed to WAL.
-    flushed_batch_positions: HashSet<usize>,
 
     /// Primary key bloom filter for staleness detection.
     pk_bloom_filter: Sbbf,
@@ -220,9 +212,6 @@ impl MemTable {
             cache_config,
             cached_dataset: RwLock::new(None),
             generation,
-            wal_batch_mapping: HashMap::new(),
-            last_flushed_wal_entry_position: 0,
-            flushed_batch_positions: HashSet::new(),
             pk_bloom_filter,
             pk_field_ids,
             // Initialize with an empty IndexStore so the visibility cursor has
@@ -561,30 +550,6 @@ impl MemTable {
         Ok(())
     }
 
-    /// Mark batches as flushed to WAL.
-    ///
-    /// Updates the WAL batch mapping for use during MemTable flush.
-    /// Also updates the batch_store's watermark to the highest flushed batch_position.
-    pub fn mark_wal_flushed(
-        &mut self,
-        batch_positions: &[usize],
-        wal_entry_position: u64,
-        positions: &[usize],
-    ) {
-        for (idx, &batch_position) in batch_positions.iter().enumerate() {
-            self.wal_batch_mapping
-                .insert(batch_position, (wal_entry_position, positions[idx]));
-            self.flushed_batch_positions.insert(batch_position);
-        }
-        self.last_flushed_wal_entry_position = wal_entry_position;
-
-        // Update batch_store watermark to the highest batch_position flushed (inclusive)
-        if let Some(&max_batch_position) = batch_positions.iter().max() {
-            self.batch_store
-                .set_max_flushed_batch_position(max_batch_position);
-        }
-    }
-
     /// Get or create a Dataset for reading.
     ///
     /// Uses caching based on the configured eventual consistency strategy:
@@ -726,16 +691,6 @@ impl MemTable {
         self.batch_store.estimated_bytes() + self.pk_bloom_filter.estimated_memory_size()
     }
 
-    /// Get the WAL batch mapping.
-    pub fn wal_batch_mapping(&self) -> &HashMap<usize, (u64, usize)> {
-        &self.wal_batch_mapping
-    }
-
-    /// Get the last flushed WAL entry position.
-    pub fn last_flushed_wal_entry_position(&self) -> u64 {
-        self.last_flushed_wal_entry_position
-    }
-
     /// Get the bloom filter for serialization.
     pub fn bloom_filter(&self) -> &Sbbf {
         &self.pk_bloom_filter
@@ -760,14 +715,6 @@ impl MemTable {
     /// Check if all batches have been flushed to WAL.
     pub fn all_flushed_to_wal(&self) -> bool {
         self.batch_store.pending_wal_flush_count() == 0
-    }
-
-    /// Get unflushed batch IDs.
-    pub fn unflushed_batch_positions(&self) -> Vec<usize> {
-        let batch_count = self.batch_count();
-        (0..batch_count)
-            .filter(|id| !self.flushed_batch_positions.contains(id))
-            .collect()
     }
 
     /// Get cache configuration.
@@ -931,29 +878,11 @@ mod tests {
         assert_eq!(total_rows, 15);
     }
 
+    /// `all_flushed_to_wal()` is the L0 flush's precondition (`flush.rs:171`):
+    /// false while any committed batch is still un-appended, true once the
+    /// durability watermark covers every one of them.
     #[tokio::test]
-    async fn test_memtable_wal_mapping() {
-        let schema = create_test_schema();
-        let mut memtable = MemTable::new(schema.clone(), 1, vec![]).unwrap();
-
-        let batch_position = memtable
-            .insert(create_test_batch(&schema, 10))
-            .await
-            .unwrap();
-        assert!(!memtable.all_flushed_to_wal());
-
-        memtable.mark_wal_flushed(&[batch_position], 5, &[0]);
-
-        assert!(memtable.all_flushed_to_wal());
-        assert_eq!(
-            memtable.wal_batch_mapping().get(&batch_position),
-            Some(&(5, 0))
-        );
-        assert_eq!(memtable.last_flushed_wal_entry_position(), 5);
-    }
-
-    #[tokio::test]
-    async fn test_memtable_unflushed_batches() {
+    async fn test_all_flushed_to_wal_tracks_the_durability_watermark() {
         let schema = create_test_schema();
         let mut memtable = MemTable::new(schema.clone(), 1, vec![]).unwrap();
 
@@ -965,12 +894,20 @@ mod tests {
             .insert(create_test_batch(&schema, 5))
             .await
             .unwrap();
+        assert!(!memtable.all_flushed_to_wal());
 
-        assert_eq!(memtable.unflushed_batch_positions(), vec![batch1, batch2]);
+        memtable
+            .batch_store()
+            .set_max_flushed_batch_position(batch1);
+        assert!(
+            !memtable.all_flushed_to_wal(),
+            "batch2 is still waiting on its WAL append"
+        );
 
-        memtable.mark_wal_flushed(&[batch1], 1, &[0]);
-
-        assert_eq!(memtable.unflushed_batch_positions(), vec![batch2]);
+        memtable
+            .batch_store()
+            .set_max_flushed_batch_position(batch2);
+        assert!(memtable.all_flushed_to_wal());
     }
 
     #[tokio::test]
