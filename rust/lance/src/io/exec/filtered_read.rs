@@ -101,11 +101,17 @@ impl EvaluatedIndex {
         })
     }
 
-    /// Drop `fragments` from the covered set so they are read in full and re-filtered on the flat
-    /// path rather than trusting the (possibly stale) index result for them.
-    fn without_fragments(mut self, fragments: &RoaringBitmap) -> Self {
-        if !fragments.is_empty() {
-            self.applicable_fragments -= fragments;
+    /// Block `rows` (stale overlay row addresses) from the index result so the index never
+    /// emits them. Their fragments stay in the covered set, so non-stale rows keep the index;
+    /// the blocked rows are re-evaluated against their current (overlay-merged) values on a
+    /// separate targeted take path built by the scanner.
+    fn without_rows(mut self, block: &RowAddrMask) -> Self {
+        // `overlay_block` is always a block list; an empty one leaves the result unchanged.
+        if let Some(block_list) = block.block_list() {
+            self.index_result.upper =
+                std::mem::take(&mut self.index_result.upper).also_block(block_list.clone());
+            self.index_result.lower =
+                std::mem::take(&mut self.index_result.lower).also_block(block_list.clone());
         }
         self
     }
@@ -1514,10 +1520,12 @@ pub struct FilteredReadOptions {
     pub io_buffer_size_bytes: Option<u64>,
     /// If true, skip fragments that are not covered by the scalar index result.
     pub only_indexed_fragments: bool,
-    /// Fragments whose index entries may be stale because an overlay committed after the index
-    /// was built touches an indexed field. They are dropped from the index's covered set so they
-    /// fall to the flat path and are re-evaluated against their current (overlay-merged) values.
-    pub overlay_stale_fragments: RoaringBitmap,
+    /// Row addresses whose index entries may be stale because an overlay committed after the
+    /// index was built touches an indexed field. They are blocked from the index result so the
+    /// index never emits them; the scanner re-evaluates just these rows against their current
+    /// (overlay-merged) values on a targeted take path. Their fragments stay in the covered set,
+    /// so non-stale rows keep the index. `None` on the common no-overlay fast path.
+    pub overlay_block: Option<RowAddrMask>,
 }
 
 impl FilteredReadOptions {
@@ -1547,19 +1555,18 @@ impl FilteredReadOptions {
             full_filter: None,
             io_buffer_size_bytes: None,
             only_indexed_fragments: false,
-            overlay_stale_fragments: RoaringBitmap::new(),
+            overlay_block: None,
             threading_mode: FilteredReadThreadingMode::OnePartitionMultipleThreads(
                 get_num_compute_intensive_cpus(),
             ),
         }
     }
 
-    /// Drop the given fragments from the scalar index's covered set, forcing them onto the flat
-    /// path where the full filter is re-evaluated against their current (overlay-merged) values.
-    /// Used to mask data overlay files: a fragment with a newer overlay on an indexed field can
-    /// no longer be trusted to the index.
-    pub fn with_overlay_stale_fragments(mut self, fragments: RoaringBitmap) -> Self {
-        self.overlay_stale_fragments = fragments;
+    /// Block the given stale overlay row addresses from the scalar index result so the index
+    /// never emits them. Used to mask data overlay files: rows with a newer overlay on an indexed
+    /// field can no longer be trusted to the index and are re-evaluated on a targeted take path.
+    pub fn with_overlay_block(mut self, block: RowAddrMask) -> Self {
+        self.overlay_block = Some(block);
         self
     }
 
@@ -2140,10 +2147,11 @@ impl FilteredReadExec {
                     let index_search_result = index_search.next().await.ok_or_else(|| {
                         Error::internal("Index search did not yield any results".to_string())
                     })??;
-                    evaluated_index = Some(Arc::new(
-                        EvaluatedIndex::try_from_arrow(&index_search_result)?
-                            .without_fragments(&options.overlay_stale_fragments),
-                    ));
+                    let mut idx = EvaluatedIndex::try_from_arrow(&index_search_result)?;
+                    if let Some(overlay_block) = options.overlay_block.as_ref() {
+                        idx = idx.without_rows(overlay_block);
+                    }
+                    evaluated_index = Some(Arc::new(idx));
                 }
 
                 // Load fragments to compute the plan

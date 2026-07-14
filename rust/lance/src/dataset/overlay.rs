@@ -44,8 +44,8 @@ use lance_core::datatypes::{Field, Schema};
 use lance_core::{Error, Result};
 use roaring::RoaringBitmap;
 
-use lance_table::format::DataFile;
 use lance_table::format::overlay::DataOverlayFile;
+use lance_table::format::{DataFile, Fragment, IndexMetadata};
 use lance_table::utils::stream::ReadBatchFut;
 
 use crate::dataset::fragment::{FileFragment, FragReadConfig, GenericFileReader};
@@ -78,6 +78,80 @@ pub fn overlay_exclusion_offsets(
         }
     }
     Ok(excluded)
+}
+
+/// Insert into `stale` the ids of fragments covered by `segment` whose index entries may be
+/// stale because an overlay committed after the segment was built touches a field the segment
+/// indexes. Field-aware and version-gated via [`overlay_exclusion_offsets`].
+///
+/// `overlaid_frags` holds only the fragments that actually carry overlays (rare), so the loop is
+/// `O(overlaid_frags)` rather than `O(fragments the segment covers)`.
+pub fn collect_stale_overlay_frags(
+    segment: &IndexMetadata,
+    overlaid_frags: &HashMap<u32, &Fragment>,
+    stale: &mut RoaringBitmap,
+) -> Result<()> {
+    let Some(coverage) = segment.fragment_bitmap.as_ref() else {
+        return Ok(());
+    };
+    for (&frag_id, fragment) in overlaid_frags {
+        if stale.contains(frag_id) || !coverage.contains(frag_id) {
+            continue;
+        }
+        // Cheap version gate: skip the field/bitmap work if every overlay on this fragment
+        // predates the segment (already incorporated by the index).
+        if fragment
+            .overlays
+            .iter()
+            .all(|o| o.committed_version <= segment.dataset_version)
+        {
+            continue;
+        }
+        if !overlay_exclusion_offsets(&fragment.overlays, &segment.fields, segment.dataset_version)?
+            .is_empty()
+        {
+            stale.insert(frag_id);
+        }
+    }
+    Ok(())
+}
+
+/// Like [`collect_stale_overlay_frags`] but with row-level granularity: instead of marking the
+/// whole fragment stale, it computes exactly which row offsets within each covered fragment are
+/// stale and accumulates them into `stale` (fragment_id → stale row offsets).
+///
+/// Used by the scalar and vector paths to block only the affected rows from index results and
+/// re-evaluate only those rows on the flat path, keeping overhead proportional to the number of
+/// overlaid rows rather than the whole fragment size.
+pub fn collect_overlay_stale_rows_for_segment(
+    segment: &IndexMetadata,
+    overlaid_frags: &HashMap<u32, &Fragment>,
+    stale: &mut HashMap<u32, RoaringBitmap>,
+) -> Result<()> {
+    let Some(coverage) = segment.fragment_bitmap.as_ref() else {
+        return Ok(());
+    };
+    for (&frag_id, fragment) in overlaid_frags {
+        if !coverage.contains(frag_id) {
+            continue;
+        }
+        if fragment
+            .overlays
+            .iter()
+            .all(|o| o.committed_version <= segment.dataset_version)
+        {
+            continue;
+        }
+        let excluded = overlay_exclusion_offsets(
+            &fragment.overlays,
+            &segment.fields,
+            segment.dataset_version,
+        )?;
+        if !excluded.is_empty() {
+            *stale.entry(frag_id).or_default() |= &excluded;
+        }
+    }
+    Ok(())
 }
 
 /// The plan for merging one field's overlays into one batch: which source (base or

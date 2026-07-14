@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use datafusion::config::ConfigOptions;
 use lance_select::result::IndexExprResultWireFormat;
@@ -83,7 +83,9 @@ use tracing::{Span, info_span, instrument};
 use uuid::Uuid;
 
 use super::Dataset;
-use crate::dataset::overlay::overlay_exclusion_offsets;
+use crate::dataset::overlay::{
+    collect_overlay_stale_rows_for_segment, collect_stale_overlay_frags,
+};
 use crate::dataset::row_offsets_to_row_addresses;
 use crate::dataset::utils::SchemaAdapter;
 use crate::index::DatasetIndexInternalExt;
@@ -2909,6 +2911,8 @@ impl Scanner {
         fragments: Option<Arc<Vec<Fragment>>>,
         scan_range: Option<Range<u64>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        // Kept for the overlay stale-Take path below, which re-evaluates blocked stale rows.
+        let user_projection = projection.clone();
         let mut read_options = FilteredReadOptions::basic_full_read(&self.dataset)
             .with_filter_plan(filter_plan.clone())
             .with_projection(projection);
@@ -2950,20 +2954,21 @@ impl Scanner {
             read_options = read_options.with_only_indexed_fragments();
         }
 
-        // Mask data overlay files: a fragment with an overlay committed after an index it relies
-        // on touched an indexed field can no longer be trusted to that index. Drop such fragments
-        // from the index's covered set so they are re-evaluated on the flat path.
+        // Mask data overlay files: a row with an overlay committed after an index it relies on
+        // touched an indexed field can no longer be trusted to that index. Block just those rows
+        // from the index result (their fragments stay indexed, so non-stale rows keep the index)
+        // and re-evaluate them on a targeted take path below — O(stale_rows), not O(fragment).
+        let mut overlay_stale_rows: HashMap<u32, RoaringBitmap> = HashMap::new();
         if let Some(index_query) = filter_plan.index_query.as_ref() {
             let candidate_frags = read_options
                 .fragments
                 .clone()
                 .unwrap_or_else(|| self.dataset.fragments().clone());
-            let stale_rows = self
+            overlay_stale_rows = self
                 .overlay_stale_index_rows(index_query, &candidate_frags)
                 .await?;
-            if !stale_rows.is_empty() {
-                let stale_frags: RoaringBitmap = stale_rows.keys().copied().collect();
-                read_options = read_options.with_overlay_stale_fragments(stale_frags);
+            if let Some(block) = Self::stale_rows_block_mask(&overlay_stale_rows) {
+                read_options = read_options.with_overlay_block(block);
             }
         }
 
@@ -2976,10 +2981,35 @@ impl Scanner {
             )) as Arc<dyn ExecutionPlan>
         });
 
-        Ok(Arc::new(FilteredReadExec::try_new(
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(FilteredReadExec::try_new(
             self.dataset.clone(),
             read_options,
             index_input,
+        )?);
+
+        if overlay_stale_rows.is_empty() {
+            return Ok(plan);
+        }
+
+        // Stale-Take path: take the stale rows' current (overlay-merged) values and re-apply the
+        // full filter, then union with the indexed read. These rows were blocked from the index
+        // result above, so this is the only path that can surface them.
+        let filter = filter_plan.full_expr.as_ref().unwrap();
+        let filter_cols = Planner::column_names_in_expr(filter);
+        let take_projection = user_projection.union_columns(filter_cols, OnMissing::Error)?;
+
+        let stale_id_plan = Self::stale_rows_row_id_exec(&overlay_stale_rows)?;
+        let stale_node = self.take(stale_id_plan, take_projection)?;
+        let planner = Planner::new(stale_node.schema());
+        let optimized_filter = planner.optimize_expr(filter.clone())?;
+        let filtered = Arc::new(LanceFilterExec::try_new(optimized_filter, stale_node)?);
+        let stale_path: Arc<dyn ExecutionPlan> =
+            Arc::new(project(filtered, plan.schema().as_ref())?);
+
+        let unioned = UnionExec::try_new(vec![plan, stale_path])?;
+        Ok(Arc::new(RepartitionExec::try_new(
+            unioned,
+            datafusion::physical_plan::Partitioning::RoundRobinBatch(1),
         )?))
     }
 
@@ -3347,10 +3377,10 @@ impl Scanner {
                 self.fragments_covered_by_fts_query(&query).await?,
             )
             .await?;
-        // TODO: FTS does not yet mask data overlay files. A fragment with an overlay
-        // on an FTS-indexed field committed after the index was built may return stale hits. The
-        // fix requires identifying stale FTS segments (analogous to `overlay_stale_index_frags`)
-        // and routing their fragments to the flat-text fallback path.
+        // Data overlay masking: match queries drop stale segments and re-evaluate the affected
+        // fragments on the flat-text path (`plan_match_query` / `fts_stale_frags_and_fresh_segments`),
+        // and phrase queries exclude stale segments (`plan_phrase_query`). Both keep stale index
+        // hits out of the result.
         let fts_exec = self
             .plan_fts(&query, &params, filter_plan, &prefilter_source)
             .await?;
@@ -3543,12 +3573,40 @@ impl Scanner {
                 .to_string()));
         }
 
-        Ok(Arc::new(PhraseQueryExec::new(
-            self.dataset.clone(),
-            query.clone(),
-            params.clone(),
-            prefilter_source.clone(),
-        )))
+        // Mask data overlay files: a fragment with an overlay committed after this FTS index can
+        // no longer be trusted to its inverted-index positions, so a stale phrase could still
+        // match. Exclude any segment covering such a fragment. Unlike match queries, phrase
+        // queries have no flat re-evaluation path, so — exactly as for unindexed fragments, which
+        // phrase queries already do not search — overlaid fragments are simply dropped from the
+        // phrase result; new phrase matches there surface once compaction folds the overlay into
+        // the base. This removes stale hits without introducing wrong ones.
+        let target_fragments = self
+            .fragments
+            .clone()
+            .unwrap_or_else(|| self.dataset.fragments().to_vec());
+        let (_flat_frag_ids, fresh_segments) = self
+            .fts_stale_frags_and_fresh_segments(&column, &target_fragments)
+            .await?;
+
+        let exec: Arc<dyn ExecutionPlan> = match fresh_segments {
+            // Every segment covers a stale fragment: with no flat phrase path there is nothing
+            // trustworthy left to search, so the phrase query returns no rows.
+            Some(segs) if segs.is_empty() => Arc::new(EmptyExec::new(FTS_SCHEMA.clone())),
+            Some(segs) => Arc::new(PhraseQueryExec::new_with_segments(
+                self.dataset.clone(),
+                query.clone(),
+                params.clone(),
+                prefilter_source.clone(),
+                segs,
+            )),
+            None => Arc::new(PhraseQueryExec::new(
+                self.dataset.clone(),
+                query.clone(),
+                params.clone(),
+                prefilter_source.clone(),
+            )),
+        };
+        Ok(exec)
     }
 
     async fn plan_match_query(
@@ -3591,7 +3649,7 @@ impl Scanner {
 
                 // Fragments that need flat evaluation: unindexed + stale (deduplicated).
                 let flat_fragments: Vec<Fragment> = {
-                    let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+                    let mut seen = RoaringBitmap::new();
                     let mut frags = Vec::new();
                     for f in unindexed_fragments.iter().chain(
                         target_fragments
@@ -3899,17 +3957,9 @@ impl Scanner {
             // These stale rows are blocked from ANN results via the prefilter and re-scored
             // on the targeted flat path below — only the specific stale rows, not the whole
             // fragment, so sparse overlays incur near-zero overhead.
-            let stale_rows = self.mask_overlay_stale_rows(&index_segments)?;
+            let stale_rows = self.overlay_stale_vector_rows(&index_segments)?;
             // Build a prefilter block mask for stale rows (empty = no-op fast path).
-            let overlay_block: Option<RowAddrMask> = if stale_rows.is_empty() {
-                None
-            } else {
-                let mut tree_map = RowAddrTreeMap::new();
-                for (&frag_id, offsets) in &stale_rows {
-                    tree_map.insert_bitmap(frag_id, offsets.clone());
-                }
-                Some(RowAddrMask::from_block(tree_map))
-            };
+            let overlay_block = Self::stale_rows_block_mask(&stale_rows);
 
             let ann_node = match vector_type {
                 DataType::FixedSizeList(_, _) => {
@@ -4079,7 +4129,7 @@ impl Scanner {
         q: &Query,
         index_name: &str,
         indexed_segments: &[IndexMetadata],
-        stale_rows: &std::collections::HashMap<u32, RoaringBitmap>,
+        stale_rows: &HashMap<u32, RoaringBitmap>,
         mut knn_node: Arc<dyn ExecutionPlan>,
         filter_plan: &ExprFilterPlan,
     ) -> Result<Arc<dyn ExecutionPlan>> {
@@ -4156,23 +4206,7 @@ impl Scanner {
         // Only specific row addresses need re-scoring, not the whole fragment, so sparse overlays
         // incur near-zero overhead.
         if has_stale {
-            let stale_addrs: Vec<u64> = stale_rows
-                .iter()
-                .flat_map(|(&frag_id, offsets)| {
-                    offsets
-                        .iter()
-                        .map(move |offset| ((frag_id as u64) << 32) | offset as u64)
-                })
-                .collect();
-            let batch = RecordBatch::try_new(
-                Arc::new(ArrowSchema::new(vec![ArrowField::new(
-                    ROW_ID,
-                    DataType::UInt64,
-                    true,
-                )])),
-                vec![Arc::new(UInt64Array::from(stale_addrs))],
-            )?;
-            let stale_id_plan = Arc::new(OneShotExec::from_batch(batch));
+            let stale_id_plan = Self::stale_rows_row_id_exec(stale_rows)?;
 
             // Fetch vector + filter columns for the stale rows.
             let mut take_proj = self
@@ -4246,11 +4280,7 @@ impl Scanner {
         &self,
         index_expr: &ScalarIndexExpr,
         fragments: Arc<Vec<Fragment>>,
-    ) -> Result<(
-        Vec<Fragment>,
-        Vec<Fragment>,
-        std::collections::HashMap<u32, RoaringBitmap>,
-    )> {
+    ) -> Result<(Vec<Fragment>, Vec<Fragment>, HashMap<u32, RoaringBitmap>)> {
         let covered_frags = self.fragments_covered_by_index_query(index_expr).await?;
         let stale_rows = self
             .overlay_stale_index_rows(index_expr, &fragments)
@@ -4279,16 +4309,16 @@ impl Scanner {
         &self,
         index_expr: &ScalarIndexExpr,
         fragments: &[Fragment],
-    ) -> Result<std::collections::HashMap<u32, RoaringBitmap>> {
+    ) -> Result<HashMap<u32, RoaringBitmap>> {
         // Overlays are rare; skip all index loading when none of the candidate fragments has one.
-        if fragments
+        let overlaid_frags: HashMap<u32, &Fragment> = fragments
             .iter()
-            .all(|fragment| fragment.overlays.is_empty())
-        {
-            return Ok(std::collections::HashMap::new());
+            .filter(|f| !f.overlays.is_empty())
+            .map(|f| (f.id as u32, f))
+            .collect();
+        if overlaid_frags.is_empty() {
+            return Ok(HashMap::new());
         }
-        let frag_by_id: std::collections::HashMap<u32, &Fragment> =
-            fragments.iter().map(|f| (f.id as u32, f)).collect();
 
         // Walk the (boolean) index expression tree to collect leaf searches.
         let mut searches = Vec::new();
@@ -4307,8 +4337,7 @@ impl Scanner {
         // `load_named_scalar_segments` returns cached index metadata — no disk I/O on the hot
         // path. Even without the cache, this code is only reached when at least one fragment has
         // overlays (rare), so the per-leaf cost is acceptable.
-        let mut stale: std::collections::HashMap<u32, RoaringBitmap> =
-            std::collections::HashMap::new();
+        let mut stale: HashMap<u32, RoaringBitmap> = HashMap::new();
         for search in searches {
             let segments = load_named_scalar_segments(
                 self.dataset.as_ref(),
@@ -4317,7 +4346,7 @@ impl Scanner {
             )
             .await?;
             for segment in &segments {
-                collect_overlay_stale_rows_for_segment(segment, &frag_by_id, &mut stale)?;
+                collect_overlay_stale_rows_for_segment(segment, &overlaid_frags, &mut stale)?;
             }
         }
         Ok(stale)
@@ -4328,23 +4357,27 @@ impl Scanner {
     /// Returns a map from fragment_id to the set of row offsets within that fragment that are stale
     /// (their vector values have been updated by a newer overlay since the index was built). An
     /// empty map means no stale rows — the fast path where no masking is needed.
-    fn mask_overlay_stale_rows(
+    fn overlay_stale_vector_rows(
         &self,
         segments: &[IndexMetadata],
-    ) -> Result<std::collections::HashMap<u32, RoaringBitmap>> {
-        let fragments = self.dataset.fragments();
-        if fragments
+    ) -> Result<HashMap<u32, RoaringBitmap>> {
+        // Scope to the query's target fragments (all dataset fragments if unscoped).
+        let dataset_frags = self.dataset.fragments();
+        let fragments: &[Fragment] = match self.fragments.as_ref() {
+            Some(f) => f.as_slice(),
+            None => dataset_frags.as_slice(),
+        };
+        let overlaid_frags: HashMap<u32, &Fragment> = fragments
             .iter()
-            .all(|fragment| fragment.overlays.is_empty())
-        {
-            return Ok(std::collections::HashMap::new());
+            .filter(|f| !f.overlays.is_empty())
+            .map(|f| (f.id as u32, f))
+            .collect();
+        if overlaid_frags.is_empty() {
+            return Ok(HashMap::new());
         }
-        let frag_by_id: std::collections::HashMap<u32, &Fragment> =
-            fragments.iter().map(|f| (f.id as u32, f)).collect();
-        let mut stale: std::collections::HashMap<u32, RoaringBitmap> =
-            std::collections::HashMap::new();
+        let mut stale: HashMap<u32, RoaringBitmap> = HashMap::new();
         for segment in segments {
-            collect_overlay_stale_rows_for_segment(segment, &frag_by_id, &mut stale)?;
+            collect_overlay_stale_rows_for_segment(segment, &overlaid_frags, &mut stale)?;
         }
         Ok(stale)
     }
@@ -4374,11 +4407,14 @@ impl Scanner {
             return Ok((RoaringBitmap::new(), None));
         };
 
-        let frag_by_id: std::collections::HashMap<u32, &Fragment> =
-            target_fragments.iter().map(|f| (f.id as u32, f)).collect();
+        let overlaid_frags: HashMap<u32, &Fragment> = target_fragments
+            .iter()
+            .filter(|f| !f.overlays.is_empty())
+            .map(|f| (f.id as u32, f))
+            .collect();
         let mut stale_frag_ids = RoaringBitmap::new();
         for seg in &segments {
-            collect_stale_overlay_frags(seg, &frag_by_id, &mut stale_frag_ids)?;
+            collect_stale_overlay_frags(seg, &overlaid_frags, &mut stale_frag_ids)?;
         }
 
         if stale_frag_ids.is_empty() {
@@ -4402,6 +4438,46 @@ impl Scanner {
         }
 
         Ok((flat_frag_ids, Some(fresh_segments)))
+    }
+
+    /// Build a block-list mask over stale row addresses, or `None` when there are none.
+    ///
+    /// The mask removes these rows from an index result so the index never emits them; they
+    /// are re-evaluated against their current (overlay-merged) values on a targeted take path
+    /// (see [`Self::stale_rows_row_id_exec`]).
+    fn stale_rows_block_mask(stale_rows: &HashMap<u32, RoaringBitmap>) -> Option<RowAddrMask> {
+        if stale_rows.is_empty() {
+            return None;
+        }
+        let mut tree_map = RowAddrTreeMap::new();
+        for (&frag_id, offsets) in stale_rows {
+            tree_map.insert_bitmap(frag_id, offsets.clone());
+        }
+        Some(RowAddrMask::from_block(tree_map))
+    }
+
+    /// A `OneShotExec` emitting a single `ROW_ID` column of the stale row addresses — the input
+    /// to a targeted take that re-evaluates only those rows, rather than their whole fragments.
+    fn stale_rows_row_id_exec(
+        stale_rows: &HashMap<u32, RoaringBitmap>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let stale_addrs: Vec<u64> = stale_rows
+            .iter()
+            .flat_map(|(&frag_id, offsets)| {
+                offsets
+                    .iter()
+                    .map(move |offset| u64::from(RowAddress::new_from_parts(frag_id, offset)))
+            })
+            .collect();
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                ROW_ID,
+                DataType::UInt64,
+                true,
+            )])),
+            vec![Arc::new(UInt64Array::from(stale_addrs))],
+        )?;
+        Ok(Arc::new(OneShotExec::from_batch(batch)))
     }
 
     // First perform a lookup in a scalar index for ids and then perform a take on the
@@ -4436,14 +4512,9 @@ impl Scanner {
             index_expr.clone(),
             Arc::new(relevant_frags),
         );
-        let mat_exec = if stale_rows.is_empty() {
-            mat_exec
-        } else {
-            let mut tree_map = RowAddrTreeMap::new();
-            for (&frag_id, offsets) in &stale_rows {
-                tree_map.insert_bitmap(frag_id, offsets.clone());
-            }
-            mat_exec.with_overlay_block(RowAddrMask::from_block(tree_map))
+        let mat_exec = match Self::stale_rows_block_mask(&stale_rows) {
+            Some(block) => mat_exec.with_overlay_block(block),
+            None => mat_exec,
         };
         let mut plan: Arc<dyn ExecutionPlan> = Arc::new(mat_exec);
 
@@ -4564,23 +4635,7 @@ impl Scanner {
             let filter = filter_plan.full_expr.as_ref().unwrap();
             let take_projection = fallback_projection.unwrap();
 
-            let stale_addrs: Vec<u64> = stale_rows
-                .iter()
-                .flat_map(|(&frag_id, offsets)| {
-                    offsets
-                        .iter()
-                        .map(move |offset| ((frag_id as u64) << 32) | offset as u64)
-                })
-                .collect();
-            let batch = RecordBatch::try_new(
-                Arc::new(ArrowSchema::new(vec![ArrowField::new(
-                    ROW_ID,
-                    DataType::UInt64,
-                    true,
-                )])),
-                vec![Arc::new(UInt64Array::from(stale_addrs))],
-            )?;
-            let stale_id_plan = Arc::new(OneShotExec::from_batch(batch));
+            let stale_id_plan = Self::stale_rows_row_id_exec(&stale_rows)?;
             let stale_node = self.take(stale_id_plan, take_projection)?;
 
             let planner = Planner::new(stale_node.schema());
@@ -10712,10 +10767,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
 
         // 8KB stays under the 64KB inline threshold, so the blob is a normal column in
         // the data file rather than a dedicated blob file.
-        let blob_meta = std::collections::HashMap::from([(
-            "lance-encoding:blob".to_string(),
-            "true".to_string(),
-        )]);
+        let blob_meta = HashMap::from([("lance-encoding:blob".to_string(), "true".to_string())]);
         let blobs = array::rand_fixedbin(ByteCount::from(8 * 1024), true).with_metadata(blob_meta);
         let data = gen_batch()
             .col("filterme", array::step::<UInt64Type>())
@@ -10774,10 +10826,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         use lance_io::assert_io_lt;
         use lance_table::io::commit::RenameCommitHandler;
 
-        let blob_meta = std::collections::HashMap::from([(
-            "lance-encoding:blob".to_string(),
-            "true".to_string(),
-        )]);
+        let blob_meta = HashMap::from([("lance-encoding:blob".to_string(), "true".to_string())]);
         let a_field = ArrowField::new("a", DataType::Int32, false);
         let blob_field =
             ArrowField::new("blob", DataType::LargeBinary, false).with_metadata(blob_meta);
@@ -13721,86 +13770,6 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
     }
 }
 
-/// Insert into `stale` the ids of fragments covered by `segment` whose index entries may be
-/// stale because an overlay committed after the segment was built touches a field the segment
-/// indexes. Field-aware and version-gated via [`overlay_exclusion_offsets`].
-fn collect_stale_overlay_frags(
-    segment: &IndexMetadata,
-    frag_by_id: &std::collections::HashMap<u32, &Fragment>,
-    stale: &mut RoaringBitmap,
-) -> Result<()> {
-    let Some(coverage) = segment.fragment_bitmap.as_ref() else {
-        return Ok(());
-    };
-    for frag_id in coverage.iter() {
-        if stale.contains(frag_id) {
-            continue;
-        }
-        let Some(fragment) = frag_by_id.get(&frag_id) else {
-            continue;
-        };
-        if fragment.overlays.is_empty() {
-            continue;
-        }
-        // Cheap version gate: skip the field/bitmap work if every overlay on this fragment
-        // predates the segment (already incorporated by the index).
-        if fragment
-            .overlays
-            .iter()
-            .all(|o| o.committed_version <= segment.dataset_version)
-        {
-            continue;
-        }
-        if !overlay_exclusion_offsets(&fragment.overlays, &segment.fields, segment.dataset_version)?
-            .is_empty()
-        {
-            stale.insert(frag_id);
-        }
-    }
-    Ok(())
-}
-
-/// Like [`collect_stale_overlay_frags`] but with row-level granularity: instead of marking the
-/// whole fragment stale, it computes exactly which row offsets within each covered fragment are
-/// stale and accumulates them into `stale` (fragment_id → stale row offsets).
-///
-/// Used by the vector ANN path to block only the affected rows from ANN results and
-/// re-score only those rows on the flat path, keeping overhead proportional to the number of
-/// overlaid rows rather than the whole fragment size.
-fn collect_overlay_stale_rows_for_segment(
-    segment: &IndexMetadata,
-    frag_by_id: &std::collections::HashMap<u32, &Fragment>,
-    stale: &mut std::collections::HashMap<u32, RoaringBitmap>,
-) -> Result<()> {
-    let Some(coverage) = segment.fragment_bitmap.as_ref() else {
-        return Ok(());
-    };
-    for frag_id in coverage.iter() {
-        let Some(fragment) = frag_by_id.get(&frag_id) else {
-            continue;
-        };
-        if fragment.overlays.is_empty() {
-            continue;
-        }
-        if fragment
-            .overlays
-            .iter()
-            .all(|o| o.committed_version <= segment.dataset_version)
-        {
-            continue;
-        }
-        let excluded = overlay_exclusion_offsets(
-            &fragment.overlays,
-            &segment.fields,
-            segment.dataset_version,
-        )?;
-        if !excluded.is_empty() {
-            *stale.entry(frag_id).or_default() |= &excluded;
-        }
-    }
-    Ok(())
-}
-
 /// End-to-end tests for data-overlay index masking: a scalar index masks data overlay files so that
 /// queries stay correct while overlays remain (stale index hits are dropped and new
 /// matches are added by re-evaluating overlay-covered rows on the flat path).
@@ -14258,7 +14227,7 @@ mod overlay_index_masking {
     }
 
     /// A compound boolean predicate (age AND id) exercises the ScalarIndexExpr tree-walk in
-    /// `overlay_stale_index_frags`. An overlay on `age` marks fragment 0 stale from the `age`
+    /// `overlay_stale_index_rows`. An overlay on `age` marks fragment 0 stale from the `age`
     /// index's perspective, so the compound query must re-evaluate fragment 0 on the flat path.
     #[tokio::test]
     async fn test_overlay_stale_with_compound_index_expression() {
@@ -14353,6 +14322,22 @@ mod overlay_index_masking {
             .unwrap();
     }
 
+    /// FTS index with token positions stored, required for phrase queries.
+    async fn build_text_fts_index_with_positions(dataset: &mut Dataset) {
+        use lance_index::scalar::inverted::InvertedIndexParams;
+
+        dataset
+            .create_index(
+                &["text"],
+                IndexType::Inverted,
+                None,
+                &InvertedIndexParams::default().with_position(true),
+                true,
+            )
+            .await
+            .unwrap();
+    }
+
     /// Collect sorted IDs of rows returned by an FTS query on `text`.
     async fn fts_ids_matching(dataset: &Dataset, term: &str) -> Vec<i32> {
         use arrow_array::cast::AsArray;
@@ -14361,6 +14346,40 @@ mod overlay_index_masking {
         let results = dataset
             .scan()
             .full_text_search(FullTextSearchQuery::new(term.to_owned()))
+            .unwrap()
+            .project(&["id"])
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let mut ids: Vec<i32> = results
+            .iter()
+            .flat_map(|b| {
+                b.column_by_name("id")
+                    .unwrap()
+                    .as_primitive::<Int32Type>()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    async fn fts_phrase_ids_matching(dataset: &Dataset, phrase: &str) -> Vec<i32> {
+        use arrow_array::cast::AsArray;
+        use futures::TryStreamExt;
+        use lance_index::scalar::inverted::query::{FtsQuery, PhraseQuery};
+
+        let query = FullTextSearchQuery::new_query(FtsQuery::Phrase(
+            PhraseQuery::new(phrase.to_owned()).with_column(Some("text".to_owned())),
+        ));
+        let results = dataset
+            .scan()
+            .full_text_search(query)
             .unwrap()
             .project(&["id"])
             .unwrap()
@@ -14431,6 +14450,64 @@ mod overlay_index_masking {
         assert!(
             mango_ids.contains(&6),
             "id=6 mango sorbet should still be found: {mango_ids:?}"
+        );
+    }
+
+    /// A phrase query must not return a stale hit for an overlaid FTS-indexed row. Phrase queries
+    /// have no flat re-evaluation path, so the fragment is excluded from the indexed phrase search
+    /// (like an unindexed fragment) rather than re-scored — the point of this test is that the
+    /// pre-overlay phrase hit is dropped, not that the new value is found.
+    #[tokio::test]
+    async fn test_fts_phrase_overlay_stale_drop() {
+        use arrow_array::StringArray;
+
+        let mut dataset = create_text_dataset().await;
+        build_text_fts_index_with_positions(&mut dataset).await;
+
+        // Before any overlay the phrase "apple banana" matches only id=1.
+        assert_eq!(
+            fts_phrase_ids_matching(&dataset, "apple banana").await,
+            vec![1]
+        );
+
+        // Overlay id=1's text (field 1) so the phrase no longer applies to its current value.
+        let dataset = commit_overlay(
+            dataset,
+            "phrase_overlay",
+            0,
+            &[1],
+            OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+            vec![Arc::new(StringArray::from(vec![Some("cherry mango")]))],
+        )
+        .await;
+
+        // The stale inverted-index positions for "apple banana" on id=1 must not be returned.
+        assert_eq!(
+            fts_phrase_ids_matching(&dataset, "apple banana").await,
+            Vec::<i32>::new()
+        );
+    }
+
+    /// An overlay on a non-FTS field must not exclude the fragment from phrase search.
+    #[tokio::test]
+    async fn test_fts_phrase_overlay_unrelated_field_not_excluded() {
+        let mut dataset = create_text_dataset().await;
+        build_text_fts_index_with_positions(&mut dataset).await;
+
+        // Overlay field 0 (`id`), not the FTS-indexed `text` column: phrase coverage is untouched.
+        let dataset = commit_overlay(
+            dataset,
+            "id_overlay",
+            0,
+            &[0],
+            OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+            vec![i32_array([Some(777)])],
+        )
+        .await;
+
+        assert_eq!(
+            fts_phrase_ids_matching(&dataset, "apple banana").await,
+            vec![777]
         );
     }
 
