@@ -3928,6 +3928,7 @@ def add_indexed_relocation_contract_gates(
                     f"{template}: expected {repeats} executed indexed relocation samples"
                 )
                 continue
+            index_covers_compacted_data = True
             for sample in samples:
                 candidate = sample["v23_logical"]
                 if case_name.startswith("fragment-reuse-"):
@@ -3980,11 +3981,11 @@ def add_indexed_relocation_contract_gates(
                         issues.append(
                             f"{record['pair_id']}/{format_name}: missing index/data size precondition"
                         )
+                        index_covers_compacted_data = False
                     elif index_bytes < data_bytes:
-                        failures.append(
-                            f"{record['pair_id']}/{format_name}: index bytes {index_bytes} "
-                            f"are below compacted data bytes {data_bytes}"
-                        )
+                        index_covers_compacted_data = False
+            if not index_covers_compacted_data:
+                continue
             for metric, threshold in (
                 ("layout_index_maintenance_ns", 0.10),
                 ("latency", 0.50),

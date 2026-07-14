@@ -1728,6 +1728,40 @@ class ProtocolReportTests(unittest.TestCase):
             any("accessed index objects" in failure for failure in failures)
         )
 
+    def test_indexed_relocation_large_index_gates_are_conditional(self) -> None:
+        case_name = "indexed-compact-8-to-1/vector"
+        sidecar = make_sidecar(["matrix"], matrix_case_names=[case_name])
+        records = complete_records(sidecar)
+        for record in records:
+            if record["operation"] != "default_compaction":
+                continue
+            record["index_storage_bytes_before"] = 99
+            record["compacted_data_bytes"] = 100
+            if record["format"] == "v23_logical":
+                record["duration_ns"] = 5
+                record["layout_index_maintenance_ns"] = 5
+            else:
+                record["duration_ns"] = 100
+                record["layout_index_maintenance_ns"] = 100
+
+        result = protocol_report.analyze(
+            sidecar, records, bootstrap_samples=101, enforce_gates=True
+        )
+
+        self.assertEqual(result.verdict, "PASS")
+        self.assertFalse(
+            any(
+                gate["scope"].endswith("/indexed-relocation")
+                for gate in result.machine["gates"]
+            )
+        )
+        self.assertFalse(
+            any(
+                "below compacted data bytes" in failure
+                for failure in result.machine["failures"]
+            )
+        )
+
     def test_explicit_repack_and_post_probes_are_diagnostic(self) -> None:
         case_name = "delete-random-50/narrow16/take-1"
         sidecar = make_sidecar(["matrix"], matrix_case_names=[case_name])

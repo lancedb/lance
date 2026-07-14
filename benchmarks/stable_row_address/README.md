@@ -189,8 +189,10 @@ Compaction records additionally expose the post-data-file
 layout/index-maintenance duration, compacted/index bytes, remapped rows and
 indices, coverage reuse, and group admission counts. Indexed relocation gates
 require zero v2.3 index object I/O/remap, 100% coverage reuse, a 10x tail-phase
-improvement, and a 2x end-to-end improvement when index bytes cover compacted
-data bytes. Vector index queries use the exact vector stored at row id zero, so
+improvement, and a 2x end-to-end improvement when every paired sample has index
+bytes covering compacted data bytes. Samples below that size precondition retain
+the standard relocation gates but do not activate the conditional 10x/2x gates.
+Vector index queries use the exact vector stored at row id zero, so
 recall is an exact first-result top-1 check with no unmeasured full-table
 ground-truth scan. Scalar recall compares the exact returned business-key set.
 Coverage comes from current manifest coverage, generation, liveness, and
