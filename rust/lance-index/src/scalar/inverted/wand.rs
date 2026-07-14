@@ -959,6 +959,29 @@ impl PostingIterator {
 /// `MaxScoreBulkScorer.INNER_WINDOW_SIZE`.
 const MAXSCORE_INNER_WINDOW: usize = 1 << 12;
 
+/// Lucene's `MathUtil.sumUpperBound` factor, adapted to Lance's `f32` score
+/// accumulation. Prefix bounds are summed in `f64`, then widened enough to
+/// cover any recursive `f32` summation order of the same non-negative values.
+#[inline]
+fn score_sum_upper_bound_factor(num_values: usize) -> f64 {
+    if num_values <= 2 {
+        1.0
+    } else {
+        let relative_error_bound = (num_values - 1) as f64 * f64::from(f32::EPSILON);
+        1.0 + 2.0 * relative_error_bound
+    }
+}
+
+#[inline]
+fn score_sum_cannot_exceed(
+    partial_score: f32,
+    remaining_upper_bound: f64,
+    threshold: f32,
+    upper_bound_factor: f64,
+) -> bool {
+    ((f64::from(partial_score) + remaining_upper_bound) * upper_bound_factor) as f32 <= threshold
+}
+
 /// Per-window score/frequency accumulator for the bulk MAXSCORE path. Slot i
 /// covers doc id `window_min + i`; `freqs` is laid out clause-major so accept
 /// paths can recover (term, freq) pairs of the essential clauses.
@@ -1616,14 +1639,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
         struct MaxScoreClause {
             posting: Box<PostingIterator>,
             bound: f32,
-            prefix_bound: f32,
-        }
-
-        #[inline]
-        fn float_sum_upper(sum: f32, num_terms: usize) -> f32 {
-            // Mirror of Lucene MathUtil.sumUpperBound: widen the float sum so
-            // it stays a true upper bound of the exact sum.
-            sum + sum.abs() * (num_terms as f32) * f32::EPSILON
+            prefix_bound: f64,
         }
 
         let limit = params.limit.unwrap_or(usize::MAX);
@@ -1637,6 +1653,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 prefix_bound: 0.0,
             })
             .collect::<Vec<_>>();
+        let total_sum_upper_bound_factor = score_sum_upper_bound_factor(clauses.len());
 
         let mut acc = WindowAccumulator::new(clauses.len());
         let mut candidates: TopKHeap =
@@ -1704,14 +1721,15 @@ impl<'a, S: Scorer> Wand<'a, S> {
             }
             clauses.sort_unstable_by(|a, b| a.bound.total_cmp(&b.bound));
             let mut first_essential = 0;
-            let mut prefix = 0.0_f32;
+            let mut prefix = 0.0_f64;
             if self.threshold > 0.0 {
                 for (i, clause) in clauses.iter_mut().enumerate() {
-                    let widened = float_sum_upper(prefix + clause.bound, i + 1);
+                    let next_prefix = prefix + f64::from(clause.bound);
+                    let widened = (next_prefix * score_sum_upper_bound_factor(i + 1)) as f32;
                     if widened > self.threshold {
                         break;
                     }
-                    prefix += clause.bound;
+                    prefix = next_prefix;
                     clause.prefix_bound = prefix;
                     first_essential = i + 1;
                 }
@@ -1791,7 +1809,12 @@ impl<'a, S: Scorer> Wand<'a, S> {
                         let doc_length = self.docs.scoring_num_tokens(doc as u32);
                         let score = essential_weight * self.scorer.doc_weight(freq, doc_length);
                         if !(self.threshold > 0.0
-                            && score + total_non_essential_bound <= self.threshold)
+                            && score_sum_cannot_exceed(
+                                score,
+                                total_non_essential_bound,
+                                self.threshold,
+                                total_sum_upper_bound_factor,
+                            ))
                         {
                             let row_id = if docs_has_row_ids {
                                 self.docs.row_id(doc as u32)
@@ -1805,7 +1828,12 @@ impl<'a, S: Scorer> Wand<'a, S> {
                                 let mut rejected = false;
                                 for i in (0..non_essential.len()).rev() {
                                     if self.threshold > 0.0
-                                        && total + non_essential[i].prefix_bound <= self.threshold
+                                        && score_sum_cannot_exceed(
+                                            total,
+                                            non_essential[i].prefix_bound,
+                                            self.threshold,
+                                            total_sum_upper_bound_factor,
+                                        )
                                     {
                                         rejected = true;
                                         break;
@@ -1970,7 +1998,12 @@ impl<'a, S: Scorer> Wand<'a, S> {
                         num_comparisons += 1;
 
                         if self.threshold > 0.0
-                            && score + total_non_essential_bound <= self.threshold
+                            && score_sum_cannot_exceed(
+                                score,
+                                total_non_essential_bound,
+                                self.threshold,
+                                total_sum_upper_bound_factor,
+                            )
                         {
                             acc.clear_slot(slot);
                             continue;
@@ -1992,7 +2025,12 @@ impl<'a, S: Scorer> Wand<'a, S> {
                         let mut rejected = false;
                         for i in (0..first_essential).rev() {
                             if self.threshold > 0.0
-                                && score + clauses[i].prefix_bound <= self.threshold
+                                && score_sum_cannot_exceed(
+                                    score,
+                                    clauses[i].prefix_bound,
+                                    self.threshold,
+                                    total_sum_upper_bound_factor,
+                                )
                             {
                                 rejected = true;
                                 break;
@@ -3007,6 +3045,31 @@ mod tests {
             },
         },
     };
+
+    #[test]
+    fn test_maxscore_prefix_bound_covers_f32_summation_rounding() {
+        let remaining_bounds = [6.286_838_4e-7_f32, 0.015_441_144_f32];
+        let essential_score = 2.762_496_2_f32;
+        let threshold = f32::from_bits(0x4031_c9bc);
+
+        // Raw f32 prefix accumulation rounds down to an apparent tie, while
+        // scoring the clauses individually produces a competitive document.
+        let raw_prefix = remaining_bounds.into_iter().sum::<f32>();
+        assert_eq!(essential_score + raw_prefix, threshold);
+        let actual_score = remaining_bounds
+            .into_iter()
+            .rev()
+            .fold(essential_score, |score, bound| score + bound);
+        assert!(actual_score > threshold);
+
+        let prefix_bound = remaining_bounds.into_iter().map(f64::from).sum::<f64>();
+        assert!(!score_sum_cannot_exceed(
+            essential_score,
+            prefix_bound,
+            threshold,
+            score_sum_upper_bound_factor(3),
+        ));
+    }
 
     struct UnitScorer;
 
