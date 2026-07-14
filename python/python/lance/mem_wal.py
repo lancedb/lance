@@ -187,6 +187,7 @@ class ShardWriter:
 
         with dataset.mem_wal_writer(shard_id) as writer:
             writer.put(batch)
+            writer.delete(pa.table({"id": [1]}))
 
     Parameters
     ----------
@@ -223,6 +224,36 @@ class ShardWriter:
         """
         reader = _coerce_reader(data, schema)
         self._raw.put(reader)
+
+    def delete(self, keys, *, schema: Optional[pa.Schema] = None) -> None:
+        """Delete rows by primary key from the MemWAL.
+
+        Parameters
+        ----------
+        keys : ReaderLike
+            Any Arrow-compatible data containing this shard's primary key
+            column(s). Non-primary-key columns, if present, are ignored by
+            the Rust core delete path.
+        schema : pa.Schema, optional
+            Schema hint, needed when *keys* is a generator.
+
+        Raises
+        ------
+        IOError
+            If delete validation fails, WAL flush fails, or the writer has
+            already been closed. Delete validation is centralized in Rust and
+            includes checks for primary-key metadata and tombstone-compatible
+            nullable non-key columns.
+
+        Examples
+        --------
+        ::
+
+            with dataset.mem_wal_writer(shard_id) as writer:
+                writer.delete(pa.table({"id": [42]}))
+        """
+        reader = _coerce_reader(keys, schema)
+        self._raw.delete(reader)
 
     def close(self) -> None:
         """Flush and close the writer.

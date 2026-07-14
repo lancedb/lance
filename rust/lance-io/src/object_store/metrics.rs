@@ -129,6 +129,69 @@ fn operation_labels(base: &str, operation: &'static str) -> Vec<metrics::Label> 
     labels
 }
 
+/// Recommended histogram bucket boundaries for [`METRIC_DURATION`], in seconds.
+///
+/// Object store requests can take anywhere from a few milliseconds to the
+/// client timeout (commonly ~120s), so the boundaries are dense below 10s and
+/// keep useful resolution through the timeout band out to 5 minutes. Exporters
+/// that aggregate into fixed buckets (e.g. the OpenTelemetry bridge in the
+/// Python bindings) use these.
+pub const REQUEST_DURATION_BOUNDS: &[f64] = &[
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, // sub-10s
+    10.0, 20.0, 30.0, 45.0, 60.0, 90.0, 120.0, 150.0, 180.0, 240.0, 300.0, // 10s–5min
+];
+
+/// Register descriptions (units and help text) for the object store metrics.
+///
+/// This routes through whatever [`metrics::Recorder`] is currently installed,
+/// so it must be called *after* the recorder is set. Exporters that build a
+/// catalog of available metrics (such as the OpenTelemetry bridge) rely on
+/// these descriptions to discover metric names, kinds, and units up front.
+pub fn describe_metrics() {
+    metrics::describe_counter!(
+        METRIC_REQUESTS,
+        metrics::Unit::Count,
+        "Total number of object store requests, by operation and scheme."
+    );
+    metrics::describe_counter!(
+        METRIC_BYTES,
+        metrics::Unit::Bytes,
+        "Total bytes transferred by object store requests, by operation and scheme."
+    );
+    metrics::describe_histogram!(
+        METRIC_DURATION,
+        metrics::Unit::Seconds,
+        "Object store request latency in seconds, by operation and scheme."
+    );
+    metrics::describe_counter!(
+        METRIC_ERRORS,
+        metrics::Unit::Count,
+        "Total number of failed object store requests, by operation and scheme."
+    );
+    metrics::describe_counter!(
+        METRIC_THROTTLE,
+        metrics::Unit::Count,
+        "Total number of throttle responses (HTTP 429 / 503) seen at the HTTP layer, by status and scheme."
+    );
+    metrics::describe_counter!(
+        METRIC_RETRYABLE,
+        metrics::Unit::Count,
+        "Total number of retryable responses (HTTP 5xx / 429 / 408) seen at the HTTP layer, by status and scheme."
+    );
+    metrics::describe_gauge!(
+        METRIC_IN_FLIGHT,
+        metrics::Unit::Count,
+        "Number of object store requests currently in flight, by operation and scheme."
+    );
+}
+
+/// Recommended fixed bucket boundaries for the histogram metrics defined here,
+/// as `(metric_name, boundaries)` pairs. Exporters that aggregate histograms
+/// into fixed buckets read this to configure each histogram.
+pub fn histogram_bounds() -> &'static [(&'static str, &'static [f64])] {
+    &[(METRIC_DURATION, REQUEST_DURATION_BOUNDS)]
+}
+
 /// Record the outcome of a unary request: count, latency, bytes (on success), and errors.
 pub fn record_request<T>(
     base: &str,

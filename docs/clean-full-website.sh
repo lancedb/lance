@@ -39,7 +39,7 @@ nav:
   - Apache DataFusion: datafusion.md
   - PostgreSQL: https://github.com/lancedb/pglance
   - PyTorch: pytorch.md
-  - Tensorflow: tensorflow.md
+  - TensorFlow: tensorflow.md
 EOF
 
 mkdir -p "$docs_src/format/catalog/dir"

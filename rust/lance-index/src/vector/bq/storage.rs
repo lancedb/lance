@@ -3930,7 +3930,7 @@ mod tests {
             .into_iter()
             .map(|(id, dist)| (id as u64, dist))
             .collect::<Vec<_>>();
-        expected.sort_by(|left, right| left.0.cmp(&right.0));
+        expected.sort_by_key(|left| left.0);
 
         let mut heap = BinaryHeap::with_capacity(k);
         let mut distances = Vec::new();
@@ -3952,7 +3952,7 @@ mod tests {
             .into_iter()
             .map(|node| (node.id, node.dist.0))
             .collect::<Vec<_>>();
-        actual.sort_by(|left, right| left.0.cmp(&right.0));
+        actual.sort_by_key(|left| left.0);
 
         assert_eq!(actual.len(), expected.len());
         for ((actual_id, actual_dist), (expected_id, expected_dist)) in

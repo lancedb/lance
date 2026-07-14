@@ -318,7 +318,7 @@ impl BlobFieldEncoder {
             .nulls()
             .cloned()
             .unwrap_or(NullBuffer::new_valid(binarray.len()));
-        for (w, is_valid) in binarray.value_offsets().windows(2).zip(nulls.into_iter()) {
+        for (w, is_valid) in binarray.value_offsets().windows(2).zip(&nulls) {
             if is_valid {
                 let start = w[0] as u64;
                 let end = w[1] as u64;

@@ -863,6 +863,148 @@ async fn test_fts_on_multiple_columns() {
     assert_eq!(results.num_rows(), 1);
 }
 
+fn nested_fts_batch(
+    ids: Vec<u64>,
+    a_values: Vec<Option<&str>>,
+    b_values: Vec<Option<&str>>,
+) -> RecordBatch {
+    let a_values = Arc::new(StringArray::from(a_values)) as ArrayRef;
+    let b_values = Arc::new(StringArray::from(b_values)) as ArrayRef;
+    let struct_array = StructArray::from(vec![
+        (
+            Arc::new(Field::new("a", DataType::Utf8, true)),
+            a_values.clone(),
+        ),
+        (
+            Arc::new(Field::new("b", DataType::Utf8, true)),
+            b_values.clone(),
+        ),
+    ]);
+    let struct_type = struct_array.data_type().clone();
+    RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::UInt64, false),
+            Field::new("s", struct_type, true),
+        ])),
+        vec![
+            Arc::new(UInt64Array::from(ids)) as ArrayRef,
+            Arc::new(struct_array) as ArrayRef,
+        ],
+    )
+    .unwrap()
+}
+
+async fn nested_fts_result_ids(dataset: &Dataset, query: FullTextSearchQuery) -> Vec<u64> {
+    let batch = dataset
+        .scan()
+        .full_text_search(query)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let mut ids = batch["id"].as_primitive::<UInt64Type>().values().to_vec();
+    ids.sort_unstable();
+    ids
+}
+
+#[tokio::test]
+async fn test_fts_on_nested_fields() {
+    let batch = nested_fts_batch(
+        vec![0, 1, 2, 3],
+        vec![
+            Some("lance nested alpha"),
+            Some("plain text"),
+            None,
+            Some("phrase target here"),
+        ],
+        vec![
+            Some("metadata only"),
+            Some("database nested beta"),
+            Some("lance beta"),
+            Some("other"),
+        ],
+    );
+    let schema = batch.schema();
+    let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    let test_uri = TempStrDir::default();
+    let mut dataset = Dataset::write(batches, &test_uri, None).await.unwrap();
+
+    dataset
+        .create_index(
+            &["s.a"],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default().with_position(true),
+            true,
+        )
+        .await
+        .unwrap();
+    dataset
+        .create_index(
+            &["s.b"],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let indices = dataset.load_indices().await.unwrap();
+    let indexed_fields = indices
+        .iter()
+        .map(|index| dataset.schema().field_path(index.fields[0]).unwrap())
+        .collect::<HashSet<_>>();
+    assert_eq!(
+        indexed_fields,
+        HashSet::from(["s.a".to_string(), "s.b".to_string()])
+    );
+
+    let query = FullTextSearchQuery::new_query(FtsQuery::Match(
+        MatchQuery::new("alpha".to_owned()).with_column(Some("s.a".to_owned())),
+    ));
+    assert_eq!(nested_fts_result_ids(&dataset, query).await, vec![0]);
+
+    let query = FullTextSearchQuery::new_query(FtsQuery::Match(
+        MatchQuery::new("beta".to_owned()).with_column(Some("s.b".to_owned())),
+    ));
+    assert_eq!(nested_fts_result_ids(&dataset, query).await, vec![1, 2]);
+
+    assert_eq!(
+        nested_fts_result_ids(&dataset, FullTextSearchQuery::new("lance".to_owned())).await,
+        vec![0, 2]
+    );
+
+    let query = FullTextSearchQuery::new_query(FtsQuery::MultiMatch(MultiMatchQuery {
+        match_queries: vec![
+            MatchQuery::new("nested".to_owned()).with_column(Some("s.a".to_owned())),
+            MatchQuery::new("nested".to_owned()).with_column(Some("s.b".to_owned())),
+        ],
+    }));
+    assert_eq!(nested_fts_result_ids(&dataset, query).await, vec![0, 1]);
+
+    let query = FullTextSearchQuery::new_query(
+        PhraseQuery::new("phrase target".to_owned())
+            .with_column(Some("s.a".to_owned()))
+            .into(),
+    );
+    assert_eq!(nested_fts_result_ids(&dataset, query).await, vec![3]);
+
+    let append_batch = nested_fts_batch(
+        vec![4, 5],
+        vec![Some("fresh lance append"), Some("plain append")],
+        vec![Some("other"), Some("fresh beta append")],
+    );
+    let schema = append_batch.schema();
+    let batches = RecordBatchIterator::new(vec![append_batch].into_iter().map(Ok), schema);
+    dataset.append(batches, None).await.unwrap();
+
+    assert_eq!(
+        nested_fts_result_ids(&dataset, FullTextSearchQuery::new("fresh".to_owned())).await,
+        vec![4, 5]
+    );
+}
+
 #[tokio::test]
 async fn test_fts_unindexed_data() {
     let params = InvertedIndexParams::default();

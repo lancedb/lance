@@ -12,8 +12,8 @@ use crate::{
         build_index_metadata_from_segments,
         scalar::{build_bitmap_index_segment, build_scalar_index},
         vector::{
-            LANCE_VECTOR_INDEX, VectorIndexParams, build_distributed_vector_index,
-            build_empty_vector_index, build_vector_index,
+            LANCE_VECTOR_INDEX, StageParams, VectorIndexParams, build_distributed_vector_index,
+            build_empty_vector_index, build_filtered_vector_index, build_vector_index,
         },
         vector_index_details, vector_index_details_default,
     },
@@ -158,12 +158,16 @@ impl<'a> CreateIndexBuilder<'a> {
         let quoted_column: String = format_field_path(&names);
         let column = quoted_column.as_str();
 
-        // If train is true but dataset is empty, automatically set train to false
-        let train = if self.train {
-            self.dataset.count_rows(None).await? > 0
-        } else {
-            false
-        };
+        let vector_fragments_for_validation =
+            is_builtin_vector_index(self.index_type, self.params)
+                .then_some(self.fragments.as_deref())
+                .flatten();
+        let train = should_train_index(
+            self.dataset,
+            self.train,
+            vector_fragments_for_validation,
+        )
+        .await?;
 
         // Load indices from the disk.
         let indices = self.dataset.load_indices().await?;
@@ -367,24 +371,40 @@ impl<'a> CreateIndexBuilder<'a> {
                     })?;
                 let index_version = vec_params.index_type().version() as u32;
 
+                let effective_fragments =
+                    effective_vector_fragments(self.dataset, self.fragments.as_deref());
                 let files = if train {
                     // Check if this is distributed indexing (fragment-level)
-                    if let Some(fragments) = &self.fragments {
-                        // For distributed indexing, build only on specified fragments
-                        // This creates temporary index metadata without committing
-                        let (segment_uuid, files) = Box::pin(build_distributed_vector_index(
-                            self.dataset,
-                            column,
-                            &index_name,
-                            index_id,
-                            vec_params,
-                            fri,
-                            fragments,
-                            self.progress.clone(),
-                        ))
-                        .await?;
-                        output_index_uuid = segment_uuid;
-                        files
+                    if let Some(fragments) = effective_fragments.as_deref() {
+                        if vector_params_have_precomputed_ivf(vec_params) {
+                            // For distributed indexing, build only on specified fragments
+                            // This creates temporary index metadata without committing
+                            let (segment_uuid, files) = Box::pin(build_distributed_vector_index(
+                                self.dataset,
+                                column,
+                                &index_name,
+                                index_id,
+                                vec_params,
+                                fri,
+                                fragments,
+                                self.progress.clone(),
+                            ))
+                            .await?;
+                            output_index_uuid = segment_uuid;
+                            files
+                        } else {
+                            Box::pin(build_filtered_vector_index(
+                                self.dataset,
+                                column,
+                                &index_name,
+                                index_id,
+                                vec_params,
+                                fri,
+                                fragments,
+                                self.progress.clone(),
+                            ))
+                            .await?
+                        }
                     } else {
                         // Standard full dataset indexing
                         Box::pin(build_vector_index(
@@ -775,6 +795,56 @@ fn is_btree_scalar_params(params: &dyn IndexParams) -> bool {
         .is_some_and(|p| p.index_type.eq_ignore_ascii_case("btree"))
 }
 
+fn is_builtin_vector_index(index_type: IndexType, params: &dyn IndexParams) -> bool {
+    params.index_name() == LANCE_VECTOR_INDEX
+        && matches!(
+            index_type,
+            IndexType::Vector
+                | IndexType::IvfPq
+                | IndexType::IvfSq
+                | IndexType::IvfFlat
+                | IndexType::IvfRq
+                | IndexType::IvfHnswFlat
+                | IndexType::IvfHnswPq
+                | IndexType::IvfHnswSq
+        )
+        && params.as_any().is::<VectorIndexParams>()
+}
+
+async fn should_train_index(
+    dataset: &Dataset,
+    train: bool,
+    vector_fragments: Option<&[u32]>,
+) -> Result<bool> {
+    if !train {
+        return Ok(false);
+    }
+
+    if dataset.fragment_bitmap.is_empty() {
+        return Ok(false);
+    }
+
+    if let Some(fragment_ids) = vector_fragments {
+        dataset.get_fragments_from_ids(fragment_ids)?;
+        return Ok(true);
+    }
+
+    Ok(dataset.count_rows(None).await? > 0)
+}
+
+fn vector_params_have_precomputed_ivf(params: &VectorIndexParams) -> bool {
+    matches!(
+        params.stages.first(),
+        Some(StageParams::Ivf(ivf_params)) if ivf_params.centroids.is_some()
+    )
+}
+
+fn effective_vector_fragments(dataset: &Dataset, fragments: Option<&[u32]>) -> Option<Vec<u32>> {
+    let fragments = Dataset::normalize_fragment_ids(fragments?);
+    let fragment_bitmap: roaring::RoaringBitmap = fragments.iter().copied().collect();
+    (fragment_bitmap != *dataset.fragment_bitmap).then_some(fragments)
+}
+
 /// Validate that a user-supplied `index_uuid` is permitted for this build.
 fn ensure_index_uuid_allowed(
     index_type: IndexType,
@@ -1150,6 +1220,50 @@ mod tests {
             .unwrap(),
         );
         IvfBuildParams::try_with_centroids(4, centroids).unwrap()
+    }
+
+    async fn write_vector_fragment_dataset(uri: &str) -> Dataset {
+        let reader = gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .col(
+                "vector",
+                lance_datagen::array::rand_vec::<Float32Type>(lance_datagen::Dimension::from(16)),
+            )
+            .into_reader_rows(
+                lance_datagen::RowCount::from(256),
+                lance_datagen::BatchCount::from(4),
+            );
+        Dataset::write(
+            reader,
+            uri,
+            Some(WriteParams {
+                max_rows_per_file: 64,
+                mode: WriteMode::Overwrite,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_get_frags_from_ordered_ids_accepts_unsorted_duplicates() {
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+        let dataset = write_vector_fragment_dataset(&dataset_uri).await;
+
+        let fragments = dataset.get_fragments();
+        assert!(fragments.len() >= 2);
+        let first = fragments[0].id() as u32;
+        let second = fragments[1].id() as u32;
+
+        let resolved = dataset.get_frags_from_ordered_ids(&[second, first, second, u32::MAX]);
+
+        assert_eq!(resolved.len(), 4);
+        assert_eq!(resolved[0].as_ref().unwrap().id() as u32, second);
+        assert_eq!(resolved[1].as_ref().unwrap().id() as u32, first);
+        assert_eq!(resolved[2].as_ref().unwrap().id() as u32, second);
+        assert!(resolved[3].is_none());
     }
 
     #[tokio::test]
@@ -1807,6 +1921,218 @@ mod tests {
             .await
             .unwrap();
         assert!(result.num_rows() > 0);
+    }
+
+    #[tokio::test]
+    async fn test_vector_explicit_all_fragments_uses_full_build_without_precomputed_ivf() {
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+        let mut dataset = write_vector_fragment_dataset(&dataset_uri).await;
+
+        let fragment_ids = dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.id() as u32)
+            .collect::<Vec<_>>();
+        assert!(fragment_ids.len() >= 2);
+
+        let mut params = VectorIndexParams::ivf_pq(2, 8, 1, MetricType::L2, 10);
+        params.version(crate::index::vector::IndexFileVersion::Legacy);
+        let segment =
+            CreateIndexBuilder::new(&mut dataset, &["vector"], IndexType::Vector, &params)
+                .name("vector_idx".to_string())
+                .fragments(fragment_ids)
+                .execute_uncommitted()
+                .await
+                .unwrap();
+
+        assert_eq!(
+            segment.fragment_bitmap.as_ref().unwrap(),
+            dataset.fragment_bitmap.as_ref()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_vector_precomputed_ivf_num_partitions_mismatch_errors() {
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+        let mut dataset = write_vector_fragment_dataset(&dataset_uri).await;
+
+        let mut ivf_params = prepare_vector_ivf(&dataset, "vector").await;
+        let centroid_count = ivf_params.centroids.as_ref().unwrap().len();
+        ivf_params.num_partitions = Some(centroid_count + 1);
+        let params = VectorIndexParams::with_ivf_flat_params(DistanceType::L2, ivf_params);
+
+        let err = CreateIndexBuilder::new(&mut dataset, &["vector"], IndexType::Vector, &params)
+            .name("vector_idx".to_string())
+            .execute_uncommitted()
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains(&format!(
+                "num_partitions {} does not match precomputed IVF centroids length {}",
+                centroid_count + 1,
+                centroid_count
+            )),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_vector_subset_legacy_ivf_pq_rejects_filtered_build() {
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+        let mut dataset = write_vector_fragment_dataset(&dataset_uri).await;
+
+        let fragments = dataset.get_fragments();
+        assert!(fragments.len() >= 2);
+        let mut params = VectorIndexParams::ivf_pq(2, 8, 1, MetricType::L2, 10);
+        params.version(crate::index::vector::IndexFileVersion::Legacy);
+
+        let err = CreateIndexBuilder::new(&mut dataset, &["vector"], IndexType::Vector, &params)
+            .name("vector_idx".to_string())
+            .fragments(vec![fragments[0].id() as u32])
+            .execute_uncommitted()
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("filtered IVF_PQ builds do not support legacy format"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_vector_subset_fragments_train_without_precomputed_ivf() {
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+        let mut dataset = write_vector_fragment_dataset(&dataset_uri).await;
+
+        let fragments = dataset.get_fragments();
+        assert!(fragments.len() >= 3);
+        let selected = vec![
+            fragments[1].id() as u32,
+            fragments[0].id() as u32,
+            fragments[1].id() as u32,
+        ];
+        let expected_bitmap = selected.iter().copied().collect::<roaring::RoaringBitmap>();
+
+        let params = VectorIndexParams::ivf_flat(2, DistanceType::L2);
+        let segment =
+            CreateIndexBuilder::new(&mut dataset, &["vector"], IndexType::Vector, &params)
+                .name("vector_idx".to_string())
+                .fragments(selected)
+                .execute_uncommitted()
+                .await
+                .unwrap();
+
+        assert_eq!(segment.fragment_bitmap.as_ref().unwrap(), &expected_bitmap);
+    }
+
+    #[tokio::test]
+    async fn test_vector_merge_rejects_independently_trained_fragment_segments() {
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+        let mut dataset = write_vector_fragment_dataset(&dataset_uri).await;
+
+        let fragments = dataset.get_fragments();
+        assert!(fragments.len() >= 2);
+
+        let params = VectorIndexParams::ivf_flat(2, DistanceType::L2);
+        let mut segments = Vec::new();
+        for fragment in fragments.iter().take(2) {
+            let segment =
+                CreateIndexBuilder::new(&mut dataset, &["vector"], IndexType::Vector, &params)
+                    .name("vector_idx".to_string())
+                    .fragments(vec![fragment.id() as u32])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap();
+            segments.push(segment);
+        }
+
+        let err = dataset
+            .merge_existing_index_segments(segments)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("IVF centroids mismatch across shards"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_vector_optimize_rejects_independently_trained_fragment_segments() {
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+        let mut dataset = write_vector_fragment_dataset(&dataset_uri).await;
+
+        let fragments = dataset.get_fragments();
+        assert!(fragments.len() >= 2);
+
+        let params = VectorIndexParams::ivf_flat(2, DistanceType::L2);
+        let mut segments = Vec::new();
+        for fragment in fragments.iter().take(2) {
+            let segment =
+                CreateIndexBuilder::new(&mut dataset, &["vector"], IndexType::Vector, &params)
+                    .name("vector_idx".to_string())
+                    .fragments(vec![fragment.id() as u32])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap();
+            segments.push(segment);
+        }
+        dataset
+            .commit_existing_index_segments("vector_idx", "vector", segments)
+            .await
+            .unwrap();
+
+        let err = dataset
+            .optimize_indices(&OptimizeOptions::merge(2))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("vector index segments do not share IVF centroids"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_vector_empty_fragments_with_precomputed_ivf_builds_empty_segment() {
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+        let mut dataset = write_vector_fragment_dataset(&dataset_uri).await;
+
+        let mut ivf_params = prepare_vector_ivf(&dataset, "vector").await;
+        let expected_partitions = ivf_params.centroids.as_ref().unwrap().len();
+        ivf_params.num_partitions = None;
+        let params = VectorIndexParams::with_ivf_flat_params(DistanceType::L2, ivf_params);
+        let segment =
+            CreateIndexBuilder::new(&mut dataset, &["vector"], IndexType::Vector, &params)
+                .name("vector_idx".to_string())
+                .fragments(vec![])
+                .execute_uncommitted()
+                .await
+                .unwrap();
+
+        assert!(segment.fragment_bitmap.as_ref().unwrap().is_empty());
+        dataset
+            .commit_existing_index_segments("vector_idx", "vector", vec![segment])
+            .await
+            .unwrap();
+        let logical_index = dataset
+            .open_logical_vector_index("vector", "vector_idx")
+            .await
+            .unwrap();
+        let metadata = logical_index.metadatas().next().unwrap();
+        assert_eq!(
+            logical_index.as_ivf().unwrap().num_partitions_per_segment(),
+            vec![(metadata.uuid, expected_partitions)]
+        );
     }
 
     #[tokio::test]

@@ -395,7 +395,14 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
     /// Set fragment filter for distributed indexing
     pub fn with_fragment_filter(&mut self, fragment_ids: Vec<u32>) -> &mut Self {
-        self.fragment_filter = Some(fragment_ids);
+        self.fragment_filter = Some(Dataset::normalize_fragment_ids(&fragment_ids));
+        self
+    }
+
+    pub fn with_optional_fragment_filter(&mut self, fragment_ids: Option<&[u32]>) -> &mut Self {
+        if let Some(fragment_ids) = fragment_ids {
+            self.fragment_filter = Some(Dataset::normalize_fragment_ids(fragment_ids));
+        }
         self
     }
 
@@ -553,19 +560,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             return Ok(None);
         };
         match &self.fragment_filter {
-            Some(fragment_ids) => {
-                let fragments: Vec<_> = dataset
-                    .get_fragments()
-                    .into_iter()
-                    .filter(|f| fragment_ids.contains(&(f.id() as u32)))
-                    .collect();
-                let counts = futures::stream::iter(fragments)
-                    .map(|f| async move { f.count_rows(None).await })
-                    .buffer_unordered(16) // ref: Dataset::count_all_rows()
-                    .try_collect::<Vec<_>>()
-                    .await?;
-                Ok(Some(counts.iter().sum::<usize>() as u64))
-            }
+            Some(fragment_ids) => Ok(Some(
+                dataset
+                    .count_rows_in_existing_fragments(fragment_ids)
+                    .await? as u64,
+            )),
             None => Ok(Some(dataset.count_rows(None).await? as u64)),
         }
     }
@@ -603,14 +602,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                         "applying fragment filter for distributed indexing: {:?}",
                         fragment_ids
                     );
-                    // Filter fragments by converting fragment_ids to Fragment objects
-                    let all_fragments = dataset.fragments();
-                    let filtered_fragments: Vec<_> = all_fragments
-                        .iter()
-                        .filter(|fragment| fragment_ids.contains(&(fragment.id as u32)))
-                        .cloned()
-                        .collect();
-                    builder.with_fragments(filtered_fragments);
+                    builder.with_fragments(
+                        dataset.get_existing_fragment_metadata_from_ids(fragment_ids),
+                    );
                 }
 
                 let (vector_type, _) = get_vector_type(dataset.schema(), &self.column)?;

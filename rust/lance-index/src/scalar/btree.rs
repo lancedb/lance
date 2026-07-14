@@ -5327,12 +5327,8 @@ mod tests {
             mapping.insert(old_id, None);
         }
 
-        let mut new_id_counter = 100_000;
-
         // Remap all other rows
-        for old_id in (0..1000).chain(10000..15000) {
-            let new_id = new_id_counter;
-            new_id_counter += 1;
+        for (new_id, old_id) in (100_000..).zip((0..1000).chain(10000..15000)) {
             mapping.insert(old_id, Some(new_id));
         }
 

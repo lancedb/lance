@@ -1003,10 +1003,15 @@ impl IndexDescriptionImpl {
         let mut missing_fragment_refs = 0u64;
 
         for shard in &segments {
-            let fragment_bitmap = shard
-            .fragment_bitmap
-            .as_ref()
-            .ok_or_else(|| Error::index("Fragment bitmap is required for index description.  This index must be retrained to support this method.".to_string()))?;
+            let Some(fragment_bitmap) = shard.fragment_bitmap.as_ref() else {
+                // A system index (e.g. __mem_wal) indexes no fragments, so a
+                // missing bitmap means zero indexed rows. For a data index it
+                // means unknown coverage — reject rather than fabricate a count.
+                if is_system_index(shard) {
+                    continue;
+                }
+                return Err(Error::index("Fragment bitmap is required for index description.  This index must be retrained to support this method.".to_string()));
+            };
 
             indexed_fragment_refs += fragment_bitmap.len();
             for fragment_id in fragment_bitmap.iter() {

@@ -1022,13 +1022,7 @@ fn merge_list_struct(left: &dyn Array, right: &dyn Array) -> Arc<dyn Array> {
 fn normalize_validity(
     validity: Option<&arrow_buffer::NullBuffer>,
 ) -> Option<&arrow_buffer::NullBuffer> {
-    validity.and_then(|v| {
-        if v.null_count() == v.len() {
-            None
-        } else {
-            Some(v)
-        }
-    })
+    validity.filter(|v| v.null_count() != v.len())
 }
 
 /// Helper function to merge validity buffers from two struct arrays

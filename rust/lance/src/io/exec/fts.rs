@@ -135,7 +135,7 @@ async fn search_segments(
     let mut searches = searches;
 
     while let Some((doc_ids, scores)) = searches.try_next().await? {
-        for (row_id, score) in doc_ids.into_iter().zip(scores.into_iter()) {
+        for (row_id, score) in doc_ids.into_iter().zip(scores) {
             if candidates.len() < limit {
                 candidates.push(std::cmp::Reverse(ScoredDoc::new(row_id, score)));
             } else if candidates.peek().unwrap().0.score.0 < score {

@@ -267,16 +267,11 @@ impl FieldEncoder for BlobV2StructuralEncoder {
         &mut self,
         array: ArrayRef,
         external_buffers: &mut OutOfLineBuffers,
-        mut repdef: RepDefBuilder,
+        repdef: RepDefBuilder,
         row_number: u64,
         num_rows: u64,
     ) -> Result<Vec<EncodeTask>> {
         let struct_arr = array.as_struct();
-        if let Some(validity) = struct_arr.nulls() {
-            repdef.add_validity_bitmap(validity.clone());
-        } else {
-            repdef.add_no_null(struct_arr.len());
-        }
 
         let kind_col = struct_arr
             .column_by_name("kind")
@@ -403,7 +398,7 @@ impl FieldEncoder for BlobV2StructuralEncoder {
         let descriptor_array = Arc::new(StructArray::try_new(
             BLOB_V2_DESC_FIELDS.clone(),
             children,
-            None,
+            struct_arr.nulls().cloned(),
         )?) as ArrayRef;
 
         self.descriptor_encoder.maybe_encode(
@@ -533,6 +528,32 @@ mod tests {
             blob_metadata,
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn test_blob_round_trip_empty_values() {
+        // Empty values share size == 0 with nulls in the descriptor layout
+        // and schedule no read; each must decode to zero-length bytes without
+        // consuming the read result of a following non-empty blob. Empties
+        // are placed before payloads so a misassignment corrupts the output
+        // instead of only exhausting the read iterator.
+        let blob_metadata =
+            HashMap::from([(lance_arrow::BLOB_META_KEY.to_string(), "true".to_string())]);
+
+        let val1: &[u8] = &vec![1u8; 1024];
+        let val2: &[u8] = &vec![2u8; 10240];
+        let empty: &[u8] = &[];
+        let array = Arc::new(LargeBinaryArray::from(vec![
+            Some(empty),
+            Some(val1),
+            None,
+            Some(empty),
+            Some(val2),
+            None,
+            Some(empty),
+        ]));
+
+        check_round_trip_encoding_of_data(vec![array], &TestCases::default(), blob_metadata).await;
     }
 
     #[tokio::test]

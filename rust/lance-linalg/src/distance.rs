@@ -28,9 +28,11 @@ pub mod norm_l2;
 pub use cosine::*;
 pub use dot::*;
 pub use hamming::{
-    Cluster, ClusteringResult, PairwiseResult, UnionFind, cluster_edges, cluster_pairwise_result,
-    extract_hashes_from_fixed_list, hamming_distance_arrow_batch, hamming_u64,
-    pairwise_hamming_distance, pairwise_hamming_distance_parallel,
+    BinaryHashValues, Cluster, ClusteringResult, PairwiseResult, UnionFind, cluster_edges,
+    cluster_pairwise_result, extract_binary_hashes_from_fixed_list, extract_hashes_from_fixed_list,
+    hamming_distance_arrow_batch, hamming_u64, pairwise_hamming_distance,
+    pairwise_hamming_distance_binary, pairwise_hamming_distance_binary_parallel,
+    pairwise_hamming_distance_parallel,
 };
 pub use l2::*;
 use lance_core::deepsize::DeepSizeOf;

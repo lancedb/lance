@@ -1701,7 +1701,7 @@ impl FMIndexScalarIndex {
         }
         pfiles.sort_by_key(|(id, _)| *id);
         let io_parallelism = store.io_parallelism().max(1);
-        let mut parts = futures::stream::iter(pfiles.into_iter())
+        let mut parts = futures::stream::iter(pfiles)
             .map(|(id, name)| {
                 let store = Arc::clone(&store);
                 async move {
