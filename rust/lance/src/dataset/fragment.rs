@@ -15,7 +15,8 @@ use arrow::compute::concat_batches;
 use arrow_array::cast::as_primitive_array;
 use arrow_array::types::UInt64Type;
 use arrow_array::{
-    Array, RecordBatch, RecordBatchReader, StructArray, UInt32Array, UInt64Array, new_null_array,
+    Array, RecordBatch, RecordBatchIterator, RecordBatchReader, StructArray, UInt32Array,
+    UInt64Array, new_null_array,
 };
 use arrow_schema::Schema as ArrowSchema;
 use datafusion::logical_expr::Expr;
@@ -65,6 +66,7 @@ use super::updater::Updater;
 use super::{NewColumnTransform, WriteParams, schema_evolution};
 use crate::dataset::Dataset;
 use crate::dataset::fragment::session::FragmentSession;
+use crate::dataset::utils::SchemaAdapter;
 use crate::io::deletion::read_dataset_deletion_file;
 
 /// Result of [`FileFragment::update_columns_with_offsets`]: updated fragment metadata, modified field ids,
@@ -1916,6 +1918,31 @@ impl FileFragment {
                 None,
             )
             .await?;
+        // The updater reads the left-hand columns in their physical form (e.g. JSON is
+        // stored as `lance.json`/`LargeBinary`). Convert the right-hand stream to the same
+        // physical form so the hash join's `interleave` sees matching types on both sides;
+        // otherwise an existing JSON column (LargeBinary) clashes with the logical Arrow
+        // JSON input (Utf8). New-column paths (`merge`/`merge_columns`) don't hit this
+        // because they have no left-hand fallback to interleave against.
+        let adapter = SchemaAdapter::new(right_schema.clone());
+        let needs_physical_conversion = adapter.requires_physical_conversion();
+        let right_stream: Box<dyn RecordBatchReader + Send> = if needs_physical_conversion {
+            let mut physical_batches = Vec::new();
+            let mut reader = right_stream;
+            while let Some(batch) = reader.next().transpose()? {
+                physical_batches.push(adapter.to_physical_batch(batch)?);
+            }
+            let physical_schema = physical_batches
+                .first()
+                .map(|b| b.schema())
+                .unwrap_or_else(|| right_schema.clone());
+            Box::new(RecordBatchIterator::new(
+                physical_batches.into_iter().map(Ok),
+                physical_schema,
+            ))
+        } else {
+            right_stream
+        };
         // Hash join: rows matched on the right-hand stream rewrite columns; track physical offsets via `_rowaddr`.
         // Convert Arrow JSON columns (Utf8) to Lance JSON (LargeBinary) in the right stream
         // so they match the physical storage format read from the fragment's left batch.

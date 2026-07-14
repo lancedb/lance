@@ -617,6 +617,69 @@ def test_fragment_update_columns_with_custom_join_key(tmp_path):
     assert result["name"][2] == "Chase"  # id=3 should have name Chase
 
 
+def test_fragment_update_columns_json(tmp_path):
+    """Backfill an existing JSON column via fragment update_columns (hash join).
+
+    Regression test: the stored JSON column is physically ``lance.json``
+    (LargeBinary), while the right-hand input arrives as Arrow JSON (Utf8).
+    The hash join used to interleave the two physical representations and fail
+    with "It is not possible to interleave arrays of different data types
+    (Utf8 and LargeBinary)".
+    """
+    base = pa.table(
+        {
+            "save_path": ["a.jpg", "b.jpg"],
+            "dt": ["2026-06-03", "2026-06-03"],
+        }
+    )
+    dataset_uri = tmp_path / "test_dataset_update_columns_json"
+    dataset = lance.write_dataset(base, dataset_uri, max_rows_per_file=2)
+
+    # Add an (all-null) JSON column to backfill later.
+    dataset.add_columns(pa.schema([pa.field("detection", pa.json_())]))
+    dataset = lance.dataset(dataset_uri)
+    assert dataset.schema.field("detection").type == pa.json_()
+
+    right = pa.table(
+        {
+            "save_path": ["a.jpg", "b.jpg"],
+            "detection": pa.array(
+                [
+                    json.dumps({"result": {"score": 0.1}, "res_status": 1}),
+                    json.dumps({"result": {"score": 0.2}, "res_status": 1}),
+                ],
+                type=pa.json_(),
+            ),
+        }
+    )
+
+    fragment = dataset.get_fragment(0)
+    updated_fragment, fields_modified = fragment.update_columns(
+        right, left_on="save_path", right_on="save_path"
+    )
+    assert len(fields_modified) > 0
+
+    op = LanceOperation.Update(
+        updated_fragments=[updated_fragment],
+        fields_modified=fields_modified,
+    )
+    updated_dataset = lance.LanceDataset.commit(
+        str(dataset_uri), op, read_version=dataset.version
+    )
+
+    # JSON type is preserved and the backfilled values round-trip.
+    assert updated_dataset.schema.field("detection").type == pa.json_()
+    result = updated_dataset.to_table(
+        filter="json_get_int(detection, 'res_status') = 1"
+    )
+    assert result.num_rows == 2
+    scores = sorted(
+        json.loads(v)["result"]["score"]
+        for v in result.column("detection").to_pylist()
+    )
+    assert scores == [0.1, 0.2]
+
+
 def test_fragment_update_columns_with_nulls(tmp_path):
     """Test fragment update columns with null values."""
     # Create initial dataset
