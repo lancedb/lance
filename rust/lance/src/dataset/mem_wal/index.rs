@@ -28,6 +28,7 @@ use std::time::Instant;
 use datafusion::common::ScalarValue;
 
 use super::memtable::batch_store::StoredBatch;
+use super::wal::WriterCursors;
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Schema as ArrowSchema};
 use lance_core::datatypes::Schema as LanceSchema;
@@ -423,21 +424,12 @@ pub struct IndexStore {
     /// writer's to make — see `visible_count`.
     indexed_count: AtomicUsize,
 
-    /// How many batches of this memtable are **published to readers**. An
-    /// exclusive count; 0 means none.
+    /// The writer's cursors, and this memtable's coordinate within them. `None`
+    /// for a bare `IndexStore` (tests, benches), where visibility is just the
+    /// indexed prefix.
     ///
-    /// Distinct from `indexed_count`, and the distinction is the whole point.
-    /// `indexed_count` is the *apply* cursor: it tracks what the index layer has
-    /// ingested, and the HNSW graph requires it to advance contiguously. It is
-    /// advanced by the index insert itself — including on a flush whose WAL
-    /// append *failed*, since the two run concurrently and the append error only
-    /// surfaces after both have completed.
-    ///
-    /// Readers must never key off that. `visible_count` is advanced by the
-    /// writer only once a batch is both indexed **and** WAL-durable, so
-    /// `visible => durable` holds and a failed append can never publish a row
-    /// that replay will not reproduce.
-    visible_count: AtomicUsize,
+    /// Visibility is **derived, never stored**: see `visible_count`.
+    durability: Option<(Arc<WriterCursors>, usize)>,
     /// Conservative flag set once this memtable has observed any primary-key
     /// rewrite while maintaining a search index. Search planners can push top-k
     /// into HNSW/FTS for append-only PK data, but must switch to
@@ -453,7 +445,7 @@ impl Default for IndexStore {
             fts_indexes: HashMap::new(),
             pk_index: None,
             indexed_count: AtomicUsize::new(0),
-            visible_count: AtomicUsize::new(0),
+            durability: None,
             pk_has_overrides: AtomicBool::new(false),
         }
     }
@@ -873,17 +865,9 @@ impl IndexStore {
         let had_existing = self.insert_composite_pk(batch, row_offset, track_pk_overrides)?;
         self.mark_pk_overrides_if_needed(had_existing);
 
-        // Update the indexed prefix after every index has been updated, and
-        // publish it.
-        //
-        // Publishing here — rather than leaving it to the writer, as the
-        // production path does — is deliberate: this entry point exists only for
-        // tests and benches, which have no writer to durably flush and then
-        // publish on their behalf. It stands in for the whole pipeline, so a
-        // fixture that indexes a batch means "this batch is indexed and durable".
+        // Update the indexed prefix after every index has been updated.
         if let Some(bp) = batch_position {
             self.advance_indexed_count(bp + 1);
-            self.publish_visible(bp + 1);
         }
 
         Ok(())
@@ -1138,17 +1122,25 @@ impl IndexStore {
         self.indexed_count.load(Ordering::Acquire)
     }
 
-    /// The prefix of this memtable that readers may see: indexed **and** durable.
-    /// Snapshot this, never `indexed_count`.
+    /// The prefix of this memtable that readers may see. Snapshot this, never
+    /// `indexed_count`.
+    ///
+    /// Derived on every call from the two cursors rather than cached, so there is
+    /// no published value that can be left stale by a race between the two tasks
+    /// that advance them. A bare `IndexStore` has no writer, so its visible
+    /// prefix is simply what has been indexed.
     pub fn visible_count(&self) -> usize {
-        self.visible_count.load(Ordering::Acquire)
+        let indexed = self.indexed_count();
+        match &self.durability {
+            Some((cursors, global_offset)) => cursors.visible_count(indexed, *global_offset),
+            None => indexed,
+        }
     }
 
-    /// Publish a prefix to readers. Called by the writer once the batches are
-    /// both indexed and WAL-durable. Monotonic — a late or out-of-order flush
-    /// completion can never retract what readers have already been shown.
-    pub(crate) fn publish_visible(&self, count: usize) {
-        self.visible_count.fetch_max(count, Ordering::AcqRel);
+    /// Bind this memtable's indexes to the writer's cursors. Called once at
+    /// construction, before the memtable is published.
+    pub(crate) fn set_durability(&mut self, cursors: Arc<WriterCursors>, global_offset: usize) {
+        self.durability = Some((cursors, global_offset));
     }
 }
 

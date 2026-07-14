@@ -50,8 +50,8 @@ pub use super::wal::{WalEntry, WalEntryData, WalFlushFailure, WalFlushResult, Wa
 use super::memtable::flush::TriggerMemTableFlush;
 use super::scanner::GenerationWarmer;
 use super::wal::{
-    BatchDurableWatcher, TriggerWalFlush, WalAppender, WalFlushSource, WalOnlyState,
-    WalRetryConfig, WalTailer, empty_flush_result,
+    BatchDurableWatcher, TriggerIndexApply, TriggerWalFlush, WalAppender, WalFlushSource,
+    WalOnlyState, WalRetryConfig, WalTailer, WriterCursors, apply_index_range, empty_flush_result,
 };
 use super::{TOMBSTONE, schema_with_tombstone};
 use crate::session::Session;
@@ -1016,6 +1016,10 @@ struct SharedWriterState {
     state: Arc<RwLock<WriterState>>,
     wal_flusher: Arc<WalFlusher>,
     wal_flush_tx: mpsc::UnboundedSender<TriggerWalFlush>,
+    /// The index-apply task's channel. Separate from the WAL flusher's on
+    /// purpose: `TaskDispatcher::run` awaits `handle()` inline, so sharing one
+    /// would put a ~100ms S3 PUT in front of every latency-sensitive index apply.
+    index_apply_tx: mpsc::UnboundedSender<TriggerIndexApply>,
     memtable_flush_tx: mpsc::UnboundedSender<TriggerMemTableFlush>,
     config: ShardWriterConfig,
     schema: Arc<ArrowSchema>,
@@ -1034,6 +1038,7 @@ impl SharedWriterState {
         state: Arc<RwLock<WriterState>>,
         wal_flusher: Arc<WalFlusher>,
         wal_flush_tx: mpsc::UnboundedSender<TriggerWalFlush>,
+        index_apply_tx: mpsc::UnboundedSender<TriggerIndexApply>,
         memtable_flush_tx: mpsc::UnboundedSender<TriggerMemTableFlush>,
         config: ShardWriterConfig,
         schema: Arc<ArrowSchema>,
@@ -1047,6 +1052,7 @@ impl SharedWriterState {
             state,
             wal_flusher,
             wal_flush_tx,
+            index_apply_tx,
             memtable_flush_tx,
             config,
             schema,
@@ -1056,6 +1062,25 @@ impl SharedWriterState {
             max_memtable_rows,
             index_configs,
         }
+    }
+
+    /// Ask the index-apply task to cover `[indexed, end_batch_position)` of this
+    /// store. Cheap and idempotent: a range already covered is a no-op, which is
+    /// the common case under load, since one apply coalesces the puts queued
+    /// behind it.
+    fn trigger_index_apply(
+        &self,
+        batch_store: Arc<BatchStore>,
+        indexes: Arc<IndexStore>,
+        end_batch_position: usize,
+    ) -> Result<()> {
+        self.index_apply_tx
+            .send(TriggerIndexApply {
+                batch_store,
+                indexes,
+                end_batch_position,
+            })
+            .map_err(|_| Error::io("index apply channel closed"))
     }
 
     /// Freeze the current memtable and send it to the flush handler.
@@ -1070,7 +1095,6 @@ impl SharedWriterState {
         let last_wal_entry_position = state.last_flushed_wal_entry_position;
 
         let old_batch_store = state.memtable.batch_store();
-        let old_indexes = state.memtable.indexes_arc();
 
         let next_generation = state.memtable.generation() + 1;
         // The incoming memtable's batch 0 continues the writer's batch sequence
@@ -1087,21 +1111,36 @@ impl SharedWriterState {
             next_global_offset,
         )?;
 
-        // Build an IndexStore when there are user indexes *or* a primary key:
-        // the PK dedup index (and its flushed on-disk sidecar) is required for
-        // cross-generation dedup even when no secondary index is configured.
-        if !self.index_configs.is_empty() || !self.pk_columns.is_empty() {
-            let mut indexes = IndexStore::from_configs(
-                &self.index_configs,
-                self.max_memtable_rows,
-                self.max_memtable_batches,
-            )?;
+        // Always build and bind an IndexStore, even with no user indexes and no
+        // primary key. It is what carries the memtable's `indexed_count`, and
+        // binding it to the writer's cursors is what lets a reader derive the
+        // visible prefix — so an index-less memtable that skipped this would fall
+        // back to `visible == indexed` and publish rows before they were durable.
+        // (A PK memtable also needs the PK dedup index and its flushed sidecar.)
+        let mut indexes = IndexStore::from_configs(
+            &self.index_configs,
+            self.max_memtable_rows,
+            self.max_memtable_batches,
+        )?;
+        if !self.pk_columns.is_empty() {
             indexes.enable_pk_index(&pk_index_columns(&self.pk_columns, &self.pk_field_ids));
-            new_memtable.set_indexes_arc(Arc::new(indexes));
         }
+        indexes.set_durability(Arc::clone(self.wal_flusher.cursors()), next_global_offset);
+        new_memtable.set_indexes_arc(Arc::new(indexes));
 
         let mut old_memtable = std::mem::replace(&mut state.memtable, new_memtable);
         old_memtable.freeze(last_wal_entry_position);
+
+        // The outgoing memtable may still owe an index apply — the puts that
+        // filled it triggered one, but the task need not have drained yet, and
+        // this is the last chance to name that store. Its L0 flush is gated on
+        // the WAL append (below), not on indexing, so without this its tail could
+        // stay unindexed and invisible for the rest of its life.
+        if let Some(old_indexes) = old_memtable.indexes_arc()
+            && old_indexes.indexed_count() < old_batch_store.len()
+        {
+            self.trigger_index_apply(old_batch_store.clone(), old_indexes, old_batch_store.len())?;
+        }
         let _memtable_flush_watcher = old_memtable.create_memtable_flush_completion();
 
         if pending_wal_range.is_some() {
@@ -1115,7 +1154,6 @@ impl SharedWriterState {
             self.wal_flusher.trigger_flush(
                 WalFlushSource::BatchStore {
                     batch_store: old_batch_store,
-                    indexes: old_indexes,
                 },
                 end_batch_position,
                 Some(completion_cell),
@@ -1156,13 +1194,19 @@ impl SharedWriterState {
         Ok(next_generation)
     }
 
-    /// Watch for a write to become WAL-durable.
+    /// Watch for a write to become visible: indexed, and — in durable mode —
+    /// WAL-durable too.
     ///
-    /// `target_durable_count` is a writer-global, exclusive batch count — not a
-    /// memtable-local position. See the caller for why that distinction is
-    /// load-bearing.
-    fn track_batch_for_wal(&self, target_durable_count: usize) -> super::wal::BatchDurableWatcher {
-        self.wal_flusher.track_batch(target_durable_count)
+    /// `target_indexed` is memtable-local; `target_durable` is writer-global.
+    /// Different coordinate spaces on purpose — see `WalFlusher::track_batch`.
+    fn track_batch_for_wal(
+        &self,
+        indexes: Option<Arc<IndexStore>>,
+        target_indexed: usize,
+        target_durable: usize,
+    ) -> super::wal::BatchDurableWatcher {
+        self.wal_flusher
+            .track_batch(indexes, target_indexed, target_durable)
     }
 
     /// Check if memtable flush is needed and trigger if so.
@@ -1193,7 +1237,6 @@ impl SharedWriterState {
         let batch_count = state.memtable.batch_count();
         let total_bytes = state.memtable.estimated_size();
         let batch_store = state.memtable.batch_store();
-        let indexes = state.memtable.indexes_arc();
 
         // Check if there are any unflushed batches
         let has_pending = batch_store.pending_wal_flush_count(self.wal_flusher.durable()) > 0;
@@ -1225,10 +1268,7 @@ impl SharedWriterState {
         // If time trigger fired, send a flush message
         if time_trigger.is_some() {
             let _ = self.wal_flush_tx.send(TriggerWalFlush {
-                source: WalFlushSource::BatchStore {
-                    batch_store,
-                    indexes,
-                },
+                source: WalFlushSource::BatchStore { batch_store },
                 end_batch_position: batch_count,
                 done: None,
             });
@@ -1253,7 +1293,6 @@ impl SharedWriterState {
             let _ = self.wal_flush_tx.send(TriggerWalFlush {
                 source: WalFlushSource::BatchStore {
                     batch_store: batch_store.clone(),
-                    indexes: indexes.clone(),
                 },
                 end_batch_position: batch_count,
                 done: None,
@@ -1418,7 +1457,12 @@ impl ShardWriter {
         }
 
         // Create WAL flusher backed by the shared appender.
-        let mut wal_flusher = WalFlusher::new(wal_appender);
+        // Build the cursors from *this writer's* config. `durable_write` is what
+        // decides whether durability is part of visibility, so a flusher that
+        // defaulted it would leave a non-durable put waiting on a durability
+        // cursor nothing ever advances.
+        let cursors = Arc::new(WriterCursors::new(config.durable_write));
+        let mut wal_flusher = WalFlusher::with_cursors(wal_appender, cursors);
 
         let (wal_flush_tx, wal_flush_rx) = mpsc::unbounded_channel();
         wal_flusher.set_flush_channel(wal_flush_tx.clone());
@@ -1506,19 +1550,20 @@ impl ShardWriter {
             config.max_memtable_batches,
         )?;
 
-        // Create indexes if configured and set them on the MemTable. The
-        // PK-position index is enabled before any WAL replay below so replayed
-        // rows are recorded in it. A primary key alone (no secondary index)
-        // still needs the PK index so flush writes its on-disk dedup sidecar.
-        if !index_configs.is_empty() || !pk_columns.is_empty() {
-            let mut indexes = IndexStore::from_configs(
-                index_configs,
-                config.max_memtable_rows,
-                config.max_memtable_batches,
-            )?;
+        // Always build and bind an IndexStore — see the matching note in
+        // `freeze_memtable`. The PK-position index is enabled before any WAL
+        // replay below so replayed rows are recorded in it.
+        let mut indexes = IndexStore::from_configs(
+            index_configs,
+            config.max_memtable_rows,
+            config.max_memtable_batches,
+        )?;
+        if !pk_columns.is_empty() {
             indexes.enable_pk_index(&pk_index_columns(&pk_columns, &pk_field_ids));
-            memtable.set_indexes_arc(Arc::new(indexes));
         }
+        // The writer's first memtable starts at coordinate 0.
+        indexes.set_durability(Arc::clone(wal_flusher.cursors()), 0);
+        memtable.set_indexes_arc(Arc::new(indexes));
 
         // Replay any WAL entries written after the last successfully-flushed
         // generation. Each entry's writer_epoch is checked against ours; an
@@ -1553,15 +1598,6 @@ impl ShardWriter {
         // The replayed memtable is the writer's first, so its `global_offset` is
         // 0 and the durable count is just its batch count.
         wal_flusher.advance_durable(memtable.batch_count());
-
-        // ...and publish them to readers. Replayed batches are durable by
-        // construction (they came out of the WAL) and were just re-indexed above,
-        // so they satisfy both halves of `visible`. Publishing is normally the
-        // flush's job; replay bypasses the flush, so it must do it here or the
-        // recovered rows stay invisible.
-        if let Some(indexes) = memtable.indexes_arc() {
-            indexes.publish_visible(memtable.batch_count());
-        }
 
         wal_flusher
             .wal_appender()
@@ -1627,11 +1663,26 @@ impl ShardWriter {
             memtable_flush_rx,
         )?;
 
+        // The index-apply task. Its own channel and its own dispatcher: the
+        // dispatcher awaits `handle()` inline, so sharing the WAL flusher's
+        // channel would queue every index apply behind a ~100ms S3 PUT.
+        let (index_apply_tx, index_apply_rx) = mpsc::unbounded_channel();
+        let index_handler = IndexApplyHandler {
+            cursors: Arc::clone(wal_flusher.cursors()),
+            wal_flusher: wal_flusher.clone(),
+        };
+        task_executor.add_handler(
+            "index_applier".to_string(),
+            Box::new(index_handler),
+            index_apply_rx,
+        )?;
+
         // Shared state used by `put()` to dispatch trigger checks.
         let writer_state = Arc::new(SharedWriterState::new(
             state.clone(),
             wal_flusher,
             wal_flush_tx,
+            index_apply_tx,
             memtable_flush_tx,
             config.clone(),
             schema.clone(),
@@ -1926,15 +1977,22 @@ impl ShardWriter {
             let end_pos = results.last().map(|(pos, _, _)| pos + 1).unwrap_or(0);
             let batch_positions = start_pos..end_pos;
 
-            // 3. Track this write for WAL durability. The target is writer-global
-            //    and exclusive. It must not be a memtable-local position: batch
-            //    positions restart at 0 in every memtable, while the durability
-            //    channel spans the writer's whole life. A local target is
-            //    therefore already satisfied by a *previous* memtable's appends,
-            //    so the first N puts into every post-rotation memtable would ack
-            //    as durable without a WAL append ever happening.
-            let durable_watcher =
-                writer_state.track_batch_for_wal(batch_store.global_offset() + end_pos);
+            // 3. Watch for this write to become *visible*: indexed, and — under
+            //    `durable_write` — WAL-durable too.
+            //
+            //    The two targets live in different coordinate spaces. `end_pos`
+            //    is memtable-local, which is what the index apply works in. The
+            //    durability cursor is writer-global, because batch positions
+            //    restart at 0 in every memtable while that cursor spans the
+            //    writer's whole life — a local durable target would already be
+            //    satisfied by a *previous* memtable's appends, so the first N
+            //    puts into every post-rotation memtable would ack as durable with
+            //    no WAL append ever happening.
+            let durable_watcher = writer_state.track_batch_for_wal(
+                indexes.clone(),
+                end_pos,
+                batch_store.global_offset() + end_pos,
+            );
 
             // 4. Check if WAL flush should be triggered
             writer_state.maybe_trigger_wal_flush(&mut state);
@@ -1949,21 +2007,33 @@ impl ShardWriter {
 
         self.stats.record_put(start.elapsed());
 
-        // Trigger the flush here (outside the lock) so the watcher can resolve;
-        // only the `wait()` is the caller's to schedule.
-        let watcher = if self.config.durable_write {
+        // Trigger the index apply, in **both** modes. This is what makes reads
+        // read-your-writes regardless of `durable_write`: skipping durability now
+        // costs the caller durability only, not visibility. It is cheap
+        // (in-memory, ~ms), so there is no reason to batch it onto the WAL's
+        // schedule — that schedule exists to bound S3 API cost, which an
+        // in-memory index apply does not incur.
+        if let Some(indexes) = &indexes {
+            writer_state.trigger_index_apply(
+                batch_store.clone(),
+                indexes.clone(),
+                batch_positions.end,
+            )?;
+        }
+
+        // Trigger the WAL flush here (outside the lock) so the watcher can
+        // resolve; only the `wait()` is the caller's to schedule.
+        if self.config.durable_write {
             self.wal_flusher.trigger_flush(
-                WalFlushSource::BatchStore {
-                    batch_store,
-                    indexes,
-                },
+                WalFlushSource::BatchStore { batch_store },
                 batch_positions.end,
                 None,
             )?;
-            Some(durable_watcher)
-        } else {
-            None
-        };
+        }
+
+        // The watcher is returned in both modes now. A non-durable put still
+        // waits — for its index apply (~ms), not for an S3 PUT (~100ms).
+        let watcher = Some(durable_watcher);
 
         Ok((WriteResult { batch_positions }, watcher))
     }
@@ -2417,20 +2487,41 @@ impl ShardWriter {
                 writer_state,
                 ..
             } => {
-                // Send final WAL flush message and wait for completion
+                // Drain *both* tasks against the active memtable. The index apply
+                // and the WAL append are independent now, so closing has to
+                // settle both: the L0 flush below turns this memtable into a
+                // Lance generation, and a generation whose indexes never saw the
+                // tail is a generation with a hole in it.
                 let st = state.read().await;
                 let batch_store = st.memtable.batch_store();
                 let indexes = st.memtable.indexes_arc();
                 let batch_count = st.memtable.batch_count();
                 drop(st);
 
+                if batch_count > 0
+                    && let Some(indexes) = indexes
+                    && indexes.indexed_count() < batch_count
+                {
+                    let mut watcher = self.wal_flusher.track_batch(
+                        Some(Arc::clone(&indexes)),
+                        batch_count,
+                        0, // durability is settled by the WAL flush below
+                    );
+                    writer_state.trigger_index_apply(
+                        Arc::clone(&batch_store),
+                        indexes,
+                        batch_count,
+                    )?;
+                    watcher.wait().await?;
+                }
+
                 if batch_count > 0 {
+                    // Append-only source: on this branch the index apply is a
+                    // separate task (drained above), so the final WAL flush carries
+                    // no indexes. #7769's failure propagation still applies.
                     let stage_result = Self::flush_final_wal(
                         &writer_state.wal_flush_tx,
-                        WalFlushSource::BatchStore {
-                            batch_store,
-                            indexes,
-                        },
+                        WalFlushSource::BatchStore { batch_store },
                         batch_count,
                     )
                     .await;
@@ -2555,6 +2646,34 @@ pub struct WalStats {
 ///
 /// This handler does parallel WAL I/O + index updates during flush.
 /// Indexes are passed through the TriggerWalFlush message.
+/// The index-apply task: one sequential consumer of the index-apply channel.
+///
+/// Sequential consumption is the safety property. `HnswGraph::insert_batch` hard-
+/// rejects any range whose start is not its `indexed_len`, so the apply must see
+/// contiguous, in-order ranges — and a single consumer guarantees that
+/// regardless of how many putters race behind it. Ordering comes from the task,
+/// not from a flush interval, which is why triggering per-put is exactly as safe
+/// as triggering on a timer, and lets a put become visible in milliseconds
+/// instead of waiting on an S3 round-trip.
+struct IndexApplyHandler {
+    cursors: Arc<WriterCursors>,
+    wal_flusher: Arc<WalFlusher>,
+}
+
+#[async_trait]
+impl MessageHandler<TriggerIndexApply> for IndexApplyHandler {
+    async fn handle(&mut self, message: TriggerIndexApply) -> Result<()> {
+        if let Err(e) = apply_index_range(&self.cursors, message).await {
+            // An index apply cannot be partially rolled back, so a failure is
+            // terminal: poison, and let reopen rebuild the indexes from the WAL.
+            // See the note in `WalFlusher::flush_from_batch_store`.
+            self.wal_flusher.poison(&e);
+            return Err(e);
+        }
+        Ok(())
+    }
+}
+
 struct WalFlushHandler {
     wal_flusher: Arc<WalFlusher>,
     /// MemTable-mode writer state, used to detect "frozen vs active" flushes
@@ -2640,13 +2759,9 @@ impl WalFlushHandler {
         // a BatchStore source carrying a non-empty `IndexStore` does. Used
         // to gate the `record_index_update` stat so WAL-only flushes don't
         // pollute the index-update counters.
-        let has_indexes = matches!(
-            &source,
-            WalFlushSource::BatchStore {
-                indexes: Some(_),
-                ..
-            }
-        );
+        // The WAL flush no longer touches indexes at all — the index apply runs
+        // on its own task — so it never records an index-update stat.
+        let has_indexes = false;
 
         // Early-out for BatchStore sources where the watermark already
         // covers the requested end position. Detection of "frozen flush"
@@ -3496,7 +3611,7 @@ mod tests {
     /// await), but the tombstone still lands in the in-memory tier. The delete
     /// analog of `test_put_no_wait_non_durable_returns_no_watcher`.
     #[tokio::test]
-    async fn test_shard_writer_delete_no_wait_non_durable_returns_no_watcher() {
+    async fn test_non_durable_delete_is_read_your_writes() {
         let (store, base_path, base_uri, _temp) = create_local_store().await;
         let schema = create_pk_test_schema();
         let config = ShardWriterConfig {
@@ -3517,7 +3632,10 @@ mod tests {
             .delete_no_wait(vec![id_only_keys(&[2])])
             .await
             .unwrap();
-        assert!(watcher.is_none(), "non-durable delete has nothing to await");
+        // As with a put: a non-durable delete awaits its index apply, not an S3
+        // round-trip. It is read-your-writes, just not durable.
+        let mut watcher = watcher.expect("a non-durable delete awaits its index apply");
+        watcher.wait().await.unwrap();
 
         // Tombstone landed in the in-memory tier (5 rows + 1 tombstone).
         assert_eq!(writer.memtable_stats().await.unwrap().row_count, 6);
@@ -3977,7 +4095,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_put_no_wait_non_durable_returns_no_watcher() {
+    async fn test_non_durable_put_is_read_your_writes() {
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
         let schema = create_test_schema();
 
@@ -4000,7 +4118,21 @@ mod tests {
         let batch = create_test_batch(&schema, 0, 10);
         let (result, watcher) = writer.put_no_wait(vec![batch]).await.unwrap();
         assert_eq!(result.batch_positions, 0..1);
-        assert!(watcher.is_none(), "non-durable put has nothing to await");
+
+        // A non-durable put still has something to await: its *index apply*.
+        // Skipping durability now costs the caller durability only — not
+        // visibility. Before the index apply was split off the WAL flush, a
+        // non-durable write was not read-your-writes at all: the row stayed
+        // invisible until some later flush happened to index it.
+        let mut watcher = watcher.expect("a non-durable put awaits its index apply");
+        watcher.wait().await.unwrap();
+
+        let scanned = writer.scan().await.unwrap().try_into_batch().await.unwrap();
+        assert_eq!(
+            scanned.num_rows(),
+            10,
+            "a non-durable put must be readable as soon as it returns"
+        );
 
         let stats = writer.memtable_stats().await.unwrap();
         assert_eq!(stats.row_count, 10);
@@ -5240,6 +5372,53 @@ mod tests {
         assert_eq!(all.num_rows(), 10);
 
         writer_b.close().await.unwrap();
+    }
+
+    /// A non-durable put is readable through the **index-backed** arms the moment
+    /// it returns, not just through a full scan.
+    ///
+    /// This is what splitting the index apply off the WAL flush buys. Before, the
+    /// index apply only ran as one arm of the flush, so with `durable_write:
+    /// false` nothing triggered it on the put path at all: the row sat in the
+    /// batch store, unindexed, until some later flush happened along. A full scan
+    /// (which reads the batch store directly) could still find it, while every
+    /// index-accelerated query could not — the tiers disagreed. Now the apply is
+    /// triggered per-put in both modes, so `put` returning means "indexed".
+    #[tokio::test]
+    async fn test_non_durable_put_is_visible_through_the_index() {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = schema_with_pk();
+        let shard_id = Uuid::new_v4();
+
+        let config = ShardWriterConfig {
+            durable_write: false,
+            ..memtable_config_with_pk(shard_id)
+        };
+        let writer = ShardWriter::open(store, base_path, base_uri, config, schema.clone(), vec![])
+            .await
+            .unwrap();
+
+        writer
+            .put(vec![create_test_batch(&schema, 0, 5)])
+            .await
+            .unwrap();
+
+        // The indexed PK lookup must find it — this is the arm that saw nothing
+        // before, because the index apply had never run.
+        let mut scanner = writer.scan().await.unwrap();
+        scanner.filter("id = 3").unwrap();
+        let hit = scanner.try_into_batch().await.unwrap();
+        assert_eq!(
+            hit.num_rows(),
+            1,
+            "an index-backed lookup must see a non-durable put as soon as it returns"
+        );
+
+        // ...and so must the unindexed full scan, i.e. the tiers agree.
+        let all = writer.scan().await.unwrap().try_into_batch().await.unwrap();
+        assert_eq!(all.num_rows(), 5);
+
+        writer.close().await.unwrap();
     }
 
     /// The durability cursor is writer-global, so a put into a *post-rotation*
