@@ -998,19 +998,6 @@ pub async fn merge_partial_vector_auxiliary_files(
 
                 let sq_meta_parsed: ScalarQuantizationMetadata = serde_json::from_str(&sq_json)
                     .map_err(|e| Error::index(format!("SQ metadata parse error: {}", e)))?;
-                if let Some(existing_sq) = sq_meta.as_ref()
-                    && existing_sq != &sq_meta_parsed
-                {
-                    return Err(Error::index(format!(
-                        "Distributed SQ merge: metadata mismatch across shards; first(dim={}, nbits={}, bounds={:?}), current(dim={}, nbits={}, bounds={:?})",
-                        existing_sq.dim,
-                        existing_sq.num_bits,
-                        existing_sq.bounds,
-                        sq_meta_parsed.dim,
-                        sq_meta_parsed.num_bits,
-                        sq_meta_parsed.bounds
-                    )));
-                }
 
                 let d0 = sq_meta_parsed.dim;
                 dim.get_or_insert(d0);
@@ -1076,9 +1063,9 @@ pub async fn merge_partial_vector_auxiliary_files(
                 }
                 validate_rq_num_bits(rq_meta_parsed.num_bits)?;
                 if rq_meta_parsed.packed {
-                    return Err(Error::index(
-                        "Distributed RQ merge: source shard stores packed RQ codes; expected row-major distributed shard".to_string(),
-                    ));
+                    return Err(Error::index(format!(
+                        "Distributed RQ merge: source shard {idx} stores packed RQ codes; expected row-major distributed shard"
+                    )));
                 }
 
                 let d0 = rq_meta_parsed.rotated_dim();
@@ -1177,9 +1164,9 @@ pub async fn merge_partial_vector_auxiliary_files(
                 let mut pm: ProductQuantizationMetadata = serde_json::from_str(&pm_json)
                     .map_err(|e| Error::index(format!("PQ metadata parse error: {}", e)))?;
                 if pm.transposed {
-                    return Err(Error::index(
-                        "Distributed PQ merge: source shard stores transposed PQ codes; expected row-major distributed shard".to_string(),
-                    ));
+                    return Err(Error::index(format!(
+                        "Distributed PQ merge: source shard {idx} stores transposed PQ codes; expected row-major distributed shard"
+                    )));
                 }
                 // Load codebook from global buffer if not present
                 if pm.codebook.is_none() {
@@ -1336,9 +1323,9 @@ pub async fn merge_partial_vector_auxiliary_files(
                 let mut pm: ProductQuantizationMetadata = serde_json::from_str(&pm_json)
                     .map_err(|e| Error::index(format!("PQ metadata parse error: {}", e)))?;
                 if pm.transposed {
-                    return Err(Error::index(
-                        "Distributed PQ merge: source shard stores transposed PQ codes; expected row-major distributed shard".to_string(),
-                    ));
+                    return Err(Error::index(format!(
+                        "Distributed PQ merge: source shard {idx} stores transposed PQ codes; expected row-major distributed shard"
+                    )));
                 }
                 if pm.codebook.is_none() {
                     let tensor_bytes = reader
@@ -1431,19 +1418,6 @@ pub async fn merge_partial_vector_auxiliary_files(
                 };
                 let sq_meta_parsed: ScalarQuantizationMetadata = serde_json::from_str(&sq_json)
                     .map_err(|e| Error::index(format!("SQ metadata parse error: {}", e)))?;
-                if let Some(existing_sq) = sq_meta.as_ref()
-                    && existing_sq != &sq_meta_parsed
-                {
-                    return Err(Error::index(format!(
-                        "Distributed SQ merge (HNSW_SQ): metadata mismatch across shards; first(dim={}, nbits={}, bounds={:?}), current(dim={}, nbits={}, bounds={:?})",
-                        existing_sq.dim,
-                        existing_sq.num_bits,
-                        existing_sq.bounds,
-                        sq_meta_parsed.dim,
-                        sq_meta_parsed.num_bits,
-                        sq_meta_parsed.bounds
-                    )));
-                }
                 let d0 = sq_meta_parsed.dim;
                 dim.get_or_insert(d0);
                 if let Some(dprev) = dim
@@ -2100,6 +2074,7 @@ mod tests {
         base_row_id: u64,
         distance_type: DistanceType,
         codebook: &FixedSizeListArray,
+        transposed: bool,
     ) -> Result<usize> {
         let num_bytes = if nbits == 4 {
             // Two 4-bit codes per byte.
@@ -2138,7 +2113,7 @@ mod tests {
             dimension,
             codebook: Some(codebook.clone()),
             codebook_tensor: Vec::new(),
-            transposed: false,
+            transposed,
         };
 
         let codebook_tensor: pb::Tensor = pb::Tensor::try_from(codebook)?;
@@ -2349,6 +2324,7 @@ mod tests {
             0,
             DistanceType::L2,
             &codebook,
+            false,
         )
         .await
         .unwrap();
@@ -2363,6 +2339,7 @@ mod tests {
             1_000,
             DistanceType::L2,
             &codebook,
+            false,
         )
         .await
         .unwrap();
@@ -2441,6 +2418,66 @@ mod tests {
         let merged_codebook = FixedSizeListArray::try_from(&cb_tensor).unwrap();
 
         assert!(fixed_size_list_equal(&codebook, &merged_codebook));
+    }
+
+    #[tokio::test]
+    async fn test_merge_ivf_pq_rejects_transposed_source_shard() {
+        let object_store = ObjectStore::memory();
+        let index_dir = Path::from("index/uuid_pq_transposed");
+
+        let partial0 = index_dir.clone().join("partial_0");
+        let aux0 = partial0.clone().join(INDEX_AUXILIARY_FILE_NAME);
+        let lengths = vec![2_u32, 1_u32];
+
+        let nbits = 4_u32;
+        let num_sub_vectors = 2_usize;
+        let dimension = 8_usize;
+        let num_centroids = 1_usize << nbits;
+        let num_codebook_vectors = num_centroids * num_sub_vectors;
+        let total_values = num_codebook_vectors * dimension;
+        let values = Float32Array::from_iter((0..total_values).map(|v| v as f32));
+        let codebook = FixedSizeListArray::try_new_from_values(values, dimension as i32).unwrap();
+
+        write_pq_partial_aux(
+            &object_store,
+            &aux0,
+            nbits,
+            num_sub_vectors,
+            dimension,
+            &lengths,
+            0,
+            DistanceType::L2,
+            &codebook,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let res = merge_partial_vector_auxiliary_files(
+            &object_store,
+            std::slice::from_ref(&aux0),
+            &index_dir,
+            crate::progress::noop_progress(),
+        )
+        .await;
+        match res {
+            Err(Error::Index { message, .. }) => {
+                assert!(
+                    message.contains("source shard 0"),
+                    "unexpected message: {}",
+                    message
+                );
+                assert!(
+                    message.contains("transposed PQ codes"),
+                    "unexpected message: {}",
+                    message
+                );
+            }
+            other => panic!(
+                "expected Error::Index for transposed PQ source shard, got {:?}",
+                other
+            ),
+        }
     }
 
     #[tokio::test]
@@ -2577,6 +2614,64 @@ mod tests {
         assert!(checked_code_width);
         let expected_total: usize = expected_lengths.iter().map(|v| *v as usize).sum();
         assert_eq!(total_rows, expected_total);
+    }
+
+    #[tokio::test]
+    async fn test_merge_ivf_rq_rejects_packed_source_shard() {
+        let object_store = ObjectStore::memory();
+        let index_dir = Path::from("index/uuid_rq_packed");
+
+        let partial0 = index_dir.clone().join("partial_0");
+        let aux0 = partial0.clone().join(INDEX_AUXILIARY_FILE_NAME);
+        let lengths = vec![2_u32, 1_u32];
+
+        let rq_meta = RabitQuantizationMetadata {
+            rotate_mat: None,
+            rotate_mat_position: None,
+            fast_rotation_signs: Some(vec![0xAA; 2]),
+            rotation_type: RQRotationType::Fast,
+            code_dim: 16,
+            num_bits: 1,
+            packed: true,
+            query_estimator: RabitQueryEstimator::RawQuery,
+        };
+
+        write_rq_partial_aux(
+            &object_store,
+            &aux0,
+            &rq_meta,
+            &lengths,
+            0,
+            DistanceType::L2,
+        )
+        .await
+        .unwrap();
+
+        let res = merge_partial_vector_auxiliary_files(
+            &object_store,
+            std::slice::from_ref(&aux0),
+            &index_dir,
+            crate::progress::noop_progress(),
+        )
+        .await;
+        match res {
+            Err(Error::Index { message, .. }) => {
+                assert!(
+                    message.contains("source shard 0"),
+                    "unexpected message: {}",
+                    message
+                );
+                assert!(
+                    message.contains("packed RQ codes"),
+                    "unexpected message: {}",
+                    message
+                );
+            }
+            other => panic!(
+                "expected Error::Index for packed RQ source shard, got {:?}",
+                other
+            ),
+        }
     }
 
     #[tokio::test]
@@ -2736,6 +2831,7 @@ mod tests {
             0,
             DistanceType::L2,
             &codebook0,
+            false,
         )
         .await
         .unwrap();
@@ -2750,6 +2846,7 @@ mod tests {
             1_000,
             DistanceType::L2,
             &codebook1,
+            false,
         )
         .await
         .unwrap();
@@ -2815,6 +2912,7 @@ mod tests {
             0,
             DistanceType::L2,
             &codebook,
+            false,
         )
         .await
         .unwrap();
@@ -2830,6 +2928,7 @@ mod tests {
             1_000,
             DistanceType::L2,
             &codebook,
+            false,
         )
         .await
         .unwrap();

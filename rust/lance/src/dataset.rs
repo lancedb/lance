@@ -2620,9 +2620,11 @@ impl Dataset {
                 }
                 let fragment_index = self.fragment_bitmap.rank(*id) as usize - 1;
                 let fragment = self.manifest.fragments.get(fragment_index)?;
-                if fragment.id != *id as u64 {
-                    return None;
-                }
+                debug_assert_eq!(
+                    fragment.id, *id as u64,
+                    "fragment_bitmap rank({id}) resolved to fragment {}, but fragment_bitmap and manifest.fragments are expected to stay in sync",
+                    fragment.id
+                );
                 Some(FileFragment::new(dataset.clone(), fragment.clone()))
             })
             .collect()
