@@ -64,6 +64,8 @@ def test_lance_schema(tmp_path: Path):
 
 
 def test_lance_schema_from_protos_rejects_missing_parent():
+    # name (field 2): child; id (field 3): 7; parent_id (field 4): 42;
+    # logical_type (field 5): int32.
     field_proto = b"\x12\x05child\x18\x07\x20\x2a\x2a\x05int32"
 
     with pytest.raises(

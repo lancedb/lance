@@ -17,6 +17,10 @@ fn proto_field(id: i32, parent_id: i32, name: String, logical_type: &str) -> pb:
     }
 }
 
+/// Builds a pre-order flat schema with `num_physical_columns` physical leaves.
+///
+/// Each struct contributes one parent and two `int32` leaves. Root fields use
+/// `-1` as `parent_id`, and each struct consumes a three-ID block.
 fn wide_two_leaf_structs(num_physical_columns: usize) -> Fields {
     assert_eq!(num_physical_columns % 2, 0);
     let num_structs = num_physical_columns / 2;
@@ -57,7 +61,7 @@ fn bench_schema_reconstruction(c: &mut Criterion) {
             BenchmarkId::new("physical_columns", num_physical_columns),
             &fields,
             |bencher, fields| {
-                bencher.iter(|| Schema::from(black_box(fields)));
+                bencher.iter(|| Schema::try_from(black_box(fields)).unwrap());
             },
         );
     }

@@ -104,6 +104,8 @@ struct FieldNode {
     child_indices: Vec<usize>,
 }
 
+/// Searches in pre-order depth-first order and returns the first matching node,
+/// preserving the legacy parent tie-break for duplicate field IDs.
 fn first_field_index_by_id(
     nodes: &[FieldNode],
     root_indices: &[usize],
@@ -131,35 +133,41 @@ impl From<&Field> for Fields {
     }
 }
 
-impl Fields {
-    /// Reconstruct a schema from a flat, pre-order protobuf field list.
-    ///
-    /// Parent fields must appear before their children. Duplicate field IDs are
-    /// retained for backwards compatibility, and parent references use the
-    /// legacy first depth-first match.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use lance_file::{datatypes::Fields, format::pb};
-    ///
-    /// let field = pb::Field {
-    ///     id: 0,
-    ///     parent_id: -1,
-    ///     name: "value".to_owned(),
-    ///     logical_type: "int32".to_owned(),
-    ///     ..Default::default()
-    /// };
-    /// let schema = Fields(vec![field]).try_to_schema()?;
-    /// assert_eq!(schema.fields[0].name, "value");
-    /// # Ok::<(), lance_core::Error>(())
-    /// ```
-    pub fn try_to_schema(&self) -> Result<Schema> {
-        let mut nodes: Vec<FieldNode> = Vec::with_capacity(self.0.len());
-        let mut root_indices = Vec::with_capacity(self.0.len());
-        let mut field_indices: HashMap<i32, Option<usize>> = HashMap::with_capacity(self.0.len());
+/// Reconstruct a schema from a flat, pre-order protobuf field list.
+///
+/// Parent fields must appear before their children. Historical manifests may
+/// contain duplicate field IDs, so an ID may not identify a unique parent. For
+/// those references, reconstruction preserves the legacy
+/// [`Schema::mut_field_by_id`] tie-break by selecting the first matching field
+/// in pre-order depth-first traversal.
+///
+/// # Examples
+///
+/// ```
+/// use lance_core::datatypes::Schema;
+/// use lance_file::{datatypes::Fields, format::pb};
+///
+/// let field = pb::Field {
+///     id: 0,
+///     parent_id: -1,
+///     name: "value".to_owned(),
+///     logical_type: "int32".to_owned(),
+///     ..Default::default()
+/// };
+/// let fields = Fields(vec![field]);
+/// let schema = Schema::try_from(&fields)?;
+/// assert_eq!(schema.fields[0].name, "value");
+/// # Ok::<(), lance_core::Error>(())
+/// ```
+impl TryFrom<&Fields> for Schema {
+    type Error = Error;
 
-        for proto_field in &self.0 {
+    fn try_from(fields: &Fields) -> Result<Self> {
+        let mut nodes: Vec<FieldNode> = Vec::with_capacity(fields.0.len());
+        let mut root_indices = Vec::with_capacity(fields.0.len());
+        let mut field_indices: HashMap<i32, Option<usize>> = HashMap::with_capacity(fields.0.len());
+
+        for proto_field in &fields.0 {
             let parent_index = if proto_field.parent_id == -1 {
                 None
             } else {
@@ -234,24 +242,10 @@ impl Fields {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        Ok(Schema {
+        Ok(Self {
             fields,
             metadata: HashMap::default(),
         })
-    }
-}
-
-/// Convert a list of protobuf fields to a schema.
-///
-/// This preserves the legacy infallible conversion contract and panics when a
-/// child references a missing or later parent. Use [`Fields::try_to_schema`]
-/// when decoding untrusted protobuf data.
-#[allow(clippy::fallible_impl_from)]
-impl From<&Fields> for Schema {
-    fn from(fields: &Fields) -> Self {
-        fields
-            .try_to_schema()
-            .unwrap_or_else(|error| panic!("Failed to reconstruct schema: {error}"))
     }
 }
 
@@ -260,26 +254,29 @@ pub struct FieldsWithMeta {
     pub metadata: HashMap<String, Vec<u8>>,
 }
 
-impl FieldsWithMeta {
-    /// Reconstruct a schema from flat protobuf fields and schema metadata.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use std::collections::HashMap;
-    ///
-    /// use lance_file::datatypes::{Fields, FieldsWithMeta};
-    ///
-    /// let schema = FieldsWithMeta {
-    ///     fields: Fields(Vec::new()),
-    ///     metadata: HashMap::from([("owner".to_owned(), b"lance".to_vec())]),
-    /// }
-    /// .try_into_schema()?;
-    /// assert_eq!(schema.metadata["owner"], "lance");
-    /// # Ok::<(), lance_core::Error>(())
-    /// ```
-    pub fn try_into_schema(self) -> Result<Schema> {
-        let lance_metadata = self
+/// Reconstruct a schema from flat protobuf fields and schema metadata.
+///
+/// # Examples
+///
+/// ```
+/// use std::collections::HashMap;
+///
+/// use lance_core::datatypes::Schema;
+/// use lance_file::datatypes::{Fields, FieldsWithMeta};
+///
+/// let fields = FieldsWithMeta {
+///     fields: Fields(Vec::new()),
+///     metadata: HashMap::from([("owner".to_owned(), b"lance".to_vec())]),
+/// };
+/// let schema = Schema::try_from(fields)?;
+/// assert_eq!(schema.metadata["owner"], "lance");
+/// # Ok::<(), lance_core::Error>(())
+/// ```
+impl TryFrom<FieldsWithMeta> for Schema {
+    type Error = Error;
+
+    fn try_from(fields_with_meta: FieldsWithMeta) -> Result<Self> {
+        let lance_metadata = fields_with_meta
             .metadata
             .into_iter()
             .map(|(key, value)| {
@@ -288,25 +285,11 @@ impl FieldsWithMeta {
             })
             .collect();
 
-        let schema_with_fields = self.fields.try_to_schema()?;
-        Ok(Schema {
+        let schema_with_fields = Self::try_from(&fields_with_meta.fields)?;
+        Ok(Self {
             fields: schema_with_fields.fields,
             metadata: lance_metadata,
         })
-    }
-}
-
-/// Convert protobuf fields and metadata to a schema.
-///
-/// This preserves the legacy infallible conversion contract and panics when a
-/// child references a missing or later parent. Use
-/// [`FieldsWithMeta::try_into_schema`] when decoding untrusted protobuf data.
-#[allow(clippy::fallible_impl_from)]
-impl From<FieldsWithMeta> for Schema {
-    fn from(fields_with_meta: FieldsWithMeta) -> Self {
-        fields_with_meta
-            .try_into_schema()
-            .unwrap_or_else(|error| panic!("Failed to reconstruct schema: {error}"))
     }
 }
 
@@ -427,7 +410,7 @@ pub async fn populate_schema_dictionary(schema: &mut Schema, reader: &dyn Reader
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, panic::AssertUnwindSafe};
+    use std::collections::HashMap;
 
     use arrow_schema::DataType;
     use arrow_schema::Field as ArrowField;
@@ -487,7 +470,7 @@ mod tests {
         let expected_schema = Schema::try_from(&arrow_schema).unwrap();
         let fields_with_meta: FieldsWithMeta = (&expected_schema).into();
 
-        let schema = Schema::from(fields_with_meta);
+        let schema = Schema::try_from(fields_with_meta).unwrap();
         assert_eq!(expected_schema, schema);
     }
 
@@ -518,7 +501,8 @@ mod tests {
             ));
         }
 
-        let schema = Fields(proto_fields).try_to_schema().unwrap();
+        let fields = Fields(proto_fields);
+        let schema = Schema::try_from(&fields).unwrap();
         assert_eq!(schema.fields.len(), NUM_STRUCTS);
         for (struct_index, field) in schema.fields.iter().enumerate() {
             let parent_id = (struct_index * 3) as i32;
@@ -551,7 +535,8 @@ mod tests {
             })
             .collect();
 
-        let schema = Fields(proto_fields).try_to_schema().unwrap();
+        let fields = Fields(proto_fields);
+        let schema = Schema::try_from(&fields).unwrap();
         assert_eq!(schema.fields.len(), 1);
         let mut field = &schema.fields[0];
         for depth in 0..DEPTH {
@@ -570,16 +555,13 @@ mod tests {
     fn test_reconstruct_schema_reports_missing_parent() {
         let fields = Fields(vec![proto_field(7, 42, "child".to_owned(), "int32")]);
 
-        let error = fields.try_to_schema().unwrap_err();
+        let error = Schema::try_from(&fields).unwrap_err();
         assert!(matches!(&error, Error::Schema { .. }));
         assert!(
             error.to_string().contains(
                 "Field 'child' (id=7) references parent id 42, which must appear earlier"
             )
         );
-
-        let panic = std::panic::catch_unwind(AssertUnwindSafe(|| Schema::from(&fields)));
-        assert!(panic.is_err());
     }
 
     #[test]
@@ -591,7 +573,7 @@ mod tests {
             proto_field(3, 2, "child".to_owned(), "int32"),
         ]);
 
-        let schema = fields.try_to_schema().unwrap();
+        let schema = Schema::try_from(&fields).unwrap();
         assert_eq!(schema.fields.len(), 2);
         assert_eq!(schema.fields[0].name, "root_a");
         assert_eq!(schema.fields[0].children.len(), 1);
@@ -632,7 +614,7 @@ mod tests {
 
         // Round-trip through protobuf
         let fields_with_meta: FieldsWithMeta = (&schema).into();
-        let restored = Schema::from(fields_with_meta);
+        let restored = Schema::try_from(fields_with_meta).unwrap();
 
         let ck2 = restored.unenforced_clustering_key();
         assert_eq!(ck2.len(), 2);

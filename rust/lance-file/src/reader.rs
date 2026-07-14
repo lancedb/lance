@@ -961,7 +961,7 @@ impl FileReader {
             fields: Fields(pb_schema.fields),
             metadata: pb_schema.metadata,
         };
-        let schema = fields_with_meta.try_into_schema()?;
+        let schema = Schema::try_from(fields_with_meta)?;
         Ok((num_rows, schema))
     }
 
