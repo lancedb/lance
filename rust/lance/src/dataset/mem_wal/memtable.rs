@@ -495,51 +495,39 @@ impl MemTable {
 
     /// Get batches visible up to a specific batch position (inclusive).
     ///
-    /// A batch at position `i` is visible if `i <= max_visible_batch_position`.
+    /// A batch at position `i` is visible if `i <= visible_count`.
     ///
     /// # Arguments
     ///
-    /// * `max_visible_batch_position` - The maximum batch position to include (inclusive)
+    /// * `visible_count` - The maximum batch position to include (inclusive)
     ///
     /// # Returns
     ///
     /// Vector of visible batches.
-    pub async fn get_visible_batches(&self, max_visible_batch_position: usize) -> Vec<RecordBatch> {
-        self.batch_store
-            .visible_record_batches(max_visible_batch_position)
+    pub async fn get_visible_batches(&self, visible_count: usize) -> Vec<RecordBatch> {
+        self.batch_store.visible_record_batches(visible_count)
     }
 
     /// Get batch positions visible up to a specific batch position (inclusive).
     ///
     /// This is useful for filtering index results by visibility.
-    pub async fn get_max_visible_batch_positions(
-        &self,
-        max_visible_batch_position: usize,
-    ) -> Vec<usize> {
-        self.batch_store
-            .max_visible_batch_positions(max_visible_batch_position)
+    pub async fn get_visible_batch_positions(&self, visible_count: usize) -> Vec<usize> {
+        self.batch_store.visible_batch_positions(visible_count)
     }
 
     /// Check if a specific batch is visible at a given visibility position.
     ///
     /// Returns true if the batch is visible, false if not visible or doesn't exist.
-    pub async fn is_batch_visible(
-        &self,
-        batch_position: usize,
-        max_visible_batch_position: usize,
-    ) -> bool {
+    pub async fn is_batch_visible(&self, batch_position: usize, visible_count: usize) -> bool {
         self.batch_store
-            .is_batch_visible(batch_position, max_visible_batch_position)
+            .is_batch_visible(batch_position, visible_count)
     }
 
     /// Scan batches visible up to a specific batch position.
     ///
     /// This combines `get_visible_batches` with the scan interface.
-    pub async fn scan_batches_at_position(
-        &self,
-        max_visible_batch_position: usize,
-    ) -> Result<Vec<RecordBatch>> {
-        Ok(self.get_visible_batches(max_visible_batch_position).await)
+    pub async fn scan_batches_at_position(&self, visible_count: usize) -> Result<Vec<RecordBatch>> {
+        Ok(self.get_visible_batches(visible_count).await)
     }
 
     /// Update the bloom filter with primary keys from a batch.
@@ -770,9 +758,9 @@ impl MemTable {
     ///
     /// # Arguments
     ///
-    /// * `max_visible_batch_position` - Maximum batch position visible (inclusive)
+    /// * `visible_count` - Maximum batch position visible (inclusive)
     ///
-    /// The scanner captures the current `max_visible_batch_position` from the
+    /// The scanner captures the current `visible_count` from the
     /// `IndexStore` at construction time to ensure consistent visibility.
     ///
     /// # Panics
@@ -954,23 +942,21 @@ mod tests {
             .await
             .unwrap();
 
-        // max_visible_batch_position=1 means positions 0 and 1 are visible
-        let visible = memtable.get_visible_batches(1).await;
+        // A count of N exposes the prefix [0, N).
+        let visible = memtable.get_visible_batches(2).await;
         assert_eq!(visible.len(), 2);
         let total_rows: usize = visible.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 15); // 10 + 5
 
-        // max_visible_batch_position=2 means all batches are visible
-        let visible = memtable.get_visible_batches(2).await;
+        let visible = memtable.get_visible_batches(3).await;
         assert_eq!(visible.len(), 3);
 
-        // max_visible_batch_position=0 means only position 0 is visible
-        let visible = memtable.get_visible_batches(0).await;
-        assert_eq!(visible.len(), 1);
+        // A count of 0 exposes nothing — not "batch 0".
+        assert!(memtable.get_visible_batches(0).await.is_empty());
     }
 
     #[tokio::test]
-    async fn test_memtable_get_max_visible_batch_positions() {
+    async fn test_memtable_get_visible_batch_positions() {
         let schema = create_test_schema();
         let mut memtable = MemTable::new(schema.clone(), 1, vec![]).unwrap();
 
@@ -988,17 +974,15 @@ mod tests {
             .await
             .unwrap();
 
-        // max_visible_batch_position=1 means positions 0 and 1 visible
-        let visible_ids = memtable.get_max_visible_batch_positions(1).await;
+        // A count of N exposes the prefix [0, N).
+        let visible_ids = memtable.get_visible_batch_positions(2).await;
         assert_eq!(visible_ids, vec![0, 1]);
 
-        // max_visible_batch_position=2 means all positions visible
-        let visible_ids = memtable.get_max_visible_batch_positions(2).await;
+        let visible_ids = memtable.get_visible_batch_positions(3).await;
         assert_eq!(visible_ids, vec![0, 1, 2]);
 
-        // max_visible_batch_position=0 means only position 0 visible
-        let visible_ids = memtable.get_max_visible_batch_positions(0).await;
-        assert_eq!(visible_ids, vec![0]);
+        // A count of 0 exposes nothing.
+        assert!(memtable.get_visible_batch_positions(0).await.is_empty());
     }
 
     #[tokio::test]
@@ -1019,14 +1003,14 @@ mod tests {
             .await
             .unwrap(); // position 2
 
-        // batch_position 0 is visible when max_visible_batch_position >= 0
-        assert!(memtable.is_batch_visible(0, 0).await);
+        // A count of 0 means nothing is visible, batch 0 included.
+        assert!(!memtable.is_batch_visible(0, 0).await);
+
+        // Batch i is visible once the count exceeds i.
         assert!(memtable.is_batch_visible(0, 1).await);
         assert!(memtable.is_batch_visible(0, 2).await);
-
-        // batch_position 2 is only visible when max_visible_batch_position >= 2
         assert!(!memtable.is_batch_visible(2, 1).await);
-        assert!(memtable.is_batch_visible(2, 2).await);
+        assert!(!memtable.is_batch_visible(2, 2).await);
         assert!(memtable.is_batch_visible(2, 3).await);
 
         // Non-existent batch
@@ -1047,12 +1031,21 @@ mod tests {
             .await
             .unwrap(); // position 1
 
-        let batches = memtable.scan_batches_at_position(0).await.unwrap();
+        let batches = memtable.scan_batches_at_position(1).await.unwrap();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 10);
 
-        let batches = memtable.scan_batches_at_position(1).await.unwrap();
+        let batches = memtable.scan_batches_at_position(2).await.unwrap();
         assert_eq!(batches.len(), 2);
+
+        // Nothing indexed yet => nothing scannable.
+        assert!(
+            memtable
+                .scan_batches_at_position(0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

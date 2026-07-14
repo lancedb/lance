@@ -48,7 +48,7 @@ const DEFAULT_DISTANCE_TYPE: DistanceType = DistanceType::L2;
 pub struct MemTableBruteForceVectorExec {
     batch_store: Arc<BatchStore>,
     query: VectorQuery,
-    max_visible_batch_position: usize,
+    visible_count: usize,
     projection: Option<Vec<usize>>,
     output_schema: SchemaRef,
     properties: Arc<PlanProperties>,
@@ -69,10 +69,7 @@ impl Debug for MemTableBruteForceVectorExec {
         f.debug_struct("MemTableBruteForceVectorExec")
             .field("column", &self.query.column)
             .field("k", &self.query.k)
-            .field(
-                "max_visible_batch_position",
-                &self.max_visible_batch_position,
-            )
+            .field("visible_count", &self.visible_count)
             .field("with_row_id", &self.with_row_id)
             .finish()
     }
@@ -85,7 +82,7 @@ impl MemTableBruteForceVectorExec {
     pub fn new(
         batch_store: Arc<BatchStore>,
         query: VectorQuery,
-        max_visible_batch_position: usize,
+        visible_count: usize,
         projection: Option<Vec<usize>>,
         base_schema: SchemaRef,
         with_row_id: bool,
@@ -111,7 +108,7 @@ impl MemTableBruteForceVectorExec {
         Ok(Self {
             batch_store,
             query,
-            max_visible_batch_position,
+            visible_count,
             projection,
             output_schema,
             properties,
@@ -160,7 +157,7 @@ impl MemTableBruteForceVectorExec {
         Ok(Some(mask))
     }
 
-    /// Last row position visible under `max_visible_batch_position`, or `None`
+    /// Last row position visible under `visible_count`, or `None`
     /// if no batches are visible. Identical to `VectorIndexExec`'s helper so
     /// both arms cut at the same MVCC boundary.
     fn compute_max_visible_row(&self) -> Option<u64> {
@@ -169,7 +166,7 @@ impl MemTableBruteForceVectorExec {
 
         for (batch_position, stored_batch) in self.batch_store.iter().enumerate() {
             let batch_end = current_row + stored_batch.num_rows as u64;
-            if batch_position <= self.max_visible_batch_position {
+            if batch_position < self.visible_count {
                 max_visible_row_exclusive = batch_end;
             }
             current_row = batch_end;
@@ -225,7 +222,7 @@ impl MemTableBruteForceVectorExec {
                 newest_pk_positions(
                     &self.batch_store,
                     pk_columns,
-                    self.max_visible_batch_position,
+                    self.visible_count,
                     max_visible_row,
                 )
                 .map_err(|e| Error::invalid_input(e.to_string()))?,
@@ -245,7 +242,7 @@ impl MemTableBruteForceVectorExec {
             if n == 0 {
                 continue;
             }
-            if batch_position > self.max_visible_batch_position {
+            if batch_position > self.visible_count {
                 current_row += n as u64;
                 continue;
             }
@@ -615,7 +612,7 @@ mod tests {
             MemTableBruteForceVectorExec::new(
                 store,
                 query,
-                /* max_visible_batch_position = */ usize::MAX,
+                /* visible_count = */ usize::MAX,
                 None,
                 schema,
                 false,
@@ -668,7 +665,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn respects_max_visible_batch_position() {
+    async fn respects_indexed_count() {
         // Two batches of two rows. Freeze at batch 0 — only ids 0,1 are
         // visible candidates; the (closer) ids 2,3 in batch 1 are excluded.
         let schema = make_schema();
@@ -678,7 +675,7 @@ mod tests {
         let query = query_for([0.0, 0.0], 4);
         let exec = Arc::new(
             MemTableBruteForceVectorExec::new(
-                store, query, /* max_visible_batch_position = */ 0, None, schema, false,
+                store, query, /* visible_count = */ 1, None, schema, false,
             )
             .expect("ctor"),
         );

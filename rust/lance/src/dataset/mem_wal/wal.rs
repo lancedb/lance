@@ -1669,7 +1669,7 @@ mod tests {
 
     // Regression test for the visibility-cursor bug: with an empty IndexStore
     // (the common case for WAL-managed tables that mirror an index-less base
-    // dataset), a WAL flush must still advance `max_visible_batch_position` so
+    // dataset), a WAL flush must still advance `visible_count` so
     // scanners can see every batch up to the durable position — not just
     // batch 0. Before the fix, the cursor stayed at 0 for the lifetime of the
     // memtable and scanners returned only the first row.
@@ -1687,14 +1687,13 @@ mod tests {
 
         // Empty registry, mimicking a memtable with `index_configs = []`.
         let indexes = Arc::new(IndexStore::new());
-        assert_eq!(indexes.max_visible_batch_position(), 0);
+        assert_eq!(indexes.indexed_count(), 0);
 
         let source = batch_store_source_with_indexes(&batch_store, &indexes);
         flusher.flush(&source, batch_store.len()).await.unwrap();
 
-        // Cursor must advance to the highest flushed batch position (2),
-        // making all three batches visible to scanners.
-        assert_eq!(indexes.max_visible_batch_position(), 2);
+        // All three batches indexed => the indexed prefix is 3 (exclusive count).
+        assert_eq!(indexes.indexed_count(), 3);
         assert_eq!(flusher.durable(), 3);
     }
 
@@ -1720,7 +1719,7 @@ mod tests {
         let source = batch_store_source_with_indexes(&batch_store, &indexes);
         flusher.flush(&source, batch_store.len()).await.unwrap();
 
-        assert_eq!(indexes.max_visible_batch_position(), 2);
+        assert_eq!(indexes.indexed_count(), 3);
         assert_eq!(flusher.durable(), 3);
     }
 

@@ -2163,7 +2163,7 @@ impl ShardWriter {
     /// The scanner provides read access to all data currently in the MemTable,
     /// with optional filtering, projection, and index support.
     ///
-    /// The scanner captures the current `max_visible_batch_position` from the
+    /// The scanner captures the current `visible_count` from the
     /// `IndexStore` at construction time to ensure consistent visibility.
     ///
     /// Returns an error in WAL-only mode, or if the writer is poisoned.
@@ -7055,8 +7055,14 @@ mod shard_writer_tests {
         // Re-open dataset and create new writer to verify recovery
         let dataset = Dataset::open(&uri).await.expect("Failed to reopen dataset");
         let new_shard_id = Uuid::new_v4();
+        // `durable_write(true)` so the put waits for its flush, which is what
+        // currently publishes the rows. A non-durable put is *not* yet
+        // read-your-writes: the index apply is welded to the WAL flush, so the
+        // rows stay invisible until the next flush. This test used to pass with
+        // `durable_write(false)` only because an un-advanced cursor of 0 was
+        // misread as "batch 0 is visible" — it was asserting the dirty read.
         let new_config = ShardWriterConfig::new(new_shard_id)
-            .with_durable_write(false)
+            .with_durable_write(true)
             .with_sync_indexed_write(true);
 
         let new_writer = dataset
