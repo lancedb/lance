@@ -787,6 +787,35 @@ impl Schema {
     /// field-path APIs such as `drop_columns` / `update_field_metadata`.
     ///
     /// This is what should be exposed as the column name in index metadata.
+    ///
+    /// ```
+    /// use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema};
+    /// use lance_core::datatypes::{parse_field_path, Schema};
+    ///
+    /// let arrow = ArrowSchema::new(vec![
+    ///     Field::new("my-col", DataType::Int32, false),
+    ///     Field::new(
+    ///         "parent",
+    ///         DataType::Struct(Fields::from(vec![Field::new("child.x", DataType::Int32, true)])),
+    ///         true,
+    ///     ),
+    /// ]);
+    /// let schema = Schema::try_from(&arrow).unwrap();
+    ///
+    /// // A hyphen is not special to `parse_field_path`, so it is left bare
+    /// // (unlike `field_path`, which would quote it as `` `my-col` ``).
+    /// let hyphen_id = schema.field("my-col").unwrap().id;
+    /// assert_eq!(schema.field_path_minimal(hyphen_id).unwrap(), "my-col");
+    ///
+    /// // A `.` in a segment forces quoting so the path still round-trips.
+    /// let dotted_id = schema.field("parent").unwrap().children[0].id;
+    /// let path = schema.field_path_minimal(dotted_id).unwrap();
+    /// assert_eq!(path, "parent.`child.x`");
+    /// assert_eq!(
+    ///     parse_field_path(&path).unwrap(),
+    ///     vec!["parent".to_string(), "child.x".to_string()],
+    /// );
+    /// ```
     pub fn field_path_minimal(&self, field_id: i32) -> Result<String> {
         self.field_ancestry_by_id(field_id)
             .map(|ancestry| {
@@ -1666,6 +1695,23 @@ pub fn format_field_path(fields: &[&str]) -> String {
 /// SQL-expression safety. Use this for human-readable, round-trippable paths
 /// (e.g. column names in index metadata); use `format_field_path` when the
 /// result will be embedded in a SQL expression.
+///
+/// ```
+/// use lance_core::datatypes::{format_field_path_minimal, parse_field_path};
+///
+/// // Plain identifiers and hyphenated names are left bare.
+/// assert_eq!(format_field_path_minimal(&["parent", "my-col"]), "parent.my-col");
+/// // A `.` in a segment forces quoting.
+/// assert_eq!(format_field_path_minimal(&["parent", "child.x"]), "parent.`child.x`");
+/// // Embedded backticks are escaped by doubling them.
+/// assert_eq!(format_field_path_minimal(&["child`x"]), "`child``x`");
+///
+/// // Whatever it produces round-trips back through `parse_field_path`.
+/// for segments in [vec!["parent", "my-col"], vec!["parent", "child.x"], vec!["child`x"]] {
+///     let path = format_field_path_minimal(&segments);
+///     assert_eq!(parse_field_path(&path).unwrap(), segments);
+/// }
+/// ```
 pub fn format_field_path_minimal(fields: &[&str]) -> String {
     fields
         .iter()
@@ -2868,6 +2914,7 @@ mod tests {
                 ArrowDataType::Struct(ArrowFields::from(vec![
                     ArrowField::new("child-field", ArrowDataType::Int32, true),
                     ArrowField::new("child.x", ArrowDataType::Int32, true),
+                    ArrowField::new("child`x", ArrowDataType::Int32, true),
                 ])),
                 true,
             ),
@@ -2887,7 +2934,10 @@ mod tests {
 
         // Plain identifiers: unchanged by either method.
         assert_eq!(schema.field_path_minimal(id_of("mycol")).unwrap(), "mycol");
-        assert_eq!(schema.field_path_minimal(id_of("my_col")).unwrap(), "my_col");
+        assert_eq!(
+            schema.field_path_minimal(id_of("my_col")).unwrap(),
+            "my_col"
+        );
 
         // Hyphen is NOT special to parse_field_path, so minimal quoting leaves it
         // bare (field_path would quote it for SQL safety).
@@ -2910,6 +2960,15 @@ mod tests {
         assert_eq!(
             parse_field_path(&dotted).unwrap(),
             vec!["parent".to_string(), "child.x".to_string()]
+        );
+
+        // Nested leaf whose NAME contains a backtick: it must be quoted AND the
+        // backtick doubled so it round-trips through parse_field_path.
+        let backticked = schema.field_path_minimal(child_id("child`x")).unwrap();
+        assert_eq!(backticked, "parent.`child``x`");
+        assert_eq!(
+            parse_field_path(&backticked).unwrap(),
+            vec!["parent".to_string(), "child`x".to_string()]
         );
     }
 
