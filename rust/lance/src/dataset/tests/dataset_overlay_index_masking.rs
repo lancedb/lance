@@ -145,15 +145,18 @@ async fn commit_overlay(
 
 /// Sorted `id` values returned by a filtered scan.
 async fn ids_matching(dataset: &Dataset, filter: &str) -> Vec<i32> {
-    let batch = dataset
-        .scan()
-        .filter(filter)
-        .unwrap()
-        .project(&["id"])
-        .unwrap()
-        .try_into_batch()
-        .await
-        .unwrap();
+    ids_matching_opts(dataset, filter, false).await
+}
+
+/// Like [`ids_matching`] but lets a test enable `fast_search()`, which skips unindexed
+/// fragments. Overlay masking on indexed fragments must still apply regardless.
+async fn ids_matching_opts(dataset: &Dataset, filter: &str, fast_search: bool) -> Vec<i32> {
+    let mut scanner = dataset.scan();
+    scanner.filter(filter).unwrap().project(&["id"]).unwrap();
+    if fast_search {
+        scanner.fast_search();
+    }
+    let batch = scanner.try_into_batch().await.unwrap();
     if batch.num_rows() == 0 {
         return Vec::new();
     }
@@ -255,6 +258,40 @@ async fn test_btree_overlay_row_level_precision(#[values(false, true)] stable_ro
     // Non-stale rows in the same fragment still return correctly.
     assert_eq!(ids_matching(&dataset, "age = 20").await, vec![2]);
     assert_eq!(ids_matching(&dataset, "age = 30").await, vec![3]);
+}
+
+/// `fast_search` skips *unindexed fragments*, but overlay masking on indexed fragments must
+/// still apply: the drop-stale block and the stale-Take re-eval both run regardless of
+/// `fast_search` on the scalar path. A regression that gated overlay masking behind
+/// `!fast_search` would leak id=1's stale age=10 hit here.
+#[tokio::test]
+async fn test_btree_overlay_masked_under_fast_search() {
+    let mut dataset = create_base_dataset().await;
+    build_age_index(&mut dataset).await;
+
+    // Fragment 0, offset 1 is id=1, age=10. Overlay (committed after the index) → age=999.
+    let dataset = commit_overlay(
+        dataset,
+        "age_fast_search",
+        0,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+        vec![i32_array([Some(999)])],
+    )
+    .await;
+
+    // Stale hit dropped even under fast_search — the block is not gated by fast_search.
+    assert_eq!(
+        ids_matching_opts(&dataset, "age = 10", true).await,
+        Vec::<i32>::new()
+    );
+    // The scalar re-eval path is likewise not gated, so the new value is still surfaced.
+    assert_eq!(
+        ids_matching_opts(&dataset, "age = 999", true).await,
+        vec![1]
+    );
+    // An untouched indexed value on the same fragment is unaffected.
+    assert_eq!(ids_matching_opts(&dataset, "age = 20", true).await, vec![2]);
 }
 
 /// An overlay touching only a non-indexed field excludes nothing from the index on `age`.
@@ -362,36 +399,35 @@ async fn test_overlay_multi_fragment(#[values(false, true)] stable_row_ids: bool
     assert_eq!(ids_matching(&dataset, "age = 30").await, vec![3]);
 }
 
-/// A vector index masks overlays: a row whose vector was moved (by a newer overlay) away
-/// from the query is dropped from results, and a row moved *onto* the query is found by
-/// re-scoring its current vector on the flat path — even though the index never saw it.
+const VEC_DIM: i32 = 8;
+
+fn vec_query() -> Vec<f32> {
+    vec![1.0_f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+}
+
+/// 64-row two-fragment vector dataset with a single-partition IVF_FLAT index, then an overlay
+/// on fragment 1 that moves id=35 (offset 3) onto `far` (away from the query) and id=40
+/// (offset 8) onto the query. Built before the overlay, the index still believes id=35 is the
+/// query and has never seen id=40 near it. Every other base vector is orthogonal to the query.
 ///
-/// Parametrized over `stable_row_ids`, overlaying fragment 1 (ids 32..64) where a physical address
-/// diverges from the stable row id, so both the ANN prefilter block and the flat re-score take must
-/// operate in the row-id domain.
-#[rstest]
-#[tokio::test]
-async fn test_vector_index_rescore_on_overlay(#[values(false, true)] stable_row_ids: bool) {
-    use arrow_array::cast::AsArray;
-    use futures::TryStreamExt;
+/// Overlaying fragment 1 (ids 32..64) is deliberate: a physical address diverges from the
+/// stable row id there, so both the ANN prefilter block and the flat re-score take must operate
+/// in the row-id domain when `stable_row_ids` is enabled.
+async fn create_vector_overlay_dataset(stable_row_ids: bool) -> Dataset {
     use lance_index::IndexType;
     use lance_linalg::distance::MetricType;
 
     use crate::index::vector::VectorIndexParams;
 
-    const DIM: i32 = 8;
-    let query = vec![1.0_f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+    let query = vec_query();
     let far = vec![0.0_f32, 100.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
 
-    // 64 rows over two fragments. Every base vector is orthogonal to the query except id=35,
-    // which equals the query (so a stale index ranks it first). All sit in fragment 1's range
-    // (32..64) for the rows we overlay; fragment 0 (0..32) holds far, never-overlaid rows.
     let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(64);
     for i in 0..64 {
         if i == 35 {
             vectors.push(query.clone());
         } else {
-            let mut v = vec![0.0_f32; DIM as usize];
+            let mut v = vec![0.0_f32; VEC_DIM as usize];
             v[1] = (i + 2) as f32; // orthogonal to the query, distinct, far
             vectors.push(v);
         }
@@ -403,7 +439,7 @@ async fn test_vector_index_rescore_on_overlay(#[values(false, true)] stable_row_
             "vec",
             DataType::FixedSizeList(
                 Arc::new(ArrowField::new("item", DataType::Float32, true)),
-                DIM,
+                VEC_DIM,
             ),
             true,
         ),
@@ -412,7 +448,7 @@ async fn test_vector_index_rescore_on_overlay(#[values(false, true)] stable_row_
         schema.clone(),
         vec![
             Arc::new(Int32Array::from_iter_values(0..64)),
-            fsl(vectors, DIM),
+            fsl(vectors, VEC_DIM),
         ],
     )
     .unwrap();
@@ -434,34 +470,40 @@ async fn test_vector_index_rescore_on_overlay(#[values(false, true)] stable_row_
         .await
         .unwrap();
 
-    // Overlay fragment 1 (ids 32..64): move id=35 (offset 3) onto `far`, and id=40
-    // (offset 8) onto the query. The index, built before the overlay, still believes id=35
-    // is the query and has never seen id=40 near it.
-    let dataset = commit_overlay(
+    commit_overlay(
         dataset,
         "vec_overlay",
         1,
         &[1],
         OverlayCoverage::dense(RoaringBitmap::from_iter([3, 8])),
-        vec![fsl(vec![far.clone(), query.clone()], DIM)],
+        vec![fsl(vec![far, query], VEC_DIM)],
     )
-    .await;
+    .await
+}
 
-    let results = dataset
-        .scan()
-        .nearest("vec", &arrow_array::Float32Array::from(query.clone()), 3)
+/// Run a top-`k` ANN search for the standard query vector and return the returned `id`s,
+/// optionally with `fast_search()` enabled.
+async fn vector_query_ids(dataset: &Dataset, k: usize, fast_search: bool) -> Vec<i32> {
+    use futures::TryStreamExt;
+
+    let mut scanner = dataset.scan();
+    scanner
+        .nearest("vec", &arrow_array::Float32Array::from(vec_query()), k)
         .unwrap()
         .minimum_nprobes(1)
         .project(&["id"])
-        .unwrap()
+        .unwrap();
+    if fast_search {
+        scanner.fast_search();
+    }
+    let results = scanner
         .try_into_stream()
         .await
         .unwrap()
         .try_collect::<Vec<_>>()
         .await
         .unwrap();
-
-    let ids: Vec<i32> = results
+    results
         .iter()
         .flat_map(|b| {
             b.column_by_name("id")
@@ -470,7 +512,19 @@ async fn test_vector_index_rescore_on_overlay(#[values(false, true)] stable_row_
                 .values()
                 .to_vec()
         })
-        .collect();
+        .collect()
+}
+
+/// A vector index masks overlays: a row whose vector was moved (by a newer overlay) away
+/// from the query is dropped from results, and a row moved *onto* the query is found by
+/// re-scoring its current vector on the flat path — even though the index never saw it.
+///
+/// Parametrized over `stable_row_ids` to cover the row-id domain for both block and re-score.
+#[rstest]
+#[tokio::test]
+async fn test_vector_index_rescore_on_overlay(#[values(false, true)] stable_row_ids: bool) {
+    let dataset = create_vector_overlay_dataset(stable_row_ids).await;
+    let ids = vector_query_ids(&dataset, 3, false).await;
 
     // id=40 was moved onto the query and is found by re-scoring (new-match recall).
     assert!(
@@ -481,6 +535,28 @@ async fn test_vector_index_rescore_on_overlay(#[values(false, true)] stable_row_
     assert!(
         !ids.contains(&35),
         "stale vector for id=35 should be dropped, got {ids:?}"
+    );
+}
+
+/// The ANN prefilter block that drops stale overlay rows runs regardless of `fast_search`;
+/// only the flat re-score is gated by it. So under `fast_search` id=35's stale hit must still
+/// be dropped, while id=40 (moved onto the query) is intentionally not re-scored — the same
+/// recall tradeoff `fast_search` already makes for unindexed data. A regression that moved the
+/// `overlay_block` computation inside the `!fast_search` guard would leak id=35's stale vector.
+#[tokio::test]
+async fn test_vector_overlay_stale_dropped_under_fast_search() {
+    let dataset = create_vector_overlay_dataset(false).await;
+    let ids = vector_query_ids(&dataset, 3, true).await;
+
+    // Correctness: the stale index hit is dropped even though the re-score is skipped.
+    assert!(
+        !ids.contains(&35),
+        "stale vector for id=35 must be dropped under fast_search, got {ids:?}"
+    );
+    // Recall tradeoff: fast_search skips the flat re-score, so the moved-on match is not surfaced.
+    assert!(
+        !ids.contains(&40),
+        "fast_search skips re-score, so id=40 should be absent, got {ids:?}"
     );
 }
 

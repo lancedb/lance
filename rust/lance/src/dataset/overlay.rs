@@ -80,12 +80,6 @@ pub fn overlay_exclusion_offsets(
     Ok(excluded)
 }
 
-/// Insert into `stale` the ids of fragments covered by `segment` whose index entries may be
-/// stale because an overlay committed after the segment was built touches a field the segment
-/// indexes. Field-aware and version-gated via [`overlay_exclusion_offsets`].
-///
-/// `overlaid_frags` holds only the fragments that actually carry overlays (rare), so the loop is
-/// `O(overlaid_frags)` rather than `O(fragments the segment covers)`.
 // Stale row offsets contributed by one fragment's overlays for a given index version.
 // Applies a cheap version gate first: if every overlay predates the segment it is already
 // incorporated by the index, so there is nothing stale and the field/bitmap work is skipped.
@@ -111,7 +105,13 @@ fn covers_fragment(coverage: Option<&RoaringBitmap>, frag_id: u32) -> bool {
     coverage.is_none_or(|c| c.contains(frag_id))
 }
 
-pub fn collect_stale_overlay_frags(
+/// Insert into `stale` the ids of fragments covered by `segment` whose index entries may be
+/// stale because an overlay committed after the segment was built touches a field the segment
+/// indexes. Field-aware and version-gated via [`overlay_exclusion_offsets`].
+///
+/// `overlaid_frags` holds only the fragments that actually carry overlays (rare), so the loop is
+/// `O(overlaid_frags)` rather than `O(fragments the segment covers)`.
+pub fn collect_overlay_stale_frags(
     segment: &IndexMetadata,
     overlaid_frags: &HashMap<u32, &Fragment>,
     stale: &mut RoaringBitmap,
@@ -130,7 +130,7 @@ pub fn collect_stale_overlay_frags(
     Ok(())
 }
 
-/// Like [`collect_stale_overlay_frags`] but with row-level granularity: instead of marking the
+/// Like [`collect_overlay_stale_frags`] but with row-level granularity: instead of marking the
 /// whole fragment stale, it computes exactly which row offsets within each covered fragment are
 /// stale and accumulates them into `stale` (fragment_id → stale row offsets).
 ///
@@ -1247,6 +1247,97 @@ mod tests {
         assert_eq!(
             overlay_exclusion_offsets(&overlays, &[3], 1).unwrap(),
             bitmap([1, 4, 5])
+        );
+    }
+
+    /// An index segment covering `fields`, built at `dataset_version`, with the given
+    /// fragment coverage (`None` = legacy index predating fragment-bitmap tracking).
+    fn segment(
+        fields: Vec<i32>,
+        dataset_version: u64,
+        fragment_bitmap: Option<RoaringBitmap>,
+    ) -> IndexMetadata {
+        IndexMetadata {
+            uuid: uuid::Uuid::new_v4(),
+            name: "idx".into(),
+            fields,
+            dataset_version,
+            fragment_bitmap,
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+        }
+    }
+
+    fn fragment_with_overlay(id: u64, overlay: DataOverlayFile) -> Fragment {
+        let mut fragment = Fragment::new(id);
+        fragment.overlays.push(overlay);
+        fragment
+    }
+
+    #[test]
+    fn test_collect_frags_missing_bitmap_covers_all() {
+        // A segment with no fragment_bitmap (legacy index predating bitmap tracking) must treat
+        // every overlaid fragment as covered so stale rows can't leak past the index unmasked.
+        let fragment = fragment_with_overlay(3, dense_overlay(vec![3], [1, 2], 9));
+        let overlaid: HashMap<u32, &Fragment> = HashMap::from([(3u32, &fragment)]);
+
+        let mut stale = RoaringBitmap::new();
+        collect_overlay_stale_frags(&segment(vec![3], 1, None), &overlaid, &mut stale).unwrap();
+        assert_eq!(stale, bitmap([3]), "missing bitmap must cover fragment 3");
+
+        // A present bitmap that excludes fragment 3 leaves it untouched.
+        let mut stale = RoaringBitmap::new();
+        collect_overlay_stale_frags(
+            &segment(vec![3], 1, Some(bitmap([0]))),
+            &overlaid,
+            &mut stale,
+        )
+        .unwrap();
+        assert!(
+            stale.is_empty(),
+            "fragment absent from bitmap is not covered"
+        );
+
+        // A present bitmap that includes fragment 3 marks it stale.
+        let mut stale = RoaringBitmap::new();
+        collect_overlay_stale_frags(
+            &segment(vec![3], 1, Some(bitmap([3]))),
+            &overlaid,
+            &mut stale,
+        )
+        .unwrap();
+        assert_eq!(stale, bitmap([3]));
+    }
+
+    #[test]
+    fn test_collect_rows_missing_bitmap_covers_all() {
+        // Same covers-all guarantee at row-level granularity.
+        let fragment = fragment_with_overlay(3, dense_overlay(vec![3], [1, 2], 9));
+        let overlaid: HashMap<u32, &Fragment> = HashMap::from([(3u32, &fragment)]);
+
+        let mut stale = HashMap::new();
+        collect_overlay_stale_rows_for_segment(&segment(vec![3], 1, None), &overlaid, &mut stale)
+            .unwrap();
+        assert_eq!(
+            stale.get(&3),
+            Some(&bitmap([1, 2])),
+            "missing bitmap must cover fragment 3"
+        );
+
+        // A present bitmap that excludes fragment 3 yields no stale rows.
+        let mut stale = HashMap::new();
+        collect_overlay_stale_rows_for_segment(
+            &segment(vec![3], 1, Some(bitmap([0]))),
+            &overlaid,
+            &mut stale,
+        )
+        .unwrap();
+        assert!(
+            stale.is_empty(),
+            "fragment absent from bitmap contributes no rows"
         );
     }
 }

@@ -84,7 +84,7 @@ use uuid::Uuid;
 
 use super::Dataset;
 use crate::dataset::overlay::{
-    collect_overlay_stale_rows_for_segment, collect_stale_overlay_frags,
+    collect_overlay_stale_frags, collect_overlay_stale_rows_for_segment,
 };
 use crate::dataset::row_offsets_to_row_addresses;
 use crate::dataset::utils::SchemaAdapter;
@@ -4192,7 +4192,9 @@ impl Scanner {
                 false,
                 vector_scan_projection,
                 Arc::new(fallback_fragments),
+                // Can't pushdown limit/offset in an ANN search
                 None,
+                // We are re-ordering anyways, so no need to get data in a deterministic order.
                 false,
             );
             if let Some(expr) = filter_plan.full_expr.as_ref() {
@@ -4416,7 +4418,7 @@ impl Scanner {
             .collect();
         let mut stale_frag_ids = RoaringBitmap::new();
         for seg in &segments {
-            collect_stale_overlay_frags(seg, &overlaid_frags, &mut stale_frag_ids)?;
+            collect_overlay_stale_frags(seg, &overlaid_frags, &mut stale_frag_ids)?;
         }
 
         if stale_frag_ids.is_empty() {
