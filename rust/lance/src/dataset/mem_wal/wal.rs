@@ -9,7 +9,7 @@
 use std::io::Cursor;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use std::time::Duration;
@@ -87,68 +87,186 @@ impl WalFlushFailure {
     }
 }
 
-/// Watcher for batch durability using watermark-based tracking.
+/// The writer's cursors, shared by the WAL-append task, the index-apply task,
+/// every memtable's `IndexStore`, and every `put` waiting to become visible.
 ///
-/// Uses a shared watch channel that broadcasts the durable watermark.
-/// The watcher waits until the watermark reaches or exceeds its target batch ID.
-#[derive(Clone)]
-pub struct BatchDurableWatcher {
-    /// Watch receiver for the durable watermark.
-    rx: watch::Receiver<usize>,
-    /// Target batch ID to wait for.
-    target_batch_position: usize,
-    /// Terminal flush failure shared with the flusher. When set, the watermark
-    /// can never reach the target, so `wait` returns this typed error instead of
-    /// blocking forever.
+/// Two cursors are stored, one view is derived:
+///
+/// - `durable` — writer-global count of WAL-durable batches, advanced by the
+///   WAL-append task. Exclusive; 0 means none.
+/// - `indexed` — per-memtable count of indexed batches, advanced by the
+///   index-apply task. It lives on the memtable's own `IndexStore`, not here,
+///   because each memtable has its own indexes.
+/// - `visible` — **derived, never stored**: a batch is visible once it is
+///   indexed and, under `durable_write`, also durable.
+///
+/// Deriving `visible` rather than caching it is deliberate. A cached
+/// `min(indexed, durable)` recomputed by two independent tasks is the classic
+/// store-buffer race: with `Release`/`Acquire` each task can read the other's
+/// *pre-store* value, so both compute a minimum below the true one, and a
+/// max-clamped publish then leaves the cached value permanently short. A `put`
+/// blocked on it would hang until some unrelated write happened to move a cursor
+/// again. With nothing cached there is nothing to leave stale — `notify` is a
+/// bare wake-up and every waiter recomputes from the cursors themselves.
+pub struct WriterCursors {
+    durable: AtomicUsize,
+    /// Bumped whenever a cursor advances or the writer poisons. Carries no
+    /// value; it exists only to wake waiters, which then recompute.
+    notify_tx: watch::Sender<u64>,
+    notify_rx: watch::Receiver<u64>,
+    /// First terminal failure. Shared so a poisoned writer wakes every waiter
+    /// with the typed error, instead of leaving it blocked on a cursor that can
+    /// never advance again.
     terminal_error: Arc<StdMutex<Option<WalFlushFailure>>>,
+    /// Whether durability is part of visibility. Per-writer, not per-write:
+    /// `visible` is a writer-wide definition, so a mix would need two visibility
+    /// views over one memtable.
+    durable_write: bool,
 }
 
-impl BatchDurableWatcher {
-    /// Create a new watcher for a specific batch ID.
-    pub fn new(
-        rx: watch::Receiver<usize>,
-        target_batch_position: usize,
-        terminal_error: Arc<StdMutex<Option<WalFlushFailure>>>,
-    ) -> Self {
+impl WriterCursors {
+    pub fn new(durable_write: bool) -> Self {
+        let (notify_tx, notify_rx) = watch::channel(0);
         Self {
-            rx,
-            target_batch_position,
-            terminal_error,
+            durable: AtomicUsize::new(0),
+            notify_tx,
+            notify_rx,
+            terminal_error: Arc::new(StdMutex::new(None)),
+            durable_write,
         }
     }
 
-    /// Wait until the batch is durable.
-    ///
-    /// Returns Ok(()) when `durable_watermark >= target_batch_position`, or
-    /// Err if a terminal flush failure (e.g. a fence) means the watermark can
-    /// never reach the target.
+    /// Writer-global count of WAL-durable batches.
+    pub fn durable(&self) -> usize {
+        self.durable.load(Ordering::Acquire)
+    }
+
+    pub fn durable_write(&self) -> bool {
+        self.durable_write
+    }
+
+    /// Advance the durability cursor. Monotonic, so an out-of-order completion
+    /// can never walk it backwards.
+    pub(crate) fn advance_durable(&self, global_count: usize) {
+        self.durable.fetch_max(global_count, Ordering::AcqRel);
+        self.wake();
+    }
+
+    /// Wake every waiter so it recomputes. Called after any cursor advances, and
+    /// after the writer poisons.
+    pub(crate) fn wake(&self) {
+        self.notify_tx.send_modify(|version| *version += 1);
+    }
+
+    /// The visible prefix of one memtable, given its indexed prefix and its
+    /// writer-global coordinate.
+    pub fn visible_count(&self, indexed_count: usize, global_offset: usize) -> usize {
+        if !self.durable_write {
+            return indexed_count;
+        }
+        indexed_count.min(self.durable().saturating_sub(global_offset))
+    }
+
+    pub(crate) fn check_poisoned(&self) -> Result<()> {
+        if let Some(failure) = self.terminal_error.lock().unwrap().clone() {
+            return Err(failure.into_error());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn mark_terminal_failure(&self, error: &Error) {
+        {
+            let mut slot = self.terminal_error.lock().unwrap();
+            if slot.is_none() {
+                *slot = Some(WalFlushFailure::from_error(error));
+            }
+        }
+        // Wake waiters without advancing anything: each re-checks `terminal_error`
+        // and returns the error rather than blocking on a cursor that can no
+        // longer move.
+        self.wake();
+    }
+}
+
+/// Blocks a `put` until its batches are visible: indexed, and — in durable mode
+/// — WAL-durable too.
+///
+/// Recomputes the condition on every wake instead of comparing against a cached
+/// watermark. `notify` only says "something moved"; this decides what that means.
+pub struct BatchDurableWatcher {
+    cursors: Arc<WriterCursors>,
+    rx: watch::Receiver<u64>,
+    /// The memtable the batches landed in; its `indexed_count` is the apply
+    /// cursor being waited on. `None` in WAL-only mode, which has no indexes.
+    indexes: Option<Arc<IndexStore>>,
+    /// Local exclusive count this write needs indexed.
+    target_indexed: usize,
+    /// Writer-global exclusive count this write needs durable. Batch positions
+    /// restart at 0 in every memtable while the durability cursor spans the
+    /// writer's whole life, so the caller must globalize this.
+    target_durable: usize,
+}
+
+impl BatchDurableWatcher {
+    pub fn new(
+        cursors: Arc<WriterCursors>,
+        indexes: Option<Arc<IndexStore>>,
+        target_indexed: usize,
+        target_durable: usize,
+    ) -> Self {
+        let rx = cursors.notify_rx.clone();
+        Self {
+            cursors,
+            rx,
+            indexes,
+            target_indexed,
+            target_durable,
+        }
+    }
+
+    /// Whether the write is readable yet.
+    fn is_visible(&self) -> bool {
+        // WAL-only mode has no indexes, so there is nothing to index-wait on.
+        let indexed = match &self.indexes {
+            Some(indexes) => indexes.indexed_count(),
+            None => self.target_indexed,
+        };
+        if indexed < self.target_indexed {
+            return false;
+        }
+        !self.cursors.durable_write() || self.cursors.durable() >= self.target_durable
+    }
+
+    /// Wait until the write is visible, or until the writer poisons — in which
+    /// case no cursor will ever reach the target, so surface the typed error
+    /// rather than blocking forever.
     pub async fn wait(&mut self) -> Result<()> {
         loop {
-            if let Some(failure) = self.terminal_error.lock().unwrap().clone() {
-                return Err(failure.into_error());
-            }
-            let current = *self.rx.borrow();
-            if current >= self.target_batch_position {
+            // Mark the current version seen *before* testing, so a wake-up landing
+            // between the test and `changed()` below is not lost.
+            self.rx.borrow_and_update();
+            self.cursors.check_poisoned()?;
+            if self.is_visible() {
                 return Ok(());
             }
             self.rx
                 .changed()
                 .await
-                .map_err(|_| Error::io("Durable watermark channel closed"))?;
+                .map_err(|_| Error::io("Writer cursor channel closed"))?;
         }
     }
 
-    /// Check if the batch is already durable (non-blocking).
+    /// Non-blocking check.
     pub fn is_durable(&self) -> bool {
-        *self.rx.borrow() >= self.target_batch_position
+        self.is_visible()
     }
 }
 
 impl std::fmt::Debug for BatchDurableWatcher {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BatchDurableWatcher")
-            .field("target_batch_position", &self.target_batch_position)
-            .field("current_watermark", &*self.rx.borrow())
+            .field("target_indexed", &self.target_indexed)
+            .field("target_durable", &self.target_durable)
             .finish()
     }
 }
@@ -185,13 +303,10 @@ pub struct WalFlushResult {
 /// Source for a WAL flush — either a `BatchStore` range (MemTable mode) or
 /// a drainable in-memory pending queue (WAL-only mode).
 pub enum WalFlushSource {
-    /// MemTable mode: read a `[max_flushed+1, end_batch_position)` range
-    /// from a `BatchStore`. Indexes are updated in parallel with the WAL
-    /// append.
-    BatchStore {
-        batch_store: Arc<BatchStore>,
-        indexes: Option<Arc<IndexStore>>,
-    },
+    /// MemTable mode: append the `[durable, end_batch_position)` range of a
+    /// `BatchStore` to the WAL. Append-only — the index apply runs on its own
+    /// task, so a failed append can no longer publish rows through it.
+    BatchStore { batch_store: Arc<BatchStore> },
     /// WAL-only mode: drain all pending batches from the shared
     /// `WalOnlyState`. There are no in-memory indexes to update.
     WalOnly { state: Arc<WalOnlyState> },
@@ -204,6 +319,78 @@ impl WalFlushSource {
             Self::WalOnly { .. } => "WalOnly",
         }
     }
+}
+
+/// Message to trigger an index apply.
+///
+/// Carries the store the batches actually landed in, captured on the put path
+/// *before* any freeze can rotate the memtable — pairing a new store with an old
+/// store's end position would index the wrong range.
+#[derive(Clone)]
+pub struct TriggerIndexApply {
+    pub batch_store: Arc<BatchStore>,
+    pub indexes: Arc<IndexStore>,
+    /// Local exclusive end of the range to cover.
+    pub end_batch_position: usize,
+}
+
+impl std::fmt::Debug for TriggerIndexApply {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TriggerIndexApply")
+            .field("end_batch_position", &self.end_batch_position)
+            .finish()
+    }
+}
+
+/// Apply a contiguous range of batches to a memtable's in-memory indexes.
+///
+/// Runs on its own task, as the single sequential consumer of its own channel.
+/// Being a single consumer is what makes it safe: it guarantees in-order,
+/// contiguous ranges, which is exactly what `HnswGraph::insert_batch` requires —
+/// it hard-rejects any range whose start is not `indexed_len`. Ordering comes
+/// from the task, not from the flush interval, so triggering per-put is exactly
+/// as safe as triggering on a timer.
+///
+/// It has its own channel rather than sharing the WAL flusher's, because
+/// `TaskDispatcher::run` awaits `handle()` inline: a shared channel would put a
+/// ~100ms S3 PUT in front of every latency-sensitive index apply.
+pub async fn apply_index_range(
+    cursors: &Arc<WriterCursors>,
+    message: TriggerIndexApply,
+) -> Result<()> {
+    let TriggerIndexApply {
+        batch_store,
+        indexes,
+        end_batch_position,
+    } = message;
+
+    // Self-batching: a message handled while more puts queue behind it covers
+    // everything committed so far, so the ones behind it find their range already
+    // applied. Redundant messages are therefore *routine*, not exceptional, and
+    // must be a clean no-op — never a call into `insert_batches`, whose HNSW arm
+    // hard-rejects a non-contiguous start, and which is now terminal for the
+    // writer.
+    let start = indexes.indexed_count();
+    if end_batch_position <= start {
+        return Ok(());
+    }
+
+    let stored: Vec<StoredBatch> = (start..end_batch_position)
+        .filter_map(|position| batch_store.get(position).cloned())
+        .collect();
+    if stored.is_empty() {
+        return Ok(());
+    }
+
+    // `insert_batches` advances `indexed_count` itself, once every index has
+    // taken the batch.
+    tokio::task::spawn_blocking(move || indexes.insert_batches(&stored))
+        .await
+        .map_err(|e| Error::internal(format!("Index apply task panicked: {e}")))??;
+
+    // Wake anything waiting to become visible.
+    cursors.wake();
+    Ok(())
 }
 
 /// Message to trigger a WAL flush.
@@ -356,11 +543,9 @@ impl WalOnlyState {
 /// shared `WalAppender`. The flusher delegates the actual WAL write to the
 /// appender, optionally running a parallel index update in MemTable mode.
 pub struct WalFlusher {
-    /// Watch channel sender for durable watermark.
-    /// Broadcasts the highest batch_position that is now durable.
-    durable_watermark_tx: watch::Sender<usize>,
-    /// Watch channel receiver for creating new watchers.
-    durable_watermark_rx: watch::Receiver<usize>,
+    /// The writer's cursors. Shared with the index-apply task and every
+    /// memtable's `IndexStore`, so all three agree on what is visible.
+    cursors: Arc<WriterCursors>,
     /// Underlying WAL append primitive — owns object store, epoch, and
     /// position discovery.
     wal_appender: Arc<WalAppender>,
@@ -372,33 +557,35 @@ pub struct WalFlusher {
     /// Created at construction and recreated after each flush.
     /// Used by backpressure to wait for WAL flushes.
     wal_flush_cell: std::sync::Mutex<Option<WatchableOnceCell<super::write::DurabilityResult>>>,
-    /// First terminal flush failure, shared with every `BatchDurableWatcher`. It
-    /// wakes durability waiters (the watermark never advances) and is read by
-    /// `check_poisoned` so the write path fails fast.
-    terminal_error: Arc<StdMutex<Option<WalFlushFailure>>>,
 }
 
 impl WalFlusher {
     /// Create a new WAL flusher backed by an existing `WalAppender`.
     ///
     /// The appender owns object store, epoch, and position state. The
-    /// flusher adds the durability watermark, trigger channel, and
-    /// completion cell on top.
+    /// flusher adds the trigger channel and completion cell on top, and shares
+    /// the writer's cursors.
     pub fn new(wal_appender: Arc<WalAppender>) -> Self {
+        // Defaults to durable visibility; the writer replaces this with cursors
+        // built from its own config.
+        Self::with_cursors(wal_appender, Arc::new(WriterCursors::new(true)))
+    }
+
+    pub fn with_cursors(wal_appender: Arc<WalAppender>, cursors: Arc<WriterCursors>) -> Self {
         let shard_id = wal_appender.shard_id();
-        // Initialize durable watermark at 0 (no batches durable yet)
-        let (durable_watermark_tx, durable_watermark_rx) = watch::channel(0);
-        // Create initial WAL flush cell for backpressure
         let wal_flush_cell = WatchableOnceCell::new();
         Self {
-            durable_watermark_tx,
-            durable_watermark_rx,
+            cursors,
             wal_appender,
             shard_id,
             flush_tx: None,
             wal_flush_cell: std::sync::Mutex::new(Some(wal_flush_cell)),
-            terminal_error: Arc::new(StdMutex::new(None)),
         }
+    }
+
+    /// The writer's cursors, for the index-apply task and the memtables.
+    pub fn cursors(&self) -> &Arc<WriterCursors> {
+        &self.cursors
     }
 
     /// Set the flush channel for background flush handler.
@@ -415,62 +602,65 @@ impl WalFlusher {
     ///
     /// Returns a `BatchDurableWatcher` that can be awaited for durability.
     /// The actual batch data is stored in the BatchStore.
-    pub fn track_batch(&self, target_durable_count: usize) -> BatchDurableWatcher {
-        // `target_durable_count` is writer-global and exclusive: "N batches into
-        // this writer's batch sequence are durable". It must NOT be a memtable-
-        // local batch position — positions restart at 0 in every memtable, while
-        // this channel spans the writer's whole life, so a local target would be
-        // satisfied by a *previous* memtable's appends and ack a write that was
-        // never persisted. Callers globalize via `BatchStore::global_offset`.
+    /// Watch a write until it becomes visible.
+    ///
+    /// `target_indexed` is a **memtable-local** exclusive count; `target_durable`
+    /// is a **writer-global** one. They are different coordinate spaces on
+    /// purpose: batch positions restart at 0 in every memtable, while the
+    /// durability cursor spans the writer's whole life. A local durable target
+    /// would already be satisfied by a *previous* memtable's appends, and would
+    /// ack a write that never reached the WAL. Callers globalize via
+    /// `BatchStore::global_offset`.
+    pub fn track_batch(
+        &self,
+        indexes: Option<Arc<IndexStore>>,
+        target_indexed: usize,
+        target_durable: usize,
+    ) -> BatchDurableWatcher {
         BatchDurableWatcher::new(
-            self.durable_watermark_rx.clone(),
-            target_durable_count,
-            Arc::clone(&self.terminal_error),
+            Arc::clone(&self.cursors),
+            indexes,
+            target_indexed,
+            target_durable,
         )
     }
 
     /// The writer-global WAL durability cursor: how many batches of this
     /// writer's batch sequence are durable. Exclusive count; 0 means none.
     pub fn durable(&self) -> usize {
-        *self.durable_watermark_rx.borrow()
+        self.cursors.durable()
     }
 
-    /// Advance the durability cursor and wake waiters. Monotonic: a stale or
-    /// out-of-order completion can never walk the cursor backwards.
+    /// Advance the durability cursor and wake waiters.
     pub(crate) fn advance_durable(&self, global_count: usize) {
-        self.durable_watermark_tx
-            .send_modify(|current| *current = (*current).max(global_count));
+        self.cursors.advance_durable(global_count);
     }
 
-    /// Latch a terminal flush failure and wake every durability waiter (the
-    /// watermark never advances, so they must observe the error, not block).
+    /// Latch a terminal flush failure and wake every waiter (no cursor will
+    /// advance again, so they must observe the error rather than block).
     /// Idempotent: only the first failure is retained.
     fn mark_terminal_failure(&self, error: &Error) {
-        {
-            let mut slot = self.terminal_error.lock().unwrap();
-            if slot.is_none() {
-                *slot = Some(WalFlushFailure::from_error(error));
-            }
-        }
-        // Wake `wait`ers without advancing the watermark; each re-checks
-        // `terminal_error` and returns the error.
-        self.durable_watermark_tx.send_modify(|_| {});
+        self.cursors.mark_terminal_failure(error);
+    }
+
+    /// Latch a terminal failure from outside the flush path (the index-apply
+    /// task). Same effect: reads and writes fail fast, waiters wake with the
+    /// typed error, and recovery is reopen -> replay.
+    pub(crate) fn poison(&self, error: &Error) {
+        self.cursors.mark_terminal_failure(error);
     }
 
     /// Fail fast with the typed error if this writer has been fenced (by a peer
-    /// or its own persistence failure). The write path calls this before touching
-    /// the memtable so a poisoned writer can't diverge further. Recovery is to
-    /// reopen the shard (replay the WAL).
+    /// or its own persistence failure). Both the read and write paths call this
+    /// so a poisoned writer can neither diverge further nor serve a snapshot
+    /// that replay will not reproduce. Recovery is to reopen and replay.
     pub fn check_poisoned(&self) -> Result<()> {
-        if let Some(failure) = self.terminal_error.lock().unwrap().clone() {
-            return Err(failure.into_error());
-        }
-        Ok(())
+        self.cursors.check_poisoned()
     }
 
     /// Get the current durable watermark.
     pub fn durable_watermark(&self) -> usize {
-        *self.durable_watermark_rx.borrow()
+        self.cursors.durable()
     }
 
     /// Get a watcher for WAL flush completion.
@@ -539,11 +729,8 @@ impl WalFlusher {
         end_batch_position: usize,
     ) -> Result<WalFlushResult> {
         let result = match source {
-            WalFlushSource::BatchStore {
-                batch_store,
-                indexes,
-            } => {
-                self.flush_from_batch_store(batch_store, indexes.clone(), end_batch_position)
+            WalFlushSource::BatchStore { batch_store } => {
+                self.flush_from_batch_store(batch_store, end_batch_position)
                     .await
             }
             WalFlushSource::WalOnly { state } => self.flush_from_wal_only(state).await,
@@ -558,10 +745,18 @@ impl WalFlusher {
         result
     }
 
+    /// Append this store's un-appended suffix to the WAL. **Append-only.**
+    ///
+    /// The index apply used to run here, concurrently, under a `tokio::join!`.
+    /// That was the source of the dirty read: `join!` runs both arms to
+    /// completion and does not cancel the index arm when the append fails, so a
+    /// failed append still advanced the cursor readers keyed off. The two
+    /// operations have nothing in common — one is an in-memory microsecond write,
+    /// the other a ~100ms S3 PUT billed per call — so they now run on separate
+    /// tasks with separate cursors, and this one only ever touches the WAL.
     async fn flush_from_batch_store(
         &self,
         batch_store: &BatchStore,
-        indexes: Option<Arc<IndexStore>>,
         end_batch_position: usize,
     ) -> Result<WalFlushResult> {
         // Where this store's un-appended suffix begins, derived from the
@@ -569,114 +764,38 @@ impl WalFlusher {
         // predates this memtable to 0 and one past its end to `committed_len`.
         let start_batch_position = batch_store.local_end(self.durable());
 
-        // If we've already flushed past this end, nothing to do
+        // Already appended past this end: nothing to do. Redundant triggers are
+        // routine (a put and the freeze can both target the same range), so this
+        // is the common case, not an error.
         if start_batch_position >= end_batch_position {
             return Ok(empty_flush_result());
         }
 
-        // Collect batches in range [start_batch_position, end_batch_position)
         let mut stored_batches: Vec<StoredBatch> =
             Vec::with_capacity(end_batch_position - start_batch_position);
-
         for batch_position in start_batch_position..end_batch_position {
             if let Some(stored) = batch_store.get(batch_position) {
                 stored_batches.push(stored.clone());
             }
         }
-
         if stored_batches.is_empty() {
             return Ok(empty_flush_result());
         }
 
-        let rows_to_index: usize = stored_batches.iter().map(|b| b.num_rows).sum();
+        let num_rows: usize = stored_batches.iter().map(|b| b.num_rows).sum();
         let record_batches: Vec<RecordBatch> =
             stored_batches.iter().map(|s| s.data.clone()).collect();
 
-        let appender = self.wal_appender.clone();
-        // Kept for the publish below: the index arm consumes its own clone.
-        let publish_target = indexes.clone();
-        let (append_result, index_result) = if let Some(idx_registry) = indexes {
-            let wal_future = async move {
-                let start = Instant::now();
-                let r = appender.append(record_batches).await?;
-                Ok::<_, Error>((r, start.elapsed()))
-            };
-            let index_future = async {
-                let start = Instant::now();
-                let per_index = tokio::task::spawn_blocking(move || {
-                    idx_registry.insert_batches(&stored_batches)
-                })
-                .await
-                .map_err(|e| Error::internal(format!("Index update task panicked: {}", e)))??;
-                Ok::<_, Error>((start.elapsed(), per_index))
-            };
-            tokio::join!(wal_future, index_future)
-        } else {
-            let wal_future = async move {
-                let start = Instant::now();
-                let r = appender.append(record_batches).await?;
-                Ok::<_, Error>((r, start.elapsed()))
-            };
-            (
-                wal_future.await,
-                Ok((std::time::Duration::ZERO, std::collections::HashMap::new())),
-            )
-        };
+        let start = Instant::now();
+        let append_result = self.wal_appender.append(record_batches).await?;
+        let wal_io_duration = start.elapsed();
 
-        // `tokio::join!` runs both arms to completion; it does not cancel the
-        // index arm when the append fails. So on a failed append the index arm has
-        // still advanced `indexed_count` — which is exactly why readers key off
-        // `visible_count` instead, and why nothing is published until both `?`
-        // below have passed.
-        let (append_result, wal_io_duration) = append_result?;
-
-        // An index-apply failure is terminal for the writer.
-        //
-        // `insert_batches` joins every index thread unconditionally, so a failure
-        // leaves the *other* indexes fully applied — FTS and BTree landed, HNSW
-        // did not — and none of them can be rolled back: HNSW has no delete (its
-        // nodes are already linked into their neighbours' adjacency lists), FTS
-        // has already incremented `doc_count`/`total_tokens`/`df`, and BTree has
-        // linked into an append-only arena skiplist. From a partial apply there is
-        // no coherent way to continue: retry and the next attempt re-covers the
-        // range, re-inserting into the indexes that *did* succeed (duplicate HNSW
-        // nodes, doubled BM25 statistics, a permanently spurious
-        // `pk_has_overrides`); skip it and the failed index is permanently short
-        // rows the others have, on a shard that reports healthy.
-        //
-        // So discard instead: poison the writer and let reopen rebuild the
-        // indexes from the WAL. The indexes are pure derived state and replay
-        // already re-derives them, so the rollback primitive exists — it is
-        // `open()`. This is safe only because a *deterministic* index failure is
-        // impossible on data that reached the batch store: `validate_index_configs`
-        // rejects a config that disagrees with the schema at open, and the
-        // memtable's schema-equality gate rejects a batch that disagrees with it.
-        // What is left is transient (allocation, a panicking thread), and that
-        // recovers on replay.
-        let (index_update_duration, index_update_duration_breakdown) =
-            index_result.map_err(|e| {
-                Error::writer_poisoned(format!(
-                    "in-memory index update failed and a partially-applied index cannot be \
-                     rolled back; reopen the shard to rebuild the indexes from the WAL: {e}"
-                ))
-            })?;
-
-        // Both arms succeeded: the range is indexed *and* durable. Publish it.
-        //
-        // This is the only place visibility advances, and it is downstream of both
-        // `?`s. A failed append therefore leaves the rows unreadable, so a reader
-        // can never observe a row that replay will not reproduce.
-        if let Some(indexes) = publish_target {
-            indexes.publish_visible(end_batch_position);
-        }
-
-        // Advance the writer-global durability cursor and wake waiters. The
-        // range we just appended was `[start, end)` *local to this store*, so it
-        // must be lifted into the writer's coordinate space before it is
-        // published — otherwise a fresh memtable's small local end would be
-        // compared against a channel carrying a previous memtable's larger one.
+        // Advance the writer-global durability cursor and wake waiters. The range
+        // just appended is `[start, end)` *local to this store*, so it must be
+        // lifted into the writer's coordinate space before it is published —
+        // otherwise a fresh memtable's small local end would be compared against a
+        // cursor carrying a previous memtable's larger one.
         self.advance_durable(batch_store.global_offset() + end_batch_position);
-        // Signal WAL flush completion for backpressure waiters
         self.signal_wal_flush_complete();
 
         Ok(WalFlushResult {
@@ -686,9 +805,9 @@ impl WalFlusher {
                 num_batches: append_result.num_batches,
             }),
             wal_io_duration,
-            index_update_duration,
-            index_update_duration_breakdown,
-            rows_indexed: rows_to_index,
+            index_update_duration: std::time::Duration::ZERO,
+            index_update_duration_breakdown: std::collections::HashMap::new(),
+            rows_indexed: num_rows,
             wal_bytes: append_result.wal_bytes,
         })
     }
@@ -1612,18 +1731,21 @@ mod tests {
     fn batch_store_source(batch_store: &Arc<BatchStore>) -> WalFlushSource {
         WalFlushSource::BatchStore {
             batch_store: batch_store.clone(),
-            indexes: None,
         }
     }
 
-    fn batch_store_source_with_indexes(
-        batch_store: &Arc<BatchStore>,
-        indexes: &Arc<IndexStore>,
-    ) -> WalFlushSource {
-        WalFlushSource::BatchStore {
-            batch_store: batch_store.clone(),
-            indexes: Some(indexes.clone()),
-        }
+    /// Run the index-apply task's body, as the writer's index task would.
+    async fn apply_all(batch_store: &Arc<BatchStore>, indexes: &Arc<IndexStore>) -> Result<()> {
+        let cursors = Arc::new(WriterCursors::new(true));
+        apply_index_range(
+            &cursors,
+            TriggerIndexApply {
+                batch_store: batch_store.clone(),
+                indexes: indexes.clone(),
+                end_batch_position: batch_store.len(),
+            },
+        )
+        .await
     }
 
     #[tokio::test]
@@ -1633,7 +1755,7 @@ mod tests {
         let buffer = build_test_flusher(store, &base_path, shard_id, 1);
 
         // Track a batch
-        let watcher = buffer.track_batch(1);
+        let watcher = buffer.track_batch(None, 0, 1);
 
         // Watcher should not be durable yet
         assert!(!watcher.is_durable());
@@ -1652,7 +1774,7 @@ mod tests {
         let batch_store = Arc::new(BatchStore::with_capacity(10));
         batch_store.append(create_test_batch(&schema, 10)).unwrap();
 
-        let mut watcher = flusher.track_batch(1);
+        let mut watcher = flusher.track_batch(None, 0, 1);
 
         // wait() must NOT resolve before the flush happens
         let result =
@@ -1685,8 +1807,8 @@ mod tests {
         batch_store.append(batch2).unwrap();
 
         // Track batch IDs in WAL flusher
-        let mut watcher1 = buffer.track_batch(1);
-        let mut watcher2 = buffer.track_batch(2);
+        let mut watcher1 = buffer.track_batch(None, 0, 1);
+        let mut watcher2 = buffer.track_batch(None, 0, 2);
 
         // Verify initial state
         assert!(!watcher1.is_durable());
@@ -1715,39 +1837,19 @@ mod tests {
 
     // Regression test for the visibility-cursor bug: with an empty IndexStore
     // (the common case for WAL-managed tables that mirror an index-less base
-    // dataset), a WAL flush must still advance `visible_count` so
-    // scanners can see every batch up to the durable position — not just
-    // batch 0. Before the fix, the cursor stayed at 0 for the lifetime of the
-    // memtable and scanners returned only the first row.
+    /// The index apply and the WAL append are separate tasks with separate
+    /// cursors. Appending makes a range durable; it does not index it. Indexing
+    /// makes it indexed; it does not make it durable. Only both together make it
+    /// visible.
+    ///
+    /// This also covers the empty-registry case (a memtable with no configured
+    /// indexes), which used to be skipped entirely by the flush's index arm and
+    /// so left the cursor stuck at 0 for the memtable's whole life.
+    #[rstest::rstest]
+    #[case::no_indexes(false)]
+    #[case::btree_index(true)]
     #[tokio::test]
-    async fn test_wal_flush_advances_visibility_with_empty_indexes() {
-        let (store, base_path, _temp_dir) = create_local_store().await;
-        let shard_id = Uuid::new_v4();
-        let flusher = build_test_flusher(store, &base_path, shard_id, 1);
-
-        let schema = create_test_schema();
-        let batch_store = Arc::new(BatchStore::with_capacity(10));
-        for _ in 0..3 {
-            batch_store.append(create_test_batch(&schema, 5)).unwrap();
-        }
-
-        // Empty registry, mimicking a memtable with `index_configs = []`.
-        let indexes = Arc::new(IndexStore::new());
-        assert_eq!(indexes.indexed_count(), 0);
-
-        let source = batch_store_source_with_indexes(&batch_store, &indexes);
-        flusher.flush(&source, batch_store.len()).await.unwrap();
-
-        // All three batches indexed => the indexed prefix is 3 (exclusive count).
-        assert_eq!(indexes.indexed_count(), 3);
-        assert_eq!(flusher.durable(), 3);
-    }
-
-    // Regression guard for the indexed path: with at least one BTree index
-    // configured, the cursor advance still fires (this was already working
-    // before the fix — keeping the test to lock in the behavior).
-    #[tokio::test]
-    async fn test_wal_flush_advances_visibility_with_btree_index() {
+    async fn test_append_and_index_advance_separate_cursors(#[case] with_btree: bool) {
         let (store, base_path, _temp_dir) = create_local_store().await;
         let shard_id = Uuid::new_v4();
         let flusher = build_test_flusher(store, &base_path, shard_id, 1);
@@ -1759,14 +1861,22 @@ mod tests {
         }
 
         let mut idx = IndexStore::new();
-        idx.add_btree("id_idx".to_string(), 0, "id".to_string());
+        if with_btree {
+            idx.add_btree("id_idx".to_string(), 0, "id".to_string());
+        }
         let indexes = Arc::new(idx);
 
-        let source = batch_store_source_with_indexes(&batch_store, &indexes);
-        flusher.flush(&source, batch_store.len()).await.unwrap();
-
-        assert_eq!(indexes.indexed_count(), 3);
+        // The append alone makes the range durable and indexes nothing.
+        flusher
+            .flush(&batch_store_source(&batch_store), batch_store.len())
+            .await
+            .unwrap();
         assert_eq!(flusher.durable(), 3);
+        assert_eq!(indexes.indexed_count(), 0);
+
+        // The index apply alone advances the index cursor.
+        apply_all(&batch_store, &indexes).await.unwrap();
+        assert_eq!(indexes.indexed_count(), 3);
     }
 
     #[tokio::test]
@@ -1782,8 +1892,8 @@ mod tests {
         batch_store.append(create_test_batch(&schema, 5)).unwrap();
 
         // Track batch IDs and flush all pending batches
-        let _watcher1 = buffer.track_batch(1);
-        let _watcher2 = buffer.track_batch(2);
+        let _watcher1 = buffer.track_batch(None, 0, 1);
+        let _watcher2 = buffer.track_batch(None, 0, 2);
         let source = batch_store_source(&batch_store);
         let result = buffer.flush(&source, batch_store.len()).await.unwrap();
         let entry = result.entry.unwrap();
@@ -1961,7 +2071,7 @@ mod tests {
         // A durable put on the predecessor: stage a batch and track it.
         let batch_store = Arc::new(BatchStore::with_capacity(10));
         batch_store.append(create_test_batch(&schema, 1)).unwrap();
-        let mut watcher = flusher.track_batch(1);
+        let mut watcher = flusher.track_batch(None, 0, 1);
 
         // Flushing collides with the sentinel and fences. Both the flush result
         // and the watcher must report the fence — and the watcher must resolve
@@ -2123,21 +2233,20 @@ mod tests {
         );
     }
 
-    /// A failed WAL append must not publish rows to readers, even though the
-    /// index arm has already applied them.
+    /// A failed WAL append must not make rows visible, even when the index apply
+    /// has already taken them.
     ///
-    /// `tokio::join!` runs both arms to completion — it does not cancel the index
-    /// arm when the append fails — so `indexed_count` *does* advance on a failed
-    /// flush. That is fine, and unavoidable: the indexes are derived state, and
-    /// replay rebuilds them. What must not happen is for that to make the rows
-    /// readable, because they are not in the WAL and replay will not reproduce
-    /// them. A reader that saw them would be reading a row that no longer exists
-    /// after a reopen.
+    /// The two now run on separate tasks, so an index apply that lands while the
+    /// append is failing advances `indexed_count` — which is fine, and
+    /// unavoidable: indexes are derived state and replay rebuilds them. What must
+    /// not happen is for that to make the rows *readable*, because they are not in
+    /// the WAL and replay will not reproduce them.
     ///
-    /// Readers therefore key off `visible_count`, which the writer advances only
-    /// downstream of *both* arms succeeding.
+    /// Visibility is derived, not published, so this holds by construction: with
+    /// `durable_write`, `visible = min(indexed, durable)`, and a failed append
+    /// leaves `durable` at 0.
     #[tokio::test]
-    async fn test_failed_append_indexes_but_does_not_publish() {
+    async fn test_failed_append_indexes_but_stays_invisible() {
         let (store, base, controls) = failing_memory_store().await;
         let shard_id = Uuid::new_v4();
         controls.fail_wal_puts(usize::MAX);
@@ -2155,7 +2264,8 @@ mod tests {
                 base_delay: Duration::from_millis(1),
             },
         ));
-        let flusher = WalFlusher::new(appender);
+        let cursors = Arc::new(WriterCursors::new(true));
+        let flusher = WalFlusher::with_cursors(appender, Arc::clone(&cursors));
 
         let schema = create_test_schema();
         let batch_store = Arc::new(BatchStore::with_capacity(10));
@@ -2163,71 +2273,61 @@ mod tests {
 
         let mut idx = IndexStore::new();
         idx.add_btree("id_idx".to_string(), 0, "id".to_string());
+        idx.set_durability(Arc::clone(&cursors), 0);
         let indexes = Arc::new(idx);
 
-        let source = batch_store_source_with_indexes(&batch_store, &indexes);
+        // The index apply succeeds.
+        apply_index_range(
+            &cursors,
+            TriggerIndexApply {
+                batch_store: batch_store.clone(),
+                indexes: indexes.clone(),
+                end_batch_position: 1,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(indexes.indexed_count(), 1);
+
+        // The append does not.
         let err = flusher
-            .flush(&source, batch_store.len())
+            .flush(&batch_store_source(&batch_store), batch_store.len())
             .await
-            .expect_err("the WAL PUT is failing, so the flush must fail");
+            .expect_err("the WAL PUT is failing, so the append must fail");
         assert_eq!(err.fence_reason(), Some(FenceReason::PersistenceFailure));
 
-        // The index arm ran to completion regardless — that is the join's nature.
-        assert_eq!(
-            indexes.indexed_count(),
-            1,
-            "the index arm applies even when the append fails"
-        );
-
-        // But nothing was published, so no reader can see the row.
+        // Indexed, but not durable — so not visible.
+        assert_eq!(flusher.durable(), 0);
         assert_eq!(
             indexes.visible_count(),
             0,
             "a row whose WAL append failed must never become readable"
         );
-        assert_eq!(flusher.durable(), 0);
     }
 
     /// An index-apply failure poisons the writer.
     ///
-    /// A partial apply cannot be rolled back (see the note at the `map_err` in
-    /// `flush_from_batch_store`), and continuing would re-cover the range on the
-    /// next flush and corrupt the indexes that *did* succeed. So the failure is
-    /// terminal: the writer poisons, reads and writes fail fast, and recovery is
+    /// A partial apply cannot be rolled back — `insert_batches` joins every index
+    /// thread unconditionally, so a failure leaves the others fully applied, and
+    /// none of HNSW, FTS or BTree has a delete. Continuing would re-cover the
+    /// range on the next attempt and corrupt the indexes that *did* succeed. So
+    /// the failure is terminal: reads and writes fail fast, and recovery is
     /// reopen -> replay, which rebuilds the indexes from the WAL.
-    ///
-    /// The batches were WAL-durable before the index failed, so this is not data
-    /// loss — it is a rebuild.
     #[tokio::test]
     async fn test_index_failure_poisons_the_writer() {
         let (store, base_path, _temp_dir) = create_local_store().await;
         let shard_id = Uuid::new_v4();
-        let manifest_store = Arc::new(ShardManifestStore::new(
-            store.clone(),
-            &base_path,
-            shard_id,
-            2,
-        ));
-        let (epoch, _) = manifest_store.claim_epoch(0).await.unwrap();
-        let appender = Arc::new(WalAppender::with_claimed_epoch(
-            store,
-            base_path,
-            shard_id,
-            manifest_store,
-            epoch,
-            0,
-            WalRetryConfig::default(),
-        ));
-        let flusher = WalFlusher::new(appender);
+        let flusher = build_test_flusher(store, &base_path, shard_id, 1);
+        let cursors = Arc::clone(flusher.cursors());
 
         let schema = create_test_schema();
         let batch_store = Arc::new(BatchStore::with_capacity(10));
         batch_store.append(create_test_batch(&schema, 1)).unwrap();
 
-        // An HNSW index on `id`, which is an Int32 and not a vector. Every insert
-        // of this batch fails deterministically. (`validate_index_configs` rejects
-        // this at shard open — that is what makes poison-and-replay terminating —
-        // so we have to build the store by hand to reach the failure at all.)
+        // An HNSW index on `id`, which is an Int32 and not a vector, so every
+        // insert of this batch fails deterministically. `validate_index_configs`
+        // rejects this at shard open — that is what makes poison-and-replay
+        // terminating — so the store has to be built by hand to reach it at all.
         let mut idx = IndexStore::new();
         idx.add_hnsw(
             "bad_hnsw".to_string(),
@@ -2239,23 +2339,23 @@ mod tests {
         );
         let indexes = Arc::new(idx);
 
-        let source = batch_store_source_with_indexes(&batch_store, &indexes);
-        let err = flusher
-            .flush(&source, batch_store.len())
-            .await
-            .expect_err("indexing an Int32 column as a vector must fail");
+        let err = apply_index_range(
+            &cursors,
+            TriggerIndexApply {
+                batch_store: batch_store.clone(),
+                indexes: indexes.clone(),
+                end_batch_position: 1,
+            },
+        )
+        .await
+        .expect_err("indexing an Int32 column as a vector must fail");
 
-        assert_eq!(
-            err.fence_reason(),
-            Some(FenceReason::PersistenceFailure),
-            "an index failure must be typed as terminal, not left as an ordinary error"
-        );
+        // The index task latches it, exactly as `IndexApplyHandler` does.
+        flusher.poison(&err);
         assert!(
             flusher.check_poisoned().is_err(),
-            "the writer must be poisoned so it cannot limp on with a corrupt index"
+            "the writer must be poisoned rather than limp on with a corrupt index"
         );
-
-        // Nothing was published, even though the WAL append itself succeeded.
         assert_eq!(indexes.visible_count(), 0);
     }
 
@@ -2286,7 +2386,7 @@ mod tests {
         let schema = create_test_schema();
         let batch_store = Arc::new(BatchStore::with_capacity(10));
         batch_store.append(create_test_batch(&schema, 1)).unwrap();
-        let mut watcher = flusher.track_batch(1);
+        let mut watcher = flusher.track_batch(None, 0, 1);
 
         let source = batch_store_source(&batch_store);
         let flush_err = flusher.flush(&source, batch_store.len()).await.unwrap_err();
