@@ -363,10 +363,12 @@ impl TryFrom<&pbold::InvertedIndexDetails> for InvertedIndexParams {
 
     fn try_from(details: &pbold::InvertedIndexDetails) -> Result<Self> {
         if details.base_tokenizer.is_none() && details.language.is_empty() {
-            let mut params = Self::default();
-            params.block_size = match details.block_size {
-                Some(block_size) => validate_block_size(block_size as usize)?,
-                None => LEGACY_BLOCK_SIZE,
+            let params = Self {
+                block_size: match details.block_size {
+                    Some(block_size) => validate_block_size(block_size as usize)?,
+                    None => LEGACY_BLOCK_SIZE,
+                },
+                ..Self::default()
             };
             return Ok(params);
         }

@@ -11476,48 +11476,6 @@ mod tests {
         assert_eq!(row_ids, &[0]);
     }
 
-    /// An [`IndexReader`] wrapper that hides the posting-group-offsets schema
-    /// metadata key, so a [`PostingListReader`] opened on it takes the
-    /// pre-grouping per-token fallback path (issue #7040).
-    struct GroupKeyStrippingReader {
-        inner: Arc<dyn IndexReader>,
-        schema: lance_core::datatypes::Schema,
-    }
-
-    impl GroupKeyStrippingReader {
-        fn new(inner: Arc<dyn IndexReader>) -> Self {
-            let mut schema = inner.schema().clone();
-            schema.metadata.remove(POSTING_GROUP_OFFSETS_BUF_KEY);
-            Self { inner, schema }
-        }
-    }
-
-    #[async_trait]
-    impl IndexReader for GroupKeyStrippingReader {
-        async fn read_record_batch(&self, n: u64, batch_size: u64) -> Result<RecordBatch> {
-            self.inner.read_record_batch(n, batch_size).await
-        }
-        async fn read_global_buffer(&self, index: u32) -> Result<bytes::Bytes> {
-            self.inner.read_global_buffer(index).await
-        }
-        async fn read_range(
-            &self,
-            range: std::ops::Range<usize>,
-            projection: Option<&[&str]>,
-        ) -> Result<RecordBatch> {
-            self.inner.read_range(range, projection).await
-        }
-        async fn num_batches(&self, batch_size: u64) -> u32 {
-            self.inner.num_batches(batch_size).await
-        }
-        fn num_rows(&self) -> usize {
-            self.inner.num_rows()
-        }
-        fn schema(&self) -> &lance_core::datatypes::Schema {
-            &self.schema
-        }
-    }
-
     fn posting_entries(posting: &PostingList) -> Vec<(u64, u32)> {
         posting.iter().map(|(doc, freq, _)| (doc, freq)).collect()
     }
