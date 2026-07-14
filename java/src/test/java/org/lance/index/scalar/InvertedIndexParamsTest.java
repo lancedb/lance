@@ -13,19 +13,66 @@
  */
 package org.lance.index.scalar;
 
+import org.lance.util.JsonUtils;
+
 import org.junit.jupiter.api.Test;
 
+import java.util.Map;
+
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-public class InvertedIndexParamsTest {
+class InvertedIndexParamsTest {
 
   @Test
-  public void testIcuSplitTokenizerVariant() {
+  void testIcuSplitTokenizerVariant() {
     ScalarIndexParams params = InvertedIndexParams.builder().baseTokenizer("icu/split").build();
 
     assertEquals("inverted", params.getIndexType());
     String jsonParams = params.getJsonParams().orElseThrow(AssertionError::new);
     assertTrue(jsonParams.contains("\"base_tokenizer\":\"icu/split\""));
+  }
+
+  @Test
+  void defaultBlockSizeIsSerialized() {
+    ScalarIndexParams params = InvertedIndexParams.builder().build();
+
+    Map<String, Object> json = JsonUtils.fromJson(params.getJsonParams().orElseThrow());
+    assertEquals(128, ((Number) json.get("block_size")).intValue());
+  }
+
+  @Test
+  void blockSizeIsSerialized() {
+    ScalarIndexParams params = InvertedIndexParams.builder().blockSize(128).build();
+
+    assertEquals("inverted", params.getIndexType());
+    Map<String, Object> json = JsonUtils.fromJson(params.getJsonParams().orElseThrow());
+    assertEquals(128, ((Number) json.get("block_size")).intValue());
+  }
+
+  @Test
+  void invalidBlockSizeIsRejected() {
+    assertThrows(
+        IllegalArgumentException.class, () -> InvertedIndexParams.builder().blockSize(129));
+    assertThrows(
+        IllegalArgumentException.class, () -> InvertedIndexParams.builder().blockSize(512));
+  }
+
+  @Test
+  void formatVersionThreeRequiresBlockSize256() {
+    ScalarIndexParams params =
+        InvertedIndexParams.builder().blockSize(256).formatVersion(3).build();
+
+    Map<String, Object> json = JsonUtils.fromJson(params.getJsonParams().orElseThrow());
+    assertEquals(256, ((Number) json.get("block_size")).intValue());
+    assertEquals(3, ((Number) json.get("format_version")).intValue());
+
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> InvertedIndexParams.builder().formatVersion(3).build());
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> InvertedIndexParams.builder().blockSize(256).formatVersion(2).build());
   }
 }

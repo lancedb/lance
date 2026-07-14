@@ -5,9 +5,14 @@ use std::io::Write;
 
 use super::builder::BLOCK_SIZE;
 use super::index::{PositionStreamCodec, PostingTailCodec};
+#[cfg(test)]
+use super::tokenizer::LEGACY_BLOCK_SIZE;
+use super::tokenizer::validate_block_size;
 use arrow::array::LargeBinaryBuilder;
-use lance_bitpacking::{BitPacker, BitPacker4x};
+use lance_bitpacking::{BitPacker, BitPacker4x, BitPacker8x};
 use lance_core::{Error, Result};
+
+pub const MAX_POSTING_BLOCK_SIZE: usize = BitPacker8x::BLOCK_LEN;
 
 // we compress the posting list to multiple blocks of fixed number of elements (BLOCK_SIZE),
 // returns a LargeBinaryArray, where each binary is a compressed block (128 row ids + 128 frequencies)
@@ -44,15 +49,37 @@ pub fn compress_posting_list_with_tail_codec<'a>(
     length: usize,
     doc_ids: impl Iterator<Item = &'a u32>,
     frequencies: impl Iterator<Item = &'a u32>,
-    mut block_max_scores: impl Iterator<Item = f32>,
+    block_max_scores: impl Iterator<Item = f32>,
     tail_codec: PostingTailCodec,
 ) -> Result<arrow::array::LargeBinaryArray> {
-    if length < BLOCK_SIZE {
+    compress_posting_list_with_tail_codec_and_block_size(
+        length,
+        doc_ids,
+        frequencies,
+        block_max_scores,
+        tail_codec,
+        LEGACY_BLOCK_SIZE,
+    )
+}
+
+#[cfg(test)]
+pub fn compress_posting_list_with_tail_codec_and_block_size<'a>(
+    length: usize,
+    doc_ids: impl Iterator<Item = &'a u32>,
+    frequencies: impl Iterator<Item = &'a u32>,
+    mut block_max_scores: impl Iterator<Item = f32>,
+    tail_codec: PostingTailCodec,
+    block_size: usize,
+) -> Result<arrow::array::LargeBinaryArray> {
+    let block_size = validate_block_size(block_size)?;
+    if length < block_size {
         // directly do remainder compression to avoid overhead of creating buffer
         let mut builder = LargeBinaryBuilder::with_capacity(1, length * 4 * 2 + 1);
-        // write the max score of the block
-        let max_score = block_max_scores.next().unwrap();
-        let _ = builder.write(max_score.to_le_bytes().as_ref())?;
+        // write the max score of the block (128-doc blocks only)
+        if posting_block_score_prefix_len(block_size) > 0 {
+            let max_score = block_max_scores.next().unwrap();
+            let _ = builder.write(max_score.to_le_bytes().as_ref())?;
+        }
         compress_posting_remainder(
             doc_ids.copied().collect::<Vec<_>>().as_slice(),
             frequencies.copied().collect::<Vec<_>>().as_slice(),
@@ -63,27 +90,25 @@ pub fn compress_posting_list_with_tail_codec<'a>(
         return Ok(builder.finish());
     }
 
-    let mut builder = LargeBinaryBuilder::with_capacity(length.div_ceil(BLOCK_SIZE), length * 3);
-    let mut buffer = [0u8; BLOCK_SIZE * 4 + 5];
-    let mut doc_id_buffer = Vec::with_capacity(BLOCK_SIZE);
-    let mut freq_buffer = Vec::with_capacity(BLOCK_SIZE);
+    let mut builder = LargeBinaryBuilder::with_capacity(length.div_ceil(block_size), length * 3);
+    let mut doc_id_buffer = Vec::with_capacity(block_size);
+    let mut freq_buffer = Vec::with_capacity(block_size);
     for (doc_id, freq) in std::iter::zip(doc_ids, frequencies) {
         doc_id_buffer.push(*doc_id);
         freq_buffer.push(*freq);
 
-        if doc_id_buffer.len() < BLOCK_SIZE {
+        if doc_id_buffer.len() < block_size {
             continue;
         }
 
-        assert_eq!(doc_id_buffer.len(), BLOCK_SIZE);
+        assert_eq!(doc_id_buffer.len(), block_size);
 
-        // write the max score of the block
-        let max_score = block_max_scores.next().unwrap();
-        let _ = builder.write(max_score.to_le_bytes().as_ref())?;
-        // delta encoding + bitpacking for doc ids
-        compress_sorted_block(&doc_id_buffer, &mut buffer, &mut builder)?;
-        // bitpacking for frequencies
-        compress_block(&freq_buffer, &mut buffer, &mut builder)?;
+        // write the max score of the block (128-doc blocks only)
+        if posting_block_score_prefix_len(block_size) > 0 {
+            let max_score = block_max_scores.next().unwrap();
+            let _ = builder.write(max_score.to_le_bytes().as_ref())?;
+        }
+        encode_posting_block_payload(&doc_id_buffer, &freq_buffer, &mut builder)?;
         builder.append_value("");
         doc_id_buffer.clear();
         freq_buffer.clear();
@@ -91,13 +116,28 @@ pub fn compress_posting_list_with_tail_codec<'a>(
 
     // we don't compress the last block if it is not full
     if !doc_id_buffer.is_empty() {
-        // write the max score of the block
-        let max_score = block_max_scores.next().unwrap();
-        let _ = builder.write(max_score.to_le_bytes().as_ref())?;
+        // write the max score of the block (128-doc blocks only)
+        if posting_block_score_prefix_len(block_size) > 0 {
+            let max_score = block_max_scores.next().unwrap();
+            let _ = builder.write(max_score.to_le_bytes().as_ref())?;
+        }
         compress_posting_remainder(&doc_id_buffer, &freq_buffer, tail_codec, &mut builder)?;
         builder.append_value("");
     }
     Ok(builder.finish())
+}
+
+/// Byte length of the block-max-score prefix on posting blocks. 128-doc
+/// blocks store a per-block max score, patched in at build time; 256-doc
+/// (V3) blocks always carry impact skip data, which supersedes it, so they
+/// store none.
+#[inline]
+pub fn posting_block_score_prefix_len(block_size: usize) -> usize {
+    if block_size == MAX_POSTING_BLOCK_SIZE {
+        0
+    } else {
+        4
+    }
 }
 
 pub fn encode_full_posting_block_into(
@@ -105,30 +145,158 @@ pub fn encode_full_posting_block_into(
     frequencies: &[u32],
     block: &mut Vec<u8>,
 ) -> Result<()> {
-    debug_assert_eq!(doc_ids.len(), BLOCK_SIZE);
-    debug_assert_eq!(frequencies.len(), BLOCK_SIZE);
-    block.extend_from_slice(&0f32.to_le_bytes());
-    let mut buffer = [0u8; BLOCK_SIZE * 4 + 5];
-    compress_sorted_block(doc_ids, &mut buffer, block)?;
-    compress_block(frequencies, &mut buffer, block)?;
+    validate_block_size(doc_ids.len())?;
+    debug_assert_eq!(doc_ids.len(), frequencies.len());
+    if posting_block_score_prefix_len(doc_ids.len()) > 0 {
+        block.extend_from_slice(&0f32.to_le_bytes());
+    }
+    encode_posting_block_payload(doc_ids, frequencies, block)?;
     Ok(())
+}
+
+fn encode_posting_block_payload(
+    doc_ids: &[u32],
+    frequencies: &[u32],
+    block: &mut impl Write,
+) -> Result<()> {
+    debug_assert_eq!(doc_ids.len(), frequencies.len());
+    validate_block_size(doc_ids.len())?;
+    let mut buffer = [0u8; MAX_POSTING_BLOCK_SIZE * 4 + 5];
+    match doc_ids.len() {
+        BitPacker4x::BLOCK_LEN => {
+            compress_sorted_block_with::<BitPacker4x>(doc_ids, &mut buffer, block)?;
+            compress_block_with::<BitPacker4x>(frequencies, &mut buffer, block)?;
+        }
+        // 256-doc blocks (format V3) store frequencies with patched FOR:
+        // outliers no longer widen the whole block, which matters because one
+        // large tf per block otherwise doubles the frequency payload.
+        BitPacker8x::BLOCK_LEN => {
+            compress_sorted_block_with::<BitPacker8x>(doc_ids, &mut buffer, block)?;
+            compress_pfor_block_with::<BitPacker8x>(frequencies, &mut buffer, block)?;
+        }
+        _ => unreachable!("validated posting block size should be supported"),
+    }
+    Ok(())
+}
+
+/// Patched FOR (Lucene PForUtil style): pick the body bit width that
+/// minimizes total bytes, pack all values masked to that width, and append
+/// up to [`PFOR_MAX_EXCEPTIONS`] exceptions as (index u8, high-bits varint).
+const PFOR_MAX_EXCEPTIONS: usize = 31;
+
+#[inline]
+fn u32_bits(value: u32) -> usize {
+    (32 - value.leading_zeros()) as usize
+}
+
+#[inline]
+fn varint_u32_len(value: u32) -> usize {
+    u32_bits(value).max(1).div_ceil(7)
+}
+
+fn compress_pfor_block_with<P: BitPacker>(
+    data: &[u32],
+    buffer: &mut [u8],
+    builder: &mut impl Write,
+) -> Result<()> {
+    debug_assert_eq!(data.len(), P::BLOCK_LEN);
+    let max_bits = data.iter().map(|&v| u32_bits(v)).max().unwrap_or(0);
+    let mut best_width = max_bits;
+    let mut best_cost = P::BLOCK_LEN * max_bits / 8;
+    for width in (0..max_bits).rev() {
+        let mut exceptions = 0usize;
+        let mut exception_bytes = 0usize;
+        for &value in data {
+            if u32_bits(value) > width {
+                exceptions += 1;
+                exception_bytes += 1 + varint_u32_len(value >> width);
+            }
+        }
+        if exceptions > PFOR_MAX_EXCEPTIONS {
+            break;
+        }
+        let cost = P::BLOCK_LEN * width / 8 + exception_bytes;
+        if cost < best_cost {
+            best_cost = cost;
+            best_width = width;
+        }
+    }
+
+    let mask = if best_width >= 32 {
+        u32::MAX
+    } else {
+        (1u32 << best_width) - 1
+    };
+    let mut body = [0u32; MAX_POSTING_BLOCK_SIZE];
+    let mut exception_buf = Vec::new();
+    let mut exception_count = 0u8;
+    for (index, &value) in data.iter().enumerate() {
+        body[index] = value & mask;
+        if u32_bits(value) > best_width {
+            exception_buf.push(index as u8);
+            encode_varint_u32(&mut exception_buf, value >> best_width);
+            exception_count += 1;
+        }
+    }
+    let compressor = P::new();
+    let num_bytes = compressor.compress(&body[..P::BLOCK_LEN], buffer, best_width as u8);
+    let _ = builder.write(&[best_width as u8, exception_count])?;
+    let _ = builder.write(&buffer[..num_bytes])?;
+    let _ = builder.write(&exception_buf)?;
+    Ok(())
+}
+
+fn decompress_pfor_block_with<P: BitPacker>(
+    block: &[u8],
+    buffer: &mut [u32],
+    res: &mut Vec<u32>,
+) -> usize {
+    debug_assert!(buffer.len() >= P::BLOCK_LEN);
+    let buffer = &mut buffer[..P::BLOCK_LEN];
+    let width = block[0];
+    let exception_count = block[1] as usize;
+    let compressor = P::new();
+    let num_bytes = compressor.decompress(&block[2..], buffer, width);
+    let mut offset = 2 + num_bytes;
+    for _ in 0..exception_count {
+        let index = block[offset] as usize;
+        offset += 1;
+        let high = decode_varint_u32(block, &mut offset)
+            .expect("pfor exception high bits should be a valid varint");
+        buffer[index] |= high << width;
+    }
+    res.extend_from_slice(buffer);
+    offset
 }
 
 pub fn encode_remainder_posting_block_into(
     doc_ids: &[u32],
     frequencies: &[u32],
     codec: PostingTailCodec,
+    block_size: usize,
     block: &mut Vec<u8>,
 ) -> Result<()> {
     debug_assert_eq!(doc_ids.len(), frequencies.len());
-    block.extend_from_slice(&0f32.to_le_bytes());
+    if posting_block_score_prefix_len(block_size) > 0 {
+        block.extend_from_slice(&0f32.to_le_bytes());
+    }
     compress_posting_remainder(doc_ids, frequencies, codec, block)?;
     Ok(())
 }
 
 #[inline]
 fn compress_sorted_block(data: &[u32], buffer: &mut [u8], builder: &mut impl Write) -> Result<()> {
-    let compressor = BitPacker4x::new();
+    compress_sorted_block_with::<BitPacker4x>(data, buffer, builder)
+}
+
+#[inline]
+fn compress_sorted_block_with<P: BitPacker>(
+    data: &[u32],
+    buffer: &mut [u8],
+    builder: &mut impl Write,
+) -> Result<()> {
+    debug_assert_eq!(data.len(), P::BLOCK_LEN);
+    let compressor = P::new();
     let num_bits = compressor.num_bits_sorted(data[0], data);
     let num_bytes = compressor.compress_sorted(data[0], data, buffer, num_bits);
     let _ = builder.write(data[0].to_le_bytes().as_ref())?;
@@ -139,7 +307,17 @@ fn compress_sorted_block(data: &[u32], buffer: &mut [u8], builder: &mut impl Wri
 
 #[inline]
 fn compress_block(data: &[u32], buffer: &mut [u8], builder: &mut impl Write) -> Result<()> {
-    let compressor = BitPacker4x::new();
+    compress_block_with::<BitPacker4x>(data, buffer, builder)
+}
+
+#[inline]
+fn compress_block_with<P: BitPacker>(
+    data: &[u32],
+    buffer: &mut [u8],
+    builder: &mut impl Write,
+) -> Result<()> {
+    debug_assert_eq!(data.len(), P::BLOCK_LEN);
+    let compressor = P::new();
     let num_bits = compressor.num_bits(data);
     let num_bytes = compressor.compress(data, buffer, num_bits);
     let _ = builder.write(&[num_bits])?;
@@ -236,7 +414,7 @@ pub fn compress_positions(positions: &[u32]) -> Result<arrow::array::LargeBinary
 }
 
 #[inline]
-fn encode_varint_u32(dst: &mut Vec<u8>, mut value: u32) {
+pub fn encode_varint_u32(dst: &mut Vec<u8>, mut value: u32) {
     while value >= 0x80 {
         dst.push((value as u8) | 0x80);
         value >>= 7;
@@ -346,7 +524,7 @@ impl PositionBlockBuilder {
 }
 
 #[inline]
-fn decode_varint_u32(src: &[u8], offset: &mut usize) -> Result<u32> {
+pub fn decode_varint_u32(src: &[u8], offset: &mut usize) -> Result<u32> {
     let mut value = 0u32;
     let mut shift = 0u32;
     while *offset < src.len() {
@@ -617,23 +795,46 @@ pub fn decompress_posting_list_with_tail_codec(
     posting_list: &arrow::array::LargeBinaryArray,
     tail_codec: PostingTailCodec,
 ) -> Result<(Vec<u32>, Vec<u32>)> {
+    decompress_posting_list_with_tail_codec_and_block_size(
+        num_docs,
+        posting_list,
+        tail_codec,
+        LEGACY_BLOCK_SIZE,
+    )
+}
+
+#[cfg(test)]
+pub fn decompress_posting_list_with_tail_codec_and_block_size(
+    num_docs: u32,
+    posting_list: &arrow::array::LargeBinaryArray,
+    tail_codec: PostingTailCodec,
+    block_size: usize,
+) -> Result<(Vec<u32>, Vec<u32>)> {
+    let block_size = validate_block_size(block_size)?;
     let mut doc_ids: Vec<u32> = Vec::with_capacity(num_docs as usize);
     let mut frequencies: Vec<u32> = Vec::with_capacity(num_docs as usize);
 
-    let mut buffer = [0u32; BLOCK_SIZE];
-    let bitpacking_blocks = num_docs as usize / BLOCK_SIZE;
+    let mut buffer = [0u32; MAX_POSTING_BLOCK_SIZE];
+    let bitpacking_blocks = num_docs as usize / block_size;
     for compressed in posting_list.iter().take(bitpacking_blocks) {
         let compressed = compressed.unwrap();
-        decompress_posting_block(compressed, &mut buffer, &mut doc_ids, &mut frequencies);
+        decompress_posting_block(
+            compressed,
+            &mut buffer,
+            &mut doc_ids,
+            &mut frequencies,
+            block_size,
+        );
     }
 
-    let remainder = num_docs as usize % BLOCK_SIZE;
+    let remainder = num_docs as usize % block_size;
     if remainder > 0 {
         let compressed = posting_list.value(bitpacking_blocks);
         decompress_posting_remainder(
             compressed,
             remainder,
             tail_codec,
+            block_size,
             &mut doc_ids,
             &mut frequencies,
         );
@@ -668,24 +869,46 @@ pub fn read_num_positions(compressed: &arrow::array::LargeBinaryArray) -> u32 {
 
 pub fn decompress_posting_block(
     block: &[u8],
-    buffer: &mut [u32; BLOCK_SIZE],
+    buffer: &mut [u32],
     doc_ids: &mut Vec<u32>,
     frequencies: &mut Vec<u32>,
+    block_size: usize,
 ) {
-    // skip the first 4 bytes for the max block score
-    let block = &block[4..];
-    let num_bytes = decompress_sorted_block(block, buffer, doc_ids);
-    decompress_block(&block[num_bytes..], buffer, frequencies);
+    debug_assert!(validate_block_size(block_size).is_ok());
+    debug_assert!(buffer.len() >= block_size);
+    // skip the block max score prefix (128-doc blocks only)
+    let mut block = &block[posting_block_score_prefix_len(block_size)..];
+    match block_size {
+        BitPacker4x::BLOCK_LEN => {
+            let num_bytes = decompress_sorted_block_with::<BitPacker4x>(block, buffer, doc_ids);
+            block = &block[num_bytes..];
+            let num_bytes = decompress_block_with::<BitPacker4x>(block, buffer, frequencies);
+            block = &block[num_bytes..];
+        }
+        BitPacker8x::BLOCK_LEN => {
+            let num_bytes = decompress_sorted_block_with::<BitPacker8x>(block, buffer, doc_ids);
+            block = &block[num_bytes..];
+            let num_bytes = decompress_pfor_block_with::<BitPacker8x>(block, buffer, frequencies);
+            block = &block[num_bytes..];
+        }
+        _ => unreachable!("validated posting block size should be supported"),
+    }
+    debug_assert!(
+        block.is_empty(),
+        "posting block has {} trailing bytes after decoding",
+        block.len()
+    );
 }
 
 pub fn decompress_posting_remainder(
     block: &[u8],
     n: usize,
     codec: PostingTailCodec,
+    block_size: usize,
     doc_ids: &mut Vec<u32>,
     frequencies: &mut Vec<u32>,
 ) {
-    let block = &block[4..];
+    let block = &block[posting_block_score_prefix_len(block_size)..];
     match codec {
         PostingTailCodec::Fixed32 => {
             decompress_raw_remainder(block, n, doc_ids);
@@ -722,9 +945,14 @@ pub fn decompress_posting_remainder(
     }
 }
 
-pub fn decode_full_posting_block(block: &[u8], doc_ids: &mut Vec<u32>, frequencies: &mut Vec<u32>) {
-    let mut buffer = [0u32; BLOCK_SIZE];
-    decompress_posting_block(block, &mut buffer, doc_ids, frequencies);
+pub fn decode_full_posting_block(
+    block: &[u8],
+    doc_ids: &mut Vec<u32>,
+    frequencies: &mut Vec<u32>,
+    block_size: usize,
+) {
+    let mut buffer = [0u32; MAX_POSTING_BLOCK_SIZE];
+    decompress_posting_block(block, &mut buffer, doc_ids, frequencies, block_size);
 }
 
 pub fn decompress_sorted_block(
@@ -732,7 +960,17 @@ pub fn decompress_sorted_block(
     buffer: &mut [u32; BLOCK_SIZE],
     res: &mut Vec<u32>,
 ) -> usize {
-    let compressor = BitPacker4x::new();
+    decompress_sorted_block_with::<BitPacker4x>(block, buffer, res)
+}
+
+fn decompress_sorted_block_with<P: BitPacker>(
+    block: &[u8],
+    buffer: &mut [u32],
+    res: &mut Vec<u32>,
+) -> usize {
+    debug_assert!(buffer.len() >= P::BLOCK_LEN);
+    let buffer = &mut buffer[..P::BLOCK_LEN];
+    let compressor = P::new();
     let initial = u32::from_le_bytes(block[0..4].try_into().unwrap());
     let num_bits = block[4];
     let num_bytes = compressor.decompress_sorted(initial, &block[5..], buffer, num_bits);
@@ -740,11 +978,18 @@ pub fn decompress_sorted_block(
     5 + num_bytes
 }
 
-fn decompress_block(block: &[u8], buffer: &mut [u32; BLOCK_SIZE], res: &mut Vec<u32>) {
-    let compressor = BitPacker4x::new();
+fn decompress_block_with<P: BitPacker>(
+    block: &[u8],
+    buffer: &mut [u32],
+    res: &mut Vec<u32>,
+) -> usize {
+    debug_assert!(buffer.len() >= P::BLOCK_LEN);
+    let buffer = &mut buffer[..P::BLOCK_LEN];
+    let compressor = P::new();
     let num_bits = block[0];
-    compressor.decompress(&block[1..], buffer, num_bits);
+    let num_bytes = compressor.decompress(&block[1..], buffer, num_bits);
     res.extend_from_slice(&buffer[..]);
+    1 + num_bytes
 }
 
 pub fn decompress_raw_remainder(compressed: &[u8], n: usize, dest: &mut Vec<u32>) {
@@ -754,11 +999,18 @@ pub fn decompress_raw_remainder(compressed: &[u8], n: usize, dest: &mut Vec<u32>
     }
 }
 
-pub fn read_posting_tail_first_doc(block: &[u8], codec: PostingTailCodec) -> u32 {
+pub fn read_posting_tail_first_doc(
+    block: &[u8],
+    codec: PostingTailCodec,
+    block_size: usize,
+) -> u32 {
+    let prefix = posting_block_score_prefix_len(block_size);
     match codec {
-        PostingTailCodec::Fixed32 => u32::from_le_bytes(block[4..8].try_into().unwrap()),
+        PostingTailCodec::Fixed32 => {
+            u32::from_le_bytes(block[prefix..prefix + 4].try_into().unwrap())
+        }
         PostingTailCodec::VarintDelta => {
-            let mut offset = 4usize;
+            let mut offset = prefix;
             decode_varint_u32(block, &mut offset)
                 .expect("posting tail block should contain a valid first doc id")
         }
@@ -806,6 +1058,84 @@ mod tests {
             decompress_posting_list(num_rows as u32, &posting_list)?;
         assert_eq!(doc_ids, decompressed_doc_ids);
         assert_eq!(frequencies, decompressed_frequencies);
+        Ok(())
+    }
+
+    #[test]
+    fn test_compress_posting_list_supported_block_sizes() -> Result<()> {
+        for block_size in [128, 256] {
+            let num_rows: usize = block_size * 2 + 7;
+            let doc_ids = (0..num_rows as u32).collect::<Vec<_>>();
+            let frequencies = (0..num_rows as u32)
+                .map(|value| value % 7 + 1)
+                .collect::<Vec<_>>();
+            let block_max_scores =
+                (0..num_rows.div_ceil(block_size)).map(|value| value as f32 + 1.0);
+
+            let posting_list = compress_posting_list_with_tail_codec_and_block_size(
+                doc_ids.len(),
+                doc_ids.iter(),
+                frequencies.iter(),
+                block_max_scores,
+                PostingTailCodec::VarintDelta,
+                block_size,
+            )?;
+            assert_eq!(posting_list.len(), num_rows.div_ceil(block_size));
+
+            let (decoded_doc_ids, decoded_frequencies) =
+                decompress_posting_list_with_tail_codec_and_block_size(
+                    num_rows as u32,
+                    &posting_list,
+                    PostingTailCodec::VarintDelta,
+                    block_size,
+                )?;
+            assert_eq!(decoded_doc_ids, doc_ids);
+            assert_eq!(decoded_frequencies, frequencies);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_256_posting_block_uses_single_physical_bitpack_chunk() -> Result<()> {
+        let block_size = BitPacker8x::BLOCK_LEN;
+        let doc_ids = (0..block_size as u32).collect::<Vec<_>>();
+        let frequencies = (0..block_size as u32)
+            .map(|value| value % 13 + 1)
+            .collect::<Vec<_>>();
+
+        let posting_list = compress_posting_list_with_tail_codec_and_block_size(
+            doc_ids.len(),
+            doc_ids.iter(),
+            frequencies.iter(),
+            std::iter::once(1.0),
+            PostingTailCodec::VarintDelta,
+            block_size,
+        )?;
+        assert_eq!(posting_list.len(), 1);
+
+        let block = posting_list.value(0);
+        // 256-doc blocks carry no block-max-score prefix (impacts supply the
+        // per-block bound): [first_doc u32][doc num_bits u8][doc payload]...
+        let doc_num_bits = block[4];
+        let doc_bytes = BitPacker8x::compressed_block_size(doc_num_bits);
+        let freq_header_offset = 5 + doc_bytes;
+        // 256-doc blocks use patched FOR for frequencies:
+        // [width u8][exception_count u8][body][exceptions...]
+        let freq_num_bits = block[freq_header_offset];
+        let exception_count = block[freq_header_offset + 1] as usize;
+        assert_eq!(exception_count, 0, "uniform freqs need no exceptions");
+        let freq_bytes = BitPacker8x::compressed_block_size(freq_num_bits);
+        assert_eq!(block.len(), freq_header_offset + 2 + freq_bytes);
+
+        let (decoded_doc_ids, decoded_frequencies) =
+            decompress_posting_list_with_tail_codec_and_block_size(
+                doc_ids.len() as u32,
+                &posting_list,
+                PostingTailCodec::VarintDelta,
+                block_size,
+            )?;
+        assert_eq!(decoded_doc_ids, doc_ids);
+        assert_eq!(decoded_frequencies, frequencies);
         Ok(())
     }
 

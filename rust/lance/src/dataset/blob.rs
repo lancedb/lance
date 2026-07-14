@@ -12,16 +12,19 @@ use std::{
 
 use arrow::array::AsArray;
 use arrow::datatypes::{UInt8Type, UInt32Type, UInt64Type};
-use arrow_array::RecordBatch;
-use arrow_array::{Array, ArrayRef};
-use arrow_schema::{DataType as ArrowDataType, Field as ArrowField};
+use arrow_array::{
+    Array, ArrayRef, GenericListArray, OffsetSizeTrait, RecordBatch, builder::LargeBinaryBuilder,
+};
+use arrow_buffer::{OffsetBuffer, ScalarBuffer};
+use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use futures::{FutureExt, StreamExt, TryStreamExt, stream};
 use lance_arrow::{
-    BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY, BLOB_INLINE_SIZE_THRESHOLD_META_KEY,
-    BLOB_PACK_FILE_SIZE_THRESHOLD_META_KEY, FieldExt, r#struct::StructArrayExt,
+    ARROW_EXT_NAME_KEY, BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY,
+    BLOB_INLINE_SIZE_THRESHOLD_META_KEY, BLOB_PACK_FILE_SIZE_THRESHOLD_META_KEY, FieldExt,
+    list::ListArrayExt, r#struct::StructArrayExt,
 };
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
 use lance_io::scheduler::{FileScheduler, ScanScheduler, SchedulerConfig};
@@ -37,9 +40,9 @@ use crate::blob::{
     is_logical_blob_v2_field, is_prepared_blob_v2_field, validate_prepared_blob_array,
 };
 use arrow_array::StructArray;
-use lance_core::datatypes::{BlobKind, BlobVersion, parse_field_path};
+use lance_core::datatypes::{BlobKind, BlobVersion, Field as LanceField, Schema, parse_field_path};
 use lance_core::utils::blob::blob_path;
-use lance_core::{Error, Result, utils::address::RowAddress};
+use lance_core::{Error, ROW_ADDR, Result, utils::address::RowAddress};
 use lance_io::traits::Reader;
 use lance_io::utils::CachedFileSize;
 
@@ -323,6 +326,9 @@ enum BlobPreprocessFieldKind {
     Struct {
         children: Vec<BlobPreprocessField>,
     },
+    List {
+        child: Box<BlobPreprocessField>,
+    },
     Passthrough,
 }
 
@@ -370,6 +376,17 @@ impl BlobPreprocessField {
             if children.iter().any(|child| child.requires_preprocessing()) {
                 return Ok(Self {
                     kind: BlobPreprocessFieldKind::Struct { children },
+                });
+            }
+        }
+
+        if let ArrowDataType::List(child) | ArrowDataType::LargeList(child) = field.data_type() {
+            let child = Self::new(child.as_ref())?;
+            if child.requires_preprocessing() {
+                return Ok(Self {
+                    kind: BlobPreprocessFieldKind::List {
+                        child: Box::new(child),
+                    },
                 });
             }
         }
@@ -659,6 +676,20 @@ impl BlobPreprocessor {
                     self.preprocess_struct_array(array, field.as_ref(), children)
                         .await
                 }
+                BlobPreprocessFieldKind::List { child } => match field.data_type() {
+                    ArrowDataType::List(_) => {
+                        self.preprocess_list_array::<i32>(array, field.as_ref(), child)
+                            .await
+                    }
+                    ArrowDataType::LargeList(_) => {
+                        self.preprocess_list_array::<i64>(array, field.as_ref(), child)
+                            .await
+                    }
+                    _ => Err(Error::internal(format!(
+                        "Blob list preprocessor received non-list field '{}'",
+                        field.name()
+                    ))),
+                },
             }
         }
         .boxed()
@@ -712,6 +743,79 @@ impl BlobPreprocessor {
             .with_metadata(field.metadata().clone()),
         );
         Ok((Arc::new(struct_array), field))
+    }
+
+    async fn preprocess_list_array<O: OffsetSizeTrait>(
+        &mut self,
+        array: ArrayRef,
+        field: &ArrowField,
+        child: &BlobPreprocessField,
+    ) -> Result<(ArrayRef, Arc<ArrowField>)> {
+        let list_arr = array.as_list::<O>();
+        let list_arr = if list_arr.null_count() > 0 {
+            list_arr.filter_garbage_nulls()
+        } else {
+            list_arr.clone()
+        };
+
+        let first_offset = *list_arr
+            .offsets()
+            .first()
+            .ok_or_else(|| Error::invalid_input("List offsets cannot be empty"))?;
+        let last_offset = *list_arr
+            .offsets()
+            .last()
+            .ok_or_else(|| Error::invalid_input("List offsets cannot be empty"))?;
+        let values_len = list_arr.values().len();
+        let needs_trim = first_offset != O::zero()
+            || last_offset.to_usize().ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "List field '{}' offset does not fit into usize",
+                    field.name()
+                ))
+            })? != values_len;
+
+        let (offsets, values) = if needs_trim {
+            let values = list_arr.trimmed_values();
+            let offsets = list_arr
+                .offsets()
+                .iter()
+                .map(|offset| *offset - first_offset)
+                .collect::<Vec<_>>();
+            (OffsetBuffer::new(ScalarBuffer::from(offsets)), values)
+        } else {
+            (list_arr.offsets().clone(), list_arr.values().clone())
+        };
+
+        let child_field = match field.data_type() {
+            ArrowDataType::List(child_field) | ArrowDataType::LargeList(child_field) => {
+                child_field.clone()
+            }
+            other => {
+                return Err(Error::invalid_input(format!(
+                    "Blob list preprocessor expected list field '{}', got {other}",
+                    field.name()
+                )));
+            }
+        };
+        let (new_values, new_child_field) =
+            self.preprocess_field(child, values, &child_field).await?;
+
+        let list_array = GenericListArray::<O>::try_new(
+            new_child_field,
+            offsets,
+            new_values,
+            list_arr.nulls().cloned(),
+        )?;
+        let field = Arc::new(
+            ArrowField::new(
+                field.name(),
+                list_array.data_type().clone(),
+                field.is_nullable(),
+            )
+            .with_metadata(field.metadata().clone()),
+        );
+        Ok((Arc::new(list_array), field))
     }
 
     async fn preprocess_blob_array(
@@ -1800,6 +1904,27 @@ async fn execute_blob_read_plan(
         .collect())
 }
 
+async fn execute_blob_entries(
+    entries: Vec<BlobEntry>,
+    io_parallelism: usize,
+    io_buffer_size_bytes: Option<u64>,
+) -> Result<Vec<IndexedReadBlob>> {
+    let plans = plan_blob_read_plans(entries);
+    if plans.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let execution = Arc::new(ReadBlobsExecution::new(io_buffer_size_bytes));
+    let batches = stream::iter(plans.into_iter().map(move |plan| {
+        let execution = execution.clone();
+        execute_blob_read_plan(plan, execution)
+    }))
+    .buffer_unordered(io_parallelism.max(1))
+    .try_collect::<Vec<_>>()
+    .await?;
+    Ok(batches.into_iter().flatten().collect())
+}
+
 pub(super) async fn take_blobs(
     dataset: &Arc<Dataset>,
     row_ids: &[u64],
@@ -1933,16 +2058,57 @@ async fn collect_blob_entries_for_selection(
 /// descriptor `StructArray`, descending through nested struct children for
 /// dotted paths.
 fn leaf_descriptor_struct<'a>(batch: &'a RecordBatch, column: &str) -> Result<&'a StructArray> {
+    let current = leaf_descriptor_array(batch, column)?;
+    current
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .ok_or_else(|| {
+            Error::invalid_input_source(
+                format!(
+                    "Blob column '{}' expected descriptor struct but got {}",
+                    column,
+                    current.data_type()
+                )
+                .into(),
+            )
+        })
+}
+
+fn leaf_descriptor_array<'a>(batch: &'a RecordBatch, column: &str) -> Result<&'a dyn Array> {
     let path = parse_field_path(column)?;
-    let mut current = batch
+    let mut current: &dyn Array = batch
         .column_by_name(&path[0])
-        .expect("validate_blob_column ensured column exists")
-        .as_struct();
+        .ok_or_else(|| {
+            Error::invalid_input(format!(
+                "Blob column '{}' was not found in descriptor batch",
+                column
+            ))
+        })?
+        .as_ref();
     for segment in &path[1..] {
-        current = current
+        let struct_array = current
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or_else(|| {
+                Error::invalid_input_source(
+                    format!(
+                        "Blob column path '{}' expected struct before segment '{}' but got {}",
+                        column,
+                        segment,
+                        current.data_type()
+                    )
+                    .into(),
+                )
+            })?;
+        current = struct_array
             .column_by_name(segment)
-            .expect("validate_blob_column ensured all path segments exist")
-            .as_struct();
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "Blob column path '{}' missing segment '{}'",
+                    column, segment
+                ))
+            })?
+            .as_ref();
     }
     Ok(current)
 }
@@ -1966,6 +2132,38 @@ fn blob_version_from_descriptions(descriptions: &StructArray) -> Result<BlobVers
         fields.iter().map(|f| f.name().as_str()).collect::<Vec<_>>(),
     )
     .into()))
+}
+
+struct BlobV2DescriptorColumns<'a> {
+    descriptions: &'a StructArray,
+    kinds: &'a arrow::array::PrimitiveArray<UInt8Type>,
+    positions: &'a arrow::array::PrimitiveArray<UInt64Type>,
+    sizes: &'a arrow::array::PrimitiveArray<UInt64Type>,
+    blob_ids: &'a arrow::array::PrimitiveArray<UInt32Type>,
+    blob_uris: &'a arrow::array::GenericStringArray<i32>,
+}
+
+impl<'a> BlobV2DescriptorColumns<'a> {
+    fn new(descriptions: &'a StructArray) -> Self {
+        Self {
+            descriptions,
+            kinds: descriptions.column(0).as_primitive::<UInt8Type>(),
+            positions: descriptions.column(1).as_primitive::<UInt64Type>(),
+            sizes: descriptions.column(2).as_primitive::<UInt64Type>(),
+            blob_ids: descriptions.column(3).as_primitive::<UInt32Type>(),
+            blob_uris: descriptions.column(4).as_string::<i32>(),
+        }
+    }
+
+    fn is_null_blob(&self, idx: usize) -> Result<bool> {
+        if self.descriptions.is_null(idx) || self.kinds.is_null(idx) {
+            return Ok(true);
+        }
+        let kind = BlobKind::try_from(self.kinds.value(idx))?;
+        Ok(matches!(kind, BlobKind::Inline)
+            && self.positions.value(idx) == 0
+            && self.sizes.value(idx) == 0)
+    }
 }
 
 /// Convert blob v1 descriptors into logical blob entries.
@@ -2030,147 +2228,563 @@ async fn collect_blob_entries_v2(
     descriptions: &StructArray,
     row_addrs: &arrow::array::PrimitiveArray<UInt64Type>,
 ) -> Result<Vec<BlobEntry>> {
-    let kinds = descriptions.column(0).as_primitive::<UInt8Type>();
-    let positions = descriptions.column(1).as_primitive::<UInt64Type>();
-    let sizes = descriptions.column(2).as_primitive::<UInt64Type>();
-    let blob_ids = descriptions.column(3).as_primitive::<UInt32Type>();
-    let blob_uris = descriptions.column(4).as_string::<i32>();
-
+    let columns = BlobV2DescriptorColumns::new(descriptions);
     let mut files = Vec::with_capacity(row_addrs.len());
-    let mut fragment_cache = HashMap::<u32, BlobReadLocation>::new();
-    let mut store_cache = HashMap::<u32, Arc<ObjectStore>>::new();
-    let mut external_base_path_cache = HashMap::<u32, Path>::new();
-    let mut source_cache = HashMap::<BlobSourceKey, Arc<BlobSource>>::new();
+    let mut read_context = BlobV2ReadContext::new(dataset, blob_field_id);
     for (selection_index, row_addr) in row_addrs.values().iter().enumerate() {
-        let idx = selection_index;
-        let kind = BlobKind::try_from(kinds.value(idx))?;
-
-        // Struct is non-nullable; null rows are encoded as inline with zero position/size and empty uri
-        if matches!(kind, BlobKind::Inline) && positions.value(idx) == 0 && sizes.value(idx) == 0 {
-            continue;
-        }
-
-        match kind {
-            BlobKind::Inline => {
-                let position = positions.value(idx);
-                let size = sizes.value(idx);
-                let location = resolve_blob_read_location(
-                    dataset,
-                    blob_field_id,
-                    *row_addr,
-                    &mut fragment_cache,
-                    &mut store_cache,
-                )
-                .await?;
-                let source = shared_blob_source(
-                    &mut source_cache,
-                    location.object_store,
-                    &location.data_file_path,
-                );
-                files.push(BlobEntry {
-                    selection_index,
-                    row_address: *row_addr,
-                    file: BlobFile::with_source(source, position, size, BlobKind::Inline, None),
-                });
-            }
-            BlobKind::Dedicated => {
-                let blob_id = blob_ids.value(idx);
-                let size = sizes.value(idx);
-                let location = resolve_blob_read_location(
-                    dataset,
-                    blob_field_id,
-                    *row_addr,
-                    &mut fragment_cache,
-                    &mut store_cache,
-                )
-                .await?;
-                let path = blob_path(&location.data_file_dir, &location.data_file_key, blob_id);
-                let source = shared_blob_source(&mut source_cache, location.object_store, &path);
-                files.push(BlobEntry {
-                    selection_index,
-                    row_address: *row_addr,
-                    file: BlobFile::with_source(source, 0, size, BlobKind::Dedicated, None),
-                });
-            }
-            BlobKind::Packed => {
-                let blob_id = blob_ids.value(idx);
-                let size = sizes.value(idx);
-                let position = positions.value(idx);
-                let location = resolve_blob_read_location(
-                    dataset,
-                    blob_field_id,
-                    *row_addr,
-                    &mut fragment_cache,
-                    &mut store_cache,
-                )
-                .await?;
-                let path = blob_path(&location.data_file_dir, &location.data_file_key, blob_id);
-                let source = shared_blob_source(&mut source_cache, location.object_store, &path);
-                files.push(BlobEntry {
-                    selection_index,
-                    row_address: *row_addr,
-                    file: BlobFile::with_source(source, position, size, BlobKind::Packed, None),
-                });
-            }
-            BlobKind::External => {
-                let uri_or_path = blob_uris.value(idx).to_string();
-                let position = positions.value(idx);
-                let size = sizes.value(idx);
-                let base_id = blob_ids.value(idx);
-                let (object_store, path) = if base_id == 0 {
-                    let registry = dataset.session.store_registry();
-                    let params = dataset
-                        .store_params
-                        .as_ref()
-                        .map(|p| Arc::new((**p).clone()))
-                        .unwrap_or_else(|| Arc::new(ObjectStoreParams::default()));
-                    ObjectStore::from_uri_and_params(registry, &uri_or_path, &params).await?
-                } else {
-                    let object_store = if let Some(store) = store_cache.get(&base_id) {
-                        store.clone()
-                    } else {
-                        let store = dataset.object_store(Some(base_id)).await?;
-                        store_cache.insert(base_id, store.clone());
-                        store
-                    };
-                    let base_root = if let Some(path) = external_base_path_cache.get(&base_id) {
-                        path.clone()
-                    } else {
-                        let base = dataset.manifest.base_paths.get(&base_id).ok_or_else(|| {
-                            Error::invalid_input(format!(
-                                "External blob references unknown base_id {}",
-                                base_id
-                            ))
-                        })?;
-                        let path = base.extract_path(dataset.session.store_registry())?;
-                        external_base_path_cache.insert(base_id, path.clone());
-                        path
-                    };
-                    let path = join_base_and_relative_path(&base_root, &uri_or_path)?;
-                    (object_store, path)
-                };
-                let size = if size > 0 {
-                    size
-                } else {
-                    object_store.size(&path).await?
-                };
-                let source = shared_blob_source(&mut source_cache, object_store, &path);
-                files.push(BlobEntry {
-                    selection_index,
-                    row_address: *row_addr,
-                    file: BlobFile::with_source(
-                        source,
-                        position,
-                        size,
-                        BlobKind::External,
-                        Some(uri_or_path),
-                    ),
-                });
-            }
+        if let Some(entry) = read_context
+            .collect_entry(&columns, selection_index, selection_index, *row_addr)
+            .await?
+        {
+            files.push(entry);
         }
     }
 
     Ok(files)
+}
+
+fn is_blob_v2_binary_view(field: &LanceField) -> bool {
+    field.is_blob_v2() && matches!(field.data_type(), ArrowDataType::LargeBinary)
+}
+
+fn public_blob_v2_binary_output_field(mut field: LanceField) -> LanceField {
+    if is_blob_v2_binary_view(&field) {
+        field.metadata.remove(ARROW_EXT_NAME_KEY);
+    }
+    field.children = field
+        .children
+        .into_iter()
+        .map(public_blob_v2_binary_output_field)
+        .collect();
+    field
+}
+
+/// Return the public Arrow-facing schema for a blob v2 binary scan.
+///
+/// Scan planning uses a blob v2 extension marker on `LargeBinary` leaves to
+/// identify payloads that need descriptor-based materialization. This helper
+/// removes that internal marker before the schema is exposed to callers.
+pub fn public_blob_v2_binary_output_schema(schema: &Schema) -> Schema {
+    Schema {
+        fields: schema
+            .fields
+            .iter()
+            .cloned()
+            .map(public_blob_v2_binary_output_field)
+            .collect(),
+        metadata: schema.metadata.clone(),
+    }
+}
+
+fn field_has_blob_v2_binary_view(field: &LanceField) -> bool {
+    is_blob_v2_binary_view(field) || field.children.iter().any(field_has_blob_v2_binary_view)
+}
+
+/// Return true if the schema contains a blob v2 leaf in binary payload view.
+///
+/// This detects the internal `LargeBinary` view created by
+/// [`BlobHandling::AllBinary`](lance_core::datatypes::BlobHandling::AllBinary)
+/// or selective binary blob handling.
+pub fn schema_has_blob_v2_binary_view(schema: &Schema) -> bool {
+    schema.fields.iter().any(field_has_blob_v2_binary_view)
+}
+
+fn blob_v2_descriptor_field(mut field: LanceField) -> LanceField {
+    if is_blob_v2_binary_view(&field) {
+        field.unloaded_mut();
+        return field;
+    }
+
+    field.children = field
+        .children
+        .into_iter()
+        .map(blob_v2_descriptor_field)
+        .collect();
+    field
+}
+
+/// Convert blob v2 binary-view leaves back to descriptor-view leaves.
+///
+/// Readers use this schema to fetch stored blob descriptors first. The scan
+/// layer then materializes those descriptors into the caller's binary payload
+/// view after row addresses are available.
+pub fn blob_v2_descriptor_schema(schema: &Schema) -> Schema {
+    Schema {
+        fields: schema
+            .fields
+            .iter()
+            .cloned()
+            .map(blob_v2_descriptor_field)
+            .collect(),
+        metadata: schema.metadata.clone(),
+    }
+}
+
+/// Materialize blob v2 descriptor arrays in a decoded batch into binary arrays.
+///
+/// The input batch must include `_rowaddr`, which is used to resolve packed,
+/// dedicated, inline, and external blob payload locations. `output_schema`
+/// defines the exact returned columns, including requested system columns, with
+/// blob v2 binary leaves exposed as plain `LargeBinary` fields.
+pub async fn materialize_blob_v2_binary_batch(
+    dataset: &Arc<Dataset>,
+    output_schema: &Schema,
+    batch: RecordBatch,
+) -> Result<RecordBatch> {
+    let row_addr_idx = batch
+        .schema()
+        .column_with_name(ROW_ADDR)
+        .ok_or_else(|| {
+            Error::internal(format!(
+                "_rowaddr column missing from blob v2 binary scan batch, columns: {:?}",
+                batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|field| field.name())
+                    .collect::<Vec<_>>()
+            ))
+        })?
+        .0;
+    let row_addrs = batch
+        .column(row_addr_idx)
+        .as_primitive::<UInt64Type>()
+        .values()
+        .iter()
+        .copied()
+        .collect::<Vec<_>>();
+    let row_addrs: Arc<[u64]> = row_addrs.into();
+
+    let mut columns = Vec::with_capacity(output_schema.fields.len());
+    let mut fields = Vec::with_capacity(output_schema.fields.len());
+
+    for field in &output_schema.fields {
+        let input = batch
+            .column_by_name(&field.name)
+            .ok_or_else(|| {
+                Error::internal(format!(
+                    "blob v2 binary scan batch missing projected column '{}'",
+                    field.name
+                ))
+            })?
+            .clone();
+        let materialized =
+            materialize_blob_v2_binary_array(dataset, field, input, row_addrs.clone()).await?;
+        columns.push(materialized);
+        let output_field = public_blob_v2_binary_output_field(field.clone());
+        fields.push(ArrowField::from(&output_field));
+    }
+
+    Ok(RecordBatch::try_new(
+        Arc::new(ArrowSchema::new_with_metadata(
+            fields,
+            batch.schema().metadata().clone(),
+        )),
+        columns,
+    )?)
+}
+
+fn materialize_blob_v2_binary_array<'a>(
+    dataset: &'a Arc<Dataset>,
+    field: &'a LanceField,
+    array: ArrayRef,
+    row_addrs: Arc<[u64]>,
+) -> BoxFuture<'a, Result<ArrayRef>> {
+    async move {
+        if is_blob_v2_binary_view(field) {
+            let descriptions = array.as_struct();
+            return materialize_blob_v2_descriptors(
+                dataset,
+                field.id as u32,
+                descriptions,
+                row_addrs.as_ref(),
+            )
+            .await;
+        }
+
+        match field.data_type() {
+            ArrowDataType::Struct(_) => {
+                let struct_array = array.as_struct();
+                let mut children = Vec::with_capacity(field.children.len());
+                for (child_field, child_array) in
+                    field.children.iter().zip(struct_array.columns().iter())
+                {
+                    children.push(
+                        materialize_blob_v2_binary_array(
+                            dataset,
+                            child_field,
+                            child_array.clone(),
+                            row_addrs.clone(),
+                        )
+                        .await?,
+                    );
+                }
+                let public_field = public_blob_v2_binary_output_field(field.clone());
+                let ArrowDataType::Struct(fields) = public_field.data_type() else {
+                    unreachable!("public output field preserved struct type")
+                };
+                Ok(Arc::new(StructArray::try_new(
+                    fields,
+                    children,
+                    struct_array.nulls().cloned(),
+                )?) as ArrayRef)
+            }
+            ArrowDataType::List(_) => {
+                let list_array = array.as_list::<i32>();
+                materialize_blob_v2_list_array::<i32>(dataset, field, list_array, row_addrs).await
+            }
+            ArrowDataType::LargeList(_) => {
+                let list_array = array.as_list::<i64>();
+                materialize_blob_v2_list_array::<i64>(dataset, field, list_array, row_addrs).await
+            }
+            _ => Ok(array),
+        }
+    }
+    .boxed()
+}
+
+async fn materialize_blob_v2_list_array<O: OffsetSizeTrait>(
+    dataset: &Arc<Dataset>,
+    field: &LanceField,
+    list_array: &GenericListArray<O>,
+    row_addrs: Arc<[u64]>,
+) -> Result<ArrayRef> {
+    let offsets = list_array.value_offsets();
+    let values_start = offsets[0].as_usize();
+    let values_end = offsets[list_array.len()].as_usize();
+    if values_end < values_start {
+        return Err(Error::internal(format!(
+            "List field '{}' has invalid offsets while materializing blob v2 binary scan",
+            field.name
+        )));
+    }
+
+    let values_len = values_end - values_start;
+    let mut normalized_offsets = Vec::with_capacity(list_array.len() + 1);
+    normalized_offsets.push(O::usize_as(0));
+    let mut child_row_addrs = Vec::with_capacity(values_len);
+    for row_idx in 0..list_array.len() {
+        let start = offsets[row_idx].as_usize();
+        let end = offsets[row_idx + 1].as_usize();
+        if end < start {
+            return Err(Error::internal(format!(
+                "List field '{}' has decreasing offsets while materializing blob v2 binary scan",
+                field.name
+            )));
+        }
+        let row_addr = row_addrs.get(row_idx).copied().ok_or_else(|| {
+            Error::internal(format!(
+                "List field '{}' row address count {} did not match row count {}",
+                field.name,
+                row_addrs.len(),
+                list_array.len()
+            ))
+        })?;
+        for _ in start..end {
+            child_row_addrs.push(row_addr);
+        }
+        normalized_offsets.push(O::usize_as(end - values_start));
+    }
+    let child_row_addrs: Arc<[u64]> = child_row_addrs.into();
+    let child = field.children.first().ok_or_else(|| {
+        Error::internal(format!(
+            "List field '{}' missing child while materializing blob v2 binary scan",
+            field.name
+        ))
+    })?;
+    let values = list_array.values().slice(values_start, values_len);
+    let values = materialize_blob_v2_binary_array(dataset, child, values, child_row_addrs).await?;
+    let child_field = public_blob_v2_binary_output_field(child.clone());
+    let list_array = GenericListArray::<O>::try_new(
+        Arc::new(ArrowField::from(&child_field)),
+        OffsetBuffer::new(ScalarBuffer::from(normalized_offsets)),
+        values,
+        list_array.nulls().cloned(),
+    )?;
+    Ok(Arc::new(list_array))
+}
+
+async fn materialize_blob_v2_descriptors(
+    dataset: &Arc<Dataset>,
+    blob_field_id: u32,
+    descriptions: &StructArray,
+    row_addrs: &[u64],
+) -> Result<ArrayRef> {
+    if descriptions.len() != row_addrs.len() {
+        return Err(Error::internal(format!(
+            "blob v2 descriptor count {} did not match row address count {}",
+            descriptions.len(),
+            row_addrs.len()
+        )));
+    }
+    match blob_version_from_descriptions(descriptions)? {
+        BlobVersion::V1 => {
+            return Err(Error::not_supported(
+                "Blob v2 binary materialization received a legacy blob descriptor".to_string(),
+            ));
+        }
+        BlobVersion::V2 => {}
+    }
+
+    let columns = BlobV2DescriptorColumns::new(descriptions);
+    let mut read_context = BlobV2ReadContext::new(dataset, blob_field_id);
+    let mut entries = Vec::with_capacity(descriptions.len());
+    let mut payloads = vec![None; descriptions.len()];
+
+    for (idx, row_addr) in row_addrs.iter().copied().enumerate() {
+        if descriptions.is_null(idx) || columns.kinds.is_null(idx) {
+            continue;
+        }
+
+        let kind = BlobKind::try_from(columns.kinds.value(idx))?;
+        if matches!(kind, BlobKind::Inline)
+            && columns.positions.value(idx) == 0
+            && columns.sizes.value(idx) == 0
+        {
+            payloads[idx] = Some(Bytes::new());
+            continue;
+        }
+
+        let entry = read_context
+            .collect_entry(&columns, idx, idx, row_addr)
+            .await?
+            .ok_or_else(|| {
+                Error::internal(format!(
+                    "blob v2 descriptor at index {idx} unexpectedly resolved to null"
+                ))
+            })?;
+        entries.push(entry);
+    }
+
+    let blobs = execute_blob_entries(entries, dataset.object_store.io_parallelism(), None).await?;
+    for blob in blobs {
+        let payload = payloads.get_mut(blob.selection_index).ok_or_else(|| {
+            Error::internal(format!(
+                "blob result selection index {} exceeded descriptor count {}",
+                blob.selection_index,
+                descriptions.len()
+            ))
+        })?;
+        if payload.replace(blob.data).is_some() {
+            return Err(Error::internal(format!(
+                "blob result selection index {} was produced more than once",
+                blob.selection_index
+            )));
+        }
+    }
+
+    let payload_capacity = payloads.iter().flatten().map(Bytes::len).sum::<usize>();
+    let mut builder = LargeBinaryBuilder::with_capacity(descriptions.len(), payload_capacity);
+    for (idx, payload) in payloads.into_iter().enumerate() {
+        if descriptions.is_null(idx) || columns.kinds.is_null(idx) {
+            builder.append_null();
+        } else {
+            let payload = payload.ok_or_else(|| {
+                Error::internal(format!(
+                    "blob v2 descriptor at index {idx} did not produce a payload"
+                ))
+            })?;
+            builder.append_value(payload);
+        }
+    }
+
+    Ok(Arc::new(builder.finish()))
+}
+
+struct BlobV2ReadContext<'a> {
+    dataset: &'a Arc<Dataset>,
+    blob_field_id: u32,
+    fragment_cache: HashMap<u32, BlobReadLocation>,
+    store_cache: HashMap<u32, Arc<ObjectStore>>,
+    external_base_path_cache: HashMap<u32, Path>,
+    source_cache: HashMap<BlobSourceKey, Arc<BlobSource>>,
+}
+
+impl<'a> BlobV2ReadContext<'a> {
+    fn new(dataset: &'a Arc<Dataset>, blob_field_id: u32) -> Self {
+        Self {
+            dataset,
+            blob_field_id,
+            fragment_cache: HashMap::new(),
+            store_cache: HashMap::new(),
+            external_base_path_cache: HashMap::new(),
+            source_cache: HashMap::new(),
+        }
+    }
+
+    async fn collect_entry(
+        &mut self,
+        columns: &BlobV2DescriptorColumns<'_>,
+        idx: usize,
+        selection_index: usize,
+        row_addr: u64,
+    ) -> Result<Option<BlobEntry>> {
+        if columns.is_null_blob(idx)? {
+            return Ok(None);
+        }
+
+        let kind = BlobKind::try_from(columns.kinds.value(idx))?;
+        let entry = match kind {
+            BlobKind::Inline => {
+                self.collect_inline(columns, idx, selection_index, row_addr)
+                    .await?
+            }
+            BlobKind::Dedicated => {
+                self.collect_dedicated(columns, idx, selection_index, row_addr)
+                    .await?
+            }
+            BlobKind::Packed => {
+                self.collect_packed(columns, idx, selection_index, row_addr)
+                    .await?
+            }
+            BlobKind::External => {
+                self.collect_external(columns, idx, selection_index, row_addr)
+                    .await?
+            }
+        };
+
+        Ok(Some(entry))
+    }
+
+    async fn blob_read_location(&mut self, row_addr: u64) -> Result<BlobReadLocation> {
+        resolve_blob_read_location(
+            self.dataset,
+            self.blob_field_id,
+            row_addr,
+            &mut self.fragment_cache,
+            &mut self.store_cache,
+        )
+        .await
+    }
+
+    async fn collect_inline(
+        &mut self,
+        columns: &BlobV2DescriptorColumns<'_>,
+        idx: usize,
+        selection_index: usize,
+        row_addr: u64,
+    ) -> Result<BlobEntry> {
+        let position = columns.positions.value(idx);
+        let size = columns.sizes.value(idx);
+        let location = self.blob_read_location(row_addr).await?;
+        let source = shared_blob_source(
+            &mut self.source_cache,
+            location.object_store,
+            &location.data_file_path,
+        );
+        Ok(BlobEntry {
+            selection_index,
+            row_address: row_addr,
+            file: BlobFile::with_source(source, position, size, BlobKind::Inline, None),
+        })
+    }
+
+    async fn collect_dedicated(
+        &mut self,
+        columns: &BlobV2DescriptorColumns<'_>,
+        idx: usize,
+        selection_index: usize,
+        row_addr: u64,
+    ) -> Result<BlobEntry> {
+        let blob_id = columns.blob_ids.value(idx);
+        let size = columns.sizes.value(idx);
+        let location = self.blob_read_location(row_addr).await?;
+        let path = blob_path(&location.data_file_dir, &location.data_file_key, blob_id);
+        let source = shared_blob_source(&mut self.source_cache, location.object_store, &path);
+        Ok(BlobEntry {
+            selection_index,
+            row_address: row_addr,
+            file: BlobFile::with_source(source, 0, size, BlobKind::Dedicated, None),
+        })
+    }
+
+    async fn collect_packed(
+        &mut self,
+        columns: &BlobV2DescriptorColumns<'_>,
+        idx: usize,
+        selection_index: usize,
+        row_addr: u64,
+    ) -> Result<BlobEntry> {
+        let blob_id = columns.blob_ids.value(idx);
+        let size = columns.sizes.value(idx);
+        let position = columns.positions.value(idx);
+        let location = self.blob_read_location(row_addr).await?;
+        let path = blob_path(&location.data_file_dir, &location.data_file_key, blob_id);
+        let source = shared_blob_source(&mut self.source_cache, location.object_store, &path);
+        Ok(BlobEntry {
+            selection_index,
+            row_address: row_addr,
+            file: BlobFile::with_source(source, position, size, BlobKind::Packed, None),
+        })
+    }
+
+    async fn collect_external(
+        &mut self,
+        columns: &BlobV2DescriptorColumns<'_>,
+        idx: usize,
+        selection_index: usize,
+        row_addr: u64,
+    ) -> Result<BlobEntry> {
+        let uri_or_path = columns.blob_uris.value(idx).to_string();
+        let position = columns.positions.value(idx);
+        let size = columns.sizes.value(idx);
+        let base_id = columns.blob_ids.value(idx);
+        let (object_store, path) = if base_id == 0 {
+            let registry = self.dataset.session.store_registry();
+            let params = self
+                .dataset
+                .store_params
+                .as_ref()
+                .map(|p| Arc::new((**p).clone()))
+                .unwrap_or_else(|| Arc::new(ObjectStoreParams::default()));
+            ObjectStore::from_uri_and_params(registry, &uri_or_path, &params).await?
+        } else {
+            let object_store = if let Some(store) = self.store_cache.get(&base_id) {
+                store.clone()
+            } else {
+                let store = self.dataset.object_store(Some(base_id)).await?;
+                self.store_cache.insert(base_id, store.clone());
+                store
+            };
+            let base_root = if let Some(path) = self.external_base_path_cache.get(&base_id) {
+                path.clone()
+            } else {
+                let base = self
+                    .dataset
+                    .manifest
+                    .base_paths
+                    .get(&base_id)
+                    .ok_or_else(|| {
+                        Error::invalid_input(format!(
+                            "External blob references unknown base_id {}",
+                            base_id
+                        ))
+                    })?;
+                let path = base.extract_path(self.dataset.session.store_registry())?;
+                self.external_base_path_cache.insert(base_id, path.clone());
+                path
+            };
+            let path = join_base_and_relative_path(&base_root, &uri_or_path)?;
+            (object_store, path)
+        };
+        let size = if size > 0 {
+            size
+        } else {
+            object_store.size(&path).await?
+        };
+        let source = shared_blob_source(&mut self.source_cache, object_store, &path);
+        Ok(BlobEntry {
+            selection_index,
+            row_address: row_addr,
+            file: BlobFile::with_source(
+                source,
+                position,
+                size,
+                BlobKind::External,
+                Some(uri_or_path),
+            ),
+        })
+    }
 }
 
 fn normalize_external_absolute_uri(uri: &str) -> Result<String> {
@@ -2273,7 +2887,7 @@ mod tests {
     use async_trait::async_trait;
     use bytes::Bytes;
     use chrono::Utc;
-    use futures::{StreamExt, TryStreamExt, future::try_join_all};
+    use futures::{StreamExt, TryStreamExt};
     use lance_arrow::{
         ARROW_EXT_NAME_KEY, BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY,
         BLOB_INLINE_SIZE_THRESHOLD_META_KEY, BLOB_META_KEY, BLOB_PACK_FILE_SIZE_THRESHOLD_META_KEY,
@@ -2297,7 +2911,7 @@ mod tests {
     use url::Url;
 
     use lance_core::{
-        Error, Result,
+        Error, ROW_ADDR, ROW_CREATED_AT_VERSION, ROW_ID, ROW_LAST_UPDATED_AT_VERSION, Result,
         utils::tempfile::{TempDir, TempStrDir},
     };
     use lance_datagen::{BatchCount, RowCount, array};
@@ -2309,7 +2923,7 @@ mod tests {
 
     use super::{
         BlobEntry, BlobFile, BlobSource, ExternalBaseCandidate, ExternalBaseResolver,
-        ReadBlobsExecution, collect_blob_entries_v1, data_file_key_from_path,
+        ReadBlobsExecution, collect_blob_entries_v1, data_file_key_from_path, execute_blob_entries,
         execute_blob_read_plan, plan_blob_read_plans,
     };
     use crate::{
@@ -2317,6 +2931,7 @@ mod tests {
         blob::{BlobArrayBuilder, BlobDescriptorArrayBuilder, PackedBlobWriter, blob_field},
         dataset::{
             CommitBuilder, ExternalBlobMode, WriteMode, WriteParams,
+            scanner::MaterializationStyle,
             transaction::{DataReplacementGroup, Operation, Transaction},
         },
         utils::test::TestDatasetGenerator,
@@ -3833,6 +4448,276 @@ mod tests {
             .await
             .unwrap();
         assert!(null_blobs.is_empty());
+
+        let filtered = dataset
+            .scan()
+            .project(&["info"])
+            .unwrap()
+            .filter("info.blob IS NOT NULL")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(filtered.num_rows(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_write_and_scan_list_blob_v2_descriptions() {
+        let test_dir = TempStrDir::default();
+        let packed_payload = vec![0x4B; super::INLINE_MAX + 1024];
+
+        let mut blob_builder = BlobArrayBuilder::new(4);
+        blob_builder.push_bytes(b"hello").unwrap();
+        blob_builder.push_null().unwrap();
+        blob_builder.push_bytes(&packed_payload).unwrap();
+        blob_builder.push_bytes(b"tail").unwrap();
+        let blob_values = blob_builder.finish().unwrap();
+
+        let item_field = Arc::new(blob_field("item", true));
+        let list_array: ArrayRef = Arc::new(
+            arrow_array::ListArray::try_new(
+                item_field.clone(),
+                arrow_buffer::OffsetBuffer::new(arrow_buffer::ScalarBuffer::from(vec![
+                    0i32, 3, 3, 3, 4,
+                ])),
+                blob_values,
+                Some(arrow_buffer::NullBuffer::from(vec![
+                    true, true, false, true,
+                ])),
+            )
+            .unwrap(),
+        );
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("blobs", DataType::List(item_field), true),
+            Field::new("id", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![list_array, Arc::new(Int32Array::from(vec![0, 1, 2, 3]))],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+
+        let dataset = Arc::new(
+            Dataset::write(
+                reader,
+                &test_dir,
+                Some(WriteParams {
+                    data_storage_version: Some(LanceFileVersion::V2_2),
+                    enable_stable_row_ids: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+
+        let descriptions = dataset
+            .scan()
+            .project(&["blobs"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let lists = descriptions.column(0).as_list::<i32>();
+        assert_eq!(lists.offsets().inner().as_ref(), &[0, 3, 3, 3, 4]);
+        assert!(lists.is_valid(0));
+        assert!(lists.is_valid(1));
+        assert!(lists.is_null(2));
+        assert!(lists.is_valid(3));
+
+        let DataType::List(descriptor_field) = lists.data_type() else {
+            panic!("unexpected list type: {}", lists.data_type());
+        };
+        assert!(matches!(descriptor_field.data_type(), DataType::Struct(_)));
+        assert!(!descriptor_field.metadata().contains_key(ARROW_EXT_NAME_KEY));
+        let descriptors = lists.values().as_struct();
+        assert_eq!(descriptors.fields().len(), 5);
+        assert_eq!(descriptors.fields()[0].name(), "kind");
+        assert!(descriptors.is_valid(0));
+        assert!(descriptors.is_null(1));
+        assert!(descriptors.is_valid(2));
+        assert!(descriptors.is_valid(3));
+        let kinds = descriptors
+            .column_by_name("kind")
+            .unwrap()
+            .as_primitive::<UInt8Type>();
+        assert_eq!(kinds.value(0), BlobKind::Inline as u8);
+        assert_eq!(kinds.value(2), BlobKind::Packed as u8);
+        assert_eq!(kinds.value(3), BlobKind::Inline as u8);
+
+        let filtered = dataset
+            .scan()
+            .project(&["blobs"])
+            .unwrap()
+            .filter("blobs IS NOT NULL")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(filtered.num_rows(), 3);
+
+        let mut scanner = dataset.scan();
+        scanner.blob_handling(BlobHandling::AllBinary);
+        let bytes = scanner
+            .project(&["blobs"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let lists = bytes.column(0).as_list::<i32>();
+        assert_eq!(lists.offsets().inner().as_ref(), &[0, 3, 3, 3, 4]);
+        assert!(lists.is_valid(0));
+        assert!(lists.is_valid(1));
+        assert!(lists.is_null(2));
+        assert!(lists.is_valid(3));
+        let DataType::List(value_field) = lists.data_type() else {
+            panic!("unexpected list type: {}", lists.data_type());
+        };
+        assert_eq!(value_field.data_type(), &DataType::LargeBinary);
+        assert!(!value_field.metadata().contains_key(ARROW_EXT_NAME_KEY));
+        let values = lists.values().as_binary::<i64>();
+        assert_eq!(values.value(0), b"hello");
+        assert!(values.is_null(1));
+        assert_eq!(values.value(2), packed_payload.as_slice());
+        assert_eq!(values.value(3), b"tail");
+
+        for (filter, materialization_style) in [
+            (None, MaterializationStyle::Heuristic),
+            (Some("id >= 2"), MaterializationStyle::Heuristic),
+            (Some("id >= 2"), MaterializationStyle::AllEarly),
+        ] {
+            let mut scanner = dataset.scan();
+            scanner.blob_handling(BlobHandling::AllBinary);
+            scanner.materialization_style(materialization_style);
+            scanner
+                .project(&["blobs", ROW_LAST_UPDATED_AT_VERSION, ROW_CREATED_AT_VERSION])
+                .unwrap()
+                .with_row_id()
+                .with_row_address();
+            if let Some(filter) = filter {
+                scanner.filter(filter).unwrap();
+            }
+
+            let expected_schema = scanner.schema().await.unwrap();
+            let batch = scanner.try_into_batch().await.unwrap();
+            assert_eq!(batch.schema().as_ref(), expected_schema.as_ref());
+            assert_eq!(batch.num_rows(), if filter.is_some() { 2 } else { 4 });
+            for column in [
+                ROW_ID,
+                ROW_ADDR,
+                ROW_LAST_UPDATED_AT_VERSION,
+                ROW_CREATED_AT_VERSION,
+            ] {
+                assert!(
+                    batch.column_by_name(column).is_some(),
+                    "requested system column {column} was missing"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_write_and_scan_struct_nested_list_blob_v2() {
+        let test_dir = TempStrDir::default();
+
+        let mut blob_builder = BlobArrayBuilder::new(2);
+        blob_builder.push_bytes(b"nested").unwrap();
+        blob_builder.push_null().unwrap();
+        let blob_values = blob_builder.finish().unwrap();
+
+        let item_field = Arc::new(blob_field("item", true));
+        let list_field = Field::new("blobs", DataType::List(item_field.clone()), true);
+        let list_array: ArrayRef = Arc::new(
+            arrow_array::ListArray::try_new(
+                item_field,
+                arrow_buffer::OffsetBuffer::new(arrow_buffer::ScalarBuffer::from(vec![0i32, 2, 2])),
+                blob_values,
+                None,
+            )
+            .unwrap(),
+        );
+        let info_fields = vec![Field::new("name", DataType::Utf8, false), list_field];
+        let info_array: ArrayRef = Arc::new(
+            StructArray::try_new(
+                info_fields.clone().into(),
+                vec![
+                    Arc::new(StringArray::from(vec!["row-0", "row-1"])) as ArrayRef,
+                    list_array,
+                ],
+                None,
+            )
+            .unwrap(),
+        );
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "info",
+            DataType::Struct(info_fields.into()),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![info_array]).unwrap();
+        let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+
+        let dataset = Arc::new(
+            Dataset::write(
+                reader,
+                &test_dir,
+                Some(WriteParams {
+                    data_storage_version: Some(LanceFileVersion::V2_2),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+
+        let descriptions = dataset
+            .scan()
+            .project(&["info"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let info = descriptions.column(0).as_struct();
+        assert_eq!(
+            info.column_by_name("name")
+                .unwrap()
+                .as_string::<i32>()
+                .value(0),
+            "row-0"
+        );
+        let lists = info.column_by_name("blobs").unwrap().as_list::<i32>();
+        assert_eq!(lists.offsets().inner().as_ref(), &[0, 2, 2]);
+        let DataType::List(descriptor_field) = lists.data_type() else {
+            panic!("unexpected nested list type: {}", lists.data_type());
+        };
+        assert!(matches!(descriptor_field.data_type(), DataType::Struct(_)));
+        assert!(!descriptor_field.metadata().contains_key(ARROW_EXT_NAME_KEY));
+        let descriptors = lists.values().as_struct();
+        assert_eq!(descriptors.fields().len(), 5);
+        assert!(descriptors.is_valid(0));
+        assert!(descriptors.is_null(1));
+
+        let mut scanner = dataset.scan();
+        scanner.blob_handling(BlobHandling::AllBinary);
+        let bytes = scanner
+            .project(&["info"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let info = bytes.column(0).as_struct();
+        let lists = info.column_by_name("blobs").unwrap().as_list::<i32>();
+        assert_eq!(lists.offsets().inner().as_ref(), &[0, 2, 2]);
+        let DataType::List(value_field) = lists.data_type() else {
+            panic!("unexpected nested list type: {}", lists.data_type());
+        };
+        assert_eq!(value_field.data_type(), &DataType::LargeBinary);
+        assert!(!value_field.metadata().contains_key(ARROW_EXT_NAME_KEY));
+        let values = lists.values().as_binary::<i64>();
+        assert_eq!(values.value(0), b"nested");
+        assert!(values.is_null(1));
     }
 
     #[tokio::test]
@@ -3943,7 +4828,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_blobs_plan_preserves_order_and_coalesces() {
+    async fn test_execute_blob_entries_preserves_order_and_coalesces() {
         let (store, inner) = recording_range_store(Bytes::from_static(b"abcdefghij"));
         let source = Arc::new(BlobSource::new(store, Path::from("blobs/test.bin")));
         let entries = vec![
@@ -3958,15 +4843,7 @@ mod tests {
                 file: BlobFile::with_source(source, 1, 3, BlobKind::Packed, None),
             },
         ];
-        let execution = Arc::new(ReadBlobsExecution::new(None));
-        let blobs = try_join_all(
-            plan_blob_read_plans(entries)
-                .into_iter()
-                .map(|plan| execute_blob_read_plan(plan, execution.clone())),
-        )
-        .await
-        .unwrap();
-        let mut blobs = blobs.into_iter().flatten().collect::<Vec<_>>();
+        let mut blobs = execute_blob_entries(entries, 2, None).await.unwrap();
         blobs.sort_by_key(|blob| blob.selection_index);
 
         assert_eq!(blobs.len(), 2);

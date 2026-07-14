@@ -1957,6 +1957,7 @@ mod test {
                     Ok(Some(Fragment {
                         files: vec![],
                         id: 0,
+                        overlays: vec![],
                         deletion_file: None,
                         row_id_meta: None,
                         physical_rows: Some(50),

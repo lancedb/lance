@@ -60,7 +60,7 @@ use roaring::RoaringBitmap;
 use rowids::get_row_id_index;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Debug;
 use std::num::NonZero;
 use std::ops::Range;
@@ -1716,26 +1716,7 @@ impl Dataset {
                     ));
                 }
 
-                let selected_fragment_ids = fragment_ids.iter().copied().collect::<BTreeSet<_>>();
-                let selected_fragments = self
-                    .get_fragments()
-                    .into_iter()
-                    .filter(|fragment| selected_fragment_ids.contains(&(fragment.id() as u32)))
-                    .collect::<Vec<_>>();
-
-                if selected_fragments.len() != selected_fragment_ids.len() {
-                    let present_fragment_ids = selected_fragments
-                        .iter()
-                        .map(|fragment| fragment.id() as u32)
-                        .collect::<HashSet<_>>();
-                    let missing_fragment_ids = selected_fragment_ids
-                        .into_iter()
-                        .filter(|fragment_id| !present_fragment_ids.contains(fragment_id))
-                        .collect::<Vec<_>>();
-                    return Err(Error::invalid_input(format!(
-                        "Dataset::sample received fragment ids that are not part of the current dataset version: {missing_fragment_ids:?}",
-                    )));
-                }
+                let selected_fragments = self.get_fragments_from_ids(fragment_ids)?;
 
                 let num_rows = stream::iter(selected_fragments.iter().cloned())
                     .map(|fragment| async move { fragment.count_rows(None).await })
@@ -2545,37 +2526,108 @@ impl Dataset {
         &self.manifest.fragments
     }
 
-    // Gets a filtered list of fragments from ids in O(N) time instead of using
-    // `get_fragment` which would require O(N^2) time.
-    pub fn get_frags_from_ordered_ids(&self, ordered_ids: &[u32]) -> Vec<Option<FileFragment>> {
-        let mut fragments = Vec::with_capacity(ordered_ids.len());
-        let mut id_iter = ordered_ids.iter();
-        let mut id = id_iter.next();
-        // This field is just used to assert the ids are in order
-        let mut last_id: i64 = -1;
-        for frag in self.manifest.fragments.iter() {
-            let mut the_id = if let Some(id) = id { *id } else { break };
-            // Assert the given ids are, in fact, in order
-            assert!(the_id as i64 > last_id);
-            // For any IDs we've passed we can assume that no fragment exists any longer
-            // with that ID.
-            while the_id < frag.id as u32 {
-                fragments.push(None);
-                last_id = the_id as i64;
-                id = id_iter.next();
-                the_id = if let Some(id) = id { *id } else { break };
-            }
+    pub(crate) fn normalize_fragment_ids(fragment_ids: &[u32]) -> Vec<u32> {
+        let mut ids = fragment_ids.to_vec();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
 
-            if the_id == frag.id as u32 {
-                fragments.push(Some(FileFragment::new(
-                    Arc::new(self.clone()),
-                    frag.clone(),
-                )));
-                last_id = the_id as i64;
-                id = id_iter.next();
-            }
+    pub(crate) fn get_fragments_from_ids(&self, fragment_ids: &[u32]) -> Result<Vec<FileFragment>> {
+        let ordered_ids = Self::normalize_fragment_ids(fragment_ids);
+        let fragments = self.get_frags_from_ordered_ids(&ordered_ids);
+        if let Some(missing_id) = fragments
+            .iter()
+            .zip(ordered_ids.iter())
+            .find_map(|(fragment, fragment_id)| fragment.is_none().then_some(*fragment_id))
+        {
+            return Err(Error::invalid_input(format!(
+                "Unknown fragment id {missing_id} in fragment filter; not part of the current dataset version"
+            )));
         }
-        fragments
+
+        Ok(fragments.into_iter().flatten().collect())
+    }
+
+    pub(crate) fn get_existing_fragments_from_ids(
+        &self,
+        fragment_ids: &[u32],
+    ) -> Vec<FileFragment> {
+        let ordered_ids = Self::normalize_fragment_ids(fragment_ids);
+        self.get_frags_from_ordered_ids(&ordered_ids)
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
+    pub(crate) fn get_fragment_metadata_from_ids(
+        &self,
+        fragment_ids: &[u32],
+    ) -> Result<Vec<Fragment>> {
+        Ok(self
+            .get_fragments_from_ids(fragment_ids)?
+            .into_iter()
+            .map(|fragment| fragment.metadata().clone())
+            .collect())
+    }
+
+    pub(crate) fn get_existing_fragment_metadata_from_ids(
+        &self,
+        fragment_ids: &[u32],
+    ) -> Vec<Fragment> {
+        self.get_existing_fragments_from_ids(fragment_ids)
+            .into_iter()
+            .map(|fragment| fragment.metadata().clone())
+            .collect()
+    }
+
+    pub(crate) async fn count_rows_in_fragments(&self, fragment_ids: &[u32]) -> Result<usize> {
+        let fragments = self.get_fragments_from_ids(fragment_ids)?;
+        self.count_rows_in_resolved_fragments(fragments).await
+    }
+
+    pub(crate) async fn count_rows_in_existing_fragments(
+        &self,
+        fragment_ids: &[u32],
+    ) -> Result<usize> {
+        let fragments = self.get_existing_fragments_from_ids(fragment_ids);
+        self.count_rows_in_resolved_fragments(fragments).await
+    }
+
+    async fn count_rows_in_resolved_fragments(
+        &self,
+        fragments: Vec<FileFragment>,
+    ) -> Result<usize> {
+        let counts = stream::iter(fragments)
+            .map(|fragment| async move { fragment.count_rows(None).await })
+            .buffer_unordered(16)
+            .try_collect::<Vec<_>>()
+            .await?;
+        Ok(counts.iter().sum())
+    }
+
+    /// Resolves fragments for the given ids without scanning the manifest.
+    ///
+    /// The ids do not need to be sorted or deduplicated. Each id is resolved
+    /// independently via the fragment bitmap.
+    pub fn get_frags_from_ordered_ids(&self, ordered_ids: &[u32]) -> Vec<Option<FileFragment>> {
+        let dataset = Arc::new(self.clone());
+        ordered_ids
+            .iter()
+            .map(|id| {
+                if !self.fragment_bitmap.contains(*id) {
+                    return None;
+                }
+                let fragment_index = self.fragment_bitmap.rank(*id) as usize - 1;
+                let fragment = self.manifest.fragments.get(fragment_index)?;
+                debug_assert_eq!(
+                    fragment.id, *id as u64,
+                    "fragment_bitmap rank({id}) resolved to fragment {}, but fragment_bitmap and manifest.fragments are expected to stay in sync",
+                    fragment.id
+                );
+                Some(FileFragment::new(dataset.clone(), fragment.clone()))
+            })
+            .collect()
     }
 
     // This method filters deleted items from `addr_or_ids` using `addrs` as a reference

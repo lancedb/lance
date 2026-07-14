@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use lance_core::{Error, Result};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::{env, path::PathBuf};
 
 #[cfg(feature = "tokenizer-jieba")]
@@ -23,7 +23,8 @@ use crate::scalar::inverted::tokenizer::document_tokenizer::{
     JsonTokenizer, LanceTokenizer, TextTokenizer,
 };
 use crate::scalar::inverted::{
-    InvertedListFormatVersion, default_fts_format_version, resolve_fts_format_version,
+    InvertedListFormatVersion, default_fts_format_version_for_block_size,
+    resolve_fts_format_version, validate_format_version_block_size,
 };
 pub use lance_tokenizer::Language;
 use lance_tokenizer::{
@@ -31,6 +32,16 @@ use lance_tokenizer::{
     SimpleTokenizer, Stemmer, StopWordFilter, TextAnalyzer, TextAnalyzerBuilder,
     WhitespaceTokenizer,
 };
+
+/// Posting block size for indexes whose metadata predates configurable block sizes.
+///
+/// This must remain 128 so that legacy on-disk data is decoded correctly.
+pub const LEGACY_BLOCK_SIZE: usize = 128;
+/// Default posting block size for newly created indexes when none is configured.
+///
+/// This intentionally matches [`LEGACY_BLOCK_SIZE`] today but may evolve independently.
+pub const DEFAULT_BLOCK_SIZE: usize = 128;
+pub const VALID_BLOCK_SIZES: [usize; 2] = [128, 256];
 
 /// Tokenizer configs
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -101,6 +112,17 @@ pub struct InvertedIndexParams {
     #[serde(default)]
     pub(crate) prefix_only: bool,
 
+    /// Number of documents in each compressed posting block.
+    ///
+    /// Missing serialized values come from indexes written before this
+    /// parameter existed and must read as 128 for backwards compatibility. New
+    /// indexes currently default to 128.
+    #[serde(
+        default = "legacy_block_size",
+        deserialize_with = "deserialize_block_size"
+    )]
+    pub(crate) block_size: usize,
+
     /// Total memory limit in MiB for the build stage.
     ///
     /// This is split evenly across FTS workers at build time. By default Lance
@@ -127,7 +149,10 @@ pub struct InvertedIndexParams {
     /// On-disk FTS format version to write when creating a new index.
     ///
     /// This is a build-time only parameter and is not persisted with the index.
-    /// If unset, Lance writes the current default FTS format.
+    /// If unset, Lance writes v2 for `block_size = 128` and v3 for
+    /// `block_size = 256`.
+    /// `format_version = 3` is experimental and is only valid with
+    /// `block_size = 256`.
     #[serde(
         rename = "format_version",
         skip_serializing,
@@ -153,6 +178,7 @@ impl TryFrom<&InvertedIndexParams> for pbold::InvertedIndexDetails {
             min_ngram_length: params.min_ngram_length,
             max_ngram_length: params.max_ngram_length,
             prefix_only: params.prefix_only,
+            block_size: Some(params.block_size as u32),
         })
     }
 }
@@ -180,6 +206,10 @@ impl TryFrom<&pbold::InvertedIndexDetails> for InvertedIndexParams {
             min_ngram_length: details.min_ngram_length,
             max_ngram_length: details.max_ngram_length,
             prefix_only: details.prefix_only,
+            block_size: match details.block_size {
+                Some(block_size) => validate_block_size(block_size as usize)?,
+                None => LEGACY_BLOCK_SIZE,
+            },
             memory_limit_mb: defaults.memory_limit_mb,
             num_workers: defaults.num_workers,
             format_version: defaults.format_version,
@@ -199,6 +229,30 @@ fn default_max_ngram_length() -> u32 {
     3
 }
 
+fn legacy_block_size() -> usize {
+    LEGACY_BLOCK_SIZE
+}
+
+fn invalid_block_size_message(block_size: usize) -> String {
+    format!("FTS inverted index block_size must be one of 128 or 256, got {block_size}")
+}
+
+pub fn validate_block_size(block_size: usize) -> Result<usize> {
+    if VALID_BLOCK_SIZES.contains(&block_size) {
+        Ok(block_size)
+    } else {
+        Err(Error::invalid_input(invalid_block_size_message(block_size)))
+    }
+}
+
+fn deserialize_block_size<'de, D>(deserializer: D) -> std::result::Result<usize, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let block_size = usize::deserialize(deserializer)?;
+    validate_block_size(block_size).map_err(serde::de::Error::custom)
+}
+
 fn deserialize_format_version<'de, D>(
     deserializer: D,
 ) -> std::result::Result<Option<InvertedListFormatVersion>, D::Error>
@@ -215,17 +269,17 @@ where
             .map(Some)
             .map_err(serde::de::Error::custom),
         serde_json::Value::Number(value) => {
-            let Some(value) = value.as_u64() else {
-                return Err(serde::de::Error::custom(
-                    "FTS format_version must be 1 or 2",
-                ));
+            let Some(format_version) = value.as_u64() else {
+                return Err(serde::de::Error::custom(format!(
+                    "FTS format_version must be 1, 2, or 3, got {value}"
+                )));
             };
-            resolve_fts_format_version(Some(&value.to_string()))
+            resolve_fts_format_version(Some(&format_version.to_string()))
                 .map(Some)
                 .map_err(serde::de::Error::custom)
         }
         other => Err(serde::de::Error::custom(format!(
-            "FTS format_version must be 1 or 2, got {other}"
+            "FTS format_version must be 1, 2, or 3, got {other}"
         ))),
     }
 }
@@ -267,6 +321,7 @@ impl InvertedIndexParams {
             min_ngram_length: default_min_ngram_length(),
             max_ngram_length: default_max_ngram_length(),
             prefix_only: false,
+            block_size: DEFAULT_BLOCK_SIZE,
             memory_limit_mb: None,
             num_workers: None,
             format_version: None,
@@ -358,6 +413,25 @@ impl InvertedIndexParams {
         self
     }
 
+    /// Set the compressed posting block size.
+    ///
+    /// Supported values are 128 and 256. Larger values reduce block-max metadata
+    /// and WAND skip granularity; smaller values preserve the legacy layout.
+    ///
+    /// `block_size = 256` is experimental and may introduce breaking changes.
+    /// Use `128` when stable compatibility with the legacy posting layout is required.
+    pub fn block_size(mut self, block_size: usize) -> Result<Self> {
+        self.block_size = validate_block_size(block_size)?;
+        Ok(self)
+    }
+
+    /// Get the compressed posting block size.
+    ///
+    /// `256` is experimental and may introduce breaking changes.
+    pub fn posting_block_size(&self) -> usize {
+        self.block_size
+    }
+
     pub fn memory_limit_mb(mut self, memory_limit_mb: u64) -> Self {
         self.memory_limit_mb = Some(memory_limit_mb);
         self
@@ -374,17 +448,29 @@ impl InvertedIndexParams {
 
     /// Set the on-disk FTS format version to use when creating a new index.
     ///
-    /// If unset, Lance writes the current default FTS format. Existing indexes
-    /// keep their own on-disk format during update and optimize operations.
+    /// If unset, Lance writes v2 for `block_size = 128` and v3 for
+    /// `block_size = 256`. Existing indexes keep their own on-disk format
+    /// during update and optimize operations.
+    /// `format_version = 3` is experimental and is only valid with
+    /// `block_size = 256`.
     pub fn format_version(mut self, format_version: InvertedListFormatVersion) -> Self {
         self.format_version = Some(format_version);
         self
     }
 
-    /// Resolve the requested FTS format version, falling back to Lance's default.
+    /// Resolve the requested FTS format version, falling back to the default for
+    /// the configured block size.
     pub fn resolved_format_version(&self) -> InvertedListFormatVersion {
-        self.format_version
-            .unwrap_or_else(default_fts_format_version)
+        self.format_version.unwrap_or_else(|| {
+            default_fts_format_version_for_block_size(self.block_size)
+                .expect("InvertedIndexParams block_size must be validated before use")
+        })
+    }
+
+    /// Validate that the requested FTS format version can safely encode the
+    /// configured posting block size.
+    pub fn validate_format_version(&self) -> Result<()> {
+        validate_format_version_block_size(self.resolved_format_version(), self.block_size)
     }
 
     /// Serialize params for the build/training path, including build-only fields.
@@ -412,6 +498,25 @@ impl InvertedIndexParams {
             );
         }
         Ok(value)
+    }
+
+    /// Deserialize params for new index training, using current creation defaults
+    /// for omitted fields.
+    pub(crate) fn from_training_json(params: &str) -> Result<Self> {
+        let supplied = serde_json::from_str::<serde_json::Value>(params)?;
+        let mut value = serde_json::to_value(Self::default())?;
+
+        let supplied = supplied.as_object().ok_or_else(|| {
+            Error::invalid_input("FTS inverted index params must be a JSON object".to_string())
+        })?;
+        let object = value
+            .as_object_mut()
+            .expect("inverted index params should serialize to a JSON object");
+        object.extend(supplied.clone());
+
+        let params: Self = serde_json::from_value(value)?;
+        params.validate_format_version()?;
+        Ok(params)
     }
 
     pub fn build(&self) -> Result<Box<dyn LanceTokenizer>> {
@@ -519,8 +624,10 @@ pub fn language_model_home() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use crate::pbold;
+
     use super::{InvertedIndexParams, InvertedListFormatVersion};
-    use lance_tokenizer::TokenStream;
+    use lance_tokenizer::{Language, TokenStream};
     use rstest::rstest;
 
     #[test]
@@ -586,6 +693,130 @@ mod tests {
             InvertedIndexParams::default().resolved_format_version(),
             InvertedListFormatVersion::V2
         );
+    }
+
+    #[test]
+    fn test_block_size_256_defaults_to_v3() {
+        assert_eq!(
+            InvertedIndexParams::default()
+                .block_size(256)
+                .unwrap()
+                .resolved_format_version(),
+            InvertedListFormatVersion::V3
+        );
+    }
+
+    #[test]
+    fn test_format_version_must_match_block_size() {
+        InvertedIndexParams::default()
+            .format_version(InvertedListFormatVersion::V2)
+            .validate_format_version()
+            .unwrap();
+        InvertedIndexParams::default()
+            .block_size(256)
+            .unwrap()
+            .validate_format_version()
+            .unwrap();
+
+        let err = InvertedIndexParams::default()
+            .block_size(256)
+            .unwrap()
+            .format_version(InvertedListFormatVersion::V2)
+            .validate_format_version()
+            .unwrap_err();
+        assert!(err.to_string().contains("block_size=256"));
+
+        let err = InvertedIndexParams::default()
+            .format_version(InvertedListFormatVersion::V3)
+            .validate_format_version()
+            .unwrap_err();
+        assert!(err.to_string().contains("format_version=3"));
+    }
+
+    #[test]
+    fn test_training_json_rejects_incompatible_format_version_and_block_size() {
+        let err =
+            InvertedIndexParams::from_training_json(r#"{"block_size": 256, "format_version": 2}"#)
+                .unwrap_err();
+        assert!(err.to_string().contains("block_size=256"));
+    }
+
+    #[test]
+    fn test_training_json_invalid_numeric_format_version_includes_value() {
+        let err = InvertedIndexParams::from_training_json(r#"{"format_version": -1}"#).unwrap_err();
+        assert!(matches!(&err, lance_core::Error::Arrow { .. }));
+        assert!(err.to_string().contains("got -1"));
+    }
+
+    #[test]
+    fn test_block_size_default_serializes() {
+        let params = InvertedIndexParams::default();
+        assert_eq!(params.block_size, 128);
+        let json = serde_json::to_value(&params).unwrap();
+        assert_eq!(json.get("block_size"), Some(&serde_json::Value::from(128)));
+    }
+
+    #[test]
+    fn test_block_size_missing_metadata_falls_back_to_128() {
+        let mut json = serde_json::to_value(InvertedIndexParams::default()).unwrap();
+        json.as_object_mut().unwrap().remove("block_size");
+
+        let params: InvertedIndexParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.block_size, 128);
+    }
+
+    #[test]
+    fn test_block_size_details_conversion() {
+        let params = InvertedIndexParams::default().block_size(256).unwrap();
+        let details = pbold::InvertedIndexDetails::try_from(&params).unwrap();
+        assert_eq!(details.block_size, Some(256));
+
+        let old_details = pbold::InvertedIndexDetails {
+            base_tokenizer: Some("simple".to_string()),
+            language: serde_json::to_string(&Language::English).unwrap(),
+            with_position: false,
+            max_token_length: Some(40),
+            lower_case: true,
+            stem: true,
+            remove_stop_words: true,
+            ascii_folding: true,
+            min_ngram_length: 3,
+            max_ngram_length: 3,
+            prefix_only: false,
+            block_size: None,
+        };
+        let params = InvertedIndexParams::try_from(&old_details).unwrap();
+        assert_eq!(params.block_size, 128);
+    }
+
+    #[rstest]
+    #[case::block_size_128(128)]
+    #[case::block_size_256(256)]
+    fn test_block_size_accepts_supported_values(#[case] block_size: usize) {
+        let params = InvertedIndexParams::default()
+            .block_size(block_size)
+            .unwrap();
+        assert_eq!(params.block_size, block_size);
+
+        let roundtrip: InvertedIndexParams =
+            serde_json::from_value(serde_json::to_value(&params).unwrap()).unwrap();
+        assert_eq!(roundtrip.block_size, block_size);
+    }
+
+    #[test]
+    fn test_block_size_rejects_invalid_values() {
+        let err = InvertedIndexParams::default().block_size(129).unwrap_err();
+        assert!(err.to_string().contains("block_size"));
+
+        let err = InvertedIndexParams::default().block_size(512).unwrap_err();
+        assert!(err.to_string().contains("128 or 256"));
+
+        let mut json = serde_json::to_value(InvertedIndexParams::default()).unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .insert("block_size".to_string(), serde_json::Value::from(1024));
+        let err = serde_json::from_value::<InvertedIndexParams>(json).unwrap_err();
+        assert!(err.to_string().contains("128 or 256"));
     }
 
     #[test]
