@@ -1247,6 +1247,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_get_frags_from_ordered_ids_accepts_unsorted_duplicates() {
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+        let dataset = write_vector_fragment_dataset(&dataset_uri).await;
+
+        let fragments = dataset.get_fragments();
+        assert!(fragments.len() >= 2);
+        let first = fragments[0].id() as u32;
+        let second = fragments[1].id() as u32;
+
+        let resolved = dataset.get_frags_from_ordered_ids(&[second, first, second, u32::MAX]);
+
+        assert_eq!(resolved.len(), 4);
+        assert_eq!(resolved[0].as_ref().unwrap().id() as u32, second);
+        assert_eq!(resolved[1].as_ref().unwrap().id() as u32, first);
+        assert_eq!(resolved[2].as_ref().unwrap().id() as u32, second);
+        assert!(resolved[3].is_none());
+    }
+
+    #[tokio::test]
     async fn test_execute_uncommitted() {
         // Test the complete workflow that covers the user's specified code pattern:
         // 1. Create dataset with multiple fragments
@@ -1929,6 +1949,58 @@ mod tests {
         assert_eq!(
             segment.fragment_bitmap.as_ref().unwrap(),
             dataset.fragment_bitmap.as_ref()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_vector_precomputed_ivf_num_partitions_mismatch_errors() {
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+        let mut dataset = write_vector_fragment_dataset(&dataset_uri).await;
+
+        let mut ivf_params = prepare_vector_ivf(&dataset, "vector").await;
+        let centroid_count = ivf_params.centroids.as_ref().unwrap().len();
+        ivf_params.num_partitions = Some(centroid_count + 1);
+        let params = VectorIndexParams::with_ivf_flat_params(DistanceType::L2, ivf_params);
+
+        let err = CreateIndexBuilder::new(&mut dataset, &["vector"], IndexType::Vector, &params)
+            .name("vector_idx".to_string())
+            .execute_uncommitted()
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains(&format!(
+                "num_partitions {} does not match precomputed IVF centroids length {}",
+                centroid_count + 1,
+                centroid_count
+            )),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_vector_subset_legacy_ivf_pq_rejects_filtered_build() {
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+        let mut dataset = write_vector_fragment_dataset(&dataset_uri).await;
+
+        let fragments = dataset.get_fragments();
+        assert!(fragments.len() >= 2);
+        let mut params = VectorIndexParams::ivf_pq(2, 8, 1, MetricType::L2, 10);
+        params.version(crate::index::vector::IndexFileVersion::Legacy);
+
+        let err = CreateIndexBuilder::new(&mut dataset, &["vector"], IndexType::Vector, &params)
+            .name("vector_idx".to_string())
+            .fragments(vec![fragments[0].id() as u32])
+            .execute_uncommitted()
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("filtered IVF_PQ builds do not support legacy format"),
+            "unexpected error: {err}"
         );
     }
 

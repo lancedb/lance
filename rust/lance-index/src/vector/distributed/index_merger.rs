@@ -112,6 +112,9 @@ fn fixed_size_list_almost_equal(a: &FixedSizeListArray, b: &FixedSizeListArray, 
                 return false;
             }
             for i in 0..av.len() {
+                if av[i].is_nan() || bv[i].is_nan() {
+                    return false;
+                }
                 if (av[i] - bv[i]).abs() > tol {
                     return false;
                 }
@@ -127,6 +130,9 @@ fn fixed_size_list_almost_equal(a: &FixedSizeListArray, b: &FixedSizeListArray, 
                 return false;
             }
             for i in 0..av.len() {
+                if av[i].is_nan() || bv[i].is_nan() {
+                    return false;
+                }
                 if (av[i] - bv[i]).abs() > tol as f64 {
                     return false;
                 }
@@ -144,6 +150,9 @@ fn fixed_size_list_almost_equal(a: &FixedSizeListArray, b: &FixedSizeListArray, 
             for i in 0..av.len() {
                 let da = av[i].to_f32();
                 let db = bv[i].to_f32();
+                if da.is_nan() || db.is_nan() {
+                    return false;
+                }
                 if (da - db).abs() > tol {
                     return false;
                 }
@@ -185,6 +194,30 @@ fn ivf_centroids_from_proto(ivf: &pb::Ivf) -> Result<Option<FixedSizeListArray>>
         .as_ref()
         .map(FixedSizeListArray::try_from)
         .transpose()
+}
+
+async fn open_sibling_index_reader(
+    object_store: &lance_io::object_store::ObjectStore,
+    sched: &Arc<ScanScheduler>,
+    idx_path: &object_store::path::Path,
+) -> Result<Option<V2Reader>> {
+    if !object_store.exists(idx_path).await? {
+        return Ok(None);
+    }
+
+    let fh = sched
+        .open_file(idx_path, &CachedFileSize::unknown())
+        .await?;
+    Ok(Some(
+        V2Reader::try_open(
+            fh,
+            None,
+            Arc::default(),
+            &lance_core::cache::LanceCache::no_cache(),
+            V2ReaderOptions::default(),
+        )
+        .await?,
+    ))
 }
 
 /// Initialize schema-level metadata on a writer for a given storage.
@@ -808,23 +841,8 @@ pub async fn merge_partial_vector_auxiliary_files(
             .parent()
             .unwrap_or_default()
             .join(crate::INDEX_FILE_NAME);
-        let idx_reader = if object_store.exists(&idx_path).await.unwrap_or(false) {
-            let fh = sched
-                .open_file(&idx_path, &CachedFileSize::unknown())
-                .await?;
-            Some(
-                V2Reader::try_open(
-                    fh,
-                    None,
-                    Arc::default(),
-                    &lance_core::cache::LanceCache::no_cache(),
-                    V2ReaderOptions::default(),
-                )
-                .await?,
-            )
-        } else {
-            None
-        };
+        let mut idx_reader: Option<V2Reader> = None;
+        let mut idx_reader_checked = false;
 
         // Inherit format version from the first shard file
         if format_version.is_none() {
@@ -849,6 +867,10 @@ pub async fn merge_partial_vector_auxiliary_files(
         // Detect index type (first iteration only)
         if detected_index_type.is_none() {
             // Try to derive precise type from sibling partial index.idx metadata if available
+            if !idx_reader_checked {
+                idx_reader = open_sibling_index_reader(object_store, &sched, &idx_path).await?;
+                idx_reader_checked = true;
+            }
             if let Some(idx_reader) = idx_reader.as_ref()
                 && let Some(idx_meta_json) = idx_reader
                     .metadata()
@@ -888,11 +910,15 @@ pub async fn merge_partial_vector_auxiliary_files(
         let nlist = lengths.len();
 
         let mut current_centroids = ivf_centroids_from_proto(&pb_ivf)?;
-        if current_centroids.is_none()
-            && let Some(idx_reader) = idx_reader.as_ref()
-            && let Some(index_ivf) = try_read_ivf_proto(idx_reader).await?
-        {
-            current_centroids = ivf_centroids_from_proto(&index_ivf)?;
+        if current_centroids.is_none() {
+            if !idx_reader_checked {
+                idx_reader = open_sibling_index_reader(object_store, &sched, &idx_path).await?;
+            }
+            if let Some(idx_reader) = idx_reader.as_ref()
+                && let Some(index_ivf) = try_read_ivf_proto(idx_reader).await?
+            {
+                current_centroids = ivf_centroids_from_proto(&index_ivf)?;
+            }
         }
         if nlist_opt.is_none() {
             nlist_opt = Some(nlist);
@@ -975,9 +1001,15 @@ pub async fn merge_partial_vector_auxiliary_files(
                 if let Some(existing_sq) = sq_meta.as_ref()
                     && existing_sq != &sq_meta_parsed
                 {
-                    return Err(Error::index(
-                        "SQ metadata mismatch across shards".to_string(),
-                    ));
+                    return Err(Error::index(format!(
+                        "Distributed SQ merge: metadata mismatch across shards; first(dim={}, nbits={}, bounds={:?}), current(dim={}, nbits={}, bounds={:?})",
+                        existing_sq.dim,
+                        existing_sq.num_bits,
+                        existing_sq.bounds,
+                        sq_meta_parsed.dim,
+                        sq_meta_parsed.num_bits,
+                        sq_meta_parsed.bounds
+                    )));
                 }
 
                 let d0 = sq_meta_parsed.dim;
@@ -1402,9 +1434,15 @@ pub async fn merge_partial_vector_auxiliary_files(
                 if let Some(existing_sq) = sq_meta.as_ref()
                     && existing_sq != &sq_meta_parsed
                 {
-                    return Err(Error::index(
-                        "SQ metadata mismatch across shards".to_string(),
-                    ));
+                    return Err(Error::index(format!(
+                        "Distributed SQ merge (HNSW_SQ): metadata mismatch across shards; first(dim={}, nbits={}, bounds={:?}), current(dim={}, nbits={}, bounds={:?})",
+                        existing_sq.dim,
+                        existing_sq.num_bits,
+                        existing_sq.bounds,
+                        sq_meta_parsed.dim,
+                        sq_meta_parsed.num_bits,
+                        sq_meta_parsed.bounds
+                    )));
                 }
                 let d0 = sq_meta_parsed.dim;
                 dim.get_or_insert(d0);

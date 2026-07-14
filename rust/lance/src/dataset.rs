@@ -2606,18 +2606,15 @@ impl Dataset {
         Ok(counts.iter().sum())
     }
 
-    // Gets a filtered list of fragments from ids without scanning the manifest.
+    /// Resolves fragments for the given ids without scanning the manifest.
+    ///
+    /// The ids do not need to be sorted or deduplicated. Each id is resolved
+    /// independently via the fragment bitmap.
     pub fn get_frags_from_ordered_ids(&self, ordered_ids: &[u32]) -> Vec<Option<FileFragment>> {
         let dataset = Arc::new(self.clone());
-        // This field is just used to assert the ids are in order
-        let mut last_id: i64 = -1;
         ordered_ids
             .iter()
             .map(|id| {
-                // Assert the given ids are, in fact, in order
-                assert!(*id as i64 > last_id);
-                last_id = *id as i64;
-
                 if !self.fragment_bitmap.contains(*id) {
                     return None;
                 }
