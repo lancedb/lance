@@ -393,7 +393,7 @@ impl MemIndexConfig {
 /// Indexes are keyed by index name. Each index stores its field_id for
 /// stable column-to-index resolution (column name → field_id → index).
 ///
-/// The store also carries the MemTable's `max_visible_batch_position`
+/// The store also carries the MemTable's `visible_count`
 /// watermark — the highest batch position that is durable in the WAL and
 /// therefore safe for scanners to read. Scanners snapshot this at plan
 /// construction time so every plan keys on a stable MVCC cursor.
@@ -412,7 +412,16 @@ pub struct IndexStore {
     /// Maximum batch position that is durable in the WAL and therefore
     /// visible to scanners. Advanced unconditionally after a WAL append
     /// succeeds; not gated on whether any indexes are configured.
-    max_visible_batch_position: AtomicUsize,
+    /// How many batches of this memtable have been fully indexed. An exclusive
+    /// count: 0 means none.
+    ///
+    /// This has only ever been an *indexed* cursor — it is advanced at the end of
+    /// `insert_batches`, once every index insert for the batch has completed, and
+    /// never before. It was named `visible_count` and treated as a
+    /// visibility cursor by five read sites, which is how rows became readable
+    /// before they were durable. The derivation from "indexed" to "visible" is a
+    /// separate thing, and it belongs to the writer, not here.
+    indexed_count: AtomicUsize,
     /// Conservative flag set once this memtable has observed any primary-key
     /// rewrite while maintaining a search index. Search planners can push top-k
     /// into HNSW/FTS for append-only PK data, but must switch to
@@ -427,7 +436,7 @@ impl Default for IndexStore {
             hnsw_indexes: HashMap::new(),
             fts_indexes: HashMap::new(),
             pk_index: None,
-            max_visible_batch_position: AtomicUsize::new(0),
+            indexed_count: AtomicUsize::new(0),
             pk_has_overrides: AtomicBool::new(false),
         }
     }
@@ -455,10 +464,7 @@ impl std::fmt::Debug for IndexStore {
                     }
                 },
             )
-            .field(
-                "max_visible_batch_position",
-                &self.max_visible_batch_position.load(Ordering::Acquire),
-            )
+            .field("indexed_count", &self.indexed_count.load(Ordering::Acquire))
             .field(
                 "pk_has_overrides",
                 &self.pk_has_overrides.load(Ordering::Acquire),
@@ -850,26 +856,25 @@ impl IndexStore {
         let had_existing = self.insert_composite_pk(batch, row_offset, track_pk_overrides)?;
         self.mark_pk_overrides_if_needed(had_existing);
 
-        // Update global watermark after all indexes have been updated
+        // Update the indexed prefix after every index has been updated.
         if let Some(bp) = batch_position {
-            self.advance_max_visible_batch_position(bp);
+            self.advance_indexed_count(bp + 1);
         }
 
         Ok(())
     }
 
-    /// Advance the visibility watermark to at least `batch_pos`.
+    /// Advance the indexed prefix to at least `count` batches.
     ///
-    /// The watermark only ever moves forward (idempotent max). The vector
-    /// planner relies on the insert paths setting `pk_has_overrides` before
-    /// calling this method, so any snapshot that can see a PK rewrite also
-    /// observes `pk_has_overrides == true`.
-    pub(crate) fn advance_max_visible_batch_position(&self, batch_pos: usize) {
-        let mut current = self.max_visible_batch_position.load(Ordering::Acquire);
-        while batch_pos > current {
-            match self.max_visible_batch_position.compare_exchange_weak(
+    /// Only ever moves forward (idempotent max). The vector planner relies on the
+    /// insert paths setting `pk_has_overrides` before this is called, so any
+    /// snapshot that can see a PK rewrite also observes `pk_has_overrides == true`.
+    pub(crate) fn advance_indexed_count(&self, count: usize) {
+        let mut current = self.indexed_count.load(Ordering::Acquire);
+        while count > current {
+            match self.indexed_count.compare_exchange_weak(
                 current,
-                batch_pos,
+                count,
                 Ordering::Release,
                 Ordering::Acquire,
             ) {
@@ -1014,9 +1019,10 @@ impl IndexStore {
         }
         self.mark_pk_overrides_if_needed(had_existing);
 
-        // Update global watermark to the max batch position
+        // The indexed prefix now covers every batch up to and including the
+        // highest position in this call, so the count is that position plus one.
         let max_bp = batches.iter().map(|b| b.batch_position).max().unwrap();
-        self.advance_max_visible_batch_position(max_bp);
+        self.advance_indexed_count(max_bp + 1);
 
         Ok(duration_map)
     }
@@ -1103,8 +1109,8 @@ impl IndexStore {
     /// construction time so every plan runs against a stable cursor.
     ///
     /// Returns 0 before any WAL flush has advanced the watermark.
-    pub fn max_visible_batch_position(&self) -> usize {
-        self.max_visible_batch_position.load(Ordering::Acquire)
+    pub fn indexed_count(&self) -> usize {
+        self.indexed_count.load(Ordering::Acquire)
     }
 }
 
@@ -1708,7 +1714,7 @@ mod tests {
     }
 
     #[test]
-    fn test_index_store_max_visible_batch_position() {
+    fn test_index_store_indexed_count() {
         let schema = create_test_schema();
         let mut registry = IndexStore::new();
 
@@ -1717,7 +1723,7 @@ mod tests {
         registry.add_fts("desc_idx".to_string(), 2, "description".to_string());
 
         // Initial watermark should be 0 (no data indexed yet)
-        assert_eq!(registry.max_visible_batch_position(), 0);
+        assert_eq!(registry.indexed_count(), 0);
 
         // Insert with batch position tracking
         let batch = create_test_batch(&schema, 0);
@@ -1725,20 +1731,20 @@ mod tests {
             .insert_with_batch_position(&batch, 0, Some(5))
             .unwrap();
 
-        // Now watermark should be 5
-        assert_eq!(registry.max_visible_batch_position(), 5);
+        // Indexing batch position 5 means the prefix [0, 6) is indexed.
+        assert_eq!(registry.indexed_count(), 6);
 
         // Insert with higher batch position
         registry
             .insert_with_batch_position(&batch, 3, Some(10))
             .unwrap();
 
-        // Watermark should advance to 10
-        assert_eq!(registry.max_visible_batch_position(), 10);
+        // Advances to cover batch position 10.
+        assert_eq!(registry.indexed_count(), 11);
 
-        // Insert without batch position shouldn't change watermark
+        // Insert without batch position shouldn't change the cursor
         registry.insert(&batch, 6).unwrap();
-        assert_eq!(registry.max_visible_batch_position(), 10);
+        assert_eq!(registry.indexed_count(), 11);
     }
 
     /// `insert_batches` picks the inline or the threaded path by row count, so
@@ -1772,7 +1778,7 @@ mod tests {
             );
         }
         assert_eq!(registry.get_fts("desc_idx").unwrap().doc_count(), num_rows);
-        assert_eq!(registry.max_visible_batch_position(), 2);
+        assert_eq!(registry.indexed_count(), 3);
     }
 
     #[test]

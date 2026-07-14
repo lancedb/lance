@@ -255,7 +255,7 @@ async fn main() -> lance_core::Result<()> {
 
         while next_cp_idx < checkpoints.len() && total_inserted >= checkpoints[next_cp_idx] {
             let cp = checkpoints[next_cp_idx];
-            let target_batch_pos = (cp / batch_size).saturating_sub(1);
+            let target_indexed_count = cp / batch_size;
             // The WAL flush handler only updates the index watermark when a
             // flush is triggered, and the time-based trigger inside the
             // writer runs only when `put()` is called. After the final put
@@ -267,7 +267,7 @@ async fn main() -> lance_core::Result<()> {
             let mut spins = 0u64;
             loop {
                 let active = writer.active_memtable_ref().await?;
-                if active.index_store.max_visible_batch_position() >= target_batch_pos {
+                if active.index_store.indexed_count() >= target_indexed_count {
                     break;
                 }
                 drop(active);

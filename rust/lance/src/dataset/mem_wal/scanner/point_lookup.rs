@@ -891,7 +891,12 @@ fn probe_position(
     if len == 0 {
         return Ok(ProbePos::Miss);
     }
-    let last_visible_idx = index_store.max_visible_batch_position().min(len - 1);
+    // The cursor is an exclusive count, so the last visible batch sits at
+    // `count - 1`. A count of 0 means nothing is visible yet — not "batch 0".
+    let visible_count = index_store.indexed_count().min(len);
+    let Some(last_visible_idx) = visible_count.checked_sub(1) else {
+        return Ok(ProbePos::Miss);
+    };
     let last = batch_store.get(last_visible_idx).ok_or_else(|| {
         lance_core::Error::internal("point-lookup: visible batch index out of range")
     })?;
@@ -1388,7 +1393,7 @@ mod tests {
 
         let batch_store = Arc::new(BatchStore::with_capacity(16));
         let mut index_store = IndexStore::new();
-        // BTree on the PK so that `max_visible_batch_position` advances as
+        // BTree on the PK so that `visible_count` advances as
         // we insert, otherwise the scanner sees no batches at all.
         index_store.add_btree("id_idx".to_string(), 0, "id".to_string());
 

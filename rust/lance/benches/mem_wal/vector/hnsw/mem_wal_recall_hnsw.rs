@@ -416,11 +416,11 @@ async fn run_checkpoint(
         writer.put(vec![batch]).await?;
     }
 
-    let target_batch_pos = total_batches.saturating_sub(1);
+    let target_indexed_count = total_batches;
     let mut spins = 0u64;
     loop {
         let active = writer.active_memtable_ref().await?;
-        if active.index_store.max_visible_batch_position() >= target_batch_pos {
+        if active.index_store.indexed_count() >= target_indexed_count {
             break;
         }
         drop(active);
