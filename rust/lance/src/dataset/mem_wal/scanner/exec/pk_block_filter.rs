@@ -322,7 +322,7 @@ mod tests {
             let (bp, off, _) = store.append(b.clone()).unwrap();
             index.insert_with_batch_position(&b, off, Some(bp)).unwrap();
         }
-        let max_visible_row = store.max_visible_row(index.indexed_count());
+        let max_visible_row = store.max_visible_row(index.visible_count());
         GenMembership::InMemory {
             index_store: Arc::new(index),
             max_visible_row,

@@ -1554,6 +1554,15 @@ impl ShardWriter {
         // 0 and the durable count is just its batch count.
         wal_flusher.advance_durable(memtable.batch_count());
 
+        // ...and publish them to readers. Replayed batches are durable by
+        // construction (they came out of the WAL) and were just re-indexed above,
+        // so they satisfy both halves of `visible`. Publishing is normally the
+        // flush's job; replay bypasses the flush, so it must do it here or the
+        // recovered rows stay invisible.
+        if let Some(indexes) = memtable.indexes_arc() {
+            indexes.publish_visible(memtable.batch_count());
+        }
+
         wal_flusher
             .wal_appender()
             .seed_next_position(next_wal_position)

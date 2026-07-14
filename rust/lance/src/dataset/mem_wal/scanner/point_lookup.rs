@@ -893,7 +893,7 @@ fn probe_position(
     }
     // The cursor is an exclusive count, so the last visible batch sits at
     // `count - 1`. A count of 0 means nothing is visible yet — not "batch 0".
-    let visible_count = index_store.indexed_count().min(len);
+    let visible_count = index_store.visible_count().min(len);
     let Some(last_visible_idx) = visible_count.checked_sub(1) else {
         return Ok(ProbePos::Miss);
     };
