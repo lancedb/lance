@@ -123,7 +123,7 @@ impl SelectionBuilderInput {
                         "logical row address bitmap uses the reserved logical fragment id",
                     ));
                 }
-                if bitmap.iter().any(|raw| raw as u32 == u32::MAX) {
+                if bitmap.bitmaps().any(|(_, slots)| slots.contains(u32::MAX)) {
                     return Err(Error::invalid_input(
                         "logical row address bitmap contains an unrepresentable terminal slot",
                     ));
@@ -198,8 +198,13 @@ impl SelectionBuilderInput {
             let max_slot = slots.max()?;
             let universe = max_slot.checked_add(1)?;
             let mut bits = vec![0_u8; (universe as usize).div_ceil(8)];
-            for slot in slots.iter() {
-                set_bit(&mut bits, slot as u64);
+            let mut runs = slots.iter();
+            while let Some(run) = runs.next_range() {
+                set_bit_range(
+                    &mut bits,
+                    u64::from(*run.start()),
+                    u64::from(*run.end()) + 1,
+                );
             }
             let mut rank_checkpoints = Vec::with_capacity(
                 (universe as usize).div_ceil(RANK_CHECKPOINT_INTERVAL as usize) + 1,
@@ -208,7 +213,7 @@ impl SelectionBuilderInput {
             for boundary in (0..universe).step_by(RANK_CHECKPOINT_INTERVAL as usize) {
                 rank_checkpoints.push(rank);
                 let end = universe.min(boundary.saturating_add(RANK_CHECKPOINT_INTERVAL));
-                rank = rank.saturating_add(count_bits(&bits, boundary as u64, end as u64));
+                rank = rank.saturating_add(count_bits_fast(&bits, boundary as u64, end as u64));
             }
             rank_checkpoints.push(rank);
             encoded_domains.push(pb::DenseBitsetLogicalDomainSelection {
@@ -349,6 +354,76 @@ impl SelectionBuilderInput {
                 *best = Some(candidate);
             }
         }
+
+        fn elias_fano_payload_bytes(universe: u64, cardinality: u64) -> Option<u64> {
+            if universe == 0 || cardinality == 0 {
+                return None;
+            }
+            let low_bit_width = if universe <= cardinality {
+                0
+            } else {
+                (universe / cardinality).ilog2()
+            };
+            let low_bits = cardinality.checked_mul(u64::from(low_bit_width))?;
+            let high_bits = (universe >> low_bit_width).checked_add(cardinality)?;
+            low_bits.div_ceil(8).checked_add(high_bits.div_ceil(8))
+        }
+
+        fn payload_lower_bounds(
+            bitmap: &RoaringTreemap,
+        ) -> Option<(Option<u64>, Option<u64>, u64)> {
+            let mut domain_count = 0_usize;
+            let mut total_universe = 0_u64;
+            let mut dense_bytes = 0_u64;
+            let mut domain_elias_fano_bytes = 0_u64;
+            for (_, slots) in bitmap.bitmaps() {
+                let universe = u64::from(slots.max()?.checked_add(1)?);
+                domain_count = domain_count.checked_add(1)?;
+                total_universe = total_universe.checked_add(universe)?;
+                dense_bytes = dense_bytes.checked_add(universe.div_ceil(8))?;
+                domain_elias_fano_bytes = domain_elias_fano_bytes
+                    .checked_add(elias_fano_payload_bytes(universe, slots.len())?)?;
+            }
+            let dense = (bitmap.len().saturating_mul(16) >= total_universe).then_some(dense_bytes);
+            let domain_elias_fano =
+                (domain_count <= MAX_RANGE_ENCODING_RUNS).then_some(domain_elias_fano_bytes);
+            let ordinal_elias_fano = elias_fano_payload_bytes(total_universe, bitmap.len())?;
+            Some((dense, domain_elias_fano, ordinal_elias_fano))
+        }
+
+        fn candidate_is_proven_smallest(
+            best: &Option<pb::LogicalRowAddressSelection>,
+            lower_bounds: impl IntoIterator<Item = Option<u64>>,
+        ) -> bool {
+            let Some(best) = best else {
+                return false;
+            };
+            let encoded_len = best.encoded_len() as u64;
+            lower_bounds
+                .into_iter()
+                .flatten()
+                .all(|lower_bound| encoded_len <= lower_bound)
+        }
+
+        // A compaction over many whole logical domains naturally arrives as
+        // one dense prefix range per domain.  Once the range count exceeds the
+        // inline range limit, Roaring encodes that shape in O(domains) space.
+        // Trying the dense and Elias-Fano candidates would materialize every
+        // selected row even though they cannot improve on that representation.
+        if let Self::Ranges(ranges) = self
+            && ranges.len() > MAX_RANGE_ENCODING_RUNS
+            && ranges.iter().all(|range| range.start_slot == 0)
+            && let Some(selected_rows) = ranges
+                .iter()
+                .try_fold(0_u64, |total, range| total.checked_add(range.len()))
+            && let Some(candidate) = Self::roaring_candidate(&self.bitmap())
+            // A dense bitset is the smallest remaining competitor and needs
+            // at least one bit per selected row for this full-universe shape.
+            && candidate.encoded_len() as u64 <= selected_rows.div_ceil(8)
+        {
+            return candidate;
+        }
+
         let mut best = self.range_candidate();
         if matches!(
             best.as_ref().and_then(|selection| selection.encoding.as_ref()),
@@ -359,8 +434,27 @@ impl SelectionBuilderInput {
         }
         let bitmap = self.bitmap();
         retain_smaller(&mut best, Self::roaring_candidate(&bitmap));
+        let lower_bounds = payload_lower_bounds(&bitmap);
+        if lower_bounds.is_some_and(|(dense, domain_elias_fano, ordinal_elias_fano)| {
+            candidate_is_proven_smallest(
+                &best,
+                [dense, domain_elias_fano, Some(ordinal_elias_fano)],
+            )
+        }) {
+            return best.unwrap_or_default();
+        }
         retain_smaller(&mut best, Self::dense_candidate(&bitmap));
+        if lower_bounds.is_some_and(|(_, domain_elias_fano, ordinal_elias_fano)| {
+            candidate_is_proven_smallest(&best, [domain_elias_fano, Some(ordinal_elias_fano)])
+        }) {
+            return best.unwrap_or_default();
+        }
         retain_smaller(&mut best, Self::elias_fano_candidate(&bitmap));
+        if lower_bounds.is_some_and(|(_, _, ordinal_elias_fano)| {
+            candidate_is_proven_smallest(&best, [Some(ordinal_elias_fano)])
+        }) {
+            return best.unwrap_or_default();
+        }
         retain_smaller(&mut best, Self::ordinal_elias_fano_candidate(&bitmap));
         best.unwrap_or_default()
     }
@@ -584,6 +678,29 @@ impl LogicalRowAddressSelection {
         })
     }
 
+    /// Visit selected addresses in ascending order with a single codec pass.
+    ///
+    /// The runtime is proportional to the encoded payload plus selection
+    /// cardinality. In particular, this does not issue one rank/select lookup
+    /// per address. The visitor's first error stops decoding and is returned.
+    pub fn try_for_each_address(
+        &self,
+        mut visit: impl FnMut(LogicalRowAddress) -> Result<()>,
+    ) -> Result<()> {
+        match self {
+            Self::Ranges(value) => visit_range_selection_addresses(value, &mut visit),
+            Self::Dense(value) => visit_dense_selection_addresses(value, &mut visit),
+            Self::EliasFano(value) => visit_elias_fano_selection_addresses(value, &mut visit),
+            Self::OrdinalEliasFano(value) => visit_ordinal_selection_addresses(value, &mut visit),
+            Self::Roaring(value) => {
+                for raw in value.bitmap()?.iter() {
+                    visit(LogicalRowAddress::try_from(raw)?)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
     /// Return the exact set difference `self - removed` in canonical encoding.
     /// Range-backed coverage stays proportional to its range count plus the
     /// removed selection; it never expands a full logical domain row by row.
@@ -631,10 +748,226 @@ impl LogicalRowAddressSelection {
     /// copied without expanding their rows; other codecs are decoded only when
     /// a caller explicitly needs range materialization.
     pub fn to_ranges(&self) -> Result<Vec<LogicalRowAddressRange>> {
-        match self {
-            Self::Ranges(ranges) => Ok(ranges.ranges.to_vec()),
-            _ => selection_value_ranges(self),
+        if let Some(ranges) = self.compact_ranges(usize::MAX)? {
+            return Ok(ranges);
         }
+        selection_value_ranges(self)
+    }
+
+    /// Return logical ranges only when their count does not exceed `max_runs`.
+    ///
+    /// This is the range-safe counterpart to [`Self::to_ranges`]. Callers that
+    /// can process a high-entropy selection directly should use this method to
+    /// avoid materializing one range per selected row.
+    pub fn to_ranges_bounded(
+        &self,
+        max_runs: usize,
+    ) -> Result<Option<Vec<LogicalRowAddressRange>>> {
+        self.compact_ranges(max_runs)
+    }
+
+    /// Return ranges only when decoding stays bounded by `max_runs`.
+    ///
+    /// Full-domain codecs and contiguous Roaring containers remain proportional
+    /// to their domain count. High-entropy selections return `None` instead of
+    /// being expanded into one range per selected row.
+    fn compact_ranges(&self, max_runs: usize) -> Result<Option<Vec<LogicalRowAddressRange>>> {
+        match self {
+            Self::Ranges(ranges) => {
+                Ok((ranges.ranges.len() <= max_runs).then(|| ranges.ranges.to_vec()))
+            }
+            Self::Dense(value)
+                if value.prefixes.windows(2).zip(&value.encoded.domains).all(
+                    |(prefixes, domain)| {
+                        prefixes[1].checked_sub(prefixes[0]) == Some(u64::from(domain.universe))
+                    },
+                ) =>
+            {
+                Ok((value.encoded.domains.len() <= max_runs).then(|| {
+                    value
+                        .encoded
+                        .domains
+                        .iter()
+                        .map(|domain| {
+                            LogicalRowAddressRange::new(
+                                domain.logical_fragment_id,
+                                0,
+                                domain.universe,
+                            )
+                        })
+                        .collect()
+                }))
+            }
+            Self::EliasFano(value)
+                if value
+                    .encoded
+                    .domains
+                    .iter()
+                    .all(|domain| domain.cardinality == domain.universe) =>
+            {
+                Ok((value.encoded.domains.len() <= max_runs).then(|| {
+                    value
+                        .encoded
+                        .domains
+                        .iter()
+                        .map(|domain| {
+                            LogicalRowAddressRange::new(
+                                domain.logical_fragment_id,
+                                0,
+                                domain.universe,
+                            )
+                        })
+                        .collect()
+                }))
+            }
+            Self::OrdinalEliasFano(value)
+                if value.encoded.cardinality == value.encoded.universe =>
+            {
+                let domain_count =
+                    value
+                        .encoded
+                        .domain_runs
+                        .iter()
+                        .try_fold(0_usize, |total, run| {
+                            total.checked_add(run.domain_count as usize).ok_or_else(|| {
+                                Error::invalid_input("ordinal logical selection domain overflow")
+                            })
+                        })?;
+                if domain_count > max_runs {
+                    return Ok(None);
+                }
+                let mut ranges = Vec::new();
+                for run in &value.encoded.domain_runs {
+                    let logical_ids = run.logical_fragment_ids.as_ref().ok_or_else(|| {
+                        Error::invalid_input(
+                            "ordinal logical selection is missing packed logical fragment ids",
+                        )
+                    })?;
+                    let slot_universes = run.slot_universes.as_ref().ok_or_else(|| {
+                        Error::invalid_input(
+                            "ordinal logical selection is missing packed slot universes",
+                        )
+                    })?;
+                    ranges.reserve(run.domain_count as usize);
+                    for ordinal in 0..run.domain_count {
+                        ranges.push(LogicalRowAddressRange::new(
+                            logical_fragment_id_at(
+                                run.first_logical_fragment_id,
+                                run.domain_count,
+                                logical_ids,
+                                ordinal,
+                            )?,
+                            0,
+                            packed_slot_count_at(slot_universes, ordinal)?,
+                        ));
+                    }
+                }
+                Ok(Some(ranges))
+            }
+            Self::Roaring(value) => Ok(bitmap_to_ranges(value.bitmap()?, max_runs)),
+            _ if self.cardinality() <= max_runs as u64 => {
+                let ranges = selection_value_ranges(self)?;
+                Ok((ranges.len() <= max_runs).then_some(ranges))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Visit the selection as canonical contiguous ranges when the codec can
+    /// expose those ranges without materializing selected rows.
+    ///
+    /// Roaring selections are streamed one container run at a time.  This is
+    /// important for packed compaction: a full 100M-row selection spanning
+    /// many logical domains is represented by a few thousand Roaring runs,
+    /// while ordinal `select` would visit every row.
+    fn visit_structural_ranges(
+        &self,
+        mut visit: impl FnMut(LogicalRowAddressRange) -> Result<()>,
+    ) -> Result<bool> {
+        match self {
+            Self::Ranges(value) => {
+                for range in value.ranges.iter().copied() {
+                    visit(range)?;
+                }
+            }
+            Self::Dense(value)
+                if value.prefixes.windows(2).zip(&value.encoded.domains).all(
+                    |(prefixes, domain)| {
+                        prefixes[1].checked_sub(prefixes[0]) == Some(u64::from(domain.universe))
+                    },
+                ) =>
+            {
+                for domain in &value.encoded.domains {
+                    visit(LogicalRowAddressRange::new(
+                        domain.logical_fragment_id,
+                        0,
+                        domain.universe,
+                    ))?;
+                }
+            }
+            Self::EliasFano(value)
+                if value
+                    .encoded
+                    .domains
+                    .iter()
+                    .all(|domain| domain.cardinality == domain.universe) =>
+            {
+                for domain in &value.encoded.domains {
+                    visit(LogicalRowAddressRange::new(
+                        domain.logical_fragment_id,
+                        0,
+                        domain.universe,
+                    ))?;
+                }
+            }
+            Self::OrdinalEliasFano(value)
+                if value.encoded.cardinality == value.encoded.universe =>
+            {
+                for run in &value.encoded.domain_runs {
+                    let logical_ids = run.logical_fragment_ids.as_ref().ok_or_else(|| {
+                        Error::invalid_input(
+                            "ordinal logical selection is missing packed logical fragment ids",
+                        )
+                    })?;
+                    let slot_universes = run.slot_universes.as_ref().ok_or_else(|| {
+                        Error::invalid_input(
+                            "ordinal logical selection is missing packed slot universes",
+                        )
+                    })?;
+                    for ordinal in 0..run.domain_count {
+                        visit(LogicalRowAddressRange::new(
+                            logical_fragment_id_at(
+                                run.first_logical_fragment_id,
+                                run.domain_count,
+                                logical_ids,
+                                ordinal,
+                            )?,
+                            0,
+                            packed_slot_count_at(slot_universes, ordinal)?,
+                        ))?;
+                    }
+                }
+            }
+            Self::Roaring(value) => {
+                for (logical_fragment_id, slots) in value.bitmap()?.bitmaps() {
+                    let mut runs = slots.iter();
+                    while let Some(run) = runs.next_range() {
+                        let end_slot = run.end().checked_add(1).ok_or_else(|| {
+                            Error::invalid_input(
+                                "portable Roaring selection contains a terminal logical slot",
+                            )
+                        })?;
+                        visit(LogicalRowAddressRange::new(
+                            logical_fragment_id,
+                            *run.start(),
+                            end_slot,
+                        ))?;
+                    }
+                }
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
     }
 
     /// Decode this selection into a Roaring tree without expanding range or
@@ -680,9 +1013,10 @@ impl LogicalRowAddressSelection {
                 }
             }
             _ => {
-                for address in self.iter() {
-                    rows.insert(address?.raw());
-                }
+                self.try_for_each_address(|address| {
+                    rows.insert(address.raw());
+                    Ok(())
+                })?;
             }
         }
         Ok(rows)
@@ -761,14 +1095,7 @@ impl LogicalRowAddressSelection {
                 }
             }
             Self::Roaring(value) => {
-                let mut previous = None;
-                for raw in value.bitmap()?.iter() {
-                    let logical_fragment_id = (raw >> 32) as u32;
-                    if previous != Some(logical_fragment_id) {
-                        fragments.insert(logical_fragment_id);
-                        previous = Some(logical_fragment_id);
-                    }
-                }
+                fragments.extend(value.bitmap()?.bitmaps().map(|(domain, _)| domain));
             }
         }
         Ok(fragments)
@@ -795,24 +1122,45 @@ fn selection_value_ranges(
     selection: &LogicalRowAddressSelection,
 ) -> Result<Vec<LogicalRowAddressRange>> {
     let mut ranges = Vec::<LogicalRowAddressRange>::new();
-    for address in selection.iter() {
-        let address = address?;
+    visit_selection_value_ranges(selection, |range| {
+        ranges.push(range);
+        Ok(())
+    })?;
+    Ok(ranges)
+}
+
+fn visit_selection_value_ranges(
+    selection: &LogicalRowAddressSelection,
+    mut visit: impl FnMut(LogicalRowAddressRange) -> Result<()>,
+) -> Result<()> {
+    let mut current = None::<LogicalRowAddressRange>;
+    selection.try_for_each_address(|address| {
         let logical_fragment_id = address.logical_fragment_id();
         let slot = address.immutable_slot();
-        if let Some(previous) = ranges.last_mut()
-            && previous.logical_fragment_id == logical_fragment_id
-            && previous.end_slot == slot
+        if let Some(range) = current.as_mut()
+            && range.logical_fragment_id == logical_fragment_id
+            && range.end_slot == slot
         {
-            previous.end_slot = slot + 1;
+            range.end_slot = slot
+                .checked_add(1)
+                .ok_or_else(|| Error::invalid_input("logical selection range overflow"))?;
         } else {
-            ranges.push(LogicalRowAddressRange::new(
+            if let Some(range) = current.take() {
+                visit(range)?;
+            }
+            current = Some(LogicalRowAddressRange::new(
                 logical_fragment_id,
                 slot,
-                slot + 1,
+                slot.checked_add(1)
+                    .ok_or_else(|| Error::invalid_input("logical selection range overflow"))?,
             ));
         }
+        Ok(())
+    })?;
+    if let Some(range) = current {
+        visit(range)?;
     }
-    Ok(ranges)
+    Ok(())
 }
 
 fn effective_source_selection(
@@ -897,7 +1245,7 @@ fn inspect_roaring_treemap(bytes: &[u8]) -> Result<u64> {
     if bitmap
         .max()
         .is_some_and(|raw| (raw >> 32) as u32 == INVALID_ID)
-        || bitmap.iter().any(|raw| raw as u32 == u32::MAX)
+        || bitmap.bitmaps().any(|(_, slots)| slots.contains(u32::MAX))
     {
         return Err(Error::invalid_input(
             "portable Roaring selection uses a reserved logical address",
@@ -1081,6 +1429,21 @@ fn range_selection_select(
     .ok()
 }
 
+fn visit_range_selection_addresses(
+    value: &RangeEncodedSelection,
+    visit: &mut impl FnMut(LogicalRowAddress) -> Result<()>,
+) -> Result<()> {
+    for range in value.ranges.iter() {
+        for slot in range.start_slot..range.end_slot {
+            visit(LogicalRowAddress::try_new_from_parts(
+                range.logical_fragment_id,
+                slot,
+            )?)?;
+        }
+    }
+    Ok(())
+}
+
 fn validate_dense_headers(encoded: &pb::DenseBitsetLogicalRowAddressSelection) -> Result<Vec<u64>> {
     if encoded.domains.len() > MAX_SELECTION_DOMAINS {
         return Err(Error::invalid_input("dense selection has too many domains"));
@@ -1184,6 +1547,21 @@ fn dense_selection_select(
         }
     }
     None
+}
+
+fn visit_dense_selection_addresses(
+    value: &DenseEncodedSelection,
+    visit: &mut impl FnMut(LogicalRowAddress) -> Result<()>,
+) -> Result<()> {
+    for domain in &value.encoded.domains {
+        for slot in set_bit_positions(&domain.bits, domain.universe as u64) {
+            visit(LogicalRowAddress::try_new_from_parts(
+                domain.logical_fragment_id,
+                slot as u32,
+            )?)?;
+        }
+    }
+    Ok(())
 }
 
 fn validate_elias_fano_headers(
@@ -1352,6 +1730,50 @@ fn elias_fano_selection_select(
     LogicalRowAddress::try_new_from_parts(domain.logical_fragment_id, slot).ok()
 }
 
+fn visit_elias_fano_selection_addresses(
+    value: &EliasFanoEncodedSelection,
+    visit: &mut impl FnMut(LogicalRowAddress) -> Result<()>,
+) -> Result<()> {
+    for domain in &value.encoded.domains {
+        let high_bit_len =
+            (u64::from(domain.universe) >> domain.low_bit_width) + u64::from(domain.cardinality);
+        let mut ordinal = 0_u64;
+        let mut previous_slot = None;
+        for position in set_bit_positions(&domain.high_bits, high_bit_len) {
+            let high = position.checked_sub(ordinal).ok_or_else(|| {
+                Error::invalid_input("Elias-Fano high position precedes its ordinal")
+            })?;
+            let low = u64::from(read_packed_u32(
+                &domain.low_bits,
+                ordinal as usize,
+                domain.low_bit_width,
+            ));
+            let slot = (high << domain.low_bit_width) | low;
+            let slot = u32::try_from(slot)
+                .ok()
+                .filter(|slot| *slot < domain.universe)
+                .ok_or_else(|| Error::invalid_input("Elias-Fano slot exceeds its universe"))?;
+            if previous_slot.is_some_and(|previous| previous >= slot) {
+                return Err(Error::invalid_input(
+                    "Elias-Fano slots are not strictly increasing",
+                ));
+            }
+            visit(LogicalRowAddress::try_new_from_parts(
+                domain.logical_fragment_id,
+                slot,
+            )?)?;
+            previous_slot = Some(slot);
+            ordinal += 1;
+        }
+        if ordinal != u64::from(domain.cardinality) {
+            return Err(Error::invalid_input(
+                "Elias-Fano high-bit cardinality changed while streaming",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_ordinal_elias_fano_headers(
     encoded: &pb::EliasFanoOrdinalLogicalRowAddressSelection,
 ) -> Result<Vec<u64>> {
@@ -1477,6 +1899,138 @@ fn ordinal_selection_select(
     ordinal_flattened_to_address(value, flattened)
 }
 
+struct OrdinalSelectionDomainCursor<'a> {
+    runs: &'a [pb::LogicalOrdinalDomainRun],
+    run_index: usize,
+    domain_ordinal: u32,
+    logical_fragment_id: u32,
+    domain_start: u64,
+    domain_end: u64,
+}
+
+impl<'a> OrdinalSelectionDomainCursor<'a> {
+    fn try_new(runs: &'a [pb::LogicalOrdinalDomainRun]) -> Result<Self> {
+        let run = runs
+            .first()
+            .ok_or_else(|| Error::invalid_input("ordinal selection has no domain runs"))?;
+        let slots = run
+            .slot_universes
+            .as_ref()
+            .ok_or_else(|| Error::invalid_input("ordinal domain run is missing slot universes"))?;
+        let domain_end = u64::from(packed_slot_count_at(slots, 0)?);
+        Ok(Self {
+            runs,
+            run_index: 0,
+            domain_ordinal: 0,
+            logical_fragment_id: run.first_logical_fragment_id,
+            domain_start: 0,
+            domain_end,
+        })
+    }
+
+    fn advance_domain(&mut self) -> Result<bool> {
+        use pb::packed_logical_fragment_ids::Encoding;
+
+        let run = &self.runs[self.run_index];
+        if self.domain_ordinal + 1 < run.domain_count {
+            let ids = run
+                .logical_fragment_ids
+                .as_ref()
+                .ok_or_else(|| Error::invalid_input("ordinal domain run is missing logical ids"))?;
+            self.logical_fragment_id = match ids.encoding.as_ref().ok_or_else(|| {
+                Error::invalid_input("packed logical fragment ids have no encoding")
+            })? {
+                Encoding::Consecutive(_) => self.logical_fragment_id.checked_add(1),
+                Encoding::PositiveDeltas(deltas) => self
+                    .logical_fragment_id
+                    .checked_add(bitpacked_u32_value_at(deltas, self.domain_ordinal)?),
+            }
+            .filter(|id| *id != INVALID_ID)
+            .ok_or_else(|| Error::invalid_input("packed logical fragment id overflow"))?;
+            self.domain_ordinal += 1;
+        } else {
+            self.run_index += 1;
+            let Some(run) = self.runs.get(self.run_index) else {
+                return Ok(false);
+            };
+            self.domain_ordinal = 0;
+            self.logical_fragment_id = run.first_logical_fragment_id;
+        }
+
+        let run = &self.runs[self.run_index];
+        let slots = run
+            .slot_universes
+            .as_ref()
+            .ok_or_else(|| Error::invalid_input("ordinal domain run is missing slot universes"))?;
+        let slot_count = packed_slot_count_at(slots, self.domain_ordinal)?;
+        self.domain_start = self.domain_end;
+        self.domain_end = self
+            .domain_end
+            .checked_add(u64::from(slot_count))
+            .ok_or_else(|| Error::invalid_input("ordinal domain universe overflow"))?;
+        Ok(true)
+    }
+
+    fn address_for(&mut self, flattened: u64) -> Result<LogicalRowAddress> {
+        while flattened >= self.domain_end {
+            if !self.advance_domain()? {
+                return Err(Error::invalid_input(
+                    "ordinal Elias-Fano value exceeds its domain universe",
+                ));
+            }
+        }
+        if flattened < self.domain_start {
+            return Err(Error::invalid_input(
+                "ordinal Elias-Fano values are not strictly increasing",
+            ));
+        }
+        let slot = u32::try_from(flattened - self.domain_start)
+            .map_err(|_| Error::invalid_input("ordinal logical slot exceeds u32"))?;
+        LogicalRowAddress::try_new_from_parts(self.logical_fragment_id, slot)
+    }
+}
+
+fn visit_ordinal_selection_addresses(
+    value: &OrdinalEliasFanoEncodedSelection,
+    visit: &mut impl FnMut(LogicalRowAddress) -> Result<()>,
+) -> Result<()> {
+    let encoded = &value.encoded;
+    let high_bit_len = (encoded.universe >> encoded.low_bit_width)
+        .checked_add(encoded.cardinality)
+        .ok_or_else(|| Error::invalid_input("ordinal Elias-Fano high-bit length overflow"))?;
+    let low_multiplier = 1_u64
+        .checked_shl(encoded.low_bit_width)
+        .ok_or_else(|| Error::invalid_input("ordinal Elias-Fano low-bit width exceeds u64"))?;
+    let mut domains = OrdinalSelectionDomainCursor::try_new(&encoded.domain_runs)?;
+    let mut ordinal = 0_u64;
+    let mut previous_flattened = None;
+    for position in set_bit_positions(&encoded.high_bits, high_bit_len) {
+        let high = position.checked_sub(ordinal).ok_or_else(|| {
+            Error::invalid_input("ordinal Elias-Fano high position precedes its ordinal")
+        })?;
+        let low = read_packed_u64(&encoded.low_bits, ordinal as usize, encoded.low_bit_width);
+        let flattened = high
+            .checked_mul(low_multiplier)
+            .and_then(|value| value.checked_add(low))
+            .filter(|value| *value < encoded.universe)
+            .ok_or_else(|| Error::invalid_input("ordinal Elias-Fano value exceeds its universe"))?;
+        if previous_flattened.is_some_and(|previous| previous >= flattened) {
+            return Err(Error::invalid_input(
+                "ordinal Elias-Fano values are not strictly increasing",
+            ));
+        }
+        visit(domains.address_for(flattened)?)?;
+        previous_flattened = Some(flattened);
+        ordinal += 1;
+    }
+    if ordinal != encoded.cardinality {
+        return Err(Error::invalid_input(
+            "ordinal Elias-Fano high-bit cardinality changed while streaming",
+        ));
+    }
+    Ok(())
+}
+
 fn ordinal_domain_slot_to_flattened(
     value: &OrdinalEliasFanoEncodedSelection,
     address: LogicalRowAddress,
@@ -1574,24 +2128,18 @@ fn bitmap_to_ranges(
     max_runs: usize,
 ) -> Option<Vec<LogicalRowAddressRange>> {
     let mut ranges = Vec::<LogicalRowAddressRange>::new();
-    for raw in bitmap.iter() {
-        let logical_fragment_id = (raw >> 32) as u32;
-        let slot = raw as u32;
-        if let Some(last) = ranges.last_mut()
-            && last.logical_fragment_id == logical_fragment_id
-            && last.end_slot == slot
-        {
-            last.end_slot = slot.checked_add(1)?;
-            continue;
+    for (logical_fragment_id, slots) in bitmap.bitmaps() {
+        let mut values = slots.iter();
+        while let Some(range) = values.next_range() {
+            if ranges.len() == max_runs {
+                return None;
+            }
+            ranges.push(LogicalRowAddressRange {
+                logical_fragment_id,
+                start_slot: *range.start(),
+                end_slot: range.end().checked_add(1)?,
+            });
         }
-        if ranges.len() == max_runs {
-            return None;
-        }
-        ranges.push(LogicalRowAddressRange {
-            logical_fragment_id,
-            start_slot: slot,
-            end_slot: slot.checked_add(1)?,
-        });
     }
     Some(ranges)
 }
@@ -1657,6 +2205,24 @@ fn elias_fano_low_bit_width(universe: u32, cardinality: u32) -> u32 {
 
 fn set_bit(bytes: &mut [u8], bit: u64) {
     bytes[bit as usize / 8] |= 1 << (bit % 8);
+}
+
+fn set_bit_range(bytes: &mut [u8], start: u64, end: u64) {
+    if start >= end {
+        return;
+    }
+    let first_full_bit = start.div_ceil(8) * 8;
+    for bit in start..end.min(first_full_bit) {
+        set_bit(bytes, bit);
+    }
+    if first_full_bit >= end {
+        return;
+    }
+    let last_full_bit = end / 8 * 8;
+    bytes[first_full_bit as usize / 8..last_full_bit as usize / 8].fill(u8::MAX);
+    for bit in last_full_bit..end {
+        set_bit(bytes, bit);
+    }
 }
 
 fn get_bit(bytes: &[u8], bit: u64) -> bool {
@@ -3273,11 +3839,20 @@ impl RowAddressPlacementDelta {
         let mut builder = RowSequenceFingerprintBuilder::new(self.target);
         let mut count = 0_u64;
         for selection in &self.source_selections {
-            for range in selection.to_ranges()? {
+            if !selection.visit_structural_ranges(|range| {
                 builder.update_range(range)?;
                 count = count
                     .checked_add(range.len())
                     .ok_or_else(|| Error::invalid_input("row-sequence cardinality overflow"))?;
+                Ok(())
+            })? {
+                selection.try_for_each_address(|address| {
+                    builder.update(address)?;
+                    count = count
+                        .checked_add(1)
+                        .ok_or_else(|| Error::invalid_input("row-sequence cardinality overflow"))?;
+                    Ok(())
+                })?;
             }
         }
         if count != self.output_cardinality {
@@ -3403,10 +3978,211 @@ pub struct PhysicalRowRange {
     pub end_offset: u32,
 }
 
+#[derive(Debug, Default)]
+struct LogicalRangeOwnershipProof {
+    mapped_rows: u64,
+    physical_ranges: Vec<PhysicalRowRange>,
+}
+
+impl LogicalRangeOwnershipProof {
+    fn add_mapped_rows(&mut self, rows: u64) -> Result<()> {
+        self.mapped_rows = self
+            .mapped_rows
+            .checked_add(rows)
+            .ok_or_else(|| Error::invalid_input("logical range ownership overflow"))?;
+        Ok(())
+    }
+
+    fn push_physical_range(
+        &mut self,
+        physical_fragment_id: u32,
+        start_offset: u64,
+        end_offset: u64,
+    ) -> Result<()> {
+        if start_offset >= end_offset {
+            return Ok(());
+        }
+        let start_offset = u32::try_from(start_offset)
+            .map_err(|_| Error::invalid_input("physical range start exceeds u32"))?;
+        let end_offset = u32::try_from(end_offset)
+            .map_err(|_| Error::invalid_input("physical range end exceeds u32"))?;
+        if let Some(previous) = self.physical_ranges.last_mut()
+            && previous.physical_fragment_id == physical_fragment_id
+            && previous.end_offset == start_offset
+        {
+            previous.end_offset = end_offset;
+        } else {
+            self.physical_ranges.push(PhysicalRowRange {
+                physical_fragment_id,
+                start_offset,
+                end_offset,
+            });
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogicalDomainDestination {
     Inline(PhysicalRowRange),
     ExplicitMap { placement_index: u32 },
+}
+
+fn add_full_range_ownership(
+    proof: &mut LogicalRangeOwnershipProof,
+    logical_range: LogicalRowAddressRange,
+    excluded: Option<&LogicalRowAddressSelection>,
+    physical_fragment_id: u32,
+    destination_start: u64,
+) -> Result<bool> {
+    let Some(excluded_ranges) = excluded
+        .map(|selection| selection.compact_ranges(MAX_SELECTION_DOMAINS))
+        .transpose()?
+        .flatten()
+        .or_else(|| excluded.is_none().then(Vec::new))
+    else {
+        return Ok(false);
+    };
+    let mut cursor = logical_range.start_slot;
+    for excluded in excluded_ranges
+        .into_iter()
+        .filter(|range| range.logical_fragment_id == logical_range.logical_fragment_id)
+    {
+        let excluded_start = excluded.start_slot.max(logical_range.start_slot);
+        let excluded_end = excluded.end_slot.min(logical_range.end_slot);
+        if excluded_start >= excluded_end {
+            continue;
+        }
+        if cursor < excluded_start {
+            proof.push_physical_range(
+                physical_fragment_id,
+                destination_start + u64::from(cursor),
+                destination_start + u64::from(excluded_start),
+            )?;
+            proof.add_mapped_rows(u64::from(excluded_start - cursor))?;
+        }
+        cursor = cursor.max(excluded_end);
+    }
+    if cursor < logical_range.end_slot {
+        proof.push_physical_range(
+            physical_fragment_id,
+            destination_start + u64::from(cursor),
+            destination_start + u64::from(logical_range.end_slot),
+        )?;
+        proof.add_mapped_rows(u64::from(logical_range.end_slot - cursor))?;
+    }
+    Ok(true)
+}
+
+fn add_selected_range_ownership(
+    proof: &mut LogicalRangeOwnershipProof,
+    logical_range: LogicalRowAddressRange,
+    selection: &LogicalRowAddressSelection,
+    excluded: Option<&LogicalRowAddressSelection>,
+    physical_fragment_id: u32,
+    destination_start: u64,
+) -> Result<bool> {
+    let selected_slots = selection_slots_for_domain(selection, logical_range.logical_fragment_id)?;
+    let selected_count =
+        selected_slots.range_cardinality(logical_range.start_slot..logical_range.end_slot);
+    if selected_count == 0 {
+        return Ok(true);
+    }
+    let selected_before = logical_range
+        .start_slot
+        .checked_sub(1)
+        .map_or(0, |previous| selected_slots.rank(previous));
+    let Some(excluded_ranges) = excluded
+        .map(|selection| selection.compact_ranges(MAX_SELECTION_DOMAINS))
+        .transpose()?
+        .flatten()
+        .or_else(|| excluded.is_none().then(Vec::new))
+    else {
+        return Ok(false);
+    };
+    let physical_start = destination_start
+        .checked_add(selected_before)
+        .ok_or_else(|| Error::invalid_input("selected destination start overflow"))?;
+    let physical_end = physical_start
+        .checked_add(selected_count)
+        .ok_or_else(|| Error::invalid_input("selected destination end overflow"))?;
+    let mut cursor = physical_start;
+    for excluded in excluded_ranges
+        .into_iter()
+        .filter(|range| range.logical_fragment_id == logical_range.logical_fragment_id)
+    {
+        let excluded_start = excluded.start_slot.max(logical_range.start_slot);
+        let excluded_end = excluded.end_slot.min(logical_range.end_slot);
+        if excluded_start >= excluded_end {
+            continue;
+        }
+        let excluded_before = excluded_start
+            .checked_sub(1)
+            .map_or(0, |previous| selected_slots.rank(previous));
+        let excluded_count = selected_slots.range_cardinality(excluded_start..excluded_end);
+        if excluded_count == 0 {
+            continue;
+        }
+        let excluded_physical_start = destination_start
+            .checked_add(excluded_before)
+            .ok_or_else(|| Error::invalid_input("selected exclusion start overflow"))?;
+        let excluded_physical_end = excluded_physical_start
+            .checked_add(excluded_count)
+            .ok_or_else(|| Error::invalid_input("selected exclusion end overflow"))?;
+        if cursor < excluded_physical_start {
+            proof.push_physical_range(physical_fragment_id, cursor, excluded_physical_start)?;
+            proof.add_mapped_rows(excluded_physical_start - cursor)?;
+        }
+        cursor = cursor.max(excluded_physical_end);
+    }
+    if cursor < physical_end {
+        proof.push_physical_range(physical_fragment_id, cursor, physical_end)?;
+        proof.add_mapped_rows(physical_end - cursor)?;
+    }
+    Ok(true)
+}
+
+fn compact_excluded_rank_ranges(
+    selection: &LogicalRowAddressSelection,
+    excluded: &LogicalRowAddressSelection,
+    logical_fragment_id: u32,
+    destination_prefix: u64,
+) -> Result<Option<Vec<(u64, u64)>>> {
+    let Some(excluded_ranges) = excluded.compact_ranges(MAX_RANGE_ENCODING_RUNS)? else {
+        return Ok(None);
+    };
+    let selected_slots = selection_slots_for_domain(selection, logical_fragment_id)?;
+    let mut rank_ranges = Vec::<(u64, u64)>::with_capacity(excluded_ranges.len());
+    for excluded in excluded_ranges {
+        if excluded.logical_fragment_id != logical_fragment_id {
+            return Err(Error::invalid_input(
+                "placement exclusion references a different logical domain",
+            ));
+        }
+        let selected_before = excluded
+            .start_slot
+            .checked_sub(1)
+            .map_or(0, |previous| selected_slots.rank(previous));
+        let selected_count =
+            selected_slots.range_cardinality(excluded.start_slot..excluded.end_slot);
+        if selected_count == 0 {
+            continue;
+        }
+        let start = destination_prefix
+            .checked_add(selected_before)
+            .ok_or_else(|| Error::invalid_input("placement exclusion rank overflow"))?;
+        let end = start
+            .checked_add(selected_count)
+            .ok_or_else(|| Error::invalid_input("placement exclusion end overflow"))?;
+        if let Some((_, previous_end)) = rank_ranges.last_mut()
+            && *previous_end == start
+        {
+            *previous_end = end;
+        } else {
+            rank_ranges.push((start, end));
+        }
+    }
+    Ok(Some(rank_ranges))
 }
 
 #[derive(Debug, Clone)]
@@ -3428,7 +4204,12 @@ impl RowAddressRouter {
         let mut source_index = Vec::<(u32, u32)>::new();
         let mut packed_source_runs = Vec::new();
         for (placement_index, placement) in layout.placements.iter().enumerate() {
-            if let RowAddressPlacement::PackedRun(value) = placement {
+            if let RowAddressPlacement::PackedRun(value) = placement
+                && matches!(
+                    value.domains.logical_fragment_ids.encoding.as_ref(),
+                    Some(pb::packed_logical_fragment_ids::Encoding::Consecutive(_))
+                )
+            {
                 packed_source_runs.push((
                     value.domains.first_logical_fragment_id(),
                     value.domains.last_logical_fragment_id()?,
@@ -3448,7 +4229,7 @@ impl RowAddressRouter {
             .any(|pair| pair[0].1 >= pair[1].0)
         {
             return Err(Error::invalid_input(
-                "PackedRun logical-id envelopes must not overlap; split gapped runs",
+                "consecutive PackedRun logical-id ranges must not overlap",
             ));
         }
         let native_domains = native_domain_routes(fragments)?;
@@ -3754,6 +4535,330 @@ impl RowAddressRouter {
             fragments.insert(self.native_domains[index].1);
         }
         Ok(fragments)
+    }
+
+    /// Prove exact inline ownership for an arbitrary logical slot bitmap.
+    ///
+    /// The proof applies each placement selection once, so high-entropy update
+    /// sets do not multiply the placement payload by their number of runs.
+    /// `None` means an ExplicitMap locator must perform the bounded row-level
+    /// fallback because its membership is not authoritative in the root.
+    fn logical_selection_inline_ownership(
+        &self,
+        logical_fragment_id: u32,
+        slots: &RoaringBitmap,
+    ) -> Result<Option<RoaringBitmap>> {
+        if slots.is_empty() {
+            return Ok(Some(RoaringBitmap::new()));
+        }
+
+        let source_start = self
+            .source_index
+            .partition_point(|(logical, _)| *logical < logical_fragment_id);
+        let source_end = self
+            .source_index
+            .partition_point(|(logical, _)| *logical <= logical_fragment_id);
+        let mut placement_indices = self.source_index[source_start..source_end]
+            .iter()
+            .map(|(_, placement_index)| *placement_index)
+            .collect::<Vec<_>>();
+        let packed_index = self
+            .packed_source_runs
+            .partition_point(|(first, _, _)| *first <= logical_fragment_id);
+        if let Some((_, last, placement_index)) = packed_index
+            .checked_sub(1)
+            .and_then(|index| self.packed_source_runs.get(index))
+            && logical_fragment_id <= *last
+            && self.layout.placements[*placement_index as usize]
+                .source_domain(logical_fragment_id)?
+                .is_some()
+        {
+            placement_indices.push(*placement_index);
+        }
+
+        let mut covered = RoaringBitmap::new();
+        let mut fragments = RoaringBitmap::new();
+        let mut record_owned = |mut owned: RoaringBitmap,
+                                physical_fragment_id: u32|
+         -> Result<()> {
+            owned &= slots;
+            if owned.is_empty() {
+                return Ok(());
+            }
+            if !covered.is_disjoint(&owned) {
+                return Err(Error::invalid_input(format!(
+                    "logical selection in fragment {logical_fragment_id} has overlapping physical owners"
+                )));
+            }
+            covered |= &owned;
+            fragments.insert(physical_fragment_id);
+            Ok(())
+        };
+        let slots_in_range = |start: u32, end: u32| {
+            let mut bounded = RoaringBitmap::new();
+            bounded.insert_range(start..end);
+            bounded &= slots;
+            bounded
+        };
+
+        for placement_index in placement_indices {
+            match &self.layout.placements[placement_index as usize] {
+                RowAddressPlacement::Direct(value) => {
+                    let mut owned = slots_in_range(0, value.source.slot_count);
+                    if let Some(excluded) = value.excluded.as_deref() {
+                        owned -= selection_slots_for_domain(excluded, logical_fragment_id)?;
+                    }
+                    record_owned(owned, value.destination_fragment_id)?;
+                }
+                RowAddressPlacement::PackedRun(value) => {
+                    let Some(ordinal) = value.domains.domain_ordinal(logical_fragment_id)? else {
+                        continue;
+                    };
+                    record_owned(
+                        slots_in_range(0, value.domains.slot_count_at(ordinal)?),
+                        value.destination_fragment_id,
+                    )?;
+                }
+                RowAddressPlacement::Selected(value) => {
+                    let mut owned =
+                        selection_slots_for_domain(&value.selection, logical_fragment_id)?;
+                    if let Some(excluded) = value.excluded.as_deref() {
+                        owned -= selection_slots_for_domain(excluded, logical_fragment_id)?;
+                    }
+                    record_owned(owned, value.destination_fragment_id)?;
+                }
+                RowAddressPlacement::ExtentList(value) => {
+                    for extent in &value.extents {
+                        let end =
+                            extent
+                                .source_start
+                                .checked_add(extent.length)
+                                .ok_or_else(|| {
+                                    Error::invalid_input("ExtentList source range overflow")
+                                })?;
+                        record_owned(
+                            slots_in_range(extent.source_start, end),
+                            extent.destination_fragment_id,
+                        )?;
+                    }
+                }
+                RowAddressPlacement::SparseSelection(value) => {
+                    for source in value
+                        .sources
+                        .iter()
+                        .filter(|source| source.source.logical_fragment_id == logical_fragment_id)
+                    {
+                        let mut owned =
+                            selection_slots_for_domain(&source.selection, logical_fragment_id)?;
+                        if let Some(excluded) = source.excluded.as_deref() {
+                            owned -= selection_slots_for_domain(excluded, logical_fragment_id)?;
+                        }
+                        record_owned(owned, value.destination_fragment_id)?;
+                    }
+                }
+                RowAddressPlacement::ExplicitMap(value) => {
+                    if value
+                        .sources
+                        .iter()
+                        .any(|source| source.source.logical_fragment_id == logical_fragment_id)
+                    {
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+        if let Ok(index) = self
+            .native_domains
+            .binary_search_by_key(&logical_fragment_id, |(logical, _, _, _)| *logical)
+        {
+            let (_, physical_fragment_id, slot_count, _) = self.native_domains[index];
+            record_owned(slots_in_range(0, slot_count), physical_fragment_id)?;
+        }
+        if &covered != slots {
+            let mut missing = slots.clone();
+            missing -= &covered;
+            return Err(Error::invalid_input(format!(
+                "touched logical selection contains unmapped address {}:{}",
+                logical_fragment_id,
+                missing.min().unwrap_or_default(),
+            )));
+        }
+        Ok(Some(fragments))
+    }
+
+    /// Prove the exact physical ownership of a contiguous logical range from
+    /// root metadata. `None` means an external or high-entropy exclusion needs
+    /// the bounded row resolver fallback.
+    fn logical_range_ownership(
+        &self,
+        range: LogicalRowAddressRange,
+    ) -> Result<Option<LogicalRangeOwnershipProof>> {
+        range.validate()?;
+        let logical_fragment_id = range.logical_fragment_id;
+        let source_start = self
+            .source_index
+            .partition_point(|(logical, _)| *logical < logical_fragment_id);
+        let source_end = self
+            .source_index
+            .partition_point(|(logical, _)| *logical <= logical_fragment_id);
+        let mut placement_indices = self.source_index[source_start..source_end]
+            .iter()
+            .map(|(_, placement_index)| *placement_index)
+            .collect::<Vec<_>>();
+        let packed_index = self
+            .packed_source_runs
+            .partition_point(|(first, _, _)| *first <= logical_fragment_id);
+        if let Some((_, last, placement_index)) = packed_index
+            .checked_sub(1)
+            .and_then(|index| self.packed_source_runs.get(index))
+            && logical_fragment_id <= *last
+            && self.layout.placements[*placement_index as usize]
+                .source_domain(logical_fragment_id)?
+                .is_some()
+        {
+            placement_indices.push(*placement_index);
+        }
+
+        let mut proof = LogicalRangeOwnershipProof::default();
+        for placement_index in placement_indices {
+            match &self.layout.placements[placement_index as usize] {
+                RowAddressPlacement::Direct(value) => {
+                    let start = range.start_slot.min(value.source.slot_count);
+                    let end = range.end_slot.min(value.source.slot_count);
+                    if start < end
+                        && !add_full_range_ownership(
+                            &mut proof,
+                            LogicalRowAddressRange::new(logical_fragment_id, start, end),
+                            value.excluded.as_deref(),
+                            value.destination_fragment_id,
+                            u64::from(value.destination_start),
+                        )?
+                    {
+                        return Ok(None);
+                    }
+                }
+                RowAddressPlacement::PackedRun(value) => {
+                    let Some(ordinal) = value.domains.domain_ordinal(logical_fragment_id)? else {
+                        continue;
+                    };
+                    let slot_count = value.domains.slot_count_at(ordinal)?;
+                    let start = range.start_slot.min(slot_count);
+                    let end = range.end_slot.min(slot_count);
+                    if start < end {
+                        let destination_start = u64::from(value.destination_start)
+                            .checked_add(value.domains.slot_prefix(ordinal)?)
+                            .ok_or_else(|| {
+                                Error::invalid_input("PackedRun destination prefix overflow")
+                            })?;
+                        proof.push_physical_range(
+                            value.destination_fragment_id,
+                            destination_start + u64::from(start),
+                            destination_start + u64::from(end),
+                        )?;
+                        proof.add_mapped_rows(u64::from(end - start))?;
+                    }
+                }
+                RowAddressPlacement::Selected(value) => {
+                    let start = range.start_slot.min(value.source.slot_count);
+                    let end = range.end_slot.min(value.source.slot_count);
+                    if start < end
+                        && !add_selected_range_ownership(
+                            &mut proof,
+                            LogicalRowAddressRange::new(logical_fragment_id, start, end),
+                            &value.selection,
+                            value.excluded.as_deref(),
+                            value.destination_fragment_id,
+                            u64::from(value.destination_start),
+                        )?
+                    {
+                        return Ok(None);
+                    }
+                }
+                RowAddressPlacement::ExtentList(value) => {
+                    for extent in &value.extents {
+                        let source_end = extent
+                            .source_start
+                            .checked_add(extent.length)
+                            .ok_or_else(|| {
+                                Error::invalid_input("ExtentList source range overflow")
+                            })?;
+                        let start = range.start_slot.max(extent.source_start);
+                        let end = range.end_slot.min(source_end);
+                        if start >= end {
+                            continue;
+                        }
+                        let destination_start = u64::from(extent.destination_start)
+                            + u64::from(start - extent.source_start);
+                        proof.push_physical_range(
+                            extent.destination_fragment_id,
+                            destination_start,
+                            destination_start + u64::from(end - start),
+                        )?;
+                        proof.add_mapped_rows(u64::from(end - start))?;
+                    }
+                }
+                RowAddressPlacement::SparseSelection(value) => {
+                    let mut prefix = 0_u64;
+                    for source in &value.sources {
+                        if source.source.logical_fragment_id == logical_fragment_id {
+                            let start = range.start_slot.min(source.source.slot_count);
+                            let end = range.end_slot.min(source.source.slot_count);
+                            if start < end
+                                && !add_selected_range_ownership(
+                                    &mut proof,
+                                    LogicalRowAddressRange::new(logical_fragment_id, start, end),
+                                    &source.selection,
+                                    source.excluded.as_deref(),
+                                    value.destination_fragment_id,
+                                    u64::from(value.destination_start) + prefix,
+                                )?
+                            {
+                                return Ok(None);
+                            }
+                        }
+                        prefix = prefix
+                            .checked_add(source.selection.cardinality())
+                            .ok_or_else(|| {
+                                Error::invalid_input("SparseSelection destination prefix overflow")
+                            })?;
+                    }
+                }
+                RowAddressPlacement::ExplicitMap(value) => {
+                    if value
+                        .sources
+                        .iter()
+                        .any(|source| source.source.logical_fragment_id == logical_fragment_id)
+                    {
+                        // The locator object is authoritative for membership;
+                        // root page bounds cannot prove every row in a range.
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+        if let Ok(index) = self
+            .native_domains
+            .binary_search_by_key(&logical_fragment_id, |(logical, _, _, _)| *logical)
+        {
+            let (_, physical_fragment_id, slot_count, _) = self.native_domains[index];
+            let start = range.start_slot.min(slot_count);
+            let end = range.end_slot.min(slot_count);
+            if start < end {
+                proof.push_physical_range(
+                    physical_fragment_id,
+                    u64::from(start),
+                    u64::from(end),
+                )?;
+                proof.add_mapped_rows(u64::from(end - start))?;
+            }
+        }
+        if proof.mapped_rows > range.len() {
+            return Err(Error::invalid_input(format!(
+                "logical range fragment_id={}, start={}, end={} has overlapping physical owners",
+                range.logical_fragment_id, range.start_slot, range.end_slot,
+            )));
+        }
+        Ok(Some(proof))
     }
 
     pub fn logical_domain(
@@ -4712,12 +5817,10 @@ fn validate_explicit_sources(sources: &[SparseSelectionSource]) -> Result<()> {
                     "ExplicitMap exclusion exceeds its source selection",
                 ));
             }
-            for address in excluded.iter() {
-                if !source.selection.contains(address?)? {
-                    return Err(Error::invalid_input(
-                        "ExplicitMap exclusion contains an address outside its source selection",
-                    ));
-                }
+            if !excluded.is_subset_of(&source.selection)? {
+                return Err(Error::invalid_input(
+                    "ExplicitMap exclusion contains an address outside its source selection",
+                ));
             }
         }
         effective_rows = effective_rows
@@ -4753,13 +5856,10 @@ fn validate_excluded_selection(
             "{context} exclusion must leave at least one mapped row"
         )));
     }
-    for address in excluded.iter() {
-        let address = address?;
-        if !selected.contains(address)? {
-            return Err(Error::invalid_input(format!(
-                "{context} exclusion contains an address outside its source selection"
-            )));
-        }
+    if !excluded.is_subset_of(selected)? {
+        return Err(Error::invalid_input(format!(
+            "{context} exclusion contains an address outside its source selection"
+        )));
     }
     Ok(())
 }
@@ -5168,15 +6268,11 @@ struct LogicalPhysicalExtent {
 }
 
 fn bitmap_ranges(bitmap: &RoaringBitmap) -> impl Iterator<Item = (u32, u32)> + '_ {
-    let mut values = bitmap.iter().peekable();
+    let mut values = bitmap.iter();
     std::iter::from_fn(move || {
-        let start = values.next()?;
-        let mut end = start.checked_add(1)?;
-        while values.peek().copied() == Some(end) {
-            values.next();
-            end = end.checked_add(1)?;
-        }
-        Some((start, end))
+        values
+            .next_range()
+            .and_then(|range| Some((*range.start(), range.end().checked_add(1)?)))
     })
 }
 
@@ -5235,13 +6331,39 @@ fn selection_intersects_removed(
     source: RowAddressLogicalDomain,
     removed: &RoaringBitmap,
 ) -> Result<bool> {
-    for slot in removed.iter() {
-        let address = LogicalRowAddress::try_new_from_parts(source.logical_fragment_id, slot)?;
-        if selection.contains(address)? && !is_excluded(excluded, address)? {
-            return Ok(true);
-        }
+    let mut selected_slots = selection_slots_for_domain(selection, source.logical_fragment_id)?;
+    if let Some(excluded) = excluded {
+        selected_slots -=
+            selection_slots_for_domain(excluded.as_ref(), source.logical_fragment_id)?;
     }
-    Ok(false)
+    Ok(!selected_slots.is_disjoint(removed))
+}
+
+fn slots_within_domain(slots: &RoaringBitmap, source: RowAddressLogicalDomain) -> RoaringBitmap {
+    let mut within_domain = RoaringBitmap::new();
+    within_domain.insert_range(0..source.slot_count);
+    within_domain &= slots;
+    within_domain
+}
+
+fn direct_intersects_removed(
+    source: RowAddressLogicalDomain,
+    excluded: Option<&Arc<LogicalRowAddressSelection>>,
+    removed: &RoaringBitmap,
+) -> Result<bool> {
+    let mut touched = slots_within_domain(removed, source);
+    if let Some(excluded) = excluded {
+        touched -= selection_slots_for_domain(excluded, source.logical_fragment_id)?;
+    }
+    Ok(!touched.is_empty())
+}
+
+fn selection_bitmap_for_domain(logical_fragment_id: u32, slots: RoaringBitmap) -> RoaringTreemap {
+    if slots.is_empty() {
+        RoaringTreemap::new()
+    } else {
+        RoaringTreemap::from_bitmaps([(logical_fragment_id, slots)])
+    }
 }
 
 fn merge_excluded_slots(
@@ -5251,20 +6373,44 @@ fn merge_excluded_slots(
     removed: &RoaringBitmap,
 ) -> Result<Arc<LogicalRowAddressSelection>> {
     let mut excluded = existing
-        .into_iter()
-        .flat_map(|selection| selection.iter())
-        .map(|address| address.map(LogicalRowAddress::raw))
-        .collect::<Result<RoaringTreemap>>()?;
-    for slot in removed.range(0..source.slot_count) {
-        let address = LogicalRowAddress::try_new_from_parts(source.logical_fragment_id, slot)?;
-        if let Some(selected) = selected
-            && !selected.contains(address)?
-        {
-            continue;
-        }
-        excluded.insert(address.raw());
+        .map(|selection| selection.to_roaring_treemap())
+        .transpose()?
+        .unwrap_or_default();
+    let mut added = slots_within_domain(removed, source);
+    if let Some(selected) = selected {
+        added &= selection_slots_for_domain(selected, source.logical_fragment_id)?;
     }
+    excluded |= selection_bitmap_for_domain(source.logical_fragment_id, added);
     Ok(Arc::new(LogicalRowAddressSelection::from_bitmap(excluded)?))
+}
+
+fn selection_slots_for_domain(
+    selection: &LogicalRowAddressSelection,
+    logical_fragment_id: u32,
+) -> Result<RoaringBitmap> {
+    match selection {
+        LogicalRowAddressSelection::Ranges(value) => {
+            let mut slots = RoaringBitmap::new();
+            for range in value
+                .ranges
+                .iter()
+                .filter(|range| range.logical_fragment_id == logical_fragment_id)
+            {
+                slots.insert_range(range.start_slot..range.end_slot);
+            }
+            Ok(slots)
+        }
+        LogicalRowAddressSelection::Roaring(value) => Ok(value
+            .bitmap()?
+            .bitmaps()
+            .find_map(|(domain, slots)| (domain == logical_fragment_id).then(|| slots.clone()))
+            .unwrap_or_default()),
+        _ => Ok(selection
+            .to_roaring_treemap()?
+            .bitmaps()
+            .find_map(|(domain, slots)| (domain == logical_fragment_id).then(|| slots.clone()))
+            .unwrap_or_default()),
+    }
 }
 
 fn residual_placements_from_extents(
@@ -5369,10 +6515,7 @@ fn selection_from_slot_bitmap(
     logical_fragment_id: u32,
     slots: &RoaringBitmap,
 ) -> Result<Arc<LogicalRowAddressSelection>> {
-    let bitmap = slots
-        .iter()
-        .map(|slot| ((logical_fragment_id as u64) << 32) | slot as u64)
-        .collect::<RoaringTreemap>();
+    let bitmap = RoaringTreemap::from_bitmaps([(logical_fragment_id, slots.clone())]);
     Ok(Arc::new(LogicalRowAddressSelection::from_bitmap(bitmap)?))
 }
 
@@ -5395,6 +6538,10 @@ fn selection_is_full_domain(
         && last.immutable_slot() == source.slot_count - 1)
 }
 
+fn slots_cover_domain(slots: &RoaringBitmap, source: RowAddressLogicalDomain) -> bool {
+    slots.range_cardinality(0..source.slot_count) == u64::from(source.slot_count)
+}
+
 fn subtract_placement(
     placement: &RowAddressPlacement,
     removed: &BTreeMap<u32, RoaringBitmap>,
@@ -5403,26 +6550,21 @@ fn subtract_placement(
 ) -> Result<Option<PlacementMaintenanceRequired>> {
     let touches = match placement {
         RowAddressPlacement::Direct(value) => {
-            let mut touches = false;
             if let Some(slots) = removed.get(&value.source.logical_fragment_id) {
-                for slot in slots.range(0..value.source.slot_count) {
-                    let address = LogicalRowAddress::try_new_from_parts(
-                        value.source.logical_fragment_id,
-                        slot,
-                    )?;
-                    if !is_excluded(value.excluded.as_ref(), address)? {
-                        touches = true;
-                        break;
-                    }
+                if slots_cover_domain(slots, value.source) {
+                    return Ok(None);
                 }
+                direct_intersects_removed(value.source, value.excluded.as_ref(), slots)?
+            } else {
+                false
             }
-            touches
         }
         RowAddressPlacement::PackedRun(value) => {
             let mut touches = false;
-            for logical_fragment_id in removed.keys() {
-                if let Some(ordinal) = value.domains.domain_ordinal(*logical_fragment_id)?
-                    && removed[logical_fragment_id]
+            for ordinal in 0..value.domains.domain_count() {
+                let logical_fragment_id = value.domains.logical_fragment_id_at(ordinal)?;
+                if let Some(removed) = removed.get(&logical_fragment_id)
+                    && removed
                         .range(0..value.domains.slot_count_at(ordinal)?)
                         .next()
                         .is_some()
@@ -5435,12 +6577,13 @@ fn subtract_placement(
         }
         RowAddressPlacement::Selected(value) => {
             if let Some(slots) = removed.get(&value.source.logical_fragment_id) {
-                selection_intersects_removed(
-                    &value.selection,
-                    value.excluded.as_ref(),
-                    value.source,
-                    slots,
-                )?
+                slots_cover_domain(slots, value.source)
+                    || selection_intersects_removed(
+                        &value.selection,
+                        value.excluded.as_ref(),
+                        value.source,
+                        slots,
+                    )?
             } else {
                 false
             }
@@ -5459,12 +6602,13 @@ fn subtract_placement(
             let mut touches = false;
             for source in &value.sources {
                 if let Some(slots) = removed.get(&source.source.logical_fragment_id)
-                    && selection_intersects_removed(
-                        &source.selection,
-                        source.excluded.as_ref(),
-                        source.source,
-                        slots,
-                    )?
+                    && (slots_cover_domain(slots, source.source)
+                        || selection_intersects_removed(
+                            &source.selection,
+                            source.excluded.as_ref(),
+                            source.source,
+                            slots,
+                        )?)
                 {
                     touches = true;
                     break;
@@ -5476,21 +6620,24 @@ fn subtract_placement(
             let mut updated = value.clone();
             let mut touched = false;
             for source in &mut updated.sources {
-                if let Some(slots) = removed.get(&source.source.logical_fragment_id)
-                    && selection_intersects_removed(
+                if let Some(slots) = removed.get(&source.source.logical_fragment_id) {
+                    if slots_cover_domain(slots, source.source) {
+                        source.excluded = Some(source.selection.clone());
+                        touched = true;
+                    } else if selection_intersects_removed(
                         &source.selection,
                         source.excluded.as_ref(),
                         source.source,
                         slots,
-                    )?
-                {
-                    source.excluded = Some(merge_excluded_slots(
-                        source.source,
-                        Some(&source.selection),
-                        source.excluded.as_ref(),
-                        slots,
-                    )?);
-                    touched = true;
+                    )? {
+                        source.excluded = Some(merge_excluded_slots(
+                            source.source,
+                            Some(&source.selection),
+                            source.excluded.as_ref(),
+                            slots,
+                        )?);
+                        touched = true;
+                    }
                 }
             }
             if touched {
@@ -5517,14 +6664,17 @@ fn subtract_placement(
     }
     match placement {
         RowAddressPlacement::Direct(value) => {
-            let excluded = merge_excluded_slots(
-                value.source,
-                None,
-                value.excluded.as_ref(),
+            let removed_slots =
                 removed
                     .get(&value.source.logical_fragment_id)
-                    .expect("Direct placement was found to intersect removed slots"),
-            )?;
+                    .ok_or_else(|| {
+                        Error::internal(format!(
+                            "removed slot map lost direct source logical fragment {}",
+                            value.source.logical_fragment_id
+                        ))
+                    })?;
+            let excluded =
+                merge_excluded_slots(value.source, None, value.excluded.as_ref(), removed_slots)?;
             if excluded.cardinality() < value.source.slot_count as u64 {
                 preserved.push(RowAddressPlacement::Direct(DirectRowAddressPlacement {
                     excluded: Some(excluded),
@@ -5534,14 +6684,15 @@ fn subtract_placement(
         }
         RowAddressPlacement::PackedRun(value) => {
             let mut touched_ordinals = Vec::<(u32, u32)>::new();
-            for logical_fragment_id in removed.keys() {
-                if let Some(ordinal) = value.domains.domain_ordinal(*logical_fragment_id)?
-                    && removed[logical_fragment_id]
+            for ordinal in 0..value.domains.domain_count() {
+                let logical_fragment_id = value.domains.logical_fragment_id_at(ordinal)?;
+                if let Some(removed) = removed.get(&logical_fragment_id)
+                    && removed
                         .range(0..value.domains.slot_count_at(ordinal)?)
                         .next()
                         .is_some()
                 {
-                    touched_ordinals.push((ordinal, *logical_fragment_id));
+                    touched_ordinals.push((ordinal, logical_fragment_id));
                 }
             }
             touched_ordinals.sort_unstable();
@@ -5583,14 +6734,17 @@ fn subtract_placement(
                         |_| Error::invalid_input("PackedRun destination prefix exceeds u32"),
                     )?)
                     .ok_or_else(|| Error::invalid_input("PackedRun destination overflow"))?;
-                let excluded = merge_excluded_slots(
-                    source,
-                    None,
-                    None,
-                    removed
-                        .get(&source.logical_fragment_id)
-                        .expect("PackedRun domain was found to intersect removed slots"),
-                )?;
+                let removed_slots = removed.get(&source.logical_fragment_id).ok_or_else(|| {
+                    Error::internal(format!(
+                        "removed slot map lost packed-run source logical fragment {}",
+                        source.logical_fragment_id
+                    ))
+                })?;
+                if slots_cover_domain(removed_slots, source) {
+                    cursor = ordinal + 1;
+                    continue;
+                }
+                let excluded = merge_excluded_slots(source, None, None, removed_slots)?;
                 if excluded.cardinality() < source.slot_count as u64 {
                     preserved.push(RowAddressPlacement::Direct(DirectRowAddressPlacement {
                         source,
@@ -5635,13 +6789,23 @@ fn subtract_placement(
             }
         }
         RowAddressPlacement::Selected(value) => {
+            let removed_slots =
+                removed
+                    .get(&value.source.logical_fragment_id)
+                    .ok_or_else(|| {
+                        Error::internal(format!(
+                            "removed slot map lost selected source logical fragment {}",
+                            value.source.logical_fragment_id
+                        ))
+                    })?;
+            if slots_cover_domain(removed_slots, value.source) {
+                return Ok(None);
+            }
             let excluded = merge_excluded_slots(
                 value.source,
                 Some(&value.selection),
                 value.excluded.as_ref(),
-                removed
-                    .get(&value.source.logical_fragment_id)
-                    .expect("Selected placement was found to intersect removed slots"),
+                removed_slots,
             )?;
             if excluded.cardinality() < value.selection.cardinality() {
                 if selection_is_full_domain(&value.selection, value.source)? {
@@ -5660,6 +6824,12 @@ fn subtract_placement(
             }
         }
         RowAddressPlacement::ExtentList(value) => {
+            if removed
+                .get(&value.source.logical_fragment_id)
+                .is_some_and(|slots| slots_cover_domain(slots, value.source))
+            {
+                return Ok(None);
+            }
             for extent in &value.extents {
                 subtract_source_range(
                     value.source,
@@ -5678,7 +6848,11 @@ fn subtract_placement(
             let mut group = Vec::new();
             for source in &value.sources {
                 let mut updated = source.clone();
-                if let Some(slots) = removed.get(&source.source.logical_fragment_id)
+                let fully_removed = removed
+                    .get(&source.source.logical_fragment_id)
+                    .is_some_and(|slots| slots_cover_domain(slots, source.source));
+                if !fully_removed
+                    && let Some(slots) = removed.get(&source.source.logical_fragment_id)
                     && selection_intersects_removed(
                         &source.selection,
                         source.excluded.as_ref(),
@@ -5694,11 +6868,12 @@ fn subtract_placement(
                     )?;
                     updated.excluded = Some(excluded);
                 }
-                if updated
-                    .excluded
-                    .as_ref()
-                    .map_or(0, |excluded| excluded.cardinality())
-                    == updated.selection.cardinality()
+                if fully_removed
+                    || updated
+                        .excluded
+                        .as_ref()
+                        .map_or(0, |excluded| excluded.cardinality())
+                        == updated.selection.cardinality()
                 {
                     if !group.is_empty() {
                         preserved.push(RowAddressPlacement::SparseSelection(
@@ -5748,35 +6923,72 @@ fn build_fast_output_placement(
     target_fragment_id: u32,
     domains: &BTreeMap<u32, RowAddressLogicalDomain>,
 ) -> Result<RowAddressPlacement> {
-    let mut previous_address = None;
+    let mut previous_address = None::<u64>;
     let mut slots_by_domain = BTreeMap::<u32, RoaringBitmap>::new();
     for selection in &delta.source_selections {
-        for address in selection.iter() {
-            let address = address?;
-            if previous_address.is_some_and(|previous| previous >= address.raw()) {
-                return Err(Error::invalid_input(
-                    "fast-path output rows must be in strict logical source order",
-                ));
-            }
-            slots_by_domain
-                .entry(address.logical_fragment_id())
-                .or_default()
-                .insert(address.immutable_slot());
-            previous_address = Some(address.raw());
+        if selection.is_empty() {
+            continue;
         }
+        let first_address = selection
+            .select(0)?
+            .ok_or_else(|| Error::invalid_input("non-empty source selection has no first row"))?
+            .raw();
+        if previous_address.is_some_and(|previous| previous >= first_address) {
+            return Err(Error::invalid_input(
+                "fast-path output rows must be in strict logical source order",
+            ));
+        }
+        let last_address = selection
+            .select(selection.cardinality() - 1)?
+            .ok_or_else(|| Error::invalid_input("non-empty source selection has no last row"))?
+            .raw();
+        if merge_selection_slots(selection, &mut slots_by_domain)?.is_some() {
+            return Err(Error::invalid_input(
+                "fast-path output rows must not contain duplicate logical addresses",
+            ));
+        }
+        previous_address = Some(last_address);
     }
     if slots_by_domain.is_empty() {
         return Err(Error::invalid_input(
             "non-Direct placement output must have source selections",
         ));
     }
-    let mut sources = Vec::<SparseSelectionSource>::with_capacity(slots_by_domain.len());
+    let mut domain_sources = Vec::with_capacity(slots_by_domain.len());
+    let mut all_domains_full = true;
     for (logical_fragment_id, slots) in &slots_by_domain {
         let source = *domains.get(logical_fragment_id).ok_or_else(|| {
             Error::invalid_input(format!(
                 "missing source-domain metadata for logical fragment {logical_fragment_id}"
             ))
         })?;
+        all_domains_full &= slots.len() == u64::from(source.slot_count)
+            && slots.min() == Some(0)
+            && slots.max() == source.slot_count.checked_sub(1);
+        domain_sources.push(source);
+    }
+    if domain_sources.len() == 1 && all_domains_full {
+        let direct = RowAddressPlacement::Direct(DirectRowAddressPlacement {
+            source: domain_sources[0],
+            destination_fragment_id: target_fragment_id,
+            destination_start: delta.target.start_offset,
+            excluded: None,
+        });
+        direct.validate()?;
+        return Ok(direct);
+    }
+    if domain_sources.len() > 1 && all_domains_full {
+        let packed = RowAddressPlacement::PackedRun(PackedRunRowAddressPlacement::from_sources(
+            domain_sources,
+            target_fragment_id,
+            delta.target.start_offset,
+        )?);
+        packed.validate()?;
+        return Ok(packed);
+    }
+
+    let mut sources = Vec::<SparseSelectionSource>::with_capacity(slots_by_domain.len());
+    for ((logical_fragment_id, slots), source) in slots_by_domain.iter().zip(domain_sources) {
         sources.push(SparseSelectionSource {
             source,
             selection: selection_from_slot_bitmap(*logical_fragment_id, slots)?,
@@ -5786,16 +6998,6 @@ fn build_fast_output_placement(
     let mut candidates = Vec::<RowAddressPlacement>::new();
     if sources.len() == 1 {
         let source = &sources[0];
-        if selection_is_full_domain(&source.selection, source.source)? {
-            let direct = RowAddressPlacement::Direct(DirectRowAddressPlacement {
-                source: source.source,
-                destination_fragment_id: target_fragment_id,
-                destination_start: delta.target.start_offset,
-                excluded: None,
-            });
-            direct.validate()?;
-            return Ok(direct);
-        }
         candidates.push(RowAddressPlacement::Selected(SelectedRowAddressPlacement {
             source: source.source,
             selection: source.selection.clone(),
@@ -5829,22 +7031,6 @@ fn build_fast_output_placement(
             ));
         }
     } else {
-        if sources
-            .iter()
-            .map(|source| selection_is_full_domain(&source.selection, source.source))
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .all(|full| full)
-        {
-            let packed =
-                RowAddressPlacement::PackedRun(PackedRunRowAddressPlacement::from_sources(
-                    sources.iter().map(|source| source.source).collect(),
-                    target_fragment_id,
-                    delta.target.start_offset,
-                )?);
-            packed.validate()?;
-            return Ok(packed);
-        }
         candidates.push(RowAddressPlacement::SparseSelection(
             SparseSelectionRowAddressPlacement {
                 sources,
@@ -5870,6 +7056,22 @@ fn build_fast_output_placement(
             )
         })
         .ok_or_else(|| Error::invalid_input("no fast-path output placement candidate"))
+}
+
+fn merge_selection_slots(
+    selection: &LogicalRowAddressSelection,
+    slots_by_domain: &mut BTreeMap<u32, RoaringBitmap>,
+) -> Result<Option<u32>> {
+    let rows = selection.to_roaring_treemap()?;
+    for (logical_fragment_id, selected_slots) in rows.bitmaps() {
+        let slots = slots_by_domain.entry(logical_fragment_id).or_default();
+        let expected_cardinality = slots.len() + selected_slots.len();
+        *slots |= selected_slots;
+        if slots.len() != expected_cardinality {
+            return Ok(Some(logical_fragment_id));
+        }
+    }
+    Ok(None)
 }
 
 fn selection_without(
@@ -6172,17 +7374,6 @@ fn logical_domain_identity_fingerprint(
     Some(stable_fingerprint(&bytes).to_vec())
 }
 
-fn selection_slots_for_domain(
-    selection: &LogicalRowAddressSelection,
-    logical_fragment_id: u32,
-) -> Result<RoaringBitmap> {
-    Ok(selection
-        .to_roaring_treemap()?
-        .bitmaps()
-        .find_map(|(domain, slots)| (domain == logical_fragment_id).then(|| slots.clone()))
-        .unwrap_or_default())
-}
-
 fn placement_owns_any_slots(
     placement: &RowAddressPlacement,
     logical_fragment_id: u32,
@@ -6243,6 +7434,268 @@ fn placement_owns_any_slots(
         }
         RowAddressPlacement::ExplicitMap(_) => Ok(false),
     }
+}
+
+fn physical_fragment_is_fully_dropped(
+    physical_fragment_id: u32,
+    context: &RowAddressDeltaApplyContext<'_>,
+) -> bool {
+    context
+        .newly_fully_deleted_source_fragments
+        .contains(&physical_fragment_id)
+        && !context
+            .successor_fragments
+            .iter()
+            .any(|fragment| fragment.id == u64::from(physical_fragment_id))
+}
+
+fn validate_retired_physical_range(
+    logical_range: LogicalRowAddressRange,
+    physical_range: PhysicalRowRange,
+    context: &RowAddressDeltaApplyContext<'_>,
+    affected_physical_fragments: &mut BTreeSet<u32>,
+) -> Result<()> {
+    affected_physical_fragments.insert(physical_range.physical_fragment_id);
+    if physical_fragment_is_fully_dropped(physical_range.physical_fragment_id, context) {
+        return Ok(());
+    }
+    let mut not_deleted = RoaringBitmap::new();
+    not_deleted.insert_range(physical_range.start_offset..physical_range.end_offset);
+    if let Some(deleted) = context
+        .current_deletion_vectors
+        .get(&physical_range.physical_fragment_id)
+    {
+        not_deleted -= *deleted;
+    }
+    if let Some(deleted) = context
+        .deletion_vectors
+        .get(&physical_range.physical_fragment_id)
+    {
+        not_deleted -= *deleted;
+    }
+    if let Some(offset) = not_deleted.min() {
+        return Err(Error::invalid_input(format!(
+            "retired logical range fragment_id={}, start={}, end={} was live in source fragment {} at offset {}",
+            logical_range.logical_fragment_id,
+            logical_range.start_slot,
+            logical_range.end_slot,
+            physical_range.physical_fragment_id,
+            offset,
+        )));
+    }
+    Ok(())
+}
+
+fn validate_retired_address_batch(
+    layout: &RowAddressLayout,
+    router: &RowAddressRouter,
+    addresses: &[LogicalRowAddress],
+    explicit_replaced_domains: &BTreeSet<u32>,
+    context: &RowAddressDeltaApplyContext<'_>,
+    affected_physical_fragments: &mut BTreeSet<u32>,
+) -> Result<()> {
+    for (address, resolution) in addresses.iter().zip(router.resolve_many(addresses)?) {
+        match resolution {
+            PlacementResolution::Mapped {
+                locator: PhysicalRowLocator::Physical(physical),
+            } => {
+                let logical_range = LogicalRowAddressRange::new(
+                    address.logical_fragment_id(),
+                    address.immutable_slot(),
+                    address.immutable_slot().checked_add(1).ok_or_else(|| {
+                        Error::invalid_input("retired logical address slot overflow")
+                    })?,
+                );
+                validate_retired_physical_range(
+                    logical_range,
+                    PhysicalRowRange {
+                        physical_fragment_id: physical.fragment_id(),
+                        start_offset: physical.row_offset(),
+                        end_offset: physical.row_offset().checked_add(1).ok_or_else(|| {
+                            Error::invalid_input("retired physical address offset overflow")
+                        })?,
+                    },
+                    context,
+                    affected_physical_fragments,
+                )?;
+            }
+            PlacementResolution::Mapped {
+                locator:
+                    PhysicalRowLocator::ExplicitMap {
+                        placement_index, ..
+                    },
+            } => {
+                // The format layer does not perform object I/O. The delete
+                // writer supplies exact logical identities; bind them to a
+                // transaction which removes a destination of the same root.
+                let Some(RowAddressPlacement::ExplicitMap(explicit)) =
+                    layout.placements.get(placement_index as usize)
+                else {
+                    return Err(Error::invalid_input(
+                        "retired ExplicitMap address references an invalid placement",
+                    ));
+                };
+                let mut removes_destination = false;
+                for destination in &explicit.destinations {
+                    if physical_fragment_is_fully_dropped(destination.physical_fragment_id, context)
+                    {
+                        removes_destination = true;
+                        affected_physical_fragments.insert(destination.physical_fragment_id);
+                    }
+                }
+                if !removes_destination
+                    && !explicit_replaced_domains.contains(&address.logical_fragment_id())
+                {
+                    return Err(Error::invalid_input(format!(
+                        "retired logical address {} belongs to an ExplicitMap with no deleted destination",
+                        address.raw()
+                    )));
+                }
+            }
+            PlacementResolution::NotLive
+                if explicit_replaced_domains.contains(&address.logical_fragment_id()) => {}
+            PlacementResolution::NotLive | PlacementResolution::Unmapped => {
+                return Err(Error::invalid_input(format!(
+                    "retired logical address {} has no live physical source location",
+                    address.raw()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_retired_addresses(
+    visit_addresses: impl FnOnce(&mut dyn FnMut(LogicalRowAddress) -> Result<()>) -> Result<()>,
+    layout: &RowAddressLayout,
+    router: &RowAddressRouter,
+    explicit_replaced_domains: &BTreeSet<u32>,
+    context: &RowAddressDeltaApplyContext<'_>,
+    affected_physical_fragments: &mut BTreeSet<u32>,
+) -> Result<()> {
+    let mut batch = Vec::with_capacity(4096);
+    {
+        let mut push = |address| {
+            batch.push(address);
+            if batch.len() == 4096 {
+                validate_retired_address_batch(
+                    layout,
+                    router,
+                    &batch,
+                    explicit_replaced_domains,
+                    context,
+                    affected_physical_fragments,
+                )?;
+                batch.clear();
+            }
+            Ok(())
+        };
+        visit_addresses(&mut push)?;
+    }
+    if !batch.is_empty() {
+        validate_retired_address_batch(
+            layout,
+            router,
+            &batch,
+            explicit_replaced_domains,
+            context,
+            affected_physical_fragments,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_touched_addresses(
+    addresses: impl Iterator<Item = Result<LogicalRowAddress>>,
+    router: &RowAddressRouter,
+    explicit_replaced_domains: &BTreeSet<u32>,
+    affected_physical_fragments: &mut BTreeSet<u32>,
+) -> Result<()> {
+    let mut batch = Vec::with_capacity(4096);
+    let validate_batch =
+        |batch: &[LogicalRowAddress], affected: &mut BTreeSet<u32>| -> Result<()> {
+            for (address, resolution) in batch.iter().zip(router.resolve_many(batch)?) {
+                match resolution {
+                    PlacementResolution::Mapped {
+                        locator: PhysicalRowLocator::Physical(physical),
+                    } => {
+                        affected.insert(physical.fragment_id());
+                    }
+                    PlacementResolution::Mapped { .. } => {}
+                    PlacementResolution::NotLive
+                        if explicit_replaced_domains.contains(&address.logical_fragment_id()) => {}
+                    _ => {
+                        return Err(Error::invalid_input(
+                            "touched logical selection contains an unmapped address",
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        };
+    for address in addresses {
+        batch.push(address?);
+        if batch.len() == 4096 {
+            validate_batch(&batch, affected_physical_fragments)?;
+            batch.clear();
+        }
+    }
+    if !batch.is_empty() {
+        validate_batch(&batch, affected_physical_fragments)?;
+    }
+    Ok(())
+}
+
+fn record_retired_range(
+    range: LogicalRowAddressRange,
+    explicit_replaced_domains: &BTreeSet<u32>,
+    declared_domains: &BTreeMap<u32, RowAddressLogicalDomain>,
+    removed: &mut BTreeMap<u32, RoaringBitmap>,
+    new_retirements: &mut BTreeMap<u32, RoaringBitmap>,
+    explicit_retirement_cardinality: &mut u64,
+) -> Result<()> {
+    range.validate()?;
+    let source = declared_domains
+        .get(&range.logical_fragment_id)
+        .ok_or_else(|| {
+            Error::invalid_input(format!(
+                "retirement references undeclared logical domain {}",
+                range.logical_fragment_id
+            ))
+        })?;
+    if range.end_slot > source.slot_count {
+        return Err(Error::invalid_input(format!(
+            "retired logical range fragment_id={}, start={}, end={} exceeds source slot_count {}",
+            range.logical_fragment_id, range.start_slot, range.end_slot, source.slot_count,
+        )));
+    }
+    let inserted = new_retirements
+        .entry(range.logical_fragment_id)
+        .or_default()
+        .insert_range(range.start_slot..range.end_slot);
+    if inserted != range.len() {
+        return Err(Error::invalid_input(format!(
+            "logical range fragment_id={}, start={}, end={} is retired more than once",
+            range.logical_fragment_id, range.start_slot, range.end_slot,
+        )));
+    }
+    if explicit_replaced_domains.contains(&range.logical_fragment_id) {
+        *explicit_retirement_cardinality = explicit_retirement_cardinality
+            .checked_add(range.len())
+            .ok_or_else(|| Error::invalid_input("ExplicitMap retirement cardinality overflow"))?;
+        return Ok(());
+    }
+    let inserted = removed
+        .entry(range.logical_fragment_id)
+        .or_default()
+        .insert_range(range.start_slot..range.end_slot);
+    if inserted != range.len() {
+        return Err(Error::invalid_input(format!(
+            "logical range fragment_id={}, start={}, end={} is both emitted and retired",
+            range.logical_fragment_id, range.start_slot, range.end_slot,
+        )));
+    }
+    Ok(())
 }
 
 impl RowAddressLayout {
@@ -6437,7 +7890,9 @@ impl RowAddressLayout {
         let mut explicit_replaced_domains = BTreeSet::<u32>::new();
         let mut explicit_source_cardinality = 0_u64;
         let mut explicit_output_cardinality = 0_u64;
-        let mut retired_addresses = Vec::new();
+        let mut retirement_cardinality = 0_u64;
+        let mut explicit_retirement_cardinality = 0_u64;
+        let mut new_retirements = BTreeMap::<u32, RoaringBitmap>::new();
         for (placement_index, placement) in delta.placements.iter().enumerate() {
             if placement.target.start_offset >= placement.target.end_offset
                 || (placement.placement_kind != RowAddressPlacementKind::ExplicitMap
@@ -6499,9 +7954,8 @@ impl RowAddressLayout {
                         });
                     }
                     for selection in &placement.source_selections {
-                        for address in selection.iter() {
-                            explicit_replaced_domains.insert(address?.logical_fragment_id());
-                        }
+                        let domains = selection.logical_fragment_bitmap()?;
+                        explicit_replaced_domains.extend(domains.iter());
                     }
                     explicit_source_cardinality = explicit_source_cardinality
                         .checked_add(source_cardinality)
@@ -6517,18 +7971,12 @@ impl RowAddressLayout {
                     placement.verify_output_row_sequence()?;
                 }
                 for selection in &placement.source_selections {
-                    for address in selection.iter() {
-                        let address = address?;
-                        if !removed
-                            .entry(address.logical_fragment_id())
-                            .or_default()
-                            .insert(address.immutable_slot())
-                        {
-                            return Err(Error::invalid_input(format!(
-                                "logical address {} is touched by multiple placement outputs",
-                                address.raw()
-                            )));
-                        }
+                    if let Some(logical_fragment_id) =
+                        merge_selection_slots(selection, &mut removed)?
+                    {
+                        return Err(Error::invalid_input(format!(
+                            "logical fragment {logical_fragment_id} overlaps another placement output"
+                        )));
                     }
                 }
             }
@@ -6552,50 +8000,37 @@ impl RowAddressLayout {
                 ));
             }
         }
-        let mut explicit_retirements = RoaringTreemap::new();
         for selection in &delta.retired_selections {
             if selection.is_empty() {
                 return Err(Error::invalid_input(
                     "retired logical row-address selection must not be empty",
                 ));
             }
-            for address in selection.iter() {
-                let address = address?;
-                let explicit_replacement =
-                    explicit_replaced_domains.contains(&address.logical_fragment_id());
-                if explicit_replacement {
-                    let source = declared_domains
-                        .get(&address.logical_fragment_id())
-                        .ok_or_else(|| {
-                            Error::invalid_input(format!(
-                                "ExplicitMap retirement references undeclared logical domain {}",
-                                address.logical_fragment_id()
-                            ))
-                        })?;
-                    if address.immutable_slot() >= source.slot_count {
-                        return Err(Error::invalid_input(format!(
-                            "ExplicitMap retirement {} exceeds source slot_count {}",
-                            address.raw(),
-                            source.slot_count
-                        )));
-                    }
-                    if !explicit_retirements.insert(address.raw()) {
-                        return Err(Error::invalid_input(format!(
-                            "logical address {} is retired more than once",
-                            address.raw()
-                        )));
-                    }
-                } else if !removed
-                    .entry(address.logical_fragment_id())
-                    .or_default()
-                    .insert(address.immutable_slot())
-                {
-                    return Err(Error::invalid_input(format!(
-                        "logical address {} is both emitted and retired, or retired more than once",
-                        address.raw()
-                    )));
+            retirement_cardinality = retirement_cardinality
+                .checked_add(selection.cardinality())
+                .ok_or_else(|| Error::invalid_input("retirement cardinality overflow"))?;
+            if let Some(ranges) = selection.compact_ranges(MAX_SELECTION_DOMAINS)? {
+                for range in ranges {
+                    record_retired_range(
+                        range,
+                        &explicit_replaced_domains,
+                        &declared_domains,
+                        &mut removed,
+                        &mut new_retirements,
+                        &mut explicit_retirement_cardinality,
+                    )?;
                 }
-                retired_addresses.push(address);
+            } else {
+                visit_selection_value_ranges(selection, |range| {
+                    record_retired_range(
+                        range,
+                        &explicit_replaced_domains,
+                        &declared_domains,
+                        &mut removed,
+                        &mut new_retirements,
+                        &mut explicit_retirement_cardinality,
+                    )
+                })?;
             }
         }
         if !explicit_replaced_domains.is_empty() {
@@ -6604,12 +8039,12 @@ impl RowAddressLayout {
                 .ok_or_else(|| {
                     Error::invalid_input("ExplicitMap output exceeds its source cardinality")
                 })?;
-            if explicit_retirements.len() != expected_retirements
-                || retired_addresses.len() as u64 != expected_retirements
+            if explicit_retirement_cardinality != expected_retirements
+                || retirement_cardinality != expected_retirements
             {
                 return Err(Error::invalid_input(format!(
                     "ExplicitMap replacement retirements cover {} rows, expected {expected_retirements}",
-                    explicit_retirements.len()
+                    explicit_retirement_cardinality
                 )));
             }
         }
@@ -6620,9 +8055,14 @@ impl RowAddressLayout {
                 "row-address delta source_domains must exactly cover touched logical domains",
             ));
         }
+        let router = RowAddressRouter::try_new(
+            Arc::new(self.clone()),
+            context.current_fragments,
+            context.current_max_logical_fragment_id,
+        )?;
         for source in delta.source_domains.iter().copied() {
-            let current = self
-                .logical_domain(context.current_fragments, source.logical_fragment_id)?
+            let current = router
+                .logical_domain(source.logical_fragment_id)?
                 .ok_or_else(|| {
                     Error::invalid_input(format!(
                         "touched logical domain {} is absent from the source snapshot",
@@ -6640,145 +8080,95 @@ impl RowAddressLayout {
                 )));
             }
         }
-        let router = RowAddressRouter::try_new(
-            Arc::new(self.clone()),
-            context.current_fragments,
-            context.current_max_logical_fragment_id,
-        )?;
+        if !removed.is_empty() {
+            let overlap_coverage = RoaringTreemap::from_bitmaps(
+                removed
+                    .iter()
+                    .filter(|(logical_fragment_id, _)| {
+                        !explicit_replaced_domains.contains(logical_fragment_id)
+                    })
+                    .map(|(logical_fragment_id, slots)| (*logical_fragment_id, slots.clone())),
+            );
+            let overlap = self.retired_logical_row_bitmap_for_coverage(&overlap_coverage)?;
+            if let Some(raw) = overlap.min() {
+                let address = LogicalRowAddress::try_from(raw)?;
+                return Err(Error::invalid_input(format!(
+                    "touched logical domain {} contains rows which were not live in the source snapshot",
+                    address.logical_fragment_id()
+                )));
+            }
+        }
         let mut affected_physical_fragments = BTreeSet::<u32>::new();
-        for chunk in retired_addresses.chunks(4096) {
-            for (address, resolution) in chunk.iter().zip(router.resolve_many(chunk)?) {
-                match resolution {
-                    PlacementResolution::Mapped {
-                        locator: PhysicalRowLocator::Physical(physical),
-                    } => {
-                        affected_physical_fragments.insert(physical.fragment_id());
-                        let deleted_in_source = context
-                            .current_deletion_vectors
-                            .get(&physical.fragment_id())
-                            .is_some_and(|deleted_offsets| {
-                                deleted_offsets.contains(physical.row_offset())
-                            });
-                        let deleted_in_successor = context
-                            .deletion_vectors
-                            .get(&physical.fragment_id())
-                            .is_some_and(|deleted_offsets| {
-                                deleted_offsets.contains(physical.row_offset())
-                            });
-                        let fully_deleted = context
-                            .newly_fully_deleted_source_fragments
-                            .contains(&physical.fragment_id())
-                            && !context
-                                .successor_fragments
-                                .iter()
-                                .any(|fragment| fragment.id == physical.fragment_id() as u64);
-                        if !deleted_in_source && !deleted_in_successor && !fully_deleted {
-                            return Err(Error::invalid_input(format!(
-                                "retired logical address {} was live in source fragment {} at offset {}",
-                                address.raw(),
-                                physical.fragment_id(),
-                                physical.row_offset()
-                            )));
+        for selection in &delta.retired_selections {
+            if let Some(ranges) = selection.compact_ranges(MAX_SELECTION_DOMAINS)? {
+                for range in ranges {
+                    if let Some(proof) = router.logical_range_ownership(range)?
+                        && proof.mapped_rows == range.len()
+                    {
+                        for physical_range in proof.physical_ranges {
+                            validate_retired_physical_range(
+                                range,
+                                physical_range,
+                                context,
+                                &mut affected_physical_fragments,
+                            )?;
                         }
-                    }
-                    PlacementResolution::Mapped {
-                        locator:
-                            PhysicalRowLocator::ExplicitMap {
-                                placement_index, ..
+                    } else {
+                        validate_retired_addresses(
+                            |visit| {
+                                for slot in range.start_slot..range.end_slot {
+                                    visit(LogicalRowAddress::try_new_from_parts(
+                                        range.logical_fragment_id,
+                                        slot,
+                                    )?)?;
+                                }
+                                Ok(())
                             },
-                    } => {
-                        // The format layer does not perform object I/O.  The
-                        // delete writer resolves the immutable locator and
-                        // supplies the exact logical identities; here we bind
-                        // that retirement to a transaction which actually
-                        // removes at least one destination of the same root.
-                        let Some(RowAddressPlacement::ExplicitMap(explicit)) =
-                            self.placements.get(placement_index as usize)
-                        else {
-                            return Err(Error::invalid_input(
-                                "retired ExplicitMap address references an invalid placement",
-                            ));
-                        };
-                        let mut removes_destination = false;
-                        for destination in &explicit.destinations {
-                            if context
-                                .newly_fully_deleted_source_fragments
-                                .contains(&destination.physical_fragment_id)
-                                && !context.successor_fragments.iter().any(|fragment| {
-                                    fragment.id == destination.physical_fragment_id as u64
-                                })
-                            {
-                                removes_destination = true;
-                                affected_physical_fragments
-                                    .insert(destination.physical_fragment_id);
-                            }
-                        }
-                        if !removes_destination
-                            && !explicit_replaced_domains.contains(&address.logical_fragment_id())
-                        {
-                            return Err(Error::invalid_input(format!(
-                                "retired logical address {} belongs to an ExplicitMap with no deleted destination",
-                                address.raw()
-                            )));
-                        }
-                    }
-                    PlacementResolution::NotLive
-                        if explicit_replaced_domains.contains(&address.logical_fragment_id()) => {}
-                    PlacementResolution::NotLive | PlacementResolution::Unmapped => {
-                        return Err(Error::invalid_input(format!(
-                            "retired logical address {} has no live physical source location",
-                            address.raw()
-                        )));
+                            self,
+                            &router,
+                            &explicit_replaced_domains,
+                            context,
+                            &mut affected_physical_fragments,
+                        )?;
                     }
                 }
+            } else {
+                validate_retired_addresses(
+                    |visit| selection.try_for_each_address(visit),
+                    self,
+                    &router,
+                    &explicit_replaced_domains,
+                    context,
+                    &mut affected_physical_fragments,
+                )?;
             }
         }
         for (logical_fragment_id, slots) in &removed {
-            let mut batch = Vec::with_capacity(4096);
-            for slot in slots.iter() {
-                batch.push(LogicalRowAddress::try_new_from_parts(
-                    *logical_fragment_id,
-                    slot,
-                )?);
-                if batch.len() == 4096 {
-                    for resolution in router.resolve_many(&batch)? {
-                        match resolution {
-                            PlacementResolution::Mapped {
-                                locator: PhysicalRowLocator::Physical(physical),
-                            } => {
-                                affected_physical_fragments.insert(physical.fragment_id());
-                            }
-                            PlacementResolution::Mapped { .. } => {}
-                            PlacementResolution::NotLive
-                                if explicit_replaced_domains.contains(logical_fragment_id) => {}
-                            _ => {
-                                return Err(Error::invalid_input(
-                                    "touched logical selection contains an unmapped address",
-                                ));
-                            }
-                        }
-                    }
-                    batch.clear();
-                }
+            // Retirement ownership was proved above against the source
+            // snapshot, including the case where its last physical fragment
+            // is being dropped.  Only emitted rows need a current owner for
+            // placement subtraction; requiring one for new retirements would
+            // reject a valid Repack of an already non-live row.
+            let mut emitted_slots = slots.clone();
+            if let Some(retired_slots) = new_retirements.get(logical_fragment_id) {
+                emitted_slots -= retired_slots;
             }
-            if !batch.is_empty() {
-                for resolution in router.resolve_many(&batch)? {
-                    match resolution {
-                        PlacementResolution::Mapped {
-                            locator: PhysicalRowLocator::Physical(physical),
-                        } => {
-                            affected_physical_fragments.insert(physical.fragment_id());
-                        }
-                        PlacementResolution::Mapped { .. } => {}
-                        PlacementResolution::NotLive
-                            if explicit_replaced_domains.contains(logical_fragment_id) => {}
-                        _ => {
-                            return Err(Error::invalid_input(
-                                "touched logical selection contains an unmapped address",
-                            ));
-                        }
-                    }
-                }
+            if emitted_slots.is_empty() {
+                continue;
+            }
+            if let Some(fragments) =
+                router.logical_selection_inline_ownership(*logical_fragment_id, &emitted_slots)?
+            {
+                affected_physical_fragments.extend(fragments.iter());
+            } else {
+                validate_touched_addresses(
+                    emitted_slots.iter().map(|slot| {
+                        LogicalRowAddress::try_new_from_parts(*logical_fragment_id, slot)
+                    }),
+                    &router,
+                    &explicit_replaced_domains,
+                    &mut affected_physical_fragments,
+                )?;
             }
         }
         for (placement_index, placement) in delta.placements.iter().enumerate() {
@@ -6914,23 +8304,18 @@ impl RowAddressLayout {
             candidate.retired_rows =
                 remove_retired_domains(&candidate.retired_rows, &explicit_replaced_domains)?;
         }
-        if !retired_addresses.is_empty() {
-            let retired_domain_ids = retired_addresses
-                .iter()
-                .map(|address| address.logical_fragment_id())
-                .collect::<BTreeSet<_>>();
-            let retired_domains = retired_domain_ids
-                .into_iter()
-                .map(|logical_fragment_id| declared_domains[&logical_fragment_id])
-                .collect::<Vec<_>>();
-            let retired_bitmap = retired_addresses
-                .iter()
-                .map(|address| address.raw())
-                .collect::<RoaringTreemap>();
-            candidate.retired_rows.push(RetiredLogicalRowSet::selected(
-                retired_domains,
-                Arc::new(LogicalRowAddressSelection::from_bitmap(retired_bitmap)?),
-            )?);
+        if !delta.retired_selections.is_empty() {
+            for selection in &delta.retired_selections {
+                let retired_domains = selection
+                    .logical_fragment_bitmap()?
+                    .iter()
+                    .map(|logical_fragment_id| declared_domains[&logical_fragment_id])
+                    .collect::<Vec<_>>();
+                candidate.retired_rows.push(RetiredLogicalRowSet::selected(
+                    retired_domains,
+                    Arc::new(selection.clone()),
+                )?);
+            }
             candidate.retired_rows = normalize_retired_rows(candidate.retired_rows)?;
         }
         preserved.retain_mut(|placement| {
@@ -7858,68 +9243,60 @@ impl RowAddressLayout {
             )));
         }
 
-        let mut ranges = Vec::new();
+        let mut ownership = RoaringTreemap::new();
         for placement in &self.placements {
             match placement {
                 RowAddressPlacement::Direct(value)
                     if value.destination_fragment_id == fragment_id =>
                 {
-                    ranges.extend(
-                        effective_source_selection(
-                            LogicalRowAddressSelection::from_full_domains(&[value.source])?,
-                            value.excluded.as_ref(),
-                        )?
-                        .to_ranges()?,
-                    );
+                    ownership |= effective_source_selection(
+                        LogicalRowAddressSelection::from_full_domains(&[value.source])?,
+                        value.excluded.as_ref(),
+                    )?
+                    .to_roaring_treemap()?;
                 }
                 RowAddressPlacement::PackedRun(value)
                     if value.destination_fragment_id == fragment_id =>
                 {
                     for ordinal in 0..value.domains.domain_count() {
                         let source = value.domains.domain_at(ordinal)?;
-                        ranges.extend(
-                            LogicalRowAddressSelection::from_full_domains(&[source])?
-                                .to_ranges()?,
-                        );
+                        let start = u64::from(source.logical_fragment_id) << 32;
+                        ownership.insert_range(start..start + u64::from(source.slot_count));
                     }
                 }
                 RowAddressPlacement::Selected(value)
                     if value.destination_fragment_id == fragment_id =>
                 {
-                    ranges.extend(
-                        effective_source_selection(
-                            value.selection.as_ref().clone(),
-                            value.excluded.as_ref(),
-                        )?
-                        .to_ranges()?,
-                    );
+                    ownership |= effective_source_selection(
+                        value.selection.as_ref().clone(),
+                        value.excluded.as_ref(),
+                    )?
+                    .to_roaring_treemap()?;
                 }
                 RowAddressPlacement::ExtentList(value) => {
-                    ranges.extend(
-                        value
-                            .extents
-                            .iter()
-                            .filter(|extent| extent.destination_fragment_id == fragment_id)
-                            .map(|extent| {
-                                LogicalRowAddressRange::new(
-                                    value.source.logical_fragment_id,
-                                    extent.source_start,
-                                    extent.source_start + extent.length,
-                                )
-                            }),
-                    );
+                    let domain_start = u64::from(value.source.logical_fragment_id) << 32;
+                    for extent in value
+                        .extents
+                        .iter()
+                        .filter(|extent| extent.destination_fragment_id == fragment_id)
+                    {
+                        ownership.insert_range(
+                            domain_start + u64::from(extent.source_start)
+                                ..domain_start
+                                    + u64::from(extent.source_start)
+                                    + u64::from(extent.length),
+                        );
+                    }
                 }
                 RowAddressPlacement::SparseSelection(value)
                     if value.destination_fragment_id == fragment_id =>
                 {
                     for source in &value.sources {
-                        ranges.extend(
-                            effective_source_selection(
-                                source.selection.as_ref().clone(),
-                                source.excluded.as_ref(),
-                            )?
-                            .to_ranges()?,
-                        );
+                        ownership |= effective_source_selection(
+                            source.selection.as_ref().clone(),
+                            source.excluded.as_ref(),
+                        )?
+                        .to_roaring_treemap()?;
                     }
                 }
                 RowAddressPlacement::ExplicitMap(value)
@@ -7942,9 +9319,9 @@ impl RowAddressLayout {
                 Error::invalid_input(format!(
                     "row-aligned rewrite fragment {fragment_id} is missing physical ownership metadata"
                 ))
-            })?;
+        })?;
         Ok(Some((
-            LogicalRowAddressSelection::from_ranges(ranges)?,
+            LogicalRowAddressSelection::from_bitmap(ownership)?,
             summary.mapped_offsets_fingerprint.clone(),
         )))
     }
@@ -8070,23 +9447,26 @@ impl RowAddressLayout {
         for retired in &self.retired_rows {
             match &retired.membership {
                 RetiredLogicalRowMembership::AllRows => {
-                    for ordinal in 0..retired.domains.domain_count() {
-                        let domain = retired.domains.domain_at(ordinal)?;
-                        if let Some(slots) = coverage_by_domain.get(&domain.logical_fragment_id) {
-                            *rows.entry(domain.logical_fragment_id).or_default() |= *slots;
+                    for (logical_fragment_id, slots) in &coverage_by_domain {
+                        if retired.source_domain(*logical_fragment_id)?.is_some() {
+                            *rows.entry(*logical_fragment_id).or_default() |= *slots;
                         }
                     }
                 }
                 RetiredLogicalRowMembership::Selection(selection) => {
-                    for (logical_fragment_id, retired_slots) in
-                        selection.to_roaring_treemap()?.bitmaps()
-                    {
-                        if let Some(covered_slots) = coverage_by_domain.get(&logical_fragment_id) {
-                            let intersection = retired_slots & *covered_slots;
-                            if !intersection.is_empty() {
-                                *rows.entry(logical_fragment_id).or_default() |= intersection;
-                            }
+                    let mut has_relevant_domain = false;
+                    for logical_fragment_id in coverage_by_domain.keys() {
+                        if retired.source_domain(*logical_fragment_id)?.is_some() {
+                            has_relevant_domain = true;
+                            break;
                         }
+                    }
+                    if !has_relevant_domain {
+                        continue;
+                    }
+                    let intersection = selection.to_roaring_treemap()? & coverage;
+                    for (logical_fragment_id, slots) in intersection.bitmaps() {
+                        *rows.entry(logical_fragment_id).or_default() |= slots;
                     }
                 }
             }
@@ -8111,32 +9491,10 @@ impl RowAddressLayout {
                     }
                 }
                 RetiredLogicalRowMembership::Selection(selection) => {
-                    let mut current = None::<LogicalRowAddressRange>;
-                    for address in selection.iter() {
-                        let address = address?;
-                        if let Some(range) = current.as_mut()
-                            && range.logical_fragment_id == address.logical_fragment_id()
-                            && range.end_slot == address.immutable_slot()
-                        {
-                            range.end_slot = range.end_slot.checked_add(1).ok_or_else(|| {
-                                Error::invalid_input("retired logical range overflow")
-                            })?;
-                        } else {
-                            if let Some(range) = current.take() {
-                                visit(range);
-                            }
-                            current = Some(LogicalRowAddressRange::new(
-                                address.logical_fragment_id(),
-                                address.immutable_slot(),
-                                address.immutable_slot().checked_add(1).ok_or_else(|| {
-                                    Error::invalid_input("retired logical range overflow")
-                                })?,
-                            ));
-                        }
-                    }
-                    if let Some(range) = current {
+                    visit_selection_value_ranges(selection, |range| {
                         visit(range);
-                    }
+                        Ok(())
+                    })?;
                 }
             }
         }
@@ -8381,17 +9739,12 @@ fn offset_ranges_fingerprint(ranges: impl IntoIterator<Item = (u32, u32)>) -> Ve
 }
 
 pub fn fingerprint_deleted_offsets(bitmap: &RoaringBitmap) -> Vec<u8> {
-    let mut values = bitmap.iter().peekable();
-    let ranges = std::iter::from_fn(move || {
-        let start = values.next()?;
-        let mut end = start.saturating_add(1);
-        while values.peek().copied() == Some(end) {
-            values.next();
-            end = end.saturating_add(1);
-        }
-        Some((start, end))
-    });
-    offset_ranges_fingerprint(ranges)
+    let mut builder = OffsetRangesFingerprintBuilder::new();
+    let mut values = bitmap.iter();
+    while let Some(range) = values.next_range() {
+        builder.update(*range.start(), range.end().saturating_add(1));
+    }
+    builder.finish()
 }
 
 fn for_each_canonical_mapped_offset_range(
@@ -8399,49 +9752,39 @@ fn for_each_canonical_mapped_offset_range(
     fragment_id: u32,
     mut visit: impl FnMut(u32, u32) -> Result<()>,
 ) -> Result<()> {
-    let mut placement_order = placements
-        .iter()
-        .enumerate()
-        .filter_map(|(index, placement)| {
-            placement
-                .destination_ranges()
-                .into_iter()
-                .filter(|(destination, _, _)| *destination == fragment_id)
-                .map(|(_, start, _)| start)
-                .min()
-                .map(|start| (start, index))
-        })
-        .collect::<Vec<_>>();
-    placement_order.sort_unstable();
-
-    let mut pending: Option<(u32, u32)> = None;
-    for (_, placement_index) in placement_order {
-        placements[placement_index].for_each_mapped_destination_range(
-            |destination, start, length| {
-                if destination != fragment_id {
-                    return Ok(());
-                }
+    let mut ranges = Vec::<(u32, u32)>::new();
+    for placement in placements {
+        placement.for_each_mapped_destination_range(|destination, start, length| {
+            if destination == fragment_id {
                 let end = u32::try_from(start as u64 + length).map_err(|_| {
                     Error::invalid_input("physical destination range end exceeds u32")
                 })?;
-                if let Some((pending_start, pending_end)) = pending.take() {
-                    if start < pending_end {
-                        return Err(Error::invalid_input(format!(
-                            "overlapping mapped ownership in physical fragment {fragment_id}: {start}..{end} overlaps {pending_start}..{pending_end}"
-                        )));
-                    }
-                    if start == pending_end {
-                        pending = Some((pending_start, end));
-                    } else {
-                        visit(pending_start, pending_end)?;
-                        pending = Some((start, end));
-                    }
-                } else {
-                    pending = Some((start, end));
-                }
-                Ok(())
-            },
-        )?;
+                ranges.push((start, end));
+            }
+            Ok(())
+        })?;
+    }
+    // Hole reuse can interleave ranges from different placements. Sorting only
+    // by each placement's first range would therefore report a false overlap.
+    ranges.sort_unstable();
+
+    let mut pending: Option<(u32, u32)> = None;
+    for (start, end) in ranges {
+        if let Some((pending_start, pending_end)) = pending.take() {
+            if start < pending_end {
+                return Err(Error::invalid_input(format!(
+                    "overlapping mapped ownership in physical fragment {fragment_id}: {start}..{end} overlaps {pending_start}..{pending_end}"
+                )));
+            }
+            if start == pending_end {
+                pending = Some((pending_start, end));
+            } else {
+                visit(pending_start, pending_end)?;
+                pending = Some((start, end));
+            }
+        } else {
+            pending = Some((start, end));
+        }
     }
     if let Some((start, end)) = pending {
         visit(start, end)?;
@@ -8559,36 +9902,114 @@ impl RowAddressPlacement {
         mut visit: impl FnMut(u32, u32, u64) -> Result<()>,
     ) -> Result<()> {
         match self {
-            Self::Direct(value) => for_each_mapped_range_excluding_ordinals(
-                value.destination_fragment_id,
-                value.destination_start,
-                value.source.slot_count as u64,
-                value
-                    .excluded
-                    .iter()
-                    .flat_map(|selection| selection.iter())
-                    .map(|address| address.map(|address| address.immutable_slot() as u64)),
-                &mut visit,
-            ),
-            Self::Selected(value) => for_each_mapped_range_excluding_ordinals(
-                value.destination_fragment_id,
-                value.destination_start,
-                value.selection.cardinality(),
-                value
-                    .excluded
-                    .iter()
-                    .flat_map(|selection| selection.iter())
-                    .map(|address| {
-                        let address = address?;
-                        value.selection.rank(address)?.ok_or_else(|| {
+            Self::Direct(value) => {
+                if let Some(excluded) = value.excluded.as_deref()
+                    && let Some(ranges) = excluded.compact_ranges(MAX_RANGE_ENCODING_RUNS)?
+                {
+                    return for_each_mapped_range_excluding_ordinal_ranges(
+                        value.destination_fragment_id,
+                        value.destination_start,
+                        value.source.slot_count as u64,
+                        ranges.into_iter().map(|range| {
+                            if range.logical_fragment_id != value.source.logical_fragment_id {
+                                return Err(Error::invalid_input(
+                                    "Direct exclusion references a different logical domain",
+                                ));
+                            }
+                            Ok((u64::from(range.start_slot), u64::from(range.end_slot)))
+                        }),
+                        &mut visit,
+                    );
+                }
+                let mut emitter = MappedRangeEmitter::new(
+                    value.destination_fragment_id,
+                    value.destination_start,
+                    value.source.slot_count as u64,
+                    &mut visit,
+                );
+                if let Some(excluded) = value.excluded.as_deref() {
+                    excluded.try_for_each_address(|address| {
+                        if address.logical_fragment_id() != value.source.logical_fragment_id {
+                            return Err(Error::invalid_input(
+                                "Direct exclusion references a different logical domain",
+                            ));
+                        }
+                        emitter.exclude(u64::from(address.immutable_slot()))
+                    })?;
+                }
+                emitter.finish()
+            }
+            Self::Selected(value) => {
+                if let Some(excluded) = value.excluded.as_deref()
+                    && let Some(ranges) = compact_excluded_rank_ranges(
+                        &value.selection,
+                        excluded,
+                        value.source.logical_fragment_id,
+                        0,
+                    )?
+                {
+                    return for_each_mapped_range_excluding_ordinal_ranges(
+                        value.destination_fragment_id,
+                        value.destination_start,
+                        value.selection.cardinality(),
+                        ranges.into_iter().map(Ok),
+                        &mut visit,
+                    );
+                }
+                let mut emitter = MappedRangeEmitter::new(
+                    value.destination_fragment_id,
+                    value.destination_start,
+                    value.selection.cardinality(),
+                    &mut visit,
+                );
+                if let Some(excluded) = value.excluded.as_deref() {
+                    excluded.try_for_each_address(|address| {
+                        let rank = value.selection.rank(address)?.ok_or_else(|| {
                             Error::invalid_input(
                                 "Selected exclusion is outside its source selection",
                             )
-                        })
-                    }),
-                &mut visit,
-            ),
+                        })?;
+                        emitter.exclude(rank)
+                    })?;
+                }
+                emitter.finish()
+            }
             Self::SparseSelection(value) => {
+                let mut prefix = 0_u64;
+                let mut compact_ranges = Some(Vec::new());
+                for source in &value.sources {
+                    if let Some(excluded) = source.excluded.as_deref()
+                        && compact_ranges.is_some()
+                    {
+                        match compact_excluded_rank_ranges(
+                            &source.selection,
+                            excluded,
+                            source.source.logical_fragment_id,
+                            prefix,
+                        )? {
+                            Some(ranges) => {
+                                if let Some(accumulated) = compact_ranges.as_mut() {
+                                    accumulated.extend(ranges);
+                                }
+                            }
+                            None => compact_ranges = None,
+                        }
+                    }
+                    prefix = prefix
+                        .checked_add(source.selection.cardinality())
+                        .ok_or_else(|| {
+                            Error::invalid_input("SparseSelection destination prefix overflow")
+                        })?;
+                }
+                if let Some(ranges) = compact_ranges {
+                    return for_each_mapped_range_excluding_ordinal_ranges(
+                        value.destination_fragment_id,
+                        value.destination_start,
+                        prefix,
+                        ranges.into_iter().map(Ok),
+                        &mut visit,
+                    );
+                }
                 let mut prefix = 0_u64;
                 let mut emitter = MappedRangeEmitter::new(
                     value.destination_fragment_id,
@@ -8602,14 +10023,16 @@ impl RowAddressPlacement {
                 );
                 for source in &value.sources {
                     if let Some(excluded) = &source.excluded {
-                        for address in excluded.iter() {
-                            let rank = source.selection.rank(address?)?.ok_or_else(|| {
+                        excluded.try_for_each_address(|address| {
+                            let rank = source.selection.rank(address)?.ok_or_else(|| {
                                 Error::invalid_input(
                                     "SparseSelection exclusion is outside its source selection",
                                 )
                             })?;
-                            emitter.exclude(prefix + rank)?;
-                        }
+                            emitter.exclude(prefix.checked_add(rank).ok_or_else(|| {
+                                Error::invalid_input("SparseSelection exclusion rank overflow")
+                            })?)
+                        })?;
                     }
                     prefix = prefix
                         .checked_add(source.selection.cardinality())
@@ -8884,13 +10307,22 @@ where
     }
 
     fn exclude(&mut self, excluded: u64) -> Result<()> {
-        if excluded < self.cursor || excluded >= self.cardinality {
+        self.exclude_range(
+            excluded,
+            excluded
+                .checked_add(1)
+                .ok_or_else(|| Error::invalid_input("placement exclusion ordinal overflow"))?,
+        )
+    }
+
+    fn exclude_range(&mut self, start: u64, end: u64) -> Result<()> {
+        if start < self.cursor || start >= end || end > self.cardinality {
             return Err(Error::invalid_input(
-                "placement exclusions must have unique increasing destination ranks",
+                "placement exclusions must have unique increasing destination rank ranges",
             ));
         }
-        self.emit(self.cursor, excluded)?;
-        self.cursor = excluded + 1;
+        self.emit(self.cursor, start)?;
+        self.cursor = end;
         Ok(())
     }
 
@@ -8899,19 +10331,20 @@ where
     }
 }
 
-fn for_each_mapped_range_excluding_ordinals<F>(
+fn for_each_mapped_range_excluding_ordinal_ranges<F>(
     fragment_id: u32,
     destination_start: u32,
     cardinality: u64,
-    excluded_ordinals: impl IntoIterator<Item = Result<u64>>,
+    excluded_ranges: impl IntoIterator<Item = Result<(u64, u64)>>,
     visit: &mut F,
 ) -> Result<()>
 where
     F: FnMut(u32, u32, u64) -> Result<()>,
 {
     let mut emitter = MappedRangeEmitter::new(fragment_id, destination_start, cardinality, visit);
-    for excluded in excluded_ordinals {
-        emitter.exclude(excluded?)?;
+    for excluded in excluded_ranges {
+        let (start, end) = excluded?;
+        emitter.exclude_range(start, end)?;
     }
     emitter.finish()
 }
@@ -10119,6 +11552,17 @@ mod tests {
         LogicalRowAddressSelection::from_bitmap(bitmap).unwrap()
     }
 
+    fn streamed_addresses(selection: &LogicalRowAddressSelection) -> Vec<LogicalRowAddress> {
+        let mut addresses = Vec::with_capacity(selection.cardinality() as usize);
+        selection
+            .try_for_each_address(|address| {
+                addresses.push(address);
+                Ok(())
+            })
+            .unwrap();
+        addresses
+    }
+
     fn fragment(id: u64, rows: usize, native: Option<(u32, u64)>) -> Fragment {
         let mut fragment = Fragment::new(id).with_physical_rows(rows);
         fragment.native_logical_domain = native.map(|(logical_fragment_id, creation_version)| {
@@ -10191,6 +11635,166 @@ mod tests {
     }
 
     #[test]
+    fn selection_streaming_matches_select_for_every_codec() {
+        let mut bitmap = RoaringTreemap::new();
+        for logical_fragment_id in [3_u32, 9] {
+            for slot in (0..1_024_u32).filter(|slot| slot % 3 != 1) {
+                bitmap.insert((u64::from(logical_fragment_id) << 32) | u64::from(slot));
+            }
+        }
+        let range_input = SelectionBuilderInput::Ranges(vec![
+            LogicalRowAddressRange::new(3, 2, 7),
+            LogicalRowAddressRange::new(9, 11, 15),
+        ]);
+        let codecs = [
+            ("ranges", range_input.range_candidate().unwrap()),
+            (
+                "dense",
+                SelectionBuilderInput::dense_candidate(&bitmap).unwrap(),
+            ),
+            (
+                "elias-fano",
+                SelectionBuilderInput::elias_fano_candidate(&bitmap).unwrap(),
+            ),
+            (
+                "ordinal-elias-fano",
+                SelectionBuilderInput::ordinal_elias_fano_candidate(&bitmap).unwrap(),
+            ),
+            (
+                "roaring",
+                SelectionBuilderInput::roaring_candidate(&bitmap).unwrap(),
+            ),
+        ];
+
+        for (codec, encoded) in codecs {
+            let selection = LogicalRowAddressSelection::try_from(encoded).unwrap();
+            let selected = selection.iter().collect::<Result<Vec<_>>>().unwrap();
+            assert_eq!(streamed_addresses(&selection), selected, "codec={codec}");
+        }
+    }
+
+    #[test]
+    fn high_entropy_selection_streams_in_one_payload_pass() {
+        const UNIVERSE: u32 = 1_000_000;
+        let bitmap = (0..UNIVERSE)
+            .step_by(5)
+            .map(|slot| (17_u64 << 32) | u64::from(slot))
+            .collect::<RoaringTreemap>();
+        let expected_count = bitmap.len();
+        let expected_checksum = bitmap
+            .iter()
+            .fold(0_u64, |checksum, raw| checksum.wrapping_add(raw));
+        let target = RowAddressTargetRange {
+            fragment: RowAddressTargetFragment::NewFragmentOrdinal(0),
+            start_offset: 0,
+            end_offset: expected_count as u32,
+        };
+        let expected_fingerprint = fingerprint_row_sequence(
+            target,
+            bitmap
+                .iter()
+                .map(|raw| LogicalRowAddress::try_from(raw).unwrap()),
+        )
+        .unwrap();
+        let codecs = [
+            SelectionBuilderInput::dense_candidate(&bitmap).unwrap(),
+            SelectionBuilderInput::elias_fano_candidate(&bitmap).unwrap(),
+            SelectionBuilderInput::roaring_candidate(&bitmap).unwrap(),
+        ];
+
+        for encoded in codecs {
+            let selection = LogicalRowAddressSelection::try_from(encoded).unwrap();
+            let mut count = 0_u64;
+            let mut checksum = 0_u64;
+            let mut previous = None;
+            selection
+                .try_for_each_address(|address| {
+                    assert!(previous.is_none_or(|previous| previous < address));
+                    previous = Some(address);
+                    count += 1;
+                    checksum = checksum.wrapping_add(address.raw());
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(count, expected_count);
+            assert_eq!(checksum, expected_checksum);
+            let delta = RowAddressPlacementDelta {
+                source_selections: vec![selection],
+                target,
+                placement_kind: RowAddressPlacementKind::Selected,
+                output_cardinality: expected_count,
+                output_row_sequence_fingerprint: Vec::new(),
+            };
+            assert_eq!(
+                delta.expected_row_sequence_fingerprint().unwrap(),
+                expected_fingerprint
+            );
+        }
+    }
+
+    #[test]
+    fn high_entropy_exclusions_stream_mapped_ranges() {
+        const ROWS: u32 = 10_000;
+        let collect_ranges = |placement: &RowAddressPlacement| {
+            let mut ranges = Vec::new();
+            placement
+                .for_each_mapped_destination_range(|fragment_id, start, length| {
+                    ranges.push((fragment_id, start, length));
+                    Ok(())
+                })
+                .unwrap();
+            ranges
+        };
+
+        let selected = Arc::new(selection(0, 0..ROWS));
+        let excluded = Arc::new(selection(0, (0..ROWS).step_by(2)));
+        assert!(
+            excluded
+                .compact_ranges(MAX_RANGE_ENCODING_RUNS)
+                .unwrap()
+                .is_none()
+        );
+        let direct = RowAddressPlacement::Direct(DirectRowAddressPlacement {
+            source: domain(0, ROWS),
+            destination_fragment_id: 10,
+            destination_start: 100,
+            excluded: Some(excluded.clone()),
+        });
+        let direct_ranges = collect_ranges(&direct);
+        assert_eq!(direct_ranges.len(), ROWS as usize / 2);
+        assert_eq!(direct_ranges.first(), Some(&(10, 101, 1)));
+        assert_eq!(direct_ranges.last(), Some(&(10, 100 + ROWS - 1, 1)));
+
+        let selected_placement = RowAddressPlacement::Selected(SelectedRowAddressPlacement {
+            source: domain(0, ROWS),
+            selection: selected,
+            destination_fragment_id: 10,
+            destination_start: 100,
+            excluded: Some(excluded),
+        });
+        assert_eq!(collect_ranges(&selected_placement), direct_ranges);
+
+        let sparse = RowAddressPlacement::SparseSelection(SparseSelectionRowAddressPlacement {
+            sources: (0..2)
+                .map(|logical_fragment_id| SparseSelectionSource {
+                    source: domain(logical_fragment_id, ROWS),
+                    selection: Arc::new(selection(logical_fragment_id, 0..ROWS)),
+                    excluded: Some(Arc::new(selection(
+                        logical_fragment_id,
+                        (0..ROWS).step_by(2),
+                    ))),
+                })
+                .collect(),
+            destination_fragment_id: 11,
+            destination_start: 100,
+        });
+        let sparse_ranges = collect_ranges(&sparse);
+        assert_eq!(sparse_ranges.len(), ROWS as usize);
+        assert_eq!(sparse_ranges.first(), Some(&(11, 101, 1)));
+        assert_eq!(sparse_ranges.last(), Some(&(11, 100 + ROWS * 2 - 1, 1)));
+    }
+
+    #[test]
     fn ordinal_elias_fano_stays_bounded_across_many_domains() {
         for domain_count in [10_000_u32, 100_000] {
             let mut bitmap = RoaringTreemap::new();
@@ -10215,6 +11819,17 @@ mod tests {
             ));
             let decoded = LogicalRowAddressSelection::try_from(proto).unwrap();
             assert_eq!(selection, decoded);
+            let mut previous = None;
+            let mut streamed = 0_u64;
+            decoded
+                .try_for_each_address(|address| {
+                    assert!(previous.is_none_or(|previous| previous < address));
+                    previous = Some(address);
+                    streamed += 1;
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(streamed, u64::from(domain_count) * 10);
         }
     }
 
@@ -10238,6 +11853,332 @@ mod tests {
             );
             assert_eq!(RowAddressPlacement::try_from(proto).unwrap(), placement);
         }
+    }
+
+    #[test]
+    fn apply_delta_packed_run_100m_uses_domain_algebra() {
+        const DOMAIN_COUNT: u32 = 10_000;
+        const ROWS_PER_DOMAIN: u32 = 10_000;
+        const TOTAL_ROWS: u32 = DOMAIN_COUNT * ROWS_PER_DOMAIN;
+
+        let domains = (0..DOMAIN_COUNT)
+            .map(|logical_fragment_id| domain(logical_fragment_id, ROWS_PER_DOMAIN))
+            .collect::<Vec<_>>();
+        let current_fragments = (0..DOMAIN_COUNT)
+            .map(|fragment_id| {
+                fragment(
+                    u64::from(fragment_id),
+                    ROWS_PER_DOMAIN as usize,
+                    Some((fragment_id, 1)),
+                )
+            })
+            .collect::<Vec<_>>();
+        let successor_fragments =
+            vec![fragment(u64::from(DOMAIN_COUNT), TOTAL_ROWS as usize, None)];
+        let mut layout = RowAddressLayout::new(Uuid::new_v4());
+        layout.refresh_fingerprint_with_fragments(&current_fragments, Some(DOMAIN_COUNT - 1));
+
+        let source_selection = LogicalRowAddressSelection::from_full_domains(&domains).unwrap();
+        assert!(matches!(
+            &source_selection,
+            LogicalRowAddressSelection::Roaring(_)
+        ));
+        assert_eq!(
+            source_selection.to_ranges().unwrap().len(),
+            DOMAIN_COUNT as usize
+        );
+        let target = RowAddressTargetRange {
+            fragment: RowAddressTargetFragment::NewFragmentOrdinal(0),
+            start_offset: 0,
+            end_offset: TOTAL_ROWS,
+        };
+        let mut placement = RowAddressPlacementDelta {
+            source_selections: vec![source_selection],
+            target,
+            placement_kind: RowAddressPlacementKind::PackedRun,
+            output_cardinality: u64::from(TOTAL_ROWS),
+            output_row_sequence_fingerprint: Vec::new(),
+        };
+        placement.output_row_sequence_fingerprint =
+            placement.expected_row_sequence_fingerprint().unwrap();
+        let delta = RowAddressLayoutDelta {
+            source_domains: domains.clone(),
+            placements: vec![placement],
+            expected_layout_fingerprint: layout.fingerprint.clone(),
+            ..RowAddressLayoutDelta::default()
+        };
+        let resolved = BTreeMap::from([(0, DOMAIN_COUNT)]);
+        let result = layout
+            .apply_delta(
+                &delta,
+                &RowAddressDeltaApplyContext {
+                    current_fragments: &current_fragments,
+                    successor_fragments: &successor_fragments,
+                    resolved_new_fragment_ids: &resolved,
+                    current_deletion_vectors: &BTreeMap::new(),
+                    newly_fully_deleted_source_fragments: &BTreeSet::new(),
+                    deletion_vectors: &BTreeMap::new(),
+                    explicit_map_placements: &BTreeMap::new(),
+                    commit_version: 2,
+                    current_max_logical_fragment_id: Some(DOMAIN_COUNT - 1),
+                    max_logical_fragment_id: Some(DOMAIN_COUNT - 1),
+                    row_address_metadata_bytes_written: 0,
+                },
+            )
+            .unwrap();
+        let RowAddressLayoutApplyResult::Admitted { layout, .. } = result else {
+            panic!("full-domain PackedRun relocation should be admitted");
+        };
+        assert_eq!(layout.placements.len(), 1);
+        let RowAddressPlacement::PackedRun(packed) = &layout.placements[0] else {
+            panic!("full-domain relocation should stay a PackedRun");
+        };
+        assert_eq!(packed.domains.domain_count(), DOMAIN_COUNT);
+        assert_eq!(
+            packed.domains.total_slot_count().unwrap(),
+            u64::from(TOTAL_ROWS)
+        );
+        let proto: pb::RowAddressPlacement = (&layout.placements[0]).into();
+        assert!(proto.encoded_len() <= 64);
+
+        let second_target = RowAddressTargetRange {
+            fragment: RowAddressTargetFragment::NewFragmentOrdinal(0),
+            start_offset: 0,
+            end_offset: TOTAL_ROWS,
+        };
+        let mut second_placement = RowAddressPlacementDelta {
+            source_selections: vec![
+                LogicalRowAddressSelection::from_full_domains(&domains).unwrap(),
+            ],
+            target: second_target,
+            placement_kind: RowAddressPlacementKind::PackedRun,
+            output_cardinality: u64::from(TOTAL_ROWS),
+            output_row_sequence_fingerprint: Vec::new(),
+        };
+        second_placement.output_row_sequence_fingerprint = second_placement
+            .expected_row_sequence_fingerprint()
+            .unwrap();
+        let second_delta = RowAddressLayoutDelta {
+            source_domains: domains,
+            placements: vec![second_placement],
+            expected_layout_fingerprint: layout.fingerprint.clone(),
+            ..RowAddressLayoutDelta::default()
+        };
+        let second_successor = vec![fragment(
+            u64::from(DOMAIN_COUNT + 1),
+            TOTAL_ROWS as usize,
+            None,
+        )];
+        let second_resolved = BTreeMap::from([(0, DOMAIN_COUNT + 1)]);
+        let second_result = layout
+            .apply_delta(
+                &second_delta,
+                &RowAddressDeltaApplyContext {
+                    current_fragments: &successor_fragments,
+                    successor_fragments: &second_successor,
+                    resolved_new_fragment_ids: &second_resolved,
+                    current_deletion_vectors: &BTreeMap::new(),
+                    newly_fully_deleted_source_fragments: &BTreeSet::new(),
+                    deletion_vectors: &BTreeMap::new(),
+                    explicit_map_placements: &BTreeMap::new(),
+                    commit_version: 3,
+                    current_max_logical_fragment_id: Some(DOMAIN_COUNT - 1),
+                    max_logical_fragment_id: Some(DOMAIN_COUNT - 1),
+                    row_address_metadata_bytes_written: 0,
+                },
+            )
+            .unwrap();
+        let RowAddressLayoutApplyResult::Admitted {
+            layout: second_layout,
+            ..
+        } = second_result
+        else {
+            panic!("repeated full-domain PackedRun relocation should be admitted");
+        };
+        assert!(matches!(
+            &second_layout.placements[..],
+            [RowAddressPlacement::PackedRun(_)]
+        ));
+    }
+
+    #[test]
+    fn apply_delta_retires_100m_rows_with_domain_algebra() {
+        const DOMAIN_COUNT: u32 = 10_000;
+        const ROWS_PER_DOMAIN: u32 = 10_000;
+
+        let domains = (0..DOMAIN_COUNT)
+            .map(|logical_fragment_id| domain(logical_fragment_id, ROWS_PER_DOMAIN))
+            .collect::<Vec<_>>();
+        let current_fragments = (0..DOMAIN_COUNT)
+            .map(|fragment_id| {
+                fragment(
+                    u64::from(fragment_id),
+                    ROWS_PER_DOMAIN as usize,
+                    Some((fragment_id, 1)),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut layout = RowAddressLayout::new(Uuid::new_v4());
+        layout.refresh_fingerprint_with_fragments(&current_fragments, Some(DOMAIN_COUNT - 1));
+        let retired = LogicalRowAddressSelection::from_full_domains(&domains).unwrap();
+        assert_eq!(retired.cardinality(), 100_000_000);
+        let delta = RowAddressLayoutDelta {
+            source_domains: domains,
+            retired_selections: vec![retired],
+            expected_layout_fingerprint: layout.fingerprint.clone(),
+            ..RowAddressLayoutDelta::default()
+        };
+        let fully_deleted = (0..DOMAIN_COUNT).collect::<BTreeSet<_>>();
+        let result = layout
+            .apply_delta(
+                &delta,
+                &RowAddressDeltaApplyContext {
+                    current_fragments: &current_fragments,
+                    successor_fragments: &[],
+                    resolved_new_fragment_ids: &BTreeMap::new(),
+                    current_deletion_vectors: &BTreeMap::new(),
+                    newly_fully_deleted_source_fragments: &fully_deleted,
+                    deletion_vectors: &BTreeMap::new(),
+                    explicit_map_placements: &BTreeMap::new(),
+                    commit_version: 2,
+                    current_max_logical_fragment_id: Some(DOMAIN_COUNT - 1),
+                    max_logical_fragment_id: Some(DOMAIN_COUNT - 1),
+                    row_address_metadata_bytes_written: 0,
+                },
+            )
+            .unwrap();
+        let RowAddressLayoutApplyResult::Admitted { layout, .. } = result else {
+            panic!("full-domain retirement should be admitted");
+        };
+        assert!(layout.placements.is_empty());
+        assert_eq!(layout.retired_rows.len(), 1);
+        assert!(matches!(
+            layout.retired_rows[0].membership,
+            RetiredLogicalRowMembership::AllRows
+        ));
+        let proto = retired_logical_row_set_to_proto(&layout.retired_rows[0], &BTreeMap::new());
+        assert!(proto.encoded_len() <= 64);
+    }
+
+    #[test]
+    fn apply_delta_retires_clustered_50m_range_without_row_expansion() {
+        const ROWS: u32 = 100_000_000;
+        const RETIRED_START: u32 = 25_000_000;
+        const RETIRED_END: u32 = 75_000_000;
+
+        let current_fragment = fragment(0, ROWS as usize, Some((0, 1)));
+        let mut deleted = RoaringBitmap::new();
+        deleted.insert_range(RETIRED_START..RETIRED_END);
+        let successor = with_deletions(fragment(0, ROWS as usize, None), 2, &deleted);
+        let mut layout = RowAddressLayout::new(Uuid::new_v4());
+        layout.refresh_fingerprint_with_fragments(std::slice::from_ref(&current_fragment), Some(0));
+        let retired_range = LogicalRowAddressRange::new(0, RETIRED_START, RETIRED_END);
+        let delta = RowAddressLayoutDelta {
+            source_domains: vec![domain(0, ROWS)],
+            retired_selections: vec![
+                LogicalRowAddressSelection::from_ranges(vec![retired_range]).unwrap(),
+            ],
+            expected_layout_fingerprint: layout.fingerprint.clone(),
+            ..RowAddressLayoutDelta::default()
+        };
+        let deletion_vectors = BTreeMap::from([(0, &deleted)]);
+        let result = layout
+            .apply_delta(
+                &delta,
+                &RowAddressDeltaApplyContext {
+                    current_fragments: std::slice::from_ref(&current_fragment),
+                    successor_fragments: std::slice::from_ref(&successor),
+                    resolved_new_fragment_ids: &BTreeMap::new(),
+                    current_deletion_vectors: &BTreeMap::new(),
+                    newly_fully_deleted_source_fragments: &BTreeSet::new(),
+                    deletion_vectors: &deletion_vectors,
+                    explicit_map_placements: &BTreeMap::new(),
+                    commit_version: 2,
+                    current_max_logical_fragment_id: Some(0),
+                    max_logical_fragment_id: Some(0),
+                    row_address_metadata_bytes_written: 0,
+                },
+            )
+            .unwrap();
+        let RowAddressLayoutApplyResult::Admitted { layout, .. } = result else {
+            panic!("clustered retirement should be admitted");
+        };
+        let [RowAddressPlacement::Direct(direct)] = &layout.placements[..] else {
+            panic!("the live native remainder should become Direct");
+        };
+        assert_eq!(
+            direct.excluded.as_ref().unwrap().to_ranges().unwrap(),
+            vec![retired_range]
+        );
+        let mut retired_ranges = Vec::new();
+        layout
+            .visit_retired_ranges(|range| retired_ranges.push(range))
+            .unwrap();
+        assert_eq!(retired_ranges, vec![retired_range]);
+    }
+
+    #[test]
+    fn apply_delta_projects_historical_retirements_to_new_coverage() {
+        const HISTORICAL_DOMAIN_COUNT: u32 = 10_000;
+        const ROWS_PER_HISTORICAL_DOMAIN: u32 = 10_000;
+        const NEW_LOGICAL_FRAGMENT_ID: u32 = 20_000;
+        const NEW_ROWS: u32 = 100_000_000;
+
+        let mut layout = RowAddressLayout::new(Uuid::new_v4());
+        layout.retired_rows = vec![
+            RetiredLogicalRowSet::all_rows(
+                (0..HISTORICAL_DOMAIN_COUNT)
+                    .map(|logical_fragment_id| {
+                        domain(logical_fragment_id, ROWS_PER_HISTORICAL_DOMAIN)
+                    })
+                    .collect(),
+            )
+            .unwrap(),
+        ];
+        let current_fragment = fragment(42, NEW_ROWS as usize, Some((NEW_LOGICAL_FRAGMENT_ID, 1)));
+        layout.refresh_fingerprint_with_fragments(
+            std::slice::from_ref(&current_fragment),
+            Some(NEW_LOGICAL_FRAGMENT_ID),
+        );
+        let source = domain(NEW_LOGICAL_FRAGMENT_ID, NEW_ROWS);
+        let delta = RowAddressLayoutDelta {
+            source_domains: vec![source],
+            retired_selections: vec![
+                LogicalRowAddressSelection::from_full_domains(&[source]).unwrap(),
+            ],
+            expected_layout_fingerprint: layout.fingerprint.clone(),
+            ..RowAddressLayoutDelta::default()
+        };
+        let result = layout
+            .apply_delta(
+                &delta,
+                &RowAddressDeltaApplyContext {
+                    current_fragments: std::slice::from_ref(&current_fragment),
+                    successor_fragments: &[],
+                    resolved_new_fragment_ids: &BTreeMap::new(),
+                    current_deletion_vectors: &BTreeMap::new(),
+                    newly_fully_deleted_source_fragments: &BTreeSet::from([42]),
+                    deletion_vectors: &BTreeMap::new(),
+                    explicit_map_placements: &BTreeMap::new(),
+                    commit_version: 2,
+                    current_max_logical_fragment_id: Some(NEW_LOGICAL_FRAGMENT_ID),
+                    max_logical_fragment_id: Some(NEW_LOGICAL_FRAGMENT_ID),
+                    row_address_metadata_bytes_written: 0,
+                },
+            )
+            .unwrap();
+        let RowAddressLayoutApplyResult::Admitted { layout, .. } = result else {
+            panic!("unrelated historical retirement should not block a new full retirement");
+        };
+        assert_eq!(layout.retired_rows.len(), 1);
+        assert!(matches!(
+            layout.retired_rows[0].membership,
+            RetiredLogicalRowMembership::AllRows
+        ));
+        assert_eq!(
+            layout.retired_rows[0].domains.domain_count(),
+            HISTORICAL_DOMAIN_COUNT + 1
+        );
     }
 
     #[test]
@@ -10508,6 +12449,51 @@ mod tests {
                 start_offset: 2,
                 end_offset: 3,
             })]
+        );
+    }
+
+    #[test]
+    fn router_indexes_interleaved_gapped_packed_runs() {
+        let fragments = vec![fragment(10, 2, None), fragment(11, 2, None)];
+        let mut layout = RowAddressLayout::new(Uuid::new_v4());
+        layout.placements = vec![
+            RowAddressPlacement::PackedRun(
+                PackedRunRowAddressPlacement::from_sources(vec![domain(1, 1), domain(3, 1)], 10, 0)
+                    .unwrap(),
+            ),
+            RowAddressPlacement::PackedRun(
+                PackedRunRowAddressPlacement::from_sources(vec![domain(2, 1), domain(4, 1)], 11, 0)
+                    .unwrap(),
+            ),
+        ];
+        for fragment in &fragments {
+            layout
+                .refresh_physical_ownership_summary(fragment, &RoaringBitmap::new())
+                .unwrap();
+        }
+        layout.refresh_fingerprint_with_fragments(&fragments, Some(4));
+        let router = RowAddressRouter::try_new(Arc::new(layout), &fragments, Some(4)).unwrap();
+        let logical = (1..=4)
+            .map(|logical_fragment_id| {
+                LogicalRowAddress::try_new_from_parts(logical_fragment_id, 0).unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            router.resolve_many(&logical).unwrap(),
+            vec![
+                PlacementResolution::Mapped {
+                    locator: PhysicalRowLocator::Physical(RowAddress::new_from_parts(10, 0)),
+                },
+                PlacementResolution::Mapped {
+                    locator: PhysicalRowLocator::Physical(RowAddress::new_from_parts(11, 0)),
+                },
+                PlacementResolution::Mapped {
+                    locator: PhysicalRowLocator::Physical(RowAddress::new_from_parts(10, 1)),
+                },
+                PlacementResolution::Mapped {
+                    locator: PhysicalRowLocator::Physical(RowAddress::new_from_parts(11, 1)),
+                },
+            ]
         );
     }
 
@@ -10927,6 +12913,57 @@ mod tests {
     }
 
     #[test]
+    fn ownership_summary_accepts_interleaved_hole_reuse() {
+        let target = fragment(9, 3, None);
+        let mut layout = RowAddressLayout::new(Uuid::new_v4());
+        layout.placements = vec![
+            RowAddressPlacement::Direct(DirectRowAddressPlacement {
+                source: domain(7, 3),
+                destination_fragment_id: 9,
+                destination_start: 0,
+                excluded: Some(Arc::new(selection(7, [1]))),
+            }),
+            RowAddressPlacement::Direct(DirectRowAddressPlacement {
+                source: domain(8, 1),
+                destination_fragment_id: 9,
+                destination_start: 1,
+                excluded: None,
+            }),
+        ];
+
+        layout
+            .refresh_physical_ownership_summary(&target, &RoaringBitmap::new())
+            .unwrap();
+        layout.refresh_fingerprint_with_fragments(std::slice::from_ref(&target), Some(8));
+        layout
+            .validate_with_fragments(std::slice::from_ref(&target), Some(8))
+            .unwrap();
+
+        let router =
+            RowAddressRouter::try_new(Arc::new(layout), std::slice::from_ref(&target), Some(8))
+                .unwrap();
+        let logical = [
+            LogicalRowAddress::try_new_from_parts(7, 0).unwrap(),
+            LogicalRowAddress::try_new_from_parts(8, 0).unwrap(),
+            LogicalRowAddress::try_new_from_parts(7, 2).unwrap(),
+        ];
+        assert_eq!(
+            router.resolve_many(&logical).unwrap(),
+            vec![
+                PlacementResolution::Mapped {
+                    locator: PhysicalRowLocator::Physical(RowAddress::new_from_parts(9, 0)),
+                },
+                PlacementResolution::Mapped {
+                    locator: PhysicalRowLocator::Physical(RowAddress::new_from_parts(9, 1)),
+                },
+                PlacementResolution::Mapped {
+                    locator: PhysicalRowLocator::Physical(RowAddress::new_from_parts(9, 2)),
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn selection_pool_serializes_once_and_shares_runtime_payload() {
         let shared = Arc::new(selection(1, [0, 1]));
         let target = fragment(10, 2, None);
@@ -11032,6 +13069,49 @@ mod tests {
             output_row_sequence_fingerprint: reordered,
         };
         assert!(delta.verify_output_row_sequence().is_err());
+    }
+
+    #[test]
+    fn structural_roaring_fingerprint_matches_row_iteration() {
+        let bitmap = [
+            (1_u64 << 32),
+            (1_u64 << 32) | 1,
+            (1_u64 << 32) | 2,
+            (1_u64 << 32) | 4,
+            (1_u64 << 32) | 7,
+            (1_u64 << 32) | 8,
+            (3_u64 << 32) | 10,
+            (3_u64 << 32) | 11,
+            (3_u64 << 32) | 12,
+        ]
+        .into_iter()
+        .collect::<RoaringTreemap>();
+        let selection = LogicalRowAddressSelection::try_from(
+            SelectionBuilderInput::roaring_candidate(&bitmap).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(selection, LogicalRowAddressSelection::Roaring(_)));
+        let target = RowAddressTargetRange {
+            fragment: RowAddressTargetFragment::NewFragmentOrdinal(7),
+            start_offset: 4,
+            end_offset: 4 + bitmap.len() as u32,
+        };
+        let delta = RowAddressPlacementDelta {
+            source_selections: vec![selection],
+            target,
+            placement_kind: RowAddressPlacementKind::Selected,
+            output_cardinality: bitmap.len(),
+            output_row_sequence_fingerprint: Vec::new(),
+        };
+        let addresses = bitmap
+            .iter()
+            .map(LogicalRowAddress::try_from)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            delta.expected_row_sequence_fingerprint().unwrap(),
+            fingerprint_row_sequence(target, addresses).unwrap()
+        );
     }
 
     #[test]
@@ -11369,6 +13449,47 @@ mod tests {
                     .raw(),
                 LogicalRowAddress::try_new_from_parts(1, 3).unwrap().raw(),
             ]
+        );
+    }
+
+    #[test]
+    fn retired_projection_decodes_multi_domain_selection_once() {
+        const DOMAIN_COUNT: u32 = 10_000;
+        const SLOT_COUNT: u32 = 997;
+
+        let mut retired_bitmap = RoaringTreemap::new();
+        let mut coverage = RoaringTreemap::new();
+        for logical_fragment_id in 0..DOMAIN_COUNT {
+            for index in 0..10_u32 {
+                let slot =
+                    (logical_fragment_id.wrapping_mul(31) + index.wrapping_mul(97)) % SLOT_COUNT;
+                retired_bitmap.insert((u64::from(logical_fragment_id) << 32) | u64::from(slot));
+                if index == 0 {
+                    coverage.insert((u64::from(logical_fragment_id) << 32) | u64::from(slot));
+                }
+            }
+        }
+        let retired_selection = LogicalRowAddressSelection::from_bitmap(retired_bitmap).unwrap();
+        assert!(matches!(
+            &retired_selection,
+            LogicalRowAddressSelection::OrdinalEliasFano(_)
+        ));
+        let mut layout = RowAddressLayout::new(Uuid::new_v4());
+        layout.retired_rows = vec![
+            RetiredLogicalRowSet::selected(
+                (0..DOMAIN_COUNT)
+                    .map(|logical_fragment_id| domain(logical_fragment_id, SLOT_COUNT))
+                    .collect(),
+                Arc::new(retired_selection),
+            )
+            .unwrap(),
+        ];
+
+        assert_eq!(
+            layout
+                .retired_logical_row_bitmap_for_coverage(&coverage)
+                .unwrap(),
+            coverage
         );
     }
 
@@ -11807,7 +13928,6 @@ mod tests {
             deleted.insert(((index as u64 * 99_991) % ROWS as u64) as u32);
         }
         assert_eq!(deleted.len(), TOUCHED as u64);
-        let touched = deleted.iter().collect::<Vec<_>>();
         let successor = vec![
             with_deletions(fragment(0, ROWS as usize, None), 1, &deleted),
             fragment(1, TOUCHED as usize, None),
@@ -11820,7 +13940,7 @@ mod tests {
         let delta = placement_delta(
             &layout,
             domain(0, ROWS),
-            touched,
+            deleted.iter(),
             target,
             RowAddressPlacementKind::Selected,
         );
@@ -11866,9 +13986,61 @@ mod tests {
                 ..
             }) if excluded.cardinality() == TOUCHED as u64
         ));
+
+        let repeated_successor = vec![successor[0].clone(), fragment(2, TOUCHED as usize, None)];
+        let repeated_delta = placement_delta(
+            &layout,
+            domain(0, ROWS),
+            deleted.iter(),
+            RowAddressTargetRange {
+                fragment: RowAddressTargetFragment::NewFragmentOrdinal(0),
+                start_offset: 0,
+                end_offset: TOUCHED,
+            },
+            RowAddressPlacementKind::Selected,
+        );
+        let repeated_resolved = BTreeMap::from([(0, 2)]);
+        let fully_deleted = BTreeSet::from([1]);
+        let repeated_result = layout
+            .apply_delta(
+                &repeated_delta,
+                &RowAddressDeltaApplyContext {
+                    current_fragments: &successor,
+                    successor_fragments: &repeated_successor,
+                    resolved_new_fragment_ids: &repeated_resolved,
+                    current_deletion_vectors: &deletions,
+                    newly_fully_deleted_source_fragments: &fully_deleted,
+                    deletion_vectors: &deletions,
+                    explicit_map_placements: &BTreeMap::new(),
+                    commit_version: 3,
+                    current_max_logical_fragment_id: Some(0),
+                    max_logical_fragment_id: Some(0),
+                    row_address_metadata_bytes_written: 0,
+                },
+            )
+            .unwrap();
+        let RowAddressLayoutApplyResult::Admitted {
+            layout: repeated_layout,
+            metrics: repeated_metrics,
+        } = repeated_result
+        else {
+            panic!("repeated fixed-hot-set update must remain admitted");
+        };
+        assert!(repeated_metrics.projected_layout_bytes <= ROW_ADDRESS_B_FAST);
+        let router =
+            RowAddressRouter::try_new(Arc::from(repeated_layout), &repeated_successor, Some(0))
+                .unwrap();
+        let touched_address =
+            LogicalRowAddress::try_new_from_parts(0, deleted.min().unwrap()).unwrap();
+        assert_eq!(
+            router.resolve_many(&[touched_address]).unwrap(),
+            vec![PlacementResolution::Mapped {
+                locator: PhysicalRowLocator::Physical(RowAddress::new_from_parts(2, 0)),
+            }]
+        );
         assert!(
             started.elapsed() < std::time::Duration::from_secs(60),
-            "100M/1M placement admission exceeded the debug benchmark budget"
+            "100M/1M repeated placement admission exceeded the optimized benchmark budget"
         );
     }
 
@@ -11886,6 +14058,66 @@ mod tests {
         assert!(
             started.elapsed() < std::time::Duration::from_secs(2),
             "sorted destination ownership validation regressed from linear behavior"
+        );
+    }
+
+    #[test]
+    fn fifty_million_clustered_deletions_fingerprint_by_runs() {
+        let mut deleted = RoaringBitmap::new();
+        deleted.insert_range(25_000_000..75_000_000);
+        let started = std::time::Instant::now();
+        assert_eq!(
+            fingerprint_deleted_offsets(&deleted),
+            offset_ranges_fingerprint([(25_000_000, 75_000_000)])
+        );
+        if !cfg!(debug_assertions) {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(1),
+                "clustered deletion fingerprints must scale with Roaring runs"
+            );
+        }
+    }
+
+    #[test]
+    fn high_entropy_touched_slots_use_one_bitmap_ownership_proof() {
+        const ROWS: u32 = 20_000;
+        let touched = RoaringBitmap::from_iter((0..ROWS).step_by(2));
+        let touched_selection = Arc::new(selection(0, touched.iter()));
+        let mut layout = RowAddressLayout::new(Uuid::new_v4());
+        layout.placements = vec![
+            RowAddressPlacement::Direct(DirectRowAddressPlacement {
+                source: domain(0, ROWS),
+                destination_fragment_id: 10,
+                destination_start: 0,
+                excluded: Some(touched_selection.clone()),
+            }),
+            RowAddressPlacement::Selected(SelectedRowAddressPlacement {
+                source: domain(0, ROWS),
+                selection: touched_selection,
+                destination_fragment_id: 11,
+                destination_start: 0,
+                excluded: None,
+            }),
+        ];
+        let router = RowAddressRouter {
+            layout: Arc::new(layout),
+            source_index: vec![(0, 0), (0, 1)],
+            packed_source_runs: Vec::new(),
+            native_domains: Vec::new(),
+            native_by_physical: Vec::new(),
+        };
+
+        assert_eq!(
+            router
+                .logical_selection_inline_ownership(0, &touched)
+                .unwrap(),
+            Some(RoaringBitmap::from_iter([11]))
+        );
+        let mut all = RoaringBitmap::new();
+        all.insert_range(0..ROWS);
+        assert_eq!(
+            router.logical_selection_inline_ownership(0, &all).unwrap(),
+            Some(RoaringBitmap::from_iter([10, 11]))
         );
     }
 

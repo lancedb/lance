@@ -268,10 +268,7 @@ impl U64Segment {
                 let holes = holes.iter().count();
                 (range.end - range.start) as usize - holes
             }
-            Self::RangeWithBitmap { range, bitmap } => {
-                let holes = bitmap.count_zeros();
-                (range.end - range.start) as usize - holes
-            }
+            Self::RangeWithBitmap { bitmap, .. } => bitmap.count_ones(),
             Self::SortedArray(array) => array.len(),
             Self::Array(array) => array.len(),
         }
@@ -303,14 +300,77 @@ impl U64Segment {
     }
 
     pub fn slice(&self, offset: usize, len: usize) -> Self {
+        // Preserve the historical iterator-based behavior: an oversized slice
+        // returns the available suffix instead of panicking.
+        let len = len.min(self.len().saturating_sub(offset));
         if len == 0 {
             return Self::Range(0..0);
         }
 
-        let values: Vec<u64> = self.iter().skip(offset).take(len).collect();
-
-        // `from_slice` will compute stats and select the best representation.
-        Self::from_slice(&values)
+        match self {
+            Self::Range(range) => {
+                let start = range.start + offset as u64;
+                Self::Range(start..start + len as u64)
+            }
+            Self::RangeWithHoles { holes, .. } => {
+                let first = self.get(offset);
+                let last = self.get(offset + len - 1);
+                debug_assert!(
+                    first.is_some() && last.is_some(),
+                    "clamped row-id hole slice must resolve both boundaries"
+                );
+                let (Some(start), Some(last)) = (first, last) else {
+                    return Self::Range(0..0);
+                };
+                debug_assert!(
+                    last < u64::MAX,
+                    "range-backed row-id segment cannot contain u64::MAX"
+                );
+                let Some(end) = last.checked_add(1) else {
+                    return Self::Range(0..0);
+                };
+                let hole_start = match holes.binary_search(start) {
+                    Ok(index) | Err(index) => index,
+                };
+                let hole_end = match holes.binary_search(end) {
+                    Ok(index) | Err(index) => index,
+                };
+                if hole_start == hole_end {
+                    Self::Range(start..end)
+                } else {
+                    Self::RangeWithHoles {
+                        range: start..end,
+                        holes: holes.slice(hole_start, hole_end - hole_start),
+                    }
+                }
+            }
+            Self::RangeWithBitmap { range, bitmap } => {
+                let first = self.get(offset);
+                let last = self.get(offset + len - 1);
+                debug_assert!(
+                    first.is_some() && last.is_some(),
+                    "clamped row-id bitmap slice must resolve both boundaries"
+                );
+                let (Some(start), Some(last)) = (first, last) else {
+                    return Self::Range(0..0);
+                };
+                debug_assert!(
+                    last < u64::MAX,
+                    "range-backed row-id segment cannot contain u64::MAX"
+                );
+                let Some(end) = last.checked_add(1) else {
+                    return Self::Range(0..0);
+                };
+                let bitmap_start = (start - range.start) as usize;
+                let bitmap_len = (end - start) as usize;
+                Self::RangeWithBitmap {
+                    range: start..end,
+                    bitmap: bitmap.slice(bitmap_start, bitmap_len).into(),
+                }
+            }
+            Self::SortedArray(array) => Self::SortedArray(array.slice(offset, len)),
+            Self::Array(array) => Self::Array(array.slice(offset, len)),
+        }
     }
 
     pub fn position(&self, val: u64) -> Option<usize> {
@@ -813,6 +873,34 @@ mod test {
             &[7000, 1, 24000],
             &U64Segment::Array(vec![7000, 1, 24000].into()),
         );
+    }
+
+    #[test]
+    fn test_slice_clamps_to_available_values() {
+        let bitmap =
+            Bitmap::from([true, true, false, true, true, false, true, true, true, true].as_slice());
+        let segments = [
+            U64Segment::Range(10..20),
+            U64Segment::RangeWithHoles {
+                range: 10..20,
+                holes: vec![12, 15].into(),
+            },
+            U64Segment::RangeWithBitmap {
+                range: 10..20,
+                bitmap,
+            },
+            U64Segment::SortedArray(vec![1, 10, 100, 1_000].into()),
+            U64Segment::Array(vec![100, 1, 1_000, 10].into()),
+        ];
+
+        for segment in segments {
+            let expected = segment.iter().skip(2).collect::<Vec<_>>();
+            assert_eq!(
+                segment.slice(2, usize::MAX).iter().collect::<Vec<_>>(),
+                expected
+            );
+            assert!(segment.slice(usize::MAX, 1).is_empty());
+        }
     }
 
     #[test]

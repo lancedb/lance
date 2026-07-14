@@ -144,8 +144,11 @@ async fn current_fragments_for_logical_selection(
 
     let mut fragment_ids = RoaringBitmap::new();
     let mut pending = Vec::with_capacity(RESOLUTION_BATCH_SIZE);
-    for address in selection.iter() {
-        pending.push(address?.raw());
+    // The compressed temporary keeps asynchronous resolution bounded without
+    // issuing one codec select for every logical row.
+    let selected = selection.to_roaring_treemap()?;
+    for address in selected.iter() {
+        pending.push(address);
         if pending.len() == RESOLUTION_BATCH_SIZE {
             for physical in dataset
                 .resolve_logical_row_ids_async(&pending)

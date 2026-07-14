@@ -12,6 +12,7 @@
 
 mod evidence;
 mod maintenance;
+mod measurement;
 
 use std::collections::{BTreeMap, BinaryHeap, HashSet};
 use std::fs;
@@ -93,7 +94,7 @@ impl BenchFormat {
         self == Self::V22Stable
     }
 
-    fn validate_dataset(self, dataset: &Dataset) -> BenchResult<()> {
+    fn validate_dataset_header(self, dataset: &Dataset) -> BenchResult<()> {
         let manifest = dataset.manifest();
         let actual_version = manifest.data_storage_format.lance_file_version()?;
         let uses_legacy_stable_row_ids =
@@ -123,11 +124,18 @@ impl BenchFormat {
                 if !manifest.uses_stable_logical_row_addresses() {
                     return Err("v23_logical is missing the logical row-address contract".into());
                 }
-                manifest.validate_row_address_contract()?;
                 Ok(())
             }
             _ => Ok(()),
         }
+    }
+
+    fn validate_dataset(self, dataset: &Dataset) -> BenchResult<()> {
+        self.validate_dataset_header(dataset)?;
+        if self == Self::V23Logical {
+            dataset.manifest().validate_row_address_contract()?;
+        }
+        Ok(())
     }
 }
 
@@ -187,6 +195,10 @@ enum Operation {
 }
 
 impl Operation {
+    fn is_read_path(self) -> bool {
+        matches!(self, Self::Open | Self::Scan | Self::Take | Self::IndexTake)
+    }
+
     fn name(self) -> &'static str {
         match self {
             Self::Create => "create",
@@ -608,6 +620,20 @@ struct OperationOutcome {
     physical_order_digest: Option<String>,
 }
 
+struct ExecutedOperation {
+    dataset: Arc<Dataset>,
+    outcome: OperationOutcome,
+}
+
+impl ExecutedOperation {
+    fn new(dataset: impl Into<Arc<Dataset>>, outcome: OperationOutcome) -> Self {
+        Self {
+            dataset: dataset.into(),
+            outcome,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize)]
 struct PathIoMetrics {
     get_requests: u64,
@@ -911,14 +937,20 @@ fn main() -> BenchResult<()> {
     let metrics_before = snapshot_object_metrics(&snapshotter);
     let started_at_unix_ns = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     let started = Instant::now();
-    let result = match prepared {
+    let execution_result = match prepared {
         Ok(prepared) => runtime.block_on(execute(&args, prepared, tracker.clone())),
         Err(error) => Err(error),
     };
-    let duration_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    // Freeze latency, I/O, and RSS at the operation boundary. Manifest/root
+    // evidence below is benchmark validation, not part of the operation cost.
+    let measured = measurement::MeasuredOperation::freeze(execution_result, started.elapsed());
     let wrapper_io_stats = tracker.incremental_stats();
     let metric_result = snapshot_object_metrics(&snapshotter).checked_delta(metrics_before);
     let measured_peak_rss_bytes = peak_rss_bytes();
+    let (duration_ns, result) = measured.finish_with(|result| {
+        result
+            .and_then(|executed| finish_outcome(&args, executed.dataset.as_ref(), executed.outcome))
+    });
 
     let mut errors = Vec::new();
     let mut outcome = match result {
@@ -937,7 +969,11 @@ fn main() -> BenchResult<()> {
     if errors.is_empty() && (needs_delta_validation || needs_coverage_validation) {
         let validation = runtime.block_on(async {
             let dataset = open_dataset(&args, Arc::new(IOTracker::default())).await?;
-            args.format.validate_dataset(&dataset)?;
+            if args.operation.is_read_path() {
+                args.format.validate_dataset_header(&dataset)?;
+            } else {
+                args.format.validate_dataset(&dataset)?;
+            }
             let delta = if needs_delta_validation {
                 Some(exact_row_address_delta_bytes(&dataset).await?)
             } else {
@@ -1371,9 +1407,7 @@ fn placement_maintenance_diagnostic(
             }
             return Some(outcome);
         }
-        let Some(source) = error.source() else {
-            return None;
-        };
+        let source = error.source()?;
         error = source;
     }
 }
@@ -2433,7 +2467,7 @@ async fn execute(
     args: &Args,
     prepared: PreparedOperation,
     tracker: Arc<IOTracker>,
-) -> BenchResult<OperationOutcome> {
+) -> BenchResult<ExecutedOperation> {
     match args.operation {
         Operation::Create => {
             let PreparedOperation::Batches(source) = prepared else {
@@ -2457,17 +2491,15 @@ async fn execute(
             };
             let dataset =
                 Dataset::write(source.into_reader(), &args.dataset_uri, Some(params)).await?;
-            finish_outcome(
-                args,
-                &dataset,
+            Ok(ExecutedOperation::new(
+                dataset,
                 OperationOutcome {
                     result_rows: Some(args.rows as u64),
                     rows_inserted: Some(args.rows as u64),
                     admission: Some(true),
                     ..Default::default()
                 },
-            )
-            .await
+            ))
         }
         Operation::FixtureClone => {
             if args.storage == Storage::Ebs && Path::new(&args.dataset_uri).exists() {
@@ -2491,17 +2523,15 @@ async fn execute(
                     Some(store_params(tracker)),
                 )
                 .await?;
-            finish_outcome(
-                args,
-                &dataset,
+            Ok(ExecutedOperation::new(
+                dataset,
                 OperationOutcome {
                     result_rows: Some(args.expected_rows as u64),
                     coverage: (args.index_kind != IndexKind::None).then_some(1.0),
                     admission: Some(true),
                     ..Default::default()
                 },
-            )
-            .await
+            ))
         }
         Operation::Append => {
             let PreparedOperation::Batches(source) = prepared else {
@@ -2518,34 +2548,30 @@ async fn execute(
             };
             let dataset =
                 Dataset::write(source.into_reader(), &args.dataset_uri, Some(params)).await?;
-            finish_outcome(
-                args,
-                &dataset,
+            Ok(ExecutedOperation::new(
+                dataset,
                 OperationOutcome {
                     result_rows: Some(args.expected_rows as u64),
                     rows_inserted: Some(args.mutation_count as u64),
                     admission: Some(true),
                     ..Default::default()
                 },
-            )
-            .await
+            ))
         }
         Operation::Delete => {
             let mut dataset = open_dataset(args, tracker).await?;
             args.format.validate_dataset(&dataset)?;
             let predicate = mutation_predicate(args)?;
             let deleted = dataset.delete(&predicate).await?;
-            finish_outcome(
-                args,
-                &dataset,
+            Ok(ExecutedOperation::new(
+                dataset,
                 OperationOutcome {
                     result_rows: Some(args.expected_rows as u64),
                     rows_deleted: Some(deleted.num_deleted_rows),
                     admission: Some(true),
                     ..Default::default()
                 },
-            )
-            .await
+            ))
         }
         Operation::Update => match args.update_driver {
             UpdateDriver::Native => {
@@ -2558,17 +2584,15 @@ async fn execute(
                     .build()?
                     .execute()
                     .await?;
-                finish_outcome(
-                    args,
-                    result.new_dataset.as_ref(),
+                Ok(ExecutedOperation::new(
+                    result.new_dataset,
                     OperationOutcome {
                         result_rows: Some(args.expected_rows as u64),
                         rows_updated: Some(result.rows_updated),
                         admission: Some(true),
                         ..Default::default()
                     },
-                )
-                .await
+                ))
             }
             UpdateDriver::ExactMatchedMerge => {
                 let PreparedOperation::Batches(source) = prepared else {
@@ -2586,9 +2610,8 @@ async fn execute(
                         Box::new(source.into_reader()) as Box<dyn RecordBatchReader + Send>
                     )
                     .await?;
-                finish_outcome(
-                    args,
-                    dataset.as_ref(),
+                Ok(ExecutedOperation::new(
+                    dataset,
                     OperationOutcome {
                         result_rows: Some(args.expected_rows as u64),
                         rows_inserted: Some(stats.num_inserted_rows),
@@ -2597,8 +2620,7 @@ async fn execute(
                         admission: Some(true),
                         ..Default::default()
                     },
-                )
-                .await
+                ))
             }
         },
         Operation::MergeInsert => {
@@ -2615,9 +2637,8 @@ async fn execute(
                 .try_build()?
                 .execute_reader(Box::new(source.into_reader()) as Box<dyn RecordBatchReader + Send>)
                 .await?;
-            finish_outcome(
-                args,
-                dataset.as_ref(),
+            Ok(ExecutedOperation::new(
+                dataset,
                 OperationOutcome {
                     result_rows: Some(args.expected_rows as u64),
                     rows_inserted: Some(stats.num_inserted_rows),
@@ -2626,8 +2647,7 @@ async fn execute(
                     admission: Some(true),
                     ..Default::default()
                 },
-            )
-            .await
+            ))
         }
         Operation::Backfill => {
             let mut dataset = open_dataset(args, tracker).await?;
@@ -2647,17 +2667,15 @@ async fn execute(
                     Some(args.rows_per_fragment.min(u32::MAX as usize) as u32),
                 )
                 .await?;
-            finish_outcome(
-                args,
-                &dataset,
+            Ok(ExecutedOperation::new(
+                dataset,
                 OperationOutcome {
                     result_rows: Some(args.expected_rows as u64),
                     rows_updated: Some(args.expected_rows as u64),
                     admission: Some(true),
                     ..Default::default()
                 },
-            )
-            .await
+            ))
         }
         Operation::DefaultCompactionPreflight => {
             let dataset = open_dataset(args, tracker).await?;
@@ -2685,9 +2703,8 @@ async fn execute(
             let planned = admitted
                 .checked_add(rejected_planned)
                 .ok_or("default compaction preflight group count overflow")?;
-            finish_outcome(
-                args,
-                &dataset,
+            Ok(ExecutedOperation::new(
+                dataset,
                 OperationOutcome {
                     result_rows: Some(args.expected_rows as u64),
                     compaction_groups_planned: Some(planned as u64),
@@ -2696,8 +2713,7 @@ async fn execute(
                     admission: Some(admitted == planned),
                     ..Default::default()
                 },
-            )
-            .await
+            ))
         }
         Operation::DefaultCompaction => {
             let mut dataset = open_dataset(args, tracker).await?;
@@ -2715,9 +2731,8 @@ async fn execute(
             )
             .await?;
             verify_maintenance_output(&dataset, maintenance_plan.as_ref())?;
-            finish_outcome(
-                args,
-                &dataset,
+            Ok(ExecutedOperation::new(
+                dataset,
                 OperationOutcome {
                     result_rows: Some(args.expected_rows as u64),
                     compacted_data_bytes: observation.compacted_data_bytes,
@@ -2741,8 +2756,7 @@ async fn execute(
                     ),
                     ..Default::default()
                 },
-            )
-            .await
+            ))
         }
         Operation::RandomDeleteReclaim => {
             let mut dataset = open_dataset(args, tracker).await?;
@@ -2834,7 +2848,7 @@ async fn execute(
                 }
             }
             verify_maintenance_output(&dataset, maintenance_plan.as_ref())?;
-            finish_outcome(args, &dataset, outcome).await
+            Ok(ExecutedOperation::new(dataset, outcome))
         }
         Operation::BoundedRecluster => {
             let mut dataset = open_dataset(args, tracker).await?;
@@ -2851,9 +2865,8 @@ async fn execute(
             )
             .await?;
             verify_maintenance_output(&dataset, Some(&maintenance_plan))?;
-            finish_outcome(
-                args,
-                &dataset,
+            Ok(ExecutedOperation::new(
+                dataset,
                 OperationOutcome {
                     result_rows: Some(args.expected_rows as u64),
                     rows_updated: Some(args.expected_rows as u64),
@@ -2880,8 +2893,7 @@ async fn execute(
                     ),
                     ..Default::default()
                 },
-            )
-            .await
+            ))
         }
         Operation::NormalizePlacement
         | Operation::Repack
@@ -2958,9 +2970,8 @@ async fn execute(
                     .count();
                 Some(reused as f64 / before.len() as f64)
             });
-            finish_outcome(
-                args,
-                &dataset,
+            Ok(ExecutedOperation::new(
+                dataset,
                 OperationOutcome {
                     result_rows: Some(args.expected_rows as u64),
                     rows_updated: Some(metrics.rows_rewritten),
@@ -2980,31 +2991,27 @@ async fn execute(
                     admission: Some(true),
                     ..Default::default()
                 },
-            )
-            .await
+            ))
         }
         Operation::IndexBuild => {
             let mut dataset = open_dataset(args, tracker).await?;
             args.format.validate_dataset(&dataset)?;
             rebuild_benchmark_indices(args, &mut dataset).await?;
-            finish_outcome(
-                args,
-                &dataset,
+            Ok(ExecutedOperation::new(
+                dataset,
                 OperationOutcome {
                     result_rows: Some(args.expected_rows as u64),
                     coverage: Some(1.0),
                     admission: Some(true),
                     ..Default::default()
                 },
-            )
-            .await
+            ))
         }
         Operation::IndexTake => {
             let PreparedOperation::Take { mut user_ids, .. } = prepared else {
                 return Err("index take is missing prepared live user IDs".into());
             };
             let dataset = open_dataset(args, tracker).await?;
-            args.format.validate_dataset(&dataset)?;
             let (result_rows, recall) = match args.index_kind {
                 IndexKind::None => unreachable!("validated before execution"),
                 IndexKind::Scalar => {
@@ -3070,17 +3077,15 @@ async fn execute(
                 )
                 .into());
             }
-            finish_outcome(
-                args,
-                &dataset,
+            Ok(ExecutedOperation::new(
+                dataset,
                 OperationOutcome {
                     result_rows: Some(result_rows as u64),
                     coverage: Some(1.0),
                     recall: Some(recall),
                     ..Default::default()
                 },
-            )
-            .await
+            ))
         }
         Operation::IndexOptimize => {
             let mut dataset = open_dataset(args, tracker).await?;
@@ -3088,25 +3093,22 @@ async fn execute(
             dataset
                 .optimize_indices(&OptimizeOptions::default())
                 .await?;
-            finish_outcome(
-                args,
-                &dataset,
+            Ok(ExecutedOperation::new(
+                dataset,
                 OperationOutcome {
                     result_rows: Some(args.expected_rows as u64),
                     coverage: Some(1.0),
                     admission: Some(true),
                     ..Default::default()
                 },
-            )
-            .await
+            ))
         }
         Operation::Open => {
             let dataset = open_dataset(args, tracker).await?;
-            finish_outcome(args, &dataset, OperationOutcome::default()).await
+            Ok(ExecutedOperation::new(dataset, OperationOutcome::default()))
         }
         Operation::Scan => {
             let dataset = open_dataset(args, tracker).await?;
-            args.format.validate_dataset(&dataset)?;
             let mut stream = dataset.scan().try_into_stream().await?;
             let mut result_rows = 0u64;
             let mut digest = StateDigest::default();
@@ -3123,24 +3125,21 @@ async fn execute(
                 )
                 .into());
             }
-            finish_outcome(
-                args,
-                &dataset,
+            Ok(ExecutedOperation::new(
+                dataset,
                 OperationOutcome {
                     result_rows: Some(result_rows),
                     state_digest: Some(digest.finish()),
                     physical_order_digest: Some(digest.finish_ordered()),
                     ..Default::default()
                 },
-            )
-            .await
+            ))
         }
         Operation::Take => {
             let PreparedOperation::Take { row_ids, .. } = prepared else {
                 return Err("take operation is missing prepared row IDs".into());
             };
             let dataset = open_dataset(args, tracker).await?;
-            args.format.validate_dataset(&dataset)?;
             let batch = dataset
                 .take_rows(&row_ids, dataset.schema().clone())
                 .await?;
@@ -3152,15 +3151,13 @@ async fn execute(
                 )
                 .into());
             }
-            finish_outcome(
-                args,
-                &dataset,
+            Ok(ExecutedOperation::new(
+                dataset,
                 OperationOutcome {
                     result_rows: Some(batch.num_rows() as u64),
                     ..Default::default()
                 },
-            )
-            .await
+            ))
         }
     }
 }
@@ -3274,12 +3271,19 @@ async fn exact_row_address_delta_bytes(dataset: &Dataset) -> BenchResult<u64> {
         .ok_or_else(|| "row-address manifest Delta overflow or underflow".into())
 }
 
-async fn finish_outcome(
+fn finish_outcome(
     args: &Args,
     dataset: &Dataset,
     mut outcome: OperationOutcome,
 ) -> BenchResult<OperationOutcome> {
-    args.format.validate_dataset(dataset)?;
+    // This function runs entirely after the measurement boundary. Manifest
+    // decoding already performed the full storage contract validation during a
+    // cold open, so read evidence only needs the constant-size header contract.
+    if args.operation.is_read_path() {
+        args.format.validate_dataset_header(dataset)?;
+    } else {
+        args.format.validate_dataset(dataset)?;
+    }
     outcome.dataset_version = Some(dataset.version().version);
     let live_rows = dataset
         .manifest()
@@ -3428,7 +3432,7 @@ async fn collect_take_ids(
     tracker: Arc<IOTracker>,
 ) -> BenchResult<(Vec<u64>, Vec<u64>)> {
     let dataset = open_dataset(args, tracker).await?;
-    args.format.validate_dataset(&dataset)?;
+    args.format.validate_dataset_header(&dataset)?;
     let mut scanner = dataset.scan();
     scanner.project(&["id", ROW_ID])?;
     let mut stream = scanner.try_into_stream().await?;

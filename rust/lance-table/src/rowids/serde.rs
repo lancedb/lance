@@ -38,12 +38,34 @@ impl TryFrom<pb::U64Segment> for U64Segment {
                 })
             }
             Some(RangeWithBitmap(pb_seg::RangeWithBitmap { start, end, bitmap })) => {
+                let len = end.checked_sub(start).ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "row-id bitmap range starts after it ends: {start}..{end}"
+                    ))
+                })?;
+                let len = usize::try_from(len)
+                    .map_err(|_| Error::invalid_input("row-id bitmap range exceeds usize"))?;
+                let expected_bytes = len.div_ceil(8);
+                if bitmap.len() != expected_bytes {
+                    return Err(Error::invalid_input(format!(
+                        "row-id bitmap for range {start}..{end} has {} bytes; expected {expected_bytes}",
+                        bitmap.len()
+                    )));
+                }
+                let used_bits_in_last_byte = len % 8;
+                if used_bits_in_last_byte != 0
+                    && bitmap.last().is_some_and(|last| {
+                        let used_mask = (1_u8 << used_bits_in_last_byte) - 1;
+                        *last & !used_mask != 0
+                    })
+                {
+                    return Err(Error::invalid_input(format!(
+                        "row-id bitmap for range {start}..{end} has non-zero padding bits"
+                    )));
+                }
                 Ok(Self::RangeWithBitmap {
                     range: start..end,
-                    bitmap: Bitmap {
-                        data: bitmap,
-                        len: (end - start) as usize,
-                    },
+                    bitmap: Bitmap { data: bitmap, len },
                 })
             }
             Some(SortedArray(array)) => Ok(Self::SortedArray(EncodedU64Array::try_from(array)?)),
@@ -235,5 +257,40 @@ mod test {
         let sequence2 = read_row_ids(&serialized).unwrap();
 
         assert_eq!(sequence.0, sequence2.0);
+    }
+
+    #[test]
+    fn rejects_malformed_row_id_bitmaps() {
+        use pb::u64_segment::{RangeWithBitmap, Segment};
+
+        let trailing_bytes = pb::U64Segment {
+            segment: Some(Segment::RangeWithBitmap(RangeWithBitmap {
+                start: 10,
+                end: 11,
+                bitmap: vec![1, 1],
+            })),
+        };
+        let error = U64Segment::try_from(trailing_bytes).unwrap_err();
+        assert!(error.to_string().contains("has 2 bytes; expected 1"));
+
+        let reversed = pb::U64Segment {
+            segment: Some(Segment::RangeWithBitmap(RangeWithBitmap {
+                start: 11,
+                end: 10,
+                bitmap: Vec::new(),
+            })),
+        };
+        let error = U64Segment::try_from(reversed).unwrap_err();
+        assert!(error.to_string().contains("starts after it ends"));
+
+        let non_zero_padding = pb::U64Segment {
+            segment: Some(Segment::RangeWithBitmap(RangeWithBitmap {
+                start: 10,
+                end: 11,
+                bitmap: vec![u8::MAX],
+            })),
+        };
+        let error = U64Segment::try_from(non_zero_padding).unwrap_err();
+        assert!(error.to_string().contains("non-zero padding bits"));
     }
 }

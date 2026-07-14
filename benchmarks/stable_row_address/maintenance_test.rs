@@ -3,9 +3,12 @@
 
 mod evidence;
 mod maintenance;
+mod measurement;
 
+use std::cell::Cell;
 use std::num::NonZero;
 use std::sync::Arc;
+use std::time::Duration;
 
 use arrow_array::types::Float32Type;
 use lance::Dataset;
@@ -23,6 +26,24 @@ use lance_io::utils::tracking_store::IoOperation;
 use lance_linalg::distance::MetricType;
 use lance_table::format::{DataFile, Fragment};
 use rstest::rstest;
+
+#[test]
+fn operation_duration_excludes_post_measurement_evidence() {
+    let simulated_elapsed_ns = Cell::new(7_u64);
+    let measured = measurement::MeasuredOperation::freeze(
+        "operation result",
+        Duration::from_nanos(simulated_elapsed_ns.get()),
+    );
+
+    let (duration_ns, evidence) = measured.finish_with(|result| {
+        simulated_elapsed_ns.set(1_000_000_007);
+        format!("evidence for {result}")
+    });
+
+    assert_eq!(duration_ns, 7);
+    assert_eq!(simulated_elapsed_ns.get(), 1_000_000_007);
+    assert_eq!(evidence, "evidence for operation result");
+}
 
 #[test]
 fn logical_coverage_evidence_intersects_liveness() {

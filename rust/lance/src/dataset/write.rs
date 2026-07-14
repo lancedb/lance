@@ -83,9 +83,10 @@ pub(crate) async fn include_previous_deletions_in_v2_3_retirement(
 ) -> Result<()> {
     let mut already_retired = RoaringTreemap::new();
     for selection in &delta.retired_selections {
-        for address in selection.iter() {
-            already_retired.insert(address?.raw());
-        }
+        selection.try_for_each_address(|address| {
+            already_retired.insert(address.raw());
+            Ok(())
+        })?;
     }
 
     let mut added = RoaringTreemap::new();

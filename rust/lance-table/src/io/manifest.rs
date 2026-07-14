@@ -23,34 +23,30 @@ use lance_io::{
     utils::read_message,
 };
 
-use crate::format::{DataStorageFormat, IndexMetadata, MAGIC, Manifest, Transaction, pb};
+use crate::format::{
+    DataStorageFormat, IndexMetadata, MAGIC, Manifest, ROW_ADDRESS_B_FAST, Transaction, pb,
+};
 
 use super::commit::ManifestLocation;
 
 /// Tail bytes fetched by the manifest reader before the 2.3 row-address layout.
 pub const BASE_MANIFEST_TAIL_PREFETCH_SIZE: u64 = 64 * 1024;
 
-/// Provisional inline row-address metadata budget used to size manifest prefetch.
-///
-/// This must be frozen or lowered using real S3 cold-open measurements before
-/// file format 2.3 is released.
-pub const PROVISIONAL_ROW_ADDRESS_B_FAST: u64 = 2 * 1024 * 1024;
-
 /// Manifest-only tail prefetch; data and index readers retain their block sizes.
 ///
-/// If row-address-only metadata is at most [`PROVISIONAL_ROW_ADDRESS_B_FAST`],
+/// If row-address-only metadata is at most [`ROW_ADDRESS_B_FAST`],
 /// adding it cannot increase the manifest GET count over the previous 64-KiB
 /// reader: a core manifest at most 64 KiB still needs one GET, while a larger
 /// core manifest already needed two and this reader needs at most two. When a
 /// second GET is needed its range ends where this tail starts, so bytes are not
 /// fetched twice.
-pub const MANIFEST_TAIL_PREFETCH_SIZE: u64 =
-    BASE_MANIFEST_TAIL_PREFETCH_SIZE + PROVISIONAL_ROW_ADDRESS_B_FAST;
+pub const MANIFEST_TAIL_PREFETCH_SIZE: u64 = BASE_MANIFEST_TAIL_PREFETCH_SIZE + ROW_ADDRESS_B_FAST;
 
 /// A decoded manifest together with the bytes fetched by its initial tail GET.
 ///
-/// Dataset open uses the tail to opportunistically decode adjacent index and
-/// transaction sections without issuing another request.
+/// Dataset open uses the tail to opportunistically decode an adjacent index
+/// section without issuing another request. Transactions remain lazy even when
+/// their bytes are present in this buffer.
 pub struct ManifestReadResult {
     pub manifest: Manifest,
     pub prefetched_tail: Bytes,
@@ -467,6 +463,47 @@ mod test {
         test_roundtrip_manifest(0, 100_000).await;
         test_roundtrip_manifest(1000, 100_000).await;
         test_roundtrip_manifest(1000, 1000).await;
+    }
+
+    #[tokio::test]
+    async fn test_small_manifest_prefetch_is_bounded_by_read_budget() {
+        let store = ObjectStore::memory();
+        let path = Path::from("/bounded_manifest_tail_prefetch");
+        let mut writer = store.create(&path).await.unwrap();
+        writer
+            .write_all(&vec![0_u8; 3 * 1024 * 1024])
+            .await
+            .unwrap();
+
+        let schema = Schema::try_from(&ArrowSchema::new(vec![ArrowField::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]))
+        .unwrap();
+        let mut manifest = Manifest::new(
+            schema,
+            Arc::new(vec![]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        let position = write_manifest(writer.as_mut(), &mut manifest, None, None)
+            .await
+            .unwrap();
+        writer
+            .write_magics(position, MAJOR_VERSION, MINOR_VERSION, MAGIC)
+            .await
+            .unwrap();
+        Writer::shutdown(writer.as_mut()).await.unwrap();
+        let file_size = store.inner.head(&path).await.unwrap().size;
+        store.io_stats_incremental();
+
+        let actual = read_manifest(&store, &path, Some(file_size)).await.unwrap();
+        let stats = store.io_stats_incremental();
+
+        assert_eq!(actual, manifest);
+        assert_eq!(stats.read_iops, 1);
+        assert_eq!(stats.read_bytes, MANIFEST_TAIL_PREFETCH_SIZE);
     }
 
     #[rstest]

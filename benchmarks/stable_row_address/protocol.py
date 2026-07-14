@@ -986,7 +986,6 @@ class ProtocolRunner:
         self.take_count = take_count
         self.matrix_sha256 = matrix_sha256
         self.shard_id = shard_id
-        self.phase_index = 0
         self.records = 0
         self.failures: list[str] = []
         self.boundaries = 0
@@ -1376,8 +1375,7 @@ class ProtocolRunner:
                 f"index-{index_kind}/"
                 "fixture_clone"
             )
-            order = run.format_order(0, self.phase_index)
-            self.phase_index += 1
+            order = run.paired_format_order(0, clone_pair_id)
             clone_records = []
             for order_index, format_name in enumerate(order):
                 source_uri = self.fixture_uri(
@@ -1435,8 +1433,7 @@ class ProtocolRunner:
                 f"{self.run_id}/fixtures/{schema_kind}/{fixture_layout_path(segments)}/"
                 f"index-{index_kind}/index_build"
             )
-            order = run.format_order(0, self.phase_index)
-            self.phase_index += 1
+            order = run.paired_format_order(0, index_pair_id)
             index_records = [
                 self.invoke_one(
                     index_step,
@@ -1489,8 +1486,7 @@ class ProtocolRunner:
                     f"{self.run_id}/fixtures/{schema_kind}/{fixture_layout_path(segments)}/"
                     f"index-none/{label}"
                 )
-                order = run.format_order(0, self.phase_index)
-                self.phase_index += 1
+                order = run.paired_format_order(0, pair_id)
                 records = [
                     self.invoke_one(
                         step,
@@ -1549,8 +1545,7 @@ class ProtocolRunner:
             index_kind=index_kind,
         )
         pair_id = f"{self.run_id}/{track}/{case}/repeat-{repeat:03d}/{label}"
-        order = run.format_order(repeat, self.phase_index)
-        self.phase_index += 1
+        order = run.paired_format_order(repeat, pair_id)
         records: dict[str, dict[str, Any]] = {}
         for order_index, format_name in enumerate(order):
             source_uri = self.fixture_uri(
@@ -1639,8 +1634,7 @@ class ProtocolRunner:
         target_file_size_bytes: int | None = None,
     ) -> dict[str, dict[str, Any]]:
         pair_id = f"{self.run_id}/{track}/{case}/repeat-{repeat:03d}/{label}"
-        order = run.format_order(repeat, self.phase_index)
-        self.phase_index += 1
+        order = run.paired_format_order(repeat, pair_id)
         if maintenance_plan is not None:
             self.validate_maintenance_plan_formats(
                 step,
@@ -1678,8 +1672,7 @@ class ProtocolRunner:
         label: str,
     ) -> dict[str, dict[str, Any]]:
         pair_id = f"{self.run_id}/{track}/{case}/repeat-{repeat:03d}/{label}"
-        order = run.format_order(repeat, self.phase_index)
-        self.phase_index += 1
+        order = run.paired_format_order(repeat, pair_id)
         take_artifacts = self.prepare_paired_take_ids(
             step,
             track=track,
@@ -2068,8 +2061,7 @@ class ProtocolRunner:
             f"{self.run_id}/{track}/{case}/repeat-{repeat:03d}/"
             f"step-{step_index:03d}/cold-take"
         )
-        order = run.format_order(repeat, self.phase_index)
-        self.phase_index += 1
+        order = run.paired_format_order(repeat, pair_id)
         take_artifacts = self.prepare_paired_take_ids(
             take_step,
             track=track,
@@ -2095,8 +2087,7 @@ class ProtocolRunner:
                 f"{self.run_id}/{track}/{case}/repeat-{repeat:03d}/"
                 f"step-{step_index:03d}/cold-index-take"
             )
-            index_order = run.format_order(repeat, self.phase_index)
-            self.phase_index += 1
+            index_order = run.paired_format_order(repeat, index_pair_id)
             for order_index, format_name in enumerate(index_order):
                 self.invoke_one(
                     index_take_step,

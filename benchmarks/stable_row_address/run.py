@@ -502,16 +502,33 @@ def canonical_policy(path: Path) -> tuple[dict[str, Any], bytes, str]:
 def format_order(round_index: int, operation_index: int) -> tuple[str, ...]:
     """Rotate the three formats so each occupies every order position."""
 
-    start = (round_index + operation_index) % len(FORMATS)
+    return _rotated_format_order(round_index + operation_index)
+
+
+def _rotated_format_order(start_index: int) -> tuple[str, ...]:
+    """Rotate formats by a deterministic start index."""
+
+    start = start_index % len(FORMATS)
     return FORMATS[start:] + FORMATS[:start]
+
+
+def paired_format_order(repeat: int, scope: str) -> tuple[str, ...]:
+    """Rotate a repeated paired phase independently of surrounding phases."""
+
+    repeat_component = f"repeat-{repeat:03d}"
+    stable_scope = "/".join(
+        "repeat-XXX" if component == repeat_component else component
+        for component in scope.split("/")
+    )
+    scope_hash = hashlib.sha256(stable_scope.encode("utf-8")).digest()
+    operation_index = int.from_bytes(scope_hash[:8], "big")
+    return format_order(repeat, operation_index)
 
 
 def dynamic_format_order(repeat: int, scope: str) -> tuple[str, ...]:
     """Derive a replayable order for optional work without mutating phase state."""
 
-    scope_hash = hashlib.sha256(scope.encode("utf-8")).digest()
-    operation_index = int.from_bytes(scope_hash[:8], "big")
-    return format_order(repeat, operation_index)
+    return paired_format_order(repeat, scope)
 
 
 def _validate_clean_checkout(commit: str, status: str) -> str:

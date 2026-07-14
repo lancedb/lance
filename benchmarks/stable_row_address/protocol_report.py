@@ -1290,13 +1290,9 @@ def _expected_record_provenance(
     expected: dict[tuple[str, str], dict[str, Any]] = {}
     seen_fixtures: set[protocol.FixtureKey] = set()
     current_take_count = profile["take_counts"][-1]
-    phase_index = 0
 
-    def paired_order(repeat: int) -> tuple[str, ...]:
-        nonlocal phase_index
-        order = run.format_order(repeat, phase_index)
-        phase_index += 1
-        return order
+    def paired_order(repeat: int, pair_id: str) -> tuple[str, ...]:
+        return run.paired_format_order(repeat, pair_id)
 
     def dynamic_order(repeat: int, scope: str) -> tuple[str, ...]:
         return run.dynamic_format_order(repeat, scope)
@@ -1395,7 +1391,7 @@ def _expected_record_provenance(
             )
             add(
                 f"{prefix}/fixture_clone",
-                paired_order(0),
+                paired_order(0, f"{prefix}/fixture_clone"),
                 operation="fixture_clone",
                 repeat=0,
                 rows_per_fragment=rows_per_fragment,
@@ -1408,7 +1404,7 @@ def _expected_record_provenance(
             )
             add(
                 f"{prefix}/index_build",
-                paired_order(0),
+                paired_order(0, f"{prefix}/index_build"),
                 operation="index_build",
                 repeat=0,
                 rows_per_fragment=rows_per_fragment,
@@ -1437,7 +1433,7 @@ def _expected_record_provenance(
                 )
                 add(
                     f"{prefix}/{label}",
-                    paired_order(0),
+                    paired_order(0, f"{prefix}/{label}"),
                     operation=operation,
                     repeat=0,
                     rows_per_fragment=segment_rows_per_fragment,
@@ -1476,7 +1472,7 @@ def _expected_record_provenance(
         for label, operation in operations:
             add(
                 f"{prefix}/{label}",
-                paired_order(repeat),
+                paired_order(repeat, f"{prefix}/{label}"),
                 operation=operation,
                 repeat=repeat,
                 rows_per_fragment=rows_per_fragment,
@@ -1556,7 +1552,7 @@ def _expected_record_provenance(
                     prefix = f"{run_id}/matrix/{case_name}/repeat-{repeat:03d}"
                     add(
                         f"{prefix}/step-000/fixture_clone",
-                        paired_order(repeat),
+                        paired_order(repeat, f"{prefix}/step-000/fixture_clone"),
                         operation="fixture_clone",
                         repeat=repeat,
                         rows_per_fragment=case.rows_per_fragment,
@@ -1605,7 +1601,10 @@ def _expected_record_provenance(
                             (
                                 ("v23_logical",)
                                 if step_value.operation == "recluster"
-                                else paired_order(repeat)
+                                else paired_order(
+                                    repeat,
+                                    f"{prefix}/step-{step_index:03d}/{step_value.operation}",
+                                )
                             ),
                             step_value,
                             operation=None,
@@ -1648,7 +1647,7 @@ def _expected_record_provenance(
                 prefix = f"{run_id}/{track}/{variant}/repeat-{repeat:03d}"
                 add(
                     f"{prefix}/setup/fixture-clone",
-                    paired_order(repeat),
+                    paired_order(repeat, f"{prefix}/setup/fixture-clone"),
                     operation="fixture_clone",
                     repeat=repeat,
                     rows_per_fragment=repeated_rows_per_fragment,
@@ -1684,14 +1683,19 @@ def _expected_record_provenance(
                     if track == "sustained":
                         add(
                             f"{prefix}/round-{update_round:03d}/update",
-                            paired_order(repeat),
+                            paired_order(
+                                repeat, f"{prefix}/round-{update_round:03d}/update"
+                            ),
                             operation="update",
                             **update_kwargs,
                         )
                     elif track == "adversarial_natural":
                         add(
                             f"{prefix}/round-{update_round:03d}/update-attempt",
-                            paired_order(repeat),
+                            paired_order(
+                                repeat,
+                                f"{prefix}/round-{update_round:03d}/update-attempt",
+                            ),
                             operation="update",
                             **update_kwargs,
                         )
@@ -1773,7 +1777,10 @@ def _expected_record_provenance(
                     if index_kind != "none":
                         add(
                             f"{prefix}/round-{update_round:03d}/index-catch-up",
-                            paired_order(repeat),
+                            paired_order(
+                                repeat,
+                                f"{prefix}/round-{update_round:03d}/index-catch-up",
+                            ),
                             operation="index_optimize",
                             **update_kwargs,
                         )
@@ -1795,7 +1802,7 @@ def _expected_record_provenance(
                         if include_optional(maintenance_pair):
                             add(
                                 maintenance_pair,
-                                paired_order(repeat),
+                                paired_order(repeat, maintenance_pair),
                                 operation="default_compaction",
                                 repeat=repeat,
                                 rows_per_fragment=repeated_rows_per_fragment,

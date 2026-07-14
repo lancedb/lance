@@ -330,7 +330,7 @@ async fn test_inline_transaction() {
     let read_tx = ds2.read_transaction().await.unwrap().unwrap();
     assert_eq!(read_tx, tx.clone());
 
-    // Case 2: reading small manifest caches transaction data, eliminating transaction reading IO.
+    // Case 2: ordinary open leaves inline transaction decoding lazy.
     let read_ds2 = DatasetBuilder::from_uri(ds2.uri.clone())
         .with_session(session.clone())
         .load()
@@ -338,15 +338,46 @@ async fn test_inline_transaction() {
         .unwrap();
     let stats = read_ds2.object_store.as_ref().io_stats_incremental(); // Reset
     assert!(stats.read_bytes < 64 * 1024);
-    // Because the manifest is so small, we should have opportunistically
-    // cached the transaction in memory already.
     let inline_tx = read_ds2.read_transaction().await.unwrap().unwrap();
+    let stats = read_ds2.object_store.as_ref().io_stats_incremental();
+    assert!(stats.read_iops > 0);
+    assert!(stats.read_bytes > 0);
+    assert_eq!(inline_tx, tx);
+    let _ = read_ds2.object_store.as_ref().io_stats_incremental();
+    assert_eq!(
+        read_ds2.read_transaction().await.unwrap().unwrap(),
+        inline_tx
+    );
     let stats = read_ds2.object_store.as_ref().io_stats_incremental();
     assert_eq!(stats.read_iops, 0);
     assert_eq!(stats.read_bytes, 0);
-    assert_eq!(inline_tx, tx);
 
-    // Case 3: manifest does not contain inline transaction, read should fall back to external transaction file
+    // Case 3: stale cached manifest sizes are repaired only after the first
+    // lazy inline-transaction read fails.
+    let manifest_size = ds2.manifest_location.size.unwrap();
+    let transaction_offset = ds2.manifest.transaction_section.unwrap() as u64;
+    for stale_size in [transaction_offset + 3, manifest_size + 4 * 1024] {
+        let mut stale_size_dataset = DatasetBuilder::from_uri(ds2.uri.clone())
+            .with_session(Arc::new(Session::default()))
+            .load()
+            .await
+            .unwrap();
+        assert_eq!(
+            stale_size_dataset.manifest_location.size,
+            Some(manifest_size)
+        );
+        stale_size_dataset.manifest_location.size = Some(stale_size);
+        assert_eq!(
+            stale_size_dataset
+                .read_transaction()
+                .await
+                .unwrap()
+                .unwrap(),
+            tx
+        );
+    }
+
+    // Case 4: manifest does not contain inline transaction, read should fall back to external transaction file
     let ds = create_dataset(2).await;
     let tx = make_tx(ds.manifest().version);
     let tx_file =

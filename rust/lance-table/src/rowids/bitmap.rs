@@ -65,11 +65,25 @@ impl Bitmap {
     }
 
     pub fn count_ones(&self) -> usize {
-        self.data.iter().map(|&x| x.count_ones() as usize).sum()
+        let full_bytes = self.len / 8;
+        let mut ones = self
+            .data
+            .iter()
+            .take(full_bytes)
+            .map(|byte| byte.count_ones() as usize)
+            .sum::<usize>();
+        let remaining_bits = self.len % 8;
+        if remaining_bits != 0
+            && let Some(byte) = self.data.get(full_bytes)
+        {
+            let mask = (1_u8 << remaining_bits) - 1;
+            ones += (byte & mask).count_ones() as usize;
+        }
+        ones
     }
 
     pub fn count_zeros(&self) -> usize {
-        self.len - self.count_ones()
+        self.len.saturating_sub(self.count_ones())
     }
 
     pub fn iter(&self) -> impl Iterator<Item = bool> + '_ {
@@ -189,6 +203,16 @@ mod tests {
 
         let bitmap_slice = bitmap.slice(5, 5);
         assert_eq!(bitmap_slice.count_ones(), 2);
+    }
+
+    #[test]
+    fn count_ones_ignores_storage_outside_the_declared_length() {
+        let bitmap = Bitmap {
+            data: vec![u8::MAX, u8::MAX],
+            len: 1,
+        };
+        assert_eq!(bitmap.count_ones(), 1);
+        assert_eq!(bitmap.count_zeros(), 0);
     }
 
     #[test]

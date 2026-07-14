@@ -1287,6 +1287,24 @@ class ProtocolReportTests(unittest.TestCase):
             any("order_index" in failure for failure in result.machine["failures"])
         )
 
+    def test_repeated_pair_order_is_balanced_across_three_phase_rounds(self) -> None:
+        case = "delete-clustered-1/narrow16/take-1"
+        sidecar = make_sidecar(["matrix"], matrix_case_names=[case])
+        expected = protocol_report.expected_record_provenance(sidecar)
+
+        for format_name in run.FORMATS:
+            positions = [
+                expected[
+                    (
+                        f"run-1/matrix/{case}/repeat-{repeat:03d}/"
+                        "step-002/default_compaction",
+                        format_name,
+                    )
+                ]["order_index"]
+                for repeat in range(3)
+            ]
+            self.assertEqual(sorted(positions), [0, 1, 2])
+
     def test_no_stable_relocation_keeps_five_percent_baseline(self) -> None:
         case_name = "compact-8-to-1/narrow16"
         sidecar = make_sidecar(["matrix"], matrix_case_names=[case_name])

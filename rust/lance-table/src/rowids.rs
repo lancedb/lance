@@ -32,6 +32,7 @@ use lance_select::{RowAddrMask, RowAddrTreeMap, RowSetOps};
 pub use serde::{read_row_ids, write_row_ids};
 
 use crate::utils::LanceIteratorExtension;
+use bitmap::Bitmap;
 use segment::U64Segment;
 use tracing::instrument;
 
@@ -172,6 +173,51 @@ impl RowIdSequence {
 
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+
+    /// Return whether row IDs are strictly increasing in sequence order.
+    ///
+    /// Sorted segment encodings are checked from their exact boundary
+    /// metadata. Only an unsorted array segment needs to visit its stored
+    /// elements, so range and bitmap-backed sequences do not scale with their
+    /// logical span.
+    pub fn is_strictly_sorted(&self) -> bool {
+        let mut previous = None;
+        for segment in &self.0 {
+            if segment.is_empty() {
+                continue;
+            }
+            let (first, last) = match segment {
+                U64Segment::Array(_) => {
+                    let mut values = segment.iter();
+                    let Some(first) = values.next() else {
+                        continue;
+                    };
+                    let mut last = first;
+                    for value in values {
+                        if value <= last {
+                            return false;
+                        }
+                        last = value;
+                    }
+                    (first, last)
+                }
+                U64Segment::Range(_)
+                | U64Segment::RangeWithHoles { .. }
+                | U64Segment::RangeWithBitmap { .. }
+                | U64Segment::SortedArray(_) => {
+                    let Some(range) = segment.range() else {
+                        return false;
+                    };
+                    (*range.start(), *range.end())
+                }
+            };
+            if previous.is_some_and(|previous| previous >= first) {
+                return false;
+            }
+            previous = Some(last);
+        }
+        true
     }
 
     /// Returns the bounding range `[min, max]` across all row IDs in this sequence,
@@ -583,6 +629,45 @@ impl<I: Iterator<Item = u64>> Iterator for GroupingIterator<I> {
 
 impl From<&RowIdSequence> for RowAddrTreeMap {
     fn from(row_ids: &RowIdSequence) -> Self {
+        fn insert_bitmap_runs(rows: &mut RowAddrTreeMap, range: &Range<u64>, bitmap: &Bitmap) {
+            let range_len =
+                usize::try_from(range.end.saturating_sub(range.start)).unwrap_or(usize::MAX);
+            let bitmap_len = bitmap.len.min(range_len);
+            let mut current = None::<Range<u64>>;
+            for (byte_index, byte) in bitmap
+                .data
+                .iter()
+                .copied()
+                .take(bitmap_len.div_ceil(8))
+                .enumerate()
+            {
+                let bit_offset = byte_index * 8;
+                let valid_bits = bitmap_len.saturating_sub(bit_offset).min(8);
+                let valid_mask = (1_u16 << valid_bits) - 1;
+                let mut bits = u16::from(byte) & valid_mask;
+                while bits != 0 {
+                    let local_start = bits.trailing_zeros() as usize;
+                    let ones = (bits >> local_start).trailing_ones() as usize;
+                    let local_end = (local_start + ones).min(valid_bits);
+                    let start = range.start + (bit_offset + local_start) as u64;
+                    let end = range.start + (bit_offset + local_end) as u64;
+                    if let Some(previous) = current.as_mut()
+                        && previous.end == start
+                    {
+                        previous.end = end;
+                    } else {
+                        if let Some(previous) = current.replace(start..end) {
+                            rows.insert_range(previous);
+                        }
+                    }
+                    bits &= !((1_u16 << local_end) - 1);
+                }
+            }
+            if let Some(current) = current {
+                rows.insert_range(current);
+            }
+        }
+
         let mut tree_map = Self::new();
         for segment in &row_ids.0 {
             let mut seg = Self::new();
@@ -591,12 +676,7 @@ impl From<&RowIdSequence> for RowAddrTreeMap {
                     seg.insert_range(range.clone());
                 }
                 U64Segment::RangeWithBitmap { range, bitmap } => {
-                    seg.insert_range(range.clone());
-                    for (i, val) in range.clone().enumerate() {
-                        if !bitmap.get(i) {
-                            seg.remove(val);
-                        }
-                    }
+                    insert_bitmap_runs(&mut seg, range, bitmap);
                 }
                 U64Segment::RangeWithHoles { range, holes } => {
                     seg.insert_range(range.clone());
@@ -858,6 +938,68 @@ mod test {
     }
 
     #[test]
+    fn test_row_id_sequence_strict_sort_uses_segment_boundaries() {
+        let mut masked = RowIdSequence::from(0..100_000);
+        masked
+            .mask((0..100_000_u32).step_by(2))
+            .expect("mask should fit the range");
+        assert!(masked.is_strictly_sorted());
+
+        let mut ordered = masked.clone();
+        ordered.extend(RowIdSequence::from(100_001..100_010));
+        assert!(ordered.is_strictly_sorted());
+
+        let mut overlapping = masked;
+        overlapping.extend(RowIdSequence::from(99_999..100_010));
+        assert!(!overlapping.is_strictly_sorted());
+        assert!(!RowIdSequence::from([2_u64, 1].as_slice()).is_strictly_sorted());
+    }
+
+    #[test]
+    fn hundred_million_row_bitmap_converts_by_bytes_and_runs() {
+        const ROWS: usize = 100_000_000;
+        let mut bitmap = Bitmap::new_empty(ROWS);
+        for offset in [0, ROWS / 2, ROWS - 1] {
+            bitmap.set(offset);
+        }
+        let sequence = RowIdSequence(vec![U64Segment::RangeWithBitmap {
+            range: 0..ROWS as u64,
+            bitmap,
+        }]);
+
+        let started = std::time::Instant::now();
+        let rows = RowAddrTreeMap::from(&sequence);
+        assert_eq!(rows.len(), Some(3));
+        assert_eq!(
+            rows.row_addrs().unwrap().map(u64::from).collect::<Vec<_>>(),
+            vec![0, (ROWS / 2) as u64, (ROWS - 1) as u64]
+        );
+        if !cfg!(debug_assertions) {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(2),
+                "100M RangeWithBitmap conversion must scale with bitmap bytes and present runs"
+            );
+        }
+    }
+
+    #[test]
+    fn bitmap_conversion_never_exceeds_its_declared_range() {
+        let sequence = RowIdSequence(vec![U64Segment::RangeWithBitmap {
+            range: 10..11,
+            bitmap: Bitmap {
+                data: vec![u8::MAX, u8::MAX],
+                len: 16,
+            },
+        }]);
+
+        let rows = RowAddrTreeMap::from(&sequence);
+        assert_eq!(
+            rows.row_addrs().unwrap().map(u64::from).collect::<Vec<_>>(),
+            vec![10]
+        );
+    }
+
+    #[test]
     fn test_row_id_sequence_delete() {
         let mut sequence = RowIdSequence::from(0..10);
         sequence.delete(vec![1, 3, 5, 7, 9]);
@@ -985,6 +1127,25 @@ mod test {
         // Too many segments -> error
         let result = rechunk_sequences(many_segments, vec![5], false);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn rechunk_large_range_preserves_constant_size_segments() {
+        let chunks = rechunk_sequences(
+            [RowIdSequence::from(0..100_000_000)],
+            [75_000_000, 15_000_000, 10_000_000],
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            chunks,
+            vec![
+                RowIdSequence(vec![U64Segment::Range(0..75_000_000)]),
+                RowIdSequence(vec![U64Segment::Range(75_000_000..90_000_000)]),
+                RowIdSequence(vec![U64Segment::Range(90_000_000..100_000_000)]),
+            ]
+        );
     }
 
     #[test]

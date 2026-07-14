@@ -22,6 +22,32 @@ import run  # noqa: E402
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_protocol_format_order_is_independent_of_phases_per_repeat(self) -> None:
+        step = protocol.Step("open", expected_rows=1)
+
+        for phases_per_repeat in (2, 3):
+            runner = object.__new__(protocol.ProtocolRunner)
+            runner.run_id = "run-1"
+            runner.invoke_one = mock.Mock(
+                side_effect=lambda _step, *, format_name, **_kwargs: {
+                    "format": format_name
+                }
+            )
+            first_formats = []
+            for repeat in range(3):
+                for phase in range(phases_per_repeat):
+                    records = runner.invoke_all(
+                        step,
+                        track="matrix",
+                        case="format-order",
+                        repeat=repeat,
+                        label=f"phase-{phase:03d}",
+                    )
+                    if phase == 0:
+                        first_formats.append(next(iter(records)))
+
+            self.assertEqual(set(first_formats), set(run.FORMATS))
+
     def test_release_profile_freezes_design_matrix(self) -> None:
         matrix, canonical, digest = protocol.load_matrix(protocol.DEFAULT_MATRIX)
         release = matrix["profiles"]["release"]
@@ -248,7 +274,6 @@ class ProtocolTests(unittest.TestCase):
     def test_index_probe_reuses_prepared_live_user_ids(self) -> None:
         runner = object.__new__(protocol.ProtocolRunner)
         runner.run_id = "run-1"
-        runner.phase_index = 0
         runner.failures = []
         invocations: list[tuple[str, str, Path | None]] = []
 
@@ -302,7 +327,6 @@ class ProtocolTests(unittest.TestCase):
     def test_direct_index_take_prepares_paired_format_artifacts(self) -> None:
         runner = object.__new__(protocol.ProtocolRunner)
         runner.run_id = "run-1"
-        runner.phase_index = 0
         runner.failures = []
         invocations: list[tuple[str, str, int, int, str, Path | None]] = []
         preparations: list[tuple[str, int, int, str]] = []
@@ -392,7 +416,6 @@ class ProtocolTests(unittest.TestCase):
     ) -> None:
         runner = object.__new__(protocol.ProtocolRunner)
         runner.run_id = "run-1"
-        runner.phase_index = 0
         runner.failures = []
 
         with tempfile.TemporaryDirectory() as directory:

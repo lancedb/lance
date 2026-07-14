@@ -135,6 +135,17 @@ class RunTests(unittest.TestCase):
             ],
         )
 
+    def test_paired_format_order_rotates_repeat_independently(self) -> None:
+        orders = [
+            run.paired_format_order(
+                repeat,
+                f"run/matrix/case/repeat-{repeat:03d}/step-001/scan",
+            )
+            for repeat in range(3)
+        ]
+
+        self.assertEqual(set(order[0] for order in orders), set(run.FORMATS))
+
     def test_dynamic_format_order_is_scope_bound_and_replayable(self) -> None:
         scopes = tuple(f"run/track/repeat-000/round-{index:03d}" for index in range(12))
         first = [run.dynamic_format_order(0, scope) for scope in scopes]

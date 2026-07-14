@@ -7,6 +7,7 @@
 //! update version for each row in a Lance dataset, enabling efficient
 //! cross-version diff operations.
 
+use std::ops::Range;
 use std::sync::Arc;
 
 use lance_core::Error;
@@ -162,6 +163,117 @@ impl RowDatasetVersionSequence {
         self.runs.retain(|r| !r.span.is_empty());
         Ok(())
     }
+
+    /// Delete sorted, non-overlapping ranges of positional row offsets.
+    ///
+    /// Work and temporary memory are bounded by the number of version runs and
+    /// deletion ranges, rather than by the number of deleted rows. The resulting
+    /// run spans are rewritten over the dense sequence of surviving rows.
+    pub fn mask_ranges(&mut self, ranges: impl IntoIterator<Item = Range<u64>>) -> Result<()> {
+        let total_len = self.runs.iter().try_fold(0_u64, |total, run| {
+            let run_len = u64::try_from(run.len()).map_err(|_| {
+                Error::format_capacity_exceeded("row-version run length exceeds u64")
+            })?;
+            total.checked_add(run_len).ok_or_else(|| {
+                Error::format_capacity_exceeded("row-version sequence length exceeds u64")
+            })
+        })?;
+        let mut ranges = ranges.into_iter();
+        let mut previous_range_end = 0_u64;
+        let mut current_range =
+            next_version_mask_range(&mut ranges, &mut previous_range_end, total_len)?;
+        let mut source_offset = 0_u64;
+        let mut output_offset = 0_u64;
+        let mut output_runs = Vec::with_capacity(self.runs.len());
+
+        for run in &self.runs {
+            let run_len = u64::try_from(run.len()).map_err(|_| {
+                Error::format_capacity_exceeded("row-version run length exceeds u64")
+            })?;
+            let run_end = source_offset.checked_add(run_len).ok_or_else(|| {
+                Error::format_capacity_exceeded("row-version sequence length exceeds u64")
+            })?;
+            let mut deleted_in_run = 0_u64;
+
+            while let Some(range) = current_range.as_ref() {
+                if range.start >= run_end {
+                    break;
+                }
+                let intersection_start = range.start.max(source_offset);
+                let intersection_end = range.end.min(run_end);
+                if intersection_start < intersection_end {
+                    deleted_in_run = deleted_in_run
+                        .checked_add(intersection_end - intersection_start)
+                        .ok_or_else(|| {
+                            Error::format_capacity_exceeded(
+                                "row-version deletion cardinality exceeds u64",
+                            )
+                        })?;
+                }
+                if range.end <= run_end {
+                    current_range =
+                        next_version_mask_range(&mut ranges, &mut previous_range_end, total_len)?;
+                } else {
+                    break;
+                }
+            }
+
+            let live_len = run_len.checked_sub(deleted_in_run).ok_or_else(|| {
+                Error::internal("row-version deletion ranges exceed their source run")
+            })?;
+            if live_len != 0 {
+                let output_end = output_offset.checked_add(live_len).ok_or_else(|| {
+                    Error::format_capacity_exceeded("masked row-version sequence exceeds u64")
+                })?;
+                output_runs.push(RowDatasetVersionRun {
+                    span: U64Segment::Range(output_offset..output_end),
+                    version: run.version,
+                });
+                output_offset = output_end;
+            }
+            source_offset = run_end;
+        }
+
+        if current_range.is_some() {
+            return Err(Error::internal(
+                "validated row-version deletion range was not consumed",
+            ));
+        }
+        self.runs = output_runs;
+        Ok(())
+    }
+}
+
+fn next_version_mask_range(
+    ranges: &mut impl Iterator<Item = Range<u64>>,
+    previous_range_end: &mut u64,
+    sequence_len: u64,
+) -> Result<Option<Range<u64>>> {
+    for range in ranges {
+        if range.start > range.end {
+            return Err(Error::invalid_input(format!(
+                "row-version deletion range {}..{} is reversed",
+                range.start, range.end
+            )));
+        }
+        if range.start < *previous_range_end {
+            return Err(Error::invalid_input(format!(
+                "row-version deletion range {}..{} overlaps or precedes previous end {}",
+                range.start, range.end, *previous_range_end
+            )));
+        }
+        if range.end > sequence_len {
+            return Err(Error::invalid_input(format!(
+                "row-version deletion range {}..{} exceeds sequence length {}",
+                range.start, range.end, sequence_len
+            )));
+        }
+        *previous_range_end = range.end;
+        if !range.is_empty() {
+            return Ok(Some(range));
+        }
+    }
+    Ok(None)
 }
 
 /// Iterator over versions expanding runs lazily.
@@ -461,6 +573,108 @@ pub fn rechunk_version_sequences(
     Ok(chunked_sequences)
 }
 
+/// Re-chunk version sequences using only run lengths and output chunk sizes.
+///
+/// Unlike [`rechunk_version_sequences`], this path never slices a
+/// [`U64Segment`] or materializes its row offsets. It emits dense positional
+/// ranges and coalesces adjacent runs with the same version, so its work and
+/// temporary memory are bounded by input runs plus output chunks.
+pub fn rechunk_version_sequences_by_run_lengths(
+    sequences: impl IntoIterator<Item = RowDatasetVersionSequence>,
+    chunk_sizes: impl IntoIterator<Item = u64>,
+    allow_incomplete: bool,
+) -> Result<Vec<RowDatasetVersionSequence>> {
+    let chunk_sizes = chunk_sizes.into_iter().collect::<Vec<_>>();
+    let total_chunks = chunk_sizes.len();
+    let mut output = Vec::with_capacity(total_chunks);
+    let mut runs = sequences
+        .into_iter()
+        .flat_map(|sequence| sequence.runs.into_iter());
+    let mut current_run = next_non_empty_version_run(&mut runs)?;
+
+    for (chunk_index, chunk_size) in chunk_sizes.into_iter().enumerate() {
+        let mut chunk = RowDatasetVersionSequence::new();
+        let mut chunk_offset = 0_u64;
+        let mut remaining = chunk_size;
+
+        while remaining != 0 {
+            let Some((run_remaining, version)) = current_run.as_mut() else {
+                if allow_incomplete {
+                    break;
+                }
+                return Err(Error::invalid_input(format!(
+                    "Got too few version runs for chunk {chunk_index}. Expected chunk size: {chunk_size}, remaining needed: {remaining}"
+                )));
+            };
+            let taken = (*run_remaining).min(remaining);
+            append_dense_version_run(&mut chunk, &mut chunk_offset, taken, *version)?;
+            *run_remaining -= taken;
+            remaining -= taken;
+            if *run_remaining == 0 {
+                current_run = next_non_empty_version_run(&mut runs)?;
+            }
+        }
+
+        output.push(chunk);
+    }
+
+    if current_run.is_some() {
+        return Err(Error::invalid_input(format!(
+            "Got too many version runs for the provided chunk lengths. Processed {} chunks out of {} expected",
+            output.len(),
+            total_chunks
+        )));
+    }
+
+    Ok(output)
+}
+
+fn next_non_empty_version_run(
+    runs: &mut impl Iterator<Item = RowDatasetVersionRun>,
+) -> Result<Option<(u64, u64)>> {
+    for run in runs {
+        let len = u64::try_from(run.len())
+            .map_err(|_| Error::format_capacity_exceeded("row-version run length exceeds u64"))?;
+        if len != 0 {
+            return Ok(Some((len, run.version)));
+        }
+    }
+    Ok(None)
+}
+
+fn append_dense_version_run(
+    sequence: &mut RowDatasetVersionSequence,
+    output_offset: &mut u64,
+    len: u64,
+    version: u64,
+) -> Result<()> {
+    let output_end = output_offset
+        .checked_add(len)
+        .ok_or_else(|| Error::format_capacity_exceeded("row-version output span exceeds u64"))?;
+    if let Some(previous) = sequence.runs.last_mut()
+        && previous.version == version
+    {
+        let U64Segment::Range(range) = &mut previous.span else {
+            return Err(Error::internal(
+                "run-length rechunk produced a non-dense output span",
+            ));
+        };
+        if range.end != *output_offset {
+            return Err(Error::internal(
+                "run-length rechunk produced non-contiguous output spans",
+            ));
+        }
+        range.end = output_end;
+    } else {
+        sequence.runs.push(RowDatasetVersionRun {
+            span: U64Segment::Range(*output_offset..output_end),
+            version,
+        });
+    }
+    *output_offset = output_end;
+    Ok(())
+}
+
 /// Build uniform version metadata for any fragment with physical rows.
 pub fn build_uniform_version_meta(
     fragment: &Fragment,
@@ -737,6 +951,190 @@ mod tests {
         assert_eq!(seq.get_version_for_row_id(&rows, 12), Some(9));
         assert_eq!(seq.get_version_for_row_id(&rows, 13), Some(9));
         assert_eq!(seq.get_version_for_row_id(&rows, 99), None);
+    }
+
+    #[test]
+    fn mask_ranges_preserves_versions_across_run_boundaries() {
+        let mut sequence = RowDatasetVersionSequence {
+            runs: vec![
+                RowDatasetVersionRun {
+                    span: U64Segment::Range(0..5),
+                    version: 1,
+                },
+                RowDatasetVersionRun {
+                    span: U64Segment::Range(0..5),
+                    version: 2,
+                },
+                RowDatasetVersionRun {
+                    span: U64Segment::Range(0..5),
+                    version: 1,
+                },
+            ],
+        };
+
+        sequence.mask_ranges([1..4, 6..12]).unwrap();
+
+        assert_eq!(sequence.len(), 6);
+        assert_eq!(sequence.runs.len(), 3);
+        assert_eq!(sequence.runs[0].span, U64Segment::Range(0..2));
+        assert_eq!(sequence.runs[1].span, U64Segment::Range(2..3));
+        assert_eq!(sequence.runs[2].span, U64Segment::Range(3..6));
+        assert_eq!(
+            sequence.versions().collect::<Vec<_>>(),
+            vec![1, 1, 2, 1, 1, 1]
+        );
+    }
+
+    #[test]
+    fn mask_ranges_handles_empty_full_and_invalid_inputs_atomically() {
+        let original = RowDatasetVersionSequence {
+            runs: vec![
+                RowDatasetVersionRun {
+                    span: U64Segment::Range(0..4),
+                    version: 1,
+                },
+                RowDatasetVersionRun {
+                    span: U64Segment::Range(4..8),
+                    version: 2,
+                },
+            ],
+        };
+
+        let mut empty = original.clone();
+        empty.mask_ranges(std::iter::empty::<Range<u64>>()).unwrap();
+        assert_eq!(empty, original);
+
+        let mut empty_ranges = original.clone();
+        empty_ranges.mask_ranges([0..0, 4..4, 8..8]).unwrap();
+        assert_eq!(empty_ranges, original);
+
+        let mut full = original.clone();
+        full.mask_ranges([0..8]).unwrap();
+        assert!(full.is_empty());
+
+        for ranges in [
+            vec![1..9],
+            vec![std::ops::Range { start: 3, end: 2 }],
+            vec![1..4, 3..5],
+        ] {
+            let mut sequence = original.clone();
+            assert!(sequence.mask_ranges(ranges).is_err());
+            assert_eq!(sequence, original);
+        }
+    }
+
+    #[test]
+    fn run_length_rechunk_splits_100m_uniform_rows_into_10k_chunks() {
+        let sequence = RowDatasetVersionSequence::from_uniform_row_count(100_000_000, 7);
+
+        let chunks = rechunk_version_sequences_by_run_lengths(
+            [sequence],
+            std::iter::repeat_n(10_000, 10_000),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(chunks.len(), 10_000);
+        assert!(chunks.iter().all(|chunk| chunk.len() == 10_000));
+        assert!(chunks.iter().all(|chunk| chunk.runs.len() == 1));
+        assert!(chunks.iter().all(|chunk| chunk.runs[0].version == 7));
+        assert_eq!(chunks[0].runs[0].span, U64Segment::Range(0..10_000));
+        assert_eq!(chunks[9_999].runs[0].span, U64Segment::Range(0..10_000));
+    }
+
+    #[test]
+    fn run_length_rechunk_coalesces_10k_uniform_input_runs_into_one_chunk() {
+        let sequences =
+            (0..10_000).map(|_| RowDatasetVersionSequence::from_uniform_row_count(10_000, 7));
+
+        let chunks =
+            rechunk_version_sequences_by_run_lengths(sequences, [100_000_000], false).unwrap();
+
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].len(), 100_000_000);
+        assert_eq!(chunks[0].runs.len(), 1);
+        assert_eq!(chunks[0].runs[0].version, 7);
+        assert_eq!(chunks[0].runs[0].span, U64Segment::Range(0..100_000_000));
+    }
+
+    #[test]
+    fn run_length_rechunk_preserves_boundaries_and_error_semantics() {
+        let sequence = RowDatasetVersionSequence {
+            runs: vec![
+                RowDatasetVersionRun {
+                    span: U64Segment::Range(4..4),
+                    version: 99,
+                },
+                RowDatasetVersionRun {
+                    span: U64Segment::Range(100..103),
+                    version: 1,
+                },
+                RowDatasetVersionRun {
+                    span: U64Segment::Range(8..10),
+                    version: 1,
+                },
+                RowDatasetVersionRun {
+                    span: U64Segment::Range(50..54),
+                    version: 2,
+                },
+                RowDatasetVersionRun {
+                    span: U64Segment::Range(9..10),
+                    version: 3,
+                },
+            ],
+        };
+
+        let chunks =
+            rechunk_version_sequences_by_run_lengths([sequence], [0, 2, 5, 3], false).unwrap();
+        assert_eq!(
+            chunks,
+            vec![
+                RowDatasetVersionSequence::new(),
+                RowDatasetVersionSequence {
+                    runs: vec![RowDatasetVersionRun {
+                        span: U64Segment::Range(0..2),
+                        version: 1,
+                    }],
+                },
+                RowDatasetVersionSequence {
+                    runs: vec![
+                        RowDatasetVersionRun {
+                            span: U64Segment::Range(0..3),
+                            version: 1,
+                        },
+                        RowDatasetVersionRun {
+                            span: U64Segment::Range(3..5),
+                            version: 2,
+                        },
+                    ],
+                },
+                RowDatasetVersionSequence {
+                    runs: vec![
+                        RowDatasetVersionRun {
+                            span: U64Segment::Range(0..2),
+                            version: 2,
+                        },
+                        RowDatasetVersionRun {
+                            span: U64Segment::Range(2..3),
+                            version: 3,
+                        },
+                    ],
+                },
+            ]
+        );
+
+        let short = RowDatasetVersionSequence::from_uniform_row_count(2, 1);
+        let error =
+            rechunk_version_sequences_by_run_lengths([short.clone()], [3], false).unwrap_err();
+        assert!(error.to_string().contains("too few version runs"));
+
+        let chunks =
+            rechunk_version_sequences_by_run_lengths([short.clone()], [3, 1], true).unwrap();
+        assert_eq!(chunks[0].len(), 2);
+        assert!(chunks[1].is_empty());
+
+        let error = rechunk_version_sequences_by_run_lengths([short], [1], false).unwrap_err();
+        assert!(error.to_string().contains("too many version runs"));
     }
 
     #[test]

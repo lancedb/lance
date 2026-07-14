@@ -216,8 +216,11 @@ async fn prepare_row_address_manifest_context(
     let mut current_fragment_ids = HashSet::<u32>::new();
     let mut pending = Vec::<u64>::with_capacity(4096);
     for selection in &delta.retired_selections {
-        for logical_address in selection.iter() {
-            pending.push(logical_address?.raw());
+        // The compressed temporary keeps asynchronous resolution bounded
+        // without issuing one codec select for every logical row.
+        let retired = selection.to_roaring_treemap()?;
+        for logical_address in retired.iter() {
+            pending.push(logical_address);
             if pending.len() == 4096 {
                 for physical_address in dataset.resolve_logical_row_ids_async(&pending).await? {
                     match physical_address {

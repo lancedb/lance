@@ -871,28 +871,6 @@ impl Dataset {
                 .await;
         }
 
-        // If transaction is also in the prefetched tail, take the opportunity to
-        // decode them now and cache them.
-        if let Some(transaction_offset) = manifest.transaction_section
-            && let Some(transaction) = decode_message_from_prefetched_tail::<pb::Transaction>(
-                &prefetched_tail,
-                manifest_size,
-                transaction_offset,
-                &manifest_location.path,
-                "transaction",
-            )?
-        {
-            let transaction: Transaction = transaction.try_into()?;
-
-            let metadata_cache = session.metadata_cache.for_dataset(uri);
-            let metadata_key = TransactionKey {
-                version: manifest_location.version,
-            };
-            metadata_cache
-                .insert_with_key(&metadata_key, Arc::new(transaction))
-                .await;
-        }
-
         if manifest.should_use_legacy_format() {
             let object_reader = object_store
                 .open_with_size(&manifest_location.path, manifest_size)
@@ -1336,15 +1314,39 @@ impl Dataset {
 
         // Prefer inline transaction from manifest when available
         let transaction = if let Some(pos) = self.manifest.transaction_section {
-            let reader = if let Some(size) = self.manifest_location.size {
-                self.object_store
-                    .open_with_size(&self.manifest_location.path, size as usize)
-                    .await?
-            } else {
-                self.object_store.open(&self.manifest_location.path).await?
+            let cached_size = self.manifest_location.size;
+            let read_inline = |known_size: Option<u64>| async move {
+                let reader = if let Some(size) = known_size {
+                    self.object_store
+                        .open_with_size(&self.manifest_location.path, size as usize)
+                        .await?
+                } else {
+                    self.object_store.open(&self.manifest_location.path).await?
+                };
+                read_message(reader.as_ref(), pos).await
             };
 
-            let tx: pb::Transaction = read_message(reader.as_ref(), pos).await?;
+            let tx: pb::Transaction = match read_inline(cached_size).await {
+                Ok(transaction) => transaction,
+                Err(initial_error) => {
+                    let Some(cached_size) = cached_size else {
+                        return Err(initial_error);
+                    };
+                    let actual_size = match self
+                        .object_store
+                        .inner
+                        .head(&self.manifest_location.path)
+                        .await
+                    {
+                        Ok(metadata) => metadata.size,
+                        Err(_) => return Err(initial_error),
+                    };
+                    if actual_size == cached_size {
+                        return Err(initial_error);
+                    }
+                    read_inline(Some(actual_size)).await?
+                }
+            };
             Transaction::try_from(tx).map(Some)?
         } else if let Some(path) = &self.manifest.transaction_file {
             // Fallback: read external transaction file if present
