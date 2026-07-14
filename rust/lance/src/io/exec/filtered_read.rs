@@ -334,11 +334,11 @@ struct FilteredReadStream {
     threading_mode: FilteredReadThreadingMode,
     /// Range to apply to the result stream if not already pushed down in planning phase
     scan_range_after_filter: Option<Range<u64>>,
-    /// Take-shaped plan (many fragments, few rows each); the output side
-    /// consolidates the tiny per-fragment batches
-    is_sparse_plan: bool,
-    /// Rows per output batch (explicit option → env default → 8192)
-    batch_target_rows: usize,
+    /// Fragments planned non-empty, and their total planned rows; the output
+    /// side uses these to detect take-shaped plans (batch size resolves at
+    /// execute time, so the detection lives there too)
+    touched_fragments: usize,
+    planned_rows: u64,
 }
 
 /// Below this many fragments there are too few handoffs to be worth
@@ -564,15 +564,6 @@ impl FilteredReadStream {
                         (fragments, rows)
                     }
                 });
-        let batch_target_rows = options
-            .batch_size
-            .map(|batch_size| batch_size as usize)
-            .unwrap_or_else(|| get_default_batch_size().unwrap_or(BATCH_SIZE_FALLBACK));
-        let is_sparse_plan = batch_target_rows > 0
-            && touched_fragments >= CONSOLIDATE_MIN_FRAGMENTS
-            && planned_rows
-                < touched_fragments as u64 * CONSOLIDATE_MAX_AVG_PLANNED_ROWS_PER_FRAGMENT;
-
         Ok(Self {
             output_schema,
             task_stream: Arc::new(AsyncMutex::new(task_stream)),
@@ -581,8 +572,8 @@ impl FilteredReadStream {
             active_partitions_counter: Arc::new(AtomicUsize::new(0)),
             threading_mode,
             scan_range_after_filter,
-            is_sparse_plan,
-            batch_target_rows,
+            touched_fragments,
+            planned_rows,
         })
     }
 
@@ -1952,6 +1943,7 @@ impl FilteredReadExec {
                 n.min(target_partitions).max(1),
             );
         }
+        let batch_size_rows = options.batch_size;
         let batch_size_bytes = options
             .file_reader_options
             .as_ref()
@@ -1986,9 +1978,19 @@ impl FilteredReadExec {
             // Only masked reads consolidate; plain scans keep their batch
             // boundaries, and the byte-based rechunk merges on its own
             let consolidate = if index_input.is_some() && batch_size_bytes.is_none() {
-                running_stream
-                    .as_ref()
-                    .and_then(|running| running.is_sparse_plan.then_some(running.batch_target_rows))
+                running_stream.as_ref().and_then(|running| {
+                    // Explicit option → lance env default → session batch size
+                    let batch_target_rows = batch_size_rows
+                        .map(|batch_size| batch_size as usize)
+                        .or_else(get_default_batch_size)
+                        .unwrap_or_else(|| context.session_config().batch_size());
+                    let is_sparse_plan = batch_target_rows > 0
+                        && running.touched_fragments >= CONSOLIDATE_MIN_FRAGMENTS
+                        && running.planned_rows
+                            < running.touched_fragments as u64
+                                * CONSOLIDATE_MAX_AVG_PLANNED_ROWS_PER_FRAGMENT;
+                    is_sparse_plan.then_some(batch_target_rows)
+                })
             } else {
                 None
             };
