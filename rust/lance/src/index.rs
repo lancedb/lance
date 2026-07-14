@@ -4958,6 +4958,57 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_optimize_empty_code_fts_index_preserves_params() {
+        let dir = TempStrDir::default();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("code", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values([0, 1])),
+                Arc::new(StringArray::from_iter_values([
+                    "fn GetUserEmail() {}",
+                    "fn ParseConfig() {}",
+                ])),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(reader, &dir, None).await.unwrap();
+
+        let params = InvertedIndexParams::default()
+            .analyzer("code")
+            .unwrap()
+            .split_identifiers(true)
+            .preserve_original(false);
+        dataset
+            .create_index_builder(&["code"], IndexType::Inverted, &params)
+            .name("code_idx".to_string())
+            .train(false)
+            .await
+            .unwrap();
+
+        dataset.optimize_indices(&Default::default()).await.unwrap();
+
+        let stats: serde_json::Value =
+            serde_json::from_str(&dataset.index_statistics("code_idx").await.unwrap()).unwrap();
+        assert_eq!(stats["num_unindexed_rows"], 0);
+
+        let result = dataset
+            .scan()
+            .project(&["id"])
+            .unwrap()
+            .full_text_search(FullTextSearchQuery::new("email".to_string()))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(result["id"].as_primitive::<Int32Type>().values(), &[0]);
+    }
+
     /// Helper function to check if an index is being used in a query plan
     fn assert_index_usage(plan: &str, column_name: &str, should_use_index: bool, context: &str) {
         let index_used = if column_name == "text" {

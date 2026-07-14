@@ -26,8 +26,6 @@ message LabelListIndexDetails {}
 message NGramIndexDetails {}
 message ZoneMapIndexDetails {}
 message InvertedIndexDetails {
-  // Analyzer profiles are input-only and are not part of persisted details.
-  reserved 12;
   // Document-level tokenizer. It extracts searchable text from the stored value,
   // e.g. "text" for a plain string or "json" for JSON content. The extracted
   // text is then passed to base_tokenizer. Absent means text / auto-inferred
