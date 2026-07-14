@@ -1035,6 +1035,7 @@ pub enum CandidateAddr {
 #[derive(Debug)]
 pub struct DocCandidate {
     pub addr: CandidateAddr,
+    pub doc_index: Vec<u32>,
     /// The document key used by the posting lists: doc_id for compressed
     /// postings, row_id for legacy plain postings.
     pub posting_doc_id: u64,
@@ -1485,6 +1486,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
             .map(
                 |Reverse((doc, freqs, doc_length, posting_doc_id))| DocCandidate {
                     addr: to_addr(doc.row_id),
+                    doc_index: Vec::new(),
                     posting_doc_id,
                     freqs,
                     doc_length,
@@ -1613,6 +1615,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
             .map(
                 |Reverse((doc, freqs, doc_length, posting_doc_id))| DocCandidate {
                     addr: CandidateAddr::RowId(doc.row_id),
+                    doc_index: Vec::new(),
                     posting_doc_id,
                     freqs,
                     doc_length,

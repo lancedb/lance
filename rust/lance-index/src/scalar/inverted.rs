@@ -149,6 +149,9 @@ impl InvertedIndexPlugin {
 
         params.validate_format_version()?;
         let format_version = params.resolved_format_version();
+        let is_element_document = params
+            .fts_target()
+            .is_some_and(FtsTarget::is_element_document);
         let details = pbold::InvertedIndexDetails::try_from(&params)?;
         let mut inverted_index =
             InvertedIndexBuilder::new_with_fragment_mask(params, fragment_mask)
@@ -156,7 +159,11 @@ impl InvertedIndexPlugin {
         let files = inverted_index.update(data, index_store, None).await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&details).unwrap(),
-            index_version: format_version.index_version(),
+            index_version: if is_element_document {
+                INVERTED_INDEX_VERSION_ELEMENT_DOCUMENT
+            } else {
+                format_version.index_version()
+            },
             files,
         })
     }
@@ -268,7 +275,7 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
     }
 
     fn version(&self) -> u32 {
-        max_supported_fts_format_version().index_version()
+        INVERTED_INDEX_VERSION_ELEMENT_DOCUMENT
     }
 
     fn new_query_parser(
@@ -301,10 +308,19 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        Ok(
+        let details = _index_details.to_msg::<pbold::InvertedIndexDetails>()?;
+        let index = if let Some(target) = details.fts_target.as_ref() {
+            InvertedIndex::load_with_target(
+                index_store,
+                frag_reuse_index,
+                cache,
+                FtsTarget::from(target),
+            )
+            .await?
+        } else {
             InvertedIndex::load(index_store, frag_reuse_index, cache).await?
-                as Arc<dyn ScalarIndex>,
-        )
+        };
+        Ok(index as Arc<dyn ScalarIndex>)
     }
 
     fn details_as_json(&self, details: &prost_types::Any) -> Result<serde_json::Value> {
@@ -322,10 +338,7 @@ mod tests {
     #[test]
     fn test_plugin_version_tracks_max_supported_format() {
         let plugin = InvertedIndexPlugin;
-        assert_eq!(
-            plugin.version(),
-            max_supported_fts_format_version().index_version()
-        );
+        assert_eq!(plugin.version(), INVERTED_INDEX_VERSION_ELEMENT_DOCUMENT);
     }
 
     #[test]

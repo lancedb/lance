@@ -45,9 +45,11 @@ use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::prelude::Expr;
+use lance_core::datatypes::{FieldPathComponent, parse_field_path_components};
 use lance_core::{Error, Result, is_system_column};
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::inverted::query::{FtsQuery as IndexFtsQuery, Operator};
+use lance_index::scalar::inverted::{DOC_INDEX_COL, DOC_INDEX_FIELD};
 use tracing::instrument;
 
 use super::block_list::compute_source_block_lists;
@@ -68,6 +70,11 @@ pub const SCORE_COLUMN: &str = "_score";
 /// dedup on with no over-fetch; callers (e.g. the sophon WAL handler) raise it
 /// so a blocked source still yields `k` live rows after the block-list filter.
 const DEFAULT_OVERFETCH_FACTOR: f64 = 1.0;
+
+fn is_element_fts_target(column: &str) -> bool {
+    parse_field_path_components(column)
+        .is_ok_and(|path| path.last() == Some(&FieldPathComponent::ListWildcard))
+}
 
 fn validate_lsm_fts_query(query: &FullTextSearchQuery) -> Result<()> {
     match &query.query {
@@ -213,8 +220,13 @@ impl LsmFtsSearchPlanner {
         {
             validate_lsm_fts_query(&query)?;
         }
-        validate_projection_names(projection, &self.base_schema, &[SCORE_COLUMN])?;
-        let target_schema = self.canonical_fts_schema(projection);
+        let allowed_system_columns: &[&str] = if is_element_fts_target(column) {
+            &[SCORE_COLUMN, DOC_INDEX_COL]
+        } else {
+            &[SCORE_COLUMN]
+        };
+        validate_projection_names(projection, &self.base_schema, allowed_system_columns)?;
+        let target_schema = self.canonical_fts_schema(projection, column);
         let overfetch = super::validate_overfetch_factor(self.overfetch_factor)?;
 
         if sources.is_empty() {
@@ -403,7 +415,7 @@ impl LsmFtsSearchPlanner {
                 ..
             } => {
                 if !active_source_can_execute_fts(source, column) {
-                    return self.empty_plan(&self.canonical_fts_schema(projection));
+                    return self.empty_plan(&self.canonical_fts_schema(projection, column));
                 }
                 validate_lsm_fts_query(query)?;
                 let mut scanner =
@@ -460,7 +472,7 @@ impl LsmFtsSearchPlanner {
     }
 
     /// Canonical FTS output: user-projected cols + PK + `_score`.
-    fn canonical_fts_schema(&self, user_projection: Option<&[String]>) -> SchemaRef {
+    fn canonical_fts_schema(&self, user_projection: Option<&[String]>, target: &str) -> SchemaRef {
         let mut ordered: Vec<String> = if let Some(p) = user_projection {
             p.to_vec()
         } else {
@@ -475,6 +487,9 @@ impl LsmFtsSearchPlanner {
                 ordered.push(pk.clone());
             }
         }
+        if is_element_fts_target(target) && !ordered.iter().any(|c| c == DOC_INDEX_COL) {
+            ordered.push(DOC_INDEX_COL.to_string());
+        }
         if !ordered.iter().any(|c| c == SCORE_COLUMN) {
             ordered.push(SCORE_COLUMN.to_string());
         }
@@ -483,6 +498,8 @@ impl LsmFtsSearchPlanner {
             .filter_map(|name| {
                 if name == SCORE_COLUMN {
                     Some(Arc::new(Field::new(SCORE_COLUMN, DataType::Float32, true)))
+                } else if name == DOC_INDEX_COL {
+                    Some(Arc::new(DOC_INDEX_FIELD.clone()))
                 } else if is_system_column(name) {
                     Some(Arc::new(Field::new(name.clone(), DataType::UInt64, true)))
                 } else {
@@ -508,7 +525,11 @@ mod tests {
     use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
     use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
     use crate::dataset::{Dataset, WriteParams};
-    use arrow_array::{BooleanArray, Int32Array, RecordBatch, RecordBatchIterator, StringArray};
+    use arrow_array::builder::{ListBuilder, StringBuilder};
+    use arrow_array::{
+        Array, BooleanArray, Int32Array, ListArray, RecordBatch, RecordBatchIterator, StringArray,
+        UInt32Array,
+    };
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use futures::TryStreamExt;
     use std::collections::HashMap;
@@ -606,6 +627,235 @@ mod tests {
             err.to_string().contains("missing"),
             "unexpected missing-column projection error: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn active_element_document_search_returns_physical_ordinals() {
+        use lance_index::scalar::inverted::{FtsTarget, InvertedIndexParams};
+
+        let mut id_meta = HashMap::new();
+        id_meta.insert(
+            "lance-schema:unenforced-primary-key".to_string(),
+            "true".to_string(),
+        );
+        let id_field = Field::new("id", DataType::Int32, false).with_metadata(id_meta);
+
+        let mut tags = ListBuilder::new(StringBuilder::new());
+        tags.values().append_value("alpha");
+        tags.values().append_value("beta gamma");
+        tags.values().append_null();
+        tags.values().append_value("beta");
+        tags.append(true);
+        tags.append(true);
+        tags.values().append_value("beta");
+        tags.append(true);
+        let tags = tags.finish();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            id_field,
+            Field::new("tags", tags.data_type().clone(), true),
+        ]));
+        let active_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3])), Arc::new(tags)],
+        )
+        .unwrap();
+
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut indexes = IndexStore::new();
+        indexes.enable_pk_index(&[("id".to_string(), 0)]);
+        indexes
+            .add_fts_with_params(
+                "tags[*]_fts".to_string(),
+                1,
+                "tags".to_string(),
+                InvertedIndexParams::default().with_fts_target(FtsTarget::new(2, vec![1])),
+            )
+            .unwrap();
+        let (_, row_offset, batch_position) = batch_store.append(active_batch.clone()).unwrap();
+        indexes
+            .insert_with_batch_position(&active_batch, row_offset, Some(batch_position))
+            .unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![])
+            .with_in_memory_memtables(
+                uuid::Uuid::new_v4(),
+                InMemoryMemTables {
+                    active: InMemoryMemTableRef {
+                        batch_store,
+                        index_store: Arc::new(indexes),
+                        schema: schema.clone(),
+                        generation: 1,
+                    },
+                    frozen: vec![],
+                },
+            );
+        let planner = LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], schema.clone());
+        let projection = vec!["id".to_string()];
+        let plan = planner
+            .plan_search(
+                "tags[*]",
+                FullTextSearchQuery::new("beta".to_string()),
+                Some(10),
+                Some(&projection),
+            )
+            .await
+            .unwrap();
+
+        let ctx = datafusion::prelude::SessionContext::new();
+        let stream = plan.execute(0, ctx.task_ctx()).unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        let mut hits = Vec::new();
+        for batch in batches {
+            let ids = batch["id"].as_any().downcast_ref::<Int32Array>().unwrap();
+            let doc_indices = batch[DOC_INDEX_COL]
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .unwrap();
+            for row in 0..batch.num_rows() {
+                let coordinate = doc_indices
+                    .value(row)
+                    .as_any()
+                    .downcast_ref::<UInt32Array>()
+                    .unwrap()
+                    .value(0);
+                hits.push((ids.value(row), coordinate));
+            }
+        }
+        hits.sort_unstable();
+        assert_eq!(hits, vec![(1, 1), (1, 3), (3, 0)]);
+    }
+
+    #[tokio::test]
+    async fn element_document_search_unions_base_and_active_sources() {
+        use crate::index::DatasetIndexExt;
+        use lance_index::IndexType;
+        use lance_index::scalar::inverted::{FtsTarget, InvertedIndexParams};
+
+        let mut id_meta = HashMap::new();
+        id_meta.insert(
+            "lance-schema:unenforced-primary-key".to_string(),
+            "true".to_string(),
+        );
+        let id_field = Field::new("id", DataType::Int32, false).with_metadata(id_meta);
+        let list_type = DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
+        let schema = Arc::new(ArrowSchema::new(vec![
+            id_field,
+            Field::new("tags", list_type, true),
+        ]));
+
+        let mut base_tags = ListBuilder::new(StringBuilder::new());
+        base_tags.values().append_value("beta");
+        base_tags.values().append_value("other");
+        base_tags.append(true);
+        let base_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(base_tags.finish()),
+            ],
+        )
+        .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let mut base_ds = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(base_batch)], schema.clone()),
+            &base_uri,
+            None,
+        )
+        .await
+        .unwrap();
+        base_ds
+            .create_index(
+                &["tags[*]"],
+                IndexType::Inverted,
+                Some("tags[*]_fts".to_string()),
+                &InvertedIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        let base_ds = Arc::new(Dataset::open(&base_uri).await.unwrap());
+
+        let mut active_tags = ListBuilder::new(StringBuilder::new());
+        active_tags.values().append_value("other");
+        active_tags.values().append_value("beta");
+        active_tags.append(true);
+        let active_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![2])),
+                Arc::new(active_tags.finish()),
+            ],
+        )
+        .unwrap();
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut indexes = IndexStore::new();
+        indexes.enable_pk_index(&[("id".to_string(), 0)]);
+        indexes
+            .add_fts_with_params(
+                "tags[*]_fts".to_string(),
+                1,
+                "tags".to_string(),
+                InvertedIndexParams::default().with_fts_target(FtsTarget::new(2, vec![1])),
+            )
+            .unwrap();
+        let (_, row_offset, batch_position) = batch_store.append(active_batch.clone()).unwrap();
+        indexes
+            .insert_with_batch_position(&active_batch, row_offset, Some(batch_position))
+            .unwrap();
+
+        let collector = LsmDataSourceCollector::new(base_ds, vec![]).with_in_memory_memtables(
+            uuid::Uuid::new_v4(),
+            InMemoryMemTables {
+                active: InMemoryMemTableRef {
+                    batch_store,
+                    index_store: Arc::new(indexes),
+                    schema: schema.clone(),
+                    generation: 1,
+                },
+                frozen: vec![],
+            },
+        );
+        let planner = LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], schema);
+        let projection = vec!["id".to_string()];
+        let plan = planner
+            .plan_search(
+                "tags[*]",
+                FullTextSearchQuery::new("beta".to_string()),
+                Some(10),
+                Some(&projection),
+            )
+            .await
+            .unwrap();
+
+        let ctx = datafusion::prelude::SessionContext::new();
+        let batches: Vec<RecordBatch> = plan
+            .execute(0, ctx.task_ctx())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut hits = Vec::new();
+        for batch in batches {
+            let ids = batch["id"].as_any().downcast_ref::<Int32Array>().unwrap();
+            let coordinates = batch[DOC_INDEX_COL]
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .unwrap();
+            for row in 0..batch.num_rows() {
+                let coordinate = coordinates
+                    .value(row)
+                    .as_any()
+                    .downcast_ref::<UInt32Array>()
+                    .unwrap()
+                    .value(0);
+                hits.push((ids.value(row), coordinate));
+            }
+        }
+        hits.sort_unstable();
+        assert_eq!(hits, vec![(1, 0), (2, 1)]);
     }
 
     #[tokio::test]

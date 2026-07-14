@@ -13,10 +13,12 @@ use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream};
 use datafusion::prelude::{Expr, SessionContext};
 use datafusion_physical_expr::PhysicalExprRef;
 use futures::TryStreamExt;
+use lance_core::datatypes::{FieldPathComponent, parse_field_path_components};
 use lance_core::{Error, ROW_ID, Result};
 use lance_datafusion::expr::safe_coerce_scalar;
 use lance_datafusion::planner::Planner;
 use lance_index::scalar::FullTextSearchQuery;
+use lance_index::scalar::inverted::DOC_INDEX_FIELD;
 use lance_index::scalar::inverted::query::{FtsQuery as IndexFtsQuery, Operator};
 use lance_linalg::distance::DistanceType;
 
@@ -1151,7 +1153,7 @@ impl MemTableScanner {
     /// queries only see indexed data.
     async fn plan_fts_search(&self, query: &FtsQuery) -> Result<Arc<dyn ExecutionPlan>> {
         if !self.has_fts_index(&query.column) {
-            return self.empty_fts_plan();
+            return self.empty_fts_plan(&query.column);
         }
 
         let max_visible = self.max_visible_batch_position;
@@ -1175,7 +1177,7 @@ impl MemTableScanner {
         self.apply_post_index_ops(Arc::new(index_exec)).await
     }
 
-    fn empty_fts_plan(&self) -> Result<Arc<dyn ExecutionPlan>> {
+    fn empty_fts_plan(&self, target: &str) -> Result<Arc<dyn ExecutionPlan>> {
         use datafusion::physical_plan::empty::EmptyExec;
 
         let mut fields: Vec<Field> = self
@@ -1184,6 +1186,11 @@ impl MemTableScanner {
             .iter()
             .map(|f| f.as_ref().clone())
             .collect();
+        if parse_field_path_components(target)
+            .is_ok_and(|path| path.last() == Some(&FieldPathComponent::ListWildcard))
+        {
+            fields.push(DOC_INDEX_FIELD.clone());
+        }
         fields.push(Field::new(SCORE_COLUMN, DataType::Float32, true));
         if self.with_row_id {
             fields.push(Field::new(ROW_ID, DataType::UInt64, true));

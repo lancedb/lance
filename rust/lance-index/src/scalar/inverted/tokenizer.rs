@@ -43,9 +43,65 @@ pub const LEGACY_BLOCK_SIZE: usize = 128;
 pub const DEFAULT_BLOCK_SIZE: usize = 128;
 pub const VALID_BLOCK_SIZES: [usize; 2] = [128, 256];
 
+/// Identifies the schema value and list boundaries that define an FTS document.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FtsTarget {
+    source_field_id: i32,
+    boundary_field_ids: Vec<i32>,
+}
+
+impl FtsTarget {
+    /// Create a target from the text source field and ordered list boundaries.
+    pub fn new(source_field_id: i32, boundary_field_ids: Vec<i32>) -> Self {
+        Self {
+            source_field_id,
+            boundary_field_ids,
+        }
+    }
+
+    /// The field id of the text value that is tokenized.
+    pub fn source_field_id(&self) -> i32 {
+        self.source_field_id
+    }
+
+    /// Ordered list boundaries crossed before reaching the text value.
+    pub fn boundary_field_ids(&self) -> &[i32] {
+        &self.boundary_field_ids
+    }
+
+    /// The number of coordinates required to identify a document within a row.
+    pub fn coordinate_rank(&self) -> usize {
+        self.boundary_field_ids.len()
+    }
+
+    /// Whether each list element is a distinct FTS document.
+    pub fn is_element_document(&self) -> bool {
+        !self.boundary_field_ids.is_empty()
+    }
+}
+
+impl From<&FtsTarget> for pbold::FtsTarget {
+    fn from(target: &FtsTarget) -> Self {
+        Self {
+            source_field_id: target.source_field_id,
+            boundary_field_ids: target.boundary_field_ids.clone(),
+        }
+    }
+}
+
+impl From<&pbold::FtsTarget> for FtsTarget {
+    fn from(target: &pbold::FtsTarget) -> Self {
+        Self::new(target.source_field_id, target.boundary_field_ids.clone())
+    }
+}
+
 /// Tokenizer configs
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct InvertedIndexParams {
+    /// Logical document target. Missing values are legacy metadata and must be
+    /// normalized against the dataset schema before the index is opened.
+    #[serde(default)]
+    pub(crate) fts_target: Option<FtsTarget>,
     /// lance tokenizer takes care of different data types, such as text, json, etc.
     /// - 'text': parsing input documents into tokens
     /// - 'json': parsing input json string into tokens
@@ -179,6 +235,8 @@ impl TryFrom<&InvertedIndexParams> for pbold::InvertedIndexDetails {
             max_ngram_length: params.max_ngram_length,
             prefix_only: params.prefix_only,
             block_size: Some(params.block_size as u32),
+            fts_target: params.fts_target.as_ref().map(Into::into),
+            posting_format_version: Some(params.resolved_format_version().index_version()),
         })
     }
 }
@@ -212,7 +270,11 @@ impl TryFrom<&pbold::InvertedIndexDetails> for InvertedIndexParams {
             },
             memory_limit_mb: defaults.memory_limit_mb,
             num_workers: defaults.num_workers,
-            format_version: defaults.format_version,
+            format_version: details
+                .posting_format_version
+                .map(|version| resolve_fts_format_version(Some(&version.to_string())))
+                .transpose()?,
+            fts_target: details.fts_target.as_ref().map(Into::into),
         })
     }
 }
@@ -308,6 +370,7 @@ impl InvertedIndexParams {
     /// Default to `English`.
     pub fn new(base_tokenizer: String, language: Language) -> Self {
         Self {
+            fts_target: None,
             lance_tokenizer: None,
             base_tokenizer,
             language,
@@ -331,6 +394,17 @@ impl InvertedIndexParams {
     pub fn lance_tokenizer(mut self, lance_tokenizer: String) -> Self {
         self.lance_tokenizer = Some(lance_tokenizer);
         self
+    }
+
+    /// Bind this configuration to a normalized logical FTS target.
+    pub fn with_fts_target(mut self, target: FtsTarget) -> Self {
+        self.fts_target = Some(target);
+        self
+    }
+
+    /// Return the normalized logical FTS target, if present.
+    pub fn fts_target(&self) -> Option<&FtsTarget> {
+        self.fts_target.as_ref()
     }
 
     pub fn base_tokenizer(mut self, base_tokenizer: String) -> Self {
@@ -626,7 +700,7 @@ pub fn language_model_home() -> Option<PathBuf> {
 mod tests {
     use crate::pbold;
 
-    use super::{InvertedIndexParams, InvertedListFormatVersion};
+    use super::{FtsTarget, InvertedIndexParams, InvertedListFormatVersion};
     use lance_tokenizer::{Language, TokenStream};
     use rstest::rstest;
 
@@ -784,9 +858,25 @@ mod tests {
             max_ngram_length: 3,
             prefix_only: false,
             block_size: None,
+            fts_target: None,
+            posting_format_version: None,
         };
         let params = InvertedIndexParams::try_from(&old_details).unwrap();
         assert_eq!(params.block_size, 128);
+    }
+
+    #[test]
+    fn test_fts_target_details_conversion() {
+        let target = FtsTarget::new(12, vec![7]);
+        let params = InvertedIndexParams::default().with_fts_target(target.clone());
+        let details = pbold::InvertedIndexDetails::try_from(&params).unwrap();
+        assert_eq!(details.posting_format_version, Some(2));
+        assert_eq!(
+            FtsTarget::from(details.fts_target.as_ref().unwrap()),
+            target
+        );
+        let roundtrip = InvertedIndexParams::try_from(&details).unwrap();
+        assert_eq!(roundtrip.fts_target(), Some(&target));
     }
 
     #[rstest]

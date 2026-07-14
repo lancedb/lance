@@ -1351,6 +1351,89 @@ def test_fts_on_list(tmp_path):
     assert results.num_rows == 6
 
 
+@pytest.mark.parametrize(
+    "list_type",
+    [
+        pa.list_(pa.string()),
+        pa.list_(pa.large_string()),
+        pa.large_list(pa.string()),
+        pa.large_list(pa.large_string()),
+    ],
+)
+def test_fts_on_list_elements(tmp_path, list_type):
+    data = pa.table(
+        {
+            "id": pa.array([0, 1, 2]),
+            "tags": pa.array(
+                [
+                    ["alpha beta", "gamma alpha", None, "", "delta"],
+                    ["beta", "gamma"],
+                    None,
+                ],
+                type=list_type,
+            ),
+        }
+    )
+    ds = lance.write_dataset(data, tmp_path)
+
+    def hits(table):
+        return sorted(zip(table["id"].to_pylist(), table["_doc_index"].to_pylist()))
+
+    query = MatchQuery("alpha", "tags[*]")
+    flat = ds.to_table(full_text_query=query)
+    assert hits(flat) == [(0, [0]), (0, [1])]
+    assert pa.types.is_list(flat.schema.field("_doc_index").type)
+    assert flat.schema.field("_doc_index").type.value_type == pa.uint32()
+    assert hits(ds.to_table(full_text_query=MatchQuery("delta", "tags[*]"))) == [
+        (0, [4])
+    ]
+
+    ds.create_scalar_index("tags", "INVERTED", with_position=True)
+    ds.create_scalar_index("tags[*]", "INVERTED", with_position=True)
+    ds.create_scalar_index(
+        "tags[*]",
+        IndexConfig(index_type="inverted", parameters={"with_position": True}),
+    )
+    index_names = {index.name for index in ds.describe_indices()}
+    assert {"tags_idx", "tags[*]_idx"}.issubset(index_names)
+    row_auto = ds.to_table(full_text_query="alpha")
+    assert row_auto["id"].to_pylist() == [0]
+    assert "_doc_index" not in row_auto.column_names
+    indexed = ds.to_table(full_text_query=query)
+    assert hits(indexed) == [(0, [0]), (0, [1])]
+    assert pa.types.is_list(indexed.schema.field("_doc_index").type)
+    assert indexed.schema.field("_doc_index").type.value_type == pa.uint32()
+    filtered = ds.to_table(full_text_query=query, filter="id = 0", prefilter=True)
+    assert hits(filtered) == [(0, [0]), (0, [1])]
+    assert hits(ds.to_table(full_text_query=MatchQuery("delta", "tags[*]"))) == [
+        (0, [4])
+    ]
+
+    phrase = ds.to_table(full_text_query=PhraseQuery("beta gamma", "tags[*]"))
+    assert phrase.num_rows == 0
+    assert hits(ds.to_table(full_text_query=PhraseQuery("alpha beta", "tags[*]"))) == [
+        (0, [0])
+    ]
+    row_phrase = ds.to_table(full_text_query=PhraseQuery("beta gamma", "tags"))
+    assert sorted(row_phrase["id"].to_pylist()) == [0, 1]
+    assert "_doc_index" not in row_phrase.column_names
+
+    ds.insert(
+        pa.table(
+            {
+                "id": pa.array([3]),
+                "tags": pa.array([["alpha", "alpha again"]], type=list_type),
+            }
+        )
+    )
+    assert hits(ds.to_table(full_text_query=query)) == [
+        (0, [0]),
+        (0, [1]),
+        (3, [0]),
+        (3, [1]),
+    ]
+
+
 def test_fts_fuzzy_query(tmp_path):
     data = pa.table(
         {

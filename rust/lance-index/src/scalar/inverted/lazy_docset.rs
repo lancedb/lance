@@ -25,7 +25,7 @@ use lance_core::Result;
 use tokio::sync::OnceCell;
 
 use crate::scalar::RowIdRemapper;
-use crate::scalar::inverted::index::{DocSet, NUM_TOKEN_COL};
+use crate::scalar::inverted::index::{DocSet, NUM_TOKEN_COL, doc_index_storage_column};
 use crate::scalar::{IndexReader, IndexStore};
 use lance_select::mask::RowAddrMask;
 
@@ -67,6 +67,7 @@ pub struct DeferredDocSet {
     /// V3 (256-doc block) partitions score with quantized doc lengths; the
     /// flag is applied to every `DocSet` this deferred set materializes.
     quantized_scoring: bool,
+    coordinate_rank: usize,
     /// Doc count cached at construction so `len()` stays sync + IO-free.
     num_rows: usize,
     /// `sum(num_tokens)` cached on first compute.
@@ -137,6 +138,7 @@ impl LazyDocSet {
         is_legacy: bool,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         quantized_scoring: bool,
+        coordinate_rank: usize,
     ) -> Self {
         Self::Deferred(Box::new(DeferredDocSet {
             store,
@@ -144,6 +146,7 @@ impl LazyDocSet {
             is_legacy,
             frag_reuse_index,
             quantized_scoring,
+            coordinate_rank,
             num_rows,
             total_tokens: OnceCell::new(),
             num_tokens_col: OnceCell::new(),
@@ -250,6 +253,18 @@ impl LazyDocSet {
             Self::Deferred(d) => d.resolve_row_ids(doc_ids).await,
         }
     }
+
+    /// Resolve post-WAND local document ids into globally meaningful row and
+    /// element coordinates before candidates cross a partition boundary.
+    pub async fn resolve_document_keys(&self, doc_ids: &[u32]) -> Result<Vec<(u64, Vec<u32>)>> {
+        match self {
+            Self::Loaded(loaded) => Ok(doc_ids
+                .iter()
+                .map(|&doc_id| (loaded.docs.row_id(doc_id), loaded.docs.doc_index(doc_id)))
+                .collect()),
+            Self::Deferred(deferred) => deferred.resolve_document_keys(doc_ids).await,
+        }
+    }
 }
 
 impl DeferredDocSet {
@@ -306,7 +321,14 @@ impl DeferredDocSet {
             .get_or_try_init(|| async {
                 // If the stats path already pulled NUM_TOKEN_COL,
                 // read only ROW_ID and rebuild from the two columns.
-                let mut docs = if self.num_tokens_col.get().is_some() {
+                let mut docs = if self.coordinate_rank > 0 {
+                    DocSet::load(
+                        self.reader().await?,
+                        self.is_legacy,
+                        self.frag_reuse_index.clone(),
+                    )
+                    .await?
+                } else if self.num_tokens_col.get().is_some() {
                     let num_tokens = self.num_tokens_column().await?;
                     let row_ids = self.row_ids_column().await?;
                     DocSet::from_columns(
@@ -367,5 +389,56 @@ impl DeferredDocSet {
         let batch = reader.read_ranges(&ranges, Some(&[ROW_ID])).await?;
         let arr = batch[ROW_ID].as_primitive::<UInt64Type>();
         Ok((0..arr.len()).map(|i| arr.value(i)).collect())
+    }
+
+    async fn resolve_document_keys(&self, doc_ids: &[u32]) -> Result<Vec<(u64, Vec<u32>)>> {
+        if self.coordinate_rank == 0 {
+            return Ok(self
+                .resolve_row_ids(doc_ids)
+                .await?
+                .into_iter()
+                .map(|row_id| (row_id, Vec::new()))
+                .collect());
+        }
+        if let Some(full) = self.full.get()
+            && full.has_row_ids()
+        {
+            return Ok(doc_ids
+                .iter()
+                .map(|&doc_id| (full.row_id(doc_id), full.doc_index(doc_id)))
+                .collect());
+        }
+
+        let ranges = doc_ids
+            .iter()
+            .map(|&doc_id| doc_id as usize..doc_id as usize + 1)
+            .collect::<Vec<_>>();
+        let coordinate_names = (0..self.coordinate_rank)
+            .map(doc_index_storage_column)
+            .collect::<Vec<_>>();
+        let mut projection = Vec::with_capacity(1 + coordinate_names.len());
+        projection.push(ROW_ID);
+        projection.extend(coordinate_names.iter().map(String::as_str));
+        let batch = self
+            .reader()
+            .await?
+            .read_ranges(&ranges, Some(&projection))
+            .await?;
+        let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
+        let coordinates = coordinate_names
+            .iter()
+            .map(|name| batch[name.as_str()].as_primitive::<UInt32Type>())
+            .collect::<Vec<_>>();
+        Ok((0..row_ids.len())
+            .map(|index| {
+                (
+                    row_ids.value(index),
+                    coordinates
+                        .iter()
+                        .map(|column| column.value(index))
+                        .collect(),
+                )
+            })
+            .collect())
     }
 }

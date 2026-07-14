@@ -5,13 +5,21 @@
 
 use std::sync::Arc;
 
-use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
+use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use lance_core::ROW_ID;
+use lance_core::{
+    ROW_ID,
+    datatypes::{
+        Field, FieldPathComponent, LogicalType, Schema, format_field_path,
+        parse_field_path_components,
+    },
+};
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::pbold::InvertedIndexDetails;
-use lance_index::scalar::inverted::InvertedIndex;
+use lance_index::scalar::inverted::{
+    FtsTarget, InvertedIndex, LEGACY_BLOCK_SIZE, default_fts_format_version_for_block_size,
+};
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::registry::VALUE_COLUMN_NAME;
 use lance_table::format::IndexMetadata;
@@ -24,6 +32,192 @@ use crate::{
     dataset::index::LanceIndexStoreExt,
     index::{DatasetIndexExt, scalar::fetch_index_details},
 };
+
+/// Schema-resolved form of a public FTS target path.
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedFtsTarget {
+    pub target: FtsTarget,
+    pub public_field_id: i32,
+    pub scan_column: String,
+    pub canonical_path: String,
+}
+
+fn text_source_field(field: &Field) -> Result<&Field> {
+    if field.logical_type == LogicalType::from("json") {
+        return Ok(field);
+    }
+    match field.data_type() {
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => Ok(field),
+        DataType::List(_) | DataType::LargeList(_) => {
+            let child = field.children.first().ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "FTS list field '{}' does not have an item field",
+                    field.name
+                ))
+            })?;
+            match child.data_type() {
+                DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => Ok(child),
+                data_type => Err(Error::invalid_input(format!(
+                    "FTS list field '{}' must contain Utf8 or LargeUtf8 values, got {data_type}",
+                    field.name
+                ))),
+            }
+        }
+        // JSON fields are represented as extension-annotated string fields, so
+        // their physical type is covered above.
+        data_type => Err(Error::invalid_input(format!(
+            "FTS field '{}' must be Utf8, LargeUtf8, JSON, or a list of strings, got {data_type}",
+            field.name
+        ))),
+    }
+}
+
+/// Resolve the public FTS path into a stable schema-id target.
+pub(crate) fn resolve_fts_target(schema: &Schema, path: &str) -> Result<ResolvedFtsTarget> {
+    let components = parse_field_path_components(path)?;
+    let wildcard_count = components
+        .iter()
+        .filter(|component| matches!(component, FieldPathComponent::ListWildcard))
+        .count();
+
+    if wildcard_count == 0 {
+        let fields = schema.resolve_case_insensitive(path).ok_or_else(|| {
+            Error::index(format!(
+                "FTS target '{path}' does not exist in the dataset schema"
+            ))
+        })?;
+        if fields
+            .iter()
+            .take(fields.len().saturating_sub(1))
+            .any(|field| {
+                matches!(
+                    field.data_type(),
+                    DataType::List(_) | DataType::LargeList(_)
+                )
+            })
+        {
+            return Err(Error::invalid_input(format!(
+                "FTS target '{path}' contains an Arrow-internal list item path; use the public list field for row-document FTS or append [*] for element-document FTS"
+            )));
+        }
+        let field = fields.last().copied().ok_or_else(|| {
+            Error::index(format!("FTS target '{path}' does not resolve to a field"))
+        })?;
+        let source = text_source_field(field)?;
+        let names = fields
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>();
+        let canonical_path = format_field_path(&names);
+        return Ok(ResolvedFtsTarget {
+            target: FtsTarget::new(source.id, Vec::new()),
+            public_field_id: field.id,
+            scan_column: canonical_path.clone(),
+            canonical_path,
+        });
+    }
+
+    if wildcard_count != 1
+        || components.len() != 2
+        || !matches!(components[0], FieldPathComponent::Field(_))
+        || !matches!(components[1], FieldPathComponent::ListWildcard)
+    {
+        return Err(Error::invalid_input(format!(
+            "FTS element target '{path}' is outside the supported Phase 1 shape: expected one top-level List<Utf8> or List<LargeUtf8> field followed by exactly one [*]"
+        )));
+    }
+
+    let FieldPathComponent::Field(requested_name) = &components[0] else {
+        return Err(Error::invalid_input(format!(
+            "FTS element target '{path}' must begin with a field name"
+        )));
+    };
+    let field = schema
+        .fields
+        .iter()
+        .find(|field| field.name == *requested_name)
+        .or_else(|| {
+            schema
+                .fields
+                .iter()
+                .find(|field| field.name.eq_ignore_ascii_case(requested_name))
+        })
+        .ok_or_else(|| {
+            Error::index(format!(
+                "FTS target '{path}' does not exist in the dataset schema"
+            ))
+        })?;
+    if !matches!(
+        field.data_type(),
+        DataType::List(_) | DataType::LargeList(_)
+    ) {
+        return Err(Error::invalid_input(format!(
+            "FTS element target '{path}' requires a List<Utf8> or List<LargeUtf8> field, got {}",
+            field.data_type()
+        )));
+    }
+    let source = field.children.first().ok_or_else(|| {
+        Error::invalid_input(format!(
+            "FTS element target '{path}' does not have an item field"
+        ))
+    })?;
+    if !matches!(source.data_type(), DataType::Utf8 | DataType::LargeUtf8) {
+        return Err(Error::invalid_input(format!(
+            "FTS element target '{path}' must contain Utf8 or LargeUtf8 values, got {}",
+            source.data_type()
+        )));
+    }
+    let scan_column = format_field_path(&[field.name.as_str()]);
+    Ok(ResolvedFtsTarget {
+        target: FtsTarget::new(source.id, vec![field.id]),
+        public_field_id: field.id,
+        canonical_path: format!("{scan_column}[*]"),
+        scan_column,
+    })
+}
+
+/// Normalize legacy, target-less inverted metadata to its row-document target.
+pub(crate) fn normalize_fts_details(
+    schema: &Schema,
+    index: &IndexMetadata,
+    mut details: InvertedIndexDetails,
+) -> Result<InvertedIndexDetails> {
+    if details.fts_target.is_none() {
+        let field_id = *index.fields.last().ok_or_else(|| {
+            Error::invalid_input(format!(
+                "FTS index {} does not record a field id",
+                index.name
+            ))
+        })?;
+        let field = schema.field_by_id(field_id).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "FTS index {} refers to missing field id {field_id}",
+                index.name
+            ))
+        })?;
+        let source = text_source_field(field)?;
+        details.fts_target = Some((&FtsTarget::new(source.id, Vec::new())).into());
+    }
+    if details.posting_format_version.is_none() {
+        let posting_format_version = match index.index_version {
+            0 | 1 => 1,
+            2 => 2,
+            3 => 3,
+            4 => default_fts_format_version_for_block_size(
+                details.block_size.unwrap_or(LEGACY_BLOCK_SIZE as u32) as usize,
+            )?
+            .index_version(),
+            version => {
+                return Err(Error::invalid_input(format!(
+                    "FTS index {} has unsupported index version {version}",
+                    index.name
+                )));
+            }
+        };
+        details.posting_format_version = Some(posting_format_version);
+    }
+    Ok(details)
+}
 
 /// Build an empty update stream for the inverted merge API.
 ///
@@ -223,6 +417,18 @@ pub async fn load_segment_details(
 mod tests {
     use super::*;
 
+    fn fts_test_schema() -> Schema {
+        let schema = ArrowSchema::new(vec![
+            ArrowField::new("text", DataType::Utf8, true),
+            ArrowField::new(
+                "tags",
+                DataType::List(Arc::new(ArrowField::new("item", DataType::Utf8, true))),
+                true,
+            ),
+        ]);
+        Schema::try_from(&schema).unwrap()
+    }
+
     #[test]
     fn decode_legacy_inverted_details_type_url() {
         let mut details_any = prost_types::Any::from_msg(&InvertedIndexDetails::default()).unwrap();
@@ -230,5 +436,48 @@ mod tests {
 
         let decoded = InvertedIndexDetails::decode(details_any.value.as_slice()).unwrap();
         assert_eq!(decoded, InvertedIndexDetails::default());
+    }
+
+    #[test]
+    fn resolve_element_document_target() {
+        let schema = fts_test_schema();
+        let tags = schema.field("tags").unwrap();
+        let target = resolve_fts_target(&schema, "tags[*]").unwrap();
+        assert_eq!(target.public_field_id, tags.id);
+        assert_eq!(target.scan_column, "tags");
+        assert_eq!(target.canonical_path, "tags[*]");
+        assert_eq!(target.target.source_field_id(), tags.children[0].id);
+        assert_eq!(target.target.boundary_field_ids(), &[tags.id]);
+
+        let err = resolve_fts_target(&schema, "text[*]").unwrap_err();
+        assert!(err.to_string().contains("requires a List<Utf8>"), "{err}");
+        let err = resolve_fts_target(&schema, "tags[*][*]").unwrap_err();
+        assert!(err.to_string().contains("Phase 1 shape"), "{err}");
+        let err = resolve_fts_target(&schema, "tags.item").unwrap_err();
+        assert!(err.to_string().contains("Arrow-internal"), "{err}");
+    }
+
+    #[test]
+    fn normalize_legacy_list_metadata_as_row_document() {
+        let schema = fts_test_schema();
+        let tags = schema.field("tags").unwrap();
+        let metadata = IndexMetadata {
+            uuid: Uuid::new_v4(),
+            fields: vec![tags.id],
+            name: "tags_idx".to_string(),
+            dataset_version: 1,
+            fragment_bitmap: None,
+            index_details: None,
+            index_version: 3,
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+        let details =
+            normalize_fts_details(&schema, &metadata, InvertedIndexDetails::default()).unwrap();
+        let target = FtsTarget::from(details.fts_target.as_ref().unwrap());
+        assert_eq!(target.source_field_id(), tags.children[0].id);
+        assert!(target.boundary_field_ids().is_empty());
+        assert_eq!(details.posting_format_version, Some(3));
     }
 }

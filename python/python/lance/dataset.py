@@ -3124,8 +3124,6 @@ class LanceDataset(pa.dataset.Dataset):
 
         column = column[0]
         lance_field = self._ds.lance_schema.field_case_insensitive(column)
-        if lance_field is None:
-            raise KeyError(f"{column} not found in schema")
 
         if isinstance(index_type, str):
             index_type = index_type.upper()
@@ -3147,6 +3145,13 @@ class LanceDataset(pa.dataset.Dataset):
                         f"scalar columns.  Received {index_type}",
                     )
                 )
+
+            if lance_field is None:
+                if index_type in ["INVERTED", "FTS"]:
+                    # Public FTS target paths such as `tags[*]` are resolved
+                    # against stable field ids by the Rust implementation.
+                    return column, index_type, index_type
+                raise KeyError(f"{column} not found in schema")
 
             field = lance_field.to_arrow()
 
@@ -3201,6 +3206,8 @@ class LanceDataset(pa.dataset.Dataset):
             return column, index_type, index_type
         elif isinstance(index_type, IndexConfig):
             logical_index_type = index_type.index_type.upper()
+            if lance_field is None and logical_index_type not in ["INVERTED", "FTS"]:
+                raise KeyError(f"{column} not found in schema")
             config = json.dumps(index_type.parameters)
             kwargs["config"] = indices.IndexConfig(index_type.index_type, config)
             return column, "scalar", logical_index_type

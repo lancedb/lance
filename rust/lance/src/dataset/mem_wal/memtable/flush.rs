@@ -713,6 +713,15 @@ impl MemTableFlusher {
 
             let fragment_ids: roaring::RoaringBitmap = dataset.fragment_bitmap.as_ref().clone();
             let format_version = fts_cfg.params.resolved_format_version();
+            let index_version = if fts_cfg
+                .params
+                .fts_target()
+                .is_some_and(|target| target.is_element_document())
+            {
+                lance_index::scalar::inverted::INVERTED_INDEX_VERSION_ELEMENT_DOCUMENT
+            } else {
+                format_version.index_version()
+            };
 
             let index_meta = IndexMetadata {
                 uuid: index_uuid,
@@ -721,7 +730,7 @@ impl MemTableFlusher {
                 dataset_version: dataset.version().version,
                 fragment_bitmap: Some(fragment_ids),
                 index_details: Some(Arc::new(index_details)),
-                index_version: format_version.index_version() as i32,
+                index_version: index_version as i32,
                 created_at: None,
                 base_id: None,
                 files: None,

@@ -57,6 +57,7 @@ use lance_index::scalar::{
 use lance_index::{IndexCriteria, IndexType};
 use lance_table::format::{Fragment, IndexMetadata};
 use log::info;
+use prost::Message;
 use tracing::instrument;
 
 // Log an update every TRAINING_UPDATE_FREQ million rows processed
@@ -401,6 +402,23 @@ pub async fn fetch_index_details(
         None => infer_scalar_index_details(dataset, column, index).await?,
     };
 
+    if index_details.type_url.ends_with("InvertedIndexDetails") {
+        let details =
+            InvertedIndexDetails::decode(index_details.value.as_slice()).map_err(|err| {
+                Error::io(format!(
+                    "failed to decode InvertedIndexDetails payload: {err}"
+                ))
+            })?;
+        let details = inverted::normalize_fts_details(dataset.schema(), index, details)?;
+        return Ok(Arc::new(prost_types::Any::from_msg(&details).map_err(
+            |err| {
+                Error::io(format!(
+                    "failed to encode InvertedIndexDetails payload: {err}"
+                ))
+            },
+        )?));
+    }
+
     Ok(index_details)
 }
 
@@ -515,11 +533,7 @@ pub(crate) async fn infer_scalar_index_details(
     let inverted_list_lookup = index_dir.clone().join(METADATA_FILE);
     let legacy_inverted_list_lookup = index_dir.clone().join(INVERT_LIST_FILE);
     let object_store = dataset.object_store_for_index(index).await?;
-    let index_details = if let DataType::List(_) = col.data_type() {
-        prost_types::Any::from_msg(&LabelListIndexDetails::default()).unwrap()
-    } else if object_store.exists(&bitmap_page_lookup).await? {
-        prost_types::Any::from_msg(&BitmapIndexDetails::default()).unwrap()
-    } else if object_store.exists(&inverted_list_lookup).await? {
+    let index_details = if object_store.exists(&inverted_list_lookup).await? {
         // Try to infer inverted index details from metadata file to capture with_position and other params
         // Fall back to defaults if anything goes wrong
         let default_details = prost_types::Any::from_msg(&InvertedIndexDetails::default()).unwrap();
@@ -536,6 +550,10 @@ pub(crate) async fn infer_scalar_index_details(
         parse_params().await.unwrap_or(default_details)
     } else if object_store.exists(&legacy_inverted_list_lookup).await? {
         prost_types::Any::from_msg(&InvertedIndexDetails::default()).unwrap()
+    } else if let DataType::List(_) | DataType::LargeList(_) = col.data_type() {
+        prost_types::Any::from_msg(&LabelListIndexDetails::default()).unwrap()
+    } else if object_store.exists(&bitmap_page_lookup).await? {
+        prost_types::Any::from_msg(&BitmapIndexDetails::default()).unwrap()
     } else {
         prost_types::Any::from_msg(&BTreeIndexDetails::default()).unwrap()
     };
@@ -572,16 +590,40 @@ pub fn index_matches_criteria(
             // return false just in case
             return Ok(false);
         }
-        let field = fields[0];
-        // Build the full field path for nested fields
-        let field_path = if let Some(ancestors) = schema.field_ancestry_by_id(field.id) {
-            let field_refs: Vec<&str> = ancestors.iter().map(|f| f.name.as_str()).collect();
-            lance_core::datatypes::format_field_path(&field_refs)
+        let is_fts_index = index
+            .index_details
+            .as_ref()
+            .is_some_and(|details| details.type_url.ends_with("InvertedIndexDetails"));
+        if criteria.must_support_fts && is_fts_index {
+            let requested = inverted::resolve_fts_target(schema, for_column)?;
+            let Some(details_any) = index.index_details.as_ref() else {
+                return Ok(false);
+            };
+            let details =
+                InvertedIndexDetails::decode(details_any.value.as_slice()).map_err(|err| {
+                    Error::io(format!(
+                        "failed to decode InvertedIndexDetails payload: {err}"
+                    ))
+                })?;
+            let details = inverted::normalize_fts_details(schema, index, details)?;
+            let stored = details.fts_target.as_ref().ok_or_else(|| {
+                Error::internal("normalized FTS metadata is missing its target".to_string())
+            })?;
+            if lance_index::scalar::inverted::FtsTarget::from(stored) != requested.target {
+                return Ok(false);
+            }
         } else {
-            field.name.clone()
-        };
-        if for_column != field_path {
-            return Ok(false);
+            let field = fields[0];
+            // Build the full field path for nested fields
+            let field_path = if let Some(ancestors) = schema.field_ancestry_by_id(field.id) {
+                let field_refs: Vec<&str> = ancestors.iter().map(|f| f.name.as_str()).collect();
+                lance_core::datatypes::format_field_path(&field_refs)
+            } else {
+                field.name.clone()
+            };
+            if for_column != field_path {
+                return Ok(false);
+            }
         }
     }
 
@@ -651,10 +693,21 @@ pub async fn initialize_scalar_index(
 
         // Parse the JSON into InvertedIndexParams
         let inverted_params: InvertedIndexParams = serde_json::from_str(params_json)?;
+        let target_column = if inverted_params
+            .fts_target()
+            .is_some_and(|target| target.is_element_document())
+        {
+            format!(
+                "{}[*]",
+                lance_core::datatypes::format_field_path(&[column_name])
+            )
+        } else {
+            column_name.to_string()
+        };
 
         target_dataset
             .create_index(
-                &[column_name],
+                &[&target_column],
                 index_type,
                 Some(source_index.name.clone()),
                 &inverted_params,

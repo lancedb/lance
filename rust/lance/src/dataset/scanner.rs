@@ -65,15 +65,17 @@ use lance_datafusion::expr::safe_coerce_scalar;
 use lance_datafusion::projection::ProjectionPlan;
 use lance_file::reader::FileReaderOptions;
 use lance_index::IndexCriteria;
+use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::expression::PlannerIndexExt;
 use lance_index::scalar::expression::ScalarIndexExpr;
 use lance_index::scalar::inverted::query::{
     FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery, PhraseQuery, fill_fts_query_column,
 };
-use lance_index::scalar::inverted::{SCORE_COL, SCORE_FIELD};
+use lance_index::scalar::inverted::{
+    DOC_INDEX_COL, DOC_INDEX_FIELD, FtsTarget, SCORE_COL, SCORE_FIELD, fts_schema,
+};
 use lance_index::vector::{ApproxMode, DEFAULT_QUERY_PARALLELISM, DIST_COL, Query};
-use lance_index::{metrics::NoOpMetricsCollector, scalar::inverted::FTS_SCHEMA};
 use lance_io::stream::RecordBatchStream;
 use lance_linalg::distance::MetricType;
 use lance_select::{IndexExprResult, RowAddrMask, RowAddrTreeMap};
@@ -86,7 +88,7 @@ use super::Dataset;
 use crate::dataset::row_offsets_to_row_addresses;
 use crate::dataset::utils::SchemaAdapter;
 use crate::index::DatasetIndexInternalExt;
-use crate::index::scalar::inverted::{load_segment_details, load_segments};
+use crate::index::scalar::inverted::{load_segment_details, load_segments, resolve_fts_target};
 use crate::index::scalar_logical::scalar_index_fragment_bitmap;
 use crate::index::vector::utils::{
     default_distance_type_for, get_vector_dim, get_vector_type, validate_distance_type_for,
@@ -96,6 +98,7 @@ use crate::io::exec::filtered_read::{
 };
 use crate::io::exec::fts::{
     BoostQueryExec, FlatMatchFilterExec, FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec,
+    SharedFtsScorer,
 };
 use crate::io::exec::knn::MultivectorScoringExec;
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
@@ -114,7 +117,7 @@ use crate::io::exec::{
 use crate::{Error, Result};
 use crate::{
     datatypes::Schema,
-    io::exec::fts::{BoolSlot, BooleanQueryExec, build_boolean_query_children},
+    io::exec::fts::{BoolSlot, BooleanQueryExec, build_boolean_query_children_with_schema},
 };
 
 pub use lance_datafusion::exec::{ExecutionStatsCallback, ExecutionSummaryCounts};
@@ -1280,9 +1283,7 @@ impl Scanner {
         let fields = query.columns();
         if !fields.is_empty() {
             for field in fields.iter() {
-                if self.dataset.schema().field(field).is_none() {
-                    return Err(Error::invalid_input(format!("Column {} not found", field)));
-                }
+                resolve_fts_target(self.dataset.schema(), field)?;
             }
         }
 
@@ -1979,8 +1980,11 @@ impl Scanner {
             }
         };
 
-        if self.full_text_query.is_some() {
+        if let Some(query) = &self.full_text_query {
             extra_columns.push(ArrowField::new(SCORE_COL, DataType::Float32, true));
+            if !query.columns().is_empty() && self.fts_element_target(&query.query)?.is_some() {
+                extra_columns.push(DOC_INDEX_FIELD.clone());
+            }
         }
 
         schema.merge(&ArrowSchema::new(extra_columns))
@@ -2012,6 +2016,16 @@ impl Scanner {
         // Select the columns from the output schema based on the user's projection (or the list
         // of all available columns if the user did not specify a projection)
         let mut output_expr = self.projection_plan.to_physical_exprs(current_schema)?;
+
+        if self.full_text_query.is_some()
+            && current_schema.field_with_name(DOC_INDEX_COL).is_ok()
+            && output_expr.iter().all(|(_, name)| name != DOC_INDEX_COL)
+        {
+            output_expr.push((
+                expressions::col(DOC_INDEX_COL, current_schema)?,
+                DOC_INDEX_COL.to_string(),
+            ));
+        }
 
         // Make sure _distance and _score are _always_ in the output unless user has opted out of the legacy
         // projection behavior
@@ -3157,7 +3171,10 @@ impl Scanner {
             // If we are prefiltering then the ann / knn node will take care of the filter
             let source: Arc<dyn ExecutionPlan> = match &filter_plan.fts_filter() {
                 Some(fts_query) => {
-                    let fts_plan = self.fts(&filter_plan.expr_filter_plan, fts_query).await?;
+                    let mut fts_plan = self.fts(&filter_plan.expr_filter_plan, fts_query).await?;
+                    if fts_plan.schema().field_with_name(DOC_INDEX_COL).is_ok() {
+                        fts_plan = self.deduplicate_fts_filter_rows(fts_plan)?;
+                    }
                     let projection = self
                         .dataset
                         .empty_projection()
@@ -3181,6 +3198,31 @@ impl Scanner {
             filter_plan.make_refine_only();
             self.vector_search(&ExprFilterPlan::default(), query).await
         }
+    }
+
+    /// Convert element-document hits into the row-selection semantics required
+    /// when FTS is used as a filter for another query.
+    fn deduplicate_fts_filter_rows(
+        &self,
+        input: Arc<dyn ExecutionPlan>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let schema = input.schema();
+        let group_expr = vec![(
+            expressions::col(ROW_ID, schema.as_ref())?,
+            ROW_ID.to_string(),
+        )];
+        let input = Arc::new(RepartitionExec::try_new(
+            input,
+            Partitioning::RoundRobinBatch(1),
+        )?);
+        Ok(Arc::new(AggregateExec::try_new(
+            AggregateMode::Single,
+            PhysicalGroupBy::new_single(group_expr),
+            Vec::new(),
+            Vec::new(),
+            input,
+            schema,
+        )?))
     }
 
     async fn fragments_covered_by_fts_leaf(
@@ -3289,6 +3331,100 @@ impl Scanner {
         }
     }
 
+    fn fts_element_target(&self, query: &FtsQuery) -> Result<Option<FtsTarget>> {
+        #[derive(Default)]
+        struct TargetState {
+            saw_row_target: bool,
+            element_target: Option<FtsTarget>,
+        }
+
+        fn add_column(
+            schema: &lance_core::datatypes::Schema,
+            column: Option<&str>,
+            state: &mut TargetState,
+        ) -> Result<()> {
+            let column = column.ok_or_else(|| {
+                Error::invalid_input("the column must be specified in the FTS query".to_string())
+            })?;
+            let target = resolve_fts_target(schema, column)?.target;
+            if target.is_element_document() {
+                if state.saw_row_target {
+                    return Err(Error::invalid_input(
+                        "FTS queries cannot mix element-document and row-document targets"
+                            .to_string(),
+                    ));
+                }
+                if let Some(existing) = &state.element_target
+                    && existing != &target
+                {
+                    return Err(Error::invalid_input(
+                        "all leaves in an element-document FTS query must use the same target"
+                            .to_string(),
+                    ));
+                }
+                state.element_target = Some(target);
+            } else {
+                if state.element_target.is_some() {
+                    return Err(Error::invalid_input(
+                        "FTS queries cannot mix element-document and row-document targets"
+                            .to_string(),
+                    ));
+                }
+                state.saw_row_target = true;
+            }
+            Ok(())
+        }
+
+        fn visit(
+            schema: &lance_core::datatypes::Schema,
+            query: &FtsQuery,
+            state: &mut TargetState,
+        ) -> Result<()> {
+            match query {
+                FtsQuery::Match(query) => add_column(schema, query.column.as_deref(), state),
+                FtsQuery::Phrase(query) => add_column(schema, query.column.as_deref(), state),
+                FtsQuery::Boost(query) => {
+                    visit(schema, &query.positive, state)?;
+                    visit(schema, &query.negative, state)
+                }
+                FtsQuery::Boolean(query) => {
+                    for child in query
+                        .must
+                        .iter()
+                        .chain(&query.should)
+                        .chain(&query.must_not)
+                    {
+                        visit(schema, child, state)?;
+                    }
+                    Ok(())
+                }
+                FtsQuery::MultiMatch(query) => {
+                    let mut multi_match_state = TargetState::default();
+                    for child in &query.match_queries {
+                        add_column(schema, child.column.as_deref(), &mut multi_match_state)?;
+                    }
+                    if multi_match_state.element_target.is_some() {
+                        return Err(Error::not_supported(
+                            "MultiMatch does not support element-document FTS targets".to_string(),
+                        ));
+                    }
+                    if state.element_target.is_some() && multi_match_state.saw_row_target {
+                        return Err(Error::invalid_input(
+                            "FTS queries cannot mix element-document and row-document targets"
+                                .to_string(),
+                        ));
+                    }
+                    state.saw_row_target |= multi_match_state.saw_row_target;
+                    Ok(())
+                }
+            }
+        }
+
+        let mut state = TargetState::default();
+        visit(self.dataset.schema(), query, &mut state)?;
+        Ok(state.element_target)
+    }
+
     // Create an execution plan to do full text search
     async fn fts(
         &self,
@@ -3337,6 +3473,10 @@ impl Scanner {
         filter_plan: &ExprFilterPlan,
         prefilter_source: &PreFilterSource,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        let element_target = self.fts_element_target(query)?;
+        let output_target = element_target
+            .clone()
+            .unwrap_or_else(|| FtsTarget::new(0, Vec::new()));
         let plan: Arc<dyn ExecutionPlan> = match query {
             FtsQuery::Match(query) => {
                 self.plan_match_query(query, params, filter_plan, prefilter_source)
@@ -3468,11 +3608,32 @@ impl Scanner {
                     );
                 }
 
-                let should = build_boolean_query_children(BoolSlot::Should, should)?
-                    .expect("Should slot always returns Some");
-                let must = build_boolean_query_children(BoolSlot::Must, must)?;
-                let must_not = build_boolean_query_children(BoolSlot::MustNot, must_not)?
-                    .expect("MustNot slot always returns Some");
+                let boolean_schema = fts_schema(&output_target);
+                let should = build_boolean_query_children_with_schema(
+                    BoolSlot::Should,
+                    should,
+                    boolean_schema.clone(),
+                )?
+                .ok_or_else(|| {
+                    Error::internal(
+                        "boolean should planning returned no execution plan".to_string(),
+                    )
+                })?;
+                let must = build_boolean_query_children_with_schema(
+                    BoolSlot::Must,
+                    must,
+                    boolean_schema.clone(),
+                )?;
+                let must_not = build_boolean_query_children_with_schema(
+                    BoolSlot::MustNot,
+                    must_not,
+                    boolean_schema,
+                )?
+                .ok_or_else(|| {
+                    Error::internal(
+                        "boolean must-not planning returned no execution plan".to_string(),
+                    )
+                })?;
 
                 if query.should.is_empty() && must.is_none() {
                     return Err(Error::invalid_input(
@@ -3502,7 +3663,7 @@ impl Scanner {
         let column = query.column.clone().ok_or(Error::invalid_input(
             "the column must be specified in the query".to_string(),
         ))?;
-
+        let resolved_target = resolve_fts_target(self.dataset.schema(), &column)?;
         let segments = load_segments(&self.dataset, &column)
             .await?
             .ok_or(Error::invalid_input(format!(
@@ -3516,11 +3677,12 @@ impl Scanner {
                 .to_string()));
         }
 
-        Ok(Arc::new(PhraseQueryExec::new(
+        Ok(Arc::new(PhraseQueryExec::new_with_target(
             self.dataset.clone(),
             query.clone(),
             params.clone(),
             prefilter_source.clone(),
+            resolved_target.target,
         )))
     }
 
@@ -3538,6 +3700,9 @@ impl Scanner {
                 "the column must be specified in the query".to_string(),
             ))?
             .clone();
+        let resolved_target = resolve_fts_target(self.dataset.schema(), &column)?;
+        let target = resolved_target.target.clone();
+        let output_schema = fts_schema(&target);
 
         let index = self
             .dataset
@@ -3559,44 +3724,77 @@ impl Scanner {
                 // If all target fragments are unindexed, skip index entirely
                 if unindexed_fragments.len() == target_fragments.len() {
                     if self.fast_search {
-                        return Ok(Arc::new(EmptyExec::new(FTS_SCHEMA.clone())));
+                        return Ok(Arc::new(EmptyExec::new(output_schema)));
                     }
                     let flat_match_plan = self
-                        .plan_flat_match_query(unindexed_fragments, query, params, filter_plan)
+                        .plan_flat_match_query(
+                            unindexed_fragments,
+                            query,
+                            params,
+                            filter_plan,
+                            None,
+                        )
                         .await?;
                     return Ok(flat_match_plan);
                 }
 
-                // Mixed case: use index + flat search for unindexed
-                let match_plan: Arc<dyn ExecutionPlan> = Arc::new(MatchQueryExec::new(
-                    self.dataset.clone(),
-                    query.clone(),
-                    params.clone(),
-                    prefilter_source.clone(),
-                ));
-
                 if self.fast_search || unindexed_fragments.is_empty() {
+                    let match_plan: Arc<dyn ExecutionPlan> =
+                        Arc::new(MatchQueryExec::new_with_target(
+                            self.dataset.clone(),
+                            query.clone(),
+                            params.clone(),
+                            prefilter_source.clone(),
+                            target.clone(),
+                        ));
                     (Some(match_plan), None)
                 } else {
+                    let shared_scorer = target
+                        .is_element_document()
+                        .then(|| Arc::new(SharedFtsScorer::new()));
+                    let mut match_plan = MatchQueryExec::new_with_target(
+                        self.dataset.clone(),
+                        query.clone(),
+                        params.clone(),
+                        prefilter_source.clone(),
+                        target.clone(),
+                    );
+                    if let Some(shared_scorer) = &shared_scorer {
+                        // Element-document results from indexed and flat
+                        // fragments must use one corpus-wide scorer.
+                        match_plan = match_plan.with_shared_scorer(shared_scorer.clone());
+                    }
+                    let match_plan: Arc<dyn ExecutionPlan> = Arc::new(match_plan);
                     let flat_match_plan = self
-                        .plan_flat_match_query(unindexed_fragments, query, params, filter_plan)
+                        .plan_flat_match_query(
+                            unindexed_fragments,
+                            query,
+                            params,
+                            filter_plan,
+                            shared_scorer,
+                        )
                         .await?;
                     (Some(match_plan), Some(flat_match_plan))
                 }
             }
             None => {
                 if self.fast_search {
-                    return Ok(Arc::new(EmptyExec::new(FTS_SCHEMA.clone())));
+                    return Ok(Arc::new(EmptyExec::new(output_schema)));
                 }
                 // No index: flat search all target fragments
                 let flat_match_plan = self
-                    .plan_flat_match_query(target_fragments.clone(), query, params, filter_plan)
+                    .plan_flat_match_query(
+                        target_fragments.clone(),
+                        query,
+                        params,
+                        filter_plan,
+                        None,
+                    )
                     .await?;
                 (None, Some(flat_match_plan))
             }
         };
 
-        // Combine plans
         let plan = match (match_plan, flat_match_plan) {
             (Some(match_plan), Some(flat_match_plan)) => {
                 let match_plan = UnionExec::try_new(vec![match_plan, flat_match_plan])?;
@@ -3615,7 +3813,11 @@ impl Scanner {
             }
             (Some(match_plan), None) => match_plan,
             (None, Some(flat_match_plan)) => flat_match_plan,
-            (None, None) => unreachable!(),
+            (None, None) => {
+                return Err(Error::internal(
+                    "FTS leaf planning produced neither an indexed nor a flat plan".to_string(),
+                ));
+            }
         };
 
         Ok(plan)
@@ -3628,6 +3830,7 @@ impl Scanner {
         query: &MatchQuery,
         params: &FtsSearchParams,
         filter_plan: &ExprFilterPlan,
+        shared_scorer: Option<Arc<SharedFtsScorer>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let column = query
             .column
@@ -3636,8 +3839,9 @@ impl Scanner {
                 "the column must be specified in the query".to_string(),
             ))?
             .clone();
-
-        let mut columns = vec![column.clone()];
+        let resolved_target = resolve_fts_target(self.dataset.schema(), &column)?;
+        let document_column = resolved_target.scan_column.clone();
+        let mut columns = vec![document_column.clone()];
         if let Some(refine_expr) = filter_plan.refine_expr.as_ref() {
             columns.extend(Planner::column_names_in_expr(refine_expr));
         }
@@ -3661,15 +3865,19 @@ impl Scanner {
         if let Some(refine_expr) = filter_plan.refine_expr.as_ref() {
             plan = Arc::new(LanceFilterExec::try_new(refine_expr.clone(), plan)?);
         }
-        plan = self.ensure_column_alias(plan, &column)?;
-
-        let flat_match_plan = Arc::new(FlatMatchQueryExec::new(
+        plan = self.ensure_column_alias(plan, &document_column)?;
+        let mut flat_match_plan = FlatMatchQueryExec::new_with_target(
             self.dataset.clone(),
             query.clone(),
             params.clone(),
             plan,
-        ));
-        Ok(flat_match_plan)
+            resolved_target.target,
+            document_column,
+        );
+        if let Some(shared_scorer) = shared_scorer {
+            flat_match_plan = flat_match_plan.with_shared_scorer(shared_scorer);
+        }
+        Ok(Arc::new(flat_match_plan))
     }
 
     // ANN/KNN search execution node with optional prefilter
@@ -4406,22 +4614,25 @@ impl Scanner {
                         "the column must be specified in the query".to_string(),
                     ))?
                     .clone();
-                let input = if schema.column_with_name(&column).is_none() {
+                let resolved_target = resolve_fts_target(self.dataset.schema(), &column)?;
+                let document_column = resolved_target.scan_column;
+                let input = if schema.column_with_name(&document_column).is_none() {
                     let projection = self
                         .dataset
                         .empty_projection()
-                        .union_column(&column, OnMissing::Error)?;
+                        .union_column(&document_column, OnMissing::Error)?;
                     let input = self.take(input, projection)?;
-                    self.ensure_column_alias(input, &column)?
+                    self.ensure_column_alias(input, &document_column)?
                 } else {
                     input
                 };
 
-                Ok(Arc::new(FlatMatchFilterExec::new(
+                Ok(Arc::new(FlatMatchFilterExec::new_with_document_column(
                     input,
                     self.dataset.clone(),
                     match_query.clone(),
                     q.params(),
+                    document_column,
                 )))
             }
             _ => Err(Error::not_supported(
@@ -4457,22 +4668,26 @@ impl Scanner {
                         "the column must be specified in the query".to_string(),
                     ))?
                     .clone();
-                let input = if schema.column_with_name(&column).is_none() {
+                let resolved_target = resolve_fts_target(self.dataset.schema(), &column)?;
+                let document_column = resolved_target.scan_column.clone();
+                let input = if schema.column_with_name(&document_column).is_none() {
                     let projection = self
                         .dataset
                         .empty_projection()
-                        .union_column(&column, OnMissing::Error)?;
+                        .union_column(&document_column, OnMissing::Error)?;
                     let input = self.take(input, projection)?;
-                    self.ensure_column_alias(input, &column)?
+                    self.ensure_column_alias(input, &document_column)?
                 } else {
                     input
                 };
 
-                Ok(Arc::new(FlatMatchQueryExec::new(
+                Ok(Arc::new(FlatMatchQueryExec::new_with_target(
                     self.dataset.clone(),
                     match_query.clone(),
                     q.params(),
                     input,
+                    resolved_target.target,
+                    document_column,
                 )))
             }
             _ => {
@@ -4968,13 +5183,23 @@ async fn fts_indexed_columns(dataset: Arc<Dataset>) -> Result<Vec<String>> {
     for field in dataset.schema().fields_pre_order() {
         if is_fts_indexable_field(field) {
             // Build the full field path for nested fields
-            let column_path =
-                if let Some(ancestors) = dataset.schema().field_ancestry_by_id(field.id) {
-                    let field_refs: Vec<&str> = ancestors.iter().map(|f| f.name.as_str()).collect();
-                    format_field_path(&field_refs)
-                } else {
-                    continue; // Skip if we can't find the field ancestry
-                };
+            let Some(ancestors) = dataset.schema().field_ancestry_by_id(field.id) else {
+                continue;
+            };
+            if ancestors
+                .iter()
+                .take(ancestors.len().saturating_sub(1))
+                .any(|ancestor| {
+                    matches!(
+                        ancestor.data_type(),
+                        DataType::List(_) | DataType::LargeList(_)
+                    )
+                })
+            {
+                continue;
+            }
+            let field_refs: Vec<&str> = ancestors.iter().map(|f| f.name.as_str()).collect();
+            let column_path = format_field_path(&field_refs);
 
             // Check if this field has an inverted index
             let has_fts_index = dataset

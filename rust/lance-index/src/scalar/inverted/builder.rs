@@ -388,6 +388,11 @@ impl InvertedIndexBuilder {
             token_set_format: self.token_set_format,
             worker_memory_limit_bytes,
             block_size: self.params.block_size,
+            coordinate_rank: self
+                .params
+                .fts_target()
+                .map(|target| target.coordinate_rank())
+                .unwrap_or(0),
         };
         let next_id = self.next_partition_id();
         let id_alloc = Arc::new(AtomicU64::new(next_id));
@@ -512,6 +517,10 @@ impl InvertedIndexBuilder {
                 None,
                 &LanceCache::no_cache(),
                 self.token_set_format,
+                self.params
+                    .fts_target()
+                    .map(|target| target.coordinate_rank())
+                    .unwrap_or(0),
             )
             .await?;
             let mut builder = part.into_builder().await?;
@@ -1005,8 +1014,16 @@ impl InnerBuilder {
         }
 
         let doc_id_offset = self.docs.len() as u32;
-        for (row_id, num_tokens) in docs.iter() {
-            self.docs.append(*row_id, *num_tokens);
+        for doc_id in 0..docs.len() as u32 {
+            let row_id = docs.row_id(doc_id);
+            let num_tokens = docs.num_tokens(doc_id);
+            let doc_index = docs.doc_index(doc_id);
+            if doc_index.is_empty() {
+                self.docs.append(row_id, num_tokens);
+            } else {
+                self.docs
+                    .append_with_doc_index(row_id, num_tokens, &doc_index)?;
+            }
         }
         self.posting_lists.resize_with(self.tokens.len(), || {
             PostingListBuilder::new_with_posting_tail_codec_and_block_size(
@@ -1246,6 +1263,7 @@ struct IndexWorker {
     token_set_format: TokenSetFormat,
     token_ids: Vec<u32>,
     last_token_count: usize,
+    coordinate_rank: usize,
 }
 
 struct TailPartition {
@@ -1271,6 +1289,7 @@ struct IndexWorkerConfig {
     token_set_format: TokenSetFormat,
     worker_memory_limit_bytes: u64,
     block_size: usize,
+    coordinate_rank: usize,
 }
 
 impl IndexWorker {
@@ -1342,6 +1361,7 @@ impl IndexWorker {
             token_set_format: config.token_set_format,
             token_ids: Vec::new(),
             last_token_count: 0,
+            coordinate_rank: config.coordinate_rank,
         })
     }
 
@@ -1362,7 +1382,7 @@ impl IndexWorker {
                     .filter_map(|(doc, row_id)| doc.map(|doc| (doc, *row_id)));
 
                 for (doc, row_id) in docs {
-                    self.process_document(row_id, DocumentSource::Text(doc), false)
+                    self.process_document(row_id, DocumentSource::Text(doc), &[], false)
                         .await?;
                 }
             }
@@ -1406,8 +1426,29 @@ impl IndexWorker {
                 continue;
             };
 
-            self.process_document(*row_id, DocumentSource::StringList(doc.as_ref()), true)
-                .await?;
+            if self.coordinate_rank == 0 {
+                self.process_document(*row_id, DocumentSource::StringList(doc.as_ref()), &[], true)
+                    .await?;
+            } else {
+                if self.coordinate_rank != 1 {
+                    return Err(Error::not_supported(format!(
+                        "FTS element documents currently support exactly one list boundary, got {}",
+                        self.coordinate_rank
+                    )));
+                }
+                for (ordinal, element) in iter_str_array(doc.as_ref()).enumerate() {
+                    let ordinal = u32::try_from(ordinal).map_err(|_| {
+                        Error::invalid_input(format!(
+                            "FTS element ordinal overflow for row_id={row_id}"
+                        ))
+                    })?;
+                    let Some(element) = element else {
+                        continue;
+                    };
+                    self.process_document(*row_id, DocumentSource::Text(element), &[ordinal], true)
+                        .await?;
+                }
+            }
         }
 
         Ok(())
@@ -1436,6 +1477,7 @@ impl IndexWorker {
         &mut self,
         row_id: u64,
         document: DocumentSource<'_>,
+        doc_index: &[u32],
         skip_empty_document: bool,
     ) -> Result<()> {
         let with_position = self.has_position();
@@ -1575,7 +1617,13 @@ impl IndexWorker {
         }
 
         let old_doc_memory_size = self.builder.docs.memory_size() as u64;
-        let appended_doc_id = self.builder.docs.append(row_id, token_num);
+        let appended_doc_id = if doc_index.is_empty() {
+            self.builder.docs.append(row_id, token_num)
+        } else {
+            self.builder
+                .docs
+                .append_with_doc_index(row_id, token_num, doc_index)?
+        };
         debug_assert_eq!(appended_doc_id, doc_id);
         self.adjust_tracked_memory_size(
             old_doc_memory_size,
@@ -1742,6 +1790,7 @@ impl PositionRecorder {
 #[derive(Debug, Eq, PartialEq, Clone, DeepSizeOf)]
 pub struct ScoredDoc {
     pub row_id: u64,
+    pub doc_index: Vec<u32>,
     pub score: OrderedFloat,
 }
 
@@ -1749,6 +1798,15 @@ impl ScoredDoc {
     pub fn new(row_id: u64, score: f32) -> Self {
         Self {
             row_id,
+            doc_index: Vec::new(),
+            score: OrderedFloat(score),
+        }
+    }
+
+    pub fn with_doc_index(row_id: u64, doc_index: Vec<u32>, score: f32) -> Self {
+        Self {
+            row_id,
+            doc_index,
             score: OrderedFloat(score),
         }
     }
@@ -3274,6 +3332,7 @@ mod tests {
                 token_set_format,
                 worker_memory_limit_bytes: u64::MAX,
                 block_size: params.block_size,
+                coordinate_rank: 0,
             },
         )
         .await?;
@@ -3298,6 +3357,7 @@ mod tests {
                 token_set_format,
                 worker_memory_limit_bytes: u64::MAX,
                 block_size: params.block_size,
+                coordinate_rank: 0,
             },
         )
         .await?;
@@ -3781,6 +3841,7 @@ mod tests {
                 token_set_format: TokenSetFormat::default(),
                 worker_memory_limit_bytes: u64::MAX,
                 block_size: InvertedIndexParams::default().block_size,
+                coordinate_rank: 0,
             },
         )
         .await?;
@@ -3813,6 +3874,7 @@ mod tests {
                 token_set_format: TokenSetFormat::default(),
                 worker_memory_limit_bytes: u64::MAX,
                 block_size: InvertedIndexParams::default().block_size,
+                coordinate_rank: 0,
             },
         )
         .await?;
@@ -3852,6 +3914,7 @@ mod tests {
                 token_set_format: TokenSetFormat::default(),
                 worker_memory_limit_bytes: u64::MAX,
                 block_size: InvertedIndexParams::default().block_size,
+                coordinate_rank: 0,
             },
         )
         .await?;

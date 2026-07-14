@@ -138,16 +138,29 @@ impl MemIndexConfig {
         let (field_id, column) = Self::extract_field_info(index_meta, schema)?;
 
         // Extract InvertedIndexParams from index_details if available
-        let params = if let Some(details_any) = &index_meta.index_details {
-            if let Ok(details) = pbold::InvertedIndexDetails::decode(details_any.value.as_slice()) {
-                InvertedIndexParams::try_from(&details)?
-            } else {
-                InvertedIndexParams::default()
+        let details = if let Some(details_any) = &index_meta.index_details {
+            match pbold::InvertedIndexDetails::decode(details_any.value.as_slice()) {
+                Ok(details) => details,
+                Err(_) => pbold::InvertedIndexDetails::try_from(&InvertedIndexParams::default())?,
             }
         } else {
-            InvertedIndexParams::default()
+            pbold::InvertedIndexDetails::try_from(&InvertedIndexParams::default())?
         };
-        let params = params.format_version(Self::fts_format_version_from_metadata(index_meta)?);
+        let details =
+            crate::index::scalar::inverted::normalize_fts_details(schema, index_meta, details)?;
+        let params = InvertedIndexParams::try_from(&details)?;
+        let format_version = if index_meta.index_version == 4
+            && params
+                .fts_target()
+                .is_some_and(|target| target.is_element_document())
+        {
+            // Index version 4 gates element-document readers independently
+            // from the posting-list payload version recorded in details.
+            params.resolved_format_version()
+        } else {
+            Self::fts_format_version_from_metadata(index_meta)?
+        };
+        let params = params.format_version(format_version);
 
         Ok(Self::Fts(FtsIndexConfig::try_with_params(
             index_meta.name.clone(),
@@ -1361,6 +1374,38 @@ mod tests {
     }
 
     #[test]
+    fn fts_registry_routes_row_and_element_targets_independently() {
+        let mut registry = IndexStore::new();
+        registry
+            .add_fts_with_params(
+                "tags_idx".to_string(),
+                1,
+                "tags".to_string(),
+                InvertedIndexParams::default()
+                    .with_fts_target(lance_index::scalar::inverted::FtsTarget::new(1, Vec::new())),
+            )
+            .unwrap();
+        registry
+            .add_fts_with_params(
+                "tags_element_idx".to_string(),
+                1,
+                "tags".to_string(),
+                InvertedIndexParams::default()
+                    .with_fts_target(lance_index::scalar::inverted::FtsTarget::new(2, vec![1])),
+            )
+            .unwrap();
+
+        assert_eq!(
+            registry.get_fts_by_column("tags").unwrap().column_name(),
+            "tags"
+        );
+        assert_eq!(
+            registry.get_fts_by_column("tags[*]").unwrap().column_name(),
+            "tags[*]"
+        );
+    }
+
+    #[test]
     fn test_check_index_type_supported() {
         assert!(check_index_type_supported("btree"));
         assert!(check_index_type_supported("BTree"));
@@ -1408,6 +1453,51 @@ mod tests {
             err.to_string().contains("unsupported index_version 4"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn fts_from_metadata_accepts_element_document_version() {
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new(
+                "tags",
+                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                true,
+            ),
+        ]));
+        let schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
+        let tags = schema.field("tags").unwrap();
+        let item_id = tags.children[0].id;
+        for (block_size, expected_format_version) in [
+            (128, InvertedListFormatVersion::V2),
+            (256, InvertedListFormatVersion::V3),
+        ] {
+            let params = InvertedIndexParams::default()
+                .block_size(block_size)
+                .unwrap()
+                .with_fts_target(lance_index::scalar::inverted::FtsTarget::new(
+                    item_id,
+                    vec![tags.id],
+                ));
+            let details = pbold::InvertedIndexDetails::try_from(&params).unwrap();
+            let config = MemIndexConfig::fts_from_metadata(
+                &fts_index_metadata_with_details(4, Some(details)),
+                &schema,
+            )
+            .unwrap();
+
+            let MemIndexConfig::Fts(config) = config else {
+                unreachable!("fts metadata should create an FTS config")
+            };
+            let index = FtsMemIndex::try_with_params(config.field_id, config.column, config.params)
+                .unwrap();
+            assert_eq!(index.column_name(), "tags[*]");
+            assert_eq!(
+                index.params().resolved_format_version(),
+                expected_format_version
+            );
+        }
     }
 
     #[test]

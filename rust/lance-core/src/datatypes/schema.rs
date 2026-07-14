@@ -1505,6 +1505,148 @@ impl Projection {
     }
 }
 
+/// A component of a parsed field path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FieldPathComponent {
+    /// A named field.
+    Field(String),
+    /// The elements of a list field, written as `[*]`.
+    ListWildcard,
+}
+
+/// Parse a field path that may contain quoted field names and list wildcards.
+///
+/// Unquoted `[*]` is parsed as [`FieldPathComponent::ListWildcard`]. To address
+/// a field whose name literally contains `[*]`, quote the field name with
+/// backticks.
+pub fn parse_field_path_components(path: &str) -> Result<Vec<FieldPathComponent>> {
+    if path.is_empty() {
+        return Err(Error::schema("Field path cannot be empty".to_string()));
+    }
+
+    let mut result = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut just_closed_quote = false;
+    let mut trailing_dot = false;
+    let mut chars = path.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '`' => {
+                if in_quotes {
+                    if chars.peek() == Some(&'`') {
+                        chars.next();
+                        current.push('`');
+                    } else {
+                        in_quotes = false;
+                        just_closed_quote = true;
+                    }
+                } else if current.is_empty() && !just_closed_quote {
+                    in_quotes = true;
+                    trailing_dot = false;
+                } else {
+                    return Err(Error::schema(format!(
+                        "Invalid field path '{}': unexpected quote in the middle of field name",
+                        path
+                    )));
+                }
+            }
+            '.' if !in_quotes => {
+                if trailing_dot {
+                    return Err(Error::schema(format!(
+                        "Invalid field path '{}': empty field name",
+                        path
+                    )));
+                }
+                if !current.is_empty() {
+                    result.push(FieldPathComponent::Field(std::mem::take(&mut current)));
+                } else if !matches!(result.last(), Some(FieldPathComponent::ListWildcard)) {
+                    return Err(Error::schema(format!(
+                        "Invalid field path '{}': empty field name",
+                        path
+                    )));
+                }
+                just_closed_quote = false;
+                trailing_dot = true;
+            }
+            '[' if !in_quotes && chars.peek() == Some(&'*') => {
+                if trailing_dot {
+                    return Err(Error::schema(format!(
+                        "Invalid field path '{}': list wildcard must immediately follow a field or list wildcard",
+                        path
+                    )));
+                }
+                let mut lookahead = chars.clone();
+                lookahead.next();
+                if lookahead.next() == Some(']') {
+                    if !current.is_empty() {
+                        result.push(FieldPathComponent::Field(std::mem::take(&mut current)));
+                    } else if !matches!(result.last(), Some(FieldPathComponent::ListWildcard)) {
+                        return Err(Error::schema(format!(
+                            "Invalid field path '{}': list wildcard must follow a field",
+                            path
+                        )));
+                    }
+                    chars.next();
+                    chars.next();
+                    result.push(FieldPathComponent::ListWildcard);
+                    just_closed_quote = false;
+                    trailing_dot = false;
+                    if let Some(next) = chars.peek()
+                        && *next != '.'
+                        && *next != '['
+                    {
+                        return Err(Error::schema(format!(
+                            "Invalid field path '{}': expected '.', '[*]', or end of string after list wildcard",
+                            path
+                        )));
+                    }
+                } else {
+                    if just_closed_quote {
+                        return Err(Error::schema(format!(
+                            "Invalid field path '{}': expected '.', '[*]', or end of string after closing quote",
+                            path
+                        )));
+                    }
+                    current.push(ch);
+                    trailing_dot = false;
+                }
+            }
+            _ => {
+                if !in_quotes && just_closed_quote {
+                    return Err(Error::schema(format!(
+                        "Invalid field path '{}': expected '.', '[*]', or end of string after closing quote",
+                        path
+                    )));
+                }
+                current.push(ch);
+                trailing_dot = false;
+            }
+        }
+    }
+
+    if in_quotes {
+        return Err(Error::schema(format!(
+            "Invalid field path '{}': unclosed quote",
+            path
+        )));
+    }
+    if trailing_dot {
+        return Err(Error::schema(format!(
+            "Invalid field path '{}': trailing dot",
+            path
+        )));
+    }
+    if !current.is_empty() {
+        result.push(FieldPathComponent::Field(current));
+    }
+    if result.is_empty() {
+        return Err(Error::schema(format!("Invalid field path '{}'", path)));
+    }
+    Ok(result)
+}
+
 /// Parse a field path that may contain quoted field names.
 ///
 /// Field names containing dots must be quoted with backticks.
@@ -1520,87 +1662,15 @@ impl Projection {
 ///
 /// The result is guaranteed to contain at least one element.
 pub fn parse_field_path(path: &str) -> Result<Vec<String>> {
-    if path.is_empty() {
-        return Err(Error::schema("Field path cannot be empty".to_string()));
-    }
-
-    let mut result = Vec::new();
-    let mut current = String::new();
-    let mut in_quotes = false;
-    let mut chars = path.chars().peekable();
-
-    while let Some(ch) = chars.next() {
-        match ch {
-            '`' => {
-                if in_quotes {
-                    // Check if this is an escaped backtick (double backtick)
-                    if chars.peek() == Some(&'`') {
-                        // Consume the second backtick and add a single backtick to current
-                        chars.next();
-                        current.push('`');
-                    } else {
-                        // End of quoted field
-                        in_quotes = false;
-                        // After closing quote, we should either see a dot or end of string
-                        if let Some(&next_ch) = chars.peek()
-                            && next_ch != '.'
-                        {
-                            return Err(Error::schema(format!(
-                                "Invalid field path '{}': expected '.' or end of string after closing quote",
-                                path
-                            )));
-                        }
-                    }
-                } else if current.is_empty() {
-                    // Start of quoted field
-                    in_quotes = true;
-                } else {
-                    // Quote in the middle of unquoted field name
-                    return Err(Error::schema(format!(
-                        "Invalid field path '{}': unexpected quote in the middle of field name",
-                        path
-                    )));
-                }
-            }
-            '.' if !in_quotes => {
-                if current.is_empty() {
-                    return Err(Error::schema(format!(
-                        "Invalid field path '{}': empty field name",
-                        path
-                    )));
-                }
-                result.push(current);
-                current = String::new();
-            }
-            _ => {
-                current.push(ch);
-            }
-        }
-    }
-
-    if in_quotes {
-        return Err(Error::schema(format!(
-            "Invalid field path '{}': unclosed quote",
-            path
-        )));
-    }
-
-    if !current.is_empty() {
-        result.push(current);
-    } else if !result.is_empty() {
-        return Err(Error::schema(format!(
-            "Invalid field path '{}': trailing dot",
-            path
-        )));
-    }
-
-    // This check is now redundant since we check for empty input at the beginning,
-    // but keeping it for extra safety
-    if result.is_empty() {
-        return Err(Error::schema(format!("Invalid field path '{}'", path)));
-    }
-
-    Ok(result)
+    parse_field_path_components(path).map(|components| {
+        components
+            .into_iter()
+            .map(|component| match component {
+                FieldPathComponent::Field(field) => field,
+                FieldPathComponent::ListWildcard => "[*]".to_string(),
+            })
+            .collect()
+    })
 }
 
 /// Format a field path, quoting field names that require escaping.
@@ -1794,6 +1864,31 @@ mod tests {
 
         // Invalid: trailing dot
         assert!(parse_field_path("parent.").is_err());
+
+        assert_eq!(
+            parse_field_path_components("tags[*]").unwrap(),
+            vec![
+                FieldPathComponent::Field("tags".to_string()),
+                FieldPathComponent::ListWildcard,
+            ]
+        );
+        assert_eq!(
+            parse_field_path_components("parent.items[*].text").unwrap(),
+            vec![
+                FieldPathComponent::Field("parent".to_string()),
+                FieldPathComponent::Field("items".to_string()),
+                FieldPathComponent::ListWildcard,
+                FieldPathComponent::Field("text".to_string()),
+            ]
+        );
+        assert_eq!(
+            parse_field_path_components("`tags[*]`").unwrap(),
+            vec![FieldPathComponent::Field("tags[*]".to_string())]
+        );
+        assert!(parse_field_path_components("[*]").is_err());
+        assert!(parse_field_path_components("tags[*]suffix").is_err());
+        assert!(parse_field_path_components("tags[*]..value").is_err());
+        assert!(parse_field_path_components("tags[*].[*]").is_err());
 
         // Test formatting
         assert_eq!(

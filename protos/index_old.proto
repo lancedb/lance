@@ -25,6 +25,12 @@ message BitmapIndexDetails {}
 message LabelListIndexDetails {}
 message NGramIndexDetails {}
 message ZoneMapIndexDetails {}
+message FtsTarget {
+  // The field id of the text value that is tokenized.
+  int32 source_field_id = 1;
+  // Ordered list boundaries crossed between the public field and source value.
+  repeated int32 boundary_field_ids = 2;
+}
 message InvertedIndexDetails {
   // Marking this field as optional as old versions of the index store blank details and we
   // need to make sure we have a proper optional field to detect this.
@@ -44,4 +50,10 @@ message InvertedIndexDetails {
   // A present value records the block size used by the index; 256 is only
   // valid with format version 3.
   optional uint32 block_size = 12;
+  // The logical FTS document target. An absent value denotes a legacy
+  // row-document index and is normalized from IndexMetadata.fields.
+  FtsTarget fts_target = 13;
+  // The posting-list payload format. This is separate from index_version,
+  // which is an element-document compatibility marker for version 4.
+  optional uint32 posting_format_version = 14;
 }
