@@ -460,6 +460,7 @@ impl FilteredReadStream {
         options: FilteredReadOptions,
         metrics: &ExecutionPlanMetricsSet,
         plan: FilteredReadInternalPlan,
+        cached_fragments: Option<Arc<Vec<LoadedFragment>>>,
     ) -> DataFusionResult<Self> {
         let global_metrics = Arc::new(FilteredReadGlobalMetrics::new(metrics));
 
@@ -483,23 +484,31 @@ impl FilteredReadStream {
             io_parallelism
         );
 
-        // Ideally we don't need to collect here but if we don't we get "implementation of FnOnce is
-        // not general enough" false positives from rustc
-        let frag_futs = fragments
-            .iter()
-            .map(|frag| {
-                Result::Ok(Self::load_fragment(
-                    dataset.clone(),
-                    frag.clone(),
-                    options.with_deleted_rows,
-                ))
-            })
-            .collect::<Vec<_>>();
-        let loaded_fragments = futures::stream::iter(frag_futs)
-            // Cannot use unordered because we need to populate logical_offset based on user-provided order
-            .try_buffered(io_parallelism)
-            .try_collect::<Vec<_>>()
-            .await?;
+        let loaded_fragments = match cached_fragments {
+            // Planning already loaded every fragment; don't repeat it
+            Some(loaded) => loaded,
+            None => {
+                // Ideally we don't need to collect here but if we don't we get "implementation of FnOnce is
+                // not general enough" false positives from rustc
+                let frag_futs = fragments
+                    .iter()
+                    .map(|frag| {
+                        Result::Ok(Self::load_fragment(
+                            dataset.clone(),
+                            frag.clone(),
+                            options.with_deleted_rows,
+                        ))
+                    })
+                    .collect::<Vec<_>>();
+                Arc::new(
+                    futures::stream::iter(frag_futs)
+                        // Cannot use unordered because we need to populate logical_offset based on user-provided order
+                        .try_buffered(io_parallelism)
+                        .try_collect::<Vec<_>>()
+                        .await?,
+                )
+            }
+        };
 
         let output_schema = public_blob_v2_binary_projection_schema(&options.projection);
 
@@ -1678,6 +1687,21 @@ impl FilteredReadOptions {
 /// In the future, we may introduce high-level cardinality statistics similar to those used by query
 /// engines like Postgres.  This might allow us to know, without executing an index search, that a scan
 /// would be better.  In that case we accept the force_scan hint to skip the index search.
+/// A resolved plan together with the fragment metadata loaded to compute it,
+/// so stream construction reuses the load instead of repeating it. The
+/// distributed path (`with_plan`, plan computed on another node) carries no
+/// fragments and the stream loads them itself.
+struct PlannedRead {
+    plan: FilteredReadInternalPlan,
+    loaded_fragments: Option<Arc<Vec<LoadedFragment>>>,
+}
+
+impl std::fmt::Debug for PlannedRead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PlannedRead").finish()
+    }
+}
+
 #[derive(Debug)]
 pub struct FilteredReadExec {
     dataset: Arc<Dataset>,
@@ -1686,7 +1710,7 @@ pub struct FilteredReadExec {
     metrics: ExecutionPlanMetricsSet,
     index_input: Option<Arc<dyn ExecutionPlan>>,
     // Precomputed internal plan
-    plan: Arc<OnceCell<FilteredReadInternalPlan>>,
+    plan: Arc<OnceCell<PlannedRead>>,
     // When execute is first called we will initialize the FilteredReadStream.  In order to support
     // multiple partitions, each partition will share the stream.
     running_stream: Arc<AsyncMutex<Option<FilteredReadStream>>>,
@@ -1820,6 +1844,9 @@ impl FilteredReadExec {
 
     /// Set the pre-computed plan for execution
     pub async fn with_plan(self, plan: FilteredReadPlan) -> Result<Self> {
+        // Distributed path: the plan was computed elsewhere (e.g. on a query
+        // node), so no fragment metadata is cached; stream construction
+        // loads it itself.
         let mut rows = BTreeMap::new();
         for (fragment_id, selection) in plan.rows.iter() {
             let ranges = match selection {
@@ -1847,7 +1874,10 @@ impl FilteredReadExec {
             scan_range_after_filter: plan.scan_range_after_filter,
         };
         let plan_cell = Arc::new(OnceCell::new());
-        let _ = plan_cell.set(internal_plan);
+        let _ = plan_cell.set(PlannedRead {
+            plan: internal_plan,
+            loaded_fragments: None,
+        });
         Ok(Self {
             plan: plan_cell,
             ..self
@@ -1856,13 +1886,13 @@ impl FilteredReadExec {
 
     /// Get or create the internal plan
     async fn get_or_create_plan_impl<'a>(
-        plan_cell: &'a OnceCell<FilteredReadInternalPlan>,
+        plan_cell: &'a OnceCell<PlannedRead>,
         dataset: Arc<Dataset>,
         options: &FilteredReadOptions,
         index_input: Option<&Arc<dyn ExecutionPlan>>,
         partition: usize,
         ctx: Arc<TaskContext>,
-    ) -> Result<&'a FilteredReadInternalPlan> {
+    ) -> Result<&'a PlannedRead> {
         plan_cell
             .get_or_try_init(|| async {
                 // Execute index if present
@@ -1900,12 +1930,14 @@ impl FilteredReadExec {
                     .try_collect::<Vec<_>>()
                     .await?;
 
-                // Plan the scan
-                Ok(FilteredReadStream::plan_scan(
-                    &loaded_fragments,
-                    &evaluated_index,
-                    options,
-                ))
+                // Plan the scan; keep the loaded fragments so stream
+                // construction doesn't reload every fragment
+                let plan =
+                    FilteredReadStream::plan_scan(&loaded_fragments, &evaluated_index, options);
+                Ok(PlannedRead {
+                    plan,
+                    loaded_fragments: Some(Arc::new(loaded_fragments)),
+                })
             })
             .await
     }
@@ -1921,7 +1953,7 @@ impl FilteredReadExec {
             ctx,
         )
         .await?;
-        Ok(internal_plan.to_external_plan())
+        Ok(internal_plan.plan.to_external_plan())
     }
 
     fn obtain_stream(
@@ -1957,7 +1989,7 @@ impl FilteredReadExec {
             let inner = if let Some(running_stream) = &*running_stream {
                 running_stream.get_stream(&metrics, partition)
             } else {
-                let plan = Self::get_or_create_plan_impl(
+                let planned = Self::get_or_create_plan_impl(
                     &plan_cell,
                     dataset.clone(),
                     &options,
@@ -1967,10 +1999,15 @@ impl FilteredReadExec {
                 )
                 .await
                 .map_err(|e| DataFusionError::External(e.into()))?;
-                let new_running_stream =
-                    FilteredReadStream::try_new(dataset, options, &metrics, plan.clone())
-                        .await
-                        .map_err(|e| DataFusionError::External(e.into()))?;
+                let new_running_stream = FilteredReadStream::try_new(
+                    dataset,
+                    options,
+                    &metrics,
+                    planned.plan.clone(),
+                    planned.loaded_fragments.clone(),
+                )
+                .await
+                .map_err(|e| DataFusionError::External(e.into()))?;
                 let first_stream = new_running_stream.get_stream(&metrics, partition);
                 *running_stream = Some(new_running_stream);
                 first_stream
@@ -2033,7 +2070,7 @@ impl FilteredReadExec {
 
     /// Return the pre-computed plan if one exists, without triggering initialization.
     pub fn plan(&self) -> Option<FilteredReadPlan> {
-        self.plan.get().map(|p| p.to_external_plan())
+        self.plan.get().map(|p| p.plan.to_external_plan())
     }
 }
 
