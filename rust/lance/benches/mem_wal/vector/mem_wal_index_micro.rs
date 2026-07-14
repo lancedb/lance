@@ -377,12 +377,14 @@ async fn measure_flush(
     memtable.set_indexes(registry);
 
     let total_batches = cp.div_ceil(batch_size);
-    for (wal_pos, i) in (0_u64..).zip(0..total_batches) {
+    for i in 0..total_batches {
         let start = (i * batch_size) as i64;
         let rows = batch_size.min(cp - i * batch_size);
         let batch = make_batch(start, rows, dim);
         let frag_id = memtable.insert(batch).await?;
-        memtable.mark_wal_flushed(&[frag_id], wal_pos + 1, &[i]);
+        memtable
+            .batch_store()
+            .set_max_flushed_batch_position(frag_id);
     }
 
     let temp_dir =
@@ -408,7 +410,7 @@ async fn measure_flush(
     let flusher = MemTableFlusher::new(store, base_path, uri, shard_id, manifest_store);
 
     // total_batches WAL entries were stamped at positions 1..=total_batches
-    // by the mark_wal_flushed loop above (1-based positions).
+    // by the loop above (1-based positions).
     let covered_wal_entry_position = total_batches as u64;
     let t = Instant::now();
     let _result = flusher

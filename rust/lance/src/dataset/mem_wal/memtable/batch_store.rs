@@ -478,12 +478,6 @@ impl BatchStore {
         }
     }
 
-    /// Check if all committed batches have been WAL-flushed.
-    #[inline]
-    pub fn is_wal_flush_complete(&self) -> bool {
-        self.pending_wal_flush_count() == 0
-    }
-
     /// Get the range of batch IDs pending WAL flush: [start, end).
     /// Returns None if nothing pending.
     #[inline]
