@@ -40,6 +40,15 @@ use crate::session::Session;
 /// The key is the resolved absolute flushed path
 /// (`{base}/_mem_wal/{shard}/{folder}`), which is globally unique, so a single
 /// cache can safely span multiple tables.
+///
+/// `store_params` is deliberately *not* part of the key: the first caller to
+/// open a path binds the store that every later hit reuses. Credential rotation
+/// still works — a vended-credential store holds the live
+/// `StorageOptionsAccessor` and re-resolves per request, so a cached handle
+/// never carries expired credentials. What this does assume is that a given
+/// path is only ever served under one store configuration. Serving one table
+/// through a single cache under two different `ObjectStoreParams` would hand
+/// every caller the store the first one opened with.
 pub struct FlushedMemTableCache {
     // `moka`'s async cache gives a bounded size plus single-flight
     // `try_get_with`, so concurrent first-queries on a just-flushed

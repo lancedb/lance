@@ -350,8 +350,13 @@ impl LsmScanner {
 
     /// Set the store params used to open flushed generations. Defaults to the
     /// base table's; set explicitly on a fresh-tier-only scanner (no base table).
+    ///
+    /// Pass the params the *base* was opened with. As in [`Self::new`], they are
+    /// adapted for generation URIs: a path-bound `object_store` binding would
+    /// redirect every generation open at the base table itself, so it is dropped
+    /// while storage options, wrapper, and credentials carry over.
     pub fn with_store_params(mut self, store_params: ObjectStoreParams) -> Self {
-        self.store_params = Some(store_params);
+        self.store_params = Some(derived_store_params(&store_params));
         self
     }
 

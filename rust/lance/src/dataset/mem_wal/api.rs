@@ -711,7 +711,7 @@ impl DatasetMemWalExt for Dataset {
 
         // Inject the dataset's store params + session so the flusher opens the
         // base + generations with the same store the base was resolved with.
-        config.store_params = self.store_params.as_deref().cloned();
+        config.store_params = self.store_params().cloned();
         config.session = Some(self.session());
 
         // Reuse the dataset's own object store + base path; `ObjectStore::from_uri`

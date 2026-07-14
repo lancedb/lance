@@ -142,7 +142,7 @@ pub fn parse_bit_reversed_filename(filename: &str) -> Option<u64> {
 /// else (storage options, wrapper, credentials, block size) still carries over.
 ///
 /// Only the base's *own* URI may reuse the params verbatim.
-pub fn derived_store_params(params: &ObjectStoreParams) -> ObjectStoreParams {
+pub(crate) fn derived_store_params(params: &ObjectStoreParams) -> ObjectStoreParams {
     #[allow(deprecated)]
     ObjectStoreParams {
         object_store: None,
