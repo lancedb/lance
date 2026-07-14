@@ -46,15 +46,6 @@ pub async fn filtered_read_exec_to_proto(
     exec: &FilteredReadExec,
     state: &SessionState,
 ) -> Result<pb::FilteredReadExecProto> {
-    if exec.row_stream_input().is_some() {
-        // TODO: define a proto representation for row-stream sources so these
-        // reads can participate in distributed plan pushdown
-        return Err(Error::not_supported_source(
-            "a FilteredReadExec with a row-stream source cannot be serialized"
-                .to_string()
-                .into(),
-        ));
-    }
     let table = table_identifier_from_dataset(exec.dataset()).await?;
     // Use the pruned dataset schema for filter encoding — filters can reference columns
     // outside the projection (e.g. SELECT name WHERE age > 10), and some dataset columns
@@ -733,6 +724,59 @@ mod tests {
         assert_eq!(
             exec.options().projection.field_ids,
             back.options().projection.field_ids
+        );
+    }
+
+    /// A row-stream (take) exec serializes like any other: the input plan
+    /// travels as the node's child through the plan codec, and decoding
+    /// re-derives the row-stream selector from the child's schema
+    #[tokio::test]
+    async fn test_exec_to_proto_roundtrip_row_stream() {
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        use lance_core::{ROW_ID, ROW_ID_FIELD};
+        use lance_datafusion::exec::OneShotExec;
+
+        fn keys_input() -> Arc<dyn ExecutionPlan> {
+            let schema = Arc::new(ArrowSchema::new(vec![ROW_ID_FIELD.clone()]));
+            let batch = arrow_array::RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(arrow_array::UInt64Array::from(vec![3u64, 1, 4]))],
+            )
+            .unwrap();
+            let stream = futures::stream::iter(vec![Ok(batch)]);
+            Arc::new(OneShotExec::new(Box::pin(RecordBatchStreamAdapter::new(
+                schema, stream,
+            ))))
+        }
+
+        let dataset = make_test_dataset().await;
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+
+        let options = FilteredReadOptions::basic_full_read(&dataset);
+        let exec = FilteredReadExec::try_new(dataset.clone(), options, Some(keys_input())).unwrap();
+        assert!(exec.row_stream_input().is_some());
+
+        let proto = filtered_read_exec_to_proto(&exec, &state).await.unwrap();
+
+        // The codec hands the decoded child back; the selector re-derives
+        // from its schema
+        let back =
+            filtered_read_exec_from_proto(proto, Some(dataset.clone()), Some(keys_input()), &state)
+                .await
+                .unwrap();
+        assert!(back.row_stream_input().is_some());
+        assert_eq!(exec.schema(), back.schema());
+        assert_eq!(
+            exec.options().projection.field_ids,
+            back.options().projection.field_ids
+        );
+        assert!(
+            back.row_stream_input()
+                .unwrap()
+                .schema()
+                .column_with_name(ROW_ID)
+                .is_some()
         );
     }
 
