@@ -926,7 +926,7 @@ async fn replay_memtable_from_wal(
                     stored.push(s.clone());
                 }
             }
-            tokio::task::spawn_blocking(move || indexes.insert_batches_parallel(&stored))
+            tokio::task::spawn_blocking(move || indexes.insert_batches(&stored))
                 .await
                 .map_err(|e| {
                     Error::internal(format!("WAL replay index update task panicked: {}", e))

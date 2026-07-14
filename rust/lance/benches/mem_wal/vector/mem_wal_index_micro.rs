@@ -10,7 +10,9 @@
 //!    index maintained, opens `mem_wal_writer` with a `ShardWriterConfig`
 //!    sized to hold the largest checkpoint without flushing, and times
 //!    `writer.put(batch)` calls. Index updates therefore go through the
-//!    parallel `IndexStore::insert_batches_parallel` path. At each
+//!    `IndexStore::insert_batches` path, which indexes inline at or below
+//!    `PARALLEL_INDEX_MIN_ROWS` rows and spawns a thread per index above it —
+//!    so the checkpoint sizes here straddle that crossover. At each
 //!    checkpoint, queries are issued against `active_memtable_ref()` via
 //!    `MemTableScanner::nearest`.
 //!

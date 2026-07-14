@@ -592,7 +592,7 @@ impl WalFlusher {
             let index_future = async {
                 let start = Instant::now();
                 let per_index = tokio::task::spawn_blocking(move || {
-                    idx_registry.insert_batches_parallel(&stored_batches)
+                    idx_registry.insert_batches(&stored_batches)
                 })
                 .await
                 .map_err(|e| Error::internal(format!("Index update task panicked: {}", e)))??;

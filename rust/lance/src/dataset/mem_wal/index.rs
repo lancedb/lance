@@ -58,6 +58,19 @@ use pk_key::encode_pk_batch;
 /// [`BTreeMemIndex`]'s byte backend indexes it directly.
 const PK_KEY_COLUMN: &str = "__pk_key__";
 
+/// Row count at or below which [`IndexStore::insert_batches`] indexes inline
+/// rather than spawning a thread per index.
+///
+/// The spawn is one OS thread *per index* — tens of microseconds each, and a table can
+/// carry several BTrees alongside its HNSW and FTS — so for a small batch it costs more
+/// than the indexing it parallelizes. Small batches are not the exceptional case: a
+/// durable put triggers a WAL flush covering only the batch it just inserted, so this
+/// path is routinely called with a single short batch.
+///
+/// The crossover depends on per-row HNSW cost, which varies with dimension and
+/// `ef_construction`; tune against `benches/mem_wal/vector/mem_wal_index_micro.rs`.
+const PARALLEL_INDEX_MIN_ROWS: usize = 64;
+
 /// The memtable's primary-key index, used to answer "newest visible version of
 /// this key" for dedup. Single-column PKs reuse the column's compact typed
 /// [`BTreeMemIndex`] (no second copy); composite PKs key a `BTreeMemIndex` on
@@ -728,43 +741,136 @@ impl IndexStore {
         }
     }
 
-    /// Insert multiple batches into all indexes with cross-batch optimization.
+    /// Insert multiple batches into every index.
+    ///
+    /// Above [`PARALLEL_INDEX_MIN_ROWS`] rows each index runs on its own thread, which
+    /// maximizes parallelism when several indexes are maintained. At or below it they run
+    /// inline on the calling thread: the spawn is one OS thread *per index*, and for a
+    /// handful of rows that costs more than the indexing itself.
+    ///
+    /// Returns a map of index names to their update durations for performance tracking.
     #[instrument(name = "idx_insert_batches", level = "debug", skip_all, fields(batch_count = batches.len()))]
-    pub fn insert_batches(&self, batches: &[StoredBatch]) -> Result<()> {
+    pub fn insert_batches(
+        &self,
+        batches: &[StoredBatch],
+    ) -> Result<std::collections::HashMap<String, std::time::Duration>> {
+        use std::time::Instant;
+
         if batches.is_empty() {
-            return Ok(());
+            return Ok(std::collections::HashMap::new());
         }
 
         let track_pk_overrides = self.should_track_pk_overrides();
-        // BTree indexes: iterate batches (no cross-batch optimization benefit)
-        for index in self.btree_indexes.values() {
+
+        // One task per index, boxed so the inline and the threaded path drive the very
+        // same closures. Each reports whether it saw an already-present PK.
+        type IndexTask<'a> = Box<dyn Fn() -> Result<bool> + Send + Sync + 'a>;
+        let mut tasks: Vec<(&str, IndexTask<'_>)> = Vec::new();
+
+        for (name, index) in &self.btree_indexes {
             let track_this_index = track_pk_overrides && self.is_single_pk_btree(index);
-            let mut had_existing = false;
-            for stored in batches {
-                if track_this_index {
-                    had_existing |=
-                        index.insert_and_report_existing(&stored.data, stored.row_offset)?;
-                } else {
-                    index.insert(&stored.data, stored.row_offset)?;
-                }
+            tasks.push((
+                name.as_str(),
+                Box::new(move || {
+                    let mut had_existing = false;
+                    for stored in batches {
+                        if track_this_index {
+                            had_existing |= index
+                                .insert_and_report_existing(&stored.data, stored.row_offset)?;
+                        } else {
+                            index.insert(&stored.data, stored.row_offset)?;
+                        }
+                    }
+                    Ok(had_existing)
+                }),
+            ));
+        }
+
+        for (name, index) in &self.hnsw_indexes {
+            tasks.push((
+                name.as_str(),
+                Box::new(move || index.insert_batches(batches).map(|_| false)),
+            ));
+        }
+
+        for (name, index) in &self.fts_indexes {
+            tasks.push((
+                name.as_str(),
+                Box::new(move || {
+                    for stored in batches {
+                        index.insert(&stored.data, stored.row_offset)?;
+                    }
+                    Ok(false)
+                }),
+            ));
+        }
+
+        // Keep the raw `Duration` so sub-millisecond timings (the steady state for BTree
+        // updates) survive instead of truncating to 0.
+        let total_rows: usize = batches.iter().map(|b| b.num_rows).sum();
+        let results: Vec<(&str, std::time::Duration, Result<bool>)> =
+            if tasks.len() < 2 || total_rows <= PARALLEL_INDEX_MIN_ROWS {
+                tasks
+                    .iter()
+                    .map(|(name, task)| {
+                        let start = Instant::now();
+                        let result = task();
+                        (*name, start.elapsed(), result)
+                    })
+                    .collect()
+            } else {
+                std::thread::scope(|scope| {
+                    let handles: Vec<_> = tasks
+                        .iter()
+                        .map(|(name, task)| {
+                            let handle = scope.spawn(move || {
+                                let start = Instant::now();
+                                let result = task();
+                                (start.elapsed(), result)
+                            });
+                            (*name, handle)
+                        })
+                        .collect();
+
+                    handles
+                        .into_iter()
+                        .map(|(name, handle)| match handle.join() {
+                            Ok((duration, result)) => (name, duration, result),
+                            Err(_) => (
+                                name,
+                                std::time::Duration::ZERO,
+                                Err(Error::internal(format!("Index '{}' thread panicked", name))),
+                            ),
+                        })
+                        .collect()
+                })
+            };
+
+        // Every task ran to completion whether or not a peer failed (the threaded path
+        // joins all handles unconditionally). Keep the first error; there is no rollback,
+        // so a failure here is terminal for the writer.
+        let mut first_error: Option<Error> = None;
+        let mut had_existing_pk = false;
+        let mut duration_map =
+            std::collections::HashMap::<String, std::time::Duration>::with_capacity(results.len());
+
+        for (name, duration, result) in results {
+            duration_map.insert(name.to_string(), duration);
+            match result {
+                Ok(had_existing) => had_existing_pk |= had_existing,
+                Err(e) if first_error.is_none() => first_error = Some(e),
+                Err(_) => {}
             }
-            self.mark_pk_overrides_if_needed(had_existing);
         }
 
-        // HNSW indexes: use batched insert
-        for index in self.hnsw_indexes.values() {
-            index.insert_batches(batches)?;
+        if let Some(e) = first_error {
+            return Err(e);
         }
+        self.mark_pk_overrides_if_needed(had_existing_pk);
 
-        // FTS indexes: iterate batches (potential future optimization)
-        for index in self.fts_indexes.values() {
-            for stored in batches {
-                index.insert(&stored.data, stored.row_offset)?;
-            }
-        }
-
-        // Single-column PK aliases a `btree_indexes` entry (maintained above);
-        // a composite PK has its own index, maintained here.
+        // Single-column PK aliases a `btree_indexes` entry — its task above already
+        // maintained it. A composite PK has its own index; maintain it here before the
+        // watermark advances so the visible prefix is fully indexed.
         let mut had_existing = false;
         for stored in batches {
             had_existing |=
@@ -776,142 +882,7 @@ impl IndexStore {
         let max_bp = batches.iter().map(|b| b.batch_position).max().unwrap();
         self.advance_max_visible_batch_position(max_bp);
 
-        Ok(())
-    }
-
-    /// Insert multiple batches into all indexes in parallel.
-    ///
-    /// Each individual index runs in its own thread, regardless of type.
-    /// This maximizes parallelism when multiple indexes are maintained.
-    ///
-    /// This is used during WAL flush to parallelize index updates with WAL I/O.
-    /// Insert batches into all indexes in parallel.
-    ///
-    /// Returns a map of index names to their update durations for performance tracking.
-    #[allow(clippy::print_stderr)]
-    #[instrument(name = "idx_insert_batches_parallel", level = "debug", skip_all, fields(batch_count = batches.len()))]
-    pub fn insert_batches_parallel(
-        &self,
-        batches: &[StoredBatch],
-    ) -> Result<std::collections::HashMap<String, std::time::Duration>> {
-        use std::time::Instant;
-
-        if batches.is_empty() {
-            return Ok(std::collections::HashMap::new());
-        }
-
-        let track_pk_overrides = self.should_track_pk_overrides();
-        // Use std::thread::scope for parallel CPU-bound work
-        std::thread::scope(|scope| {
-            // Each handle returns (index_name, index_type, duration, Result)
-            let mut handles: Vec<(
-                &str,
-                &str,
-                std::thread::ScopedJoinHandle<'_, (std::time::Duration, Result<bool>)>,
-            )> = Vec::new();
-
-            // Spawn a thread for each BTree index
-            for (name, index) in &self.btree_indexes {
-                let track_this_index = track_pk_overrides && self.is_single_pk_btree(index);
-                let handle = scope.spawn(move || -> (std::time::Duration, Result<bool>) {
-                    let start = Instant::now();
-                    let result = (|| {
-                        let mut had_existing = false;
-                        for stored in batches {
-                            if track_this_index {
-                                had_existing |= index
-                                    .insert_and_report_existing(&stored.data, stored.row_offset)?;
-                            } else {
-                                index.insert(&stored.data, stored.row_offset)?;
-                            }
-                        }
-                        Ok(had_existing)
-                    })();
-                    (start.elapsed(), result)
-                });
-                handles.push((name.as_str(), "btree", handle));
-            }
-
-            // Spawn a thread for each HNSW index
-            for (name, index) in &self.hnsw_indexes {
-                let handle = scope.spawn(move || -> (std::time::Duration, Result<bool>) {
-                    let start = Instant::now();
-                    let result = index.insert_batches(batches).map(|_| false);
-                    (start.elapsed(), result)
-                });
-                handles.push((name.as_str(), "hnsw", handle));
-            }
-
-            // Spawn a thread for each FTS index
-            for (name, index) in &self.fts_indexes {
-                let handle = scope.spawn(move || -> (std::time::Duration, Result<bool>) {
-                    let start = Instant::now();
-                    let result = (|| {
-                        for stored in batches {
-                            index.insert(&stored.data, stored.row_offset)?;
-                        }
-                        Ok(false)
-                    })();
-                    (start.elapsed(), result)
-                });
-                handles.push((name.as_str(), "fts", handle));
-            }
-
-            // Collect results, log timing, and check for errors. Keep the raw
-            // `Duration` so sub-millisecond timings (the steady-state case for
-            // BTree updates) are preserved instead of getting truncated to 0.
-            let mut first_error: Option<Error> = None;
-            let mut timings: Vec<(&str, &str, std::time::Duration)> = Vec::new();
-            let mut had_existing_pk = false;
-
-            for (name, idx_type, handle) in handles {
-                match handle.join() {
-                    Ok((duration, Ok(had_existing))) => {
-                        timings.push((name, idx_type, duration));
-                        had_existing_pk |= had_existing;
-                    }
-                    Ok((duration, Err(e))) => {
-                        timings.push((name, idx_type, duration));
-                        if first_error.is_none() {
-                            first_error = Some(e);
-                        }
-                    }
-                    Err(_) => {
-                        if first_error.is_none() {
-                            first_error =
-                                Some(Error::internal(format!("Index '{}' thread panicked", name)));
-                        }
-                    }
-                }
-            }
-
-            if let Some(e) = first_error {
-                return Err(e);
-            }
-            self.mark_pk_overrides_if_needed(had_existing_pk);
-
-            let duration_map: std::collections::HashMap<String, std::time::Duration> = timings
-                .into_iter()
-                .map(|(name, _idx_type, duration)| (name.to_string(), duration))
-                .collect();
-
-            // Single-column PK aliases a `btree_indexes` entry — its thread above
-            // already maintained it (and joined). A composite PK has its own
-            // index; maintain it here before the watermark advances so the
-            // visible prefix is fully indexed.
-            let mut had_existing = false;
-            for stored in batches {
-                had_existing |=
-                    self.insert_composite_pk(&stored.data, stored.row_offset, track_pk_overrides)?;
-            }
-            self.mark_pk_overrides_if_needed(had_existing);
-
-            // Update global watermark to the max batch position
-            let max_bp = batches.iter().map(|b| b.batch_position).max().unwrap();
-            self.advance_max_visible_batch_position(max_bp);
-
-            Ok(duration_map)
-        })
+        Ok(duration_map)
     }
 
     /// Get a BTree index by name.
@@ -1007,6 +978,7 @@ mod tests {
     use arrow_array::{Int32Array, StringArray};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use log::warn;
+    use rstest::rstest;
     use std::sync::Arc;
     use uuid::Uuid;
 
@@ -1046,6 +1018,21 @@ mod tests {
                     "goodbye world",
                     "hello again",
                 ])),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn create_sized_batch(schema: &ArrowSchema, start_id: i32, num_rows: usize) -> RecordBatch {
+        let ids: Vec<i32> = (0..num_rows as i32).map(|i| start_id + i).collect();
+        let names: Vec<String> = ids.iter().map(|id| format!("name-{id}")).collect();
+        let descriptions: Vec<String> = ids.iter().map(|id| format!("hello world {id}")).collect();
+        RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(StringArray::from(names)),
+                Arc::new(StringArray::from(descriptions)),
             ],
         )
         .unwrap()
@@ -1529,6 +1516,40 @@ mod tests {
         // Insert without batch position shouldn't change watermark
         registry.insert(&batch, 6).unwrap();
         assert_eq!(registry.max_visible_batch_position(), 10);
+    }
+
+    /// `insert_batches` picks the inline or the threaded path by row count, so
+    /// exercise both and assert they leave the same index state: every row indexed
+    /// exactly once, in every index, with a timing reported for each.
+    #[rstest]
+    #[case::inline(8)]
+    #[case::threaded(PARALLEL_INDEX_MIN_ROWS + 64)]
+    fn test_insert_batches_indexes_every_row_once(#[case] num_rows: usize) {
+        let schema = create_test_schema();
+        let mut registry = IndexStore::new();
+        registry.add_btree("id_idx".to_string(), 0, "id".to_string());
+        registry.add_fts("desc_idx".to_string(), 2, "description".to_string());
+
+        let batch = create_sized_batch(&schema, 0, num_rows);
+        let durations = registry
+            .insert_batches(&[StoredBatch::new(batch, 0, 2)])
+            .unwrap();
+
+        assert_eq!(durations.len(), 2, "expected one timing per index");
+        assert!(durations.contains_key("id_idx"));
+        assert!(durations.contains_key("desc_idx"));
+
+        let btree = registry.get_btree("id_idx").unwrap();
+        for id in 0..num_rows as i32 {
+            let positions = btree.get(&ScalarValue::Int32(Some(id)));
+            assert_eq!(
+                positions.len(),
+                1,
+                "id={id} should be indexed exactly once, got {positions:?}"
+            );
+        }
+        assert_eq!(registry.get_fts("desc_idx").unwrap().doc_count(), num_rows);
+        assert_eq!(registry.max_visible_batch_position(), 2);
     }
 
     #[test]
