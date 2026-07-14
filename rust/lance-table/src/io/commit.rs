@@ -1091,7 +1091,7 @@ pub async fn commit_handler_from_url(
 
     match url.scheme() {
         "file" | "file-object-store" => Ok(local_handler),
-        "s3" | "gs" | "az" | "abfss" | "memory" | "oss" | "cos" | "shared-memory" => {
+        "s3" | "gs" | "az" | "abfss" | "memory" | "oss" | "cos" | "cosn" | "shared-memory" => {
             Ok(Arc::new(ConditionalPutCommitHandler))
         }
         #[cfg(not(feature = "dynamodb"))]

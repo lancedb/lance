@@ -37,7 +37,7 @@ use super::local::LocalObjectReader;
 use crate::uring::{UringCurrentThreadReader, UringReader};
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
 pub(crate) mod dynamic_credentials;
-#[cfg(any(feature = "oss", feature = "huggingface", feature = "tos"))]
+#[cfg(any(feature = "oss", feature = "huggingface", feature = "tos", feature = "tencent"))]
 pub(crate) mod dynamic_opendal;
 mod list_retry;
 #[cfg(feature = "metrics")]

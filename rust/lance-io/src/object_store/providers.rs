@@ -354,6 +354,8 @@ impl Default for ObjectStoreRegistry {
         providers.insert("oss".into(), Arc::new(oss::OssStoreProvider));
         #[cfg(feature = "tencent")]
         providers.insert("cos".into(), Arc::new(tencent::TencentStoreProvider));
+        #[cfg(feature = "tencent")]
+        providers.insert("cosn".into(), Arc::new(tencent::TencentStoreProvider));
         #[cfg(feature = "huggingface")]
         providers.insert("hf".into(), Arc::new(huggingface::HuggingfaceStoreProvider));
         #[cfg(feature = "tos")]
