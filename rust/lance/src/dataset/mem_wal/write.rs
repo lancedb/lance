@@ -37,6 +37,7 @@ use uuid::Uuid;
 
 pub use super::index::{
     BTreeIndexConfig, BTreeMemIndex, FtsIndexConfig, HnswIndexConfig, IndexStore, MemIndexConfig,
+    validate_index_configs,
 };
 pub use super::memtable::CacheConfig;
 pub use super::memtable::MemTable;
@@ -1495,6 +1496,13 @@ impl ShardWriter {
         let pk_fields = lance_schema.unenforced_primary_key();
         let pk_field_ids: Vec<i32> = pk_fields.iter().map(|f| f.id).collect();
         let pk_columns: Vec<String> = pk_fields.iter().map(|f| f.name.clone()).collect();
+
+        // Reject an index config that disagrees with the schema *before* a
+        // single row is accepted. Such a config fails deterministically on every
+        // insert, including inserts replayed from the WAL — so once a row is
+        // durable the shard can never reopen. Fail the open instead.
+        validate_index_configs(index_configs, schema.as_ref(), &pk_columns)?;
+
         let mut memtable = MemTable::with_capacity(
             schema.clone(),
             manifest.current_generation,
@@ -5047,6 +5055,45 @@ mod tests {
         assert_eq!(all.num_rows(), 10);
 
         writer_b.close().await.unwrap();
+    }
+
+    /// An index config that disagrees with the schema fails `open()` outright.
+    /// It must not be allowed to accept writes: the insert would fail
+    /// deterministically on every batch, including batches replayed from the
+    /// WAL, so once a row was durable the shard could never reopen. Before this
+    /// check, an FTS index on a non-Utf8 column silently indexed nothing and the
+    /// shard reported healthy.
+    #[tokio::test]
+    async fn test_open_rejects_index_config_that_disagrees_with_schema() {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = schema_with_pk();
+        let shard_id = Uuid::new_v4();
+
+        // `id` is Int32, not a string column.
+        let bad_fts = MemIndexConfig::Fts(FtsIndexConfig::new(
+            "bad_fts".to_string(),
+            0,
+            "id".to_string(),
+        ));
+
+        let Err(err) = ShardWriter::open(
+            store,
+            base_path,
+            base_uri,
+            memtable_config_with_pk(shard_id),
+            schema,
+            vec![bad_fts],
+        )
+        .await
+        else {
+            panic!("open must reject an FTS index on a non-Utf8 column");
+        };
+
+        let message = err.to_string();
+        assert!(
+            message.contains("bad_fts") && message.contains("Utf8"),
+            "error must name the index and the constraint, got: {message}"
+        );
     }
 
     /// Replay is a no-op on a fresh shard: the MemTable starts empty.

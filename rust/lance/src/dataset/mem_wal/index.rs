@@ -28,6 +28,7 @@ use datafusion::common::ScalarValue;
 
 use super::memtable::batch_store::StoredBatch;
 use arrow_array::RecordBatch;
+use arrow_schema::{DataType, Schema as ArrowSchema};
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::{Error, Result};
 use lance_index::pbold;
@@ -92,6 +93,143 @@ enum PkIndex {
 // ============================================================================
 // Index Store
 // ============================================================================
+
+/// Validate every configured in-memory index, and the composite primary key,
+/// against the shard schema. Call once at shard open, before any write can land.
+///
+/// This is what makes poison-and-replay *terminating*. An index insert that
+/// fails deterministically on a row that is already WAL-durable cannot be
+/// recovered from: the writer poisons, the operator reopens, replay re-reads the
+/// same WAL rows, the same insert fails again, and `open()` propagates it — a
+/// shard that never comes back. Every such failure is an index *config*
+/// disagreeing with the schema, never a property of the data, so one pass here
+/// closes the whole class before a single row is accepted.
+///
+/// The data-dependent errors inside the index layer are already unreachable
+/// through `put`: `MemTable::insert_batches_only` does a full `Arc<Schema>`
+/// equality check, so a batch that would trip one is rejected before it reaches
+/// the batch store, let alone the WAL.
+pub fn validate_index_configs(
+    configs: &[MemIndexConfig],
+    schema: &ArrowSchema,
+    pk_columns: &[String],
+) -> Result<()> {
+    for config in configs {
+        let column = config.column();
+        let field = schema.field_with_name(column).map_err(|_| {
+            Error::invalid_input(format!(
+                "index '{}' is configured on column '{}', which is not in the shard schema; \
+                 available columns: [{}]",
+                config.name(),
+                column,
+                schema
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        })?;
+
+        match config {
+            // BTree falls back to per-row `ScalarValue` extraction, so it
+            // accepts any column type the schema can hold. Existence is the
+            // only precondition.
+            MemIndexConfig::BTree(_) => {}
+            MemIndexConfig::Fts(_) => {
+                if !matches!(
+                    field.data_type(),
+                    DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+                ) {
+                    return Err(Error::invalid_input(format!(
+                        "FTS index '{}' requires a Utf8, LargeUtf8, or Utf8View column; \
+                         column '{}' is {:?}",
+                        config.name(),
+                        column,
+                        field.data_type()
+                    )));
+                }
+            }
+            MemIndexConfig::Hnsw(_) => match field.data_type() {
+                DataType::FixedSizeList(item, dim) => {
+                    if item.data_type() != &DataType::Float32 {
+                        return Err(Error::invalid_input(format!(
+                            "HNSW index '{}' requires a FixedSizeList<Float32> column; \
+                             column '{}' has item type {:?}",
+                            config.name(),
+                            column,
+                            item.data_type()
+                        )));
+                    }
+                    // `HnswMemIndex.dim` is a placeholder until the first batch
+                    // pins it (`hnsw.rs`), so a zero-width vector would only
+                    // surface at insert time — i.e. on already-durable data.
+                    if *dim <= 0 {
+                        return Err(Error::invalid_input(format!(
+                            "HNSW index '{}' requires a vector dimension > 0; column '{}' has \
+                             dimension {dim}",
+                            config.name(),
+                            column,
+                        )));
+                    }
+                }
+                other => {
+                    return Err(Error::invalid_input(format!(
+                        "HNSW index '{}' requires a FixedSizeList<Float32> column; \
+                         column '{}' is {:?}",
+                        config.name(),
+                        column,
+                        other
+                    )));
+                }
+            },
+        }
+    }
+
+    // A single-column PK aliases a BTree entry (any type). Only a *composite* PK
+    // builds an order-preserving encoded key, and only some types encode.
+    if pk_columns.len() > 1 {
+        for column in pk_columns {
+            let field = schema.field_with_name(column).map_err(|_| {
+                Error::invalid_input(format!(
+                    "primary-key column '{column}' is not in the shard schema"
+                ))
+            })?;
+            if !is_encodable_pk_type(field.data_type()) {
+                return Err(Error::invalid_input(format!(
+                    "composite primary-key column '{column}' has type {:?}, which has no \
+                     order-preserving key encoding",
+                    field.data_type()
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Types `pk_key::encode_value` can encode into an order-preserving composite key.
+fn is_encodable_pk_type(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Date32
+            | DataType::Date64
+            | DataType::Boolean
+            | DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Binary
+            | DataType::LargeBinary
+            | DataType::FixedSizeBinary(_)
+    )
+}
 
 /// Configuration for an index in MemWAL.
 ///
@@ -1477,6 +1615,105 @@ mod tests {
         // Also test field_id lookup
         assert!(registry.get_btree_by_field_id(0).is_some());
         assert!(registry.get_fts_by_field_id(2).is_some());
+    }
+
+    fn vector_schema() -> Arc<ArrowSchema> {
+        Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("description", DataType::Utf8, true),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 4),
+                true,
+            ),
+            Field::new(
+                "f64_vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float64, true)), 4),
+                true,
+            ),
+        ]))
+    }
+
+    /// Every index config that would fail *deterministically* on insert must be
+    /// rejected at open instead. Such a config also fails on WAL replay, so once
+    /// a row is durable the shard could never reopen — poison-and-replay would
+    /// not terminate.
+    #[rstest]
+    #[case::btree_ok(MemIndexConfig::BTree(BTreeIndexConfig {
+        name: "idx".into(), field_id: 0, column: "id".into(),
+    }), None)]
+    #[case::btree_missing_column(MemIndexConfig::BTree(BTreeIndexConfig {
+        name: "idx".into(), field_id: 9, column: "nope".into(),
+    }), Some("not in the shard schema"))]
+    #[case::fts_ok(MemIndexConfig::Fts(FtsIndexConfig::new(
+        "idx".into(), 1, "description".into(),
+    )), None)]
+    #[case::fts_non_utf8(MemIndexConfig::Fts(FtsIndexConfig::new(
+        "idx".into(), 0, "id".into(),
+    )), Some("requires a Utf8, LargeUtf8, or Utf8View column"))]
+    #[case::fts_missing_column(MemIndexConfig::Fts(FtsIndexConfig::new(
+        "idx".into(), 9, "nope".into(),
+    )), Some("not in the shard schema"))]
+    #[case::hnsw_ok(MemIndexConfig::Hnsw(Box::new(HnswIndexConfig::new(
+        "idx".into(), 2, "vector".into(), DistanceType::L2,
+    ))), None)]
+    #[case::hnsw_not_a_vector(MemIndexConfig::Hnsw(Box::new(HnswIndexConfig::new(
+        "idx".into(), 0, "id".into(), DistanceType::L2,
+    ))), Some("requires a FixedSizeList<Float32> column"))]
+    #[case::hnsw_wrong_item_type(MemIndexConfig::Hnsw(Box::new(HnswIndexConfig::new(
+        "idx".into(), 3, "f64_vector".into(), DistanceType::L2,
+    ))), Some("item type Float64"))]
+    #[case::hnsw_missing_column(MemIndexConfig::Hnsw(Box::new(HnswIndexConfig::new(
+        "idx".into(), 9, "nope".into(), DistanceType::L2,
+    ))), Some("not in the shard schema"))]
+    fn test_validate_index_configs(
+        #[case] config: MemIndexConfig,
+        #[case] expected_error: Option<&str>,
+    ) {
+        let schema = vector_schema();
+        let result = validate_index_configs(&[config], &schema, &[]);
+        match expected_error {
+            None => result.expect("valid config must pass validation"),
+            Some(fragment) => {
+                let message = result
+                    .expect_err("invalid config must be rejected")
+                    .to_string();
+                assert!(
+                    message.contains(fragment),
+                    "error must explain the mismatch; wanted {fragment:?}, got {message:?}"
+                );
+            }
+        }
+    }
+
+    /// A composite PK builds an order-preserving encoded key, so its columns must
+    /// be encodable. A single-column PK aliases a BTree entry, which accepts any
+    /// type — so it must *not* be rejected here.
+    #[test]
+    fn test_validate_composite_pk_column_types() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new(
+                "coords",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 2),
+                true,
+            ),
+        ]));
+
+        validate_index_configs(&[], &schema, &["id".into(), "name".into()])
+            .expect("Int32 + Utf8 composite PK must be encodable");
+
+        let err = validate_index_configs(&[], &schema, &["id".into(), "coords".into()])
+            .expect_err("a FixedSizeList PK column has no order-preserving encoding");
+        assert!(
+            err.to_string().contains("order-preserving key encoding"),
+            "error must name the reason, got {err}"
+        );
+
+        // A single-column PK of the same type is fine: it aliases a BTree.
+        validate_index_configs(&[], &schema, &["coords".into()])
+            .expect("single-column PK aliases a BTree and accepts any type");
     }
 
     #[test]

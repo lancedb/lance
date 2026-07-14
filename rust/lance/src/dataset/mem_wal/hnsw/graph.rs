@@ -594,9 +594,12 @@ impl HnswGraph {
     }
 
     fn validate_source(&self, vectors: &impl VectorSource, needed_len: usize) -> Result<()> {
+        // Not caller input: the graph was sized below what the memtable holds.
+        // See the matching note in `storage.rs::append_batch`.
         if needed_len > self.nodes.len() {
-            return Err(Error::invalid_input(format!(
-                "graph capacity {} exhausted: need {needed_len}",
+            return Err(Error::internal(format!(
+                "HNSW graph capacity {} exhausted: need {needed_len}; \
+                 the graph is sized below the memtable's row capacity",
                 self.nodes.len()
             )));
         }
