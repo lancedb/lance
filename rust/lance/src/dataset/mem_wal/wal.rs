@@ -283,7 +283,7 @@ pub struct WalEntry {
 }
 
 /// Result of a WAL flush. Append-only: index application runs on its own task
-/// (see [`apply_index_range`]), which records its own stats, so this no longer
+/// (see `apply_index_range`), which records its own stats, so this no longer
 /// carries index-update timing or row counts.
 #[derive(Debug, Clone)]
 pub struct WalFlushResult {
