@@ -536,6 +536,30 @@ fn field_column_shape(field: &Field, is_structural: bool) -> (bool, bool) {
     (contributes, recurse)
 }
 
+// Count the V2.1 physical columns required to reconstruct a projected field.
+// This is the same DFS shape consumed by `ColumnInfoIter`: ordinary structural
+// nodes are transparent and leaves contribute columns. Indexed metadata loading
+// can therefore compact any ordinary structural projection into 0..N while
+// preserving this order.
+//
+// Blob and packed-struct fields remain unsupported by indexed projection. Their
+// opaque decode semantics are handled by the existing full-metadata reader.
+fn indexed_projection_column_count(field: &Field) -> Option<usize> {
+    if field.is_blob() || field.is_packed_struct() {
+        return None;
+    }
+
+    let (contributes, recurse) = field_column_shape(field, true);
+    let initial = usize::from(contributes);
+    if !recurse {
+        return Some(initial);
+    }
+
+    field.children.iter().try_fold(initial, |count, child| {
+        count.checked_add(indexed_projection_column_count(child)?)
+    })
+}
+
 // Whether a field's children each cover the same rows as the field itself. Struct
 // children do (one value per parent row), so they must share its length. List,
 // map, and fixed-size-list items have an independent cardinality (item count, not
@@ -961,7 +985,7 @@ impl FileReader {
             fields: Fields(pb_schema.fields),
             metadata: pb_schema.metadata,
         };
-        let schema = lance_core::datatypes::Schema::from(fields_with_meta);
+        let schema = Schema::try_from(fields_with_meta)?;
         Ok((num_rows, schema))
     }
 
@@ -1836,12 +1860,18 @@ impl FileMetadataProvider {
         projection: &ReaderProjection,
         version: LanceFileVersion,
     ) -> bool {
-        version >= LanceFileVersion::V2_1
-            && !projection.schema.fields.is_empty()
-            && projection.schema.fields.len() == projection.column_indices.len()
-            && projection.schema.fields.iter().all(|field| {
-                field.children.is_empty() && !field.is_blob() && !field.is_packed_struct()
+        if version < LanceFileVersion::V2_1 || projection.schema.fields.is_empty() {
+            return false;
+        }
+
+        projection
+            .schema
+            .fields
+            .iter()
+            .try_fold(0usize, |count, field| {
+                count.checked_add(indexed_projection_column_count(field)?)
             })
+            == Some(projection.column_indices.len())
     }
 
     fn validate_indexed_projection(
@@ -1871,7 +1901,7 @@ impl FileMetadataProvider {
         }
         if !Self::supports_indexed_projection(projection, metadata_index.version) {
             return Err(Error::not_supported(format!(
-                "lazy column metadata loading only supports direct V2.1+ top-level physical column projections; got file version {:?}, {} schema fields, and {} column indices",
+                "lazy column metadata loading requires a V2.1+ ordinary structural projection without blob or packed-struct fields whose physical-column count matches the projection; got file version {:?}, {} schema fields, and {} column indices",
                 metadata_index.version,
                 projection.schema.fields.len(),
                 projection.column_indices.len()
@@ -2593,7 +2623,7 @@ mod tests {
     use futures::{StreamExt, prelude::stream::TryStreamExt};
     use lance_arrow::{BLOB_META_KEY, RecordBatchExt};
     use lance_core::{ArrowResult, datatypes::Schema};
-    use lance_datagen::{BatchCount, ByteCount, RowCount, array, gen_batch};
+    use lance_datagen::{ArrayGeneratorExt, BatchCount, ByteCount, RowCount, array, gen_batch};
     use lance_encoding::{
         decoder::{
             DecodeBatchScheduler, DecoderPlugins, FilterExpression, ReadBatchTask, decode_batch,
@@ -2648,6 +2678,60 @@ mod tests {
             reader = reader.col(format!("c{column_idx}"), array::step::<Int32Type>());
         }
         let reader = reader.into_reader_rows(RowCount::from(1000), BatchCount::from(100));
+
+        write_lance_file(
+            reader,
+            fs,
+            FileWriterOptions {
+                format_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    async fn create_wide_fixed_size_list_file(fs: &FsFixture, num_columns: usize) -> WrittenFile {
+        let data_type =
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 4);
+        let mut reader = gen_batch();
+        for column_idx in 0..num_columns {
+            reader = reader.col(
+                format!("c{column_idx}"),
+                array::rand_type(&data_type).with_random_nulls(0.1),
+            );
+        }
+        let reader = reader.into_reader_rows(RowCount::from(64), BatchCount::from(4));
+
+        write_lance_file(
+            reader,
+            fs,
+            FileWriterOptions {
+                format_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    async fn create_wide_structural_file(fs: &FsFixture, num_groups: usize) -> WrittenFile {
+        let struct_type = DataType::Struct(Fields::from(vec![
+            Field::new("x", DataType::Int32, true),
+            Field::new("y", DataType::Int32, true),
+        ]));
+        let list_type = DataType::List(Arc::new(Field::new("item", DataType::Int32, true)));
+        let mut reader = gen_batch();
+        for group_idx in 0..num_groups {
+            reader = reader
+                .col(
+                    format!("s{group_idx}"),
+                    array::rand_type(&struct_type).with_random_nulls(0.5),
+                )
+                .col(
+                    format!("l{group_idx}"),
+                    array::rand_type(&list_type).with_random_nulls(0.5),
+                );
+        }
+        let reader = reader.into_reader_rows(RowCount::from(64), BatchCount::from(4));
 
         write_lance_file(
             reader,
@@ -3157,6 +3241,170 @@ mod tests {
         );
     }
 
+    async fn assert_lazy_projection_matches_eager_and_reads_metadata_subset(
+        fs: &FsFixture,
+        projection: ReaderProjection,
+        shape: &str,
+    ) -> Vec<RecordBatch> {
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let eager_reader = FileReader::try_open(
+            file_scheduler.clone(),
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &test_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        let expected = eager_reader
+            .read_stream_projected(
+                lance_io::ReadBatchParams::RangeFull,
+                127,
+                16,
+                projection.clone(),
+                FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        let cache = test_cache();
+        let lazy_reader = ProjectedFileReader::try_open(
+            file_scheduler,
+            Some(projection.clone()),
+            Arc::<DecoderPlugins>::default(),
+            &cache,
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        let metadata_index = lazy_reader.metadata_index().unwrap();
+        let requested_metadata_bytes = projection
+            .column_indices
+            .iter()
+            .map(|column_index| metadata_index.column_metadata_offsets[*column_index as usize].1)
+            .sum::<u64>();
+        let total_metadata_bytes = metadata_index
+            .column_metadata_offsets
+            .iter()
+            .map(|(_, length)| *length)
+            .sum::<u64>();
+        assert!(total_metadata_bytes > requested_metadata_bytes * 8);
+
+        fs.object_store.io_stats_incremental();
+        let tasks = lazy_reader
+            .read_tasks(
+                lance_io::ReadBatchParams::Range(0..0),
+                127,
+                None,
+                FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap();
+        assert!(collect_read_tasks(tasks, 1).await.is_empty());
+        let metadata_stats = fs.object_store.io_stats_incremental();
+        assert!(
+            metadata_stats.read_bytes < total_metadata_bytes / 2,
+            "lazy {shape} read fetched too much metadata: read {} bytes, requested column metadata is {} bytes, total column metadata is {} bytes",
+            metadata_stats.read_bytes,
+            requested_metadata_bytes,
+            total_metadata_bytes
+        );
+
+        let tasks = lazy_reader
+            .read_tasks(
+                lance_io::ReadBatchParams::RangeFull,
+                127,
+                None,
+                FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap();
+        let actual = collect_read_tasks(tasks, 16).await;
+        assert_eq!(expected, actual);
+        actual
+    }
+
+    #[tokio::test]
+    async fn test_lazy_reader_fixed_size_list_projection_matches_eager_reader() {
+        let fs = FsFixture::default();
+        let written_file = create_wide_fixed_size_list_file(&fs, 512).await;
+        let projection = ReaderProjection::from_column_names(
+            LanceFileVersion::V2_1,
+            &written_file.schema,
+            &["c17", "c509"],
+        )
+        .unwrap();
+        assert!(ProjectedFileReader::supports_projection(
+            &projection,
+            LanceFileVersion::V2_1
+        ));
+        assert!(!ProjectedFileReader::supports_projection(
+            &projection,
+            LanceFileVersion::V2_0
+        ));
+        assert_lazy_projection_matches_eager_and_reads_metadata_subset(
+            &fs,
+            projection,
+            "fixed-size-list",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_lazy_reader_nested_projection_compacts_physical_columns() {
+        let fs = FsFixture::default();
+        let written_file = create_wide_structural_file(&fs, 128).await;
+        let projection = ReaderProjection::from_column_names(
+            LanceFileVersion::V2_1,
+            &written_file.schema,
+            &["s97.y", "l4", "s3"],
+        )
+        .unwrap();
+
+        assert_eq!(
+            projection
+                .schema
+                .fields
+                .iter()
+                .map(|field| field.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["s97", "l4", "s3"]
+        );
+        assert_eq!(projection.schema.fields[0].children.len(), 1);
+        assert_eq!(projection.schema.fields[0].children[0].name, "y");
+        assert_eq!(projection.schema.fields[2].children.len(), 2);
+        assert_eq!(projection.column_indices.len(), 4);
+        assert!(
+            projection
+                .column_indices
+                .windows(2)
+                .any(|indices| indices[0] > indices[1]),
+            "the projection must reorder physical columns to exercise compact remapping"
+        );
+        assert!(ProjectedFileReader::supports_projection(
+            &projection,
+            LanceFileVersion::V2_1
+        ));
+        let actual = assert_lazy_projection_matches_eager_and_reads_metadata_subset(
+            &fs, projection, "nested",
+        )
+        .await;
+        assert!(
+            actual
+                .iter()
+                .flat_map(|batch| batch.columns())
+                .any(|column| column.null_count() > 0),
+            "the structural projection must exercise nullable arrays"
+        );
+    }
+
     #[rstest]
     #[case::before_metadata_region(90, 5)]
     #[case::after_metadata_region(190, 20)]
@@ -3185,19 +3433,23 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::blob(BLOB_META_KEY)]
+    #[case::packed_struct("lance-encoding:packed")]
     #[tokio::test]
-    async fn test_lazy_reader_rejects_unsupported_projection() {
+    async fn test_lazy_reader_rejects_opaque_projection(#[case] metadata_key: &str) {
         let fs = FsFixture::default();
         let written_file = create_some_file(&fs, LanceFileVersion::V2_1).await;
 
-        let projection = ReaderProjection::from_column_names(
+        let ordinary_projection = ReaderProjection::from_column_names(
             LanceFileVersion::V2_1,
             &written_file.schema,
-            &["location"],
+            &["location.x"],
         )
         .unwrap();
-        assert!(!ProjectedFileReader::supports_projection(
-            &projection,
+        assert_eq!(ordinary_projection.schema.fields[0].children.len(), 1);
+        assert!(ProjectedFileReader::supports_projection(
+            &ordinary_projection,
             LanceFileVersion::V2_1
         ));
 
@@ -3220,6 +3472,15 @@ mod tests {
             "expected InvalidInput, got {err:?}"
         );
 
+        let mut projection = ordinary_projection;
+        Arc::make_mut(&mut projection.schema).fields[0]
+            .metadata
+            .insert(metadata_key.to_string(), "true".to_string());
+        assert!(!ProjectedFileReader::supports_projection(
+            &projection,
+            LanceFileVersion::V2_1
+        ));
+
         let err = ProjectedFileReader::try_open(
             file_scheduler,
             Some(projection),
@@ -3231,7 +3492,7 @@ mod tests {
         .unwrap_err();
         assert!(
             matches!(err, lance_core::Error::NotSupported { .. }),
-            "expected NotSupported, got {err:?}"
+            "expected NotSupported for {metadata_key}, got {err:?}"
         );
     }
 

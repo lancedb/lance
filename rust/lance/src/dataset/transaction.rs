@@ -3246,7 +3246,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                         .into_iter()
                         .map(Fragment::try_from)
                         .collect::<Result<Vec<_>>>()?,
-                    schema: Schema::from(&Fields(schema)),
+                    schema: Schema::try_from(&Fields(schema))?,
                     config_upsert_values: config_upsert_option,
                     initial_bases: if initial_bases.is_empty() {
                         None
@@ -3314,7 +3314,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                     .into_iter()
                     .map(Fragment::try_from)
                     .collect::<Result<Vec<_>>>()?,
-                schema: Schema::from(&Fields(schema)),
+                schema: Schema::try_from(&Fields(schema))?,
             },
             Some(pb::transaction::Operation::Restore(pb::transaction::Restore { version })) => {
                 Operation::Restore { version }
@@ -3368,7 +3368,7 @@ impl TryFrom<pb::Transaction> for Transaction {
             },
             Some(pb::transaction::Operation::Project(pb::transaction::Project { schema })) => {
                 Operation::Project {
-                    schema: Schema::from(&Fields(schema)),
+                    schema: Schema::try_from(&Fields(schema))?,
                 }
             }
             Some(pb::transaction::Operation::UpdateConfig(update_config)) => {

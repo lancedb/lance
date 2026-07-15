@@ -40,6 +40,7 @@ use super::projection::{
     project_to_canonical, validate_projection_names, wants_row_address, wants_row_id,
 };
 use crate::session::Session;
+use lance_io::object_store::ObjectStoreParams;
 
 /// Plans point lookup queries over LSM data.
 ///
@@ -89,6 +90,8 @@ pub struct LsmPointLookupPlanner {
     bloom_filters: std::collections::HashMap<u64, Arc<Sbbf>>,
     /// Session threaded into flushed-generation opens (shared caches).
     session: Option<Arc<Session>>,
+    /// Store params for opening flushed generations, reusing the base dataset's store.
+    store_params: Option<ObjectStoreParams>,
     /// Cache of opened flushed-generation datasets.
     flushed_cache: Option<Arc<dyn DatasetCache>>,
     /// Optional warmer fired on first open of a flushed generation.
@@ -124,6 +127,7 @@ impl LsmPointLookupPlanner {
             base_schema,
             bloom_filters: std::collections::HashMap::new(),
             session: None,
+            store_params: None,
             flushed_cache: None,
             warmer: None,
             none_target,
@@ -131,10 +135,15 @@ impl LsmPointLookupPlanner {
         }
     }
 
-    /// Thread a session into flushed-generation opens so the first open
-    /// populates the shared index / file-metadata caches.
+    /// Set the session used to open flushed generations.
     pub fn with_session(mut self, session: Arc<Session>) -> Self {
         self.session = Some(session);
+        self
+    }
+
+    /// Set the store params used to open flushed generations.
+    pub fn with_store_params(mut self, store_params: ObjectStoreParams) -> Self {
+        self.store_params = Some(store_params);
         self
     }
 
@@ -651,6 +660,7 @@ impl LsmPointLookupPlanner {
                 let dataset = open_flushed_dataset(
                     path,
                     self.session.as_ref(),
+                    self.store_params.as_ref(),
                     self.flushed_cache.as_ref(),
                     self.warmer.as_ref(),
                 )

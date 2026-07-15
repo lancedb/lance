@@ -856,7 +856,8 @@ def hamming_clustering_for_sample(
     dataset : LanceDataset
         The Lance dataset containing the hash column.
     column : str
-        Name of the hash column (must be FixedSizeList<UInt8, 8>)
+        Name of the hash column (must be FixedSizeList<UInt8, N> where N is a
+        positive multiple of 8 bytes)
     sample_size : int, optional
         Number of rows to sample. If None, uses all rows.
     hamming_threshold : int, default 10
@@ -898,7 +899,8 @@ def hamming_clustering_for_range(
     dataset : LanceDataset
         The Lance dataset containing the hash column.
     column : str
-        Name of the hash column (must be FixedSizeList<UInt8, 8>)
+        Name of the hash column (must be FixedSizeList<UInt8, N> where N is a
+        positive multiple of 8 bytes)
     fragment_id : int
         The fragment ID to read from
     start_row : int

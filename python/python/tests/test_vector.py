@@ -155,21 +155,26 @@ def test_binary_vectors_invalid_metric(tmp_path):
 
 
 def _hash_table(hashes):
-    """Build a table with a ``hash`` column of FixedSizeList<UInt8, 8>.
+    """Build a table with a ``hash`` column of FixedSizeList<UInt8, N>.
 
-    ``hashes`` is a list of 8-byte sequences, one per row.
+    ``hashes`` is a list of byte sequences, one per row. The byte width must
+    be a positive multiple of 8.
     """
+    byte_width = len(hashes[0])
+    assert byte_width > 0 and byte_width % 8 == 0
+    assert all(len(row) == byte_width for row in hashes)
     flat = [byte for row in hashes for byte in row]
     values = pa.FixedSizeListArray.from_arrays(
-        pa.array(flat, type=pa.uint8()), list_size=8
+        pa.array(flat, type=pa.uint8()), list_size=byte_width
     )
     return pa.Table.from_arrays([values], names=["hash"])
 
 
-def test_hamming_clustering_for_sample(tmp_path):
-    hash_a = [0, 0, 0, 0, 0, 0, 0, 0]
-    hash_b = [255, 0, 0, 0, 0, 0, 0, 0]  # 8 bits from hash_a
-    hash_c = [1, 2, 3, 4, 5, 6, 7, 8]  # far from both
+@pytest.mark.parametrize("byte_width", [8, 16])
+def test_hamming_clustering_for_sample(tmp_path, byte_width):
+    hash_a = [0] * byte_width
+    hash_b = [0] * (byte_width - 8) + [255] + [0] * 7  # 8 bits from hash_a
+    hash_c = list(range(1, byte_width + 1))  # far from both
     # Rows 0,1,2 share hash_a; rows 3,4 share hash_b; row 5 is unique.
     table = _hash_table([hash_a, hash_a, hash_a, hash_b, hash_b, hash_c])
     dataset = lance.write_dataset(table, tmp_path / "hashes")
@@ -189,11 +194,28 @@ def test_hamming_clustering_for_sample(tmp_path):
     assert clusters == {0: [1, 2], 3: [4]}
 
 
-def test_hamming_clustering_multi_segment(tmp_path):
+@pytest.mark.parametrize("byte_width", [8, 16])
+def test_hamming_clustering_multi_segment(tmp_path, byte_width):
+    mask = (1 << 64) - 1
+
+    def hash_bytes(value):
+        if byte_width == 8:
+            lanes = [(value * 0x9E3779B97F4A7C15) & mask]
+        else:
+            # Adjacent logical values share the first 64-bit lane and differ in
+            # later lanes, so threshold-0 clustering must compare every lane.
+            lanes = [
+                ((value // 2) * 0x9E3779B97F4A7C15) & mask,
+                ((value * 0xD6E8FEB86659FD93) ^ 0xA5A5A5A5A5A5A5A5) & mask,
+            ]
+        return [
+            byte for lane_value in lanes for byte in lane_value.to_bytes(8, "little")
+        ]
+
     # 25 distinct hash values, two copies each; the same table is written to
     # fragment 0 and appended as fragment 1.
-    values = [((i // 2) * 0x9E3779B97F4A7C15) & 0xFFFFFFFFFFFFFFFF for i in range(50)]
-    table = _hash_table([list(value.to_bytes(8, "little")) for value in values])
+    values = [i // 2 for i in range(50)]
+    table = _hash_table([hash_bytes(value) for value in values])
     dataset = lance.write_dataset(table, tmp_path / "hashes")
     dataset.create_index(
         "hash", index_type="IVF_FLAT", num_partitions=4, metric="hamming"

@@ -70,7 +70,7 @@ impl SqlToAllNullsOptimizer {
         match expr {
             Expr::Cast(cast) => {
                 if matches!(cast.expr.as_ref(), Expr::Literal(ScalarValue::Null, _)) {
-                    let data_type = cast.data_type.clone();
+                    let data_type = cast.field.data_type().clone();
                     AllNullsResult::AllNulls(data_type)
                 } else {
                     AllNullsResult::NotAllNulls

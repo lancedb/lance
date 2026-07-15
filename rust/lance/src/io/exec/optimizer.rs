@@ -32,9 +32,9 @@ pub struct CoalesceTake;
 impl CoalesceTake {
     /// Whether `plan` is a take node this rule knows how to collapse
     fn as_take(plan: &Arc<dyn ExecutionPlan>) -> Option<&dyn ExecutionPlan> {
-        if plan.as_any().is::<TakeExec>() {
+        if plan.downcast_ref::<TakeExec>().is_some() {
             Some(plan.as_ref())
-        } else if let Some(filtered_read) = plan.as_any().downcast_ref::<FilteredReadExec>() {
+        } else if let Some(filtered_read) = plan.downcast_ref::<FilteredReadExec>() {
             filtered_read
                 .row_stream_input()
                 .is_some()
@@ -125,9 +125,7 @@ impl PhysicalOptimizerRule for CoalesceTake {
                             return Ok(Transformed::yes(collapsed));
                         }
                     // Case 2: take -> CoalesceBatchesExec -> take
-                    } else if let Some(exec_child) =
-                        child.as_any().downcast_ref::<CoalesceBatchesExec>()
-                    {
+                    } else if let Some(exec_child) = child.downcast_ref::<CoalesceBatchesExec>() {
                         let inner_child = exec_child.children()[0].clone();
                         if let Some(inner_take) = Self::as_take(&inner_child)
                             && let Some(collapsed) =
@@ -164,7 +162,7 @@ impl PhysicalOptimizerRule for SimplifyProjection {
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         Ok(plan
             .transform_down(|plan| {
-                if let Some(proj) = plan.as_any().downcast_ref::<ProjectionExec>() {
+                if let Some(proj) = plan.downcast_ref::<ProjectionExec>() {
                     let children = proj.children();
                     if children.len() != 1 {
                         return Ok(Transformed::no(plan));
@@ -181,7 +179,7 @@ impl PhysicalOptimizerRule for SimplifyProjection {
                     }
 
                     if proj.expr().iter().enumerate().all(|(index, proj_expr)| {
-                        if let Some(expr) = proj_expr.expr.as_any().downcast_ref::<Column>() {
+                        if let Some(expr) = proj_expr.expr.downcast_ref::<Column>() {
                             // no renaming, no reordering
                             expr.index() == index && expr.name() == proj_expr.alias
                         } else {

@@ -3,7 +3,6 @@
 
 //! BTreeIndexExec - BTree index queries with MVCC visibility.
 
-use std::any::Any;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
@@ -312,10 +311,6 @@ impl ExecutionPlan for BTreeIndexExec {
         "BTreeIndexExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.output_schema.clone()
     }
@@ -358,13 +353,13 @@ impl ExecutionPlan for BTreeIndexExec {
         )))
     }
 
-    fn partition_statistics(&self, _partition: Option<usize>) -> DataFusionResult<Statistics> {
+    fn partition_statistics(&self, _partition: Option<usize>) -> DataFusionResult<Arc<Statistics>> {
         // We can't know the exact count without querying the index
-        Ok(Statistics {
+        Ok(Arc::new(Statistics {
             num_rows: Precision::Absent,
             total_byte_size: Precision::Absent,
             column_statistics: vec![],
-        })
+        }))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {

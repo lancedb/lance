@@ -24,6 +24,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use lance_core::{Error, Result};
+use lance_io::object_store::ObjectStoreParams;
 
 use crate::dataset::{Dataset, DatasetBuilder};
 use crate::session::Session;
@@ -39,6 +40,15 @@ use crate::session::Session;
 /// The key is the resolved absolute flushed path
 /// (`{base}/_mem_wal/{shard}/{folder}`), which is globally unique, so a single
 /// cache can safely span multiple tables.
+///
+/// `store_params` is deliberately *not* part of the key: the first caller to
+/// open a path binds the store that every later hit reuses. Credential rotation
+/// still works — a vended-credential store holds the live
+/// `StorageOptionsAccessor` and re-resolves per request, so a cached handle
+/// never carries expired credentials. What this does assume is that a given
+/// path is only ever served under one store configuration. Serving one table
+/// through a single cache under two different `ObjectStoreParams` would hand
+/// every caller the store the first one opened with.
 pub struct FlushedMemTableCache {
     // `moka`'s async cache gives a bounded size plus single-flight
     // `try_get_with`, so concurrent first-queries on a just-flushed
@@ -66,22 +76,23 @@ impl FlushedMemTableCache {
     }
 
     /// Get the dataset for `path`, opening it (exactly once) on a miss.
-    ///
-    /// `session` is threaded into the open so the first open populates the
-    /// shared index / file-metadata caches; subsequent hits are a pure
-    /// `Arc::clone` with zero object-store I/O. Concurrent callers for the
-    /// same path share a single open via `moka`'s single-flight
-    /// `try_get_with`.
+    /// Concurrent callers share a single open via `moka`'s single-flight
+    /// `try_get_with`; hits are a pure `Arc::clone`. `session` / `store_params`
+    /// configure the open.
     pub async fn get_or_open(
         &self,
         path: &str,
         session: Option<Arc<Session>>,
+        store_params: Option<ObjectStoreParams>,
     ) -> Result<Arc<Dataset>> {
         self.inner
             .try_get_with(path.to_string(), async move {
                 let mut builder = DatasetBuilder::from_uri(path);
                 if let Some(session) = session {
                     builder = builder.with_session(session);
+                }
+                if let Some(store_params) = store_params {
+                    builder = builder.with_store_params(store_params);
                 }
                 builder.load().await.map(Arc::new)
             })
@@ -125,7 +136,12 @@ impl std::fmt::Debug for FlushedMemTableCache {
 /// supply its own implementation.
 #[async_trait]
 pub trait DatasetCache: Send + Sync + std::fmt::Debug {
-    async fn get_or_open(&self, path: &str, session: Option<Arc<Session>>) -> Result<Arc<Dataset>>;
+    async fn get_or_open(
+        &self,
+        path: &str,
+        session: Option<Arc<Session>>,
+        store_params: Option<ObjectStoreParams>,
+    ) -> Result<Arc<Dataset>>;
 
     /// Drop cached entries whose path is not in `live_paths`. Async so an
     /// implementation can evict retired generations' index objects (e.g.
@@ -136,8 +152,13 @@ pub trait DatasetCache: Send + Sync + std::fmt::Debug {
 
 #[async_trait]
 impl DatasetCache for FlushedMemTableCache {
-    async fn get_or_open(&self, path: &str, session: Option<Arc<Session>>) -> Result<Arc<Dataset>> {
-        Self::get_or_open(self, path, session).await
+    async fn get_or_open(
+        &self,
+        path: &str,
+        session: Option<Arc<Session>>,
+        store_params: Option<ObjectStoreParams>,
+    ) -> Result<Arc<Dataset>> {
+        Self::get_or_open(self, path, session, store_params).await
     }
 
     async fn retain_paths(&self, live_paths: &HashSet<String>) {
@@ -179,15 +200,23 @@ pub trait GenerationWarmer: Send + Sync + std::fmt::Debug {
 pub async fn open_flushed_dataset(
     path: &str,
     session: Option<&Arc<Session>>,
+    store_params: Option<&ObjectStoreParams>,
     cache: Option<&Arc<dyn DatasetCache>>,
     warmer: Option<&Arc<dyn GenerationWarmer>>,
 ) -> Result<Arc<Dataset>> {
     let dataset = match cache {
-        Some(cache) => cache.get_or_open(path, session.cloned()).await?,
+        Some(cache) => {
+            cache
+                .get_or_open(path, session.cloned(), store_params.cloned())
+                .await?
+        }
         None => {
             let mut builder = DatasetBuilder::from_uri(path);
             if let Some(session) = session {
                 builder = builder.with_session(session.clone());
+            }
+            if let Some(store_params) = store_params {
+                builder = builder.with_store_params(store_params.clone());
             }
             Arc::new(builder.load().await?)
         }
@@ -239,8 +268,8 @@ mod tests {
         write_dataset(&uri, &[1, 2, 3]).await;
 
         let cache = FlushedMemTableCache::new(8);
-        let first = cache.get_or_open(&uri, None).await.unwrap();
-        let second = cache.get_or_open(&uri, None).await.unwrap();
+        let first = cache.get_or_open(&uri, None, None).await.unwrap();
+        let second = cache.get_or_open(&uri, None, None).await.unwrap();
 
         assert!(
             Arc::ptr_eq(&first, &second),
@@ -271,7 +300,7 @@ mod tests {
             let calls = calls.clone();
             handles.push(tokio::spawn(async move {
                 calls.fetch_add(1, Ordering::SeqCst);
-                cache.get_or_open(&uri, None).await.unwrap()
+                cache.get_or_open(&uri, None, None).await.unwrap()
             }));
         }
 
@@ -299,8 +328,8 @@ mod tests {
         write_dataset(&drop_uri, &[2]).await;
 
         let cache = FlushedMemTableCache::new(8);
-        cache.get_or_open(&keep_uri, None).await.unwrap();
-        cache.get_or_open(&drop_uri, None).await.unwrap();
+        cache.get_or_open(&keep_uri, None, None).await.unwrap();
+        cache.get_or_open(&drop_uri, None, None).await.unwrap();
         cache.inner.run_pending_tasks().await;
         assert_eq!(cache.inner.entry_count(), 2);
 
@@ -321,8 +350,12 @@ mod tests {
         let uri = format!("{}/gen_1", temp_dir.path().to_str().unwrap());
         write_dataset(&uri, &[7, 8, 9]).await;
 
-        let a = open_flushed_dataset(&uri, None, None, None).await.unwrap();
-        let b = open_flushed_dataset(&uri, None, None, None).await.unwrap();
+        let a = open_flushed_dataset(&uri, None, None, None, None)
+            .await
+            .unwrap();
+        let b = open_flushed_dataset(&uri, None, None, None, None)
+            .await
+            .unwrap();
         assert!(
             !Arc::ptr_eq(&a, &b),
             "no-cache path must cold-open each call"
@@ -331,10 +364,10 @@ mod tests {
 
         // With a cache, the second call is a shared clone.
         let cache: Arc<dyn DatasetCache> = Arc::new(FlushedMemTableCache::new(8));
-        let c = open_flushed_dataset(&uri, None, Some(&cache), None)
+        let c = open_flushed_dataset(&uri, None, None, Some(&cache), None)
             .await
             .unwrap();
-        let d = open_flushed_dataset(&uri, None, Some(&cache), None)
+        let d = open_flushed_dataset(&uri, None, None, Some(&cache), None)
             .await
             .unwrap();
         assert!(Arc::ptr_eq(&c, &d), "cached path must reuse the Arc");
@@ -372,7 +405,7 @@ mod tests {
             notify: notify.clone(),
         });
 
-        let ds = open_flushed_dataset(&uri, None, None, Some(&warmer))
+        let ds = open_flushed_dataset(&uri, None, None, None, Some(&warmer))
             .await
             .unwrap();
         assert_eq!(ds.count_rows(None).await.unwrap(), 3);

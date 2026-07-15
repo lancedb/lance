@@ -28,7 +28,8 @@ use lance_index::vector::flat::storage::FLAT_COLUMN;
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::storage::VectorStore;
 use lance_linalg::distance::{
-    ClusteringResult, cluster_pairwise_result, extract_hashes_from_fixed_list,
+    BinaryHashValues, ClusteringResult, cluster_pairwise_result,
+    extract_binary_hashes_from_fixed_list, pairwise_hamming_distance_binary_parallel,
     pairwise_hamming_distance_parallel,
 };
 use lance_table::format::IndexMetadata;
@@ -56,17 +57,30 @@ impl HashIndexSegment {
     }
 }
 
-/// Validate that a column stores 64-bit hashes as `FixedSizeList<UInt8, 8>`.
-fn validate_hash_column(column: &str, data_type: &DataType) -> Result<()> {
+/// Validate that a column stores fixed-width binary hashes as
+/// `FixedSizeList<UInt8, N>`, where `N` is a positive multiple of 8 bytes.
+fn validate_hash_column(column: &str, data_type: &DataType) -> Result<usize> {
     match data_type {
-        DataType::FixedSizeList(inner, 8) if *inner.data_type() == DataType::UInt8 => Ok(()),
-        DataType::FixedSizeList(inner, 8) => Err(Error::invalid_input(format!(
-            "Column '{}' must be FixedSizeList<UInt8, 8>, got FixedSizeList<{:?}, 8>",
+        DataType::FixedSizeList(inner, size) if *inner.data_type() == DataType::UInt8 => {
+            if *size <= 0 || !(*size as usize).is_multiple_of(8) {
+                return Err(Error::invalid_input(format!(
+                    "Column '{}' must be FixedSizeList<UInt8, N> where N is a positive \
+                     multiple of 8 bytes, got FixedSizeList<UInt8, {}>",
+                    column, size
+                )));
+            }
+            Ok(*size as usize)
+        }
+        DataType::FixedSizeList(inner, size) => Err(Error::invalid_input(format!(
+            "Column '{}' must be FixedSizeList<UInt8, N> where N is a positive \
+             multiple of 8 bytes, got FixedSizeList<{:?}, {}>",
             column,
-            inner.data_type()
+            inner.data_type(),
+            size
         ))),
         _ => Err(Error::invalid_input(format!(
-            "Column '{}' must be FixedSizeList<UInt8, 8>, got {:?}",
+            "Column '{}' must be FixedSizeList<UInt8, N> where N is a positive \
+             multiple of 8 bytes, got {:?}",
             column, data_type
         ))),
     }
@@ -125,7 +139,7 @@ fn validate_shared_centroids<'a>(
 ///
 /// When `segment_ids` is `None` all segments are opened; otherwise only the
 /// requested segments are opened and every requested id must exist. Validates
-/// that all selected segments index the same `FixedSizeList<UInt8, 8>` column,
+/// that all selected segments index the same fixed-width binary hash column,
 /// are IVF_FLAT indices for binary data, and share the same global centroids.
 async fn open_hash_index_segments(
     dataset: &Dataset,
@@ -225,7 +239,8 @@ async fn hamming_clustering_for_ivf_partition_impl(
     // hashes land in the same partition of every segment, so one pairwise pass
     // over the union finds cross-segment duplicates.
     let mut all_row_ids: Vec<u64> = Vec::new();
-    let mut all_hashes: Vec<u64> = Vec::new();
+    let mut hash_chunks = Vec::new();
+    let mut num_hashes = 0;
     for segment in &segments {
         let storage = segment
             .ivf_flat_bin()
@@ -239,16 +254,18 @@ async fn hamming_clustering_for_ivf_partition_impl(
                     Error::invalid_input(format!("Column '{}' not found in storage", FLAT_COLUMN))
                 })?
                 .as_fixed_size_list();
-            all_hashes.extend(extract_hashes_from_fixed_list(vectors)?);
+            let hashes = extract_binary_hashes_from_fixed_list(vectors)?;
+            num_hashes += hashes.len();
+            hash_chunks.push(hashes);
         }
-        if all_row_ids.len() != all_hashes.len() {
+        if all_row_ids.len() != num_hashes {
             return Err(Error::internal(format!(
                 "Index '{}' segment {} partition {}: row id count {} does not match hash count {}",
                 index_name,
                 segment.metadata.uuid,
                 partition_id,
                 all_row_ids.len(),
-                all_hashes.len()
+                num_hashes
             )));
         }
     }
@@ -259,9 +276,10 @@ async fn hamming_clustering_for_ivf_partition_impl(
         };
         return Ok(empty.into_reader(None));
     }
+    let all_hashes = BinaryHashValues::concat(&hash_chunks)?;
 
     // Compute pairwise hamming distances with threshold filtering
-    let pairwise_result = pairwise_hamming_distance_parallel(
+    let pairwise_result = pairwise_hamming_distance_binary_parallel(
         &all_hashes,
         Some(&all_row_ids),
         Some(hamming_threshold),
@@ -298,7 +316,8 @@ async fn hamming_clustering_for_ivf_partition_impl(
 ///
 /// Returns an error if:
 /// - The index doesn't exist or is not an IVF_FLAT index
-/// - The indexed column has wrong type (must be `FixedSizeList<UInt8, 8>`)
+/// - The indexed column has wrong type (must be `FixedSizeList<UInt8, N>` where
+///   `N` is a positive multiple of 8 bytes)
 /// - The index segments do not share the same global IVF centroids
 /// - The partition ID is out of range
 pub async fn hamming_clustering_for_ivf_partition(
@@ -407,7 +426,8 @@ pub struct PartitionInfo {
 /// # Arguments
 ///
 /// * `dataset` - The Lance dataset
-/// * `column` - Name of the hash column (must be `FixedSizeList<UInt8, 8>`)
+/// * `column` - Name of the hash column (must be `FixedSizeList<UInt8, N>`
+///   where `N` is a positive multiple of 8 bytes)
 /// * `sample_size` - Number of rows to sample (if None or >= total rows, uses all rows)
 /// * `hamming_threshold` - Maximum hamming distance to consider as similar
 ///
@@ -467,7 +487,7 @@ pub async fn hamming_clustering_for_sample(
             Error::invalid_input(format!("Column '{}' not found in result", column))
         })?;
         let hashes_arr = hash_col.as_fixed_size_list();
-        let hashes = extract_hashes_from_fixed_list(hashes_arr)?;
+        let hashes = extract_binary_hashes_from_fixed_list(hashes_arr)?;
 
         (hashes, row_id_vec)
     } else {
@@ -489,7 +509,7 @@ pub async fn hamming_clustering_for_sample(
             Error::invalid_input(format!("Column '{}' not found in result", column))
         })?;
         let hashes_arr = hash_col.as_fixed_size_list();
-        let hashes = extract_hashes_from_fixed_list(hashes_arr)?;
+        let hashes = extract_binary_hashes_from_fixed_list(hashes_arr)?;
 
         (hashes, row_id_vec)
     };
@@ -503,7 +523,7 @@ pub async fn hamming_clustering_for_sample(
 
     // Compute pairwise hamming distances
     let pairwise =
-        pairwise_hamming_distance_parallel(&hashes, Some(&row_ids), Some(hamming_threshold));
+        pairwise_hamming_distance_binary_parallel(&hashes, Some(&row_ids), Some(hamming_threshold));
 
     // Cluster edges
     let clustering = cluster_pairwise_result(&pairwise);
@@ -521,7 +541,8 @@ pub async fn hamming_clustering_for_sample(
 /// # Arguments
 ///
 /// * `dataset` - The Lance dataset
-/// * `column` - Name of the hash column (must be `FixedSizeList<UInt8, 8>`)
+/// * `column` - Name of the hash column (must be `FixedSizeList<UInt8, N>`
+///   where `N` is a positive multiple of 8 bytes)
 /// * `fragment_id` - The fragment ID to read from
 /// * `start_row` - The starting row offset within the fragment
 /// * `num_rows` - Number of rows to read from the start position
@@ -537,7 +558,8 @@ pub async fn hamming_clustering_for_sample(
 ///
 /// Returns an error if:
 /// - The fragment doesn't exist
-/// - The column has wrong type (must be `FixedSizeList<UInt8, 8>`)
+/// - The column has wrong type (must be `FixedSizeList<UInt8, N>` where `N`
+///   is a positive multiple of 8 bytes)
 /// - The row range is out of bounds
 pub async fn hamming_clustering_for_range(
     dataset: &Dataset,
@@ -605,7 +627,7 @@ pub async fn hamming_clustering_for_range(
         .column_by_name(column)
         .ok_or_else(|| Error::invalid_input(format!("Column '{}' not found in result", column)))?;
     let hashes_arr = hash_col.as_fixed_size_list();
-    let hashes = extract_hashes_from_fixed_list(hashes_arr)?;
+    let hashes = extract_binary_hashes_from_fixed_list(hashes_arr)?;
 
     if hashes.len() < 2 {
         let empty = ClusteringResult {
@@ -615,8 +637,11 @@ pub async fn hamming_clustering_for_range(
     }
 
     // Compute pairwise hamming distances
-    let pairwise =
-        pairwise_hamming_distance_parallel(&hashes, Some(&row_id_vec), Some(hamming_threshold));
+    let pairwise = pairwise_hamming_distance_binary_parallel(
+        &hashes,
+        Some(&row_id_vec),
+        Some(hamming_threshold),
+    );
 
     // Cluster edges
     let clustering = cluster_pairwise_result(&pairwise);
@@ -719,6 +744,31 @@ mod tests {
             }
         }
         clusters
+    }
+
+    #[test]
+    fn test_validate_hash_column_generic_widths() {
+        use arrow_schema::{DataType, Field};
+        use std::sync::Arc;
+
+        fn hash_type(size: i32) -> DataType {
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::UInt8, true)), size)
+        }
+
+        assert_eq!(validate_hash_column("hash", &hash_type(8)).unwrap(), 8);
+        assert_eq!(validate_hash_column("hash", &hash_type(16)).unwrap(), 16);
+        assert_eq!(validate_hash_column("hash", &hash_type(32)).unwrap(), 32);
+
+        let err = validate_hash_column("hash", &hash_type(12)).unwrap_err();
+        assert!(err.to_string().contains("12"), "{}", err);
+        assert!(err.to_string().contains("multiple of 8 bytes"), "{}", err);
+
+        let err = validate_hash_column("hash", &hash_type(4)).unwrap_err();
+        assert!(err.to_string().contains("4"), "{}", err);
+        assert!(err.to_string().contains("multiple of 8 bytes"), "{}", err);
+
+        let err = validate_hash_column("hash", &hash_type(-8)).unwrap_err();
+        assert!(err.to_string().contains("-8"), "{}", err);
     }
 
     #[test]
@@ -928,7 +978,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_hamming_clustering_for_ivf_partition_multi_segment() {
+    async fn test_hamming_clustering_for_ivf_partition_multi_segment_128_bit() {
         use arrow_array::{FixedSizeListArray, RecordBatchIterator, UInt8Array};
         use arrow_schema::{Field, Schema};
         use lance_arrow::FixedSizeListArrayExt;
@@ -937,13 +987,18 @@ mod tests {
         use std::sync::Arc;
         use tempfile::tempdir;
 
+        const HASH_BYTES: i32 = 16;
+
         fn hash_batch(schema: Arc<Schema>, values: &[u64]) -> arrow_array::RecordBatch {
-            let mut bytes = Vec::with_capacity(values.len() * 8);
+            let mut bytes = Vec::with_capacity(values.len() * HASH_BYTES as usize);
             for value in values {
                 bytes.extend_from_slice(&value.to_le_bytes());
+                let high = value.rotate_left(17) ^ 0xA5A5_A5A5_A5A5_A5A5;
+                bytes.extend_from_slice(&high.to_le_bytes());
             }
             let array =
-                FixedSizeListArray::try_new_from_values(UInt8Array::from(bytes), 8).unwrap();
+                FixedSizeListArray::try_new_from_values(UInt8Array::from(bytes), HASH_BYTES)
+                    .unwrap();
             arrow_array::RecordBatch::try_new(schema, vec![Arc::new(array)]).unwrap()
         }
 
@@ -951,7 +1006,7 @@ mod tests {
             "hash",
             arrow_schema::DataType::FixedSizeList(
                 Arc::new(Field::new("item", arrow_schema::DataType::UInt8, true)),
-                8,
+                HASH_BYTES,
             ),
             false,
         )]));
