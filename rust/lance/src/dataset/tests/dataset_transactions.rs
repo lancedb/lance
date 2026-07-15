@@ -509,8 +509,13 @@ async fn test_read_version_transaction_does_not_populate_caches() {
         assert!(version_transaction.transaction.is_some());
     }
 
-    // A missing (e.g. cleaned up) version is an error.
-    assert!(dataset.read_version_transaction(9999).await.is_err());
+    // A missing (e.g. cleaned up) version is an error: the version resolves
+    // to a manifest path that does not exist, surfacing as NotFound.
+    let err = dataset.read_version_transaction(9999).await.unwrap_err();
+    assert!(
+        matches!(err, crate::Error::NotFound { .. }),
+        "expected NotFound for a missing version, got {err:?}"
+    );
 }
 
 #[tokio::test]

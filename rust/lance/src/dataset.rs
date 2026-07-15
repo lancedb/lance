@@ -1247,7 +1247,7 @@ impl Dataset {
     }
 
     /// Read the transaction (if any) and commit timestamp of a version of the
-    /// dataset, on the same branch as this dataset.
+    /// dataset. `version` is a version number on this dataset's current branch.
     ///
     /// Reads the version's manifest transiently: no historical `Dataset` is
     /// constructed, no `IndexSection` is decoded, and no session cache is read
@@ -1256,6 +1256,18 @@ impl Dataset {
     ///
     /// Returns an error if the version does not exist (for example, if it has
     /// been cleaned up).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # async fn example(dataset: &Dataset) -> Result<()> {
+    /// let record = dataset.read_version_transaction(5).await?;
+    /// let committed_at = record.timestamp;
+    /// let operation = record.transaction.as_ref().map(|t| t.operation.name());
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn read_version_transaction(&self, version: u64) -> Result<VersionTransaction> {
         // Resolve against this dataset's current branch.
         let manifest_location = self
@@ -1269,6 +1281,20 @@ impl Dataset {
             manifest_location.size,
         )
         .await?;
+
+        // The resolved manifest must belong to this dataset's branch. A
+        // mismatch means the commit handler resolved against a different chain
+        // (for example an external manifest store that ignores
+        // branch-qualified paths); error loudly rather than hand back another
+        // branch's transaction.
+        if manifest.branch != self.manifest.branch {
+            return Err(Error::internal(format!(
+                "reading version {} on branch '{}' resolved a manifest belonging to branch '{}'",
+                version,
+                refs::normalize_branch(self.manifest.branch.as_deref()),
+                refs::normalize_branch(manifest.branch.as_deref()),
+            )));
+        }
 
         let transaction = self
             .read_transaction_from_storage(&manifest, &manifest_location)
@@ -1288,6 +1314,17 @@ impl Dataset {
     ///
     /// Does not populate the session caches; see
     /// [`Self::read_version_transaction`].
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # async fn example(dataset: &Dataset) -> Result<()> {
+    /// let transaction = dataset.read_transaction_by_version(5).await?;
+    /// let operation = transaction.as_ref().map(|t| t.operation.name());
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn read_transaction_by_version(&self, version: u64) -> Result<Option<Transaction>> {
         Ok(self.read_version_transaction(version).await?.transaction)
     }
