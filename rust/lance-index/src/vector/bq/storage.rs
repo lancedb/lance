@@ -68,6 +68,11 @@ use crate::vector::storage::{
 
 pub const RABIT_METADATA_KEY: &str = "lance:rabit";
 pub const RABIT_CODE_COLUMN: &str = "_rabit_codes";
+/// Exact rotated residuals used only while constructing an HNSW graph.
+///
+/// This column is removed when [`RabitQuantizationStorage`] is created and is
+/// never persisted in the index auxiliary file.
+pub const RABIT_HNSW_BUILD_VECTOR_COLUMN: &str = "__rabit_hnsw_build_vector";
 /// Legacy ex-code column: sequential LSB-first bit stream per row. Read-only;
 /// rows are repacked into the blocked layout at load time.
 pub const RABIT_EX_CODE_COLUMN: &str = "__ex_codes";
@@ -498,6 +503,7 @@ pub struct RabitQuantizationStorage {
     packed_ex_codes: Option<FixedSizeListArray>,
     ex_add_factors: Option<Float32Array>,
     ex_scale_factors: Option<Float32Array>,
+    hnsw_build_vectors: Option<FixedSizeListArray>,
 }
 
 impl DeepSizeOf for RabitQuantizationStorage {
@@ -508,6 +514,11 @@ impl DeepSizeOf for RabitQuantizationStorage {
                 .packed_ex_codes
                 .as_ref()
                 .map(|codes| (codes as &dyn Array).deep_size_of_children(context))
+                .unwrap_or_default()
+            + self
+                .hnsw_build_vectors
+                .as_ref()
+                .map(|vectors| (vectors as &dyn Array).deep_size_of_children(context))
                 .unwrap_or_default()
     }
 }
@@ -867,6 +878,8 @@ pub struct RabitDistCalculator<'a> {
 
     sum_q: f32,
     sqrt_d: f32,
+    exact_query: Option<&'a [f32]>,
+    exact_vectors: Option<&'a [f32]>,
 }
 
 impl<'a> RabitDistCalculator<'a> {
@@ -913,6 +926,37 @@ impl<'a> RabitDistCalculator<'a> {
             approx_mode,
             sqrt_d: (dim as f32 * num_bits as f32).sqrt(),
             sum_q,
+            exact_query: None,
+            exact_vectors: None,
+        }
+    }
+
+    fn for_hnsw_build(dim: usize, query: &'a [f32], vectors: &'a [f32]) -> Self {
+        debug_assert_eq!(query.len(), dim);
+        debug_assert!(vectors.len().is_multiple_of(dim));
+        Self {
+            dim,
+            num_bits: 1,
+            query_estimator: RabitQueryEstimator::ResidualQuery,
+            codes: &[],
+            ex_codes: None,
+            ex_code_len: 0,
+            dist_table: Cow::Borrowed(&[]),
+            ex_query: Cow::Borrowed(&[]),
+            ex_dot: None,
+            add_factors: &[],
+            scale_factors: &[],
+            error_factors: None,
+            ex_add_factors: None,
+            ex_scale_factors: None,
+            packed_ex_codes: None,
+            query_factor: 0.0,
+            query_error: 0.0,
+            approx_mode: ApproxMode::Accurate,
+            sum_q: 0.0,
+            sqrt_d: (dim as f32).sqrt(),
+            exact_query: Some(query),
+            exact_vectors: Some(vectors),
         }
     }
 
@@ -1771,6 +1815,11 @@ pub(crate) fn load_blocked_ex_codes(
 impl DistCalculator for RabitDistCalculator<'_> {
     #[inline(always)]
     fn distance(&self, id: u32) -> f32 {
+        if let (Some(query), Some(vectors)) = (self.exact_query, self.exact_vectors) {
+            let start = id as usize * self.dim;
+            return l2(query, &vectors[start..start + self.dim]);
+        }
+
         let id = id as usize;
         let code_len = rabit_binary_code_bytes(self.dim);
         let num_vectors = self.codes.len() / code_len;
@@ -1836,6 +1885,19 @@ impl DistCalculator for RabitDistCalculator<'_> {
         quantized_dists_table: &mut Vec<u8>,
         hacc_quantized_dists: &mut Vec<u32>,
     ) {
+        if let (Some(query), Some(vectors)) = (self.exact_query, self.exact_vectors) {
+            dists.clear();
+            dists.extend(
+                vectors
+                    .chunks_exact(self.dim)
+                    .map(|vector| l2(query, vector)),
+            );
+            quantized_dists.clear();
+            quantized_dists_table.clear();
+            hacc_quantized_dists.clear();
+            return;
+        }
+
         let code_len = rabit_binary_code_bytes(self.dim);
         let n = self.codes.len() / code_len;
         if n == 0 {
@@ -2072,6 +2134,22 @@ impl VectorStore for RabitQuantizationStorage {
         self.distance_type
     }
 
+    fn validate_hnsw_build(&self) -> Result<()> {
+        if self.distance_type != DistanceType::L2 {
+            return Err(Error::not_supported(format!(
+                "IVF_HNSW_RQ only supports L2 distance, got {}",
+                self.distance_type
+            )));
+        }
+        if self.hnsw_build_vectors.is_none() {
+            return Err(Error::invalid_input(format!(
+                "IVF_HNSW_RQ construction requires the transient {} column",
+                RABIT_HNSW_BUILD_VECTOR_COLUMN
+            )));
+        }
+        Ok(())
+    }
+
     // qr = (q-c)
     #[inline(never)]
     fn dist_calculator(&self, qr: Arc<dyn Array>, dist_q_c: f32) -> Self::DistanceCalculator<'_> {
@@ -2227,10 +2305,15 @@ impl VectorStore for RabitQuantizationStorage {
         })
     }
 
-    // TODO: implement this
-    // This method is required for HNSW, we can't support HNSW_RABIT before this is implemented
-    fn dist_calculator_from_id(&self, _: u32) -> Self::DistanceCalculator<'_> {
-        unimplemented!("RabitQ does not support dist_calculator_from_id")
+    fn dist_calculator_from_id(&self, id: u32) -> Self::DistanceCalculator<'_> {
+        let vectors = self.hnsw_build_vectors.as_ref().expect(
+            "RabitQ stored-vector distances require exact HNSW build vectors; \
+             HNSW construction validates this invariant before use",
+        );
+        let dim = vectors.value_length() as usize;
+        let values = vectors.values().as_primitive::<Float32Type>().values();
+        let start = id as usize * dim;
+        RabitDistCalculator::for_hnsw_build(dim, &values[start..start + dim], values)
     }
 }
 
@@ -2420,11 +2503,46 @@ impl QuantizerStorage for RabitQuantizationStorage {
     type Metadata = RabitQuantizationMetadata;
 
     fn try_from_batch(
-        batch: RecordBatch,
+        mut batch: RecordBatch,
         metadata: &Self::Metadata,
         distance_type: DistanceType,
         fri: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
+        let hnsw_build_vectors = match batch.column_by_name(RABIT_HNSW_BUILD_VECTOR_COLUMN) {
+            Some(vectors) => {
+                if distance_type != DistanceType::L2 {
+                    return Err(Error::not_supported(format!(
+                        "IVF_HNSW_RQ only supports L2 distance, got {}",
+                        distance_type
+                    )));
+                }
+                let vectors = vectors.as_fixed_size_list_opt().ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "{} must be a FixedSizeList<Float32>, got {}",
+                        RABIT_HNSW_BUILD_VECTOR_COLUMN,
+                        vectors.data_type()
+                    ))
+                })?;
+                if vectors.value_type() != DataType::Float32
+                    || vectors.value_length() as usize != metadata.rotated_dim()
+                    || vectors.null_count() != 0
+                    || vectors.values().null_count() != 0
+                {
+                    return Err(Error::invalid_input(format!(
+                        "{} must contain non-null Float32 vectors with dimension {}, got {}",
+                        RABIT_HNSW_BUILD_VECTOR_COLUMN,
+                        metadata.rotated_dim(),
+                        vectors.data_type()
+                    )));
+                }
+                Some(vectors.clone())
+            }
+            None => None,
+        };
+        if hnsw_build_vectors.is_some() {
+            batch = batch.drop_column(RABIT_HNSW_BUILD_VECTOR_COLUMN)?;
+        }
+
         let distance_type = match (metadata.query_estimator, distance_type) {
             (RabitQueryEstimator::RawQuery, DistanceType::Cosine) => DistanceType::L2,
             _ => distance_type,
@@ -2532,6 +2650,7 @@ impl QuantizerStorage for RabitQuantizationStorage {
             packed_ex_codes,
             ex_add_factors,
             ex_scale_factors,
+            hnsw_build_vectors,
         };
 
         match build_frag_reuse_mapping(fri.as_deref(), &storage.row_ids) {
@@ -2586,12 +2705,13 @@ impl QuantizerStorage for RabitQuantizationStorage {
             UInt8Array::from(new_codes),
             num_code_bytes as i32,
         )?;
+        let indices = UInt32Array::from(indices);
         let batch = if new_row_ids.is_empty() {
             RecordBatch::new_empty(self.schema().clone())
         } else {
             let codes = Arc::new(pack_codes(&new_codes));
             self.batch
-                .take(&UInt32Array::from(indices))?
+                .take(&indices)?
                 .replace_column_by_name(ROW_ID, Arc::new(new_row_ids.clone()))?
                 .replace_column_by_name(RABIT_CODE_COLUMN, codes)?
         };
@@ -2623,6 +2743,14 @@ impl QuantizerStorage for RabitQuantizationStorage {
         let ex_scale_factors = batch
             .column_by_name(EX_SCALE_FACTORS_COLUMN)
             .map(|factors| factors.as_primitive::<Float32Type>().clone());
+        let hnsw_build_vectors = self
+            .hnsw_build_vectors
+            .as_ref()
+            .map(|vectors| {
+                arrow::compute::take(vectors, &indices, None)
+                    .map(|vectors| vectors.as_fixed_size_list().clone())
+            })
+            .transpose()?;
 
         Ok(Self {
             metadata: self.metadata.clone(),
@@ -2636,6 +2764,7 @@ impl QuantizerStorage for RabitQuantizationStorage {
             packed_ex_codes,
             ex_add_factors,
             ex_scale_factors,
+            hnsw_build_vectors,
             row_ids: new_row_ids,
         })
     }

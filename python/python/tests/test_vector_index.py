@@ -1117,6 +1117,34 @@ def test_create_ivf_rq_skip_transpose():
     assert stats["indices"][0]["sub_index"]["packed"] is False
 
 
+def test_create_reopen_and_query_ivf_hnsw_rq_index(tmp_path):
+    rng = np.random.default_rng(42)
+    mat = rng.standard_normal((1000, 128)).astype(np.float32)
+    table = vec_to_table(data=mat).append_column("id", pa.array(range(len(mat))))
+    ds = lance.write_dataset(table, tmp_path)
+    query = mat[0]
+    nearest = {"column": "vector", "q": query, "k": 10, "nprobes": 4}
+    ground_truth = set(
+        ds.to_table(nearest={**nearest, "use_index": False}, columns=["id"])[
+            "id"
+        ].to_pylist()
+    )
+
+    ds = ds.create_index(
+        "vector",
+        index_type="IVF_HNSW_RQ",
+        num_partitions=4,
+        num_bits=5,
+        metric="l2",
+    )
+    assert ds.stats.index_stats("vector_idx")["index_type"] == "IVF_HNSW_RQ"
+
+    reopened = lance.dataset(tmp_path)
+    result = reopened.to_table(nearest=nearest, columns=["id"])["id"].to_pylist()
+    assert len(result) == 10
+    assert len(ground_truth.intersection(result)) / 10 >= 0.5
+
+
 def _assert_recall_at_least(ds, query, metric=None, k=10, recall_requirement=0.5):
     nearest = {"column": "vector", "q": query, "k": k}
     if metric is not None:

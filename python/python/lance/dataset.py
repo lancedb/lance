@@ -3601,6 +3601,7 @@ class LanceDataset(pa.dataset.Dataset):
             "IVF_HNSW_PQ",
             "IVF_HNSW_SQ",
             "IVF_RQ",
+            "IVF_HNSW_RQ",
         ]
         if index_type not in valid_index_types:
             raise NotImplementedError(
@@ -3926,7 +3927,8 @@ class LanceDataset(pa.dataset.Dataset):
             The column to be indexed.
         index_type : str
             The type of the index.
-            ``"IVF_PQ, IVF_HNSW_PQ and IVF_HNSW_SQ"`` are supported now.
+            ``"IVF_PQ"``, ``"IVF_RQ"``, ``"IVF_HNSW_PQ"``,
+            ``"IVF_HNSW_SQ"``, and ``"IVF_HNSW_RQ"`` are supported now.
         name : str, optional
             The index name. If not provided, it will be generated from the
             column name.
@@ -4049,7 +4051,9 @@ class LanceDataset(pa.dataset.Dataset):
             - index_file_version
                 The version of the index file. Default is "V3".
 
-        Optional parameters for `IVF_RQ`:
+        Optional parameters for `IVF_RQ` and `IVF_HNSW_RQ`:
+
+            ``IVF_HNSW_RQ`` currently supports only the ``l2`` metric.
 
             - num_bits
                 The number of bits for RQ (Rabit Quantization). Default is 1.

@@ -18,6 +18,7 @@ import org.lance.index.IndexParams;
 import org.lance.index.vector.HnswBuildParams;
 import org.lance.index.vector.IvfBuildParams;
 import org.lance.index.vector.PQBuildParams;
+import org.lance.index.vector.RQBuildParams;
 import org.lance.index.vector.SQBuildParams;
 import org.lance.index.vector.VectorIndexParams;
 import org.lance.ipc.ApproxMode;
@@ -144,6 +145,24 @@ public class JNITest {
         IndexParams.builder()
             .setVectorIndexParams(
                 VectorIndexParams.withIvfHnswSqParams(DistanceType.Dot, ivf, hnsw, sq))
+            .build());
+  }
+
+  @Test
+  public void testIvfHnswRqIndexParams() {
+    IvfBuildParams ivf = new IvfBuildParams.Builder().setNumPartitions(25).build();
+    HnswBuildParams hnsw =
+        new HnswBuildParams.Builder()
+            .setMaxLevel((short) 8)
+            .setM(25)
+            .setEfConstruction(175)
+            .build();
+    RQBuildParams rq = new RQBuildParams.Builder().setNumBits((byte) 5).build();
+
+    JniTestHelper.parseIndexParams(
+        IndexParams.builder()
+            .setVectorIndexParams(
+                VectorIndexParams.withIvfHnswRqParams(DistanceType.L2, ivf, hnsw, rq))
             .build());
   }
 

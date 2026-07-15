@@ -887,6 +887,7 @@ pub async fn merge_partial_vector_auxiliary_files(
                     "IVF_HNSW_FLAT" => SupportedIvfIndexType::IvfHnswFlat,
                     "IVF_HNSW_PQ" => SupportedIvfIndexType::IvfHnswPq,
                     "IVF_HNSW_SQ" => SupportedIvfIndexType::IvfHnswSq,
+                    "IVF_HNSW_RQ" => SupportedIvfIndexType::IvfHnswRq,
                     other => {
                         return Err(Error::index(format!(
                             "Unsupported index type in shard index.idx: {}",
@@ -959,6 +960,12 @@ pub async fn merge_partial_vector_auxiliary_files(
         let fv = format_version.unwrap_or(LanceFileVersion::V2_0);
 
         match idx_type {
+            SupportedIvfIndexType::IvfHnswRq => {
+                return Err(Error::not_supported(
+                    "Physical IVF_HNSW_RQ shard merging requires exact build vectors; \
+                     merge logical shard indices instead",
+                ));
+            }
             SupportedIvfIndexType::IvfSq => {
                 // Handle Scalar Quantization (SQ) storage for IVF_SQ
                 let sq_json = if let Some(sq_json) =

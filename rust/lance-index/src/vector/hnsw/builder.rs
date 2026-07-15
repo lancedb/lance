@@ -1193,6 +1193,7 @@ impl IvfSubIndex for HNSW {
     where
         Self: Sized,
     {
+        storage.validate_hnsw_build()?;
         let builder = HnswBuilder::with_params(params, storage);
 
         log::debug!(

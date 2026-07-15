@@ -180,6 +180,8 @@ fn determine_index_type<'local>(
                 Some("IVF_HNSW_SQ")
             } else if lower.contains("pq") {
                 Some("IVF_HNSW_PQ")
+            } else if lower.contains("rq") {
+                Some("IVF_HNSW_RQ")
             } else {
                 Some("IVF_HNSW_FLAT")
             }
@@ -188,6 +190,8 @@ fn determine_index_type<'local>(
                 Some("IVF_SQ")
             } else if lower.contains("pq") {
                 Some("IVF_PQ")
+            } else if lower.contains("rq") {
+                Some("IVF_RQ")
             } else {
                 Some("IVF_FLAT")
             }

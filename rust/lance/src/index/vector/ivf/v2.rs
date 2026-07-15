@@ -1343,15 +1343,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
             (SubIndexType::Flat, QuantizationType::Rabit) => IndexType::IvfRq,
             (SubIndexType::Hnsw, QuantizationType::Product) => IndexType::IvfHnswPq,
             (SubIndexType::Hnsw, QuantizationType::Scalar) => IndexType::IvfHnswSq,
+            (SubIndexType::Hnsw, QuantizationType::Rabit) => IndexType::IvfHnswRq,
             (SubIndexType::Hnsw, QuantizationType::Flat)
             | (SubIndexType::Hnsw, QuantizationType::FlatBin) => IndexType::IvfHnswFlat,
-            (sub_index_type, quantization_type) => {
-                unimplemented!(
-                    "unsupported index type: {}, {}",
-                    sub_index_type,
-                    quantization_type
-                )
-            }
         }
     }
 
@@ -1943,6 +1937,7 @@ pub type IvfFlatIndex = IVFIndex<FlatIndex, FlatQuantizer>;
 pub type IvfPq = IVFIndex<FlatIndex, ProductQuantizer>;
 pub type IvfHnswSqIndex = IVFIndex<HNSW, ScalarQuantizer>;
 pub type IvfHnswPqIndex = IVFIndex<HNSW, ProductQuantizer>;
+pub type IvfHnswRqIndex = IVFIndex<HNSW, RabitQuantizer>;
 
 async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
     state: &IvfIndexState<Q>,
@@ -2038,16 +2033,21 @@ mod tests {
     use arrow::{array::AsArray, datatypes::Float32Type};
     use arrow_array::{
         Array, ArrayRef, ArrowPrimitiveType, FixedSizeListArray, Float32Array, Int64Array,
-        ListArray, RecordBatch, RecordBatchIterator, UInt64Array,
+        ListArray, RecordBatch, RecordBatchIterator, UInt64Array, make_array,
     };
-    use arrow_buffer::OffsetBuffer;
+    use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer};
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
     use itertools::Itertools;
     use lance_arrow::FixedSizeListArrayExt;
+    #[cfg(feature = "slow_tests")]
+    use lance_index::vector::bq::builder::RabitQuantizer;
     use lance_index::vector::bq::{
         RQBuildParams, RQRotationType,
         ex_dot::{blocked_ex_code_bytes, padded_query_len},
-        storage::{RABIT_BLOCKED_EX_CODE_COLUMN, RabitQuantizationMetadata, RabitQueryEstimator},
+        storage::{
+            RABIT_BLOCKED_EX_CODE_COLUMN, RABIT_HNSW_BUILD_VECTOR_COLUMN,
+            RabitQuantizationMetadata, RabitQueryEstimator,
+        },
         transform::{EX_ADD_FACTORS_COLUMN, EX_SCALE_FACTORS_COLUMN},
     };
     use lance_index::vector::storage::VectorStore;
@@ -3778,6 +3778,7 @@ mod tests {
     #[case::flat("IVF_HNSW_FLAT")]
     #[case::pq("IVF_HNSW_PQ")]
     #[case::sq("IVF_HNSW_SQ")]
+    #[case::rq("IVF_HNSW_RQ")]
     #[tokio::test]
     async fn test_merge_existing_hnsw_segments_rebuilds_graph(#[case] expected_index_type: &str) {
         let test_dir = TempStrDir::default();
@@ -3808,6 +3809,12 @@ mod tests {
                 prepare_global_ivf(&dataset, "vector").await,
                 HnswBuildParams::default(),
                 SQBuildParams::default(),
+            ),
+            "IVF_HNSW_RQ" => VectorIndexParams::with_ivf_hnsw_rq_params(
+                DistanceType::L2,
+                prepare_global_ivf(&dataset, "vector").await,
+                HnswBuildParams::default(),
+                RQBuildParams::with_rotation_type(5, RQRotationType::Fast),
             ),
             other => panic!("unexpected HNSW index type {other}"),
         };
@@ -3950,8 +3957,7 @@ mod tests {
 
         let progress = Arc::new(RecordingProgress::default());
         let merged_segment = crate::index::vector::ivf::merge_segments_with_progress(
-            dataset.object_store.as_ref(),
-            &dataset.indices_dir(),
+            &dataset,
             segments,
             progress.clone(),
         )
@@ -4558,6 +4564,369 @@ mod tests {
     }
 
     #[rstest]
+    #[case::one_bit(1)]
+    #[case::five_bits(5)]
+    #[tokio::test]
+    async fn test_build_reopen_and_query_ivf_hnsw_rq(#[case] num_bits: u8) {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let (mut dataset, vectors) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
+        let params = VectorIndexParams::with_ivf_hnsw_rq_params(
+            DistanceType::L2,
+            IvfBuildParams::new(4),
+            HnswBuildParams::default(),
+            RQBuildParams::with_rotation_type(num_bits, RQRotationType::Fast),
+        );
+
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("ivf_hnsw_rq".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let indices = dataset.load_indices_by_name("ivf_hnsw_rq").await.unwrap();
+        assert_eq!(indices.len(), 1);
+        let scheduler = ScanScheduler::new(
+            Arc::new(ObjectStore::local()),
+            SchedulerConfig::default_for_testing(),
+        );
+        let reader = open_rq_aux_reader(&dataset, scheduler, &indices[0].uuid.to_string()).await;
+        assert!(
+            reader
+                .schema()
+                .field(RABIT_HNSW_BUILD_VECTOR_COLUMN)
+                .is_none(),
+            "exact HNSW build vectors must not be persisted"
+        );
+
+        drop(dataset);
+        let reopened = Dataset::open(test_uri).await.unwrap();
+        test_recall::<Float32Type>(params, 4, 0.5, "vector", &reopened, vectors).await;
+    }
+
+    #[tokio::test]
+    async fn test_ivf_hnsw_rq_skips_null_vectors() {
+        let test_dir = TempStrDir::default();
+        let (batch, schema) = generate_batch::<Float32Type>(NUM_ROWS, None, 0.0..1.0, false);
+        let nulls = NullBuffer::new(BooleanBuffer::from_iter(
+            (0..NUM_ROWS).map(|row| row.is_multiple_of(2)),
+        ));
+        let vectors = make_array(
+            batch["vector"]
+                .clone()
+                .to_data()
+                .into_builder()
+                .nulls(Some(nulls))
+                .build()
+                .unwrap(),
+        );
+        let num_non_null = vectors.len() - vectors.logical_null_count();
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![batch["id"].clone(), vectors]).unwrap();
+        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+        let mut dataset = Dataset::write(batches, test_dir.as_str(), None)
+            .await
+            .unwrap();
+        let params = VectorIndexParams::with_ivf_hnsw_rq_params(
+            DistanceType::L2,
+            IvfBuildParams::new(4),
+            HnswBuildParams::default(),
+            RQBuildParams::with_rotation_type(5, RQRotationType::Fast),
+        );
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+
+        let query = Float32Array::from(vec![0.0; DIM]);
+        let results = dataset
+            .scan()
+            .nearest("vector", &query, NUM_ROWS)
+            .unwrap()
+            .ef(10_000)
+            .minimum_nprobes(4)
+            .try_into_batch()
+            .await
+            .unwrap();
+        let recall = results.num_rows() as f32 / num_non_null as f32;
+        assert_ge!(recall, 0.99);
+        assert_eq!(results["vector"].logical_null_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_ivf_hnsw_rq_remap_after_compaction() {
+        let params = VectorIndexParams::with_ivf_hnsw_rq_params(
+            DistanceType::L2,
+            IvfBuildParams::new(4),
+            HnswBuildParams::default(),
+            RQBuildParams::with_rotation_type(5, RQRotationType::Fast),
+        );
+        test_remap(params, 4, 0.5).await;
+    }
+
+    #[cfg(feature = "slow_tests")]
+    #[tokio::test]
+    async fn test_ivf_hnsw_rq_benchmark() {
+        const BENCH_ROWS: usize = 100_000;
+        const BENCH_QUERIES: usize = 32;
+        const K: usize = 10;
+        const NLIST: usize = 4;
+        const NUM_BITS: u8 = 5;
+        const HNSW_EF: [usize; 3] = [20, 50, 100];
+
+        async fn write_benchmark_dataset(
+            uri: &str,
+            batch: RecordBatch,
+            schema: SchemaRef,
+        ) -> Dataset {
+            let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+            Dataset::write(
+                batches,
+                uri,
+                Some(WriteParams {
+                    mode: WriteMode::Overwrite,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap()
+        }
+
+        async fn measure_queries(
+            dataset: &Dataset,
+            queries: &[ArrayRef],
+            ground_truths: &[HashSet<u64>],
+            nprobes: usize,
+            ef: Option<usize>,
+        ) -> (f64, f64, f64, f32) {
+            async fn query(
+                dataset: &Dataset,
+                query: &dyn Array,
+                nprobes: usize,
+                ef: Option<usize>,
+            ) -> RecordBatch {
+                let mut scan = dataset.scan();
+                scan.nearest("vector", query, K).unwrap();
+                scan.nprobes(nprobes).with_row_id().fast_search();
+                if let Some(ef) = ef {
+                    scan.ef(ef);
+                }
+                scan.try_into_batch().await.unwrap()
+            }
+
+            for query_vector in queries.iter().take(3) {
+                query(dataset, query_vector.as_ref(), nprobes, ef).await;
+            }
+
+            let mut latencies_us = Vec::with_capacity(queries.len());
+            let mut matches = 0usize;
+            for (query_vector, ground_truth) in queries.iter().zip(ground_truths) {
+                let started = std::time::Instant::now();
+                let result = query(dataset, query_vector.as_ref(), nprobes, ef).await;
+                latencies_us.push(started.elapsed().as_secs_f64() * 1_000_000.0);
+                let row_ids = result[ROW_ID]
+                    .as_primitive::<UInt64Type>()
+                    .values()
+                    .iter()
+                    .copied()
+                    .collect::<HashSet<_>>();
+                assert_eq!(row_ids.len(), K);
+                matches += row_ids.intersection(ground_truth).count();
+            }
+
+            latencies_us.sort_by(f64::total_cmp);
+            let percentile = |percent: usize| {
+                let index = ((latencies_us.len() - 1) * percent).div_ceil(100);
+                latencies_us[index]
+            };
+            let mean_us = latencies_us.iter().sum::<f64>() / latencies_us.len() as f64;
+            let recall = matches as f32 / (queries.len() * K) as f32;
+            (mean_us, percentile(50), percentile(95), recall)
+        }
+
+        async fn index_size_bytes(dataset: &Dataset) -> u64 {
+            dataset
+                .load_indices_by_name("vector_idx")
+                .await
+                .unwrap()
+                .iter()
+                .map(|index| {
+                    index
+                        .total_size_bytes()
+                        .expect("new index metadata should contain file sizes")
+                })
+                .sum()
+        }
+
+        let test_dir = TempStrDir::default();
+        let base_uri = test_dir.as_str();
+        let (all_rows, schema) =
+            generate_batch::<Float32Type>(BENCH_ROWS + BENCH_QUERIES, None, 0.0..1.0, false);
+        let vectors = all_rows["vector"].as_fixed_size_list();
+        let queries = (BENCH_ROWS..BENCH_ROWS + BENCH_QUERIES)
+            .map(|row| vectors.value(row))
+            .collect::<Vec<_>>();
+        let data = all_rows.slice(0, BENCH_ROWS);
+
+        // Build one seed index outside the measured region. Its centroids and rotation
+        // are reused by both measured builds so the comparison only changes FLAT vs HNSW.
+        let seed_uri = format!("{base_uri}/seed");
+        let mut seed = write_benchmark_dataset(&seed_uri, data.clone(), schema.clone()).await;
+        let seed_params = VectorIndexParams::with_ivf_rq_params(
+            DistanceType::L2,
+            IvfBuildParams::new(NLIST),
+            RQBuildParams::with_rotation_type(NUM_BITS, RQRotationType::Fast),
+        );
+        seed.create_index(
+            &["vector"],
+            IndexType::Vector,
+            Some("vector_idx".to_string()),
+            &seed_params,
+            true,
+        )
+        .await
+        .unwrap();
+        let seed_index_meta = seed.load_indices_by_name("vector_idx").await.unwrap();
+        let seed_index = seed
+            .open_vector_index("vector", &seed_index_meta[0].uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let centroids = seed_index
+            .ivf_model()
+            .centroids
+            .clone()
+            .expect("IVF_RQ index should persist centroids");
+        let seed_quantizer = RabitQuantizer::try_from(seed_index.quantizer()).unwrap();
+        let rotation = seed_quantizer.metadata_ref().clone();
+
+        let mut shared_rq = RQBuildParams::with_rotation_type(NUM_BITS, RQRotationType::Fast);
+        shared_rq.rotation = Some(rotation);
+        let shared_ivf = IvfBuildParams {
+            centroids: Some(Arc::new(centroids)),
+            ..IvfBuildParams::new(NLIST)
+        };
+
+        let mut ground_truths = Vec::with_capacity(queries.len());
+        for query in &queries {
+            ground_truths
+                .push(ground_truth(&seed, "vector", query.as_ref(), K, DistanceType::L2).await);
+        }
+
+        let rq_uri = format!("{base_uri}/ivf_rq");
+        let mut rq_dataset = write_benchmark_dataset(&rq_uri, data.clone(), schema.clone()).await;
+        let rq_params = VectorIndexParams::with_ivf_rq_params(
+            DistanceType::L2,
+            shared_ivf.clone(),
+            shared_rq.clone(),
+        );
+        let started = std::time::Instant::now();
+        rq_dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("vector_idx".to_string()),
+                &rq_params,
+                true,
+            )
+            .await
+            .unwrap();
+        let rq_build_seconds = started.elapsed().as_secs_f64();
+        let rq_size_bytes = index_size_bytes(&rq_dataset).await;
+        let rq_query = measure_queries(&rq_dataset, &queries, &ground_truths, NLIST, None).await;
+
+        let hnsw_uri = format!("{base_uri}/ivf_hnsw_rq");
+        let mut hnsw_dataset = write_benchmark_dataset(&hnsw_uri, data, schema).await;
+        let hnsw_params = VectorIndexParams::with_ivf_hnsw_rq_params(
+            DistanceType::L2,
+            shared_ivf,
+            HnswBuildParams::default(),
+            shared_rq,
+        );
+        let started = std::time::Instant::now();
+        hnsw_dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("vector_idx".to_string()),
+                &hnsw_params,
+                true,
+            )
+            .await
+            .unwrap();
+        let hnsw_build_seconds = started.elapsed().as_secs_f64();
+        let hnsw_size_bytes = index_size_bytes(&hnsw_dataset).await;
+        let mut hnsw_queries = Vec::new();
+        for ef in HNSW_EF {
+            hnsw_queries.push((
+                ef,
+                measure_queries(&hnsw_dataset, &queries, &ground_truths, NLIST, Some(ef)).await,
+            ));
+        }
+
+        let result = serde_json::json!({
+            "dataset": {
+                "rows": BENCH_ROWS,
+                "dimension": DIM,
+                "queries": BENCH_QUERIES,
+                "k": K,
+                "nlist": NLIST,
+                "nprobes": NLIST,
+                "num_bits": NUM_BITS,
+            },
+            "ivf_rq": {
+                "build_seconds": rq_build_seconds,
+                "index_size_bytes": rq_size_bytes,
+                "query_mean_us": rq_query.0,
+                "query_p50_us": rq_query.1,
+                "query_p95_us": rq_query.2,
+                "recall_at_10": rq_query.3,
+            },
+            "ivf_hnsw_rq": hnsw_queries.iter().map(|(ef, query)| serde_json::json!({
+                "ef": ef,
+                "build_seconds": hnsw_build_seconds,
+                "index_size_bytes": hnsw_size_bytes,
+                "query_mean_us": query.0,
+                "query_p50_us": query.1,
+                "query_p95_us": query.2,
+                "recall_at_10": query.3,
+                "speedup_vs_ivf_rq": rq_query.0 / query.0,
+            })).collect::<Vec<_>>(),
+        });
+        println!("IVF_HNSW_RQ_BENCHMARK_JSON={result}");
+
+        assert!(
+            hnsw_queries
+                .iter()
+                .any(|(_, query)| { query.3 + 0.05 >= rq_query.3 && query.0 < rq_query.0 }),
+            "IVF_HNSW_RQ must provide lower mean latency within five recall points of IVF_RQ: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ivf_hnsw_rq_rejects_non_l2_metric() {
+        let test_dir = TempStrDir::default();
+        let (mut dataset, _) =
+            generate_test_dataset::<Float32Type>(test_dir.as_str(), 0.0..1.0).await;
+        let params = VectorIndexParams::with_ivf_hnsw_rq_params(
+            DistanceType::Cosine,
+            IvfBuildParams::new(4),
+            HnswBuildParams::default(),
+            RQBuildParams::default(),
+        );
+
+        let error = dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("IVF_HNSW_RQ only supports L2"));
+    }
+
+    #[rstest]
     #[case::l2(DistanceType::L2, 9)]
     #[case::cosine(DistanceType::Cosine, 9)]
     // ex_bits=3 and ex_bits=5 have no FastScan support and use the bit-plane
@@ -4913,6 +5282,12 @@ mod tests {
                 Default::default(),
                 Default::default()
             ), IndexType::IvfHnswSq),
+            (VectorIndexParams::with_ivf_hnsw_rq_params(
+                DistanceType::L2,
+                IvfBuildParams::new(4),
+                Default::default(),
+                RQBuildParams::with_rotation_type(5, RQRotationType::Fast)
+            ), IndexType::IvfHnswRq),
         )]
         index: (VectorIndexParams, IndexType),
     ) {
@@ -4954,7 +5329,7 @@ mod tests {
             );
 
             let sub_index = match index_type {
-                IndexType::IvfHnswPq | IndexType::IvfHnswSq => "HNSW",
+                IndexType::IvfHnswPq | IndexType::IvfHnswSq | IndexType::IvfHnswRq => "HNSW",
                 IndexType::IvfPq => "PQ",
                 _ => "FLAT",
             };

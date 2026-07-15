@@ -37,7 +37,7 @@ pub const INDEX_FILE_NAME: &str = "index.idx";
 /// The name of the auxiliary index file.
 ///
 /// This file is used to store additional information about the index, to improve performance.
-/// - For 'IVF_HNSW' index, it stores the partitioned PQ Storage.
+/// - For `IVF_HNSW_*` indices, it stores partitioned vector storage and HNSW graphs.
 pub const INDEX_AUXILIARY_FILE_NAME: &str = "auxiliary.idx";
 pub const INDEX_METADATA_SCHEMA_KEY: &str = "lance:index";
 
@@ -46,7 +46,7 @@ pub const INDEX_METADATA_SCHEMA_KEY: &str = "lance:index";
 /// Most vector indices should use this version unless they need to bump for a
 /// format change.
 pub const VECTOR_INDEX_VERSION: u32 = 1;
-/// Version for IVF_RQ indices.
+/// Version for IVF_RQ and IVF_HNSW_RQ indices.
 pub const IVF_RQ_INDEX_VERSION: u32 = 2;
 
 /// The factor of threshold to trigger split / join for vector index.
@@ -141,6 +141,7 @@ pub enum IndexType {
     IvfHnswPq = 105,
     IvfHnswFlat = 106,
     IvfRq = 107,
+    IvfHnswRq = 108,
 }
 
 impl std::fmt::Display for IndexType {
@@ -164,6 +165,7 @@ impl std::fmt::Display for IndexType {
             Self::IvfHnswPq => write!(f, "IVF_HNSW_PQ"),
             Self::IvfHnswFlat => write!(f, "IVF_HNSW_FLAT"),
             Self::IvfRq => write!(f, "IVF_RQ"),
+            Self::IvfHnswRq => write!(f, "IVF_HNSW_RQ"),
         }
     }
 }
@@ -193,6 +195,7 @@ impl TryFrom<i32> for IndexType {
             v if v == Self::IvfHnswPq as i32 => Ok(Self::IvfHnswPq),
             v if v == Self::IvfHnswFlat as i32 => Ok(Self::IvfHnswFlat),
             v if v == Self::IvfRq as i32 => Ok(Self::IvfRq),
+            v if v == Self::IvfHnswRq as i32 => Ok(Self::IvfHnswRq),
             _ => Err(Error::invalid_input_source(
                 format!("the input value {} is not a valid IndexType", value).into(),
             )),
@@ -222,6 +225,7 @@ impl TryFrom<&str> for IndexType {
             "IVF_HNSW_FLAT" => Ok(Self::IvfHnswFlat),
             "IVF_HNSW_SQ" => Ok(Self::IvfHnswSq),
             "IVF_HNSW_PQ" => Ok(Self::IvfHnswPq),
+            "IVF_HNSW_RQ" => Ok(Self::IvfHnswRq),
             "FragmentReuse" => Ok(Self::FragmentReuse),
             "MemWal" => Ok(Self::MemWal),
             _ => Err(Error::invalid_input(format!(
@@ -257,6 +261,7 @@ impl IndexType {
                 | Self::IvfHnswSq
                 | Self::IvfHnswPq
                 | Self::IvfHnswFlat
+                | Self::IvfHnswRq
                 | Self::IvfFlat
                 | Self::IvfSq
                 | Self::IvfRq
@@ -300,7 +305,7 @@ impl IndexType {
             | Self::IvfHnswSq
             | Self::IvfHnswPq
             | Self::IvfHnswFlat => VECTOR_INDEX_VERSION as i32,
-            Self::IvfRq => IVF_RQ_INDEX_VERSION as i32,
+            Self::IvfRq | Self::IvfHnswRq => IVF_RQ_INDEX_VERSION as i32,
         }
     }
 
@@ -320,6 +325,7 @@ impl IndexType {
             Self::IvfHnswFlat => 1 << 20,
             Self::IvfHnswSq => 1 << 20,
             Self::IvfHnswPq => 1 << 20,
+            Self::IvfHnswRq => 1 << 20,
             _ => 8192,
         }
     }
@@ -335,6 +341,7 @@ impl IndexType {
             Self::IvfHnswPq,
             Self::IvfHnswFlat,
             Self::IvfRq,
+            Self::IvfHnswRq,
         ]
         .into_iter()
         .map(|index_type| index_type.version() as u32)
@@ -377,9 +384,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_ivf_rq_has_dedicated_index_version() {
+    fn test_ivf_rq_indices_have_dedicated_index_version() {
         assert!(IndexType::IvfRq.version() > IndexType::IvfPq.version());
         assert_eq!(IndexType::IvfRq.version() as u32, IVF_RQ_INDEX_VERSION);
+        assert_eq!(IndexType::IvfHnswRq.version() as u32, IVF_RQ_INDEX_VERSION);
     }
 
     #[test]
@@ -388,8 +396,9 @@ mod tests {
     }
 
     #[test]
-    fn test_ivf_rq_target_partition_size() {
+    fn test_ivf_rq_target_partition_sizes() {
         assert_eq!(IndexType::IvfRq.target_partition_size(), 4096);
+        assert_eq!(IndexType::IvfHnswRq.target_partition_size(), 1 << 20);
     }
 
     #[test]
@@ -415,6 +424,7 @@ mod tests {
             IndexType::IvfHnswPq,
             IndexType::IvfHnswFlat,
             IndexType::IvfRq,
+            IndexType::IvfHnswRq,
         ];
 
         for index_type in all {
@@ -459,6 +469,7 @@ mod tests {
             ("IVF_HNSW_FLAT", IndexType::IvfHnswFlat),
             ("IVF_HNSW_SQ", IndexType::IvfHnswSq),
             ("IVF_HNSW_PQ", IndexType::IvfHnswPq),
+            ("IVF_HNSW_RQ", IndexType::IvfHnswRq),
             ("FragmentReuse", IndexType::FragmentReuse),
             ("MemWal", IndexType::MemWal),
         ];

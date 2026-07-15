@@ -16,6 +16,7 @@ package org.lance.index;
 import org.lance.Dataset;
 import org.lance.Fragment;
 import org.lance.TestVectorDataset;
+import org.lance.index.vector.HnswBuildParams;
 import org.lance.index.vector.IvfBuildParams;
 import org.lance.index.vector.PQBuildParams;
 import org.lance.index.vector.RQBuildParams;
@@ -309,6 +310,41 @@ public class VectorIndexTest {
         assertTrue(
             indexType == IndexType.VECTOR || indexType == IndexType.IVF_RQ,
             "IndexType for IVF_RQ index should be VECTOR or IVF_RQ but was " + indexType);
+      }
+    }
+  }
+
+  @Test
+  public void testCreateIvfHnswRqIndex(@TempDir Path tempDir) throws Exception {
+    Path datasetPath = tempDir.resolve("ivf_hnsw_rq_index");
+
+    try (TestVectorDataset testVectorDataset = new TestVectorDataset(datasetPath)) {
+      try (Dataset dataset = testVectorDataset.create()) {
+        IvfBuildParams ivf = new IvfBuildParams.Builder().setNumPartitions(2).build();
+        HnswBuildParams hnsw = new HnswBuildParams.Builder().build();
+        RQBuildParams rq = new RQBuildParams.Builder().setNumBits((byte) 5).build();
+        VectorIndexParams vectorIndexParams =
+            VectorIndexParams.withIvfHnswRqParams(DistanceType.L2, ivf, hnsw, rq);
+        IndexParams indexParams =
+            IndexParams.builder().setVectorIndexParams(vectorIndexParams).build();
+
+        dataset.createIndex(
+            IndexOptions.builder(
+                    Collections.singletonList(TestVectorDataset.vectorColumnName),
+                    IndexType.IVF_HNSW_RQ,
+                    indexParams)
+                .withIndexName(TestVectorDataset.indexName)
+                .build());
+
+        Index index =
+            dataset.getIndexes().stream()
+                .filter(candidate -> TestVectorDataset.indexName.equals(candidate.name()))
+                .findFirst()
+                .orElse(null);
+        assertNotNull(index, "Expected IVF_HNSW_RQ index to be present");
+        assertTrue(
+            index.indexType() == IndexType.VECTOR || index.indexType() == IndexType.IVF_HNSW_RQ,
+            "IndexType should be VECTOR or IVF_HNSW_RQ but was " + index.indexType());
       }
     }
   }

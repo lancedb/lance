@@ -33,7 +33,9 @@ use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::progress::{IndexBuildProgress, NoopIndexBuildProgress};
-use lance_index::vector::bq::storage::{RABIT_CODE_COLUMN, unpack_codes};
+use lance_index::vector::bq::storage::{
+    RABIT_CODE_COLUMN, RABIT_HNSW_BUILD_VECTOR_COLUMN, unpack_codes,
+};
 use lance_index::vector::kmeans::KMeansParams;
 use lance_index::vector::pq::storage::transpose;
 use lance_index::vector::quantizer::{
@@ -179,6 +181,11 @@ pub struct VectorIndexBuildSummary {
 }
 
 impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> {
+    fn needs_rq_hnsw_build_vectors() -> bool {
+        Q::quantization_type() == QuantizationType::Rabit
+            && matches!(SubIndexType::try_from(S::name()), Ok(SubIndexType::Hnsw))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         dataset: Dataset,
@@ -346,10 +353,38 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         log::info!("remap {} partitions", ivf.num_partitions());
         let existing_index = self.existing_indices[0].clone();
         let mapping = Arc::new(mapping.clone());
+        let rebuild_rq_hnsw = Self::needs_rq_hnsw_build_vectors();
+        let dataset = if rebuild_rq_hnsw {
+            Some(self.dataset.clone().ok_or_else(|| {
+                Error::invalid_input("Dataset is required to remap IVF_HNSW_RQ indices")
+            })?)
+        } else {
+            None
+        };
+        let quantizer = if rebuild_rq_hnsw {
+            Some(self.quantizer.clone().ok_or_else(|| {
+                Error::invalid_input("Quantizer is required to remap IVF_HNSW_RQ indices")
+            })?)
+        } else {
+            None
+        };
+        let centroids = if rebuild_rq_hnsw {
+            Some(ivf.centroids.clone().ok_or_else(|| {
+                Error::invalid_input("IVF centroids are required to remap IVF_HNSW_RQ indices")
+            })?)
+        } else {
+            None
+        };
+        let column = self.column.clone();
+        let distance_type = self.distance_type;
         let build_iter =
             (0..ivf.num_partitions()).map(move |part_id| {
                 let existing_index = existing_index.clone();
                 let mapping = mapping.clone();
+                let dataset = dataset.clone();
+                let quantizer = quantizer.clone();
+                let centroids = centroids.clone();
+                let column = column.clone();
                 async move {
                     let ivf_index = existing_index
                         .as_any()
@@ -361,6 +396,63 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     let part = part.as_any().downcast_ref::<PartitionEntry<S, Q>>().ok_or(
                         Error::internal("failed to downcast partition entry".to_string()),
                     )?;
+
+                    if rebuild_rq_hnsw {
+                        let dataset = dataset.as_ref().ok_or_else(|| {
+                            Error::internal(
+                                "IVF_HNSW_RQ remap dataset was validated before partition rebuild"
+                                    .to_string(),
+                            )
+                        })?;
+                        let quantizer = quantizer.ok_or_else(|| {
+                            Error::internal(
+                            "IVF_HNSW_RQ remap quantizer was validated before partition rebuild"
+                                .to_string(),
+                        )
+                        })?;
+                        let centroids = centroids.ok_or_else(|| {
+                            Error::internal(
+                            "IVF_HNSW_RQ remap centroids were validated before partition rebuild"
+                                .to_string(),
+                        )
+                        })?;
+                        let mut seen = HashSet::new();
+                        let (source_row_ids, remapped_row_ids): (Vec<_>, Vec<_>) = part
+                            .storage
+                            .row_ids()
+                            .filter_map(|old_row_id| {
+                                let new_row_id = match mapping.get(*old_row_id) {
+                                    None => *old_row_id,
+                                    Some(Some(new_row_id)) => new_row_id,
+                                    Some(None) => return None,
+                                };
+                                seen.insert(new_row_id).then_some((*old_row_id, new_row_id))
+                            })
+                            .unzip();
+                        if source_row_ids.is_empty() {
+                            return Ok(None);
+                        }
+
+                        let batch = Self::transform_rq_hnsw_rows(
+                            dataset,
+                            centroids,
+                            quantizer.clone(),
+                            part_id,
+                            &column,
+                            source_row_ids,
+                            Some(remapped_row_ids),
+                        )
+                        .await?;
+                        if batch.num_rows() == 0 {
+                            return Err(Error::index(format!(
+                                "Remapping IVF_HNSW_RQ partition {part_id} produced no vectors"
+                            )));
+                        }
+                        let storage = StorageBuilder::new(column, distance_type, quantizer, None)?
+                            .build(vec![batch])?;
+                        let index = part.index.remap(&mapping, &storage)?;
+                        return Ok(Some((storage, index, 0.0)));
+                    }
 
                     let storage = part.storage.remap(&mapping)?;
                     let index = part.index.remap(&mapping, &storage)?;
@@ -650,6 +742,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         self
     }
 
+    /// Record that an incremental build has no new, unindexed rows.
+    pub fn without_unindexed_data(&mut self) -> &mut Self {
+        self.shuffle_reader = Some(Arc::new(EmptyReader));
+        self
+    }
+
     // shuffle the unindexed data and existing indices
     // data must be with schema | ROW_ID | vector_column |
     // the shuffled data will be with schema | ROW_ID | PART_ID | code_column |
@@ -681,12 +779,15 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let code_column = quantizer.column();
 
         let transformer = Arc::new(
-            lance_index::vector::ivf::new_ivf_transformer_with_quantizer(
+            lance_index::vector::ivf::new_ivf_transformer_with_quantizer_and_options(
                 ivf.centroids.clone().unwrap(),
                 self.distance_type,
                 &self.column,
                 quantizer.into(),
                 None,
+                lance_index::vector::ivf::IvfTransformerOptions {
+                    keep_rq_hnsw_build_vectors: Self::needs_rq_hnsw_build_vectors(),
+                },
             )?,
         );
 
@@ -889,6 +990,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
         let distance_type = self.distance_type;
         let column = self.column.clone();
+        let dataset = self.dataset.clone();
+        let centroids = self
+            .ivf
+            .as_ref()
+            .and_then(|ivf| ivf.centroids.clone())
+            .ok_or_else(|| Error::invalid_input("IVF centroids not set before build"))?;
+        let needs_rq_hnsw_build_vectors = Self::needs_rq_hnsw_build_vectors();
         let frag_reuse_index = self.frag_reuse_index.clone();
         let partition_adjustment = Arc::new(partition_adjustment);
         let build_iter =
@@ -902,6 +1010,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     let quantizer = quantizer.clone();
                     let sub_index_params = sub_index_params.clone();
                     let column = column.clone();
+                    let dataset = dataset.clone();
+                    let centroids = centroids.clone();
                     let frag_reuse_index = frag_reuse_index.clone();
                     let partition_adjustment = partition_adjustment.clone();
                     async move {
@@ -954,6 +1064,29 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                             loss += extra_loss;
                         }
 
+                        if needs_rq_hnsw_build_vectors
+                            && batches.iter().any(|batch| {
+                                batch
+                                    .column_by_name(RABIT_HNSW_BUILD_VECTOR_COLUMN)
+                                    .is_none()
+                            })
+                        {
+                            let dataset = dataset.as_ref().ok_or_else(|| {
+                                Error::invalid_input(
+                                    "Dataset is required to rebuild IVF_HNSW_RQ partitions",
+                                )
+                            })?;
+                            batches = Self::regenerate_rq_hnsw_batches(
+                                dataset,
+                                centroids,
+                                quantizer.clone(),
+                                partition,
+                                &column,
+                                batches,
+                            )
+                            .await?;
+                        }
+
                         spawn_cpu(move || {
                             // Apply assign_batch for join operations (splits no
                             // longer use assign_batches)
@@ -1002,6 +1135,100 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         Ok(stream::iter(build_iter)
             .buffered(get_num_compute_intensive_cpus())
             .boxed())
+    }
+
+    async fn regenerate_rq_hnsw_batches(
+        dataset: &Dataset,
+        centroids: FixedSizeListArray,
+        quantizer: Q,
+        partition: usize,
+        column: &str,
+        batches: Vec<RecordBatch>,
+    ) -> Result<Vec<RecordBatch>> {
+        let mut rebuilt = Vec::with_capacity(batches.len());
+
+        for batch in batches {
+            if batch
+                .column_by_name(RABIT_HNSW_BUILD_VECTOR_COLUMN)
+                .is_some()
+            {
+                rebuilt.push(batch);
+                continue;
+            }
+
+            let mut seen = HashSet::new();
+            let row_ids = batch[ROW_ID]
+                .as_primitive::<UInt64Type>()
+                .values()
+                .iter()
+                .copied()
+                .filter(|row_id| seen.insert(*row_id))
+                .collect::<Vec<_>>();
+            let row_ids = dataset.filter_deleted_ids(&row_ids).await?;
+            if row_ids.is_empty() {
+                continue;
+            }
+
+            let transformed = Self::transform_rq_hnsw_rows(
+                dataset,
+                centroids.clone(),
+                quantizer.clone(),
+                partition,
+                column,
+                row_ids,
+                None,
+            )
+            .await?;
+            if transformed.num_rows() > 0 {
+                rebuilt.push(transformed);
+            }
+        }
+
+        Ok(rebuilt)
+    }
+
+    async fn transform_rq_hnsw_rows(
+        dataset: &Dataset,
+        centroids: FixedSizeListArray,
+        quantizer: Q,
+        partition: usize,
+        column: &str,
+        source_row_ids: Vec<u64>,
+        remapped_row_ids: Option<Vec<u64>>,
+    ) -> Result<RecordBatch> {
+        if let Some(remapped_row_ids) = remapped_row_ids.as_ref()
+            && remapped_row_ids.len() != source_row_ids.len()
+        {
+            return Err(Error::invalid_input(format!(
+                "IVF_HNSW_RQ source and remapped row ID counts differ: {} != {}",
+                source_row_ids.len(),
+                remapped_row_ids.len()
+            )));
+        }
+        let partition = u32::try_from(partition)
+            .map_err(|_| Error::invalid_input("IVF partition id exceeds u32"))?;
+        let projection = Arc::new(dataset.schema().project(&[column])?);
+        let raw_batch = dataset
+            .take_rows(&source_row_ids, ProjectionRequest::Schema(projection))
+            .await?;
+        let output_row_ids = remapped_row_ids.unwrap_or(source_row_ids);
+        let raw_batch = raw_batch.try_with_column(
+            ROW_ID_FIELD.clone(),
+            Arc::new(UInt64Array::from(output_row_ids)),
+        )?;
+        let transformer = lance_index::vector::ivf::new_ivf_transformer_with_quantizer_and_options(
+            centroids,
+            DistanceType::L2,
+            column,
+            quantizer.into(),
+            Some(partition..partition + 1),
+            lance_index::vector::ivf::IvfTransformerOptions {
+                keep_rq_hnsw_build_vectors: true,
+            },
+        )?;
+        Ok(transformer
+            .transform(&raw_batch)?
+            .drop_column(PART_ID_COLUMN)?)
     }
 
     #[instrument(name = "build_index", level = "debug", skip_all)]
@@ -1663,12 +1890,15 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         .boxed();
 
         let transformer = Arc::new(
-            lance_index::vector::ivf::new_ivf_transformer_with_quantizer(
+            lance_index::vector::ivf::new_ivf_transformer_with_quantizer_and_options(
                 new_centroids.clone(),
                 self.distance_type,
                 &self.column,
                 quantizer.into(),
                 None,
+                lance_index::vector::ivf::IvfTransformerOptions {
+                    keep_rq_hnsw_build_vectors: Self::needs_rq_hnsw_build_vectors(),
+                },
             )?,
         );
 
@@ -1965,12 +2195,15 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         };
 
         let transformer = Arc::new(
-            lance_index::vector::ivf::new_ivf_transformer_with_quantizer(
+            lance_index::vector::ivf::new_ivf_transformer_with_quantizer_and_options(
                 centroids.clone(),
                 self.distance_type,
                 vector_field.name().as_str(),
                 quantizer.into(),
                 None,
+                lance_index::vector::ivf::IvfTransformerOptions {
+                    keep_rq_hnsw_build_vectors: Self::needs_rq_hnsw_build_vectors(),
+                },
             )?,
         );
 

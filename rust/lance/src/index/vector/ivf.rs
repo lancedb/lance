@@ -732,7 +732,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .await?
         }
         // IVF_HNSW_FLAT
-        (SubIndexType::Hnsw, QuantizationType::Flat) => {
+        (SubIndexType::Hnsw, QuantizationType::Flat | QuantizationType::FlatBin) => {
             if element_type == DataType::UInt8 {
                 IvfIndexBuilder::<HNSW, FlatBinQuantizer>::new_incremental(
                     dataset.clone(),
@@ -811,12 +811,25 @@ pub(crate) async fn optimize_vector_indices_v2(
             .build()
             .await?
         }
-        (sub_index_type, quantization_type) => {
-            unimplemented!(
-                "unsupported index type: {}, {}",
-                sub_index_type,
-                quantization_type
-            )
+        // IVF_HNSW_RQ
+        (SubIndexType::Hnsw, QuantizationType::Rabit) => {
+            IvfIndexBuilder::<HNSW, RabitQuantizer>::new_incremental(
+                dataset.clone(),
+                vector_column.to_owned(),
+                index_dir,
+                distance_type,
+                shuffler,
+                HnswBuildParams::default(),
+                frag_reuse_index,
+                options.clone(),
+            )?
+            .with_ivf(ivf_model.clone())
+            .with_quantizer(quantizer.try_into()?)
+            .with_existing_indices(existing_indices.clone())
+            .with_progress(options.progress.clone())
+            .shuffle_data_input(unindexed)
+            .build()
+            .await?
         }
     };
 
@@ -2275,24 +2288,16 @@ async fn write_ivf_hnsw_file(
 
 /// Merge one caller-defined group of source segments into a single segment.
 pub(crate) async fn merge_segments(
-    object_store: &ObjectStore,
-    indices_dir: &Path,
+    dataset: &Dataset,
     segments: Vec<TableIndexMetadata>,
 ) -> Result<TableIndexMetadata> {
-    merge_segments_with_progress(
-        object_store,
-        indices_dir,
-        segments,
-        lance_index::progress::noop_progress(),
-    )
-    .await
+    merge_segments_with_progress(dataset, segments, lance_index::progress::noop_progress()).await
 }
 
 /// Merge one caller-defined group of source segments into a single segment and
 /// report progress through the provided callback.
 pub(crate) async fn merge_segments_with_progress(
-    object_store: &ObjectStore,
-    indices_dir: &Path,
+    dataset: &Dataset,
     segments: Vec<TableIndexMetadata>,
     progress: Arc<dyn lance_index::progress::IndexBuildProgress>,
 ) -> Result<TableIndexMetadata> {
@@ -2316,22 +2321,58 @@ pub(crate) async fn merge_segments_with_progress(
     }
 
     let index_version = infer_source_index_version(&segments)?;
-    let segment_uuid = Uuid::new_v4();
-    let final_dir = indices_dir.clone().join(segment_uuid.to_string());
-    let files = merge_segments_to_dir(
-        object_store,
-        indices_dir,
-        &final_dir,
-        &segments,
-        None,
-        progress,
+    let indices_dir = dataset.indices_dir();
+    let source_index_paths = segments
+        .iter()
+        .map(|segment| {
+            indices_dir
+                .clone()
+                .join(segment.uuid.to_string())
+                .join(INDEX_FILE_NAME)
+        })
+        .collect::<Vec<_>>();
+    let scheduler = ScanScheduler::new(
+        dataset.object_store.clone(),
+        SchedulerConfig::max_bandwidth(&dataset.object_store),
+    );
+    let hnsw_metadata = read_hnsw_index_metadata_from_sources(
+        dataset.object_store.as_ref(),
+        &scheduler,
+        &source_index_paths,
     )
     .await?;
+
+    let (segment_uuid, files) = if hnsw_metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.index_type == "IVF_HNSW_RQ")
+    {
+        merge_ivf_hnsw_rq_segments(
+            dataset,
+            &indices_dir,
+            &segments,
+            &source_index_paths,
+            &scheduler,
+            progress,
+        )
+        .await?
+    } else {
+        let segment_uuid = Uuid::new_v4();
+        let final_dir = indices_dir.clone().join(segment_uuid.to_string());
+        let files = merge_segments_to_dir(
+            dataset.object_store.as_ref(),
+            &indices_dir,
+            &final_dir,
+            &segments,
+            None,
+            progress,
+        )
+        .await?;
+        (segment_uuid, files)
+    };
 
     merged_segment = TableIndexMetadata {
         uuid: segment_uuid,
         fragment_bitmap: Some(fragment_bitmap),
-        index_details: Some(Arc::new(crate::index::vector_index_details_default())),
         index_version,
         created_at: Some(chrono::Utc::now()),
         base_id: None,
@@ -2339,6 +2380,129 @@ pub(crate) async fn merge_segments_with_progress(
         ..merged_segment
     };
     Ok(merged_segment)
+}
+
+async fn merge_ivf_hnsw_rq_segments(
+    dataset: &Dataset,
+    indices_dir: &Path,
+    segments: &[TableIndexMetadata],
+    source_index_paths: &[Path],
+    scheduler: &Arc<ScanScheduler>,
+    progress: Arc<dyn lance_index::progress::IndexBuildProgress>,
+) -> Result<(Uuid, Vec<IndexFile>)> {
+    let field_id = *segments[0]
+        .fields
+        .first()
+        .ok_or_else(|| Error::invalid_input("IVF_HNSW_RQ segment is missing a field id"))?;
+    let column = dataset.schema().field_path(field_id)?;
+    let hnsw_params = read_hnsw_build_params_from_sources(
+        dataset.object_store.as_ref(),
+        scheduler,
+        source_index_paths,
+    )
+    .await?;
+
+    let mut existing_indices = Vec::<Arc<dyn VectorIndex>>::with_capacity(segments.len());
+    let mut common_ivf: Option<IvfModel> = None;
+    let mut common_quantizer: Option<RabitQuantizer> = None;
+    let mut common_distance_type: Option<DistanceType> = None;
+
+    for segment in segments {
+        let index = v2::IVFIndex::<HNSW, RabitQuantizer>::try_new(
+            dataset.object_store.clone(),
+            indices_dir.clone(),
+            segment.uuid,
+            None,
+            dataset.metadata_cache.as_ref(),
+            dataset.index_cache.for_index(&segment.uuid, None),
+            segment.file_size_map(),
+        )
+        .await?;
+        let ivf = index.ivf_model();
+        let quantizer: RabitQuantizer = index.quantizer().try_into()?;
+        let distance_type = index.metric_type();
+
+        if let Some(common_ivf) = common_ivf.as_ref() {
+            if common_ivf.centroids != ivf.centroids {
+                return Err(Error::invalid_input(format!(
+                    "IVF centroids mismatch while merging IVF_HNSW_RQ segment {}",
+                    segment.uuid
+                )));
+            }
+        } else {
+            common_ivf = Some(ivf.clone());
+        }
+        if let Some(common_quantizer) = common_quantizer.as_ref() {
+            if !rabit_quantizer_params_eq(common_quantizer, &quantizer) {
+                return Err(Error::invalid_input(format!(
+                    "RQ parameters mismatch while merging IVF_HNSW_RQ segment {}",
+                    segment.uuid
+                )));
+            }
+        } else {
+            common_quantizer = Some(quantizer);
+        }
+        if let Some(common_distance_type) = common_distance_type {
+            if common_distance_type != distance_type {
+                return Err(Error::invalid_input(format!(
+                    "Distance type mismatch while merging IVF_HNSW_RQ segment {}: expected {}, got {}",
+                    segment.uuid, common_distance_type, distance_type
+                )));
+            }
+        } else {
+            common_distance_type = Some(distance_type);
+        }
+
+        existing_indices.push(Arc::new(index));
+    }
+
+    let common_ivf = common_ivf.ok_or_else(|| Error::index("No IVF_HNSW_RQ indices found"))?;
+    let common_quantizer =
+        common_quantizer.ok_or_else(|| Error::index("No IVF_HNSW_RQ quantizer found"))?;
+    let distance_type =
+        common_distance_type.ok_or_else(|| Error::index("No IVF_HNSW_RQ distance type found"))?;
+    let segment_uuid = Uuid::new_v4();
+    let final_dir = indices_dir.clone().join(segment_uuid.to_string());
+    let temp_dir = lance_core::utils::tempfile::TempStdDir::default();
+    let temp_dir_path = Path::from_filesystem_path(&temp_dir)?;
+    let shuffler = create_ivf_shuffler(
+        temp_dir_path,
+        common_ivf.num_partitions(),
+        dataset_format_version(dataset),
+        Some(progress.clone()),
+    );
+    let frag_reuse_index = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await?;
+    let mut builder = IvfIndexBuilder::<HNSW, RabitQuantizer>::new_incremental(
+        dataset.clone(),
+        column,
+        final_dir,
+        distance_type,
+        shuffler,
+        hnsw_params,
+        frag_reuse_index,
+        OptimizeOptions::merge(existing_indices.len()),
+    )?;
+    builder
+        .with_ivf(common_ivf)
+        .with_quantizer(common_quantizer)
+        .with_existing_indices(existing_indices)
+        .without_unindexed_data()
+        .with_progress(progress);
+    let summary = builder.build().await?;
+    Ok((segment_uuid, summary.files))
+}
+
+fn rabit_quantizer_params_eq(left: &RabitQuantizer, right: &RabitQuantizer) -> bool {
+    let left = left.metadata_ref();
+    let right = right.metadata_ref();
+    // Each distributed segment may generate an independent random rotation.
+    // The merge rereads exact vectors from the Dataset and requantizes every row
+    // with the first segment's model, so only the requested RQ configuration must match.
+    left.rotation_type == right.rotation_type
+        && left.code_dim == right.code_dim
+        && left.num_bits == right.num_bits
+        && left.packed == right.packed
+        && left.query_estimator == right.query_estimator
 }
 
 /// Merge the selected input segments into `final_dir`.

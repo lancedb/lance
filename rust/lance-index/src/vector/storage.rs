@@ -400,6 +400,12 @@ pub trait VectorStore: Send + Sync + Sized + Clone {
     /// Return [DistanceType].
     fn distance_type(&self) -> DistanceType;
 
+    /// Validate that this storage can supply exact stored-vector distances for
+    /// HNSW construction.
+    fn validate_hnsw_build(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Get the lance ROW ID from one vector.
     fn row_id(&self, id: u32) -> u64;
 

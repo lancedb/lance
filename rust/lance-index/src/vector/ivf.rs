@@ -58,6 +58,29 @@ pub fn new_ivf_transformer_with_quantizer(
     quantizer: Quantizer,
     range: Option<Range<u32>>,
 ) -> Result<IvfTransformer> {
+    new_ivf_transformer_with_quantizer_and_options(
+        centroids,
+        metric_type,
+        vector_column,
+        quantizer,
+        range,
+        IvfTransformerOptions::default(),
+    )
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct IvfTransformerOptions {
+    pub keep_rq_hnsw_build_vectors: bool,
+}
+
+pub fn new_ivf_transformer_with_quantizer_and_options(
+    centroids: FixedSizeListArray,
+    metric_type: MetricType,
+    vector_column: &str,
+    quantizer: Quantizer,
+    range: Option<Range<u32>>,
+    options: IvfTransformerOptions,
+) -> Result<IvfTransformer> {
     match quantizer {
         Quantizer::Flat(_) | Quantizer::FlatBin(_) => Ok(IvfTransformer::new_flat(
             centroids,
@@ -79,9 +102,14 @@ pub fn new_ivf_transformer_with_quantizer(
             sq,
             range,
         )),
-        Quantizer::Rabit(rq) => {
-            IvfTransformer::with_rq(centroids, metric_type, vector_column, rq, range)
-        }
+        Quantizer::Rabit(rq) => IvfTransformer::with_rq(
+            centroids,
+            metric_type,
+            vector_column,
+            rq,
+            range,
+            options.keep_rq_hnsw_build_vectors,
+        ),
     }
 }
 
@@ -280,6 +308,7 @@ impl IvfTransformer {
         vector_column: &str,
         rq: RabitQuantizer,
         range: Option<Range<u32>>,
+        keep_hnsw_build_vectors: bool,
     ) -> Result<Self> {
         let mut transforms: Vec<Arc<dyn Transformer>> =
             vec![Arc::new(super::transform::Flatten::new(vector_column))];
@@ -313,12 +342,14 @@ impl IvfTransformer {
             vector_column,
         )));
 
-        transforms.push(Arc::new(RQTransformer::new(
-            rq,
-            distance_type,
-            centroids.clone(),
-            vector_column,
-        )?));
+        let rq_transformer =
+            RQTransformer::new(rq, distance_type, centroids.clone(), vector_column)?;
+        let rq_transformer = if keep_hnsw_build_vectors {
+            rq_transformer.keep_hnsw_build_vectors()
+        } else {
+            rq_transformer
+        };
+        transforms.push(Arc::new(rq_transformer));
 
         Ok(Self::new(centroids, distance_type, transforms))
     }

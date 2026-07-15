@@ -1414,12 +1414,7 @@ impl DatasetIndexExt for Dataset {
         }
 
         let mut merged_segment = if all_vector {
-            crate::index::vector::ivf::merge_segments(
-                self.object_store.as_ref(),
-                &self.indices_dir(),
-                source_segments,
-            )
-            .await?
+            crate::index::vector::ivf::merge_segments(self, source_segments).await?
         } else if all_inverted {
             crate::index::scalar::inverted::merge_segments(self, source_segments).await?
         } else if all_fmindex {
@@ -2403,6 +2398,20 @@ impl DatasetIndexInternalExt for Dataset {
 
                     "IVF_HNSW_PQ" => {
                         let ivf = IVFIndex::<HNSW, ProductQuantizer>::try_new(
+                            self.object_store.clone(),
+                            index_dir,
+                            uuid.to_owned(),
+                            frag_reuse_index,
+                            self.metadata_cache.as_ref(),
+                            index_cache,
+                            file_sizes,
+                        )
+                        .await?;
+                        Ok(wrap_ivf(ivf))
+                    }
+
+                    "IVF_HNSW_RQ" => {
+                        let ivf = IVFIndex::<HNSW, RabitQuantizer>::try_new(
                             self.object_store.clone(),
                             index_dir,
                             uuid.to_owned(),

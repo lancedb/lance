@@ -10,7 +10,7 @@ use arrow_array::{
     Array, ArrowNativeTypeOp, FixedSizeListArray, Float32Array, RecordBatch, UInt32Array,
 };
 use arrow_schema::DataType;
-use lance_arrow::RecordBatchExt;
+use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
 use lance_core::{Error, Result};
 use lance_linalg::distance::{DistanceType, norm_squared_fsl};
 use tracing::instrument;
@@ -18,7 +18,8 @@ use tracing::instrument;
 use crate::vector::bq::builder::RabitQuantizer;
 use crate::vector::bq::rabit_ex_bits;
 use crate::vector::bq::storage::{
-    RABIT_BLOCKED_EX_CODE_COLUMN, RABIT_CODE_COLUMN, RabitQueryEstimator,
+    RABIT_BLOCKED_EX_CODE_COLUMN, RABIT_CODE_COLUMN, RABIT_HNSW_BUILD_VECTOR_COLUMN,
+    RabitQueryEstimator,
 };
 use crate::vector::quantizer::Quantization;
 use crate::vector::transform::Transformer;
@@ -60,6 +61,7 @@ pub struct RQTransformer {
     centroids_norm_square: Option<Float32Array>,
     rotated_centroids: Option<Vec<f32>>,
     vector_column: String,
+    keep_hnsw_build_vectors: bool,
 }
 
 impl RQTransformer {
@@ -83,7 +85,13 @@ impl RQTransformer {
             centroids_norm_square,
             rotated_centroids,
             vector_column: vector_column.into(),
+            keep_hnsw_build_vectors: false,
         })
+    }
+
+    pub fn keep_hnsw_build_vectors(mut self) -> Self {
+        self.keep_hnsw_build_vectors = true;
+        self
     }
 }
 
@@ -324,7 +332,10 @@ impl Transformer for RQTransformer {
             }
         };
 
-        let rq_codes = self.rq.quantize_split(residual_vectors)?;
+        let mut rq_codes = self.rq.quantize_split(residual_vectors)?;
+        let rotated_residuals = rq_codes.rotated_residuals.as_deref().ok_or_else(|| {
+            Error::internal("RabitQ quantization did not return rotated residuals".to_string())
+        })?;
         let codes_fsl = rq_codes.binary_codes.as_fixed_size_list();
         debug_assert_eq!(codes_fsl.len(), batch.num_rows());
 
@@ -415,9 +426,6 @@ impl Transformer for RQTransformer {
             let ex_bits = rabit_ex_bits(self.rq.num_bits())?;
             let ex_codes = rq_codes.ex_codes;
             let ex_res_dot_dists = rq_codes.ex_res_dot_dists;
-            let rotated_residuals = rq_codes.rotated_residuals.ok_or_else(|| {
-                Error::internal("RabitQ quantization did not return rotated residuals".to_string())
-            })?;
             let ex_code_values = rq_codes.ex_code_values;
             if ex_bits != 0
                 && (ex_codes.is_none() || ex_res_dot_dists.is_none() || ex_code_values.is_none())
@@ -434,7 +442,7 @@ impl Transformer for RQTransformer {
             let raw_query_factors = compute_raw_query_factors(
                 self.distance_type,
                 &res_norm_square,
-                &rotated_residuals,
+                rotated_residuals,
                 rotated_centroids,
                 part_ids,
                 ex_code_values.as_deref(),
@@ -475,6 +483,24 @@ impl Transformer for RQTransformer {
                 batch = batch
                     .try_with_column(EX_SCALE_FACTORS_FIELD.clone(), Arc::new(ex_scale_factors))?;
             }
+        }
+
+        if self.keep_hnsw_build_vectors {
+            let rotated_residuals = rq_codes.rotated_residuals.take().ok_or_else(|| {
+                Error::internal("RabitQ quantization did not return rotated residuals".to_string())
+            })?;
+            let hnsw_build_vectors = FixedSizeListArray::try_new_from_values(
+                Float32Array::from(rotated_residuals),
+                self.rq.dim() as i32,
+            )?;
+            batch = batch.try_with_column(
+                arrow_schema::Field::new(
+                    RABIT_HNSW_BUILD_VECTOR_COLUMN,
+                    hnsw_build_vectors.data_type().clone(),
+                    false,
+                ),
+                Arc::new(hnsw_build_vectors),
+            )?;
         }
 
         let batch = batch
