@@ -14,8 +14,8 @@ use arrow::array::AsArray;
 use arrow::datatypes::Int32Type;
 use arrow_array::Array;
 use itertools::Itertools;
-use lance_core::Result;
 use lance_core::utils::address::RowAddress;
+use lance_core::{Error, Result};
 use lance_select::RowAddrMask;
 
 use crate::metrics::MetricsCollector;
@@ -679,12 +679,18 @@ impl PostingIterator {
         self.current_doc = current_doc;
     }
 
-    fn position_cursor(&self) -> Option<PositionCursor<'_>> {
+    fn position_cursor(&self) -> Result<PositionCursor<'_>> {
         match self.list {
-            PostingList::Plain(ref list) => list.positions.as_ref().map(|positions| {
+            PostingList::Plain(ref list) => {
+                let positions = list.positions.as_ref().ok_or_else(|| {
+                    Error::index(format!(
+                        "positions are missing for token {:?} (token id {}, query position {})",
+                        self.token, self.token_id, self.position
+                    ))
+                })?;
                 let start = positions.value_offsets()[self.index] as usize;
                 let end = positions.value_offsets()[self.index + 1] as usize;
-                PositionCursor::new(
+                Ok(PositionCursor::new(
                     PositionValues::Owned(
                         positions.values().as_primitive::<Int32Type>().values()[start..end]
                             .iter()
@@ -692,13 +698,18 @@ impl PostingIterator {
                             .collect(),
                     ),
                     self.position as i32,
-                )
-            }),
-            PostingList::Compressed(ref list) => match list.positions.as_ref()? {
+                ))
+            }
+            PostingList::Compressed(ref list) => match list.positions.as_ref().ok_or_else(|| {
+                Error::index(format!(
+                    "positions are missing for token {:?} (token id {}, query position {})",
+                    self.token, self.token_id, self.position
+                ))
+            })? {
                 CompressedPositionStorage::LegacyPerDoc(positions) => {
                     let positions = positions.value(self.index);
                     let positions = decompress_positions(positions.as_binary());
-                    Some(PositionCursor::new(
+                    Ok(PositionCursor::new(
                         PositionValues::Owned(positions),
                         self.position as i32,
                     ))
@@ -740,7 +751,7 @@ impl PostingIterator {
                                 .borrow_mut()
                                 .take()
                                 .unwrap_or_default();
-                            seek_packed_doc_positions(
+                            if let Err(error) = seek_packed_doc_positions(
                                 stream.block(block_idx),
                                 compressed.position_total_deltas,
                                 delta_start..delta_end,
@@ -749,9 +760,14 @@ impl PostingIterator {
                                 &mut compressed.position_unpacked_group_idx,
                                 &mut compressed.position_tail,
                                 &mut position_values,
-                            )
-                            .expect("shared position stream doc decoding should succeed");
-                            Some(PositionCursor::new(
+                            ) {
+                                *self.position_scratch.borrow_mut() = Some(position_values);
+                                return Err(Error::index(format!(
+                                    "failed to decode positions for token {:?} (token id {}, query position {}) at posting index {}: {error}",
+                                    self.token, self.token_id, self.position, self.index
+                                )));
+                            }
+                            Ok(PositionCursor::new(
                                 PositionValues::Recycled(RecycledPositionValues::new(
                                     position_values,
                                     &self.position_scratch,
@@ -768,7 +784,12 @@ impl PostingIterator {
                                     stream.codec(),
                                     &mut compressed.position_values,
                                 )
-                                .expect("shared position stream decoding should succeed");
+                                .map_err(|error| {
+                                    Error::index(format!(
+                                        "failed to decode positions for token {:?} (token id {}, query position {}) in block {block_idx}: {error}",
+                                        self.token, self.token_id, self.position
+                                    ))
+                                })?;
                                 compressed.position_offsets.clear();
                                 compressed
                                     .position_offsets
@@ -791,7 +812,7 @@ impl PostingIterator {
                             position_values.clear();
                             position_values
                                 .extend_from_slice(&compressed.position_values[start..end]);
-                            Some(PositionCursor::new(
+                            Ok(PositionCursor::new(
                                 PositionValues::Recycled(RecycledPositionValues::new(
                                     position_values,
                                     &self.position_scratch,
@@ -1574,7 +1595,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
             let score = if self.operator == Operator::Or {
                 self.advance_all_tail(doc.doc_id(), Some(doc_length), Some(&mut score));
                 if params.phrase_slop.is_some()
-                    && !self.check_positions(params.phrase_slop.unwrap() as i32)
+                    && !self.check_positions(params.phrase_slop.unwrap() as i32)?
                 {
                     self.push_back_leads(doc.doc_id() + 1);
                     continue;
@@ -1583,7 +1604,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
             } else {
                 self.advance_all_tail(doc.doc_id(), None, None);
                 if params.phrase_slop.is_some()
-                    && !self.check_positions(params.phrase_slop.unwrap() as i32)
+                    && !self.check_positions(params.phrase_slop.unwrap() as i32)?
                 {
                     continue;
                 }
@@ -1733,7 +1754,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
 
             // check positions
             if params.phrase_slop.is_some()
-                && !self.check_positions(params.phrase_slop.unwrap() as i32)
+                && !self.check_positions(params.phrase_slop.unwrap() as i32)?
             {
                 self.advance_lead_to_head(doc_id + 1);
                 continue;
@@ -2710,9 +2731,9 @@ impl<'a, S: Scorer> Wand<'a, S> {
                             }));
                         }
                         let matched = if slop == 0 {
-                            self.check_exact_positions_bulk()
+                            self.check_exact_positions_bulk()?
                         } else {
-                            self.check_positions(slop as i32)
+                            self.check_positions(slop as i32)?
                         };
                         if !matched {
                             wins[0].pos += 1;
@@ -3340,7 +3361,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
             .collect()
     }
 
-    fn check_positions(&self, slop: i32) -> bool {
+    fn check_positions(&self, slop: i32) -> Result<bool> {
         if slop == 0 {
             return self.check_exact_positions();
         }
@@ -3348,8 +3369,8 @@ impl<'a, S: Scorer> Wand<'a, S> {
         let mut position_iters = self
             .current_doc_postings()
             .into_iter()
-            .map(|posting| posting.position_cursor().expect("positions must exist"))
-            .collect::<Vec<_>>();
+            .map(PostingIterator::position_cursor)
+            .collect::<Result<Vec<_>>>()?;
         position_iters.sort_unstable_by_key(|iter| iter.position_in_query);
 
         loop {
@@ -3359,7 +3380,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 let last = window[0].relative_position();
                 let next = window[1].relative_position();
                 let (Some(last), Some(next)) = (last, next) else {
-                    return false;
+                    return Ok(false);
                 };
 
                 let move_to = if last > next {
@@ -3375,7 +3396,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
             }
 
             if all_same {
-                return true;
+                return Ok(true);
             }
 
             position_iters.iter_mut().for_each(|iter| {
@@ -3389,7 +3410,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
     /// to [`Self::check_exact_positions`] — some base position must align all
     /// clauses at their query offsets — without the per-candidate cursor vec
     /// and sort.
-    fn check_exact_positions_bulk(&self) -> bool {
+    fn check_exact_positions_bulk(&self) -> Result<bool> {
         const MAX_INLINE_CLAUSES: usize = 16;
         let num_clauses = self.lead.len();
         if num_clauses > MAX_INLINE_CLAUSES {
@@ -3402,7 +3423,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
         let mut anchor_idx = 0usize;
         let mut anchor_len = usize::MAX;
         for (index, (slot, posting)) in cursors.iter_mut().zip(self.lead.iter()).enumerate() {
-            let cursor = posting.position_cursor().expect("positions must exist");
+            let cursor = posting.position_cursor()?;
             if cursor.len() < anchor_len {
                 anchor_len = cursor.len();
                 anchor_idx = index;
@@ -3424,32 +3445,32 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 }
                 let cursor = slot.as_ref().expect("clause cursor was just populated");
                 let Some(target) = base.checked_add(cursor.position_in_query as u32) else {
-                    return false;
+                    return Ok(false);
                 };
                 if cursor.positions.as_slice().binary_search(&target).is_err() {
                     continue 'anchor;
                 }
             }
-            return true;
+            return Ok(true);
         }
-        false
+        Ok(false)
     }
 
-    fn check_exact_positions(&self) -> bool {
+    fn check_exact_positions(&self) -> Result<bool> {
         let mut position_iters = self
             .current_doc_postings()
             .into_iter()
-            .map(|posting| posting.position_cursor().expect("positions must exist"))
-            .collect::<Vec<_>>();
+            .map(PostingIterator::position_cursor)
+            .collect::<Result<Vec<_>>>()?;
         position_iters.sort_unstable_by_key(|iter| iter.len());
         let Some(lead) = position_iters.first() else {
-            return false;
+            return Ok(false);
         };
         let lead_position = lead.position_in_query;
 
         loop {
             let Some(anchor) = position_iters[0].absolute_position() else {
-                return false;
+                return Ok(false);
             };
             let Some(base) = anchor.checked_sub(lead_position as u32) else {
                 position_iters[0].advance_next();
@@ -3460,10 +3481,10 @@ impl<'a, S: Scorer> Wand<'a, S> {
             let mut matched = true;
             for follower in position_iters.iter_mut().skip(1) {
                 let Some(target) = base.checked_add(follower.position_in_query as u32) else {
-                    return false;
+                    return Ok(false);
                 };
                 let Some(position) = follower.advance_to_absolute(target) else {
-                    return false;
+                    return Ok(false);
                 };
                 if position != target {
                     next_lead_relative = Some(position as i32 - follower.position_in_query);
@@ -3473,7 +3494,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
             }
 
             if matched {
-                return true;
+                return Ok(true);
             }
 
             position_iters[0].advance_to_relative(next_lead_relative.unwrap());
@@ -3602,10 +3623,11 @@ mod tests {
     use crate::{
         metrics::{MetricsCollector, NoOpMetricsCollector},
         scalar::inverted::{
-            CompressedPostingList, PlainPostingList, PostingListBuilder,
+            CompressedPostingList, PlainPostingList, PostingListBuilder, SharedPositionStream,
             builder::PositionRecorder,
             encoding::{
                 compress_posting_list, compress_posting_list_with_tail_codec_and_block_size,
+                encode_position_stream_block_into,
             },
         },
     };
@@ -3944,21 +3966,26 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_packed_position_cursors_use_independent_scratch() {
-        let posting_list =
+    #[rstest]
+    #[case::packed_delta(PositionStreamCodec::PackedDelta)]
+    #[case::varint_doc_delta(PositionStreamCodec::VarintDocDelta)]
+    fn test_shared_position_cursors_use_independent_scratch(
+        #[case] codec: PositionStreamCodec,
+    ) -> Result<()> {
+        let mut posting_list =
             generate_posting_list_with_positions(vec![0], vec![vec![1_u32, 3, 10]], 1.0, true);
-        let PostingList::Compressed(ref list) = posting_list else {
+        let PostingList::Compressed(ref mut list) = posting_list else {
             unreachable!("the helper was asked for a compressed posting list");
         };
-        let Some(CompressedPositionStorage::SharedStream(stream)) = list.positions.as_ref() else {
-            panic!("compressed positions should use shared stream storage");
-        };
-        assert_eq!(stream.codec(), PositionStreamCodec::PackedDelta);
+        let mut encoded = Vec::new();
+        encode_position_stream_block_into(&[1, 3, 10], &[3], codec, &mut encoded)?;
+        list.positions = Some(CompressedPositionStorage::SharedStream(
+            SharedPositionStream::new(codec, vec![0], bytes::Bytes::from(encoded)),
+        ));
 
         let posting = PostingIterator::new(String::from("term"), 0, 0, posting_list, 1);
-        let first = posting.position_cursor().expect("positions must exist");
-        let second = posting.position_cursor().expect("positions must exist");
+        let first = posting.position_cursor()?;
+        let second = posting.position_cursor()?;
 
         assert_eq!(second.positions.as_slice(), &[1, 3, 10]);
         assert_eq!(first.positions.as_slice(), &[1, 3, 10]);
@@ -3967,6 +3994,65 @@ mod tests {
         assert!(posting.position_scratch.borrow().is_some());
         drop(first);
         assert!(posting.position_scratch.borrow().is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn test_phrase_search_propagates_corrupt_packed_positions() {
+        let mut docs = DocSet::default();
+        docs.append(0, BLOCK_SIZE as u32 + 1);
+
+        let mut corrupt_list = generate_posting_list_with_positions(
+            vec![0],
+            vec![(0..BLOCK_SIZE as u32).collect()],
+            1.0,
+            true,
+        );
+        let PostingList::Compressed(ref mut list) = corrupt_list else {
+            unreachable!("the helper was asked for a compressed posting list");
+        };
+        // A bit width of one requires a 16-byte payload. Keep only the header
+        // to verify malformed on-disk data becomes a search error, not a panic.
+        list.positions = Some(CompressedPositionStorage::SharedStream(
+            SharedPositionStream::new(
+                PositionStreamCodec::PackedDelta,
+                vec![0],
+                bytes::Bytes::from_static(&[1]),
+            ),
+        ));
+
+        let postings = vec![
+            PostingIterator::new(String::from("corrupt"), 0, 0, corrupt_list, docs.len()),
+            PostingIterator::new(
+                String::from("valid"),
+                1,
+                1,
+                generate_posting_list_with_positions(
+                    vec![0],
+                    vec![vec![BLOCK_SIZE as u32]],
+                    1.0,
+                    true,
+                ),
+                docs.len(),
+            ),
+        ];
+        let mut wand = Wand::new(Operator::And, postings.into_iter(), &docs, UnitScorer);
+        let mut params = FtsSearchParams::default().with_limit(Some(10));
+        params.phrase_slop = Some(0);
+
+        let error = wand
+            .search(
+                &params,
+                Arc::new(RowAddrMask::default()),
+                &NoOpMetricsCollector,
+            )
+            .expect_err("corrupt packed positions should fail the phrase search");
+        let message = error.to_string();
+        assert!(
+            message.contains("packed position group payload"),
+            "{message}"
+        );
+        assert!(message.contains("corrupt"), "{message}");
     }
 
     fn sorted_candidate_row_ids(candidates: Vec<DocCandidate>) -> Vec<u64> {
@@ -5506,8 +5592,8 @@ mod tests {
 
         let bm25 = IndexBM25Scorer::new(std::iter::empty());
         let wand = Wand::new(Operator::And, postings.into_iter(), &docs, bm25);
-        assert!(wand.check_exact_positions());
-        assert!(wand.check_positions(0));
+        assert!(wand.check_exact_positions().unwrap());
+        assert!(wand.check_positions(0).unwrap());
     }
 
     #[rstest]
@@ -5544,8 +5630,8 @@ mod tests {
 
         let bm25 = IndexBM25Scorer::new(std::iter::empty());
         let wand = Wand::new(Operator::And, postings.into_iter(), &docs, bm25);
-        assert!(wand.check_exact_positions());
-        assert!(wand.check_positions(0));
+        assert!(wand.check_exact_positions().unwrap());
+        assert!(wand.check_positions(0).unwrap());
     }
 
     #[rstest]
@@ -5584,12 +5670,12 @@ mod tests {
         let mut wand = Wand::new(Operator::And, postings.into_iter(), &docs, UnitScorer);
         let first = wand.next().unwrap().unwrap();
         assert_eq!(first.0.doc_id(), 0);
-        assert!(!wand.check_positions(0));
+        assert!(!wand.check_positions(0).unwrap());
 
         wand.threshold = 1.5;
         let second = wand.next().unwrap().unwrap();
         assert_eq!(second.0.doc_id(), 1);
-        assert!(wand.check_positions(0));
+        assert!(wand.check_positions(0).unwrap());
     }
 
     /// The bulk conjunction path must return exactly the classic loop's
@@ -5597,20 +5683,22 @@ mod tests {
     /// phrase queries, across multi-block lists with heap/threshold pruning
     /// in play.
     #[rstest]
-    #[case::and_k10(false, 10, 3)]
-    #[case::and_k3(false, 3, 3)]
-    #[case::and_two_clauses(false, 10, 2)]
-    #[case::and_four_clauses(false, 10, 4)]
-    #[case::and_five_clauses(false, 10, 5)]
-    #[case::and_six_clauses(false, 10, 6)]
-    #[case::phrase_k10(true, 10, 3)]
-    #[case::phrase_k3(true, 3, 3)]
-    #[case::phrase_two_clauses(true, 10, 2)]
-    #[case::phrase_four_clauses(true, 10, 4)]
-    #[case::phrase_five_clauses(true, 10, 5)]
-    #[case::phrase_six_clauses(true, 10, 6)]
+    #[case::and_k10(false, 0, 10, 3)]
+    #[case::and_k3(false, 0, 3, 3)]
+    #[case::and_two_clauses(false, 0, 10, 2)]
+    #[case::and_four_clauses(false, 0, 10, 4)]
+    #[case::and_five_clauses(false, 0, 10, 5)]
+    #[case::and_six_clauses(false, 0, 10, 6)]
+    #[case::phrase_k10(true, 0, 10, 3)]
+    #[case::phrase_k3(true, 0, 3, 3)]
+    #[case::phrase_slop_three(true, 3, 10, 3)]
+    #[case::phrase_two_clauses(true, 0, 10, 2)]
+    #[case::phrase_four_clauses(true, 0, 10, 4)]
+    #[case::phrase_five_clauses(true, 0, 10, 5)]
+    #[case::phrase_six_clauses(true, 0, 10, 6)]
     fn test_bulk_and_matches_classic(
         #[case] phrase: bool,
+        #[case] slop: u32,
         #[case] limit: usize,
         #[case] num_clauses: usize,
     ) {
@@ -5657,9 +5745,9 @@ mod tests {
                                 }
                             })
                             .collect::<Vec<_>>();
-                        generate_posting_list_with_positions(doc_ids.clone(), positions, 1.0, true)
+                        generate_posting_list_with_positions(doc_ids.clone(), positions, 8.0, true)
                     } else {
-                        generate_posting_list(doc_ids.clone(), 1.0, None, true)
+                        generate_posting_list(doc_ids.clone(), 8.0, None, true)
                     };
                     PostingIterator::with_query_weight(
                         format!("t{term_pos}"),
@@ -5675,7 +5763,7 @@ mod tests {
 
         let mut params = FtsSearchParams::default().with_limit(Some(limit));
         if phrase {
-            params.phrase_slop = Some(0);
+            params.phrase_slop = Some(slop);
         }
 
         let normalize = |result: Vec<DocCandidate>| {

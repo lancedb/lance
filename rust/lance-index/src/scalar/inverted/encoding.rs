@@ -702,15 +702,10 @@ fn decode_position_stream_packed_block(
     let mut deltas = Vec::with_capacity(total_positions);
 
     for _ in 0..full_delta_blocks {
-        if packed_offset >= src.len() {
-            return Err(Error::index(
-                "unexpected EOF while decoding packed position stream".to_owned(),
-            ));
-        }
-        let num_bits = src[packed_offset];
-        packed_offset += 1;
-        let consumed = compressor.decompress(&src[packed_offset..], &mut packed_values, num_bits);
-        packed_offset += consumed;
+        let (num_bits, payload, next_offset) = packed_position_group(src, packed_offset)?;
+        let consumed = compressor.decompress(payload, &mut packed_values, num_bits);
+        debug_assert_eq!(consumed, payload.len());
+        packed_offset = next_offset;
         deltas.extend_from_slice(&packed_values);
     }
 
@@ -746,6 +741,39 @@ fn decode_position_stream_packed_block(
     Ok(())
 }
 
+fn packed_position_group(src: &[u8], offset: usize) -> Result<(u8, &[u8], usize)> {
+    let num_bits = *src.get(offset).ok_or_else(|| {
+        Error::index(format!(
+            "unexpected EOF reading packed position group header at byte offset {offset}; \
+             stream length is {}",
+            src.len()
+        ))
+    })?;
+    if num_bits > u32::BITS as u8 {
+        return Err(Error::index(format!(
+            "invalid packed position group bit width {num_bits} at byte offset {offset}; \
+             expected at most {}",
+            u32::BITS
+        )));
+    }
+
+    let payload_start = offset
+        .checked_add(1)
+        .ok_or_else(|| Error::index("packed position group offset overflow".to_owned()))?;
+    let payload_len = usize::from(num_bits) * BLOCK_SIZE / 8;
+    let payload_end = payload_start
+        .checked_add(payload_len)
+        .ok_or_else(|| Error::index("packed position group length overflow".to_owned()))?;
+    let payload = src.get(payload_start..payload_end).ok_or_else(|| {
+        Error::index(format!(
+            "unexpected EOF reading packed position group payload at byte offset {offset}; \
+             need {payload_len} bytes after the header but stream length is {}",
+            src.len()
+        ))
+    })?;
+    Ok((num_bits, payload, payload_end))
+}
+
 /// Decode one document's positions out of a PackedDelta position block
 /// without decoding the rest of the block. Full 128-delta groups are
 /// self-describing (`[num_bits u8][16 * num_bits packed bytes]`), so group
@@ -771,6 +799,12 @@ pub(super) fn seek_packed_doc_positions(
     dst: &mut Vec<u32>,
 ) -> Result<()> {
     dst.clear();
+    if delta_range.start > delta_range.end || delta_range.end > total_deltas {
+        return Err(Error::index(format!(
+            "invalid packed position delta range {}..{} for {total_deltas} total deltas",
+            delta_range.start, delta_range.end
+        )));
+    }
     if delta_range.is_empty() {
         return Ok(());
     }
@@ -787,11 +821,9 @@ pub(super) fn seek_packed_doc_positions(
     while group_offsets.len() <= last_needed_group {
         let last = *group_offsets
             .last()
-            .expect("group offset index is seeded with the first group");
-        let num_bits = *src.get(last).ok_or_else(|| {
-            Error::index("unexpected EOF while seeking packed position stream".to_owned())
-        })? as usize;
-        group_offsets.push(last + 1 + num_bits * BLOCK_SIZE / 8);
+            .ok_or_else(|| Error::index("packed position group offsets are empty".to_owned()))?;
+        let (_, _, next_offset) = packed_position_group(src, last)?;
+        group_offsets.push(next_offset);
     }
 
     let mut previous = 0u32;
@@ -813,9 +845,14 @@ pub(super) fn seek_packed_doc_positions(
     for index in delta_range.start..delta_range.end.min(packed_deltas_end) {
         let group = index / BLOCK_SIZE;
         if *unpacked_group_idx != Some(group) {
-            let offset = group_offsets[group];
-            let num_bits = src[offset];
-            BitPacker4x::new().decompress(&src[offset + 1..], unpacked_group, num_bits);
+            let offset = *group_offsets.get(group).ok_or_else(|| {
+                Error::index(format!(
+                    "missing packed position group offset for group {group}; have {} offsets",
+                    group_offsets.len()
+                ))
+            })?;
+            let (num_bits, payload, _) = packed_position_group(src, offset)?;
+            BitPacker4x::new().decompress(payload, unpacked_group, num_bits);
             *unpacked_group_idx = Some(group);
         }
         push_delta(unpacked_group[index % BLOCK_SIZE], dst)?;
@@ -826,7 +863,11 @@ pub(super) fn seek_packed_doc_positions(
         if tail_cache.len() != tail_len {
             tail_cache.clear();
             tail_cache.reserve(tail_len);
-            let mut offset = group_offsets[num_full_groups];
+            let mut offset = *group_offsets.get(num_full_groups).ok_or_else(|| {
+                Error::index(format!(
+                    "missing packed position tail offset after {num_full_groups} full groups"
+                ))
+            })?;
             for _ in 0..tail_len {
                 tail_cache.push(decode_varint_u32(src, &mut offset)?);
             }
@@ -1349,6 +1390,42 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    #[test]
+    fn test_packed_position_decoders_reject_malformed_groups() {
+        let frequencies = [BLOCK_SIZE as u32];
+        for encoded in [&[1_u8][..], &[33_u8][..]] {
+            let mut decoded = Vec::new();
+            assert!(
+                decode_position_stream_block(
+                    encoded,
+                    &frequencies,
+                    PositionStreamCodec::PackedDelta,
+                    &mut decoded,
+                )
+                .is_err()
+            );
+
+            let mut group_offsets = vec![0usize];
+            let mut unpacked_group = Box::new([0u32; BLOCK_SIZE]);
+            let mut unpacked_group_idx = None;
+            let mut tail_cache = Vec::new();
+            let mut scratch = Vec::new();
+            assert!(
+                seek_packed_doc_positions(
+                    encoded,
+                    BLOCK_SIZE,
+                    0..BLOCK_SIZE,
+                    &mut group_offsets,
+                    &mut unpacked_group,
+                    &mut unpacked_group_idx,
+                    &mut tail_cache,
+                    &mut scratch,
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]
