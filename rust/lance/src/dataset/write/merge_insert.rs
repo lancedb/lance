@@ -7916,7 +7916,12 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
         let plan = merge_insert_job.explain_plan(None, false).await.unwrap();
         assert!(plan.contains("HashJoinExec"));
         assert!(plan.contains("join_type=Full"));
-        assert!(plan.contains("projection=[_rowid"));
+        assert!(
+            plan.lines().any(|line| line.contains("HashJoinExec")
+                && line.contains("projection=[")
+                && line.contains("_rowid")),
+            "join should push down a projection that retains _rowid: {plan}"
+        );
         assert!(
             plan.contains("LanceRead: uri=") && plan.contains("projection=[id]"),
             "target-side scan should prune the FSL payload from the join build side: {plan}"
@@ -7984,7 +7989,12 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
         let plan = merge_insert_job.explain_plan(None, false).await.unwrap();
         assert!(plan.contains("HashJoinExec"));
         assert!(plan.contains("join_type=Full"));
-        assert!(plan.contains("projection=[_rowid"));
+        assert!(
+            plan.lines().any(|line| line.contains("HashJoinExec")
+                && line.contains("projection=[")
+                && line.contains("_rowid")),
+            "join should push down a projection that retains _rowid: {plan}"
+        );
         assert!(
             plan.contains("LanceRead: uri=") && plan.contains("projection=[id]"),
             "target-side scan should prune the FSL payload from the join build side even when a scalar index exists: {plan}"
