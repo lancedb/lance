@@ -5443,6 +5443,107 @@ mod tests {
         }
     }
 
+    /// Wraps a namespace `MatchQuery` (with a column) as an `FtsQuery` for use as a clause in
+    /// compound queries (boolean / boost).
+    fn ns_match_query(terms: &str, column: &str) -> lance_namespace::models::FtsQuery {
+        let mut m = lance_namespace::models::MatchQuery::new(terms.to_string());
+        m.column = Some(column.to_string());
+        let mut q = lance_namespace::models::FtsQuery::new();
+        q.r#match = Some(Box::new(m));
+        q
+    }
+
+    #[test]
+    fn test_build_engine_fts_query_phrase() {
+        let mut ns_phrase = lance_namespace::models::PhraseQuery::new("hello world".to_string());
+        ns_phrase.column = Some("body".to_string());
+        ns_phrase.slop = Some(2);
+
+        let mut ns_query = lance_namespace::models::FtsQuery::new();
+        ns_query.phrase = Some(Box::new(ns_phrase));
+
+        match build_engine_fts_query(&ns_query).unwrap() {
+            FtsQuery::Phrase(p) => {
+                assert_eq!(p.terms, "hello world");
+                assert_eq!(p.column, Some("body".to_string()));
+                assert_eq!(p.slop, 2);
+            }
+            other => panic!("expected Phrase, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_build_engine_fts_query_multi_match() {
+        let mut m1 = lance_namespace::models::MatchQuery::new("hello".to_string());
+        m1.column = Some("title".to_string());
+        let mut m2 = lance_namespace::models::MatchQuery::new("hello".to_string());
+        m2.column = Some("body".to_string());
+        m2.boost = Some(2.0);
+
+        let ns_multi = lance_namespace::models::MultiMatchQuery::new(vec![m1, m2]);
+        let mut ns_query = lance_namespace::models::FtsQuery::new();
+        ns_query.multi_match = Some(Box::new(ns_multi));
+
+        match build_engine_fts_query(&ns_query).unwrap() {
+            FtsQuery::MultiMatch(mm) => {
+                assert_eq!(mm.match_queries.len(), 2);
+                assert_eq!(mm.match_queries[0].terms, "hello");
+                assert_eq!(mm.match_queries[0].column, Some("title".to_string()));
+                assert_eq!(mm.match_queries[1].column, Some("body".to_string()));
+                assert_eq!(mm.match_queries[1].boost, 2.0);
+            }
+            other => panic!("expected MultiMatch, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_build_engine_fts_query_boolean() {
+        // BooleanQuery::new(must, must_not, should)
+        let ns_boolean = lance_namespace::models::BooleanQuery::new(
+            vec![ns_match_query("must-term", "body")],
+            vec![ns_match_query("must-not-term", "body")],
+            vec![ns_match_query("should-term", "body")],
+        );
+        let mut ns_query = lance_namespace::models::FtsQuery::new();
+        ns_query.boolean = Some(Box::new(ns_boolean));
+
+        match build_engine_fts_query(&ns_query).unwrap() {
+            FtsQuery::Boolean(b) => {
+                assert!(matches!(&b.must[..], [FtsQuery::Match(m)] if m.terms == "must-term"));
+                assert!(
+                    matches!(&b.must_not[..], [FtsQuery::Match(m)] if m.terms == "must-not-term")
+                );
+                assert!(matches!(&b.should[..], [FtsQuery::Match(m)] if m.terms == "should-term"));
+            }
+            other => panic!("expected Boolean, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_build_engine_fts_query_boost() {
+        let mut ns_boost = lance_namespace::models::BoostQuery::new(
+            ns_match_query("positive-term", "body"),
+            ns_match_query("negative-term", "body"),
+        );
+        ns_boost.negative_boost = Some(0.25);
+
+        let mut ns_query = lance_namespace::models::FtsQuery::new();
+        ns_query.boost = Some(Box::new(ns_boost));
+
+        match build_engine_fts_query(&ns_query).unwrap() {
+            FtsQuery::Boost(b) => {
+                assert!(
+                    matches!(b.positive.as_ref(), FtsQuery::Match(m) if m.terms == "positive-term")
+                );
+                assert!(
+                    matches!(b.negative.as_ref(), FtsQuery::Match(m) if m.terms == "negative-term")
+                );
+                assert_eq!(b.negative_boost, 0.25);
+            }
+            other => panic!("expected Boost, got {:?}", other),
+        }
+    }
+
     #[test]
     fn test_build_engine_fts_query_requires_a_variant() {
         // An FtsQuery with no variant set is rejected rather than silently ignored.
