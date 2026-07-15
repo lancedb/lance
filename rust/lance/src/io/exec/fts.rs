@@ -365,6 +365,40 @@ impl SharedFtsScorer {
     }
 }
 
+struct SharedFtsScorerProducer {
+    scorer: Arc<SharedFtsScorer>,
+    completed: bool,
+}
+
+impl SharedFtsScorerProducer {
+    fn new(scorer: Arc<SharedFtsScorer>) -> Self {
+        Self {
+            scorer,
+            completed: false,
+        }
+    }
+
+    fn publish(mut self, scorer: MemBM25Scorer) {
+        self.scorer.publish(scorer);
+        self.completed = true;
+    }
+
+    fn publish_error(mut self, error: &DataFusionError) {
+        self.scorer.publish_error(error);
+        self.completed = true;
+    }
+}
+
+impl Drop for SharedFtsScorerProducer {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.scorer.sender.send_replace(Some(Err(Arc::from(
+                "mixed FTS corpus scorer producer was cancelled before publishing statistics",
+            ))));
+        }
+    }
+}
+
 pub struct FtsIndexMetrics {
     index_metrics: IndexMetrics,
     partitions_searched: Count,
@@ -1279,6 +1313,7 @@ pub struct FlatMatchQueryExec {
     preset_segments: Option<Vec<IndexMetadata>>,
     document_granularity: DocumentGranularity,
     document_column: String,
+    phrase_slop: Option<u32>,
     schema: SchemaRef,
 
     properties: Arc<PlanProperties>,
@@ -1352,6 +1387,7 @@ impl FlatMatchQueryExec {
             preset_segments: None,
             document_granularity,
             document_column,
+            phrase_slop: None,
             schema,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
@@ -1405,6 +1441,7 @@ impl FlatMatchQueryExec {
             preset_segments: Some(segments),
             document_granularity,
             document_column,
+            phrase_slop: None,
             schema,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
@@ -1419,6 +1456,11 @@ impl FlatMatchQueryExec {
 
     pub(crate) fn with_shared_scorer(mut self, scorer: Arc<SharedFtsScorer>) -> Self {
         self.shared_scorer = Some(scorer);
+        self
+    }
+
+    pub(crate) fn with_phrase_slop(mut self, phrase_slop: u32) -> Self {
+        self.phrase_slop = Some(phrase_slop);
         self
     }
 
@@ -1484,6 +1526,7 @@ impl ExecutionPlan for FlatMatchQueryExec {
             preset_segments: self.preset_segments.clone(),
             document_granularity: self.document_granularity,
             document_column: self.document_column.clone(),
+            phrase_slop: self.phrase_slop,
             schema: self.schema.clone(),
             properties: self.properties.clone(),
             metrics: ExecutionPlanMetricsSet::new(),
@@ -1499,13 +1542,14 @@ impl ExecutionPlan for FlatMatchQueryExec {
         let query = self.query.clone();
         let ds = self.dataset.clone();
         let preset_base_scorer = self.base_scorer.clone();
-        let shared_scorer = self.shared_scorer.clone();
+        let shared_scorer_producer = self.shared_scorer.clone().map(SharedFtsScorerProducer::new);
         let preset_segments = self.preset_segments.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
         let metrics_clone = metrics.clone();
         let target_batch_size = context.session_config().batch_size();
         let document_granularity = self.document_granularity;
         let document_column = self.document_column.clone();
+        let phrase_slop = self.phrase_slop;
 
         // CPU time accumulator passed into `flat_bm25_search_stream_with_metrics`
         // so it can attribute the spawn_cpu tokenize work and synchronous
@@ -1524,6 +1568,7 @@ impl ExecutionPlan for FlatMatchQueryExec {
         )?;
 
         let stream = stream::once(async move {
+            let shared_scorer_producer = shared_scorer_producer;
             let result = async {
                 let segments = match preset_segments {
                     Some(segments) => Some(segments),
@@ -1576,6 +1621,7 @@ impl ExecutionPlan for FlatMatchQueryExec {
                         operator: query.operator,
                         boost: query.boost,
                         document_granularity,
+                        phrase_slop,
                     },
                 )
                 .await
@@ -1584,14 +1630,14 @@ impl ExecutionPlan for FlatMatchQueryExec {
 
             match result {
                 Ok((stream, scorer)) => {
-                    if let Some(shared_scorer) = shared_scorer {
-                        shared_scorer.publish(scorer);
+                    if let Some(producer) = shared_scorer_producer {
+                        producer.publish(scorer);
                     }
                     Ok(stream)
                 }
                 Err(error) => {
-                    if let Some(shared_scorer) = shared_scorer {
-                        shared_scorer.publish_error(&error);
+                    if let Some(producer) = shared_scorer_producer {
+                        producer.publish_error(&error);
                     }
                     Err(error)
                 }
@@ -1638,6 +1684,8 @@ pub struct PhraseQueryExec {
     /// Optional override for the BM25 scorer normally built locally inside
     /// `execute()`. See [`MatchQueryExec::with_base_scorer`].
     base_scorer: Option<Arc<MemBM25Scorer>>,
+    /// Corpus-wide scorer published by the flat branch of a mixed search.
+    shared_scorer: Option<Arc<SharedFtsScorer>>,
     /// Optional pre-resolved segment list. See
     /// [`MatchQueryExec::new_with_segments`].
     preset_segments: Option<Vec<IndexMetadata>>,
@@ -1709,6 +1757,7 @@ impl PhraseQueryExec {
             params,
             prefilter_source,
             base_scorer: None,
+            shared_scorer: None,
             preset_segments: None,
             document_granularity,
             schema,
@@ -1759,6 +1808,7 @@ impl PhraseQueryExec {
             params,
             prefilter_source,
             base_scorer: None,
+            shared_scorer: None,
             preset_segments: Some(segments),
             document_granularity,
             schema,
@@ -1770,6 +1820,11 @@ impl PhraseQueryExec {
     /// Override the local BM25 scorer; see [`MatchQueryExec::with_base_scorer`].
     pub fn with_base_scorer(mut self, scorer: Arc<MemBM25Scorer>) -> Self {
         self.base_scorer = Some(scorer);
+        self
+    }
+
+    pub(crate) fn with_shared_scorer(mut self, scorer: Arc<SharedFtsScorer>) -> Self {
+        self.shared_scorer = Some(scorer);
         self
     }
 
@@ -1834,6 +1889,7 @@ impl ExecutionPlan for PhraseQueryExec {
                 params: self.params.clone(),
                 prefilter_source: PreFilterSource::None,
                 base_scorer: self.base_scorer.clone(),
+                shared_scorer: self.shared_scorer.clone(),
                 preset_segments: self.preset_segments.clone(),
                 document_granularity: self.document_granularity,
                 schema: self.schema.clone(),
@@ -1861,6 +1917,7 @@ impl ExecutionPlan for PhraseQueryExec {
                     params: self.params.clone(),
                     prefilter_source,
                     base_scorer: self.base_scorer.clone(),
+                    shared_scorer: self.shared_scorer.clone(),
                     preset_segments: self.preset_segments.clone(),
                     document_granularity: self.document_granularity,
                     schema: self.schema.clone(),
@@ -1888,6 +1945,7 @@ impl ExecutionPlan for PhraseQueryExec {
         let ds = self.dataset.clone();
         let prefilter_source = self.prefilter_source.clone();
         let preset_base_scorer = self.base_scorer.clone();
+        let shared_scorer = self.shared_scorer.clone();
         let preset_segments = self.preset_segments.clone();
         let document_granularity = self.document_granularity;
         let schema = self.schema.clone();
@@ -1934,9 +1992,10 @@ impl ExecutionPlan for PhraseQueryExec {
             )))?;
             let mut tokenizer = first_index.tokenizer();
             let tokens = collect_query_tokens(&query.terms, &mut tokenizer);
-            let base_scorer = match preset_base_scorer {
-                Some(scorer) => scorer,
-                None => Arc::new(
+            let base_scorer = match (preset_base_scorer, shared_scorer) {
+                (Some(scorer), _) => scorer,
+                (None, Some(shared_scorer)) => shared_scorer.wait().await?,
+                (None, None) => Arc::new(
                     build_global_bm25_scorer(&indices, &tokens, &params)
                         .boxed()
                         .await?,
@@ -2594,6 +2653,22 @@ mod tests {
             &query_tokens,
             Operator::And,
         ));
+    }
+
+    #[tokio::test]
+    async fn shared_fts_scorer_reports_cancelled_producer() {
+        let scorer = Arc::new(super::SharedFtsScorer::new());
+        let producer = super::SharedFtsScorerProducer::new(scorer.clone());
+        drop(producer);
+
+        let error = tokio::time::timeout(std::time::Duration::from_secs(1), scorer.wait())
+            .await
+            .expect("cancelled producer must wake scorer waiters")
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("producer was cancelled"),
+            "{error}"
+        );
     }
 
     #[test]

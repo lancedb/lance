@@ -247,6 +247,25 @@ async fn test_element_document_fts_flat_indexed_and_mixed() {
     assert_eq!(element_hits(&flat), vec![(0, vec![0]), (0, vec![1])]);
     let flat_and = run_fts(&ds, element_and_query.clone(), None).await;
     assert_eq!(element_hits(&flat_and), vec![(0, vec![0])]);
+    let flat_phrase = run_fts(&ds, list_element_phrase("tags", "alpha beta"), None).await;
+    assert_eq!(element_hits(&flat_phrase), vec![(0, vec![0])]);
+    let flat_cross_element_phrase =
+        run_fts(&ds, list_element_phrase("tags", "beta gamma"), None).await;
+    assert_eq!(flat_cross_element_phrase.num_rows(), 0);
+    let row_flat_phrase = run_fts(
+        &ds,
+        FullTextSearchQuery::new_query(FtsQuery::Phrase(
+            PhraseQuery::new("beta gamma".to_string()).with_column(Some("tags".to_string())),
+        )),
+        None,
+    )
+    .await;
+    assert_eq!(
+        row_flat_phrase["id"]
+            .as_primitive::<arrow_array::types::Int32Type>()
+            .values(),
+        &[0, 1]
+    );
     assert_element_coordinates_point_to(&flat, "tags", "alpha");
     let params = list_element_params(true);
     let err = ds
@@ -484,7 +503,7 @@ async fn test_element_document_fts_flat_indexed_and_mixed() {
         ("id", Arc::new(Int32Array::from(vec![6])) as ArrayRef),
         (
             "tags",
-            string_lists(&[Some(vec![Some("alpha"), Some("alpha again")])]),
+            string_lists(&[Some(vec![Some("alpha beta"), Some("alpha again")])]),
         ),
     ])
     .unwrap();
@@ -503,17 +522,34 @@ async fn test_element_document_fts_flat_indexed_and_mixed() {
         vec![(0, vec![0]), (0, vec![1]), (6, vec![0]), (6, vec![1])]
     );
     assert_element_coordinates_point_to(&mixed, "tags", "alpha");
+    let mixed_phrase = run_fts(&ds, list_element_phrase("tags", "alpha beta"), None).await;
+    assert_eq!(
+        element_hits(&mixed_phrase),
+        vec![(0, vec![0]), (6, vec![0])]
+    );
     let all_data = ds.scan().try_into_batch().await.unwrap();
     let flat_reference_dir = tempfile::tempdir().unwrap();
-    let flat_reference = Dataset::write(
+    let flat_reference_ds = Dataset::write(
         RecordBatchIterator::new(vec![Ok(all_data.clone())], all_data.schema()),
         flat_reference_dir.path().to_str().unwrap(),
         None,
     )
     .await
     .unwrap();
-    let flat_reference = run_fts(&flat_reference, list_element_match("tags", "alpha"), None).await;
+    let flat_reference = run_fts(
+        &flat_reference_ds,
+        list_element_match("tags", "alpha"),
+        None,
+    )
+    .await;
     assert_same_element_scores(&mixed, &flat_reference);
+    let flat_phrase_reference = run_fts(
+        &flat_reference_ds,
+        list_element_phrase("tags", "alpha beta"),
+        None,
+    )
+    .await;
+    assert_same_element_scores(&mixed_phrase, &flat_phrase_reference);
 
     ds.optimize_indices(&OptimizeOptions::append())
         .await
@@ -563,6 +599,51 @@ async fn test_element_document_fts_flat_indexed_and_mixed() {
         .err()
         .expect("renamed element target must reject the old path");
     assert!(err.to_string().contains("tags"), "{err}");
+}
+
+#[tokio::test]
+async fn test_element_document_persists_empty_and_zero_token_corpora() {
+    async fn assert_empty_query(tags: ArrayRef, expected_documents: usize) {
+        let ids = Arc::new(Int32Array::from_iter_values(0..tags.len() as i32));
+        let batch =
+            RecordBatch::try_from_iter(vec![("id", ids as ArrayRef), ("tags", tags)]).unwrap();
+        let test_dir = tempfile::tempdir().unwrap();
+        let mut ds = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+            test_dir.path().to_str().unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        ds.create_index(
+            &["tags"],
+            IndexType::Inverted,
+            None,
+            &list_element_params(true),
+            true,
+        )
+        .await
+        .unwrap();
+
+        let result = run_fts(&ds, list_element_match("tags", "alpha"), None).await;
+        assert_eq!(result.num_rows(), 0);
+
+        let metadata = ds
+            .load_indices_by_name("tags_list_element_idx")
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let index = ds
+            .open_scalar_index("tags", &metadata.uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(index.statistics().unwrap()["num_docs"], expected_documents);
+    }
+
+    assert_empty_query(string_lists(&[None, Some(vec![])]), 0).await;
+    assert_empty_query(string_lists(&[Some(vec![None, Some(""), Some("!!!")])]), 3).await;
 }
 
 #[tokio::test]

@@ -1170,7 +1170,7 @@ impl MemTableScanner {
     /// Uses the effective visibility (min of max_visible and max_indexed) to ensure
     /// queries only see indexed data.
     async fn plan_fts_search(&self, query: &FtsQuery) -> Result<Arc<dyn ExecutionPlan>> {
-        if !self.has_fts_index(&query.column) {
+        if !self.has_fts_index(&query.column, query.document_granularity) {
             return self.empty_fts_plan(query.document_granularity);
         }
 
@@ -1351,8 +1351,10 @@ impl MemTableScanner {
     }
 
     /// Check if an FTS index exists for a column.
-    fn has_fts_index(&self, column: &str) -> bool {
-        self.indexes.get_fts_by_column(column).is_some()
+    fn has_fts_index(&self, column: &str, document_granularity: DocumentGranularity) -> bool {
+        self.indexes
+            .get_fts_by_column_and_granularity(column, document_granularity)
+            .is_some()
     }
 }
 

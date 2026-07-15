@@ -954,7 +954,24 @@ struct PendingMerge {
     /// merged-away partitions when the writer installs the result.
     sources: Vec<usize>,
     /// Filled by the worker when the merge completes.
-    result: Option<Result<Arc<Partition>>>,
+    result: Option<Arc<Partition>>,
+}
+
+fn publish_pending_merge(slot: &Mutex<Option<PendingMerge>>, merged: Result<Partition>) {
+    let Ok(mut guard) = slot.lock() else {
+        return;
+    };
+    match merged {
+        Ok(merged) => {
+            if let Some(pending) = guard.as_mut() {
+                pending.result = Some(Arc::new(merged));
+            }
+        }
+        Err(error) => {
+            tracing::error!(?error, "background FTS tiered merge failed");
+            *guard = None;
+        }
+    }
 }
 
 impl std::fmt::Debug for FtsMemIndex {
@@ -1264,7 +1281,6 @@ impl FtsMemIndex {
         };
         let sources: HashSet<usize> = pending.sources.iter().copied().collect();
         *guard = None;
-        let merged = merged?;
         // Install only if every source is still live. If a synchronous
         // `MAX_PARTITIONS` collapse merged the sources away while this merge
         // ran, the merged docs are already present — appending it would
@@ -1306,12 +1322,7 @@ impl FtsMemIndex {
         // `group`, the source partitions), so it is safe even if the index is
         // dropped mid-merge.
         std::thread::spawn(move || {
-            let merged = Partition::merge(&group).map(Arc::new);
-            if let Ok(mut g) = slot.lock()
-                && let Some(p) = g.as_mut()
-            {
-                p.result = Some(merged);
-            }
+            publish_pending_merge(slot.as_ref(), Partition::merge(&group));
         });
         Ok(())
     }
@@ -3119,13 +3130,22 @@ impl Partition {
         let mut merged: HashMap<Arc<str>, Vec<(u32, u32, Vec<u32>)>> = HashMap::new();
         let mut docs = DocSet::default();
         let mut doc_offset: u32 = 0;
+        let coordinate_rank = parts
+            .first()
+            .map_or(0, |partition| partition.docs.coordinate_rank());
         for p in parts {
+            if p.docs.coordinate_rank() != coordinate_rank {
+                return Err(Error::index(format!(
+                    "cannot merge MemWAL FTS partitions with coordinate ranks {coordinate_rank} and {}",
+                    p.docs.coordinate_rank()
+                )));
+            }
             for (doc_id, (row_position, num_tokens)) in p.docs.iter().enumerate() {
-                if p.docs.coordinate_rank() == 1 {
+                if coordinate_rank > 0 {
                     docs.append_with_doc_index(
                         *row_position,
                         *num_tokens,
-                        &[p.docs.coordinate(doc_id as u32, 0)],
+                        &p.docs.doc_index(doc_id as u32),
                     )?;
                 } else {
                     docs.append(*row_position, *num_tokens);
@@ -3843,7 +3863,8 @@ mod tests {
             "groups.docs.content".to_string(),
             InvertedIndexParams::default().document_granularity(DocumentGranularity::ListElement),
         )
-        .unwrap();
+        .unwrap()
+        .with_freeze_threshold_rows(1);
 
         index.insert(&batch, 7).unwrap();
         let mut entries = index.search("alpha");
@@ -3855,7 +3876,59 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(7, Some(vec![0, 0])), (7, Some(vec![1, 1]))]
         );
-        index.to_index_builder(8, 8).unwrap();
+
+        index.insert(&batch, 8).unwrap();
+        let state = index.state.load_full();
+        assert_eq!(state.partitions.len(), 2);
+        let merged = Partition::merge(&state.partitions).unwrap();
+        assert_eq!(merged.docs.coordinate_rank(), 2);
+        assert_eq!(
+            (0..merged.docs.len() as u32)
+                .map(|doc_id| doc_set_key(&merged.docs, doc_id))
+                .collect::<Vec<_>>(),
+            vec![
+                DocumentKey {
+                    row_position: 7,
+                    doc_index: vec![0, 0],
+                },
+                DocumentKey {
+                    row_position: 7,
+                    doc_index: vec![1, 0],
+                },
+                DocumentKey {
+                    row_position: 7,
+                    doc_index: vec![1, 1],
+                },
+                DocumentKey {
+                    row_position: 8,
+                    doc_index: vec![0, 0],
+                },
+                DocumentKey {
+                    row_position: 8,
+                    doc_index: vec![1, 0],
+                },
+                DocumentKey {
+                    row_position: 8,
+                    doc_index: vec![1, 1],
+                },
+            ]
+        );
+        index.to_index_builder(8, 9).unwrap();
+    }
+
+    #[test]
+    fn test_failed_background_merge_releases_pending_slot() {
+        let slot = Mutex::new(Some(PendingMerge {
+            sources: vec![1],
+            result: None,
+        }));
+
+        publish_pending_merge(
+            &slot,
+            Err(Error::index("inconsistent test partitions".to_string())),
+        );
+
+        assert!(slot.lock().unwrap().is_none());
     }
 
     #[test]

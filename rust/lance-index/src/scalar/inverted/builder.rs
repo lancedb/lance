@@ -108,9 +108,13 @@ fn merge_all_tail_partitions(
 ) -> Result<Vec<InnerBuilder>> {
     let mut merged_builders: Vec<InnerBuilder> = Vec::new();
     let mut merged: Option<InnerBuilder> = None;
+    let mut empty_coordinate_builder: Option<InnerBuilder> = None;
     for tail in tails {
         let builder = tail.builder;
         if builder.is_empty() {
+            if builder.docs.coordinate_rank() > 0 && empty_coordinate_builder.is_none() {
+                empty_coordinate_builder = Some(builder);
+            }
             continue;
         }
         match &mut merged {
@@ -130,6 +134,11 @@ fn merge_all_tail_partitions(
         }
     }
     if let Some(builder) = merged {
+        merged_builders.push(builder);
+    }
+    if merged_builders.is_empty()
+        && let Some(builder) = empty_coordinate_builder
+    {
         merged_builders.push(builder);
     }
     Ok(merged_builders)
@@ -1331,17 +1340,20 @@ impl IndexWorker {
             config.block_size,
         );
 
+        let mut builder = InnerBuilder::new_with_format_version_and_block_size(
+            id_alloc.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                | config.fragment_mask.unwrap_or(0),
+            config.with_position,
+            config.token_set_format,
+            config.format_version,
+            config.block_size,
+        );
+        builder.docs = DocSet::with_coordinate_rank(config.coordinate_rank);
+
         Ok(Self {
             tokenizer,
             dest_store,
-            builder: InnerBuilder::new_with_format_version_and_block_size(
-                id_alloc.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                    | config.fragment_mask.unwrap_or(0),
-                config.with_position,
-                config.token_set_format,
-                config.format_version,
-                config.block_size,
-            ),
+            builder,
             partitions: Vec::new(),
             files: Vec::new(),
             id_alloc,
@@ -1713,7 +1725,7 @@ impl IndexWorker {
 
     #[instrument(level = "debug", skip_all)]
     async fn flush(&mut self) -> Result<()> {
-        if self.builder.tokens.is_empty() {
+        if self.builder.docs.is_empty() {
             return Ok(());
         }
 
@@ -1725,18 +1737,17 @@ impl IndexWorker {
         let with_position = self.has_position();
         let format_version = self.builder.format_version;
         let block_size = self.builder.block_size;
-        let builder = std::mem::replace(
-            &mut self.builder,
-            InnerBuilder::new_with_format_version_and_block_size(
-                self.id_alloc
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                    | self.fragment_mask.unwrap_or(0),
-                with_position,
-                self.token_set_format,
-                format_version,
-                block_size,
-            ),
+        let mut replacement = InnerBuilder::new_with_format_version_and_block_size(
+            self.id_alloc
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                | self.fragment_mask.unwrap_or(0),
+            with_position,
+            self.token_set_format,
+            format_version,
+            block_size,
         );
+        replacement.docs = DocSet::with_coordinate_rank(self.coordinate_rank);
+        let builder = std::mem::replace(&mut self.builder, replacement);
         let written_partition_id = builder.id();
         let mut builder = builder;
         let target = if self.fragment_mask.is_some() {
@@ -1759,7 +1770,7 @@ impl IndexWorker {
     }
 
     async fn finish(self) -> Result<WorkerOutput> {
-        let tail_partition = if self.builder.tokens.is_empty() {
+        let tail_partition = if self.builder.docs.is_empty() && self.coordinate_rank == 0 {
             None
         } else {
             Some(TailPartition {

@@ -70,7 +70,8 @@ use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::expression::PlannerIndexExt;
 use lance_index::scalar::expression::ScalarIndexExpr;
 use lance_index::scalar::inverted::query::{
-    FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery, PhraseQuery, fill_fts_query_column,
+    FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery, Operator, PhraseQuery,
+    fill_fts_query_column,
 };
 use lance_index::scalar::inverted::{
     DOC_INDEX_COL, DOC_INDEX_FIELD, DocumentGranularity, SCORE_COL, SCORE_FIELD, fts_schema,
@@ -3498,7 +3499,7 @@ impl Scanner {
                     .await?
             }
             FtsQuery::Phrase(query) => {
-                self.plan_phrase_query(query, params, prefilter_source)
+                self.plan_phrase_query(query, params, filter_plan, prefilter_source)
                     .await?
             }
 
@@ -3673,32 +3674,124 @@ impl Scanner {
         &self,
         query: &PhraseQuery,
         params: &FtsSearchParams,
+        filter_plan: &ExprFilterPlan,
         prefilter_source: &PreFilterSource,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let column = query.column.clone().ok_or(Error::invalid_input(
             "the column must be specified in the query".to_string(),
         ))?;
         resolve_fts_field(self.dataset.schema(), &column, query.document_granularity)?;
-        let segments = load_segments(&self.dataset, &column, query.document_granularity)
-            .await?
-            .ok_or(Error::invalid_input(format!(
-                "No Inverted index found for column {}",
-                column
-            )))?;
-        let details = load_segment_details(&self.dataset, &column, &segments).await?;
+        let output_schema = fts_schema(query.document_granularity);
+        let index = self
+            .dataset
+            .load_scalar_index(
+                IndexCriteria::default()
+                    .for_column(&column)
+                    .supports_fts()
+                    .with_fts_document_granularity(query.document_granularity),
+            )
+            .await?;
+        let target_fragments = self
+            .fragments
+            .clone()
+            .unwrap_or_else(|| self.dataset.fragments().to_vec());
+        let flat_query = MatchQuery::new(query.terms.clone())
+            .with_column(Some(column.clone()))
+            .with_operator(Operator::And)
+            .with_document_granularity(query.document_granularity);
 
-        if !details.with_position {
-            return Err(Error::invalid_input("position is not found but required for phrase queries, try recreating the index with position"
-                .to_string()));
-        }
+        let (phrase_plan, flat_phrase_plan) = match &index {
+            Some(index) => {
+                let unindexed_fragments = self
+                    .retain_target_fragments(self.dataset.unindexed_fragments(&index.name).await?);
+                if unindexed_fragments.len() == target_fragments.len() {
+                    if self.fast_search {
+                        return Ok(Arc::new(EmptyExec::new(output_schema)));
+                    }
+                    let flat_phrase_plan = self
+                        .plan_flat_match_query(
+                            unindexed_fragments,
+                            &flat_query,
+                            params,
+                            filter_plan,
+                            None,
+                            Some(query.slop),
+                        )
+                        .await?;
+                    return Ok(flat_phrase_plan);
+                }
 
-        Ok(Arc::new(PhraseQueryExec::new_with_document_granularity(
-            self.dataset.clone(),
-            query.clone(),
-            params.clone(),
-            prefilter_source.clone(),
-            query.document_granularity,
-        )))
+                let segments = load_segments(&self.dataset, &column, query.document_granularity)
+                    .await?
+                    .ok_or_else(|| {
+                        Error::internal(format!(
+                            "FTS metadata routed column {column} without loadable segments"
+                        ))
+                    })?;
+                let details = load_segment_details(&self.dataset, &column, &segments).await?;
+                if !details.with_position {
+                    return Err(Error::invalid_input("position is not found but required for phrase queries, try recreating the index with position"
+                        .to_string()));
+                }
+
+                if self.fast_search || unindexed_fragments.is_empty() {
+                    let phrase_plan: Arc<dyn ExecutionPlan> =
+                        Arc::new(PhraseQueryExec::new_with_document_granularity(
+                            self.dataset.clone(),
+                            query.clone(),
+                            params.clone(),
+                            prefilter_source.clone(),
+                            query.document_granularity,
+                        ));
+                    (Some(phrase_plan), None)
+                } else {
+                    let shared_scorer = query
+                        .document_granularity
+                        .is_list_element()
+                        .then(|| Arc::new(SharedFtsScorer::new()));
+                    let mut phrase_plan = PhraseQueryExec::new_with_document_granularity(
+                        self.dataset.clone(),
+                        query.clone(),
+                        params.clone(),
+                        prefilter_source.clone(),
+                        query.document_granularity,
+                    );
+                    if let Some(shared_scorer) = &shared_scorer {
+                        phrase_plan = phrase_plan.with_shared_scorer(shared_scorer.clone());
+                    }
+                    let phrase_plan: Arc<dyn ExecutionPlan> = Arc::new(phrase_plan);
+                    let flat_phrase_plan = self
+                        .plan_flat_match_query(
+                            unindexed_fragments,
+                            &flat_query,
+                            params,
+                            filter_plan,
+                            shared_scorer,
+                            Some(query.slop),
+                        )
+                        .await?;
+                    (Some(phrase_plan), Some(flat_phrase_plan))
+                }
+            }
+            None => {
+                if self.fast_search {
+                    return Ok(Arc::new(EmptyExec::new(output_schema)));
+                }
+                let flat_phrase_plan = self
+                    .plan_flat_match_query(
+                        target_fragments,
+                        &flat_query,
+                        params,
+                        filter_plan,
+                        None,
+                        Some(query.slop),
+                    )
+                    .await?;
+                (None, Some(flat_phrase_plan))
+            }
+        };
+
+        Self::combine_fts_leaf_plans(phrase_plan, flat_phrase_plan, params)
     }
 
     async fn plan_match_query(
@@ -3752,6 +3845,7 @@ impl Scanner {
                             params,
                             filter_plan,
                             None,
+                            None,
                         )
                         .await?;
                     return Ok(flat_match_plan);
@@ -3792,6 +3886,7 @@ impl Scanner {
                             params,
                             filter_plan,
                             shared_scorer,
+                            None,
                         )
                         .await?;
                     (Some(match_plan), Some(flat_match_plan))
@@ -3809,13 +3904,22 @@ impl Scanner {
                         params,
                         filter_plan,
                         None,
+                        None,
                     )
                     .await?;
                 (None, Some(flat_match_plan))
             }
         };
 
-        let plan = match (match_plan, flat_match_plan) {
+        Self::combine_fts_leaf_plans(match_plan, flat_match_plan, params)
+    }
+
+    fn combine_fts_leaf_plans(
+        indexed_plan: Option<Arc<dyn ExecutionPlan>>,
+        flat_plan: Option<Arc<dyn ExecutionPlan>>,
+        params: &FtsSearchParams,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let plan = match (indexed_plan, flat_plan) {
             (Some(match_plan), Some(flat_match_plan)) => {
                 let match_plan = UnionExec::try_new(vec![match_plan, flat_match_plan])?;
                 let match_plan = Arc::new(RepartitionExec::try_new(
@@ -3851,6 +3955,7 @@ impl Scanner {
         params: &FtsSearchParams,
         filter_plan: &ExprFilterPlan,
         shared_scorer: Option<Arc<SharedFtsScorer>>,
+        phrase_slop: Option<u32>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let column = query
             .column
@@ -3910,6 +4015,9 @@ impl Scanner {
         );
         if let Some(shared_scorer) = shared_scorer {
             flat_match_plan = flat_match_plan.with_shared_scorer(shared_scorer);
+        }
+        if let Some(phrase_slop) = phrase_slop {
+            flat_match_plan = flat_match_plan.with_phrase_slop(phrase_slop);
         }
         Ok(Arc::new(flat_match_plan))
     }
