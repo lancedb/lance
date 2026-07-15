@@ -45,11 +45,10 @@ use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::prelude::Expr;
-use lance_core::datatypes::{FieldPathComponent, parse_field_path_components};
 use lance_core::{Error, Result, is_system_column};
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::inverted::query::{FtsQuery as IndexFtsQuery, Operator};
-use lance_index::scalar::inverted::{DOC_INDEX_COL, DOC_INDEX_FIELD};
+use lance_index::scalar::inverted::{DOC_INDEX_COL, DOC_INDEX_FIELD, DocumentGranularity};
 use tracing::instrument;
 
 use super::block_list::compute_source_block_lists;
@@ -71,9 +70,12 @@ pub const SCORE_COLUMN: &str = "_score";
 /// so a blocked source still yields `k` live rows after the block-list filter.
 const DEFAULT_OVERFETCH_FACTOR: f64 = 1.0;
 
-fn is_element_fts_target(column: &str) -> bool {
-    parse_field_path_components(column)
-        .is_ok_and(|path| path.last() == Some(&FieldPathComponent::ListWildcard))
+fn query_document_granularity(query: &FullTextSearchQuery) -> DocumentGranularity {
+    match &query.query {
+        IndexFtsQuery::Match(query) => query.document_granularity,
+        IndexFtsQuery::Phrase(query) => query.document_granularity,
+        _ => DocumentGranularity::Row,
+    }
 }
 
 fn validate_lsm_fts_query(query: &FullTextSearchQuery) -> Result<()> {
@@ -93,7 +95,11 @@ fn validate_lsm_fts_query(query: &FullTextSearchQuery) -> Result<()> {
     }
 }
 
-fn active_source_can_execute_fts(source: &LsmDataSource, column: &str) -> bool {
+fn active_source_can_execute_fts(
+    source: &LsmDataSource,
+    column: &str,
+    document_granularity: DocumentGranularity,
+) -> bool {
     match source {
         LsmDataSource::ActiveMemTable {
             batch_store,
@@ -101,7 +107,7 @@ fn active_source_can_execute_fts(source: &LsmDataSource, column: &str) -> bool {
             ..
         } => {
             index_store
-                .get_fts_by_column(column)
+                .get_fts_by_column_and_granularity(column, document_granularity)
                 .is_some_and(|index| !index.is_empty())
                 && batch_store
                     .max_visible_row(index_store.max_visible_batch_position())
@@ -213,20 +219,21 @@ impl LsmFtsSearchPlanner {
         limit: Option<usize>,
         projection: Option<&[String]>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        let document_granularity = query_document_granularity(&query);
         let sources = self.collector.collect()?;
         if sources
             .iter()
-            .any(|source| active_source_can_execute_fts(source, column))
+            .any(|source| active_source_can_execute_fts(source, column, document_granularity))
         {
             validate_lsm_fts_query(&query)?;
         }
-        let allowed_system_columns: &[&str] = if is_element_fts_target(column) {
+        let allowed_system_columns: &[&str] = if document_granularity.is_list_element() {
             &[SCORE_COLUMN, DOC_INDEX_COL]
         } else {
             &[SCORE_COLUMN]
         };
         validate_projection_names(projection, &self.base_schema, allowed_system_columns)?;
-        let target_schema = self.canonical_fts_schema(projection, column);
+        let target_schema = self.canonical_fts_schema(projection, document_granularity);
         let overfetch = super::validate_overfetch_factor(self.overfetch_factor)?;
 
         if sources.is_empty() {
@@ -414,8 +421,10 @@ impl LsmFtsSearchPlanner {
                 schema,
                 ..
             } => {
-                if !active_source_can_execute_fts(source, column) {
-                    return self.empty_plan(&self.canonical_fts_schema(projection, column));
+                let document_granularity = query_document_granularity(query);
+                if !active_source_can_execute_fts(source, column, document_granularity) {
+                    return self
+                        .empty_plan(&self.canonical_fts_schema(projection, document_granularity));
                 }
                 validate_lsm_fts_query(query)?;
                 let mut scanner =
@@ -472,7 +481,11 @@ impl LsmFtsSearchPlanner {
     }
 
     /// Canonical FTS output: user-projected cols + PK + `_score`.
-    fn canonical_fts_schema(&self, user_projection: Option<&[String]>, target: &str) -> SchemaRef {
+    fn canonical_fts_schema(
+        &self,
+        user_projection: Option<&[String]>,
+        document_granularity: DocumentGranularity,
+    ) -> SchemaRef {
         let mut ordered: Vec<String> = if let Some(p) = user_projection {
             p.to_vec()
         } else {
@@ -487,7 +500,7 @@ impl LsmFtsSearchPlanner {
                 ordered.push(pk.clone());
             }
         }
-        if is_element_fts_target(target) && !ordered.iter().any(|c| c == DOC_INDEX_COL) {
+        if document_granularity.is_list_element() && !ordered.iter().any(|c| c == DOC_INDEX_COL) {
             ordered.push(DOC_INDEX_COL.to_string());
         }
         if !ordered.iter().any(|c| c == SCORE_COLUMN) {
@@ -532,6 +545,7 @@ mod tests {
     };
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use futures::TryStreamExt;
+    use lance_index::scalar::inverted::query::MatchQuery;
     use std::collections::HashMap;
 
     fn fts_schema() -> Arc<ArrowSchema> {
@@ -631,7 +645,7 @@ mod tests {
 
     #[tokio::test]
     async fn active_element_document_search_returns_physical_ordinals() {
-        use lance_index::scalar::inverted::{FtsTarget, InvertedIndexParams};
+        use lance_index::scalar::inverted::InvertedIndexParams;
 
         let mut id_meta = HashMap::new();
         id_meta.insert(
@@ -665,10 +679,11 @@ mod tests {
         indexes.enable_pk_index(&[("id".to_string(), 0)]);
         indexes
             .add_fts_with_params(
-                "tags[*]_fts".to_string(),
+                "tags_list_element_fts".to_string(),
                 1,
                 "tags".to_string(),
-                InvertedIndexParams::default().with_fts_target(FtsTarget::new(2, vec![1])),
+                InvertedIndexParams::default()
+                    .document_granularity(DocumentGranularity::ListElement),
             )
             .unwrap();
         let (_, row_offset, batch_position) = batch_store.append(active_batch.clone()).unwrap();
@@ -695,8 +710,11 @@ mod tests {
         let projection = vec!["id".to_string()];
         let plan = planner
             .plan_search(
-                "tags[*]",
-                FullTextSearchQuery::new("beta".to_string()),
+                "tags",
+                FullTextSearchQuery::new_query(IndexFtsQuery::Match(
+                    MatchQuery::new("beta".to_string())
+                        .with_document_granularity(DocumentGranularity::ListElement),
+                )),
                 Some(10),
                 Some(&projection),
             )
@@ -731,7 +749,7 @@ mod tests {
     async fn element_document_search_unions_base_and_active_sources() {
         use crate::index::DatasetIndexExt;
         use lance_index::IndexType;
-        use lance_index::scalar::inverted::{FtsTarget, InvertedIndexParams};
+        use lance_index::scalar::inverted::InvertedIndexParams;
 
         let mut id_meta = HashMap::new();
         id_meta.insert(
@@ -768,10 +786,11 @@ mod tests {
         .unwrap();
         base_ds
             .create_index(
-                &["tags[*]"],
+                &["tags"],
                 IndexType::Inverted,
-                Some("tags[*]_fts".to_string()),
-                &InvertedIndexParams::default(),
+                Some("tags_list_element_fts".to_string()),
+                &InvertedIndexParams::default()
+                    .document_granularity(DocumentGranularity::ListElement),
                 false,
             )
             .await
@@ -795,10 +814,11 @@ mod tests {
         indexes.enable_pk_index(&[("id".to_string(), 0)]);
         indexes
             .add_fts_with_params(
-                "tags[*]_fts".to_string(),
+                "tags_list_element_fts".to_string(),
                 1,
                 "tags".to_string(),
-                InvertedIndexParams::default().with_fts_target(FtsTarget::new(2, vec![1])),
+                InvertedIndexParams::default()
+                    .document_granularity(DocumentGranularity::ListElement),
             )
             .unwrap();
         let (_, row_offset, batch_position) = batch_store.append(active_batch.clone()).unwrap();
@@ -822,8 +842,11 @@ mod tests {
         let projection = vec!["id".to_string()];
         let plan = planner
             .plan_search(
-                "tags[*]",
-                FullTextSearchQuery::new("beta".to_string()),
+                "tags",
+                FullTextSearchQuery::new_query(IndexFtsQuery::Match(
+                    MatchQuery::new("beta".to_string())
+                        .with_document_granularity(DocumentGranularity::ListElement),
+                )),
                 Some(10),
                 Some(&projection),
             )

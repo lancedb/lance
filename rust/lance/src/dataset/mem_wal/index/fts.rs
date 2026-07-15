@@ -47,18 +47,15 @@
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
-use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use arc_swap::ArcSwap;
-use arrow::array::AsArray;
-use arrow_array::{Array, LargeStringArray, RecordBatch, StringArray, StringViewArray};
-use arrow_schema::DataType;
+use arrow_array::RecordBatch;
 use crossbeam_skiplist::SkipMap;
 use fst::{Map, Streamer};
-use lance_arrow::iter_str_array;
 use lance_bitpacking::{BitPacker, BitPacker4x};
+use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::{Error, Result};
 use lance_index::scalar::InvertedIndexParams;
 use lance_index::scalar::inverted::query::Operator;
@@ -69,6 +66,7 @@ use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
 use super::RowPosition;
+use crate::index::scalar::inverted::{ResolvedFtsField, resolve_fts_field};
 
 // ============================================================================
 // Public types preserved from previous API
@@ -79,28 +77,28 @@ use super::RowPosition;
 pub struct FtsEntry {
     /// Row position in MemTable.
     pub row_position: RowPosition,
-    /// Physical element ordinal for an element-document index.
-    pub doc_index: Option<u32>,
+    /// Root-to-leaf physical list ordinals for a ListElement document.
+    pub doc_index: Option<Vec<u32>>,
     /// BM25 score for this document.
     pub score: f32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 struct DocumentKey {
     row_position: RowPosition,
-    doc_index: Option<u32>,
+    doc_index: Vec<u32>,
 }
 
 impl FtsEntry {
     fn key(&self) -> DocumentKey {
         DocumentKey {
             row_position: self.row_position,
-            doc_index: self.doc_index,
+            doc_index: self.doc_index.clone().unwrap_or_default(),
         }
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct DocumentMetadata {
     key: DocumentKey,
     num_tokens: u32,
@@ -109,8 +107,14 @@ struct DocumentMetadata {
 fn doc_set_key(docs: &DocSet, doc_id: u32) -> DocumentKey {
     DocumentKey {
         row_position: docs.row_id(doc_id),
-        doc_index: (docs.coordinate_rank() == 1).then(|| docs.coordinate(doc_id, 0)),
+        doc_index: (0..docs.coordinate_rank())
+            .map(|rank| docs.coordinate(doc_id, rank))
+            .collect(),
     }
+}
+
+fn public_doc_index(coordinates: &[u32]) -> Option<Vec<u32>> {
+    (!coordinates.is_empty()).then(|| coordinates.to_vec())
 }
 
 /// Full-text search query expression for composable queries.
@@ -921,8 +925,8 @@ impl IndexState {
 pub struct FtsMemIndex {
     field_id: i32,
     source_column_name: String,
-    target_column_name: String,
     params: InvertedIndexParams,
+    resolved_field: OnceLock<ResolvedFtsField>,
 
     tokenizer_pool: Arc<TokenizerPool>,
     /// Writer-only tokenizer slot. Held under a Mutex purely so `insert`
@@ -959,7 +963,6 @@ impl std::fmt::Debug for FtsMemIndex {
         f.debug_struct("FtsMemIndex")
             .field("field_id", &self.field_id)
             .field("source_column_name", &self.source_column_name)
-            .field("target_column_name", &self.target_column_name)
             .field("doc_count", &self.doc_count())
             .field("partitions", &st.partitions.len())
             .field("params", &self.params)
@@ -1009,32 +1012,32 @@ impl FtsMemIndex {
         params: InvertedIndexParams,
     ) -> Result<Self> {
         params.validate_format_version()?;
-        let coordinate_rank = params
-            .fts_target()
-            .map_or(0, |target| target.coordinate_rank());
-        if coordinate_rank > 1 {
-            return Err(Error::not_supported(format!(
-                "MemWAL FTS element documents currently support exactly one list boundary, got {coordinate_rank}"
-            )));
-        }
         let pool = TokenizerPool::new(&params, Self::DEFAULT_TOKENIZER_POOL_CAP)?;
         let writer_tokenizer = pool.template.box_clone();
-        let target_column_name = if coordinate_rank == 1 {
-            format!("{column_name}[*]")
-        } else {
-            column_name.clone()
-        };
         Ok(Self {
             field_id,
             source_column_name: column_name,
-            target_column_name,
             params,
+            resolved_field: OnceLock::new(),
             tokenizer_pool: Arc::new(pool),
             writer_tokenizer: Mutex::new(writer_tokenizer),
             state: ArcSwap::from(IndexState::empty()),
             freeze_threshold_rows: Self::DEFAULT_FREEZE_THRESHOLD_ROWS,
             merge: Arc::new(Mutex::new(None)),
         })
+    }
+
+    pub(crate) fn try_with_resolved_field(
+        field_id: i32,
+        column_name: String,
+        params: InvertedIndexParams,
+        resolved_field: ResolvedFtsField,
+    ) -> Result<Self> {
+        let index = Self::try_with_params(field_id, column_name, params)?;
+        index.resolved_field.set(resolved_field).map_err(|_| {
+            Error::internal("MemWAL FTS traversal was initialized twice".to_string())
+        })?;
+        Ok(index)
     }
 
     /// Override the tail freeze threshold (docs) — the analogue of Lucene's
@@ -1051,7 +1054,7 @@ impl FtsMemIndex {
     }
 
     pub fn column_name(&self) -> &str {
-        &self.target_column_name
+        &self.source_column_name
     }
 
     pub fn source_column_name(&self) -> &str {
@@ -1060,6 +1063,10 @@ impl FtsMemIndex {
 
     pub fn params(&self) -> &InvertedIndexParams {
         &self.params
+    }
+
+    pub fn document_granularity(&self) -> lance_index::scalar::inverted::DocumentGranularity {
+        self.params.get_document_granularity()
     }
 
     /// Number of visible documents across all partitions and the tail.
@@ -1154,43 +1161,19 @@ impl FtsMemIndex {
         let st = self.state.load_full();
         let batch_position = st.tail.next_position();
         let document_position_start = st.tail.doc_count();
-        let coordinate_rank = self
-            .params
-            .fts_target()
-            .map_or(0, |target| target.coordinate_rank());
-
-        let Some(col_idx) = batch
-            .schema()
-            .column_with_name(&self.source_column_name)
-            .map(|(idx, _)| idx)
-        else {
-            // Column missing: nothing to index, but publish an empty batch so
-            // the tail's visibility counters keep up with the writer.
-            let documents = if coordinate_rank == 0 {
-                (0..batch.num_rows())
-                    .map(|row| DocumentMetadata {
-                        key: DocumentKey {
-                            row_position: row_offset + row as u64,
-                            doc_index: None,
-                        },
-                        num_tokens: 0,
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            st.tail.append_batch(
-                batch_position,
-                document_position_start,
-                documents,
-                0,
-                FxHashMap::default(),
-                self.params.has_positions(),
-            );
-            return Ok(());
-        };
-
-        let column = batch.column(col_idx);
+        if self.resolved_field.get().is_none() {
+            let schema = LanceSchema::try_from(batch.schema().as_ref())?;
+            let resolved = resolve_fts_field(
+                &schema,
+                &self.source_column_name,
+                self.params.get_document_granularity(),
+            )?;
+            let _ = self.resolved_field.set(resolved);
+        }
+        let resolved = self.resolved_field.get().ok_or_else(|| {
+            Error::internal("MemWAL FTS traversal was not initialized".to_string())
+        })?;
+        let extracted_documents = resolved.documents_from_batch(batch)?;
 
         let mut tok_guard = self
             .writer_tokenizer
@@ -1205,127 +1188,22 @@ impl FtsMemIndex {
         let mut term_builders: FxHashMap<Arc<str>, BatchTermBuilder> = FxHashMap::default();
         let mut documents: Vec<DocumentMetadata> = Vec::with_capacity(batch.num_rows());
         let mut total_tokens: u64 = 0;
-        let mut index_document =
-            |key: DocumentKey, text: Option<&str>, skip_empty: bool| -> Result<()> {
-                let document_position = document_position_start + documents.len() as u64;
-                let num_tokens = text.map_or(0, |text| {
-                    index_text(text, document_position, tokenizer, &mut term_builders)
-                });
-                if skip_empty && num_tokens == 0 {
-                    return Ok(());
-                }
-                documents.push(DocumentMetadata { key, num_tokens });
-                total_tokens += num_tokens as u64;
-                Ok(())
-            };
+        let mut index_document = |key: DocumentKey, text: &str| -> Result<()> {
+            let document_position = document_position_start + documents.len() as u64;
+            let num_tokens = index_text(text, document_position, tokenizer, &mut term_builders);
+            documents.push(DocumentMetadata { key, num_tokens });
+            total_tokens += num_tokens as u64;
+            Ok(())
+        };
 
-        match (coordinate_rank, column.data_type()) {
-            (0, DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View) => {
-                let texts = extract_texts(column.as_ref())?;
-                debug_assert_eq!(texts.len(), batch.num_rows());
-                for (row, text) in texts.into_iter().enumerate() {
-                    index_document(
-                        DocumentKey {
-                            row_position: row_offset + row as u64,
-                            doc_index: None,
-                        },
-                        text,
-                        false,
-                    )?;
-                }
-            }
-            (0, DataType::List(_)) => {
-                let lists = column.as_list::<i32>();
-                validate_string_list_type(lists.value_type())?;
-                for (row, values) in lists.iter().enumerate() {
-                    let Some(values) = values else {
-                        continue;
-                    };
-                    let text = materialize_string_list(values.as_ref());
-                    index_document(
-                        DocumentKey {
-                            row_position: row_offset + row as u64,
-                            doc_index: None,
-                        },
-                        Some(&text),
-                        true,
-                    )?;
-                }
-            }
-            (0, DataType::LargeList(_)) => {
-                let lists = column.as_list::<i64>();
-                validate_string_list_type(lists.value_type())?;
-                for (row, values) in lists.iter().enumerate() {
-                    let Some(values) = values else {
-                        continue;
-                    };
-                    let text = materialize_string_list(values.as_ref());
-                    index_document(
-                        DocumentKey {
-                            row_position: row_offset + row as u64,
-                            doc_index: None,
-                        },
-                        Some(&text),
-                        true,
-                    )?;
-                }
-            }
-            (1, DataType::List(_)) => {
-                let lists = column.as_list::<i32>();
-                validate_string_list_type(lists.value_type())?;
-                for (row, values) in lists.iter().enumerate() {
-                    let Some(values) = values else {
-                        continue;
-                    };
-                    for (ordinal, element) in iter_str_array(values.as_ref()).enumerate() {
-                        let ordinal = u32::try_from(ordinal).map_err(|_| {
-                            Error::invalid_input(format!(
-                                "FTS element ordinal overflow for row_position={}",
-                                row_offset + row as u64
-                            ))
-                        })?;
-                        index_document(
-                            DocumentKey {
-                                row_position: row_offset + row as u64,
-                                doc_index: Some(ordinal),
-                            },
-                            element,
-                            true,
-                        )?;
-                    }
-                }
-            }
-            (1, DataType::LargeList(_)) => {
-                let lists = column.as_list::<i64>();
-                validate_string_list_type(lists.value_type())?;
-                for (row, values) in lists.iter().enumerate() {
-                    let Some(values) = values else {
-                        continue;
-                    };
-                    for (ordinal, element) in iter_str_array(values.as_ref()).enumerate() {
-                        let ordinal = u32::try_from(ordinal).map_err(|_| {
-                            Error::invalid_input(format!(
-                                "FTS element ordinal overflow for row_position={}",
-                                row_offset + row as u64
-                            ))
-                        })?;
-                        index_document(
-                            DocumentKey {
-                                row_position: row_offset + row as u64,
-                                doc_index: Some(ordinal),
-                            },
-                            element,
-                            true,
-                        )?;
-                    }
-                }
-            }
-            (_, data_type) => {
-                return Err(Error::invalid_input(format!(
-                    "FTS target '{}' does not support source type {data_type}",
-                    self.target_column_name
-                )));
-            }
+        for document in extracted_documents {
+            index_document(
+                DocumentKey {
+                    row_position: row_offset + document.row_index as u64,
+                    doc_index: document.doc_index,
+                },
+                &document.text,
+            )?;
         }
 
         // Drop the tokenizer guard before publishing so we don't hold it
@@ -1912,7 +1790,7 @@ impl FtsMemIndex {
             .into_iter()
             .map(|(key, score)| FtsEntry {
                 row_position: key.row_position,
-                doc_index: key.doc_index,
+                doc_index: public_doc_index(&key.doc_index),
                 score,
             })
             .collect()
@@ -1963,7 +1841,7 @@ impl FtsMemIndex {
         let tail_snap = st.tail.snapshot();
         for batch in tail_snap.batches.iter().take(tail_snap.visible_count) {
             for document in &batch.documents {
-                all_docs.push((document.key, document.num_tokens));
+                all_docs.push((document.key.clone(), document.num_tokens));
             }
         }
         if all_docs.is_empty() {
@@ -1986,19 +1864,19 @@ impl FtsMemIndex {
                     key.row_position, total_rows
                 )));
             }
-            entries.push((*key, *num_tokens));
+            entries.push((key.clone(), *num_tokens));
         }
-        entries.sort_by_key(|(key, _)| *key);
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
         let mut docs = DocSet::default();
         let mut original_to_doc_id: HashMap<DocumentKey, u32> =
             HashMap::with_capacity(entries.len());
         for (key, num_tokens) in &entries {
-            let doc_id = if let Some(doc_index) = key.doc_index {
-                docs.append_with_doc_index(key.row_position, *num_tokens, &[doc_index])?
+            let doc_id = if !key.doc_index.is_empty() {
+                docs.append_with_doc_index(key.row_position, *num_tokens, &key.doc_index)?
             } else {
                 docs.append(key.row_position, *num_tokens)
             };
-            original_to_doc_id.insert(*key, doc_id);
+            original_to_doc_id.insert(key.clone(), doc_id);
         }
 
         // Step 3: merge per-term postings across every partition and the tail.
@@ -2176,9 +2054,6 @@ impl BatchTermBuilder {
     }
 }
 
-/// Borrowed text for a row, or `None` for null/missing.
-type TextOpt<'a> = Option<&'a str>;
-
 fn index_text(
     text: &str,
     document_position: u64,
@@ -2202,61 +2077,6 @@ fn index_text(
     position
 }
 
-fn validate_string_list_type(data_type: DataType) -> Result<()> {
-    match data_type {
-        DataType::Utf8 | DataType::LargeUtf8 => Ok(()),
-        other => Err(Error::invalid_input(format!(
-            "FTS list target requires Utf8 or LargeUtf8 elements, got {other}"
-        ))),
-    }
-}
-
-fn materialize_string_list(elements: &dyn Array) -> String {
-    let mut text = String::new();
-    for element in iter_str_array(elements).flatten() {
-        if !text.is_empty() {
-            text.push(' ');
-        }
-        text.push_str(element);
-    }
-    text
-}
-
-fn extract_texts(column: &dyn Array) -> Result<Vec<TextOpt<'_>>> {
-    match column.data_type() {
-        DataType::Utf8 => {
-            let array = column
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .expect("Utf8 array");
-            Ok((0..array.len())
-                .map(|i| (!array.is_null(i)).then(|| array.value(i)))
-                .collect())
-        }
-        DataType::LargeUtf8 => {
-            let array = column
-                .as_any()
-                .downcast_ref::<LargeStringArray>()
-                .expect("LargeUtf8 array");
-            Ok((0..array.len())
-                .map(|i| (!array.is_null(i)).then(|| array.value(i)))
-                .collect())
-        }
-        DataType::Utf8View => {
-            let array = column
-                .as_any()
-                .downcast_ref::<StringViewArray>()
-                .expect("Utf8View array");
-            Ok((0..array.len())
-                .map(|i| (!array.is_null(i)).then(|| array.value(i)))
-                .collect())
-        }
-        other => Err(Error::invalid_input(format!(
-            "FTS index only supports Utf8, LargeUtf8, and Utf8View columns; got {other:?}"
-        ))),
-    }
-}
-
 fn has_visible_chunk(slice: &TermSlice, visible_count: usize) -> bool {
     slice.chunks().any(|c| c.batch_position < visible_count)
 }
@@ -2264,7 +2084,7 @@ fn has_visible_chunk(slice: &TermSlice, visible_count: usize) -> bool {
 fn lookup_document(snap: &Snapshot, document_position: u64) -> Option<DocumentMetadata> {
     snap.batches
         .iter()
-        .find_map(|batch| batch.document(document_position).copied())
+        .find_map(|batch| batch.document(document_position).cloned())
 }
 
 fn lookup_dl(snap: &Snapshot, document_position: u64) -> Option<u32> {
@@ -2415,7 +2235,7 @@ fn score_terms(
         .filter_map(|(document_position, score)| {
             lookup_document(snap, document_position).map(|document| FtsEntry {
                 row_position: document.key.row_position,
-                doc_index: document.key.doc_index,
+                doc_index: public_doc_index(&document.key.doc_index),
                 score,
             })
         })
@@ -2506,7 +2326,7 @@ fn phrase_search_tail(
             if let Some(document) = lookup_document(snap, document_position) {
                 results.push(FtsEntry {
                     row_position: document.key.row_position,
-                    doc_index: document.key.doc_index,
+                    doc_index: public_doc_index(&document.key.doc_index),
                     score,
                 });
             }
@@ -2565,6 +2385,7 @@ pub struct FtsIndexConfig {
     pub field_id: i32,
     pub column: String,
     pub params: InvertedIndexParams,
+    pub(crate) resolved_field: Option<Arc<ResolvedFtsField>>,
 }
 
 impl FtsIndexConfig {
@@ -2574,6 +2395,7 @@ impl FtsIndexConfig {
             field_id,
             column,
             params: InvertedIndexParams::default(),
+            resolved_field: None,
         }
     }
 
@@ -2599,7 +2421,13 @@ impl FtsIndexConfig {
             field_id,
             column,
             params,
+            resolved_field: None,
         })
+    }
+
+    pub(crate) fn with_resolved_field(mut self, resolved_field: ResolvedFtsField) -> Self {
+        self.resolved_field = Some(Arc::new(resolved_field));
+        self
     }
 }
 
@@ -3231,11 +3059,11 @@ impl Partition {
         let mut pos_to_doc: HashMap<u64, u32> = HashMap::new();
         for batch in snap.batches.iter().take(snap.visible_count) {
             for (offset, document) in batch.documents.iter().enumerate() {
-                let doc_id = if let Some(doc_index) = document.key.doc_index {
+                let doc_id = if !document.key.doc_index.is_empty() {
                     docs.append_with_doc_index(
                         document.key.row_position,
                         document.num_tokens,
-                        &[doc_index],
+                        &document.key.doc_index,
                     )?
                 } else {
                     docs.append(document.key.row_position, document.num_tokens)
@@ -3374,7 +3202,7 @@ impl Partition {
             let key = doc_set_key(&self.docs, doc as u32);
             results.push(FtsEntry {
                 row_position: key.row_position,
-                doc_index: key.doc_index,
+                doc_index: public_doc_index(&key.doc_index),
                 score: scores[doc],
             });
         }
@@ -3589,7 +3417,7 @@ impl Partition {
                 let key = doc_set_key(&self.docs, doc);
                 results.push(FtsEntry {
                     row_position: key.row_position,
-                    doc_index: key.doc_index,
+                    doc_index: public_doc_index(&key.doc_index),
                     score,
                 });
             }
@@ -3664,7 +3492,7 @@ impl TopK {
             .into_iter()
             .map(|Reverse(e)| FtsEntry {
                 row_position: e.key.row_position,
-                doc_index: e.key.doc_index,
+                doc_index: public_doc_index(&e.key.doc_index),
                 score: e.score,
             })
             .collect()
@@ -3870,9 +3698,10 @@ impl<'a> PostingCursor<'a> {
 mod tests {
     use super::*;
     use arrow_array::builder::{ListBuilder, StringBuilder};
-    use arrow_array::{Int32Array, StringArray};
-    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
-    use lance_index::scalar::inverted::FtsTarget;
+    use arrow_array::{Array, Int32Array, ListArray, StringArray, StructArray};
+    use arrow_buffer::{OffsetBuffer, ScalarBuffer};
+    use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema};
+    use lance_index::scalar::inverted::DocumentGranularity;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
 
@@ -3935,28 +3764,31 @@ mod tests {
     fn test_element_document_search_and_flush_identity() {
         let params = InvertedIndexParams::default()
             .with_position(true)
-            .with_fts_target(FtsTarget::new(2, vec![1]));
+            .document_granularity(DocumentGranularity::ListElement);
         let index = FtsMemIndex::try_with_params(1, "tags".to_string(), params)
             .unwrap()
             .with_freeze_threshold_rows(1);
-        assert_eq!(index.column_name(), "tags[*]");
+        assert_eq!(index.column_name(), "tags");
         assert_eq!(index.source_column_name(), "tags");
 
         index.insert(&create_element_test_batch(), 0).unwrap();
-        assert_eq!(index.doc_count(), 4);
+        assert_eq!(index.doc_count(), 6);
 
         let mut beta = index.search("beta");
-        beta.sort_by_key(|entry| (entry.row_position, entry.doc_index));
+        beta.sort_by_key(|entry| (entry.row_position, entry.doc_index.clone()));
         assert_eq!(
             beta.iter()
-                .map(|entry| (entry.row_position, entry.doc_index))
+                .map(|entry| (entry.row_position, entry.doc_index.clone()))
                 .collect::<Vec<_>>(),
-            vec![(0, Some(0)), (0, Some(3)), (1, Some(1))]
+            vec![(0, Some(vec![0])), (0, Some(vec![3])), (1, Some(vec![1]))]
         );
 
         let phrase = index.search_phrase("beta gamma", 0);
         assert_eq!(phrase.len(), 1);
-        assert_eq!((phrase[0].row_position, phrase[0].doc_index), (0, Some(3)));
+        assert_eq!(
+            (phrase[0].row_position, phrase[0].doc_index.clone()),
+            (0, Some(vec![3]))
+        );
 
         let conjunctive = FtsQueryExpr::boolean()
             .must(FtsQueryExpr::match_query("alpha"))
@@ -3965,15 +3797,69 @@ mod tests {
         let results = index.search_query(&conjunctive);
         assert_eq!(results.len(), 1);
         assert_eq!(
-            (results[0].row_position, results[0].doc_index),
-            (0, Some(0))
+            (results[0].row_position, results[0].doc_index.clone()),
+            (0, Some(vec![0]))
         );
 
         index.to_index_builder(7, 2).unwrap();
     }
 
     #[test]
-    fn test_empty_element_document_tail_remains_empty_after_flush() {
+    fn test_nested_element_documents_keep_all_list_ordinals() {
+        let doc_fields = Fields::from(vec![Field::new("content", DataType::Utf8, true)]);
+        let doc_values = StructArray::new(
+            doc_fields.clone(),
+            vec![Arc::new(StringArray::from(vec!["alpha", "beta", "alpha"]))],
+            None,
+        );
+        let doc_item = Arc::new(Field::new("item", DataType::Struct(doc_fields), true));
+        let docs_type = DataType::List(doc_item.clone());
+        let docs = ListArray::new(
+            doc_item,
+            OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 1, 3])),
+            Arc::new(doc_values),
+            None,
+        );
+        let group_fields = Fields::from(vec![Field::new("docs", docs_type, true)]);
+        let group_values = StructArray::new(group_fields.clone(), vec![Arc::new(docs)], None);
+        let group_item = Arc::new(Field::new("item", DataType::Struct(group_fields), true));
+        let groups = ListArray::new(
+            group_item,
+            OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 2])),
+            Arc::new(group_values),
+            None,
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![Field::new(
+                "groups",
+                groups.data_type().clone(),
+                true,
+            )])),
+            vec![Arc::new(groups)],
+        )
+        .unwrap();
+        let index = FtsMemIndex::try_with_params(
+            1,
+            "groups.docs.content".to_string(),
+            InvertedIndexParams::default().document_granularity(DocumentGranularity::ListElement),
+        )
+        .unwrap();
+
+        index.insert(&batch, 7).unwrap();
+        let mut entries = index.search("alpha");
+        entries.sort_by_key(|entry| entry.doc_index.clone());
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| (entry.row_position, entry.doc_index.clone()))
+                .collect::<Vec<_>>(),
+            vec![(7, Some(vec![0, 0])), (7, Some(vec![1, 1]))]
+        );
+        index.to_index_builder(8, 8).unwrap();
+    }
+
+    #[test]
+    fn test_zero_token_element_documents_remain_addressable_after_flush() {
         let mut tags = ListBuilder::new(StringBuilder::new());
         tags.values().append_null();
         tags.values().append_value("");
@@ -3992,15 +3878,16 @@ mod tests {
         let index = FtsMemIndex::try_with_params(
             1,
             "tags".to_string(),
-            InvertedIndexParams::default().with_fts_target(FtsTarget::new(2, vec![1])),
+            InvertedIndexParams::default().document_granularity(DocumentGranularity::ListElement),
         )
         .unwrap();
 
         index.insert(&batch, 0).unwrap();
         index.flush();
 
-        assert!(index.is_empty());
-        assert_eq!(index.doc_count(), 0);
+        assert!(!index.is_empty());
+        assert_eq!(index.doc_count(), 3);
+        assert!(index.search("missing").is_empty());
     }
 
     #[test]

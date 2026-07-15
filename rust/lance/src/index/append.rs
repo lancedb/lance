@@ -17,6 +17,7 @@ use lance_index::{
 };
 use lance_select::{RowAddrTreeMap, RowSetOps};
 use lance_table::format::{Fragment, IndexMetadata};
+use prost::Message;
 use roaring::RoaringBitmap;
 use uuid::Uuid;
 
@@ -26,7 +27,7 @@ use super::vector::ivf::{optimize_vector_indices, select_segment_for_single_reba
 use crate::dataset::Dataset;
 use crate::dataset::index::LanceIndexStoreExt;
 use crate::dataset::rowids::load_row_id_sequences;
-use crate::index::scalar::load_training_data;
+use crate::index::scalar::{load_fts_training_data, load_training_data};
 use crate::index::vector_index_details_default;
 
 #[derive(Debug, Clone)]
@@ -467,7 +468,33 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
             old_indices[0].fields[0]
         )))?;
 
-    let field_path = dataset.schema().field_path(old_indices[0].fields[0])?;
+    let raw_field_path = dataset.schema().field_path(old_indices[0].fields[0])?;
+    let first_details =
+        super::scalar::fetch_index_details(dataset.as_ref(), &raw_field_path, old_indices[0])
+            .await?;
+    let resolved_fts = if first_details.type_url.ends_with("InvertedIndexDetails") {
+        let details =
+            lance_index::pbold::InvertedIndexDetails::decode(first_details.value.as_slice())
+                .map_err(|error| {
+                    Error::io(format!(
+                        "failed to decode InvertedIndexDetails payload: {error}"
+                    ))
+                })?;
+        let granularity = lance_index::scalar::inverted::DocumentGranularity::try_from(
+            details.document_granularity,
+        )?;
+        Some(crate::index::scalar::inverted::resolve_fts_field_by_id(
+            dataset.schema(),
+            old_indices[0].fields[0],
+            granularity,
+        )?)
+    } else {
+        None
+    };
+    let field_path = resolved_fts
+        .as_ref()
+        .map(|resolved| resolved.canonical_path.clone())
+        .unwrap_or(raw_field_path);
     let first_is_vector_index = metadata_is_vector_index(dataset.as_ref(), old_indices[0]).await?;
     for idx in old_indices.iter().skip(1) {
         let is_vector_index = metadata_is_vector_index(dataset.as_ref(), idx).await?;
@@ -707,9 +734,14 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 let update_criteria = reference_index.update_criteria();
                 if update_criteria.requires_old_data {
                     let params = reference_index.derive_index_params()?;
-                    let new_data_stream = load_training_data(
+                    let resolved = resolved_fts.as_ref().ok_or_else(|| {
+                        Error::internal(
+                            "Inverted index metadata did not resolve an FTS field".to_string(),
+                        )
+                    })?;
+                    let new_data_stream = load_fts_training_data(
                         dataset.as_ref(),
-                        &field_path,
+                        resolved,
                         &update_criteria.data_criteria,
                         None,
                         true,
@@ -719,7 +751,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     let new_uuid = Uuid::new_v4();
                     let created_index = super::scalar::build_scalar_index(
                         dataset.as_ref(),
-                        column.name.as_str(),
+                        &resolved.canonical_path,
                         new_uuid,
                         &params,
                         true,
@@ -739,9 +771,14 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 }
 
                 let fragments = Some(unindexed.to_vec());
-                let new_data_stream = load_training_data(
+                let resolved = resolved_fts.as_ref().ok_or_else(|| {
+                    Error::internal(
+                        "Inverted index metadata did not resolve an FTS field".to_string(),
+                    )
+                })?;
+                let new_data_stream = load_fts_training_data(
                     dataset.as_ref(),
-                    &field_path,
+                    resolved,
                     &update_criteria.data_criteria,
                     fragments,
                     true,
@@ -793,7 +830,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     let params = reference_index.derive_index_params()?;
                     super::scalar::build_scalar_index(
                         dataset.as_ref(),
-                        column.name.as_str(),
+                        &resolved.canonical_path,
                         new_uuid,
                         &params,
                         true,

@@ -149,9 +149,7 @@ impl InvertedIndexPlugin {
 
         params.validate_format_version()?;
         let format_version = params.resolved_format_version();
-        let is_element_document = params
-            .fts_target()
-            .is_some_and(FtsTarget::is_element_document);
+        let is_element_document = params.get_document_granularity().is_list_element();
         let details = pbold::InvertedIndexDetails::try_from(&params)?;
         let mut inverted_index =
             InvertedIndexBuilder::new_with_fragment_mask(params, fragment_mask)
@@ -308,18 +306,7 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        let details = _index_details.to_msg::<pbold::InvertedIndexDetails>()?;
-        let index = if let Some(target) = details.fts_target.as_ref() {
-            InvertedIndex::load_with_target(
-                index_store,
-                frag_reuse_index,
-                cache,
-                FtsTarget::from(target),
-            )
-            .await?
-        } else {
-            InvertedIndex::load(index_store, frag_reuse_index, cache).await?
-        };
+        let index = InvertedIndex::load(index_store, frag_reuse_index, cache).await?;
         Ok(index as Arc<dyn ScalarIndex>)
     }
 

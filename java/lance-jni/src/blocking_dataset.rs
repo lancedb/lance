@@ -3402,6 +3402,7 @@ fn inner_describe_indices<'local>(
             for_column: for_column.as_deref(),
             has_name: has_name.as_deref(),
             must_support_fts,
+            fts_document_granularity: None,
             must_support_exact_equality,
         })
     })?;
@@ -3579,6 +3580,7 @@ fn inner_get_zonemap_stats<'local>(
                     for_column: Some(&column_name),
                     has_name: None,
                     must_support_fts: false,
+                    fts_document_granularity: None,
                     must_support_exact_equality: false,
                 }))
                 .await

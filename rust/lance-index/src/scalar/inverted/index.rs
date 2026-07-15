@@ -58,7 +58,7 @@ use super::impact::{IMPACT_LEVEL1_BLOCKS, ImpactSkipData, ImpactSkipDataBuilder}
 use super::iter::PostingListIterator;
 use super::lazy_docset::LazyDocSet;
 use super::tokenizer::{LEGACY_BLOCK_SIZE, validate_block_size};
-use super::{FtsTarget, InvertedIndexBuilder, InvertedIndexParams, wand::*};
+use super::{DocumentGranularity, InvertedIndexBuilder, InvertedIndexParams, wand::*};
 use super::{
     builder::{
         BLOCK_SIZE, ScoredDoc, doc_file_path,
@@ -153,8 +153,8 @@ pub static ELEMENT_FTS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     ]))
 });
 
-pub fn fts_schema(target: &FtsTarget) -> SchemaRef {
-    if target.is_element_document() {
+pub fn fts_schema(document_granularity: DocumentGranularity) -> SchemaRef {
+    if document_granularity.is_list_element() {
         ELEMENT_FTS_SCHEMA.clone()
     } else {
         FTS_SCHEMA.clone()
@@ -632,11 +632,7 @@ impl InvertedIndex {
     }
 
     fn index_version(&self) -> u32 {
-        if self
-            .params
-            .fts_target()
-            .is_some_and(FtsTarget::is_element_document)
-        {
+        if self.params.get_document_granularity().is_list_element() {
             return INVERTED_INDEX_VERSION_ELEMENT_DOCUMENT;
         }
         match (self.token_set_format, self.format_version()) {
@@ -1038,9 +1034,9 @@ impl InvertedIndex {
         let impact_shared_threshold = Arc::new(AtomicU32::new(f32::NEG_INFINITY.to_bits()));
         let legacy_shared_threshold = Arc::new(AtomicU32::new(f32::NEG_INFINITY.to_bits()));
         let coordinate_rank = self
-            .params
-            .fts_target()
-            .map(FtsTarget::coordinate_rank)
+            .partitions
+            .first()
+            .map(|partition| partition.docs.coordinate_rank())
             .unwrap_or(0);
         let parts = self
             .partitions
@@ -1305,30 +1301,6 @@ impl InvertedIndex {
     where
         Self: Sized,
     {
-        Self::load_with_target_override(store, frag_reuse_index, index_cache, None).await
-    }
-
-    pub async fn load_with_target(
-        store: Arc<dyn IndexStore>,
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
-        index_cache: &LanceCache,
-        target: FtsTarget,
-    ) -> Result<Arc<Self>>
-    where
-        Self: Sized,
-    {
-        Self::load_with_target_override(store, frag_reuse_index, index_cache, Some(target)).await
-    }
-
-    async fn load_with_target_override(
-        store: Arc<dyn IndexStore>,
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
-        index_cache: &LanceCache,
-        target: Option<FtsTarget>,
-    ) -> Result<Arc<Self>>
-    where
-        Self: Sized,
-    {
         // for new index format, there is a metadata file and multiple partitions,
         // each partition is a separate index containing tokens, inverted list and docs.
         // for old index format, there is no metadata file, and it's just like a single partition
@@ -1340,14 +1312,7 @@ impl InvertedIndex {
                     .metadata
                     .get("params")
                     .ok_or(Error::index("params not found in metadata".to_owned()))?;
-                let mut params = serde_json::from_str::<InvertedIndexParams>(params)?;
-                if let Some(target) = target.clone() {
-                    params.fts_target = Some(target);
-                }
-                let coordinate_rank = params
-                    .fts_target()
-                    .map(FtsTarget::coordinate_rank)
-                    .unwrap_or(0);
+                let params = serde_json::from_str::<InvertedIndexParams>(params)?;
                 let partitions = reader
                     .schema()
                     .metadata
@@ -1391,7 +1356,6 @@ impl InvertedIndex {
                                 frag_reuse_index_clone,
                                 &index_cache_for_part,
                                 token_set_format,
-                                coordinate_rank,
                             )
                             .await?,
                         ))
@@ -1401,6 +1365,34 @@ impl InvertedIndex {
                     .buffer_unordered(store.io_parallelism())
                     .try_collect::<Vec<_>>()
                     .await?;
+
+                let coordinate_rank = partitions
+                    .first()
+                    .map(|partition| partition.docs.coordinate_rank())
+                    .unwrap_or(0);
+                if partitions
+                    .iter()
+                    .any(|partition| partition.docs.coordinate_rank() != coordinate_rank)
+                {
+                    return Err(Error::index(
+                        "FTS partitions have inconsistent document coordinate ranks".to_string(),
+                    ));
+                }
+                match params.get_document_granularity() {
+                    DocumentGranularity::Row if coordinate_rank != 0 => {
+                        return Err(Error::index(
+                            "row-document FTS metadata has persisted document coordinates"
+                                .to_string(),
+                        ));
+                    }
+                    DocumentGranularity::ListElement if coordinate_rank == 0 => {
+                        return Err(Error::index(
+                            "ListElement FTS metadata is missing persisted document coordinates"
+                                .to_string(),
+                        ));
+                    }
+                    _ => {}
+                }
 
                 let tokenizer = params.build()?;
                 Ok(Arc::new(Self {
@@ -1415,21 +1407,8 @@ impl InvertedIndex {
                 }))
             }
             Err(_) => {
-                if target.as_ref().is_some_and(FtsTarget::is_element_document) {
-                    return Err(Error::not_supported(
-                        "element-document FTS is not supported by the legacy inverted index format"
-                            .to_string(),
-                    ));
-                }
                 // old index format
-                let index = Self::load_legacy_index(store, frag_reuse_index, index_cache).await?;
-                if let Some(target) = target {
-                    let mut index = (*index).clone();
-                    index.params.fts_target = Some(target);
-                    Ok(Arc::new(index))
-                } else {
-                    Ok(index)
-                }
+                Self::load_legacy_index(store, frag_reuse_index, index_cache).await
             }
         }
     }
@@ -1871,7 +1850,6 @@ impl InvertedPartition {
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         index_cache: &LanceCache,
         token_set_format: TokenSetFormat,
-        coordinate_rank: usize,
     ) -> Result<Self> {
         let token_file = store.open_index_file(&token_file_path(id)).await?;
         let tokens = TokenSet::load(token_file, token_set_format).await?;
@@ -1884,7 +1862,10 @@ impl InvertedPartition {
         // the store + path instead of an open reader keeps a cached partition
         // from pinning a docs-file handle for its whole lifetime.
         let docs_path = doc_file_path(id);
-        let num_docs = store.open_index_file(&docs_path).await?.num_rows();
+        let docs_reader = store.open_index_file(&docs_path).await?;
+        let num_docs = docs_reader.num_rows();
+        let docs_schema = arrow_schema::Schema::from(docs_reader.schema());
+        let coordinate_rank = document_coordinate_rank(&docs_schema);
         let docs = Arc::new(LazyDocSet::new(
             store.clone(),
             docs_path,
@@ -6751,6 +6732,16 @@ pub fn doc_index_storage_column(rank: usize) -> String {
     format!("{DOC_INDEX_STORAGE_PREFIX}{rank}")
 }
 
+pub fn document_coordinate_rank(schema: &arrow_schema::Schema) -> usize {
+    (0..)
+        .take_while(|rank| {
+            schema
+                .column_with_name(&doc_index_storage_column(*rank))
+                .is_some()
+        })
+        .count()
+}
+
 pub fn flat_full_text_search(
     batches: &[&RecordBatch],
     doc_col: &str,
@@ -6876,16 +6867,13 @@ async fn tokenize_and_count(
     query_tokens: Arc<Tokens>,
     doc_col_idx: usize,
     elapsed_compute: Option<Time>,
-    element_documents: bool,
+    coordinate_rank: usize,
 ) -> DataFusionResult<RecordBatch> {
     let mut output_fields = vec![ROW_ID_FIELD.clone()];
-    if element_documents {
-        output_fields.push(Field::new(
-            doc_index_storage_column(0),
-            DataType::UInt32,
-            false,
-        ));
-    }
+    output_fields.extend(
+        (0..coordinate_rank)
+            .map(|rank| Field::new(doc_index_storage_column(rank), DataType::UInt32, false)),
+    );
     output_fields.extend([
         Field::new(FLAT_ALL_TOKENS_COL, DataType::UInt64, false),
         Field::new(
@@ -6917,9 +6905,23 @@ async fn tokenize_and_count(
                 let start = std::time::Instant::now();
                 let batch = batch?;
                 let row_id_array = batch[ROW_ID].as_primitive::<UInt64Type>();
+                let input_doc_indices = (0..coordinate_rank)
+                    .map(|rank| {
+                        let column_name = doc_index_storage_column(rank);
+                        batch
+                            .column_by_name(&column_name)
+                            .ok_or_else(|| {
+                                datafusion_common::DataFusionError::Internal(format!(
+                                    "flat ListElement FTS is missing {column_name}"
+                                ))
+                            })
+                            .map(|column| column.as_primitive::<UInt32Type>())
+                    })
+                    .collect::<DataFusionResult<Vec<_>>>()?;
                 let mut row_ids = UInt64Builder::with_capacity(batch.num_rows());
-                let mut doc_indices =
-                    element_documents.then(|| UInt32Builder::with_capacity(batch.num_rows()));
+                let mut doc_indices = (0..coordinate_rank)
+                    .map(|_| UInt32Builder::with_capacity(batch.num_rows()))
+                    .collect::<Vec<_>>();
                 let mut all_token_counts = UInt64Builder::with_capacity(batch.num_rows());
                 let mut query_token_counts = FixedSizeListBuilder::with_capacity(
                     UInt64Builder::with_capacity(batch.num_rows() * query_tokens.len()),
@@ -6938,19 +6940,16 @@ async fn tokenize_and_count(
                     }
                     all_tokens
                 };
-                let mut append_counts = |row_id: u64,
-                                         doc_index: Option<u32>,
+                let mut append_counts = |row_index: usize,
+                                         row_id: u64,
                                          all_tokens: u64,
                                          temp_query_token_counts: &[u64]|
                  -> DataFusionResult<()> {
                         row_ids.append_value(row_id);
-                        if let Some(builder) = doc_indices.as_mut() {
-                            builder.append_value(doc_index.ok_or_else(|| {
-                                datafusion_common::DataFusionError::Internal(
-                                    "element-document flat FTS is missing a document coordinate"
-                                        .to_string(),
-                                )
-                            })?);
+                        for (builder, input) in
+                            doc_indices.iter_mut().zip(input_doc_indices.iter())
+                        {
+                            builder.append_value(input.value(row_index));
                         }
                         all_token_counts.append_value(all_tokens);
                         for count in temp_query_token_counts.iter().copied() {
@@ -6960,23 +6959,38 @@ async fn tokenize_and_count(
                         Ok(())
                     };
                 match batch.column(doc_col_idx).data_type() {
-                    DataType::Utf8 | DataType::LargeUtf8 => {
+                    DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
                         let doc_iter = iter_str_array(batch.column(doc_col_idx));
-                        for (doc, row_id) in doc_iter.zip(row_id_array.values().iter()) {
+                        for (row_index, (doc, row_id)) in
+                            doc_iter.zip(row_id_array.values().iter()).enumerate()
+                        {
                             temp_query_token_counts.clear();
                             temp_query_token_counts
                                 .extend(std::iter::repeat_n(0, query_tokens.len()));
 
                             let Some(doc) = doc else {
-                                append_counts(*row_id, None, 0, &temp_query_token_counts)?;
+                                append_counts(row_index, *row_id, 0, &temp_query_token_counts)?;
                                 continue;
                             };
 
                             let all_tokens = count_text(doc, &mut temp_query_token_counts);
-                            append_counts(*row_id, None, all_tokens, &temp_query_token_counts)?;
+                            append_counts(
+                                row_index,
+                                *row_id,
+                                all_tokens,
+                                &temp_query_token_counts,
+                            )?;
                         }
                     }
                     DataType::List(_) => {
+                        if coordinate_rank != 0 {
+                            return DataFusionResult::Err(
+                                datafusion_common::DataFusionError::Internal(
+                                    "ListElement flat FTS input must be expanded to string documents"
+                                        .to_string(),
+                                ),
+                            );
+                        }
                         tokenize_and_count_list::<i32>(
                             batch.column(doc_col_idx),
                             row_id_array,
@@ -6984,10 +6998,17 @@ async fn tokenize_and_count(
                             &mut append_counts,
                             &mut temp_query_token_counts,
                             query_tokens.len(),
-                            element_documents,
                         )?;
                     }
                     DataType::LargeList(_) => {
+                        if coordinate_rank != 0 {
+                            return DataFusionResult::Err(
+                                datafusion_common::DataFusionError::Internal(
+                                    "ListElement flat FTS input must be expanded to string documents"
+                                        .to_string(),
+                                ),
+                            );
+                        }
                         tokenize_and_count_list::<i64>(
                             batch.column(doc_col_idx),
                             row_id_array,
@@ -6995,7 +7016,6 @@ async fn tokenize_and_count(
                             &mut append_counts,
                             &mut temp_query_token_counts,
                             query_tokens.len(),
-                            element_documents,
                         )?;
                     }
                     data_type => {
@@ -7005,11 +7025,14 @@ async fn tokenize_and_count(
                     }
                 }
                 let row_ids = row_ids.finish();
-                let doc_indices = doc_indices.map(|mut builder| builder.finish());
+                let doc_indices = doc_indices
+                    .into_iter()
+                    .map(|mut builder| builder.finish())
+                    .collect::<Vec<_>>();
                 let all_token_counts = all_token_counts.finish();
                 let query_token_counts = query_token_counts.finish();
                 let mut columns = vec![Arc::new(row_ids) as ArrayRef];
-                if let Some(doc_indices) = doc_indices {
+                for doc_indices in doc_indices {
                     columns.push(Arc::new(doc_indices) as ArrayRef);
                 }
                 columns.extend([
@@ -7042,10 +7065,9 @@ fn tokenize_and_count_list<ListOffset: OffsetSizeTrait>(
     doc_col: &ArrayRef,
     row_id_array: &arrow_array::PrimitiveArray<UInt64Type>,
     count_text: &mut impl FnMut(&str, &mut Vec<u64>) -> u64,
-    append_counts: &mut impl FnMut(u64, Option<u32>, u64, &[u64]) -> DataFusionResult<()>,
+    append_counts: &mut impl FnMut(usize, u64, u64, &[u64]) -> DataFusionResult<()>,
     temp_query_token_counts: &mut Vec<u64>,
     query_tokens_len: usize,
-    element_documents: bool,
 ) -> DataFusionResult<()> {
     let doc_array = doc_col.as_list::<ListOffset>();
     match doc_array.value_type() {
@@ -7059,50 +7081,21 @@ fn tokenize_and_count_list<ListOffset: OffsetSizeTrait>(
     }
 
     for i in 0..row_id_array.len() {
-        if doc_array.is_null(i) {
-            continue;
-        }
-
-        let elements = doc_array.value(i);
-        if element_documents {
-            for (ordinal, element) in iter_str_array(elements.as_ref()).enumerate() {
-                let ordinal = u32::try_from(ordinal).map_err(|_| {
-                    datafusion_common::DataFusionError::Execution(format!(
-                        "FTS element ordinal overflow for row_id={}",
-                        row_id_array.value(i)
-                    ))
-                })?;
-                let Some(element) = element else {
-                    continue;
-                };
-                temp_query_token_counts.clear();
-                temp_query_token_counts.extend(std::iter::repeat_n(0, query_tokens_len));
-                let all_tokens = count_text(element, temp_query_token_counts);
-                if all_tokens > 0 {
-                    append_counts(
-                        row_id_array.value(i),
-                        Some(ordinal),
-                        all_tokens,
-                        temp_query_token_counts,
-                    )?;
-                }
-            }
-        } else {
-            temp_query_token_counts.clear();
-            temp_query_token_counts.extend(std::iter::repeat_n(0, query_tokens_len));
-            let mut all_tokens = 0;
+        temp_query_token_counts.clear();
+        temp_query_token_counts.extend(std::iter::repeat_n(0, query_tokens_len));
+        let mut all_tokens = 0;
+        if !doc_array.is_null(i) {
+            let elements = doc_array.value(i);
             for element in iter_str_array(elements.as_ref()).flatten() {
                 all_tokens += count_text(element, temp_query_token_counts);
             }
-            if all_tokens > 0 {
-                append_counts(
-                    row_id_array.value(i),
-                    None,
-                    all_tokens,
-                    temp_query_token_counts,
-                )?;
-            }
         }
+        append_counts(
+            i,
+            row_id_array.value(i),
+            all_tokens,
+            temp_query_token_counts,
+        )?;
     }
 
     Ok(())
@@ -7167,28 +7160,32 @@ fn flat_bm25_score(
     query_tokens: &Tokens,
     counted_input: &RecordBatch,
     scorer: &MemBM25Scorer,
-    target: &FtsTarget,
+    document_granularity: DocumentGranularity,
     operator: Operator,
     boost: f32,
 ) -> Result<RecordBatch> {
     let mut row_ids_builder = UInt64Builder::with_capacity(counted_input.num_rows());
     let mut scores_builder = Float32Builder::with_capacity(counted_input.num_rows());
-    let coordinate_column = doc_index_storage_column(0);
-    let input_doc_indices = if target.is_element_document() {
-        Some(
+    let coordinate_rank = document_coordinate_rank(counted_input.schema().as_ref());
+    let input_doc_indices = (0..coordinate_rank)
+        .map(|rank| {
+            let coordinate_column = doc_index_storage_column(rank);
             counted_input
                 .column_by_name(&coordinate_column)
                 .ok_or_else(|| {
                     Error::internal(format!(
-                        "flat element-document FTS is missing {coordinate_column}"
+                        "flat ListElement FTS is missing {coordinate_column}"
                     ))
-                })?
-                .as_primitive::<UInt32Type>(),
-        )
-    } else {
-        None
-    };
-    let mut doc_indices_builder = target.is_element_document().then(|| {
+                })
+                .map(|column| column.as_primitive::<UInt32Type>())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if document_granularity.is_list_element() != (coordinate_rank > 0) {
+        return Err(Error::internal(
+            "flat FTS document granularity does not match its coordinate columns".to_string(),
+        ));
+    }
+    let mut doc_indices_builder = document_granularity.is_list_element().then(|| {
         ListBuilder::new(UInt32Builder::new()).with_field(Field::new(
             "item",
             DataType::UInt32,
@@ -7236,12 +7233,12 @@ fn flat_bm25_score(
         }
         if score > 0.0 {
             row_ids_builder.append_value(row_id);
-            if let (Some(builder), Some(input_doc_indices)) =
-                (doc_indices_builder.as_mut(), input_doc_indices)
-            {
-                builder
-                    .values()
-                    .append_value(input_doc_indices.value(input_index));
+            if let Some(builder) = doc_indices_builder.as_mut() {
+                for input_doc_index in &input_doc_indices {
+                    builder
+                        .values()
+                        .append_value(input_doc_index.value(input_index));
+                }
                 builder.append(true);
             }
             scores_builder.append_value(score * boost);
@@ -7255,7 +7252,7 @@ fn flat_bm25_score(
         columns.push(Arc::new(builder.finish()) as ArrayRef);
     }
     columns.push(Arc::new(scores) as ArrayRef);
-    let batch = RecordBatch::try_new(fts_schema(target), columns)?;
+    let batch = RecordBatch::try_new(fts_schema(document_granularity), columns)?;
     Ok(batch)
 }
 
@@ -7297,7 +7294,7 @@ pub async fn flat_bm25_search_stream_with_metrics(
     target_batch_size: usize,
     elapsed_compute: Option<Time>,
 ) -> DataFusionResult<SendableRecordBatchStream> {
-    Ok(flat_bm25_search_stream_with_target_metrics_and_scorer(
+    Ok(flat_bm25_search_stream_with_options_and_scorer(
         input,
         doc_col,
         query,
@@ -7306,7 +7303,7 @@ pub async fn flat_bm25_search_stream_with_metrics(
         FlatBm25SearchOptions {
             target_batch_size,
             elapsed_compute,
-            target: FtsTarget::new(0, Vec::new()),
+            document_granularity: DocumentGranularity::Row,
             operator: Operator::Or,
             boost: 1.0,
         },
@@ -7321,8 +7318,8 @@ pub struct FlatBm25SearchOptions {
     pub target_batch_size: usize,
     /// Optional DataFusion metric tracking compute time.
     pub elapsed_compute: Option<Time>,
-    /// Logical FTS target that determines the output document key.
-    pub target: FtsTarget,
+    /// Logical FTS document boundary.
+    pub document_granularity: DocumentGranularity,
     /// Match operator applied within each logical document.
     pub operator: Operator,
     /// Score multiplier for the match query.
@@ -7331,7 +7328,7 @@ pub struct FlatBm25SearchOptions {
 
 /// Run a flat BM25 search and return the scorer initialized from both the
 /// optional indexed corpus and the flat input corpus.
-pub async fn flat_bm25_search_stream_with_target_metrics_and_scorer(
+pub async fn flat_bm25_search_stream_with_options_and_scorer(
     input: SendableRecordBatchStream,
     doc_col: String,
     query: String,
@@ -7342,12 +7339,12 @@ pub async fn flat_bm25_search_stream_with_target_metrics_and_scorer(
     let FlatBm25SearchOptions {
         target_batch_size,
         elapsed_compute,
-        target,
+        document_granularity,
         operator,
         boost,
     } = options;
     let mut tokenizer = tokenizer;
-    let output_schema = fts_schema(&target);
+    let output_schema = fts_schema(document_granularity);
 
     // Pre-await synchronous work: query tokenization + chunk-stream setup.
     let pre_await_start = std::time::Instant::now();
@@ -7370,6 +7367,12 @@ pub async fn flat_bm25_search_stream_with_target_metrics_and_scorer(
 
     let input_schema = input.schema();
     let doc_col_idx = input_schema.index_of(&doc_col)?;
+    let coordinate_rank = document_coordinate_rank(input_schema.as_ref());
+    if document_granularity.is_list_element() != (coordinate_rank > 0) {
+        return Err(datafusion_common::DataFusionError::Execution(
+            "flat FTS document granularity does not match its input coordinate columns".to_string(),
+        ));
+    }
 
     // Accumulate small batches until this threshold before dispatching a task.
     const ACCUMULATE_BYTES: usize = 256 * 1024;
@@ -7398,7 +7401,7 @@ pub async fn flat_bm25_search_stream_with_target_metrics_and_scorer(
         query_tokens.clone(),
         doc_col_idx,
         elapsed_compute.clone(),
-        target.is_element_document(),
+        coordinate_rank,
     )
     .await?;
 
@@ -7410,7 +7413,7 @@ pub async fn flat_bm25_search_stream_with_target_metrics_and_scorer(
         query_tokens.as_ref(),
         &counted_input,
         &scorer,
-        &target,
+        document_granularity,
         operator,
         boost,
     )?;
@@ -8205,7 +8208,6 @@ mod tests {
             None,
             &LanceCache::no_cache(),
             TokenSetFormat::default(),
-            0,
         )
         .await
         .unwrap();

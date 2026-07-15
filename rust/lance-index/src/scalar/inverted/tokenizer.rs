@@ -19,6 +19,7 @@ use jieba::JiebaTokenizerBuilder;
 use lindera::LinderaTokenizerBuilder;
 
 use crate::pbold;
+use crate::pbold::inverted_index_details::DocumentGranularity as PbDocumentGranularity;
 use crate::scalar::inverted::tokenizer::document_tokenizer::{
     JsonTokenizer, LanceTokenizer, TextTokenizer,
 };
@@ -43,65 +44,68 @@ pub const LEGACY_BLOCK_SIZE: usize = 128;
 pub const DEFAULT_BLOCK_SIZE: usize = 128;
 pub const VALID_BLOCK_SIZES: [usize; 2] = [128, 256];
 
-/// Identifies the schema value and list boundaries that define an FTS document.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct FtsTarget {
-    source_field_id: i32,
-    boundary_field_ids: Vec<i32>,
+/// The unit treated as one logical full-text-search document.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DocumentGranularity {
+    /// All text selected from one dataset row belongs to one document.
+    #[default]
+    Row,
+    /// Each element of the deepest list on the field path is one document.
+    ListElement,
 }
 
-impl FtsTarget {
-    /// Create a target from the text source field and ordered list boundaries.
-    pub fn new(source_field_id: i32, boundary_field_ids: Vec<i32>) -> Self {
-        Self {
-            source_field_id,
-            boundary_field_ids,
-        }
-    }
-
-    /// The field id of the text value that is tokenized.
-    pub fn source_field_id(&self) -> i32 {
-        self.source_field_id
-    }
-
-    /// Ordered list boundaries crossed before reaching the text value.
-    pub fn boundary_field_ids(&self) -> &[i32] {
-        &self.boundary_field_ids
-    }
-
-    /// The number of coordinates required to identify a document within a row.
-    pub fn coordinate_rank(&self) -> usize {
-        self.boundary_field_ids.len()
-    }
-
-    /// Whether each list element is a distinct FTS document.
-    pub fn is_element_document(&self) -> bool {
-        !self.boundary_field_ids.is_empty()
+impl DocumentGranularity {
+    /// Whether results identify a list element within the dataset row.
+    pub fn is_list_element(self) -> bool {
+        self == Self::ListElement
     }
 }
 
-impl From<&FtsTarget> for pbold::FtsTarget {
-    fn from(target: &FtsTarget) -> Self {
-        Self {
-            source_field_id: target.source_field_id,
-            boundary_field_ids: target.boundary_field_ids.clone(),
+impl TryFrom<&str> for DocumentGranularity {
+    type Error = Error;
+
+    fn try_from(value: &str) -> Result<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "row" => Ok(Self::Row),
+            "list_element" => Ok(Self::ListElement),
+            _ => Err(Error::invalid_input(format!(
+                "unknown FTS document granularity '{value}'; expected 'row' or 'list_element'"
+            ))),
         }
     }
 }
 
-impl From<&pbold::FtsTarget> for FtsTarget {
-    fn from(target: &pbold::FtsTarget) -> Self {
-        Self::new(target.source_field_id, target.boundary_field_ids.clone())
+impl TryFrom<i32> for DocumentGranularity {
+    type Error = Error;
+
+    fn try_from(value: i32) -> Result<Self> {
+        match PbDocumentGranularity::try_from(value) {
+            Ok(PbDocumentGranularity::Row) => Ok(Self::Row),
+            Ok(PbDocumentGranularity::ListElement) => Ok(Self::ListElement),
+            Err(_) => Err(Error::invalid_input(format!(
+                "unknown FTS document granularity value {value}"
+            ))),
+        }
+    }
+}
+
+impl From<DocumentGranularity> for PbDocumentGranularity {
+    fn from(value: DocumentGranularity) -> Self {
+        match value {
+            DocumentGranularity::Row => Self::Row,
+            DocumentGranularity::ListElement => Self::ListElement,
+        }
     }
 }
 
 /// Tokenizer configs
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct InvertedIndexParams {
-    /// Logical document target. Missing values are legacy metadata and must be
-    /// normalized against the dataset schema before the index is opened.
+    /// The logical document boundary. Missing serialized values default to
+    /// row documents for backwards compatibility.
     #[serde(default)]
-    pub(crate) fts_target: Option<FtsTarget>,
+    pub(crate) document_granularity: DocumentGranularity,
     /// lance tokenizer takes care of different data types, such as text, json, etc.
     /// - 'text': parsing input documents into tokens
     /// - 'json': parsing input json string into tokens
@@ -235,8 +239,8 @@ impl TryFrom<&InvertedIndexParams> for pbold::InvertedIndexDetails {
             max_ngram_length: params.max_ngram_length,
             prefix_only: params.prefix_only,
             block_size: Some(params.block_size as u32),
-            fts_target: params.fts_target.as_ref().map(Into::into),
             posting_format_version: Some(params.resolved_format_version().index_version()),
+            document_granularity: PbDocumentGranularity::from(params.document_granularity) as i32,
         })
     }
 }
@@ -274,7 +278,7 @@ impl TryFrom<&pbold::InvertedIndexDetails> for InvertedIndexParams {
                 .posting_format_version
                 .map(|version| resolve_fts_format_version(Some(&version.to_string())))
                 .transpose()?,
-            fts_target: details.fts_target.as_ref().map(Into::into),
+            document_granularity: details.document_granularity.try_into()?,
         })
     }
 }
@@ -370,7 +374,7 @@ impl InvertedIndexParams {
     /// Default to `English`.
     pub fn new(base_tokenizer: String, language: Language) -> Self {
         Self {
-            fts_target: None,
+            document_granularity: DocumentGranularity::Row,
             lance_tokenizer: None,
             base_tokenizer,
             language,
@@ -396,15 +400,15 @@ impl InvertedIndexParams {
         self
     }
 
-    /// Bind this configuration to a normalized logical FTS target.
-    pub fn with_fts_target(mut self, target: FtsTarget) -> Self {
-        self.fts_target = Some(target);
+    /// Set the logical FTS document boundary.
+    pub fn document_granularity(mut self, document_granularity: DocumentGranularity) -> Self {
+        self.document_granularity = document_granularity;
         self
     }
 
-    /// Return the normalized logical FTS target, if present.
-    pub fn fts_target(&self) -> Option<&FtsTarget> {
-        self.fts_target.as_ref()
+    /// Return the logical FTS document boundary.
+    pub fn get_document_granularity(&self) -> DocumentGranularity {
+        self.document_granularity
     }
 
     pub fn base_tokenizer(mut self, base_tokenizer: String) -> Self {
@@ -699,8 +703,9 @@ pub fn language_model_home() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use crate::pbold;
+    use crate::pbold::inverted_index_details::DocumentGranularity as PbDocumentGranularity;
 
-    use super::{FtsTarget, InvertedIndexParams, InvertedListFormatVersion};
+    use super::{DocumentGranularity, InvertedIndexParams, InvertedListFormatVersion};
     use lance_tokenizer::{Language, TokenStream};
     use rstest::rstest;
 
@@ -858,25 +863,29 @@ mod tests {
             max_ngram_length: 3,
             prefix_only: false,
             block_size: None,
-            fts_target: None,
             posting_format_version: None,
+            document_granularity: PbDocumentGranularity::Row as i32,
         };
         let params = InvertedIndexParams::try_from(&old_details).unwrap();
         assert_eq!(params.block_size, 128);
+        assert_eq!(params.get_document_granularity(), DocumentGranularity::Row);
     }
 
     #[test]
-    fn test_fts_target_details_conversion() {
-        let target = FtsTarget::new(12, vec![7]);
-        let params = InvertedIndexParams::default().with_fts_target(target.clone());
+    fn test_document_granularity_details_conversion() {
+        let params =
+            InvertedIndexParams::default().document_granularity(DocumentGranularity::ListElement);
         let details = pbold::InvertedIndexDetails::try_from(&params).unwrap();
         assert_eq!(details.posting_format_version, Some(2));
         assert_eq!(
-            FtsTarget::from(details.fts_target.as_ref().unwrap()),
-            target
+            details.document_granularity,
+            PbDocumentGranularity::ListElement as i32
         );
         let roundtrip = InvertedIndexParams::try_from(&details).unwrap();
-        assert_eq!(roundtrip.fts_target(), Some(&target));
+        assert_eq!(
+            roundtrip.get_document_granularity(),
+            DocumentGranularity::ListElement
+        );
     }
 
     #[rstest]

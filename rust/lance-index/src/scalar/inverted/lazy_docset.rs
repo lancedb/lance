@@ -175,6 +175,13 @@ impl LazyDocSet {
         }
     }
 
+    pub fn coordinate_rank(&self) -> usize {
+        match self {
+            Self::Loaded(loaded) => loaded.docs.coordinate_rank(),
+            Self::Deferred(deferred) => deferred.coordinate_rank,
+        }
+    }
+
     /// Sync read of cached `total_tokens`. Returns `None` for a
     /// `Deferred` LazyDocSet that hasn't yet had any of
     /// `total_tokens_num` / `ensure_num_tokens_loaded` / `ensure_loaded`

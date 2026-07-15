@@ -18,10 +18,13 @@ use lance::dataset::scanner::{
     ExecutionSummaryCounts, Scanner,
 };
 use lance_index::scalar::FullTextSearchQuery;
-use lance_index::scalar::inverted::query::{
-    BooleanQuery as FtsBooleanQuery, BoostQuery as FtsBoostQuery, FtsQuery,
-    MatchQuery as FtsMatchQuery, MultiMatchQuery as FtsMultiMatchQuery, Occur as FtsOccur,
-    PhraseQuery as FtsPhraseQuery,
+use lance_index::scalar::inverted::{
+    DocumentGranularity,
+    query::{
+        BooleanQuery as FtsBooleanQuery, BoostQuery as FtsBoostQuery, FtsQuery,
+        MatchQuery as FtsMatchQuery, MultiMatchQuery as FtsMultiMatchQuery, Occur as FtsOccur,
+        PhraseQuery as FtsPhraseQuery,
+    },
 };
 use lance_io::ffi::to_ffi_arrow_array_stream;
 use lance_linalg::distance::DistanceType;
@@ -114,6 +117,7 @@ pub(crate) fn build_full_text_search_query<'a>(
             let max_expansions = env.get_int_as_usize_from_method(&java_obj, "getMaxExpansions")?;
             let operator = env.get_fts_operator_from_method(&java_obj)?;
             let prefix_length = env.get_u32_from_method(&java_obj, "getPrefixLength")?;
+            let document_granularity = get_document_granularity(env, &java_obj)?;
 
             let mut query = FtsMatchQuery::new(query_text);
             query = query.with_column(Some(column));
@@ -122,7 +126,8 @@ pub(crate) fn build_full_text_search_query<'a>(
                 .with_fuzziness(fuzziness)
                 .with_max_expansions(max_expansions)
                 .with_operator(operator)
-                .with_prefix_length(prefix_length);
+                .with_prefix_length(prefix_length)
+                .with_document_granularity(document_granularity);
 
             Ok(FtsQuery::Match(query))
         }
@@ -130,10 +135,13 @@ pub(crate) fn build_full_text_search_query<'a>(
             let query_text = env.get_string_from_method(&java_obj, "getQueryText")?;
             let column = env.get_string_from_method(&java_obj, "getColumn")?;
             let slop = env.get_u32_from_method(&java_obj, "getSlop")?;
+            let document_granularity = get_document_granularity(env, &java_obj)?;
 
             let mut query = FtsPhraseQuery::new(query_text);
             query = query.with_column(Some(column));
-            query = query.with_slop(slop);
+            query = query
+                .with_slop(slop)
+                .with_document_granularity(document_granularity);
 
             Ok(FtsQuery::Phrase(query))
         }
@@ -227,6 +235,22 @@ pub(crate) fn build_full_text_search_query<'a>(
             other
         ))),
     }
+}
+
+fn get_document_granularity(
+    env: &mut JNIEnv<'_>,
+    java_obj: &JObject,
+) -> Result<DocumentGranularity> {
+    let granularity_obj = env
+        .call_method(
+            java_obj,
+            "getDocumentGranularity",
+            "()Lorg/lance/DocumentGranularity;",
+            &[],
+        )?
+        .l()?;
+    let value = env.get_string_from_method(&granularity_obj, "toRustString")?;
+    DocumentGranularity::try_from(value.as_str()).map_err(Error::from)
 }
 
 /// Scanner options passed from JNI - shared between blocking and async scanners

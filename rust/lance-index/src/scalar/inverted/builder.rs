@@ -388,11 +388,7 @@ impl InvertedIndexBuilder {
             token_set_format: self.token_set_format,
             worker_memory_limit_bytes,
             block_size: self.params.block_size,
-            coordinate_rank: self
-                .params
-                .fts_target()
-                .map(|target| target.coordinate_rank())
-                .unwrap_or(0),
+            coordinate_rank: document_coordinate_rank(&stream.schema()),
         };
         let next_id = self.next_partition_id();
         let id_alloc = Arc::new(AtomicU64::new(next_id));
@@ -517,10 +513,6 @@ impl InvertedIndexBuilder {
                 None,
                 &LanceCache::no_cache(),
                 self.token_set_format,
-                self.params
-                    .fts_target()
-                    .map(|target| target.coordinate_rank())
-                    .unwrap_or(0),
             )
             .await?;
             let mut builder = part.into_builder().await?;
@@ -1375,22 +1367,55 @@ impl IndexWorker {
     async fn process_batch(&mut self, batch: RecordBatch) -> Result<()> {
         let doc_col = batch.column(0);
         let row_id_col = batch[ROW_ID].as_primitive::<datatypes::UInt64Type>();
+        let doc_index_columns = (0..self.coordinate_rank)
+            .map(|rank| {
+                let column_name = doc_index_storage_column(rank);
+                batch
+                    .column_by_name(&column_name)
+                    .ok_or_else(|| {
+                        Error::index(format!(
+                            "FTS document input is missing coordinate column {column_name}"
+                        ))
+                    })
+                    .map(|column| column.as_primitive::<datatypes::UInt32Type>())
+            })
+            .collect::<Result<Vec<_>>>()?;
         match doc_col.data_type() {
-            DataType::Utf8 | DataType::LargeUtf8 => {
-                let docs = iter_str_array(doc_col.as_ref())
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
+                for (row_index, (doc, row_id)) in iter_str_array(doc_col.as_ref())
                     .zip(row_id_col.values().iter())
-                    .filter_map(|(doc, row_id)| doc.map(|doc| (doc, *row_id)));
-
-                for (doc, row_id) in docs {
-                    self.process_document(row_id, DocumentSource::Text(doc), &[], false)
-                        .await?;
+                    .enumerate()
+                {
+                    let doc_index = doc_index_columns
+                        .iter()
+                        .map(|column| column.value(row_index))
+                        .collect::<Vec<_>>();
+                    self.process_document(
+                        *row_id,
+                        DocumentSource::Text(doc.unwrap_or_default()),
+                        &doc_index,
+                        false,
+                    )
+                    .await?;
                 }
             }
             DataType::List(_) => {
+                if self.coordinate_rank > 0 {
+                    return Err(Error::index(
+                        "ListElement FTS input must be expanded to string documents before indexing"
+                            .to_string(),
+                    ));
+                }
                 self.process_string_list_batch::<i32>(doc_col, row_id_col)
                     .await?;
             }
             DataType::LargeList(_) => {
+                if self.coordinate_rank > 0 {
+                    return Err(Error::index(
+                        "ListElement FTS input must be expanded to string documents before indexing"
+                            .to_string(),
+                    ));
+                }
                 self.process_string_list_batch::<i64>(doc_col, row_id_col)
                     .await?;
             }
@@ -1422,30 +1447,18 @@ impl IndexWorker {
         }
 
         for (doc, row_id) in docs.iter().zip(row_id_col.values().iter()) {
-            let Some(doc) = doc else {
-                continue;
-            };
-
-            if self.coordinate_rank == 0 {
-                self.process_document(*row_id, DocumentSource::StringList(doc.as_ref()), &[], true)
+            match doc {
+                Some(doc) => {
+                    self.process_document(
+                        *row_id,
+                        DocumentSource::StringList(doc.as_ref()),
+                        &[],
+                        false,
+                    )
                     .await?;
-            } else {
-                if self.coordinate_rank != 1 {
-                    return Err(Error::not_supported(format!(
-                        "FTS element documents currently support exactly one list boundary, got {}",
-                        self.coordinate_rank
-                    )));
                 }
-                for (ordinal, element) in iter_str_array(doc.as_ref()).enumerate() {
-                    let ordinal = u32::try_from(ordinal).map_err(|_| {
-                        Error::invalid_input(format!(
-                            "FTS element ordinal overflow for row_id={row_id}"
-                        ))
-                    })?;
-                    let Some(element) = element else {
-                        continue;
-                    };
-                    self.process_document(*row_id, DocumentSource::Text(element), &[ordinal], true)
+                None => {
+                    self.process_document(*row_id, DocumentSource::Text(""), &[], false)
                         .await?;
                 }
             }
@@ -2312,7 +2325,7 @@ pub fn document_input(
     let schema = input.schema();
     let field = schema.column_with_name(column).expect_ok()?.1;
     match field.data_type() {
-        DataType::Utf8 | DataType::LargeUtf8 => Ok(input),
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => Ok(input),
         DataType::List(field) | DataType::LargeList(field)
             if matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8) =>
         {

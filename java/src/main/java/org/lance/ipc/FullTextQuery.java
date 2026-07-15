@@ -13,6 +13,8 @@
  */
 package org.lance.ipc;
 
+import org.lance.DocumentGranularity;
+
 import com.google.common.base.MoreObjects;
 import org.apache.arrow.util.Preconditions;
 
@@ -63,7 +65,13 @@ public abstract class FullTextQuery {
   public abstract Type getType();
 
   public static FullTextQuery match(String queryText, String column) {
-    return match(queryText, column, 1.0f, Optional.empty(), 50, Operator.OR, 0);
+    return match(queryText, column, DocumentGranularity.ROW);
+  }
+
+  public static FullTextQuery match(
+      String queryText, String column, DocumentGranularity documentGranularity) {
+    return match(
+        queryText, column, 1.0f, Optional.empty(), 50, Operator.OR, 0, documentGranularity);
   }
 
   public static FullTextQuery match(
@@ -74,16 +82,53 @@ public abstract class FullTextQuery {
       int maxExpansions,
       Operator operator,
       int prefixLength) {
+    return match(
+        queryText,
+        column,
+        boost,
+        fuzziness,
+        maxExpansions,
+        operator,
+        prefixLength,
+        DocumentGranularity.ROW);
+  }
+
+  public static FullTextQuery match(
+      String queryText,
+      String column,
+      float boost,
+      Optional<Integer> fuzziness,
+      int maxExpansions,
+      Operator operator,
+      int prefixLength,
+      DocumentGranularity documentGranularity) {
     return new MatchQuery(
-        queryText, column, boost, fuzziness, maxExpansions, operator, prefixLength);
+        queryText,
+        column,
+        boost,
+        fuzziness,
+        maxExpansions,
+        operator,
+        prefixLength,
+        documentGranularity);
   }
 
   public static FullTextQuery phrase(String queryText, String column) {
-    return phrase(queryText, column, 0);
+    return phrase(queryText, column, 0, DocumentGranularity.ROW);
+  }
+
+  public static FullTextQuery phrase(
+      String queryText, String column, DocumentGranularity documentGranularity) {
+    return phrase(queryText, column, 0, documentGranularity);
   }
 
   public static FullTextQuery phrase(String queryText, String column, int slop) {
-    return new PhraseQuery(queryText, column, slop);
+    return phrase(queryText, column, slop, DocumentGranularity.ROW);
+  }
+
+  public static FullTextQuery phrase(
+      String queryText, String column, int slop, DocumentGranularity documentGranularity) {
+    return new PhraseQuery(queryText, column, slop, documentGranularity);
   }
 
   public static FullTextQuery multiMatch(String queryText, List<String> columns) {
@@ -117,6 +162,7 @@ public abstract class FullTextQuery {
     private final int maxExpansions;
     private final Operator operator;
     private final int prefixLength;
+    private final DocumentGranularity documentGranularity;
 
     MatchQuery(
         String queryText,
@@ -125,7 +171,8 @@ public abstract class FullTextQuery {
         Optional<Integer> fuzziness,
         int maxExpansions,
         Operator operator,
-        int prefixLength) {
+        int prefixLength,
+        DocumentGranularity documentGranularity) {
       Preconditions.checkArgument(
           queryText != null && !queryText.isEmpty(), "queryText must not be null or empty");
       Preconditions.checkArgument(
@@ -140,6 +187,8 @@ public abstract class FullTextQuery {
       this.maxExpansions = maxExpansions;
       this.operator = operator == null ? Operator.OR : operator;
       this.prefixLength = prefixLength;
+      this.documentGranularity =
+          Objects.requireNonNull(documentGranularity, "documentGranularity must not be null");
     }
 
     @Override
@@ -175,6 +224,10 @@ public abstract class FullTextQuery {
       return prefixLength;
     }
 
+    public DocumentGranularity getDocumentGranularity() {
+      return documentGranularity;
+    }
+
     @Override
     public boolean equals(Object o) {
       if (this == o) return true;
@@ -184,6 +237,7 @@ public abstract class FullTextQuery {
           && maxExpansions == other.maxExpansions
           && prefixLength == other.prefixLength
           && operator == other.operator
+          && documentGranularity == other.documentGranularity
           && Objects.equals(queryText, other.queryText)
           && Objects.equals(column, other.column)
           && Objects.equals(fuzziness, other.fuzziness);
@@ -192,7 +246,14 @@ public abstract class FullTextQuery {
     @Override
     public int hashCode() {
       return Objects.hash(
-          queryText, column, boost, fuzziness, maxExpansions, operator, prefixLength);
+          queryText,
+          column,
+          boost,
+          fuzziness,
+          maxExpansions,
+          operator,
+          prefixLength,
+          documentGranularity);
     }
 
     @Override
@@ -206,6 +267,7 @@ public abstract class FullTextQuery {
           .add("maxExpansions", maxExpansions)
           .add("operator", operator)
           .add("prefixLength", prefixLength)
+          .add("documentGranularity", documentGranularity)
           .toString();
     }
   }
@@ -215,8 +277,10 @@ public abstract class FullTextQuery {
     private final String queryText;
     private final String column;
     private final int slop;
+    private final DocumentGranularity documentGranularity;
 
-    PhraseQuery(String queryText, String column, int slop) {
+    PhraseQuery(
+        String queryText, String column, int slop, DocumentGranularity documentGranularity) {
       Preconditions.checkArgument(
           queryText != null && !queryText.isEmpty(), "queryText must not be null or empty");
       Preconditions.checkArgument(
@@ -226,6 +290,8 @@ public abstract class FullTextQuery {
       this.queryText = queryText;
       this.column = column;
       this.slop = slop;
+      this.documentGranularity =
+          Objects.requireNonNull(documentGranularity, "documentGranularity must not be null");
     }
 
     @Override
@@ -245,19 +311,24 @@ public abstract class FullTextQuery {
       return slop;
     }
 
+    public DocumentGranularity getDocumentGranularity() {
+      return documentGranularity;
+    }
+
     @Override
     public boolean equals(Object o) {
       if (this == o) return true;
       if (!(o instanceof PhraseQuery)) return false;
       PhraseQuery other = (PhraseQuery) o;
       return slop == other.slop
+          && documentGranularity == other.documentGranularity
           && Objects.equals(queryText, other.queryText)
           && Objects.equals(column, other.column);
     }
 
     @Override
     public int hashCode() {
-      return Objects.hash(queryText, column, slop);
+      return Objects.hash(queryText, column, slop, documentGranularity);
     }
 
     @Override
@@ -267,6 +338,7 @@ public abstract class FullTextQuery {
           .add("queryText", queryText)
           .add("column", column)
           .add("slop", slop)
+          .add("documentGranularity", documentGranularity)
           .toString();
     }
   }

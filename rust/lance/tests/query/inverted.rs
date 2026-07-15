@@ -6,9 +6,11 @@ use std::sync::Arc;
 use arrow_array::cast::AsArray;
 use arrow_array::{
     ArrayRef, FixedSizeListArray, Float32Array, Int32Array, ListArray, RecordBatch,
-    RecordBatchIterator, StringArray, UInt32Array,
+    RecordBatchIterator, StringArray, StructArray, UInt32Array,
     builder::{ListBuilder, StringBuilder},
 };
+use arrow_buffer::{OffsetBuffer, ScalarBuffer};
+use arrow_schema::{DataType, Field as ArrowField, Fields as ArrowFields};
 use lance::Dataset;
 use lance::dataset::optimize::{CompactionOptions, compact_files};
 use lance::dataset::scanner::{ColumnOrdering, QueryFilter};
@@ -19,11 +21,11 @@ use lance_index::IndexType;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::prefilter::NoFilter;
-use lance_index::scalar::inverted::Language;
 use lance_index::scalar::inverted::query::{
     BooleanQuery, BoostQuery, FtsQuery, FtsSearchParams, MatchQuery, MultiMatchQuery, Occur,
     Operator, PhraseQuery, collect_query_tokens,
 };
+use lance_index::scalar::inverted::{DocumentGranularity, Language};
 use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams};
 use lance_table::format::IndexMetadata;
 
@@ -49,6 +51,28 @@ fn params_for(base_tokenizer: &str, lower_case: bool, with_position: bool) -> In
         .remove_stop_words(false)
         .ascii_folding(false)
         .max_token_length(None)
+}
+
+fn list_element_params(with_position: bool) -> InvertedIndexParams {
+    base_inverted_params(with_position).document_granularity(DocumentGranularity::ListElement)
+}
+
+fn list_element_match_node(column: &str, terms: &str) -> MatchQuery {
+    MatchQuery::new(terms.to_string())
+        .with_column(Some(column.to_string()))
+        .with_document_granularity(DocumentGranularity::ListElement)
+}
+
+fn list_element_match(column: &str, terms: &str) -> FullTextSearchQuery {
+    FullTextSearchQuery::new_query(FtsQuery::Match(list_element_match_node(column, terms)))
+}
+
+fn list_element_phrase(column: &str, terms: &str) -> FullTextSearchQuery {
+    FullTextSearchQuery::new_query(FtsQuery::Phrase(
+        PhraseQuery::new(terms.to_string())
+            .with_column(Some(column.to_string()))
+            .with_document_granularity(DocumentGranularity::ListElement),
+    ))
 }
 
 // Execute a full-text search with optional filter and deterministic id ordering.
@@ -215,28 +239,27 @@ async fn test_element_document_fts_flat_indexed_and_mixed() {
     .await
     .unwrap();
 
-    let element_query = FullTextSearchQuery::new("alpha".to_string())
-        .with_column("tags[*]".to_string())
-        .unwrap();
+    let element_query = list_element_match("tags", "alpha");
     let element_and_query = FullTextSearchQuery::new_query(FtsQuery::Match(
-        MatchQuery::new("alpha beta".to_string())
-            .with_column(Some("tags[*]".to_string()))
-            .with_operator(Operator::And),
+        list_element_match_node("tags", "alpha beta").with_operator(Operator::And),
     ));
     let flat = run_fts(&ds, element_query.clone(), None).await;
     assert_eq!(element_hits(&flat), vec![(0, vec![0]), (0, vec![1])]);
     let flat_and = run_fts(&ds, element_and_query.clone(), None).await;
     assert_eq!(element_hits(&flat_and), vec![(0, vec![0])]);
     assert_element_coordinates_point_to(&flat, "tags", "alpha");
-    let params = base_inverted_params(true);
-    for invalid_target in ["id[*]", "tags[*][*]", "json.tags[*]", "tags[*].value"] {
-        let err = ds
-            .create_index(&[invalid_target], IndexType::Inverted, None, &params, true)
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains(invalid_target), "{err}");
-    }
-    ds.create_index(&["tags[*]"], IndexType::Inverted, None, &params, true)
+    let params = list_element_params(true);
+    let err = ds
+        .create_index(&["id"], IndexType::Inverted, None, &params, true)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("must resolve to Utf8"), "{err}");
+    let err = ds
+        .create_index(&["tags[*]"], IndexType::Inverted, None, &params, true)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("tags[*]"), "{err}");
+    ds.create_index(&["tags"], IndexType::Inverted, None, &params, true)
         .await
         .unwrap();
     let mut element_only_auto = ds.scan();
@@ -249,9 +272,15 @@ async fn test_element_document_fts_flat_indexed_and_mixed() {
             .contains("unless an INVERTED index has been created"),
         "{err}"
     );
-    ds.create_index(&["tags"], IndexType::Inverted, None, &params, true)
-        .await
-        .unwrap();
+    ds.create_index(
+        &["tags"],
+        IndexType::Inverted,
+        None,
+        &base_inverted_params(true),
+        true,
+    )
+    .await
+    .unwrap();
     let names = ds
         .load_indices()
         .await
@@ -260,7 +289,7 @@ async fn test_element_document_fts_flat_indexed_and_mixed() {
         .map(|index| index.name.clone())
         .collect::<Vec<_>>();
     assert!(names.contains(&"tags_idx".to_string()));
-    assert!(names.contains(&"tags[*]_idx".to_string()));
+    assert!(names.contains(&"tags_list_element_idx".to_string()));
 
     let auto_row = run_fts(&ds, FullTextSearchQuery::new("alpha".to_string()), None).await;
     assert_eq!(auto_row.num_rows(), 1);
@@ -283,16 +312,20 @@ async fn test_element_document_fts_flat_indexed_and_mixed() {
     assert_eq!(element_hits(&indexed_and), vec![(0, vec![0])]);
     assert_element_coordinates_point_to(&indexed, "tags", "alpha");
     let element_index = ds
-        .load_indices_by_name("tags[*]_idx")
+        .load_indices_by_name("tags_list_element_idx")
         .await
         .unwrap()
         .pop()
         .unwrap();
+    assert_eq!(
+        element_index.index_version,
+        lance_index::scalar::inverted::INVERTED_INDEX_VERSION_ELEMENT_DOCUMENT as i32
+    );
     let element_index = ds
         .open_scalar_index("tags", &element_index.uuid, &NoOpMetricsCollector)
         .await
         .unwrap();
-    assert_eq!(element_index.statistics().unwrap()["num_docs"], 6);
+    assert_eq!(element_index.statistics().unwrap()["num_docs"], 11);
     let element_index = element_index
         .as_any()
         .downcast_ref::<lance_index::scalar::inverted::InvertedIndex>()
@@ -301,7 +334,7 @@ async fn test_element_document_fts_flat_indexed_and_mixed() {
         .bm25_stats_for_terms(&["alpha".to_string()])
         .await
         .unwrap();
-    assert_eq!((total_tokens, num_docs, token_docs), (8, 6, vec![2]));
+    assert_eq!((total_tokens, num_docs, token_docs), (8, 11, vec![2]));
     let mut tokenizer = element_index.tokenizer();
     let tokens = Arc::new(collect_query_tokens("alpha", &mut tokenizer));
     let documents = element_index
@@ -315,7 +348,7 @@ async fn test_element_document_fts_flat_indexed_and_mixed() {
         )
         .await
         .unwrap();
-    let expected_score = expected_bm25_score(6, 2, 8, 2);
+    let expected_score = expected_bm25_score(11, 2, 8, 2);
     assert!(
         documents
             .iter()
@@ -323,34 +356,13 @@ async fn test_element_document_fts_flat_indexed_and_mixed() {
         "{documents:?}"
     );
     assert_same_element_scores(&flat, &indexed);
-    let indexed_phrase = run_fts(
-        &ds,
-        FullTextSearchQuery::new_query(FtsQuery::Phrase(
-            PhraseQuery::new("alpha beta".to_string()).with_column(Some("tags[*]".to_string())),
-        )),
-        None,
-    )
-    .await;
+    let indexed_phrase = run_fts(&ds, list_element_phrase("tags", "alpha beta"), None).await;
     assert_eq!(element_hits(&indexed_phrase), vec![(0, vec![0])]);
     let filtered = run_fts(&ds, element_query.clone(), Some("id = 0")).await;
     assert_eq!(element_hits(&filtered), vec![(0, vec![0]), (0, vec![1])]);
-    let ordinal = run_fts(
-        &ds,
-        FullTextSearchQuery::new("delta".to_string())
-            .with_column("tags[*]".to_string())
-            .unwrap(),
-        None,
-    )
-    .await;
+    let ordinal = run_fts(&ds, list_element_match("tags", "delta"), None).await;
     assert_eq!(element_hits(&ordinal), vec![(0, vec![4])]);
-    let punctuation_gap = run_fts(
-        &ds,
-        FullTextSearchQuery::new("epsilon".to_string())
-            .with_column("tags[*]".to_string())
-            .unwrap(),
-        None,
-    )
-    .await;
+    let punctuation_gap = run_fts(&ds, list_element_match("tags", "epsilon"), None).await;
     assert_eq!(element_hits(&punctuation_gap), vec![(5, vec![1])]);
     let limited = run_fts(&ds, element_query.clone().limit(Some(1)), None).await;
     assert_eq!(limited.num_rows(), 1);
@@ -362,9 +374,7 @@ async fn test_element_document_fts_flat_indexed_and_mixed() {
     );
     assert_eq!(element_hits(&limited).len(), 1);
 
-    let element_match = |terms: &str| {
-        FtsQuery::Match(MatchQuery::new(terms.to_string()).with_column(Some("tags[*]".to_string())))
-    };
+    let element_match = |terms: &str| FtsQuery::Match(list_element_match_node("tags", terms));
     let boolean = BooleanQuery::new([
         (Occur::Must, element_match("alpha")),
         (Occur::Must, element_match("beta")),
@@ -386,8 +396,9 @@ async fn test_element_document_fts_flat_indexed_and_mixed() {
     .await;
     assert_eq!(element_hits(&boost), vec![(0, vec![0]), (0, vec![1])]);
 
-    let phrase =
-        PhraseQuery::new("beta gamma".to_string()).with_column(Some("tags[*]".to_string()));
+    let phrase = PhraseQuery::new("beta gamma".to_string())
+        .with_column(Some("tags".to_string()))
+        .with_document_granularity(DocumentGranularity::ListElement);
     let element_phrase = run_fts(
         &ds,
         FullTextSearchQuery::new_query(FtsQuery::Phrase(phrase)),
@@ -422,30 +433,31 @@ async fn test_element_document_fts_flat_indexed_and_mixed() {
         ),
     ]);
     let mut scanner = ds.scan();
-    scanner
+    let err = scanner
         .full_text_search(FullTextSearchQuery::new_query(FtsQuery::Boolean(
             cross_target,
         )))
-        .unwrap();
-    let err = scanner.try_into_batch().await.unwrap_err();
+        .err()
+        .expect("mixed document granularities must be rejected");
     assert!(
         err.to_string()
-            .contains("cannot mix element-document and row-document targets"),
+            .contains("cannot mix Row and ListElement document granularities"),
         "{err}"
     );
 
-    let multi_match =
-        MultiMatchQuery::try_new("alpha".to_string(), vec!["tags[*]".to_string()]).unwrap();
+    let mut multi_match =
+        MultiMatchQuery::try_new("alpha".to_string(), vec!["tags".to_string()]).unwrap();
+    multi_match.match_queries[0].document_granularity = DocumentGranularity::ListElement;
     let mut scanner = ds.scan();
-    scanner
+    let err = scanner
         .full_text_search(FullTextSearchQuery::new_query(FtsQuery::MultiMatch(
             multi_match,
         )))
-        .unwrap();
-    let err = scanner.try_into_batch().await.unwrap_err();
+        .err()
+        .expect("ListElement MultiMatch must be rejected");
     assert!(
         err.to_string()
-            .contains("MultiMatch does not support element-document FTS targets"),
+            .contains("MultiMatch does not support ListElement document granularity"),
         "{err}"
     );
 
@@ -456,15 +468,15 @@ async fn test_element_document_fts_flat_indexed_and_mixed() {
         (Occur::Must, FtsQuery::MultiMatch(row_multi_match)),
     ]);
     let mut scanner = ds.scan();
-    scanner
+    let err = scanner
         .full_text_search(FullTextSearchQuery::new_query(FtsQuery::Boolean(
             mixed_multi_match,
         )))
-        .unwrap();
-    let err = scanner.try_into_batch().await.unwrap_err();
+        .err()
+        .expect("mixed document granularities must be rejected");
     assert!(
         err.to_string()
-            .contains("cannot mix element-document and row-document targets"),
+            .contains("cannot mix Row and ListElement document granularities"),
         "{err}"
     );
 
@@ -500,49 +512,36 @@ async fn test_element_document_fts_flat_indexed_and_mixed() {
     )
     .await
     .unwrap();
-    let flat_reference = run_fts(
-        &flat_reference,
-        FullTextSearchQuery::new("alpha".to_string())
-            .with_column("tags[*]".to_string())
-            .unwrap(),
-        None,
-    )
-    .await;
+    let flat_reference = run_fts(&flat_reference, list_element_match("tags", "alpha"), None).await;
     assert_same_element_scores(&mixed, &flat_reference);
 
     ds.optimize_indices(&OptimizeOptions::append())
         .await
         .unwrap();
     assert_eq!(
-        ds.load_indices_by_name("tags[*]_idx").await.unwrap().len(),
+        ds.load_indices_by_name("tags_list_element_idx")
+            .await
+            .unwrap()
+            .len(),
         2
     );
-    let optimized = run_fts(
-        &ds,
-        FullTextSearchQuery::new("alpha".to_string())
-            .with_column("tags[*]".to_string())
-            .unwrap(),
-        None,
-    )
-    .await;
+    let optimized = run_fts(&ds, list_element_match("tags", "alpha"), None).await;
     assert_same_element_scores(&optimized, &flat_reference);
     assert_element_coordinates_point_to(&optimized, "tags", "alpha");
 
-    ds.optimize_indices(&OptimizeOptions::merge(2).index_names(vec!["tags[*]_idx".to_string()]))
-        .await
-        .unwrap();
+    ds.optimize_indices(
+        &OptimizeOptions::merge(2).index_names(vec!["tags_list_element_idx".to_string()]),
+    )
+    .await
+    .unwrap();
     assert_eq!(
-        ds.load_indices_by_name("tags[*]_idx").await.unwrap().len(),
+        ds.load_indices_by_name("tags_list_element_idx")
+            .await
+            .unwrap()
+            .len(),
         1
     );
-    let merged = run_fts(
-        &ds,
-        FullTextSearchQuery::new("alpha".to_string())
-            .with_column("tags[*]".to_string())
-            .unwrap(),
-        None,
-    )
-    .await;
+    let merged = run_fts(&ds, list_element_match("tags", "alpha"), None).await;
     assert_same_element_scores(&merged, &flat_reference);
     assert_element_coordinates_point_to(&merged, "tags", "alpha");
 
@@ -550,38 +549,139 @@ async fn test_element_document_fts_flat_indexed_and_mixed() {
     compact_files(&mut ds, CompactionOptions::default(), None)
         .await
         .unwrap();
-    let compacted = run_fts(
-        &ds,
-        FullTextSearchQuery::new("alpha".to_string())
-            .with_column("tags[*]".to_string())
-            .unwrap(),
-        None,
-    )
-    .await;
+    let compacted = run_fts(&ds, list_element_match("tags", "alpha"), None).await;
     assert_eq!(element_hits(&compacted), vec![(6, vec![0]), (6, vec![1])]);
 
     ds.alter_columns(&[ColumnAlteration::new("tags".into()).rename("labels".into())])
         .await
         .unwrap();
-    let renamed = run_fts(
+    let renamed = run_fts(&ds, list_element_match("labels", "alpha"), None).await;
+    assert_eq!(element_hits(&renamed), vec![(6, vec![0]), (6, vec![1])]);
+    let mut old_name_scanner = ds.scan();
+    let err = old_name_scanner
+        .full_text_search(list_element_match("tags", "alpha"))
+        .err()
+        .expect("renamed element target must reject the old path");
+    assert!(err.to_string().contains("tags"), "{err}");
+}
+
+#[tokio::test]
+async fn test_element_document_nested_lists_use_deepest_boundary() {
+    let doc_fields = ArrowFields::from(vec![ArrowField::new("content", DataType::Utf8, true)]);
+    let doc_values = StructArray::new(
+        doc_fields.clone(),
+        vec![Arc::new(StringArray::from(vec![
+            Some("alpha"),
+            Some("beta"),
+            Some("gamma"),
+            Some("alpha delta"),
+            Some("alpha"),
+        ])) as ArrayRef],
+        None,
+    );
+    let doc_item = Arc::new(ArrowField::new("item", DataType::Struct(doc_fields), true));
+    let docs_type = DataType::List(doc_item.clone());
+    let docs = ListArray::new(
+        doc_item,
+        OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 2, 4, 4, 5])),
+        Arc::new(doc_values),
+        None,
+    );
+    let group_fields = ArrowFields::from(vec![ArrowField::new("docs", docs_type, true)]);
+    let group_values =
+        StructArray::new(group_fields.clone(), vec![Arc::new(docs) as ArrayRef], None);
+    let group_item = Arc::new(ArrowField::new(
+        "item",
+        DataType::Struct(group_fields),
+        true,
+    ));
+    let groups = ListArray::new(
+        group_item,
+        OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 2, 4])),
+        Arc::new(group_values),
+        None,
+    );
+    let batch = RecordBatch::try_from_iter(vec![
+        ("id", Arc::new(Int32Array::from(vec![0, 1])) as ArrayRef),
+        ("groups", Arc::new(groups) as ArrayRef),
+    ])
+    .unwrap();
+    let test_dir = tempfile::tempdir().unwrap();
+    let mut ds = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+        test_dir.path().to_str().unwrap(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    let path = "groups.docs.content";
+    let expected = vec![(0, vec![0, 0]), (0, vec![1, 1]), (1, vec![1, 0])];
+    let flat = run_fts(&ds, list_element_match(path, "alpha"), None).await;
+    assert_eq!(element_hits(&flat), expected);
+
+    let row_flat = run_fts(
         &ds,
         FullTextSearchQuery::new("alpha".to_string())
-            .with_column("labels[*]".to_string())
+            .with_column(path.to_string())
             .unwrap(),
         None,
     )
     .await;
-    assert_eq!(element_hits(&renamed), vec![(6, vec![0]), (6, vec![1])]);
-    let mut old_name_scanner = ds.scan();
-    let err = old_name_scanner
-        .full_text_search(
-            FullTextSearchQuery::new("alpha".to_string())
-                .with_column("tags[*]".to_string())
-                .unwrap(),
-        )
-        .err()
-        .expect("renamed element target must reject the old path");
-    assert!(err.to_string().contains("tags[*]"), "{err}");
+    assert_eq!(
+        row_flat["id"]
+            .as_primitive::<arrow_array::types::Int32Type>()
+            .values(),
+        &[0, 1]
+    );
+    assert!(row_flat.column_by_name("_doc_index").is_none());
+
+    ds.create_index(
+        &[path],
+        IndexType::Inverted,
+        None,
+        &list_element_params(true),
+        true,
+    )
+    .await
+    .unwrap();
+    ds.create_index(
+        &[path],
+        IndexType::Inverted,
+        None,
+        &base_inverted_params(true),
+        true,
+    )
+    .await
+    .unwrap();
+
+    let indexed = run_fts(&ds, list_element_match(path, "alpha"), None).await;
+    assert_eq!(element_hits(&indexed), expected);
+    let indices = ds.load_indices().await.unwrap();
+    let row = indices
+        .iter()
+        .find(|index| index.name == "groups.docs.content_idx")
+        .unwrap();
+    let elements = indices
+        .iter()
+        .find(|index| index.name == "groups.docs.content_list_element_idx")
+        .unwrap();
+    let groups = ds.schema().field("groups").unwrap();
+    let group_item = groups.children.first().unwrap();
+    let docs = group_item
+        .children
+        .iter()
+        .find(|field| field.name == "docs")
+        .unwrap();
+    let doc_item = docs.children.first().unwrap();
+    let content = doc_item
+        .children
+        .iter()
+        .find(|field| field.name == "content")
+        .unwrap();
+    assert_eq!(row.fields, elements.fields);
+    assert_eq!(row.fields, vec![content.id]);
+    assert_ne!(row.fields, vec![docs.children[0].id]);
 }
 
 #[tokio::test]
@@ -613,9 +713,15 @@ async fn test_element_document_bm25_uses_element_corpus() {
     ds.create_index(&["tags"], IndexType::Inverted, None, &params, true)
         .await
         .unwrap();
-    ds.create_index(&["tags[*]"], IndexType::Inverted, None, &params, true)
-        .await
-        .unwrap();
+    ds.create_index(
+        &["tags"],
+        IndexType::Inverted,
+        None,
+        &list_element_params(false),
+        true,
+    )
+    .await
+    .unwrap();
 
     let row = run_fts(
         &ds,
@@ -625,14 +731,7 @@ async fn test_element_document_bm25_uses_element_corpus() {
         None,
     )
     .await;
-    let element = run_fts(
-        &ds,
-        FullTextSearchQuery::new("needle".to_string())
-            .with_column("tags[*]".to_string())
-            .unwrap(),
-        None,
-    )
-    .await;
+    let element = run_fts(&ds, list_element_match("tags", "needle"), None).await;
     let row_scores = row["_score"].as_primitive::<arrow_array::types::Float32Type>();
     let element_scores = element["_score"].as_primitive::<arrow_array::types::Float32Type>();
 
@@ -675,10 +774,10 @@ async fn test_element_document_fts_vector_prefilter_deduplicates_parent_rows() {
     .await
     .unwrap();
     ds.create_index(
-        &["tags[*]"],
+        &["tags"],
         IndexType::Inverted,
         None,
-        &base_inverted_params(false),
+        &list_element_params(false),
         true,
     )
     .await
@@ -689,11 +788,7 @@ async fn test_element_document_fts_vector_prefilter_deduplicates_parent_rows() {
     scanner
         .nearest("vector", &query_vector, 10)
         .unwrap()
-        .filter_query(QueryFilter::Fts(
-            FullTextSearchQuery::new("alpha".to_string())
-                .with_column("tags[*]".to_string())
-                .unwrap(),
-        ))
+        .filter_query(QueryFilter::Fts(list_element_match("tags", "alpha")))
         .unwrap()
         .prefilter(true);
     let result = scanner.try_into_batch().await.unwrap();

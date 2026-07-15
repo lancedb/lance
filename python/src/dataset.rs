@@ -78,7 +78,7 @@ use lance_index::{
     FtsPrewarmOptions, IndexParams, IndexType, PrewarmOptions,
     optimize::OptimizeOptions,
     progress::{IndexBuildProgress, NoopIndexBuildProgress},
-    scalar::inverted::InvertedListFormatVersion,
+    scalar::inverted::{DocumentGranularity, InvertedListFormatVersion},
     scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams},
     vector::{
         ApproxMode, DEFAULT_QUERY_PARALLELISM, Query as VectorQuery,
@@ -1211,6 +1211,14 @@ impl Dataset {
 
                 let is_phrase = query.len() >= 2 && query.starts_with('"') && query.ends_with('"');
                 let is_multi_match = columns.as_ref().map(|cols| cols.len() > 1).unwrap_or(false);
+                let document_granularity = full_text_query
+                    .get_item("document_granularity")?
+                    .map(|value| value.extract::<String>())
+                    .transpose()?
+                    .map(|value| DocumentGranularity::try_from(value.as_str()))
+                    .transpose()
+                    .map_err(|err| PyValueError::new_err(err.to_string()))?
+                    .unwrap_or_default();
 
                 if is_phrase {
                     // Remove the surrounding quotes for phrase queries
@@ -1218,8 +1226,12 @@ impl Dataset {
                 }
 
                 let query: FtsQuery = match (is_phrase, is_multi_match) {
-                    (false, _) => MatchQuery::new(query).into(),
-                    (true, false) => PhraseQuery::new(query).into(),
+                    (false, _) => MatchQuery::new(query)
+                        .with_document_granularity(document_granularity)
+                        .into(),
+                    (true, false) => PhraseQuery::new(query)
+                        .with_document_granularity(document_granularity)
+                        .into(),
                     (true, true) => {
                         return Err(PyValueError::new_err(
                             "Phrase queries cannot be used with multiple columns.",
@@ -2421,6 +2433,13 @@ impl Dataset {
             "INVERTED" | "FTS" => {
                 let mut params = InvertedIndexParams::default();
                 if let Some(kwargs) = kwargs {
+                    if let Some(document_granularity) = kwargs.get_item("document_granularity")? {
+                        let document_granularity: String = document_granularity.extract()?;
+                        params = params.document_granularity(
+                            DocumentGranularity::try_from(document_granularity.as_str())
+                                .map_err(|err| PyValueError::new_err(err.to_string()))?,
+                        );
+                    }
                     if let Some(with_position) = kwargs.get_item("with_position")? {
                         params = params.with_position(with_position.extract()?);
                     }
@@ -5081,7 +5100,8 @@ pub struct PyFullTextQuery {
 #[pymethods]
 impl PyFullTextQuery {
     #[staticmethod]
-    #[pyo3(signature = (query, column, boost=1.0, fuzziness=Some(0), max_expansions=50, operator="OR", prefix_length=0))]
+    #[pyo3(signature = (query, column, boost=1.0, fuzziness=Some(0), max_expansions=50, operator="OR", prefix_length=0, document_granularity="row"))]
+    #[allow(clippy::too_many_arguments)]
     fn match_query(
         query: String,
         column: String,
@@ -5090,6 +5110,7 @@ impl PyFullTextQuery {
         max_expansions: usize,
         operator: &str,
         prefix_length: u32,
+        document_granularity: &str,
     ) -> PyResult<Self> {
         Ok(Self {
             inner: MatchQuery::new(query)
@@ -5102,17 +5123,30 @@ impl PyFullTextQuery {
                         .map_err(|e| PyValueError::new_err(format!("Invalid operator: {}", e)))?,
                 )
                 .with_prefix_length(prefix_length)
+                .with_document_granularity(
+                    DocumentGranularity::try_from(document_granularity)
+                        .map_err(|err| PyValueError::new_err(err.to_string()))?,
+                )
                 .into(),
         })
     }
 
     #[staticmethod]
-    #[pyo3(signature = (query, column, slop))]
-    fn phrase_query(query: String, column: String, slop: u32) -> PyResult<Self> {
+    #[pyo3(signature = (query, column, slop, document_granularity="row"))]
+    fn phrase_query(
+        query: String,
+        column: String,
+        slop: u32,
+        document_granularity: &str,
+    ) -> PyResult<Self> {
         Ok(Self {
             inner: PhraseQuery::new(query)
                 .with_column(Some(column))
                 .with_slop(slop)
+                .with_document_granularity(
+                    DocumentGranularity::try_from(document_granularity)
+                        .map_err(|err| PyValueError::new_err(err.to_string()))?,
+                )
                 .into(),
         })
     }

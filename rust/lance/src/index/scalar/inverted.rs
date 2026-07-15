@@ -5,20 +5,25 @@
 
 use std::sync::Arc;
 
+use arrow_array::cast::AsArray;
+use arrow_array::{
+    Array, ArrayRef, LargeStringArray, RecordBatch, StringArray, StringViewArray, UInt32Array,
+    UInt64Array,
+};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use futures::StreamExt;
 use lance_core::{
     ROW_ID,
-    datatypes::{
-        Field, FieldPathComponent, LogicalType, Schema, format_field_path,
-        parse_field_path_components,
-    },
+    datatypes::{Field, LogicalType, Schema, format_field_path, parse_field_path},
 };
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::pbold::InvertedIndexDetails;
 use lance_index::scalar::inverted::{
-    FtsTarget, InvertedIndex, LEGACY_BLOCK_SIZE, default_fts_format_version_for_block_size,
+    DocumentGranularity, InvertedIndex, LEGACY_BLOCK_SIZE,
+    default_fts_format_version_for_block_size, doc_index_storage_column,
 };
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::registry::VALUE_COLUMN_NAME;
@@ -33,21 +38,314 @@ use crate::{
     index::{DatasetIndexExt, scalar::fetch_index_details},
 };
 
-/// Schema-resolved form of a public FTS target path.
 #[derive(Debug, Clone)]
-pub(crate) struct ResolvedFtsTarget {
-    pub target: FtsTarget,
-    pub public_field_id: i32,
-    pub scan_column: String,
-    pub canonical_path: String,
+enum FtsTraversal {
+    Text,
+    Struct {
+        child_index: usize,
+        child: Box<Self>,
+    },
+    List {
+        child: Box<Self>,
+    },
 }
 
-fn text_source_field(field: &Field) -> Result<&Field> {
-    if field.logical_type == LogicalType::from("json") {
-        return Ok(field);
+impl FtsTraversal {
+    fn list_depth(&self) -> usize {
+        match self {
+            Self::Text => 0,
+            Self::Struct { child, .. } => child.list_depth(),
+            Self::List { child } => 1 + child.list_depth(),
+        }
     }
+}
+
+/// Schema-derived form of an FTS field path.
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedFtsField {
+    pub final_field_id: i32,
+    pub root_column: String,
+    pub canonical_path: String,
+    pub document_granularity: DocumentGranularity,
+    traversal: FtsTraversal,
+    list_depth: usize,
+}
+
+/// One logical document extracted from a dataset row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FtsDocument {
+    pub row_index: usize,
+    pub text: String,
+    pub doc_index: Vec<u32>,
+}
+
+impl ResolvedFtsField {
+    pub fn has_lists(&self) -> bool {
+        self.list_depth > 0
+    }
+
+    pub fn coordinate_rank(&self) -> usize {
+        if self.document_granularity.is_list_element() {
+            self.list_depth
+        } else {
+            0
+        }
+    }
+
+    pub fn documents_from_batch(&self, batch: &RecordBatch) -> Result<Vec<FtsDocument>> {
+        let column = batch.column_by_name(&self.root_column).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "FTS root column '{}' is missing from the input batch",
+                self.root_column
+            ))
+        })?;
+        self.documents_from_array(column, batch.num_rows())
+    }
+
+    fn documents_from_array(&self, column: &ArrayRef, num_rows: usize) -> Result<Vec<FtsDocument>> {
+        let mut documents = Vec::new();
+        match self.document_granularity {
+            DocumentGranularity::Row => {
+                documents.reserve(num_rows);
+                for row_index in 0..num_rows {
+                    let mut text = String::new();
+                    append_row_text(&self.traversal, column.as_ref(), row_index, &mut text)?;
+                    documents.push(FtsDocument {
+                        row_index,
+                        text,
+                        doc_index: Vec::new(),
+                    });
+                }
+            }
+            DocumentGranularity::ListElement => {
+                for row_index in 0..num_rows {
+                    collect_element_documents(
+                        &self.traversal,
+                        column.as_ref(),
+                        row_index,
+                        row_index,
+                        0,
+                        self.list_depth,
+                        &mut Vec::with_capacity(self.list_depth),
+                        &mut documents,
+                    )?;
+                }
+            }
+        }
+        Ok(documents)
+    }
+}
+
+fn string_value(array: &dyn Array, index: usize) -> Result<Option<&str>> {
+    if array.is_null(index) {
+        return Ok(None);
+    }
+    match array.data_type() {
+        DataType::Utf8 => Ok(Some(
+            array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("Utf8 array type")
+                .value(index),
+        )),
+        DataType::LargeUtf8 => Ok(Some(
+            array
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .expect("LargeUtf8 array type")
+                .value(index),
+        )),
+        DataType::Utf8View => Ok(Some(
+            array
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .expect("Utf8View array type")
+                .value(index),
+        )),
+        data_type => Err(Error::internal(format!(
+            "FTS traversal expected a string array, got {data_type}"
+        ))),
+    }
+}
+
+fn append_text(output: &mut String, text: &str) {
+    if !output.is_empty() {
+        output.push(' ');
+    }
+    output.push_str(text);
+}
+
+fn append_row_text(
+    traversal: &FtsTraversal,
+    array: &dyn Array,
+    index: usize,
+    output: &mut String,
+) -> Result<()> {
+    match traversal {
+        FtsTraversal::Text => {
+            if let Some(text) = string_value(array, index)? {
+                append_text(output, text);
+            }
+        }
+        FtsTraversal::Struct { child_index, child } => {
+            if !array.is_null(index) {
+                let structs = array.as_struct();
+                append_row_text(child, structs.column(*child_index).as_ref(), index, output)?;
+            }
+        }
+        FtsTraversal::List { child } => match array.data_type() {
+            DataType::List(_) => {
+                let lists = array.as_list::<i32>();
+                if !lists.is_null(index) {
+                    let offsets = lists.value_offsets();
+                    let start = offsets[index] as usize;
+                    let end = offsets[index + 1] as usize;
+                    for element_index in start..end {
+                        append_row_text(child, lists.values().as_ref(), element_index, output)?;
+                    }
+                }
+            }
+            DataType::LargeList(_) => {
+                let lists = array.as_list::<i64>();
+                if !lists.is_null(index) {
+                    let offsets = lists.value_offsets();
+                    let start = offsets[index] as usize;
+                    let end = offsets[index + 1] as usize;
+                    for element_index in start..end {
+                        append_row_text(child, lists.values().as_ref(), element_index, output)?;
+                    }
+                }
+            }
+            data_type => {
+                return Err(Error::internal(format!(
+                    "FTS traversal expected a list array, got {data_type}"
+                )));
+            }
+        },
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_element_documents(
+    traversal: &FtsTraversal,
+    array: &dyn Array,
+    index: usize,
+    row_index: usize,
+    list_depth: usize,
+    boundary_depth: usize,
+    doc_index: &mut Vec<u32>,
+    documents: &mut Vec<FtsDocument>,
+) -> Result<()> {
+    match traversal {
+        FtsTraversal::Text => Err(Error::internal(
+            "ListElement FTS traversal did not encounter its list boundary".to_string(),
+        )),
+        FtsTraversal::Struct { child_index, child } => {
+            if !array.is_null(index) {
+                let structs = array.as_struct();
+                collect_element_documents(
+                    child,
+                    structs.column(*child_index).as_ref(),
+                    index,
+                    row_index,
+                    list_depth,
+                    boundary_depth,
+                    doc_index,
+                    documents,
+                )?;
+            }
+            Ok(())
+        }
+        FtsTraversal::List { child } => {
+            let mut visit = |values: &ArrayRef, start: usize, end: usize| -> Result<()> {
+                for (ordinal, element_index) in (start..end).enumerate() {
+                    let ordinal = u32::try_from(ordinal).map_err(|_| {
+                        Error::invalid_input(format!(
+                            "FTS element ordinal overflow for row index {row_index}"
+                        ))
+                    })?;
+                    doc_index.push(ordinal);
+                    if list_depth + 1 == boundary_depth {
+                        let mut text = String::new();
+                        append_row_text(child, values.as_ref(), element_index, &mut text)?;
+                        documents.push(FtsDocument {
+                            row_index,
+                            text,
+                            doc_index: doc_index.clone(),
+                        });
+                    } else {
+                        collect_element_documents(
+                            child,
+                            values.as_ref(),
+                            element_index,
+                            row_index,
+                            list_depth + 1,
+                            boundary_depth,
+                            doc_index,
+                            documents,
+                        )?;
+                    }
+                    doc_index.pop();
+                }
+                Ok(())
+            };
+            match array.data_type() {
+                DataType::List(_) => {
+                    let lists = array.as_list::<i32>();
+                    if !lists.is_null(index) {
+                        let offsets = lists.value_offsets();
+                        visit(
+                            lists.values(),
+                            offsets[index] as usize,
+                            offsets[index + 1] as usize,
+                        )?;
+                    }
+                }
+                DataType::LargeList(_) => {
+                    let lists = array.as_list::<i64>();
+                    if !lists.is_null(index) {
+                        let offsets = lists.value_offsets();
+                        visit(
+                            lists.values(),
+                            offsets[index] as usize,
+                            offsets[index + 1] as usize,
+                        )?;
+                    }
+                }
+                data_type => {
+                    return Err(Error::internal(format!(
+                        "FTS traversal expected a list array, got {data_type}"
+                    )));
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn find_child_case_insensitive<'a>(field: &'a Field, name: &str) -> Option<(usize, &'a Field)> {
+    field
+        .children
+        .iter()
+        .enumerate()
+        .find(|(_, child)| child.name == name)
+        .or_else(|| {
+            field
+                .children
+                .iter()
+                .enumerate()
+                .find(|(_, child)| child.name.eq_ignore_ascii_case(name))
+        })
+}
+
+fn build_fts_traversal(
+    field: &Field,
+    remaining_names: &[String],
+    canonical_names: &mut Vec<String>,
+    final_field_id: &mut i32,
+) -> Result<FtsTraversal> {
     match field.data_type() {
-        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => Ok(field),
         DataType::List(_) | DataType::LargeList(_) => {
             let child = field.children.first().ok_or_else(|| {
                 Error::invalid_input(format!(
@@ -55,149 +353,252 @@ fn text_source_field(field: &Field) -> Result<&Field> {
                     field.name
                 ))
             })?;
-            match child.data_type() {
-                DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => Ok(child),
-                data_type => Err(Error::invalid_input(format!(
-                    "FTS list field '{}' must contain Utf8 or LargeUtf8 values, got {data_type}",
-                    field.name
-                ))),
-            }
+            Ok(FtsTraversal::List {
+                child: Box::new(build_fts_traversal(
+                    child,
+                    remaining_names,
+                    canonical_names,
+                    final_field_id,
+                )?),
+            })
         }
-        // JSON fields are represented as extension-annotated string fields, so
-        // their physical type is covered above.
+        DataType::Struct(_) => {
+            let Some((name, rest)) = remaining_names.split_first() else {
+                return Err(Error::invalid_input(format!(
+                    "FTS field path ends at struct '{}'; specify the final text field",
+                    field.name
+                )));
+            };
+            let (child_index, child) =
+                find_child_case_insensitive(field, name).ok_or_else(|| {
+                    Error::index(format!(
+                        "FTS field '{}' does not contain child '{}'",
+                        field.name, name
+                    ))
+                })?;
+            canonical_names.push(child.name.clone());
+            *final_field_id = child.id;
+            Ok(FtsTraversal::Struct {
+                child_index,
+                child: Box::new(build_fts_traversal(
+                    child,
+                    rest,
+                    canonical_names,
+                    final_field_id,
+                )?),
+            })
+        }
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View if remaining_names.is_empty() => {
+            Ok(FtsTraversal::Text)
+        }
+        _ if field.logical_type == LogicalType::from("json") && remaining_names.is_empty() => {
+            Ok(FtsTraversal::Text)
+        }
+        data_type if !remaining_names.is_empty() => Err(Error::invalid_input(format!(
+            "FTS field '{}' has type {data_type} and cannot contain child '{}'",
+            field.name, remaining_names[0]
+        ))),
         data_type => Err(Error::invalid_input(format!(
-            "FTS field '{}' must be Utf8, LargeUtf8, JSON, or a list of strings, got {data_type}",
+            "FTS field '{}' must resolve to Utf8, LargeUtf8, Utf8View, or JSON, got {data_type}",
             field.name
         ))),
     }
 }
 
-/// Resolve the public FTS path into a stable schema-id target.
-pub(crate) fn resolve_fts_target(schema: &Schema, path: &str) -> Result<ResolvedFtsTarget> {
-    let components = parse_field_path_components(path)?;
-    let wildcard_count = components
-        .iter()
-        .filter(|component| matches!(component, FieldPathComponent::ListWildcard))
-        .count();
-
-    if wildcard_count == 0 {
-        let fields = schema.resolve_case_insensitive(path).ok_or_else(|| {
-            Error::index(format!(
-                "FTS target '{path}' does not exist in the dataset schema"
-            ))
-        })?;
-        if fields
-            .iter()
-            .take(fields.len().saturating_sub(1))
-            .any(|field| {
-                matches!(
-                    field.data_type(),
-                    DataType::List(_) | DataType::LargeList(_)
-                )
-            })
-        {
-            return Err(Error::invalid_input(format!(
-                "FTS target '{path}' contains an Arrow-internal list item path; use the public list field for row-document FTS or append [*] for element-document FTS"
-            )));
-        }
-        let field = fields.last().copied().ok_or_else(|| {
-            Error::index(format!("FTS target '{path}' does not resolve to a field"))
-        })?;
-        let source = text_source_field(field)?;
-        let names = fields
-            .iter()
-            .map(|field| field.name.as_str())
-            .collect::<Vec<_>>();
-        let canonical_path = format_field_path(&names);
-        return Ok(ResolvedFtsTarget {
-            target: FtsTarget::new(source.id, Vec::new()),
-            public_field_id: field.id,
-            scan_column: canonical_path.clone(),
-            canonical_path,
-        });
-    }
-
-    if wildcard_count != 1
-        || components.len() != 2
-        || !matches!(components[0], FieldPathComponent::Field(_))
-        || !matches!(components[1], FieldPathComponent::ListWildcard)
-    {
-        return Err(Error::invalid_input(format!(
-            "FTS element target '{path}' is outside the supported Phase 1 shape: expected one top-level List<Utf8> or List<LargeUtf8> field followed by exactly one [*]"
-        )));
-    }
-
-    let FieldPathComponent::Field(requested_name) = &components[0] else {
-        return Err(Error::invalid_input(format!(
-            "FTS element target '{path}' must begin with a field name"
-        )));
-    };
-    let field = schema
+/// Resolve a public FTS field path and derive all list traversal from schema.
+pub(crate) fn resolve_fts_field(
+    schema: &Schema,
+    path: &str,
+    document_granularity: DocumentGranularity,
+) -> Result<ResolvedFtsField> {
+    let names = parse_field_path(path)?;
+    let (root_name, remaining_names) = names
+        .split_first()
+        .ok_or_else(|| Error::invalid_input("FTS field path cannot be empty".to_string()))?;
+    let root = schema
         .fields
         .iter()
-        .find(|field| field.name == *requested_name)
+        .find(|field| field.name == *root_name)
         .or_else(|| {
             schema
                 .fields
                 .iter()
-                .find(|field| field.name.eq_ignore_ascii_case(requested_name))
+                .find(|field| field.name.eq_ignore_ascii_case(root_name))
         })
         .ok_or_else(|| {
             Error::index(format!(
-                "FTS target '{path}' does not exist in the dataset schema"
+                "FTS field path '{path}' does not exist in the dataset schema"
             ))
         })?;
-    if !matches!(
-        field.data_type(),
-        DataType::List(_) | DataType::LargeList(_)
-    ) {
+
+    let mut canonical_names = vec![root.name.clone()];
+    let mut final_field_id = root.id;
+    let traversal = build_fts_traversal(
+        root,
+        remaining_names,
+        &mut canonical_names,
+        &mut final_field_id,
+    )?;
+    let list_depth = traversal.list_depth();
+    if document_granularity.is_list_element() && list_depth == 0 {
         return Err(Error::invalid_input(format!(
-            "FTS element target '{path}' requires a List<Utf8> or List<LargeUtf8> field, got {}",
-            field.data_type()
+            "FTS field path '{}' has no List layer and cannot use ListElement document granularity",
+            format_field_path(
+                &canonical_names
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+            )
         )));
     }
-    let source = field.children.first().ok_or_else(|| {
-        Error::invalid_input(format!(
-            "FTS element target '{path}' does not have an item field"
-        ))
-    })?;
-    if !matches!(source.data_type(), DataType::Utf8 | DataType::LargeUtf8) {
-        return Err(Error::invalid_input(format!(
-            "FTS element target '{path}' must contain Utf8 or LargeUtf8 values, got {}",
-            source.data_type()
-        )));
+    if list_depth > 0 && root.logical_type == LogicalType::from("json") {
+        return Err(Error::invalid_input(
+            "nested List traversal is not supported for JSON FTS sources".to_string(),
+        ));
     }
-    let scan_column = format_field_path(&[field.name.as_str()]);
-    Ok(ResolvedFtsTarget {
-        target: FtsTarget::new(source.id, vec![field.id]),
-        public_field_id: field.id,
-        canonical_path: format!("{scan_column}[*]"),
-        scan_column,
+    let canonical_path = format_field_path(
+        &canonical_names
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+    );
+    Ok(ResolvedFtsField {
+        final_field_id,
+        root_column: root.name.clone(),
+        canonical_path,
+        document_granularity,
+        traversal,
+        list_depth,
     })
 }
 
-/// Normalize legacy, target-less inverted metadata to its row-document target.
-pub(crate) fn normalize_fts_details(
+fn find_public_path_by_id(field: &Field, field_id: i32, path: &mut Vec<String>) -> bool {
+    if field.id == field_id {
+        return true;
+    }
+    match field.data_type() {
+        DataType::List(_) | DataType::LargeList(_) => field
+            .children
+            .first()
+            .is_some_and(|child| find_physical_path_by_id(child, field_id, path)),
+        DataType::Struct(_) => field.children.iter().any(|child| {
+            path.push(child.name.clone());
+            let found = find_public_path_by_id(child, field_id, path);
+            if !found {
+                path.pop();
+            }
+            found
+        }),
+        _ => false,
+    }
+}
+
+fn find_physical_path_by_id(field: &Field, field_id: i32, path: &mut Vec<String>) -> bool {
+    if field.id == field_id {
+        return false;
+    }
+    match field.data_type() {
+        DataType::List(_) | DataType::LargeList(_) => field
+            .children
+            .first()
+            .is_some_and(|child| find_physical_path_by_id(child, field_id, path)),
+        DataType::Struct(_) => field.children.iter().any(|child| {
+            path.push(child.name.clone());
+            let found = find_public_path_by_id(child, field_id, path);
+            if !found {
+                path.pop();
+            }
+            found
+        }),
+        _ => false,
+    }
+}
+
+/// Resolve an indexed final field id against the current schema, preserving
+/// routing across field renames.
+pub(crate) fn resolve_fts_field_by_id(
     schema: &Schema,
+    field_id: i32,
+    document_granularity: DocumentGranularity,
+) -> Result<ResolvedFtsField> {
+    for root in &schema.fields {
+        let mut path = vec![root.name.clone()];
+        if find_public_path_by_id(root, field_id, &mut path) {
+            let path_refs = path.iter().map(String::as_str).collect::<Vec<_>>();
+            return resolve_fts_field(schema, &format_field_path(&path_refs), document_granularity);
+        }
+    }
+    Err(Error::invalid_input(format!(
+        "FTS index refers to missing or Arrow-internal field id {field_id}"
+    )))
+}
+
+pub(crate) fn fts_document_schema(coordinate_rank: usize) -> Arc<ArrowSchema> {
+    let mut fields = vec![
+        ArrowField::new(VALUE_COLUMN_NAME, DataType::Utf8, false),
+        ArrowField::new(ROW_ID, DataType::UInt64, false),
+    ];
+    fields.extend(
+        (0..coordinate_rank)
+            .map(|rank| ArrowField::new(doc_index_storage_column(rank), DataType::UInt32, false)),
+    );
+    Arc::new(ArrowSchema::new(fields))
+}
+
+pub(crate) fn transform_fts_document_stream(
+    input: SendableRecordBatchStream,
+    resolved: ResolvedFtsField,
+) -> Result<SendableRecordBatchStream> {
+    let input_schema = input.schema();
+    if (input_schema
+        .column_with_name(&resolved.root_column)
+        .is_none()
+        && input_schema.column_with_name(VALUE_COLUMN_NAME).is_none())
+        || input_schema.column_with_name(ROW_ID).is_none()
+    {
+        return Err(Error::internal(
+            "FTS document input must contain the root source column and _rowid".to_string(),
+        ));
+    }
+    let output_schema = fts_document_schema(resolved.coordinate_rank());
+    let stream_schema = output_schema.clone();
+    let stream = input.map(move |batch| {
+        let batch = batch?;
+        let source = batch
+            .column_by_name(&resolved.root_column)
+            .or_else(|| batch.column_by_name(VALUE_COLUMN_NAME))
+            .expect("FTS document input schema was validated");
+        let documents = resolved
+            .documents_from_array(source, batch.num_rows())
+            .map_err(DataFusionError::from)?;
+        let input_row_ids = batch[ROW_ID].as_primitive::<arrow_array::types::UInt64Type>();
+        let texts =
+            StringArray::from_iter_values(documents.iter().map(|document| document.text.as_str()));
+        let row_ids = UInt64Array::from_iter_values(
+            documents
+                .iter()
+                .map(|document| input_row_ids.value(document.row_index)),
+        );
+        let mut columns = vec![Arc::new(texts) as ArrayRef, Arc::new(row_ids) as ArrayRef];
+        for rank in 0..resolved.coordinate_rank() {
+            columns.push(Arc::new(UInt32Array::from_iter_values(
+                documents.iter().map(|document| document.doc_index[rank]),
+            )) as ArrayRef);
+        }
+        RecordBatch::try_new(stream_schema.clone(), columns).map_err(DataFusionError::from)
+    });
+    Ok(Box::pin(RecordBatchStreamAdapter::new(
+        output_schema,
+        stream,
+    )))
+}
+
+/// Fill legacy posting-format metadata while leaving protobuf-default row
+/// document granularity untouched.
+pub(crate) fn normalize_inverted_details(
     index: &IndexMetadata,
     mut details: InvertedIndexDetails,
 ) -> Result<InvertedIndexDetails> {
-    if details.fts_target.is_none() {
-        let field_id = *index.fields.last().ok_or_else(|| {
-            Error::invalid_input(format!(
-                "FTS index {} does not record a field id",
-                index.name
-            ))
-        })?;
-        let field = schema.field_by_id(field_id).ok_or_else(|| {
-            Error::invalid_input(format!(
-                "FTS index {} refers to missing field id {field_id}",
-                index.name
-            ))
-        })?;
-        let source = text_source_field(field)?;
-        details.fts_target = Some((&FtsTarget::new(source.id, Vec::new())).into());
-    }
     if details.posting_format_version.is_none() {
         let posting_format_version = match index.index_version {
             0 | 1 => 1,
@@ -226,18 +627,25 @@ pub(crate) fn normalize_fts_details(
 /// and `_rowid` fields. The stream intentionally contains no batches.
 fn empty_inverted_update_stream(
     dataset: &Dataset,
-    field_id: i32,
+    resolved: &ResolvedFtsField,
 ) -> Result<SendableRecordBatchStream> {
-    let field = dataset.schema().field_by_id(field_id).ok_or_else(|| {
-        Error::invalid_input(format!(
-            "merge_existing_index_segments: field id {} does not exist",
-            field_id
-        ))
-    })?;
-    let schema = Arc::new(ArrowSchema::new(vec![
-        ArrowField::new(VALUE_COLUMN_NAME, field.data_type(), true),
-        ArrowField::new(ROW_ID, arrow_schema::DataType::UInt64, false),
-    ]));
+    let field = dataset
+        .schema()
+        .field_by_id(resolved.final_field_id)
+        .ok_or_else(|| {
+            Error::invalid_input(format!(
+                "merge_existing_index_segments: field id {} does not exist",
+                resolved.final_field_id
+            ))
+        })?;
+    let schema = if resolved.has_lists() {
+        fts_document_schema(resolved.coordinate_rank())
+    } else {
+        Arc::new(ArrowSchema::new(vec![
+            ArrowField::new(VALUE_COLUMN_NAME, field.data_type(), true),
+            ArrowField::new(ROW_ID, arrow_schema::DataType::UInt64, false),
+        ]))
+    };
     Ok(Box::pin(RecordBatchStreamAdapter::new(
         schema,
         futures::stream::empty(),
@@ -284,7 +692,21 @@ pub(crate) async fn merge_segments(
             segments[0].uuid
         ))
     })?;
-    let field_path = dataset.schema().field_path(field_id)?;
+    let details = match segments[0].index_details.as_ref() {
+        Some(details_any) => {
+            let details =
+                InvertedIndexDetails::decode(details_any.value.as_slice()).map_err(|error| {
+                    Error::io(format!(
+                        "failed to decode InvertedIndexDetails payload: {error}"
+                    ))
+                })?;
+            normalize_inverted_details(&segments[0], details)?
+        }
+        None => normalize_inverted_details(&segments[0], InvertedIndexDetails::default())?,
+    };
+    let document_granularity = DocumentGranularity::try_from(details.document_granularity)?;
+    let resolved = resolve_fts_field_by_id(dataset.schema(), field_id, document_granularity)?;
+    load_segment_details(dataset, &resolved.canonical_path, &segments).await?;
 
     let mut source_indices = Vec::with_capacity(segments.len());
     let mut fragment_bitmap = RoaringBitmap::new();
@@ -296,8 +718,19 @@ pub(crate) async fn merge_segments(
                 segment.uuid
             ))
         })?;
-        let scalar_index =
-            super::open_scalar_index(dataset, &field_path, segment, &NoOpMetricsCollector).await?;
+        if segment.fields != segments[0].fields {
+            return Err(Error::invalid_input(format!(
+                "FTS index {} has inconsistent fields across segments",
+                segments[0].name
+            )));
+        }
+        let scalar_index = super::open_scalar_index(
+            dataset,
+            &resolved.canonical_path,
+            segment,
+            &NoOpMetricsCollector,
+        )
+        .await?;
         let inverted_index = scalar_index
             .as_any()
             .downcast_ref::<InvertedIndex>()
@@ -315,7 +748,7 @@ pub(crate) async fn merge_segments(
     let new_store = LanceIndexStore::from_dataset_for_new(dataset, &new_uuid)?;
     let created_index = InvertedIndex::merge_segments(
         &source_indices,
-        empty_inverted_update_stream(dataset, field_id)?,
+        empty_inverted_update_stream(dataset, &resolved)?,
         &new_store,
         None,
         lance_index::progress::noop_progress(),
@@ -343,12 +776,17 @@ pub(crate) async fn merge_segments(
 /// exists, the returned vector contains every committed segment's
 /// [`IndexMetadata`] (UUID, fragment coverage, index details). All segments
 /// must share the same indexed fields; mismatched fields return an error.
-pub async fn load_segments(dataset: &Dataset, column: &str) -> Result<Option<Vec<IndexMetadata>>> {
+pub async fn load_segments(
+    dataset: &Dataset,
+    column: &str,
+    document_granularity: DocumentGranularity,
+) -> Result<Option<Vec<IndexMetadata>>> {
     let Some(index_meta) = dataset
         .load_scalar_index(
             lance_index::IndexCriteria::default()
                 .for_column(column)
-                .supports_fts(),
+                .supports_fts()
+                .with_fts_document_granularity(document_granularity),
         )
         .await?
     else {
@@ -439,31 +877,29 @@ mod tests {
     }
 
     #[test]
-    fn resolve_element_document_target() {
+    fn resolve_element_document_field() {
         let schema = fts_test_schema();
         let tags = schema.field("tags").unwrap();
-        let target = resolve_fts_target(&schema, "tags[*]").unwrap();
-        assert_eq!(target.public_field_id, tags.id);
-        assert_eq!(target.scan_column, "tags");
-        assert_eq!(target.canonical_path, "tags[*]");
-        assert_eq!(target.target.source_field_id(), tags.children[0].id);
-        assert_eq!(target.target.boundary_field_ids(), &[tags.id]);
+        let resolved =
+            resolve_fts_field(&schema, "tags", DocumentGranularity::ListElement).unwrap();
+        assert_eq!(resolved.final_field_id, tags.id);
+        assert_eq!(resolved.root_column, "tags");
+        assert_eq!(resolved.canonical_path, "tags");
+        assert_eq!(resolved.coordinate_rank(), 1);
 
-        let err = resolve_fts_target(&schema, "text[*]").unwrap_err();
-        assert!(err.to_string().contains("requires a List<Utf8>"), "{err}");
-        let err = resolve_fts_target(&schema, "tags[*][*]").unwrap_err();
-        assert!(err.to_string().contains("Phase 1 shape"), "{err}");
-        let err = resolve_fts_target(&schema, "tags.item").unwrap_err();
-        assert!(err.to_string().contains("Arrow-internal"), "{err}");
+        let err = resolve_fts_field(&schema, "text", DocumentGranularity::ListElement).unwrap_err();
+        assert!(err.to_string().contains("has no List layer"), "{err}");
+
+        let err =
+            resolve_fts_field(&schema, "tags[*]", DocumentGranularity::ListElement).unwrap_err();
+        assert!(err.to_string().contains("does not exist"), "{err}");
     }
 
     #[test]
-    fn normalize_legacy_list_metadata_as_row_document() {
-        let schema = fts_test_schema();
-        let tags = schema.field("tags").unwrap();
+    fn normalize_legacy_metadata_as_row_document() {
         let metadata = IndexMetadata {
             uuid: Uuid::new_v4(),
-            fields: vec![tags.id],
+            fields: vec![1],
             name: "tags_idx".to_string(),
             dataset_version: 1,
             fragment_bitmap: None,
@@ -474,10 +910,11 @@ mod tests {
             files: None,
         };
         let details =
-            normalize_fts_details(&schema, &metadata, InvertedIndexDetails::default()).unwrap();
-        let target = FtsTarget::from(details.fts_target.as_ref().unwrap());
-        assert_eq!(target.source_field_id(), tags.children[0].id);
-        assert!(target.boundary_field_ids().is_empty());
+            normalize_inverted_details(&metadata, InvertedIndexDetails::default()).unwrap();
+        assert_eq!(
+            DocumentGranularity::try_from(details.document_granularity).unwrap(),
+            DocumentGranularity::Row
+        );
         assert_eq!(details.posting_format_version, Some(3));
     }
 }

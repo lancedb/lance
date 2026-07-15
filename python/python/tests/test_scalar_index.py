@@ -21,6 +21,7 @@ from lance.indices import IndexConfig
 from lance.query import (
     BooleanQuery,
     BoostQuery,
+    DocumentGranularity,
     MatchQuery,
     MultiMatchQuery,
     Occur,
@@ -1379,23 +1380,34 @@ def test_fts_on_list_elements(tmp_path, list_type):
     def hits(table):
         return sorted(zip(table["id"].to_pylist(), table["_doc_index"].to_pylist()))
 
-    query = MatchQuery("alpha", "tags[*]")
+    list_element = DocumentGranularity.LIST_ELEMENT
+    query = MatchQuery("alpha", "tags", document_granularity=list_element)
     flat = ds.to_table(full_text_query=query)
     assert hits(flat) == [(0, [0]), (0, [1])]
     assert pa.types.is_list(flat.schema.field("_doc_index").type)
     assert flat.schema.field("_doc_index").type.value_type == pa.uint32()
-    assert hits(ds.to_table(full_text_query=MatchQuery("delta", "tags[*]"))) == [
-        (0, [4])
-    ]
+    assert hits(
+        ds.to_table(
+            full_text_query=MatchQuery(
+                "delta", "tags", document_granularity=list_element
+            )
+        )
+    ) == [(0, [4])]
 
     ds.create_scalar_index("tags", "INVERTED", with_position=True)
-    ds.create_scalar_index("tags[*]", "INVERTED", with_position=True)
     ds.create_scalar_index(
-        "tags[*]",
+        "tags",
+        "INVERTED",
+        with_position=True,
+        document_granularity=list_element,
+    )
+    ds.create_scalar_index(
+        "tags",
         IndexConfig(index_type="inverted", parameters={"with_position": True}),
+        document_granularity=list_element,
     )
     index_names = {index.name for index in ds.describe_indices()}
-    assert {"tags_idx", "tags[*]_idx"}.issubset(index_names)
+    assert {"tags_idx", "tags_list_element_idx"}.issubset(index_names)
     row_auto = ds.to_table(full_text_query="alpha")
     assert row_auto["id"].to_pylist() == [0]
     assert "_doc_index" not in row_auto.column_names
@@ -1405,15 +1417,27 @@ def test_fts_on_list_elements(tmp_path, list_type):
     assert indexed.schema.field("_doc_index").type.value_type == pa.uint32()
     filtered = ds.to_table(full_text_query=query, filter="id = 0", prefilter=True)
     assert hits(filtered) == [(0, [0]), (0, [1])]
-    assert hits(ds.to_table(full_text_query=MatchQuery("delta", "tags[*]"))) == [
-        (0, [4])
-    ]
+    assert hits(
+        ds.to_table(
+            full_text_query=MatchQuery(
+                "delta", "tags", document_granularity=list_element
+            )
+        )
+    ) == [(0, [4])]
 
-    phrase = ds.to_table(full_text_query=PhraseQuery("beta gamma", "tags[*]"))
+    phrase = ds.to_table(
+        full_text_query=PhraseQuery(
+            "beta gamma", "tags", document_granularity=list_element
+        )
+    )
     assert phrase.num_rows == 0
-    assert hits(ds.to_table(full_text_query=PhraseQuery("alpha beta", "tags[*]"))) == [
-        (0, [0])
-    ]
+    assert hits(
+        ds.to_table(
+            full_text_query=PhraseQuery(
+                "alpha beta", "tags", document_granularity=list_element
+            )
+        )
+    ) == [(0, [0])]
     row_phrase = ds.to_table(full_text_query=PhraseQuery("beta gamma", "tags"))
     assert sorted(row_phrase["id"].to_pylist()) == [0, 1]
     assert "_doc_index" not in row_phrase.column_names
@@ -1432,6 +1456,13 @@ def test_fts_on_list_elements(tmp_path, list_type):
         (3, [0]),
         (3, [1]),
     ]
+
+    with pytest.raises(RuntimeError, match=r"tags\[\*\]"):
+        ds.create_scalar_index(
+            "tags[*]",
+            "INVERTED",
+            document_granularity=list_element,
+        )
 
 
 def test_fts_fuzzy_query(tmp_path):

@@ -47,7 +47,7 @@ type MaterializedFtsRows = (
     Vec<Arc<dyn arrow_array::Array>>,
     Vec<f32>,
     Vec<u64>,
-    Vec<Option<u32>>,
+    Vec<Option<Vec<u32>>>,
 );
 
 /// ExecutionPlan node that queries FTS index with MVCC visibility.
@@ -114,16 +114,15 @@ impl FtsIndexExec {
     ) -> Result<Self> {
         // Verify the index exists for this column
         let column = &query.column;
-        let Some(index) = indexes.get_fts_by_column(column) else {
+        let Some(_index) =
+            indexes.get_fts_by_column_and_granularity(column, query.document_granularity)
+        else {
             return Err(Error::invalid_input(format!(
                 "No FTS index found for column '{}'",
                 column
             )));
         };
-        let with_doc_index = index
-            .params()
-            .fts_target()
-            .is_some_and(|target| target.is_element_document());
+        let with_doc_index = query.document_granularity.is_list_element();
 
         // Build output schema: base fields + optional _doc_index + _score + optional _rowid
         let mut fields: Vec<Field> = base_schema
@@ -220,8 +219,11 @@ impl FtsIndexExec {
     }
 
     /// Query the index and return matching rows with BM25 scores.
-    fn query_index(&self) -> Vec<(u64, Option<u32>, f32)> {
-        let Some(index) = self.indexes.get_fts_by_column(&self.query.column) else {
+    fn query_index(&self) -> Vec<(u64, Option<Vec<u32>>, f32)> {
+        let Some(index) = self
+            .indexes
+            .get_fts_by_column_and_granularity(&self.query.column, self.query.document_granularity)
+        else {
             return vec![];
         };
 
@@ -292,14 +294,14 @@ impl FtsIndexExec {
     /// Filter results by MVCC visibility using max_row_position. O(n).
     fn filter_by_visibility(
         &self,
-        results: Vec<(u64, Option<u32>, f32)>,
-    ) -> Vec<(u64, Option<u32>, f32)> {
+        results: Vec<(u64, Option<Vec<u32>>, f32)>,
+    ) -> Vec<(u64, Option<Vec<u32>>, f32)> {
         let Some(max_visible) = self.max_visible_row else {
             return vec![];
         };
         results
             .into_iter()
-            .filter(|&(pos, _, _)| pos <= max_visible)
+            .filter(|(pos, _, _)| *pos <= max_visible)
             .collect()
     }
 
@@ -309,7 +311,7 @@ impl FtsIndexExec {
     /// then combines them into a single batch.
     fn materialize_rows_sorted(
         &self,
-        results: &[(u64, Option<u32>, f32)],
+        results: &[(u64, Option<Vec<u32>>, f32)],
     ) -> DataFusionResult<Vec<RecordBatch>> {
         if results.is_empty() {
             return Ok(vec![]);
@@ -319,7 +321,7 @@ impl FtsIndexExec {
         let mut all_rows: Vec<u32> = Vec::with_capacity(results.len());
         let mut all_scores: Vec<f32> = Vec::with_capacity(results.len());
         let mut all_row_positions: Vec<u64> = Vec::with_capacity(results.len());
-        let mut all_doc_indices: Vec<Option<u32>> = Vec::with_capacity(results.len());
+        let mut all_doc_indices: Vec<Option<Vec<u32>>> = Vec::with_capacity(results.len());
         let mut all_columns: Vec<Vec<Arc<dyn arrow_array::Array>>> = Vec::new();
 
         // Initialize column vectors based on first batch's schema
@@ -330,7 +332,9 @@ impl FtsIndexExec {
             }
         }
 
-        for &(pos, doc_index, score) in results {
+        for (pos, doc_index, score) in results {
+            let pos = *pos;
+            let score = *score;
             if let Some(batch_range) = self.find_batch(pos as usize)
                 && let Some(stored) = self.batch_store.get(batch_range.batch_id)
             {
@@ -349,7 +353,7 @@ impl FtsIndexExec {
                 all_rows.push(row_in_batch);
                 all_scores.push(score);
                 all_row_positions.push(pos);
-                all_doc_indices.push(doc_index);
+                all_doc_indices.push(doc_index.clone());
             }
         }
 
@@ -406,10 +410,11 @@ impl FtsIndexExec {
                     .zip(mask.iter())
                     .filter_map(|(p, keep)| keep.unwrap_or(false).then_some(*p))
                     .collect();
-                let filtered_doc_indices: Vec<Option<u32>> = all_doc_indices
+                let filtered_doc_indices: Vec<Option<Vec<u32>>> = all_doc_indices
                     .iter()
                     .zip(mask.iter())
-                    .filter_map(|(index, keep)| keep.unwrap_or(false).then_some(*index))
+                    .filter(|(_, keep)| keep.unwrap_or(false))
+                    .map(|(index, _)| index.clone())
                     .collect();
                 (
                     filtered_columns,
@@ -463,7 +468,7 @@ impl FtsIndexExec {
                             .to_string(),
                     )
                 })?;
-                builder.values().append_value(doc_index);
+                builder.values().append_slice(&doc_index);
                 builder.append(true);
             }
             final_columns.push(Arc::new(builder.finish()));
@@ -502,7 +507,7 @@ impl FtsIndexExec {
         final_columns: Vec<Arc<dyn arrow_array::Array>>,
         all_scores: Vec<f32>,
         all_row_positions: Vec<u64>,
-        all_doc_indices: Vec<Option<u32>>,
+        all_doc_indices: Vec<Option<Vec<u32>>>,
     ) -> DataFusionResult<MaterializedFtsRows> {
         let Some(pk_columns) = &self.pk_columns else {
             return Ok((
@@ -709,7 +714,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use futures::TryStreamExt;
     use lance_index::scalar::InvertedIndexParams;
-    use lance_index::scalar::inverted::{DOC_INDEX_COL, FtsTarget};
+    use lance_index::scalar::inverted::{DOC_INDEX_COL, DocumentGranularity};
 
     fn create_test_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
@@ -791,7 +796,8 @@ mod tests {
                 "tags_element_idx".to_string(),
                 1,
                 "tags".to_string(),
-                InvertedIndexParams::default().with_fts_target(FtsTarget::new(2, vec![1])),
+                InvertedIndexParams::default()
+                    .document_granularity(DocumentGranularity::ListElement),
             )
             .unwrap();
         registry.insert(&batch, 0).unwrap();
@@ -800,7 +806,8 @@ mod tests {
         let exec = FtsIndexExec::new(
             batch_store,
             Arc::new(registry),
-            FtsQuery::match_query("tags[*]", "beta"),
+            FtsQuery::match_query("tags", "beta")
+                .with_document_granularity(DocumentGranularity::ListElement),
             0,
             None,
             schema,

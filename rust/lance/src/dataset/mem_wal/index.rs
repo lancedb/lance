@@ -135,7 +135,7 @@ impl MemIndexConfig {
 
     /// Create an FTS index config from base table IndexMetadata.
     pub fn fts_from_metadata(index_meta: &IndexMetadata, schema: &LanceSchema) -> Result<Self> {
-        let (field_id, column) = Self::extract_field_info(index_meta, schema)?;
+        let (field_id, _) = Self::extract_field_info(index_meta, schema)?;
 
         // Extract InvertedIndexParams from index_details if available
         let details = if let Some(details_any) = &index_meta.index_details {
@@ -147,12 +147,15 @@ impl MemIndexConfig {
             pbold::InvertedIndexDetails::try_from(&InvertedIndexParams::default())?
         };
         let details =
-            crate::index::scalar::inverted::normalize_fts_details(schema, index_meta, details)?;
+            crate::index::scalar::inverted::normalize_inverted_details(index_meta, details)?;
         let params = InvertedIndexParams::try_from(&details)?;
+        let resolved = crate::index::scalar::inverted::resolve_fts_field_by_id(
+            schema,
+            field_id,
+            params.get_document_granularity(),
+        )?;
         let format_version = if index_meta.index_version == 4
-            && params
-                .fts_target()
-                .is_some_and(|target| target.is_element_document())
+            && params.get_document_granularity().is_list_element()
         {
             // Index version 4 gates element-document readers independently
             // from the posting-list payload version recorded in details.
@@ -162,12 +165,15 @@ impl MemIndexConfig {
         };
         let params = params.format_version(format_version);
 
-        Ok(Self::Fts(FtsIndexConfig::try_with_params(
-            index_meta.name.clone(),
-            field_id,
-            column,
-            params,
-        )?))
+        Ok(Self::Fts(
+            FtsIndexConfig::try_with_params(
+                index_meta.name.clone(),
+                field_id,
+                resolved.canonical_path.clone(),
+                params,
+            )?
+            .with_resolved_field(resolved),
+        ))
     }
 
     /// Create an HNSW vector index config.
@@ -366,11 +372,19 @@ impl IndexStore {
                     registry.hnsw_indexes.insert(c.name.clone(), index);
                 }
                 MemIndexConfig::Fts(c) => {
-                    let index = FtsMemIndex::try_with_params(
-                        c.field_id,
-                        c.column.clone(),
-                        c.params.clone(),
-                    )?;
+                    let index = match c.resolved_field.as_deref() {
+                        Some(resolved) => FtsMemIndex::try_with_resolved_field(
+                            c.field_id,
+                            c.column.clone(),
+                            c.params.clone(),
+                            resolved.clone(),
+                        )?,
+                        None => FtsMemIndex::try_with_params(
+                            c.field_id,
+                            c.column.clone(),
+                            c.params.clone(),
+                        )?,
+                    };
                     registry.fts_indexes.insert(c.name.clone(), index);
                 }
             }
@@ -961,9 +975,20 @@ impl IndexStore {
     /// Searches through all FTS indexes to find one matching the field_id.
     /// Use this for column-to-index resolution (column → field_id → index).
     pub fn get_fts_by_field_id(&self, field_id: i32) -> Option<&FtsMemIndex> {
-        self.fts_indexes
-            .values()
-            .find(|idx| idx.field_id() == field_id)
+        self.get_fts_by_field_id_and_granularity(
+            field_id,
+            lance_index::scalar::inverted::DocumentGranularity::Row,
+        )
+    }
+
+    pub fn get_fts_by_field_id_and_granularity(
+        &self,
+        field_id: i32,
+        document_granularity: lance_index::scalar::inverted::DocumentGranularity,
+    ) -> Option<&FtsMemIndex> {
+        self.fts_indexes.values().find(|idx| {
+            idx.field_id() == field_id && idx.document_granularity() == document_granularity
+        })
     }
 
     /// Get a BTree index by column name.
@@ -983,9 +1008,20 @@ impl IndexStore {
 
     /// Get an FTS index by column name.
     pub fn get_fts_by_column(&self, column: &str) -> Option<&FtsMemIndex> {
-        self.fts_indexes
-            .values()
-            .find(|idx| idx.column_name() == column)
+        self.get_fts_by_column_and_granularity(
+            column,
+            lance_index::scalar::inverted::DocumentGranularity::Row,
+        )
+    }
+
+    pub fn get_fts_by_column_and_granularity(
+        &self,
+        column: &str,
+        document_granularity: lance_index::scalar::inverted::DocumentGranularity,
+    ) -> Option<&FtsMemIndex> {
+        self.fts_indexes.values().find(|idx| {
+            idx.column_name() == column && idx.document_granularity() == document_granularity
+        })
     }
 
     /// Check if the registry has any indexes.
@@ -1381,8 +1417,7 @@ mod tests {
                 "tags_idx".to_string(),
                 1,
                 "tags".to_string(),
-                InvertedIndexParams::default()
-                    .with_fts_target(lance_index::scalar::inverted::FtsTarget::new(1, Vec::new())),
+                InvertedIndexParams::default(),
             )
             .unwrap();
         registry
@@ -1390,8 +1425,9 @@ mod tests {
                 "tags_element_idx".to_string(),
                 1,
                 "tags".to_string(),
-                InvertedIndexParams::default()
-                    .with_fts_target(lance_index::scalar::inverted::FtsTarget::new(2, vec![1])),
+                InvertedIndexParams::default().document_granularity(
+                    lance_index::scalar::inverted::DocumentGranularity::ListElement,
+                ),
             )
             .unwrap();
 
@@ -1400,8 +1436,14 @@ mod tests {
             "tags"
         );
         assert_eq!(
-            registry.get_fts_by_column("tags[*]").unwrap().column_name(),
-            "tags[*]"
+            registry
+                .get_fts_by_column_and_granularity(
+                    "tags",
+                    lance_index::scalar::inverted::DocumentGranularity::ListElement,
+                )
+                .unwrap()
+                .column_name(),
+            "tags"
         );
     }
 
@@ -1468,7 +1510,6 @@ mod tests {
         ]));
         let schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
         let tags = schema.field("tags").unwrap();
-        let item_id = tags.children[0].id;
         for (block_size, expected_format_version) in [
             (128, InvertedListFormatVersion::V2),
             (256, InvertedListFormatVersion::V3),
@@ -1476,25 +1517,25 @@ mod tests {
             let params = InvertedIndexParams::default()
                 .block_size(block_size)
                 .unwrap()
-                .with_fts_target(lance_index::scalar::inverted::FtsTarget::new(
-                    item_id,
-                    vec![tags.id],
-                ));
+                .document_granularity(
+                    lance_index::scalar::inverted::DocumentGranularity::ListElement,
+                );
             let details = pbold::InvertedIndexDetails::try_from(&params).unwrap();
-            let config = MemIndexConfig::fts_from_metadata(
-                &fts_index_metadata_with_details(4, Some(details)),
-                &schema,
-            )
-            .unwrap();
+            let mut metadata = fts_index_metadata_with_details(4, Some(details));
+            metadata.fields = vec![tags.id];
+            let config = MemIndexConfig::fts_from_metadata(&metadata, &schema).unwrap();
 
             let MemIndexConfig::Fts(config) = config else {
                 unreachable!("fts metadata should create an FTS config")
             };
-            let index = FtsMemIndex::try_with_params(config.field_id, config.column, config.params)
-                .unwrap();
-            assert_eq!(index.column_name(), "tags[*]");
+            assert_eq!(config.field_id, tags.id);
+            assert_eq!(config.column, "tags");
             assert_eq!(
-                index.params().resolved_format_version(),
+                config.params.get_document_granularity(),
+                lance_index::scalar::inverted::DocumentGranularity::ListElement
+            );
+            assert_eq!(
+                config.params.resolved_format_version(),
                 expected_format_version
             );
         }

@@ -13,13 +13,12 @@ use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream};
 use datafusion::prelude::{Expr, SessionContext};
 use datafusion_physical_expr::PhysicalExprRef;
 use futures::TryStreamExt;
-use lance_core::datatypes::{FieldPathComponent, parse_field_path_components};
 use lance_core::{Error, ROW_ID, Result};
 use lance_datafusion::expr::safe_coerce_scalar;
 use lance_datafusion::planner::Planner;
 use lance_index::scalar::FullTextSearchQuery;
-use lance_index::scalar::inverted::DOC_INDEX_FIELD;
 use lance_index::scalar::inverted::query::{FtsQuery as IndexFtsQuery, Operator};
+use lance_index::scalar::inverted::{DOC_INDEX_FIELD, DocumentGranularity};
 use lance_linalg::distance::DistanceType;
 
 use super::exec::{
@@ -107,6 +106,8 @@ pub struct FtsQuery {
     pub column: String,
     /// Query type.
     pub query_type: FtsQueryType,
+    /// Logical document unit. Defaults to one document per dataset row.
+    pub document_granularity: DocumentGranularity,
     /// WAND factor for early termination (0.0 to 1.0).
     /// 1.0 = full recall (default), <1.0 = faster but may miss low-scoring results.
     pub wand_factor: f32,
@@ -143,6 +144,7 @@ impl FtsQuery {
                 operator,
                 boost: 1.0,
             },
+            document_granularity: DocumentGranularity::Row,
             wand_factor: DEFAULT_WAND_FACTOR,
             limit: None,
             include_tail: true,
@@ -157,6 +159,7 @@ impl FtsQuery {
                 query: query.into(),
                 slop,
             },
+            document_granularity: DocumentGranularity::Row,
             wand_factor: DEFAULT_WAND_FACTOR,
             limit: None,
             include_tail: true,
@@ -177,6 +180,7 @@ impl FtsQuery {
                 should,
                 must_not,
             },
+            document_granularity: DocumentGranularity::Row,
             wand_factor: DEFAULT_WAND_FACTOR,
             limit: None,
             include_tail: true,
@@ -199,6 +203,7 @@ impl FtsQuery {
                 max_expansions: DEFAULT_MAX_EXPANSIONS,
                 boost: 1.0,
             },
+            document_granularity: DocumentGranularity::Row,
             wand_factor: DEFAULT_WAND_FACTOR,
             limit: None,
             include_tail: true,
@@ -220,6 +225,7 @@ impl FtsQuery {
                 max_expansions: DEFAULT_MAX_EXPANSIONS,
                 boost: 1.0,
             },
+            document_granularity: DocumentGranularity::Row,
             wand_factor: DEFAULT_WAND_FACTOR,
             limit: None,
             include_tail: true,
@@ -243,6 +249,7 @@ impl FtsQuery {
                 max_expansions,
                 boost: 1.0,
             },
+            document_granularity: DocumentGranularity::Row,
             wand_factor: DEFAULT_WAND_FACTOR,
             limit: None,
             include_tail: true,
@@ -268,6 +275,11 @@ impl FtsQuery {
     /// immutable frozen partitions (the Lucene model). Default `true`.
     pub fn with_include_tail(mut self, include_tail: bool) -> Self {
         self.include_tail = include_tail;
+        self
+    }
+
+    pub fn with_document_granularity(mut self, document_granularity: DocumentGranularity) -> Self {
+        self.document_granularity = document_granularity;
         self
     }
 
@@ -313,8 +325,9 @@ fn local_fts_query(query: FullTextSearchQuery) -> Result<FtsQuery> {
     };
     let local = match query.query {
         IndexFtsQuery::Match(m) => {
+            let document_granularity = m.document_granularity;
             let column = require_column(m.column)?;
-            match m.fuzziness {
+            let local = match m.fuzziness {
                 // Some(0) is an exact match in the index model.
                 Some(0) => FtsQuery::match_query_with_operator(column, m.terms, m.operator)
                     .with_boost(m.boost),
@@ -332,9 +345,14 @@ fn local_fts_query(query: FullTextSearchQuery) -> Result<FtsQuery> {
                     m.max_expansions,
                 )
                 .with_boost(m.boost),
-            }
+            };
+            local.with_document_granularity(document_granularity)
         }
-        IndexFtsQuery::Phrase(p) => FtsQuery::phrase(require_column(p.column)?, p.terms, p.slop),
+        IndexFtsQuery::Phrase(p) => {
+            let document_granularity = p.document_granularity;
+            FtsQuery::phrase(require_column(p.column)?, p.terms, p.slop)
+                .with_document_granularity(document_granularity)
+        }
         other => {
             return Err(Error::not_supported(format!(
                 "MemTable full-text search supports match and phrase queries, got: {other}"
@@ -1153,7 +1171,7 @@ impl MemTableScanner {
     /// queries only see indexed data.
     async fn plan_fts_search(&self, query: &FtsQuery) -> Result<Arc<dyn ExecutionPlan>> {
         if !self.has_fts_index(&query.column) {
-            return self.empty_fts_plan(&query.column);
+            return self.empty_fts_plan(query.document_granularity);
         }
 
         let max_visible = self.max_visible_batch_position;
@@ -1177,7 +1195,10 @@ impl MemTableScanner {
         self.apply_post_index_ops(Arc::new(index_exec)).await
     }
 
-    fn empty_fts_plan(&self, target: &str) -> Result<Arc<dyn ExecutionPlan>> {
+    fn empty_fts_plan(
+        &self,
+        document_granularity: DocumentGranularity,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
         use datafusion::physical_plan::empty::EmptyExec;
 
         let mut fields: Vec<Field> = self
@@ -1186,9 +1207,7 @@ impl MemTableScanner {
             .iter()
             .map(|f| f.as_ref().clone())
             .collect();
-        if parse_field_path_components(target)
-            .is_ok_and(|path| path.last() == Some(&FieldPathComponent::ListWildcard))
-        {
+        if document_granularity.is_list_element() {
             fields.push(DOC_INDEX_FIELD.clone());
         }
         fields.push(Field::new(SCORE_COLUMN, DataType::Float32, true));

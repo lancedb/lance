@@ -22,6 +22,13 @@ class FullTextOperator(Enum):
     OR = "OR"
 
 
+class DocumentGranularity(str, Enum):
+    """The unit treated as one full-text-search document."""
+
+    ROW = "row"
+    LIST_ELEMENT = "list_element"
+
+
 class Occur(Enum):
     SHOULD = "SHOULD"
     MUST = "MUST"
@@ -98,6 +105,7 @@ class MatchQuery(FullTextQuery):
         max_expansions: int = 50,
         operator: FullTextOperator = FullTextOperator.OR,
         prefix_length: int = 0,
+        document_granularity: DocumentGranularity = DocumentGranularity.ROW,
     ):
         """
         Match query for full-text search.
@@ -129,6 +137,9 @@ class MatchQuery(FullTextQuery):
         prefix_length : int, default 0
             The number of beginning characters being unchanged for fuzzy matching.
             This is useful to achieve prefix matching.
+        document_granularity : DocumentGranularity, default ROW
+            Whether each dataset row or each element of the deepest list on the
+            field path is one document. ``LIST_ELEMENT`` requires an explicit column.
         """
         self._inner = PyFullTextQuery.match_query(
             query,
@@ -138,6 +149,7 @@ class MatchQuery(FullTextQuery):
             max_expansions=max_expansions,
             operator=operator.value,
             prefix_length=prefix_length,
+            document_granularity=document_granularity.value,
         )
 
     def query_type(self) -> FullTextQueryType:
@@ -145,7 +157,14 @@ class MatchQuery(FullTextQuery):
 
 
 class PhraseQuery(FullTextQuery):
-    def __init__(self, query: str, column: str, *, slop: int = 0):
+    def __init__(
+        self,
+        query: str,
+        column: str,
+        *,
+        slop: int = 0,
+        document_granularity: DocumentGranularity = DocumentGranularity.ROW,
+    ):
         """
         Phrase query for full-text search.
 
@@ -155,8 +174,18 @@ class PhraseQuery(FullTextQuery):
             The query string to match against.
         column : str
             The name of the column to match against.
+        slop : int, default 0
+            The maximum number of intervening positions permitted in the phrase.
+        document_granularity : DocumentGranularity, default ROW
+            Whether each dataset row or each element of the deepest list on the
+            field path is one document. ``LIST_ELEMENT`` requires an explicit column.
         """
-        self._inner = PyFullTextQuery.phrase_query(query, column, slop)
+        self._inner = PyFullTextQuery.phrase_query(
+            query,
+            column,
+            slop,
+            document_granularity=document_granularity.value,
+        )
 
     def query_type(self) -> FullTextQueryType:
         return FullTextQueryType.MATCH_PHRASE

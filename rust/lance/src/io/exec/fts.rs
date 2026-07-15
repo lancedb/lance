@@ -20,13 +20,13 @@ use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::{Distribution, EquivalenceProperties, Partitioning, PhysicalExpr};
+use datafusion_physical_plan::ExecutionPlanProperties;
 use datafusion_physical_plan::joins::{HashJoinExec, PartitionMode};
 use datafusion_physical_plan::metrics::{BaselineMetrics, Count};
 use futures::future::try_join_all;
 use futures::stream::{self};
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use itertools::Itertools;
-use lance_arrow::iter_str_array;
 use lance_core::{
     Error, ROW_ID, Result,
     utils::{tokio::get_num_compute_intensive_cpus, tracing::StreamTracingExt},
@@ -36,7 +36,10 @@ use lance_table::format::IndexMetadata;
 
 use super::PreFilterSource;
 use super::utils::{IndexMetrics, build_prefilter};
-use crate::index::scalar::inverted::{load_segment_details, load_segments};
+use crate::index::scalar::inverted::{
+    ResolvedFtsField, fts_document_schema, load_segment_details, load_segments,
+    transform_fts_document_stream,
+};
 use crate::{Dataset, index::DatasetIndexInternalExt};
 use lance_index::metrics::{
     AND_CANDIDATES_PRUNED_BEFORE_RETURN_METRIC, AND_CANDIDATES_SEEN_METRIC, AND_FULL_SCORES_METRIC,
@@ -51,13 +54,94 @@ use lance_index::scalar::inverted::query::{
 };
 use lance_index::scalar::inverted::tokenizer::document_tokenizer::TextTokenizer;
 use lance_index::scalar::inverted::{
-    DOC_INDEX_COL, FTS_SCHEMA, FlatBm25SearchOptions, FtsTarget, InvertedIndex, MemBM25Scorer,
-    SCORE_COL, build_global_bm25_scorer, flat_bm25_search_stream_with_target_metrics_and_scorer,
-    fts_schema,
+    DOC_INDEX_COL, DocumentGranularity, FTS_SCHEMA, FlatBm25SearchOptions, InvertedIndex,
+    MemBM25Scorer, SCORE_COL, build_global_bm25_scorer,
+    flat_bm25_search_stream_with_options_and_scorer, fts_schema,
 };
 use lance_index::{prefilter::PreFilter, scalar::inverted::query::BooleanQuery};
 use lance_tokenizer::{SimpleTokenizer, TextAnalyzer};
 use tracing::instrument;
+
+/// Expands a schema-derived nested FTS source into one canonical row per
+/// logical document before flat search or index building consumes it.
+#[derive(Debug)]
+pub struct FtsDocumentExec {
+    input: Arc<dyn ExecutionPlan>,
+    resolved: ResolvedFtsField,
+    properties: Arc<PlanProperties>,
+}
+
+impl FtsDocumentExec {
+    pub(crate) fn new(input: Arc<dyn ExecutionPlan>, resolved: ResolvedFtsField) -> Self {
+        let schema = fts_document_schema(resolved.coordinate_rank());
+        let properties = Arc::new(PlanProperties::new(
+            EquivalenceProperties::new(schema),
+            input.output_partitioning().clone(),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        ));
+        Self {
+            input,
+            resolved,
+            properties,
+        }
+    }
+}
+
+impl DisplayAs for FtsDocumentExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "FtsDocument: column={}, granularity={:?}",
+            self.resolved.canonical_path, self.resolved.document_granularity
+        )
+    }
+}
+
+impl ExecutionPlan for FtsDocumentExec {
+    fn name(&self) -> &str {
+        "FtsDocumentExec"
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        mut children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        if children.len() != 1 {
+            return Err(DataFusionError::Internal(
+                "FtsDocumentExec expects one child".to_string(),
+            ));
+        }
+        Ok(Arc::new(Self::new(
+            children.pop().unwrap(),
+            self.resolved.clone(),
+        )))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<datafusion::execution::TaskContext>,
+    ) -> DataFusionResult<SendableRecordBatchStream> {
+        transform_fts_document_stream(
+            self.input.execute(partition, context)?,
+            self.resolved.clone(),
+        )
+        .map_err(DataFusionError::from)
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
+    }
+}
 
 /// Open one FTS segment as an [`InvertedIndex`].
 async fn open_fts_segment(
@@ -354,7 +438,7 @@ pub struct MatchQueryExec {
     /// When set, `execute()` skips `load_segments` and searches exactly these
     /// segments.
     preset_segments: Option<Vec<IndexMetadata>>,
-    target: FtsTarget,
+    document_granularity: DocumentGranularity,
     schema: SchemaRef,
 
     properties: Arc<PlanProperties>,
@@ -400,23 +484,24 @@ impl MatchQueryExec {
         params: FtsSearchParams,
         prefilter_source: PreFilterSource,
     ) -> Self {
-        Self::new_with_target(
+        let document_granularity = query.document_granularity;
+        Self::new_with_document_granularity(
             dataset,
             query,
             params,
             prefilter_source,
-            FtsTarget::new(0, Vec::new()),
+            document_granularity,
         )
     }
 
-    pub fn new_with_target(
+    pub fn new_with_document_granularity(
         dataset: Arc<Dataset>,
         query: MatchQuery,
         params: FtsSearchParams,
         prefilter_source: PreFilterSource,
-        target: FtsTarget,
+        document_granularity: DocumentGranularity,
     ) -> Self {
-        let schema = fts_schema(&target);
+        let schema = fts_schema(document_granularity);
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
             Partitioning::RoundRobinBatch(1),
@@ -432,7 +517,7 @@ impl MatchQueryExec {
             base_scorer: None,
             shared_scorer: None,
             preset_segments: None,
-            target,
+            document_granularity,
             schema,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
@@ -455,25 +540,26 @@ impl MatchQueryExec {
         prefilter_source: PreFilterSource,
         segments: Vec<IndexMetadata>,
     ) -> Self {
-        Self::new_with_segments_and_target(
+        let document_granularity = query.document_granularity;
+        Self::new_with_segments_and_document_granularity(
             dataset,
             query,
             params,
             prefilter_source,
             segments,
-            FtsTarget::new(0, Vec::new()),
+            document_granularity,
         )
     }
 
-    pub fn new_with_segments_and_target(
+    pub fn new_with_segments_and_document_granularity(
         dataset: Arc<Dataset>,
         query: MatchQuery,
         params: FtsSearchParams,
         prefilter_source: PreFilterSource,
         segments: Vec<IndexMetadata>,
-        target: FtsTarget,
+        document_granularity: DocumentGranularity,
     ) -> Self {
-        let schema = fts_schema(&target);
+        let schema = fts_schema(document_granularity);
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
             Partitioning::RoundRobinBatch(1),
@@ -489,7 +575,7 @@ impl MatchQueryExec {
             base_scorer: None,
             shared_scorer: None,
             preset_segments: Some(segments),
-            target,
+            document_granularity,
             schema,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
@@ -588,7 +674,7 @@ impl ExecutionPlan for MatchQueryExec {
                     base_scorer: self.base_scorer.clone(),
                     shared_scorer: self.shared_scorer.clone(),
                     preset_segments: self.preset_segments.clone(),
-                    target: self.target.clone(),
+                    document_granularity: self.document_granularity,
                     schema: self.schema.clone(),
                     properties: self.properties.clone(),
                     metrics: ExecutionPlanMetricsSet::new(),
@@ -618,7 +704,7 @@ impl ExecutionPlan for MatchQueryExec {
                     base_scorer: self.base_scorer.clone(),
                     shared_scorer: self.shared_scorer.clone(),
                     preset_segments: self.preset_segments.clone(),
-                    target: self.target.clone(),
+                    document_granularity: self.document_granularity,
                     schema: self.schema.clone(),
                     properties: self.properties.clone(),
                     metrics: ExecutionPlanMetricsSet::new(),
@@ -646,6 +732,7 @@ impl ExecutionPlan for MatchQueryExec {
         let preset_base_scorer = self.base_scorer.clone();
         let shared_scorer = self.shared_scorer.clone();
         let preset_segments = self.preset_segments.clone();
+        let document_granularity = self.document_granularity;
         let schema = self.schema.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
         let column = query.column.ok_or(DataFusionError::Execution(format!(
@@ -656,7 +743,7 @@ impl ExecutionPlan for MatchQueryExec {
             let _timer = metrics.baseline_metrics.elapsed_compute().timer();
             let segments = match preset_segments {
                 Some(segments) => segments,
-                None => load_segments(&ds, &column)
+                None => load_segments(&ds, &column, document_granularity)
                     .await?
                     .ok_or(DataFusionError::Execution(format!(
                         "No Inverted index found for column {}",
@@ -768,6 +855,7 @@ pub struct FlatMatchFilterExec {
     /// the field round-trips through `with_new_children`.
     preset_segments: Option<Vec<IndexMetadata>>,
     document_column: String,
+    resolved_field: Option<ResolvedFtsField>,
 
     metrics: ExecutionPlanMetricsSet,
 }
@@ -777,7 +865,36 @@ struct FlatMatchFilterStreamOptions {
     query: MatchQuery,
     document_column: String,
     preset_segments: Option<Vec<IndexMetadata>>,
+    resolved_field: Option<ResolvedFtsField>,
     metrics_set: ExecutionPlanMetricsSet,
+}
+
+fn document_matches_query(
+    text: &str,
+    tokenizer: &mut Box<dyn LanceTokenizer>,
+    query_tokens: &Tokens,
+    operator: Operator,
+) -> bool {
+    match operator {
+        Operator::Or => has_query_token(text, tokenizer, query_tokens),
+        Operator::And => {
+            let mut remaining = query_tokens
+                .into_iter()
+                .map(String::as_str)
+                .collect::<HashSet<_>>();
+            if remaining.is_empty() {
+                return false;
+            }
+            let mut stream = tokenizer.token_stream_for_doc(text);
+            while let Some(token) = stream.next() {
+                remaining.remove(token.text.as_str());
+                if remaining.is_empty() {
+                    return true;
+                }
+            }
+            false
+        }
+    }
 }
 
 impl DisplayAs for FlatMatchFilterExec {
@@ -807,9 +924,10 @@ impl FlatMatchFilterExec {
     async fn load_tokenizer(
         dataset: &Dataset,
         column: &str,
+        document_granularity: DocumentGranularity,
         metrics: &IndexMetrics,
     ) -> DataFusionResult<Box<dyn LanceTokenizer>> {
-        if let Some(segments) = load_segments(dataset, column).await? {
+        if let Some(segments) = load_segments(dataset, column, document_granularity).await? {
             let index_meta = segments.first().ok_or_else(|| {
                 DataFusionError::Execution(format!(
                     "FTS index for column {} has no segments",
@@ -861,6 +979,26 @@ impl FlatMatchFilterExec {
             params,
             preset_segments: None,
             document_column,
+            resolved_field: None,
+            metrics: ExecutionPlanMetricsSet::new(),
+        }
+    }
+
+    pub(crate) fn new_with_resolved_field(
+        input: Arc<dyn ExecutionPlan>,
+        dataset: Arc<Dataset>,
+        query: MatchQuery,
+        params: FtsSearchParams,
+        resolved_field: ResolvedFtsField,
+    ) -> Self {
+        Self {
+            dataset,
+            input,
+            query,
+            params,
+            preset_segments: None,
+            document_column: resolved_field.root_column.clone(),
+            resolved_field: Some(resolved_field),
             metrics: ExecutionPlanMetricsSet::new(),
         }
     }
@@ -883,6 +1021,7 @@ impl FlatMatchFilterExec {
             params,
             preset_segments: Some(segments),
             document_column,
+            resolved_field: None,
             metrics: ExecutionPlanMetricsSet::new(),
         }
     }
@@ -907,51 +1046,20 @@ impl FlatMatchFilterExec {
         text_col: &dyn Array,
         tokenizer: &mut Box<dyn LanceTokenizer>,
         query_tokens: &Tokens,
+        operator: Operator,
     ) -> BooleanArray {
         let text_col = text_col.as_string::<O>();
         let mut predicate = BooleanBuilder::with_capacity(text_col.len());
         for idx in 0..text_col.len() {
             predicate.append_value(
                 !text_col.is_null(idx)
-                    && has_query_token(text_col.value(idx), tokenizer, query_tokens),
+                    && document_matches_query(
+                        text_col.value(idx),
+                        tokenizer,
+                        query_tokens,
+                        operator,
+                    ),
             );
-        }
-        predicate.finish()
-    }
-
-    fn find_list_matches<O: OffsetSizeTrait>(
-        list_col: &dyn Array,
-        tokenizer: &mut Box<dyn LanceTokenizer>,
-        query_tokens: &Tokens,
-        operator: Operator,
-    ) -> BooleanArray {
-        let list_col = list_col.as_list::<O>();
-        let mut predicate = BooleanBuilder::with_capacity(list_col.len());
-        for row in 0..list_col.len() {
-            let matches = !list_col.is_null(row)
-                && iter_str_array(list_col.value(row).as_ref())
-                    .flatten()
-                    .any(|element| match operator {
-                        Operator::Or => has_query_token(element, tokenizer, query_tokens),
-                        Operator::And => {
-                            let mut remaining = query_tokens
-                                .into_iter()
-                                .map(String::as_str)
-                                .collect::<HashSet<_>>();
-                            if remaining.is_empty() {
-                                return false;
-                            }
-                            let mut stream = tokenizer.token_stream_for_doc(element);
-                            while let Some(token) = stream.next() {
-                                remaining.remove(token.text.as_str());
-                                if remaining.is_empty() {
-                                    return true;
-                                }
-                            }
-                            false
-                        }
-                    });
-            predicate.append_value(matches);
         }
         predicate.finish()
     }
@@ -967,6 +1075,7 @@ impl FlatMatchFilterExec {
             query,
             document_column,
             preset_segments,
+            resolved_field,
             metrics_set,
         } = options;
         let metrics = Arc::new(FtsIndexMetrics::new(&metrics_set, partition));
@@ -977,7 +1086,6 @@ impl FlatMatchFilterExec {
                 "column not set for MatchQuery {}",
                 query.terms
             )))?;
-        let element_documents = column != document_column;
         let mut tokenizer = match preset_segments {
             Some(segments) => {
                 Self::load_tokenizer_from_preset_segments(
@@ -988,7 +1096,15 @@ impl FlatMatchFilterExec {
                 )
                 .await?
             }
-            None => Self::load_tokenizer(&dataset, &column, &metrics.index_metrics).await?,
+            None => {
+                Self::load_tokenizer(
+                    &dataset,
+                    &column,
+                    query.document_granularity,
+                    &metrics.index_metrics,
+                )
+                .await?
+            }
         };
         let query_tokens = Arc::new(collect_query_tokens(&query.terms, &mut tokenizer));
 
@@ -999,34 +1115,52 @@ impl FlatMatchFilterExec {
             let query_tokens = query_tokens.clone();
             let mut tokenizer = tokenizer.box_clone();
             let elapsed_compute = elapsed_compute.clone();
+            let resolved_field = resolved_field.clone();
+            let query_operator = query.operator;
             async move {
                 let batch = batch_result?;
                 let _t = elapsed_compute.timer();
+                if let Some(resolved_field) = resolved_field {
+                    let documents = resolved_field
+                        .documents_from_batch(&batch)
+                        .map_err(DataFusionError::from)?;
+                    let mut matches = vec![false; batch.num_rows()];
+                    for document in documents {
+                        if document_matches_query(
+                            &document.text,
+                            &mut tokenizer,
+                            &query_tokens,
+                            query_operator,
+                        ) {
+                            matches[document.row_index] = true;
+                        }
+                    }
+                    let predicate = BooleanArray::from(matches);
+                    return Ok(arrow::compute::filter_record_batch(&batch, &predicate)?);
+                }
                 let text_column = batch.column_by_name(&column).ok_or_else(|| {
                     DataFusionError::Execution(format!("Column {} not found in batch", column,))
                 })?;
                 let predicate = match text_column.data_type() {
                     DataType::Utf8 => {
-                        Self::find_matches::<i32>(text_column, &mut tokenizer, &query_tokens)
+                        Self::find_matches::<i32>(
+                            text_column,
+                            &mut tokenizer,
+                            &query_tokens,
+                            query_operator,
+                        )
                     }
                     DataType::LargeUtf8 => {
-                        Self::find_matches::<i64>(text_column, &mut tokenizer, &query_tokens)
+                        Self::find_matches::<i64>(
+                            text_column,
+                            &mut tokenizer,
+                            &query_tokens,
+                            query_operator,
+                        )
                     }
-                    DataType::List(_) if element_documents => Self::find_list_matches::<i32>(
-                        text_column,
-                        &mut tokenizer,
-                        &query_tokens,
-                        query.operator,
-                    ),
-                    DataType::LargeList(_) if element_documents => Self::find_list_matches::<i64>(
-                        text_column,
-                        &mut tokenizer,
-                        &query_tokens,
-                        query.operator,
-                    ),
                     _ => {
                         return Err(DataFusionError::Execution(format!(
-                            "Column {} is not a string",
+                            "FTS document column {} is not a string; nested List inputs must be expanded before filtering",
                             column,
                         )));
                     }
@@ -1078,6 +1212,7 @@ impl ExecutionPlan for FlatMatchFilterExec {
             params: self.params.clone(),
             preset_segments: self.preset_segments.clone(),
             document_column: self.document_column.clone(),
+            resolved_field: self.resolved_field.clone(),
             metrics: ExecutionPlanMetricsSet::new(),
         }))
     }
@@ -1099,6 +1234,7 @@ impl ExecutionPlan for FlatMatchFilterExec {
                 query: self.query.clone(),
                 document_column: self.document_column.clone(),
                 preset_segments: self.preset_segments.clone(),
+                resolved_field: self.resolved_field.clone(),
                 metrics_set: self.metrics.clone(),
             },
         );
@@ -1141,7 +1277,7 @@ pub struct FlatMatchQueryExec {
     /// Optional pre-resolved segment list. See
     /// [`MatchQueryExec::new_with_segments`].
     preset_segments: Option<Vec<IndexMetadata>>,
-    target: FtsTarget,
+    document_granularity: DocumentGranularity,
     document_column: String,
     schema: SchemaRef,
 
@@ -1180,25 +1316,26 @@ impl FlatMatchQueryExec {
         unindexed_input: Arc<dyn ExecutionPlan>,
     ) -> Self {
         let document_column = query.column.clone().unwrap_or_default();
-        Self::new_with_target(
+        let document_granularity = query.document_granularity;
+        Self::new_with_document_granularity(
             dataset,
             query,
             params,
             unindexed_input,
-            FtsTarget::new(0, Vec::new()),
+            document_granularity,
             document_column,
         )
     }
 
-    pub fn new_with_target(
+    pub fn new_with_document_granularity(
         dataset: Arc<Dataset>,
         query: MatchQuery,
         params: FtsSearchParams,
         unindexed_input: Arc<dyn ExecutionPlan>,
-        target: FtsTarget,
+        document_granularity: DocumentGranularity,
         document_column: String,
     ) -> Self {
-        let schema = fts_schema(&target);
+        let schema = fts_schema(document_granularity);
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
             Partitioning::RoundRobinBatch(1),
@@ -1213,7 +1350,7 @@ impl FlatMatchQueryExec {
             base_scorer: None,
             shared_scorer: None,
             preset_segments: None,
-            target,
+            document_granularity,
             document_column,
             schema,
             properties,
@@ -1230,27 +1367,28 @@ impl FlatMatchQueryExec {
         segments: Vec<IndexMetadata>,
     ) -> Self {
         let document_column = query.column.clone().unwrap_or_default();
-        Self::new_with_segments_and_target(
+        let document_granularity = query.document_granularity;
+        Self::new_with_segments_and_document_granularity(
             dataset,
             query,
             params,
             unindexed_input,
             segments,
-            FtsTarget::new(0, Vec::new()),
+            document_granularity,
             document_column,
         )
     }
 
-    pub fn new_with_segments_and_target(
+    pub fn new_with_segments_and_document_granularity(
         dataset: Arc<Dataset>,
         query: MatchQuery,
         params: FtsSearchParams,
         unindexed_input: Arc<dyn ExecutionPlan>,
         segments: Vec<IndexMetadata>,
-        target: FtsTarget,
+        document_granularity: DocumentGranularity,
         document_column: String,
     ) -> Self {
-        let schema = fts_schema(&target);
+        let schema = fts_schema(document_granularity);
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
             Partitioning::RoundRobinBatch(1),
@@ -1265,7 +1403,7 @@ impl FlatMatchQueryExec {
             base_scorer: None,
             shared_scorer: None,
             preset_segments: Some(segments),
-            target,
+            document_granularity,
             document_column,
             schema,
             properties,
@@ -1344,7 +1482,7 @@ impl ExecutionPlan for FlatMatchQueryExec {
             base_scorer: self.base_scorer.clone(),
             shared_scorer: self.shared_scorer.clone(),
             preset_segments: self.preset_segments.clone(),
-            target: self.target.clone(),
+            document_granularity: self.document_granularity,
             document_column: self.document_column.clone(),
             schema: self.schema.clone(),
             properties: self.properties.clone(),
@@ -1366,7 +1504,7 @@ impl ExecutionPlan for FlatMatchQueryExec {
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
         let metrics_clone = metrics.clone();
         let target_batch_size = context.session_config().batch_size();
-        let target = self.target.clone();
+        let document_granularity = self.document_granularity;
         let document_column = self.document_column.clone();
 
         // CPU time accumulator passed into `flat_bm25_search_stream_with_metrics`
@@ -1389,7 +1527,7 @@ impl ExecutionPlan for FlatMatchQueryExec {
             let result = async {
                 let segments = match preset_segments {
                     Some(segments) => Some(segments),
-                    None => load_segments(&ds, &column).await?,
+                    None => load_segments(&ds, &column, document_granularity).await?,
                 };
                 let (tokenizer, base_scorer) = match segments {
                     Some(segments) => {
@@ -1426,7 +1564,7 @@ impl ExecutionPlan for FlatMatchQueryExec {
                     ),
                 };
 
-                flat_bm25_search_stream_with_target_metrics_and_scorer(
+                flat_bm25_search_stream_with_options_and_scorer(
                     unindexed_input,
                     document_column,
                     query.terms,
@@ -1435,17 +1573,9 @@ impl ExecutionPlan for FlatMatchQueryExec {
                     FlatBm25SearchOptions {
                         target_batch_size,
                         elapsed_compute: Some(elapsed_compute),
-                        operator: if target.is_element_document() {
-                            query.operator
-                        } else {
-                            Operator::Or
-                        },
-                        boost: if target.is_element_document() {
-                            query.boost
-                        } else {
-                            1.0
-                        },
-                        target,
+                        operator: query.operator,
+                        boost: query.boost,
+                        document_granularity,
                     },
                 )
                 .await
@@ -1511,7 +1641,7 @@ pub struct PhraseQueryExec {
     /// Optional pre-resolved segment list. See
     /// [`MatchQueryExec::new_with_segments`].
     preset_segments: Option<Vec<IndexMetadata>>,
-    target: FtsTarget,
+    document_granularity: DocumentGranularity,
     schema: SchemaRef,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
@@ -1547,23 +1677,24 @@ impl PhraseQueryExec {
         params: FtsSearchParams,
         prefilter_source: PreFilterSource,
     ) -> Self {
-        Self::new_with_target(
+        let document_granularity = query.document_granularity;
+        Self::new_with_document_granularity(
             dataset,
             query,
             params,
             prefilter_source,
-            FtsTarget::new(0, Vec::new()),
+            document_granularity,
         )
     }
 
-    pub fn new_with_target(
+    pub fn new_with_document_granularity(
         dataset: Arc<Dataset>,
         query: PhraseQuery,
         params: FtsSearchParams,
         prefilter_source: PreFilterSource,
-        target: FtsTarget,
+        document_granularity: DocumentGranularity,
     ) -> Self {
-        let schema = fts_schema(&target);
+        let schema = fts_schema(document_granularity);
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
             Partitioning::RoundRobinBatch(1),
@@ -1579,7 +1710,7 @@ impl PhraseQueryExec {
             prefilter_source,
             base_scorer: None,
             preset_segments: None,
-            target,
+            document_granularity,
             schema,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
@@ -1594,25 +1725,26 @@ impl PhraseQueryExec {
         prefilter_source: PreFilterSource,
         segments: Vec<IndexMetadata>,
     ) -> Self {
-        Self::new_with_segments_and_target(
+        let document_granularity = query.document_granularity;
+        Self::new_with_segments_and_document_granularity(
             dataset,
             query,
             params,
             prefilter_source,
             segments,
-            FtsTarget::new(0, Vec::new()),
+            document_granularity,
         )
     }
 
-    pub fn new_with_segments_and_target(
+    pub fn new_with_segments_and_document_granularity(
         dataset: Arc<Dataset>,
         query: PhraseQuery,
         params: FtsSearchParams,
         prefilter_source: PreFilterSource,
         segments: Vec<IndexMetadata>,
-        target: FtsTarget,
+        document_granularity: DocumentGranularity,
     ) -> Self {
-        let schema = fts_schema(&target);
+        let schema = fts_schema(document_granularity);
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
             Partitioning::RoundRobinBatch(1),
@@ -1628,7 +1760,7 @@ impl PhraseQueryExec {
             prefilter_source,
             base_scorer: None,
             preset_segments: Some(segments),
-            target,
+            document_granularity,
             schema,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
@@ -1703,7 +1835,7 @@ impl ExecutionPlan for PhraseQueryExec {
                 prefilter_source: PreFilterSource::None,
                 base_scorer: self.base_scorer.clone(),
                 preset_segments: self.preset_segments.clone(),
-                target: self.target.clone(),
+                document_granularity: self.document_granularity,
                 schema: self.schema.clone(),
                 properties: self.properties.clone(),
                 metrics: ExecutionPlanMetricsSet::new(),
@@ -1730,7 +1862,7 @@ impl ExecutionPlan for PhraseQueryExec {
                     prefilter_source,
                     base_scorer: self.base_scorer.clone(),
                     preset_segments: self.preset_segments.clone(),
-                    target: self.target.clone(),
+                    document_granularity: self.document_granularity,
                     schema: self.schema.clone(),
                     properties: self.properties.clone(),
                     metrics: ExecutionPlanMetricsSet::new(),
@@ -1757,6 +1889,7 @@ impl ExecutionPlan for PhraseQueryExec {
         let prefilter_source = self.prefilter_source.clone();
         let preset_base_scorer = self.base_scorer.clone();
         let preset_segments = self.preset_segments.clone();
+        let document_granularity = self.document_granularity;
         let schema = self.schema.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
         let stream = stream::once(async move {
@@ -1767,7 +1900,7 @@ impl ExecutionPlan for PhraseQueryExec {
             )))?;
             let segments = match preset_segments {
                 Some(segments) => segments,
-                None => load_segments(&ds, &column)
+                None => load_segments(&ds, &column, document_granularity)
                     .await?
                     .ok_or(DataFusionError::Execution(format!(
                         "No Inverted index found for column {}",
@@ -2373,7 +2506,6 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use crate::index::DatasetIndexExt;
-    use arrow_array::builder::{ListBuilder, StringBuilder};
     use arrow_array::{
         ArrayRef, Float32Array, Int32Array, RecordBatch, RecordBatchIterator, StringArray,
         UInt64Array,
@@ -2393,7 +2525,8 @@ mod tests {
         PhraseQuery, collect_query_tokens, has_query_token,
     };
     use lance_index::scalar::inverted::{
-        FTS_SCHEMA, InvertedIndex, Language, SCORE_COL, build_global_bm25_scorer,
+        DocumentGranularity, FTS_SCHEMA, InvertedIndex, Language, SCORE_COL,
+        build_global_bm25_scorer,
     };
     use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams};
     use lance_index::{IndexCriteria, IndexType};
@@ -2437,44 +2570,30 @@ mod tests {
     }
 
     #[test]
-    fn element_document_match_filter_emits_each_parent_once() {
-        let mut lists = ListBuilder::new(StringBuilder::new());
-        lists.values().append_value("alpha");
-        lists.values().append_value("beta");
-        lists.append(true);
-        lists.values().append_value("alpha beta");
-        lists.append(true);
-        lists.append(false);
-        lists.values().append_value("gamma");
-        lists.append(true);
-        let lists = lists.finish();
+    fn document_match_filter_respects_document_boundary() {
         let mut tokenizer = default_text_tokenizer();
         let query_tokens = collect_query_tokens("alpha", &mut tokenizer);
-
-        let matches = FlatMatchFilterExec::find_list_matches::<i32>(
-            &lists,
+        assert!(super::document_matches_query(
+            "alpha beta",
             &mut tokenizer,
             &query_tokens,
             Operator::Or,
-        );
-
-        assert_eq!(
-            matches.iter().collect::<Vec<_>>(),
-            vec![Some(true), Some(true), Some(false), Some(false)]
-        );
+        ));
 
         let mut tokenizer = default_text_tokenizer();
         let query_tokens = collect_query_tokens("alpha beta", &mut tokenizer);
-        let matches = FlatMatchFilterExec::find_list_matches::<i32>(
-            &lists,
+        assert!(!super::document_matches_query(
+            "alpha",
             &mut tokenizer,
             &query_tokens,
             Operator::And,
-        );
-        assert_eq!(
-            matches.iter().collect::<Vec<_>>(),
-            vec![Some(false), Some(true), Some(false), Some(false)]
-        );
+        ));
+        assert!(super::document_matches_query(
+            "alpha beta",
+            &mut tokenizer,
+            &query_tokens,
+            Operator::And,
+        ));
     }
 
     #[test]
@@ -2573,8 +2692,12 @@ mod tests {
         let text_col =
             LargeStringArray::from(vec!["hello world", "no match here", "say hello there"]);
 
-        let result =
-            FlatMatchFilterExec::find_matches::<i64>(&text_col, &mut tokenizer, &query_tokens);
+        let result = FlatMatchFilterExec::find_matches::<i64>(
+            &text_col,
+            &mut tokenizer,
+            &query_tokens,
+            Operator::Or,
+        );
 
         assert_eq!(result.len(), 3);
         assert!(result.value(0), "expected match in 'hello world'");
@@ -2626,14 +2749,24 @@ mod tests {
             .unwrap();
 
         let metrics = IndexMetrics::new(&ExecutionPlanMetricsSet::new(), 0);
-        let mut tokenizer = FlatMatchFilterExec::load_tokenizer(&dataset, "text", &metrics)
-            .await
-            .unwrap();
+        let mut tokenizer = FlatMatchFilterExec::load_tokenizer(
+            &dataset,
+            "text",
+            DocumentGranularity::Row,
+            &metrics,
+        )
+        .await
+        .unwrap();
         let query_tokens = collect_query_tokens("hello", &mut tokenizer);
 
-        let mut tokenizer = FlatMatchFilterExec::load_tokenizer(&dataset, "text", &metrics)
-            .await
-            .unwrap();
+        let mut tokenizer = FlatMatchFilterExec::load_tokenizer(
+            &dataset,
+            "text",
+            DocumentGranularity::Row,
+            &metrics,
+        )
+        .await
+        .unwrap();
         assert!(has_query_token("hello", &mut tokenizer, &query_tokens));
         assert!(
             !has_query_token("HELLO", &mut tokenizer, &query_tokens),
@@ -2879,10 +3012,14 @@ mod tests {
 
         // Override: build the global scorer manually via the public helper, then
         // construct the exec with the preset segments and the preset scorer.
-        let preset_segments = crate::index::scalar::inverted::load_segments(&dataset, "text")
-            .await
-            .unwrap()
-            .expect("FTS index just created");
+        let preset_segments = crate::index::scalar::inverted::load_segments(
+            &dataset,
+            "text",
+            DocumentGranularity::Row,
+        )
+        .await
+        .unwrap()
+        .expect("FTS index just created");
         let metrics_set = ExecutionPlanMetricsSet::new();
         let metrics = IndexMetrics::new(&metrics_set, 0);
         let indices = open_fts_segments(&dataset, "text", &preset_segments, &metrics)

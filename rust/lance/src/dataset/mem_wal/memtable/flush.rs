@@ -703,21 +703,11 @@ impl MemTableFlusher {
             let index_details = prost_types::Any::from_msg(&details)
                 .map_err(|e| Error::io(format!("Failed to serialize index details: {}", e)))?;
 
-            let schema = dataset.schema();
-            let field_idx = schema.field(&fts_cfg.column).map(|f| f.id).ok_or_else(|| {
-                Error::invalid_input(format!(
-                    "FTS index '{}' references column '{}' which is not in the dataset schema",
-                    fts_cfg.name, fts_cfg.column
-                ))
-            })?;
+            let field_idx = fts_cfg.field_id;
 
             let fragment_ids: roaring::RoaringBitmap = dataset.fragment_bitmap.as_ref().clone();
             let format_version = fts_cfg.params.resolved_format_version();
-            let index_version = if fts_cfg
-                .params
-                .fts_target()
-                .is_some_and(|target| target.is_element_document())
-            {
+            let index_version = if fts_cfg.params.get_document_granularity().is_list_element() {
                 lance_index::scalar::inverted::INVERTED_INDEX_VERSION_ELEMENT_DOCUMENT
             } else {
                 format_version.index_version()
