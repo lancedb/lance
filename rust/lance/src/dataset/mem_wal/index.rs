@@ -891,7 +891,7 @@ impl IndexStore {
 
     /// Insert multiple batches into every index.
     ///
-    /// Above [`PARALLEL_INDEX_MIN_ROWS`] rows each index runs on its own thread, which
+    /// Above `PARALLEL_INDEX_MIN_ROWS` rows each index runs on its own thread, which
     /// maximizes parallelism when several indexes are maintained. At or below it they run
     /// inline on the calling thread: the spawn is one OS thread *per index*, and for a
     /// handful of rows that costs more than the indexing itself.
