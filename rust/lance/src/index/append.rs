@@ -11,8 +11,8 @@ use lance_index::{
     optimize::OptimizeOptions,
     progress::NoopIndexBuildProgress,
     scalar::{
-        CreatedIndex, OldIndexDataFilter, ScalarIndex, inverted::InvertedIndex,
-        lance_format::LanceIndexStore,
+        CreatedIndex, OldIndexDataFilter, ScalarIndex, index_files_to_table,
+        inverted::InvertedIndex, lance_format::LanceIndexStore, table_files_to_index,
     },
 };
 use lance_select::{RowAddrTreeMap, RowSetOps};
@@ -592,7 +592,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 CreatedIndex {
                     index_details: vector_index_details_default(),
                     index_version: lance_index::IndexType::Vector.version() as u32,
-                    files,
+                    files: table_files_to_index(files),
                 },
             ))
         } else {
@@ -655,7 +655,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     // index_version <= our max supported version, so we can safely
                     // write the current library's version for this index type.
                     index_version: lance_index::IndexType::Vector.version() as u32,
-                    files,
+                    files: table_files_to_index(files),
                 },
             ))
         }
@@ -734,7 +734,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                         new_fragment_bitmap: dataset.fragment_bitmap.as_ref().clone(),
                         new_index_version: created_index.index_version as i32,
                         new_index_details: created_index.index_details,
-                        files: created_index.files,
+                        files: index_files_to_table(created_index.files),
                     }));
                 }
 
@@ -850,7 +850,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
         new_fragment_bitmap,
         new_index_version: created_index.index_version as i32,
         new_index_details: created_index.index_details,
-        files: created_index.files,
+        files: index_files_to_table(created_index.files),
     }))
 }
 

@@ -18,45 +18,10 @@ use crate::progress::IndexBuildProgress;
 use crate::registry::IndexPluginRegistry;
 use crate::scalar::RowIdRemapper;
 use crate::scalar::{CreatedIndex, IndexStore, ScalarIndex, expression::ScalarQueryParser};
+// Re-export training types that were previously defined here
+pub use crate::scalar::{TrainingCriteria, TrainingOrdering};
 
 pub const VALUE_COLUMN_NAME: &str = "value";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TrainingOrdering {
-    /// The input will arrive sorted by the value column in ascending order
-    Values,
-    /// The input will arrive sorted by the address column in ascending order
-    Addresses,
-    /// The input will arrive in an arbitrary order
-    None,
-}
-
-#[derive(Debug, Clone)]
-pub struct TrainingCriteria {
-    pub ordering: TrainingOrdering,
-    pub needs_row_ids: bool,
-    pub needs_row_addrs: bool,
-}
-
-impl TrainingCriteria {
-    pub fn new(ordering: TrainingOrdering) -> Self {
-        Self {
-            ordering,
-            needs_row_ids: false,
-            needs_row_addrs: false,
-        }
-    }
-
-    pub fn with_row_id(mut self) -> Self {
-        self.needs_row_ids = true;
-        self
-    }
-
-    pub fn with_row_addr(mut self) -> Self {
-        self.needs_row_addrs = true;
-        self
-    }
-}
 
 /// A trait object for plugin-specific training parameters and data requirements.
 ///

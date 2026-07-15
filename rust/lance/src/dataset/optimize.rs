@@ -2236,6 +2236,7 @@ mod tests {
     use lance_datagen::Dimension;
     use lance_file::version::LanceFileVersion;
     use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
+    use lance_index::frag_reuse::FragReuseIndexHandle;
     use lance_index::scalar::{
         BuiltinIndexType, FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams,
     };
@@ -3432,7 +3433,9 @@ mod tests {
             open_frag_reuse_index(frag_reuse_index_meta.uuid, frag_reuse_details.as_ref())
                 .await
                 .unwrap();
-        let stats = frag_reuse_index.statistics().unwrap();
+        let stats = FragReuseIndexHandle(Arc::new(frag_reuse_index.clone()))
+            .statistics()
+            .unwrap();
         assert_eq!(
             serde_json::to_string(&stats).unwrap(),
             dataset

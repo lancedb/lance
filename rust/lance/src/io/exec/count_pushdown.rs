@@ -83,7 +83,7 @@ impl PhysicalOptimizerRule for CountPushdown {
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         Ok(plan
             .transform_down(|plan| {
-                let Some(agg) = plan.as_any().downcast_ref::<AggregateExec>() else {
+                let Some(agg) = plan.downcast_ref::<AggregateExec>() else {
                     return Ok(Transformed::no(plan));
                 };
                 if let Some(rewritten) = try_rewrite(agg)? {
@@ -202,15 +202,12 @@ fn try_rewrite(agg: &AggregateExec) -> DFResult<Option<Arc<dyn ExecutionPlan>>> 
     let index_coverage = match &prefilter_input {
         None => None,
         Some(input) => {
-            let scalar_exec = input
-                .as_any()
-                .downcast_ref::<ScalarIndexExec>()
-                .ok_or_else(|| {
-                    datafusion::error::DataFusionError::Internal(
-                        "count_pushdown: FilteredReadExec.index_input is not a ScalarIndexExec"
-                            .to_string(),
-                    )
-                })?;
+            let scalar_exec = input.downcast_ref::<ScalarIndexExec>().ok_or_else(|| {
+                datafusion::error::DataFusionError::Internal(
+                    "count_pushdown: FilteredReadExec.index_input is not a ScalarIndexExec"
+                        .to_string(),
+                )
+            })?;
             if scalar_exec.expr().needs_recheck() {
                 return Ok(None);
             }
@@ -367,21 +364,21 @@ fn build_scan_branch(
 fn strip_row_preserving_wrappers(plan: &Arc<dyn ExecutionPlan>) -> Option<&FilteredReadExec> {
     let mut current: &dyn ExecutionPlan = plan.as_ref();
     loop {
-        if let Some(filtered_read) = current.as_any().downcast_ref::<FilteredReadExec>() {
+        if let Some(filtered_read) = current.downcast_ref::<FilteredReadExec>() {
             return Some(filtered_read);
         }
         let next: &Arc<dyn ExecutionPlan> =
-            if let Some(inner) = current.as_any().downcast_ref::<RepartitionExec>() {
+            if let Some(inner) = current.downcast_ref::<RepartitionExec>() {
                 inner.input()
             } else if let Some(inner) = {
                 #[allow(deprecated)]
-                current.as_any().downcast_ref::<CoalesceBatchesExec>()
+                current.downcast_ref::<CoalesceBatchesExec>()
             } {
                 inner.input()
-            } else if let Some(inner) = current.as_any().downcast_ref::<CoalescePartitionsExec>() {
+            } else if let Some(inner) = current.downcast_ref::<CoalescePartitionsExec>() {
                 inner.input()
             } else {
-                let proj = current.as_any().downcast_ref::<ProjectionExec>()?;
+                let proj = current.downcast_ref::<ProjectionExec>()?;
                 // Only walk through projections that are row-preserving: every
                 // output expression is a direct column reference back to the
                 // input. (Empty projections trivially qualify — DataFusion uses
@@ -391,7 +388,6 @@ fn strip_row_preserving_wrappers(plan: &Arc<dyn ExecutionPlan>) -> Option<&Filte
                 let identity = proj.expr().iter().all(|projection_expr| {
                     projection_expr
                         .expr
-                        .as_any()
                         .downcast_ref::<Column>()
                         .is_some_and(|c| c.name() == input_schema.field(c.index()).name())
                 });
@@ -433,7 +429,7 @@ fn is_count_star(af: &Arc<AggregateFunctionExpr>) -> bool {
     if args.len() != 1 {
         return false;
     }
-    let Some(lit) = args[0].as_any().downcast_ref::<Literal>() else {
+    let Some(lit) = args[0].downcast_ref::<Literal>() else {
         return false;
     };
     // `COUNT(NULL)` would always return 0; rule it out so we don't accidentally
@@ -496,7 +492,7 @@ mod tests {
     fn plan_contains_pushdown(plan: &Arc<dyn ExecutionPlan>) -> bool {
         let mut found = false;
         plan.apply(|node| {
-            if node.as_any().is::<CountFromMaskExec>() {
+            if node.is::<CountFromMaskExec>() {
                 found = true;
                 Ok(TreeNodeRecursion::Stop)
             } else {
@@ -510,7 +506,7 @@ mod tests {
     fn plan_contains_union(plan: &Arc<dyn ExecutionPlan>) -> bool {
         let mut found = false;
         plan.apply(|node| {
-            if node.as_any().is::<UnionExec>() {
+            if node.is::<UnionExec>() {
                 found = true;
                 Ok(TreeNodeRecursion::Stop)
             } else {

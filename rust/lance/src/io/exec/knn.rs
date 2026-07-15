@@ -3,7 +3,6 @@
 
 #[cfg(test)]
 use lance_core::utils::row_addr_remap::RowAddrRemap;
-use std::any::Any;
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -829,10 +828,6 @@ impl ExecutionPlan for KNNVectorDistanceExec {
         "KNNVectorDistanceExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     /// Flat KNN inherits the schema from input node, and add one distance column.
     fn schema(&self) -> arrow_schema::SchemaRef {
         self.output_schema.clone()
@@ -948,7 +943,7 @@ impl ExecutionPlan for KNNVectorDistanceExec {
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> DataFusionResult<Statistics> {
+    fn partition_statistics(&self, partition: Option<usize>) -> DataFusionResult<Arc<Statistics>> {
         let inner_stats = self.input.partition_statistics(partition)?;
         let input_schema = self.input.schema();
         let input_stats_by_name = inner_stats
@@ -985,11 +980,11 @@ impl ExecutionPlan for KNNVectorDistanceExec {
                 }
             })
             .collect::<Vec<_>>();
-        Ok(Statistics {
+        Ok(Arc::new(Statistics {
             num_rows: inner_stats.num_rows,
             column_statistics,
             ..Statistics::new_unknown(self.schema().as_ref())
-        })
+        }))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -1225,10 +1220,6 @@ impl ExecutionPlan for ANNIvfPartitionExec {
         "ANNIVFPartitionExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         KNN_PARTITION_SCHEMA.clone()
     }
@@ -1237,11 +1228,11 @@ impl ExecutionPlan for ANNIvfPartitionExec {
         &self.properties
     }
 
-    fn partition_statistics(&self, _partition: Option<usize>) -> DataFusionResult<Statistics> {
-        Ok(Statistics {
+    fn partition_statistics(&self, _partition: Option<usize>) -> DataFusionResult<Arc<Statistics>> {
+        Ok(Arc::new(Statistics {
             num_rows: Precision::Exact(self.query.minimum_nprobes),
             ..Statistics::new_unknown(self.schema().as_ref())
-        })
+        }))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -1843,10 +1834,6 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
         "ANNSubIndexExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> arrow_schema::SchemaRef {
         KNN_INDEX_SCHEMA.clone()
     }
@@ -2043,8 +2030,8 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
     fn partition_statistics(
         &self,
         partition: Option<usize>,
-    ) -> DataFusionResult<datafusion::physical_plan::Statistics> {
-        Ok(Statistics {
+    ) -> DataFusionResult<Arc<datafusion::physical_plan::Statistics>> {
+        Ok(Arc::new(Statistics {
             num_rows: Precision::Exact(
                 self.query.k
                     * self.query.refine_factor.unwrap_or(1) as usize
@@ -2056,7 +2043,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                         .unwrap_or(&1),
             ),
             ..Statistics::new_unknown(self.schema().as_ref())
-        })
+        }))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -2137,10 +2124,6 @@ impl DisplayAs for MultivectorScoringExec {
 impl ExecutionPlan for MultivectorScoringExec {
     fn name(&self) -> &str {
         "MultivectorScoringExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn schema(&self) -> arrow_schema::SchemaRef {
@@ -2289,6 +2272,8 @@ impl ExecutionPlan for MultivectorScoringExec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::any::Any;
 
     use crate::index::DatasetIndexExt;
     use arrow::compute::{concat_batches, sort_to_indices, take_record_batch};

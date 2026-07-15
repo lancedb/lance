@@ -25,8 +25,8 @@ use lance_file::previous::reader::FileReader as PreviousFileReader;
 use lance_file::reader::FileReaderOptions;
 use lance_index::INDEX_METADATA_SCHEMA_KEY;
 pub use lance_index::IndexParams;
-use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragReuseIndex};
-use lance_index::mem_wal::{MEM_WAL_INDEX_NAME, MemWalIndex};
+use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragReuseIndex, FragReuseIndexHandle};
+use lance_index::mem_wal::{MEM_WAL_INDEX_NAME, MemWalIndex, MemWalIndexHandle};
 use lance_index::optimize::OptimizeOptions;
 use lance_index::pb::index::Implementation;
 pub use lance_index::progress::{IndexBuildProgress, NoopIndexBuildProgress};
@@ -34,7 +34,7 @@ use lance_index::scalar::expression::{IndexInformationProvider, MultiQueryParser
 use lance_index::scalar::inverted::{InvertedIndex, InvertedIndexPlugin};
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::registry::{TrainingCriteria, TrainingOrdering};
-use lance_index::scalar::{CreatedIndex, ScalarIndex};
+use lance_index::scalar::{CreatedIndex, ScalarIndex, index_files_to_table, table_files_to_index};
 use lance_index::vector::bq::builder::RabitQuantizer;
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
 use lance_index::vector::hnsw::HNSW;
@@ -827,7 +827,7 @@ pub(crate) async fn remap_index(
                 )
                 .unwrap(),
                 index_version,
-                files,
+                files: table_files_to_index(files),
             }
         }
         _ => {
@@ -843,7 +843,7 @@ pub(crate) async fn remap_index(
         new_id,
         index_details: created_index.index_details,
         index_version: created_index.index_version,
-        files: Some(created_index.files),
+        files: Some(index_files_to_table(created_index.files)),
     }))
 }
 
@@ -1814,7 +1814,7 @@ async fn index_statistics_frag_reuse(ds: &Dataset) -> Result<String> {
         .open_frag_reuse_index(&NoOpMetricsCollector)
         .await?
         .expect("FragmentReuse index does not exist");
-    serialize_index_statistics(&index.statistics()?)
+    serialize_index_statistics(&FragReuseIndexHandle(index).statistics()?)
 }
 
 async fn index_statistics_mem_wal(ds: &Dataset) -> Result<String> {
@@ -1822,7 +1822,7 @@ async fn index_statistics_mem_wal(ds: &Dataset) -> Result<String> {
         .open_mem_wal_index(&NoOpMetricsCollector)
         .await?
         .expect("MemWal index does not exist");
-    serialize_index_statistics(&index.statistics()?)
+    serialize_index_statistics(&MemWalIndexHandle(index).statistics()?)
 }
 
 async fn index_statistics_scalar(
@@ -2082,7 +2082,7 @@ impl DatasetIndexInternalExt for Dataset {
 
         let frag_reuse_cache_key = FragReuseIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
         if let Some(index) = self.index_cache.get_with_key(&frag_reuse_cache_key).await {
-            return Ok(index.as_index());
+            return Ok(Arc::new(FragReuseIndexHandle(index)).as_index());
         }
 
         // Sometimes we want to open an index and we don't care if it is a scalar or vector index.
