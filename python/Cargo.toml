@@ -1,6 +1,6 @@
 [package]
 name = "pylance"
-version = "9.0.0-beta.21"
+version = "9.0.0-beta.24"
 edition = "2024"
 authors = ["Lance Devs <dev@lance.org>"]
 license = "Apache-2.0"
@@ -83,7 +83,7 @@ serde_yaml = "0.9.34"
 tracing-chrome = "0.7.1"
 tracing-subscriber = "0.3.17"
 tracing = { version = "0.1" }
-bytes = "1.4"
+bytes = "1.11.1"
 
 [features]
 default = []

@@ -25,7 +25,7 @@ use lance_core::datatypes::Schema;
 use lance_core::{Error, Result};
 use lance_index::mem_wal::ShardManifest;
 use lance_index::vector::hnsw::builder::HnswBuildParams;
-use lance_io::object_store::ObjectStore;
+use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use log::{debug, error, info, warn};
 use object_store::path::Path;
 use tokio::sync::{RwLock, mpsc};
@@ -53,6 +53,7 @@ use super::wal::{
     WalRetryConfig, WalTailer, empty_flush_result,
 };
 use super::{TOMBSTONE, schema_with_tombstone};
+use crate::session::Session;
 
 use super::manifest::ShardManifestStore;
 
@@ -249,6 +250,17 @@ pub struct ShardWriterConfig {
     /// on first query). Wired to the flusher; supplied by the consumer (e.g. the
     /// WAL pod). Default: `None`.
     pub warmer: Option<Arc<dyn GenerationWarmer>>,
+
+    /// Store params the base dataset was opened with, reused for the flusher's
+    /// opens + writes (base + generations). Injected by `mem_wal_writer`; set
+    /// these to the params of the dataset at `base_uri`, not to params bound to
+    /// some other path — generation URIs are derived from them.
+    /// Default: `None` (open by URI alone).
+    pub store_params: Option<ObjectStoreParams>,
+
+    /// Session for those opens, injected alongside `store_params`.
+    /// Default: `None`.
+    pub session: Option<Arc<Session>>,
 }
 
 impl Default for ShardWriterConfig {
@@ -275,6 +287,8 @@ impl Default for ShardWriterConfig {
             enable_memtable: true,
             hnsw_params: HashMap::new(),
             warmer: None,
+            store_params: None,
+            session: None,
         }
     }
 }
@@ -1533,7 +1547,8 @@ impl ShardWriter {
 
         let flusher = Arc::new(
             MemTableFlusher::new(object_store, base_path, base_uri, shard_id, manifest_store)
-                .with_warmer(config.warmer.clone()),
+                .with_warmer(config.warmer.clone())
+                .with_storage_context(config.store_params.clone(), config.session.clone()),
         );
 
         let backpressure = BackpressureController::new(config.clone());
@@ -6742,5 +6757,310 @@ mod shard_writer_tests {
             .close()
             .await
             .expect("Failed to close new writer");
+    }
+
+    /// Regression: a base opened with a *path-bound* store binding (the
+    /// deprecated `ObjectStoreParams::object_store`) must still flush and read
+    /// generations at their own paths.
+    ///
+    /// The binding pins a store to one location, and both
+    /// `ObjectStore::from_uri_and_params` and `DatasetBuilder::build_object_store`
+    /// take the path from it while ignoring the URI they were handed. Reusing the
+    /// base's params verbatim therefore aimed every generation write and open at
+    /// the base table itself: the flush failed ("dataset already exists") and any
+    /// derived open returned base rows as generation rows.
+    #[tokio::test]
+    async fn test_flush_and_read_with_path_bound_object_store() {
+        use crate::dataset::mem_wal::scanner::{LsmScanner, ShardSnapshot};
+        use futures::TryStreamExt;
+        use lance_io::object_store::ObjectStoreParams;
+        use tempfile::TempDir;
+
+        let vector_dim = 8;
+        let schema = create_test_schema(vector_dim);
+        let temp_dir = TempDir::new().unwrap();
+        let uri = format!("file://{}", temp_dir.path().display());
+
+        let initial = create_test_batch(&schema, 0, 16, vector_dim);
+        let batches = RecordBatchIterator::new([Ok(initial)], schema.clone());
+        let mut dataset = Dataset::write(batches, &uri, Some(WriteParams::default()))
+            .await
+            .expect("Failed to create dataset");
+        dataset
+            .initialize_mem_wal()
+            .execute()
+            .await
+            .expect("Failed to initialize MemWAL");
+
+        // Re-bind the base to a store pinned at the base's own path — what
+        // `DatasetBuilder::with_object_store` leaves on an opened dataset.
+        #[allow(deprecated)]
+        let store_params = ObjectStoreParams {
+            object_store: Some((
+                Arc::new(object_store::local::LocalFileSystem::new()),
+                url::Url::parse(&uri).unwrap(),
+            )),
+            ..Default::default()
+        };
+        let dataset = dataset.with_object_store(dataset.object_store.clone(), Some(store_params));
+
+        let shard_id = Uuid::new_v4();
+        let writer = dataset
+            .mem_wal_writer(shard_id, ShardWriterConfig::new(shard_id))
+            .await
+            .expect("Failed to create writer");
+        writer
+            .put(vec![create_test_batch(&schema, 1_000, 8, vector_dim)])
+            .await
+            .expect("Failed to write");
+        writer.force_seal_active().await.unwrap();
+        writer
+            .wait_for_flush_drain()
+            .await
+            .expect("flush must not be redirected at the base table");
+
+        let manifest = writer.manifest().await.unwrap().expect("manifest exists");
+        assert_eq!(manifest.flushed_generations.len(), 1);
+        let flushed = manifest.flushed_generations[0].clone();
+
+        // The generation landed under `_mem_wal/`, and the base table is untouched.
+        let gen_uri = format!("{}/_mem_wal/{}/{}", uri, shard_id, flushed.path);
+        let generation = Dataset::open(&gen_uri)
+            .await
+            .expect("generation must exist at its own path");
+        assert_eq!(generation.count_rows(None).await.unwrap(), 8);
+        let base = Dataset::open(&uri).await.unwrap();
+        assert_eq!(
+            base.count_rows(None).await.unwrap(),
+            16,
+            "the generation write must not land in the base table"
+        );
+
+        // The read path resolves the generation, not the base: 16 base + 8 flushed.
+        // Opening the base instead would dedup back down to 16 rows.
+        let snapshot = ShardSnapshot::new(shard_id)
+            .with_current_generation(manifest.current_generation)
+            .with_flushed_generation(flushed.generation, flushed.path.clone());
+        let scanner = LsmScanner::new(Arc::new(dataset), vec![snapshot], vec!["id".to_string()]);
+        let rows: usize = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("scan must open the generation, not the base")
+            .iter()
+            .map(|batch| batch.num_rows())
+            .sum();
+        assert_eq!(rows, 24);
+
+        writer.close().await.unwrap();
+    }
+
+    /// The store params a base was opened with must reach every *derived* open:
+    /// the flush that writes a generation and the scan that reads it back.
+    ///
+    /// This is the point of threading them at all. A namespace-vended store
+    /// exists only on the params (credentials, endpoint, wrapper), so a
+    /// generation resolved by URI alone would silently sign with the ambient
+    /// identity instead — succeeding against a local store and failing against
+    /// the vended one. Asserting on the *generation folder* rather than
+    /// `_mem_wal/` is what makes this bite: WAL entries are written through the
+    /// base dataset's own store, so they would show up here either way.
+    #[tokio::test]
+    async fn test_store_params_reach_generation_write_and_read() {
+        use crate::dataset::builder::DatasetBuilder;
+        use crate::dataset::mem_wal::scanner::{LsmScanner, ShardSnapshot};
+        use crate::dataset::mem_wal::test_util::observable_store_params;
+        use futures::TryStreamExt;
+        use tempfile::TempDir;
+
+        let vector_dim = 8;
+        let schema = create_test_schema(vector_dim);
+        let temp_dir = TempDir::new().unwrap();
+        let uri = format!("file://{}", temp_dir.path().display());
+
+        let initial = create_test_batch(&schema, 0, 16, vector_dim);
+        let batches = RecordBatchIterator::new([Ok(initial)], schema.clone());
+        Dataset::write(batches, &uri, Some(WriteParams::default()))
+            .await
+            .expect("Failed to create dataset");
+
+        // Open the base through an observable store, exactly as a namespace
+        // client would hand in a vended-credential store.
+        let (store_params, controls) = observable_store_params();
+        let mut dataset = DatasetBuilder::from_uri(&uri)
+            .with_store_params(store_params)
+            .load()
+            .await
+            .expect("Failed to open dataset");
+        dataset
+            .initialize_mem_wal()
+            .execute()
+            .await
+            .expect("Failed to initialize MemWAL");
+
+        let shard_id = Uuid::new_v4();
+        let writer = dataset
+            .mem_wal_writer(shard_id, ShardWriterConfig::new(shard_id))
+            .await
+            .expect("Failed to create writer");
+        writer
+            .put(vec![create_test_batch(&schema, 1_000, 8, vector_dim)])
+            .await
+            .expect("Failed to write");
+        writer.force_seal_active().await.unwrap();
+        writer.wait_for_flush_drain().await.expect("flush failed");
+
+        let manifest = writer.manifest().await.unwrap().expect("manifest exists");
+        assert_eq!(manifest.flushed_generations.len(), 1);
+        let flushed = manifest.flushed_generations[0].clone();
+
+        // The generation's own Lance manifest is the signal to key on. Keying on
+        // the generation folder alone would pass vacuously: sidecars like
+        // `{gen}/bloom_filter.bin` are written through the *base* dataset's
+        // store, which is observable no matter what the params do. And the
+        // fragments can't be used either — `ObjectStore::create` writes local
+        // files through `tokio::fs`, bypassing the object store entirely, so
+        // `{gen}/data/` never reaches a wrapper under `file://`. The manifest
+        // goes through `put_opts`, and only the flusher's `Dataset::write` /
+        // `open_generation` writes it — both of which must carry the params.
+        let gen_manifest = format!("{}/_versions", flushed.path);
+
+        assert!(
+            controls.wrote_under(&gen_manifest),
+            "the flush must write the generation through the base's store params, \
+             not a store resolved from the generation URI alone"
+        );
+
+        // And the read path must resolve the generation through them too.
+        let snapshot = ShardSnapshot::new(shard_id)
+            .with_current_generation(manifest.current_generation)
+            .with_flushed_generation(flushed.generation, flushed.path.clone());
+        let scanner = LsmScanner::new(Arc::new(dataset), vec![snapshot], vec!["id".to_string()]);
+        let rows: usize = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("scan failed")
+            .iter()
+            .map(|batch| batch.num_rows())
+            .sum();
+        assert_eq!(rows, 24);
+
+        // Reads key on the data files, not the manifest: the flusher already
+        // pulled the generation's manifest into the shared session cache, so the
+        // scan's open serves it from memory and never touches the store. The
+        // fragments are read through it (reads have no local bypass), as is the
+        // generation's standalone PK index.
+        assert!(
+            controls.read_under(&format!("{}/data/", flushed.path)),
+            "the scan must read the generation through the base's store params"
+        );
+
+        writer.close().await.unwrap();
+    }
+
+    /// A fresh-tier-only scanner reaches its store params through
+    /// `with_store_params`, not `new()`, so the setter must strip the path-bound
+    /// store binding too. Left raw, it redirects the generation open at the base
+    /// table and the scan silently returns base rows as WAL rows.
+    #[tokio::test]
+    async fn test_fresh_tier_scan_with_path_bound_object_store() {
+        use crate::dataset::mem_wal::scanner::{LsmScanner, ShardSnapshot};
+        use futures::TryStreamExt;
+        use lance_io::object_store::ObjectStoreParams;
+        use tempfile::TempDir;
+
+        let vector_dim = 8;
+        let schema = create_test_schema(vector_dim);
+        let temp_dir = TempDir::new().unwrap();
+        let uri = format!("file://{}", temp_dir.path().display());
+
+        // 16 base rows with ids 0..16; the WAL gets 8 rows with ids 1000..1008,
+        // so a redirected generation open is unambiguous in the output.
+        let initial = create_test_batch(&schema, 0, 16, vector_dim);
+        let batches = RecordBatchIterator::new([Ok(initial)], schema.clone());
+        let mut dataset = Dataset::write(batches, &uri, Some(WriteParams::default()))
+            .await
+            .expect("Failed to create dataset");
+        dataset
+            .initialize_mem_wal()
+            .execute()
+            .await
+            .expect("Failed to initialize MemWAL");
+
+        let shard_id = Uuid::new_v4();
+        let writer = dataset
+            .mem_wal_writer(shard_id, ShardWriterConfig::new(shard_id))
+            .await
+            .expect("Failed to create writer");
+        writer
+            .put(vec![create_test_batch(&schema, 1_000, 8, vector_dim)])
+            .await
+            .expect("Failed to write");
+        writer.force_seal_active().await.unwrap();
+        writer.wait_for_flush_drain().await.expect("flush failed");
+
+        let manifest = writer.manifest().await.unwrap().expect("manifest exists");
+        let flushed = manifest.flushed_generations[0].clone();
+        let snapshot = ShardSnapshot::new(shard_id)
+            .with_current_generation(manifest.current_generation)
+            .with_flushed_generation(flushed.generation, flushed.path.clone());
+
+        // What `DatasetBuilder::with_object_store` leaves on an opened dataset:
+        // a store pinned at the base's own path.
+        #[allow(deprecated)]
+        let store_params = ObjectStoreParams {
+            object_store: Some((
+                Arc::new(object_store::local::LocalFileSystem::new()),
+                url::Url::parse(&uri).unwrap(),
+            )),
+            ..Default::default()
+        };
+
+        let arrow_schema: Arc<ArrowSchema> = schema.clone();
+        let batches = LsmScanner::without_base_table(
+            arrow_schema,
+            uri.clone(),
+            vec![snapshot],
+            vec!["id".to_string()],
+        )
+        .with_session(dataset.session())
+        .with_store_params(store_params)
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("scan must open the generation, not the base");
+
+        let rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+        assert_eq!(
+            rows, 8,
+            "fresh tier holds only the 8 WAL rows; 16 means the generation open \
+             was redirected at the base table"
+        );
+        let ids: Vec<i64> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert!(
+            ids.iter().all(|id| (1_000..1_008).contains(id)),
+            "expected the WAL's own rows, got {ids:?}"
+        );
+
+        writer.close().await.unwrap();
     }
 }

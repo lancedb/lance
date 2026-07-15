@@ -248,6 +248,28 @@ def test_io_counters(tmp_path):
     assert lance.bytes_read_counter() > starting_bytes
 
 
+def test_simd_info():
+    info = lance.simd_info()
+    assert info["tier"] in (
+        "none",
+        "sse",
+        "avx",
+        "avx_fma",
+        "avx2",
+        "avx512",
+        "avx512_fp16",
+        "neon",
+        "lsx",
+        "lasx",
+    )
+    assert isinstance(info["target_arch"], str) and info["target_arch"]
+    if info["target_arch"] == "x86_64":
+        # The x86_64 ABI mandates SSE2.
+        assert "sse2" in info["host_features"]
+    else:
+        assert info["host_features"] == []
+
+
 @pytest.mark.parametrize(
     "row_param, column_name",
     [("with_row_id", "_rowid"), ("with_row_address", "_rowaddr")],
