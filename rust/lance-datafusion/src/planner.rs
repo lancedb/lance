@@ -58,6 +58,31 @@ fn encode_jsonb(json_str: &str) -> Result<Expr> {
     Ok(Expr::Literal(ScalarValue::LargeBinary(Some(bytes)), None))
 }
 
+// The escape in `LIKE/ILIKE ... ESCAPE '<char>'` must be exactly one character.
+// Reject empty or multi-character escape strings rather than silently treating
+// them as "no escape" or truncating to the first character.
+fn parse_like_escape_char(escape_char: &Option<ValueWithSpan>) -> Result<Option<char>> {
+    let Some(value) = escape_char else {
+        return Ok(None);
+    };
+    let ValueWithSpan {
+        value: Value::SingleQuotedString(escape),
+        ..
+    } = value
+    else {
+        return Err(Error::invalid_input(format!(
+            "Invalid escape character in LIKE expression. Expected a single character wrapped with single quotes, got {value}"
+        )));
+    };
+    let mut chars = escape.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) => Ok(Some(c)),
+        _ => Err(Error::invalid_input(format!(
+            "Invalid escape character in LIKE expression. Expected a single character, got '{escape}'"
+        ))),
+    }
+}
+
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 struct CastListF16Udf {
     signature: Signature,
@@ -793,19 +818,7 @@ impl Planner {
                 *negated,
                 Box::new(self.parse_sql_expr(expr)?),
                 Box::new(self.parse_sql_expr(pattern)?),
-                match escape_char {
-                    Some(ValueWithSpan {
-                        value: Value::SingleQuotedString(char),
-                        ..
-                    }) => char.chars().next(),
-                    Some(value) => {
-                        return Err(Error::invalid_input(format!(
-                            "Invalid escape character in LIKE expression. Expected a single character wrapped with single quotes, got {}",
-                            value
-                        )));
-                    }
-                    None => None,
-                },
+                parse_like_escape_char(escape_char)?,
                 true,
             ))),
             SQLExpr::Like {
@@ -818,19 +831,7 @@ impl Planner {
                 *negated,
                 Box::new(self.parse_sql_expr(expr)?),
                 Box::new(self.parse_sql_expr(pattern)?),
-                match escape_char {
-                    Some(ValueWithSpan {
-                        value: Value::SingleQuotedString(char),
-                        ..
-                    }) => char.chars().next(),
-                    Some(value) => {
-                        return Err(Error::invalid_input(format!(
-                            "Invalid escape character in LIKE expression. Expected a single character wrapped with single quotes, got {}",
-                            value
-                        )));
-                    }
-                    None => None,
-                },
+                parse_like_escape_char(escape_char)?,
                 false,
             ))),
             // JSONB cast: CAST('...' AS JSONB) or '...'::jsonb
@@ -1460,6 +1461,36 @@ mod tests {
                 true, true, true, true, false, true, true, true, true, true
             ])
         );
+    }
+
+    #[test]
+    fn test_like_escape_char() {
+        let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, true)]));
+        let planner = Planner::new(schema);
+
+        // A valid single-character escape is captured for both LIKE and ILIKE.
+        for filter in ["s LIKE 'a!%' ESCAPE '!'", "s ILIKE 'a!%' ESCAPE '!'"] {
+            match planner.parse_filter(filter).unwrap() {
+                Expr::Like(like) => assert_eq!(like.escape_char, Some('!'), "{filter}"),
+                other => panic!("expected a LIKE expression for `{filter}`, got {other:?}"),
+            }
+        }
+
+        // Empty and multi-character escapes are rejected rather than silently
+        // dropped or truncated to the first character.
+        for filter in [
+            "s LIKE 'x' ESCAPE ''",
+            "s LIKE 'x' ESCAPE 'ab'",
+            "s ILIKE 'x' ESCAPE ''",
+            "s ILIKE 'x' ESCAPE 'ab'",
+        ] {
+            let err = planner.parse_filter(filter).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("Invalid escape character in LIKE expression"),
+                "unexpected error for `{filter}`: {err}"
+            );
+        }
     }
 
     #[test]
