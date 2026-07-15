@@ -241,7 +241,7 @@ impl DisplayAs for MatchQueryExec {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(
                     f,
-                    "MatchQuery: column={}, query={}",
+                    "MatchQuery: column={}, query=[{}]",
                     self.query.column.as_deref().unwrap_or_default(),
                     self.query.terms
                 )

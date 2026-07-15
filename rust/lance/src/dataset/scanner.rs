@@ -11251,7 +11251,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         let expected = r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
-      MatchQuery: column=s, query=hello"#;
+      MatchQuery: column=s, query=[hello]"#;
         assert_plan_equals(
             &dataset.dataset,
             |scan| {
@@ -11285,8 +11285,8 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
       BoostQuery: negative_boost=1
-        MatchQuery: column=s, query=hello
-        MatchQuery: column=s, query=world"#;
+        MatchQuery: column=s, query=[hello]
+        MatchQuery: column=s, query=[world]"#;
         assert_plan_equals(
             &dataset.dataset,
             |scan| {
@@ -11308,7 +11308,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
-      MatchQuery: column=s, query=hello
+      MatchQuery: column=s, query=[hello]
         CoalescePartitionsExec
           UnionExec
             MaterializeIndex: query=[i > 10]@i_idx(BTree)
@@ -11319,7 +11319,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
-      MatchQuery: column=s, query=hello
+      MatchQuery: column=s, query=[hello]
         LanceRead: uri=..., projection=[], num_fragments=5, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=--
           ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"#
         };
@@ -11348,7 +11348,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
       SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
         CoalescePartitionsExec
           UnionExec
-            MatchQuery: column=s, query=hello
+            MatchQuery: column=s, query=[hello]
             FlatMatchQuery: column=s, query=hello
               LanceScan: uri=..., projection=[s], row_id=true, row_addr=false, ordered=true, range=None"#
         } else {
@@ -11358,7 +11358,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
       SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
         CoalescePartitionsExec
           UnionExec
-            MatchQuery: column=s, query=hello
+            MatchQuery: column=s, query=[hello]
             FlatMatchQuery: column=s, query=hello
               LanceRead: uri=..., projection=[s], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=--, refine_filter=--"#
         };
@@ -11378,7 +11378,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         let expected = r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
-      MatchQuery: column=s, query=hello"#;
+      MatchQuery: column=s, query=[hello]"#;
         assert_plan_equals(
             &dataset.dataset,
             |scan| {
@@ -11405,7 +11405,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
       SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
         CoalescePartitionsExec
           UnionExec
-            MatchQuery: column=s, query=hello
+            MatchQuery: column=s, query=[hello]
               CoalescePartitionsExec
                 UnionExec
                   MaterializeIndex: query=[i > 10]@i_idx(BTree)
@@ -11428,7 +11428,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
       SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
         CoalescePartitionsExec
           UnionExec
-            MatchQuery: column=s, query=hello
+            MatchQuery: column=s, query=[hello]
               LanceRead: uri=..., projection=[], num_fragments=5, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=--
                 ScalarIndexQuery: query=[i > 10]@i_idx(BTree)
             FlatMatchQuery: column=s, query=hello

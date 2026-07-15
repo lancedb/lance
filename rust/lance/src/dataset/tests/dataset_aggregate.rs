@@ -1598,7 +1598,7 @@ async fn test_scanner_count_rows_with_fts() {
     assert_plan_node_equals(
         plan.clone(),
         "AggregateExec: mode=Single, gby=[], aggr=[count(Int32(1))]
-  MatchQuery: column=text, query=document",
+  MatchQuery: column=text, query=[document]",
     )
     .await
     .unwrap();
