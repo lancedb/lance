@@ -188,22 +188,21 @@ pub fn validate_index_configs(
         }
     }
 
-    // A single-column PK aliases a BTree entry (any type). Only a *composite* PK
-    // builds an order-preserving encoded key, and only some types encode.
-    if pk_columns.len() > 1 {
-        for column in pk_columns {
-            let field = schema.field_with_name(column).map_err(|_| {
-                Error::invalid_input(format!(
-                    "primary-key column '{column}' is not in the shard schema"
-                ))
-            })?;
-            if !is_encodable_pk_type(field.data_type()) {
-                return Err(Error::invalid_input(format!(
-                    "composite primary-key column '{column}' has type {:?}, which has no \
-                     order-preserving key encoding",
-                    field.data_type()
-                )));
-            }
+    // Every PK column must exist in the schema. A single-column PK aliases a
+    // BTree entry (any type); only a *composite* PK builds an order-preserving
+    // encoded key, and only some types encode.
+    for column in pk_columns {
+        let field = schema.field_with_name(column).map_err(|_| {
+            Error::invalid_input(format!(
+                "primary-key column '{column}' is not in the shard schema"
+            ))
+        })?;
+        if pk_columns.len() > 1 && !is_encodable_pk_type(field.data_type()) {
+            return Err(Error::invalid_input(format!(
+                "composite primary-key column '{column}' has type {:?}, which has no \
+                 order-preserving key encoding",
+                field.data_type()
+            )));
         }
     }
 
@@ -410,9 +409,6 @@ pub struct IndexStore {
     /// primary key. Queried via [`Self::pk_newest_visible`] (see
     /// [`Self::enable_pk_index`]).
     pk_index: Option<PkIndex>,
-    /// Maximum batch position that is durable in the WAL and therefore
-    /// visible to scanners. Advanced unconditionally after a WAL append
-    /// succeeds; not gated on whether any indexes are configured.
     /// How many batches of this memtable have been fully indexed. An exclusive
     /// count: 0 means none.
     ///
@@ -1111,13 +1107,13 @@ impl IndexStore {
         self.btree_indexes.len() + self.hnsw_indexes.len() + self.fts_indexes.len()
     }
 
-    /// Get the visibility watermark (max batch position safe to read).
+    /// How many batches of this memtable have been fully indexed (exclusive
+    /// count; 0 before any batch is indexed).
     ///
-    /// Returns the highest batch position whose data is durable in the WAL
-    /// and therefore visible to scanners. Scanners snapshot this at plan
-    /// construction time so every plan runs against a stable cursor.
-    ///
-    /// Returns 0 before any WAL flush has advanced the watermark.
+    /// This is the *indexed* cursor, not the visibility watermark: it advances
+    /// once every index insert for a batch completes, regardless of WAL
+    /// durability. Readers must snapshot [`Self::visible_count`], which derives
+    /// what is safe to read from this cursor and the writer's durability cursor.
     pub fn indexed_count(&self) -> usize {
         self.indexed_count.load(Ordering::Acquire)
     }
@@ -1741,6 +1737,16 @@ mod tests {
         // A single-column PK of the same type is fine: it aliases a BTree.
         validate_index_configs(&[], &schema, &["coords".into()])
             .expect("single-column PK aliases a BTree and accepts any type");
+
+        // But every PK column must exist. A single-column PK naming an absent
+        // column is rejected here, not left to fail deterministically on every
+        // later index build and WAL replay.
+        let err = validate_index_configs(&[], &schema, &["missing".into()])
+            .expect_err("a single-column PK on an absent column must be rejected");
+        assert!(
+            err.to_string().contains("not in the shard schema"),
+            "error must name the missing column, got {err}"
+        );
     }
 
     #[test]

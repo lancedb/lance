@@ -282,20 +282,15 @@ pub struct WalEntry {
     pub num_batches: usize,
 }
 
-/// Result of a parallel WAL flush with index update.
+/// Result of a WAL flush. Append-only: index application runs on its own task
+/// (see [`apply_index_range`]), which records its own stats, so this no longer
+/// carries index-update timing or row counts.
 #[derive(Debug, Clone)]
 pub struct WalFlushResult {
     /// WAL entry that was written (if any).
     pub entry: Option<WalEntry>,
     /// Duration of WAL I/O operation.
     pub wal_io_duration: std::time::Duration,
-    /// Overall wall-clock duration of the index update operation.
-    /// This includes any overhead from thread scheduling and context switching.
-    pub index_update_duration: std::time::Duration,
-    /// Per-index update durations. Key is index name, value is duration.
-    pub index_update_duration_breakdown: std::collections::HashMap<String, std::time::Duration>,
-    /// Number of rows indexed.
-    pub rows_indexed: usize,
     /// Size of WAL data written in bytes.
     pub wal_bytes: usize,
 }
@@ -342,6 +337,17 @@ impl std::fmt::Debug for TriggerIndexApply {
     }
 }
 
+/// What an [`apply_index_range`] call actually indexed. `rows_indexed == 0`
+/// marks a routine coalesced no-op (the range was already covered) that must
+/// not be recorded as an index update.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct IndexApplyStats {
+    pub rows_indexed: usize,
+    /// Wall-clock time spent applying the range, including the thread-scheduling
+    /// overhead of the blocking hand-off.
+    pub duration: std::time::Duration,
+}
+
 /// Apply a contiguous range of batches to a memtable's in-memory indexes.
 ///
 /// Runs on its own task, as the single sequential consumer of its own channel.
@@ -357,7 +363,7 @@ impl std::fmt::Debug for TriggerIndexApply {
 pub async fn apply_index_range(
     cursors: &Arc<WriterCursors>,
     message: TriggerIndexApply,
-) -> Result<()> {
+) -> Result<IndexApplyStats> {
     let TriggerIndexApply {
         batch_store,
         indexes,
@@ -372,25 +378,32 @@ pub async fn apply_index_range(
     // writer.
     let start = indexes.indexed_count();
     if end_batch_position <= start {
-        return Ok(());
+        return Ok(IndexApplyStats::default());
     }
 
     let stored: Vec<StoredBatch> = (start..end_batch_position)
         .filter_map(|position| batch_store.get(position).cloned())
         .collect();
     if stored.is_empty() {
-        return Ok(());
+        return Ok(IndexApplyStats::default());
     }
 
     // `insert_batches` advances `indexed_count` itself, once every index has
-    // taken the batch.
+    // taken the batch. Time the whole hand-off so the recorded latency reflects
+    // the blocking-pool scheduling too, matching the old inline-flush measurement.
+    let rows_indexed: usize = stored.iter().map(|b| b.num_rows).sum();
+    let apply_start = Instant::now();
     tokio::task::spawn_blocking(move || indexes.insert_batches(&stored))
         .await
         .map_err(|e| Error::internal(format!("Index apply task panicked: {e}")))??;
+    let duration = apply_start.elapsed();
 
     // Wake anything waiting to become visible.
     cursors.wake();
-    Ok(())
+    Ok(IndexApplyStats {
+        rows_indexed,
+        duration,
+    })
 }
 
 /// Message to trigger a WAL flush.
@@ -782,7 +795,6 @@ impl WalFlusher {
             return Ok(empty_flush_result());
         }
 
-        let num_rows: usize = stored_batches.iter().map(|b| b.num_rows).sum();
         let record_batches: Vec<RecordBatch> =
             stored_batches.iter().map(|s| s.data.clone()).collect();
 
@@ -805,9 +817,6 @@ impl WalFlusher {
                 num_batches: append_result.num_batches,
             }),
             wal_io_duration,
-            index_update_duration: std::time::Duration::ZERO,
-            index_update_duration_breakdown: std::collections::HashMap::new(),
-            rows_indexed: num_rows,
             wal_bytes: append_result.wal_bytes,
         })
     }
@@ -840,9 +849,6 @@ impl WalFlusher {
                 num_batches: append_result.num_batches,
             }),
             wal_io_duration,
-            index_update_duration: std::time::Duration::ZERO,
-            index_update_duration_breakdown: std::collections::HashMap::new(),
-            rows_indexed: 0,
             wal_bytes: append_result.wal_bytes,
         })
     }
@@ -875,9 +881,6 @@ pub fn empty_flush_result() -> WalFlushResult {
     WalFlushResult {
         entry: None,
         wal_io_duration: std::time::Duration::ZERO,
-        index_update_duration: std::time::Duration::ZERO,
-        index_update_duration_breakdown: std::collections::HashMap::new(),
-        rows_indexed: 0,
         wal_bytes: 0,
     }
 }
@@ -1746,6 +1749,7 @@ mod tests {
             },
         )
         .await
+        .map(|_| ())
     }
 
     #[tokio::test]
