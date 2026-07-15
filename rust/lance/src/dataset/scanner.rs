@@ -84,7 +84,7 @@ use uuid::Uuid;
 
 use super::Dataset;
 use crate::dataset::overlay::{
-    collect_overlay_stale_frags, collect_overlay_stale_rows_for_segment,
+    collect_overlay_stale_frags, collect_overlay_stale_rows_for_segment, overlaid_fragments,
 };
 use crate::dataset::row_offsets_to_row_addresses;
 use crate::dataset::utils::SchemaAdapter;
@@ -4315,11 +4315,7 @@ impl Scanner {
         fragments: &[Fragment],
     ) -> Result<HashMap<u32, RoaringBitmap>> {
         // Overlays are rare; skip all index loading when none of the candidate fragments has one.
-        let overlaid_frags: HashMap<u32, &Fragment> = fragments
-            .iter()
-            .filter(|f| !f.overlays.is_empty())
-            .map(|f| (f.id as u32, f))
-            .collect();
+        let overlaid_frags = overlaid_fragments(fragments);
         if overlaid_frags.is_empty() {
             return Ok(HashMap::new());
         }
@@ -4371,11 +4367,7 @@ impl Scanner {
             Some(f) => f.as_slice(),
             None => dataset_frags.as_slice(),
         };
-        let overlaid_frags: HashMap<u32, &Fragment> = fragments
-            .iter()
-            .filter(|f| !f.overlays.is_empty())
-            .map(|f| (f.id as u32, f))
-            .collect();
+        let overlaid_frags = overlaid_fragments(fragments);
         if overlaid_frags.is_empty() {
             return Ok(HashMap::new());
         }
@@ -4411,11 +4403,7 @@ impl Scanner {
             return Ok((RoaringBitmap::new(), None));
         };
 
-        let overlaid_frags: HashMap<u32, &Fragment> = target_fragments
-            .iter()
-            .filter(|f| !f.overlays.is_empty())
-            .map(|f| (f.id as u32, f))
-            .collect();
+        let overlaid_frags = overlaid_fragments(target_fragments);
         let mut stale_frag_ids = RoaringBitmap::new();
         for seg in &segments {
             collect_overlay_stale_frags(seg, &overlaid_frags, &mut stale_frag_ids)?;
@@ -4450,23 +4438,16 @@ impl Scanner {
         Ok((flat_frag_ids, Some(fresh_segments)))
     }
 
-    /// Build a block-list mask over stale rows, or `None` when there are none.
-    ///
-    /// The mask removes these rows from an index result so the index never emits them; they
-    /// are re-evaluated against their current (overlay-merged) values on a targeted take path
-    /// (see [`Self::stale_rows_take`]).
+    /// Collect the stale rows into a [`RowAddrTreeMap`] in the domain the index results use.
     ///
     /// Index results are in the row-id domain (see `ScalarQuery::evaluate_nullable`), and a
     /// physical row address equals its row id only when the dataset does not use stable row ids.
-    /// Under stable row ids the stale addresses are translated to their row ids so the block
-    /// lines up with the index results it is combined with.
-    async fn stale_rows_block_mask(
+    /// Under stable row ids the addresses are translated to their row ids so the result lines up
+    /// with the index output it is combined with (block mask) or taken against.
+    async fn stale_rows_in_id_domain(
         &self,
         stale_rows: &HashMap<u32, RoaringBitmap>,
-    ) -> Result<Option<RowAddrMask>> {
-        if stale_rows.is_empty() {
-            return Ok(None);
-        }
+    ) -> Result<RowAddrTreeMap> {
         let mut tree_map = RowAddrTreeMap::new();
         for (&frag_id, offsets) in stale_rows {
             tree_map.insert_bitmap(frag_id, offsets.clone());
@@ -4474,6 +4455,22 @@ impl Scanner {
         if self.dataset.manifest.uses_stable_row_ids() {
             tree_map = translate_addr_treemap_to_row_ids(&self.dataset, &tree_map).await?;
         }
+        Ok(tree_map)
+    }
+
+    /// Build a block-list mask over stale rows, or `None` when there are none.
+    ///
+    /// The mask removes these rows from an index result so the index never emits them; they
+    /// are re-evaluated against their current (overlay-merged) values on a targeted take path
+    /// (see [`Self::stale_rows_take`]).
+    async fn stale_rows_block_mask(
+        &self,
+        stale_rows: &HashMap<u32, RoaringBitmap>,
+    ) -> Result<Option<RowAddrMask>> {
+        if stale_rows.is_empty() {
+            return Ok(None);
+        }
+        let tree_map = self.stale_rows_in_id_domain(stale_rows).await?;
         Ok(Some(RowAddrMask::from_block(tree_map)))
     }
 
@@ -4481,26 +4478,14 @@ impl Scanner {
     /// those rows (rather than their whole fragments) against their current overlay-merged values.
     ///
     /// The rows are identified by an address allow list routed through `FilteredReadExec`, not a
-    /// `_rowid` column: `_rowid` and row address only coincide when the dataset does not use stable
-    /// row ids. For stable-row-id datasets `_rowid` is a logical id resolved through a separate
-    /// mapping, so feeding raw addresses under that name would take the wrong rows.
+    /// `_rowid` column (`_rowid` and row address diverge under stable row ids — see
+    /// [`Self::stale_rows_in_id_domain`]).
     async fn stale_rows_take(
         &self,
         stale_rows: &HashMap<u32, RoaringBitmap>,
         projection: Projection,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let mut addrs = RowAddrTreeMap::new();
-        for (&frag_id, offsets) in stale_rows {
-            addrs.insert_bitmap(frag_id, offsets.clone());
-        }
-        // The take input is an index result (row-id domain). A physical address equals its row id
-        // only without stable row ids; under stable row ids translate so the take reads the right
-        // rows (see [`Self::stale_rows_block_mask`]).
-        let take_id_map = if self.dataset.manifest.uses_stable_row_ids() {
-            translate_addr_treemap_to_row_ids(&self.dataset, &addrs).await?
-        } else {
-            addrs
-        };
+        let take_id_map = self.stale_rows_in_id_domain(stale_rows).await?;
         let take_ids: Vec<u64> = take_id_map
             .row_addrs()
             .map(|it| it.map(u64::from).collect())

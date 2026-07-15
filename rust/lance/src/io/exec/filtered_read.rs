@@ -1564,9 +1564,8 @@ impl FilteredReadOptions {
         }
     }
 
-    /// Block the given stale overlay row addresses from the scalar index result so the index
-    /// never emits them. Used to mask data overlay files: rows with a newer overlay on an indexed
-    /// field can no longer be trusted to the index and are re-evaluated on a targeted take path.
+    /// Block the given stale overlay row addresses (see the `overlay_block` field) from the
+    /// scalar index result so the index never emits them.
     pub fn with_overlay_block(mut self, block: RowAddrMask) -> Self {
         self.overlay_block = Some(block);
         self

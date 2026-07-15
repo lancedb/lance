@@ -1101,11 +1101,8 @@ pub static KNN_PARTITION_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     ]))
 });
 
-/// Create a new ANN execution node, optionally blocking stale row addresses from index results.
-///
-/// `overlay_block`: when `Some`, rows whose addresses are in the block list are excluded from
-/// ANN results (their index entries may be stale due to a newer data overlay). Pass `None`
-/// when no overlay masking is needed.
+/// Create a new ANN execution node. `overlay_block`, when `Some`, excludes rows whose index
+/// entries may be stale due to a newer data overlay (see [`ANNIvfSubIndexExec::with_overlay_block`]).
 pub fn new_knn_exec(
     dataset: Arc<Dataset>,
     indices: &[IndexMetadata],
@@ -1430,8 +1427,7 @@ impl ANNIvfSubIndexExec {
         })
     }
 
-    /// Block stale row addresses from index results — rows whose index entries may be stale due to
-    /// a newer data overlay. Applied at execution time via [`DatasetPreFilter::with_overlay_block`].
+    /// Block stale row addresses (see the `overlay_block` field) from index results.
     pub fn with_overlay_block(mut self, overlay_block: RowAddrMask) -> Self {
         self.overlay_block = Some(overlay_block);
         self

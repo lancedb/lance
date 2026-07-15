@@ -7,14 +7,18 @@
 
 use std::sync::Arc;
 
+use futures::TryStreamExt;
+
 use arrow_array::cast::AsArray;
 use arrow_array::types::Int32Type;
-use arrow_array::{ArrayRef, Int32Array, RecordBatch, RecordBatchIterator};
+use arrow_array::{ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, StringArray};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance_index::IndexType;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::ScalarIndexParams;
+use lance_index::scalar::inverted::InvertedIndexParams;
 use lance_io::utils::CachedFileSize;
+use lance_linalg::distance::MetricType;
 use lance_table::format::DataFile;
 use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
 use roaring::RoaringBitmap;
@@ -26,6 +30,7 @@ use crate::Dataset;
 use crate::dataset::transaction::{DataOverlayGroup, Operation};
 use crate::dataset::{WriteDestination, WriteParams};
 use crate::index::DatasetIndexExt;
+use crate::index::vector::VectorIndexParams;
 
 /// Two-fragment Int32 dataset: `id` (field 0) = 0..12 and `age` (field 1) = id * 10,
 /// six rows per file (fragments 0 and 1). In-memory store so overlay files can be written
@@ -157,17 +162,23 @@ async fn ids_matching_opts(dataset: &Dataset, filter: &str, fast_search: bool) -
         scanner.fast_search();
     }
     let batch = scanner.try_into_batch().await.unwrap();
-    if batch.num_rows() == 0 {
-        return Vec::new();
-    }
-    let mut ids = batch
-        .column_by_name("id")
-        .unwrap()
-        .as_primitive::<Int32Type>()
-        .values()
-        .to_vec();
+    let mut ids = ids_from_batches(std::slice::from_ref(&batch));
     ids.sort_unstable();
     ids
+}
+
+/// Concatenate the `id` (Int32) column from each batch, in batch order.
+fn ids_from_batches(batches: &[RecordBatch]) -> Vec<i32> {
+    batches
+        .iter()
+        .flat_map(|b| {
+            b.column_by_name("id")
+                .unwrap()
+                .as_primitive::<Int32Type>()
+                .values()
+                .to_vec()
+        })
+        .collect()
 }
 
 fn i32_array(values: impl IntoIterator<Item = Option<i32>>) -> ArrayRef {
@@ -414,11 +425,6 @@ fn vec_query() -> Vec<f32> {
 /// stable row id there, so both the ANN prefilter block and the flat re-score take must operate
 /// in the row-id domain when `stable_row_ids` is enabled.
 async fn create_vector_overlay_dataset(stable_row_ids: bool) -> Dataset {
-    use lance_index::IndexType;
-    use lance_linalg::distance::MetricType;
-
-    use crate::index::vector::VectorIndexParams;
-
     let query = vec_query();
     let far = vec![0.0_f32, 100.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
 
@@ -484,8 +490,6 @@ async fn create_vector_overlay_dataset(stable_row_ids: bool) -> Dataset {
 /// Run a top-`k` ANN search for the standard query vector and return the returned `id`s,
 /// optionally with `fast_search()` enabled.
 async fn vector_query_ids(dataset: &Dataset, k: usize, fast_search: bool) -> Vec<i32> {
-    use futures::TryStreamExt;
-
     let mut scanner = dataset.scan();
     scanner
         .nearest("vec", &arrow_array::Float32Array::from(vec_query()), k)
@@ -503,16 +507,7 @@ async fn vector_query_ids(dataset: &Dataset, k: usize, fast_search: bool) -> Vec
         .try_collect::<Vec<_>>()
         .await
         .unwrap();
-    results
-        .iter()
-        .flat_map(|b| {
-            b.column_by_name("id")
-                .unwrap()
-                .as_primitive::<Int32Type>()
-                .values()
-                .to_vec()
-        })
-        .collect()
+    ids_from_batches(&results)
 }
 
 /// A vector index masks overlays: a row whose vector was moved (by a newer overlay) away
@@ -602,8 +597,6 @@ async fn test_overlay_stale_with_compound_index_expression() {
 /// Text dataset: two fragments, 6 rows each. Schema: id (Int32), text (Utf8).
 /// Texts are unique tokens so each row can be identified by its term.
 async fn create_text_dataset() -> Dataset {
-    use arrow_array::StringArray;
-
     let schema = Arc::new(ArrowSchema::new(vec![
         ArrowField::new("id", DataType::Int32, true),
         ArrowField::new("text", DataType::Utf8, true),
@@ -642,8 +635,6 @@ async fn create_text_dataset() -> Dataset {
 }
 
 async fn build_text_fts_index(dataset: &mut Dataset) {
-    use lance_index::scalar::inverted::InvertedIndexParams;
-
     dataset
         .create_index(
             &["text"],
@@ -658,8 +649,6 @@ async fn build_text_fts_index(dataset: &mut Dataset) {
 
 /// FTS index with token positions stored, required for phrase queries.
 async fn build_text_fts_index_with_positions(dataset: &mut Dataset) {
-    use lance_index::scalar::inverted::InvertedIndexParams;
-
     dataset
         .create_index(
             &["text"],
@@ -673,44 +662,7 @@ async fn build_text_fts_index_with_positions(dataset: &mut Dataset) {
 }
 
 /// Collect sorted IDs of rows returned by an FTS query on `text`.
-async fn fts_ids_matching(dataset: &Dataset, term: &str) -> Vec<i32> {
-    use arrow_array::cast::AsArray;
-    use futures::TryStreamExt;
-
-    let results = dataset
-        .scan()
-        .full_text_search(FullTextSearchQuery::new(term.to_owned()))
-        .unwrap()
-        .project(&["id"])
-        .unwrap()
-        .try_into_stream()
-        .await
-        .unwrap()
-        .try_collect::<Vec<_>>()
-        .await
-        .unwrap();
-    let mut ids: Vec<i32> = results
-        .iter()
-        .flat_map(|b| {
-            b.column_by_name("id")
-                .unwrap()
-                .as_primitive::<Int32Type>()
-                .values()
-                .to_vec()
-        })
-        .collect();
-    ids.sort_unstable();
-    ids
-}
-
-async fn fts_phrase_ids_matching(dataset: &Dataset, phrase: &str) -> Vec<i32> {
-    use arrow_array::cast::AsArray;
-    use futures::TryStreamExt;
-    use lance_index::scalar::inverted::query::{FtsQuery, PhraseQuery};
-
-    let query = FullTextSearchQuery::new_query(FtsQuery::Phrase(
-        PhraseQuery::new(phrase.to_owned()).with_column(Some("text".to_owned())),
-    ));
+async fn fts_ids(dataset: &Dataset, query: FullTextSearchQuery) -> Vec<i32> {
     let results = dataset
         .scan()
         .full_text_search(query)
@@ -723,26 +675,28 @@ async fn fts_phrase_ids_matching(dataset: &Dataset, phrase: &str) -> Vec<i32> {
         .try_collect::<Vec<_>>()
         .await
         .unwrap();
-    let mut ids: Vec<i32> = results
-        .iter()
-        .flat_map(|b| {
-            b.column_by_name("id")
-                .unwrap()
-                .as_primitive::<Int32Type>()
-                .values()
-                .to_vec()
-        })
-        .collect();
+    let mut ids = ids_from_batches(&results);
     ids.sort_unstable();
     ids
+}
+
+async fn fts_ids_matching(dataset: &Dataset, term: &str) -> Vec<i32> {
+    fts_ids(dataset, FullTextSearchQuery::new(term.to_owned())).await
+}
+
+async fn fts_phrase_ids_matching(dataset: &Dataset, phrase: &str) -> Vec<i32> {
+    use lance_index::scalar::inverted::query::{FtsQuery, PhraseQuery};
+
+    let query = FullTextSearchQuery::new_query(FtsQuery::Phrase(
+        PhraseQuery::new(phrase.to_owned()).with_column(Some("text".to_owned())),
+    ));
+    fts_ids(dataset, query).await
 }
 
 /// An overlay committed after the FTS index is built replaces a row's text. Searching for
 /// the old term must not return the stale row; searching for the new term must find it.
 #[tokio::test]
 async fn test_fts_overlay_stale_drop_and_new_match() {
-    use arrow_array::StringArray;
-
     let mut dataset = create_text_dataset().await;
     build_text_fts_index(&mut dataset).await;
 
@@ -793,8 +747,6 @@ async fn test_fts_overlay_stale_drop_and_new_match() {
 /// pre-overlay phrase hit is dropped, not that the new value is found.
 #[tokio::test]
 async fn test_fts_phrase_overlay_stale_drop() {
-    use arrow_array::StringArray;
-
     let mut dataset = create_text_dataset().await;
     build_text_fts_index_with_positions(&mut dataset).await;
 
@@ -879,9 +831,6 @@ async fn bench_index_query_overlay_overhead() {
     use std::time::Instant;
 
     use arrow_array::Float32Array;
-    use lance_linalg::distance::MetricType;
-
-    use crate::index::vector::VectorIndexParams;
 
     const DIM: i32 = 32;
     const ROWS: i32 = 1_000_000;

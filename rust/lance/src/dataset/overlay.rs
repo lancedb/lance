@@ -105,6 +105,17 @@ fn covers_fragment(coverage: Option<&RoaringBitmap>, frag_id: u32) -> bool {
     coverage.is_none_or(|c| c.contains(frag_id))
 }
 
+/// Index by fragment id the fragments that carry at least one overlay. Overlays are rare, so
+/// this is empty on the common path, letting callers skip index loading entirely; when non-empty
+/// it bounds the stale-collection loops to `O(overlaid fragments)`.
+pub fn overlaid_fragments(fragments: &[Fragment]) -> HashMap<u32, &Fragment> {
+    fragments
+        .iter()
+        .filter(|f| !f.overlays.is_empty())
+        .map(|f| (f.id as u32, f))
+        .collect()
+}
+
 /// Insert into `stale` the ids of fragments covered by `segment` whose index entries may be
 /// stale because an overlay committed after the segment was built touches a field the segment
 /// indexes. Field-aware and version-gated via [`overlay_exclusion_offsets`].

@@ -742,8 +742,7 @@ impl MaterializeIndexExec {
         }
     }
 
-    /// Block specific row addresses from the index result. Used to exclude rows whose indexed
-    /// values are stale because a data overlay was committed after the index was built.
+    /// Block specific row addresses (see the `overlay_block` field) from the index result.
     pub fn with_overlay_block(mut self, block: RowAddrMask) -> Self {
         self.overlay_block = Some(block);
         self
