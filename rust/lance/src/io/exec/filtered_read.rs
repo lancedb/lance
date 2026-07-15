@@ -2054,10 +2054,7 @@ impl ExecutionPlan for FilteredReadExec {
             None,
         )?);
         let df_filter_exec = FilterExec::try_new(physical_filter, mock_input)?;
-        let mut df_stats = df_filter_exec
-            .partition_statistics(partition)?
-            .as_ref()
-            .clone();
+        let mut df_stats = Arc::unwrap_or_clone(df_filter_exec.partition_statistics(partition)?);
 
         // If we have an after-filter range, we should apply it to the stats (the before-filter range
         // is applied in the mock input)

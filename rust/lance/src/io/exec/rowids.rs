@@ -288,7 +288,7 @@ impl ExecutionPlan for AddRowAddrExec {
         &self,
         partition: Option<usize>,
     ) -> Result<Arc<datafusion::physical_plan::Statistics>> {
-        let mut stats = self.input.partition_statistics(partition)?.as_ref().clone();
+        let mut stats = Arc::unwrap_or_clone(self.input.partition_statistics(partition)?);
 
         let row_id_col_stats = stats.column_statistics.get(self.rowid_pos).ok_or_else(|| {
             DataFusionError::Internal("RowAddrExec: rowid column stats not found".into())
