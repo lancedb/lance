@@ -27,6 +27,9 @@
 //! ```
 
 #![allow(clippy::print_stdout, clippy::print_stderr)]
+// Overlay-aware index masking deepens the scan/take future graph past rustc's
+// default query-recursion limit (128); raise it so run_lookup's layout resolves.
+#![recursion_limit = "256"]
 
 use std::collections::HashMap;
 use std::path::PathBuf;
