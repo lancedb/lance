@@ -207,6 +207,21 @@ impl<'py> IntoPyObject<'py> for PyLance<&DataReplacementGroup> {
     }
 }
 
+// The Nth offset in an overlay list positionally maps to the Nth value row in
+// `data_file`, but `RoaringBitmap` stores offsets in ascending order and drops
+// duplicates. A caller-supplied list that isn't strictly ascending would be
+// silently reordered, breaking that mapping, so reject it here instead. This can
+// go away once we expose RoaringBitmap directly to Python (issue #7695).
+fn bitmap_from_sorted_offsets(offsets: Vec<u32>) -> PyResult<RoaringBitmap> {
+    if offsets.windows(2).any(|w| w[0] >= w[1]) {
+        return Err(PyValueError::new_err(
+            "DataOverlayFile.offsets must be strictly ascending with no duplicates; \
+             each offset positionally maps to a value row in data_file",
+        ));
+    }
+    Ok(RoaringBitmap::from_sorted_iter(offsets).expect("offsets verified strictly ascending"))
+}
+
 impl FromPyObject<'_, '_> for PyLance<DataOverlayFile> {
     type Error = PyErr;
     fn extract(ob: Borrowed<'_, '_, PyAny>) -> PyResult<Self> {
@@ -217,13 +232,13 @@ impl FromPyObject<'_, '_> for PyLance<DataOverlayFile> {
         // field); a list of per-field lists is a sparse overlay. Differentiate by
         // shape, trying the dense form first.
         let coverage = if let Ok(shared) = offsets.extract::<Vec<u32>>() {
-            OverlayCoverage::dense(RoaringBitmap::from_iter(shared))
+            OverlayCoverage::dense(bitmap_from_sorted_offsets(shared)?)
         } else if let Ok(per_field) = offsets.extract::<Vec<Vec<u32>>>() {
             OverlayCoverage::sparse(
                 per_field
                     .into_iter()
-                    .map(RoaringBitmap::from_iter)
-                    .collect(),
+                    .map(bitmap_from_sorted_offsets)
+                    .collect::<PyResult<Vec<_>>>()?,
             )
         } else {
             return Err(PyValueError::new_err(

@@ -6015,7 +6015,9 @@ class LanceOperation:
         offsets : Union[List[int], List[List[int]]]
             The covered physical row offsets. A flat list is dense coverage
             (shared by every field); a list of per-field lists is sparse
-            coverage (in field order).
+            coverage (in field order). Each list must be strictly ascending
+            with no duplicates, since the Nth offset maps to the Nth value row
+            in ``data_file``; a non-ascending list raises ``ValueError``.
         committed_version : Optional[int]
             The dataset version at which this overlay became effective. Leave as
             ``None`` when creating an overlay to commit — the commit stamps it.

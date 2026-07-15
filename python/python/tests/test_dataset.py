@@ -5195,6 +5195,49 @@ def test_data_overlay_rejects_invalid_offsets(tmp_path: Path):
         )
 
 
+@pytest.mark.parametrize(
+    "offsets",
+    [
+        [2, 1],  # dense, descending
+        [1, 1],  # dense, duplicate
+        [[2, 1]],  # sparse, descending
+        [[1, 1]],  # sparse, duplicate
+    ],
+)
+def test_data_overlay_rejects_unsorted_offsets(tmp_path: Path, offsets):
+    # Offsets map positionally to value rows in data_file. A RoaringBitmap would
+    # silently reorder/dedup them, so a non-ascending list must be rejected up
+    # front rather than corrupting the row mapping.
+    base_dir = tmp_path / "test"
+    table = pa.table({"val": pa.array([0, 1, 2], pa.int32())})
+    dataset = lance.write_dataset(table, base_dir)
+    data_file = _write_overlay_file(
+        dataset,
+        base_dir,
+        "ov.lance",
+        pa.table({"val": pa.array([9, 9], pa.int32())}),
+        fields=[0],
+    )
+
+    with pytest.raises(ValueError, match="strictly ascending"):
+        lance.LanceDataset.commit(
+            dataset,
+            lance.LanceOperation.DataOverlay(
+                [
+                    lance.LanceOperation.DataOverlayGroup(
+                        0,
+                        [
+                            lance.LanceOperation.DataOverlayFile(
+                                data_file, offsets=offsets
+                            )
+                        ],
+                    )
+                ]
+            ),
+            read_version=dataset.version,
+        )
+
+
 def test_schema_project_drop_column(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100, 200), "b": range(300, 400)})
     base_dir = tmp_path / "test"
