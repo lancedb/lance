@@ -661,13 +661,12 @@ fn encode_structural_plan(
                     encode_validity_set(validity, compression_strategy, "validity")?;
                 buffers.extend(validity_buffer);
                 layers.push(pb21::SparseStructuralLayer {
-                    kind: pb21::sparse_structural_layer::Kind::SparseLayerValidity as i32,
-                    num_slots: *num_slots,
-                    num_child_slots: *num_slots,
-                    non_empty_positions: None,
-                    counts: None,
-                    fixed_size_list_dimension: 0,
-                    validity: Some(validity),
+                    layer: Some(pb21::sparse_structural_layer::Layer::Validity(
+                        pb21::SparseValidityLayer {
+                            num_slots: *num_slots,
+                            validity: Some(validity),
+                        },
+                    )),
                 });
             }
             SparseStructuralLayerPlan::List {
@@ -699,13 +698,15 @@ fn encode_structural_plan(
                     encode_validity_set(validity, compression_strategy, "list validity")?;
                 buffers.extend(validity_buffer);
                 layers.push(pb21::SparseStructuralLayer {
-                    kind: pb21::sparse_structural_layer::Kind::SparseLayerList as i32,
-                    num_slots: *num_slots,
-                    num_child_slots: *num_child_slots,
-                    non_empty_positions: Some(non_empty_positions),
-                    counts: Some(counts),
-                    fixed_size_list_dimension: 0,
-                    validity: Some(validity),
+                    layer: Some(pb21::sparse_structural_layer::Layer::List(
+                        pb21::SparseListLayer {
+                            num_slots: *num_slots,
+                            num_child_slots: *num_child_slots,
+                            non_empty_positions: Some(non_empty_positions),
+                            counts: Some(counts),
+                            validity: Some(validity),
+                        },
+                    )),
                 });
             }
             SparseStructuralLayerPlan::FixedSizeList {
@@ -719,7 +720,7 @@ fn encode_structural_plan(
                     "fixed-size-list validity",
                 )?;
                 buffers.extend(validity_buffer);
-                let num_child_slots = num_slots.checked_mul(*dimension).ok_or_else(|| {
+                num_slots.checked_mul(*dimension).ok_or_else(|| {
                     Error::invalid_input_source(
                         format!(
                             "Sparse structural fixed-size-list child slot count overflows: slots={num_slots}, dimension={dimension}"
@@ -728,13 +729,13 @@ fn encode_structural_plan(
                     )
                 })?;
                 layers.push(pb21::SparseStructuralLayer {
-                    kind: pb21::sparse_structural_layer::Kind::SparseLayerFixedSizeList as i32,
-                    num_slots: *num_slots,
-                    num_child_slots,
-                    non_empty_positions: None,
-                    counts: None,
-                    fixed_size_list_dimension: *dimension,
-                    validity: Some(validity),
+                    layer: Some(pb21::sparse_structural_layer::Layer::FixedSizeList(
+                        pb21::SparseFixedSizeListLayer {
+                            num_slots: *num_slots,
+                            dimension: *dimension,
+                            validity: Some(validity),
+                        },
+                    )),
                 });
             }
         }
@@ -1108,12 +1109,39 @@ mod tests {
         sparse
     }
 
-    fn list_layer(sparse: &pb21::SparseLayout) -> &pb21::SparseStructuralLayer {
+    fn list_layer(sparse: &pb21::SparseLayout) -> &pb21::SparseListLayer {
         sparse
             .structural_layers
             .iter()
-            .find(|layer| layer.kind == pb21::sparse_structural_layer::Kind::SparseLayerList as i32)
+            .find_map(|layer| match layer.layer.as_ref() {
+                Some(pb21::sparse_structural_layer::Layer::List(layer)) => Some(layer),
+                _ => None,
+            })
             .expect("expected sparse list layer")
+    }
+
+    fn validity_layer(layer: &pb21::SparseStructuralLayer) -> Option<&pb21::SparseValidityLayer> {
+        match layer.layer.as_ref() {
+            Some(pb21::sparse_structural_layer::Layer::Validity(layer)) => Some(layer),
+            _ => None,
+        }
+    }
+
+    fn layer_num_slots(layer: &pb21::SparseStructuralLayer) -> u64 {
+        match layer.layer.as_ref().expect("expected sparse layer variant") {
+            pb21::sparse_structural_layer::Layer::Validity(layer) => layer.num_slots,
+            pb21::sparse_structural_layer::Layer::List(layer) => layer.num_slots,
+            pb21::sparse_structural_layer::Layer::FixedSizeList(layer) => layer.num_slots,
+        }
+    }
+
+    fn fixed_size_list_dimension(layer: &pb21::SparseStructuralLayer) -> Option<u64> {
+        match layer.layer.as_ref() {
+            Some(pb21::sparse_structural_layer::Layer::FixedSizeList(layer)) => {
+                Some(layer.dimension)
+            }
+            _ => None,
+        }
     }
 
     fn planned_list(
@@ -1240,7 +1268,11 @@ mod tests {
         assert_eq!(sparse.num_items, 6);
         assert_eq!(sparse.num_visible_items, 6);
         assert_eq!(sparse.structural_layers.len(), 1);
-        let validity = sparse.structural_layers[0].validity.as_ref().unwrap();
+        let validity = validity_layer(&sparse.structural_layers[0])
+            .unwrap()
+            .validity
+            .as_ref()
+            .unwrap();
         assert_eq!(
             validity.meaning,
             pb21::sparse_validity_set::Meaning::SparseValidityNullPositions as i32
@@ -1268,10 +1300,17 @@ mod tests {
         assert_eq!(pages.len(), 1);
         let sparse = sparse_layout(&pages[0]);
         assert_eq!(sparse.structural_layers.len(), 2);
-        assert!(sparse.structural_layers.iter().all(|layer| {
-            layer.kind == pb21::sparse_structural_layer::Kind::SparseLayerValidity as i32
-        }));
-        let struct_validity = sparse.structural_layers[0].validity.as_ref().unwrap();
+        assert!(
+            sparse
+                .structural_layers
+                .iter()
+                .all(|layer| validity_layer(layer).is_some())
+        );
+        let struct_validity = validity_layer(&sparse.structural_layers[0])
+            .unwrap()
+            .validity
+            .as_ref()
+            .unwrap();
         assert_eq!(
             struct_validity.meaning,
             pb21::sparse_validity_set::Meaning::SparseValidityNullPositions as i32
@@ -1357,7 +1396,8 @@ mod tests {
         )
         .await
         .unwrap();
-        let validity = sparse_layout(&null_positions[0]).structural_layers[0]
+        let validity = validity_layer(&sparse_layout(&null_positions[0]).structural_layers[0])
+            .unwrap()
             .validity
             .as_ref()
             .unwrap();
@@ -1373,7 +1413,8 @@ mod tests {
         )
         .await
         .unwrap();
-        let validity = sparse_layout(&valid_positions[0]).structural_layers[0]
+        let validity = validity_layer(&sparse_layout(&valid_positions[0]).structural_layers[0])
+            .unwrap()
             .validity
             .as_ref()
             .unwrap();
@@ -1410,15 +1451,19 @@ mod tests {
                 .structural_layers
                 .iter()
                 .filter(|layer| {
-                    layer.kind == pb21::sparse_structural_layer::Kind::SparseLayerList as i32
+                    matches!(
+                        layer.layer.as_ref(),
+                        Some(pb21::sparse_structural_layer::Layer::List(_))
+                    )
                 })
                 .count()
                 >= 2
         }));
         assert!(sparse.iter().any(|layout| {
-            layout.structural_layers.iter().any(|layer| {
-                layer.kind == pb21::sparse_structural_layer::Kind::SparseLayerValidity as i32
-            })
+            layout
+                .structural_layers
+                .iter()
+                .any(|layer| validity_layer(layer).is_some())
         }));
 
         let cases = TestCases::default()
@@ -1458,7 +1503,10 @@ mod tests {
                 .unwrap();
             assert!(pages.iter().map(sparse_layout).all(|layout| {
                 layout.structural_layers.iter().any(|layer| {
-                    layer.kind == pb21::sparse_structural_layer::Kind::SparseLayerList as i32
+                    matches!(
+                        layer.layer.as_ref(),
+                        Some(pb21::sparse_structural_layer::Layer::List(_))
+                    )
                 })
             }));
             check_round_trip_encoding_of_data(vec![array], &cases, sparse_metadata()).await;
@@ -1473,7 +1521,10 @@ mod tests {
             .unwrap();
         assert!(map_pages.iter().map(sparse_layout).any(|layout| {
             layout.structural_layers.iter().any(|layer| {
-                layer.kind == pb21::sparse_structural_layer::Kind::SparseLayerList as i32
+                matches!(
+                    layer.layer.as_ref(),
+                    Some(pb21::sparse_structural_layer::Layer::List(_))
+                )
             })
         }));
         let map_cases = TestCases::default()
@@ -1490,23 +1541,19 @@ mod tests {
             .unwrap();
         for page in &fsl_pages {
             let layout = sparse_layout(page);
-            let outer_slots = layout.structural_layers.first().unwrap().num_slots;
+            let outer_slots = layer_num_slots(layout.structural_layers.first().unwrap());
             let fixed_size_scale = layout
                 .structural_layers
                 .iter()
-                .filter(|layer| {
-                    layer.kind
-                        == pb21::sparse_structural_layer::Kind::SparseLayerFixedSizeList as i32
-                })
-                .map(|layer| layer.fixed_size_list_dimension)
+                .filter_map(fixed_size_list_dimension)
                 .product::<u64>();
             assert_eq!(page.num_rows, outer_slots * fixed_size_scale);
         }
         assert!(fsl_pages.iter().map(sparse_layout).any(|layout| {
-            layout.structural_layers.iter().any(|layer| {
-                layer.kind == pb21::sparse_structural_layer::Kind::SparseLayerFixedSizeList as i32
-                    && layer.fixed_size_list_dimension == 2
-            })
+            layout
+                .structural_layers
+                .iter()
+                .any(|layer| fixed_size_list_dimension(layer) == Some(2))
         }));
         let fsl_cases = TestCases::default()
             .with_min_file_version(LanceFileVersion::V2_3)
@@ -1527,16 +1574,17 @@ mod tests {
             let kinds = layout
                 .structural_layers
                 .iter()
-                .map(|layer| layer.kind)
+                .map(|layer| match layer.layer.as_ref().unwrap() {
+                    pb21::sparse_structural_layer::Layer::Validity(_) => "validity",
+                    pb21::sparse_structural_layer::Layer::List(_) => "list",
+                    pb21::sparse_structural_layer::Layer::FixedSizeList(_) => "fixed-size-list",
+                })
                 .collect::<Vec<_>>();
-            kinds.starts_with(&[
-                pb21::sparse_structural_layer::Kind::SparseLayerList as i32,
-                pb21::sparse_structural_layer::Kind::SparseLayerFixedSizeList as i32,
-            ])
+            kinds.starts_with(&["list", "fixed-size-list"])
         }));
         for page in &pages {
             let layout = sparse_layout(page);
-            let outer_slots = layout.structural_layers.first().unwrap().num_slots;
+            let outer_slots = layer_num_slots(layout.structural_layers.first().unwrap());
             assert_eq!(page.num_rows, outer_slots * 2);
         }
 

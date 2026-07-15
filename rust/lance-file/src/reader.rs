@@ -1204,7 +1204,7 @@ impl FileReader {
                         )?)
                     }
                     _ => {
-                        let layout = Self::fetch_encoding::<pbenc21::PageLayout>(
+                        PageEncoding::Structural(Self::fetch_encoding::<pbenc21::PageLayout>(
                             page.encoding.as_ref().ok_or_else(|| {
                                 Error::invalid_input_source(
                                     format!(
@@ -1214,19 +1214,7 @@ impl FileReader {
                                     .into(),
                                 )
                             })?,
-                        )?;
-                        if file_version < LanceFileVersion::V2_3
-                            && Self::layout_contains_sparse(&layout)
-                        {
-                            return Err(Error::invalid_input_source(
-                                format!(
-                                    "Column {} page {} uses SparseLayout in a pre-2.3 file",
-                                    col_idx, page_idx
-                                )
-                                .into(),
-                            ));
-                        }
-                        PageEncoding::Structural(layout)
+                        )?)
                     }
                 };
                 if page.buffer_offsets.len() != page.buffer_sizes.len() {
@@ -1298,20 +1286,6 @@ impl FileReader {
                 )
             })?)?,
         }))
-    }
-
-    fn layout_contains_sparse(layout: &pbenc21::PageLayout) -> bool {
-        let mut current = Some(layout);
-        while let Some(layout) = current {
-            match layout.layout.as_ref() {
-                Some(pbenc21::page_layout::Layout::SparseLayout(_)) => return true,
-                Some(pbenc21::page_layout::Layout::BlobLayout(blob)) => {
-                    current = blob.inner_layout.as_deref();
-                }
-                _ => return false,
-            }
-        }
-        false
     }
 
     fn validate_projection(
@@ -2215,7 +2189,18 @@ impl FileReadCore {
                         Some(pbenc21::page_layout::Layout::SparseLayout(sparse)) => sparse
                             .structural_layers
                             .first()
-                            .map_or(page.num_rows, |layer| layer.num_slots),
+                            .and_then(|layer| layer.layer.as_ref())
+                            .map_or(page.num_rows, |layer| match layer {
+                                pbenc21::sparse_structural_layer::Layer::Validity(layer) => {
+                                    layer.num_slots
+                                }
+                                pbenc21::sparse_structural_layer::Layer::List(layer) => {
+                                    layer.num_slots
+                                }
+                                pbenc21::sparse_structural_layer::Layer::FixedSizeList(layer) => {
+                                    layer.num_slots
+                                }
+                            }),
                         _ => page.num_rows,
                     },
                     _ => page.num_rows,
@@ -2722,8 +2707,6 @@ mod tests {
     };
     use lance_io::{stream::RecordBatchStream, utils::CachedFileSize};
     use log::debug;
-    use prost::{Message, Name};
-    use prost_types::Any;
     use rstest::rstest;
     use tokio::sync::mpsc;
 
@@ -2734,78 +2717,6 @@ mod tests {
     use crate::testing::{FsFixture, WrittenFile, test_cache, write_lance_file};
     use crate::writer::{EncodedBatchWriteExt, FileWriter, FileWriterOptions};
     use lance_encoding::decoder::DecoderConfig;
-
-    fn direct_encoding<M: Message + Name>(message: &M) -> crate::format::pbfile::Encoding {
-        crate::format::pbfile::Encoding {
-            location: Some(crate::format::pbfile::encoding::Location::Direct(
-                crate::format::pbfile::DirectEncoding {
-                    encoding: Any::from_msg(message).unwrap().encode_to_vec(),
-                },
-            )),
-        }
-    }
-
-    #[test]
-    fn sparse_layout_requires_file_version_2_3() {
-        use lance_encoding::format::{pb, pb21};
-
-        let layout = pb21::PageLayout {
-            layout: Some(pb21::page_layout::Layout::SparseLayout(
-                pb21::SparseLayout {
-                    value_compression: None,
-                    num_buffers: 0,
-                    num_items: 0,
-                    num_visible_items: 0,
-                    has_large_chunk: false,
-                    structural_layers: Vec::new(),
-                },
-            )),
-        };
-        let column_encoding = pb::ColumnEncoding {
-            column_encoding: Some(pb::column_encoding::ColumnEncoding::Values(())),
-        };
-        let metadata = crate::format::pbfile::ColumnMetadata {
-            pages: vec![crate::format::pbfile::column_metadata::Page {
-                buffer_offsets: vec![0, 4096],
-                buffer_sizes: vec![0, 0],
-                length: 0,
-                encoding: Some(direct_encoding(&layout)),
-                priority: 0,
-            }],
-            buffer_offsets: Vec::new(),
-            buffer_sizes: Vec::new(),
-            encoding: Some(direct_encoding(&column_encoding)),
-        };
-
-        let err = FileReader::meta_to_col_info(0, &metadata, LanceFileVersion::V2_2).unwrap_err();
-        assert!(err.to_string().contains("SparseLayout in a pre-2.3 file"));
-        FileReader::meta_to_col_info(0, &metadata, LanceFileVersion::V2_3).unwrap();
-
-        let blob_wrapped_layout = pb21::PageLayout {
-            layout: Some(pb21::page_layout::Layout::BlobLayout(Box::new(
-                pb21::BlobLayout {
-                    inner_layout: Some(Box::new(layout)),
-                    layers: Vec::new(),
-                },
-            ))),
-        };
-        let mut blob_wrapped = metadata.clone();
-        blob_wrapped.pages[0].encoding = Some(direct_encoding(&blob_wrapped_layout));
-        let err =
-            FileReader::meta_to_col_info(0, &blob_wrapped, LanceFileVersion::V2_2).unwrap_err();
-        assert!(err.to_string().contains("SparseLayout in a pre-2.3 file"));
-
-        let mut malformed = metadata;
-        malformed.pages[0].encoding = Some(crate::format::pbfile::Encoding {
-            location: Some(crate::format::pbfile::encoding::Location::Direct(
-                crate::format::pbfile::DirectEncoding {
-                    encoding: vec![0xff],
-                },
-            )),
-        });
-        let err = FileReader::meta_to_col_info(0, &malformed, LanceFileVersion::V2_3).unwrap_err();
-        assert!(matches!(err, lance_core::Error::InvalidInput { .. }));
-    }
 
     #[tokio::test]
     async fn sparse_file_writer_reader_scan_range_and_take_roundtrip() {

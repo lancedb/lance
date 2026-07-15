@@ -329,10 +329,13 @@ have per offset (for variable-width data).
 
 ### Sparse Page Layout
 
-Sparse pages are a Lance 2.3+ layout for flat or nested data whose Arrow structure can be represented directly as
-slot-domain mappings instead of dense repetition and definition events. Readers must reject this layout in files whose
-declared version is earlier than 2.3, including when it is nested as a blob layout's inner page. This layout is
+Sparse pages require Lance 2.3. They represent flat or nested Arrow structure directly as slot-domain mappings instead
+of dense repetition and definition events. Writers emit this layout only in files declared as 2.3. The layout is
 identified only by `PageLayout`; field metadata does not identify the layout of an existing page.
+
+A domain is a layer-local integer coordinate space `[0, num_slots)`, and a slot is one element in that space. The
+outer-most domain contains the page's top-level rows. Each layer maps its parent domain to the next layer's parent
+domain, and the terminal child domain contains the leaf value slots stored in value chunks.
 
 Structural layers are ordered from outer-most to inner-most:
 
@@ -347,11 +350,11 @@ page could use this shorter wire representation.
 A list slot that is valid and absent from `non_empty_positions` is an empty list. Maps use the same structural contract
 as lists. The terminal child-domain size equals `SparseLayout.num_visible_items`.
 
-`SparseLayout.num_items` is exact, not a lower bound. It equals `num_visible_items` plus, for every list layer,
-`num_slots - non_empty_positions.num_positions`. `ColumnMetadata.Page.length` is the encoded scheduling length: it
-equals the outer layer's `num_slots` multiplied by every fixed-size-list dimension in the layer chain. It is not the
-primitive leaf count when a fixed-size-list is nested below a list. The first layer's `num_slots` is the logical
-top-level row count used for projection. With no layers, `Page.length` equals `num_visible_items`.
+`SparseLayout.num_visible_items` is the number of leaf value slots encoded in value chunks. Null leaf slots count
+because they still occupy positions in Arrow's leaf value buffer; a nullable primitive with 100 slots, including 30
+nulls, has 100 visible items. `SparseLayout.num_items` is the number of entries in the equivalent dense repetition and
+definition stream. It equals `num_visible_items` plus one structural placeholder for every list slot without children.
+The first layer's `num_slots` is the logical top-level row count used for projection.
 
 Position sets have four semantic representations: `empty`, `all`, one non-empty `range`, or an `explicit`
 delta-compressed `u64` buffer. Count sets are `empty`, one positive `constant` value, or an `explicit` compressed `u64`
@@ -365,16 +368,15 @@ semantics after normalization.
 
 #### Writer Selection
 
-Writers may emit this layout only for Lance 2.3+ fields that explicitly set
-`lance-encoding:structural-encoding=sparse`. The same request is an input error for earlier file versions. This metadata
-controls writer selection only: readers always use `PageLayout` to determine the layout of an encoded page and must
-not use field metadata for that decision.
+The Lance 2.3 writer selects this layout when a field sets `lance-encoding:structural-encoding=sparse`. The same request
+is an input error for earlier file versions. This metadata controls writer selection only: readers always use
+`PageLayout` to determine the layout of an encoded page and must not use field metadata for that decision.
 
-Sparse selection is opt-in. The default Lance 2.3 writer policy remains unchanged, as do explicit `miniblock` and
-`fullzip` requests. Writers normalize Arrow validity and list structure once, then use that semantic structure for
-either dense repetition/definition serialization or sparse position/count serialization. All-valid layers use null
-positions plus `empty`; all-null layers use valid positions plus `empty`. Other layers choose the validity polarity
-with the lower semantic encoded cost, with ties using null positions.
+The default Lance 2.3 writer policy remains unchanged, as do explicit `miniblock` and `fullzip` requests. Writers
+normalize Arrow validity and list structure once, then use that semantic structure for either dense
+repetition/definition serialization or sparse position/count serialization. All-valid layers use null positions plus
+`empty`; all-null layers use valid positions plus `empty`. Other layers choose the validity polarity with the lower
+semantic encoded cost, with ties using null positions.
 
 Pages without a value payload keep the existing canonical `ConstantLayout`: structural-only types such as an empty
 struct, and leaf pages whose visible values are all null, do not emit `SparseLayout`. An explicitly sparse page with
@@ -406,6 +408,18 @@ Readers normalize structural metadata once, project requested top-level ranges t
 chunks that intersect the resulting leaf ranges. When no leaf range remains, readers rebuild offsets and validity from
 the structural plan without reading buffer 1.
 
+#### Caching and Point Reads
+
+Reader initialization loads buffer 0 and every explicit structural buffer, then validates and normalizes them into a
+cached page plan. The cached state contains parsed value-chunk descriptors and prefix offsets, decoded semantic
+position/count sets, validity, and the ordered structural layers. It does not contain value payload bytes from buffer
+1. The plan is cached per field and page and reused by later scans, range reads, and takes.
+
+After that plan is cached, reading one primitive leaf value reads only the value chunk that contains it. A cold read
+first loads the structural metadata and then the intersecting value chunk. Reading one top-level list or
+fixed-size-list value may intersect multiple leaf chunks and reads each intersecting chunk. A selection whose projected
+structure contains no leaf slots reads no value chunk.
+
 #### Validation
 
 Readers must reject malformed sparse metadata instead of inferring or repairing it. Required checks include:
@@ -425,6 +439,18 @@ Readers must reject malformed sparse metadata instead of inferring or repairing 
 
 ```protobuf
 %%% proto.message.SparseStructuralLayer %%%
+```
+
+```protobuf
+%%% proto.message.SparseValidityLayer %%%
+```
+
+```protobuf
+%%% proto.message.SparseListLayer %%%
+```
+
+```protobuf
+%%% proto.message.SparseFixedSizeListLayer %%%
 ```
 
 ```protobuf
@@ -661,7 +687,7 @@ options. However, they can also be set in the field metadata in the schema.
 | `lance-encoding:dict-values-compression-level` | Integers (scheme dependent) | Varies by scheme | Compression level for dictionary values general compression                             |
 | `lance-encoding:general`             | `off`, `on`                          | `off`            | Whether to apply general compression.                                                   |
 | `lance-encoding:packed`              | Any string                           | Not set          | Whether to apply packed struct encoding (see above).                                    |
-| `lance-encoding:structural-encoding` | `miniblock`, `fullzip`, `sparse`     | Not set          | Select a structural encoding; `sparse` is an explicit Lance 2.3-only opt-in.             |
+| `lance-encoding:structural-encoding` | `miniblock`, `fullzip`, `sparse`     | Not set          | Select a structural encoding; `sparse` requires Lance 2.3.                               |
 
 ### Configuration Details
 

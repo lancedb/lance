@@ -1171,6 +1171,43 @@ pub(super) struct SparseStructuralScheduler {
 }
 
 impl SparseStructuralScheduler {
+    fn require_layer(
+        layer: &pb21::SparseStructuralLayer,
+    ) -> Result<&pb21::sparse_structural_layer::Layer> {
+        layer.layer.as_ref().ok_or_else(|| {
+            Error::invalid_input_source(
+                "Sparse structural layer is missing its layer variant".into(),
+            )
+        })
+    }
+
+    fn layer_num_slots(layer: &pb21::SparseStructuralLayer) -> Result<u64> {
+        Ok(match Self::require_layer(layer)? {
+            pb21::sparse_structural_layer::Layer::Validity(layer) => layer.num_slots,
+            pb21::sparse_structural_layer::Layer::List(layer) => layer.num_slots,
+            pb21::sparse_structural_layer::Layer::FixedSizeList(layer) => layer.num_slots,
+        })
+    }
+
+    fn layer_num_child_slots(layer: &pb21::SparseStructuralLayer) -> Result<u64> {
+        Ok(match Self::require_layer(layer)? {
+            pb21::sparse_structural_layer::Layer::Validity(layer) => layer.num_slots,
+            pb21::sparse_structural_layer::Layer::List(layer) => layer.num_child_slots,
+            pb21::sparse_structural_layer::Layer::FixedSizeList(layer) => layer
+                .num_slots
+                .checked_mul(layer.dimension)
+                .ok_or_else(|| {
+                    Error::invalid_input_source(
+                        format!(
+                            "Sparse structural fixed-size-list child slot count overflows: slots={}, dimension={}",
+                            layer.num_slots, layer.dimension
+                        )
+                        .into(),
+                    )
+                })?,
+        })
+    }
+
     pub(super) fn try_new(
         buffer_offsets_and_sizes: &[(u64, u64)],
         priority: u64,
@@ -1192,10 +1229,10 @@ impl SparseStructuralScheduler {
                 .into(),
             ));
         }
-        let row_domain = layout
-            .structural_layers
-            .first()
-            .map_or(encoded_row_domain, |layer| layer.num_slots);
+        let row_domain = match layout.structural_layers.first() {
+            Some(layer) => Self::layer_num_slots(layer)?,
+            None => encoded_row_domain,
+        };
         Self::validate_domain_chain(
             &layout.structural_layers,
             row_domain,
@@ -1219,20 +1256,16 @@ impl SparseStructuralScheduler {
                 .structural_layers
                 .iter()
                 .try_fold(1_u64, |scale, layer| -> Result<u64> {
-                    let kind = invalid_enum(
-                        pb21::sparse_structural_layer::Kind::try_from(layer.kind),
-                        "layer kind",
-                    )?;
-                    if kind == pb21::sparse_structural_layer::Kind::SparseLayerFixedSizeList {
-                        scale
-                            .checked_mul(layer.fixed_size_list_dimension)
-                            .ok_or_else(|| {
+                    match Self::require_layer(layer)? {
+                        pb21::sparse_structural_layer::Layer::FixedSizeList(layer) => {
+                            scale.checked_mul(layer.dimension).ok_or_else(|| {
                                 Error::invalid_input_source(
                                     "Sparse structural fixed-size-list row scale overflows".into(),
                                 )
                             })
-                    } else {
-                        Ok(scale)
+                        }
+                        pb21::sparse_structural_layer::Layer::Validity(_)
+                        | pb21::sparse_structural_layer::Layer::List(_) => Ok(scale),
                     }
                 })?;
         let expected_encoded_row_domain = row_domain.checked_mul(row_scale).ok_or_else(|| {
@@ -1676,12 +1709,8 @@ impl SparseStructuralScheduler {
             layers
                 .iter()
                 .try_fold(num_visible_items, |items, layer| -> Result<u64> {
-                    let kind = invalid_enum(
-                        pb21::sparse_structural_layer::Kind::try_from(layer.kind),
-                        "layer kind",
-                    )?;
-                    let additional = match kind {
-                        pb21::sparse_structural_layer::Kind::SparseLayerList => {
+                    let additional = match Self::require_layer(layer)? {
+                        pb21::sparse_structural_layer::Layer::List(layer) => {
                             let positions = Self::require_position_set(
                                 &layer.non_empty_positions,
                                 "list non-empty",
@@ -1698,9 +1727,8 @@ impl SparseStructuralScheduler {
                             )
                             })?
                         }
-                        pb21::sparse_structural_layer::Kind::SparseLayerValidity
-                        | pb21::sparse_structural_layer::Kind::SparseLayerFixedSizeList
-                        | pb21::sparse_structural_layer::Kind::SparseLayerUnspecified => 0,
+                        pb21::sparse_structural_layer::Layer::Validity(_)
+                        | pb21::sparse_structural_layer::Layer::FixedSizeList(_) => 0,
                     };
                     items.checked_add(additional).ok_or_else(|| {
                         Error::invalid_input_source("Sparse structural item count overflows".into())
@@ -1717,18 +1745,20 @@ impl SparseStructuralScheduler {
         }
         let mut expected_slots = row_domain;
         for (layer_index, layer) in layers.iter().enumerate() {
-            usize_from_u64(layer.num_slots, "layer slot count")?;
-            usize_from_u64(layer.num_child_slots, "layer child slot count")?;
-            if layer.num_slots != expected_slots {
+            let num_slots = Self::layer_num_slots(layer)?;
+            let num_child_slots = Self::layer_num_child_slots(layer)?;
+            usize_from_u64(num_slots, "layer slot count")?;
+            usize_from_u64(num_child_slots, "layer child slot count")?;
+            if num_slots != expected_slots {
                 return Err(Error::invalid_input_source(
                     format!(
                         "Sparse structural layer {} has {} slots, expected {} from the outer domain",
-                        layer_index, layer.num_slots, expected_slots
+                        layer_index, num_slots, expected_slots
                     )
                     .into(),
                 ));
             }
-            expected_slots = layer.num_child_slots;
+            expected_slots = num_child_slots;
         }
         if expected_slots != num_visible_items {
             return Err(Error::invalid_input_source(
@@ -1857,25 +1887,6 @@ impl SparseStructuralScheduler {
                 format!("Sparse structural {label} validity set is required").into(),
             )
         })
-    }
-
-    fn reject_position_set(set: &Option<pb21::SparsePositionSet>, label: &str) -> Result<()> {
-        if set.is_some() {
-            return Err(Error::invalid_input_source(
-                format!("Sparse structural {label} position set is not valid for this layer")
-                    .into(),
-            ));
-        }
-        Ok(())
-    }
-
-    fn reject_count_set(set: &Option<pb21::SparseCountSet>, label: &str) -> Result<()> {
-        if set.is_some() {
-            return Err(Error::invalid_input_source(
-                format!("Sparse structural {label} count set is not valid for this layer").into(),
-            ));
-        }
-        Ok(())
     }
 
     fn validity_meaning(
@@ -2228,158 +2239,106 @@ impl SparseStructuralScheduler {
     }
 
     fn structural_buffer_count(layers: &[pb21::SparseStructuralLayer]) -> Result<usize> {
-        layers.iter().try_fold(
-            0_usize,
-            |mut count, layer| -> Result<usize> {
-            let kind = invalid_enum(
-                pb21::sparse_structural_layer::Kind::try_from(layer.kind),
-                "layer kind",
-            )?;
-            match kind {
-                pb21::sparse_structural_layer::Kind::SparseLayerValidity => {
-                    if layer.num_child_slots != layer.num_slots {
-                        return Err(Error::invalid_input_source(
-                            format!(
-                                "Sparse structural validity child slots {} do not match slots {}",
-                                layer.num_child_slots, layer.num_slots
-                            )
-                            .into(),
-                        ));
+        layers
+            .iter()
+            .try_fold(0_usize, |mut count, layer| -> Result<usize> {
+                match Self::require_layer(layer)? {
+                    pb21::sparse_structural_layer::Layer::Validity(layer) => {
+                        let (validity_buffers, _, _) = Self::validity_buffer_count(
+                            Self::require_validity_set(&layer.validity, "validity")?,
+                            layer.num_slots,
+                            "validity positions",
+                        )?;
+                        Self::add_buffer_count(&mut count, validity_buffers)?;
                     }
-                    if layer.fixed_size_list_dimension != 0 {
-                        return Err(Error::invalid_input_source(
-                            "Sparse structural validity layer has fixed-size-list dimension".into(),
-                        ));
+                    pb21::sparse_structural_layer::Layer::List(layer) => {
+                        let non_empty_positions = Self::require_position_set(
+                            &layer.non_empty_positions,
+                            "list non-empty",
+                        )?;
+                        let num_non_empty = Self::position_cardinality(
+                            non_empty_positions,
+                            layer.num_slots,
+                            "list non-empty positions",
+                        )?;
+                        let non_empty_buffers = Self::position_buffer_count(
+                            non_empty_positions,
+                            layer.num_slots,
+                            "list non-empty positions",
+                        )?;
+                        Self::add_buffer_count(&mut count, non_empty_buffers)?;
+                        let (validity_buffers, validity_meaning, validity_cardinality) =
+                            Self::validity_buffer_count(
+                                Self::require_validity_set(&layer.validity, "list")?,
+                                layer.num_slots,
+                                "list validity positions",
+                            )?;
+                        Self::add_buffer_count(&mut count, validity_buffers)?;
+                        let num_valid_slots = Self::num_valid_slots(
+                            validity_meaning,
+                            validity_cardinality,
+                            layer.num_slots,
+                            "list validity",
+                        )?;
+                        if num_non_empty > num_valid_slots {
+                            return Err(Error::invalid_input_source(
+                                format!(
+                                    "Sparse structural list has {} non-empty slots but only {} valid slots",
+                                    num_non_empty, num_valid_slots
+                                )
+                                .into(),
+                            ));
+                        }
+                        let counts = Self::require_count_set(&layer.counts, "list counts")?;
+                        let count_buffers =
+                            Self::count_buffer_count(counts, num_non_empty, "list counts")?;
+                        Self::add_buffer_count(&mut count, count_buffers)?;
+                        if let Some(child_slots) =
+                            Self::count_set_child_slots(counts, num_non_empty, "list counts")?
+                            && child_slots != layer.num_child_slots
+                        {
+                            return Err(Error::invalid_input_source(
+                                format!(
+                                    "Sparse structural list count sum {} does not match child slots {}",
+                                    child_slots, layer.num_child_slots
+                                )
+                                .into(),
+                            ));
+                        }
                     }
-                    Self::reject_position_set(
-                        &layer.non_empty_positions,
-                        "validity non-empty positions",
-                    )?;
-                    Self::reject_count_set(&layer.counts, "validity counts")?;
-                    let (validity_buffers, _, _) = Self::validity_buffer_count(
-                        Self::require_validity_set(&layer.validity, "validity")?,
-                        layer.num_slots,
-                        "validity positions",
-                    )?;
-                    Self::add_buffer_count(&mut count, validity_buffers)?;
-                }
-                pb21::sparse_structural_layer::Kind::SparseLayerList => {
-                    if layer.fixed_size_list_dimension != 0 {
-                        return Err(Error::invalid_input_source(
-                            "Sparse structural list layer has fixed-size-list dimension".into(),
-                        ));
-                    }
-                    let non_empty_positions =
-                        Self::require_position_set(&layer.non_empty_positions, "list non-empty")?;
-                    let num_non_empty = Self::position_cardinality(
-                        non_empty_positions,
-                        layer.num_slots,
-                        "list non-empty positions",
-                    )?;
-                    let non_empty_buffers = Self::position_buffer_count(
-                        non_empty_positions,
-                        layer.num_slots,
-                        "list non-empty positions",
-                    )?;
-                    Self::add_buffer_count(&mut count, non_empty_buffers)?;
-                    let (validity_buffers, validity_meaning, validity_cardinality) =
-                        Self::validity_buffer_count(
-                        Self::require_validity_set(&layer.validity, "list")?,
-                        layer.num_slots,
-                        "list validity positions",
-                    )?;
-                    Self::add_buffer_count(&mut count, validity_buffers)?;
-                    let num_valid_slots = Self::num_valid_slots(
-                        validity_meaning,
-                        validity_cardinality,
-                        layer.num_slots,
-                        "list validity",
-                    )?;
-                    if num_non_empty > num_valid_slots {
-                        return Err(Error::invalid_input_source(
-                            format!(
-                                "Sparse structural list has {} non-empty slots but only {} valid slots",
-                                num_non_empty, num_valid_slots
-                            )
-                            .into(),
-                        ));
-                    }
-                    let counts = Self::require_count_set(&layer.counts, "list counts")?;
-                    let count_buffers =
-                        Self::count_buffer_count(counts, num_non_empty, "list counts")?;
-                    Self::add_buffer_count(&mut count, count_buffers)?;
-                    if let Some(child_slots) =
-                        Self::count_set_child_slots(counts, num_non_empty, "list counts")?
-                        && child_slots != layer.num_child_slots
-                    {
-                        return Err(Error::invalid_input_source(
-                            format!(
-                                "Sparse structural list count sum {} does not match child slots {}",
-                                child_slots, layer.num_child_slots
-                            )
-                            .into(),
-                        ));
-                    }
-                }
-                pb21::sparse_structural_layer::Kind::SparseLayerFixedSizeList => {
-                    if layer.fixed_size_list_dimension == 0 {
-                        return Err(Error::invalid_input_source(
-                            "Sparse structural fixed-size-list dimension is zero".into(),
-                        ));
-                    }
-                    Self::reject_position_set(
-                        &layer.non_empty_positions,
-                        "fixed-size-list non-empty positions",
-                    )?;
-                    Self::reject_count_set(&layer.counts, "fixed-size-list counts")?;
-                    let expected_child_slots = layer
-                        .num_slots
-                        .checked_mul(layer.fixed_size_list_dimension)
-                        .ok_or_else(|| {
+                    pb21::sparse_structural_layer::Layer::FixedSizeList(layer) => {
+                        if layer.dimension == 0 {
+                            return Err(Error::invalid_input_source(
+                                "Sparse structural fixed-size-list dimension is zero".into(),
+                            ));
+                        }
+                        layer.num_slots.checked_mul(layer.dimension).ok_or_else(|| {
                             Error::invalid_input_source(
                                 format!(
                                     "Sparse structural fixed-size-list child slot count overflows: slots={}, dimension={}",
-                                    layer.num_slots, layer.fixed_size_list_dimension
+                                    layer.num_slots, layer.dimension
                                 )
                                 .into(),
                             )
                         })?;
-                    if expected_child_slots != layer.num_child_slots {
-                        return Err(Error::invalid_input_source(
-                            format!(
-                                "Sparse structural fixed-size-list child slot count {} does not match slots {} * dimension {}",
-                                layer.num_child_slots, layer.num_slots, layer.fixed_size_list_dimension
-                            )
-                            .into(),
-                        ));
+                        let (validity_buffers, _, _) = Self::validity_buffer_count(
+                            Self::require_validity_set(&layer.validity, "fixed-size-list")?,
+                            layer.num_slots,
+                            "fixed-size-list validity positions",
+                        )?;
+                        Self::add_buffer_count(&mut count, validity_buffers)?;
                     }
-                    let (validity_buffers, _, _) = Self::validity_buffer_count(
-                        Self::require_validity_set(&layer.validity, "fixed-size-list")?,
-                        layer.num_slots,
-                        "fixed-size-list validity positions",
-                    )?;
-                    Self::add_buffer_count(&mut count, validity_buffers)?;
                 }
-                pb21::sparse_structural_layer::Kind::SparseLayerUnspecified => {
-                    return Err(Error::invalid_input_source(
-                        "Sparse structural layer kind is unspecified".into(),
-                    ));
-                }
-            }
-            Ok(count)
-        })
+                Ok(count)
+            })
     }
 
     fn layer_decompressors(
         layer: &pb21::SparseStructuralLayer,
         decompressors: &dyn DecompressionStrategy,
     ) -> Result<SparseLayerDecompressors> {
-        let kind = invalid_enum(
-            pb21::sparse_structural_layer::Kind::try_from(layer.kind),
-            "layer kind",
-        )?;
-        Ok(match kind {
-            pb21::sparse_structural_layer::Kind::SparseLayerValidity => {
+        Ok(match Self::require_layer(layer)? {
+            pb21::sparse_structural_layer::Layer::Validity(layer) => {
                 let (validity, _) = Self::validity_set_decoder(
                     Self::require_validity_set(&layer.validity, "validity")?,
                     layer.num_slots,
@@ -2391,7 +2350,7 @@ impl SparseStructuralScheduler {
                     validity,
                 }
             }
-            pb21::sparse_structural_layer::Kind::SparseLayerList => {
+            pb21::sparse_structural_layer::Layer::List(layer) => {
                 let non_empty_positions =
                     Self::require_position_set(&layer.non_empty_positions, "list non-empty")?;
                 let (non_empty_positions, num_non_empty) = Self::position_set_decoder(
@@ -2420,7 +2379,7 @@ impl SparseStructuralScheduler {
                     validity,
                 }
             }
-            pb21::sparse_structural_layer::Kind::SparseLayerFixedSizeList => {
+            pb21::sparse_structural_layer::Layer::FixedSizeList(layer) => {
                 let (validity, _) = Self::validity_set_decoder(
                     Self::require_validity_set(&layer.validity, "fixed-size-list")?,
                     layer.num_slots,
@@ -2429,15 +2388,17 @@ impl SparseStructuralScheduler {
                 )?;
                 SparseLayerDecompressors::FixedSizeList {
                     num_slots: layer.num_slots,
-                    num_child_slots: layer.num_child_slots,
-                    dimension: layer.fixed_size_list_dimension,
+                    num_child_slots: layer.num_slots.checked_mul(layer.dimension).ok_or_else(
+                        || {
+                            Error::invalid_input_source(
+                                "Sparse structural fixed-size-list child slot count overflows"
+                                    .into(),
+                            )
+                        },
+                    )?,
+                    dimension: layer.dimension,
                     validity,
                 }
-            }
-            pb21::sparse_structural_layer::Kind::SparseLayerUnspecified => {
-                return Err(Error::invalid_input_source(
-                    "Sparse structural layer kind is unspecified".into(),
-                ));
             }
         })
     }
@@ -4813,6 +4774,56 @@ mod tests {
         }
     }
 
+    fn validity_layer(
+        num_slots: u64,
+        validity: Option<pb21::SparseValiditySet>,
+    ) -> pb21::SparseStructuralLayer {
+        pb21::SparseStructuralLayer {
+            layer: Some(pb21::sparse_structural_layer::Layer::Validity(
+                pb21::SparseValidityLayer {
+                    num_slots,
+                    validity,
+                },
+            )),
+        }
+    }
+
+    fn list_layer(
+        num_slots: u64,
+        num_child_slots: u64,
+        non_empty_positions: Option<pb21::SparsePositionSet>,
+        counts: Option<pb21::SparseCountSet>,
+        validity: Option<pb21::SparseValiditySet>,
+    ) -> pb21::SparseStructuralLayer {
+        pb21::SparseStructuralLayer {
+            layer: Some(pb21::sparse_structural_layer::Layer::List(
+                pb21::SparseListLayer {
+                    num_slots,
+                    num_child_slots,
+                    non_empty_positions,
+                    counts,
+                    validity,
+                },
+            )),
+        }
+    }
+
+    fn fixed_size_list_layer(
+        num_slots: u64,
+        dimension: u64,
+        validity: Option<pb21::SparseValiditySet>,
+    ) -> pb21::SparseStructuralLayer {
+        pb21::SparseStructuralLayer {
+            layer: Some(pb21::sparse_structural_layer::Layer::FixedSizeList(
+                pb21::SparseFixedSizeListLayer {
+                    num_slots,
+                    dimension,
+                    validity,
+                },
+            )),
+        }
+    }
+
     fn assert_invalid_input_contains(err: Error, expected: &str) {
         let message = err.to_string();
         assert!(
@@ -4826,19 +4837,13 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_enums_and_item_count_mismatches() {
+    fn rejects_missing_layer_variants_and_item_count_mismatches() {
         let decompressors = DefaultDecompressionStrategy::default();
 
         let mut layout = sparse_layout();
-        layout.structural_layers.push(pb21::SparseStructuralLayer {
-            kind: i32::MAX,
-            num_slots: 1,
-            num_child_slots: 1,
-            non_empty_positions: None,
-            counts: None,
-            fixed_size_list_dimension: 0,
-            validity: null_positions(position_empty()),
-        });
+        layout
+            .structural_layers
+            .push(pb21::SparseStructuralLayer { layer: None });
         let err = SparseStructuralScheduler::try_new(
             &[(0, 0), (0, 0)],
             0,
@@ -4848,19 +4853,13 @@ mod tests {
             &decompressors,
         )
         .unwrap_err();
-        assert_invalid_input_contains(err, "invalid enum value");
+        assert_invalid_input_contains(err, "missing its layer variant");
 
         let mut layout = sparse_layout();
         layout.num_items = 2;
-        layout.structural_layers.push(pb21::SparseStructuralLayer {
-            kind: pb21::sparse_structural_layer::Kind::SparseLayerValidity as i32,
-            num_slots: 1,
-            num_child_slots: 1,
-            non_empty_positions: None,
-            counts: None,
-            fixed_size_list_dimension: 0,
-            validity: null_positions(position_empty()),
-        });
+        layout
+            .structural_layers
+            .push(validity_layer(1, null_positions(position_empty())));
         let err = SparseStructuralScheduler::try_new(
             &[(0, 0), (0, 0)],
             0,
@@ -4884,15 +4883,10 @@ mod tests {
         let mut layout = sparse_layout();
         layout.num_items = explicit_values;
         layout.num_visible_items = explicit_values;
-        layout.structural_layers.push(pb21::SparseStructuralLayer {
-            kind: pb21::sparse_structural_layer::Kind::SparseLayerValidity as i32,
-            num_slots: explicit_values,
-            num_child_slots: explicit_values,
-            non_empty_positions: None,
-            counts: None,
-            fixed_size_list_dimension: 0,
-            validity: null_positions(position_explicit(explicit_values)),
-        });
+        layout.structural_layers.push(validity_layer(
+            explicit_values,
+            null_positions(position_explicit(explicit_values)),
+        ));
 
         SparseStructuralScheduler::try_new(
             &[
@@ -5181,20 +5175,15 @@ mod tests {
     #[tokio::test]
     async fn rejects_malformed_general_structural_buffers_as_invalid_input() {
         let mut layout = sparse_layout();
-        layout.structural_layers.push(pb21::SparseStructuralLayer {
-            kind: pb21::sparse_structural_layer::Kind::SparseLayerValidity as i32,
-            num_slots: 1,
-            num_child_slots: 1,
-            non_empty_positions: None,
-            counts: None,
-            fixed_size_list_dimension: 0,
-            validity: null_positions(position_set(
+        layout.structural_layers.push(validity_layer(
+            1,
+            null_positions(position_set(
                 pb21::sparse_position_set::Positions::Explicit(general_lz4(ProtobufUtils21::flat(
                     64, None,
                 ))),
                 1,
             )),
-        });
+        ));
         let decompressors = DefaultDecompressionStrategy::default();
 
         let mut scheduler = SparseStructuralScheduler::try_new(
@@ -5257,15 +5246,12 @@ mod tests {
         let mut layout = sparse_layout();
         layout.num_items = 2;
         layout.num_visible_items = 2;
-        layout.structural_layers.push(pb21::SparseStructuralLayer {
-            kind: pb21::sparse_structural_layer::Kind::SparseLayerValidity as i32,
-            num_slots: 1,
-            num_child_slots: 2,
-            non_empty_positions: None,
-            counts: None,
-            fixed_size_list_dimension: 0,
-            validity: null_positions(position_empty()),
-        });
+        layout
+            .structural_layers
+            .push(validity_layer(1, null_positions(position_empty())));
+        layout
+            .structural_layers
+            .push(validity_layer(2, null_positions(position_empty())));
         let err = SparseStructuralScheduler::try_new(
             &[(0, 0), (0, 0)],
             0,
@@ -5275,20 +5261,16 @@ mod tests {
             &decompressors,
         )
         .unwrap_err();
-        assert_invalid_input_contains(err, "validity child slots");
+        assert_invalid_input_contains(err, "layer 1 has 2 slots, expected 1");
 
         let mut layout = sparse_layout();
         layout.num_items = 4;
         layout.num_visible_items = 4;
-        layout.structural_layers.push(pb21::SparseStructuralLayer {
-            kind: pb21::sparse_structural_layer::Kind::SparseLayerFixedSizeList as i32,
-            num_slots: 2,
-            num_child_slots: 4,
-            non_empty_positions: None,
-            counts: None,
-            fixed_size_list_dimension: 3,
-            validity: null_positions(position_empty()),
-        });
+        layout.structural_layers.push(fixed_size_list_layer(
+            2,
+            3,
+            null_positions(position_empty()),
+        ));
         let err = SparseStructuralScheduler::try_new(
             &[(0, 0), (0, 0)],
             0,
@@ -5298,25 +5280,20 @@ mod tests {
             &decompressors,
         )
         .unwrap_err();
-        assert_invalid_input_contains(err, "does not match slots 2 * dimension 3");
+        assert_invalid_input_contains(err, "terminal domain has 6 slots");
     }
 
     #[test]
     fn rejects_invalid_validity_and_list_count_semantics() {
         let decompressors = DefaultDecompressionStrategy::default();
         let mut layout = sparse_layout();
-        layout.structural_layers.push(pb21::SparseStructuralLayer {
-            kind: pb21::sparse_structural_layer::Kind::SparseLayerValidity as i32,
-            num_slots: 1,
-            num_child_slots: 1,
-            non_empty_positions: None,
-            counts: None,
-            fixed_size_list_dimension: 0,
-            validity: validity(
+        layout.structural_layers.push(validity_layer(
+            1,
+            validity(
                 pb21::sparse_validity_set::Meaning::SparseValidityUnspecified,
                 position_empty(),
             ),
-        });
+        ));
         let err = SparseStructuralScheduler::try_new(
             &[(0, 0), (0, 0)],
             0,
@@ -5331,15 +5308,13 @@ mod tests {
         let mut layout = sparse_layout();
         layout.num_items = 3;
         layout.num_visible_items = 3;
-        layout.structural_layers.push(pb21::SparseStructuralLayer {
-            kind: pb21::sparse_structural_layer::Kind::SparseLayerList as i32,
-            num_slots: 2,
-            num_child_slots: 3,
-            non_empty_positions: position_all(2),
-            counts: count_constant(2),
-            fixed_size_list_dimension: 0,
-            validity: null_positions(position_empty()),
-        });
+        layout.structural_layers.push(list_layer(
+            2,
+            3,
+            position_all(2),
+            count_constant(2),
+            null_positions(position_empty()),
+        ));
         let err = SparseStructuralScheduler::try_new(
             &[(0, 0), (0, 0)],
             0,
@@ -5357,15 +5332,9 @@ mod tests {
         let mut layout = sparse_layout();
         layout.num_items = 4;
         layout.num_visible_items = 4;
-        layout.structural_layers.push(pb21::SparseStructuralLayer {
-            kind: pb21::sparse_structural_layer::Kind::SparseLayerValidity as i32,
-            num_slots: 4,
-            num_child_slots: 4,
-            non_empty_positions: None,
-            counts: None,
-            fixed_size_list_dimension: 0,
-            validity: null_positions(position_explicit(2)),
-        });
+        layout
+            .structural_layers
+            .push(validity_layer(4, null_positions(position_explicit(2))));
         let decompressors = DefaultDecompressionStrategy::default();
         let mut scheduler = SparseStructuralScheduler::try_new(
             &[(0, 8), (8, 8), (16, 16)],
@@ -5607,15 +5576,13 @@ mod tests {
     async fn empty_leaf_selection_rebuilds_offsets_without_value_io() {
         let mut layout = sparse_layout();
         layout.num_visible_items = 0;
-        layout.structural_layers.push(pb21::SparseStructuralLayer {
-            kind: pb21::sparse_structural_layer::Kind::SparseLayerList as i32,
-            num_slots: 1,
-            num_child_slots: 0,
-            non_empty_positions: position_empty(),
-            counts: count_empty(),
-            fixed_size_list_dimension: 0,
-            validity: null_positions(position_empty()),
-        });
+        layout.structural_layers.push(list_layer(
+            1,
+            0,
+            position_empty(),
+            count_empty(),
+            null_positions(position_empty()),
+        ));
         let decompressors = DefaultDecompressionStrategy::default();
         let mut scheduler = SparseStructuralScheduler::try_new(
             &[(0, 0), (0, 0)],
