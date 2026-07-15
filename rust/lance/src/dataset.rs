@@ -230,6 +230,23 @@ impl From<&Manifest> for Version {
     }
 }
 
+/// The transaction that produced a version of the dataset, along with the
+/// version's commit timestamp.
+///
+/// Returned by [`Dataset::read_version_transaction`], which reads this
+/// information directly from storage without checking out the version.
+#[derive(Debug, Clone)]
+pub struct VersionTransaction {
+    /// Version number.
+    pub version: u64,
+
+    /// Timestamp the version was committed, in UTC.
+    pub timestamp: DateTime<Utc>,
+
+    /// The transaction that produced this version, if one was recorded.
+    pub transaction: Option<Transaction>,
+}
+
 /// Customize read behavior of a dataset.
 #[derive(Clone, Debug)]
 pub struct ReadParams {
@@ -1187,27 +1204,9 @@ impl Dataset {
             return Ok(Some((*transaction).clone()));
         }
 
-        // Prefer inline transaction from manifest when available
-        let transaction = if let Some(pos) = self.manifest.transaction_section {
-            let reader = if let Some(size) = self.manifest_location.size {
-                self.object_store
-                    .open_with_size(&self.manifest_location.path, size as usize)
-                    .await?
-            } else {
-                self.object_store.open(&self.manifest_location.path).await?
-            };
-
-            let tx: pb::Transaction = read_message(reader.as_ref(), pos).await?;
-            Transaction::try_from(tx).map(Some)?
-        } else if let Some(path) = &self.manifest.transaction_file {
-            // Fallback: read external transaction file if present
-            let path = self.transactions_dir().join(path.as_str());
-            let data = self.object_store.inner.get(&path).await?.bytes().await?;
-            let transaction = lance_table::format::pb::Transaction::decode(data)?;
-            Transaction::try_from(transaction).map(Some)?
-        } else {
-            None
-        };
+        let transaction = self
+            .read_transaction_from_storage(&self.manifest, &self.manifest_location)
+            .await?;
 
         if let Some(tx) = transaction.as_ref() {
             self.metadata_cache
@@ -1217,13 +1216,80 @@ impl Dataset {
         Ok(transaction)
     }
 
+    /// Read the transaction recorded by `manifest` directly from storage,
+    /// without consulting or populating any session cache.
+    async fn read_transaction_from_storage(
+        &self,
+        manifest: &Manifest,
+        manifest_location: &ManifestLocation,
+    ) -> Result<Option<Transaction>> {
+        // Prefer inline transaction from manifest when available
+        if let Some(pos) = manifest.transaction_section {
+            let reader = if let Some(size) = manifest_location.size {
+                self.object_store
+                    .open_with_size(&manifest_location.path, size as usize)
+                    .await?
+            } else {
+                self.object_store.open(&manifest_location.path).await?
+            };
+
+            let tx: pb::Transaction = read_message(reader.as_ref(), pos).await?;
+            Transaction::try_from(tx).map(Some)
+        } else if let Some(path) = &manifest.transaction_file {
+            // Fallback: read external transaction file if present
+            let path = self.transactions_dir().join(path.as_str());
+            let data = self.object_store.inner.get(&path).await?.bytes().await?;
+            let transaction = lance_table::format::pb::Transaction::decode(data)?;
+            Transaction::try_from(transaction).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Read the transaction (if any) and commit timestamp of a version of the
+    /// dataset, on the same branch as this dataset.
+    ///
+    /// Reads the version's manifest transiently: no historical `Dataset` is
+    /// constructed, no `IndexSection` is decoded, and no session cache is read
+    /// or written, so scanning many historical versions does not fill the
+    /// shared caches.
+    ///
+    /// Returns an error if the version does not exist (for example, if it has
+    /// been cleaned up).
+    pub async fn read_version_transaction(&self, version: u64) -> Result<VersionTransaction> {
+        // Resolve against this dataset's current branch.
+        let manifest_location = self
+            .commit_handler
+            .resolve_version_location(&self.base, version, &self.object_store.inner)
+            .await?;
+
+        let manifest = read_manifest(
+            &self.object_store,
+            &manifest_location.path,
+            manifest_location.size,
+        )
+        .await?;
+
+        let transaction = self
+            .read_transaction_from_storage(&manifest, &manifest_location)
+            .await?;
+
+        Ok(VersionTransaction {
+            version: manifest.version,
+            timestamp: manifest.timestamp(),
+            transaction,
+        })
+    }
+
     /// Read the transaction file for this version of the dataset.
     ///
     /// If there was no transaction file written for this version of the dataset
     /// then this will return None.
+    ///
+    /// Does not populate the session caches; see
+    /// [`Self::read_version_transaction`].
     pub async fn read_transaction_by_version(&self, version: u64) -> Result<Option<Transaction>> {
-        let dataset_version = self.checkout_version(version).await?;
-        dataset_version.read_transaction().await
+        Ok(self.read_version_transaction(version).await?.transaction)
     }
 
     /// List transactions for the dataset, up to a maximum number.
