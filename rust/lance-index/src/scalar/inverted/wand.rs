@@ -5,7 +5,7 @@ use std::ops::Deref;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::{
-    cell::UnsafeCell,
+    cell::{RefCell, UnsafeCell},
     collections::{BinaryHeap, VecDeque},
 };
 use std::{cmp::Reverse, fmt::Debug};
@@ -59,9 +59,60 @@ static USE_MAXSCORE_SEARCH: LazyLock<bool> =
 // Bulk conjunction path for top-k AND / phrase queries: block-max window
 // skipping plus a slice-level merge over decompressed blocks, replacing the
 // per-doc `next()` leapfrog. Results are identical to the classic AND loop.
-// LANCE_FTS_BULK_AND=0 opts back into the classic loop.
-static USE_BULK_AND_SEARCH: LazyLock<bool> =
-    LazyLock::new(|| std::env::var("LANCE_FTS_BULK_AND").as_deref() != Ok("0"));
+// LANCE_FTS_BULK_AND accepts auto (default), on/1, or off/0. Auto enables the
+// bulk path only for its consistently faster two- and three-clause kernels.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum BulkAndMode {
+    #[default]
+    Auto,
+    On,
+    Off,
+}
+
+impl BulkAndMode {
+    fn parse(value: &str) -> Option<Self> {
+        let value = value.trim();
+        if value.eq_ignore_ascii_case("auto") {
+            Some(Self::Auto)
+        } else if value.eq_ignore_ascii_case("on") || value == "1" {
+            Some(Self::On)
+        } else if value.eq_ignore_ascii_case("off") || value == "0" {
+            Some(Self::Off)
+        } else {
+            None
+        }
+    }
+
+    const fn enabled_for(self, num_clauses: usize) -> bool {
+        match self {
+            Self::Auto => matches!(num_clauses, 2 | 3),
+            Self::On => true,
+            Self::Off => false,
+        }
+    }
+}
+
+fn bulk_and_mode_from_env() -> BulkAndMode {
+    match std::env::var("LANCE_FTS_BULK_AND") {
+        Ok(value) => BulkAndMode::parse(&value).unwrap_or_else(|| {
+            log::warn!(
+                "Invalid LANCE_FTS_BULK_AND value {value:?}; expected auto, on/1, or off/0; \
+                 falling back to auto"
+            );
+            BulkAndMode::Auto
+        }),
+        Err(std::env::VarError::NotPresent) => BulkAndMode::Auto,
+        Err(std::env::VarError::NotUnicode(value)) => {
+            log::warn!(
+                "Invalid non-Unicode LANCE_FTS_BULK_AND value {value:?}; expected auto, on/1, \
+                 or off/0; falling back to auto"
+            );
+            BulkAndMode::Auto
+        }
+    }
+}
+
+static BULK_AND_MODE: LazyLock<BulkAndMode> = LazyLock::new(bulk_and_mode_from_env);
 
 #[inline]
 fn conservative_bm25_upper_bound(query_weight: f32) -> f32 {
@@ -98,6 +149,10 @@ pub struct PostingIterator {
     block_idx: usize,
     current_doc: Option<DocInfo>,
     approximate_upper_bound: f32,
+    // Position cursors temporarily own this buffer and return it on drop. This
+    // keeps repeated cursor creation allocation-free without lending a slice
+    // out of the interior-mutable compressed state.
+    position_scratch: RefCell<Option<Vec<u32>>>,
 
     // for compressed posting list
     compressed: Option<UnsafeCell<CompressedState>>,
@@ -114,15 +169,14 @@ struct CompressedState {
     position_offsets: Vec<usize>,
     // Seek state for PackedDelta position blocks: the lazily-built group
     // header index, the last unpacked group (memoized), the decoded varint
-    // tail, the block's total delta count, and the scratch the current doc's
-    // positions land in. Together these let a phrase check decode just the
-    // candidate doc's positions instead of the whole 256-doc position block.
+    // tail, and the block's total delta count. Together these let a phrase
+    // check decode just the candidate doc's positions instead of the whole
+    // 256-doc position block.
     position_group_offsets: Vec<usize>,
     position_unpacked_group: Box<[u32; BLOCK_SIZE]>,
     position_unpacked_group_idx: Option<usize>,
     position_tail: Vec<u32>,
     position_total_deltas: usize,
-    position_doc_scratch: Vec<u32>,
     block_max_window: BlockMaxWindow,
     // Lucene-style anchored impact score caches: one slot per level, keyed by
     // the entry the block cursor currently sits in. Each holds
@@ -146,7 +200,6 @@ impl CompressedState {
             position_unpacked_group_idx: None,
             position_tail: Vec::new(),
             position_total_deltas: 0,
-            position_doc_scratch: Vec::new(),
             block_max_window: BlockMaxWindow::new(),
             level0_cache: None,
             level1_cache: None,
@@ -533,6 +586,7 @@ impl PostingIterator {
             block_idx: 0,
             current_doc: None,
             approximate_upper_bound,
+            position_scratch: RefCell::new(Some(Vec::new())),
             compressed,
         };
         posting.refresh_current_doc();
@@ -681,6 +735,11 @@ impl PostingIterator {
                             }
                             let delta_start = compressed.position_offsets[block_offset];
                             let delta_end = compressed.position_offsets[block_offset + 1];
+                            let mut position_values = self
+                                .position_scratch
+                                .borrow_mut()
+                                .take()
+                                .unwrap_or_default();
                             seek_packed_doc_positions(
                                 stream.block(block_idx),
                                 compressed.position_total_deltas,
@@ -689,11 +748,14 @@ impl PostingIterator {
                                 &mut compressed.position_unpacked_group,
                                 &mut compressed.position_unpacked_group_idx,
                                 &mut compressed.position_tail,
-                                &mut compressed.position_doc_scratch,
+                                &mut position_values,
                             )
                             .expect("shared position stream doc decoding should succeed");
                             Some(PositionCursor::new(
-                                PositionValues::Borrowed(&compressed.position_doc_scratch[..]),
+                                PositionValues::Recycled(RecycledPositionValues::new(
+                                    position_values,
+                                    &self.position_scratch,
+                                )),
                                 self.position as i32,
                             ))
                         }
@@ -721,8 +783,19 @@ impl PostingIterator {
                             }
                             let start = compressed.position_offsets[block_offset];
                             let end = compressed.position_offsets[block_offset + 1];
+                            let mut position_values = self
+                                .position_scratch
+                                .borrow_mut()
+                                .take()
+                                .unwrap_or_default();
+                            position_values.clear();
+                            position_values
+                                .extend_from_slice(&compressed.position_values[start..end]);
                             Some(PositionCursor::new(
-                                PositionValues::Borrowed(&compressed.position_values[start..end]),
+                                PositionValues::Recycled(RecycledPositionValues::new(
+                                    position_values,
+                                    &self.position_scratch,
+                                )),
                                 self.position as i32,
                             ))
                         }
@@ -1265,9 +1338,11 @@ pub struct Wand<'a, S: Scorer> {
     and_last_doc: Option<u64>,
     and_window_stats: AndWindowStats,
     and_candidates_pruned_before_return: usize,
-    // Test-only escape hatch to run the classic conjunction loop even when the
-    // bulk path is enabled process-wide.
-    bulk_and_disabled: bool,
+    // Test-only override for comparing bulk and classic conjunctions without
+    // mutating the process-wide environment.
+    bulk_and_mode_override: Option<BulkAndMode>,
+    #[cfg(test)]
+    bulk_and_searches: usize,
     docs: &'a DocSet,
     scorer: S,
     // Shared cross-partition top-k floor. Each partition publishes its local
@@ -1332,18 +1407,20 @@ impl<'a, S: Scorer> Wand<'a, S> {
             and_last_doc: None,
             and_window_stats: AndWindowStats::default(),
             and_candidates_pruned_before_return: 0,
-            bulk_and_disabled: false,
+            bulk_and_mode_override: None,
+            #[cfg(test)]
+            bulk_and_searches: 0,
             docs,
             scorer,
             shared_threshold: None,
         }
     }
 
-    /// Test hook: force the classic doc-at-a-time AND loop so parity tests can
-    /// compare it against the bulk conjunction path within one process.
+    /// Test hook: force one conjunction mode so parity tests can compare bulk
+    /// and classic search within one process.
     #[cfg(test)]
-    pub(crate) fn disable_bulk_and(mut self) -> Self {
-        self.bulk_and_disabled = true;
+    fn with_bulk_and_mode(mut self, mode: BulkAndMode) -> Self {
+        self.bulk_and_mode_override = Some(mode);
         self
     }
 
@@ -1422,12 +1499,18 @@ impl<'a, S: Scorer> Wand<'a, S> {
         // bulk path: the same block-max window pruning, but candidates come
         // from a slice-level merge over decompressed blocks instead of per-doc
         // `next()` leapfrogging through boxed iterators.
-        if *USE_BULK_AND_SEARCH
-            && !self.bulk_and_disabled
-            && self.operator == Operator::And
+        if self.operator == Operator::And
             && !self.lead.is_empty()
             && self.lead.iter().all(|posting| posting.is_compressed())
+            && self
+                .bulk_and_mode_override
+                .unwrap_or_else(|| *BULK_AND_MODE)
+                .enabled_for(self.lead.len())
         {
+            #[cfg(test)]
+            {
+                self.bulk_and_searches += 1;
+            }
             return self.and_bulk_search(params, mask, metrics);
         }
 
@@ -3399,15 +3482,49 @@ impl<'a, S: Scorer> Wand<'a, S> {
 }
 
 #[derive(Debug)]
+struct RecycledPositionValues<'a> {
+    values: Option<Vec<u32>>,
+    pool: &'a RefCell<Option<Vec<u32>>>,
+}
+
+impl<'a> RecycledPositionValues<'a> {
+    fn new(values: Vec<u32>, pool: &'a RefCell<Option<Vec<u32>>>) -> Self {
+        Self {
+            values: Some(values),
+            pool,
+        }
+    }
+
+    fn as_slice(&self) -> &[u32] {
+        self.values
+            .as_deref()
+            .expect("position values are present until drop")
+    }
+}
+
+impl Drop for RecycledPositionValues<'_> {
+    fn drop(&mut self) {
+        let values = self
+            .values
+            .take()
+            .expect("position values are present until drop");
+        let mut pool = self.pool.borrow_mut();
+        if pool.is_none() {
+            *pool = Some(values);
+        }
+    }
+}
+
+#[derive(Debug)]
 enum PositionValues<'a> {
-    Borrowed(&'a [u32]),
+    Recycled(RecycledPositionValues<'a>),
     Owned(Vec<u32>),
 }
 
 impl<'a> PositionValues<'a> {
     fn as_slice(&self) -> &[u32] {
         match self {
-            Self::Borrowed(values) => values,
+            Self::Recycled(values) => values.as_slice(),
             Self::Owned(values) => values.as_slice(),
         }
     }
@@ -3528,6 +3645,36 @@ mod tests {
         fn doc_weight(&self, freq: u32, _doc_tokens: u32) -> f32 {
             freq as f32
         }
+    }
+
+    #[rstest]
+    #[case::auto("auto", Some(BulkAndMode::Auto))]
+    #[case::auto_case_and_whitespace(" AUTO ", Some(BulkAndMode::Auto))]
+    #[case::on("on", Some(BulkAndMode::On))]
+    #[case::on_legacy("1", Some(BulkAndMode::On))]
+    #[case::off("off", Some(BulkAndMode::Off))]
+    #[case::off_legacy("0", Some(BulkAndMode::Off))]
+    #[case::invalid("true", None)]
+    #[case::empty("", None)]
+    fn test_bulk_and_mode_parse(#[case] value: &str, #[case] expected: Option<BulkAndMode>) {
+        assert_eq!(BulkAndMode::parse(value), expected);
+    }
+
+    #[rstest]
+    #[case::auto_one(BulkAndMode::Auto, 1, false)]
+    #[case::auto_two(BulkAndMode::Auto, 2, true)]
+    #[case::auto_three(BulkAndMode::Auto, 3, true)]
+    #[case::auto_four(BulkAndMode::Auto, 4, false)]
+    #[case::on_one(BulkAndMode::On, 1, true)]
+    #[case::on_five(BulkAndMode::On, 5, true)]
+    #[case::off_two(BulkAndMode::Off, 2, false)]
+    #[case::off_five(BulkAndMode::Off, 5, false)]
+    fn test_bulk_and_mode_enabled_for(
+        #[case] mode: BulkAndMode,
+        #[case] num_clauses: usize,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(mode.enabled_for(num_clauses), expected);
     }
 
     struct PanicQueryWeightScorer;
@@ -3795,6 +3942,31 @@ mod tests {
                 Some(position_builder.finish()),
             ))
         }
+    }
+
+    #[test]
+    fn test_packed_position_cursors_use_independent_scratch() {
+        let posting_list =
+            generate_posting_list_with_positions(vec![0], vec![vec![1_u32, 3, 10]], 1.0, true);
+        let PostingList::Compressed(ref list) = posting_list else {
+            unreachable!("the helper was asked for a compressed posting list");
+        };
+        let Some(CompressedPositionStorage::SharedStream(stream)) = list.positions.as_ref() else {
+            panic!("compressed positions should use shared stream storage");
+        };
+        assert_eq!(stream.codec(), PositionStreamCodec::PackedDelta);
+
+        let posting = PostingIterator::new(String::from("term"), 0, 0, posting_list, 1);
+        let first = posting.position_cursor().expect("positions must exist");
+        let second = posting.position_cursor().expect("positions must exist");
+
+        assert_eq!(second.positions.as_slice(), &[1, 3, 10]);
+        assert_eq!(first.positions.as_slice(), &[1, 3, 10]);
+        assert!(posting.position_scratch.borrow().is_none());
+        drop(second);
+        assert!(posting.position_scratch.borrow().is_some());
+        drop(first);
+        assert!(posting.position_scratch.borrow().is_some());
     }
 
     fn sorted_candidate_row_ids(candidates: Vec<DocCandidate>) -> Vec<u64> {
@@ -5425,25 +5597,46 @@ mod tests {
     /// phrase queries, across multi-block lists with heap/threshold pruning
     /// in play.
     #[rstest]
-    #[case::and_k10(false, 10)]
-    #[case::and_k3(false, 3)]
-    #[case::phrase_k10(true, 10)]
-    #[case::phrase_k3(true, 3)]
-    fn test_bulk_and_matches_classic(#[case] phrase: bool, #[case] limit: usize) {
+    #[case::and_k10(false, 10, 3)]
+    #[case::and_k3(false, 3, 3)]
+    #[case::and_two_clauses(false, 10, 2)]
+    #[case::and_four_clauses(false, 10, 4)]
+    #[case::and_five_clauses(false, 10, 5)]
+    #[case::and_six_clauses(false, 10, 6)]
+    #[case::phrase_k10(true, 10, 3)]
+    #[case::phrase_k3(true, 3, 3)]
+    #[case::phrase_two_clauses(true, 10, 2)]
+    #[case::phrase_four_clauses(true, 10, 4)]
+    #[case::phrase_five_clauses(true, 10, 5)]
+    #[case::phrase_six_clauses(true, 10, 6)]
+    fn test_bulk_and_matches_classic(
+        #[case] phrase: bool,
+        #[case] limit: usize,
+        #[case] num_clauses: usize,
+    ) {
         let num_docs = (BLOCK_SIZE * 8 + 37) as u32;
         let mut docs = DocSet::default();
         for doc_id in 0..num_docs {
             docs.append(u64::from(doc_id), 32 + doc_id % 57);
         }
 
-        // Three clauses with different densities; membership comes from a
-        // cheap deterministic mix so docs scatter across blocks.
+        // Clauses with different densities; membership comes from a cheap
+        // deterministic mix so docs scatter across blocks. Clause count picks
+        // the dedicated (1-3) or generic (4+) merge kernel.
         let clause_docs = |modulus: u32, salt: u32| -> Vec<u32> {
             (0..num_docs)
                 .filter(|doc| (doc.wrapping_mul(2654435761).wrapping_add(salt)) % modulus < 2)
                 .collect()
         };
-        let clauses = [clause_docs(3, 7), clause_docs(4, 13), clause_docs(5, 29)];
+        let clauses = [
+            clause_docs(3, 7),
+            clause_docs(4, 13),
+            clause_docs(5, 29),
+            clause_docs(3, 41),
+            clause_docs(3, 7),
+            clause_docs(4, 13),
+        ][..num_clauses]
+            .to_vec();
 
         let build_postings = || {
             clauses
@@ -5504,29 +5697,34 @@ mod tests {
             rows
         };
 
-        let run = |disable_bulk: bool| {
+        let run = |mode| {
             let mut wand = Wand::new(
                 Operator::And,
                 build_postings().into_iter(),
                 &docs,
                 UnitScorer,
-            );
-            if disable_bulk {
-                wand = wand.disable_bulk_and();
-            }
-            normalize(
+            )
+            .with_bulk_and_mode(mode);
+            let rows = normalize(
                 wand.search(
                     &params,
                     Arc::new(RowAddrMask::default()),
                     &NoOpMetricsCollector,
                 )
                 .unwrap(),
-            )
+            );
+            let used_bulk = wand.bulk_and_searches > 0;
+            (rows, used_bulk)
         };
 
-        let bulk = run(false);
-        let classic = run(true);
+        let (bulk, bulk_used) = run(BulkAndMode::On);
+        let (classic, classic_used) = run(BulkAndMode::Off);
+        let (auto, auto_used) = run(BulkAndMode::Auto);
+        assert!(bulk_used, "on should use bulk conjunction search");
+        assert!(!classic_used, "off should use classic conjunction search");
+        assert_eq!(auto_used, matches!(num_clauses, 2 | 3));
         assert!(!bulk.is_empty(), "test corpus should produce matches");
         assert_eq!(bulk, classic);
+        assert_eq!(auto, classic);
     }
 }
