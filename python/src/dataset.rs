@@ -164,7 +164,6 @@ fn stats_log_interval_from_millis(ms: u64) -> Option<std::time::Duration> {
 #[allow(clippy::too_many_arguments)]
 fn writer_config_from_kwargs(
     durable_write: Option<bool>,
-    sync_indexed_write: Option<bool>,
     max_wal_buffer_size: Option<usize>,
     max_wal_flush_interval_ms: Option<u64>,
     max_memtable_size: Option<usize>,
@@ -172,8 +171,6 @@ fn writer_config_from_kwargs(
     max_memtable_batches: Option<usize>,
     max_unflushed_memtable_bytes: Option<usize>,
     manifest_scan_batch_size: Option<usize>,
-    async_index_buffer_rows: Option<usize>,
-    async_index_interval_ms: Option<u64>,
     backpressure_log_interval_ms: Option<u64>,
     stats_log_interval_ms: Option<u64>,
     hnsw_params: Option<HashMap<String, HashMap<String, u32>>>,
@@ -184,10 +181,6 @@ fn writer_config_from_kwargs(
     let mut any = false;
     if let Some(v) = durable_write {
         config = config.with_durable_write(v);
-        any = true;
-    }
-    if let Some(v) = sync_indexed_write {
-        config = config.with_sync_indexed_write(v);
         any = true;
     }
     if let Some(v) = max_wal_buffer_size {
@@ -216,14 +209,6 @@ fn writer_config_from_kwargs(
     }
     if let Some(v) = manifest_scan_batch_size {
         config = config.with_manifest_scan_batch_size(v);
-        any = true;
-    }
-    if let Some(v) = async_index_buffer_rows {
-        config = config.with_async_index_buffer_rows(v);
-        any = true;
-    }
-    if let Some(v) = async_index_interval_ms {
-        config = config.with_async_index_interval(Duration::from_millis(v));
         any = true;
     }
     if let Some(v) = backpressure_log_interval_ms {
@@ -3414,7 +3399,6 @@ impl Dataset {
         identity_column=None,
         unsharded=false,
         durable_write=None,
-        sync_indexed_write=None,
         max_wal_buffer_size=None,
         max_wal_flush_interval_ms=None,
         max_memtable_size=None,
@@ -3422,8 +3406,6 @@ impl Dataset {
         max_memtable_batches=None,
         max_unflushed_memtable_bytes=None,
         manifest_scan_batch_size=None,
-        async_index_buffer_rows=None,
-        async_index_interval_ms=None,
         backpressure_log_interval_ms=None,
         stats_log_interval_ms=None,
         hnsw_params=None,
@@ -3437,7 +3419,6 @@ impl Dataset {
         identity_column: Option<String>,
         unsharded: bool,
         durable_write: Option<bool>,
-        sync_indexed_write: Option<bool>,
         max_wal_buffer_size: Option<usize>,
         max_wal_flush_interval_ms: Option<u64>,
         max_memtable_size: Option<usize>,
@@ -3445,8 +3426,6 @@ impl Dataset {
         max_memtable_batches: Option<usize>,
         max_unflushed_memtable_bytes: Option<usize>,
         manifest_scan_batch_size: Option<usize>,
-        async_index_buffer_rows: Option<usize>,
-        async_index_interval_ms: Option<u64>,
         backpressure_log_interval_ms: Option<u64>,
         stats_log_interval_ms: Option<u64>,
         hnsw_params: Option<HashMap<String, HashMap<String, u32>>>,
@@ -3474,7 +3453,6 @@ impl Dataset {
 
         let writer_config = writer_config_from_kwargs(
             durable_write,
-            sync_indexed_write,
             max_wal_buffer_size,
             max_wal_flush_interval_ms,
             max_memtable_size,
@@ -3482,8 +3460,6 @@ impl Dataset {
             max_memtable_batches,
             max_unflushed_memtable_bytes,
             manifest_scan_batch_size,
-            async_index_buffer_rows,
-            async_index_interval_ms,
             backpressure_log_interval_ms,
             stats_log_interval_ms,
             hnsw_params,
@@ -3565,7 +3541,6 @@ impl Dataset {
         shard_id,
         *,
         durable_write=None,
-        sync_indexed_write=None,
         max_wal_buffer_size=None,
         max_wal_flush_interval_ms=None,
         max_memtable_size=None,
@@ -3573,8 +3548,6 @@ impl Dataset {
         max_memtable_batches=None,
         max_unflushed_memtable_bytes=None,
         manifest_scan_batch_size=None,
-        async_index_buffer_rows=None,
-        async_index_interval_ms=None,
         backpressure_log_interval_ms=None,
         stats_log_interval_ms=None,
         hnsw_params=None,
@@ -3584,7 +3557,6 @@ impl Dataset {
         py: Python<'_>,
         shard_id: String,
         durable_write: Option<bool>,
-        sync_indexed_write: Option<bool>,
         max_wal_buffer_size: Option<usize>,
         max_wal_flush_interval_ms: Option<u64>,
         max_memtable_size: Option<usize>,
@@ -3592,8 +3564,6 @@ impl Dataset {
         max_memtable_batches: Option<usize>,
         max_unflushed_memtable_bytes: Option<usize>,
         manifest_scan_batch_size: Option<usize>,
-        async_index_buffer_rows: Option<usize>,
-        async_index_interval_ms: Option<u64>,
         backpressure_log_interval_ms: Option<u64>,
         stats_log_interval_ms: Option<u64>,
         hnsw_params: Option<HashMap<String, HashMap<String, u32>>>,
@@ -3605,7 +3575,6 @@ impl Dataset {
 
         let config = writer_config_from_kwargs(
             durable_write,
-            sync_indexed_write,
             max_wal_buffer_size,
             max_wal_flush_interval_ms,
             max_memtable_size,
@@ -3613,8 +3582,6 @@ impl Dataset {
             max_memtable_batches,
             max_unflushed_memtable_bytes,
             manifest_scan_batch_size,
-            async_index_buffer_rows,
-            async_index_interval_ms,
             backpressure_log_interval_ms,
             stats_log_interval_ms,
             hnsw_params,

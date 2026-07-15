@@ -1265,9 +1265,6 @@ fn build_writer_config(env: &mut JNIEnv, config: &JObject) -> Result<ShardWriter
     if let Some(v) = read_optional_bool(env, config, "durableWrite")? {
         writer_config = writer_config.with_durable_write(v);
     }
-    if let Some(v) = read_optional_bool(env, config, "syncIndexedWrite")? {
-        writer_config = writer_config.with_sync_indexed_write(v);
-    }
     if let Some(v) = read_optional_u64(env, config, "maxWalBufferSize")? {
         writer_config = writer_config.with_max_wal_buffer_size(v as usize);
     }
@@ -1288,12 +1285,6 @@ fn build_writer_config(env: &mut JNIEnv, config: &JObject) -> Result<ShardWriter
     }
     if let Some(v) = read_optional_u64(env, config, "manifestScanBatchSize")? {
         writer_config = writer_config.with_manifest_scan_batch_size(v as usize);
-    }
-    if let Some(v) = read_optional_u64(env, config, "asyncIndexBufferRows")? {
-        writer_config = writer_config.with_async_index_buffer_rows(v as usize);
-    }
-    if let Some(v) = read_optional_u64(env, config, "asyncIndexIntervalMs")? {
-        writer_config = writer_config.with_async_index_interval(Duration::from_millis(v));
     }
     if let Some(v) = read_optional_u64(env, config, "backpressureLogIntervalMs")? {
         writer_config = writer_config.with_backpressure_log_interval(Duration::from_millis(v));

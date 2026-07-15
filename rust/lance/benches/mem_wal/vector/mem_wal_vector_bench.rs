@@ -520,7 +520,6 @@ async fn run_search(args: &Args) -> Result<serde_json::Value> {
         wal_persist_retry_base_delay: std::time::Duration::from_millis(50),
         shard_spec_id: 0,
         durable_write: false,
-        sync_indexed_write: false,
         max_memtable_size: args.max_memtable_rows * row_bytes * 2,
         max_memtable_rows: args.max_memtable_rows,
         max_unflushed_memtable_bytes: args.max_memtable_rows * row_bytes * 6,

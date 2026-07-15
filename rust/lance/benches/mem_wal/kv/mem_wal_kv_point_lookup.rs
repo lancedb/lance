@@ -792,7 +792,6 @@ async fn run_lance(
         wal_persist_retry_base_delay: std::time::Duration::from_millis(50),
         shard_spec_id: 0,
         durable_write: true,
-        sync_indexed_write: true,
         max_memtable_size: big,
         max_memtable_rows: args.rows * 4 + 1_000_000,
         max_memtable_batches: args.rows / args.batch_rows + 1_000_000,
