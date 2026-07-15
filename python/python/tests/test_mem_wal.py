@@ -210,7 +210,6 @@ def test_shard_writer_delete_binding_masks_base_row(tmp_path):
     with ds.mem_wal_writer(
         shard_id,
         durable_write=True,
-        sync_indexed_write=True,
         max_wal_buffer_size=1,
         max_wal_flush_interval_ms=10,
     ) as writer:
@@ -356,7 +355,6 @@ def test_shard_writer_e2e_correctness(tmp_path):
     writer = ds.mem_wal_writer(
         shard_id,
         durable_write=True,
-        sync_indexed_write=True,
         max_wal_buffer_size=10 * 1024,  # 10 KB
         max_wal_flush_interval_ms=50,
         max_memtable_size=80,  # flush after ~80 rows
@@ -406,9 +404,7 @@ def test_shard_writer_e2e_correctness(tmp_path):
     # === New writer: write and read back via active MemTable scanner ===
     ds2 = lance.dataset(ds_path)
     shard_id2 = str(uuid.uuid4())
-    with ds2.mem_wal_writer(
-        shard_id2, durable_write=False, sync_indexed_write=True
-    ) as writer2:
+    with ds2.mem_wal_writer(shard_id2, durable_write=False) as writer2:
         verify_batch = _e2e_batch(schema, start_id=10000, num_rows=10)
         writer2.put(pa.Table.from_batches([verify_batch]))
         result = writer2.lsm_scanner().to_table()
@@ -523,7 +519,6 @@ def test_initialize_mem_wal_writer_config_defaults(tmp_path):
     # Duration knobs are recorded in milliseconds with a `_ms` suffix.
     assert defaults["max_wal_flush_interval_ms"] == "250"
     # Every ShardWriterConfig tunable is recorded once any default is set.
-    assert "sync_indexed_write" in defaults
     assert "enable_memtable" in defaults
 
 

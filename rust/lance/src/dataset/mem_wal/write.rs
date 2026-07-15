@@ -85,17 +85,6 @@ pub struct ShardWriterConfig {
     /// - Lower latency, batched S3 operations
     pub durable_write: bool,
 
-    /// Whether to update indexes synchronously on each write.
-    ///
-    /// When true:
-    /// - Newly written data is immediately searchable via indexes
-    /// - Higher latency due to index update overhead
-    ///
-    /// When false:
-    /// - Index updates are deferred
-    /// - New data may not appear in index-accelerated queries immediately
-    pub sync_indexed_write: bool,
-
     /// Maximum WAL buffer size in bytes before triggering a flush.
     ///
     /// This is a soft threshold - write batches are atomic and won't be split.
@@ -167,23 +156,6 @@ pub struct ShardWriterConfig {
     /// Default: 30 seconds
     pub backpressure_log_interval: Duration,
 
-    /// Maximum rows to buffer before flushing to async indexes.
-    ///
-    /// Only applies when `sync_indexed_write` is false. Larger values enable
-    /// better vectorization but increase memory usage and latency before data
-    /// becomes searchable.
-    ///
-    /// Default: 10,000 rows
-    pub async_index_buffer_rows: usize,
-
-    /// Maximum time to buffer before flushing to async indexes.
-    ///
-    /// Only applies when `sync_indexed_write` is false. Ensures bounded latency
-    /// for data to become searchable even during low write throughput.
-    ///
-    /// Default: 1 second
-    pub async_index_interval: Duration,
-
     /// Interval for periodic stats logging.
     ///
     /// Stats (write throughput, backpressure events, memtable size) are logged
@@ -225,8 +197,7 @@ pub struct ShardWriterConfig {
     ///   `durable_write` settings as MemTable mode.
     ///
     /// MemTable-tied tunables (`max_memtable_size`, `max_memtable_rows`,
-    /// `max_memtable_batches`, `sync_indexed_write`, `async_index_buffer_rows`,
-    /// `async_index_interval`) are ignored when `enable_memtable == false`.
+    /// `max_memtable_batches`) are ignored when `enable_memtable == false`.
     ///
     /// For raw single-entry synchronous atomic appends with no buffering and
     /// no background tasks, use `WalAppender` directly — it is a strictly
@@ -270,7 +241,6 @@ impl Default for ShardWriterConfig {
             shard_id: Uuid::new_v4(),
             shard_spec_id: 0,
             durable_write: true,
-            sync_indexed_write: true,
             max_wal_buffer_size: 10 * 1024 * 1024, // 10MB
             max_wal_flush_interval: Some(Duration::from_millis(100)), // 100ms
             max_wal_persist_retries: 3,
@@ -281,8 +251,6 @@ impl Default for ShardWriterConfig {
             manifest_scan_batch_size: 2,
             max_unflushed_memtable_bytes: 1024 * 1024 * 1024, // 1GB
             backpressure_log_interval: Duration::from_secs(30),
-            async_index_buffer_rows: 10_000,
-            async_index_interval: Duration::from_secs(1),
             stats_log_interval: Some(Duration::from_secs(60)), // 1 minute
             frozen_memtable_grace: Duration::ZERO,
             enable_memtable: true,
@@ -312,12 +280,6 @@ impl ShardWriterConfig {
     /// Set durable writes mode.
     pub fn with_durable_write(mut self, durable: bool) -> Self {
         self.durable_write = durable;
-        self
-    }
-
-    /// Set indexed writes mode.
-    pub fn with_sync_indexed_write(mut self, indexed: bool) -> Self {
-        self.sync_indexed_write = indexed;
         self
     }
 
@@ -380,18 +342,6 @@ impl ShardWriterConfig {
     /// Set backpressure log interval.
     pub fn with_backpressure_log_interval(mut self, interval: Duration) -> Self {
         self.backpressure_log_interval = interval;
-        self
-    }
-
-    /// Set async index buffer rows.
-    pub fn with_async_index_buffer_rows(mut self, rows: usize) -> Self {
-        self.async_index_buffer_rows = rows;
-        self
-    }
-
-    /// Set async index interval.
-    pub fn with_async_index_interval(mut self, interval: Duration) -> Self {
-        self.async_index_interval = interval;
         self
     }
 
@@ -3991,7 +3941,6 @@ mod tests {
         ShardWriterConfig {
             shard_id,
             durable_write: false,
-            sync_indexed_write: true,
             manifest_scan_batch_size: 2,
             ..Default::default()
         }
@@ -4316,7 +4265,6 @@ mod tests {
             shard_id: Uuid::new_v4(),
             shard_spec_id: 0,
             durable_write: false,
-            sync_indexed_write: false,
             max_wal_buffer_size: 1024 * 1024,
             max_wal_flush_interval: Some(Duration::from_millis(10)),
             max_memtable_size: 64 * 1024 * 1024,
@@ -4359,7 +4307,6 @@ mod tests {
             shard_id: Uuid::new_v4(),
             shard_spec_id: 0,
             durable_write: true,
-            sync_indexed_write: false,
             max_wal_buffer_size: 1024 * 1024,
             max_wal_flush_interval: Some(Duration::from_millis(10)),
             max_memtable_size: 64 * 1024 * 1024,
@@ -4396,7 +4343,6 @@ mod tests {
             shard_id: Uuid::new_v4(),
             shard_spec_id: 0,
             durable_write: false,
-            sync_indexed_write: false,
             max_wal_buffer_size: 1024 * 1024,
             max_wal_flush_interval: Some(Duration::from_millis(10)),
             max_memtable_size: 64 * 1024 * 1024,
@@ -4442,7 +4388,6 @@ mod tests {
             shard_id: Uuid::new_v4(),
             shard_spec_id: 0,
             durable_write: false,
-            sync_indexed_write: false,
             max_wal_buffer_size: 1024 * 1024,
             max_wal_flush_interval: Some(Duration::from_millis(10)),
             max_memtable_size: 64 * 1024 * 1024,
@@ -4477,7 +4422,6 @@ mod tests {
             shard_id: Uuid::new_v4(),
             shard_spec_id: 0,
             durable_write: false,
-            sync_indexed_write: true,
             max_wal_buffer_size: 1024 * 1024,
             max_wal_flush_interval: Some(Duration::from_millis(10)),
             max_memtable_size: 64 * 1024 * 1024,
@@ -4529,7 +4473,6 @@ mod tests {
             shard_id,
             shard_spec_id: 0,
             durable_write: false,
-            sync_indexed_write: true,
             max_wal_buffer_size: 1024 * 1024,
             max_wal_flush_interval: Some(Duration::from_millis(10)),
             max_memtable_size: 64 * 1024 * 1024,
@@ -4618,7 +4561,6 @@ mod tests {
             shard_id: Uuid::new_v4(),
             shard_spec_id: 0,
             durable_write: false,
-            sync_indexed_write: false,
             max_wal_buffer_size: 1024 * 1024,
             max_wal_flush_interval: Some(Duration::from_millis(10)),
             max_memtable_size: 1024, // Very small - will trigger flush quickly
@@ -4725,7 +4667,6 @@ mod tests {
             shard_id: Uuid::new_v4(),
             shard_spec_id: 0,
             durable_write: true,
-            sync_indexed_write: false,
             max_wal_buffer_size: 1024 * 1024,
             max_wal_flush_interval: Some(Duration::from_millis(10)),
             max_memtable_size: 64,
@@ -4770,7 +4711,6 @@ mod tests {
             shard_id: Uuid::new_v4(),
             shard_spec_id: 0,
             durable_write: true,
-            sync_indexed_write: false,
             max_wal_buffer_size: 1024 * 1024,
             max_wal_flush_interval: Some(Duration::from_millis(10)),
             // Tiny size threshold — every batch crosses it.
@@ -4837,7 +4777,6 @@ mod tests {
             shard_id,
             shard_spec_id: 0,
             durable_write: true,
-            sync_indexed_write: false,
             max_wal_buffer_size: 1024 * 1024,
             max_wal_flush_interval: Some(Duration::from_millis(10)),
             max_memtable_size: usize::MAX,
@@ -4917,7 +4856,6 @@ mod tests {
             shard_spec_id: 0,
             durable_write: false,
             enable_memtable,
-            sync_indexed_write: false,
             max_wal_buffer_size: usize::MAX,
             max_wal_flush_interval: None,
             max_wal_persist_retries: 0,
@@ -4968,7 +4906,6 @@ mod tests {
             shard_id: Uuid::new_v4(),
             shard_spec_id: 0,
             durable_write: true,
-            sync_indexed_write: false,
             max_wal_buffer_size: 1024 * 1024,
             max_wal_flush_interval: Some(Duration::from_millis(10)),
             // Tiny size threshold so a few batches cross it.
@@ -5402,7 +5339,6 @@ mod tests {
             shard_id,
             shard_spec_id: 0,
             durable_write: true,
-            sync_indexed_write: false,
             max_wal_buffer_size: 1024 * 1024,
             max_wal_flush_interval: Some(Duration::from_millis(10)),
             max_memtable_size: 64 * 1024 * 1024,
@@ -6715,7 +6651,6 @@ mod tests {
             shard_id: Uuid::new_v4(),
             shard_spec_id: 0,
             durable_write: false,
-            sync_indexed_write: false,
             max_wal_buffer_size: 64 * 1024 * 1024,
             max_wal_flush_interval: Some(Duration::from_millis(10)),
             max_memtable_size: 64 * 1024 * 1024,
@@ -6770,7 +6705,6 @@ mod tests {
             shard_id: Uuid::new_v4(),
             shard_spec_id: 0,
             durable_write: false,
-            sync_indexed_write: false,
             max_wal_buffer_size: 64 * 1024 * 1024,
             max_wal_flush_interval: Some(Duration::from_millis(10)),
             max_memtable_size: 64 * 1024 * 1024,
@@ -6825,7 +6759,6 @@ mod tests {
             shard_id: Uuid::new_v4(),
             shard_spec_id: 0,
             durable_write: false,
-            sync_indexed_write: false,
             max_wal_buffer_size: 64 * 1024 * 1024,
             max_wal_flush_interval: Some(Duration::from_millis(10)),
             max_memtable_size: 64 * 1024 * 1024,
@@ -6885,7 +6818,6 @@ mod tests {
             shard_id: Uuid::new_v4(),
             shard_spec_id: 0,
             durable_write: false,
-            sync_indexed_write: false,
             max_wal_buffer_size: 64 * 1024 * 1024,
             max_wal_flush_interval: Some(Duration::from_millis(10)),
             max_memtable_size: 64 * 1024 * 1024,
@@ -7196,9 +7128,7 @@ mod shard_writer_tests {
             Some("100")
         );
         // Every tunable field is present.
-        assert!(defaults.contains_key("sync_indexed_write"));
         assert!(defaults.contains_key("enable_memtable"));
-        assert!(defaults.contains_key("async_index_interval_ms"));
         // add_writer_config_default records arbitrary keys.
         assert_eq!(
             defaults.get("custom_knob").map(String::as_str),
@@ -7410,9 +7340,7 @@ mod shard_writer_tests {
             .expect("Failed to initialize MemWAL");
 
         let shard_id = Uuid::new_v4();
-        let config = ShardWriterConfig::new(shard_id)
-            .with_durable_write(true)
-            .with_sync_indexed_write(true);
+        let config = ShardWriterConfig::new(shard_id).with_durable_write(true);
         let writer = dataset
             .mem_wal_writer(shard_id, config)
             .await
@@ -7750,9 +7678,7 @@ mod shard_writer_tests {
 
         // Create shard writer
         let shard_id = Uuid::new_v4();
-        let config = ShardWriterConfig::new(shard_id)
-            .with_durable_write(false)
-            .with_sync_indexed_write(false);
+        let config = ShardWriterConfig::new(shard_id).with_durable_write(false);
 
         let writer = dataset
             .mem_wal_writer(shard_id, config)
@@ -7810,9 +7736,7 @@ mod shard_writer_tests {
             .expect("Failed to initialize MemWAL");
 
         let shard_id = Uuid::new_v4();
-        let config = ShardWriterConfig::new(shard_id)
-            .with_durable_write(true)
-            .with_sync_indexed_write(true);
+        let config = ShardWriterConfig::new(shard_id).with_durable_write(true);
 
         let writer = dataset
             .mem_wal_writer(shard_id, config)
@@ -7951,9 +7875,7 @@ mod shard_writer_tests {
 
         // Create shard writer with default config
         let shard_id = Uuid::new_v4();
-        let config = ShardWriterConfig::new(shard_id)
-            .with_durable_write(false)
-            .with_sync_indexed_write(false);
+        let config = ShardWriterConfig::new(shard_id).with_durable_write(false);
 
         let writer = dataset
             .mem_wal_writer(shard_id, config)
@@ -8030,7 +7952,6 @@ mod shard_writer_tests {
         let shard_id = Uuid::new_v4();
         let config = ShardWriterConfig::new(shard_id)
             .with_durable_write(true) // Ensure WAL files are written
-            .with_sync_indexed_write(true)
             .with_max_memtable_size(50 * 1024) // 50KB - triggers flush after ~8 batches
             .with_max_wal_buffer_size(10 * 1024) // 10KB WAL buffer
             .with_max_wal_flush_interval(Duration::from_millis(50)); // Fast flush
@@ -8160,9 +8081,7 @@ mod shard_writer_tests {
         // rows stay invisible until the next flush. This test used to pass with
         // `durable_write(false)` only because an un-advanced cursor of 0 was
         // misread as "batch 0 is visible" — it was asserting the dirty read.
-        let new_config = ShardWriterConfig::new(new_shard_id)
-            .with_durable_write(true)
-            .with_sync_indexed_write(true);
+        let new_config = ShardWriterConfig::new(new_shard_id).with_durable_write(true);
 
         let new_writer = dataset
             .mem_wal_writer(new_shard_id, new_config)

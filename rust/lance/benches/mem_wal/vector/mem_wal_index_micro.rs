@@ -214,7 +214,6 @@ async fn main() -> lance_core::Result<()> {
         wal_persist_retry_base_delay: std::time::Duration::from_millis(50),
         shard_spec_id: 0,
         durable_write,
-        sync_indexed_write: true,
         max_memtable_size: max_rows.saturating_mul(row_size_estimate).saturating_mul(4),
         max_memtable_rows: max_rows.saturating_mul(2),
         max_memtable_batches: total_batches_max.saturating_mul(2).max(8_000),
