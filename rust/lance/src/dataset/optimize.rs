@@ -262,6 +262,15 @@ pub struct CompactionOptions {
     /// fragments at a time).
     /// Defaults to `None` (no limit, all eligible fragments are compacted).
     pub max_source_fragments: Option<usize>,
+    /// Maximum number of data overlay files a fragment may carry before it is
+    /// fully compacted. When set, any fragment with more than this many overlays
+    /// is rewritten into a fresh fragment with its overlays (and deletions)
+    /// materialized into the base data, dropping the fragment from any index
+    /// left stale by those overlays.
+    /// Defaults to `Some(10)`. Set to `Some(0)` to compact every fragment that
+    /// carries any overlay, or `None` to disable the overlay-count trigger
+    /// entirely.
+    pub max_overlays_per_fragment: Option<usize>,
     /// Transaction properties to store with this commit.
     ///
     /// These key-value pairs are stored in the transaction file
@@ -291,6 +300,7 @@ impl Default for CompactionOptions {
             enable_binary_copy_force: false,
             binary_copy_read_batch_bytes: Some(16 * 1024 * 1024),
             max_source_fragments: None,
+            max_overlays_per_fragment: Some(10),
             transaction_properties: None,
         }
     }
@@ -317,6 +327,7 @@ impl CompactionOptions {
     /// - `lance.compaction.compaction_mode`
     /// - `lance.compaction.binary_copy_read_batch_bytes`
     /// - `lance.compaction.max_source_fragments`
+    /// - `lance.compaction.max_overlays_per_fragment`
     pub fn from_dataset_config(config: &HashMap<String, String>) -> Result<Self> {
         let mut opts = Self::default();
         opts.apply_dataset_config(config)?;
@@ -426,6 +437,19 @@ impl CompactionOptions {
                             key, value
                         ))
                     })?);
+                }
+                "max_overlays_per_fragment" => {
+                    // The default is `Some(10)`, so an explicit "none" is the only
+                    // way to disable the trigger through the manifest config.
+                    self.max_overlays_per_fragment = match value.to_ascii_lowercase().as_str() {
+                        "none" => None,
+                        _ => Some(value.parse().map_err(|_| {
+                            Error::invalid_input(format!(
+                                "Invalid value for {}: '{}' (expected a non-negative integer or 'none')",
+                                key, value
+                            ))
+                        })?),
+                    };
                 }
                 _ => {
                     warn!("Ignoring unknown compaction config key: {}", key);
@@ -714,7 +738,16 @@ impl CompactionPlanner for DefaultCompactionPlanner {
         while let Some(res) = fragment_metrics.next().await {
             let (fragment, metrics) = res?;
 
-            let candidacy = if self.options.materialize_deletions
+            let over_overlay_limit = self
+                .options
+                .max_overlays_per_fragment
+                .is_some_and(|max| fragment.overlays.len() > max);
+
+            let candidacy = if over_overlay_limit {
+                // Too many overlays: fully compact this fragment on its own,
+                // regardless of its size or deletion count.
+                Some(CompactionCandidacy::CompactItself)
+            } else if self.options.materialize_deletions
                 && metrics.deletion_percentage() > self.options.materialize_deletions_threshold
             {
                 Some(CompactionCandidacy::CompactItself)
@@ -6495,6 +6528,29 @@ mod tests {
     }
 
     #[test]
+    fn test_from_dataset_config_max_overlays_per_fragment() {
+        let key = "lance.compaction.max_overlays_per_fragment".to_string();
+
+        // An integer sets the threshold.
+        let config = HashMap::from([(key.clone(), "3".to_string())]);
+        let opts = CompactionOptions::from_dataset_config(&config).unwrap();
+        assert_eq!(opts.max_overlays_per_fragment, Some(3));
+
+        // "none" (case-insensitive) disables the trigger, overriding the Some(10) default.
+        let config = HashMap::from([(key.clone(), "None".to_string())]);
+        let opts = CompactionOptions::from_dataset_config(&config).unwrap();
+        assert_eq!(opts.max_overlays_per_fragment, None);
+
+        // Anything else is rejected.
+        let config = HashMap::from([(key, "not_a_number".to_string())]);
+        let err_msg = CompactionOptions::from_dataset_config(&config)
+            .unwrap_err()
+            .to_string();
+        assert!(err_msg.contains("max_overlays_per_fragment"));
+        assert!(err_msg.contains("not_a_number"));
+    }
+
+    #[test]
     fn test_apply_dataset_config_overrides() {
         let config = HashMap::from([(
             "lance.compaction.target_rows_per_fragment".to_string(),
@@ -8114,5 +8170,340 @@ mod tests {
                 (5, Some(b"batch-1-row-3".to_vec()))
             ]
         );
+    }
+    // ---- `max_overlays_per_fragment` compaction trigger ----
+    //
+    // Tests for the trigger that fully compacts a fragment carrying too many data
+    // overlay files into a fresh fragment with the overlays (and deletions)
+    // materialized into the base data.
+    use arrow_array::record_batch;
+    use lance_file::writer::{FileWriter, FileWriterOptions};
+    use lance_io::utils::CachedFileSize;
+    use lance_table::format::DataFile;
+    use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
+    use std::collections::BTreeMap;
+
+    use crate::dataset::DATA_DIR;
+    use crate::dataset::transaction::DataOverlayGroup;
+
+    /// Two-fragment Int32 dataset: `id` (field 0) = 0..12 and `val` (field 1) =
+    /// id * 10, six rows per fragment (fragments 0 and 1).
+    async fn create_base_dataset(uri: &str) -> Dataset {
+        let batch = record_batch!(
+            ("id", Int32, (0..12).collect::<Vec<_>>()),
+            ("val", Int32, (0..12).map(|v| v * 10).collect::<Vec<_>>())
+        )
+        .unwrap();
+        let schema = batch.schema();
+        let write_params = WriteParams {
+            max_rows_per_file: 6,
+            max_rows_per_group: 6,
+            data_storage_version: Some(LanceFileVersion::Stable),
+            ..Default::default()
+        };
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        Dataset::write(reader, uri, Some(write_params))
+            .await
+            .unwrap()
+    }
+
+    fn i32_array(values: impl IntoIterator<Item = Option<i32>>) -> ArrayRef {
+        Arc::new(Int32Array::from_iter(values))
+    }
+
+    fn bitmap(offsets: impl IntoIterator<Item = u32>) -> RoaringBitmap {
+        RoaringBitmap::from_iter(offsets)
+    }
+
+    /// Write a dense overlay covering `fields` of `fragment_id` with `columns`
+    /// as the per-field value columns, then commit it as a `DataOverlay`.
+    async fn commit_overlay(
+        dataset: Dataset,
+        fragment_id: u64,
+        fields: &[i32],
+        coverage: OverlayCoverage,
+        columns: Vec<ArrayRef>,
+    ) -> Dataset {
+        let read_version = dataset.version().version;
+        let overlay_schema = dataset.schema().project_by_ids(fields, true);
+        let filename = format!("{}.lance", Uuid::new_v4());
+        let path = dataset.base.clone().join(DATA_DIR).join(filename.as_str());
+        let obj_writer = dataset.object_store.create(&path).await.unwrap();
+        let mut writer = FileWriter::try_new(
+            obj_writer,
+            overlay_schema,
+            FileWriterOptions {
+                format_version: Some(LanceFileVersion::Stable),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let (major, minor) = writer.version().to_numbers();
+        for (column_index, array) in columns.into_iter().enumerate() {
+            writer.write_column(column_index, array).await.unwrap();
+        }
+        let summary = writer.finish().await.unwrap();
+
+        let mut data_file = DataFile::new_unstarted(filename, major, minor);
+        data_file.fields = writer
+            .field_id_to_column_indices()
+            .iter()
+            .map(|(f, _)| *f as i32)
+            .collect::<Vec<_>>()
+            .into();
+        data_file.column_indices = writer
+            .field_id_to_column_indices()
+            .iter()
+            .map(|(_, c)| *c as i32)
+            .collect::<Vec<_>>()
+            .into();
+        data_file.file_size_bytes = CachedFileSize::new(summary.size_bytes);
+
+        Dataset::commit(
+            WriteDestination::Dataset(Arc::new(dataset)),
+            Operation::DataOverlay {
+                groups: vec![DataOverlayGroup {
+                    fragment_id,
+                    overlays: vec![DataOverlayFile {
+                        data_file,
+                        coverage,
+                        committed_version: 0,
+                    }],
+                }],
+            },
+            Some(read_version),
+            None,
+            None,
+            Arc::new(Default::default()),
+            false,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Commit `n` distinct single-cell overlays to fragment 0 (offset `i`, val
+    /// column set to `1000 + i`), so the fragment ends up with `n` overlays. The
+    /// `1000 +` offset keeps overlaid values clear of the base `id * 10` values.
+    async fn commit_n_overlays(mut dataset: Dataset, n: u32) -> Dataset {
+        for i in 0..n {
+            dataset = commit_overlay(
+                dataset,
+                0,
+                &[1],
+                OverlayCoverage::dense(bitmap([i])),
+                vec![i32_array([Some(1000 + i as i32)])],
+            )
+            .await;
+        }
+        dataset
+    }
+
+    /// Options whose only compaction trigger is the overlay limit: base
+    /// fragments here are far below the default 1M-row target, which would
+    /// otherwise make them size-based compaction candidates on their own.
+    fn overlay_only_options(max_overlays_per_fragment: usize) -> CompactionOptions {
+        CompactionOptions {
+            max_overlays_per_fragment: Some(max_overlays_per_fragment),
+            target_rows_per_fragment: 6,
+            ..Default::default()
+        }
+    }
+
+    /// Scan `id` and `val` and return an `id -> val` map (order-independent).
+    async fn id_val_map(dataset: &Dataset) -> BTreeMap<i32, Option<i32>> {
+        let mut scanner = dataset.scan();
+        scanner.project(&["id", "val"]).unwrap();
+        let batch = scanner.try_into_batch().await.unwrap();
+        let mut out = BTreeMap::new();
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let vals = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            let v = if vals.is_null(i) {
+                None
+            } else {
+                Some(vals.value(i))
+            };
+            out.insert(ids.value(i), v);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn test_max_overlays_triggers_full_compaction() {
+        // Fragment 0 gets 3 overlays; fragment 1 stays clean.
+        let dataset = create_base_dataset("memory://").await;
+        let mut dataset = commit_n_overlays(dataset, 3).await;
+        assert_eq!(
+            dataset.get_fragment(0).unwrap().metadata().overlays.len(),
+            3
+        );
+
+        // Threshold 2: only fragment 0 (3 > 2) is compacted.
+        let metrics = compact_files(&mut dataset, overlay_only_options(2), None)
+            .await
+            .unwrap();
+        assert_eq!(metrics.fragments_removed, 1);
+        assert_eq!(metrics.fragments_added, 1);
+
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 2);
+        // The compacted fragment is a fresh single-data-file fragment with no
+        // overlays; fragment 1 is untouched.
+        let compacted = fragments
+            .iter()
+            .find(|f| f.id() != 1)
+            .expect("a new fragment id was assigned");
+        assert!(compacted.metadata().overlays.is_empty());
+        assert_eq!(compacted.metadata().files.len(), 1);
+
+        // The overlaid values were materialized: id i in 0..3 -> 1000 + i.
+        let values = id_val_map(&dataset).await;
+        let expected: BTreeMap<i32, Option<i32>> = (0..12)
+            .map(|id| {
+                let v = if id < 3 { 1000 + id } else { id * 10 };
+                (id, Some(v))
+            })
+            .collect();
+        assert_eq!(values, expected);
+    }
+
+    #[tokio::test]
+    async fn test_below_threshold_is_a_noop() {
+        let dataset = create_base_dataset("memory://").await;
+        let mut dataset = commit_n_overlays(dataset, 2).await;
+
+        // 2 overlays, threshold 2: `overlays > max` is false, so no compaction.
+        let metrics = compact_files(&mut dataset, overlay_only_options(2), None)
+            .await
+            .unwrap();
+        assert_eq!(metrics.fragments_removed, 0);
+        assert_eq!(metrics.fragments_added, 0);
+        assert_eq!(
+            dataset.get_fragment(0).unwrap().metadata().overlays.len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn test_overlay_compaction_materializes_deletions() {
+        let dataset = create_base_dataset("memory://").await;
+        let mut dataset = commit_n_overlays(dataset, 3).await;
+        // Delete a row from the overlaid fragment (id 2 is at offset 2).
+        dataset.delete("id = 2").await.unwrap();
+        assert!(
+            dataset
+                .get_fragment(0)
+                .unwrap()
+                .metadata()
+                .deletion_file
+                .is_some()
+        );
+
+        compact_files(&mut dataset, overlay_only_options(2), None)
+            .await
+            .unwrap();
+
+        // The deletion was materialized: no deletion file remains and id 2 is gone.
+        for fragment in dataset.get_fragments() {
+            assert!(fragment.metadata().deletion_file.is_none());
+            assert!(fragment.metadata().overlays.is_empty());
+        }
+        let values = id_val_map(&dataset).await;
+        assert!(!values.contains_key(&2));
+        // Surviving overlaid cells still carry their materialized values.
+        assert_eq!(values.get(&0), Some(&Some(1000)));
+        assert_eq!(values.get(&1), Some(&Some(1001)));
+    }
+
+    #[tokio::test]
+    async fn test_overlay_compaction_reconciles_stale_index() {
+        let mut dataset = create_base_dataset("memory://").await;
+        // Index `val` before any overlay -> the index is stale once val is overlaid.
+        dataset
+            .create_index(
+                &["val"],
+                IndexType::Scalar,
+                None,
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Overlay val[0] 0 -> 100 (committed after the index) and push fragment 0
+        // over the overlay limit.
+        let mut dataset = commit_n_overlays(dataset, 3).await;
+
+        let val_index_before = dataset
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .find(|i| i.fields == vec![1])
+            .expect("val index present")
+            .clone();
+        assert!(
+            val_index_before
+                .fragment_bitmap
+                .as_ref()
+                .unwrap()
+                .contains(0)
+        );
+
+        compact_files(&mut dataset, overlay_only_options(2), None)
+            .await
+            .unwrap();
+
+        // The stale val index no longer covers the compacted fragment, so its
+        // rows fall back to a flat scan instead of serving stale values.
+        let indices = dataset.load_indices().await.unwrap();
+        let val_index = indices
+            .iter()
+            .find(|i| i.fields == vec![1])
+            .expect("val index present");
+        let compacted_id = dataset
+            .get_fragments()
+            .iter()
+            .map(|f| f.id() as u32)
+            .find(|id| *id != 1)
+            .unwrap();
+        assert!(
+            !val_index
+                .fragment_bitmap
+                .as_ref()
+                .unwrap()
+                .contains(compacted_id),
+            "stale index must drop the compacted fragment from its coverage"
+        );
+
+        // The indexed query is correct: the materialized value is found and the
+        // stale pre-overlay value is gone.
+        let mut scanner = dataset.scan();
+        scanner
+            .filter("val = 1000")
+            .unwrap()
+            .project(&["id"])
+            .unwrap();
+        let batch = scanner.try_into_batch().await.unwrap();
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids.value(0), 0);
+
+        let mut scanner = dataset.scan();
+        scanner.filter("val = 0").unwrap().project(&["id"]).unwrap();
+        let batch = scanner.try_into_batch().await.unwrap();
+        assert_eq!(batch.num_rows(), 0, "stale value 0 must no longer match");
     }
 }
