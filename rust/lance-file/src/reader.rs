@@ -10,12 +10,11 @@ use std::{
     sync::Arc,
 };
 
-use arrow_array::{RecordBatch, RecordBatchReader};
+use arrow_array::RecordBatchReader;
 use arrow_schema::Schema as ArrowSchema;
 use byteorder::{ByteOrder, LittleEndian, ReadBytesExt};
 use bytes::{Bytes, BytesMut};
-use futures::{FutureExt, Stream, StreamExt, stream::BoxStream};
-use lance_arrow::RecordBatchExt;
+use futures::{Stream, StreamExt, stream::BoxStream};
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_encoding::{
     EncodingsIo,
@@ -269,9 +268,7 @@ impl CachedFileMetadata {
 #[derive(Debug, Clone)]
 pub struct ReaderProjection {
     /// The data types (schema) of the selected columns.  The names
-    /// of the schema are arbitrary and ignored. A partial packed-struct
-    /// projection must retain stable field IDs because the single physical
-    /// column index identifies the packed root, not an individual child.
+    /// of the schema are arbitrary and ignored.
     pub schema: Arc<Schema>,
     /// The indices of the columns to load.
     ///
@@ -373,16 +370,27 @@ impl ReaderProjection {
     /// the projection will be invalid and the read will fail.
     /// If the field is a `struct datatype` with `packed` set to true in the field metadata,
     /// the whole struct has one column index.
+    /// To support nested `packed-struct encoding`, this method need to be further adjusted.
     pub fn from_whole_schema(schema: &Schema, version: LanceFileVersion) -> Self {
         let schema = Arc::new(schema.clone());
-        let mapping = physical_column_index_by_field_id(schema.as_ref(), version);
-        let num_columns = mapping
-            .values()
-            .copied()
-            .max()
-            .map(|last_column| last_column + 1)
-            .unwrap_or(0);
-        let column_indices = (0..num_columns).collect();
+        let is_structural = version >= LanceFileVersion::V2_1;
+        let mut column_indices = vec![];
+        let mut curr_column_idx = 0;
+        let mut packed_struct_fields_num = 0;
+        for field in schema.fields_pre_order() {
+            if packed_struct_fields_num > 0 {
+                packed_struct_fields_num -= 1;
+                continue;
+            }
+            if field.is_packed_struct() {
+                column_indices.push(curr_column_idx);
+                curr_column_idx += 1;
+                packed_struct_fields_num = field.children.len();
+            } else if field.children.is_empty() || !is_structural {
+                column_indices.push(curr_column_idx);
+                curr_column_idx += 1;
+            }
+        }
         Self {
             schema,
             column_indices,
@@ -400,7 +408,16 @@ impl ReaderProjection {
         schema: &Schema,
         column_names: &[&str],
     ) -> Result<Self> {
-        let field_id_to_column_index = physical_column_index_by_field_id(schema, file_version);
+        let field_id_to_column_index = schema
+            .fields_pre_order()
+            // In the 2.0 system we needed ids for intermediate fields.  In 2.1+
+            // we only need ids for leaf fields.
+            .filter(|field| {
+                file_version < LanceFileVersion::V2_1 || field.is_leaf() || field.is_packed_struct()
+            })
+            .enumerate()
+            .map(|(idx, field)| (field.id as u32, idx as u32))
+            .collect::<BTreeMap<_, _>>();
         let projected = schema.project(column_names)?;
         let mut column_indices = Vec::new();
         Self::from_field_ids_helper(
@@ -447,28 +464,6 @@ impl Default for FileReaderOptions {
 struct PreparedProjection {
     column_infos: Vec<Arc<ColumnInfo>>,
     decoder_projection: ReaderProjection,
-    post_decode_projection: Option<Arc<ArrowSchema>>,
-}
-
-struct ProjectingRecordBatchReader {
-    inner: Box<dyn RecordBatchReader + Send + 'static>,
-    schema: Arc<ArrowSchema>,
-}
-
-impl Iterator for ProjectingRecordBatchReader {
-    type Item = std::result::Result<RecordBatch, arrow_schema::ArrowError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.inner
-            .next()
-            .map(|batch| batch.and_then(|batch| batch.project_by_schema(self.schema.as_ref())))
-    }
-}
-
-impl RecordBatchReader for ProjectingRecordBatchReader {
-    fn schema(&self) -> Arc<ArrowSchema> {
-        self.schema.clone()
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -547,10 +542,8 @@ fn field_column_shape(field: &Field, is_structural: bool) -> (bool, bool) {
 // can therefore compact any ordinary structural projection into 0..N while
 // preserving this order.
 //
-// Blob and packed-struct fields are physically atomic but need the stored file
-// schema to select their logical decode view. They remain on the full-metadata
-// path; ordinary structural fields can be reconstructed from their selected
-// physical leaves alone.
+// Blob and packed-struct fields remain unsupported by indexed projection. Their
+// opaque decode semantics are handled by the existing full-metadata reader.
 fn indexed_projection_column_count(field: &Field) -> Option<usize> {
     if field.is_blob() || field.is_packed_struct() {
         return None;
@@ -565,193 +558,6 @@ fn indexed_projection_column_count(field: &Field) -> Option<usize> {
     field.children.iter().try_fold(initial, |count, child| {
         count.checked_add(indexed_projection_column_count(child)?)
     })
-}
-
-fn physical_column_index_by_field_id(
-    schema: &Schema,
-    version: LanceFileVersion,
-) -> BTreeMap<u32, u32> {
-    physical_fields_in_order(schema, version)
-        .into_iter()
-        .enumerate()
-        .map(|(column_index, field)| (field.id as u32, column_index as u32))
-        .collect()
-}
-
-fn physical_fields_in_order(schema: &Schema, version: LanceFileVersion) -> Vec<&Field> {
-    fn visit<'a>(fields: &'a [Field], is_structural: bool, physical_fields: &mut Vec<&'a Field>) {
-        for field in fields {
-            let (contributes, recurse) = field_column_shape(field, is_structural);
-            if contributes {
-                physical_fields.push(field);
-            }
-            if recurse {
-                visit(&field.children, is_structural, physical_fields);
-            }
-        }
-    }
-
-    let mut physical_fields = Vec::new();
-    visit(
-        &schema.fields,
-        version >= LanceFileVersion::V2_1,
-        &mut physical_fields,
-    );
-    physical_fields
-}
-
-fn overlay_projected_field(expanded: &mut Field, projected: &Field) -> Result<()> {
-    let full_children = std::mem::take(&mut expanded.children);
-    let mut overlaid = projected.clone();
-    overlaid.children = full_children;
-    let has_stable_child_ids = projected.children.iter().all(|child| child.id >= 0);
-    if has_stable_child_ids {
-        for projected_child in &projected.children {
-            let expanded_child = overlaid
-                .children
-                .iter_mut()
-                .find(|candidate| candidate.id == projected_child.id)
-                .ok_or_else(|| {
-                    Error::schema(format!(
-                        "projected packed field '{}.{}' does not exist in the file schema",
-                        projected.name, projected_child.name
-                    ))
-                })?;
-            overlay_projected_field(expanded_child, projected_child)?;
-        }
-    } else if projected.children.len() == overlaid.children.len() {
-        for (expanded_child, projected_child) in
-            overlaid.children.iter_mut().zip(&projected.children)
-        {
-            overlay_projected_field(expanded_child, projected_child)?;
-        }
-    } else {
-        return Err(Error::not_supported(format!(
-            "partial packed projection '{}' requires stable field IDs because projection names are arbitrary",
-            projected.name
-        )));
-    }
-    *expanded = overlaid;
-    Ok(())
-}
-
-fn contains_packed_struct(field: &Field) -> bool {
-    field.is_packed_struct() || field.children.iter().any(contains_packed_struct)
-}
-
-fn expand_packed_struct_fields(
-    fields: &mut [Field],
-    column_indices: &[u32],
-    cursor: &mut usize,
-    file_physical_fields: &[&Field],
-    is_structural: bool,
-) -> Result<bool> {
-    let mut expanded = false;
-    for field in fields {
-        let (contributes, recurse) = field_column_shape(field, is_structural);
-        let physical_column = if contributes {
-            let column = *column_indices.get(*cursor).ok_or_else(|| {
-                Error::invalid_input(format!(
-                    "projection supplied fewer column indices than its fields require (ran out at field '{}')",
-                    field.name
-                ))
-            })?;
-            *cursor += 1;
-            Some(column)
-        } else {
-            None
-        };
-
-        if field.is_packed_struct() {
-            let physical_column = physical_column.ok_or_else(|| {
-                Error::internal(format!(
-                    "packed field '{}' did not map to a physical column",
-                    field.name
-                ))
-            })?;
-            let file_field = file_physical_fields
-                .get(physical_column as usize)
-                .copied()
-                .ok_or_else(|| {
-                    Error::invalid_input(format!(
-                        "packed field '{}' references column index {} but the file has only {} physical columns",
-                        field.name,
-                        physical_column,
-                        file_physical_fields.len()
-                    ))
-                })?;
-            if !file_field.is_packed_struct() {
-                return Err(Error::schema(format!(
-                    "projected field '{}' maps to physical column {} but that column is not a packed struct",
-                    field.name, physical_column
-                )));
-            }
-            if field != file_field {
-                let requested = field.clone();
-                *field = file_field.clone();
-                overlay_projected_field(field, &requested)?;
-                expanded = true;
-            }
-        } else if recurse {
-            expanded |= expand_packed_struct_fields(
-                &mut field.children,
-                column_indices,
-                cursor,
-                file_physical_fields,
-                is_structural,
-            )?;
-        }
-    }
-    Ok(expanded)
-}
-
-fn prepare_decoder_projection(
-    projection: &ReaderProjection,
-    file_schema: &Schema,
-    version: LanceFileVersion,
-) -> Result<(Arc<Schema>, Option<Arc<ArrowSchema>>)> {
-    let mut decoder_schema = projection.schema.as_ref().clone();
-    if !decoder_schema.fields.iter().any(contains_packed_struct) {
-        return Ok((Arc::new(decoder_schema), None));
-    }
-    let file_physical_fields = physical_fields_in_order(file_schema, version);
-    let mut cursor = 0;
-    let expanded = expand_packed_struct_fields(
-        &mut decoder_schema.fields,
-        &projection.column_indices,
-        &mut cursor,
-        &file_physical_fields,
-        version >= LanceFileVersion::V2_1,
-    )?;
-
-    let post_decode_projection =
-        expanded.then(|| Arc::new(ArrowSchema::from(projection.schema.as_ref())));
-    Ok((Arc::new(decoder_schema), post_decode_projection))
-}
-
-fn apply_post_decode_projection(
-    tasks: Pin<Box<dyn Stream<Item = ReadBatchTask> + Send>>,
-    projection: Option<Arc<ArrowSchema>>,
-) -> Pin<Box<dyn Stream<Item = ReadBatchTask> + Send>> {
-    let Some(projection) = projection else {
-        return tasks;
-    };
-
-    tasks
-        .map(move |task| {
-            let projection = projection.clone();
-            ReadBatchTask {
-                num_rows: task.num_rows,
-                task: async move {
-                    let batch = task.task.await?;
-                    batch
-                        .project_by_schema(projection.as_ref())
-                        .map_err(Error::from)
-                }
-                .boxed(),
-            }
-        })
-        .boxed()
 }
 
 // Whether a field's children each cover the same rows as the field itself. Struct
@@ -1901,15 +1707,6 @@ impl FileReader {
     ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
         let projection = projection.unwrap_or_else(|| self.core.base_projection.clone());
         Self::validate_projection(&projection, &self.metadata)?;
-        let (decoder_schema, post_decode_projection) = prepare_decoder_projection(
-            &projection,
-            self.metadata.file_schema.as_ref(),
-            self.metadata.version(),
-        )?;
-        let decoder_projection = ReaderProjection {
-            schema: decoder_schema,
-            column_indices: projection.column_indices,
-        };
         // Apply the same projection-length validation as the async path.  This
         // reader is always backed by full metadata, so we can build the prepared
         // projection synchronously (no column-metadata I/O) and reuse the shared
@@ -1917,8 +1714,7 @@ impl FileReader {
         // `RangeFull`/`RangeFrom` resolve against rather than `num_rows`.
         let prepared = PreparedProjection {
             column_infos: self.metadata.column_infos.clone(),
-            decoder_projection: decoder_projection.clone(),
-            post_decode_projection: post_decode_projection.clone(),
+            decoder_projection: projection.clone(),
         };
         let read_len = self.core.prepared_read_length(&prepared)?;
         let verify_bound = |params: &ReadBatchParams, bound: u64, inclusive: bool| {
@@ -1930,7 +1726,7 @@ impl FileReader {
                 Ok(())
             }
         };
-        let reader = match &params {
+        match &params {
             ReadBatchParams::Indices(indices) => {
                 for idx in indices {
                     match idx {
@@ -1943,14 +1739,14 @@ impl FileReader {
                     }
                 }
                 let indices = indices.iter().map(|idx| idx.unwrap() as u64).collect();
-                self.take_rows_blocking(indices, batch_size, decoder_projection, filter)
+                self.take_rows_blocking(indices, batch_size, projection, filter)
             }
             ReadBatchParams::Range(range) => {
                 verify_bound(&params, range.end as u64, false)?;
                 self.read_range_blocking(
                     range.start as u64..range.end as u64,
                     batch_size,
-                    decoder_projection,
+                    projection,
                     filter,
                 )
             }
@@ -1960,38 +1756,24 @@ impl FileReader {
                     verify_bound(&params, range.end, false)?;
                     ranges_u64.push(range.start..range.end);
                 }
-                self.read_ranges_blocking(ranges_u64, batch_size, decoder_projection, filter)
+                self.read_ranges_blocking(ranges_u64, batch_size, projection, filter)
             }
             ReadBatchParams::RangeFrom(range) => {
                 verify_bound(&params, range.start as u64, true)?;
                 self.read_range_blocking(
                     range.start as u64..read_len,
                     batch_size,
-                    decoder_projection,
+                    projection,
                     filter,
                 )
             }
             ReadBatchParams::RangeTo(range) => {
                 verify_bound(&params, range.end as u64, false)?;
-                self.read_range_blocking(
-                    0..range.end as u64,
-                    batch_size,
-                    decoder_projection,
-                    filter,
-                )
+                self.read_range_blocking(0..range.end as u64, batch_size, projection, filter)
             }
             ReadBatchParams::RangeFull => {
-                self.read_range_blocking(0..read_len, batch_size, decoder_projection, filter)
+                self.read_range_blocking(0..read_len, batch_size, projection, filter)
             }
-        }?;
-
-        if let Some(schema) = post_decode_projection {
-            Ok(Box::new(ProjectingRecordBatchReader {
-                inner: reader,
-                schema,
-            }))
-        } else {
-            Ok(reader)
         }
     }
 
@@ -2226,16 +2008,10 @@ impl FileMetadataProvider {
         cache: &Arc<LanceCache>,
     ) -> Result<PreparedProjection> {
         self.validate_projection(projection)?;
-        let (decoder_schema, post_decode_projection) =
-            prepare_decoder_projection(projection, self.schema().as_ref(), self.version())?;
         match self {
             Self::Full(metadata) => Ok(PreparedProjection {
                 column_infos: metadata.column_infos.clone(),
-                decoder_projection: ReaderProjection {
-                    schema: decoder_schema,
-                    column_indices: projection.column_indices.clone(),
-                },
-                post_decode_projection,
+                decoder_projection: projection.clone(),
             }),
             Self::Indexed(metadata_index) => {
                 let column_infos = Self::load_indexed_column_infos(
@@ -2246,7 +2022,7 @@ impl FileMetadataProvider {
                 )
                 .await?;
                 let decoder_projection = ReaderProjection {
-                    schema: decoder_schema,
+                    schema: projection.schema.clone(),
                     column_indices: (0..projection.column_indices.len())
                         .map(|idx| idx as u32)
                         .collect(),
@@ -2254,7 +2030,6 @@ impl FileMetadataProvider {
                 Ok(PreparedProjection {
                     column_infos,
                     decoder_projection,
-                    post_decode_projection,
                 })
             }
         }
@@ -2475,7 +2250,6 @@ impl FileReadCore {
         // common length, which `RangeFull`/`RangeFrom` resolve against (rather
         // than `num_rows`, the file's longest column).
         let read_len = self.prepared_read_length(&prepared)?;
-        let post_decode_projection = prepared.post_decode_projection.clone();
         let verify_bound = |params: &ReadBatchParams, bound: u64, inclusive: bool| {
             if bound > read_len || (bound == read_len && inclusive) {
                 Err(Error::invalid_input(format!(
@@ -2485,7 +2259,7 @@ impl FileReadCore {
                 Ok(())
             }
         };
-        let tasks = match &params {
+        match &params {
             ReadBatchParams::Indices(indices) => {
                 for idx in indices {
                     match idx {
@@ -2533,8 +2307,7 @@ impl FileReadCore {
                 self.read_range(0..read_len, batch_size, prepared, filter)
                     .await
             }
-        }?;
-        Ok(apply_post_decode_projection(tasks, post_decode_projection))
+        }
     }
 }
 
@@ -2842,12 +2615,9 @@ mod tests {
     };
 
     use arrow_array::{
-        ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, StringArray, StructArray,
-        UInt32Array,
-        cast::AsArray,
+        RecordBatch, UInt32Array,
         types::{Float64Type, Int32Type},
     };
-    use arrow_buffer::NullBuffer;
     use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema};
     use bytes::Bytes;
     use futures::{StreamExt, prelude::stream::TryStreamExt};
@@ -2970,106 +2740,6 @@ mod tests {
                 format_version: Some(LanceFileVersion::V2_1),
                 ..Default::default()
             },
-        )
-        .await
-    }
-
-    async fn write_wide_packed_struct_file(
-        fs: &FsFixture,
-        num_scalar_columns: usize,
-        packed_fields: Fields,
-        packed_array: ArrayRef,
-        version: LanceFileVersion,
-    ) -> WrittenFile {
-        let num_rows = packed_array.len();
-        let packed_position = num_scalar_columns / 2;
-        let mut fields = Vec::with_capacity(num_scalar_columns + 1);
-        let mut columns = Vec::with_capacity(num_scalar_columns + 1);
-        for column_idx in 0..num_scalar_columns {
-            if column_idx == packed_position {
-                fields.push(
-                    Field::new("packed", DataType::Struct(packed_fields.clone()), true)
-                        .with_metadata(HashMap::from([(
-                            "lance-encoding:packed".to_string(),
-                            "true".to_string(),
-                        )])),
-                );
-                columns.push(packed_array.clone());
-            }
-            fields.push(Field::new(format!("c{column_idx}"), DataType::Int32, false));
-            columns.push(Arc::new(Int32Array::from_iter_values(
-                column_idx as i32..column_idx as i32 + num_rows as i32,
-            )));
-        }
-
-        let arrow_schema = Arc::new(ArrowSchema::new(fields));
-        let batch = RecordBatch::try_new(arrow_schema.clone(), columns).unwrap();
-        let reader = RecordBatchIterator::new(vec![Ok(batch)], arrow_schema);
-        write_lance_file(
-            reader,
-            fs,
-            FileWriterOptions {
-                format_version: Some(version),
-                ..Default::default()
-            },
-        )
-        .await
-    }
-
-    async fn create_wide_packed_struct_file(
-        fs: &FsFixture,
-        num_scalar_columns: usize,
-    ) -> WrittenFile {
-        let num_rows: usize = 64;
-        let packed_fields = Fields::from(vec![
-            Field::new("x", DataType::Int32, false),
-            Field::new("y", DataType::Int32, false),
-        ]);
-        let packed_array: ArrayRef = Arc::new(StructArray::new(
-            packed_fields.clone(),
-            vec![
-                Arc::new(Int32Array::from_iter_values(0..num_rows as i32)),
-                Arc::new(Int32Array::from_iter_values(
-                    10_000..10_000 + num_rows as i32,
-                )),
-            ],
-            Some(NullBuffer::from_iter((0..num_rows).map(|row| row % 5 != 0))),
-        ));
-        write_wide_packed_struct_file(
-            fs,
-            num_scalar_columns,
-            packed_fields,
-            packed_array,
-            LanceFileVersion::V2_1,
-        )
-        .await
-    }
-
-    async fn create_wide_variable_packed_struct_file(
-        fs: &FsFixture,
-        num_scalar_columns: usize,
-    ) -> WrittenFile {
-        let num_rows: usize = 64;
-        let packed_fields = Fields::from(vec![
-            Field::new("x", DataType::Int32, false),
-            Field::new("y", DataType::Utf8, false),
-        ]);
-        let packed_array: ArrayRef = Arc::new(StructArray::new(
-            packed_fields.clone(),
-            vec![
-                Arc::new(Int32Array::from_iter_values(0..num_rows as i32)),
-                Arc::new(StringArray::from_iter_values(
-                    (0..num_rows).map(|row| format!("value-{row}")),
-                )),
-            ],
-            Some(NullBuffer::from_iter((0..num_rows).map(|row| row % 7 != 0))),
-        ));
-        write_wide_packed_struct_file(
-            fs,
-            num_scalar_columns,
-            packed_fields,
-            packed_array,
-            LanceFileVersion::V2_2,
         )
         .await
     }
@@ -3735,191 +3405,6 @@ mod tests {
         );
     }
 
-    async fn read_full_metadata_projection(
-        fs: &FsFixture,
-        projection: ReaderProjection,
-    ) -> Vec<RecordBatch> {
-        let file_scheduler = fs
-            .scheduler
-            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
-            .await
-            .unwrap();
-        let reader = FileReader::try_open(
-            file_scheduler,
-            None,
-            Arc::<DecoderPlugins>::default(),
-            &test_cache(),
-            FileReaderOptions::default(),
-        )
-        .await
-        .unwrap();
-        reader
-            .read_stream_projected(
-                lance_io::ReadBatchParams::RangeFull,
-                127,
-                16,
-                projection,
-                FilterExpression::no_filter(),
-            )
-            .await
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap()
-    }
-
-    #[tokio::test]
-    async fn test_packed_child_projection_falls_back_to_full_metadata() {
-        let fs = FsFixture::default();
-        let written_file = create_wide_packed_struct_file(&fs, 128).await;
-
-        let whole_projection =
-            ReaderProjection::from_whole_schema(&written_file.schema, LanceFileVersion::V2_1);
-        assert_eq!(whole_projection.column_indices.len(), 129);
-
-        let packed_projection = ReaderProjection::from_column_names(
-            LanceFileVersion::V2_1,
-            &written_file.schema,
-            &["packed"],
-        )
-        .unwrap();
-        assert_eq!(packed_projection.column_indices, vec![64]);
-        assert!(!ProjectedFileReader::supports_projection(
-            &packed_projection,
-            LanceFileVersion::V2_1
-        ));
-
-        let projection = ReaderProjection::from_column_names(
-            LanceFileVersion::V2_1,
-            &written_file.schema,
-            &["c127", "packed.y", "c0"],
-        )
-        .unwrap();
-        assert_eq!(projection.column_indices, vec![128, 64, 0]);
-        assert_eq!(projection.schema.fields[1].children.len(), 1);
-        assert_eq!(projection.schema.fields[1].children[0].name, "y");
-        assert!(!ProjectedFileReader::supports_projection(
-            &projection,
-            LanceFileVersion::V2_1
-        ));
-
-        let file_scheduler = fs
-            .scheduler
-            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
-            .await
-            .unwrap();
-        let err = ProjectedFileReader::try_open(
-            file_scheduler,
-            Some(projection.clone()),
-            Arc::<DecoderPlugins>::default(),
-            &test_cache(),
-            FileReaderOptions::default(),
-        )
-        .await
-        .unwrap_err();
-        assert!(matches!(err, lance_core::Error::NotSupported { .. }));
-        assert!(err.to_string().contains("without blob or packed-struct"));
-
-        let actual = read_full_metadata_projection(&fs, projection.clone()).await;
-        let projection_arrow = ArrowSchema::from(projection.schema.as_ref());
-        let expected = written_file
-            .data
-            .iter()
-            .map(|batch| batch.project_by_schema(&projection_arrow).unwrap())
-            .collect::<Vec<_>>();
-        assert_eq!(actual, expected);
-
-        let file_scheduler = fs
-            .scheduler
-            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
-            .await
-            .unwrap();
-        let reader = FileReader::try_open(
-            file_scheduler,
-            None,
-            Arc::<DecoderPlugins>::default(),
-            &test_cache(),
-            FileReaderOptions::default(),
-        )
-        .await
-        .unwrap();
-        let blocking = tokio::task::spawn_blocking(move || {
-            reader
-                .read_stream_projected_blocking(
-                    lance_io::ReadBatchParams::RangeFull,
-                    127,
-                    Some(projection),
-                    FilterExpression::no_filter(),
-                )
-                .unwrap()
-                .collect::<ArrowResult<Vec<_>>>()
-                .unwrap()
-        })
-        .await
-        .unwrap();
-        assert_eq!(blocking, expected);
-    }
-
-    #[tokio::test]
-    async fn test_variable_packed_child_projection_uses_full_metadata() {
-        let fs = FsFixture::default();
-        let written_file = create_wide_variable_packed_struct_file(&fs, 32).await;
-        let projection = ReaderProjection::from_column_names(
-            LanceFileVersion::V2_2,
-            &written_file.schema,
-            &["packed.y"],
-        )
-        .unwrap();
-        assert_eq!(projection.column_indices, vec![16]);
-        assert!(!ProjectedFileReader::supports_projection(
-            &projection,
-            LanceFileVersion::V2_2
-        ));
-
-        let actual = read_full_metadata_projection(&fs, projection.clone()).await;
-        let projection_arrow = ArrowSchema::from(projection.schema.as_ref());
-        let expected = written_file
-            .data
-            .iter()
-            .map(|batch| batch.project_by_schema(&projection_arrow).unwrap())
-            .collect::<Vec<_>>();
-        assert_eq!(actual, expected);
-    }
-
-    #[tokio::test]
-    async fn test_full_packed_projection_allows_arbitrary_names_without_field_ids() {
-        let fs = FsFixture::default();
-        let written_file = create_wide_packed_struct_file(&fs, 4).await;
-        let packed_projection = ReaderProjection::from_column_names(
-            LanceFileVersion::V2_1,
-            &written_file.schema,
-            &["packed"],
-        )
-        .unwrap();
-        let mut alias_schema = packed_projection.schema.as_ref().clone();
-        let packed = &mut alias_schema.fields[0];
-        packed.name = "alias".to_string();
-        packed.id = -1;
-        for (idx, child) in packed.children.iter_mut().enumerate() {
-            child.name = format!("alias_{idx}");
-            child.id = -1;
-        }
-        let alias_projection = ReaderProjection {
-            schema: Arc::new(alias_schema),
-            column_indices: packed_projection.column_indices,
-        };
-
-        let actual = read_full_metadata_projection(&fs, alias_projection).await;
-        assert_eq!(actual.len(), 1);
-        let alias = actual[0].column_by_name("alias").unwrap().as_struct();
-        let original = written_file.data[0]
-            .column_by_name("packed")
-            .unwrap()
-            .as_struct();
-        assert_eq!(alias.column(0), original.column(0));
-        assert_eq!(alias.column(1), original.column(1));
-    }
-
     #[rstest]
     #[case::before_metadata_region(90, 5)]
     #[case::after_metadata_region(190, 20)]
@@ -3948,8 +3433,11 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::blob(BLOB_META_KEY)]
+    #[case::packed_struct("lance-encoding:packed")]
     #[tokio::test]
-    async fn test_lazy_reader_rejects_blob_projection() {
+    async fn test_lazy_reader_rejects_opaque_projection(#[case] metadata_key: &str) {
         let fs = FsFixture::default();
         let written_file = create_some_file(&fs, LanceFileVersion::V2_1).await;
 
@@ -3987,7 +3475,7 @@ mod tests {
         let mut projection = ordinary_projection;
         Arc::make_mut(&mut projection.schema).fields[0]
             .metadata
-            .insert(BLOB_META_KEY.to_string(), "true".to_string());
+            .insert(metadata_key.to_string(), "true".to_string());
         assert!(!ProjectedFileReader::supports_projection(
             &projection,
             LanceFileVersion::V2_1
@@ -4004,7 +3492,7 @@ mod tests {
         .unwrap_err();
         assert!(
             matches!(err, lance_core::Error::NotSupported { .. }),
-            "expected NotSupported for blob, got {err:?}"
+            "expected NotSupported for {metadata_key}, got {err:?}"
         );
     }
 
