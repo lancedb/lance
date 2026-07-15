@@ -59,6 +59,7 @@ use super::flushed_cache::{DatasetCache, GenerationWarmer, open_flushed_dataset}
 use super::projection::{project_to_canonical, validate_projection_names};
 use crate::dataset::mem_wal::memtable::scanner::MemTableScanner;
 use crate::session::Session;
+use lance_io::object_store::ObjectStoreParams;
 
 /// `_score` column name in FTS results — kept aligned with
 /// `lance_index::scalar::inverted::SCORE_COL` so this module doesn't
@@ -124,6 +125,8 @@ pub struct LsmFtsSearchPlanner {
     base_schema: SchemaRef,
     /// Session threaded into flushed-generation opens (shared caches).
     session: Option<Arc<Session>>,
+    /// Store params for opening flushed generations, reusing the base dataset's store.
+    store_params: Option<ObjectStoreParams>,
     /// Cache of opened flushed-generation datasets.
     flushed_cache: Option<Arc<dyn DatasetCache>>,
     /// Optional warmer fired on first open of a flushed generation.
@@ -148,6 +151,7 @@ impl LsmFtsSearchPlanner {
             pk_columns,
             base_schema,
             session: None,
+            store_params: None,
             flushed_cache: None,
             warmer: None,
             overfetch_factor: DEFAULT_OVERFETCH_FACTOR,
@@ -171,10 +175,15 @@ impl LsmFtsSearchPlanner {
         self
     }
 
-    /// Thread a session into flushed-generation opens so the first open
-    /// populates the shared index / file-metadata caches.
+    /// Set the session used to open flushed generations.
     pub fn with_session(mut self, session: Arc<Session>) -> Self {
         self.session = Some(session);
+        self
+    }
+
+    /// Set the store params used to open flushed generations.
+    pub fn with_store_params(mut self, store_params: ObjectStoreParams) -> Self {
+        self.store_params = Some(store_params);
         self
     }
 
@@ -247,6 +256,7 @@ impl LsmFtsSearchPlanner {
         let block_lists = Box::pin(compute_source_block_lists(
             &sources,
             self.session.as_ref(),
+            self.store_params.as_ref(),
             self.flushed_cache.as_ref(),
         ))
         .await?;
@@ -393,6 +403,7 @@ impl LsmFtsSearchPlanner {
                 let dataset = open_flushed_dataset(
                     path,
                     self.session.as_ref(),
+                    self.store_params.as_ref(),
                     self.flushed_cache.as_ref(),
                     self.warmer.as_ref(),
                 )

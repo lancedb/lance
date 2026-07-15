@@ -4434,6 +4434,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_indexed_metadata_heuristic_counts_selected_physical_columns() {
+        let schema = Schema::try_from(&ArrowSchema::new(vec![
+            ArrowField::new(
+                "s",
+                DataType::Struct(
+                    vec![
+                        ArrowField::new("x", DataType::Int32, true),
+                        ArrowField::new("y", DataType::Int32, true),
+                    ]
+                    .into(),
+                ),
+                true,
+            ),
+            ArrowField::new("a", DataType::Int32, true),
+            ArrowField::new("b", DataType::Int32, true),
+            ArrowField::new("c", DataType::Int32, true),
+        ]))
+        .unwrap();
+        let data_file = DataFile {
+            path: "wide.lance".to_string(),
+            fields: Arc::from([0, 1, 2, 3, 4, 5]),
+            column_indices: Arc::from([-1, 0, 1, 2, 3, 4]),
+            file_major_version: 2,
+            file_minor_version: 1,
+            file_size_bytes: CachedFileSize::unknown(),
+            base_id: None,
+        };
+
+        let full_struct =
+            ReaderProjection::from_column_names(LanceFileVersion::V2_1, &schema, &["s"]).unwrap();
+        assert_eq!(full_struct.column_indices.len(), 2);
+        assert!(!FileFragment::should_try_indexed_metadata(
+            &data_file,
+            &full_struct,
+            LanceFileVersion::V2_1
+        ));
+
+        let partial_struct =
+            ReaderProjection::from_column_names(LanceFileVersion::V2_1, &schema, &["s.x"]).unwrap();
+        assert_eq!(partial_struct.column_indices.len(), 1);
+        assert!(FileFragment::should_try_indexed_metadata(
+            &data_file,
+            &partial_struct,
+            LanceFileVersion::V2_1
+        ));
+    }
+
     #[tokio::test]
     async fn test_iops_read_small() {
         // Create a file that has 8 columns.
