@@ -11,7 +11,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use lance_core::ROW_ID;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::pbold::InvertedIndexDetails;
-use lance_index::scalar::inverted::InvertedIndex;
+use lance_index::scalar::inverted::{InvertedIndex, InvertedIndexParams};
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::registry::VALUE_COLUMN_NAME;
 use lance_table::format::IndexMetadata;
@@ -217,6 +217,15 @@ pub async fn load_segment_details(
             column
         ))
     })
+}
+
+/// Read one segment's [`InvertedIndexParams`]
+pub async fn load_segment_params(
+    dataset: &Dataset,
+    segment: &IndexMetadata,
+) -> Result<InvertedIndexParams> {
+    let store = LanceIndexStore::from_dataset_for_existing(dataset, segment).await?;
+    InvertedIndex::load_params(&store).await
 }
 
 #[cfg(test)]
