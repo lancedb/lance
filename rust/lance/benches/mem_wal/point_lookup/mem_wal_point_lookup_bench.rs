@@ -27,9 +27,6 @@
 //! ```
 
 #![allow(clippy::print_stdout, clippy::print_stderr)]
-// Overlay-aware index masking deepens the scan/take future graph past rustc's
-// default query-recursion limit (128); raise it so run_lookup's layout resolves.
-#![recursion_limit = "256"]
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -434,9 +431,9 @@ async fn run_lookup(args: &Args) -> Result<serde_json::Value> {
 
         for (qi, &id) in ids.iter().enumerate() {
             let t0 = Instant::now();
-            let plan = planner
-                .plan_lookup(&[ScalarValue::Int64(Some(id))], None)
-                .await?;
+            // Box this deep future: overlay-aware index masking pushes its layout past rustc's
+            // default recursion limit when inlined here.
+            let plan = Box::pin(planner.plan_lookup(&[ScalarValue::Int64(Some(id))], None)).await?;
             let stream = plan.execute(0, task_ctx.clone())?;
             let batches: Vec<RecordBatch> = stream.try_collect().await?;
             let elapsed_us = t0.elapsed().as_micros() as f64;

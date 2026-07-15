@@ -69,11 +69,6 @@
 //! ```
 //!
 
-// Overlay-aware index masking deepens the async future graph in the scan/index
-// read path past rustc's default query-recursion limit (128); raise it so the
-// layout of those futures resolves.
-#![recursion_limit = "256"]
-
 use arrow_schema::DataType;
 use dataset::builder::DatasetBuilder;
 pub use lance_core::datatypes;

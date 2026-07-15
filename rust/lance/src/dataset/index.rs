@@ -73,7 +73,9 @@ impl IndexRemapper for DatasetIndexRemapper {
                         .any(|frag_idx| affected_frag_ids.contains(&(frag_idx as u64))),
                 };
             if needs_remapped {
-                let remap_result = self.remap_index(index, &mapping).await?;
+                // Box this deep future: overlay-aware index masking pushes its layout past
+                // rustc's default recursion limit when inlined into this state machine.
+                let remap_result = Box::pin(self.remap_index(index, &mapping)).await?;
                 match remap_result {
                     RemapResult::Drop => continue,
                     RemapResult::Keep(id) => {

@@ -39,9 +39,6 @@ async fn create_base_dataset() -> Dataset {
     create_base_dataset_with(false).await
 }
 
-/// Like [`create_base_dataset`] but lets a test enable stable row ids, under which `_rowid` is a
-/// logical id resolved through a separate mapping (not a physical row address). This exercises the
-/// address-based stale-row take path.
 async fn create_base_dataset_with(stable_row_ids: bool) -> Dataset {
     let schema = Arc::new(ArrowSchema::new(vec![
         ArrowField::new("id", DataType::Int32, true),
@@ -57,7 +54,6 @@ async fn create_base_dataset_with(stable_row_ids: bool) -> Dataset {
     .unwrap();
     let write_params = WriteParams {
         max_rows_per_file: 6,
-        max_rows_per_group: 6,
         enable_stable_row_ids: stable_row_ids,
         ..Default::default()
     };
@@ -460,7 +456,6 @@ async fn create_vector_overlay_dataset(stable_row_ids: bool) -> Dataset {
     .unwrap();
     let write_params = WriteParams {
         max_rows_per_file: 32,
-        max_rows_per_group: 32,
         enable_stable_row_ids: stable_row_ids,
         ..Default::default()
     };
@@ -625,7 +620,6 @@ async fn create_text_dataset() -> Dataset {
     .unwrap();
     let write_params = WriteParams {
         max_rows_per_file: 6,
-        max_rows_per_group: 6,
         ..Default::default()
     };
     let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
@@ -890,7 +884,6 @@ async fn bench_index_query_overlay_overhead() {
 
     let write_params = WriteParams {
         max_rows_per_file: ROWS_PER_FRAG as usize,
-        max_rows_per_group: ROWS_PER_FRAG as usize,
         ..Default::default()
     };
     let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
