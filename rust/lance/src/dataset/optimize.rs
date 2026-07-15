@@ -267,8 +267,9 @@ pub struct CompactionOptions {
     /// is rewritten into a fresh fragment with its overlays (and deletions)
     /// materialized into the base data, dropping the fragment from any index
     /// left stale by those overlays.
-    /// Defaults to `Some(10)`. Set to `None` to disable the overlay-count
-    /// trigger entirely.
+    /// Defaults to `Some(10)`. Set to `Some(0)` to compact every fragment that
+    /// carries any overlay, or `None` to disable the overlay-count trigger
+    /// entirely.
     pub max_overlays_per_fragment: Option<usize>,
     /// Transaction properties to store with this commit.
     ///
@@ -438,12 +439,17 @@ impl CompactionOptions {
                     })?);
                 }
                 "max_overlays_per_fragment" => {
-                    self.max_overlays_per_fragment = Some(value.parse().map_err(|_| {
-                        Error::invalid_input(format!(
-                            "Invalid value for {}: '{}' (expected a non-negative integer)",
-                            key, value
-                        ))
-                    })?);
+                    // The default is `Some(10)`, so an explicit "none" is the only
+                    // way to disable the trigger through the manifest config.
+                    self.max_overlays_per_fragment = match value.to_ascii_lowercase().as_str() {
+                        "none" => None,
+                        _ => Some(value.parse().map_err(|_| {
+                            Error::invalid_input(format!(
+                                "Invalid value for {}: '{}' (expected a non-negative integer or 'none')",
+                                key, value
+                            ))
+                        })?),
+                    };
                 }
                 _ => {
                     warn!("Ignoring unknown compaction config key: {}", key);
@@ -6519,6 +6525,29 @@ mod tests {
         let result = CompactionOptions::from_dataset_config(&config);
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("invalid_mode"));
+    }
+
+    #[test]
+    fn test_from_dataset_config_max_overlays_per_fragment() {
+        let key = "lance.compaction.max_overlays_per_fragment".to_string();
+
+        // An integer sets the threshold.
+        let config = HashMap::from([(key.clone(), "3".to_string())]);
+        let opts = CompactionOptions::from_dataset_config(&config).unwrap();
+        assert_eq!(opts.max_overlays_per_fragment, Some(3));
+
+        // "none" (case-insensitive) disables the trigger, overriding the Some(10) default.
+        let config = HashMap::from([(key.clone(), "None".to_string())]);
+        let opts = CompactionOptions::from_dataset_config(&config).unwrap();
+        assert_eq!(opts.max_overlays_per_fragment, None);
+
+        // Anything else is rejected.
+        let config = HashMap::from([(key, "not_a_number".to_string())]);
+        let err_msg = CompactionOptions::from_dataset_config(&config)
+            .unwrap_err()
+            .to_string();
+        assert!(err_msg.contains("max_overlays_per_fragment"));
+        assert!(err_msg.contains("not_a_number"));
     }
 
     #[test]
