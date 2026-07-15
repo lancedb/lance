@@ -23,7 +23,7 @@ use crate::metrics::MetricsCollector;
 use super::{
     CompressedPositionStorage,
     impact::{IMPACT_LEVEL1_BLOCKS, ImpactScoreCache, ImpactSkipData},
-    index::PositionStreamCodec,
+    index::{PositionStreamCodec, dequantize_doc_length},
     query::Operator,
     scorer::{K1, idf},
 };
@@ -113,6 +113,55 @@ fn bulk_and_mode_from_env() -> BulkAndMode {
 }
 
 static BULK_AND_MODE: LazyLock<BulkAndMode> = LazyLock::new(bulk_and_mode_from_env);
+
+#[cfg(target_arch = "x86_64")]
+static HAS_AVX2: LazyLock<bool> = LazyLock::new(|| std::arch::is_x86_feature_detected!("avx2"));
+
+/// First index in `[pos, end)` where `docs[index] >= target` (scalar).
+/// Posting-block doc ids stay below 2^31, which the AVX2 variant relies on.
+#[inline]
+unsafe fn find_next_geq_scalar(docs: *const u32, mut pos: usize, end: usize, target: u32) -> usize {
+    unsafe {
+        while pos < end && *docs.add(pos) < target {
+            pos += 1;
+        }
+    }
+    pos
+}
+
+/// AVX2 `find_next_geq` (the analogue of Lucene's VectorUtil.findNextGEQ):
+/// branchless 8-wide compare+movemask kills the mispredicted exits that
+/// dominate the scalar catch-up scan on irregular doc gaps.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn find_next_geq_avx2(docs: *const u32, mut pos: usize, end: usize, target: u32) -> usize {
+    use core::arch::x86_64::*;
+    debug_assert!(target <= i32::MAX as u32);
+    unsafe {
+        let target_lanes = _mm256_set1_epi32(target as i32);
+        while pos + 8 <= end {
+            let docs_lanes = _mm256_loadu_si256(docs.add(pos) as *const __m256i);
+            // lane mask of docs[i] < target; doc ids < 2^31 keep the signed
+            // compare equivalent to unsigned.
+            let below = _mm256_cmpgt_epi32(target_lanes, docs_lanes);
+            let mask = _mm256_movemask_ps(_mm256_castsi256_ps(below)) as u32;
+            if mask != 0xFF {
+                return pos + mask.trailing_ones() as usize;
+            }
+            pos += 8;
+        }
+        find_next_geq_scalar(docs, pos, end, target)
+    }
+}
+
+#[inline]
+unsafe fn find_next_geq(docs: *const u32, pos: usize, end: usize, target: u32) -> usize {
+    #[cfg(target_arch = "x86_64")]
+    if *HAS_AVX2 {
+        return unsafe { find_next_geq_avx2(docs, pos, end, target) };
+    }
+    unsafe { find_next_geq_scalar(docs, pos, end, target) }
+}
 
 #[inline]
 fn conservative_bm25_upper_bound(query_weight: f32) -> f32 {
@@ -2558,6 +2607,180 @@ impl<'a, S: Scorer> Wand<'a, S> {
             block_start: usize,
         }
 
+        // Merge kernels: intersect the window's per-clause slices and record
+        // each match as (doc, per-clause block offsets). Hand-specialized for
+        // two and three clauses so cursors and bounds stay in registers; the
+        // generic kernel covers other widths. Offsets fit u8 because a block
+        // holds at most `MAX_POSTING_BLOCK_SIZE` (256) entries. The macro
+        // stamps a scalar and an AVX2 variant — `#[target_feature]` must
+        // cover the whole kernel for the vector catch-up scans to inline.
+        // Kernels prune a lead doc before any follower advance when its
+        // frequency-bucketed score bound (plus the other clauses' block
+        // maxes) cannot beat the threshold — the score-first ordering
+        // Lucene's conjunction scorer uses, with doc length dropped from the
+        // bound so no doc-length load is involved. The bound is monotone
+        // (doc length only shrinks a BM25 weight, and the last bucket holds
+        // the clause sup), so every skipped doc would also fail the exact
+        // per-candidate prune: results are unchanged, the work never happens.
+        macro_rules! merge_kernels {
+            ($name2:ident, $name3:ident, $geq:ident $(, #[$feat:meta])?) => {
+                $(#[$feat])?
+                unsafe fn $name2(
+                    wins: &[WindowList],
+                    lut: &[f32; FREQ_LUT_BUCKETS],
+                    others_block_max: f32,
+                    threshold: f32,
+                    docs_out: &mut Vec<u32>,
+                    offs_out: &mut Vec<u8>,
+                ) {
+                    let (d0, mut p0, e0) = (wins[0].docs, wins[0].pos, wins[0].end);
+                    let (d1, mut p1, e1) = (wins[1].docs, wins[1].pos, wins[1].end);
+                    let f0 = wins[0].freqs;
+                    let prune = threshold > f32::NEG_INFINITY;
+                    unsafe {
+                        while p0 < e0 {
+                            let doc = *d0.add(p0);
+                            if prune {
+                                let freq = (*f0.add(p0) as usize).min(FREQ_LUT_BUCKETS - 1);
+                                if lut[freq] + others_block_max <= threshold {
+                                    p0 += 1;
+                                    continue;
+                                }
+                            }
+                            p1 = $geq(d1, p1, e1, doc);
+                            if p1 >= e1 {
+                                return;
+                            }
+                            let second = *d1.add(p1);
+                            if second > doc {
+                                p0 = $geq(d0, p0 + 1, e0, second);
+                                continue;
+                            }
+                            docs_out.push(doc);
+                            offs_out.push(p0 as u8);
+                            offs_out.push(p1 as u8);
+                            p0 += 1;
+                        }
+                    }
+                }
+
+                $(#[$feat])?
+                unsafe fn $name3(
+                    wins: &[WindowList],
+                    lut: &[f32; FREQ_LUT_BUCKETS],
+                    others_block_max: f32,
+                    threshold: f32,
+                    docs_out: &mut Vec<u32>,
+                    offs_out: &mut Vec<u8>,
+                ) {
+                    let (d0, mut p0, e0) = (wins[0].docs, wins[0].pos, wins[0].end);
+                    let (d1, mut p1, e1) = (wins[1].docs, wins[1].pos, wins[1].end);
+                    let (d2, mut p2, e2) = (wins[2].docs, wins[2].pos, wins[2].end);
+                    let f0 = wins[0].freqs;
+                    let prune = threshold > f32::NEG_INFINITY;
+                    unsafe {
+                        'outer: while p0 < e0 {
+                            let doc = *d0.add(p0);
+                            if prune {
+                                let freq = (*f0.add(p0) as usize).min(FREQ_LUT_BUCKETS - 1);
+                                if lut[freq] + others_block_max <= threshold {
+                                    p0 += 1;
+                                    continue 'outer;
+                                }
+                            }
+                            p1 = $geq(d1, p1, e1, doc);
+                            if p1 >= e1 {
+                                return;
+                            }
+                            let second = *d1.add(p1);
+                            if second > doc {
+                                p0 = $geq(d0, p0 + 1, e0, second);
+                                continue 'outer;
+                            }
+                            p2 = $geq(d2, p2, e2, doc);
+                            if p2 >= e2 {
+                                return;
+                            }
+                            let third = *d2.add(p2);
+                            if third > doc {
+                                p0 = $geq(d0, p0 + 1, e0, third);
+                                continue 'outer;
+                            }
+                            docs_out.push(doc);
+                            offs_out.push(p0 as u8);
+                            offs_out.push(p1 as u8);
+                            offs_out.push(p2 as u8);
+                            p0 += 1;
+                        }
+                    }
+                }
+            };
+        }
+        merge_kernels!(merge_window_2, merge_window_3, find_next_geq_scalar);
+        #[cfg(target_arch = "x86_64")]
+        merge_kernels!(
+            merge_window_2_avx2,
+            merge_window_3_avx2,
+            find_next_geq_avx2,
+            #[target_feature(enable = "avx2")]
+        );
+
+        #[inline]
+        fn merge_window_1(wins: &[WindowList], docs_out: &mut Vec<u32>, offs_out: &mut Vec<u8>) {
+            let win = &wins[0];
+            for pos in win.pos..win.end {
+                docs_out.push(unsafe { *win.docs.add(pos) });
+                offs_out.push(pos as u8);
+            }
+        }
+
+        #[inline]
+        #[allow(clippy::too_many_arguments)]
+        fn merge_window_n(
+            wins: &[WindowList],
+            lut: &[f32; FREQ_LUT_BUCKETS],
+            others_block_max: f32,
+            threshold: f32,
+            cursors: &mut Vec<usize>,
+            docs_out: &mut Vec<u32>,
+            offs_out: &mut Vec<u8>,
+        ) {
+            let prune = threshold > f32::NEG_INFINITY;
+            cursors.clear();
+            cursors.extend(wins.iter().map(|win| win.pos));
+            'outer: while cursors[0] < wins[0].end {
+                let doc = unsafe { *wins[0].docs.add(cursors[0]) };
+                if prune {
+                    let freq = unsafe { *wins[0].freqs.add(cursors[0]) as usize }
+                        .min(FREQ_LUT_BUCKETS - 1);
+                    if lut[freq] + others_block_max <= threshold {
+                        cursors[0] += 1;
+                        continue 'outer;
+                    }
+                }
+                for j in 1..wins.len() {
+                    let win = &wins[j];
+                    let pos = unsafe { find_next_geq(win.docs, cursors[j], win.end, doc) };
+                    cursors[j] = pos;
+                    if pos >= win.end {
+                        return;
+                    }
+                    let clause_doc = unsafe { *win.docs.add(pos) };
+                    if clause_doc > doc {
+                        cursors[0] = unsafe {
+                            find_next_geq(wins[0].docs, cursors[0] + 1, wins[0].end, clause_doc)
+                        };
+                        continue 'outer;
+                    }
+                }
+                docs_out.push(doc);
+                for &pos in cursors.iter() {
+                    offs_out.push(pos as u8);
+                }
+                cursors[0] += 1;
+            }
+        }
+
         let mut candidates: TopKHeap =
             BinaryHeap::with_capacity(std::cmp::min(limit, BLOCK_SIZE * 10));
         let mut num_comparisons: usize = 0;
@@ -2566,6 +2789,37 @@ impl<'a, S: Scorer> Wand<'a, S> {
             ..Default::default()
         };
         let mut wins: Vec<WindowList> = Vec::with_capacity(num_lists);
+        // Per-window candidate batch. The merge kernel only records matches;
+        // scoring then runs in two passes so the doc-length gather issues
+        // independent loads (their cache misses overlap) instead of
+        // serializing behind per-candidate branching. A window spans at most
+        // one block per clause, so a batch holds at most one block's worth.
+        let mut batch_docs: Vec<u32> = Vec::with_capacity(MAX_POSTING_BLOCK_SIZE);
+        let mut batch_offs: Vec<u8> = Vec::with_capacity(MAX_POSTING_BLOCK_SIZE * num_lists);
+        let mut batch_lens: Vec<u32> = Vec::with_capacity(MAX_POSTING_BLOCK_SIZE);
+        let mut cursor_scratch: Vec<usize> = Vec::with_capacity(num_lists);
+
+        // Per-window prune LUT for the merge kernels: an upper bound of the
+        // first (rarest) clause's score by clamped frequency. Lead docs whose
+        // bound plus the remaining clauses' block maxes cannot beat the
+        // threshold are skipped before any follower advances — the same
+        // score-first ordering Lucene's conjunction scorer uses, with the
+        // doc-length dropped from the bound so no doc-length load is needed.
+        // The last bucket holds the frequency-independent sup, so clamping
+        // stays a valid upper bound. Skips only avoid work; every emitted
+        // candidate still goes through the exact per-candidate prune below.
+        const FREQ_LUT_BUCKETS: usize = 64;
+        let mut freq_bound_lut = [f32::INFINITY; FREQ_LUT_BUCKETS];
+        for (freq, slot) in freq_bound_lut
+            .iter_mut()
+            .enumerate()
+            .take(FREQ_LUT_BUCKETS - 1)
+        {
+            *slot = self.lead[0].score(&self.scorer, freq as u32, 0);
+        }
+        // The clamp bucket must bound every frequency it absorbs; the
+        // clause-wide sup does.
+        freq_bound_lut[FREQ_LUT_BUCKETS - 1] = self.lead[0].approximate_upper_bound();
 
         // The conjunction can only start at the max of the clauses' first docs.
         let mut target: u64 = 0;
@@ -2659,46 +2913,105 @@ impl<'a, S: Scorer> Wand<'a, S> {
                     .map(|posting| posting.block_max_score(&self.scorer))
                     .sum();
 
-                while wins[0].pos < wins[0].end {
-                    let doc = unsafe { *wins[0].docs.add(wins[0].pos) };
-                    let mut advance_to: Option<u32> = None;
-                    let mut window_done = false;
-                    for win in wins.iter_mut().skip(1) {
-                        while win.pos < win.end && unsafe { *win.docs.add(win.pos) } < doc {
-                            win.pos += 1;
-                        }
-                        if win.pos >= win.end {
-                            window_done = true;
-                            break;
-                        }
-                        let clause_doc = unsafe { *win.docs.add(win.pos) };
-                        if clause_doc > doc {
-                            advance_to = Some(clause_doc);
-                            break;
-                        }
-                    }
-                    if window_done {
-                        break;
-                    }
-                    if let Some(advance_to) = advance_to {
-                        let win = &mut wins[0];
-                        while win.pos < win.end && unsafe { *win.docs.add(win.pos) } < advance_to {
-                            win.pos += 1;
-                        }
-                        continue;
-                    }
+                batch_docs.clear();
+                batch_offs.clear();
+                // NEG_INFINITY disables the kernel-level freq-bound prune
+                // (single clause, or no threshold yet).
+                let kernel_threshold = if self.threshold > 0.0 && num_lists >= 2 {
+                    self.threshold
+                } else {
+                    f32::NEG_INFINITY
+                };
+                #[cfg(target_arch = "x86_64")]
+                let use_avx2 = *HAS_AVX2;
+                #[cfg(not(target_arch = "x86_64"))]
+                let use_avx2 = false;
+                match (num_lists, use_avx2) {
+                    (1, _) => merge_window_1(&wins, &mut batch_docs, &mut batch_offs),
+                    #[cfg(target_arch = "x86_64")]
+                    (2, true) => unsafe {
+                        merge_window_2_avx2(
+                            &wins,
+                            &freq_bound_lut,
+                            others_block_max,
+                            kernel_threshold,
+                            &mut batch_docs,
+                            &mut batch_offs,
+                        )
+                    },
+                    #[cfg(target_arch = "x86_64")]
+                    (3, true) => unsafe {
+                        merge_window_3_avx2(
+                            &wins,
+                            &freq_bound_lut,
+                            others_block_max,
+                            kernel_threshold,
+                            &mut batch_docs,
+                            &mut batch_offs,
+                        )
+                    },
+                    (2, _) => unsafe {
+                        merge_window_2(
+                            &wins,
+                            &freq_bound_lut,
+                            others_block_max,
+                            kernel_threshold,
+                            &mut batch_docs,
+                            &mut batch_offs,
+                        )
+                    },
+                    (3, _) => unsafe {
+                        merge_window_3(
+                            &wins,
+                            &freq_bound_lut,
+                            others_block_max,
+                            kernel_threshold,
+                            &mut batch_docs,
+                            &mut batch_offs,
+                        )
+                    },
+                    _ => merge_window_n(
+                        &wins,
+                        &freq_bound_lut,
+                        others_block_max,
+                        kernel_threshold,
+                        &mut cursor_scratch,
+                        &mut batch_docs,
+                        &mut batch_offs,
+                    ),
+                }
 
-                    // All clauses sit on `doc`: a conjunction candidate.
-                    let doc_length = self.docs.scoring_num_tokens(doc);
+                // Pass A: gather doc lengths for the whole batch up front so
+                // the loads issue back-to-back and their cache misses overlap.
+                // Quantized (V3) sets gather through the byte-norm slab: a
+                // quarter of the bytes through the cache versus the u32 vec.
+                batch_lens.clear();
+                match self.docs.scoring_norms() {
+                    Some(norms) => {
+                        for &doc in batch_docs.iter() {
+                            batch_lens.push(dequantize_doc_length(norms[doc as usize]));
+                        }
+                    }
+                    None => {
+                        for &doc in batch_docs.iter() {
+                            batch_lens.push(self.docs.scoring_num_tokens(doc));
+                        }
+                    }
+                }
+
+                // Pass B: prune / verify / score / insert, in doc order, with
+                // exactly the classic loop's semantics.
+                for (index, &doc) in batch_docs.iter().enumerate() {
+                    let doc_length = batch_lens[index];
+                    let offs = &batch_offs[index * num_lists..(index + 1) * num_lists];
                     if self.threshold > 0.0 && num_lists >= 2 {
                         let first_score = self.lead[0].score(
                             &self.scorer,
-                            unsafe { *wins[0].freqs.add(wins[0].pos) },
+                            unsafe { *wins[0].freqs.add(offs[0] as usize) },
                             doc_length,
                         );
                         if first_score + others_block_max <= self.threshold {
                             self.and_candidates_pruned_before_return += 1;
-                            wins[0].pos += 1;
                             continue;
                         }
                     }
@@ -2714,7 +3027,6 @@ impl<'a, S: Scorer> Wand<'a, S> {
                     if docs_has_row_ids
                         && (row_id == RowAddress::TOMBSTONE_ROW || !mask.selected(row_id))
                     {
-                        wins[0].pos += 1;
                         continue;
                     }
 
@@ -2723,11 +3035,13 @@ impl<'a, S: Scorer> Wand<'a, S> {
                         // `position_cursor` reads the right posting entry. The
                         // window block is already decompressed; position blocks
                         // decode lazily and are cached per block.
-                        for (win, posting) in wins.iter().zip(self.lead.iter_mut()) {
-                            posting.index = win.block_start + win.pos;
+                        for ((win, posting), &off) in
+                            wins.iter().zip(self.lead.iter_mut()).zip(offs.iter())
+                        {
+                            posting.index = win.block_start + off as usize;
                             posting.current_doc = Some(DocInfo::Raw(RawDocInfo {
                                 doc_id: doc,
-                                frequency: unsafe { *win.freqs.add(win.pos) },
+                                frequency: unsafe { *win.freqs.add(off as usize) },
                             }));
                         }
                         let matched = if slop == 0 {
@@ -2736,15 +3050,15 @@ impl<'a, S: Scorer> Wand<'a, S> {
                             self.check_positions(slop as i32)?
                         };
                         if !matched {
-                            wins[0].pos += 1;
                             continue;
                         }
                     }
                     stats.full_scores += 1;
 
                     let mut score = 0.0f32;
-                    for (win, posting) in wins.iter().zip(self.lead.iter()) {
-                        let freq = unsafe { *win.freqs.add(win.pos) };
+                    for ((win, posting), &off) in wins.iter().zip(self.lead.iter()).zip(offs.iter())
+                    {
+                        let freq = unsafe { *win.freqs.add(off as usize) };
                         score += posting.score(&self.scorer, freq, doc_length);
                     }
 
@@ -2758,8 +3072,11 @@ impl<'a, S: Scorer> Wand<'a, S> {
                         let freqs = wins
                             .iter()
                             .zip(self.lead.iter())
-                            .map(|(win, posting)| {
-                                (posting.term_index(), unsafe { *win.freqs.add(win.pos) })
+                            .zip(offs.iter())
+                            .map(|((win, posting), &off)| {
+                                (posting.term_index(), unsafe {
+                                    *win.freqs.add(off as usize)
+                                })
                             })
                             .collect();
                         if candidates.len() >= limit {
@@ -2776,7 +3093,6 @@ impl<'a, S: Scorer> Wand<'a, S> {
                             self.update_threshold(kth, params.wand_factor);
                         }
                     }
-                    wins[0].pos += 1;
                 }
             }
 
@@ -5172,8 +5488,11 @@ mod tests {
         let addrs = result.into_iter().map(|doc| doc.addr).collect::<Vec<_>>();
         assert!(matches!(addrs.as_slice(), [CandidateAddr::RowId(0)]));
         let scored = scored.load(Ordering::Relaxed);
+        // The bulk path evaluates 63 doc weights up front to fill its
+        // frequency-bound prune LUT; those are bound computations, not
+        // per-candidate scoring.
         assert!(
-            scored <= BLOCK_SIZE + 1,
+            scored <= BLOCK_SIZE + 1 + 63,
             "expected candidate pruning to avoid full scoring in the first block, scored {scored}"
         );
     }
