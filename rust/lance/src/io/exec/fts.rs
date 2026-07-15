@@ -13,7 +13,7 @@ use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
-use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
+use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, Gauge, MetricsSet};
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::union::UnionExec;
@@ -166,6 +166,9 @@ pub struct FtsIndexMetrics {
     and_candidates_pruned_before_return: Count,
     and_full_scores: Count,
     freqs_collected: Count,
+    /// Wall time (ms) of the exec-local `build_global_bm25_scorer`
+    /// fallback; zero when a preset base scorer was injected.
+    scorer_build_ms: Gauge,
     baseline_metrics: BaselineMetrics,
 }
 
@@ -179,12 +182,17 @@ impl FtsIndexMetrics {
                 .new_count(AND_CANDIDATES_PRUNED_BEFORE_RETURN_METRIC, partition),
             and_full_scores: metrics.new_count(AND_FULL_SCORES_METRIC, partition),
             freqs_collected: metrics.new_count(FREQS_COLLECTED_METRIC, partition),
+            scorer_build_ms: metrics.new_gauge("scorer_build_ms", partition),
             baseline_metrics: BaselineMetrics::new(metrics, partition),
         }
     }
 
     pub fn record_parts_searched(&self, num_parts: usize) {
         self.partitions_searched.add(num_parts);
+    }
+
+    pub fn record_scorer_build(&self, elapsed: std::time::Duration) {
+        self.scorer_build_ms.set(elapsed.as_millis() as usize);
     }
 }
 
@@ -521,11 +529,16 @@ impl ExecutionPlan for MatchQueryExec {
             let tokens = collect_query_tokens(&query.terms, &mut tokenizer);
             let base_scorer = match preset_base_scorer {
                 Some(scorer) => scorer,
-                None => Arc::new(
-                    build_global_bm25_scorer(&indices, &tokens, &params)
-                        .boxed()
-                        .await?,
-                ),
+                None => {
+                    let scorer_start = std::time::Instant::now();
+                    let scorer = Arc::new(
+                        build_global_bm25_scorer(&indices, &tokens, &params)
+                            .boxed()
+                            .await?,
+                    );
+                    metrics.record_scorer_build(scorer_start.elapsed());
+                    scorer
+                }
             };
 
             pre_filter.wait_for_ready().await?;
@@ -1066,13 +1079,16 @@ impl ExecutionPlan for FlatMatchQueryExec {
                         Some(scorer) => (*scorer).clone(),
                         None => {
                             let query_tokens = collect_query_tokens(&query.terms, &mut tokenizer);
-                            build_global_bm25_scorer(
+                            let scorer_start = std::time::Instant::now();
+                            let scorer = build_global_bm25_scorer(
                                 &indices,
                                 &query_tokens,
                                 &FtsSearchParams::new(),
                             )
                             .boxed()
-                            .await?
+                            .await?;
+                            metrics.record_scorer_build(scorer_start.elapsed());
+                            scorer
                         }
                     };
                     (tokenizer, Some(base_scorer))
@@ -1379,11 +1395,16 @@ impl ExecutionPlan for PhraseQueryExec {
             let tokens = collect_query_tokens(&query.terms, &mut tokenizer);
             let base_scorer = match preset_base_scorer {
                 Some(scorer) => scorer,
-                None => Arc::new(
-                    build_global_bm25_scorer(&indices, &tokens, &params)
-                        .boxed()
-                        .await?,
-                ),
+                None => {
+                    let scorer_start = std::time::Instant::now();
+                    let scorer = Arc::new(
+                        build_global_bm25_scorer(&indices, &tokens, &params)
+                            .boxed()
+                            .await?,
+                    );
+                    metrics.record_scorer_build(scorer_start.elapsed());
+                    scorer
+                }
             };
 
             pre_filter.wait_for_ready().await?;
