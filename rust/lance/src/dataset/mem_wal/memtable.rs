@@ -749,11 +749,6 @@ impl MemTable {
         self.batch_store.remaining_capacity()
     }
 
-    /// Check if batch store is full.
-    pub fn is_batch_store_full(&self) -> bool {
-        self.batch_store.is_full()
-    }
-
     /// Create a scanner for querying this MemTable.
     ///
     /// # Arguments
@@ -1056,7 +1051,7 @@ mod tests {
 
         assert_eq!(memtable.batch_capacity(), 3);
         assert_eq!(memtable.remaining_batch_capacity(), 3);
-        assert!(!memtable.is_batch_store_full());
+        assert!(!memtable.batch_store().is_full());
 
         // Fill up the store
         memtable
@@ -1072,7 +1067,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(memtable.is_batch_store_full());
+        assert!(memtable.batch_store().is_full());
         assert_eq!(memtable.remaining_batch_capacity(), 0);
 
         // Next insert should fail

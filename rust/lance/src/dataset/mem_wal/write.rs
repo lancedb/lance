@@ -851,14 +851,46 @@ fn now_millis() -> u64 {
 /// Aborts with an error if any replayed entry's `writer_epoch` is strictly
 /// greater than `our_epoch` — that indicates a successor writer claimed the
 /// shard between our `claim_epoch` and this replay, fencing us.
+/// Outcome of replaying a shard's WAL into memory.
+struct ReplayResult {
+    /// The active memtable — the final, partial one replay left unsealed. A fresh
+    /// shard yields an empty one; every sealed memtable was flushed to a Lance
+    /// generation during replay and is not returned.
+    active: MemTable,
+    /// One past the highest WAL entry position observed — the next write position.
+    next_wal_position: u64,
+}
+
+/// Replay a shard's WAL into memory, flushing sealed memtables as the batch store
+/// fills.
+///
+/// A single memtable holds at most `max_memtable_batches` batches, but a WAL is
+/// unbounded — so replay must rotate exactly as the live write path does. It
+/// seals a full memtable and, because the data is already durable, flushes it to
+/// a Lance generation right here (the same `MemTableFlusher::flush` the live path
+/// uses), rather than holding every sealed memtable in memory until open
+/// finishes. That bounds resident memory to ~two memtables and truncates the WAL
+/// as it goes, so a later reopen replays only the unflushed tail. Only the final
+/// partial memtable is returned, as the active one.
+///
+/// `make_memtable(generation, global_offset)` builds a fresh, cursor-bound
+/// memtable. Rotation happens at WAL-entry boundaries, never mid-entry, so each
+/// sealed memtable covers a clean range of complete entries and stamps the last
+/// one as its flushed generation's `replay_after_wal_entry_position`.
+#[allow(clippy::too_many_arguments)]
 async fn replay_memtable_from_wal(
     object_store: Arc<ObjectStore>,
     base_path: Path,
     shard_id: Uuid,
     our_epoch: u64,
     manifest: &ShardManifest,
-    memtable: &mut MemTable,
-) -> Result<u64> {
+    base_generation: u64,
+    mut make_memtable: impl FnMut(u64, usize) -> Result<MemTable>,
+    flusher: &MemTableFlusher,
+    wal_flusher: &WalFlusher,
+    index_configs: &[MemIndexConfig],
+    max_memtable_size: usize,
+) -> Result<ReplayResult> {
     // WAL positions are 1-based (see `FIRST_WAL_ENTRY_POSITION`), so a
     // cursor of 0 means "no flush has ever stamped this shard" and replay
     // starts at position 1. After flushing position N the cursor holds N
@@ -869,13 +901,10 @@ async fn replay_memtable_from_wal(
     // contents into the base table.
     let start_position = manifest.replay_after_wal_entry_position.saturating_add(1);
 
-    // The MemTable is always freshly built before this function runs, so
-    // any existing BatchStore entries can only have come from this replay
-    // pass. We index everything in `[0, batch_count)` at the end.
-    debug_assert_eq!(memtable.batch_count(), 0);
-
     let tailer = WalTailer::new(object_store, base_path, shard_id);
     let mut position = start_position;
+
+    let mut active = make_memtable(base_generation, 0)?;
 
     loop {
         match tailer.read_entry(position).await? {
@@ -895,13 +924,60 @@ async fn replay_memtable_from_wal(
                     // Entries written before deletes existed lack `_tombstone`;
                     // inject `false` so they match the extended memtable schema.
                     // Normal entries already carry it and pass through unchanged.
-                    let target_schema = memtable.schema().clone();
+                    let target_schema = active.schema().clone();
                     let batches = entry
                         .batches
                         .into_iter()
                         .map(|b| ensure_tombstone_column(b, &target_schema))
                         .collect::<Result<Vec<_>>>()?;
-                    memtable.insert_batches_only(batches).await?;
+
+                    // Seal + flush at the entry boundary on the *same* criteria the
+                    // live path uses (`maybe_trigger_memtable_flush`): the memtable
+                    // is at or over `max_memtable_size` bytes, or this whole entry
+                    // won't fit the batch store. The byte trigger is the one that
+                    // matters beyond avoiding overflow — it is what keeps a memtable
+                    // under `max_memtable_rows`, and therefore keeps the in-memory
+                    // HNSW index (sized to `max_memtable_rows`) from exhausting its
+                    // capacity when the final active memtable is indexed.
+                    //
+                    // Rotate at the entry boundary so no entry is split across two
+                    // memtables and each sealed one covers a clean range of complete
+                    // entries. Never rotate an empty memtable — if a single entry
+                    // has more batches than a memtable can hold, a fresh one would
+                    // overflow too, the same hard limit the live put path has, left
+                    // to the insert below to surface.
+                    if !active.batch_store().is_empty()
+                        && memtable_reached_flush_threshold(
+                            &active,
+                            max_memtable_size,
+                            batches.len(),
+                        )
+                    {
+                        let store = active.batch_store();
+                        // The last entry this memtable fully absorbed is the one
+                        // before the entry about to be inserted.
+                        let covered = position.saturating_sub(1);
+                        let generation = active.generation() + 1;
+                        let global_end = store.global_end();
+
+                        // The sealed data is already durable in the WAL — mark it
+                        // so the flush's `all_flushed_to_wal` precondition holds and
+                        // no WAL re-append is attempted.
+                        wal_flusher.advance_durable(global_end);
+                        flush_replayed_memtable(
+                            flusher,
+                            &active,
+                            our_epoch,
+                            covered,
+                            global_end,
+                            index_configs,
+                        )
+                        .await?;
+
+                        active = make_memtable(generation, global_end)?;
+                    }
+
+                    active.insert_batches_only(batches).await?;
                 }
                 position = position.checked_add(1).ok_or_else(|| {
                     Error::io(format!(
@@ -913,20 +989,17 @@ async fn replay_memtable_from_wal(
         }
     }
 
-    // Update in-memory indexes with the replayed batches so readers see them
-    // through the index path (matching what would have happened on the
-    // pre-crash writer's WAL flush). Indexes from the previous writer don't
-    // persist; this rebuilds them from the WAL.
-    if let Some(indexes) = memtable.indexes_arc() {
-        let batches_after = memtable.batch_count();
-        if batches_after > 0 {
-            let store = memtable.batch_store();
-            let mut stored: Vec<StoredBatch> = Vec::with_capacity(batches_after);
-            for pos in 0..batches_after {
-                if let Some(s) = store.get(pos) {
-                    stored.push(s.clone());
-                }
-            }
+    // Rebuild the active memtable's in-memory indexes from the batches just
+    // replayed, so readers see them through the index path — matching what the
+    // pre-crash writer's flush would have done. Sealed memtables needed no
+    // in-memory index build: they were flushed straight to disk and are gone.
+    if let Some(indexes) = active.indexes_arc() {
+        let batch_count = active.batch_count();
+        if batch_count > 0 {
+            let store = active.batch_store();
+            let stored: Vec<StoredBatch> = (0..batch_count)
+                .filter_map(|pos| store.get(pos).cloned())
+                .collect();
             tokio::task::spawn_blocking(move || indexes.insert_batches(&stored))
                 .await
                 .map_err(|e| {
@@ -935,7 +1008,50 @@ async fn replay_memtable_from_wal(
         }
     }
 
-    Ok(position)
+    Ok(ReplayResult {
+        active,
+        next_wal_position: position,
+    })
+}
+
+/// Whether a memtable has reached the threshold at which it should be sealed and
+/// flushed: at or over `max_memtable_size` bytes, or without room in its batch
+/// store for `incoming_batches` more.
+///
+/// The single source of truth for the flush trigger, shared by the live put path
+/// (`maybe_trigger_memtable_flush`, checking post-insert with `incoming_batches =
+/// 1` — "is there room for the next batch") and by replay (checking pre-insert
+/// with the next WAL entry's batch count). Keeping one predicate is what stops the
+/// two from drifting — e.g. someone adding a third criterion to one and not the
+/// other, which is the exact class of bug this whole change set is about.
+fn memtable_reached_flush_threshold(
+    memtable: &MemTable,
+    max_memtable_size: usize,
+    incoming_batches: usize,
+) -> bool {
+    memtable.estimated_size() >= max_memtable_size
+        || memtable.batch_store().remaining_capacity() < incoming_batches
+}
+
+/// Flush a sealed replay memtable to a Lance generation, choosing the indexed
+/// path when secondary indexes are configured (mirroring the live memtable-flush
+/// handler). Commits the manifest, stamping `covered` as the generation's
+/// `replay_after_wal_entry_position` so a later reopen skips these entries.
+async fn flush_replayed_memtable(
+    flusher: &MemTableFlusher,
+    memtable: &MemTable,
+    epoch: u64,
+    covered: u64,
+    durable: usize,
+    index_configs: &[MemIndexConfig],
+) -> Result<()> {
+    if index_configs.is_empty() {
+        flusher.flush(memtable, epoch, covered, durable).await?;
+    } else {
+        Box::pin(flusher.flush_with_indexes(memtable, epoch, index_configs, covered, durable))
+            .await?;
+    }
+    Ok(())
 }
 
 /// Pair each primary-key column name with its field id (both derived from the
@@ -1217,8 +1333,10 @@ impl SharedWriterState {
             return Ok(());
         }
 
-        let should_flush = state.memtable.estimated_size() >= self.config.max_memtable_size
-            || state.memtable.is_batch_store_full();
+        // Checked post-insert: flush if there is no longer room for even one more
+        // batch (or the byte threshold is crossed). Same predicate replay uses.
+        let should_flush =
+            memtable_reached_flush_threshold(&state.memtable, self.config.max_memtable_size, 1);
 
         if should_flush {
             state.flush_requested = true;
@@ -1542,62 +1660,88 @@ impl ShardWriter {
         // durable the shard can never reopen. Fail the open instead.
         validate_index_configs(index_configs, schema.as_ref(), &pk_columns)?;
 
-        let mut memtable = MemTable::with_capacity(
-            schema.clone(),
-            manifest.current_generation,
-            pk_field_ids.clone(),
-            CacheConfig::default(),
-            config.max_memtable_batches,
-        )?;
+        // Build a fresh, cursor-bound memtable at a given generation and
+        // writer-global coordinate. Replay calls this for the first memtable and
+        // after every rotation. Always builds and binds an `IndexStore`, even
+        // with no user indexes and no primary key — see the note in
+        // `freeze_memtable` for why an index-less memtable still needs one.
+        let make_bound_memtable = |generation: u64, global_offset: usize| -> Result<MemTable> {
+            let mut memtable = MemTable::with_capacity_at(
+                schema.clone(),
+                generation,
+                pk_field_ids.clone(),
+                CacheConfig::default(),
+                config.max_memtable_batches,
+                global_offset,
+            )?;
+            let mut indexes = IndexStore::from_configs(
+                index_configs,
+                config.max_memtable_rows,
+                config.max_memtable_batches,
+            )?;
+            if !pk_columns.is_empty() {
+                indexes.enable_pk_index(&pk_index_columns(&pk_columns, &pk_field_ids));
+            }
+            indexes.set_durability(Arc::clone(wal_flusher.cursors()), global_offset);
+            memtable.set_indexes_arc(Arc::new(indexes));
+            Ok(memtable)
+        };
 
-        // Always build and bind an IndexStore — see the matching note in
-        // `freeze_memtable`. The PK-position index is enabled before any WAL
-        // replay below so replayed rows are recorded in it.
-        let mut indexes = IndexStore::from_configs(
-            index_configs,
-            config.max_memtable_rows,
-            config.max_memtable_batches,
-        )?;
-        if !pk_columns.is_empty() {
-            indexes.enable_pk_index(&pk_index_columns(&pk_columns, &pk_field_ids));
-        }
-        // The writer's first memtable starts at coordinate 0.
-        indexes.set_durability(Arc::clone(wal_flusher.cursors()), 0);
-        memtable.set_indexes_arc(Arc::new(indexes));
+        // The flusher writes sealed memtables to Lance generations — both the
+        // ones replay seals below and the ones the live path freezes later.
+        let flusher = Arc::new(
+            MemTableFlusher::new(
+                object_store.clone(),
+                base_path.clone(),
+                base_uri.clone(),
+                shard_id,
+                manifest_store.clone(),
+            )
+            .with_warmer(config.warmer.clone())
+            .with_storage_context(config.store_params.clone(), config.session.clone()),
+        );
 
         // Replay any WAL entries written after the last successfully-flushed
-        // generation. Each entry's writer_epoch is checked against ours; an
-        // entry with a strictly greater epoch indicates a successor writer
-        // claimed the shard between our `claim_epoch` and replay, so we
-        // abort the open with a fence error. The replay walked the tailer
-        // up to the WAL tip, so we hand the discovered next-write position
-        // straight to the appender — its first append skips the
-        // discover_next_position probe entirely.
-        let next_wal_position = replay_memtable_from_wal(
+        // generation, flushing sealed memtables to Lance generations as the batch
+        // store fills. Each entry's writer_epoch is checked against ours; an entry
+        // with a strictly greater epoch means a successor claimed the shard
+        // between our `claim_epoch` and replay, so we abort with a fence error.
+        // Replay walks the tailer to the WAL tip and returns the discovered
+        // next-write position, so the appender's first append skips the
+        // discover_next_position probe.
+        let ReplayResult {
+            active: memtable,
+            next_wal_position,
+        } = replay_memtable_from_wal(
             object_store.clone(),
             base_path.clone(),
             shard_id,
             epoch,
             manifest,
-            &mut memtable,
+            manifest.current_generation,
+            make_bound_memtable,
+            &flusher,
+            &wal_flusher,
+            index_configs,
+            config.max_memtable_size,
         )
         .await?;
 
-        // Mark the replayed batches durable. They came *from* the WAL, and the
-        // replay above has already re-derived the indexes over them.
+        // Mark the active memtable's replayed batches durable. They came *from*
+        // the WAL, and replay has already re-derived its indexes over them.
         //
-        // Without this the durability cursor stays at 0, so the next WAL flush
-        // re-covers [0, end): it re-appends the already-durable rows *and*
-        // re-inserts every replayed row into the indexes. None of the three
-        // in-memory indexes is idempotent (HNSW mints fresh node ids for the
-        // same row, FTS increments doc_count/df rather than recomputing them,
-        // BTree is a multiset), so a full scan keeps looking healthy while every
-        // index-accelerated query silently returns duplicates — and it compounds,
-        // because the WAL now holds those rows twice.
+        // Without this the durability cursor stays at the last sealed generation,
+        // so the next WAL flush re-covers the active tail: it re-appends the
+        // already-durable rows *and* re-inserts every replayed row into the
+        // indexes. None of the three in-memory indexes is idempotent (HNSW mints
+        // fresh node ids for the same row, FTS increments doc_count/df rather than
+        // recomputing them, BTree is a multiset), so a full scan keeps looking
+        // healthy while every index-accelerated query silently returns duplicates
+        // — and it compounds, because the WAL now holds those rows twice.
         //
-        // The replayed memtable is the writer's first, so its `global_offset` is
-        // 0 and the durable count is just its batch count.
-        wal_flusher.advance_durable(memtable.batch_count());
+        // `global_end()` is the writer-global batch count through this memtable,
+        // since its coordinate continues where the last sealed generation ended.
+        wal_flusher.advance_durable(memtable.batch_store().global_end());
 
         wal_flusher
             .wal_appender()
@@ -1628,12 +1772,6 @@ impl ShardWriter {
         }));
 
         let (memtable_flush_tx, memtable_flush_rx) = mpsc::unbounded_channel();
-
-        let flusher = Arc::new(
-            MemTableFlusher::new(object_store, base_path, base_uri, shard_id, manifest_store)
-                .with_warmer(config.warmer.clone())
-                .with_storage_context(config.store_params.clone(), config.session.clone()),
-        );
 
         let backpressure = BackpressureController::new(config.clone());
 
@@ -5212,6 +5350,112 @@ mod tests {
             .put(vec![create_test_batch(&schema, 2, 1)])
             .await
             .unwrap();
+    }
+
+    /// A WAL holding more batches than one memtable's capacity must reopen.
+    ///
+    /// One memtable holds at most `max_memtable_batches` batches, but a WAL is
+    /// unbounded, so replay has to rotate — seal the full memtable, start a fresh
+    /// one — exactly as the live write path does. Before, replay stuffed
+    /// everything into a single memtable and `open()` failed outright with
+    /// "MemTable batch store is full", leaving the shard permanently unopenable.
+    #[tokio::test]
+    async fn test_replay_rotates_when_wal_exceeds_one_memtable() {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = schema_with_pk();
+        let shard_id = Uuid::new_v4();
+
+        const N: i32 = 8;
+
+        // Writer A has a *large* capacity, so its eight one-batch puts all land in
+        // a single memtable and it never freezes or flushes a generation of its
+        // own. Dropping it without close leaves an eight-entry WAL and no
+        // generations — a WAL that no single small memtable could hold.
+        let writer_a_config = ShardWriterConfig {
+            max_memtable_batches: 1000,
+            ..memtable_config_with_pk(shard_id)
+        };
+        // Writer B has a *two-batch* capacity, so replaying that eight-entry WAL is
+        // exactly what must rotate. Keeping the configs distinct isolates replay
+        // rotation from the live rotation writer A would otherwise do concurrently.
+        let config = ShardWriterConfig {
+            max_memtable_batches: 2,
+            ..memtable_config_with_pk(shard_id)
+        };
+
+        {
+            let writer_a = ShardWriter::open(
+                store.clone(),
+                base_path.clone(),
+                base_uri.clone(),
+                writer_a_config,
+                schema.clone(),
+                vec![],
+            )
+            .await
+            .unwrap();
+            for id in 0..N {
+                writer_a
+                    .put(vec![create_test_batch(&schema, id, 1)])
+                    .await
+                    .unwrap();
+            }
+            // Drop without close: only the WAL survives, and it holds more batches
+            // than writer B's memtable can.
+        }
+
+        // Total rows across the active memtable plus every flushed generation.
+        // Distinct ids, so no cross-generation dedup — a plain sum is exact.
+        async fn total_rows(writer: &ShardWriter, base_uri: &str, shard_id: Uuid) -> usize {
+            let mut rows = writer.memtable_stats().await.unwrap().row_count;
+            let manifest = writer.manifest().await.unwrap().unwrap();
+            for fg in &manifest.flushed_generations {
+                let gen_uri = format!("{}/_mem_wal/{}/{}", base_uri, shard_id, fg.path);
+                let dataset = crate::Dataset::open(&gen_uri).await.unwrap();
+                rows += dataset.count_rows(None).await.unwrap();
+            }
+            rows
+        }
+
+        // Reopen. This used to fail with a full-batch-store error.
+        let writer_b = ShardWriter::open(
+            store.clone(),
+            base_path.clone(),
+            base_uri.clone(),
+            config.clone(),
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .expect("a WAL larger than one memtable must still reopen");
+
+        // Rotation produced sealed memtables, and replay flushed each to a Lance
+        // generation rather than holding it in memory or leaving it in the WAL.
+        let manifest = writer_b.manifest().await.unwrap().unwrap();
+        assert!(
+            !manifest.flushed_generations.is_empty(),
+            "replay must have sealed and flushed at least one full memtable"
+        );
+
+        // Every row survived, split between the flushed generations and the
+        // active (partial) memtable.
+        assert_eq!(
+            total_rows(&writer_b, &base_uri, shard_id).await as i32,
+            N,
+            "every replayed row must be durable, across generations and the active memtable"
+        );
+        writer_b.close().await.unwrap();
+
+        // Because the sealed memtables were flushed, the manifest's replay cursor
+        // advanced past their WAL entries — so a second reopen replays only the
+        // tail and still accounts for every row. The WAL truncates across reopens
+        // rather than growing without bound.
+        let writer_c =
+            ShardWriter::open(store, base_path, base_uri.clone(), config, schema, vec![])
+                .await
+                .unwrap();
+        assert_eq!(total_rows(&writer_c, &base_uri, shard_id).await as i32, N);
+        writer_c.close().await.unwrap();
     }
 
     /// Replay-on-open recovers durable WAL entries that were never flushed
