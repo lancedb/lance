@@ -1393,8 +1393,9 @@ mod tests {
 
         let batch_store = Arc::new(BatchStore::with_capacity(16));
         let mut index_store = IndexStore::new();
-        // BTree on the PK so that `visible_count` advances as
-        // we insert, otherwise the scanner sees no batches at all.
+        // BTree on the PK: the point lookup resolves keys through the indexed PK
+        // path, which this exercises. (`indexed_count`/`visible_count` advance
+        // from the batch position regardless of whether any index is configured.)
         index_store.add_btree("id_idx".to_string(), 0, "id".to_string());
 
         // Two writes to pk=1, then an unrelated pk=2. The "new" row goes

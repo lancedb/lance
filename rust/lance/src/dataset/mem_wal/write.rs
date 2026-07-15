@@ -1775,7 +1775,7 @@ impl ShardWriter {
             wal_flusher.clone(),
             epoch,
             index_configs.to_vec(),
-            stats,
+            stats.clone(),
             config.frozen_memtable_grace,
         );
         task_executor.add_handler(
@@ -1791,6 +1791,7 @@ impl ShardWriter {
         let index_handler = IndexApplyHandler {
             cursors: Arc::clone(wal_flusher.cursors()),
             wal_flusher: wal_flusher.clone(),
+            stats,
         };
         task_executor.add_handler(
             "index_applier".to_string(),
@@ -2729,19 +2730,30 @@ fn next_pending_store(
 struct IndexApplyHandler {
     cursors: Arc<WriterCursors>,
     wal_flusher: Arc<WalFlusher>,
+    stats: SharedWriteStats,
 }
 
 #[async_trait]
 impl MessageHandler<TriggerIndexApply> for IndexApplyHandler {
     async fn handle(&mut self, message: TriggerIndexApply) -> Result<()> {
-        if let Err(e) = apply_index_range(&self.cursors, message).await {
+        match apply_index_range(&self.cursors, message).await {
+            Ok(applied) => {
+                // A coalesced no-op indexes nothing (`rows_indexed == 0`);
+                // recording it would inflate the count and skew avg latency.
+                if applied.rows_indexed > 0 {
+                    self.stats
+                        .record_index_update(applied.duration, applied.rows_indexed);
+                }
+                Ok(())
+            }
             // An index apply cannot be partially rolled back, so a failure is
             // terminal: poison, and let reopen rebuild the indexes from the WAL.
             // See the note in `WalFlusher::flush_from_batch_store`.
-            self.wal_flusher.poison(&e);
-            return Err(e);
+            Err(e) => {
+                self.wal_flusher.poison(&e);
+                Err(e)
+            }
         }
-        Ok(())
     }
 }
 
@@ -2906,14 +2918,6 @@ impl WalFlushHandler {
     ) -> Result<WalFlushResult> {
         let start = Instant::now();
 
-        // Whether this flush actually updates any in-memory indexes — only
-        // a BatchStore source carrying a non-empty `IndexStore` does. Used
-        // to gate the `record_index_update` stat so WAL-only flushes don't
-        // pollute the index-update counters.
-        // The WAL flush no longer touches indexes at all — the index apply runs
-        // on its own task — so it never records an index-update stat.
-        let has_indexes = false;
-
         // Early-out for BatchStore sources where the watermark already
         // covers the requested end position. Detection of "frozen flush"
         // requires the active memtable's batch_store; WAL-only handlers
@@ -2946,12 +2950,6 @@ impl WalFlushHandler {
             self.stats
                 .record_wal_flush(start.elapsed(), flush_result.wal_bytes);
             self.stats.record_wal_io(flush_result.wal_io_duration);
-            if has_indexes {
-                self.stats.record_index_update(
-                    flush_result.index_update_duration,
-                    flush_result.rows_indexed,
-                );
-            }
         }
 
         Ok(flush_result)
@@ -6314,6 +6312,55 @@ mod tests {
         assert_eq!(
             snapshot.index_update_count, 0,
             "WAL-only mode must never trigger an index update"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_memtable_stats_record_index_update() {
+        // MemTable mode with a BTree index: index application runs on its own
+        // task and must record an index-update stat. Regression for the stat
+        // silently reading zero after index apply moved off the WAL-flush path.
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = create_pk_test_schema();
+        let index_configs = vec![MemIndexConfig::BTree(BTreeIndexConfig {
+            name: "id_idx".to_string(),
+            field_id: 0,
+            column: "id".to_string(),
+        })];
+
+        let writer = ShardWriter::open(
+            store,
+            base_path,
+            base_uri,
+            flush_test_config(Uuid::new_v4()),
+            schema.clone(),
+            index_configs,
+        )
+        .await
+        .unwrap();
+        writer
+            .put(vec![create_test_batch(&schema, 0, 3)])
+            .await
+            .unwrap();
+
+        let stats_handle = writer.stats_handle();
+        // `close()` drains the index-apply task, so the apply is settled here.
+        writer.close().await.unwrap();
+
+        let snapshot = stats_handle.snapshot();
+        assert!(
+            snapshot.index_update_count >= 1,
+            "the index apply must record an index-update stat, got {}",
+            snapshot.index_update_count
+        );
+        assert_eq!(
+            snapshot.index_update_rows, 3,
+            "every indexed row must be counted exactly once, got {}",
+            snapshot.index_update_rows
+        );
+        assert!(
+            snapshot.avg_index_update_latency().is_some(),
+            "a recorded index update must expose an average latency"
         );
     }
 
