@@ -411,14 +411,14 @@ impl ObjectStoreRegistry {
         // `lock_owned()` await (see `BuildLockSession`) so a waiter cancelled
         // while queued still cleans up.
         let lock = self.acquire_build_lock(&cache_key);
-        let mut _session = BuildLockSession {
+        let mut session = BuildLockSession {
             registry: self,
             cache_key: cache_key.clone(),
             guard: None,
         };
-        // Cancellation point: `_session` already exists, so its Drop cleans up
+        // Cancellation point: `session` already exists, so its Drop cleans up
         // even if we are cancelled here before the guard is assigned.
-        _session.guard = Some(lock.lock_owned().await);
+        session.guard = Some(lock.lock_owned().await);
 
         // Re-check after acquiring the lock — coalesced waiters become hits.
         if let Some(store) = self.lookup_cached(&cache_key) {
@@ -430,17 +430,17 @@ impl ObjectStoreRegistry {
             return Ok(store);
         }
 
-        // `fetch_add` returns the prior value; `+ 1` is this attempt's
-        // 1-indexed sequence number. Use it (not a separate counter) to
-        // gate the opportunistic sweep below: cadence is approximate
-        // because cold attempts that fail still bump `misses` but skip
-        // the sweep block, so a failure at a multiple-of-N sequence
-        // skips that sweep cycle entirely; the next candidate is the
-        // next multiple-of-N cold attempt that succeeds. That's fine —
-        // the sweep is a footprint trim, not a correctness invariant.
-        // `wrapping_add` only silences debug-build overflow checks; at
-        // 10M cold opens/sec the wrap is >58 millennia away.
-        let cold_attempt_nth = self.misses.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        // `fetch_add` returns the prior value: this attempt's 0-based
+        // sequence index. Use it (not a separate counter) to gate the
+        // opportunistic sweep below: cadence is approximate because cold
+        // attempts that fail still bump `misses` but skip the sweep block,
+        // so a failure at a sweep-eligible index skips that sweep cycle
+        // entirely; the next candidate is the next sweep-eligible cold
+        // attempt that succeeds. That's fine — the sweep is a footprint
+        // trim, not a correctness invariant. The raw `fetch_add` value is
+        // used as-is (no `+ 1`), so there is no counter arithmetic of our
+        // own that could overflow.
+        let cold_attempt_index = self.misses.fetch_add(1, Ordering::Relaxed);
         log::debug!(
             "ObjectStoreRegistry: cold build starting for cache_key path={:?}",
             cache_key.0,
@@ -482,12 +482,13 @@ impl ObjectStoreRegistry {
         // insert. Per-key `lookup_cached` and full sweep via `active_stores()`
         // remain unchanged; this is purely a per-insert cost lever.
         //
-        // Cadence is "every 64th cold attempt" (1-indexed via the pre-bump
-        // above), so the first sweep fires at the 64th, not the 0th, and
-        // a near-empty map never pays the retain cost on its very first
-        // cold build.
+        // Cadence is "every 64th cold attempt": with a 0-based index the
+        // eligible attempts are indices 63, 127, 191, … so the first sweep
+        // fires at the 64th cold build, not the very first, and a
+        // near-empty map never pays the retain cost on its first cold
+        // build.
         const SWEEP_INTERVAL: u64 = 64;
-        let should_sweep = cold_attempt_nth.is_multiple_of(SWEEP_INTERVAL);
+        let should_sweep = cold_attempt_index % SWEEP_INTERVAL == SWEEP_INTERVAL - 1;
         {
             let mut cache_lock = self
                 .active_stores
@@ -545,11 +546,28 @@ impl ObjectStoreRegistry {
             .build_locks
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // RAII pairs every `acquire_build_lock` with exactly one release, so
+        // the entry must exist and its waiter count must be positive here. A
+        // violation means the acquire/release accounting is broken — surface
+        // it loudly in debug/test, and fall back safely (saturating, no-op on
+        // a missing entry) in release so a bug can't underflow `usize` or
+        // panic in production.
         if let Some(entry) = locks.get_mut(cache_key) {
-            entry.waiters -= 1;
+            debug_assert!(
+                entry.waiters > 0,
+                "release_build_lock: waiter count already zero for an existing entry — \
+                 acquire/release pairing is broken",
+            );
+            entry.waiters = entry.waiters.saturating_sub(1);
             if entry.waiters == 0 {
                 locks.remove(cache_key);
             }
+        } else {
+            debug_assert!(
+                false,
+                "release_build_lock: no build-lock entry for cache_key — \
+                 release called without a matching acquire",
+            );
         }
     }
 
@@ -983,8 +1001,8 @@ mod tests {
 
     /// A provider that returns an `Err` after a yield, simulating a normal
     /// (non-panic) build failure such as bad credentials or a network error.
-    /// Counts invocations so the test can assert the single-flight collapsed
-    /// N concurrent failures into 1 underlying call.
+    /// Counts invocations so the test can assert failures are serialized but
+    /// retried once per caller.
     #[derive(Debug, Default)]
     struct FailingProvider {
         builds: AtomicU64,
@@ -1049,7 +1067,15 @@ mod tests {
         let mut err_count = 0;
         for h in handles {
             let result = h.await.expect("task must not panic");
-            assert!(result.is_err(), "every waiter must surface Err");
+            let err = result.expect_err("every waiter must surface Err");
+            assert!(
+                matches!(err, Error::InvalidInput { .. }),
+                "expected InvalidInput from the failing provider, got: {err:?}",
+            );
+            assert!(
+                err.to_string().contains("simulated cold-build failure"),
+                "error must carry the provider's message, got: {err}",
+            );
             err_count += 1;
         }
         assert_eq!(err_count, n, "all N callers must observe an error");

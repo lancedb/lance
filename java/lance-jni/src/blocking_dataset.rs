@@ -77,9 +77,12 @@ pub const NATIVE_DATASET: &str = "nativeDatasetHandle";
 /// and a separate warning when the variable is set to a value the parser does
 /// not recognize.
 ///
-/// Backed by `AtomicU8` rather than `OnceLock<bool>` so unit tests can override
-/// the resolved value via `DisableSharingTestGuard` without spawning a fresh
-/// process per case.
+/// Backed by `AtomicU8` so the env var is read and resolved at most once per
+/// process (lazy first-read caching), rather than on every default-open. Unit
+/// tests do NOT touch this atomic: they override the resolved value through a
+/// test-only per-thread thread-local (see [`DisableSharingTestGuard`]), so
+/// tests running in parallel on different threads cannot observe each other's
+/// temporary settings.
 ///
 /// State encoding:
 /// - 0 = uninitialized (read env on next access)
@@ -92,7 +95,25 @@ const SHARING_DISABLED: u8 = 2;
 static DISABLE_DEFAULT_REGISTRY_SHARING: std::sync::atomic::AtomicU8 =
     std::sync::atomic::AtomicU8::new(SHARING_UNINIT);
 
+// Test-only per-thread override for `disable_default_registry_sharing`.
+//
+// `DisableSharingTestGuard` sets this instead of the process-global
+// `DISABLE_DEFAULT_REGISTRY_SHARING` atomic, so parallel tests on different
+// threads never race on a shared setting and concurrent guards cannot restore
+// a sibling's snapshot.
+#[cfg(test)]
+thread_local! {
+    static DISABLE_SHARING_TEST_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
 fn disable_default_registry_sharing() -> bool {
+    // Test-only per-thread override wins so unit tests never mutate the
+    // process-global atomic below. Compiled out entirely in production.
+    #[cfg(test)]
+    if let Some(over) = DISABLE_SHARING_TEST_OVERRIDE.with(|cell| cell.get()) {
+        return over;
+    }
     use std::sync::atomic::Ordering;
     match DISABLE_DEFAULT_REGISTRY_SHARING.load(Ordering::Relaxed) {
         SHARING_ENABLED => false,
@@ -181,30 +202,26 @@ fn select_default_open_registry(
 }
 
 #[cfg(test)]
-/// RAII guard that restores `DISABLE_DEFAULT_REGISTRY_SHARING` to its prior
-/// value on drop. Tests should always go through this guard so they cannot
-/// leak state into sibling tests run in the same process.
+/// RAII guard that overrides the sharing flag for the *current thread* and
+/// restores its prior per-thread value on drop. Tests should always go through
+/// this guard so they cannot leak state into sibling tests run in the same
+/// process.
+///
+/// The override is a thread-local (see [`DISABLE_SHARING_TEST_OVERRIDE`]), not
+/// the process-global atomic, so tests running in parallel on different threads
+/// never observe each other's temporary settings.
 ///
 /// Each guard captures and restores its own snapshot, so nested guards compose
 /// correctly: LIFO drop order means the outer guard's snapshot always wins,
 /// returning the flag to the value seen before the outermost `set` call.
 struct DisableSharingTestGuard {
-    prior: u8,
+    prior: Option<bool>,
 }
 
 #[cfg(test)]
 impl DisableSharingTestGuard {
     fn set(disabled: bool) -> Self {
-        use std::sync::atomic::Ordering;
-        let prior = DISABLE_DEFAULT_REGISTRY_SHARING.load(Ordering::Relaxed);
-        DISABLE_DEFAULT_REGISTRY_SHARING.store(
-            if disabled {
-                SHARING_DISABLED
-            } else {
-                SHARING_ENABLED
-            },
-            Ordering::Relaxed,
-        );
+        let prior = DISABLE_SHARING_TEST_OVERRIDE.with(|cell| cell.replace(Some(disabled)));
         Self { prior }
     }
 }
@@ -212,8 +229,7 @@ impl DisableSharingTestGuard {
 #[cfg(test)]
 impl Drop for DisableSharingTestGuard {
     fn drop(&mut self) {
-        use std::sync::atomic::Ordering;
-        DISABLE_DEFAULT_REGISTRY_SHARING.store(self.prior, Ordering::Relaxed);
+        DISABLE_SHARING_TEST_OVERRIDE.with(|cell| cell.set(self.prior));
     }
 }
 
@@ -3891,6 +3907,7 @@ fn inner_get_zonemap_stats<'local>(
 #[cfg(test)]
 mod default_open_registry_tests {
     use super::*;
+    use rstest::rstest;
 
     /// Default-open path must reuse the process-wide
     /// `GLOBAL_OBJECT_STORE_REGISTRY` so concurrent opens can coalesce on its
@@ -3923,12 +3940,12 @@ mod default_open_registry_tests {
 
     /// `disable_default_registry_sharing()` must honor the in-process override
     /// hook. This guards against future refactors that re-introduce a once-cell
-    /// that bypasses the AtomicU8 state.
+    /// that bypasses the per-thread test override.
     #[test]
     fn disable_flag_honors_test_override() {
-        // RAII guard restores prior state at end-of-scope so this test cannot
-        // leak SHARING_ENABLED/DISABLED state into sibling tests that rely on
-        // env-driven first-read resolution.
+        // RAII guard restores the prior per-thread override at end-of-scope, so
+        // this test cannot leak its setting into sibling tests sharing this
+        // thread, and — being thread-local — never races tests on other threads.
         let _g = DisableSharingTestGuard::set(true);
         assert!(disable_default_registry_sharing());
 
@@ -3936,134 +3953,131 @@ mod default_open_registry_tests {
         assert!(!disable_default_registry_sharing());
     }
 
-    /// Truthy spellings (case + whitespace insensitive) must parse to `Some(true)`.
-    /// These are the values that opt the operator OUT of registry sharing —
-    /// getting any of them wrong silently re-enables coalescing in a config
-    /// that asked for isolation, so accept-list correctness is load-bearing.
-    #[test]
-    fn parse_disable_value_accepts_truthy() {
-        for raw in [
-            "1", "true", "yes", "TRUE", "Yes", "True", "  1  ", "\ttrue\n",
-        ] {
-            assert_eq!(
-                parse_disable_value(raw),
-                Some(true),
-                "expected {raw:?} to parse as Some(true)",
-            );
-        }
-    }
-
-    /// Documented falsy spellings — empty, whitespace-only, `0`/`false`/`no` —
-    /// must parse to `Some(false)`. These are explicit keep-default opts;
-    /// distinguishing them from unrecognized noise lets the caller skip the
-    /// warning log.
-    #[test]
-    fn parse_disable_value_accepts_falsy() {
-        for raw in ["", " ", "\t\n", "0", "false", "no", "FALSE", "  No  "] {
-            assert_eq!(
-                parse_disable_value(raw),
-                Some(false),
-                "expected {raw:?} to parse as Some(false)",
-            );
-        }
-    }
-
-    /// Anything outside the accept-list — typos, `on`, `y`, numeric noise —
-    /// must parse to `None` so [`disable_default_registry_sharing`] can warn
-    /// the operator that their escape hatch is being silently ignored.
-    #[test]
-    fn parse_disable_value_returns_none_for_unrecognized() {
-        for raw in ["off", "disable", "2", "1.0", "true!", "y", "on", "enable"] {
-            assert_eq!(
-                parse_disable_value(raw),
-                None,
-                "expected {raw:?} to parse as None (unrecognized)",
-            );
-        }
-    }
-
-    /// End-to-end pin for PR#1's two-piece contract at the JNI boundary:
-    /// `select_default_open_registry` must hand back a registry whose
-    /// `get_store` coalesces concurrent cold builds for the same URI.
-    /// A regression in single-flight (dropped from `get_store`) would
-    /// surface here as `provider.builds > 1` or callers observing
-    /// different `Arc<ObjectStore>` instances.
+    /// Classification contract for [`parse_disable_value`], one case per input
+    /// so a regression names the exact spelling that broke.
     ///
-    /// The complementary "sharing-on returns the process-wide registry"
-    /// invariant is covered by
-    /// `select_default_open_registry_reuses_global_when_sharing_enabled`,
-    /// so this test deliberately uses the sharing-disabled path to take a
-    /// fresh registry — registering a one-off provider on
-    /// `GLOBAL_OBJECT_STORE_REGISTRY` would leak that scheme's `Arc` for
-    /// the rest of the test binary's lifetime.
-    ///
-    /// Provider counts invocations and sleeps before returning so concurrent
-    /// callers reliably queue on the build lock before the first build
-    /// completes — without the delay the winner returns before any contention
-    /// develops and the test would pass even if single-flight were broken.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn jni_default_open_coalesces_concurrent_cold_builds() {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        use std::time::Duration;
-
-        use lance_core::Result as LanceResult;
-        use lance_io::object_store::ObjectStore as LanceObjectStore;
-        use lance_io::object_store::providers::memory::MemoryStoreProvider;
-        use lance_io::object_store::{ObjectStoreParams, ObjectStoreProvider};
-        use url::Url;
-
-        #[derive(Debug, Default)]
-        struct CountingProvider {
-            builds: AtomicU64,
-        }
-
-        #[async_trait::async_trait]
-        impl ObjectStoreProvider for CountingProvider {
-            async fn new_store(
-                &self,
-                base_path: Url,
-                params: &ObjectStoreParams,
-            ) -> LanceResult<LanceObjectStore> {
-                self.builds.fetch_add(1, Ordering::Relaxed);
-                tokio::time::sleep(Duration::from_millis(20)).await;
-                MemoryStoreProvider.new_store(base_path, params).await
-            }
-        }
-
-        let provider = Arc::new(CountingProvider::default());
-        // Take a fresh registry via the sharing-disabled path so the
-        // test-only `pr1-jni-coalesce` provider never touches
-        // `GLOBAL_OBJECT_STORE_REGISTRY`.
-        let registry = select_default_open_registry(true);
-        registry.insert("pr1-jni-coalesce", provider.clone());
-
-        let url = Url::parse("pr1-jni-coalesce://x").unwrap();
-        let params = ObjectStoreParams::default();
-
-        let n = 8;
-        let mut handles = Vec::with_capacity(n);
-        for _ in 0..n {
-            let registry = registry.clone();
-            let url = url.clone();
-            let params = params.clone();
-            handles.push(tokio::spawn(async move {
-                registry.get_store(url, &params).await.unwrap()
-            }));
-        }
-        let mut stores = Vec::with_capacity(n);
-        for h in handles {
-            stores.push(h.await.expect("task must not panic"));
-        }
-
+    /// - Truthy (`Some(true)`): case- and whitespace-insensitive `1`/`true`/`yes`.
+    ///   These opt the operator OUT of registry sharing, so accept-list
+    ///   correctness is load-bearing — a miss silently re-enables coalescing in a
+    ///   config that asked for isolation.
+    /// - Falsy (`Some(false)`): empty, whitespace-only, `0`/`false`/`no` — explicit
+    ///   keep-default opts, distinguished from noise so the caller can skip warning.
+    /// - Unrecognized (`None`): typos, `on`, `y`, numeric noise — so
+    ///   [`disable_default_registry_sharing`] warns that the escape hatch is ignored.
+    #[rstest]
+    #[case::one("1", Some(true))]
+    #[case::true_lower("true", Some(true))]
+    #[case::yes("yes", Some(true))]
+    #[case::true_upper("TRUE", Some(true))]
+    #[case::yes_title("Yes", Some(true))]
+    #[case::true_title("True", Some(true))]
+    #[case::padded_one("  1  ", Some(true))]
+    #[case::whitespace_true("\ttrue\n", Some(true))]
+    #[case::empty("", Some(false))]
+    #[case::space(" ", Some(false))]
+    #[case::tab_newline("\t\n", Some(false))]
+    #[case::zero("0", Some(false))]
+    #[case::false_lower("false", Some(false))]
+    #[case::no("no", Some(false))]
+    #[case::false_upper("FALSE", Some(false))]
+    #[case::padded_no("  No  ", Some(false))]
+    #[case::off("off", None)]
+    #[case::disable("disable", None)]
+    #[case::two("2", None)]
+    #[case::one_point_zero("1.0", None)]
+    #[case::true_bang("true!", None)]
+    #[case::y("y", None)]
+    #[case::on("on", None)]
+    #[case::enable("enable", None)]
+    fn parse_disable_value_classifies(#[case] raw: &str, #[case] expected: Option<bool>) {
         assert_eq!(
-            provider.builds.load(Ordering::Relaxed),
-            1,
-            "single-flight must collapse N concurrent cold misses into one provider call",
+            parse_disable_value(raw),
+            expected,
+            "unexpected classification for {raw:?}",
         );
-        for store in &stores[1..] {
+    }
+
+    /// Integration pin for the core behavior change of this PR: a default open
+    /// (`session = None`) must build its `Session` on the registry chosen by
+    /// `select_default_open_registry`, i.e. the process-wide
+    /// `GLOBAL_OBJECT_STORE_REGISTRY` when sharing is enabled and a fresh
+    /// registry when the escape hatch disables it.
+    ///
+    /// This closes the gap the unit tests leave open: they pin
+    /// `select_default_open_registry` in isolation, but nothing asserts that
+    /// `BlockingDataset::open` actually *wires that registry into the Session*.
+    /// A regression that stops threading the selected registry into
+    /// `LanceSession::new` — or hardcodes a fresh one — passes every other test
+    /// but fails here. Provider-level single-flight itself is covered by
+    /// `test_get_store_coalesces_concurrent_misses` in `providers.rs`, so this
+    /// test deliberately checks registry *identity* (an `Arc::ptr_eq`) rather
+    /// than re-testing coalescing: identity is what the JNI layer owns, needs
+    /// no custom scheme provider, and so never leaks state into
+    /// `GLOBAL_OBJECT_STORE_REGISTRY`.
+    #[test]
+    fn open_wires_selected_registry_into_session() {
+        use std::sync::Arc;
+
+        use arrow_array::{Int32Array, RecordBatch};
+        use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchemaDef};
+
+        // Write a tiny local dataset (pure Rust, no JVM) to open below.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let uri = tmp.path().join("ds").to_str().unwrap().to_string();
+        let schema = Arc::new(ArrowSchemaDef::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        BlockingDataset::write(reader, &uri, None).expect("write dataset");
+
+        // `open` with no session and no key-distinguishing input takes the
+        // default path. The `DisableSharingTestGuard` override is read
+        // synchronously inside `open` (outside `RT.block_on`), so it applies.
+        let open_default = |uri: &str| {
+            BlockingDataset::open(
+                uri,
+                None,
+                None,
+                0,
+                0,
+                HashMap::new(),
+                HashMap::new(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+            )
+            .expect("open dataset")
+        };
+
+        // Sharing enabled (default): the Session must reuse the global registry.
+        {
+            let _g = DisableSharingTestGuard::set(false);
+            let ds = open_default(&uri);
+            let registry = ds.inner.session().store_registry();
             assert!(
-                Arc::ptr_eq(&stores[0], store),
-                "every coalesced waiter must observe the same Arc<ObjectStore>",
+                Arc::ptr_eq(&registry, &crate::GLOBAL_OBJECT_STORE_REGISTRY),
+                "default open must build its Session on GLOBAL_OBJECT_STORE_REGISTRY",
+            );
+        }
+
+        // Escape hatch on: the Session must get a fresh, non-global registry.
+        {
+            let _g = DisableSharingTestGuard::set(true);
+            let ds = open_default(&uri);
+            let registry = ds.inner.session().store_registry();
+            assert!(
+                !Arc::ptr_eq(&registry, &crate::GLOBAL_OBJECT_STORE_REGISTRY),
+                "disabled-sharing open must NOT alias the global registry",
             );
         }
     }
