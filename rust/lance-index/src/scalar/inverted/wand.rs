@@ -41,38 +41,159 @@ use super::{DocInfo, builder::BLOCK_SIZE};
 
 const TERMINATED_DOC_ID: u64 = u64::MAX;
 
-/// Top-k heap entry: (scored doc, doc length, posting doc id, freq-log index).
-/// The (term, freq) pairs live in a side [`FreqLog`] so heap churn moves a
-/// small Copy tuple instead of allocating a `Vec` per insert; only the final
-/// top-k get their pairs materialized.
+/// Top-k heap entry: (scored doc, doc length, posting doc id, frequency slot).
+/// The (term, freq) pairs live outside the heap so heap churn moves a compact
+/// tuple instead of a `Vec`.
 type TopKHeap = BinaryHeap<Reverse<(ScoredDoc, u32, u64, u32)>>;
 
-/// Append-only (term, freq) log for heap candidates: flat storage plus
-/// per-entry offsets (entries vary in width across paths). Discarded entries
-/// just leak into the log until the search ends — inserts are far rarer than
-/// candidates, so the log stays tiny.
-#[derive(Default)]
-struct FreqLog {
-    offsets: Vec<u32>,
-    pairs: Vec<(u32, u32)>,
+/// Reusable (term, freq) storage for live heap candidates. Replacing the k-th
+/// result reuses its slot and retained `Vec` capacity, so memory stays bounded
+/// by the live top-k rather than every historical heap admission.
+struct FrequencySlots {
+    slots: Vec<Vec<(u32, u32)>>,
 }
 
-impl FreqLog {
-    fn push(&mut self, pairs: impl Iterator<Item = (u32, u32)>) -> u32 {
-        let index = self.offsets.len() as u32;
-        self.offsets.push(self.pairs.len() as u32);
-        self.pairs.extend(pairs);
-        index
+impl FrequencySlots {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            slots: Vec::with_capacity(capacity),
+        }
     }
 
-    fn get(&self, index: u32) -> &[(u32, u32)] {
-        let start = self.offsets[index as usize] as usize;
-        let end = self
-            .offsets
-            .get(index as usize + 1)
-            .map(|&offset| offset as usize)
-            .unwrap_or(self.pairs.len());
-        &self.pairs[start..end]
+    fn push(&mut self, pairs: impl Iterator<Item = (u32, u32)>) -> Result<u32> {
+        let slot = u32::try_from(self.slots.len()).map_err(|_| {
+            Error::internal(format!(
+                "FTS top-k frequency slot count {} exceeds u32::MAX",
+                self.slots.len()
+            ))
+        })?;
+        self.slots.push(pairs.collect());
+        Ok(slot)
+    }
+
+    fn replace(&mut self, slot: u32, pairs: impl Iterator<Item = (u32, u32)>) -> Result<()> {
+        let num_slots = self.slots.len();
+        let slot = self.slots.get_mut(slot as usize).ok_or_else(|| {
+            Error::internal(format!(
+                "FTS top-k frequency slot {slot} is out of bounds for {num_slots} slots"
+            ))
+        })?;
+        slot.clear();
+        slot.extend(pairs);
+        Ok(())
+    }
+
+    fn take(&mut self, slot: u32) -> Result<Vec<(u32, u32)>> {
+        let num_slots = self.slots.len();
+        self.slots
+            .get_mut(slot as usize)
+            .map(std::mem::take)
+            .ok_or_else(|| {
+                Error::internal(format!(
+                    "FTS top-k frequency slot {slot} is out of bounds for {num_slots} slots"
+                ))
+            })
+    }
+}
+
+/// Owns the top-k heap and the frequency slots referenced by its entries.
+struct TopKCollector {
+    limit: usize,
+    heap: TopKHeap,
+    frequency_slots: FrequencySlots,
+}
+
+impl TopKCollector {
+    fn new(limit: usize, initial_capacity: usize) -> Self {
+        let initial_capacity = initial_capacity.min(limit);
+        Self {
+            limit,
+            heap: BinaryHeap::with_capacity(initial_capacity),
+            frequency_slots: FrequencySlots::with_capacity(initial_capacity),
+        }
+    }
+
+    /// Insert a competitive result. When the heap is full, its evicted entry's
+    /// frequency slot is cleared and reused before the replacement is pushed.
+    fn insert(
+        &mut self,
+        doc: ScoredDoc,
+        doc_length: u32,
+        posting_doc_id: u64,
+        pairs: impl Iterator<Item = (u32, u32)>,
+    ) -> Result<bool> {
+        if self.limit == 0 {
+            return Ok(false);
+        }
+        if self.heap.len() > self.limit {
+            return Err(Error::internal(format!(
+                "FTS top-k heap length {} exceeds limit {}",
+                self.heap.len(),
+                self.limit
+            )));
+        }
+
+        let frequency_slot = if self.heap.len() == self.limit {
+            let Some(kth_score) = self.heap.peek().map(|entry| entry.0.0.score.0) else {
+                return Err(Error::internal(
+                    "FTS top-k heap is empty while its nonzero limit is reached",
+                ));
+            };
+            // Preserve the existing collector semantics for non-finite custom
+            // scorer output: only a strictly greater raw f32 replaces k-th.
+            if doc.score.0.partial_cmp(&kth_score) != Some(std::cmp::Ordering::Greater) {
+                return Ok(false);
+            }
+            let Some(Reverse((_, _, _, frequency_slot))) = self.heap.pop() else {
+                return Err(Error::internal(
+                    "FTS top-k heap entry disappeared during replacement",
+                ));
+            };
+            self.frequency_slots.replace(frequency_slot, pairs)?;
+            frequency_slot
+        } else {
+            self.frequency_slots.push(pairs)?
+        };
+
+        self.heap
+            .push(Reverse((doc, doc_length, posting_doc_id, frequency_slot)));
+        Ok(true)
+    }
+
+    fn kth_score_if_full(&self) -> Option<f32> {
+        if self.heap.len() == self.limit {
+            self.heap.peek().map(|entry| entry.0.0.score.0)
+        } else {
+            None
+        }
+    }
+
+    fn into_candidates(
+        self,
+        mut to_addr: impl FnMut(u64) -> CandidateAddr,
+    ) -> Result<Vec<DocCandidate>> {
+        let Self {
+            heap,
+            mut frequency_slots,
+            ..
+        } = self;
+        heap.into_iter()
+            .map(
+                |Reverse((doc, doc_length, posting_doc_id, frequency_slot))| {
+                    Ok(DocCandidate {
+                        addr: to_addr(doc.row_id),
+                        posting_doc_id,
+                        freqs: frequency_slots.take(frequency_slot)?,
+                        doc_length,
+                    })
+                },
+            )
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn num_frequency_slots(&self) -> usize {
+        self.frequency_slots.slots.len()
     }
 }
 const LINEAR_BLOCK_SKIP_LIMIT: usize = 8;
@@ -1553,13 +1674,9 @@ impl<'a, S: Scorer> Wand<'a, S> {
     fn norm_k_cache(&self) -> Option<(&'a [u8], Box<[f32; 256]>)> {
         let docs: &'a DocSet = self.docs;
         let norms = docs.scoring_norms()?;
-        self.scorer.doc_norm(0)?;
         let mut cache = Box::new([0f32; 256]);
         for (code, slot) in cache.iter_mut().enumerate() {
-            *slot = self
-                .scorer
-                .doc_norm(dequantize_doc_length(code as u8))
-                .expect("doc_norm support was just probed");
+            *slot = self.scorer.doc_norm(dequantize_doc_length(code as u8))?;
         }
         Some((norms, cache))
     }
@@ -1654,8 +1771,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
         // row_ids post-wand.
         let docs_has_row_ids = self.docs.has_row_ids();
 
-        let mut candidates = BinaryHeap::with_capacity(std::cmp::min(limit, BLOCK_SIZE * 10));
-        let mut freq_log = FreqLog::default();
+        let mut candidates = TopKCollector::new(limit, std::cmp::min(limit, BLOCK_SIZE * 10));
         let mut num_comparisons = 0;
         let mut and_search_stats = (self.operator == Operator::And).then_some(AndSearchStats {
             pruned_before_return_start: self.and_candidates_pruned_before_return,
@@ -1728,35 +1844,18 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 self.score(doc_length)
             };
 
-            if candidates.len() < limit {
-                let log_idx = freq_log.push(self.iter_term_freqs());
+            if candidates.insert(
+                ScoredDoc::new(row_id, score),
+                doc_length,
+                posting_doc_id,
+                self.iter_term_freqs(),
+            )? {
                 if let Some(and_stats) = and_search_stats.as_mut() {
                     and_stats.freqs_collected += 1;
                 }
-                candidates.push(Reverse((
-                    ScoredDoc::new(row_id, score),
-                    doc_length,
-                    posting_doc_id,
-                    log_idx,
-                )));
-                if candidates.len() == limit {
-                    let kth = candidates.peek().unwrap().0.0.score.0;
+                if let Some(kth) = candidates.kth_score_if_full() {
                     self.update_threshold(kth, params.wand_factor);
                 }
-            } else if score > candidates.peek().unwrap().0.0.score.0 {
-                let log_idx = freq_log.push(self.iter_term_freqs());
-                if let Some(and_stats) = and_search_stats.as_mut() {
-                    and_stats.freqs_collected += 1;
-                }
-                candidates.pop();
-                candidates.push(Reverse((
-                    ScoredDoc::new(row_id, score),
-                    doc_length,
-                    posting_doc_id,
-                    log_idx,
-                )));
-                let kth = candidates.peek().unwrap().0.0.score.0;
-                self.update_threshold(kth, params.wand_factor);
             }
             if self.operator == Operator::Or {
                 self.push_back_leads(doc.doc_id() + 1);
@@ -1794,17 +1893,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 CandidateAddr::Pending(row_id_slot as u32)
             }
         };
-        Ok(candidates
-            .into_iter()
-            .map(
-                |Reverse((doc, doc_length, posting_doc_id, log_idx))| DocCandidate {
-                    addr: to_addr(doc.row_id),
-                    posting_doc_id,
-                    freqs: freq_log.get(log_idx).to_vec(),
-                    doc_length,
-                },
-            )
-            .collect())
+        candidates.into_candidates(to_addr)
     }
 
     fn flat_search(
@@ -1844,8 +1933,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
             .unwrap_or(false);
 
         let mut num_comparisons = 0;
-        let mut candidates: TopKHeap = BinaryHeap::new();
-        let mut freq_log = FreqLog::default();
+        let mut candidates = TopKCollector::new(limit, 0);
         for (doc_id, row_id) in doc_ids {
             num_comparisons += 1;
             self.move_head_before_target_to_tail(doc_id);
@@ -1892,28 +1980,13 @@ impl<'a, S: Scorer> Wand<'a, S> {
             self.collect_tail_matches(doc_id);
             let score = self.score(doc_length);
 
-            if candidates.len() < limit {
-                let log_idx = freq_log.push(self.iter_term_freqs());
-                candidates.push(Reverse((
-                    ScoredDoc::new(row_id, score),
-                    doc_length,
-                    doc_id,
-                    log_idx,
-                )));
-                if candidates.len() == limit {
-                    let kth = candidates.peek().unwrap().0.0.score.0;
-                    self.update_threshold(kth, params.wand_factor);
-                }
-            } else if score > candidates.peek().unwrap().0.0.score.0 {
-                let log_idx = freq_log.push(self.iter_term_freqs());
-                candidates.pop();
-                candidates.push(Reverse((
-                    ScoredDoc::new(row_id, score),
-                    doc_length,
-                    doc_id,
-                    log_idx,
-                )));
-                let kth = candidates.peek().unwrap().0.0.score.0;
+            if candidates.insert(
+                ScoredDoc::new(row_id, score),
+                doc_length,
+                doc_id,
+                self.iter_term_freqs(),
+            )? && let Some(kth) = candidates.kth_score_if_full()
+            {
                 self.update_threshold(kth, params.wand_factor);
             }
 
@@ -1923,17 +1996,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
 
         // flat_search is driven by an explicit row_ids iterator, so
         // every candidate already has a real row_id.
-        Ok(candidates
-            .into_iter()
-            .map(
-                |Reverse((doc, doc_length, posting_doc_id, log_idx))| DocCandidate {
-                    addr: CandidateAddr::RowId(doc.row_id),
-                    posting_doc_id,
-                    freqs: freq_log.get(log_idx).to_vec(),
-                    doc_length,
-                },
-            )
-            .collect())
+        candidates.into_candidates(CandidateAddr::RowId)
     }
 
     /// Bulk MAXSCORE top-k disjunction, mirroring Lucene's MaxScoreBulkScorer.
@@ -1971,9 +2034,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
         let total_sum_upper_bound_factor = score_sum_upper_bound_factor(clauses.len());
 
         let mut acc = WindowAccumulator::new(clauses.len());
-        let mut candidates: TopKHeap =
-            BinaryHeap::with_capacity(std::cmp::min(limit, BLOCK_SIZE * 10));
-        let mut freq_log = FreqLog::default();
+        let mut candidates = TopKCollector::new(limit, std::cmp::min(limit, BLOCK_SIZE * 10));
         let norm_k = self.norm_k_cache();
         let norm_k_ref = norm_k
             .as_ref()
@@ -2200,38 +2261,23 @@ impl<'a, S: Scorer> Wand<'a, S> {
                                 // which drops zero-score matches (e.g. terms
                                 // with idf 0) exactly like Wand::next does.
                                 if !rejected && total > self.threshold {
-                                    let full = candidates.len() >= limit;
-                                    let beats_kth =
-                                        !full || total > candidates.peek().unwrap().0.0.score.0;
-                                    if beats_kth {
-                                        let doc_length = self.docs.scoring_num_tokens(doc as u32);
-                                        let log_idx = freq_log.push(
-                                            std::iter::once((essential_term, freq)).chain(
-                                                non_essential.iter().filter_map(|clause| {
-                                                    clause.posting.doc().and_then(|d| {
-                                                        (d.doc_id() == doc).then(|| {
-                                                            (
-                                                                clause.posting.term_index(),
-                                                                d.frequency(),
-                                                            )
-                                                        })
+                                    let doc_length = self.docs.scoring_num_tokens(doc as u32);
+                                    if candidates.insert(
+                                        ScoredDoc::new(row_id, total),
+                                        doc_length,
+                                        doc,
+                                        std::iter::once((essential_term, freq)).chain(
+                                            non_essential.iter().filter_map(|clause| {
+                                                clause.posting.doc().and_then(|d| {
+                                                    (d.doc_id() == doc).then(|| {
+                                                        (clause.posting.term_index(), d.frequency())
                                                     })
-                                                }),
-                                            ),
-                                        );
-                                        if full {
-                                            candidates.pop();
-                                        }
-                                        candidates.push(Reverse((
-                                            ScoredDoc::new(row_id, total),
-                                            doc_length,
-                                            doc,
-                                            log_idx,
-                                        )));
-                                        if candidates.len() == limit {
-                                            let kth = candidates.peek().unwrap().0.0.score.0;
-                                            self.update_threshold(kth, params.wand_factor);
-                                        }
+                                                })
+                                            }),
+                                        ),
+                                    )? && let Some(kth) = candidates.kth_score_if_full()
+                                    {
+                                        self.update_threshold(kth, params.wand_factor);
                                     }
                                 }
                             }
@@ -2413,38 +2459,27 @@ impl<'a, S: Scorer> Wand<'a, S> {
                         }
 
                         if !rejected && score > self.threshold {
-                            let full = candidates.len() >= limit;
-                            let beats_kth = !full || score > candidates.peek().unwrap().0.0.score.0;
-                            if beats_kth {
-                                let doc_length = doc_length_cell
-                                    .unwrap_or_else(|| self.docs.scoring_num_tokens(doc as u32));
-                                let log_idx = freq_log.push(clauses.iter().enumerate().filter_map(
-                                    |(i, clause)| {
-                                        if i >= first_essential {
-                                            let freq = acc.clause_freq(i, slot);
-                                            (freq > 0).then(|| (clause.posting.term_index(), freq))
-                                        } else {
-                                            clause.posting.doc().and_then(|d| {
-                                                (d.doc_id() == doc).then(|| {
-                                                    (clause.posting.term_index(), d.frequency())
-                                                })
+                            let doc_length = doc_length_cell
+                                .unwrap_or_else(|| self.docs.scoring_num_tokens(doc as u32));
+                            if candidates.insert(
+                                ScoredDoc::new(row_id, score),
+                                doc_length,
+                                doc,
+                                clauses.iter().enumerate().filter_map(|(i, clause)| {
+                                    if i >= first_essential {
+                                        let freq = acc.clause_freq(i, slot);
+                                        (freq > 0).then(|| (clause.posting.term_index(), freq))
+                                    } else {
+                                        clause.posting.doc().and_then(|d| {
+                                            (d.doc_id() == doc).then(|| {
+                                                (clause.posting.term_index(), d.frequency())
                                             })
-                                        }
-                                    },
-                                ));
-                                if full {
-                                    candidates.pop();
-                                }
-                                candidates.push(Reverse((
-                                    ScoredDoc::new(row_id, score),
-                                    doc_length,
-                                    doc,
-                                    log_idx,
-                                )));
-                                if candidates.len() == limit {
-                                    let kth = candidates.peek().unwrap().0.0.score.0;
-                                    self.update_threshold(kth, params.wand_factor);
-                                }
+                                        })
+                                    }
+                                }),
+                            )? && let Some(kth) = candidates.kth_score_if_full()
+                            {
+                                self.update_threshold(kth, params.wand_factor);
                             }
                         }
                         acc.clear_slot(slot);
@@ -2471,17 +2506,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 CandidateAddr::Pending(row_id_slot as u32)
             }
         };
-        Ok(candidates
-            .into_iter()
-            .map(
-                |Reverse((doc, doc_length, posting_doc_id, log_idx))| DocCandidate {
-                    addr: to_addr(doc.row_id),
-                    posting_doc_id,
-                    freqs: freq_log.get(log_idx).to_vec(),
-                    doc_length,
-                },
-            )
-            .collect())
+        candidates.into_candidates(to_addr)
     }
 
     // calculate the score of the current document
@@ -2898,8 +2923,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
             }
         }
 
-        let mut candidates: TopKHeap =
-            BinaryHeap::with_capacity(std::cmp::min(limit, BLOCK_SIZE * 10));
+        let mut candidates = TopKCollector::new(limit, std::cmp::min(limit, BLOCK_SIZE * 10));
         let mut num_comparisons: usize = 0;
         let mut stats = AndSearchStats {
             pruned_before_return_start: self.and_candidates_pruned_before_return,
@@ -2916,7 +2940,6 @@ impl<'a, S: Scorer> Wand<'a, S> {
         let mut batch_lens: Vec<u32> = Vec::with_capacity(MAX_POSTING_BLOCK_SIZE);
         let mut batch_norms: Vec<u8> = Vec::with_capacity(MAX_POSTING_BLOCK_SIZE);
         let mut cursor_scratch: Vec<usize> = Vec::with_capacity(num_lists);
-        let mut freq_log = FreqLog::default();
         // Norm cache: one byte-norm load plus a cached addend replaces the
         // per-clause BM25 denominator recompute in pass B.
         let norm_k = self.norm_k_cache();
@@ -3209,32 +3232,20 @@ impl<'a, S: Scorer> Wand<'a, S> {
                         };
                     }
 
-                    let insert = if candidates.len() < limit {
-                        true
-                    } else {
-                        score > candidates.peek().unwrap().0.0.score.0
-                    };
-                    if insert {
+                    if candidates.insert(
+                        ScoredDoc::new(row_id, score),
+                        doc_length,
+                        u64::from(doc),
+                        wins.iter().zip(self.lead.iter()).zip(offs.iter()).map(
+                            |((win, posting), &off)| {
+                                (posting.term_index(), unsafe {
+                                    *win.freqs.add(off as usize)
+                                })
+                            },
+                        ),
+                    )? {
                         stats.freqs_collected += 1;
-                        let log_idx =
-                            freq_log.push(wins.iter().zip(self.lead.iter()).zip(offs.iter()).map(
-                                |((win, posting), &off)| {
-                                    (posting.term_index(), unsafe {
-                                        *win.freqs.add(off as usize)
-                                    })
-                                },
-                            ));
-                        if candidates.len() >= limit {
-                            candidates.pop();
-                        }
-                        candidates.push(Reverse((
-                            ScoredDoc::new(row_id, score),
-                            doc_length,
-                            u64::from(doc),
-                            log_idx,
-                        )));
-                        if candidates.len() == limit {
-                            let kth = candidates.peek().unwrap().0.0.score.0;
+                        if let Some(kth) = candidates.kth_score_if_full() {
                             self.update_threshold(kth, params.wand_factor);
                         }
                     }
@@ -3271,17 +3282,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 CandidateAddr::Pending(row_id_slot as u32)
             }
         };
-        Ok(candidates
-            .into_iter()
-            .map(
-                |Reverse((doc, doc_length, posting_doc_id, log_idx))| DocCandidate {
-                    addr: to_addr(doc.row_id),
-                    posting_doc_id,
-                    freqs: freq_log.get(log_idx).to_vec(),
-                    doc_length,
-                },
-            )
-            .collect())
+        candidates.into_candidates(to_addr)
     }
 
     fn and_move_to_next_block(&mut self, target: u64) {
@@ -4128,6 +4129,68 @@ mod tests {
         fn doc_weight(&self, freq: u32, _doc_tokens: u32) -> f32 {
             freq as f32
         }
+    }
+
+    struct PartialNormScorer;
+
+    impl Scorer for PartialNormScorer {
+        fn query_weight(&self, _token: &str) -> f32 {
+            1.0
+        }
+
+        fn doc_weight(&self, freq: u32, _doc_tokens: u32) -> f32 {
+            freq as f32
+        }
+
+        fn doc_norm(&self, doc_tokens: u32) -> Option<f32> {
+            (doc_tokens == 0).then_some(0.0)
+        }
+    }
+
+    #[test]
+    fn test_norm_cache_requires_all_norm_codes() {
+        let mut docs = DocSet::default();
+        docs.append(0, 1);
+        docs.set_quantized_scoring(true);
+        let wand = Wand::new(Operator::Or, std::iter::empty(), &docs, PartialNormScorer);
+
+        assert!(wand.norm_k_cache().is_none());
+    }
+
+    #[test]
+    fn test_top_k_collector_reuses_frequency_slots() -> Result<()> {
+        const LIMIT: usize = 8;
+        const NUM_DOCS: usize = 10_000;
+        let mut collector = TopKCollector::new(LIMIT, LIMIT);
+
+        for doc in 0..NUM_DOCS {
+            let num_terms = doc % 4 + 1;
+            let inserted = collector.insert(
+                ScoredDoc::new(doc as u64, doc as f32),
+                num_terms as u32,
+                doc as u64,
+                (0..num_terms).map(|term| (term as u32, doc as u32)),
+            )?;
+            assert!(inserted);
+            assert!(collector.num_frequency_slots() <= LIMIT);
+        }
+        assert_eq!(collector.num_frequency_slots(), LIMIT);
+
+        let mut candidates = collector.into_candidates(CandidateAddr::RowId)?;
+        candidates.sort_unstable_by_key(|candidate| candidate.posting_doc_id);
+        assert_eq!(candidates.len(), LIMIT);
+        for (candidate, expected_doc) in candidates.iter().zip(NUM_DOCS - LIMIT..NUM_DOCS) {
+            assert_eq!(candidate.posting_doc_id, expected_doc as u64);
+            assert!(matches!(
+                candidate.addr,
+                CandidateAddr::RowId(row_id) if row_id == expected_doc as u64
+            ));
+            let expected_freqs = (0..expected_doc % 4 + 1)
+                .map(|term| (term as u32, expected_doc as u32))
+                .collect::<Vec<_>>();
+            assert_eq!(candidate.freqs, expected_freqs);
+        }
+        Ok(())
     }
 
     #[rstest]
