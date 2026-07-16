@@ -11,7 +11,10 @@ use futures::Future;
 use crate::Result;
 
 use super::CacheCodec;
-use super::backend::{CacheBackend, CacheEntry, CacheKeyIterator, InternalCacheKey};
+use super::backend::{
+    CacheBackend, CacheEntry, CacheEntryRecord, CacheEntryRecordIterator, CacheKeyIterator,
+    InternalCacheKey,
+};
 
 /// Internal record stored in the moka cache.
 #[derive(Clone, Debug)]
@@ -24,6 +27,14 @@ struct MokaCacheEntry {
 /// Excludes the shared `prefix` `Arc<str>`, which isn't freed per eviction.
 fn key_footprint(key: &InternalCacheKey) -> usize {
     std::mem::size_of::<InternalCacheKey>() + key.key().len()
+}
+
+fn logical_entry_size(key: &InternalCacheKey, entry_size_bytes: usize) -> usize {
+    key_footprint(key).saturating_add(entry_size_bytes)
+}
+
+fn entry_weight(key: &InternalCacheKey, entry_size_bytes: usize) -> usize {
+    logical_entry_size(key, entry_size_bytes).min(u32::MAX as usize)
 }
 
 /// Default [`CacheBackend`] backed by a [moka](https://crates.io/crates/moka) cache.
@@ -47,10 +58,7 @@ impl MokaCacheBackend {
         let cache = moka::future::Cache::builder()
             .max_capacity(capacity as u64)
             .weigher(|key: &InternalCacheKey, entry: &MokaCacheEntry| {
-                key_footprint(key)
-                    .saturating_add(entry.size_bytes)
-                    .try_into()
-                    .unwrap_or(u32::MAX)
+                entry_weight(key, entry.size_bytes) as u32
             })
             .support_invalidation_closures()
             .build();
@@ -141,6 +149,15 @@ impl CacheBackend for MokaCacheBackend {
         ))
     }
 
+    async fn entry_records(&self) -> Option<CacheEntryRecordIterator<'_>> {
+        self.cache.run_pending_tasks().await;
+        Some(Box::new(self.cache.iter().map(|(key, entry)| {
+            let key = key.as_ref().clone();
+            let size_bytes = entry_weight(&key, entry.size_bytes);
+            CacheEntryRecord { key, size_bytes }
+        })))
+    }
+
     async fn num_entries(&self) -> usize {
         self.cache.run_pending_tasks().await;
         self.cache.entry_count() as usize
@@ -161,7 +178,7 @@ impl CacheBackend for MokaCacheBackend {
         // is async and can't be called from this synchronous context.
         self.cache
             .iter()
-            .map(|(key, entry)| key_footprint(key.as_ref()) + entry.size_bytes)
+            .map(|(key, entry)| logical_entry_size(key.as_ref(), entry.size_bytes))
             .sum()
     }
 }

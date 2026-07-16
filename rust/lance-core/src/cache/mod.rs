@@ -50,7 +50,10 @@ pub mod codec;
 mod entry_io;
 mod moka;
 
-pub use backend::{CacheBackend, CacheEntry, CacheKeyIterator, InternalCacheKey};
+pub use backend::{
+    CacheBackend, CacheEntry, CacheEntryRecord, CacheEntryRecordIterator, CacheKeyIterator,
+    InternalCacheKey,
+};
 pub use codec::{
     CacheCodec, CacheCodecImpl, CacheDecode, CacheMissReason, MAGIC, has_cache_envelope,
 };
@@ -280,6 +283,20 @@ impl LanceCache {
                 .keys()
                 .await?
                 .filter(|key| key.starts_with(&self.prefix)),
+        ))
+    }
+
+    /// Return diagnostic entry records currently stored under this cache's prefix.
+    ///
+    /// Returns `None` when the backend does not support entry inventory. The
+    /// iterator is intended for diagnostics and may be weakly consistent with
+    /// concurrent cache mutations.
+    pub async fn entry_records(&self) -> Option<CacheEntryRecordIterator<'_>> {
+        Some(Box::new(
+            self.cache
+                .entry_records()
+                .await?
+                .filter(|record| record.key.starts_with(&self.prefix)),
         ))
     }
 
@@ -659,6 +676,22 @@ mod tests {
             .collect()
     }
 
+    fn record_fields(
+        records: &[CacheEntryRecord],
+    ) -> BTreeSet<(String, String, &'static str, usize)> {
+        records
+            .iter()
+            .map(|record| {
+                (
+                    record.key.prefix().to_string(),
+                    record.key.key().to_string(),
+                    record.key.type_name(),
+                    record.size_bytes,
+                )
+            })
+            .collect()
+    }
+
     #[tokio::test]
     async fn test_cache_bytes() {
         let item = Arc::new(vec![1, 2, 3]);
@@ -895,6 +928,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_cache_entry_records_with_prefixes() {
+        let base = LanceCache::with_capacity(10_000);
+        let prefixed = base.with_key_prefix("ns");
+        let nested = prefixed.with_key_prefix("index");
+        let other = base.with_key_prefix("ns-other");
+
+        let root = Arc::new(vec![0]);
+        let child = Arc::new(vec![1]);
+        let nested_value = Arc::new(vec![2]);
+        let other_value = Arc::new(vec![3]);
+
+        base.insert_with_key(&TestKey::new("root"), root.clone())
+            .await;
+        prefixed
+            .insert_with_key(&TestKey::new("child"), child.clone())
+            .await;
+        nested
+            .insert_with_key(&TestKey::new("nested"), nested_value.clone())
+            .await;
+        other
+            .insert_with_key(&TestKey::new("other"), other_value.clone())
+            .await;
+
+        let key_size = std::mem::size_of::<InternalCacheKey>();
+        let base_records = base.entry_records().await.unwrap().collect::<Vec<_>>();
+        assert_eq!(
+            record_fields(&base_records),
+            BTreeSet::from([
+                (
+                    "".to_string(),
+                    "root".to_string(),
+                    TestKey::<Vec<i32>>::type_name(),
+                    key_size + "root".len() + cache_entry_size(&*root),
+                ),
+                (
+                    "ns/".to_string(),
+                    "child".to_string(),
+                    TestKey::<Vec<i32>>::type_name(),
+                    key_size + "child".len() + cache_entry_size(&*child),
+                ),
+                (
+                    "ns/index/".to_string(),
+                    "nested".to_string(),
+                    TestKey::<Vec<i32>>::type_name(),
+                    key_size + "nested".len() + cache_entry_size(&*nested_value),
+                ),
+                (
+                    "ns-other/".to_string(),
+                    "other".to_string(),
+                    TestKey::<Vec<i32>>::type_name(),
+                    key_size + "other".len() + cache_entry_size(&*other_value),
+                ),
+            ])
+        );
+
+        let prefixed_records = prefixed.entry_records().await.unwrap().collect::<Vec<_>>();
+        assert_eq!(
+            record_fields(&prefixed_records),
+            BTreeSet::from([
+                (
+                    "ns/".to_string(),
+                    "child".to_string(),
+                    TestKey::<Vec<i32>>::type_name(),
+                    key_size + "child".len() + cache_entry_size(&*child),
+                ),
+                (
+                    "ns/index/".to_string(),
+                    "nested".to_string(),
+                    TestKey::<Vec<i32>>::type_name(),
+                    key_size + "nested".len() + cache_entry_size(&*nested_value),
+                ),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cache_entry_records_use_clamped_weight() {
+        struct HugeValue;
+
+        impl DeepSizeOf for HugeValue {
+            fn deep_size_of_children(&self, _context: &mut Context) -> usize {
+                u32::MAX as usize
+            }
+        }
+
+        let cache = LanceCache::with_capacity(usize::MAX);
+        cache
+            .insert_with_key(&TestKey::new("huge"), Arc::new(HugeValue))
+            .await;
+
+        let records = cache.entry_records().await.unwrap().collect::<Vec<_>>();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].size_bytes, u32::MAX as usize);
+        assert_eq!(cache.size_bytes().await, u32::MAX as usize);
+    }
+
+    #[tokio::test]
     async fn test_cache_get_or_insert() {
         let cache = LanceCache::with_capacity(1000);
 
@@ -1010,6 +1140,7 @@ mod tests {
                 .is_none()
         );
         assert!(cache.keys().await.is_none());
+        assert!(cache.entry_records().await.is_none());
     }
 
     #[tokio::test]

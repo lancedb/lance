@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use lance_core::cache::{CacheBackend, CacheKeyIterator, LanceCache};
+use lance_core::cache::{
+    CacheBackend, CacheEntryRecord, CacheKeyIterator, InternalCacheKey, LanceCache,
+};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 use lance_index::IndexType;
@@ -20,6 +22,50 @@ use self::index_extension::IndexExtension;
 pub(crate) mod caches;
 pub mod index_caches;
 pub(crate) mod index_extension;
+
+/// Summary of entries currently held by one cache.
+///
+/// This is intended for diagnostics. It is computed from a weakly consistent
+/// snapshot of backend entry inventory and may race with concurrent cache
+/// insertions or evictions.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CacheSummary {
+    /// Number of entries included in this summary.
+    pub total_entries: usize,
+    /// Total backend-accounted size in bytes for entries included here.
+    pub total_size_bytes: usize,
+    /// Entries grouped by summary label.
+    pub groups: Vec<CacheGroupSummary>,
+}
+
+/// Summary of cache entries under one summary group.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CacheGroupSummary {
+    /// Group label.
+    ///
+    /// Index summaries use the Lance cache prefix. Metadata summaries may use
+    /// a synthetic label to keep diagnostics compact.
+    pub cache_prefix: String,
+    /// Number of entries under this group.
+    pub entry_count: usize,
+    /// Total backend-accounted size in bytes under this group.
+    pub size_bytes: usize,
+    /// Entries further grouped by component and value type.
+    pub components: Vec<CacheComponentSummary>,
+}
+
+/// Summary of one cache component within a cache summary group.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CacheComponentSummary {
+    /// Compact component name derived from the cache key.
+    pub component: String,
+    /// Lance cache value type name.
+    pub type_name: String,
+    /// Number of entries for this component and value type.
+    pub entry_count: usize,
+    /// Total backend-accounted size in bytes for this component and value type.
+    pub size_bytes: usize,
+}
 
 /// A user session holds the runtime state for a [`crate::Dataset`]
 ///
@@ -259,6 +305,18 @@ impl Session {
         self.index_cache.0.keys().await
     }
 
+    /// Return a compact read-time summary of entries held by the index cache.
+    ///
+    /// Returns `None` when the configured index cache backend does not support
+    /// entry inventory.
+    pub async fn index_cache_summary(&self) -> Option<CacheSummary> {
+        Some(summarize_cache_records(
+            self.index_cache.0.entry_records().await?,
+            cache_prefix_group,
+            index_cache_component,
+        ))
+    }
+
     /// Return an iterator over keys currently held by the metadata cache.
     ///
     /// Returns `None` when the metadata cache backend does not support key
@@ -277,6 +335,18 @@ impl Session {
     pub async fn metadata_cache_keys(&self) -> Option<CacheKeyIterator<'_>> {
         self.metadata_cache.0.keys().await
     }
+
+    /// Return a compact read-time summary of entries held by the metadata cache.
+    ///
+    /// Returns `None` when the configured metadata cache backend does not
+    /// support entry inventory.
+    pub async fn metadata_cache_summary(&self) -> Option<CacheSummary> {
+        Some(summarize_cache_records(
+            self.metadata_cache.0.entry_records().await?,
+            metadata_cache_group,
+            metadata_cache_component,
+        ))
+    }
 }
 
 impl Default for Session {
@@ -289,13 +359,129 @@ impl Default for Session {
     }
 }
 
+#[derive(Default)]
+struct CacheGroupAccumulator {
+    entry_count: usize,
+    size_bytes: usize,
+    components: BTreeMap<(String, String), CacheComponentSummary>,
+}
+
+fn summarize_cache_records(
+    records: impl Iterator<Item = CacheEntryRecord>,
+    group_name: fn(&InternalCacheKey) -> String,
+    component_name: fn(&InternalCacheKey) -> String,
+) -> CacheSummary {
+    let mut groups = BTreeMap::<String, CacheGroupAccumulator>::new();
+    let mut total_entries = 0usize;
+    let mut total_size_bytes = 0usize;
+
+    for record in records {
+        total_entries = total_entries.saturating_add(1);
+        total_size_bytes = total_size_bytes.saturating_add(record.size_bytes);
+
+        let group = groups.entry(group_name(&record.key)).or_default();
+        group.entry_count = group.entry_count.saturating_add(1);
+        group.size_bytes = group.size_bytes.saturating_add(record.size_bytes);
+
+        let component = component_name(&record.key);
+        let type_name = record.key.type_name().to_string();
+        let component_summary = group
+            .components
+            .entry((component.clone(), type_name.clone()))
+            .or_insert_with(|| CacheComponentSummary {
+                component,
+                type_name,
+                entry_count: 0,
+                size_bytes: 0,
+            });
+        component_summary.entry_count = component_summary.entry_count.saturating_add(1);
+        component_summary.size_bytes = component_summary
+            .size_bytes
+            .saturating_add(record.size_bytes);
+    }
+
+    CacheSummary {
+        total_entries,
+        total_size_bytes,
+        groups: groups
+            .into_iter()
+            .map(|(cache_prefix, group)| CacheGroupSummary {
+                cache_prefix,
+                entry_count: group.entry_count,
+                size_bytes: group.size_bytes,
+                components: group.components.into_values().collect(),
+            })
+            .collect(),
+    }
+}
+
+fn cache_prefix_group(key: &InternalCacheKey) -> String {
+    key.prefix().trim_end_matches('/').to_string()
+}
+
+fn metadata_cache_group(_key: &InternalCacheKey) -> String {
+    "<metadata>".to_string()
+}
+
+fn index_cache_component(key: &InternalCacheKey) -> String {
+    cache_key_component(key.key(), key.type_name())
+}
+
+fn metadata_cache_component(key: &InternalCacheKey) -> String {
+    cache_key_component(key.key(), key.type_name())
+}
+
+fn cache_key_component(key: &str, type_name: &str) -> String {
+    let has_path_separator = key.contains('/');
+    let key = key.split('/').next().unwrap_or_default();
+    if key.is_empty() {
+        return "<empty>".to_string();
+    }
+    if type_name == "Vec<IndexMetadata>" && key.chars().all(|ch| ch.is_ascii_digit()) {
+        return "version".to_string();
+    }
+    if let Some((column_index, view_tag)) = key.split_once(':')
+        && !column_index.is_empty()
+        && !view_tag.is_empty()
+        && column_index.chars().all(|ch| ch.is_ascii_digit())
+    {
+        return "field_data".to_string();
+    }
+
+    for prefix in [
+        "ivf-",
+        "page-",
+        "postings-",
+        "posting-list-",
+        "posting-metadata-",
+        "positions-",
+    ] {
+        if key.starts_with(prefix) {
+            return prefix.trim_end_matches('-').to_string();
+        }
+    }
+
+    if has_path_separator {
+        return key.to_string();
+    }
+
+    type_name.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lance_core::cache::{CacheKey, UnsizedCacheKey};
+    use async_trait::async_trait;
+    use futures::Future;
+    use lance_core::cache::{
+        CacheBackend, CacheCodec, CacheEntry, CacheKey, InternalCacheKey, UnsizedCacheKey,
+    };
     use lance_index::vector::VectorIndex;
+    use object_store::path::Path;
     use std::borrow::Cow;
+    use std::pin::Pin;
     use tokio::io::AsyncWriteExt;
+    use uuid::Uuid;
 
     struct TestKey(&'static str);
     impl CacheKey for TestKey {
@@ -319,6 +505,51 @@ mod tests {
 
         fn type_name() -> &'static str {
             "TestUnsized"
+        }
+    }
+
+    #[derive(Debug)]
+    struct NoInventoryBackend;
+
+    #[async_trait]
+    impl CacheBackend for NoInventoryBackend {
+        async fn get(
+            &self,
+            _key: &InternalCacheKey,
+            _codec: Option<CacheCodec>,
+        ) -> Option<CacheEntry> {
+            None
+        }
+
+        async fn insert(
+            &self,
+            _key: &InternalCacheKey,
+            _entry: CacheEntry,
+            _size_bytes: usize,
+            _codec: Option<CacheCodec>,
+        ) {
+        }
+
+        async fn get_or_insert<'a>(
+            &self,
+            _key: &InternalCacheKey,
+            loader: Pin<Box<dyn Future<Output = Result<(CacheEntry, usize)>> + Send + 'a>>,
+            _codec: Option<CacheCodec>,
+        ) -> Result<(CacheEntry, bool)> {
+            let (entry, _) = loader.await?;
+            Ok((entry, false))
+        }
+
+        async fn invalidate_prefix(&self, _prefix: &str) {}
+
+        async fn clear(&self) {}
+
+        async fn num_entries(&self) -> usize {
+            0
+        }
+
+        async fn size_bytes(&self) -> usize {
+            0
         }
     }
 
@@ -369,6 +600,126 @@ mod tests {
         assert_eq!(metadata_keys[0].type_name(), "TestVec");
 
         assert_ne!(index_keys, metadata_keys);
+    }
+
+    #[tokio::test]
+    async fn test_session_cache_summaries() {
+        let session = Session::new(10_000, 10_000, Default::default());
+        let index_uuid = Uuid::nil();
+
+        let ds_index_cache = session.index_cache.for_dataset("memory://dataset");
+        let index_cache = ds_index_cache.for_index(&index_uuid, None);
+        index_cache
+            .insert_with_key(&TestKey("ivf-0"), Arc::new(vec![1]))
+            .await;
+        index_cache
+            .insert_with_key(&TestKey("ivf-1"), Arc::new(vec![2]))
+            .await;
+        index_cache
+            .insert_with_key(&TestKey("page-0"), Arc::new(vec![3]))
+            .await;
+
+        let index_summary = session.index_cache_summary().await.unwrap();
+        assert_eq!(index_summary.total_entries, 3);
+        assert_eq!(index_summary.groups.len(), 1);
+        let index_group = &index_summary.groups[0];
+        assert_eq!(
+            index_group.cache_prefix,
+            format!("memory://dataset/{index_uuid}")
+        );
+        assert_eq!(index_group.entry_count, 3);
+        assert_eq!(index_group.components.len(), 2);
+        assert_eq!(index_group.components[0].component, "ivf");
+        assert_eq!(index_group.components[0].type_name, "TestVec");
+        assert_eq!(index_group.components[0].entry_count, 2);
+        assert!(index_group.components[0].size_bytes > 0);
+        assert_eq!(index_group.components[1].component, "page");
+        assert_eq!(index_group.components[1].type_name, "TestVec");
+        assert_eq!(index_group.components[1].entry_count, 1);
+        assert!(index_group.components[1].size_bytes > 0);
+        assert_eq!(
+            index_summary.total_size_bytes,
+            index_group
+                .components
+                .iter()
+                .map(|component| component.size_bytes)
+                .sum::<usize>()
+        );
+
+        let ds_metadata_cache = session.metadata_cache.for_dataset("memory://dataset");
+        ds_metadata_cache
+            .insert_with_key(&TestKey("manifest/1"), Arc::new(vec![4]))
+            .await;
+        ds_metadata_cache
+            .insert_with_key(&TestKey("txn/1"), Arc::new(vec![5]))
+            .await;
+        let file_metadata_cache =
+            ds_metadata_cache.file_metadata_cache(&Path::from("data/0.lance"));
+        file_metadata_cache
+            .insert_with_key(&TestKey(""), Arc::new(vec![6]))
+            .await;
+
+        let metadata_summary = session.metadata_cache_summary().await.unwrap();
+        assert_eq!(metadata_summary.total_entries, 3);
+        assert_eq!(metadata_summary.groups.len(), 1);
+        let metadata_group = &metadata_summary.groups[0];
+        assert_eq!(metadata_group.cache_prefix, "<metadata>");
+        assert_eq!(
+            metadata_group
+                .components
+                .iter()
+                .map(|component| component.entry_count)
+                .sum::<usize>(),
+            3
+        );
+        assert!(
+            metadata_group
+                .components
+                .iter()
+                .any(|component| component.component == "manifest")
+        );
+        assert!(
+            metadata_group
+                .components
+                .iter()
+                .any(|component| component.component == "txn")
+        );
+        assert!(
+            metadata_group
+                .components
+                .iter()
+                .any(|component| component.component == "<empty>")
+        );
+    }
+
+    #[test]
+    fn test_cache_key_component_names_are_compact() {
+        let uuid = Uuid::nil();
+
+        assert_eq!(
+            cache_key_component(&format!("frag_reuse/{uuid}"), "FragReuseIndex"),
+            "frag_reuse"
+        );
+        assert_eq!(
+            cache_key_component(&format!("type/{uuid}"), "ScalarIndexDetails"),
+            "type"
+        );
+        assert_eq!(cache_key_component("12", "Vec<IndexMetadata>"), "version");
+        assert_eq!(cache_key_component("12", "Bitmap"), "Bitmap");
+        assert_eq!(cache_key_component("0:default", "FieldData"), "field_data");
+        assert_eq!(cache_key_component("ivf-12", "LegacyIVFPartition"), "ivf");
+        assert_eq!(cache_key_component("some-value", "Bitmap"), "Bitmap");
+    }
+
+    #[tokio::test]
+    async fn test_session_cache_summary_unsupported_backend() {
+        let session = Session::with_index_cache_backend(
+            Arc::new(NoInventoryBackend),
+            10_000,
+            Default::default(),
+        );
+
+        assert!(session.index_cache_summary().await.is_none());
     }
 
     #[tokio::test]

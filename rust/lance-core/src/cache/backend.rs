@@ -25,6 +25,9 @@ pub type CacheEntry = Arc<dyn Any + Send + Sync>;
 /// Iterator over cache keys currently known to a backend.
 pub type CacheKeyIterator<'a> = Box<dyn Iterator<Item = InternalCacheKey> + Send + 'a>;
 
+/// Iterator over cache entries currently known to a backend.
+pub type CacheEntryRecordIterator<'a> = Box<dyn Iterator<Item = CacheEntryRecord> + Send + 'a>;
+
 /// Structured cache key passed to [`CacheBackend`] methods.
 ///
 /// CacheBackend impls receive these ready-made from [`LanceCache`](super::LanceCache)
@@ -65,6 +68,17 @@ impl InternalCacheKey {
     pub fn starts_with(&self, prefix: &str) -> bool {
         self.prefix.starts_with(prefix)
     }
+}
+
+/// Diagnostic inventory record for one cached entry.
+///
+/// `size_bytes` is the backend's per-entry weighted size for capacity
+/// accounting. Backends may include key overhead or physical storage overhead
+/// according to the same accounting they use for eviction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CacheEntryRecord {
+    pub key: InternalCacheKey,
+    pub size_bytes: usize,
 }
 
 /// Low-level pluggable cache backend.
@@ -125,6 +139,14 @@ pub trait CacheBackend: Send + Sync + std::fmt::Debug {
     /// `None`. An empty iterator means key inventory is supported and the
     /// cache currently has no entries.
     async fn keys(&self) -> Option<CacheKeyIterator<'_>> {
+        None
+    }
+
+    /// Return an iterator over cache entries currently known to this backend.
+    ///
+    /// This is intended for diagnostics and summary APIs. Backends that cannot
+    /// enumerate entries cheaply or accurately should return `None`.
+    async fn entry_records(&self) -> Option<CacheEntryRecordIterator<'_>> {
         None
     }
 
