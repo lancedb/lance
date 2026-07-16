@@ -17,7 +17,7 @@ use arrow_schema::DataType;
 use async_trait::async_trait;
 use lance_core::{Error, Result};
 use lance_encoding::version::LanceFileVersion;
-use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
+use lance_index::is_system_index;
 use lance_index::pb::VectorIndexDetails;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_table::format::IndexMetadata;
@@ -29,19 +29,39 @@ use super::optimize::{IndexRemapper, IndexRemapperOptions};
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DatasetIndexRemapperOptions {}
 
+/// Loads index metadata when compaction has at least one index to remap.
+///
+/// Returns all index metadata, including system indices, so the remapper uses a
+/// consistent snapshot. Returns `None` when there are no non-system indices.
+pub(crate) async fn load_indices_for_remapping(
+    dataset: &Dataset,
+) -> Result<Option<Arc<Vec<IndexMetadata>>>> {
+    if dataset.manifest.index_section.is_none() {
+        return Ok(None);
+    }
+
+    let indices = dataset.load_indices().await?;
+    let has_remappable_index = indices.iter().any(|index| !is_system_index(index));
+    Ok(has_remappable_index.then_some(indices))
+}
+
+#[async_trait]
 impl IndexRemapperOptions for DatasetIndexRemapperOptions {
-    fn create_remapper(
-        &self,
-        dataset: &Dataset,
-    ) -> crate::Result<Box<dyn super::optimize::IndexRemapper>> {
-        Ok(Box::new(DatasetIndexRemapper {
+    async fn create_remapper(&self, dataset: &Dataset) -> Result<Option<Box<dyn IndexRemapper>>> {
+        let Some(indices) = load_indices_for_remapping(dataset).await? else {
+            return Ok(None);
+        };
+
+        Ok(Some(Box::new(DatasetIndexRemapper {
             dataset: Arc::new(dataset.clone()),
-        }))
+            indices,
+        })))
     }
 }
 
 struct DatasetIndexRemapper {
     dataset: Arc<Dataset>,
+    indices: Arc<Vec<IndexMetadata>>,
 }
 
 impl DatasetIndexRemapper {
@@ -62,10 +82,9 @@ impl IndexRemapper for DatasetIndexRemapper {
         affected_fragment_ids: &[u64],
     ) -> Result<Vec<RemappedIndex>> {
         let affected_frag_ids = HashSet::<u64>::from_iter(affected_fragment_ids.iter().copied());
-        let indices = self.dataset.load_indices().await?;
-        let mut remapped = Vec::with_capacity(indices.len());
-        for index in indices.iter() {
-            let needs_remapped = index.name != FRAG_REUSE_INDEX_NAME
+        let mut remapped = Vec::with_capacity(self.indices.len());
+        for index in self.indices.iter() {
+            let needs_remapped = !is_system_index(index)
                 && match &index.fragment_bitmap {
                     None => true,
                     Some(fragment_bitmap) => fragment_bitmap
@@ -178,12 +197,54 @@ impl LanceIndexStoreExt for LanceIndexStore {
 mod tests {
     use super::*;
     use crate::dataset::WriteParams;
+    use crate::dataset::transaction::{Operation, Transaction};
     use crate::index::DatasetIndexExt;
+    use crate::index::frag_reuse::build_frag_reuse_index_metadata;
     use crate::index::vector::VectorIndexParams;
     use lance_datagen::{BatchCount, RowCount, array};
     use lance_index::IndexType;
+    use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragReuseIndexDetails};
     use lance_linalg::distance::MetricType;
     use uuid::Uuid;
+
+    #[tokio::test]
+    async fn test_remapper_not_created_without_remappable_indices() {
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .into_reader_rows(RowCount::from(1), BatchCount::from(1));
+        let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+        let options = DatasetIndexRemapperOptions::default();
+
+        assert!(options.create_remapper(&dataset).await.unwrap().is_none());
+
+        let frag_reuse_index = build_frag_reuse_index_metadata(
+            &dataset,
+            None,
+            FragReuseIndexDetails {
+                versions: Vec::new(),
+            },
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        let transaction = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![frag_reuse_index],
+                removed_indices: Vec::new(),
+            },
+            None,
+        );
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1);
+        assert_eq!(indices[0].name, FRAG_REUSE_INDEX_NAME);
+        assert!(options.create_remapper(&dataset).await.unwrap().is_none());
+    }
 
     #[tokio::test]
     async fn test_remapper_only_touches_segments_with_affected_fragments() {
@@ -296,7 +357,9 @@ mod tests {
 
         let remapper = DatasetIndexRemapperOptions::default()
             .create_remapper(&dataset)
-            .unwrap();
+            .await
+            .unwrap()
+            .expect("vector index should require a remapper");
         let remapped = remapper
             .remap_indices(RowAddrRemap::empty(), &[target_fragments[0].id() as u64])
             .await
