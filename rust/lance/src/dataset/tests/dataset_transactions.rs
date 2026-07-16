@@ -519,6 +519,26 @@ async fn test_read_version_transaction_does_not_populate_caches() {
 }
 
 #[tokio::test]
+async fn test_read_transaction_recovers_from_stale_manifest_size() {
+    let test_uri = TempStrDir::default();
+    let ds = write_versions(&test_uri, 1, true).await;
+    let manifest = ds.manifest().clone();
+    // Only meaningful for the inline path; a plain write inlines the transaction.
+    assert!(manifest.transaction_section.is_some());
+
+    // A size at/under the transaction offset makes the first read_message fail
+    // "file size is too small"; only the retry at the true size can recover.
+    let mut stale = ds.manifest_location().clone();
+    stale.size = Some(1);
+    let recovered = ds
+        .read_transaction_from_storage(&manifest, &stale)
+        .await
+        .unwrap();
+    assert_eq!(recovered, ds.read_transaction().await.unwrap());
+    assert!(recovered.is_some());
+}
+
+#[tokio::test]
 async fn test_read_version_transaction_v1_manifest_naming() {
     let test_uri = TempStrDir::default();
     let ds = write_versions(&test_uri, 3, false).await;
