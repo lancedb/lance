@@ -1,0 +1,55 @@
+/* Lance Design System — color tokens (Swiss editorial: white, ink, brand purple #625EFF) */
+:root {
+  /* ---- Ink scale (dark values — code surfaces & tooltips only) ---- */
+  --ink-950: #0E0C14;
+  --ink-900: #14111D;
+  --ink-850: #1A1626;
+  --ink-800: #221D30;
+  --ink-700: #2C2640;
+  --ink-600: #3A3352;
+
+  /* ---- Foreground scale (on white) ---- */
+  --fg-1: #0E0C14;
+  --fg-2: #4A4459;
+  --fg-3: #8A8499;
+  --fg-inverse: #ffffff;
+
+  /* ---- Brand purple ramp (official #625EFF) ---- */
+  --beam-300: #B3B1FF;
+  --beam-400: #625EFF;
+  --beam-500: #625EFF; /* primary accent — official lance.org purple */
+  --beam-600: #4B47E0;
+  --beam-700: #3936B4;
+  --beam-glow: rgba(98, 94, 255, 0.25);
+  --beam-dim: rgba(98, 94, 255, 0.09);
+
+  /* ---- Semantic status (calibrated for white) ---- */
+  --ok-500: #0E8F63;
+  --ok-dim: rgba(14, 143, 99, 0.1);
+  --warn-500: #B26205;
+  --warn-dim: rgba(178, 98, 5, 0.1);
+  --danger-500: #D92D20;
+  --danger-dim: rgba(217, 45, 32, 0.08);
+
+  /* ---- Lines: ink rules carry the structure ---- */
+  --line-1: #14111D;               /* default border — full ink, 1px */
+  --line-2: rgba(20, 17, 29, 0.16); /* subtle divider */
+  --line-bright: #625EFF;           /* hover/active border */
+
+  /* ---- Semantic aliases ---- */
+  --surface-page: #FFFFFF;
+  --surface-raised: #FFFFFF;
+  --surface-card: #FFFFFF;
+  --surface-overlay: #F5F4F8;
+  --surface-code: #14111D; /* code blocks stay ink-dark */
+  --text-body: var(--fg-1);
+  --text-secondary: var(--fg-2);
+  --text-muted: var(--fg-3);
+  --text-accent: #4B47E0;
+  --border-default: var(--line-1);
+  --border-subtle: var(--line-2);
+  --accent: #625EFF;
+  --accent-hover: #4B47E0;
+  --accent-press: #3936B4;
+  --focus-ring: 0 0 0 2px #ffffff, 0 0 0 4px #625EFF;
+}

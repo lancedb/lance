@@ -1,0 +1,19 @@
+/* Lance Design System — minimal base rules */
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--surface-page);
+  color: var(--text-body);
+  font-family: var(--font-body);
+  font-size: var(--text-base);
+  line-height: var(--leading-body);
+  -webkit-font-smoothing: antialiased;
+}
+
+::selection { background: rgba(98, 94, 255, 0.18); color: var(--text-body); }
+
+a { color: var(--text-accent); }
+a:hover { color: var(--accent); }
+
+code, kbd, pre { font-family: var(--font-mono); }

@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lance Docs</title>
+<link rel="icon" href="../src/logo/logo.png">
+<link rel="stylesheet" href="ds/tokens/fonts.css">
+<link rel="stylesheet" href="ds/tokens/colors.css">
+<link rel="stylesheet" href="ds/tokens/typography.css">
+<link rel="stylesheet" href="ds/tokens/spacing.css">
+<link rel="stylesheet" href="ds/tokens/effects.css">
+<link rel="stylesheet" href="ds/tokens/base.css">
+<link rel="stylesheet" href="site.css">
+</head>
+<body>
+<div class="ld-shell">
+  <header class="ld-header">
+    <a class="ld-brand" href="#/home">
+      <img src="../src/logo/logo.png" alt="Lance logo">
+      <span>Lance</span>
+    </a>
+    <nav class="ld-topnav" id="top-tabs" aria-label="Sections"></nav>
+    <div class="ld-header__actions">
+      <a class="ld-btn ld-btn--ghost" href="https://github.com/lance-format/lance" target="_blank" rel="noopener">★ GitHub</a>
+      <a class="ld-btn ld-btn--primary" href="#/quickstart/index">Get started</a>
+    </div>
+  </header>
+
+  <main id="view-home" class="ld-home" hidden>
+    <section class="ld-hero">
+      <div class="ld-kicker">Lance format · Open source · Apache-2.0</div>
+      <h1>The open lakehouse format for multimodal AI.</h1>
+      <p class="ld-hero__lead">A file format, table format, and catalog spec for building a complete lakehouse on object storage — vector search, full-text search, random access, and feature engineering for your AI workflows.</p>
+      <div class="ld-hero__cta">
+        <a class="ld-btn ld-btn--primary ld-btn--lg" href="#/quickstart/index">Get started</a>
+        <a class="ld-btn ld-btn--outline ld-btn--lg" href="#/format/index">Read the spec</a>
+        <a class="ld-btn ld-btn--outline ld-btn--lg" href="#/examples/python/llm_training">Train an LLM</a>
+        <a class="ld-btn ld-btn--text ld-btn--lg" href="https://discord.gg/lance" target="_blank" rel="noopener">Join Discord →</a>
+      </div>
+    </section>
+
+    <section class="ld-band">
+      <div class="ld-stats">
+        <div class="ld-stat">
+          <div class="ld-stat__value">100×</div>
+          <div class="ld-stat__label">Faster random access than Parquet</div>
+        </div>
+        <div class="ld-stat">
+          <div class="ld-stat__value">1 line</div>
+          <div class="ld-stat__label">To convert Parquet to Lance</div>
+        </div>
+        <div class="ld-stat">
+          <div class="ld-stat__value ld-stat__value--beam">VLDB '25</div>
+          <div class="ld-stat__label">Peer-reviewed research paper</div>
+        </div>
+      </div>
+    </section>
+
+    <section class="ld-what">
+      <h2>What is Lance?</h2>
+      <p class="ld-what__body">Lance is a modern, open source lakehouse format for multimodal AI. It brings high-performance vector search, full-text search, random access, and feature engineering to the lakehouse — while keeping SQL analytics, ACID transactions, time travel, and integrations with open engines (Apache Spark, Ray, PyTorch, Trino, DuckDB) and open catalogs (Apache Polaris, Unity Catalog, Apache Gravitino, Hive Metastore).</p>
+      <p class="ld-what__more">Learn more in the <a class="ld-inline-link" href="https://arxiv.org/abs/2504.15247" target="_blank" rel="noopener">research paper</a> published at VLDB 2025.</p>
+    </section>
+
+    <section class="ld-features">
+      <div class="ld-feature">
+        <div class="ld-feature__num">01</div>
+        <div class="ld-feature__body">
+          <h3>Expressive hybrid search</h3>
+          <p>Combine vector similarity, full-text search (BM25), and SQL analytics on the same dataset. All query types are accelerated by secondary indexes that are part of the Lance specification.</p>
+          <a class="ld-more" href="#/quickstart/vector-search">Learn more →</a>
+        </div>
+        <div class="ld-feature__img">
+          <img src="../src/assets/images/hybrid-search.png" alt="Expressive hybrid search">
+        </div>
+      </div>
+      <div class="ld-feature">
+        <div class="ld-feature__num">02</div>
+        <div class="ld-feature__body">
+          <h3>Lightning-fast random access</h3>
+          <p>100x faster random access than Parquet or Iceberg. An optimized file format plus row addressing and secondary indexes let you fetch individual records across files instantly — for ML serving, sampling, and interactive apps.</p>
+          <a class="ld-more" href="#/guide/read_and_write">Learn more →</a>
+        </div>
+        <div class="ld-feature__img">
+          <img src="../src/assets/images/random-access.png" alt="Lightning-fast random access">
+        </div>
+      </div>
+      <div class="ld-feature">
+        <div class="ld-feature__num">03</div>
+        <div class="ld-feature__body">
+          <h3>Native multimodal data</h3>
+          <p>Store images, videos, audio, text, and embeddings alongside tabular data in one format. Blob encoding handles large binary objects with lazy loading; optimized vector storage accelerates similarity search.</p>
+          <a class="ld-more" href="#/guide/blob">Learn more →</a>
+        </div>
+        <div class="ld-feature__img">
+          <img src="../src/assets/images/multimodal-data.png" alt="Native multimodal data">
+        </div>
+      </div>
+      <div class="ld-feature">
+        <div class="ld-feature__num">04</div>
+        <div class="ld-feature__body">
+          <h3>Data evolution &gt; schema evolution</h3>
+          <p>Backfilling column values normally forces a full table rewrite. Lance supports efficient schema evolution with backfill — adding a column with data is just writing new Lance files to the table.</p>
+          <a class="ld-more" href="#/guide/data_evolution">Learn more →</a>
+        </div>
+        <div class="ld-feature__img">
+          <img src="../src/assets/images/data-evolution.png" alt="Data evolution">
+        </div>
+      </div>
+      <div class="ld-feature">
+        <div class="ld-feature__num">05</div>
+        <div class="ld-feature__body">
+          <h3>Rich ecosystem integrations</h3>
+          <p>Works with Pandas, Polars, Ray, and PyTorch for processing and ML. Connects to Apache DataFusion, DuckDB, Apache Spark, Trino, and Apache Flink for SQL analytics and distributed processing.</p>
+          <a class="ld-more" href="#/integrations/index">View integrations →</a>
+        </div>
+        <div class="ld-feature__img">
+          <img src="../src/assets/images/ecosystem-integrations.png" alt="Rich ecosystem integrations">
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <main id="view-docs" class="ld-docs" hidden>
+    <aside class="ld-sidenav" id="sidenav" aria-label="Section pages"></aside>
+    <div class="ld-article">
+      <div class="ld-crumbs" id="crumbs"></div>
+      <div class="ld-loading" id="loading" hidden>Loading…</div>
+      <div id="article"></div>
+      <div class="ld-pagenav" id="pagenav"></div>
+    </div>
+  </main>
+
+  <footer class="ld-footer">
+    <div class="ld-footer__brand">
+      <img src="../src/logo/wide.png" alt="Lance">
+      <p>Lance is an open-source columnar format for multimodal AI. Apache-2.0. © 2026 Lance Format.</p>
+    </div>
+    <div class="ld-footer__cols">
+      <div class="ld-footer__col">
+        <h5>Format</h5>
+        <a href="#/format/index">Specification</a>
+        <a href="#/format/file/index">File format</a>
+        <a href="#/format/table/index">Table format</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Develop</h5>
+        <a href="#/quickstart/index">Getting started</a>
+        <a href="#/guide/read_and_write">User guide</a>
+        <a href="#/sdk_docs">SDK docs</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Community</h5>
+        <a href="https://github.com/lance-format/lance" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://discord.gg/lance" target="_blank" rel="noopener">Discord</a>
+        <a href="https://groups.google.com/a/lance.org/g/dev" target="_blank" rel="noopener">Mailing list</a>
+        <a href="#/community/contributing">Contributing</a>
+      </div>
+    </div>
+  </footer>
+</div>
+<script src="docs-app.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
