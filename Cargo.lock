@@ -4572,6 +4572,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "lance-cache-abi"
+version = "11.0.0-beta.2"
+dependencies = [
+ "futures",
+ "xabi",
+ "xabi-assert",
+]
+
+[[package]]
+name = "lance-cache-xabi-fixture"
+version = "0.0.0"
+dependencies = [
+ "lance-cache-abi",
+ "xabi",
+]
+
+[[package]]
 name = "lance-core"
 version = "11.0.0-beta.2"
 dependencies = [
@@ -4589,6 +4606,7 @@ dependencies = [
  "futures",
  "itertools 0.14.0",
  "lance-arrow",
+ "lance-cache-abi",
  "lance-derive",
  "libc",
  "libm",
@@ -5242,6 +5260,16 @@ name = "libc"
 version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
+
+[[package]]
+name = "libloading"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
+dependencies = [
+ "cfg-if 1.0.4",
+ "windows-link",
+]
 
 [[package]]
 name = "libm"
@@ -10207,6 +10235,36 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "05f360fc0b24296329c78fda852a1e9ae82de9cf7b27dae4b7f62f118f77b9ed"
 dependencies = [
  "tap",
+]
+
+[[package]]
+name = "xabi"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "502d74af326b336ce3d0bb4f90a181bedc1a79de6eeccf51983339b5395e8aca"
+dependencies = [
+ "libloading",
+ "xabi-macros",
+]
+
+[[package]]
+name = "xabi-assert"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0bd399017ed5d647c7ed3612b0bc0b47eb5a5b7be315c89c2c4af462cdfd606e"
+dependencies = [
+ "xabi",
+]
+
+[[package]]
+name = "xabi-macros"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef9ded715a3002053fea77d239272e8bc8bbafd89dbdc8e0f1c8c21c2b3fc239"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]

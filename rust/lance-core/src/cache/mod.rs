@@ -48,6 +48,7 @@
 pub mod backend;
 mod backend_uri;
 pub mod codec;
+mod dynamic;
 mod entry_io;
 mod key;
 mod moka;
@@ -59,8 +60,10 @@ pub use backend_uri::{build_from_uri, parse_backend_uri};
 pub use codec::{
     CacheCodec, CacheCodecImpl, CacheDecode, CacheMissReason, MAGIC, has_cache_envelope,
 };
+pub use dynamic::DynamicCacheBackendAdapter;
 pub use entry_io::{CacheEntryReader, CacheEntryWriter};
 pub use key::{CACHE_KEY_FORMAT, CacheKeySchema, CacheNamespace, InternalCacheKey, KeyBuilder};
+pub use lance_cache_abi as dynamic_cache_abi;
 pub use moka::MokaCacheBackend;
 pub use quick::{QuickCacheBackend, recommended_cache_shards};
 pub use registry::{BackendBuildFn, BackendConfig, build_from_config, register_backend};

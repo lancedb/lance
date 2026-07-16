@@ -3306,6 +3306,57 @@ async fn test_fts_strict_prewarm_fails_missing_scalar_container() {
     );
 }
 
+mod dynamic_cache_fixture {
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::sync::OnceLock;
+
+    static FIXTURE_LIBRARY: OnceLock<PathBuf> = OnceLock::new();
+
+    pub fn library_path() -> &'static Path {
+        FIXTURE_LIBRARY.get_or_init(build_fixture_library).as_path()
+    }
+
+    fn build_fixture_library() -> PathBuf {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let workspace_dir = manifest_dir
+            .ancestors()
+            .nth(2)
+            .expect("lance lives under rust/")
+            .to_path_buf();
+        let target_dir = workspace_dir.join("target").join("xabi-fixtures");
+        let status = Command::new("cargo")
+            .args(["build", "-p", "lance-cache-xabi-fixture", "--target-dir"])
+            .arg(&target_dir)
+            .args(["--message-format", "short"])
+            .current_dir(&workspace_dir)
+            .env_remove("RUSTC_WRAPPER")
+            .env_remove("CARGO_TARGET_DIR")
+            .status()
+            .expect("cargo build can be launched");
+        assert!(status.success(), "fixture cdylib build failed");
+
+        let profile_dir = target_dir.join("debug");
+        let library_path = profile_dir.join(dynamic_library_name("lance_cache_xabi_fixture"));
+        assert!(
+            library_path.exists(),
+            "fixture cdylib was not built at {}",
+            library_path.display()
+        );
+        library_path
+    }
+
+    fn dynamic_library_name(stem: &str) -> String {
+        if cfg!(target_os = "macos") {
+            format!("lib{stem}.dylib")
+        } else if cfg!(target_os = "windows") {
+            format!("{stem}.dll")
+        } else {
+            format!("lib{stem}.so")
+        }
+    }
+}
+
 /// Validates the OSS-741 contract: after FTS prewarm through a serializing
 /// cache backend, FTS queries serve results without any further IO. The
 /// serializing backend forces every cache hit through the new
@@ -3421,6 +3472,97 @@ async fn test_fts_prewarm_with_serializing_backend_serves_query_with_no_io() {
         0,
         "FTS query should not perform IO after prewarm; the serializing cache \
          backend must serve every posting list and positions entry from memory"
+    );
+}
+
+/// End-to-end smoke test for a dynamic cache backend plugin: build and load a
+/// real `.so`, inject it through `Session::with_index_cache_backend`, prewarm a
+/// BTree index, then query from the cache without object-store IO.
+#[tokio::test]
+async fn test_btree_prewarm_with_dynamic_so_backend_serves_query_with_no_io() {
+    use lance_core::cache::{CacheBackend, DynamicCacheBackendAdapter};
+    use lance_io::assert_io_eq;
+
+    let tmpdir = TempStrDir::default();
+    let uri = tmpdir.to_owned();
+    drop(tmpdir);
+
+    let num_rows = 16_384;
+    let values = Int32Array::from_iter_values(0..num_rows);
+    let ids = UInt64Array::from_iter_values(0..num_rows as u64);
+    let batch = RecordBatch::try_new(
+        arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("value", DataType::Int32, false),
+            arrow_schema::Field::new("id", DataType::UInt64, false),
+        ])
+        .into(),
+        vec![Arc::new(values) as ArrayRef, Arc::new(ids) as ArrayRef],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    let mut dataset = Dataset::write(batches, &uri, None).await.unwrap();
+    dataset
+        .create_index(
+            &["value"],
+            IndexType::BTree,
+            Some("value_idx".to_owned()),
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let backend = Arc::new(unsafe {
+        DynamicCacheBackendAdapter::load_named(
+            dynamic_cache_fixture::library_path(),
+            "memory",
+            128 * 1024 * 1024,
+        )
+        .expect("fixture dynamic cache backend should load")
+    });
+    let session = Arc::new(Session::with_index_cache_backend(
+        backend.clone(),
+        128 * 1024 * 1024,
+        Arc::new(lance_io::object_store::ObjectStoreRegistry::default()),
+    ));
+    let dataset = DatasetBuilder::from_uri(&uri)
+        .with_session(session)
+        .load()
+        .await
+        .unwrap();
+
+    dataset.object_store.as_ref().io_stats_incremental();
+    dataset.prewarm_index("value_idx").await.unwrap();
+
+    assert!(
+        backend.num_entries().await > 0,
+        "prewarm should have populated the dynamic .so cache adapter"
+    );
+
+    dataset.object_store.as_ref().io_stats_incremental();
+    let result = dataset
+        .scan()
+        .project(&[ROW_ID])
+        .unwrap()
+        .filter("value >= 100 AND value < 200")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(
+        result.num_rows(),
+        100,
+        "indexed filter should return correct results through the dynamic cache adapter"
+    );
+
+    let stats = dataset.object_store.as_ref().io_stats_incremental();
+    assert_io_eq!(
+        stats,
+        read_iops,
+        0,
+        "BTree filter query should not perform IO after prewarm; the dynamic .so \
+         cache backend must serve the index state and pages"
     );
 }
 
