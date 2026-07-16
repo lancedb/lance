@@ -9,6 +9,7 @@
 use std::io::Cursor;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::sync::MutexGuard as StdMutexGuard;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
@@ -167,8 +168,22 @@ impl WriterCursors {
         indexed_count.min(self.durable().saturating_sub(global_offset))
     }
 
+    /// Lock `terminal_error`, ignoring mutex poisoning.
+    ///
+    /// A panic under this lock cannot tear the `Option` it guards: the sole
+    /// writer builds the value first and assigns it whole, so a panic mid-section
+    /// leaves the slot exactly as it was. Surfacing poison as an error instead
+    /// would mask the latched `FenceReason` behind an unrelated "mutex poisoned"
+    /// precisely when a caller needs the real reason — and would strand
+    /// `mark_terminal_failure`, which has no error to return.
+    fn lock_terminal_error(&self) -> StdMutexGuard<'_, Option<WalFlushFailure>> {
+        self.terminal_error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     pub(crate) fn check_poisoned(&self) -> Result<()> {
-        if let Some(failure) = self.terminal_error.lock().unwrap().clone() {
+        if let Some(failure) = self.lock_terminal_error().clone() {
             return Err(failure.into_error());
         }
         Ok(())
@@ -176,7 +191,7 @@ impl WriterCursors {
 
     pub(crate) fn mark_terminal_failure(&self, error: &Error) {
         {
-            let mut slot = self.terminal_error.lock().unwrap();
+            let mut slot = self.lock_terminal_error();
             if slot.is_none() {
                 *slot = Some(WalFlushFailure::from_error(error));
             }
@@ -2431,5 +2446,34 @@ mod tests {
             .expect("watcher hung after a poisoning flush")
             .expect_err("watcher must surface the poison");
         assert_eq!(waited.fence_reason(), Some(FenceReason::PersistenceFailure));
+    }
+
+    // A panic under the `terminal_error` lock must not cost the writer its
+    // latched failure. Recovery is reopen -> replay, which is driven by the real
+    // `FenceReason`; reporting the mutex poisoning instead would bury it.
+    #[tokio::test]
+    async fn test_poisoned_terminal_error_mutex_still_reports_typed_failure() {
+        let cursors = Arc::new(WriterCursors::new(true));
+        cursors.mark_terminal_failure(&Error::writer_poisoned("injected persistence failure"));
+
+        let terminal_error = Arc::clone(&cursors.terminal_error);
+        let panicked = std::thread::spawn(move || {
+            let _guard = terminal_error.lock().unwrap();
+            panic!("poison the terminal error mutex");
+        })
+        .join();
+        assert!(panicked.is_err());
+        assert!(cursors.terminal_error.is_poisoned());
+
+        let error = cursors.check_poisoned().unwrap_err();
+        assert_eq!(error.fence_reason(), Some(FenceReason::PersistenceFailure));
+        assert!(error.to_string().contains("injected persistence failure"));
+
+        // The latch still takes writes, and still keeps the first failure.
+        cursors.mark_terminal_failure(&Error::fenced_by_peer("later peer fence"));
+        assert_eq!(
+            cursors.check_poisoned().unwrap_err().fence_reason(),
+            Some(FenceReason::PersistenceFailure)
+        );
     }
 }
