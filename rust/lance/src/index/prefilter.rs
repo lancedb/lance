@@ -52,10 +52,10 @@ pub struct DatasetPreFilter {
     // Fragment IDs whose data is still in the index but has been removed from the dataset.
     // Used by FTS merge-on-read to prune stale fragments at search time.
     pub(super) deleted_fragments: Option<RoaringBitmap>,
-    // Physical fragment restriction for non-stable row addresses. Keep this
-    // separate from deletion masks so sparse deletions do not force expansion
-    // of full-fragment allow lists.
-    pub(super) allowed_fragments: Option<RoaringBitmap>,
+    // Physical fragments outside every index bitmap. Store these as full-fragment
+    // blocks so mask-based consumers enforce index coverage without expanding
+    // partially deleted fragments into full-fragment allow lists.
+    pub(super) excluded_fragments: Option<RoaringBitmap>,
     // When the tasks are finished this is the combined filter
     pub(super) final_mask: Mutex<OnceCell<Arc<RowAddrMask>>>,
 }
@@ -77,19 +77,28 @@ impl DatasetPreFilter {
         }
         let uses_stable_row_ids = dataset.manifest.uses_stable_row_ids();
         let deleted_ids = if all_have_bitmaps && uses_stable_row_ids {
-            Self::create_restricted_deletion_mask(dataset, fragments.clone())
+            Self::create_restricted_deletion_mask(dataset.clone(), fragments.clone())
         } else {
-            Self::create_deletion_mask(dataset, fragments.clone())
+            Self::create_deletion_mask(dataset.clone(), fragments.clone())
         }
         .map(SharedPrerequisite::spawn);
-        let allowed_fragments = (all_have_bitmaps && !uses_stable_row_ids).then_some(fragments);
+        let excluded_fragments = if all_have_bitmaps && !uses_stable_row_ids {
+            let mut historical_fragments = RoaringBitmap::new();
+            if let Some(max_fragment_id) = dataset.manifest.max_fragment_id() {
+                historical_fragments.insert_range(0..=max_fragment_id as u32);
+            }
+            historical_fragments -= &fragments;
+            (!historical_fragments.is_empty()).then_some(historical_fragments)
+        } else {
+            None
+        };
         let filtered_ids = filter
             .map(|filtered_ids| SharedPrerequisite::spawn(filtered_ids.load().in_current_span()));
         Self {
             deleted_ids,
             filtered_ids,
             deleted_fragments: None,
-            allowed_fragments,
+            excluded_fragments,
             final_mask: Mutex::new(OnceCell::new()),
         }
     }
@@ -369,13 +378,16 @@ impl PreFilter for DatasetPreFilter {
             if let Some(deleted_ids) = &self.deleted_ids {
                 combined = combined & (*deleted_ids.get_ready()).clone();
             }
-            if let Some(deleted) = &self.deleted_fragments {
-                let mut block_list = RowAddrTreeMap::new();
-                for frag_id in deleted.iter() {
-                    block_list.insert_fragment(frag_id);
-                }
-                combined = combined & RowAddrMask::from_block(block_list);
+            let blocked_fragments = self
+                .deleted_fragments
+                .iter()
+                .chain(&self.excluded_fragments)
+                .flat_map(|fragments| fragments.iter());
+            let mut fragment_block_list = RowAddrTreeMap::new();
+            for fragment_id in blocked_fragments {
+                fragment_block_list.insert_fragment(fragment_id);
             }
+            combined = combined & RowAddrMask::from_block(fragment_block_list);
             Arc::new(combined)
         });
 
@@ -386,7 +398,7 @@ impl PreFilter for DatasetPreFilter {
         self.deleted_ids.is_none()
             && self.filtered_ids.is_none()
             && self.deleted_fragments.is_none()
-            && self.allowed_fragments.is_none()
+            && self.excluded_fragments.is_none()
     }
 
     /// Get the row id mask for this prefilter
@@ -407,18 +419,7 @@ impl PreFilter for DatasetPreFilter {
     /// This method must be called after `wait_for_ready`
     #[instrument(level = "debug", skip_all)]
     fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {
-        let mask = self.mask();
-        row_ids
-            .enumerate()
-            .filter_map(|(idx, row_id)| {
-                let fragment_allowed = self
-                    .allowed_fragments
-                    .as_ref()
-                    .map(|fragments| fragments.contains((row_id >> 32) as u32))
-                    .unwrap_or(true);
-                (fragment_allowed && mask.selected(*row_id)).then_some(idx as u64)
-            })
-            .collect()
+        self.mask().selected_indices(row_ids)
     }
 }
 
@@ -426,6 +427,7 @@ impl PreFilter for DatasetPreFilter {
 mod test {
     use lance_select::RowSetOps;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
+    use uuid::Uuid;
 
     use crate::dataset::WriteParams;
 
@@ -546,6 +548,33 @@ mod test {
         expected.insert_fragment(1);
         expected.insert_fragment(2);
         assert_eq!(mask.block_list(), Some(&expected));
+    }
+
+    #[tokio::test]
+    async fn test_prefilter_mask_honors_legacy_index_fragment_bitmap() {
+        let datasets = test_datasets(false).await;
+        let mut dataset = (*datasets.no_deletions).clone();
+        // Older manifests derive the high-water mark from the fragment list.
+        Arc::make_mut(&mut dataset.manifest).max_fragment_id = None;
+        let index = IndexMetadata {
+            uuid: Uuid::new_v4(),
+            fields: vec![0],
+            name: "legacy_vector_index".to_string(),
+            dataset_version: dataset.manifest.version,
+            fragment_bitmap: Some(RoaringBitmap::from_iter([1])),
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+        let prefilter = DatasetPreFilter::new(Arc::new(dataset), &[index], None);
+        prefilter.wait_for_ready().await.unwrap();
+
+        let mask = prefilter.mask();
+        assert!(!mask.selected(0));
+        assert!(mask.selected(1 << 32));
+        assert!(!mask.selected(2 << 32));
     }
 
     #[tokio::test]

@@ -10643,21 +10643,24 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
             .await
             .unwrap();
 
-        // Check no duplicate ids
+        // Every logical row should be returned exactly once. Checking only for
+        // duplicates is insufficient because stale addresses can be discarded by
+        // TakeExec after they have displaced valid candidates from the top-k.
         let ids = results
             .column_by_name("id")
             .unwrap()
             .as_any()
             .downcast_ref::<StringArray>()
             .unwrap();
-        let unique_ids: std::collections::HashSet<&str> =
+        let actual_ids: std::collections::HashSet<&str> =
             (0..ids.len()).map(|i| ids.value(i)).collect();
+        let expected_ids: std::collections::HashSet<String> =
+            (0..total_rows).map(|i| format!("id-{i:04}")).collect();
+        assert_eq!(ids.len(), total_rows);
+        assert_eq!(actual_ids.len(), total_rows);
         assert_eq!(
-            unique_ids.len(),
-            ids.len(),
-            "Found duplicate ids in KNN results: {} unique out of {} total",
-            unique_ids.len(),
-            ids.len()
+            actual_ids,
+            expected_ids.iter().map(String::as_str).collect(),
         );
     }
 
