@@ -5394,7 +5394,10 @@ impl Scanner {
 
     #[instrument(level = "info", skip(self))]
     pub async fn explain_plan(&self, verbose: bool) -> Result<String> {
-        let plan = self.create_plan().await?;
+        // Box the plan-building future: overlay-aware index masking deepens its
+        // async layout past rustc's default recursion limit when awaited inline
+        // here, matching the boxing `try_into_stream` and `count_rows` already use.
+        let plan = Box::pin(self.create_plan()).await?;
         let display = DisplayableExecutionPlan::new(plan.as_ref());
 
         Ok(format!("{}", display.indent(verbose)))

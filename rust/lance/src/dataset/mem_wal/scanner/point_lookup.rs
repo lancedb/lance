@@ -654,7 +654,10 @@ impl LsmPointLookupPlanner {
                     scanner.with_row_address();
                 }
                 scanner.filter_expr(filter.clone());
-                scanner.create_plan().await?
+                // Box the plan-building future: overlay-aware index masking deepens
+                // create_plan's async layout past rustc's default recursion limit
+                // when this scan builder is awaited inline up the point-lookup chain.
+                Box::pin(scanner.create_plan()).await?
             }
             LsmDataSource::FlushedMemTable { path, .. } => {
                 let dataset = open_flushed_dataset(
@@ -672,7 +675,7 @@ impl LsmPointLookupPlanner {
                 let cols = cols_with_tombstone(&cols, dataset.schema().field(TOMBSTONE).is_some());
                 scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
                 scanner.filter_expr(filter.clone());
-                scanner.create_plan().await?
+                Box::pin(scanner.create_plan()).await?
             }
             LsmDataSource::ActiveMemTable {
                 batch_store,
@@ -695,7 +698,7 @@ impl LsmPointLookupPlanner {
                 // over insert-ordered scan would return the *oldest* of
                 // multiple rows sharing the target primary key.
                 scanner.with_row_id();
-                let raw = scanner.create_plan().await?;
+                let raw = Box::pin(scanner.create_plan()).await?;
                 // The filter already restricts to the exact PK value, so the
                 // scan yields that key's insert history. Within the active
                 // memtable larger `_rowid` = newer insert, so sorting `_rowid`
