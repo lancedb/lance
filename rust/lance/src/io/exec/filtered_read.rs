@@ -380,14 +380,8 @@ fn consolidated_stream(
     builder.build()
 }
 
-/// Coalesce the input up to `target` rows per batch the way
-/// [`CoalesceBatchesExec`] does: small batches merge until the buffer
-/// reaches the target, larger batches pass through whole — a caller's
-/// batch is never split.  Bigger batches make denser reads (more ranges
-/// per fragment close enough to merge into one I/O), so the window a
-/// caller hands us is worth keeping.  Order is preserved.
-///
-/// [`CoalesceBatchesExec`]: datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec
+/// Merge batches up to `target` rows; batches already at the target pass
+/// through whole (never split). Order is preserved.
 pub fn coalesce_batches(
     input: SendableRecordBatchStream,
     target: usize,
