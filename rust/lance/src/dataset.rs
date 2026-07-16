@@ -1225,15 +1225,27 @@ impl Dataset {
     ) -> Result<Option<Transaction>> {
         // Prefer inline transaction from manifest when available
         if let Some(pos) = manifest.transaction_section {
-            let reader = if let Some(size) = manifest_location.size {
-                self.object_store
-                    .open_with_size(&manifest_location.path, size as usize)
-                    .await?
-            } else {
-                self.object_store.open(&manifest_location.path).await?
+            let reader = match manifest_location.size {
+                Some(size) => {
+                    self.object_store
+                        .open_with_size(&manifest_location.path, size as usize)
+                        .await?
+                }
+                None => self.object_store.open(&manifest_location.path).await?,
             };
 
-            let tx: pb::Transaction = read_message(reader.as_ref(), pos).await?;
+            // A concurrent overwrite can leave the listed size too small; retry
+            // once with the true size.
+            let tx: pb::Transaction = match read_message(reader.as_ref(), pos).await {
+                Err(e)
+                    if manifest_location.size.is_some()
+                        && e.to_string().contains("file size is too small") =>
+                {
+                    let reader = self.object_store.open(&manifest_location.path).await?;
+                    read_message(reader.as_ref(), pos).await?
+                }
+                other => other?,
+            };
             Transaction::try_from(tx).map(Some)
         } else if let Some(path) = &manifest.transaction_file {
             // Fallback: read external transaction file if present
@@ -1275,12 +1287,17 @@ impl Dataset {
             .resolve_version_location(&self.base, version, &self.object_store.inner)
             .await?;
 
+        // Keep the DatasetNotFound variant callers expect for a missing version.
         let manifest = read_manifest(
             &self.object_store,
             &manifest_location.path,
             manifest_location.size,
         )
-        .await?;
+        .await
+        .map_err(|e| match &e {
+            Error::NotFound { uri, .. } => Error::dataset_not_found(uri.clone(), box_error(e)),
+            _ => e,
+        })?;
 
         // The resolved manifest must belong to this dataset's branch. A
         // mismatch means the commit handler resolved against a different chain

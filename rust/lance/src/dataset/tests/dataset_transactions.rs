@@ -509,12 +509,12 @@ async fn test_read_version_transaction_does_not_populate_caches() {
         assert!(version_transaction.transaction.is_some());
     }
 
-    // A missing (e.g. cleaned up) version is an error: the version resolves
-    // to a manifest path that does not exist, surfacing as NotFound.
+    // A missing (e.g. cleaned up) version errors as DatasetNotFound, matching
+    // the historical checkout_version-based contract of the public API.
     let err = dataset.read_version_transaction(9999).await.unwrap_err();
     assert!(
-        matches!(err, crate::Error::NotFound { .. }),
-        "expected NotFound for a missing version, got {err:?}"
+        matches!(err, crate::Error::DatasetNotFound { .. }),
+        "expected DatasetNotFound for a missing version, got {err:?}"
     );
 }
 
