@@ -34,7 +34,7 @@ use lance::dataset::index::DatasetIndexRemapperOptions;
 use lance::dataset::optimize::{
     CompactionMetrics, CompactionOptions, CompactionPlan, IndexRemapper, IndexRemapperOptions,
     RemappedIndex, RowAddressMaintenanceOptions, TaskData, commit_compaction,
-    maintain_row_addresses, plan_compaction, rewrite_files_in_order,
+    execute_compaction_plan_tasks, maintain_row_addresses, plan_compaction, rewrite_files_in_order,
 };
 use lance::dataset::scanner::ColumnOrdering;
 use lance::dataset::{
@@ -2351,17 +2351,15 @@ async fn compact_files_with_observation(
         )
         .into());
     }
-    let tasks = plan.compaction_tasks().collect::<Vec<_>>();
-    let mut completed = Vec::with_capacity(tasks.len());
-    for task in tasks {
-        let task_read_version = task.read_version;
-        completed.push(task.execute(dataset).await.map_err(|error| {
+    let (completed, execution_planning_metrics) = execute_compaction_plan_tasks(dataset, &plan)
+        .await
+        .map_err(|error| {
             format!(
-                "compaction task read version {task_read_version}, dataset version {}: {error}",
+                "compaction plan read version {}, dataset version {}: {error}",
+                plan.read_version(),
                 dataset.version().version
             )
-        })?);
-    }
+        })?;
     let measurement = Arc::new(Mutex::new(RemapMeasurement::default()));
     let commit_started = Instant::now();
     let mut metrics = commit_compaction(
@@ -2376,6 +2374,7 @@ async fn compact_files_with_observation(
     layout_index_maintenance_ns = layout_index_maintenance_ns
         .saturating_add(u64::try_from(commit_started.elapsed().as_nanos()).unwrap_or(u64::MAX));
     metrics += plan.planning_metrics;
+    metrics += execution_planning_metrics;
     let indices_after = dataset.load_indices().await?;
     let fragment_reuse_index_present = indices_after
         .iter()

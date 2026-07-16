@@ -1277,6 +1277,9 @@ pub fn logical_index_coverage_is_current(dataset: &Dataset, index: &IndexMetadat
 
 pub(crate) fn validate_index_contract(dataset: &Dataset, indices: &[IndexMetadata]) -> Result<()> {
     let v23 = dataset.manifest.uses_stable_logical_row_addresses();
+    let row_address_router = (v23 && indices.iter().any(|index| !is_system_index(index)))
+        .then(|| dataset.row_address_router())
+        .transpose()?;
     let schema_fields = dataset
         .schema()
         .field_ids()
@@ -1315,6 +1318,9 @@ pub(crate) fn validate_index_contract(dataset: &Dataset, indices: &[IndexMetadat
                     index.uuid
                 ))
             })?;
+            let row_address_router = row_address_router
+                .as_ref()
+                .expect("storage-version-2.3 index validation initialized the row-address router");
             coverage
                 .validate_index_binding(layout.namespace_uuid, index.uuid, files)
                 .map_err(|error| {
@@ -1325,8 +1331,8 @@ pub(crate) fn validate_index_contract(dataset: &Dataset, indices: &[IndexMetadat
                 })?;
             for shard in &coverage.shards {
                 for logical_fragment_id in shard.logical_fragment_bitmap()? {
-                    let domain = layout
-                        .logical_domain(dataset.manifest.fragments.as_ref(), logical_fragment_id)?
+                    let domain = row_address_router
+                        .logical_domain(logical_fragment_id)?
                         .ok_or_else(|| {
                             Error::internal(format!(
                                 "v2.3 index segment {} covers unknown logical domain {}",
@@ -1359,11 +1365,8 @@ pub(crate) fn validate_index_contract(dataset: &Dataset, indices: &[IndexMetadat
                     continue;
                 };
                 for range in selection.to_ranges()? {
-                    let domain = layout
-                        .logical_domain(
-                            dataset.manifest.fragments.as_ref(),
-                            range.logical_fragment_id,
-                        )?
+                    let domain = row_address_router
+                        .logical_domain(range.logical_fragment_id)?
                         .ok_or_else(|| {
                             Error::internal(format!(
                                 "v2.3 index segment {} covers unknown logical domain {}",

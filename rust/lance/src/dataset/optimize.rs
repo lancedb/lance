@@ -113,6 +113,7 @@ use arrow_array::RecordBatch;
 use arrow_array::StructArray;
 use arrow_array::builder::{LargeBinaryBuilder, PrimitiveBuilder, StringBuilder};
 use arrow_buffer::NullBuffer;
+use bytes::Bytes;
 use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr, expressions};
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::physical_plan::sorts::sort::SortExec;
@@ -129,11 +130,12 @@ use lance_core::utils::tracing::{DATASET_COMPACTING_EVENT, TRACE_DATASET_EVENTS}
 use lance_datafusion::exec::execute_plan;
 use lance_index::frag_reuse::FragReuseGroup;
 use lance_index::is_system_index;
+use lance_io::object_store::ObjectStore;
 use lance_table::format::{
-    Fragment, IndexMetadata, PlacementMaintenanceRequired, ROW_ADDRESS_LAYOUT_FINGERPRINT_SIZE,
-    RowAddressLayoutDelta, RowAddressLogicalDomain, RowAddressTargetFragment,
-    RowDatasetVersionMeta, RowDatasetVersionRun, RowDatasetVersionSequence, RowIdMeta,
-    ValidatedRowAddressDestinationIndex, pb,
+    Fragment, IndexMetadata, Manifest, PlacementMaintenanceRequired,
+    ROW_ADDRESS_LAYOUT_FINGERPRINT_SIZE, RowAddressLayoutDelta, RowAddressLogicalDomain,
+    RowAddressRouter, RowAddressTargetFragment, RowDatasetVersionMeta, RowDatasetVersionRun,
+    RowDatasetVersionSequence, RowIdMeta, ValidatedRowAddressDestinationIndex, pb,
 };
 use lance_table::rowids::segment::U64Segment;
 use lance_table::rowids::{RowIdSequence, read_row_ids, write_row_ids};
@@ -161,7 +163,12 @@ use logical_row_addresses::{
 };
 pub use remapping::{IgnoreRemap, IndexRemapper, IndexRemapperOptions, RemappedIndex};
 
-type RewriteRowProvenance = (Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>);
+type RewriteRowProvenance = (
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+);
 type RowVersionSequences = (
     Vec<RowDatasetVersionSequence>,
     Vec<RowDatasetVersionSequence>,
@@ -907,66 +914,10 @@ impl CompactionPlanner for DefaultCompactionPlanner {
         let mut compaction_plan =
             CompactionPlan::new(dataset.manifest.version, self.options.clone());
         if dataset.manifest.uses_stable_logical_row_addresses() {
-            let indices = dataset.load_indices().await?;
-            let destination_index = dataset
-                .manifest
-                .row_address_layout
-                .as_ref()
-                .ok_or_else(|| {
-                    Error::internal("storage-version-2.3 manifest has no row-address layout")
-                })?
-                .validated_destination_index()?;
-            let mut prepared_tasks = Vec::with_capacity(tasks.len());
-            for task in tasks {
-                match preflight_v2_3_compaction_task(
-                    dataset,
-                    &task.fragments,
-                    &self.options,
-                    &destination_index,
-                    indices.as_ref(),
-                )
-                .await?
-                {
-                    V2_3CompactionAdmission::Admitted(prepared) => {
-                        prepared_tasks.push((task, *prepared));
-                    }
-                    V2_3CompactionAdmission::NotAdmitted(reason) => {
-                        compaction_plan.planning_metrics.groups_planned += 1;
-                        compaction_plan.planning_metrics.groups_not_admitted += 1;
-                        warn!(
-                            "Skipping storage-version-2.3 compaction group before page reads or data writes: {reason}"
-                        );
-                    }
-                }
-            }
-
-            if prepared_tasks.len() > 1 {
-                while let Some(reason) = preflight_prepared_v2_3_compaction_tasks(
-                    dataset,
-                    &prepared_tasks,
-                    indices.as_ref(),
-                )? {
-                    let (task, _) = prepared_tasks.pop().expect("prepared tasks is non-empty");
-                    compaction_plan.planning_metrics.groups_planned += 1;
-                    compaction_plan.planning_metrics.groups_not_admitted += 1;
-                    warn!(
-                        "Skipping storage-version-2.3 compaction group {:?} because the combined transaction was not admitted before page reads or data writes: {reason}",
-                        task.fragments
-                            .iter()
-                            .map(|fragment| fragment.id)
-                            .collect::<Vec<_>>()
-                    );
-                    if prepared_tasks.is_empty() {
-                        break;
-                    }
-                }
-            }
-            compaction_plan
-                .tasks
-                .extend(prepared_tasks.into_iter().map(|(mut task, prepared)| {
-                    task.v2_3_plan = Some(prepared.plan);
-                    task
-                }));
+            let (tasks, planning_metrics) =
+                prepare_v2_3_compaction_tasks(dataset, tasks, &self.options).await?;
+            compaction_plan.tasks = tasks;
+            compaction_plan.planning_metrics += planning_metrics;
         } else {
             compaction_plan.extend_tasks(tasks);
         }
@@ -1387,19 +1338,13 @@ pub async fn compact_files_with_planner(
         return Ok(compaction_plan.planning_metrics);
     }
 
-    let dataset_ref = &dataset.clone();
-    let planning_metrics = compaction_plan.planning_metrics.clone();
-
-    let result_stream = futures::stream::iter(compaction_plan.tasks)
-        .map(|task| rewrite_files(Cow::Borrowed(dataset_ref), task, &compaction_plan.options))
-        .buffer_unordered(
-            compaction_plan
-                .options
-                .num_threads
-                .unwrap_or_else(get_num_compute_intensive_cpus),
-        );
-
-    let completed_tasks: Vec<RewriteResult> = result_stream.try_collect().await?;
+    let mut planning_metrics = compaction_plan.planning_metrics.clone();
+    let (completed_tasks, execution_planning_metrics) =
+        execute_compaction_plan_tasks(dataset, &compaction_plan).await?;
+    planning_metrics += execution_planning_metrics;
+    if completed_tasks.is_empty() {
+        return Ok(planning_metrics);
+    }
     let remap_options = remap_options.unwrap_or(Arc::new(DatasetIndexRemapperOptions::default()));
     let mut metrics = commit_compaction(
         dataset,
@@ -1411,6 +1356,55 @@ pub async fn compact_files_with_planner(
     metrics += planning_metrics;
 
     Ok(metrics)
+}
+
+/// Execute every task in a compaction plan without committing it.
+///
+/// This is an internal integration point for the stable-row-address benchmark.
+/// Storage-version-2.3 plans are admitted as one exact batch before any task
+/// reads data pages or writes data objects. The returned results must be kept
+/// in order and committed as the complete batch. Standalone tasks obtained
+/// from [`CompactionPlan::compaction_tasks`] repeat exact individual admission
+/// and retain the public subset-commit contract.
+#[doc(hidden)]
+pub async fn execute_compaction_plan_tasks(
+    dataset: &Dataset,
+    plan: &CompactionPlan,
+) -> Result<(Vec<RewriteResult>, CompactionMetrics)> {
+    if plan.read_version != dataset.manifest.version {
+        return Err(Error::invalid_input(format!(
+            "compaction plan read version {} differs from dataset version {}",
+            plan.read_version, dataset.manifest.version
+        )));
+    }
+    let uses_v2_3_row_addresses = dataset.manifest.uses_stable_logical_row_addresses();
+    let (tasks, planning_metrics) = if uses_v2_3_row_addresses {
+        if let Some(tasks) =
+            cached_batch_admitted_v2_3_compaction_tasks(dataset, plan.tasks.clone(), &plan.options)
+                .await?
+        {
+            (tasks, CompactionMetrics::default())
+        } else {
+            prepare_v2_3_compaction_tasks(dataset, plan.tasks.clone(), &plan.options).await?
+        }
+    } else {
+        (plan.tasks.clone(), CompactionMetrics::default())
+    };
+    if uses_v2_3_row_addresses
+        && (tasks.len() != plan.tasks.len() || planning_metrics.groups_not_admitted > 0)
+    {
+        return Err(Error::not_supported(
+            "storage-version-2.3 compaction plan was not admitted as one complete batch",
+        ));
+    }
+    let result_stream = futures::stream::iter(tasks)
+        .map(|task| rewrite_files_with_admission(Cow::Borrowed(dataset), task, &plan.options, true))
+        .buffered(
+            plan.options
+                .num_threads
+                .unwrap_or_else(get_num_compute_intensive_cpus),
+        );
+    Ok((result_stream.try_collect().await?, planning_metrics))
 }
 
 /// Information about a fragment used to decide its fate in compaction
@@ -1449,9 +1443,9 @@ async fn collect_metrics(fragment: &FileFragment) -> Result<FragmentMetrics> {
     })
 }
 
-enum V2_3CompactionAdmission {
-    Admitted(Box<PreparedV2_3CompactionTask>),
-    NotAdmitted(String),
+enum V2_3CompactionPreparation {
+    Prepared(Box<PreparedV2_3CompactionTask>),
+    NotAdmitted(PlacementMaintenanceRequired),
 }
 
 struct PreparedV2_3CompactionTask {
@@ -1555,20 +1549,24 @@ async fn planned_reencode_output_row_counts(
     planned_output_row_counts(output_row_count, rows_per_fragment)
 }
 
-async fn preflight_v2_3_compaction_task(
+async fn prepare_v2_3_compaction_task(
     dataset: &Dataset,
     fragments: &[Fragment],
     options: &CompactionOptions,
     destination_index: &ValidatedRowAddressDestinationIndex<'_>,
-    indices: &[IndexMetadata],
-) -> Result<V2_3CompactionAdmission> {
+) -> Result<V2_3CompactionPreparation> {
     let rows = match plan_default_compaction_rows(dataset, fragments, destination_index).await {
         Err(Error::NotSupported { source, .. })
             if source
                 .downcast_ref::<PlacementMaintenanceRequired>()
                 .is_some() =>
         {
-            return Ok(V2_3CompactionAdmission::NotAdmitted(source.to_string()));
+            return Ok(V2_3CompactionPreparation::NotAdmitted(
+                source
+                    .downcast_ref::<PlacementMaintenanceRequired>()
+                    .expect("placement-maintenance reason was checked above")
+                    .clone(),
+            ));
         }
         other => other?,
     };
@@ -1667,60 +1665,28 @@ async fn preflight_v2_3_compaction_task(
         &pb::transaction::RowAddressLayoutDelta::from(&delta).encode_to_vec(),
     )?;
 
-    let transaction = TransactionBuilder::new(
-        dataset.manifest.version,
-        Operation::Rewrite {
-            groups: vec![RewriteGroup {
-                old_fragments: fragments.to_vec(),
-                new_fragments: planned_fragments,
-            }],
-            rewritten_indices: Vec::new(),
-            frag_reuse_index: None,
-        },
-    )
-    .row_address_layout_delta(Some(delta))
-    .build();
-    let context = RowAddressManifestApplyContext {
-        current_deletion_vectors: rows.current_deletion_vectors.clone(),
-        ..RowAddressManifestApplyContext::default()
-    };
-    match transaction.build_manifest_with_row_address_context(
-        Some(dataset.manifest.as_ref()),
-        indices.to_vec(),
-        "default-compaction-preflight.txn",
-        &Default::default(),
-        Some(&context),
-    ) {
-        Ok(_) => Ok(V2_3CompactionAdmission::Admitted(Box::new(
-            PreparedV2_3CompactionTask {
-                plan: V2_3CompactionTaskPlan {
-                    logical_row_ids,
-                    retired_logical_row_ids,
-                    output_row_counts,
-                    logical_run_ends: rows.logical_run_ends,
-                    requires_full_logical_sort: rows.requires_full_logical_sort,
-                    rewrite_strategy,
-                    row_address_layout_delta: encoded_row_address_layout_delta,
-                },
-                current_deletion_vectors: rows.current_deletion_vectors,
+    Ok(V2_3CompactionPreparation::Prepared(Box::new(
+        PreparedV2_3CompactionTask {
+            plan: V2_3CompactionTaskPlan {
+                logical_row_ids: logical_row_ids.into(),
+                retired_logical_row_ids: retired_logical_row_ids.map(Into::into),
+                output_row_counts,
+                logical_run_ends: rows.logical_run_ends,
+                requires_full_logical_sort: rows.requires_full_logical_sort,
+                rewrite_strategy,
+                row_address_layout_delta: encoded_row_address_layout_delta,
+                batch_admission_proof: None,
             },
-        ))),
-        Err(Error::NotSupported { source, .. })
-            if source
-                .downcast_ref::<PlacementMaintenanceRequired>()
-                .is_some() =>
-        {
-            Ok(V2_3CompactionAdmission::NotAdmitted(source.to_string()))
-        }
-        Err(error) => Err(error),
-    }
+            current_deletion_vectors: rows.current_deletion_vectors,
+        },
+    )))
 }
 
 fn preflight_prepared_v2_3_compaction_tasks(
     dataset: &Dataset,
     tasks: &[(TaskData, PreparedV2_3CompactionTask)],
     indices: &[IndexMetadata],
-) -> Result<Option<String>> {
+) -> Result<Option<PlacementMaintenanceRequired>> {
     let layout = dataset
         .manifest
         .row_address_layout
@@ -1815,10 +1781,212 @@ fn preflight_prepared_v2_3_compaction_tasks(
                 .downcast_ref::<PlacementMaintenanceRequired>()
                 .is_some() =>
         {
-            Ok(Some(source.to_string()))
+            Ok(Some(
+                source
+                    .downcast_ref::<PlacementMaintenanceRequired>()
+                    .expect("placement-maintenance reason was checked above")
+                    .clone(),
+            ))
         }
         Err(error) => Err(error),
     }
+}
+
+async fn prepare_v2_3_compaction_tasks(
+    dataset: &Dataset,
+    tasks: Vec<TaskData>,
+    options: &CompactionOptions,
+) -> Result<(Vec<TaskData>, CompactionMetrics)> {
+    let indices = dataset.load_indices().await?;
+    let destination_index = dataset
+        .manifest
+        .row_address_layout
+        .as_ref()
+        .ok_or_else(|| Error::internal("storage-version-2.3 manifest has no row-address layout"))?
+        .validated_destination_index()?;
+    let mut planning_metrics = CompactionMetrics::default();
+    let mut prepared_tasks = Vec::with_capacity(tasks.len());
+    for task in tasks {
+        match prepare_v2_3_compaction_task(dataset, &task.fragments, options, &destination_index)
+            .await?
+        {
+            V2_3CompactionPreparation::Prepared(prepared) => {
+                if let Some(planned) = task.v2_3_plan.as_ref()
+                    && planned != &prepared.plan
+                {
+                    return Err(Error::invalid_input(
+                        "storage-version-2.3 compaction task changed after planning",
+                    ));
+                }
+                prepared_tasks.push((task, *prepared));
+            }
+            V2_3CompactionPreparation::NotAdmitted(reason) => {
+                planning_metrics.groups_planned += 1;
+                planning_metrics.groups_not_admitted += 1;
+                warn!(
+                    "Skipping storage-version-2.3 compaction group before page reads or data writes: {reason}"
+                );
+            }
+        }
+    }
+
+    let mut combined_admitted = prepared_tasks.is_empty();
+    if !prepared_tasks.is_empty() {
+        if let Some(reason) =
+            preflight_prepared_v2_3_compaction_tasks(dataset, &prepared_tasks, indices.as_ref())?
+        {
+            if prepared_tasks.len() == 1 {
+                let (task, _) = prepared_tasks.pop().expect("one prepared task exists");
+                planning_metrics.groups_planned += 1;
+                planning_metrics.groups_not_admitted += 1;
+                warn!(
+                    "Skipping storage-version-2.3 compaction group {:?} before page reads or data writes: {reason}",
+                    task.fragments
+                        .iter()
+                        .map(|fragment| fragment.id)
+                        .collect::<Vec<_>>()
+                );
+            } else {
+                let mut individually_admitted = Vec::with_capacity(prepared_tasks.len());
+                for prepared in std::mem::take(&mut prepared_tasks) {
+                    if let Some(reason) = preflight_prepared_v2_3_compaction_tasks(
+                        dataset,
+                        std::slice::from_ref(&prepared),
+                        indices.as_ref(),
+                    )? {
+                        planning_metrics.groups_planned += 1;
+                        planning_metrics.groups_not_admitted += 1;
+                        warn!(
+                            "Skipping storage-version-2.3 compaction group {:?} before page reads or data writes: {reason}",
+                            prepared
+                                .0
+                                .fragments
+                                .iter()
+                                .map(|fragment| fragment.id)
+                                .collect::<Vec<_>>()
+                        );
+                    } else {
+                        individually_admitted.push(prepared);
+                    }
+                }
+                prepared_tasks = individually_admitted;
+                combined_admitted = prepared_tasks.len() <= 1;
+            }
+        } else {
+            combined_admitted = true;
+        }
+    }
+
+    while !combined_admitted && !prepared_tasks.is_empty() {
+        let Some(reason) =
+            preflight_prepared_v2_3_compaction_tasks(dataset, &prepared_tasks, indices.as_ref())?
+        else {
+            break;
+        };
+        let (task, _) = prepared_tasks
+            .pop()
+            .expect("prepared tasks was checked as non-empty");
+        planning_metrics.groups_planned += 1;
+        planning_metrics.groups_not_admitted += 1;
+        warn!(
+            "Skipping storage-version-2.3 compaction group {:?} because the combined transaction was not admitted before page reads or data writes: {reason}",
+            task.fragments
+                .iter()
+                .map(|fragment| fragment.id)
+                .collect::<Vec<_>>()
+        );
+        if prepared_tasks.len() <= 1 {
+            break;
+        }
+    }
+
+    let mut tasks = prepared_tasks
+        .into_iter()
+        .map(|(mut task, prepared)| {
+            task.v2_3_plan = Some(prepared.plan);
+            task
+        })
+        .collect::<Vec<_>>();
+    if !tasks.is_empty() {
+        let layout_fingerprint = &dataset
+            .manifest
+            .row_address_layout
+            .as_ref()
+            .expect("storage-version-2.3 layout was checked during preparation")
+            .fingerprint;
+        let binding = v2_3_batch_admission_binding(
+            dataset.manifest.version,
+            layout_fingerprint,
+            options,
+            &tasks,
+        )?;
+        let row_address_router = dataset.row_address_router()?;
+        for task in &mut tasks {
+            let plan = task
+                .v2_3_plan
+                .as_mut()
+                .expect("prepared task has its storage-version-2.3 plan");
+            plan.batch_admission_proof = Some(V2_3BatchAdmissionProof {
+                binding,
+                manifest: dataset.manifest.clone(),
+                row_address_router: row_address_router.clone(),
+                object_store: dataset.object_store.clone(),
+                indices: indices.clone(),
+                logical_row_ids: plan.logical_row_ids.clone(),
+                retired_logical_row_ids: plan.retired_logical_row_ids.clone(),
+            });
+        }
+    }
+    Ok((tasks, planning_metrics))
+}
+
+async fn cached_batch_admitted_v2_3_compaction_tasks(
+    dataset: &Dataset,
+    tasks: Vec<TaskData>,
+    options: &CompactionOptions,
+) -> Result<Option<Vec<TaskData>>> {
+    let layout_fingerprint = &dataset
+        .manifest
+        .row_address_layout
+        .as_ref()
+        .ok_or_else(|| Error::internal("storage-version-2.3 manifest has no row-address layout"))?
+        .fingerprint;
+    if tasks.iter().any(|task| {
+        task.v2_3_plan
+            .as_ref()
+            .is_none_or(|plan| plan.row_address_layout_delta.is_empty())
+    }) {
+        return Ok(None);
+    }
+    let expected_binding = v2_3_batch_admission_binding(
+        dataset.manifest.version,
+        layout_fingerprint,
+        options,
+        &tasks,
+    )?;
+    let row_address_router = dataset.row_address_router()?;
+    let indices = dataset.load_indices().await?;
+    if tasks.iter().any(|task| {
+        let plan = task
+            .v2_3_plan
+            .as_ref()
+            .expect("cached plans were checked above");
+        plan.batch_admission_proof.as_ref().is_none_or(|proof| {
+            proof.binding != expected_binding
+                || !Arc::ptr_eq(&proof.manifest, &dataset.manifest)
+                || !Arc::ptr_eq(&proof.row_address_router, &row_address_router)
+                || !Arc::ptr_eq(&proof.object_store, &dataset.object_store)
+                || !Arc::ptr_eq(&proof.indices, &indices)
+                || !proof.logical_row_ids.same_allocation(&plan.logical_row_ids)
+                || !V2_3PlanBytes::same_optional_allocation(
+                    proof.retired_logical_row_ids.as_ref(),
+                    plan.retired_logical_row_ids.as_ref(),
+                )
+        })
+    }) {
+        return Ok(None);
+    }
+    Ok(Some(tasks))
 }
 
 /// A plan for what groups of fragments to compact.
@@ -2400,10 +2568,89 @@ pub struct TaskData {
 }
 
 /// Metadata-only plan for one storage-version-2.3 compaction task.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct V2_3PlanBytes(Bytes);
+
+impl V2_3PlanBytes {
+    fn same_allocation(&self, other: &Self) -> bool {
+        self.len() == other.len() && self.as_ptr() == other.as_ptr()
+    }
+
+    fn same_optional_allocation(left: Option<&Self>, right: Option<&Self>) -> bool {
+        match (left, right) {
+            (Some(left), Some(right)) => left.same_allocation(right),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+}
+
+impl From<Vec<u8>> for V2_3PlanBytes {
+    fn from(value: Vec<u8>) -> Self {
+        Self(Bytes::from(value))
+    }
+}
+
+impl std::ops::Deref for V2_3PlanBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref()
+    }
+}
+
+impl AsRef<[u8]> for V2_3PlanBytes {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_ref()
+    }
+}
+
+impl Serialize for V2_3PlanBytes {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.0.as_ref().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for V2_3PlanBytes {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Vec::<u8>::deserialize(deserializer).map(Self::from)
+    }
+}
+
+#[derive(Clone)]
+struct V2_3BatchAdmissionProof {
+    binding: [u8; ROW_ADDRESS_LAYOUT_FINGERPRINT_SIZE],
+    manifest: Arc<Manifest>,
+    row_address_router: Arc<RowAddressRouter>,
+    object_store: Arc<ObjectStore>,
+    indices: Arc<Vec<IndexMetadata>>,
+    logical_row_ids: V2_3PlanBytes,
+    retired_logical_row_ids: Option<V2_3PlanBytes>,
+}
+
+impl std::fmt::Debug for V2_3BatchAdmissionProof {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("V2_3BatchAdmissionProof")
+            .field("logical_row_ids_len", &self.logical_row_ids.len())
+            .field(
+                "retired_logical_row_ids_len",
+                &self.retired_logical_row_ids.as_ref().map(|rows| rows.len()),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct V2_3CompactionTaskPlan {
-    logical_row_ids: Vec<u8>,
-    retired_logical_row_ids: Option<Vec<u8>>,
+    logical_row_ids: V2_3PlanBytes,
+    retired_logical_row_ids: Option<V2_3PlanBytes>,
     output_row_counts: Vec<u32>,
     /// Exclusive source-fragment boundaries for already-sorted input runs.
     /// Multiple runs are merged without sorting user columns.
@@ -2420,6 +2667,23 @@ pub struct V2_3CompactionTaskPlan {
     /// snapshot. Targets use task-local new-fragment ordinals.
     #[serde(default)]
     row_address_layout_delta: Vec<u8>,
+    /// In-process proof that this exact task set and options passed combined
+    /// admission against the read snapshot. Trusted execution can reuse that
+    /// proof; serialized and modified plans must repeat preparation.
+    #[serde(skip)]
+    batch_admission_proof: Option<V2_3BatchAdmissionProof>,
+}
+
+impl PartialEq for V2_3CompactionTaskPlan {
+    fn eq(&self, other: &Self) -> bool {
+        self.logical_row_ids == other.logical_row_ids
+            && self.retired_logical_row_ids == other.retired_logical_row_ids
+            && self.output_row_counts == other.output_row_counts
+            && self.logical_run_ends == other.logical_run_ends
+            && self.requires_full_logical_sort == other.requires_full_logical_sort
+            && self.rewrite_strategy == other.rewrite_strategy
+            && self.row_address_layout_delta == other.row_address_layout_delta
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -2666,6 +2930,15 @@ async fn rewrite_files(
     task: TaskData,
     options: &CompactionOptions,
 ) -> Result<RewriteResult> {
+    rewrite_files_with_admission(dataset, task, options, false).await
+}
+
+async fn rewrite_files_with_admission(
+    dataset: Cow<'_, Dataset>,
+    task: TaskData,
+    options: &CompactionOptions,
+    allow_batch_admission: bool,
+) -> Result<RewriteResult> {
     let mut metrics = CompactionMetrics::default();
 
     if task.fragments.is_empty() {
@@ -2685,7 +2958,12 @@ async fn rewrite_files(
     metrics.groups_planned = 1;
     let uses_v2_3_row_addresses = dataset.manifest.uses_stable_logical_row_addresses();
     let v2_3_plan = if uses_v2_3_row_addresses {
-        if let Some(plan) = task.v2_3_plan.clone() {
+        if allow_batch_admission {
+            let plan = task.v2_3_plan.clone().ok_or_else(|| {
+                Error::invalid_input(
+                    "batch-admitted storage-version-2.3 compaction task is missing its plan",
+                )
+            })?;
             metrics.groups_admitted = 1;
             Some(plan)
         } else {
@@ -2698,20 +2976,16 @@ async fn rewrite_files(
                 })?
                 .validated_destination_index()?;
             let indices = dataset.load_indices().await?;
-            match preflight_v2_3_compaction_task(
+            let prepared = match prepare_v2_3_compaction_task(
                 dataset.as_ref(),
                 &task.fragments,
                 options,
                 &destination_index,
-                indices.as_ref(),
             )
             .await?
             {
-                V2_3CompactionAdmission::Admitted(prepared) => {
-                    metrics.groups_admitted = 1;
-                    Some(prepared.plan)
-                }
-                V2_3CompactionAdmission::NotAdmitted(reason) => {
+                V2_3CompactionPreparation::Prepared(prepared) => *prepared,
+                V2_3CompactionPreparation::NotAdmitted(reason) => {
                     metrics.groups_not_admitted = 1;
                     warn!(
                         "Skipping storage-version-2.3 compaction group before page reads or data writes: {reason}"
@@ -2728,7 +3002,45 @@ async fn rewrite_files(
                         row_address_layout_delta: None,
                     });
                 }
+            };
+            if let Some(planned) = task.v2_3_plan.as_ref()
+                && planned != &prepared.plan
+            {
+                return Err(Error::invalid_input(
+                    "storage-version-2.3 compaction task changed after planning",
+                ));
             }
+            let prepared_tasks = vec![(task.clone(), prepared)];
+            if let Some(reason) = preflight_prepared_v2_3_compaction_tasks(
+                dataset.as_ref(),
+                &prepared_tasks,
+                indices.as_ref(),
+            )? {
+                metrics.groups_not_admitted = 1;
+                warn!(
+                    "Skipping storage-version-2.3 compaction group before page reads or data writes: {reason}"
+                );
+                return Ok(RewriteResult {
+                    metrics,
+                    new_fragments: Vec::new(),
+                    read_version: dataset.manifest.version,
+                    original_fragments: Vec::new(),
+                    row_addrs: None,
+                    ordered_row_addrs: None,
+                    logical_row_ids: None,
+                    retired_logical_row_ids: None,
+                    row_address_layout_delta: None,
+                });
+            }
+            metrics.groups_admitted = 1;
+            Some(
+                prepared_tasks
+                    .into_iter()
+                    .next()
+                    .expect("one prepared task was inserted")
+                    .1
+                    .plan,
+            )
         }
     } else {
         metrics.groups_admitted = 1;
@@ -2948,8 +3260,10 @@ async fn rewrite_files(
                     plan.output_row_counts, actual_row_counts
                 )));
             }
-            logical_row_ids = Some(plan.logical_row_ids.clone());
-            plan.retired_logical_row_ids.clone()
+            logical_row_ids = Some(plan.logical_row_ids.as_ref().to_vec());
+            plan.retired_logical_row_ids
+                .as_ref()
+                .map(|rows| rows.as_ref().to_vec())
         } else if let Some(row_ids_rx) = row_ids_rx {
             let captured_ids = row_ids_rx
                 .try_recv()
@@ -2988,18 +3302,43 @@ async fn rewrite_files(
             )
             .await?;
         }
-        Ok((row_addrs, logical_row_ids, retired))
+        let row_address_layout_delta = match v2_3_plan.as_ref() {
+            Some(plan) if !plan.row_address_layout_delta.is_empty() => {
+                let logical_row_ids = logical_row_ids.as_deref().ok_or_else(|| {
+                    Error::internal(
+                        "storage-version-2.3 compaction result is missing logical output provenance",
+                    )
+                })?;
+                Some(bind_prepared_v2_3_rewrite_delta_to_result(
+                    &plan.row_address_layout_delta,
+                    PreparedV2_3RewriteBinding {
+                        original_fragments: &fragments,
+                        new_fragments: &new_fragments,
+                        logical_row_ids,
+                        retired_logical_row_ids: retired.as_deref(),
+                    },
+                )?)
+            }
+            _ => None,
+        };
+        Ok((
+            row_addrs,
+            logical_row_ids,
+            retired,
+            row_address_layout_delta,
+        ))
     }
     .await;
 
-    let (row_addrs, logical_row_ids, retired_logical_row_ids) = match provenance_result {
-        Ok(v) => v,
-        Err(e) => {
-            cleanup_data_fragments(&dataset.object_store, &dataset.base, None, &new_fragments)
-                .await;
-            return Err(e);
-        }
-    };
+    let (row_addrs, logical_row_ids, retired_logical_row_ids, row_address_layout_delta) =
+        match provenance_result {
+            Ok(v) => v,
+            Err(e) => {
+                cleanup_data_fragments(&dataset.object_store, &dataset.base, None, &new_fragments)
+                    .await;
+                return Err(e);
+            }
+        };
 
     metrics.files_removed = task
         .fragments
@@ -3014,9 +3353,6 @@ async fn rewrite_files(
         .sum();
 
     log::info!("Compaction task {}: completed", task_id);
-    let row_address_layout_delta = v2_3_plan.as_ref().and_then(|plan| {
-        (!plan.row_address_layout_delta.is_empty()).then(|| plan.row_address_layout_delta.clone())
-    });
 
     Ok(RewriteResult {
         metrics,
@@ -3422,6 +3758,85 @@ fn frame_prepared_rewrite_binding(hash: &mut u128, bytes: &[u8]) {
     update_prepared_rewrite_binding(hash, bytes);
 }
 
+fn frame_u32_sequence(hash: &mut u128, values: &[u32]) {
+    update_prepared_rewrite_binding(hash, &(values.len() as u64).to_le_bytes());
+    for value in values {
+        update_prepared_rewrite_binding(hash, &value.to_le_bytes());
+    }
+}
+
+fn frame_u64_sequence(hash: &mut u128, values: &[u64]) {
+    update_prepared_rewrite_binding(hash, &(values.len() as u64).to_le_bytes());
+    for value in values {
+        update_prepared_rewrite_binding(hash, &value.to_le_bytes());
+    }
+}
+
+fn v2_3_batch_admission_binding(
+    read_version: u64,
+    base_layout_fingerprint: &[u8],
+    options: &CompactionOptions,
+    tasks: &[TaskData],
+) -> Result<[u8; ROW_ADDRESS_LAYOUT_FINGERPRINT_SIZE]> {
+    const OFFSET: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
+    let mut hash = OFFSET;
+    update_prepared_rewrite_binding(&mut hash, b"LanceV23CompactionBatchAdmissionV1");
+    update_prepared_rewrite_binding(&mut hash, &read_version.to_le_bytes());
+    frame_prepared_rewrite_binding(&mut hash, base_layout_fingerprint);
+    let options = serde_json::to_vec(options).map_err(|error| {
+        Error::internal(format!(
+            "failed to encode v2.3 compaction batch options: {error}"
+        ))
+    })?;
+    frame_prepared_rewrite_binding(&mut hash, &options);
+    update_prepared_rewrite_binding(&mut hash, &(tasks.len() as u64).to_le_bytes());
+    for task in tasks {
+        update_prepared_rewrite_binding(&mut hash, &(task.fragments.len() as u64).to_le_bytes());
+        for fragment in &task.fragments {
+            let fragment = pb::DataFragment::from(fragment).encode_to_vec();
+            frame_prepared_rewrite_binding(&mut hash, &fragment);
+        }
+
+        let plan = task.v2_3_plan.as_ref().ok_or_else(|| {
+            Error::internal("admitted storage-version-2.3 compaction task has no prepared plan")
+        })?;
+        // The prepared sidecar contains a compact fingerprint over the
+        // potentially huge logical-row sequences, retired rows, source IDs,
+        // output boundaries, and exact placement delta. The in-process proof
+        // separately retains the immutable row buffers and exact dataset/index
+        // authority, so this deterministic binding only needs to frame their
+        // lengths alongside the remaining execution fields.
+        frame_prepared_rewrite_binding(&mut hash, &plan.row_address_layout_delta);
+        update_prepared_rewrite_binding(
+            &mut hash,
+            &(plan.logical_row_ids.len() as u64).to_le_bytes(),
+        );
+        match &plan.retired_logical_row_ids {
+            Some(retired) => {
+                update_prepared_rewrite_binding(&mut hash, &[1]);
+                update_prepared_rewrite_binding(&mut hash, &(retired.len() as u64).to_le_bytes());
+            }
+            None => update_prepared_rewrite_binding(&mut hash, &[0]),
+        }
+        frame_u32_sequence(&mut hash, &plan.output_row_counts);
+        frame_u32_sequence(&mut hash, &plan.logical_run_ends);
+        update_prepared_rewrite_binding(&mut hash, &[u8::from(plan.requires_full_logical_sort)]);
+        match &plan.rewrite_strategy {
+            V2_3CompactionRewriteStrategy::Reencode => {
+                update_prepared_rewrite_binding(&mut hash, &[0]);
+            }
+            V2_3CompactionRewriteStrategy::BinaryCopy(copy) => {
+                update_prepared_rewrite_binding(&mut hash, &[1]);
+                frame_u32_sequence(&mut hash, &copy.source_file_row_counts);
+                frame_u64_sequence(&mut hash, &copy.source_file_size_bytes);
+                frame_u32_sequence(&mut hash, &copy.output_source_file_ends);
+                frame_u32_sequence(&mut hash, &copy.output_row_counts);
+            }
+        }
+    }
+    Ok(hash.to_le_bytes())
+}
+
 #[derive(Clone, Copy)]
 struct PreparedV2_3RewriteBinding<'a> {
     original_fragments: &'a [Fragment],
@@ -3444,27 +3859,16 @@ fn prepared_rewrite_binding_fingerprint(
         &(binding.original_fragments.len() as u64).to_le_bytes(),
     );
     for fragment in binding.original_fragments {
-        update_prepared_rewrite_binding(&mut hash, &fragment.id.to_le_bytes());
-        match fragment.physical_rows {
-            Some(rows) => {
-                update_prepared_rewrite_binding(&mut hash, &[1]);
-                update_prepared_rewrite_binding(&mut hash, &(rows as u64).to_le_bytes());
-            }
-            None => update_prepared_rewrite_binding(&mut hash, &[0]),
-        }
+        let fragment = pb::DataFragment::from(fragment).encode_to_vec();
+        frame_prepared_rewrite_binding(&mut hash, &fragment);
     }
     update_prepared_rewrite_binding(
         &mut hash,
         &(binding.new_fragments.len() as u64).to_le_bytes(),
     );
     for fragment in binding.new_fragments {
-        match fragment.physical_rows {
-            Some(rows) => {
-                update_prepared_rewrite_binding(&mut hash, &[1]);
-                update_prepared_rewrite_binding(&mut hash, &(rows as u64).to_le_bytes());
-            }
-            None => update_prepared_rewrite_binding(&mut hash, &[0]),
-        }
+        let fragment = pb::DataFragment::from(fragment).encode_to_vec();
+        frame_prepared_rewrite_binding(&mut hash, &fragment);
     }
     frame_prepared_rewrite_binding(&mut hash, binding.logical_row_ids);
     match binding.retired_logical_row_ids {
@@ -3495,6 +3899,16 @@ fn encode_prepared_v2_3_rewrite_delta(
     encoded.extend_from_slice(&binding);
     encoded.extend_from_slice(delta);
     Ok(encoded)
+}
+
+fn bind_prepared_v2_3_rewrite_delta_to_result(
+    encoded: &[u8],
+    binding: PreparedV2_3RewriteBinding<'_>,
+) -> Result<Vec<u8>> {
+    let Some(envelope) = parse_prepared_v2_3_rewrite_delta(encoded)? else {
+        return Ok(encoded.to_vec());
+    };
+    encode_prepared_v2_3_rewrite_delta(envelope.base_layout_fingerprint, binding, envelope.delta)
 }
 
 struct PreparedV2_3RewriteDeltaEnvelope<'a> {
@@ -4862,8 +5276,86 @@ mod tests {
                 plan.output_row_counts == [8] && !plan.row_address_layout_delta.is_empty()
             })
         }));
+        assert!(plan.tasks.iter().all(|task| {
+            task.v2_3_plan
+                .as_ref()
+                .unwrap()
+                .batch_admission_proof
+                .is_some()
+        }));
+        assert!(
+            cached_batch_admitted_v2_3_compaction_tasks(&dataset, plan.tasks.clone(), &options,)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let reopened = Dataset::open(test_dir.as_str()).await.unwrap();
+        assert!(
+            cached_batch_admitted_v2_3_compaction_tasks(&reopened, plan.tasks.clone(), &options,)
+                .await
+                .unwrap()
+                .is_none(),
+            "an admission proof must not cross dataset runtime authority"
+        );
+        let serialized_plan =
+            serde_json::from_slice::<CompactionPlan>(&serde_json::to_vec(&plan).unwrap()).unwrap();
+        assert!(serialized_plan.tasks.iter().all(|task| {
+            task.v2_3_plan
+                .as_ref()
+                .unwrap()
+                .batch_admission_proof
+                .is_none()
+        }));
+        let data_files_before = count_data_files_in(test_dir.as_str());
+        let mut changed_logical_rows = plan.clone();
+        let logical_rows = &mut changed_logical_rows.tasks[0]
+            .v2_3_plan
+            .as_mut()
+            .unwrap()
+            .logical_row_ids;
+        let mut replacement = logical_rows.as_ref().to_vec();
+        replacement[0] ^= 1;
+        *logical_rows = replacement.into();
+        let error = execute_compaction_plan_tasks(&dataset, &changed_logical_rows)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("compaction task changed after planning")
+        );
+        assert_eq!(count_data_files_in(test_dir.as_str()), data_files_before);
 
-        let metrics = compact_files(&mut dataset, options, None).await.unwrap();
+        let mut changed_plan = plan.clone();
+        changed_plan.tasks[0]
+            .v2_3_plan
+            .as_mut()
+            .unwrap()
+            .requires_full_logical_sort = true;
+        let error = execute_compaction_plan_tasks(&dataset, &changed_plan)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("compaction task changed after planning")
+        );
+        assert_eq!(count_data_files_in(test_dir.as_str()), data_files_before);
+
+        let (results, execution_planning_metrics) =
+            execute_compaction_plan_tasks(&dataset, &serialized_plan)
+                .await
+                .unwrap();
+        assert_eq!(results.len(), 5);
+        let mut metrics = commit_compaction(
+            &mut dataset,
+            results,
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &options,
+        )
+        .await
+        .unwrap();
+        metrics += execution_planning_metrics;
         assert_eq!(metrics.groups_planned, 5);
         assert_eq!(metrics.groups_admitted, 5);
         assert_eq!(metrics.groups_not_admitted, 0);
@@ -4899,6 +5391,25 @@ mod tests {
         };
         let plan = plan_compaction(&dataset, &options).await.unwrap();
         assert_eq!(plan.num_tasks(), 5);
+        let data_files_before = count_data_files_in(test_dir.as_str());
+        let mut changed_task = plan.compaction_tasks().next().unwrap();
+        changed_task
+            .task
+            .v2_3_plan
+            .as_mut()
+            .unwrap()
+            .output_row_counts[0] += 1;
+        let changed_task =
+            serde_json::from_slice::<CompactionTask>(&serde_json::to_vec(&changed_task).unwrap())
+                .unwrap();
+        let error = changed_task.execute(&dataset).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("compaction task changed after planning")
+        );
+        assert_eq!(count_data_files_in(test_dir.as_str()), data_files_before);
+
         let mut results = Vec::new();
         for task in plan.compaction_tasks().skip(1).take(3) {
             let task =
@@ -4921,6 +5432,37 @@ mod tests {
         let error = commit_compaction(
             &mut dataset,
             swapped_results,
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &options,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("provenance is not bound to this rewrite result")
+        );
+        assert_eq!(dataset.version().version, version);
+
+        let mut swapped_outputs = results[..2].to_vec();
+        assert_eq!(
+            swapped_outputs[0]
+                .new_fragments
+                .iter()
+                .map(|fragment| fragment.physical_rows)
+                .collect::<Vec<_>>(),
+            swapped_outputs[1]
+                .new_fragments
+                .iter()
+                .map(|fragment| fragment.physical_rows)
+                .collect::<Vec<_>>()
+        );
+        let first_output = swapped_outputs[0].new_fragments.clone();
+        swapped_outputs[0].new_fragments = swapped_outputs[1].new_fragments.clone();
+        swapped_outputs[1].new_fragments = first_output;
+        let error = commit_compaction(
+            &mut dataset,
+            swapped_outputs,
             Arc::new(DatasetIndexRemapperOptions::default()),
             &options,
         )
@@ -5324,19 +5866,36 @@ mod tests {
         let data_files = count_data_files_in(test_dir.as_str());
         tracker.incremental_stats();
 
-        let metrics = compact_files(
-            &mut dataset,
-            CompactionOptions {
-                target_rows_per_fragment: 20,
-                ..Default::default()
-            },
-            None,
-        )
-        .await
-        .unwrap();
+        let options = CompactionOptions {
+            target_rows_per_fragment: 20,
+            ..Default::default()
+        };
+        let metrics = compact_files(&mut dataset, options.clone(), None)
+            .await
+            .unwrap();
         assert_eq!(metrics.groups_planned, 1);
         assert_eq!(metrics.groups_admitted, 0);
         assert_eq!(metrics.groups_not_admitted, 1);
+        assert_eq!(dataset.version().version, version);
+        assert_eq!(count_data_files_in(test_dir.as_str()), data_files);
+
+        let raw_plan = CompactionPlan {
+            tasks: vec![TaskData {
+                fragments: dataset.manifest.fragments.to_vec(),
+                v2_3_plan: None,
+            }],
+            read_version: version,
+            options,
+            planning_metrics: CompactionMetrics::default(),
+        };
+        let error = execute_compaction_plan_tasks(&dataset, &raw_plan)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("not admitted as one complete batch")
+        );
         assert_eq!(dataset.version().version, version);
         assert_eq!(count_data_files_in(test_dir.as_str()), data_files);
 
@@ -5434,19 +5993,37 @@ mod tests {
         dataset.delete("a = 1 OR a = 3").await.unwrap();
         let before = scan_v2_3_rows(&dataset).await;
 
-        compact_files(
-            &mut dataset,
-            CompactionOptions {
-                target_rows_per_fragment: 20,
-                max_rows_per_group: 20,
-                materialize_deletions: true,
-                materialize_deletions_threshold: 0.0,
-                ..Default::default()
-            },
-            None,
-        )
-        .await
-        .unwrap();
+        let options = CompactionOptions {
+            target_rows_per_fragment: 20,
+            max_rows_per_group: 20,
+            materialize_deletions: true,
+            materialize_deletions_threshold: 0.0,
+            ..Default::default()
+        };
+        let plan = plan_compaction(&dataset, &options).await.unwrap();
+        let mut changed_retired_rows = plan.clone();
+        let retired_rows = changed_retired_rows.tasks[0]
+            .v2_3_plan
+            .as_mut()
+            .unwrap()
+            .retired_logical_row_ids
+            .as_mut()
+            .expect("materialized deletions produce retired logical rows");
+        let mut replacement = retired_rows.as_ref().to_vec();
+        replacement[0] ^= 1;
+        *retired_rows = replacement.into();
+        let data_files_before = count_data_files_in(test_dir.as_str());
+        let error = execute_compaction_plan_tasks(&dataset, &changed_retired_rows)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("compaction task changed after planning")
+        );
+        assert_eq!(count_data_files_in(test_dir.as_str()), data_files_before);
+
+        compact_files(&mut dataset, options, None).await.unwrap();
 
         assert_eq!(dataset.manifest.fragments.len(), 1);
         assert_eq!(scan_v2_3_rows(&dataset).await, before);

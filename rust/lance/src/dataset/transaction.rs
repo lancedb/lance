@@ -37,10 +37,10 @@ use lance_table::{
         IndexGenerationBlocker, IndexMetadata, LogicalRowAddressSelection, Manifest,
         NativeLogicalDomain, PhysicalToLogicalResolution, PlacementMaintenanceRequired,
         RowAddressDeltaApplyContext, RowAddressLayout, RowAddressLayoutApplyResult,
-        RowAddressLayoutDelta, RowAddressPlacementKind, RowAddressRouter, RowAddressTargetFragment,
-        RowDatasetVersionMeta, RowDatasetVersionRun, RowDatasetVersionSequence, RowIdMeta,
-        RowReferenceDomain, evaluate_projected_row_address_delta,
-        evaluate_projected_row_address_epoch, pb,
+        RowAddressLayoutDelta, RowAddressPlacementDebtSummary, RowAddressPlacementKind,
+        RowAddressRouter, RowAddressTargetFragment, RowDatasetVersionMeta, RowDatasetVersionRun,
+        RowDatasetVersionSequence, RowIdMeta, RowReferenceDomain,
+        evaluate_projected_row_address_delta, evaluate_projected_row_address_epoch, pb,
     },
     io::{
         commit::CommitHandler,
@@ -54,7 +54,7 @@ use lance_table::{
     },
 };
 use object_store::path::Path;
-use prost::Message;
+use prost::{Message, encoding::encoded_len_varint};
 use roaring::RoaringBitmap;
 use std::cmp::Ordering;
 use std::{
@@ -111,6 +111,81 @@ struct RowAddressMetadataBytes {
     fast: u64,
     explicit: u64,
     generation: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RowAddressMetadataSizeProjection {
+    root_base_bytes: u64,
+    layout_base_bytes: u64,
+    debt_base_bytes: u64,
+}
+
+fn protobuf_length_prefix_delta(bytes: u64, base_bytes: u64) -> Result<u64> {
+    let bytes = encoded_len_varint(bytes) as u64;
+    let base_bytes = encoded_len_varint(base_bytes) as u64;
+    bytes
+        .checked_sub(base_bytes)
+        .ok_or_else(|| Error::internal("protobuf length prefix unexpectedly shrank"))
+}
+
+impl RowAddressMetadataSizeProjection {
+    fn try_new(manifest: &Manifest, index_bytes: u64) -> Result<Self> {
+        let proto = pb::Manifest::from(manifest);
+        let layout = proto.row_address_layout.as_ref().ok_or_else(|| {
+            Error::internal("row-address metadata size projection is missing its layout")
+        })?;
+        let debt = layout.debt_summary.as_ref().ok_or_else(|| {
+            Error::internal("row-address metadata size projection is missing its debt summary")
+        })?;
+        Ok(Self {
+            root_base_bytes: u64::try_from(proto.encoded_len())
+                .map_err(|_| Error::format_capacity_exceeded("manifest bytes exceed u64"))?
+                .checked_add(index_bytes)
+                .ok_or_else(|| Error::invalid_input("manifest metadata byte overflow"))?,
+            layout_base_bytes: u64::try_from(layout.encoded_len()).map_err(|_| {
+                Error::format_capacity_exceeded("row-address layout bytes exceed u64")
+            })?,
+            debt_base_bytes: u64::try_from(debt.encoded_len()).map_err(|_| {
+                Error::format_capacity_exceeded("row-address debt summary bytes exceed u64")
+            })?,
+        })
+    }
+
+    fn root_bytes(&self, debt: &RowAddressPlacementDebtSummary) -> Result<u64> {
+        let debt_bytes =
+            u64::try_from(pb::RowAddressPlacementDebtSummary::from(debt).encoded_len()).map_err(
+                |_| Error::format_capacity_exceeded("row-address debt summary bytes exceed u64"),
+            )?;
+        let debt_delta = debt_bytes
+            .checked_sub(self.debt_base_bytes)
+            .ok_or_else(|| {
+                Error::internal(
+                    "row-address debt summary is smaller than its zero-counter projection",
+                )
+            })?;
+        let debt_prefix_delta = protobuf_length_prefix_delta(debt_bytes, self.debt_base_bytes)?;
+        let layout_bytes = self
+            .layout_base_bytes
+            .checked_add(debt_delta)
+            .and_then(|bytes| bytes.checked_add(debt_prefix_delta))
+            .ok_or_else(|| Error::invalid_input("row-address layout metadata byte overflow"))?;
+        let layout_delta = layout_bytes
+            .checked_sub(self.layout_base_bytes)
+            .ok_or_else(|| Error::internal("row-address layout size projection shrank"))?;
+        let layout_prefix_delta =
+            protobuf_length_prefix_delta(layout_bytes, self.layout_base_bytes)?;
+        self.root_base_bytes
+            .checked_add(layout_delta)
+            .and_then(|bytes| bytes.checked_add(layout_prefix_delta))
+            .ok_or_else(|| Error::invalid_input("manifest metadata byte overflow"))
+    }
+}
+
+struct RowAddressMetadataSizeModel {
+    full: RowAddressMetadataSizeProjection,
+    fast: RowAddressMetadataSizeProjection,
+    generation_free_fast: RowAddressMetadataSizeProjection,
+    core_bytes: u64,
 }
 
 impl RowAddressMetadataBytes {
@@ -3058,6 +3133,125 @@ impl Transaction {
         )
     }
 
+    fn clear_layout_debt_fixed_point_counters(layout: &mut RowAddressLayout) {
+        let debt = &mut layout.debt_summary;
+        debt.metadata_bytes_written_since_maintenance = 0;
+        debt.fast_delta_bytes = 0;
+        debt.explicit_delta_bytes = 0;
+        debt.explicit_metadata_bytes_written_since_maintenance = 0;
+        debt.generation_delta_bytes = 0;
+        debt.generation_metadata_bytes_written_since_maintenance = 0;
+    }
+
+    fn row_address_metadata_size_model(
+        manifest: &Manifest,
+        indices: &[IndexMetadata],
+    ) -> Result<RowAddressMetadataSizeModel> {
+        let mut full_manifest = manifest.clone();
+        Self::clear_layout_debt_fixed_point_counters(Arc::make_mut(
+            full_manifest.row_address_layout.as_mut().ok_or_else(|| {
+                Error::internal("row-address metadata size model is missing its layout")
+            })?,
+        ));
+        let full_index_bytes = u64::try_from(
+            pb::IndexSection {
+                indices: indices.iter().map(Into::into).collect(),
+            }
+            .encoded_len(),
+        )
+        .map_err(|_| Error::format_capacity_exceeded("index metadata bytes exceed u64"))?;
+        let full = RowAddressMetadataSizeProjection::try_new(&full_manifest, full_index_bytes)?;
+
+        let mut fast_manifest = full_manifest.clone();
+        fast_manifest.row_address_layout = fast_manifest
+            .row_address_layout
+            .as_ref()
+            .map(|layout| layout.fast_admission_projection().map(Arc::new))
+            .transpose()?;
+        let fast = RowAddressMetadataSizeProjection::try_new(&fast_manifest, full_index_bytes)?;
+
+        let mut generation_free_fast_manifest = fast_manifest;
+        if let Some(layout) = generation_free_fast_manifest.row_address_layout.as_mut() {
+            Self::strip_layout_generation_metadata(Arc::make_mut(layout));
+        }
+        let mut generation_free_fast_indices = indices.to_vec();
+        for index in &mut generation_free_fast_indices {
+            Self::strip_index_generation_metadata(index);
+        }
+        let generation_free_fast_index_bytes = u64::try_from(
+            pb::IndexSection {
+                indices: generation_free_fast_indices
+                    .iter()
+                    .map(Into::into)
+                    .collect(),
+            }
+            .encoded_len(),
+        )
+        .map_err(|_| Error::format_capacity_exceeded("index metadata bytes exceed u64"))?;
+        let generation_free_fast = RowAddressMetadataSizeProjection::try_new(
+            &generation_free_fast_manifest,
+            generation_free_fast_index_bytes,
+        )?;
+
+        let mut core_manifest = manifest.clone();
+        core_manifest.row_address_layout = None;
+        core_manifest.max_logical_fragment_id = None;
+        let mut core_fragments = core_manifest.fragments.as_ref().clone();
+        for fragment in &mut core_fragments {
+            fragment.native_logical_domain = None;
+        }
+        core_manifest.fragments = Arc::new(core_fragments);
+        let mut core_indices = indices.to_vec();
+        for index in &mut core_indices {
+            Self::strip_index_row_address_metadata(index);
+        }
+        let core_manifest_bytes =
+            u64::try_from(pb::Manifest::from(&core_manifest).encoded_len())
+                .map_err(|_| Error::format_capacity_exceeded("manifest bytes exceed u64"))?;
+        let core_index_bytes = u64::try_from(
+            pb::IndexSection {
+                indices: core_indices.iter().map(Into::into).collect(),
+            }
+            .encoded_len(),
+        )
+        .map_err(|_| Error::format_capacity_exceeded("index metadata bytes exceed u64"))?;
+        let core_bytes = core_manifest_bytes
+            .checked_add(core_index_bytes)
+            .ok_or_else(|| Error::invalid_input("manifest metadata byte overflow"))?;
+
+        Ok(RowAddressMetadataSizeModel {
+            full,
+            fast,
+            generation_free_fast,
+            core_bytes,
+        })
+    }
+
+    fn modeled_row_address_metadata_bytes(
+        model: &RowAddressMetadataSizeModel,
+        debt: &RowAddressPlacementDebtSummary,
+    ) -> Result<RowAddressMetadataBytes> {
+        let full_bytes = model.full.root_bytes(debt)?;
+        let mut fast_debt = debt.clone();
+        fast_debt.explicit_layout_bytes = 0;
+        fast_debt.explicit_delta_bytes = 0;
+        fast_debt.explicit_metadata_bytes_written_since_maintenance = 0;
+        let fast_bytes = model.fast.root_bytes(&fast_debt)?;
+        let mut generation_free_fast_debt = fast_debt;
+        generation_free_fast_debt.generation_delta_bytes = 0;
+        generation_free_fast_debt.generation_metadata_bytes_written_since_maintenance = 0;
+        let generation_free_fast_bytes = model
+            .generation_free_fast
+            .root_bytes(&generation_free_fast_debt)?;
+        Self::split_row_address_metadata_bytes(
+            full_bytes,
+            fast_bytes,
+            generation_free_fast_bytes,
+            model.core_bytes,
+            "manifest metadata",
+        )
+    }
+
     fn serialized_transaction_row_address_metadata_bytes(&self) -> Result<RowAddressMetadataBytes> {
         let full_bytes = pb::Transaction::from(self).encoded_len() as u64;
         let fast_bytes =
@@ -3100,13 +3294,21 @@ impl Transaction {
             ));
         }
 
+        // Canonicalization can deduplicate pooled selections and therefore
+        // change encoded lengths. Freeze that representation before building
+        // the fixed-point size model; the final refresh only changes fixed-size
+        // fingerprint contents and the converged debt counters.
+        let fragments = manifest.fragments.clone();
+        let max_logical_fragment_id = manifest.max_logical_fragment_id;
         let layout = Arc::make_mut(
             manifest
                 .row_address_layout
                 .as_mut()
                 .expect("row-address layout was checked above"),
         );
+        layout.refresh_fingerprint_with_fragments(fragments.as_ref(), max_logical_fragment_id);
         layout.refresh_layout_byte_debt()?;
+        let metadata_size_model = Self::row_address_metadata_size_model(manifest, indices)?;
 
         let transaction_snapshot_bytes =
             self.serialized_transaction_row_address_metadata_bytes()?;
@@ -3135,7 +3337,14 @@ impl Transaction {
         let mut snapshot_bytes = RowAddressMetadataBytes::default();
         let mut converged = false;
         for _ in 0..16 {
-            let root_bytes = Self::serialized_row_address_metadata_bytes(manifest, indices)?;
+            let root_bytes = Self::modeled_row_address_metadata_bytes(
+                &metadata_size_model,
+                &manifest
+                    .row_address_layout
+                    .as_ref()
+                    .expect("row-address layout was checked above")
+                    .debt_summary,
+            )?;
             // Delta is the canonical successor manifest/catalog overhead.
             // Transaction metadata contributes to W_epoch because it is
             // written by the commit, but it is not part of snapshot M_2.3.
@@ -3181,8 +3390,6 @@ impl Transaction {
         // The fingerprint fields have fixed encoded lengths, so their content
         // cannot affect debt convergence. Refresh once from the converged
         // counters instead of rebuilding the full manifest closure per round.
-        let fragments = manifest.fragments.clone();
-        let max_logical_fragment_id = manifest.max_logical_fragment_id;
         Arc::make_mut(
             manifest
                 .row_address_layout
@@ -3195,6 +3402,13 @@ impl Transaction {
             .as_ref()
             .expect("row-address layout was checked above")
             .validate_with_fragments(fragments.as_ref(), max_logical_fragment_id)?;
+        let serialized = Self::serialized_row_address_metadata_bytes(manifest, indices)?;
+        if snapshot_bytes != serialized {
+            return Err(Error::internal(format!(
+                "row-address metadata size model diverged from canonical serialization: \
+                 modeled={snapshot_bytes:?}, serialized={serialized:?}"
+            )));
+        }
         let placement_delta_bytes = snapshot_bytes
             .fast
             .checked_sub(snapshot_bytes.generation)
@@ -6842,6 +7056,117 @@ mod tests {
             manifest.max_logical_fragment_id,
         );
         assert_eq!(refreshed.fingerprint, layout.fingerprint);
+    }
+
+    #[test]
+    fn v2_3_metadata_size_model_matches_canonical_at_protobuf_boundaries() {
+        assert_eq!(protobuf_length_prefix_delta(128, 127).unwrap(), 1);
+        assert_eq!(protobuf_length_prefix_delta(16_384, 16_383).unwrap(), 1);
+
+        let namespace_uuid = Uuid::new_v4();
+        let schema = sample_manifest().schema;
+        let transaction = TransactionBuilder::new(
+            0,
+            Operation::Overwrite {
+                fragments: vec![uncommitted_v2_3_fragment(8)],
+                schema,
+                config_upsert_values: None,
+                initial_bases: None,
+            },
+        )
+        .row_address_layout_delta(Some(direct_row_address_delta(
+            Some(namespace_uuid),
+            None,
+            &[8],
+        )))
+        .build();
+        let (mut manifest, _) = transaction
+            .build_manifest(None, vec![], "txn", &v2_3_manifest_config())
+            .unwrap();
+        let base_debt = manifest
+            .row_address_layout
+            .as_ref()
+            .unwrap()
+            .debt_summary
+            .clone();
+        let values = [
+            0,
+            1,
+            127,
+            128,
+            16_383,
+            16_384,
+            (1 << 21) - 1,
+            1 << 21,
+            u64::MAX,
+        ];
+        let setters: [(&str, fn(&mut RowAddressPlacementDebtSummary, u64)); 6] = [
+            ("metadata_bytes_written_since_maintenance", |debt, value| {
+                debt.metadata_bytes_written_since_maintenance = value
+            }),
+            ("fast_delta_bytes", |debt, value| {
+                debt.fast_delta_bytes = value
+            }),
+            ("explicit_delta_bytes", |debt, value| {
+                debt.explicit_delta_bytes = value
+            }),
+            (
+                "explicit_metadata_bytes_written_since_maintenance",
+                |debt, value| debt.explicit_metadata_bytes_written_since_maintenance = value,
+            ),
+            ("generation_delta_bytes", |debt, value| {
+                debt.generation_delta_bytes = value
+            }),
+            (
+                "generation_metadata_bytes_written_since_maintenance",
+                |debt, value| debt.generation_metadata_bytes_written_since_maintenance = value,
+            ),
+        ];
+
+        for index_count in [0, 1, 3] {
+            let indices = (0..index_count)
+                .map(|index| sample_index_metadata(&format!("index-{index}")))
+                .collect::<Vec<_>>();
+            let model = Transaction::row_address_metadata_size_model(&manifest, &indices).unwrap();
+            for (name, set) in setters {
+                for value in values {
+                    let mut debt = base_debt.clone();
+                    for (_, clear) in setters {
+                        clear(&mut debt, 0);
+                    }
+                    set(&mut debt, value);
+                    Arc::make_mut(manifest.row_address_layout.as_mut().unwrap()).debt_summary =
+                        debt.clone();
+                    let modeled =
+                        Transaction::modeled_row_address_metadata_bytes(&model, &debt).unwrap();
+                    let canonical =
+                        Transaction::serialized_row_address_metadata_bytes(&manifest, &indices)
+                            .unwrap();
+                    assert_eq!(
+                        modeled, canonical,
+                        "index_count={index_count}, counter={name}, value={value}"
+                    );
+                }
+            }
+
+            for value in values {
+                let mut debt = base_debt.clone();
+                for (_, set) in setters {
+                    set(&mut debt, value);
+                }
+                Arc::make_mut(manifest.row_address_layout.as_mut().unwrap()).debt_summary =
+                    debt.clone();
+                let modeled =
+                    Transaction::modeled_row_address_metadata_bytes(&model, &debt).unwrap();
+                let canonical =
+                    Transaction::serialized_row_address_metadata_bytes(&manifest, &indices)
+                        .unwrap();
+                assert_eq!(
+                    modeled, canonical,
+                    "index_count={index_count}, all_counters={value}"
+                );
+            }
+        }
     }
 
     #[test]
