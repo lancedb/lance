@@ -41,6 +41,7 @@ impl PartialEq for ImpactSkipData {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy)]
 pub struct ImpactScore {
     pub score: f32,
@@ -211,6 +212,16 @@ impl ImpactSkipData {
         cache.bounds(self, scorer).global
     }
 
+    /// Cached per-block max doc weights (level0 entries only), for bulk skip
+    /// scans over dead ranges without per-block window bookkeeping.
+    pub(crate) fn level0_doc_weight_bounds_cached<'a, S: Scorer + ?Sized>(
+        &self,
+        scorer: &S,
+        cache: &'a mut ImpactScoreCache,
+    ) -> &'a [f32] {
+        &cache.bounds(self, scorer).per_entry[..self.level0_len]
+    }
+
     pub fn entries(&self) -> &LargeBinaryArray {
         &self.entries
     }
@@ -256,6 +267,18 @@ impl ImpactSkipData {
         }
     }
 
+    /// Last doc id covered by the level0 entry of `block_idx`, or `None` when
+    /// the entry is missing or malformed.
+    pub(crate) fn level0_doc_up_to(&self, block_idx: usize) -> Option<u32> {
+        if block_idx >= self.level0_len {
+            return None;
+        }
+        match self.entry_doc_up_tos[block_idx] {
+            u32::MAX => None,
+            doc_up_to => Some(doc_up_to),
+        }
+    }
+
     pub fn level0_score_cached<S: Scorer + ?Sized>(
         &self,
         block_idx: usize,
@@ -269,6 +292,22 @@ impl ImpactSkipData {
         cache.entry_score(self, block_idx, query_weight, scorer)
     }
 
+    /// Max score of the docs covered by the level1 entry of `group_idx`,
+    /// answered from the scorer-specific cached bounds slab.
+    pub(crate) fn level1_score_cached<S: Scorer + ?Sized>(
+        &self,
+        group_idx: usize,
+        query_weight: f32,
+        scorer: &S,
+        cache: &mut ImpactScoreCache,
+    ) -> f32 {
+        if group_idx >= level1_len(self.level0_len) {
+            return 0.0;
+        }
+        cache.entry_score(self, self.level0_len + group_idx, query_weight, scorer)
+    }
+
+    #[cfg(test)]
     pub fn max_score_up_to_cached<S>(
         &self,
         start_block_idx: usize,

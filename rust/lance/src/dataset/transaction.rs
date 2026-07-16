@@ -2115,6 +2115,12 @@ impl Transaction {
                     Self::handle_rewrite_indices(&mut final_indices, rewritten_indices, groups)?;
                 }
 
+                // A full compaction materializes a fragment's overlays into fresh
+                // base data. Any index older than one of those overlays was built on
+                // the pre-overlay values, so drop the rewritten fragment from its
+                // coverage to keep it from serving stale values.
+                Self::prune_overlay_stale_fields_from_indices(&mut final_indices, groups);
+
                 if let Some(frag_reuse_index) = frag_reuse_index {
                     final_indices.retain(|idx| idx.name != frag_reuse_index.name);
                     final_indices.push(frag_reuse_index.clone());
@@ -2778,6 +2784,56 @@ impl Transaction {
         }
     }
 
+    /// After a `Rewrite` fully compacts a fragment, its data overlays are baked
+    /// into the new fragment's base data. An index built *before* one of those
+    /// overlays (`overlay.committed_version > index.dataset_version`) indexed the
+    /// stale pre-overlay values -- and unlike a live overlay, the compacted
+    /// fragment no longer signals that staleness to the query path. Drop each
+    /// rewritten (new) fragment from the coverage of any index covering a field
+    /// such an overlay supplied, so those rows fall back to a flat scan.
+    fn prune_overlay_stale_fields_from_indices(
+        indices: &mut [IndexMetadata],
+        groups: &[RewriteGroup],
+    ) {
+        for group in groups {
+            // field id -> newest overlay committed_version supplying that field
+            let mut overlaid_field_versions: HashMap<i32, u64> = HashMap::new();
+            for old_frag in &group.old_fragments {
+                for overlay in &old_frag.overlays {
+                    for &field_id in overlay.data_file.fields.iter() {
+                        if field_id < 0 {
+                            // Tombstoned (obsolete) overlay field: supplies nothing.
+                            continue;
+                        }
+                        let entry = overlaid_field_versions.entry(field_id).or_insert(0);
+                        *entry = (*entry).max(overlay.committed_version);
+                    }
+                }
+            }
+            if overlaid_field_versions.is_empty() {
+                continue;
+            }
+
+            let new_fragment_ids = group
+                .new_fragments
+                .iter()
+                .map(|f| f.id as u32)
+                .collect::<Vec<_>>();
+            for index in indices.iter_mut() {
+                let is_stale = index.fields.iter().any(|field_id| {
+                    overlaid_field_versions
+                        .get(field_id)
+                        .is_some_and(|&overlay_version| overlay_version > index.dataset_version)
+                });
+                if is_stale && let Some(fragment_bitmap) = &mut index.fragment_bitmap {
+                    for new_id in &new_fragment_ids {
+                        fragment_bitmap.remove(*new_id);
+                    }
+                }
+            }
+        }
+    }
+
     fn is_vector_index(index: &IndexMetadata) -> bool {
         if let Some(details) = &index.index_details {
             details.type_url.ends_with("VectorIndexDetails")
@@ -3246,7 +3302,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                         .into_iter()
                         .map(Fragment::try_from)
                         .collect::<Result<Vec<_>>>()?,
-                    schema: Schema::from(&Fields(schema)),
+                    schema: Schema::try_from(&Fields(schema))?,
                     config_upsert_values: config_upsert_option,
                     initial_bases: if initial_bases.is_empty() {
                         None
@@ -3314,7 +3370,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                     .into_iter()
                     .map(Fragment::try_from)
                     .collect::<Result<Vec<_>>>()?,
-                schema: Schema::from(&Fields(schema)),
+                schema: Schema::try_from(&Fields(schema))?,
             },
             Some(pb::transaction::Operation::Restore(pb::transaction::Restore { version })) => {
                 Operation::Restore { version }
@@ -3368,7 +3424,7 @@ impl TryFrom<pb::Transaction> for Transaction {
             },
             Some(pb::transaction::Operation::Project(pb::transaction::Project { schema })) => {
                 Operation::Project {
-                    schema: Schema::from(&Fields(schema)),
+                    schema: Schema::try_from(&Fields(schema))?,
                 }
             }
             Some(pb::transaction::Operation::UpdateConfig(update_config)) => {
@@ -6418,6 +6474,45 @@ mod tests {
             coverage: OverlayCoverage::dense(roaring::RoaringBitmap::from_iter([0u32])),
             committed_version,
         }
+    }
+
+    #[test]
+    fn test_prune_overlay_stale_fields_from_indices() {
+        // Fragment 0 carried an overlay on field 1 committed at v5, and was
+        // fully compacted into new fragment 7.
+        let mut old_frag = Fragment::new(0);
+        old_frag.overlays = vec![overlay_with_field(1, 5)];
+        let groups = vec![RewriteGroup {
+            old_fragments: vec![old_frag],
+            new_fragments: vec![Fragment::new(7)],
+        }];
+
+        // Post-remap state: every index already covers the new fragment (7).
+        let covering = || Some(RoaringBitmap::from_iter([7u32]));
+        let mut indices = vec![
+            // Stale: covers the overlaid field 1, built (v2) before the overlay.
+            create_test_index("stale", 1, 2, covering(), false),
+            // Not stale: covers field 1 but built at the overlay's version (v5);
+            // `committed_version > dataset_version` is false at equality.
+            create_test_index("fresh", 1, 5, covering(), false),
+            // Unrelated: covers field 2, which the overlay never touched.
+            create_test_index("unrelated", 2, 2, covering(), false),
+        ];
+
+        Transaction::prune_overlay_stale_fields_from_indices(&mut indices, &groups);
+
+        assert!(
+            !indices[0].fragment_bitmap.as_ref().unwrap().contains(7),
+            "stale index must drop the rewritten fragment from its coverage"
+        );
+        assert!(
+            indices[1].fragment_bitmap.as_ref().unwrap().contains(7),
+            "an index built at/after the overlay is not stale"
+        );
+        assert!(
+            indices[2].fragment_bitmap.as_ref().unwrap().contains(7),
+            "an index on an un-overlaid field is unaffected"
+        );
     }
 
     #[test]

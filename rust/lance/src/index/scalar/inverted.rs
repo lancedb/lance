@@ -11,6 +11,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use lance_core::ROW_ID;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::pbold::InvertedIndexDetails;
+use lance_index::scalar::index_files_to_table;
 use lance_index::scalar::inverted::{
     InvertedIndex, InvertedIndexParams, document_tokenizer::DocType,
 };
@@ -139,7 +140,7 @@ pub(crate) async fn merge_segments(
         index_version: created_index.index_version as i32,
         created_at: Some(chrono::Utc::now()),
         base_id: None,
-        files: Some(created_index.files),
+        files: Some(index_files_to_table(created_index.files)),
         ..segments[0].clone()
     })
 }
@@ -255,6 +256,15 @@ fn canonicalize_inverted_index_details_for_field(
         params
     };
     InvertedIndexDetails::try_from(&params)
+}
+
+/// Read one segment's [`InvertedIndexParams`]
+pub async fn load_segment_params(
+    dataset: &Dataset,
+    segment: &IndexMetadata,
+) -> Result<InvertedIndexParams> {
+    let store = LanceIndexStore::from_dataset_for_existing(dataset, segment).await?;
+    InvertedIndex::load_params(&store).await
 }
 
 #[cfg(test)]

@@ -797,10 +797,6 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
         "FullSchemaMergeInsertExec"
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn schema(&self) -> arrow_schema::SchemaRef {
         Arc::new(arrow_schema::Schema::empty())
     }

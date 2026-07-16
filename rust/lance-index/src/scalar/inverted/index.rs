@@ -1206,6 +1206,33 @@ impl InvertedIndex {
         self.partitions.len() == 1 && self.partitions[0].is_legacy()
     }
 
+    /// Read only the index's [`InvertedIndexParams`],
+    /// Contains more complete info than manifest's lossy `InvertedIndexDetails`.
+    pub async fn load_params(store: &dyn IndexStore) -> Result<InvertedIndexParams> {
+        match store.open_index_file(METADATA_FILE).await {
+            Ok(reader) => {
+                let params = reader
+                    .schema()
+                    .metadata
+                    .get("params")
+                    .ok_or(Error::index("params not found in metadata".to_owned()))?;
+                Ok(serde_json::from_str::<InvertedIndexParams>(params)?)
+            }
+            Err(_) => {
+                // Legacy format: params live in the tokens file (see
+                // `load_legacy_index`).
+                let reader = store.open_index_file(TOKENS_FILE).await?;
+                Ok(reader
+                    .schema()
+                    .metadata
+                    .get("tokenizer")
+                    .map(|s| serde_json::from_str::<InvertedIndexParams>(s))
+                    .transpose()?
+                    .unwrap_or_default())
+            }
+        }
+    }
+
     pub async fn load(
         store: Arc<dyn IndexStore>,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,

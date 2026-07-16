@@ -24,6 +24,7 @@ use super::projection::{
     validate_projection_names,
 };
 use crate::session::Session;
+use lance_io::object_store::ObjectStoreParams;
 
 /// Combine the user filter (if any) with `NOT _tombstone` so tombstone rows are
 /// dropped from a WAL-arm scan. Used only for sources whose schema carries the
@@ -46,6 +47,8 @@ pub struct LsmScanPlanner {
     base_schema: SchemaRef,
     /// Session threaded into flushed-generation opens (shared caches).
     session: Option<Arc<Session>>,
+    /// Store params for opening flushed generations, reusing the base dataset's store.
+    store_params: Option<ObjectStoreParams>,
     /// Cache of opened flushed-generation datasets.
     flushed_cache: Option<Arc<dyn DatasetCache>>,
     /// Optional warmer fired on first open of a flushed generation.
@@ -77,16 +80,22 @@ impl LsmScanPlanner {
             pk_columns,
             base_schema,
             session: None,
+            store_params: None,
             flushed_cache: None,
             warmer: None,
             overfetch_factor: 1.0,
         }
     }
 
-    /// Thread a session into flushed-generation opens so the first open
-    /// populates the shared index / file-metadata caches.
+    /// Set the session used to open flushed generations.
     pub fn with_session(mut self, session: Arc<Session>) -> Self {
         self.session = Some(session);
+        self
+    }
+
+    /// Set the store params used to open flushed generations.
+    pub fn with_store_params(mut self, store_params: ObjectStoreParams) -> Self {
+        self.store_params = Some(store_params);
         self
     }
 
@@ -167,6 +176,7 @@ impl LsmScanPlanner {
         let block_lists = Box::pin(super::block_list::compute_source_block_lists(
             &sources,
             self.session.as_ref(),
+            self.store_params.as_ref(),
             self.flushed_cache.as_ref(),
         ))
         .await?;
@@ -342,6 +352,7 @@ impl LsmScanPlanner {
                 let dataset = open_flushed_dataset(
                     path,
                     self.session.as_ref(),
+                    self.store_params.as_ref(),
                     self.flushed_cache.as_ref(),
                     self.warmer.as_ref(),
                 )
