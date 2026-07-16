@@ -7,7 +7,7 @@ use std::ops::Range;
 use futures::{StreamExt, TryStreamExt};
 use lance_core::utils::address::{LogicalRowAddress, RowAddress};
 use lance_core::{Error, Result};
-use lance_select::{RowAddrTreeMap, RowSetOps};
+use lance_select::{RowAddrSelection, RowAddrTreeMap, RowSetOps};
 use lance_table::format::{
     Fragment, LogicalRowAddressRange, LogicalRowAddressSelection, PlacementMaintenanceRequired,
     RowAddressLayout, RowAddressLayoutDelta, RowAddressLogicalDomain, RowAddressPlacement,
@@ -426,6 +426,37 @@ fn canonical_logical_sequence(logical_rows: RowAddrTreeMap) -> Result<RowIdSeque
         )?);
     }
     Ok(output)
+}
+
+fn merge_fragment_logical_rows(
+    canonical_live_rows: &mut RowAddrTreeMap,
+    fragment_rows: RowAddrTreeMap,
+    expected_rows: u64,
+    physical_fragment_id: u32,
+) -> Result<()> {
+    if fragment_rows.len() != Some(expected_rows) {
+        return Err(Error::internal(format!(
+            "storage-version-2.3 compaction found duplicate logical ownership in physical fragment {physical_fragment_id}"
+        )));
+    }
+    for (logical_fragment_id, fragment_selection) in fragment_rows.iter() {
+        let Some(canonical_selection) = canonical_live_rows.get(logical_fragment_id) else {
+            continue;
+        };
+        let overlaps = match (canonical_selection, fragment_selection) {
+            (RowAddrSelection::Full, _) | (_, RowAddrSelection::Full) => true,
+            (RowAddrSelection::Partial(canonical), RowAddrSelection::Partial(fragment)) => {
+                !canonical.is_disjoint(fragment)
+            }
+        };
+        if overlaps {
+            return Err(Error::internal(format!(
+                "storage-version-2.3 compaction found duplicate logical ownership in physical fragment {physical_fragment_id}"
+            )));
+        }
+    }
+    canonical_live_rows.extend([fragment_rows]);
+    Ok(())
 }
 
 /// Maximum physical deletion runs admitted across one compaction group.
@@ -929,19 +960,12 @@ pub(super) async fn plan_default_compaction_rows(
             current_run_end = Some(last);
         }
 
-        let fragment_rows = RowAddrTreeMap::from(&fragment_sequence);
-        let canonical_rows_before = canonical_live_rows
-            .len()
-            .ok_or_else(|| Error::internal("logical live-row cardinality is unknown"))?;
-        canonical_live_rows |= fragment_rows;
-        let canonical_rows_after = canonical_live_rows
-            .len()
-            .ok_or_else(|| Error::internal("logical live-row cardinality is unknown"))?;
-        if canonical_rows_after.checked_sub(canonical_rows_before) != Some(fragment_len) {
-            return Err(Error::internal(format!(
-                "storage-version-2.3 compaction found duplicate logical ownership in physical fragment {fragment_id}"
-            )));
-        }
+        merge_fragment_logical_rows(
+            &mut canonical_live_rows,
+            RowAddrTreeMap::from(&fragment_sequence),
+            fragment_len,
+            fragment_id,
+        )?;
 
         if !deleted.is_empty() {
             current_deletion_vectors.insert(fragment_id, deleted);
@@ -1308,6 +1332,68 @@ mod tests {
             started.elapsed() < std::time::Duration::from_secs(2),
             "100M native/PackedRun metadata planning must not scale with row count"
         );
+    }
+
+    #[test]
+    fn hundred_thousand_fragment_ownership_check_is_bounded() {
+        const FRAGMENTS: u32 = 100_000;
+        const ROWS_PER_FRAGMENT: u32 = 1_000;
+        let mut canonical = RowAddrTreeMap::new();
+
+        for logical_fragment_id in 0..FRAGMENTS {
+            let rows = logical_range_sequence(logical_fragment_id, 0, ROWS_PER_FRAGMENT).unwrap();
+            merge_fragment_logical_rows(
+                &mut canonical,
+                RowAddrTreeMap::from(&rows),
+                u64::from(ROWS_PER_FRAGMENT),
+                logical_fragment_id,
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            canonical.len(),
+            Some(u64::from(FRAGMENTS) * u64::from(ROWS_PER_FRAGMENT))
+        );
+    }
+
+    #[test]
+    fn fragment_ownership_check_rejects_duplicates() {
+        let mut canonical = RowAddrTreeMap::new();
+        let first = logical_range_sequence(7, 0, 4).unwrap();
+        merge_fragment_logical_rows(
+            &mut canonical,
+            RowAddrTreeMap::from(&first),
+            first.len(),
+            11,
+        )
+        .unwrap();
+
+        let duplicate = logical_range_sequence(7, 3, 6).unwrap();
+        let error = merge_fragment_logical_rows(
+            &mut canonical,
+            RowAddrTreeMap::from(&duplicate),
+            duplicate.len(),
+            12,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("physical fragment 12"));
+    }
+
+    #[test]
+    fn fragment_ownership_check_rejects_intra_fragment_duplicates() {
+        let rows = logical_range_sequence(7, 0, 4).unwrap();
+        let mut duplicate = rows.clone();
+        duplicate.extend(rows);
+
+        let error = merge_fragment_logical_rows(
+            &mut RowAddrTreeMap::new(),
+            RowAddrTreeMap::from(&duplicate),
+            duplicate.len(),
+            13,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("physical fragment 13"));
     }
 
     #[test]

@@ -37,7 +37,7 @@ use lance_table::{
         IndexGenerationBlocker, IndexMetadata, LogicalRowAddressSelection, Manifest,
         NativeLogicalDomain, PhysicalToLogicalResolution, PlacementMaintenanceRequired,
         RowAddressDeltaApplyContext, RowAddressLayout, RowAddressLayoutApplyResult,
-        RowAddressLayoutDelta, RowAddressPlacementKind, RowAddressTargetFragment,
+        RowAddressLayoutDelta, RowAddressPlacementKind, RowAddressRouter, RowAddressTargetFragment,
         RowDatasetVersionMeta, RowDatasetVersionRun, RowDatasetVersionSequence, RowIdMeta,
         RowReferenceDomain, evaluate_projected_row_address_delta,
         evaluate_projected_row_address_epoch, pb,
@@ -2348,31 +2348,35 @@ impl Transaction {
             .ok_or_else(|| {
                 Error::invalid_input("storage-version-2.3 manifest is missing RowAddressLayout")
             })?;
-        for source in &delta.source_domains {
-            let current = layout
-                .logical_domain(
-                    current_manifest.fragments.as_ref(),
-                    source.logical_fragment_id,
-                )?
-                .ok_or_else(|| {
-                    Error::commit_conflict_source(
+        if !delta.source_domains.is_empty() {
+            let router = RowAddressRouter::try_new(
+                layout.clone(),
+                current_manifest.fragments.as_ref(),
+                current_manifest.max_logical_fragment_id,
+            )?;
+            for source in &delta.source_domains {
+                let current = router
+                    .logical_domain(source.logical_fragment_id)?
+                    .ok_or_else(|| {
+                        Error::commit_conflict_source(
+                            current_manifest.version,
+                            format!(
+                                "logical source domain {} disappeared during transaction rebase",
+                                source.logical_fragment_id
+                            )
+                            .into(),
+                        )
+                    })?;
+                if current != *source {
+                    return Err(Error::commit_conflict_source(
                         current_manifest.version,
                         format!(
-                            "logical source domain {} disappeared during transaction rebase",
+                            "logical source domain {} changed during transaction rebase",
                             source.logical_fragment_id
                         )
                         .into(),
-                    )
-                })?;
-            if current != *source {
-                return Err(Error::commit_conflict_source(
-                    current_manifest.version,
-                    format!(
-                        "logical source domain {} changed during transaction rebase",
-                        source.logical_fragment_id
-                    )
-                    .into(),
-                ));
+                    ));
+                }
             }
         }
         for source_floor in &mut delta.source_floors {
@@ -6243,8 +6247,9 @@ mod tests {
     use lance_io::utils::CachedFileSize;
     use lance_table::format::{
         LogicalIndexCoverage, LogicalIndexCoverageShard, LogicalRowAddressSelection,
-        RowAddressLogicalDomain, RowAddressPlacementDelta, RowAddressTargetRange,
-        RowDatasetVersionMeta, RowDatasetVersionRun, RowDatasetVersionSequence, RowIdMeta,
+        RowAddressLogicalDomain, RowAddressPlacementDelta, RowAddressSourceFloor,
+        RowAddressTargetRange, RowDatasetVersionMeta, RowDatasetVersionRun,
+        RowDatasetVersionSequence, RowIdMeta,
     };
     use lance_table::rowids::segment::U64Segment;
     use lance_table::rowids::write_row_ids;
@@ -6513,6 +6518,129 @@ mod tests {
             .build_manifest(None, vec![], "txn", &v2_3_manifest_config())
             .unwrap()
             .0
+    }
+
+    fn native_v2_3_manifest(domain_count: u32) -> Manifest {
+        assert!(domain_count > 0);
+        let fragments = (0..domain_count)
+            .map(|logical_fragment_id| {
+                let mut fragment = Fragment::new(u64::from(logical_fragment_id));
+                fragment.physical_rows = Some(1);
+                fragment.native_logical_domain =
+                    Some(NativeLogicalDomain::new(logical_fragment_id, 1).unwrap());
+                fragment
+            })
+            .collect::<Vec<_>>();
+        let mut manifest = Manifest::new(
+            sample_manifest().schema,
+            Arc::new(fragments),
+            DataStorageFormat::new(LanceFileVersion::V2_3),
+            HashMap::new(),
+        );
+        manifest.version = 41;
+        manifest.max_logical_fragment_id = Some(domain_count - 1);
+
+        let mut layout = RowAddressLayout::new(Uuid::new_v4());
+        layout.field_default_generations = vec![FieldGeneration {
+            field_id: 0,
+            generation: 7,
+        }];
+        layout.index_commit_floors = layout.field_default_generations.clone();
+        layout.refresh_fingerprint_with_fragments(
+            manifest.fragments.as_ref(),
+            manifest.max_logical_fragment_id,
+        );
+        manifest.row_address_layout = Some(Arc::new(layout));
+        manifest
+    }
+
+    fn native_source_domains(domain_count: u32) -> Vec<RowAddressLogicalDomain> {
+        (0..domain_count)
+            .map(|logical_fragment_id| {
+                RowAddressLogicalDomain::new(logical_fragment_id, 1, 1).unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn unchanged_layout_rebase_is_bounded_for_hundred_thousand_domains() {
+        const DOMAIN_COUNT: u32 = 100_000;
+        let manifest = native_v2_3_manifest(DOMAIN_COUNT);
+        let layout = manifest.row_address_layout.as_ref().unwrap();
+        let mut transaction = TransactionBuilder::new(3, Operation::Append { fragments: vec![] })
+            .row_address_layout_delta(Some(RowAddressLayoutDelta {
+                source_domains: native_source_domains(DOMAIN_COUNT),
+                source_floors: vec![RowAddressSourceFloor {
+                    field_id: 0,
+                    generation: 1,
+                }],
+                expected_layout_fingerprint: layout.fingerprint.clone(),
+                ..Default::default()
+            }))
+            .build();
+
+        transaction
+            .rebase_row_address_layout_delta(&manifest)
+            .unwrap();
+
+        assert_eq!(transaction.read_version, manifest.version);
+        let delta = transaction.row_address_layout_delta.as_ref().unwrap();
+        assert_eq!(delta.expected_layout_fingerprint, layout.fingerprint);
+        assert_eq!(delta.source_floors[0].generation, 7);
+    }
+
+    #[test]
+    fn changed_layout_rebase_still_checks_source_domains() {
+        let manifest = native_v2_3_manifest(2);
+        let stale_fingerprint = vec![
+            0;
+            manifest
+                .row_address_layout
+                .as_ref()
+                .unwrap()
+                .fingerprint
+                .len()
+        ];
+        let transaction = |source_domains| {
+            TransactionBuilder::new(3, Operation::Append { fragments: vec![] })
+                .row_address_layout_delta(Some(RowAddressLayoutDelta {
+                    source_domains,
+                    expected_layout_fingerprint: stale_fingerprint.clone(),
+                    ..Default::default()
+                }))
+                .build()
+        };
+
+        let mut valid = transaction(native_source_domains(2));
+        valid.rebase_row_address_layout_delta(&manifest).unwrap();
+        assert_eq!(
+            valid
+                .row_address_layout_delta
+                .as_ref()
+                .unwrap()
+                .expected_layout_fingerprint,
+            manifest.row_address_layout.as_ref().unwrap().fingerprint
+        );
+
+        let mut changed = transaction(vec![RowAddressLogicalDomain::new(0, 2, 1).unwrap()]);
+        let error = changed
+            .rebase_row_address_layout_delta(&manifest)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("changed during transaction rebase")
+        );
+
+        let mut disappeared = transaction(vec![RowAddressLogicalDomain::new(2, 1, 1).unwrap()]);
+        let error = disappeared
+            .rebase_row_address_layout_delta(&manifest)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("disappeared during transaction rebase")
+        );
     }
 
     #[test]
