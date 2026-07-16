@@ -278,6 +278,7 @@ mod test {
                     deleted_ids: None,
                     filtered_ids: None,
                     deleted_fragments: None,
+                    allowed_fragments: None,
                     final_mask: Mutex::new(OnceCell::new()),
                 }),
                 &NoOpMetricsCollector,

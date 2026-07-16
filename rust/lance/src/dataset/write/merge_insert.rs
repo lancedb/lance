@@ -10429,9 +10429,10 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
     // in a fragment) followed by partial merge_insert should not produce
     // "fragment id N does not exist" errors.
     //
-    // The bug: stale btree entries reference the deleted fragment. The deletion mask doesn't
-    // block those addresses because the fragment isn't in the index bitmap. TakeExec tries
-    // to read from a non-existent fragment.
+    // The bug: stale btree entries reference the deleted fragment. A deletion in a covered
+    // fragment forces the restricted prefilter to use a block list. That block list must also
+    // block historical fragments outside the index bitmap, or TakeExec tries to read from a
+    // non-existent fragment.
     #[tokio::test]
     async fn test_partial_merge_insert_stale_index_fragment_not_exist() {
         let dataset = create_indexed_3frag_dataset().await;
@@ -10451,11 +10452,15 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
             .execute()
             .await
             .unwrap();
-        let dataset = update_result.new_dataset;
+        let mut dataset = (*update_result.new_dataset).clone();
 
-        // Step 4: Partial merge_insert on the same rows.
+        // Step 4: Delete a row from fragment 0, which is still covered by the index.
+        // This forces the restricted deletion mask's block-list branch.
+        dataset.delete("id = 'id-0000'").await.unwrap();
+
+        // Step 5: Partial merge_insert on the same rows.
         // This should succeed, not fail with "fragment does not exist".
-        let dataset = partial_merge_insert(dataset, 100..200, 888.0).await;
+        let dataset = partial_merge_insert(Arc::new(dataset), 100..200, 888.0).await;
 
         // Verify correctness
         let batches = dataset
@@ -10473,7 +10478,7 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
             Field::new("value_b", DataType::Float64, false),
         ]));
         let combined = concat_batches(&all_schema, &batches).unwrap();
-        assert_eq!(combined.num_rows(), 300);
+        assert_eq!(combined.num_rows(), 299);
     }
 
     // Regression test: partial-schema merge_insert followed by update (deleting SOME rows

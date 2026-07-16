@@ -490,13 +490,21 @@ impl MapIndexExec {
             });
         }
         let fragment_bitmap = fragment_bitmap.expect("MapIndexExec built with no lookups");
-        let deletion_mask_fut =
-            DatasetPreFilter::create_restricted_deletion_mask(dataset.clone(), fragment_bitmap);
+        let uses_stable_row_ids = dataset.manifest.uses_stable_row_ids();
+        let deletion_mask_fut = if uses_stable_row_ids {
+            DatasetPreFilter::create_restricted_deletion_mask(
+                dataset.clone(),
+                fragment_bitmap.clone(),
+            )
+        } else {
+            DatasetPreFilter::create_deletion_mask(dataset.clone(), fragment_bitmap.clone())
+        };
         let deletion_mask = if let Some(fut) = deletion_mask_fut {
             Some(fut.await?)
         } else {
             None
         };
+        let allowed_fragments = (!uses_stable_row_ids).then_some(Arc::new(fragment_bitmap));
 
         let baseline = BaselineMetrics::new(&metrics_set, partition);
         let elapsed_compute = baseline.elapsed_compute().clone();
@@ -504,6 +512,7 @@ impl MapIndexExec {
             let lookups = lookups.clone();
             let dataset = dataset.clone();
             let deletion_mask = deletion_mask.clone();
+            let allowed_fragments = allowed_fragments.clone();
             let metrics = index_metrics.clone();
             let elapsed_compute = elapsed_compute.clone();
             async move {
@@ -512,7 +521,15 @@ impl MapIndexExec {
                 // the per-batch sargable index evaluation, which is the work
                 // we want attributed here.
                 let _t = elapsed_compute.timer();
-                Self::map_batch(lookups, dataset, deletion_mask, batch, metrics).await
+                Self::map_batch(
+                    lookups,
+                    dataset,
+                    deletion_mask,
+                    allowed_fragments,
+                    batch,
+                    metrics,
+                )
+                .await
             }
         });
         let stream = stream.map(move |batch| {
@@ -560,6 +577,7 @@ impl MapIndexExec {
         lookups: Vec<IndexLookup>,
         dataset: Arc<Dataset>,
         deletion_mask: Option<Arc<RowAddrMask>>,
+        allowed_fragments: Option<Arc<RoaringBitmap>>,
         batch: RecordBatch,
         metrics: Arc<IndexMetrics>,
     ) -> datafusion::error::Result<RecordBatch> {
@@ -570,6 +588,11 @@ impl MapIndexExec {
         }
         let mut row_addr_mask = query_result.upper;
 
+        if let (Some(allowed_fragments), RowAddrMask::AllowList(candidates)) =
+            (allowed_fragments.as_ref(), &mut row_addr_mask)
+        {
+            candidates.retain_fragments(allowed_fragments.iter());
+        }
         if let Some(deletion_mask) = deletion_mask.as_ref() {
             row_addr_mask = row_addr_mask & deletion_mask.as_ref().clone();
         }
