@@ -4768,43 +4768,55 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::bounded_smoke(65_536, 8_192, true)]
+    #[case::oversized_high_entropy(100_000, 10_000, false)]
     #[tokio::test]
-    async fn test_v2_3_group_high_entropy_deletes_are_not_admitted() {
+    async fn test_v2_3_group_deletion_entropy_admission_boundary(
+        #[case] rows: usize,
+        #[case] rows_per_file: usize,
+        #[case] expected_admission: bool,
+    ) {
         let test_dir = TempStrDir::default();
         let data = RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)])),
-            vec![Arc::new(Int64Array::from_iter_values(0..20_000))],
+            vec![Arc::new(Int64Array::from_iter_values(0..rows as i64))],
         )
         .unwrap();
         let mut dataset = Dataset::write(
             RecordBatchIterator::new(vec![Ok(data.clone())], data.schema()),
             &test_dir,
             Some(WriteParams {
-                max_rows_per_file: 2_000,
+                max_rows_per_file: rows_per_file,
                 data_storage_version: Some(LanceFileVersion::V2_3),
                 ..Default::default()
             }),
         )
         .await
         .unwrap();
-        assert_eq!(dataset.manifest.fragments.len(), 10);
+        assert_eq!(dataset.manifest.fragments.len(), rows / rows_per_file);
         dataset.delete("a % 2 = 0").await.unwrap();
 
         let plan = plan_compaction(
             &dataset,
             &CompactionOptions {
-                target_rows_per_fragment: 20_000,
-                max_rows_per_group: 20_000,
+                target_rows_per_fragment: rows,
+                max_rows_per_group: rows,
                 ..Default::default()
             },
         )
         .await
         .unwrap();
 
-        assert!(plan.tasks.is_empty());
-        assert_eq!(plan.planning_metrics.groups_planned, 1);
-        assert_eq!(plan.planning_metrics.groups_admitted, 0);
-        assert_eq!(plan.planning_metrics.groups_not_admitted, 1);
+        assert_eq!(plan.tasks.len(), usize::from(expected_admission));
+        if expected_admission {
+            assert_eq!(plan.planning_metrics, CompactionMetrics::default());
+            assert!(plan.tasks[0].v2_3_plan.is_some());
+        } else {
+            assert_eq!(plan.planning_metrics.groups_planned, 1);
+            assert_eq!(plan.planning_metrics.groups_admitted, 0);
+            assert_eq!(plan.planning_metrics.groups_not_admitted, 1);
+        }
     }
 
     #[tokio::test]

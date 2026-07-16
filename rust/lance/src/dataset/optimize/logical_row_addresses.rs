@@ -429,7 +429,11 @@ fn canonical_logical_sequence(logical_rows: RowAddrTreeMap) -> Result<RowIdSeque
 }
 
 /// Maximum physical deletion runs admitted across one compaction group.
-const MAX_CLUSTERED_DELETION_RUNS: usize = 4_096;
+///
+/// This admits every deletion bitmap for a 65,536-row group while bounding the
+/// element storage of each per-bitmap `Vec<Range<u32>>` to 256 KiB. Larger
+/// high-entropy groups must use explicit placement maintenance.
+const MAX_CLUSTERED_DELETION_RUNS: usize = 32_768;
 /// Serialized retirement payload ceiling for decoding directly to ranges.
 /// Larger payloads stream into the final Roaring selection instead.
 const MAX_RETIRED_RANGE_DECODE_BYTES: usize = 1 << 20;
@@ -1609,12 +1613,13 @@ mod tests {
     }
 
     #[test]
-    fn high_entropy_deletion_detection_is_bounded() {
-        let mut deleted = RoaringBitmap::new();
-        for offset in (0..20_000).step_by(2) {
-            deleted.insert(offset);
-        }
-        assert!(clustered_deletion_ranges(&deleted).unwrap().is_none());
+    fn deletion_entropy_boundary_is_bounded() {
+        let bounded = RoaringBitmap::from_iter((0..65_536).step_by(2));
+        let ranges = clustered_deletion_ranges(&bounded).unwrap().unwrap();
+        assert_eq!(ranges.len(), MAX_CLUSTERED_DELETION_RUNS);
+
+        let over_limit = RoaringBitmap::from_iter((0..65_538).step_by(2));
+        assert!(clustered_deletion_ranges(&over_limit).unwrap().is_none());
     }
 
     #[test]
@@ -1634,11 +1639,19 @@ mod tests {
     fn group_high_entropy_is_rejected_before_range_expansion() {
         let deleted = RoaringBitmap::from_iter((0..2_000).step_by(2));
         let mut entropy = 0;
-        for logical_fragment_id in 0..4 {
+        for logical_fragment_id in 0..32 {
             admitted_deletion_ranges(&deleted, logical_fragment_id, &mut entropy).unwrap();
         }
-        assert_eq!(entropy, 3_996);
-        assert!(admitted_deletion_ranges(&deleted, 4, &mut entropy).is_err());
-        assert_eq!(entropy, 3_996);
+        assert_eq!(entropy, 31_968);
+
+        let tail = RoaringBitmap::from_iter((0..1_600).step_by(2));
+        admitted_deletion_ranges(&tail, 32, &mut entropy).unwrap();
+        assert_eq!(entropy, 32_767);
+
+        let final_run = RoaringBitmap::from_iter([0, 2]);
+        admitted_deletion_ranges(&final_run, 33, &mut entropy).unwrap();
+        assert_eq!(entropy, MAX_CLUSTERED_DELETION_RUNS);
+        assert!(admitted_deletion_ranges(&final_run, 34, &mut entropy).is_err());
+        assert_eq!(entropy, MAX_CLUSTERED_DELETION_RUNS);
     }
 }
