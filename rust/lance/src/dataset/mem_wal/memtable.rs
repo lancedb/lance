@@ -721,9 +721,23 @@ impl MemTable {
         self.batch_count()
     }
 
-    /// Get estimated size in bytes.
+    /// Row-data bytes: the buffered batches plus the PK bloom filter.
+    ///
+    /// This is the **flush unit**, not the memtable's footprint — it drives the
+    /// `max_memtable_size` freeze trigger and deliberately excludes index
+    /// memory, so a generation's size stays a function of the rows in it. Use
+    /// [`Self::memory_size`] to budget resident memory.
     pub fn estimated_size(&self) -> usize {
         self.batch_store.estimated_bytes() + self.pk_bloom_filter.estimated_memory_size()
+    }
+
+    /// Total resident heap bytes: row data plus every in-memory index.
+    ///
+    /// Can far exceed [`Self::estimated_size`] on an indexed table — an HNSW
+    /// index pre-allocates its full graph on the first insert — so this, not
+    /// `estimated_size`, is what a memory ceiling must be built on.
+    pub fn memory_size(&self) -> usize {
+        self.estimated_size() + self.indexes().map_or(0, IndexStore::memory_size)
     }
 
     /// Get the WAL batch mapping.

@@ -156,6 +156,19 @@ impl HnswMemIndex {
         self.len() == 0
     }
 
+    /// Upper bound on heap bytes held by this index.
+    ///
+    /// Zero until the first insert, then a near-constant sized by `capacity`
+    /// (the writer's `max_memtable_rows`) rather than by rows inserted — the
+    /// graph and lookup slabs are pre-allocated in full by [`Self::ensure_state`].
+    /// So an idle-but-touched vector memtable costs the same as a full one.
+    pub fn memory_size(&self) -> usize {
+        self.state
+            .get()
+            .map(|s| s.graph.memory_size() + s.storage.memory_size())
+            .unwrap_or(0)
+    }
+
     fn ensure_state(&self, dim: usize) -> Result<&HnswState> {
         if let Some(state) = self.state.get() {
             if state.storage.dim() != dim {
@@ -460,6 +473,51 @@ mod tests {
             ),
         ]));
         RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(ids)), Arc::new(fsl)]).unwrap()
+    }
+
+    /// The graph is pre-allocated from `capacity`, so its footprint appears in
+    /// full on the first insert and barely moves as rows arrive. A memory
+    /// budget that samples only row bytes would miss all of it.
+    #[test]
+    fn test_memory_size_is_preallocated_not_proportional_to_rows() {
+        let dim = 8;
+        let capacity = 4_000;
+        let index = || {
+            HnswMemIndex::with_capacity(
+                1,
+                "vector".to_string(),
+                DistanceType::L2,
+                HnswBuildParams::default().num_edges(16).ef_construction(64),
+                capacity,
+                64,
+            )
+        };
+
+        let untouched = index();
+        assert_eq!(
+            untouched.memory_size(),
+            0,
+            "an index with no state built holds nothing"
+        );
+
+        let sparse = index();
+        sparse.insert(&make_batch(0, 1, dim), 0).unwrap();
+        let one_row = sparse.memory_size();
+
+        let full = index();
+        full.insert(&make_batch(0, capacity, dim), 0).unwrap();
+        let all_rows = full.memory_size();
+
+        // One row already pays for the whole graph: well over a KB per slot of
+        // capacity, and within a small factor of the fully-populated index.
+        assert!(
+            one_row > capacity * 128,
+            "one row should commit the pre-allocated graph, got {one_row} for capacity {capacity}"
+        );
+        assert!(
+            all_rows < one_row * 2,
+            "a full index ({all_rows}) should not dwarf a one-row index ({one_row})"
+        );
     }
 
     #[test]

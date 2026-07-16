@@ -231,6 +231,17 @@ impl LevelLinks {
         }
     }
 
+    /// Heap bytes for one level, counting `published` at its full width even
+    /// while empty — the build fills it, and the caller budgets against a
+    /// ceiling where over-counting is the safe direction.
+    fn allocated_bytes(max_neighbors: usize) -> usize {
+        // Arc<Vec<u32>>: strong + weak refcounts, the Vec header, then the ids.
+        let published = 2 * std::mem::size_of::<usize>()
+            + std::mem::size_of::<Vec<u32>>()
+            + max_neighbors * std::mem::size_of::<u32>();
+        published + max_neighbors * std::mem::size_of::<ScoredPoint>()
+    }
+
     fn publish_from_ranked(&self, ranked: &[ScoredPoint]) {
         self.published.store(Arc::new(
             ranked.iter().map(|point| point.id).collect::<Vec<_>>(),
@@ -257,6 +268,16 @@ impl Node {
             levels,
             dirty_levels: AtomicU64::new(0),
         }
+    }
+
+    /// Heap bytes held by a node of `target_level`, excluding the `Node` itself
+    /// (which lives inline in the graph's node arena).
+    fn allocated_bytes(target_level: u16, m: usize) -> usize {
+        let levels = target_level as usize + 1;
+        levels * std::mem::size_of::<LevelLinks>()
+            + (0..=target_level)
+                .map(|level| LevelLinks::allocated_bytes(max_neighbors(m, level)))
+                .sum::<usize>()
     }
 
     fn has_level(&self, level: u16) -> bool {
@@ -292,6 +313,12 @@ pub struct HnswGraph {
     visible_len: AtomicUsize,
     visited_pool: ArrayQueue<VisitedList>,
     packed_level0: ArcSwap<PackedLevel>,
+    /// Heap bytes of the node arena and visited pool. Fixed at construction:
+    /// both are sized from `capacity`, not from `len()`.
+    base_bytes: usize,
+    /// Heap bytes of the current `packed_level0` snapshot, which is rebuilt
+    /// wholesale on each level-0 publish rather than grown.
+    packed_bytes: AtomicUsize,
 }
 
 impl HnswGraph {
@@ -309,12 +336,14 @@ impl HnswGraph {
 
         let mut rng = SmallRng::seed_from_u64(params.seed);
         let mut nodes = Vec::with_capacity(capacity);
+        let mut node_bytes = 0;
         for id in 0..capacity {
             let target_level = if id == 0 {
                 0
             } else {
                 random_level(&params, &mut rng)
             };
+            node_bytes += Node::allocated_bytes(target_level, params.m);
             nodes.push(Node::new(target_level, params.m));
         }
 
@@ -323,9 +352,15 @@ impl HnswGraph {
         for _ in 0..pool_size {
             let _ = visited_pool.push(VisitedList::new(0));
         }
+        // Pooled lists start empty but `VisitedList::reset` resizes each to one
+        // bit per node on first use.
+        let visited_bytes = pool_size
+            * (std::mem::size_of::<VisitedList>()
+                + capacity.div_ceil(WORD_BITS) * std::mem::size_of::<usize>());
 
         Ok(Self {
             params,
+            base_bytes: capacity * std::mem::size_of::<Node>() + node_bytes + visited_bytes,
             nodes,
             build_entry_point: AtomicU32::new(0),
             build_max_level: AtomicU16::new(0),
@@ -335,7 +370,18 @@ impl HnswGraph {
             visible_len: AtomicUsize::new(0),
             visited_pool,
             packed_level0: ArcSwap::from_pointee(PackedLevel::empty()),
+            packed_bytes: AtomicUsize::new(0),
         })
+    }
+
+    /// Upper bound on the graph's dominant heap allocations.
+    ///
+    /// Near-constant from the first insert rather than proportional to `len()`:
+    /// the node arena is allocated in full at construction, sized by `capacity`.
+    /// Callers budgeting memtable memory must account for this the moment a
+    /// vector memtable takes its first row.
+    pub fn memory_size(&self) -> usize {
+        self.base_bytes + self.packed_bytes.load(Ordering::Relaxed)
     }
 
     /// Number of nodes visible to readers.
@@ -1051,9 +1097,13 @@ impl HnswGraph {
             offsets.push(neighbors.len());
         }
 
+        let packed_bytes = offsets.capacity() * std::mem::size_of::<usize>()
+            + neighbors.capacity() * std::mem::size_of::<u32>();
+
         // ArcSwap reclaims the prior snapshot once no reader guard holds it.
         self.packed_level0
             .store(Arc::new(PackedLevel { offsets, neighbors }));
+        self.packed_bytes.store(packed_bytes, Ordering::Relaxed);
         Ok(())
     }
 }
