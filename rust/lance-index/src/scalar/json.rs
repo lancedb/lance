@@ -8,22 +8,24 @@ use std::{
 };
 
 use arrow_array::{Array, LargeBinaryArray, RecordBatch, StructArray, UInt8Array};
-use arrow_schema::{DataType, Field, Field as ArrowField, Schema};
+use arrow_schema::{DataType, Field, Field as ArrowField, Schema, SortOptions};
 use async_trait::async_trait;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::{
     execution::SendableRecordBatchStream,
-    physical_plan::{ExecutionPlan, projection::ProjectionExec},
+    physical_plan::{ExecutionPlan, projection::ProjectionExec, sorts::sort::SortExec},
 };
 use datafusion_common::{ScalarValue, config::ConfigOptions};
 use datafusion_expr::{Expr, Operator, ScalarUDF};
 use datafusion_physical_expr::{
-    PhysicalExpr, ScalarFunctionExpr,
+    PhysicalExpr, PhysicalSortExpr, ScalarFunctionExpr,
     expressions::{Column, Literal},
 };
 use futures::StreamExt;
 use lance_core::deepsize::DeepSizeOf;
-use lance_datafusion::exec::{LanceExecutionOptions, OneShotExec, get_session_context};
+use lance_datafusion::exec::{
+    LanceExecutionOptions, OneShotExec, execute_plan, get_session_context,
+};
 use lance_datafusion::udf::json::JsonbType;
 use prost::Message;
 use roaring::RoaringBitmap;
@@ -665,6 +667,38 @@ impl JsonIndexPlugin {
             futures::stream::iter(converted_batches.into_iter().map(Ok)),
         )))
     }
+
+    /// Sort the converted `(value, row_id)` stream ascending by value.
+    ///
+    /// The scalar-index framework pre-sorts input rows by the *raw* indexed
+    /// column, but a JSON index re-extracts a different value (the value at
+    /// `path`) whose ordering does not match the raw-column order. The target
+    /// index requires its input sorted by the value it stores (e.g. btree page
+    /// min/max stats assume sorted input), so we re-sort here before training.
+    /// Without this, range and equality queries return incorrect results.
+    /// See https://github.com/lancedb/lance/issues/7485.
+    async fn sort_stream_by_value(
+        data: SendableRecordBatchStream,
+    ) -> Result<SendableRecordBatchStream> {
+        let input = Arc::new(OneShotExec::new(data));
+        let schema = input.schema();
+        let value_idx = schema.column_with_name(VALUE_COLUMN_NAME).expect_ok()?.0;
+        let sort_expr = PhysicalSortExpr {
+            expr: Arc::new(Column::new(VALUE_COLUMN_NAME, value_idx)),
+            options: SortOptions {
+                descending: false,
+                nulls_first: true,
+            },
+        };
+        let plan = Arc::new(SortExec::new([sort_expr].into(), input));
+        execute_plan(
+            plan,
+            LanceExecutionOptions {
+                use_spilling: true,
+                ..Default::default()
+            },
+        )
+    }
 }
 
 #[async_trait]
@@ -719,6 +753,11 @@ impl BasicTrainer for JsonIndexPlugin {
         // Convert the stream to properly typed values based on inferred type
         let converted_stream =
             Self::convert_stream_by_type(data_stream, inferred_type.clone()).await?;
+
+        // Re-sort by the extracted value: the framework sorted the input by the
+        // raw JSON column, which does not match the order of the value at `path`.
+        // The target index requires input sorted by the value it stores.
+        let converted_stream = Self::sort_stream_by_value(converted_stream).await?;
 
         // Update the target request with inferred type
         let registry = self.registry()?;
@@ -977,5 +1016,124 @@ mod tests {
                 .unwrap();
 
         assert_eq!(inferred_type, DataType::Utf8);
+    }
+
+    // Regression for https://github.com/lancedb/lance/issues/7485
+    //
+    // A JSON-path btree index returned wrong results for float values whose row
+    // order (after the framework's sort on the raw JSON column) does not match
+    // the order of the extracted value. The btree trainer assumes its input is
+    // sorted by the stored value, so without re-sorting the extracted values the
+    // page min/max stats are wrong and range/equality queries miss rows.
+    #[tokio::test]
+    async fn test_json_btree_index_unsorted_extracted_values() {
+        use crate::metrics::NoOpMetricsCollector;
+        use crate::progress::noop_progress;
+        use crate::scalar::{SargableQuery, SearchResult, lance_format::LanceIndexStore};
+        use arrow_array::{LargeBinaryArray, UInt64Array};
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        use datafusion_common::ScalarValue;
+        use futures::stream;
+        use lance_core::cache::LanceCache;
+        use lance_core::utils::tempfile::TempObjDir;
+        use lance_io::object_store::ObjectStore;
+        use lance_select::RowAddrTreeMap;
+        use std::ops::Bound;
+
+        // Non-exact floats deliberately laid out so that the row order does not
+        // match ascending value order (10.5, 40.1, -3.2 sorts to -3.2, 10.5, 40.1).
+        let json_data = [
+            r#"{"latitude": 10.5}"#,
+            r#"{"latitude": 40.1}"#,
+            r#"{"latitude": -3.2}"#,
+        ];
+        let jsonb: Vec<Vec<u8>> = json_data
+            .iter()
+            .map(|s| s.parse::<jsonb::OwnedJsonb>().unwrap().to_vec())
+            .collect();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(VALUE_COLUMN_NAME, DataType::LargeBinary, true),
+            Field::new(ROW_ID, DataType::UInt64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(LargeBinaryArray::from(
+                    jsonb.iter().map(|v| Some(v.as_slice())).collect::<Vec<_>>(),
+                )) as ArrayRef,
+                Arc::new(UInt64Array::from(vec![0u64, 1, 2])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let data = Box::pin(RecordBatchStreamAdapter::new(
+            schema.clone(),
+            stream::iter(vec![Ok(batch)]),
+        )) as SendableRecordBatchStream;
+
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let registry = IndexPluginRegistry::with_default_plugins();
+        let plugin = registry.get_plugin_by_name("json").unwrap();
+        let trainer = plugin.basic_trainer().unwrap();
+        let params = r#"{"target_index_type":"btree","path":"latitude"}"#;
+        let request = trainer
+            .new_training_request(
+                params,
+                &Field::new(VALUE_COLUMN_NAME, DataType::LargeBinary, true),
+            )
+            .unwrap();
+        let created = trainer
+            .train_index(data, store.as_ref(), request, None, noop_progress())
+            .await
+            .unwrap();
+
+        let index = plugin
+            .load_index(
+                store.clone(),
+                &created.index_details,
+                None,
+                &LanceCache::no_cache(),
+            )
+            .await
+            .unwrap();
+
+        let search = |q: SargableQuery| {
+            let query = JsonQuery::new(Arc::new(q) as Arc<dyn AnyQuery>, "latitude".to_string());
+            let index = index.clone();
+            async move { index.search(&query, &NoOpMetricsCollector).await.unwrap() }
+        };
+
+        // Range: latitude > 0 -> rows 0 (10.5) and 1 (40.1).
+        assert_eq!(
+            search(SargableQuery::Range(
+                Bound::Excluded(ScalarValue::Float64(Some(0.0))),
+                Bound::Unbounded,
+            ))
+            .await,
+            SearchResult::exact(RowAddrTreeMap::from_iter([0u64, 1])),
+        );
+
+        // Equality on a non-exact float: latitude = 40.1 -> row 1.
+        assert_eq!(
+            search(SargableQuery::Equals(ScalarValue::Float64(Some(40.1)))).await,
+            SearchResult::exact(RowAddrTreeMap::from_iter([1u64])),
+        );
+
+        // Lower bound that must exclude the smallest value:
+        // latitude >= 10.5 -> rows 0 (10.5) and 1 (40.1).
+        assert_eq!(
+            search(SargableQuery::Range(
+                Bound::Included(ScalarValue::Float64(Some(10.5))),
+                Bound::Unbounded,
+            ))
+            .await,
+            SearchResult::exact(RowAddrTreeMap::from_iter([0u64, 1])),
+        );
     }
 }
