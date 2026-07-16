@@ -8976,7 +8976,9 @@ impl RowAddressLayout {
                                 source.logical_fragment_id
                             )));
                         }
-                        if matches!(&retired.membership, RetiredLogicalRowMembership::AllRows) {
+                        if matches!(&retired.membership, RetiredLogicalRowMembership::AllRows)
+                            && !matches!(placement, RowAddressPlacement::ExplicitMap(_))
+                        {
                             return Err(Error::invalid_input(format!(
                                 "fully retired logical domain {} still has a live placement",
                                 source.logical_fragment_id
@@ -12591,6 +12593,115 @@ mod tests {
             .validate_with_fragments(&overlap_fragments, Some(3))
             .unwrap_err();
         assert!(error.to_string().contains("overlapping"));
+    }
+
+    #[test]
+    fn fully_retired_domain_can_remain_in_explicit_map_root() {
+        let retired_source = domain(0, 2);
+        let live_source = domain(1, 2);
+        let target = fragment(10, 2, None);
+        let first_live = LogicalRowAddress::try_new_from_parts(1, 0).unwrap();
+        let last_live = LogicalRowAddress::try_new_from_parts(1, 1).unwrap();
+        let mut layout = RowAddressLayout::new(Uuid::new_v4());
+        layout.placements = vec![RowAddressPlacement::ExplicitMap(
+            ExplicitMapRowAddressPlacement {
+                sources: [retired_source, live_source]
+                    .into_iter()
+                    .map(|source| {
+                        Ok(SparseSelectionSource {
+                            source,
+                            selection: Arc::new(LogicalRowAddressSelection::from_full_domains(&[
+                                source,
+                            ])?),
+                            excluded: None,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()
+                    .unwrap(),
+                object_path: "data/_row_addresses/locator.lance".to_owned(),
+                object_size: 128,
+                pages: vec![ExplicitMapPage {
+                    first_logical_address: first_live.raw(),
+                    last_logical_address: last_live.raw(),
+                    row_start: 0,
+                    row_count: 2,
+                    content_fingerprint: vec![11; ROW_ADDRESS_LAYOUT_FINGERPRINT_SIZE],
+                }],
+                destinations: vec![ExplicitMapDestination {
+                    physical_fragment_id: 10,
+                    destination_start: 0,
+                    row_count: 2,
+                    row_id_file_path: "data/_row_addresses/row_ids.lance".to_owned(),
+                    row_id_file_size: 64,
+                    row_id_pages: vec![ExplicitMapRowIdPage {
+                        row_start: 0,
+                        row_count: 2,
+                        content_fingerprint: vec![12; ROW_ADDRESS_LAYOUT_FINGERPRINT_SIZE],
+                    }],
+                }],
+                base_id: None,
+            },
+        )];
+        layout.retired_rows = vec![RetiredLogicalRowSet::all_rows(vec![retired_source]).unwrap()];
+        layout
+            .refresh_physical_ownership_summary(&target, &RoaringBitmap::new())
+            .unwrap();
+        layout.refresh_fingerprint_with_fragments(std::slice::from_ref(&target), Some(1));
+        layout
+            .validate_with_fragments(std::slice::from_ref(&target), Some(1))
+            .unwrap();
+
+        let proto: pb::RowAddressLayout = (&layout).into();
+        let decoded = RowAddressLayout::try_from(proto).unwrap();
+        decoded
+            .validate_with_fragments(std::slice::from_ref(&target), Some(1))
+            .unwrap();
+        let router =
+            RowAddressRouter::try_new(Arc::new(decoded), std::slice::from_ref(&target), Some(1))
+                .unwrap();
+        assert_eq!(
+            router
+                .resolve_many(&[LogicalRowAddress::try_new_from_parts(0, 0).unwrap()])
+                .unwrap(),
+            vec![PlacementResolution::NotLive]
+        );
+        assert_eq!(
+            router.resolve_many(&[first_live]).unwrap(),
+            vec![PlacementResolution::Mapped {
+                locator: PhysicalRowLocator::ExplicitMap {
+                    placement_index: 0,
+                    page_index: 0,
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn fully_retired_domain_still_rejects_inline_placement() {
+        let inline_target = fragment(11, 2, None);
+        let inline_source = domain(2, 2);
+        let mut inline_layout = RowAddressLayout::new(Uuid::new_v4());
+        inline_layout.placements = vec![RowAddressPlacement::Direct(DirectRowAddressPlacement {
+            source: inline_source,
+            destination_fragment_id: 11,
+            destination_start: 0,
+            excluded: None,
+        })];
+        inline_layout.retired_rows =
+            vec![RetiredLogicalRowSet::all_rows(vec![inline_source]).unwrap()];
+        inline_layout
+            .refresh_physical_ownership_summary(&inline_target, &RoaringBitmap::new())
+            .unwrap();
+        inline_layout
+            .refresh_fingerprint_with_fragments(std::slice::from_ref(&inline_target), Some(2));
+        let error = inline_layout
+            .validate_with_fragments(std::slice::from_ref(&inline_target), Some(2))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("fully retired logical domain 2 still has a live placement")
+        );
     }
 
     #[test]

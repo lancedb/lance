@@ -2121,6 +2121,135 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repack_preserves_fully_retired_logical_domain_root() {
+        let temp = TempStrDir::default();
+        let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..20))],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            temp.as_str(),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_3),
+                max_rows_per_file: 4,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.fragments().len(), 5);
+        let original = scan_i_and_row_ids(&dataset).await;
+        let original_ids = original.iter().copied().collect::<HashMap<_, _>>();
+
+        let compaction = compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 20,
+                max_rows_per_group: 20,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(compaction.fragments_removed, 5);
+        assert_eq!(compaction.fragments_added, 1);
+        assert!(matches!(
+            dataset
+                .manifest
+                .row_address_layout
+                .as_ref()
+                .unwrap()
+                .placements
+                .as_slice(),
+            [RowAddressPlacement::PackedRun(_)]
+        ));
+
+        let deleted = dataset.delete("i >= 4 AND i < 8").await.unwrap();
+        assert_eq!(deleted.num_deleted_rows, 4);
+        maintain_row_addresses(
+            &mut dataset,
+            RowAddressMaintenanceOptions {
+                target_rows_per_fragment: 16,
+                max_rows_per_group: 16,
+                ..RowAddressMaintenanceOptions::repack()
+            },
+        )
+        .await
+        .unwrap();
+        dataset.validate().await.unwrap();
+        dataset.manifest.validate_row_address_contract().unwrap();
+
+        let layout = dataset.manifest.row_address_layout.as_ref().unwrap();
+        let RowAddressPlacement::ExplicitMap(explicit) = &layout.placements[0] else {
+            panic!("Repack must publish ExplicitMap")
+        };
+        assert_eq!(explicit.sources.len(), 5);
+        assert_eq!(
+            layout
+                .retired_logical_row_bitmap()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            (4..8).map(|value| original_ids[&value]).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            scan_i_and_row_ids(&dataset).await,
+            (0..4)
+                .chain(8..20)
+                .map(|value| (value, original_ids[&value]))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            dataset
+                .resolve_logical_row_ids_async(
+                    &(4..8).map(|value| original_ids[&value]).collect::<Vec<_>>()
+                )
+                .await
+                .unwrap()
+                .iter()
+                .all(Option::is_none)
+        );
+        let taken = dataset
+            .take_rows(
+                &[original_ids[&10]],
+                ProjectionRequest::from_columns(["i", ROW_ID], dataset.schema()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            taken["i"]
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(0),
+            10
+        );
+        assert_eq!(
+            taken[ROW_ID]
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap()
+                .value(0),
+            original_ids[&10]
+        );
+
+        drop(dataset);
+        let reopened = Dataset::open(temp.as_str()).await.unwrap();
+        reopened.validate().await.unwrap();
+        assert_eq!(
+            scan_i_and_row_ids(&reopened).await,
+            (0..4)
+                .chain(8..20)
+                .map(|value| (value, original_ids[&value]))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
     async fn shallow_clone_rebinds_explicit_map_objects_to_source_base() {
         let source_uri = TempStrDir::default();
         let clone_uri = TempStrDir::default();
