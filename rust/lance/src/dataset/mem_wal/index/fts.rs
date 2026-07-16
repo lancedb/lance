@@ -5031,9 +5031,10 @@ mod tests {
         .unwrap();
 
         let err = index.insert(&batch, 0).unwrap_err();
+        let message = err.to_string();
         assert!(
-            err.to_string()
-                .contains("does not support source type Int32"),
+            message.contains("must resolve to Utf8, LargeUtf8, Utf8View, or JSON")
+                && message.contains("got Int32"),
             "{err}"
         );
     }
