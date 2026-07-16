@@ -2013,6 +2013,7 @@ fn derive_sq_params(sq_quantizer: &ScalarQuantizer) -> SQBuildParams {
     SQBuildParams {
         num_bits: sq_quantizer.num_bits(),
         sample_rate: 256, // Default
+        bounds: None,
     }
 }
 

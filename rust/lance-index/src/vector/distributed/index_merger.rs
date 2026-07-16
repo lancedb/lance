@@ -178,6 +178,21 @@ fn ensure_fixed_size_list_compatible(
     Ok(())
 }
 
+/// SQ shards must share bit-identical bounds. Unlike PQ codebooks / IVF
+/// centroids (compared with a tolerance above, since training can drift), SQ
+/// bounds are injected verbatim into every shard's build, so any difference is
+/// not benign drift -- it means a shard self-trained its own scale and its
+/// codes are incomparable with the others. Exact inequality is the check.
+fn ensure_sq_bounds_match(
+    reference: &ScalarQuantizationMetadata,
+    candidate: &ScalarQuantizationMetadata,
+) -> Result<()> {
+    if reference.bounds != candidate.bounds {
+        return Err(Error::index("SQ bounds mismatch across shards".to_string()));
+    }
+    Ok(())
+}
+
 async fn try_read_ivf_proto(reader: &V2Reader) -> Result<Option<pb::Ivf>> {
     let Some(ivf_idx) = reader.metadata().file_schema.metadata.get(IVF_METADATA_KEY) else {
         return Ok(None);
@@ -1007,7 +1022,9 @@ pub async fn merge_partial_vector_auxiliary_files(
                     return Err(Error::index("Dimension mismatch across shards".to_string()));
                 }
 
-                if sq_meta.is_none() {
+                if let Some(prev) = &sq_meta {
+                    ensure_sq_bounds_match(prev, &sq_meta_parsed)?;
+                } else {
                     sq_meta = Some(sq_meta_parsed.clone());
                 }
                 if v2w_opt.is_none() {
@@ -1425,7 +1442,9 @@ pub async fn merge_partial_vector_auxiliary_files(
                 {
                     return Err(Error::index("Dimension mismatch across shards".to_string()));
                 }
-                if sq_meta.is_none() {
+                if let Some(prev) = &sq_meta {
+                    ensure_sq_bounds_match(prev, &sq_meta_parsed)?;
+                } else {
                     sq_meta = Some(sq_meta_parsed.clone());
                 }
                 if v2w_opt.is_none() {

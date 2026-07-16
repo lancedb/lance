@@ -142,6 +142,17 @@ impl Quantization for ScalarQuantizer {
             data.data_type()
         )))?;
 
+        // Pre-trained (e.g. globally-trained) bounds take precedence over
+        // training on the local sample, so codes are comparable across
+        // independently built shards.
+        if let Some(bounds) = params.bounds.clone() {
+            return Ok(Self::with_bounds(
+                params.num_bits,
+                fsl.value_length() as usize,
+                bounds,
+            ));
+        }
+
         let mut quantizer = Self::new(params.num_bits, fsl.value_length() as usize);
 
         match fsl.value_type() {
@@ -347,6 +358,68 @@ mod tests {
         sq_values.values().iter().enumerate().for_each(|(i, v)| {
             assert_eq!(*v, (i * 17) as u8,);
         });
+    }
+
+    #[test]
+    fn test_build_with_injected_bounds() {
+        let dim = 16;
+        let injected = Range::<f64> {
+            start: -3.0,
+            end: 42.0,
+        };
+        let params = SQBuildParams::with_bounds(8, injected.clone());
+
+        // Two samples with very different value ranges.
+        let sample_a = FixedSizeListArray::try_new_from_values(
+            Float32Array::from_iter_values((0..dim).map(|v| v as f32)),
+            dim,
+        )
+        .unwrap();
+        let sample_b = FixedSizeListArray::try_new_from_values(
+            Float32Array::from_iter_values((0..dim).map(|v| (v as f32) * 100.0 - 500.0)),
+            dim,
+        )
+        .unwrap();
+
+        let sq_a = ScalarQuantizer::build(&sample_a, DistanceType::L2, &params).unwrap();
+        let sq_b = ScalarQuantizer::build(&sample_b, DistanceType::L2, &params).unwrap();
+
+        // Bounds come from the params, not from either sample.
+        assert_eq!(sq_a.bounds(), injected);
+        assert_eq!(sq_b.bounds(), injected);
+
+        // Both quantizers produce identical codes for the same input.
+        let query = FixedSizeListArray::try_new_from_values(
+            Float32Array::from_iter_values((0..dim).map(|v| v as f32 * 2.0)),
+            dim,
+        )
+        .unwrap();
+        let code_a = sq_a.quantize(&query).unwrap();
+        let code_b = sq_b.quantize(&query).unwrap();
+        assert_eq!(code_a.as_ref(), code_b.as_ref());
+    }
+
+    #[test]
+    fn test_build_without_bounds_self_trains() {
+        let dim = 16;
+        let params = SQBuildParams::default();
+        assert!(params.bounds.is_none());
+
+        let sample = FixedSizeListArray::try_new_from_values(
+            Float32Array::from_iter_values((0..dim).map(|v| v as f32)),
+            dim,
+        )
+        .unwrap();
+        let sq = ScalarQuantizer::build(&sample, DistanceType::L2, &params).unwrap();
+        assert_eq!(sq.bounds(), 0.0..(dim - 1) as f64);
+    }
+
+    #[test]
+    fn test_sq_build_params_with_bounds() {
+        let params = SQBuildParams::with_bounds(4, 1.0..2.0);
+        assert_eq!(params.num_bits, 4);
+        assert_eq!(params.bounds, Some(1.0..2.0));
+        assert_eq!(params.sample_rate, SQBuildParams::default().sample_rate);
     }
 
     #[tokio::test]

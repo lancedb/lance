@@ -465,6 +465,7 @@ pub fn get_vector_index_params(
                     Ok(SQBuildParams {
                         num_bits,
                         sample_rate,
+                        bounds: None,
                     })
                 },
             )?;

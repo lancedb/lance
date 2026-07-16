@@ -10,6 +10,13 @@ pub struct SQBuildParams {
 
     /// Sample rate for training.
     pub sample_rate: usize,
+
+    /// User-provided, globally-trained quantization bounds.
+    ///
+    /// When set, per-build training is skipped and these exact bounds are used,
+    /// so codes are comparable across independently built shards of a
+    /// distributed index build. Mirrors `PQBuildParams::codebook`.
+    pub bounds: Option<std::ops::Range<f64>>,
 }
 
 impl From<&SQBuildParams> for crate::pb::vector_index_details::ScalarQuantization {
@@ -25,6 +32,18 @@ impl Default for SQBuildParams {
         Self {
             num_bits: 8,
             sample_rate: 256,
+            bounds: None,
+        }
+    }
+}
+
+impl SQBuildParams {
+    /// Create build params carrying pre-trained bounds, skipping training.
+    pub fn with_bounds(num_bits: u16, bounds: std::ops::Range<f64>) -> Self {
+        Self {
+            num_bits,
+            bounds: Some(bounds),
+            ..Default::default()
         }
     }
 }

@@ -3545,7 +3545,9 @@ mod tests {
                 VectorIndexParams::with_ivf_sq_params(
                     DistanceType::L2,
                     ivf_params,
-                    SQBuildParams::default(),
+                    // Shards must share globally-trained bounds to be
+                    // mergeable; the data is generated in [0, 1).
+                    SQBuildParams::with_bounds(8, 0.0..1.0),
                 )
             }
             other => panic!("unsupported test index type: {}", other),
@@ -3807,7 +3809,9 @@ mod tests {
                 DistanceType::L2,
                 prepare_global_ivf(&dataset, "vector").await,
                 HnswBuildParams::default(),
-                SQBuildParams::default(),
+                // Shards must share globally-trained bounds to be mergeable;
+                // the data is generated in [0, 1).
+                SQBuildParams::with_bounds(8, 0.0..1.0),
             ),
             other => panic!("unexpected HNSW index type {other}"),
         };
@@ -3911,6 +3915,207 @@ mod tests {
             error
                 .to_string()
                 .contains("HNSW build parameters mismatch while merging index segments"),
+            "{error}"
+        );
+    }
+
+    fn make_sq_index_params(
+        index_kind: &str,
+        ivf_params: IvfBuildParams,
+        sq_params: SQBuildParams,
+    ) -> VectorIndexParams {
+        match index_kind {
+            "IVF_SQ" => {
+                VectorIndexParams::with_ivf_sq_params(DistanceType::L2, ivf_params, sq_params)
+            }
+            "IVF_HNSW_SQ" => VectorIndexParams::with_ivf_hnsw_sq_params(
+                DistanceType::L2,
+                ivf_params,
+                HnswBuildParams::default(),
+                sq_params,
+            ),
+            other => panic!("unexpected SQ index kind {other}"),
+        }
+    }
+
+    #[rstest]
+    #[case::ivf_sq("IVF_SQ")]
+    #[case::ivf_hnsw_sq("IVF_HNSW_SQ")]
+    #[tokio::test]
+    async fn test_merge_sq_segments_with_injected_bounds(#[case] index_kind: &str) {
+        const INDEX_NAME: &str = "vector_idx";
+        const K: usize = 10;
+        const NUM_QUERIES: usize = 10;
+
+        let test_dir = TempStrDir::default();
+        let base_uri = test_dir.as_str();
+        let (schema, batches) = make_two_fragment_batches();
+
+        let ds_single_uri = format!("{}/single", base_uri);
+        let ds_split_uri = format!("{}/split", base_uri);
+        let mut ds_single =
+            write_dataset_from_batches(&ds_single_uri, schema.clone(), batches.clone()).await;
+        let mut ds_split = write_dataset_from_batches(&ds_split_uri, schema, batches).await;
+
+        // Globally-trained bounds injected into every build; the data is
+        // generated in [0, 1) so these bounds cover it entirely.
+        let injected_bounds = 0.0f64..1.0f64;
+        let ivf_params = prepare_global_ivf(&ds_single, "vector").await;
+        let params = make_sq_index_params(
+            index_kind,
+            ivf_params,
+            SQBuildParams::with_bounds(8, injected_bounds.clone()),
+        );
+
+        // Baseline: single non-sharded index built with the same injected bounds.
+        ds_single
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some(INDEX_NAME.to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Sharded: one uncommitted segment per fragment, then merge + commit.
+        let fragments = ds_split.get_fragments();
+        assert!(fragments.len() >= 2);
+        let mut segments = Vec::new();
+        for fragment in &fragments {
+            let segment = ds_split
+                .create_index_builder(&["vector"], IndexType::Vector, &params)
+                .name(INDEX_NAME.to_string())
+                .fragments(vec![fragment.id() as u32])
+                .execute_uncommitted()
+                .await
+                .unwrap();
+            segments.push(segment);
+        }
+        let merged = ds_split
+            .merge_existing_index_segments(segments)
+            .await
+            .unwrap();
+        ds_split
+            .commit_existing_index_segments(INDEX_NAME, "vector", vec![merged])
+            .await
+            .unwrap();
+
+        // Both the baseline and the merged index must carry exactly the
+        // injected bounds in their SQ storage metadata.
+        let obj_store = Arc::new(ObjectStore::local());
+        let scheduler = ScanScheduler::new(obj_store, SchedulerConfig::default_for_testing());
+        for ds in [&ds_single, &ds_split] {
+            let indices = ds.load_indices_by_name(INDEX_NAME).await.unwrap();
+            assert_eq!(indices.len(), 1);
+            let sq_meta =
+                get_sq_metadata(ds, scheduler.clone(), &indices[0].uuid.to_string()).await;
+            assert_eq!(sq_meta.bounds, injected_bounds);
+        }
+
+        // Query both datasets with the same query set.
+        let query_batch = ds_single
+            .scan()
+            .project(&["vector"] as &[&str])
+            .unwrap()
+            .limit(Some(NUM_QUERIES as i64), None)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let vectors = query_batch["vector"].as_fixed_size_list();
+
+        for i in 0..vectors.len() {
+            let q = vectors.value(i);
+            let collect = |ds: &Dataset| {
+                let q = q.clone();
+                let ds = ds.clone();
+                async move {
+                    let result = ds
+                        .scan()
+                        .with_row_id()
+                        .project(&["_rowid"] as &[&str])
+                        .unwrap()
+                        .nearest("vector", q.as_ref(), K)
+                        .unwrap()
+                        .minimum_nprobes(TWO_FRAG_NUM_PARTITIONS)
+                        .try_into_batch()
+                        .await
+                        .unwrap();
+                    result[ROW_ID]
+                        .as_primitive::<UInt64Type>()
+                        .values()
+                        .iter()
+                        .copied()
+                        .collect::<Vec<u64>>()
+                }
+            };
+            let ids_single = collect(&ds_single).await;
+            let ids_split = collect(&ds_split).await;
+            if index_kind == "IVF_SQ" {
+                // With identical bounds the codes are identical, so the merged
+                // index must return exactly the same Top-K as the baseline.
+                assert_eq!(
+                    ids_single, ids_split,
+                    "single vs merged IVF_SQ returned different Top-K row ids",
+                );
+            } else {
+                // HNSW graph construction is approximate; just require results.
+                assert_eq!(ids_split.len(), K);
+            }
+        }
+    }
+
+    #[rstest]
+    #[case::ivf_sq("IVF_SQ")]
+    #[case::ivf_hnsw_sq("IVF_HNSW_SQ")]
+    #[tokio::test]
+    async fn test_merge_sq_segments_rejects_mismatched_bounds(#[case] index_kind: &str) {
+        let test_dir = TempStrDir::default();
+        let base_uri = test_dir.as_str();
+        let (schema, batches) = make_two_fragment_batches();
+        let dataset_uri = format!("{}/merge_sq_rejects_mismatched_bounds", base_uri);
+        let mut dataset = write_dataset_from_batches(&dataset_uri, schema, batches).await;
+
+        let fragments = dataset.get_fragments();
+        assert!(fragments.len() >= 2);
+
+        let ivf_params = prepare_global_ivf(&dataset, "vector").await;
+        let first_params = make_sq_index_params(
+            index_kind,
+            ivf_params.clone(),
+            SQBuildParams::with_bounds(8, 0.0..1.0),
+        );
+        let second_params = make_sq_index_params(
+            index_kind,
+            ivf_params,
+            SQBuildParams::with_bounds(8, 0.0..2.0),
+        );
+
+        let first_segment = dataset
+            .create_index_builder(&["vector"], IndexType::Vector, &first_params)
+            .name("vector_idx".to_string())
+            .fragments(vec![fragments[0].id() as u32])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        let second_segment = dataset
+            .create_index_builder(&["vector"], IndexType::Vector, &second_params)
+            .name("vector_idx".to_string())
+            .fragments(vec![fragments[1].id() as u32])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+
+        let error = dataset
+            .merge_existing_index_segments(vec![first_segment, second_segment])
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("SQ bounds mismatch across shards"),
             "{error}"
         );
     }
