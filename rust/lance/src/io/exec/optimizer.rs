@@ -78,21 +78,19 @@ impl PhysicalOptimizerRule for CoalesceTake {
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         Ok(plan
             .transform_down(|plan| {
-                if let Some(outer_take) = plan.as_any().downcast_ref::<TakeExec>() {
+                if let Some(outer_take) = plan.downcast_ref::<TakeExec>() {
                     let child = outer_take.children()[0];
                     // Case 1: TakeExec -> TakeExec
-                    if let Some(inner_take) = child.as_any().downcast_ref::<TakeExec>() {
+                    if let Some(inner_take) = child.downcast_ref::<TakeExec>() {
                         return Ok(Transformed::yes(Self::collapse_takes(
                             inner_take,
                             outer_take,
                             plan.clone(),
                         )));
                     // Case 2: TakeExec -> CoalesceBatchesExec -> TakeExec
-                    } else if let Some(exec_child) =
-                        child.as_any().downcast_ref::<CoalesceBatchesExec>()
-                    {
+                    } else if let Some(exec_child) = child.downcast_ref::<CoalesceBatchesExec>() {
                         let inner_child = exec_child.children()[0].clone();
-                        if let Some(inner_take) = inner_child.as_any().downcast_ref::<TakeExec>() {
+                        if let Some(inner_take) = inner_child.downcast_ref::<TakeExec>() {
                             return Ok(Transformed::yes(Self::collapse_takes(
                                 inner_take,
                                 outer_take,
@@ -128,7 +126,7 @@ impl PhysicalOptimizerRule for SimplifyProjection {
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         Ok(plan
             .transform_down(|plan| {
-                if let Some(proj) = plan.as_any().downcast_ref::<ProjectionExec>() {
+                if let Some(proj) = plan.downcast_ref::<ProjectionExec>() {
                     let children = proj.children();
                     if children.len() != 1 {
                         return Ok(Transformed::no(plan));
@@ -145,7 +143,7 @@ impl PhysicalOptimizerRule for SimplifyProjection {
                     }
 
                     if proj.expr().iter().enumerate().all(|(index, proj_expr)| {
-                        if let Some(expr) = proj_expr.expr.as_any().downcast_ref::<Column>() {
+                        if let Some(expr) = proj_expr.expr.downcast_ref::<Column>() {
                             // no renaming, no reordering
                             expr.index() == index && expr.name() == proj_expr.alias
                         } else {

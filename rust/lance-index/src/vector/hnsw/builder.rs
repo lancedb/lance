@@ -1330,7 +1330,6 @@ mod tests {
     use rstest::rstest;
 
     use super::HnswGraph;
-    use crate::scalar::IndexWriter;
     use crate::vector::storage::{DistCalculator, VectorStore};
     use crate::vector::v3::subindex::IvfSubIndex;
     use crate::vector::{
@@ -1375,7 +1374,7 @@ mod tests {
         .unwrap();
         let batch = builder.to_batch().unwrap();
         let metadata = batch.schema_ref().metadata().clone();
-        writer.write_record_batch(batch).await.unwrap();
+        writer.write(&[batch]).await.unwrap();
         writer.finish_with_metadata(&metadata).await.unwrap();
 
         let reader = PreviousFileReader::try_new_self_described(&object_store, &path, None)
@@ -1436,7 +1435,7 @@ mod tests {
         .unwrap();
         let batch = builder.to_batch().unwrap();
         let metadata = batch.schema_ref().metadata().clone();
-        writer.write_record_batch(batch).await.unwrap();
+        writer.write(&[batch]).await.unwrap();
         writer.finish_with_metadata(&metadata).await.unwrap();
 
         let reader = PreviousFileReader::try_new_self_described(&object_store, &path, None)

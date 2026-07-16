@@ -24,7 +24,10 @@ use lance_index::progress::{IndexBuildProgress, NoopIndexBuildProgress};
 use lance_index::{IndexParams, IndexType, scalar::CreatedIndex};
 use lance_index::{
     metrics::NoOpMetricsCollector,
-    scalar::{LANCE_SCALAR_INDEX, ScalarIndexParams, inverted::tokenizer::InvertedIndexParams},
+    scalar::{
+        LANCE_SCALAR_INDEX, ScalarIndexParams, index_files_to_table,
+        inverted::tokenizer::InvertedIndexParams, table_files_to_index,
+    },
 };
 use lance_table::format::{IndexMetadata, list_index_files_with_sizes};
 use std::{collections::HashMap, future::IntoFuture, sync::Arc};
@@ -530,7 +533,7 @@ impl<'a> CreateIndexBuilder<'a> {
                 CreatedIndex {
                     index_details: vector_index_details(vec_params),
                     index_version,
-                    files,
+                    files: table_files_to_index(files),
                 }
             }
             // Can't use if let Some(...) here because it's not stable yet.
@@ -569,7 +572,7 @@ impl<'a> CreateIndexBuilder<'a> {
                 CreatedIndex {
                     index_details: vector_index_details_default(),
                     index_version: self.index_type.version() as u32,
-                    files,
+                    files: table_files_to_index(files),
                 }
             }
             (IndexType::FragmentReuse, _) => {
@@ -602,7 +605,7 @@ impl<'a> CreateIndexBuilder<'a> {
             index_version: created_index.index_version as i32,
             created_at: Some(chrono::Utc::now()),
             base_id: None,
-            files: Some(created_index.files),
+            files: Some(index_files_to_table(created_index.files)),
         })
         }
         .boxed()
@@ -769,7 +772,7 @@ impl<'a> CreateIndexBuilder<'a> {
                 index_version: created_index.index_version as i32,
                 created_at: Some(chrono::Utc::now()),
                 base_id: None,
-                files: Some(created_index.files),
+                files: Some(index_files_to_table(created_index.files)),
             };
             let segments = vec![metadata.into_index_segment()?];
             let new_indices =
@@ -838,7 +841,7 @@ impl<'a> CreateIndexBuilder<'a> {
                 index_version: created_index.index_version as i32,
                 created_at: Some(chrono::Utc::now()),
                 base_id: None,
-                files: Some(created_index.files),
+                files: Some(index_files_to_table(created_index.files)),
             });
         }
 
@@ -2990,7 +2993,7 @@ mod tests {
         let mut legacy_segment = segment.clone();
         legacy_segment.uuid = legacy_uuid;
         legacy_segment.index_version = LABEL_LIST_NULLS_MIN_VERSION;
-        legacy_segment.files = Some(vec![legacy_file]);
+        legacy_segment.files = Some(index_files_to_table(vec![legacy_file]));
 
         let err = dataset
             .merge_existing_index_segments(vec![legacy_segment])

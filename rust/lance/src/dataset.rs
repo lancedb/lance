@@ -80,6 +80,7 @@ pub mod index;
 pub mod mem_wal;
 mod metadata;
 pub mod optimize;
+pub(crate) mod overlay;
 pub mod progress;
 pub mod refs;
 pub(crate) mod rowids;

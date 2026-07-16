@@ -21,8 +21,9 @@ use lance_core::{
 };
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::pbold::InvertedIndexDetails;
+use lance_index::scalar::index_files_to_table;
 use lance_index::scalar::inverted::{
-    DocumentGranularity, InvertedIndex, LEGACY_BLOCK_SIZE,
+    DocumentGranularity, InvertedIndex, InvertedIndexParams, LEGACY_BLOCK_SIZE,
     default_fts_format_version_for_block_size, doc_index_storage_column,
 };
 use lance_index::scalar::lance_format::LanceIndexStore;
@@ -764,7 +765,7 @@ pub(crate) async fn merge_segments(
         index_version: created_index.index_version as i32,
         created_at: Some(chrono::Utc::now()),
         base_id: None,
-        files: Some(created_index.files),
+        files: Some(index_files_to_table(created_index.files)),
         ..segments[0].clone()
     })
 }
@@ -849,6 +850,15 @@ pub async fn load_segment_details(
             column
         ))
     })
+}
+
+/// Read one segment's [`InvertedIndexParams`]
+pub async fn load_segment_params(
+    dataset: &Dataset,
+    segment: &IndexMetadata,
+) -> Result<InvertedIndexParams> {
+    let store = LanceIndexStore::from_dataset_for_existing(dataset, segment).await?;
+    InvertedIndex::load_params(&store).await
 }
 
 #[cfg(test)]
