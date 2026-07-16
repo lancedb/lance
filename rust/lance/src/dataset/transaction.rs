@@ -3100,8 +3100,6 @@ impl Transaction {
             ));
         }
 
-        let fragments = manifest.fragments.clone();
-        let max_logical_fragment_id = manifest.max_logical_fragment_id;
         let layout = Arc::make_mut(
             manifest
                 .row_address_layout
@@ -3109,7 +3107,6 @@ impl Transaction {
                 .expect("row-address layout was checked above"),
         );
         layout.refresh_layout_byte_debt()?;
-        layout.refresh_fingerprint_with_fragments(fragments.as_ref(), max_logical_fragment_id);
 
         let transaction_snapshot_bytes =
             self.serialized_transaction_row_address_metadata_bytes()?;
@@ -3149,8 +3146,6 @@ impl Transaction {
             } else {
                 previous_epoch_bytes.checked_add(commit_bytes)?
             };
-            let fragments = manifest.fragments.clone();
-            let max_logical_fragment_id = manifest.max_logical_fragment_id;
             let layout = Arc::make_mut(
                 manifest
                     .row_address_layout
@@ -3177,13 +3172,24 @@ impl Transaction {
             summary.generation_delta_bytes = snapshot_bytes.generation;
             summary.generation_metadata_bytes_written_since_maintenance =
                 next_epoch_bytes.generation;
-            layout.refresh_fingerprint_with_fragments(fragments.as_ref(), max_logical_fragment_id);
         }
         if !converged {
             return Err(Error::internal(
                 "row-address metadata debt serialization did not converge",
             ));
         }
+        // The fingerprint fields have fixed encoded lengths, so their content
+        // cannot affect debt convergence. Refresh once from the converged
+        // counters instead of rebuilding the full manifest closure per round.
+        let fragments = manifest.fragments.clone();
+        let max_logical_fragment_id = manifest.max_logical_fragment_id;
+        Arc::make_mut(
+            manifest
+                .row_address_layout
+                .as_mut()
+                .expect("row-address layout was checked above"),
+        )
+        .refresh_fingerprint_with_fragments(fragments.as_ref(), max_logical_fragment_id);
         let placement_delta_bytes = snapshot_bytes
             .fast
             .checked_sub(snapshot_bytes.generation)
@@ -6827,6 +6833,14 @@ mod tests {
             debt.generation_metadata_bytes_written_since_maintenance
                 <= debt.metadata_bytes_written_since_maintenance
         );
+        manifest.validate_row_address_contract().unwrap();
+        let layout = manifest.row_address_layout.as_ref().unwrap();
+        let mut refreshed = layout.as_ref().clone();
+        refreshed.refresh_fingerprint_with_fragments(
+            &manifest.fragments,
+            manifest.max_logical_fragment_id,
+        );
+        assert_eq!(refreshed.fingerprint, layout.fingerprint);
     }
 
     #[test]

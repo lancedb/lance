@@ -4431,6 +4431,13 @@ mod tests {
         assert_ne!(first.fast_delta_bytes, 999_002);
         assert_ne!(first.metadata_bytes_written_since_maintenance, 999_003);
         assert!(first.fast_delta_bytes > 0);
+        cloned.validate_row_address_contract().unwrap();
+        let first_fingerprint = cloned
+            .row_address_layout
+            .as_ref()
+            .unwrap()
+            .fingerprint
+            .clone();
 
         transaction
             .finalize_row_address_metadata_debt(
@@ -4445,6 +4452,11 @@ mod tests {
             cloned.row_address_layout.as_ref().unwrap().debt_summary,
             first
         );
+        assert_eq!(
+            cloned.row_address_layout.as_ref().unwrap().fingerprint,
+            first_fingerprint
+        );
+        cloned.validate_row_address_contract().unwrap();
     }
 
     #[test]

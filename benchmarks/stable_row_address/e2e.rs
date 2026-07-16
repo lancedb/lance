@@ -2679,7 +2679,9 @@ async fn execute(
         }
         Operation::DefaultCompactionPreflight => {
             let dataset = open_dataset(args, tracker).await?;
-            args.format.validate_dataset(&dataset)?;
+            // Cold open already validates the persisted v2.3 contract, and
+            // finish_outcome performs full post-measurement validation.
+            args.format.validate_dataset_header(&dataset)?;
             let source_version = dataset.version().version;
             let plan = plan_compaction(&dataset, &default_compaction_options(args)).await?;
             if plan.read_version() != source_version || dataset.version().version != source_version
@@ -2717,7 +2719,11 @@ async fn execute(
         }
         Operation::DefaultCompaction => {
             let mut dataset = open_dataset(args, tracker).await?;
-            args.format.validate_dataset(&dataset)?;
+            // Cold open already validates the persisted v2.3 contract, and
+            // finish_outcome performs full post-measurement validation. Keep
+            // the timed path to the constant-size header check so v2.3 does
+            // not pay for the same full manifest validation twice.
+            args.format.validate_dataset_header(&dataset)?;
             let maintenance_plan = args
                 .maintenance_plan_input
                 .as_ref()

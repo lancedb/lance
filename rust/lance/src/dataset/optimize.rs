@@ -132,6 +132,7 @@ use lance_index::is_system_index;
 use lance_table::format::{
     Fragment, IndexMetadata, PlacementMaintenanceRequired, RowAddressLayoutDelta,
     RowDatasetVersionMeta, RowDatasetVersionRun, RowDatasetVersionSequence, RowIdMeta,
+    ValidatedRowAddressDestinationIndex,
 };
 use lance_table::rowids::segment::U64Segment;
 use lance_table::rowids::{RowIdSequence, read_row_ids, write_row_ids};
@@ -902,10 +903,23 @@ impl CompactionPlanner for DefaultCompactionPlanner {
         let mut compaction_plan =
             CompactionPlan::new(dataset.manifest.version, self.options.clone());
         if dataset.manifest.uses_stable_logical_row_addresses() {
+            let destination_index = dataset
+                .manifest
+                .row_address_layout
+                .as_ref()
+                .ok_or_else(|| {
+                    Error::internal("storage-version-2.3 manifest has no row-address layout")
+                })?
+                .validated_destination_index()?;
             let mut prepared_tasks = Vec::with_capacity(tasks.len());
             for task in tasks {
-                match preflight_v2_3_compaction_task(dataset, &task.fragments, &self.options)
-                    .await?
+                match preflight_v2_3_compaction_task(
+                    dataset,
+                    &task.fragments,
+                    &self.options,
+                    &destination_index,
+                )
+                .await?
                 {
                     V2_3CompactionAdmission::Admitted(prepared) => {
                         prepared_tasks.push((task, prepared));
@@ -1539,8 +1553,9 @@ async fn preflight_v2_3_compaction_task(
     dataset: &Dataset,
     fragments: &[Fragment],
     options: &CompactionOptions,
+    destination_index: &ValidatedRowAddressDestinationIndex<'_>,
 ) -> Result<V2_3CompactionAdmission> {
-    let rows = match plan_default_compaction_rows(dataset, fragments).await {
+    let rows = match plan_default_compaction_rows(dataset, fragments, destination_index).await {
         Err(Error::NotSupported { source, .. })
             if source
                 .downcast_ref::<PlacementMaintenanceRequired>()
@@ -2618,7 +2633,21 @@ async fn rewrite_files(
             metrics.groups_admitted = 1;
             Some(plan)
         } else {
-            match preflight_v2_3_compaction_task(dataset.as_ref(), &task.fragments, options).await?
+            let destination_index = dataset
+                .manifest
+                .row_address_layout
+                .as_ref()
+                .ok_or_else(|| {
+                    Error::internal("storage-version-2.3 manifest has no row-address layout")
+                })?
+                .validated_destination_index()?;
+            match preflight_v2_3_compaction_task(
+                dataset.as_ref(),
+                &task.fragments,
+                options,
+                &destination_index,
+            )
+            .await?
             {
                 V2_3CompactionAdmission::Admitted(prepared) => {
                     metrics.groups_admitted = 1;

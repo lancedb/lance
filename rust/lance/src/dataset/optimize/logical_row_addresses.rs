@@ -8,11 +8,13 @@ use futures::{StreamExt, TryStreamExt};
 use lance_core::utils::address::{LogicalRowAddress, RowAddress};
 use lance_core::{Error, Result};
 use lance_select::{RowAddrSelection, RowAddrTreeMap, RowSetOps};
+#[cfg(test)]
+use lance_table::format::RowAddressLayout;
 use lance_table::format::{
     Fragment, LogicalRowAddressRange, LogicalRowAddressSelection, PlacementMaintenanceRequired,
-    RowAddressLayout, RowAddressLayoutDelta, RowAddressLogicalDomain, RowAddressPlacement,
-    RowAddressPlacementDelta, RowAddressPlacementKind, RowAddressRouter, RowAddressTargetFragment,
-    RowAddressTargetRange, RowSequenceFingerprintBuilder,
+    RowAddressLayoutDelta, RowAddressLogicalDomain, RowAddressPlacement, RowAddressPlacementDelta,
+    RowAddressPlacementKind, RowAddressRouter, RowAddressTargetFragment, RowAddressTargetRange,
+    RowSequenceFingerprintBuilder, ValidatedRowAddressDestinationIndex,
 };
 use lance_table::rowids::{RowIdSequence, read_row_ids, rechunk_sequences, write_row_ids};
 use roaring::{RoaringBitmap, RoaringTreemap};
@@ -228,8 +230,8 @@ fn append_selected_excluded_physical_offsets(
     Ok(())
 }
 
-fn physical_logical_sequences(
-    layout: &RowAddressLayout,
+fn physical_logical_sequences_from_placements<'a>(
+    placements: impl IntoIterator<Item = &'a RowAddressPlacement>,
     physical_fragment_ids: &BTreeSet<u32>,
 ) -> Result<BTreeMap<u32, Vec<PhysicalLogicalSequence>>> {
     let mut sequences = BTreeMap::<u32, Vec<PhysicalLogicalSequence>>::new();
@@ -242,7 +244,7 @@ fn physical_logical_sequences(
         }
     };
 
-    for placement in &layout.placements {
+    for placement in placements {
         match placement {
             RowAddressPlacement::Direct(value) => push(
                 value.destination_fragment_id,
@@ -391,6 +393,14 @@ fn physical_logical_sequences(
         fragment_sequences.sort_by_key(|sequence| sequence.destination_start);
     }
     Ok(sequences)
+}
+
+#[cfg(test)]
+fn physical_logical_sequences(
+    layout: &RowAddressLayout,
+    physical_fragment_ids: &BTreeSet<u32>,
+) -> Result<BTreeMap<u32, Vec<PhysicalLogicalSequence>>> {
+    physical_logical_sequences_from_placements(layout.placements.iter(), physical_fragment_ids)
 }
 
 fn validated_logical_ranges(sequence: &RowIdSequence) -> Result<Vec<std::ops::Range<u64>>> {
@@ -829,12 +839,8 @@ fn append_fragment_provenance(
 pub(super) async fn plan_default_compaction_rows(
     dataset: &Dataset,
     fragments: &[Fragment],
+    destination_index: &ValidatedRowAddressDestinationIndex<'_>,
 ) -> Result<PlannedDefaultCompactionRows> {
-    let layout = dataset
-        .manifest
-        .row_address_layout
-        .as_ref()
-        .ok_or_else(|| Error::internal("storage-version-2.3 manifest has no row-address layout"))?;
     let physical_fragment_ids = fragments
         .iter()
         .map(|fragment| {
@@ -879,7 +885,16 @@ pub(super) async fn plan_default_compaction_rows(
             Ok((fragment, physical_rows, deleted))
         })
         .collect::<Result<Vec<_>>>()?;
-    let mut placement_sequences = physical_logical_sequences(layout, &physical_fragment_ids)?;
+    for (fragment, _, deleted) in fragment_states
+        .iter()
+        .filter(|(fragment, _, _)| fragment.native_logical_domain.is_none())
+    {
+        destination_index.verify_visibility(fragment, deleted)?;
+    }
+    let placements =
+        destination_index.placements_for_fragments(physical_fragment_ids.iter().copied());
+    let mut placement_sequences =
+        physical_logical_sequences_from_placements(placements, &physical_fragment_ids)?;
 
     let mut canonical_live_rows = RowAddrTreeMap::new();
     let mut current_run_end = None;
@@ -929,7 +944,6 @@ pub(super) async fn plan_default_compaction_rows(
                 )?);
             }
         } else {
-            layout.verify_visibility(&fragment, &deleted)?;
             let sequences = placement_sequences.remove(&fragment_id).unwrap_or_default();
             append_fragment_provenance(
                 &sequences,

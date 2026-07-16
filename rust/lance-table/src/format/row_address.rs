@@ -3300,6 +3300,53 @@ pub struct RowAddressLayout {
     pub logical_domain_fingerprint: Vec<u8>,
 }
 
+/// An immutable view of a row-address layout whose destination index has been
+/// checked against every persisted placement.
+#[derive(Debug, Clone, Copy)]
+pub struct ValidatedRowAddressDestinationIndex<'a> {
+    layout: &'a RowAddressLayout,
+}
+
+impl<'a> ValidatedRowAddressDestinationIndex<'a> {
+    /// Verify one fragment using only the placements referenced by its
+    /// destination-index entry.
+    pub fn verify_visibility(
+        &self,
+        fragment: &Fragment,
+        deleted_offsets: &RoaringBitmap,
+    ) -> Result<()> {
+        self.layout
+            .verify_visibility_from_index(fragment, deleted_offsets)
+    }
+
+    /// Return each placement referenced by the requested physical fragments
+    /// exactly once.
+    pub fn placements_for_fragments(
+        &self,
+        fragment_ids: impl IntoIterator<Item = u32>,
+    ) -> Vec<&'a RowAddressPlacement> {
+        let mut placement_indices = BTreeSet::new();
+        for fragment_id in fragment_ids {
+            if let Ok(index) = self
+                .layout
+                .destination_index
+                .binary_search_by_key(&fragment_id, |entry| entry.physical_fragment_id)
+            {
+                placement_indices.extend(
+                    self.layout.destination_index[index]
+                        .placement_indices
+                        .iter()
+                        .copied(),
+                );
+            }
+        }
+        placement_indices
+            .into_iter()
+            .map(|index| &self.layout.placements[index as usize])
+            .collect()
+    }
+}
+
 impl DeepSizeOf for RowAddressLayout {
     fn deep_size_of_children(&self, context: &mut Context) -> usize {
         self.placements.deep_size_of_children(context)
@@ -7880,6 +7927,32 @@ impl RowAddressLayout {
             context.current_fragments,
             context.current_max_logical_fragment_id,
         )?;
+        let mut current_fragments_by_id =
+            HashMap::<u64, &Fragment>::with_capacity(context.current_fragments.len());
+        for fragment in context.current_fragments {
+            if current_fragments_by_id
+                .insert(fragment.id, fragment)
+                .is_some()
+            {
+                return Err(Error::invalid_input(format!(
+                    "source snapshot contains duplicate physical fragment id {}",
+                    fragment.id
+                )));
+            }
+        }
+        let mut successor_fragments_by_id =
+            HashMap::<u64, &Fragment>::with_capacity(context.successor_fragments.len());
+        for fragment in context.successor_fragments {
+            if successor_fragments_by_id
+                .insert(fragment.id, fragment)
+                .is_some()
+            {
+                return Err(Error::invalid_input(format!(
+                    "successor snapshot contains duplicate physical fragment id {}",
+                    fragment.id
+                )));
+            }
+        }
         validate_strictly_sorted_domains(&delta.source_domains)?;
         let declared_domains = delta
             .source_domains
@@ -7982,10 +8055,9 @@ impl RowAddressLayout {
             }
             let target_fragment_id =
                 target_fragment_id(placement.target, context.resolved_new_fragment_ids)?;
-            let target_fragment = context
-                .successor_fragments
-                .iter()
-                .find(|fragment| fragment.id == target_fragment_id as u64)
+            let target_fragment = successor_fragments_by_id
+                .get(&u64::from(target_fragment_id))
+                .copied()
                 .ok_or_else(|| {
                     Error::invalid_input(format!(
                         "placement target fragment {target_fragment_id} is absent from successor"
@@ -8210,10 +8282,7 @@ impl RowAddressLayout {
             let Some(removed_slots) = removed.get(&native.logical_fragment_id) else {
                 continue;
             };
-            let successor = context
-                .successor_fragments
-                .iter()
-                .find(|successor| successor.id == fragment.id);
+            let successor = successor_fragments_by_id.get(&fragment.id).copied();
             if successor.is_some_and(|successor| successor.native_logical_domain.is_some()) {
                 return Err(Error::invalid_input(format!(
                     "updated native logical domain {} must clear its native marker in the successor",
@@ -8248,10 +8317,9 @@ impl RowAddressLayout {
             {
                 let fragment_id =
                     target_fragment_id(placement.target, context.resolved_new_fragment_ids)?;
-                let fragment = context
-                    .successor_fragments
-                    .iter()
-                    .find(|fragment| fragment.id == fragment_id as u64)
+                let fragment = successor_fragments_by_id
+                    .get(&u64::from(fragment_id))
+                    .copied()
                     .expect("target fragment was validated above");
                 if fragment.native_logical_domain.is_none() {
                     return Err(Error::invalid_input(
@@ -8277,10 +8345,8 @@ impl RowAddressLayout {
                         *destination == fragment_id && *start == placement.target.start_offset
                     })
                     || ranges.iter().any(|(destination, start, rows)| {
-                        context
-                            .successor_fragments
-                            .iter()
-                            .find(|fragment| fragment.id == *destination as u64)
+                        successor_fragments_by_id
+                            .get(&u64::from(*destination))
                             .and_then(|fragment| fragment.physical_rows)
                             .is_none_or(|physical_rows| {
                                 *start as u64 + *rows > physical_rows as u64
@@ -8323,10 +8389,7 @@ impl RowAddressLayout {
                 return true;
             };
             explicit.destinations.retain(|destination| {
-                context
-                    .successor_fragments
-                    .iter()
-                    .any(|fragment| fragment.id == destination.physical_fragment_id as u64)
+                successor_fragments_by_id.contains_key(&u64::from(destination.physical_fragment_id))
             });
             !explicit.destinations.is_empty()
         });
@@ -8338,26 +8401,30 @@ impl RowAddressLayout {
             .map(|summary| (summary.physical_fragment_id, summary))
             .collect::<BTreeMap<_, _>>();
         candidate.physical_row_ownership.clear();
-        for fragment in context
+        candidate.canonicalize();
+        let mut successor_target_fragments = context
             .successor_fragments
             .iter()
             .filter(|fragment| fragment.native_logical_domain.is_none())
-        {
+            .collect::<Vec<_>>();
+        successor_target_fragments.sort_unstable_by_key(|fragment| fragment.id);
+        for fragment in successor_target_fragments {
             let fragment_id = physical_fragment_id(fragment.id, "target-only fragment")?;
             let unchanged_target_only = !affected_physical_fragments.contains(&fragment_id)
-                && context.current_fragments.iter().any(|current| {
-                    current.id == fragment.id
-                        && current.native_logical_domain.is_none()
-                        && current.physical_rows == fragment.physical_rows
-                        && current.deletion_file == fragment.deletion_file
-                });
+                && current_fragments_by_id
+                    .get(&fragment.id)
+                    .is_some_and(|current| {
+                        current.native_logical_domain.is_none()
+                            && current.physical_rows == fragment.physical_rows
+                            && current.deletion_file == fragment.deletion_file
+                    });
             if unchanged_target_only {
                 let summary = previous_ownership.get(&fragment_id).ok_or_else(|| {
                     Error::invalid_input(format!(
                         "unchanged target-only fragment {fragment_id} is missing its ownership summary"
                     ))
                 })?;
-                candidate.physical_row_ownership.push((*summary).clone());
+                candidate.set_physical_ownership_summary((*summary).clone());
                 continue;
             }
             if fragment.deletion_file.is_some() {
@@ -8366,12 +8433,15 @@ impl RowAddressLayout {
                         "target-only fragment {fragment_id} is missing its deletion vector input"
                     ))
                 })?;
-                candidate.refresh_physical_ownership_summary(fragment, deleted_offsets)?;
+                candidate
+                    .refresh_physical_ownership_summary_from_index(fragment, deleted_offsets)?;
             } else {
-                candidate.refresh_physical_ownership_summary(fragment, &RoaringBitmap::new())?;
+                candidate.refresh_physical_ownership_summary_from_index(
+                    fragment,
+                    &RoaringBitmap::new(),
+                )?;
             }
         }
-        candidate.canonicalize();
         let (max_extent_fanout, max_extent_domain) = max_extent_fanout(&candidate.placements)?;
         candidate.refresh_layout_byte_debt()?;
         let fast_layout_bytes = candidate.debt_summary.canonical_layout_bytes;
@@ -9102,13 +9172,18 @@ impl RowAddressLayout {
                 })?;
             let mut mapped_row_count = 0_u64;
             let mut fingerprint = OffsetRangesFingerprintBuilder::new();
-            for_each_canonical_mapped_offset_range(&self.placements, fragment_id, |start, end| {
-                mapped_row_count = mapped_row_count
-                    .checked_add((end - start) as u64)
-                    .ok_or_else(|| Error::invalid_input("mapped row count overflow"))?;
-                fingerprint.update(start, end);
-                Ok(())
-            })?;
+            for_each_indexed_canonical_mapped_offset_range(
+                &self.placements,
+                &self.destination_index,
+                fragment_id,
+                |start, end| {
+                    mapped_row_count = mapped_row_count
+                        .checked_add((end - start) as u64)
+                        .ok_or_else(|| Error::invalid_input("mapped row count overflow"))?;
+                    fingerprint.update(start, end);
+                    Ok(())
+                },
+            )?;
             let unowned_row_count =
                 physical_rows.checked_sub(mapped_row_count).ok_or_else(|| {
                     Error::invalid_input("mapped rows exceed target fragment physical rows")
@@ -9154,6 +9229,62 @@ impl RowAddressLayout {
         fragment: &Fragment,
         deleted_offsets: &RoaringBitmap,
     ) -> Result<()> {
+        self.verify_visibility_with_placements(fragment, deleted_offsets, self.placements.iter())
+    }
+
+    /// Check the persisted destination index once and return an immutable view
+    /// that can reuse it for bounded fragment-local lookups.
+    pub fn validated_destination_index(&self) -> Result<ValidatedRowAddressDestinationIndex<'_>> {
+        if self.destination_index != build_destination_index(&self.placements) {
+            return Err(Error::invalid_input(
+                "RowAddressLayout destination index does not match placement destinations",
+            ));
+        }
+        Ok(ValidatedRowAddressDestinationIndex { layout: self })
+    }
+
+    fn verify_visibility_from_index(
+        &self,
+        fragment: &Fragment,
+        deleted_offsets: &RoaringBitmap,
+    ) -> Result<()> {
+        let fragment_id = physical_fragment_id(fragment.id, "DataFragment")?;
+        let placement_indices = self
+            .destination_index
+            .binary_search_by_key(&fragment_id, |entry| entry.physical_fragment_id)
+            .ok()
+            .map(|index| &self.destination_index[index].placement_indices);
+        let Some(placement_indices) = placement_indices else {
+            return self.verify_visibility_with_placements(
+                fragment,
+                deleted_offsets,
+                std::iter::empty(),
+            );
+        };
+        for placement_index in placement_indices {
+            self.placements
+                .get(*placement_index as usize)
+                .ok_or_else(|| {
+                    Error::invalid_input(
+                        "row-address destination index references a missing placement",
+                    )
+                })?;
+        }
+        self.verify_visibility_with_placements(
+            fragment,
+            deleted_offsets,
+            placement_indices
+                .iter()
+                .map(|index| &self.placements[*index as usize]),
+        )
+    }
+
+    fn verify_visibility_with_placements<'a>(
+        &self,
+        fragment: &Fragment,
+        deleted_offsets: &RoaringBitmap,
+        placements: impl IntoIterator<Item = &'a RowAddressPlacement>,
+    ) -> Result<()> {
         let fragment_id = physical_fragment_id(fragment.id, "DataFragment")?;
         if fragment.native_logical_domain.is_some() {
             return Ok(());
@@ -9193,7 +9324,7 @@ impl RowAddressLayout {
         }
         let mut cursor = 0_u32;
         let mut unowned = 0_u64;
-        for_each_canonical_mapped_offset_range(&self.placements, fragment_id, |start, end| {
+        for_each_canonical_mapped_offset_range(placements, fragment_id, |start, end| {
             if cursor < start {
                 if !deleted_offsets.contains_range(cursor..start) {
                     return Err(Error::invalid_input(
@@ -9333,6 +9464,15 @@ impl RowAddressLayout {
         fragment: &Fragment,
         deleted_offsets: &RoaringBitmap,
     ) -> Result<()> {
+        self.destination_index = build_destination_index(&self.placements);
+        self.refresh_physical_ownership_summary_from_index(fragment, deleted_offsets)
+    }
+
+    fn refresh_physical_ownership_summary_from_index(
+        &mut self,
+        fragment: &Fragment,
+        deleted_offsets: &RoaringBitmap,
+    ) -> Result<()> {
         let fragment_id = physical_fragment_id(fragment.id, "DataFragment")?;
         if fragment.native_logical_domain.is_some() {
             self.physical_row_ownership
@@ -9345,13 +9485,18 @@ impl RowAddressLayout {
         .map_err(|_| Error::invalid_input("fragment row count exceeds u64"))?;
         let mut mapped_row_count = 0_u64;
         let mut fingerprint = OffsetRangesFingerprintBuilder::new();
-        for_each_canonical_mapped_offset_range(&self.placements, fragment_id, |start, end| {
-            mapped_row_count = mapped_row_count
-                .checked_add((end - start) as u64)
-                .ok_or_else(|| Error::invalid_input("mapped row count overflow"))?;
-            fingerprint.update(start, end);
-            Ok(())
-        })?;
+        for_each_indexed_canonical_mapped_offset_range(
+            &self.placements,
+            &self.destination_index,
+            fragment_id,
+            |start, end| {
+                mapped_row_count = mapped_row_count
+                    .checked_add((end - start) as u64)
+                    .ok_or_else(|| Error::invalid_input("mapped row count overflow"))?;
+                fingerprint.update(start, end);
+                Ok(())
+            },
+        )?;
         let summary = PhysicalRowOwnershipSummary {
             physical_fragment_id: fragment_id,
             mapped_row_count,
@@ -9365,12 +9510,19 @@ impl RowAddressLayout {
                 .checked_sub(mapped_row_count)
                 .ok_or_else(|| Error::invalid_input("mapped rows exceed fragment physical rows"))?,
         };
-        self.physical_row_ownership
-            .retain(|existing| existing.physical_fragment_id != fragment_id);
-        self.physical_row_ownership.push(summary);
-        self.physical_row_ownership
-            .sort_by_key(|summary| summary.physical_fragment_id);
-        self.verify_visibility(fragment, deleted_offsets)
+        self.set_physical_ownership_summary(summary);
+        self.verify_visibility_from_index(fragment, deleted_offsets)
+    }
+
+    fn set_physical_ownership_summary(&mut self, summary: PhysicalRowOwnershipSummary) {
+        match self
+            .physical_row_ownership
+            .binary_search_by_key(&summary.physical_fragment_id, |existing| {
+                existing.physical_fragment_id
+            }) {
+            Ok(index) => self.physical_row_ownership[index] = summary,
+            Err(index) => self.physical_row_ownership.insert(index, summary),
+        }
     }
 
     pub fn is_retired(&self, address: LogicalRowAddress) -> Result<bool> {
@@ -9749,8 +9901,36 @@ pub fn fingerprint_deleted_offsets(bitmap: &RoaringBitmap) -> Vec<u8> {
     builder.finish()
 }
 
-fn for_each_canonical_mapped_offset_range(
+fn for_each_indexed_canonical_mapped_offset_range(
     placements: &[RowAddressPlacement],
+    destination_index: &[RowAddressDestinationIndexEntry],
+    fragment_id: u32,
+    visit: impl FnMut(u32, u32) -> Result<()>,
+) -> Result<()> {
+    let Some(destination) = destination_index
+        .binary_search_by_key(&fragment_id, |entry| entry.physical_fragment_id)
+        .ok()
+        .map(|index| &destination_index[index])
+    else {
+        return Ok(());
+    };
+    for placement_index in &destination.placement_indices {
+        placements.get(*placement_index as usize).ok_or_else(|| {
+            Error::invalid_input("row-address destination index references a missing placement")
+        })?;
+    }
+    for_each_canonical_mapped_offset_range(
+        destination
+            .placement_indices
+            .iter()
+            .map(|index| &placements[*index as usize]),
+        fragment_id,
+        visit,
+    )
+}
+
+fn for_each_canonical_mapped_offset_range<'a>(
+    placements: impl IntoIterator<Item = &'a RowAddressPlacement>,
     fragment_id: u32,
     mut visit: impl FnMut(u32, u32) -> Result<()>,
 ) -> Result<()> {
@@ -12989,6 +13169,56 @@ mod tests {
     }
 
     #[test]
+    fn destination_index_bounds_fragment_ownership_lookup() {
+        const FRAGMENT_COUNT: u32 = 4096;
+        let placements = (0..FRAGMENT_COUNT)
+            .map(|fragment_id| {
+                RowAddressPlacement::Direct(DirectRowAddressPlacement {
+                    source: domain(fragment_id, 1),
+                    destination_fragment_id: fragment_id,
+                    destination_start: 0,
+                    excluded: None,
+                })
+            })
+            .collect::<Vec<_>>();
+        let destination_index = build_destination_index(&placements);
+
+        assert_eq!(destination_index.len(), FRAGMENT_COUNT as usize);
+        for fragment_id in [0, FRAGMENT_COUNT / 2, FRAGMENT_COUNT - 1] {
+            let mut ranges = Vec::new();
+            for_each_indexed_canonical_mapped_offset_range(
+                &placements,
+                &destination_index,
+                fragment_id,
+                |start, end| {
+                    ranges.push((start, end));
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(ranges, vec![(0, 1)]);
+            assert_eq!(
+                destination_index[fragment_id as usize].placement_indices,
+                vec![fragment_id]
+            );
+        }
+
+        let corrupt_index = vec![RowAddressDestinationIndexEntry {
+            physical_fragment_id: 0,
+            placement_indices: vec![u32::MAX],
+        }];
+        let error = for_each_indexed_canonical_mapped_offset_range(
+            &placements,
+            &corrupt_index,
+            0,
+            |_, _| Ok(()),
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("references a missing placement"));
+    }
+
+    #[test]
     fn ownership_allows_deleted_mapped_rows_but_requires_unowned_subset() {
         let mut target = fragment(10, 4, None);
         target.deletion_file = Some(crate::format::DeletionFile {
@@ -13042,13 +13272,62 @@ mod tests {
             }),
         ];
 
+        assert!(layout.destination_index.is_empty());
         layout
             .refresh_physical_ownership_summary(&target, &RoaringBitmap::new())
             .unwrap();
+        assert_eq!(
+            layout.destination_index,
+            vec![RowAddressDestinationIndexEntry {
+                physical_fragment_id: 9,
+                placement_indices: vec![0, 1],
+            }]
+        );
         layout.refresh_fingerprint_with_fragments(std::slice::from_ref(&target), Some(8));
         layout
             .validate_with_fragments(std::slice::from_ref(&target), Some(8))
             .unwrap();
+        let destination_index = layout.validated_destination_index().unwrap();
+        assert_eq!(
+            destination_index
+                .placements_for_fragments([target.id as u32, target.id as u32])
+                .len(),
+            2
+        );
+        destination_index
+            .verify_visibility(&target, &RoaringBitmap::new())
+            .unwrap();
+        let mut missing_index = layout.clone();
+        missing_index.destination_index.clear();
+        missing_index
+            .verify_visibility(&target, &RoaringBitmap::new())
+            .unwrap();
+        assert!(
+            missing_index
+                .validated_destination_index()
+                .unwrap_err()
+                .to_string()
+                .contains("destination index does not match")
+        );
+        let mut incomplete_index = layout.clone();
+        incomplete_index.destination_index[0].placement_indices = vec![0];
+        incomplete_index
+            .verify_visibility(&target, &RoaringBitmap::new())
+            .unwrap();
+        assert!(
+            incomplete_index
+                .validated_destination_index()
+                .unwrap_err()
+                .to_string()
+                .contains("destination index does not match")
+        );
+        assert!(
+            incomplete_index
+                .validate_with_fragments(std::slice::from_ref(&target), Some(8))
+                .unwrap_err()
+                .to_string()
+                .contains("destination index does not match")
+        );
 
         let router =
             RowAddressRouter::try_new(Arc::new(layout), std::slice::from_ref(&target), Some(8))
@@ -13738,6 +14017,110 @@ mod tests {
                 end_offset: 6,
             })]
         );
+    }
+
+    #[test]
+    fn apply_delta_rejects_duplicate_successor_fragment_ids() {
+        let current_fragment = fragment(0, 4, Some((0, 1)));
+        let mut layout = RowAddressLayout::new(Uuid::new_v4());
+        layout.refresh_fingerprint_with_fragments(std::slice::from_ref(&current_fragment), Some(0));
+        let delta = RowAddressLayoutDelta {
+            expected_layout_fingerprint: layout.fingerprint.clone(),
+            ..Default::default()
+        };
+        let successor = vec![current_fragment.clone(), current_fragment.clone()];
+
+        let error = layout
+            .apply_delta(
+                &delta,
+                &RowAddressDeltaApplyContext {
+                    current_fragments: std::slice::from_ref(&current_fragment),
+                    successor_fragments: &successor,
+                    resolved_new_fragment_ids: &BTreeMap::new(),
+                    current_deletion_vectors: &BTreeMap::new(),
+                    newly_fully_deleted_source_fragments: &BTreeSet::new(),
+                    deletion_vectors: &BTreeMap::new(),
+                    explicit_map_placements: &BTreeMap::new(),
+                    commit_version: 2,
+                    current_max_logical_fragment_id: Some(0),
+                    max_logical_fragment_id: Some(0),
+                    row_address_metadata_bytes_written: 0,
+                },
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("successor snapshot contains duplicate physical fragment id 0")
+        );
+    }
+
+    #[test]
+    fn apply_delta_canonicalizes_shuffled_successor_ownership() {
+        let current_fragments = vec![fragment(10, 1, None), fragment(11, 1, None)];
+        let mut layout = RowAddressLayout::new(Uuid::new_v4());
+        layout.placements = vec![
+            RowAddressPlacement::Direct(DirectRowAddressPlacement {
+                source: domain(0, 1),
+                destination_fragment_id: 10,
+                destination_start: 0,
+                excluded: None,
+            }),
+            RowAddressPlacement::Direct(DirectRowAddressPlacement {
+                source: domain(1, 1),
+                destination_fragment_id: 11,
+                destination_start: 0,
+                excluded: None,
+            }),
+        ];
+        for fragment in &current_fragments {
+            layout
+                .refresh_physical_ownership_summary(fragment, &RoaringBitmap::new())
+                .unwrap();
+        }
+        layout.refresh_fingerprint_with_fragments(&current_fragments, Some(1));
+        let delta = RowAddressLayoutDelta {
+            expected_layout_fingerprint: layout.fingerprint.clone(),
+            ..Default::default()
+        };
+        let mut successor_fragments = current_fragments.clone();
+        successor_fragments.reverse();
+
+        let result = layout
+            .apply_delta(
+                &delta,
+                &RowAddressDeltaApplyContext {
+                    current_fragments: &current_fragments,
+                    successor_fragments: &successor_fragments,
+                    resolved_new_fragment_ids: &BTreeMap::new(),
+                    current_deletion_vectors: &BTreeMap::new(),
+                    newly_fully_deleted_source_fragments: &BTreeSet::new(),
+                    deletion_vectors: &BTreeMap::new(),
+                    explicit_map_placements: &BTreeMap::new(),
+                    commit_version: 2,
+                    current_max_logical_fragment_id: Some(1),
+                    max_logical_fragment_id: Some(1),
+                    row_address_metadata_bytes_written: 0,
+                },
+            )
+            .unwrap();
+        let RowAddressLayoutApplyResult::Admitted { layout, .. } = result else {
+            panic!("unchanged shuffled successor should be admitted");
+        };
+
+        assert_eq!(
+            layout
+                .physical_row_ownership
+                .iter()
+                .map(|summary| summary.physical_fragment_id)
+                .collect::<Vec<_>>(),
+            vec![10, 11]
+        );
+        layout
+            .validate_with_fragments(&successor_fragments, Some(1))
+            .unwrap();
     }
 
     #[test]
