@@ -373,6 +373,19 @@ pub enum Error {
         #[snafu(implicit)]
         location: Location,
     },
+    /// A write was refused to keep the writer inside its memory budget.
+    ///
+    /// Unlike every other write error this one is *expected* under load and
+    /// carries no data loss: the write was never accepted, so a caller that
+    /// retries once the flush pipeline drains loses nothing. Callers should
+    /// surface it as a retryable "busy" signal (HTTP 503), not a failure.
+    /// Match via [`Error::is_backpressure`] rather than on the message.
+    #[snafu(display("Write rejected by backpressure: {message}, {location}"))]
+    Backpressure {
+        message: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
 }
 
 impl Error {
@@ -423,7 +436,8 @@ impl Error {
             | Self::FieldNotFound { .. }
             | Self::Timeout { .. }
             | Self::DiskCapExceeded { .. }
-            | Self::Fenced { .. } => None,
+            | Self::Fenced { .. }
+            | Self::Backpressure { .. } => None,
         }
     }
 
@@ -483,6 +497,23 @@ impl Error {
             Self::Fenced { reason, .. } => Some(*reason),
             _ => None,
         }
+    }
+
+    /// A write was refused because the writer is at its memory ceiling; the
+    /// data was never accepted. See [`Error::Backpressure`].
+    #[track_caller]
+    pub fn backpressure(message: impl Into<String>) -> Self {
+        BackpressureSnafu {
+            message: message.into(),
+        }
+        .build()
+    }
+
+    /// Whether this is [`Error::Backpressure`] — i.e. a retryable "writer is
+    /// full" signal rather than a real failure. Prefer this over matching the
+    /// error message.
+    pub fn is_backpressure(&self) -> bool {
+        matches!(self, Self::Backpressure { .. })
     }
 
     #[track_caller]
