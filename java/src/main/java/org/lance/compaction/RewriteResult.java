@@ -35,6 +35,7 @@ public class RewriteResult implements Serializable {
   @Nullable private final byte[] rowAddrs;
   @Nullable private final byte[] logicalRowIds;
   @Nullable private final byte[] retiredLogicalRowIds;
+  @Nullable private final byte[] rowAddressLayoutDelta;
 
   public RewriteResult(
       CompactionMetrics metrics,
@@ -53,6 +54,26 @@ public class RewriteResult implements Serializable {
       @Nullable byte[] rowAddrs,
       @Nullable byte[] logicalRowIds,
       @Nullable byte[] retiredLogicalRowIds) {
+    this(
+        metrics,
+        newFragments,
+        originalFragments,
+        readVersion,
+        rowAddrs,
+        logicalRowIds,
+        retiredLogicalRowIds,
+        null);
+  }
+
+  public RewriteResult(
+      CompactionMetrics metrics,
+      List<FragmentMetadata> newFragments,
+      List<FragmentMetadata> originalFragments,
+      long readVersion,
+      @Nullable byte[] rowAddrs,
+      @Nullable byte[] logicalRowIds,
+      @Nullable byte[] retiredLogicalRowIds,
+      @Nullable byte[] rowAddressLayoutDelta) {
     this.metrics = metrics;
     this.newFragments = newFragments;
     this.originalFragments = originalFragments;
@@ -60,6 +81,7 @@ public class RewriteResult implements Serializable {
     this.rowAddrs = rowAddrs;
     this.logicalRowIds = logicalRowIds;
     this.retiredLogicalRowIds = retiredLogicalRowIds;
+    this.rowAddressLayoutDelta = rowAddressLayoutDelta;
   }
 
   public long getReadVersion() {
@@ -85,6 +107,12 @@ public class RewriteResult implements Serializable {
   @Nullable
   public byte[] getRetiredLogicalRowIds() {
     return retiredLogicalRowIds;
+  }
+
+  /** Placement provenance admitted while planning a storage-version-2.3 rewrite. */
+  @Nullable
+  public byte[] getRowAddressLayoutDelta() {
+    return rowAddressLayoutDelta;
   }
 
   public List<FragmentMetadata> getNewFragments() {

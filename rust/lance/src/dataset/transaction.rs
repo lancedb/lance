@@ -3190,6 +3190,11 @@ impl Transaction {
                 .expect("row-address layout was checked above"),
         )
         .refresh_fingerprint_with_fragments(fragments.as_ref(), max_logical_fragment_id);
+        manifest
+            .row_address_layout
+            .as_ref()
+            .expect("row-address layout was checked above")
+            .validate_with_fragments(fragments.as_ref(), max_logical_fragment_id)?;
         let placement_delta_bytes = snapshot_bytes
             .fast
             .checked_sub(snapshot_bytes.generation)
@@ -4375,7 +4380,7 @@ impl Transaction {
                     max_logical_fragment_id: manifest.max_logical_fragment_id,
                     row_address_metadata_bytes_written: 0,
                 };
-                match current_layout.apply_delta(delta, &apply_context)? {
+                match current_layout.apply_delta_for_commit(delta, &apply_context)? {
                     RowAddressLayoutApplyResult::Admitted { layout, .. } => {
                         manifest.row_address_layout = Some(Arc::from(layout));
                     }
@@ -4384,8 +4389,6 @@ impl Transaction {
                     }
                 }
             }
-            let fragments = manifest.fragments.clone();
-            let max_logical_fragment_id = manifest.max_logical_fragment_id;
             let layout = manifest.row_address_layout.as_mut().ok_or_else(|| {
                 Error::invalid_input(
                     "storage-version-2.3 manifest is missing its row-address layout",
@@ -4398,8 +4401,6 @@ impl Transaction {
                 &final_indices,
                 new_version,
             )?;
-            layout.refresh_fingerprint_with_fragments(fragments.as_ref(), max_logical_fragment_id);
-            layout.validate_with_fragments(fragments.as_ref(), max_logical_fragment_id)?;
 
             let maintenance_boundary = matches!(
                 &self.operation,

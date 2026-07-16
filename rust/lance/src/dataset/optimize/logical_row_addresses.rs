@@ -23,8 +23,8 @@ use crate::Dataset;
 use crate::io::deletion::read_dataset_deletion_file;
 
 pub(super) struct PlannedDefaultCompactionRows {
-    pub logical_row_ids: Vec<u8>,
-    pub retired_logical_row_ids: Option<Vec<u8>>,
+    pub logical_row_ids: RowIdSequence,
+    pub retired_logical_row_ids: Option<RowIdSequence>,
     pub current_deletion_vectors: BTreeMap<u32, RoaringBitmap>,
     /// Exclusive source-fragment boundaries for monotonic input runs that
     /// must be merged by logical row address. Empty when the physical input is
@@ -896,7 +896,8 @@ pub(super) async fn plan_default_compaction_rows(
     let mut placement_sequences =
         physical_logical_sequences_from_placements(placements, &physical_fragment_ids)?;
 
-    let mut canonical_live_rows = RowAddrTreeMap::new();
+    let mut physical_order_live_rows = RowIdSequence::new();
+    let mut canonical_live_rows = None::<RowAddrTreeMap>;
     let mut current_run_end = None;
     let mut logical_run_ends = Vec::new();
     let mut requires_full_logical_sort = false;
@@ -961,11 +962,13 @@ pub(super) async fn plan_default_compaction_rows(
             .ok()
             .and_then(|len| len.checked_sub(1))
             .and_then(|last| fragment_sequence.get(last));
+        let starts_new_logical_run = matches!(
+            (current_run_end, first),
+            (Some(run_end), Some(first)) if run_end >= first
+        );
         if !is_fragment_monotonic {
             requires_full_logical_sort = true;
-        } else if let (Some(run_end), Some(first)) = (current_run_end, first)
-            && run_end >= first
-        {
+        } else if starts_new_logical_run {
             logical_run_ends.push(u32::try_from(fragment_index).map_err(|_| {
                 Error::invalid_input("compaction source fragment count exceeds u32")
             })?);
@@ -974,12 +977,21 @@ pub(super) async fn plan_default_compaction_rows(
             current_run_end = Some(last);
         }
 
-        merge_fragment_logical_rows(
-            &mut canonical_live_rows,
-            RowAddrTreeMap::from(&fragment_sequence),
-            fragment_len,
-            fragment_id,
-        )?;
+        if canonical_live_rows.is_none() && (!is_fragment_monotonic || starts_new_logical_run) {
+            let accumulated =
+                std::mem::replace(&mut physical_order_live_rows, RowIdSequence::new());
+            canonical_live_rows = Some(RowAddrTreeMap::from(&accumulated));
+        }
+        if let Some(canonical_live_rows) = canonical_live_rows.as_mut() {
+            merge_fragment_logical_rows(
+                canonical_live_rows,
+                RowAddrTreeMap::from(&fragment_sequence),
+                fragment_len,
+                fragment_id,
+            )?;
+        } else {
+            physical_order_live_rows.extend(fragment_sequence);
+        }
 
         if !deleted.is_empty() {
             current_deletion_vectors.insert(fragment_id, deleted);
@@ -995,12 +1007,16 @@ pub(super) async fn plan_default_compaction_rows(
             })?,
         );
     }
-    let logical_sequence = canonical_logical_sequence(canonical_live_rows)?;
+    let logical_sequence = if let Some(canonical_live_rows) = canonical_live_rows {
+        canonical_logical_sequence(canonical_live_rows)?
+    } else {
+        physical_order_live_rows
+    };
 
-    let retired_logical_row_ids = (!retired.is_empty()).then(|| write_row_ids(&retired));
+    let retired_logical_row_ids = (!retired.is_empty()).then_some(retired);
 
     Ok(PlannedDefaultCompactionRows {
-        logical_row_ids: write_row_ids(&logical_sequence),
+        logical_row_ids: logical_sequence,
         retired_logical_row_ids,
         current_deletion_vectors,
         logical_run_ends,
@@ -1008,16 +1024,12 @@ pub(super) async fn plan_default_compaction_rows(
     })
 }
 
-pub(super) fn validate_default_compaction_logical_order(sequence: &RowIdSequence) -> Result<()> {
+fn validated_default_compaction_logical_ranges(
+    sequence: &RowIdSequence,
+) -> Result<Vec<Range<u64>>> {
+    let ranges = validated_logical_ranges(sequence)?;
     let mut previous = None;
-    for range in sequence.contiguous_ranges() {
-        let first = LogicalRowAddress::try_from(range.start)?;
-        let last = LogicalRowAddress::try_from(range.end - 1)?;
-        if first.logical_fragment_id() != last.logical_fragment_id() {
-            return Err(Error::invalid_input(
-                "logical row-id sequence range crosses a logical fragment boundary",
-            ));
-        }
+    for range in &ranges {
         if let Some(previous_address) = previous
             && previous_address >= range.start
         {
@@ -1030,7 +1042,12 @@ pub(super) fn validate_default_compaction_logical_order(sequence: &RowIdSequence
         }
         previous = Some(range.end - 1);
     }
-    Ok(())
+    Ok(ranges)
+}
+
+#[cfg(test)]
+pub(super) fn validate_default_compaction_logical_order(sequence: &RowIdSequence) -> Result<()> {
+    validated_default_compaction_logical_ranges(sequence).map(drop)
 }
 
 struct LogicalRangeCursor {
@@ -1039,11 +1056,8 @@ struct LogicalRangeCursor {
 }
 
 impl LogicalRangeCursor {
-    fn new(sequence: &RowIdSequence) -> Self {
-        Self {
-            ranges: sequence.contiguous_ranges(),
-            index: 0,
-        }
+    fn new(ranges: Vec<Range<u64>>) -> Self {
+        Self { ranges, index: 0 }
     }
 
     fn take(&mut self, mut row_count: u32) -> Result<Vec<LogicalRowAddressRange>> {
@@ -1177,10 +1191,33 @@ pub(super) fn add_rewrite_provenance(
     source_domains: &mut BTreeMap<u32, RowAddressLogicalDomain>,
     delta: &mut RowAddressLayoutDelta,
 ) -> Result<()> {
+    let logical_row_ids = read_row_ids(logical_row_ids)?;
+    let retired_logical_row_ids = retired_row_ids.map(read_row_ids).transpose()?;
+    add_rewrite_provenance_from_sequences(
+        dataset,
+        new_fragments,
+        &logical_row_ids,
+        retired_logical_row_ids
+            .as_ref()
+            .zip(retired_row_ids.map(|encoded| encoded.len())),
+        next_new_fragment_ordinal,
+        source_domains,
+        delta,
+    )
+}
+
+pub(super) fn add_rewrite_provenance_from_sequences(
+    dataset: &Dataset,
+    new_fragments: &[Fragment],
+    logical_row_ids: &RowIdSequence,
+    retired_logical_row_ids: Option<(&RowIdSequence, usize)>,
+    next_new_fragment_ordinal: &mut u32,
+    source_domains: &mut BTreeMap<u32, RowAddressLogicalDomain>,
+    delta: &mut RowAddressLayoutDelta,
+) -> Result<()> {
     let router = dataset.row_address_router()?;
-    let sequence = read_row_ids(logical_row_ids)?;
-    validate_default_compaction_logical_order(&sequence)?;
-    let mut rows = LogicalRangeCursor::new(&sequence);
+    let ranges = validated_default_compaction_logical_ranges(logical_row_ids)?;
+    let mut rows = LogicalRangeCursor::new(ranges);
 
     for fragment in new_fragments {
         if fragment.row_id_meta.is_some() || fragment.native_logical_domain.is_some() {
@@ -1265,48 +1302,41 @@ pub(super) fn add_rewrite_provenance(
         ));
     }
 
-    if let Some(retired_row_ids) = retired_row_ids {
-        let retired = read_row_ids(retired_row_ids)?;
-        if !retired.is_empty() {
-            let selection = if retired_row_ids.len() <= MAX_RETIRED_RANGE_DECODE_BYTES {
-                let raw_ranges = validated_logical_ranges(&retired)?;
-                let mut ranges = Vec::with_capacity(raw_ranges.len());
-                for range in raw_ranges {
-                    let first = LogicalRowAddress::try_from(range.start)?;
-                    let last = LogicalRowAddress::try_from(range.end - 1)?;
-                    register_source_domain(&router, source_domains, first.logical_fragment_id())?;
-                    ranges.push(LogicalRowAddressRange::new(
-                        first.logical_fragment_id(),
-                        first.immutable_slot(),
-                        last.immutable_slot().checked_add(1).ok_or_else(|| {
-                            Error::format_capacity_exceeded(
-                                "retired logical row range end exceeds u32",
-                            )
-                        })?,
-                    ));
+    if let Some((retired, retired_encoded_len)) = retired_logical_row_ids
+        && !retired.is_empty()
+    {
+        let selection = if retired_encoded_len <= MAX_RETIRED_RANGE_DECODE_BYTES {
+            let raw_ranges = validated_logical_ranges(retired)?;
+            let mut ranges = Vec::with_capacity(raw_ranges.len());
+            for range in raw_ranges {
+                let first = LogicalRowAddress::try_from(range.start)?;
+                let last = LogicalRowAddress::try_from(range.end - 1)?;
+                register_source_domain(&router, source_domains, first.logical_fragment_id())?;
+                ranges.push(LogicalRowAddressRange::new(
+                    first.logical_fragment_id(),
+                    first.immutable_slot(),
+                    last.immutable_slot().checked_add(1).ok_or_else(|| {
+                        Error::format_capacity_exceeded("retired logical row range end exceeds u32")
+                    })?,
+                ));
+            }
+            LogicalRowAddressSelection::from_ranges(ranges)?
+        } else {
+            // High-entropy retirement is information-theoretically large.
+            // Stream it into the final compressed bitmap without a second
+            // full-size range vector or repeated domain lookups.
+            let mut bitmap = RoaringTreemap::new();
+            let mut observed_domains = BTreeSet::new();
+            for raw in retired.iter() {
+                let address = LogicalRowAddress::try_from(raw)?;
+                if observed_domains.insert(address.logical_fragment_id()) {
+                    register_source_domain(&router, source_domains, address.logical_fragment_id())?;
                 }
-                LogicalRowAddressSelection::from_ranges(ranges)?
-            } else {
-                // High-entropy retirement is information-theoretically large.
-                // Stream it into the final compressed bitmap without a second
-                // full-size range vector or repeated domain lookups.
-                let mut bitmap = RoaringTreemap::new();
-                let mut observed_domains = BTreeSet::new();
-                for raw in retired.iter() {
-                    let address = LogicalRowAddress::try_from(raw)?;
-                    if observed_domains.insert(address.logical_fragment_id()) {
-                        register_source_domain(
-                            &router,
-                            source_domains,
-                            address.logical_fragment_id(),
-                        )?;
-                    }
-                    bitmap.insert(raw);
-                }
-                LogicalRowAddressSelection::from_bitmap(bitmap)?
-            };
-            delta.retired_selections.push(selection);
-        }
+                bitmap.insert(raw);
+            }
+            LogicalRowAddressSelection::from_bitmap(bitmap)?
+        };
+        delta.retired_selections.push(selection);
     }
     Ok(())
 }

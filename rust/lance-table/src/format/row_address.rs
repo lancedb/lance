@@ -4248,6 +4248,13 @@ impl RowAddressRouter {
         max_logical_fragment_id: Option<u32>,
     ) -> Result<Self> {
         layout.validate_with_fragments(fragments, max_logical_fragment_id)?;
+        Self::from_validated_layout(layout, fragments)
+    }
+
+    fn from_validated_layout(
+        layout: Arc<RowAddressLayout>,
+        fragments: &[Fragment],
+    ) -> Result<Self> {
         let mut source_index = Vec::<(u32, u32)>::new();
         let mut packed_source_runs = Vec::new();
         for (placement_index, placement) in layout.placements.iter().enumerate() {
@@ -7906,6 +7913,31 @@ impl RowAddressLayout {
         delta: &RowAddressLayoutDelta,
         context: &RowAddressDeltaApplyContext<'_>,
     ) -> Result<RowAddressLayoutApplyResult> {
+        self.apply_delta_inner(delta, context, true)
+    }
+
+    /// Apply a delta for a commit that will refresh and validate the complete
+    /// successor manifest before it is persisted.
+    ///
+    /// The returned admitted layout has passed all checked transformations and
+    /// admission limits, but its closure fingerprints still describe the
+    /// source snapshot. Callers must refresh and validate the final successor
+    /// after applying any schema and metadata-debt changes.
+    #[doc(hidden)]
+    pub fn apply_delta_for_commit(
+        &self,
+        delta: &RowAddressLayoutDelta,
+        context: &RowAddressDeltaApplyContext<'_>,
+    ) -> Result<RowAddressLayoutApplyResult> {
+        self.apply_delta_inner(delta, context, false)
+    }
+
+    fn apply_delta_inner(
+        &self,
+        delta: &RowAddressLayoutDelta,
+        context: &RowAddressDeltaApplyContext<'_>,
+        finalize_successor: bool,
+    ) -> Result<RowAddressLayoutApplyResult> {
         delta.validate_admission_tier()?;
         delta.validate_row_aligned_rewrite_proofs()?;
         if context.commit_version == 0 {
@@ -8127,10 +8159,9 @@ impl RowAddressLayout {
                 "row-address delta source_domains must exactly cover touched logical domains",
             ));
         }
-        let router = RowAddressRouter::try_new(
+        let router = RowAddressRouter::from_validated_layout(
             Arc::new(self.clone()),
             context.current_fragments,
-            context.current_max_logical_fragment_id,
         )?;
         for source in delta.source_domains.iter().copied() {
             let current = router
@@ -8483,14 +8514,16 @@ impl RowAddressLayout {
             total_physical_rows
                 .checked_sub(deleted_rows)
                 .ok_or_else(|| Error::invalid_input("deleted rows exceed physical rows"))?;
-        candidate.refresh_fingerprint_with_fragments(
-            context.successor_fragments,
-            context.max_logical_fragment_id,
-        );
-        candidate.validate_with_fragments(
-            context.successor_fragments,
-            context.max_logical_fragment_id,
-        )?;
+        if finalize_successor {
+            candidate.refresh_fingerprint_with_fragments(
+                context.successor_fragments,
+                context.max_logical_fragment_id,
+            );
+            candidate.validate_with_fragments(
+                context.successor_fragments,
+                context.max_logical_fragment_id,
+            )?;
+        }
         Ok(RowAddressLayoutApplyResult::Admitted {
             layout: Box::new(candidate),
             metrics,
@@ -13594,6 +13627,9 @@ mod tests {
             123
         );
         assert_eq!(updated.generation_regions.len(), 1);
+        updated
+            .validate_with_fragments(&successor_fragments, Some(0))
+            .unwrap();
         let router =
             RowAddressRouter::try_new(Arc::from(updated.clone()), &successor_fragments, Some(0))
                 .unwrap();
@@ -13686,6 +13722,63 @@ mod tests {
                 locator: PhysicalRowLocator::Physical(RowAddress::new_from_parts(2, 0))
             }]
         );
+    }
+
+    #[test]
+    fn apply_delta_validates_source_before_explicit_map_admission() {
+        let current_fragments = vec![fragment(0, 2, Some((0, 1)))];
+        let mut layout = RowAddressLayout::new(Uuid::new_v4());
+        layout.refresh_fingerprint_with_fragments(&current_fragments, Some(0));
+        layout.debt_summary.live_physical_rows = 1;
+        layout.refresh_fingerprint_with_fragments(&current_fragments, Some(0));
+
+        let successor_fragments = vec![fragment(1, 2, None)];
+        let target = RowAddressTargetRange {
+            fragment: RowAddressTargetFragment::NewFragmentOrdinal(0),
+            start_offset: 0,
+            end_offset: 2,
+        };
+        let mut delta = placement_delta(
+            &layout,
+            domain(0, 2),
+            [0, 1],
+            target,
+            RowAddressPlacementKind::ExplicitMap,
+        );
+        delta.explicit_map_placements.insert(
+            0,
+            ExplicitMapRowAddressPlacement {
+                sources: Vec::new(),
+                object_path: String::new(),
+                object_size: 0,
+                pages: Vec::new(),
+                destinations: Vec::new(),
+                base_id: None,
+            },
+        );
+        let resolved = BTreeMap::from([(0, 1)]);
+
+        let error = layout
+            .apply_delta(
+                &delta,
+                &RowAddressDeltaApplyContext {
+                    current_fragments: &current_fragments,
+                    successor_fragments: &successor_fragments,
+                    resolved_new_fragment_ids: &resolved,
+                    current_deletion_vectors: &BTreeMap::new(),
+                    newly_fully_deleted_source_fragments: &BTreeSet::new(),
+                    deletion_vectors: &BTreeMap::new(),
+                    explicit_map_placements: &BTreeMap::new(),
+                    commit_version: 2,
+                    current_max_logical_fragment_id: Some(0),
+                    max_logical_fragment_id: Some(0),
+                    row_address_metadata_bytes_written: 0,
+                },
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("more live rows than total rows"));
     }
 
     #[test]

@@ -130,12 +130,14 @@ use lance_datafusion::exec::execute_plan;
 use lance_index::frag_reuse::FragReuseGroup;
 use lance_index::is_system_index;
 use lance_table::format::{
-    Fragment, IndexMetadata, PlacementMaintenanceRequired, RowAddressLayoutDelta,
+    Fragment, IndexMetadata, PlacementMaintenanceRequired, ROW_ADDRESS_LAYOUT_FINGERPRINT_SIZE,
+    RowAddressLayoutDelta, RowAddressLogicalDomain, RowAddressTargetFragment,
     RowDatasetVersionMeta, RowDatasetVersionRun, RowDatasetVersionSequence, RowIdMeta,
-    ValidatedRowAddressDestinationIndex,
+    ValidatedRowAddressDestinationIndex, pb,
 };
 use lance_table::rowids::segment::U64Segment;
 use lance_table::rowids::{RowIdSequence, read_row_ids, write_row_ids};
+use prost::Message;
 use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -154,7 +156,9 @@ pub use explicit_maintenance::{
 };
 #[cfg(test)]
 use logical_row_addresses::validate_default_compaction_logical_order;
-use logical_row_addresses::{add_rewrite_provenance, plan_default_compaction_rows};
+use logical_row_addresses::{
+    add_rewrite_provenance, add_rewrite_provenance_from_sequences, plan_default_compaction_rows,
+};
 pub use remapping::{IgnoreRemap, IndexRemapper, IndexRemapperOptions, RemappedIndex};
 
 type RewriteRowProvenance = (Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>);
@@ -903,6 +907,7 @@ impl CompactionPlanner for DefaultCompactionPlanner {
         let mut compaction_plan =
             CompactionPlan::new(dataset.manifest.version, self.options.clone());
         if dataset.manifest.uses_stable_logical_row_addresses() {
+            let indices = dataset.load_indices().await?;
             let destination_index = dataset
                 .manifest
                 .row_address_layout
@@ -918,11 +923,12 @@ impl CompactionPlanner for DefaultCompactionPlanner {
                     &task.fragments,
                     &self.options,
                     &destination_index,
+                    indices.as_ref(),
                 )
                 .await?
                 {
                     V2_3CompactionAdmission::Admitted(prepared) => {
-                        prepared_tasks.push((task, prepared));
+                        prepared_tasks.push((task, *prepared));
                     }
                     V2_3CompactionAdmission::NotAdmitted(reason) => {
                         compaction_plan.planning_metrics.groups_planned += 1;
@@ -935,7 +941,6 @@ impl CompactionPlanner for DefaultCompactionPlanner {
             }
 
             if prepared_tasks.len() > 1 {
-                let indices = dataset.load_indices().await?;
                 while let Some(reason) = preflight_prepared_v2_3_compaction_tasks(
                     dataset,
                     &prepared_tasks,
@@ -1359,6 +1364,7 @@ pub async fn rewrite_files_in_order(
         ordered_row_addrs,
         logical_row_ids: None,
         retired_logical_row_ids: None,
+        row_address_layout_delta: None,
     };
     commit_compaction(
         dataset,
@@ -1444,7 +1450,7 @@ async fn collect_metrics(fragment: &FileFragment) -> Result<FragmentMetrics> {
 }
 
 enum V2_3CompactionAdmission {
-    Admitted(PreparedV2_3CompactionTask),
+    Admitted(Box<PreparedV2_3CompactionTask>),
     NotAdmitted(String),
 }
 
@@ -1554,6 +1560,7 @@ async fn preflight_v2_3_compaction_task(
     fragments: &[Fragment],
     options: &CompactionOptions,
     destination_index: &ValidatedRowAddressDestinationIndex<'_>,
+    indices: &[IndexMetadata],
 ) -> Result<V2_3CompactionAdmission> {
     let rows = match plan_default_compaction_rows(dataset, fragments, destination_index).await {
         Err(Error::NotSupported { source, .. })
@@ -1565,7 +1572,6 @@ async fn preflight_v2_3_compaction_task(
         }
         other => other?,
     };
-    let sequence = read_row_ids(&rows.logical_row_ids)?;
     let physical_order_matches_logical = rows.current_deletion_vectors.is_empty()
         && rows.logical_run_ends.is_empty()
         && !rows.requires_full_logical_sort;
@@ -1581,7 +1587,7 @@ async fn preflight_v2_3_compaction_task(
             .iter()
             .map(|rows| u64::from(*rows))
             .sum::<u64>()
-            != sequence.len()
+            != rows.logical_row_ids.len()
     }) {
         log::debug!(
             "Binary copy disabled: source file rows differ from the admitted logical sequence"
@@ -1607,7 +1613,13 @@ async fn preflight_v2_3_compaction_task(
     let output_row_counts = match &rewrite_strategy {
         V2_3CompactionRewriteStrategy::BinaryCopy(plan) => plan.output_row_counts.clone(),
         V2_3CompactionRewriteStrategy::Reencode => {
-            planned_reencode_output_row_counts(dataset, fragments, sequence.len(), options).await?
+            planned_reencode_output_row_counts(
+                dataset,
+                fragments,
+                rows.logical_row_ids.len(),
+                options,
+            )
+            .await?
         }
     };
     let planned_fragments = output_row_counts
@@ -1628,16 +1640,32 @@ async fn preflight_v2_3_compaction_task(
     };
     let mut next_ordinal = 0_u32;
     let mut source_domains = BTreeMap::new();
-    add_rewrite_provenance(
+    let logical_row_ids = write_row_ids(&rows.logical_row_ids);
+    let retired_logical_row_ids = rows.retired_logical_row_ids.as_ref().map(write_row_ids);
+    add_rewrite_provenance_from_sequences(
         dataset,
         &planned_fragments,
         &rows.logical_row_ids,
-        rows.retired_logical_row_ids.as_deref(),
+        rows.retired_logical_row_ids.as_ref().zip(
+            retired_logical_row_ids
+                .as_ref()
+                .map(|encoded| encoded.len()),
+        ),
         &mut next_ordinal,
         &mut source_domains,
         &mut delta,
     )?;
     delta.source_domains = source_domains.into_values().collect();
+    let encoded_row_address_layout_delta = encode_prepared_v2_3_rewrite_delta(
+        &layout.fingerprint,
+        PreparedV2_3RewriteBinding {
+            original_fragments: fragments,
+            new_fragments: &planned_fragments,
+            logical_row_ids: &logical_row_ids,
+            retired_logical_row_ids: retired_logical_row_ids.as_deref(),
+        },
+        &pb::transaction::RowAddressLayoutDelta::from(&delta).encode_to_vec(),
+    )?;
 
     let transaction = TransactionBuilder::new(
         dataset.manifest.version,
@@ -1656,27 +1684,27 @@ async fn preflight_v2_3_compaction_task(
         current_deletion_vectors: rows.current_deletion_vectors.clone(),
         ..RowAddressManifestApplyContext::default()
     };
-    let indices = dataset.load_indices().await?;
     match transaction.build_manifest_with_row_address_context(
         Some(dataset.manifest.as_ref()),
-        indices.as_ref().clone(),
+        indices.to_vec(),
         "default-compaction-preflight.txn",
         &Default::default(),
         Some(&context),
     ) {
-        Ok(_) => Ok(V2_3CompactionAdmission::Admitted(
+        Ok(_) => Ok(V2_3CompactionAdmission::Admitted(Box::new(
             PreparedV2_3CompactionTask {
                 plan: V2_3CompactionTaskPlan {
-                    logical_row_ids: rows.logical_row_ids,
-                    retired_logical_row_ids: rows.retired_logical_row_ids,
+                    logical_row_ids,
+                    retired_logical_row_ids,
                     output_row_counts,
                     logical_run_ends: rows.logical_run_ends,
                     requires_full_logical_sort: rows.requires_full_logical_sort,
                     rewrite_strategy,
+                    row_address_layout_delta: encoded_row_address_layout_delta,
                 },
                 current_deletion_vectors: rows.current_deletion_vectors,
             },
-        )),
+        ))),
         Err(Error::NotSupported { source, .. })
             if source
                 .downcast_ref::<PlacementMaintenanceRequired>()
@@ -1716,15 +1744,33 @@ fn preflight_prepared_v2_3_compaction_tasks(
             .iter()
             .map(|count| Fragment::new(0).with_physical_rows(*count as usize))
             .collect::<Vec<_>>();
-        add_rewrite_provenance(
-            dataset,
-            &planned_fragments,
-            &prepared.plan.logical_row_ids,
-            prepared.plan.retired_logical_row_ids.as_deref(),
-            &mut next_ordinal,
-            &mut source_domains,
-            &mut delta,
-        )?;
+        let reused = if prepared.plan.row_address_layout_delta.is_empty() {
+            false
+        } else {
+            append_prepared_v2_3_rewrite_delta(
+                &prepared.plan.row_address_layout_delta,
+                PreparedV2_3RewriteBinding {
+                    original_fragments: &task.fragments,
+                    new_fragments: &planned_fragments,
+                    logical_row_ids: &prepared.plan.logical_row_ids,
+                    retired_logical_row_ids: prepared.plan.retired_logical_row_ids.as_deref(),
+                },
+                &mut next_ordinal,
+                &mut source_domains,
+                &mut delta,
+            )?
+        };
+        if !reused {
+            add_rewrite_provenance(
+                dataset,
+                &planned_fragments,
+                &prepared.plan.logical_row_ids,
+                prepared.plan.retired_logical_row_ids.as_deref(),
+                &mut next_ordinal,
+                &mut source_domains,
+                &mut delta,
+            )?;
+        }
         groups.push(RewriteGroup {
             old_fragments: task.fragments.clone(),
             new_fragments: planned_fragments,
@@ -2370,6 +2416,10 @@ pub struct V2_3CompactionTaskPlan {
     /// Data rewrite selected and admitted before any output object is created.
     #[serde(default)]
     rewrite_strategy: V2_3CompactionRewriteStrategy,
+    /// Protobuf-encoded placement delta admitted against the task read
+    /// snapshot. Targets use task-local new-fragment ordinals.
+    #[serde(default)]
+    row_address_layout_delta: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -2563,6 +2613,11 @@ pub struct RewriteResult {
     /// by this rewrite.
     #[serde(default)]
     pub retired_logical_row_ids: Option<Vec<u8>>,
+    /// Protobuf-encoded storage-version-2.3 placement delta admitted during
+    /// planning. Targets use task-local new-fragment ordinals and are rebased
+    /// when multiple results are committed together.
+    #[serde(default)]
+    pub row_address_layout_delta: Option<Vec<u8>>,
 }
 
 async fn reserve_fragment_ids(
@@ -2623,6 +2678,7 @@ async fn rewrite_files(
             ordered_row_addrs: None,
             logical_row_ids: None,
             retired_logical_row_ids: None,
+            row_address_layout_delta: None,
         });
     }
 
@@ -2641,11 +2697,13 @@ async fn rewrite_files(
                     Error::internal("storage-version-2.3 manifest has no row-address layout")
                 })?
                 .validated_destination_index()?;
+            let indices = dataset.load_indices().await?;
             match preflight_v2_3_compaction_task(
                 dataset.as_ref(),
                 &task.fragments,
                 options,
                 &destination_index,
+                indices.as_ref(),
             )
             .await?
             {
@@ -2667,6 +2725,7 @@ async fn rewrite_files(
                         ordered_row_addrs: None,
                         logical_row_ids: None,
                         retired_logical_row_ids: None,
+                        row_address_layout_delta: None,
                     });
                 }
             }
@@ -2955,6 +3014,9 @@ async fn rewrite_files(
         .sum();
 
     log::info!("Compaction task {}: completed", task_id);
+    let row_address_layout_delta = v2_3_plan.as_ref().and_then(|plan| {
+        (!plan.row_address_layout_delta.is_empty()).then(|| plan.row_address_layout_delta.clone())
+    });
 
     Ok(RewriteResult {
         metrics,
@@ -2965,6 +3027,7 @@ async fn rewrite_files(
         ordered_row_addrs: None,
         logical_row_ids,
         retired_logical_row_ids,
+        row_address_layout_delta,
     })
 }
 
@@ -3199,6 +3262,70 @@ fn mask_source_ordered_version_sequence(
     }))
 }
 
+const SOURCE_ORDERED_VERSION_CACHE_ENTRIES: usize = 4;
+
+#[derive(Default)]
+struct SourceOrderedVersionSequenceCache {
+    entries: Vec<(Arc<[u8]>, RowDatasetVersionSequence)>,
+}
+
+impl SourceOrderedVersionSequenceCache {
+    fn load(&mut self, metadata: &RowDatasetVersionMeta) -> Result<RowDatasetVersionSequence> {
+        let RowDatasetVersionMeta::Inline(encoded) = metadata else {
+            return metadata.load_sequence();
+        };
+        if let Some((_, sequence)) = self
+            .entries
+            .iter()
+            .find(|(cached, _)| Arc::ptr_eq(cached, encoded))
+        {
+            return Ok(sequence.clone());
+        }
+
+        let sequence = metadata.load_sequence()?;
+        if self.entries.len() == SOURCE_ORDERED_VERSION_CACHE_ENTRIES {
+            self.entries.remove(0);
+        }
+        self.entries.push((encoded.clone(), sequence.clone()));
+        Ok(sequence)
+    }
+}
+
+fn load_source_ordered_version_sequences(
+    fragment: &Fragment,
+    cache: &mut SourceOrderedVersionSequenceCache,
+) -> Result<(RowDatasetVersionSequence, RowDatasetVersionSequence)> {
+    let row_count = u64::try_from(fragment.physical_rows.ok_or_else(|| {
+        Error::invalid_input(format!(
+            "storage-version-2.3 source fragment {} is missing physical_rows",
+            fragment.id
+        ))
+    })?)
+    .map_err(|_| Error::format_capacity_exceeded("source physical_rows exceed u64"))?;
+    let created = if let Some(metadata) = &fragment.created_at_version_meta {
+        cache.load(metadata)?
+    } else {
+        let native = fragment.native_logical_domain.ok_or_else(|| {
+            Error::internal("source-order row-version preflight changed during resolution")
+        })?;
+        RowDatasetVersionSequence::from_uniform_row_count(row_count, native.creation_version)
+    };
+    let updated = if let Some(metadata) = &fragment.last_updated_at_version_meta {
+        cache.load(metadata)?
+    } else {
+        created.clone()
+    };
+    if created.len() != row_count || updated.len() != row_count {
+        return Err(Error::invalid_input(format!(
+            "row-version metadata for source fragment {} covers created={} updated={} rows, expected {row_count}",
+            fragment.id,
+            created.len(),
+            updated.len()
+        )));
+    }
+    Ok((created, updated))
+}
+
 /// Preserve version runs without resolving individual logical rows when the
 /// admitted output order is exactly the live physical source order.
 async fn source_ordered_v2_3_version_sequences(
@@ -3214,40 +3341,21 @@ async fn source_ordered_v2_3_version_sequences(
         return Ok(None);
     }
 
-    let sequences = futures::stream::iter(fragments)
-        .map(|fragment| async move {
-            let row_count = u64::try_from(fragment.physical_rows.ok_or_else(|| {
-                Error::invalid_input(format!(
-                    "storage-version-2.3 source fragment {} is missing physical_rows",
-                    fragment.id
-                ))
-            })?)
-            .map_err(|_| Error::format_capacity_exceeded("source physical_rows exceed u64"))?;
-            let mut created = if let Some(metadata) = &fragment.created_at_version_meta {
-                metadata.load_sequence()?
-            } else {
-                let native = fragment.native_logical_domain.ok_or_else(|| {
-                    Error::internal("source-order row-version preflight changed during resolution")
-                })?;
-                RowDatasetVersionSequence::from_uniform_row_count(
-                    row_count,
-                    native.creation_version,
-                )
-            };
-            let mut updated = if let Some(metadata) = &fragment.last_updated_at_version_meta {
-                metadata.load_sequence()?
-            } else {
-                created.clone()
-            };
-            if created.len() != row_count || updated.len() != row_count {
-                return Err(Error::invalid_input(format!(
-                    "row-version metadata for source fragment {} covers created={} updated={} rows, expected {row_count}",
-                    fragment.id,
-                    created.len(),
-                    updated.len()
-                )));
-            }
+    let mut cache = SourceOrderedVersionSequenceCache::default();
+    let mut sequences = fragments
+        .iter()
+        .map(|fragment| load_source_ordered_version_sequences(fragment, &mut cache))
+        .collect::<Result<Vec<_>>>()?;
+    if fragments
+        .iter()
+        .all(|fragment| fragment.deletion_file.is_none())
+    {
+        let (created_sequences, updated_sequences) = sequences.into_iter().unzip();
+        return Ok(Some((created_sequences, updated_sequences)));
+    }
 
+    sequences = futures::stream::iter(fragments.iter().zip(sequences))
+        .map(|(fragment, (mut created, mut updated))| async move {
             if let Some(deletion_file) = &fragment.deletion_file {
                 let deletions =
                     read_dataset_deletion_file(dataset, fragment.id, deletion_file).await?;
@@ -3295,6 +3403,253 @@ async fn resolve_logical_row_version_sequences_bounded(
     }
 
     Ok((created_sequences, updated_sequences))
+}
+
+const PREPARED_V2_3_REWRITE_DELTA_MAGIC: &[u8; 8] = b"L23PRD01";
+const PREPARED_V2_3_REWRITE_DELTA_HEADER_LEN: usize =
+    PREPARED_V2_3_REWRITE_DELTA_MAGIC.len() + 2 * ROW_ADDRESS_LAYOUT_FINGERPRINT_SIZE;
+
+fn update_prepared_rewrite_binding(hash: &mut u128, bytes: &[u8]) {
+    const PRIME: u128 = 0x0000_0000_0100_0000_0000_0000_0000_013b;
+    for byte in bytes {
+        *hash ^= u128::from(*byte);
+        *hash = hash.wrapping_mul(PRIME);
+    }
+}
+
+fn frame_prepared_rewrite_binding(hash: &mut u128, bytes: &[u8]) {
+    update_prepared_rewrite_binding(hash, &(bytes.len() as u64).to_le_bytes());
+    update_prepared_rewrite_binding(hash, bytes);
+}
+
+#[derive(Clone, Copy)]
+struct PreparedV2_3RewriteBinding<'a> {
+    original_fragments: &'a [Fragment],
+    new_fragments: &'a [Fragment],
+    logical_row_ids: &'a [u8],
+    retired_logical_row_ids: Option<&'a [u8]>,
+}
+
+fn prepared_rewrite_binding_fingerprint(
+    base_layout_fingerprint: &[u8],
+    binding: PreparedV2_3RewriteBinding<'_>,
+    delta: &[u8],
+) -> [u8; ROW_ADDRESS_LAYOUT_FINGERPRINT_SIZE] {
+    const OFFSET: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
+    let mut hash = OFFSET;
+    update_prepared_rewrite_binding(&mut hash, b"LancePreparedV23CompactionDeltaV1");
+    frame_prepared_rewrite_binding(&mut hash, base_layout_fingerprint);
+    update_prepared_rewrite_binding(
+        &mut hash,
+        &(binding.original_fragments.len() as u64).to_le_bytes(),
+    );
+    for fragment in binding.original_fragments {
+        update_prepared_rewrite_binding(&mut hash, &fragment.id.to_le_bytes());
+        match fragment.physical_rows {
+            Some(rows) => {
+                update_prepared_rewrite_binding(&mut hash, &[1]);
+                update_prepared_rewrite_binding(&mut hash, &(rows as u64).to_le_bytes());
+            }
+            None => update_prepared_rewrite_binding(&mut hash, &[0]),
+        }
+    }
+    update_prepared_rewrite_binding(
+        &mut hash,
+        &(binding.new_fragments.len() as u64).to_le_bytes(),
+    );
+    for fragment in binding.new_fragments {
+        match fragment.physical_rows {
+            Some(rows) => {
+                update_prepared_rewrite_binding(&mut hash, &[1]);
+                update_prepared_rewrite_binding(&mut hash, &(rows as u64).to_le_bytes());
+            }
+            None => update_prepared_rewrite_binding(&mut hash, &[0]),
+        }
+    }
+    frame_prepared_rewrite_binding(&mut hash, binding.logical_row_ids);
+    match binding.retired_logical_row_ids {
+        Some(retired) => {
+            update_prepared_rewrite_binding(&mut hash, &[1]);
+            frame_prepared_rewrite_binding(&mut hash, retired);
+        }
+        None => update_prepared_rewrite_binding(&mut hash, &[0]),
+    }
+    frame_prepared_rewrite_binding(&mut hash, delta);
+    hash.to_le_bytes()
+}
+
+fn encode_prepared_v2_3_rewrite_delta(
+    base_layout_fingerprint: &[u8],
+    binding: PreparedV2_3RewriteBinding<'_>,
+    delta: &[u8],
+) -> Result<Vec<u8>> {
+    if base_layout_fingerprint.len() != ROW_ADDRESS_LAYOUT_FINGERPRINT_SIZE {
+        return Err(Error::invalid_input(
+            "prepared compaction base layout fingerprint must be 16 bytes",
+        ));
+    }
+    let binding = prepared_rewrite_binding_fingerprint(base_layout_fingerprint, binding, delta);
+    let mut encoded = Vec::with_capacity(PREPARED_V2_3_REWRITE_DELTA_HEADER_LEN + delta.len());
+    encoded.extend_from_slice(PREPARED_V2_3_REWRITE_DELTA_MAGIC);
+    encoded.extend_from_slice(base_layout_fingerprint);
+    encoded.extend_from_slice(&binding);
+    encoded.extend_from_slice(delta);
+    Ok(encoded)
+}
+
+struct PreparedV2_3RewriteDeltaEnvelope<'a> {
+    base_layout_fingerprint: &'a [u8],
+    binding_fingerprint: &'a [u8],
+    delta: &'a [u8],
+}
+
+fn parse_prepared_v2_3_rewrite_delta(
+    encoded: &[u8],
+) -> Result<Option<PreparedV2_3RewriteDeltaEnvelope<'_>>> {
+    if !encoded.starts_with(PREPARED_V2_3_REWRITE_DELTA_MAGIC) {
+        return Ok(None);
+    }
+    if encoded.len() <= PREPARED_V2_3_REWRITE_DELTA_HEADER_LEN {
+        return Err(Error::invalid_input(
+            "prepared compaction provenance envelope is truncated",
+        ));
+    }
+    let base_start = PREPARED_V2_3_REWRITE_DELTA_MAGIC.len();
+    let binding_start = base_start + ROW_ADDRESS_LAYOUT_FINGERPRINT_SIZE;
+    Ok(Some(PreparedV2_3RewriteDeltaEnvelope {
+        base_layout_fingerprint: &encoded[base_start..binding_start],
+        binding_fingerprint: &encoded[binding_start..PREPARED_V2_3_REWRITE_DELTA_HEADER_LEN],
+        delta: &encoded[PREPARED_V2_3_REWRITE_DELTA_HEADER_LEN..],
+    }))
+}
+
+fn append_prepared_v2_3_rewrite_delta(
+    encoded: &[u8],
+    binding: PreparedV2_3RewriteBinding<'_>,
+    next_new_fragment_ordinal: &mut u32,
+    source_domains: &mut BTreeMap<u32, RowAddressLogicalDomain>,
+    aggregate: &mut RowAddressLayoutDelta,
+) -> Result<bool> {
+    let Some(envelope) = parse_prepared_v2_3_rewrite_delta(encoded)? else {
+        return Ok(false);
+    };
+    if envelope.base_layout_fingerprint != aggregate.expected_layout_fingerprint {
+        return Ok(false);
+    }
+    let expected_binding = prepared_rewrite_binding_fingerprint(
+        envelope.base_layout_fingerprint,
+        binding,
+        envelope.delta,
+    );
+    if envelope.binding_fingerprint != expected_binding {
+        return Err(Error::invalid_input(
+            "prepared compaction provenance is not bound to this rewrite result",
+        ));
+    }
+
+    let message =
+        pb::transaction::RowAddressLayoutDelta::decode(envelope.delta).map_err(|error| {
+            Error::invalid_input(format!(
+                "prepared storage-version-2.3 compaction provenance is invalid: {error}"
+            ))
+        })?;
+    let mut prepared = RowAddressLayoutDelta::try_from(message)?;
+    if prepared.expected_layout_fingerprint != envelope.base_layout_fingerprint {
+        return Err(Error::invalid_input(
+            "prepared compaction provenance has an inconsistent base layout fingerprint",
+        ));
+    }
+    if !prepared.field_changes.is_empty()
+        || !prepared.source_floors.is_empty()
+        || !prepared.replaced_generations.is_empty()
+        || !prepared.row_aligned_rewrite_proofs.is_empty()
+        || prepared.create_namespace_uuid.is_some()
+        || !prepared.explicit_map_placements.is_empty()
+    {
+        return Err(Error::invalid_input(
+            "prepared compaction provenance contains non-rewrite row-address metadata",
+        ));
+    }
+    if prepared.placements.len() != binding.new_fragments.len() {
+        return Err(Error::invalid_input(format!(
+            "prepared compaction provenance has {} placements for {} output fragments",
+            prepared.placements.len(),
+            binding.new_fragments.len()
+        )));
+    }
+
+    let ordinal_base = *next_new_fragment_ordinal;
+    for (local_ordinal, (placement, fragment)) in prepared
+        .placements
+        .iter_mut()
+        .zip(binding.new_fragments)
+        .enumerate()
+    {
+        let local_ordinal = u32::try_from(local_ordinal).map_err(|_| {
+            Error::format_capacity_exceeded("prepared compaction output fragment count exceeds u32")
+        })?;
+        if placement.target.fragment != RowAddressTargetFragment::NewFragmentOrdinal(local_ordinal)
+        {
+            return Err(Error::invalid_input(
+                "prepared compaction provenance target ordinals are not task-local and contiguous",
+            ));
+        }
+        placement.verify_output_row_sequence()?;
+        if fragment.row_id_meta.is_some() || fragment.native_logical_domain.is_some() {
+            return Err(Error::invalid_input(
+                "storage-version-2.3 speculative compaction output contains row identity metadata",
+            ));
+        }
+        let physical_rows = u32::try_from(fragment.physical_rows.ok_or_else(|| {
+            Error::invalid_input("storage-version-2.3 compaction output is missing physical_rows")
+        })?)
+        .map_err(|_| {
+            Error::format_capacity_exceeded("storage-version-2.3 compaction output rows exceed u32")
+        })?;
+        if physical_rows == 0 {
+            return Err(Error::invalid_input(
+                "storage-version-2.3 compaction output fragment must not be empty",
+            ));
+        }
+        if placement.target.start_offset != 0
+            || placement.target.end_offset != physical_rows
+            || placement.output_cardinality != u64::from(physical_rows)
+        {
+            return Err(Error::invalid_input(
+                "prepared compaction provenance does not match actual output boundaries",
+            ));
+        }
+        placement.target.fragment = RowAddressTargetFragment::NewFragmentOrdinal(
+            ordinal_base.checked_add(local_ordinal).ok_or_else(|| {
+                Error::format_capacity_exceeded("compaction output ordinal exceeds u32")
+            })?,
+        );
+        placement.output_row_sequence_fingerprint =
+            placement.expected_row_sequence_fingerprint()?;
+    }
+    let fragment_count = u32::try_from(binding.new_fragments.len()).map_err(|_| {
+        Error::format_capacity_exceeded("compaction output fragment count exceeds u32")
+    })?;
+    *next_new_fragment_ordinal = ordinal_base
+        .checked_add(fragment_count)
+        .ok_or_else(|| Error::format_capacity_exceeded("compaction output ordinal exceeds u32"))?;
+
+    for source in prepared.source_domains {
+        if source_domains
+            .insert(source.logical_fragment_id, source)
+            .is_some_and(|previous| previous != source)
+        {
+            return Err(Error::invalid_input(format!(
+                "logical fragment {} has inconsistent prepared source metadata",
+                source.logical_fragment_id
+            )));
+        }
+    }
+    aggregate.placements.extend(prepared.placements);
+    aggregate
+        .retired_selections
+        .extend(prepared.retired_selections);
+    Ok(true)
 }
 
 /// Commit the results of file compaction.
@@ -3399,15 +3754,41 @@ pub async fn commit_compaction(
                     "storage-version-2.3 compaction result is missing logical output provenance",
                 )
             })?;
-            add_rewrite_provenance(
-                dataset,
-                &task.new_fragments,
-                logical_row_ids,
-                task.retired_logical_row_ids.as_deref(),
-                &mut next_new_fragment_ordinal,
-                &mut source_domains,
-                delta,
-            )?;
+            if let Some(prepared) = task.row_address_layout_delta.as_deref() {
+                let reused = append_prepared_v2_3_rewrite_delta(
+                    prepared,
+                    PreparedV2_3RewriteBinding {
+                        original_fragments: &task.original_fragments,
+                        new_fragments: &task.new_fragments,
+                        logical_row_ids,
+                        retired_logical_row_ids: task.retired_logical_row_ids.as_deref(),
+                    },
+                    &mut next_new_fragment_ordinal,
+                    &mut source_domains,
+                    delta,
+                )?;
+                if !reused {
+                    add_rewrite_provenance(
+                        dataset,
+                        &task.new_fragments,
+                        logical_row_ids,
+                        task.retired_logical_row_ids.as_deref(),
+                        &mut next_new_fragment_ordinal,
+                        &mut source_domains,
+                        delta,
+                    )?;
+                }
+            } else {
+                add_rewrite_provenance(
+                    dataset,
+                    &task.new_fragments,
+                    logical_row_ids,
+                    task.retired_logical_row_ids.as_deref(),
+                    &mut next_new_fragment_ordinal,
+                    &mut source_domains,
+                    delta,
+                )?;
+            }
         }
         let rewrite_group = RewriteGroup {
             old_fragments: task.original_fragments.clone(),
@@ -3713,6 +4094,32 @@ mod tests {
         assert_eq!(sequence.runs.len(), 1);
         assert_eq!(sequence.runs[0].span, U64Segment::Range(0..50_000_000));
         assert_eq!(sequence.runs[0].version, 7);
+    }
+
+    #[test]
+    fn test_source_ordered_version_cache_returns_independent_sequences() {
+        let metadata = RowDatasetVersionMeta::from_sequence(
+            &RowDatasetVersionSequence::from_uniform_row_count(8, 7),
+        )
+        .unwrap();
+        let mut cache = SourceOrderedVersionSequenceCache::default();
+        let mut created = cache.load(&metadata).unwrap();
+        let updated = cache.load(&metadata.clone()).unwrap();
+
+        assert_eq!(cache.entries.len(), 1);
+        let mut deleted = RoaringBitmap::new();
+        deleted.insert_range(2..4);
+        mask_source_ordered_version_sequence(&mut created, &DeletionVector::Bitmap(deleted))
+            .unwrap();
+        assert_eq!(created.len(), 6);
+        assert_eq!(updated.len(), 8);
+
+        let other = RowDatasetVersionMeta::from_sequence(
+            &RowDatasetVersionSequence::from_uniform_row_count(8, 9),
+        )
+        .unwrap();
+        assert_eq!(cache.load(&other).unwrap().version_at(0), Some(9));
+        assert_eq!(cache.entries.len(), 2);
     }
 
     fn sample_data() -> RecordBatch {
@@ -4224,6 +4631,13 @@ mod tests {
             layout.placements[0],
             lance_table::format::RowAddressPlacement::PackedRun(_)
         ));
+        dataset.manifest.validate_row_address_contract().unwrap();
+        let mut refreshed = layout.as_ref().clone();
+        refreshed.refresh_fingerprint_with_fragments(
+            &dataset.manifest.fragments,
+            dataset.manifest.max_logical_fragment_id,
+        );
+        assert_eq!(refreshed.fingerprint, layout.fingerprint);
     }
 
     #[tokio::test]
@@ -4444,9 +4858,9 @@ mod tests {
         assert_eq!(plan.num_tasks(), 5);
         assert_eq!(plan.planning_metrics, CompactionMetrics::default());
         assert!(plan.tasks.iter().all(|task| {
-            task.v2_3_plan
-                .as_ref()
-                .is_some_and(|plan| plan.output_row_counts == [8])
+            task.v2_3_plan.as_ref().is_some_and(|plan| {
+                plan.output_row_counts == [8] && !plan.row_address_layout_delta.is_empty()
+            })
         }));
 
         let metrics = compact_files(&mut dataset, options, None).await.unwrap();
@@ -4454,6 +4868,149 @@ mod tests {
         assert_eq!(metrics.groups_admitted, 5);
         assert_eq!(metrics.groups_not_admitted, 0);
         assert_eq!(dataset.manifest.fragments.len(), 5);
+        dataset.manifest.validate_row_address_contract().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_v2_3_compaction_commits_serialized_task_subset() {
+        let test_dir = TempStrDir::default();
+        let data = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)])),
+            vec![Arc::new(Int64Array::from_iter_values(0..40))],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(data.clone())], data.schema()),
+            &test_dir,
+            Some(WriteParams {
+                max_rows_per_file: 4,
+                data_storage_version: Some(LanceFileVersion::V2_3),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let mut before = scan_v2_3_rows(&dataset).await;
+        before.sort_unstable();
+        let options = CompactionOptions {
+            target_rows_per_fragment: 8,
+            max_rows_per_group: 8,
+            ..Default::default()
+        };
+        let plan = plan_compaction(&dataset, &options).await.unwrap();
+        assert_eq!(plan.num_tasks(), 5);
+        let mut results = Vec::new();
+        for task in plan.compaction_tasks().skip(1).take(3) {
+            let task =
+                serde_json::from_slice::<CompactionTask>(&serde_json::to_vec(&task).unwrap())
+                    .unwrap();
+            let result = task.execute(&dataset).await.unwrap();
+            assert!(result.row_address_layout_delta.is_some());
+            results.push(
+                serde_json::from_slice::<RewriteResult>(&serde_json::to_vec(&result).unwrap())
+                    .unwrap(),
+            );
+        }
+
+        let version = dataset.version().version;
+        let mut swapped_results = results[..2].to_vec();
+        let first_sidecar = swapped_results[0].row_address_layout_delta.clone();
+        swapped_results[0].row_address_layout_delta =
+            swapped_results[1].row_address_layout_delta.clone();
+        swapped_results[1].row_address_layout_delta = first_sidecar;
+        let error = commit_compaction(
+            &mut dataset,
+            swapped_results,
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &options,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("provenance is not bound to this rewrite result")
+        );
+        assert_eq!(dataset.version().version, version);
+
+        let mut spliced_results = results[..2].to_vec();
+        let sidecars = spliced_results
+            .iter()
+            .map(|result| result.row_address_layout_delta.as_ref().unwrap().clone())
+            .collect::<Vec<_>>();
+        for (index, result) in spliced_results.iter_mut().enumerate() {
+            let mut spliced = sidecars[index][..PREPARED_V2_3_REWRITE_DELTA_HEADER_LEN].to_vec();
+            let other = (index + 1) % sidecars.len();
+            spliced.extend_from_slice(&sidecars[other][PREPARED_V2_3_REWRITE_DELTA_HEADER_LEN..]);
+            result.row_address_layout_delta = Some(spliced);
+        }
+        let error = commit_compaction(
+            &mut dataset,
+            spliced_results,
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &options,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("provenance is not bound to this rewrite result")
+        );
+        assert_eq!(dataset.version().version, version);
+
+        let mut corrupt_result = results[0].clone();
+        let encoded = corrupt_result.row_address_layout_delta.as_ref().unwrap();
+        let envelope = parse_prepared_v2_3_rewrite_delta(encoded).unwrap().unwrap();
+        let base_layout_fingerprint = envelope.base_layout_fingerprint.to_vec();
+        let message = pb::transaction::RowAddressLayoutDelta::decode(envelope.delta).unwrap();
+        let mut corrupt_delta = RowAddressLayoutDelta::try_from(message).unwrap();
+        corrupt_delta.placements[0].output_row_sequence_fingerprint[0] ^= 1;
+        let corrupt_payload =
+            pb::transaction::RowAddressLayoutDelta::from(&corrupt_delta).encode_to_vec();
+        let corrupt_sidecar = encode_prepared_v2_3_rewrite_delta(
+            &base_layout_fingerprint,
+            PreparedV2_3RewriteBinding {
+                original_fragments: &corrupt_result.original_fragments,
+                new_fragments: &corrupt_result.new_fragments,
+                logical_row_ids: corrupt_result.logical_row_ids.as_deref().unwrap(),
+                retired_logical_row_ids: corrupt_result.retired_logical_row_ids.as_deref(),
+            },
+            &corrupt_payload,
+        )
+        .unwrap();
+        corrupt_result.row_address_layout_delta = Some(corrupt_sidecar);
+        let error = commit_compaction(
+            &mut dataset,
+            vec![corrupt_result],
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &options,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("emitted output row sequence does not match placement source order")
+        );
+        assert_eq!(dataset.version().version, version);
+
+        let metrics = commit_compaction(
+            &mut dataset,
+            results.into_iter().skip(1).collect(),
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &options,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(metrics.groups_planned, 2);
+        assert_eq!(metrics.groups_admitted, 2);
+        assert_eq!(dataset.manifest.fragments.len(), 8);
+        let mut after = scan_v2_3_rows(&dataset).await;
+        after.sort_unstable();
+        assert_eq!(after, before);
+        dataset.manifest.validate_row_address_contract().unwrap();
     }
 
     #[tokio::test]
@@ -4490,6 +5047,7 @@ mod tests {
             ordered_row_addrs: None,
             logical_row_ids: None,
             retired_logical_row_ids: None,
+            row_address_layout_delta: None,
         };
 
         let actual = commit_compaction(

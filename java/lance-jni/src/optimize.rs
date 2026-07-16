@@ -310,7 +310,7 @@ const COMPACTION_PLAN_CONSTRUCTOR_SIG: &str =
     "(Ljava/util/List;JLorg/lance/compaction/CompactionOptions;)V";
 const REWRITE_RESULT_CLASS: &str = "org/lance/compaction/RewriteResult";
 const REWRITE_RESULT_CONSTRUCTOR_SIG: &str =
-    "(Lorg/lance/compaction/CompactionMetrics;Ljava/util/List;Ljava/util/List;J[B[B[B)V";
+    "(Lorg/lance/compaction/CompactionMetrics;Ljava/util/List;Ljava/util/List;J[B[B[B[B)V";
 const COMPACTION_OPTIONS_CLASS: &str = "org/lance/compaction/CompactionOptions";
 const COMPACTION_OPTIONS_CONSTRUCTOR_SIG: &str = "(Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;)V";
 
@@ -441,6 +441,10 @@ impl IntoJava for &RewriteResult {
             Some(row_ids) => env.byte_array_from_slice(row_ids)?.into(),
             None => JObject::null(),
         };
+        let row_address_layout_delta: JObject<'_> = match &self.row_address_layout_delta {
+            Some(delta) => env.byte_array_from_slice(delta)?.into(),
+            None => JObject::null(),
+        };
         Ok(env.new_object(
             REWRITE_RESULT_CLASS,
             REWRITE_RESULT_CONSTRUCTOR_SIG,
@@ -452,6 +456,7 @@ impl IntoJava for &RewriteResult {
                 JValueGen::Object(&row_addrs),
                 JValueGen::Object(&logical_row_ids),
                 JValueGen::Object(&retired_logical_row_ids),
+                JValueGen::Object(&row_address_layout_delta),
             ],
         )?)
     }
@@ -533,14 +538,18 @@ impl FromJObjectWithEnv<RewriteResult> for JObject<'_> {
         let logical_row_ids = optional_byte_array_from_method(env, self, "getLogicalRowIds")?;
         let retired_logical_row_ids =
             optional_byte_array_from_method(env, self, "getRetiredLogicalRowIds")?;
+        let row_address_layout_delta =
+            optional_byte_array_from_method(env, self, "getRowAddressLayoutDelta")?;
         Ok(RewriteResult {
             metrics,
             new_fragments,
             read_version,
             original_fragments,
             row_addrs,
+            ordered_row_addrs: None,
             logical_row_ids,
             retired_logical_row_ids,
+            row_address_layout_delta,
         })
     }
 }
