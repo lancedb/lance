@@ -56,7 +56,7 @@ class LanceScannerFullTextSearchTest {
   }
 
   @Test
-  void testListElementGranularityReachesRustValidation() {
+  void testExplicitListElementGranularityReachesRustRouting() {
     RuntimeException error =
         assertThrows(
             RuntimeException.class,
@@ -65,7 +65,8 @@ class LanceScannerFullTextSearchTest {
                     "memory://fts_java_list_element_validation",
                     FullTextQuery.match("hello", "doc", DocumentGranularity.LIST_ELEMENT),
                     0L));
-    assertTrue(error.getMessage().contains("no List layer"));
+    assertTrue(error.getMessage().contains("requested ListElement"), error.getMessage());
+    assertTrue(error.getMessage().contains("'doc_idx' (Row)"), error.getMessage());
   }
 
   @Test

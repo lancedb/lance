@@ -274,10 +274,6 @@ impl From<BooleanQuery> for FtsQuery {
     }
 }
 
-fn is_row_document_granularity(value: &DocumentGranularity) -> bool {
-    *value == DocumentGranularity::Row
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MatchQuery {
     // The column to search in.
@@ -314,9 +310,14 @@ pub struct MatchQuery {
     #[serde(default)]
     pub prefix_length: u32,
 
-    /// The unit treated as one logical document.
-    #[serde(default, skip_serializing_if = "is_row_document_granularity")]
-    pub document_granularity: DocumentGranularity,
+    /// The requested logical document unit.
+    ///
+    /// When absent, query planning uses the granularity stored by the unique
+    /// FTS index on `column`. If no index exists, planning defaults to row
+    /// documents. Callers must set this when both row and list-element indexes
+    /// exist on the same field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document_granularity: Option<DocumentGranularity>,
 }
 
 impl MatchQuery {
@@ -329,7 +330,7 @@ impl MatchQuery {
             max_expansions: 50,
             operator: Operator::Or,
             prefix_length: 0,
-            document_granularity: DocumentGranularity::Row,
+            document_granularity: None,
         }
     }
 
@@ -372,7 +373,7 @@ impl MatchQuery {
     }
 
     pub fn with_document_granularity(mut self, document_granularity: DocumentGranularity) -> Self {
-        self.document_granularity = document_granularity;
+        self.document_granularity = Some(document_granularity);
         self
     }
 
@@ -403,9 +404,14 @@ pub struct PhraseQuery {
     pub terms: String,
     #[serde(default = "u32::default")]
     pub slop: u32,
-    /// The unit treated as one logical document.
-    #[serde(default, skip_serializing_if = "is_row_document_granularity")]
-    pub document_granularity: DocumentGranularity,
+    /// The requested logical document unit.
+    ///
+    /// When absent, query planning uses the granularity stored by the unique
+    /// FTS index on `column`. If no index exists, planning defaults to row
+    /// documents. Callers must set this when both row and list-element indexes
+    /// exist on the same field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document_granularity: Option<DocumentGranularity>,
 }
 
 impl PhraseQuery {
@@ -414,7 +420,7 @@ impl PhraseQuery {
             column: None,
             terms,
             slop: 0,
-            document_granularity: DocumentGranularity::Row,
+            document_granularity: None,
         }
     }
 
@@ -429,7 +435,7 @@ impl PhraseQuery {
     }
 
     pub fn with_document_granularity(mut self, document_granularity: DocumentGranularity) -> Self {
-        self.document_granularity = document_granularity;
+        self.document_granularity = Some(document_granularity);
         self
     }
 }
@@ -972,9 +978,13 @@ mod tests {
         assert_eq!(query.max_expansions, 50);
         assert_eq!(query.operator, Operator::Or);
         assert_eq!(query.prefix_length, 0);
-        assert_eq!(query.document_granularity, DocumentGranularity::Row);
+        assert_eq!(query.document_granularity, None);
 
         let query = query.with_document_granularity(DocumentGranularity::ListElement);
+        assert_eq!(
+            query.document_granularity,
+            Some(DocumentGranularity::ListElement)
+        );
         let serialized = serde_json::to_value(&query).unwrap();
         assert_eq!(serialized["document_granularity"], "list_element");
         assert_eq!(

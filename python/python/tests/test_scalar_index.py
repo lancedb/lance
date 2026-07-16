@@ -1394,7 +1394,6 @@ def test_fts_on_list_elements(tmp_path, list_type):
         )
     ) == [(0, [4])]
 
-    ds.create_scalar_index("tags", "INVERTED", with_position=True)
     ds.create_scalar_index(
         "tags",
         "INVERTED",
@@ -1406,11 +1405,23 @@ def test_fts_on_list_elements(tmp_path, list_type):
         IndexConfig(index_type="inverted", parameters={"with_position": True}),
         document_granularity=list_element,
     )
+    inferred = ds.to_table(full_text_query=MatchQuery("alpha", "tags"))
+    assert hits(inferred) == [(0, [0]), (0, [1])]
+    with pytest.raises(ValueError, match=r"requested Row.*ListElement"):
+        ds.to_table(
+            full_text_query=MatchQuery(
+                "alpha", "tags", document_granularity=DocumentGranularity.ROW
+            )
+        )
+
+    ds.create_scalar_index("tags", "INVERTED", with_position=True)
     index_names = {index.name for index in ds.describe_indices()}
     assert {"tags_idx", "tags_list_element_idx"}.issubset(index_names)
     row_auto = ds.to_table(full_text_query="alpha")
     assert row_auto["id"].to_pylist() == [0]
     assert "_doc_index" not in row_auto.column_names
+    with pytest.raises(ValueError, match=r"ambiguous.*document_granularity"):
+        ds.to_table(full_text_query=MatchQuery("alpha", "tags"))
     indexed = ds.to_table(full_text_query=query)
     assert hits(indexed) == [(0, [0]), (0, [1])]
     assert pa.types.is_list(indexed.schema.field("_doc_index").type)
@@ -1438,7 +1449,13 @@ def test_fts_on_list_elements(tmp_path, list_type):
             )
         )
     ) == [(0, [0])]
-    row_phrase = ds.to_table(full_text_query=PhraseQuery("beta gamma", "tags"))
+    row_phrase = ds.to_table(
+        full_text_query=PhraseQuery(
+            "beta gamma",
+            "tags",
+            document_granularity=DocumentGranularity.ROW,
+        )
+    )
     assert sorted(row_phrase["id"].to_pylist()) == [0, 1]
     assert "_doc_index" not in row_phrase.column_names
 

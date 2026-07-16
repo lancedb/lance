@@ -41,7 +41,7 @@ public class FullTextQueryTest {
     assertEquals(50, q.getMaxExpansions());
     assertEquals(FullTextQuery.Operator.OR, q.getOperator());
     assertEquals(0, q.getPrefixLength());
-    assertEquals(DocumentGranularity.ROW, q.getDocumentGranularity());
+    assertEquals(Optional.empty(), q.getDocumentGranularity());
   }
 
   @Test
@@ -66,7 +66,7 @@ public class FullTextQueryTest {
     assertEquals(10, q.getMaxExpansions());
     assertEquals(FullTextQuery.Operator.AND, q.getOperator());
     assertEquals(3, q.getPrefixLength());
-    assertEquals(DocumentGranularity.LIST_ELEMENT, q.getDocumentGranularity());
+    assertEquals(Optional.of(DocumentGranularity.LIST_ELEMENT), q.getDocumentGranularity());
   }
 
   @Test
@@ -78,7 +78,7 @@ public class FullTextQueryTest {
     assertEquals("exact match", q.getQueryText());
     assertEquals("content", q.getColumn());
     assertEquals(0, q.getSlop());
-    assertEquals(DocumentGranularity.ROW, q.getDocumentGranularity());
+    assertEquals(Optional.empty(), q.getDocumentGranularity());
   }
 
   @Test
@@ -91,7 +91,7 @@ public class FullTextQueryTest {
     assertEquals("ordered terms", q.getQueryText());
     assertEquals("content", q.getColumn());
     assertEquals(2, q.getSlop());
-    assertEquals(DocumentGranularity.LIST_ELEMENT, q.getDocumentGranularity());
+    assertEquals(Optional.of(DocumentGranularity.LIST_ELEMENT), q.getDocumentGranularity());
   }
 
   @Test

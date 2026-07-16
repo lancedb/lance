@@ -75,6 +75,24 @@ fn list_element_phrase(column: &str, terms: &str) -> FullTextSearchQuery {
     ))
 }
 
+fn row_match_node(column: &str, terms: &str) -> MatchQuery {
+    MatchQuery::new(terms.to_string())
+        .with_column(Some(column.to_string()))
+        .with_document_granularity(DocumentGranularity::Row)
+}
+
+fn row_match(column: &str, terms: &str) -> FullTextSearchQuery {
+    FullTextSearchQuery::new_query(FtsQuery::Match(row_match_node(column, terms)))
+}
+
+fn row_phrase(column: &str, terms: &str) -> FullTextSearchQuery {
+    FullTextSearchQuery::new_query(FtsQuery::Phrase(
+        PhraseQuery::new(terms.to_string())
+            .with_column(Some(column.to_string()))
+            .with_document_granularity(DocumentGranularity::Row),
+    ))
+}
+
 // Execute a full-text search with optional filter and deterministic id ordering.
 async fn run_fts(ds: &Dataset, query: FullTextSearchQuery, filter: Option<&str>) -> RecordBatch {
     let mut scanner = ds.scan();
@@ -291,6 +309,28 @@ async fn test_element_document_fts_flat_indexed_and_mixed() {
             .contains("unless an INVERTED index has been created"),
         "{err}"
     );
+    let inferred_element = run_fts(
+        &ds,
+        FullTextSearchQuery::new_query(FtsQuery::Match(
+            MatchQuery::new("alpha".to_string()).with_column(Some("tags".to_string())),
+        )),
+        None,
+    )
+    .await;
+    assert_eq!(
+        element_hits(&inferred_element),
+        vec![(0, vec![0]), (0, vec![1])]
+    );
+    let mut mismatched_row = ds.scan();
+    mismatched_row
+        .full_text_search(row_match("tags", "alpha"))
+        .unwrap();
+    let err = mismatched_row.try_into_batch().await.unwrap_err();
+    assert!(
+        err.to_string().contains("requested Row") && err.to_string().contains("ListElement"),
+        "{err}"
+    );
+
     ds.create_index(
         &["tags"],
         IndexType::Inverted,
@@ -313,13 +353,23 @@ async fn test_element_document_fts_flat_indexed_and_mixed() {
     let auto_row = run_fts(&ds, FullTextSearchQuery::new("alpha".to_string()), None).await;
     assert_eq!(auto_row.num_rows(), 1);
     assert!(auto_row.column_by_name("_doc_index").is_none());
-    let mut row_projection = ds.scan();
-    row_projection
+    let mut ambiguous = ds.scan();
+    ambiguous
         .full_text_search(
             FullTextSearchQuery::new("alpha".to_string())
                 .with_column("tags".to_string())
                 .unwrap(),
         )
+        .unwrap();
+    let err = ambiguous.try_into_batch().await.unwrap_err();
+    assert!(
+        err.to_string().contains("ambiguous")
+            && err.to_string().contains("specify document_granularity"),
+        "{err}"
+    );
+    let mut row_projection = ds.scan();
+    row_projection
+        .full_text_search(row_match("tags", "alpha"))
         .unwrap();
     row_projection.project(&["_doc_index"]).unwrap();
     let err = row_projection.try_into_batch().await.unwrap_err();
@@ -426,14 +476,7 @@ async fn test_element_document_fts_flat_indexed_and_mixed() {
     .await;
     assert_eq!(element_phrase.num_rows(), 0);
 
-    let row_phrase =
-        PhraseQuery::new("beta gamma".to_string()).with_column(Some("tags".to_string()));
-    let row_phrase = run_fts(
-        &ds,
-        FullTextSearchQuery::new_query(FtsQuery::Phrase(row_phrase)),
-        None,
-    )
-    .await;
+    let row_phrase = run_fts(&ds, row_phrase("tags", "beta gamma"), None).await;
     assert_eq!(
         row_phrase["id"]
             .as_primitive::<arrow_array::types::Int32Type>()
@@ -444,20 +487,18 @@ async fn test_element_document_fts_flat_indexed_and_mixed() {
 
     let cross_target = BooleanQuery::new([
         (Occur::Must, element_match("alpha")),
-        (
-            Occur::Must,
-            FtsQuery::Match(
-                MatchQuery::new("beta".to_string()).with_column(Some("tags".to_string())),
-            ),
-        ),
+        (Occur::Must, FtsQuery::Match(row_match_node("tags", "beta"))),
     ]);
     let mut scanner = ds.scan();
-    let err = scanner
+    scanner
         .full_text_search(FullTextSearchQuery::new_query(FtsQuery::Boolean(
             cross_target,
         )))
-        .err()
-        .expect("mixed document granularities must be rejected");
+        .unwrap();
+    let err = scanner
+        .try_into_batch()
+        .await
+        .expect_err("mixed document granularities must be rejected");
     assert!(
         err.to_string()
             .contains("cannot mix Row and ListElement document granularities"),
@@ -466,33 +507,40 @@ async fn test_element_document_fts_flat_indexed_and_mixed() {
 
     let mut multi_match =
         MultiMatchQuery::try_new("alpha".to_string(), vec!["tags".to_string()]).unwrap();
-    multi_match.match_queries[0].document_granularity = DocumentGranularity::ListElement;
+    multi_match.match_queries[0].document_granularity = Some(DocumentGranularity::ListElement);
     let mut scanner = ds.scan();
-    let err = scanner
+    scanner
         .full_text_search(FullTextSearchQuery::new_query(FtsQuery::MultiMatch(
             multi_match,
         )))
-        .err()
-        .expect("ListElement MultiMatch must be rejected");
+        .unwrap();
+    let err = scanner
+        .try_into_batch()
+        .await
+        .expect_err("ListElement MultiMatch must be rejected");
     assert!(
         err.to_string()
             .contains("MultiMatch does not support ListElement document granularity"),
         "{err}"
     );
 
-    let row_multi_match =
+    let mut row_multi_match =
         MultiMatchQuery::try_new("beta".to_string(), vec!["tags".to_string()]).unwrap();
+    row_multi_match.match_queries[0].document_granularity = Some(DocumentGranularity::Row);
     let mixed_multi_match = BooleanQuery::new([
         (Occur::Must, element_match("alpha")),
         (Occur::Must, FtsQuery::MultiMatch(row_multi_match)),
     ]);
     let mut scanner = ds.scan();
-    let err = scanner
+    scanner
         .full_text_search(FullTextSearchQuery::new_query(FtsQuery::Boolean(
             mixed_multi_match,
         )))
-        .err()
-        .expect("mixed document granularities must be rejected");
+        .unwrap();
+    let err = scanner
+        .try_into_batch()
+        .await
+        .expect_err("mixed document granularities must be rejected");
     assert!(
         err.to_string()
             .contains("cannot mix Row and ListElement document granularities"),
@@ -594,10 +642,13 @@ async fn test_element_document_fts_flat_indexed_and_mixed() {
     let renamed = run_fts(&ds, list_element_match("labels", "alpha"), None).await;
     assert_eq!(element_hits(&renamed), vec![(6, vec![0]), (6, vec![1])]);
     let mut old_name_scanner = ds.scan();
-    let err = old_name_scanner
+    old_name_scanner
         .full_text_search(list_element_match("tags", "alpha"))
-        .err()
-        .expect("renamed element target must reject the old path");
+        .unwrap();
+    let err = old_name_scanner
+        .try_into_batch()
+        .await
+        .expect_err("renamed element target must reject the old path");
     assert!(err.to_string().contains("tags"), "{err}");
 }
 

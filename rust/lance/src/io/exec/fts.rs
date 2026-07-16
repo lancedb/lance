@@ -521,15 +521,17 @@ impl MatchQueryExec {
         query: MatchQuery,
         params: FtsSearchParams,
         prefilter_source: PreFilterSource,
-    ) -> Self {
-        let document_granularity = query.document_granularity;
-        Self::new_with_document_granularity(
+    ) -> Result<Self> {
+        let document_granularity = query.document_granularity.ok_or_else(|| {
+            Error::invalid_input("MatchQuery document granularity must be resolved".to_string())
+        })?;
+        Ok(Self::new_with_document_granularity(
             dataset,
             query,
             params,
             prefilter_source,
             document_granularity,
-        )
+        ))
     }
 
     pub fn new_with_document_granularity(
@@ -577,16 +579,18 @@ impl MatchQueryExec {
         params: FtsSearchParams,
         prefilter_source: PreFilterSource,
         segments: Vec<IndexMetadata>,
-    ) -> Self {
-        let document_granularity = query.document_granularity;
-        Self::new_with_segments_and_document_granularity(
+    ) -> Result<Self> {
+        let document_granularity = query.document_granularity.ok_or_else(|| {
+            Error::invalid_input("MatchQuery document granularity must be resolved".to_string())
+        })?;
+        Ok(Self::new_with_segments_and_document_granularity(
             dataset,
             query,
             params,
             prefilter_source,
             segments,
             document_granularity,
-        )
+        ))
     }
 
     pub fn new_with_segments_and_document_granularity(
@@ -1125,6 +1129,15 @@ impl FlatMatchFilterExec {
                 "column not set for MatchQuery {}",
                 query.terms
             )))?;
+        let document_granularity = resolved_field
+            .as_ref()
+            .map(|resolved| resolved.document_granularity)
+            .or(query.document_granularity)
+            .ok_or_else(|| {
+                DataFusionError::Execution(
+                    "MatchQuery document granularity was not resolved".to_string(),
+                )
+            })?;
         let mut tokenizer = match preset_segments {
             Some(segments) => {
                 Self::load_tokenizer_from_preset_segments(
@@ -1139,7 +1152,7 @@ impl FlatMatchFilterExec {
                 Self::load_tokenizer(
                     &dataset,
                     &column,
-                    query.document_granularity,
+                    document_granularity,
                     &metrics.index_metrics,
                 )
                 .await?
@@ -1350,17 +1363,19 @@ impl FlatMatchQueryExec {
         query: MatchQuery,
         params: FtsSearchParams,
         unindexed_input: Arc<dyn ExecutionPlan>,
-    ) -> Self {
+    ) -> Result<Self> {
         let document_column = query.column.clone().unwrap_or_default();
-        let document_granularity = query.document_granularity;
-        Self::new_with_document_granularity(
+        let document_granularity = query.document_granularity.ok_or_else(|| {
+            Error::invalid_input("MatchQuery document granularity must be resolved".to_string())
+        })?;
+        Ok(Self::new_with_document_granularity(
             dataset,
             query,
             params,
             unindexed_input,
             document_granularity,
             document_column,
-        )
+        ))
     }
 
     pub fn new_with_document_granularity(
@@ -1402,10 +1417,12 @@ impl FlatMatchQueryExec {
         params: FtsSearchParams,
         unindexed_input: Arc<dyn ExecutionPlan>,
         segments: Vec<IndexMetadata>,
-    ) -> Self {
+    ) -> Result<Self> {
         let document_column = query.column.clone().unwrap_or_default();
-        let document_granularity = query.document_granularity;
-        Self::new_with_segments_and_document_granularity(
+        let document_granularity = query.document_granularity.ok_or_else(|| {
+            Error::invalid_input("MatchQuery document granularity must be resolved".to_string())
+        })?;
+        Ok(Self::new_with_segments_and_document_granularity(
             dataset,
             query,
             params,
@@ -1413,7 +1430,7 @@ impl FlatMatchQueryExec {
             segments,
             document_granularity,
             document_column,
-        )
+        ))
     }
 
     pub fn new_with_segments_and_document_granularity(
@@ -1724,15 +1741,17 @@ impl PhraseQueryExec {
         query: PhraseQuery,
         params: FtsSearchParams,
         prefilter_source: PreFilterSource,
-    ) -> Self {
-        let document_granularity = query.document_granularity;
-        Self::new_with_document_granularity(
+    ) -> Result<Self> {
+        let document_granularity = query.document_granularity.ok_or_else(|| {
+            Error::invalid_input("PhraseQuery document granularity must be resolved".to_string())
+        })?;
+        Ok(Self::new_with_document_granularity(
             dataset,
             query,
             params,
             prefilter_source,
             document_granularity,
-        )
+        ))
     }
 
     pub fn new_with_document_granularity(
@@ -1773,16 +1792,18 @@ impl PhraseQueryExec {
         params: FtsSearchParams,
         prefilter_source: PreFilterSource,
         segments: Vec<IndexMetadata>,
-    ) -> Self {
-        let document_granularity = query.document_granularity;
-        Self::new_with_segments_and_document_granularity(
+    ) -> Result<Self> {
+        let document_granularity = query.document_granularity.ok_or_else(|| {
+            Error::invalid_input("PhraseQuery document granularity must be resolved".to_string())
+        })?;
+        Ok(Self::new_with_segments_and_document_granularity(
             dataset,
             query,
             params,
             prefilter_source,
             segments,
             document_granularity,
-        )
+        ))
     }
 
     pub fn new_with_segments_and_document_granularity(
@@ -2672,10 +2693,13 @@ mod tests {
         let fixture = NoContextTestFixture::new();
         let match_query = MatchQueryExec::new(
             Arc::new(fixture.dataset.clone()),
-            MatchQuery::new("blah".to_string()).with_column(Some("text".to_string())),
+            MatchQuery::new("blah".to_string())
+                .with_column(Some("text".to_string()))
+                .with_document_granularity(DocumentGranularity::Row),
             FtsSearchParams::default(),
             PreFilterSource::None,
-        );
+        )
+        .unwrap();
         match_query
             .execute(0, Arc::new(TaskContext::default()))
             .unwrap();
@@ -2691,10 +2715,13 @@ mod tests {
 
         let flat_match_query = FlatMatchQueryExec::new(
             Arc::new(fixture.dataset.clone()),
-            MatchQuery::new("blah".to_string()).with_column(Some("text".to_string())),
+            MatchQuery::new("blah".to_string())
+                .with_column(Some("text".to_string()))
+                .with_document_granularity(DocumentGranularity::Row),
             FtsSearchParams::default(),
             flat_input,
-        );
+        )
+        .unwrap();
         flat_match_query
             .execute(0, Arc::new(TaskContext::default()))
             .unwrap();
@@ -2703,10 +2730,12 @@ mod tests {
 
         let phrase_query = PhraseQueryExec::new(
             Arc::new(fixture.dataset.clone()),
-            PhraseQuery::new("blah".to_string()),
+            PhraseQuery::new("blah".to_string())
+                .with_document_granularity(DocumentGranularity::Row),
             FtsSearchParams::new().with_phrase_slop(Some(0)),
             PreFilterSource::None,
-        );
+        )
+        .unwrap();
         phrase_query
             .execute(0, Arc::new(TaskContext::default()))
             .unwrap();
@@ -2715,17 +2744,23 @@ mod tests {
 
         let boost_input_one = MatchQueryExec::new(
             Arc::new(fixture.dataset.clone()),
-            MatchQuery::new("blah".to_string()).with_column(Some("text".to_string())),
+            MatchQuery::new("blah".to_string())
+                .with_column(Some("text".to_string()))
+                .with_document_granularity(DocumentGranularity::Row),
             FtsSearchParams::default(),
             PreFilterSource::None,
-        );
+        )
+        .unwrap();
 
         let boost_input_two = MatchQueryExec::new(
             Arc::new(fixture.dataset),
-            MatchQuery::new("blah".to_string()).with_column(Some("text".to_string())),
+            MatchQuery::new("blah".to_string())
+                .with_column(Some("text".to_string()))
+                .with_document_granularity(DocumentGranularity::Row),
             FtsSearchParams::default(),
             PreFilterSource::None,
-        );
+        )
+        .unwrap();
 
         let boost_query = BoostQueryExec::new(
             BoostQuery::new(
@@ -3056,7 +3091,9 @@ mod tests {
         );
 
         let dataset = Arc::new(ds);
-        let query = MatchQuery::new("lance".to_string()).with_column(Some("text".to_string()));
+        let query = MatchQuery::new("lance".to_string())
+            .with_column(Some("text".to_string()))
+            .with_document_granularity(DocumentGranularity::Row);
         let search_params = FtsSearchParams::default().with_limit(Some(10));
 
         // Baseline: the existing path that builds the global scorer locally.
@@ -3065,7 +3102,8 @@ mod tests {
             query.clone(),
             search_params.clone(),
             PreFilterSource::None,
-        );
+        )
+        .unwrap();
         let baseline_batches: Vec<RecordBatch> = baseline_exec
             .execute(0, Arc::new(TaskContext::default()))
             .unwrap()
@@ -3113,6 +3151,7 @@ mod tests {
             PreFilterSource::None,
             preset_segments,
         )
+        .unwrap()
         .with_base_scorer(global_scorer);
         let override_batches: Vec<RecordBatch> = override_exec
             .execute(0, Arc::new(TaskContext::default()))

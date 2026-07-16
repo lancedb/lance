@@ -58,6 +58,7 @@ use super::exec::PkBlockFilterExec;
 use super::flushed_cache::{DatasetCache, GenerationWarmer, open_flushed_dataset};
 use super::projection::{project_to_canonical, validate_projection_names};
 use crate::dataset::mem_wal::memtable::scanner::MemTableScanner;
+use crate::index::scalar::inverted::{indexed_fts_document_granularities, resolve_fts_field};
 use crate::session::Session;
 use lance_io::object_store::ObjectStoreParams;
 
@@ -71,12 +72,138 @@ pub const SCORE_COLUMN: &str = "_score";
 /// so a blocked source still yields `k` live rows after the block-list filter.
 const DEFAULT_OVERFETCH_FACTOR: f64 = 1.0;
 
-fn query_document_granularity(query: &FullTextSearchQuery) -> DocumentGranularity {
-    match &query.query {
-        IndexFtsQuery::Match(query) => query.document_granularity,
-        IndexFtsQuery::Phrase(query) => query.document_granularity,
-        _ => DocumentGranularity::Row,
+fn requested_query_document_granularity(
+    query: &IndexFtsQuery,
+) -> Result<Option<DocumentGranularity>> {
+    fn merge(
+        current: &mut Option<DocumentGranularity>,
+        requested: Option<DocumentGranularity>,
+    ) -> Result<()> {
+        let Some(requested) = requested else {
+            return Ok(());
+        };
+        if let Some(current) = current
+            && *current != requested
+        {
+            return Err(Error::invalid_input(
+                "FTS queries cannot mix Row and ListElement document granularities".to_string(),
+            ));
+        }
+        *current = Some(requested);
+        Ok(())
     }
+
+    fn visit(query: &IndexFtsQuery, current: &mut Option<DocumentGranularity>) -> Result<()> {
+        match query {
+            IndexFtsQuery::Match(query) => merge(current, query.document_granularity),
+            IndexFtsQuery::Phrase(query) => merge(current, query.document_granularity),
+            IndexFtsQuery::Boost(query) => {
+                visit(&query.positive, current)?;
+                visit(&query.negative, current)
+            }
+            IndexFtsQuery::Boolean(query) => {
+                for child in query
+                    .must
+                    .iter()
+                    .chain(&query.should)
+                    .chain(&query.must_not)
+                {
+                    visit(child, current)?;
+                }
+                Ok(())
+            }
+            IndexFtsQuery::MultiMatch(query) => {
+                for child in &query.match_queries {
+                    merge(current, child.document_granularity)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    let mut requested = None;
+    visit(query, &mut requested)?;
+    Ok(requested)
+}
+
+fn set_query_document_granularity(
+    query: &mut IndexFtsQuery,
+    document_granularity: DocumentGranularity,
+) {
+    match query {
+        IndexFtsQuery::Match(query) => {
+            query.document_granularity = Some(document_granularity);
+        }
+        IndexFtsQuery::Phrase(query) => {
+            query.document_granularity = Some(document_granularity);
+        }
+        IndexFtsQuery::Boost(query) => {
+            set_query_document_granularity(&mut query.positive, document_granularity);
+            set_query_document_granularity(&mut query.negative, document_granularity);
+        }
+        IndexFtsQuery::Boolean(query) => {
+            for child in query
+                .must
+                .iter_mut()
+                .chain(&mut query.should)
+                .chain(&mut query.must_not)
+            {
+                set_query_document_granularity(child, document_granularity);
+            }
+        }
+        IndexFtsQuery::MultiMatch(query) => {
+            for child in &mut query.match_queries {
+                child.document_granularity = Some(document_granularity);
+            }
+        }
+    }
+}
+
+fn query_document_granularity(query: &FullTextSearchQuery) -> Result<DocumentGranularity> {
+    requested_query_document_granularity(&query.query)?.ok_or_else(|| {
+        Error::internal("LSM FTS query document granularity was not resolved".to_string())
+    })
+}
+
+fn resolve_document_granularity_from_candidates(
+    column: &str,
+    requested: Option<DocumentGranularity>,
+    mut available: Vec<DocumentGranularity>,
+) -> Result<DocumentGranularity> {
+    available.sort_by_key(|document_granularity| match document_granularity {
+        DocumentGranularity::Row => 0,
+        DocumentGranularity::ListElement => 1,
+    });
+    available.dedup();
+    match requested {
+        Some(requested) if available.is_empty() || available.contains(&requested) => Ok(requested),
+        Some(requested) => Err(Error::invalid_input(format!(
+            "FTS query for field '{column}' requested {requested:?} document granularity, but \
+             the MemWAL sources use a different indexed granularity: {available:?}"
+        ))),
+        None if available.is_empty() => Ok(DocumentGranularity::Row),
+        None if available.len() == 1 => Ok(available[0]),
+        None => Err(Error::invalid_input(format!(
+            "FTS query for field '{column}' is ambiguous because Row and ListElement indexes \
+             coexist across MemWAL sources; specify document_granularity"
+        ))),
+    }
+}
+
+fn validate_source_document_granularities(
+    column: &str,
+    resolved: DocumentGranularity,
+    source_granularities: &[Vec<DocumentGranularity>],
+) -> Result<()> {
+    for granularities in source_granularities {
+        if !granularities.is_empty() && !granularities.contains(&resolved) {
+            return Err(Error::invalid_input(format!(
+                "FTS query for field '{column}' resolved to {resolved:?}, but a MemWAL source has \
+                 only incompatible indexed granularities: {granularities:?}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn validate_lsm_fts_query(query: &FullTextSearchQuery) -> Result<()> {
@@ -224,12 +351,55 @@ impl LsmFtsSearchPlanner {
     pub async fn plan_search(
         &self,
         column: &str,
-        query: FullTextSearchQuery,
+        mut query: FullTextSearchQuery,
         limit: Option<usize>,
         projection: Option<&[String]>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let document_granularity = query_document_granularity(&query);
         let sources = self.collector.collect()?;
+        let requested = requested_query_document_granularity(&query.query)?;
+        let mut available = Vec::new();
+        let mut source_granularities = Vec::with_capacity(sources.len());
+        for source in &sources {
+            let granularities = match source {
+                LsmDataSource::BaseTable { dataset } => {
+                    indexed_fts_document_granularities(dataset, column)
+                        .await?
+                        .into_iter()
+                        .map(|(_, document_granularity)| document_granularity)
+                        .collect::<Vec<_>>()
+                }
+                LsmDataSource::FlushedMemTable { path, .. } => {
+                    let dataset = open_flushed_dataset(
+                        path,
+                        self.session.as_ref(),
+                        self.store_params.as_ref(),
+                        self.flushed_cache.as_ref(),
+                        self.warmer.as_ref(),
+                    )
+                    .await?;
+                    indexed_fts_document_granularities(&dataset, column)
+                        .await?
+                        .into_iter()
+                        .map(|(_, document_granularity)| document_granularity)
+                        .collect::<Vec<_>>()
+                }
+                LsmDataSource::ActiveMemTable { index_store, .. } => {
+                    index_store.fts_document_granularities_by_column(column)
+                }
+            };
+            available.extend(granularities.iter().copied());
+            source_granularities.push(granularities);
+        }
+        let document_granularity =
+            resolve_document_granularity_from_candidates(column, requested, available)?;
+        validate_source_document_granularities(
+            column,
+            document_granularity,
+            &source_granularities,
+        )?;
+        let schema = lance_core::datatypes::Schema::try_from(self.base_schema.as_ref())?;
+        resolve_fts_field(&schema, column, document_granularity)?;
+        set_query_document_granularity(&mut query.query, document_granularity);
         if sources
             .iter()
             .any(|source| active_source_can_execute_fts(source, column, document_granularity))
@@ -432,7 +602,7 @@ impl LsmFtsSearchPlanner {
                 schema,
                 ..
             } => {
-                let document_granularity = query_document_granularity(query);
+                let document_granularity = query_document_granularity(query)?;
                 if !active_source_can_execute_fts(source, column, document_granularity) {
                     return self
                         .empty_plan(&self.canonical_fts_schema(projection, document_granularity));
@@ -654,6 +824,81 @@ mod tests {
         );
     }
 
+    #[test]
+    fn resolves_document_granularity_from_memwal_indexes() {
+        assert_eq!(
+            resolve_document_granularity_from_candidates("tags", None, vec![]).unwrap(),
+            DocumentGranularity::Row
+        );
+        assert_eq!(
+            resolve_document_granularity_from_candidates(
+                "tags",
+                None,
+                vec![DocumentGranularity::ListElement],
+            )
+            .unwrap(),
+            DocumentGranularity::ListElement
+        );
+        assert!(
+            resolve_document_granularity_from_candidates(
+                "tags",
+                Some(DocumentGranularity::Row),
+                vec![DocumentGranularity::ListElement],
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("different indexed granularity")
+        );
+        let both = vec![DocumentGranularity::Row, DocumentGranularity::ListElement];
+        assert!(
+            resolve_document_granularity_from_candidates("tags", None, both.clone())
+                .unwrap_err()
+                .to_string()
+                .contains("ambiguous")
+        );
+        assert_eq!(
+            resolve_document_granularity_from_candidates(
+                "tags",
+                Some(DocumentGranularity::ListElement),
+                both,
+            )
+            .unwrap(),
+            DocumentGranularity::ListElement
+        );
+        assert!(
+            validate_source_document_granularities(
+                "tags",
+                DocumentGranularity::ListElement,
+                &[
+                    vec![DocumentGranularity::ListElement],
+                    vec![DocumentGranularity::Row],
+                ],
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("incompatible indexed granularities")
+        );
+    }
+
+    #[tokio::test]
+    async fn memwal_rejects_list_element_without_a_list_path() {
+        let schema = fts_schema();
+        let tmp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![]);
+        let planner = LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], schema);
+        let query = FullTextSearchQuery::new_query(IndexFtsQuery::Match(
+            MatchQuery::new("lance".to_string())
+                .with_document_granularity(DocumentGranularity::ListElement),
+        ));
+
+        let error = planner
+            .plan_search("text", query, Some(1), None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("has no List layer"), "{error}");
+    }
+
     #[tokio::test]
     async fn active_element_document_search_returns_physical_ordinals() {
         use lance_index::scalar::inverted::InvertedIndexParams;
@@ -722,10 +967,9 @@ mod tests {
         let plan = planner
             .plan_search(
                 "tags",
-                FullTextSearchQuery::new_query(IndexFtsQuery::Match(
-                    MatchQuery::new("beta".to_string())
-                        .with_document_granularity(DocumentGranularity::ListElement),
-                )),
+                FullTextSearchQuery::new_query(IndexFtsQuery::Match(MatchQuery::new(
+                    "beta".to_string(),
+                ))),
                 Some(10),
                 Some(&projection),
             )
@@ -854,10 +1098,9 @@ mod tests {
         let plan = planner
             .plan_search(
                 "tags",
-                FullTextSearchQuery::new_query(IndexFtsQuery::Match(
-                    MatchQuery::new("beta".to_string())
-                        .with_document_granularity(DocumentGranularity::ListElement),
-                )),
+                FullTextSearchQuery::new_query(IndexFtsQuery::Match(MatchQuery::new(
+                    "beta".to_string(),
+                ))),
                 Some(10),
                 Some(&projection),
             )

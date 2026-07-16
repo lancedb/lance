@@ -1024,6 +1024,26 @@ impl IndexStore {
         })
     }
 
+    /// Return the distinct persisted document granularities for FTS indexes on
+    /// `column`, ordered from row to list-element.
+    pub fn fts_document_granularities_by_column(
+        &self,
+        column: &str,
+    ) -> Vec<lance_index::scalar::inverted::DocumentGranularity> {
+        let mut granularities = self
+            .fts_indexes
+            .values()
+            .filter(|index| index.column_name() == column)
+            .map(|index| index.document_granularity())
+            .collect::<Vec<_>>();
+        granularities.sort_by_key(|document_granularity| match document_granularity {
+            lance_index::scalar::inverted::DocumentGranularity::Row => 0,
+            lance_index::scalar::inverted::DocumentGranularity::ListElement => 1,
+        });
+        granularities.dedup();
+        granularities
+    }
+
     /// Check if the registry has any indexes.
     pub fn is_empty(&self) -> bool {
         self.btree_indexes.is_empty() && self.hnsw_indexes.is_empty() && self.fts_indexes.is_empty()

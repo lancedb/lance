@@ -3,7 +3,7 @@
 
 #![allow(clippy::redundant_pub_crate)]
 
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use arrow_array::cast::AsArray;
 use arrow_array::{
@@ -532,6 +532,106 @@ pub(crate) fn resolve_fts_field_by_id(
     Err(Error::invalid_input(format!(
         "FTS index refers to missing or Arrow-internal field id {field_id}"
     )))
+}
+
+/// Return the persisted FTS document granularity for each logical index on a
+/// public field path. Multiple physical segments with the same index name are
+/// collapsed after validating that their metadata agrees.
+pub(crate) async fn indexed_fts_document_granularities(
+    dataset: &Dataset,
+    column: &str,
+) -> Result<Vec<(String, DocumentGranularity)>> {
+    let resolved = resolve_fts_field(dataset.schema(), column, DocumentGranularity::Row)?;
+    let mut by_name = BTreeMap::new();
+
+    for index in dataset.load_indices().await?.iter() {
+        if index.fields.as_slice() != [resolved.final_field_id] {
+            continue;
+        }
+        let details_any = fetch_index_details(dataset, &resolved.canonical_path, index).await?;
+        if !details_any.type_url.ends_with("InvertedIndexDetails") {
+            continue;
+        }
+        let details =
+            InvertedIndexDetails::decode(details_any.value.as_slice()).map_err(|error| {
+                Error::corrupt_file(
+                    dataset.indices_dir().join(index.uuid.to_string()),
+                    format!(
+                        "failed to decode InvertedIndexDetails for FTS index '{}': {error}",
+                        index.name
+                    ),
+                )
+            })?;
+        let document_granularity = DocumentGranularity::try_from(details.document_granularity)?;
+        if let Some(existing) = by_name.insert(index.name.clone(), document_granularity)
+            && existing != document_granularity
+        {
+            return Err(Error::corrupt_file(
+                dataset.indices_dir().join(index.uuid.to_string()),
+                format!(
+                    "FTS index '{}' has inconsistent document granularity across segments: \
+                     {existing:?} and {document_granularity:?}",
+                    index.name
+                ),
+            ));
+        }
+    }
+
+    Ok(by_name.into_iter().collect())
+}
+
+/// Resolve an optional query granularity against persisted FTS index metadata.
+///
+/// A unique indexed granularity is authoritative and also controls flat search
+/// over unindexed fragments. An explicit request selects between coexisting
+/// row and list-element indexes, but cannot contradict the only indexed
+/// granularity. With no index, the established row default is retained.
+pub(crate) async fn resolve_query_document_granularity(
+    dataset: &Dataset,
+    column: &str,
+    requested: Option<DocumentGranularity>,
+) -> Result<DocumentGranularity> {
+    let indices = indexed_fts_document_granularities(dataset, column).await?;
+    let mut available = indices
+        .iter()
+        .map(|(_, document_granularity)| *document_granularity)
+        .collect::<Vec<_>>();
+    available.sort_by_key(|document_granularity| match document_granularity {
+        DocumentGranularity::Row => 0,
+        DocumentGranularity::ListElement => 1,
+    });
+    available.dedup();
+
+    let resolved = match requested {
+        Some(requested) if available.is_empty() || available.contains(&requested) => requested,
+        Some(requested) => {
+            let indexed = indices
+                .iter()
+                .map(|(name, document_granularity)| format!("'{name}' ({document_granularity:?})"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(Error::invalid_input(format!(
+                "FTS query for field '{column}' requested {requested:?} document granularity, \
+                 but the existing FTS index uses a different granularity: {indexed}"
+            )));
+        }
+        None if available.is_empty() => DocumentGranularity::Row,
+        None if available.len() == 1 => available[0],
+        None => {
+            let indexed = indices
+                .iter()
+                .map(|(name, document_granularity)| format!("'{name}' ({document_granularity:?})"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(Error::invalid_input(format!(
+                "FTS query for field '{column}' is ambiguous because Row and ListElement \
+                 indexes coexist: {indexed}; specify document_granularity"
+            )));
+        }
+    };
+
+    resolve_fts_field(dataset.schema(), column, resolved)?;
+    Ok(resolved)
 }
 
 pub(crate) fn fts_document_schema(coordinate_rank: usize) -> Arc<ArrowSchema> {

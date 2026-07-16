@@ -126,8 +126,10 @@ pub(crate) fn build_full_text_search_query<'a>(
                 .with_fuzziness(fuzziness)
                 .with_max_expansions(max_expansions)
                 .with_operator(operator)
-                .with_prefix_length(prefix_length)
-                .with_document_granularity(document_granularity);
+                .with_prefix_length(prefix_length);
+            if let Some(document_granularity) = document_granularity {
+                query = query.with_document_granularity(document_granularity);
+            }
 
             Ok(FtsQuery::Match(query))
         }
@@ -139,9 +141,10 @@ pub(crate) fn build_full_text_search_query<'a>(
 
             let mut query = FtsPhraseQuery::new(query_text);
             query = query.with_column(Some(column));
-            query = query
-                .with_slop(slop)
-                .with_document_granularity(document_granularity);
+            query = query.with_slop(slop);
+            if let Some(document_granularity) = document_granularity {
+                query = query.with_document_granularity(document_granularity);
+            }
 
             Ok(FtsQuery::Phrase(query))
         }
@@ -240,17 +243,15 @@ pub(crate) fn build_full_text_search_query<'a>(
 fn get_document_granularity(
     env: &mut JNIEnv<'_>,
     java_obj: &JObject,
-) -> Result<DocumentGranularity> {
-    let granularity_obj = env
-        .call_method(
-            java_obj,
-            "getDocumentGranularity",
-            "()Lorg/lance/DocumentGranularity;",
-            &[],
-        )?
-        .l()?;
-    let value = env.get_string_from_method(&granularity_obj, "toRustString")?;
-    DocumentGranularity::try_from(value.as_str()).map_err(Error::from)
+) -> Result<Option<DocumentGranularity>> {
+    env.get_optional_from_method(
+        java_obj,
+        "getDocumentGranularity",
+        |env, granularity_obj| {
+            let value = env.get_string_from_method(&granularity_obj, "toRustString")?;
+            DocumentGranularity::try_from(value.as_str()).map_err(Error::from)
+        },
+    )
 }
 
 /// Scanner options passed from JNI - shared between blocking and async scanners

@@ -77,14 +77,16 @@ impl JsonParser for PhraseQuery {
     }
 }
 
-fn parse_document_granularity(value: &Value) -> Result<DocumentGranularity> {
+fn parse_document_granularity(value: &Value) -> Result<Option<DocumentGranularity>> {
     match value.get("document_granularity") {
-        None | Some(Value::Null) => Ok(DocumentGranularity::Row),
-        Some(granularity) => serde_json::from_value(granularity.clone()).map_err(|error| {
-            Error::invalid_input(format!(
-                "invalid document_granularity in FTS query: {error}"
-            ))
-        }),
+        None | Some(Value::Null) => Ok(None),
+        Some(granularity) => serde_json::from_value(granularity.clone())
+            .map(Some)
+            .map_err(|error| {
+                Error::invalid_input(format!(
+                    "invalid document_granularity in FTS query: {error}"
+                ))
+            }),
     }
 }
 
@@ -211,7 +213,7 @@ mod tests {
             max_expansions: 10,
             operator: Operator::And,
             prefix_length: 2,
-            document_granularity: DocumentGranularity::Row,
+            document_granularity: None,
         });
         assert_eq!(fts_query, expected_query);
     }
@@ -231,7 +233,7 @@ mod tests {
             column: Some("text".to_string()),
             terms: "hello world".to_string(),
             slop: 1,
-            document_granularity: DocumentGranularity::Row,
+            document_granularity: None,
         });
         assert_eq!(fts_query, expected_query);
     }

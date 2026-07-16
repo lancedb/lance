@@ -300,7 +300,30 @@ impl FtsQuery {
 /// phrase leaf queries; the column must be bound on the query. Compound queries
 /// (boolean / boost / multi-match) cannot be modeled by the MemTable path and
 /// return a `not_supported` error rather than failing deep in planning.
-fn local_fts_query(query: FullTextSearchQuery) -> Result<FtsQuery> {
+fn resolve_memtable_document_granularity(
+    column: &str,
+    requested: Option<DocumentGranularity>,
+    indexes: Option<&IndexStore>,
+) -> Result<DocumentGranularity> {
+    let available = indexes
+        .map(|indexes| indexes.fts_document_granularities_by_column(column))
+        .unwrap_or_default();
+    match requested {
+        Some(requested) if available.is_empty() || available.contains(&requested) => Ok(requested),
+        Some(requested) => Err(Error::invalid_input(format!(
+            "FTS query for field '{column}' requested {requested:?} document granularity, but \
+             the active MemTable FTS index uses a different granularity: {available:?}"
+        ))),
+        None if available.is_empty() => Ok(DocumentGranularity::Row),
+        None if available.len() == 1 => Ok(available[0]),
+        None => Err(Error::invalid_input(format!(
+            "FTS query for field '{column}' is ambiguous because Row and ListElement active \
+             MemTable indexes coexist; specify document_granularity"
+        ))),
+    }
+}
+
+fn local_fts_query(query: FullTextSearchQuery, indexes: Option<&IndexStore>) -> Result<FtsQuery> {
     let wand_factor = query.wand_factor.unwrap_or(DEFAULT_WAND_FACTOR);
     let limit = query
         .limit
@@ -325,8 +348,9 @@ fn local_fts_query(query: FullTextSearchQuery) -> Result<FtsQuery> {
     };
     let local = match query.query {
         IndexFtsQuery::Match(m) => {
-            let document_granularity = m.document_granularity;
             let column = require_column(m.column)?;
+            let document_granularity =
+                resolve_memtable_document_granularity(&column, m.document_granularity, indexes)?;
             let local = match m.fuzziness {
                 // Some(0) is an exact match in the index model.
                 Some(0) => FtsQuery::match_query_with_operator(column, m.terms, m.operator)
@@ -349,8 +373,10 @@ fn local_fts_query(query: FullTextSearchQuery) -> Result<FtsQuery> {
             local.with_document_granularity(document_granularity)
         }
         IndexFtsQuery::Phrase(p) => {
-            let document_granularity = p.document_granularity;
-            FtsQuery::phrase(require_column(p.column)?, p.terms, p.slop)
+            let column = require_column(p.column)?;
+            let document_granularity =
+                resolve_memtable_document_granularity(&column, p.document_granularity, indexes)?;
+            FtsQuery::phrase(column, p.terms, p.slop)
                 .with_document_granularity(document_granularity)
         }
         other => {
@@ -708,7 +734,7 @@ impl MemTableScanner {
     /// queries are supported; compound queries (boolean/boost/multi-match) are
     /// not yet supported by the MemTable path and return an error.
     pub fn full_text_search(&mut self, query: FullTextSearchQuery) -> Result<&mut Self> {
-        self.full_text_query = Some(local_fts_query(query)?);
+        self.full_text_query = Some(local_fts_query(query, Some(self.indexes.as_ref()))?);
         Ok(self)
     }
 
@@ -1577,11 +1603,58 @@ mod tests {
         let q = FullTextSearchQuery::new("hello".to_string())
             .with_column("text".to_string())
             .unwrap();
-        let local = local_fts_query(q).unwrap();
+        let local = local_fts_query(q, None).unwrap();
         assert_eq!(local.column, "text");
         assert!(
             matches!(local.query_type, FtsQueryType::Match { query, operator, .. }
                 if query == "hello" && operator == Operator::Or)
+        );
+
+        let mut indexes = IndexStore::new();
+        indexes
+            .add_fts_with_params(
+                "tags_list_element_idx".to_string(),
+                1,
+                "tags".to_string(),
+                lance_index::scalar::inverted::InvertedIndexParams::default()
+                    .document_granularity(DocumentGranularity::ListElement),
+            )
+            .unwrap();
+        let inferred = FullTextSearchQuery::new("hello".to_string())
+            .with_column("tags".to_string())
+            .unwrap();
+        let inferred = local_fts_query(inferred, Some(&indexes)).unwrap();
+        assert_eq!(
+            inferred.document_granularity,
+            DocumentGranularity::ListElement
+        );
+        let conflicting = FullTextSearchQuery::new_query(IndexFtsQuery::Match(
+            MatchQuery::new("hello".to_string())
+                .with_column(Some("tags".to_string()))
+                .with_document_granularity(DocumentGranularity::Row),
+        ));
+        assert!(
+            local_fts_query(conflicting, Some(&indexes))
+                .unwrap_err()
+                .to_string()
+                .contains("different granularity")
+        );
+        indexes
+            .add_fts_with_params(
+                "tags_idx".to_string(),
+                1,
+                "tags".to_string(),
+                lance_index::scalar::inverted::InvertedIndexParams::default(),
+            )
+            .unwrap();
+        let ambiguous = FullTextSearchQuery::new("hello".to_string())
+            .with_column("tags".to_string())
+            .unwrap();
+        assert!(
+            local_fts_query(ambiguous, Some(&indexes))
+                .unwrap_err()
+                .to_string()
+                .contains("ambiguous")
         );
 
         let exact_and = FullTextSearchQuery::new_query(IndexFtsQuery::Match(
@@ -1590,7 +1663,7 @@ mod tests {
                 .with_boost(3.0)
                 .with_column(Some("text".to_string())),
         ));
-        let local = local_fts_query(exact_and).unwrap();
+        let local = local_fts_query(exact_and, None).unwrap();
         assert!(
             matches!(local.query_type, FtsQueryType::Match { query, operator, boost }
                 if query == "hello world" && operator == Operator::And && boost == 3.0)
@@ -1604,7 +1677,7 @@ mod tests {
                 .with_boost(2.5)
                 .with_column(Some("text".to_string())),
         ));
-        let local = local_fts_query(fuzzy).unwrap();
+        let local = local_fts_query(fuzzy, None).unwrap();
         assert!(
             matches!(local.query_type, FtsQueryType::Fuzzy { fuzziness, prefix_length, boost, .. }
                 if fuzziness == Some(2) && prefix_length == 2 && boost == 2.5)
@@ -1617,7 +1690,7 @@ mod tests {
                 .with_column(Some("text".to_string())),
         ));
         assert!(
-            local_fts_query(fuzzy_and).is_err(),
+            local_fts_query(fuzzy_and, None).is_err(),
             "fuzzy AND cannot be represented by the local memtable query"
         );
 
@@ -1625,7 +1698,7 @@ mod tests {
         let phrase = FullTextSearchQuery::new_query(IndexFtsQuery::Phrase(
             PhraseQuery::new("quick fox".to_string()).with_column(Some("text".to_string())),
         ));
-        let local = local_fts_query(phrase).unwrap();
+        let local = local_fts_query(phrase, None).unwrap();
         assert!(matches!(local.query_type, FtsQueryType::Phrase { .. }));
 
         // Compound (boolean) -> not supported.
@@ -1637,14 +1710,14 @@ mod tests {
                 ),
             )])));
         assert!(
-            local_fts_query(boolean).is_err(),
+            local_fts_query(boolean, None).is_err(),
             "boolean must be rejected"
         );
 
         // Missing column -> error.
         let no_col = FullTextSearchQuery::new("hi".to_string());
         assert!(
-            local_fts_query(no_col).is_err(),
+            local_fts_query(no_col, None).is_err(),
             "missing column must error"
         );
     }
