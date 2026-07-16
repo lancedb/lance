@@ -22,6 +22,61 @@ import run  # noqa: E402
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_release_orders_baselines_before_v23_for_fail_fast(self) -> None:
+        for repeat in range(5):
+            order = protocol.execution_format_order("release", repeat, "scope")
+            self.assertEqual(set(order[:2]), {"v22_no_stable", "v22_stable"})
+            self.assertEqual(order[-1], "v23_logical")
+
+    def test_release_v23_timeout_is_derived_from_the_faster_baseline(self) -> None:
+        runner = object.__new__(protocol.ProtocolRunner)
+        runner.mode = "release"
+        runner.operation_timeout_seconds = 1800
+        runner.fail_fast_runtime_ratio = 1.5
+        runner._existing_records = {
+            ("pair", "v22_no_stable"): {"status": "ok", "duration_ns": 120_000_000_000},
+            ("pair", "v22_stable"): {"status": "ok", "duration_ns": 100_000_000_000},
+        }
+
+        self.assertEqual(runner._worker_timeout("pair", "v23_logical"), 150.0)
+        self.assertEqual(runner._worker_timeout("pair", "v22_stable"), 1800)
+        with (
+            mock.patch.object(
+                protocol.subprocess,
+                "run",
+                side_effect=protocol.subprocess.TimeoutExpired(["worker"], 150),
+            ),
+            self.assertRaises(protocol.PerformanceRegressionTimeout),
+        ):
+            runner._run_worker(["worker"], pair_id="pair", format_name="v23_logical")
+
+    def test_absolute_timeout_is_not_misreported_as_a_v23_regression(self) -> None:
+        runner = object.__new__(protocol.ProtocolRunner)
+        runner.mode = "release"
+        runner.operation_timeout_seconds = 1800
+        runner.fail_fast_runtime_ratio = 1.5
+        runner._existing_records = {
+            ("pair", "v22_no_stable"): {
+                "status": "ok",
+                "duration_ns": 2_100_000_000_000,
+            },
+            ("pair", "v22_stable"): {
+                "status": "ok",
+                "duration_ns": 2_000_000_000_000,
+            },
+        }
+
+        self.assertEqual(runner._worker_timeout("pair", "v23_logical"), 1800.0)
+        with (
+            mock.patch.object(
+                protocol.subprocess,
+                "run",
+                side_effect=protocol.subprocess.TimeoutExpired(["worker"], 1800),
+            ),
+            self.assertRaises(protocol.OperationTimeout),
+        ):
+            runner._run_worker(["worker"], pair_id="pair", format_name="v23_logical")
+
     def test_protocol_format_order_is_independent_of_phases_per_repeat(self) -> None:
         step = protocol.Step("open", expected_rows=1)
 
@@ -51,7 +106,9 @@ class ProtocolTests(unittest.TestCase):
     def test_release_profile_freezes_design_matrix(self) -> None:
         matrix, canonical, digest = protocol.load_matrix(protocol.DEFAULT_MATRIX)
         release = matrix["profiles"]["release"]
+        contract = matrix["release_contract"]
         self.assertEqual(release["rows"], 100_000_000)
+        self.assertEqual(release["paired_repeats"], 5)
         self.assertEqual(release["logical_fragment_counts"], [100, 10_000, 100_000])
         self.assertEqual(release["take_counts"], [1, 32, 1024, 10_000])
         self.assertEqual(release["delete_percentages"], [1, 50, 90])
@@ -62,8 +119,13 @@ class ProtocolTests(unittest.TestCase):
             "must_admit",
         )
         self.assertEqual(release["random_delete_reclaim_admission"], "must_not_admit")
+        self.assertEqual(contract["shard_count"], 5)
+        self.assertEqual(contract["operation_timeout_seconds"], 1800)
+        self.assertEqual(contract["fail_fast_runtime_ratio"], 1.5)
+        self.assertEqual(contract["tracks"], ["matrix"])
+        self.assertEqual(contract["variants"], [])
         self.assertEqual(len(digest), 64)
-        self.assertIn('"schema_version":1', canonical)
+        self.assertIn('"schema_version":2', canonical)
 
     def test_random_update_uses_exact_selection_driver(self) -> None:
         matrix, _, _ = protocol.load_matrix(protocol.DEFAULT_MATRIX)
@@ -596,32 +658,29 @@ class ProtocolTests(unittest.TestCase):
     def test_release_fixture_dedup_and_cost_projection_are_frozen(self) -> None:
         matrix, _, _ = protocol.load_matrix(protocol.DEFAULT_MATRIX)
         profile = matrix["profiles"]["release"]
-        tracks = list(matrix["tracks"])
-        variants = ["bare", "scalar", "vector"]
-        cases = list(
-            protocol.iter_matrix_cases(
-                profile, set(matrix["tracks"]["matrix"]["cases"])
-            )
-        )
+        contract = matrix["release_contract"]
+        tracks = contract["tracks"]
+        variants = contract["variants"]
+        cases = list(protocol.canonical_release_cases(matrix))
         keys = protocol.fixture_keys_for_run(profile, tracks, variants, cases)
-        self.assertEqual(len(keys), 17)
+        self.assertEqual(len(keys), 5)
         self.assertEqual(
             protocol.projected_canonical_payload_bytes(profile, keys),
-            614_400_000_000,
+            211_200_000_000,
         )
         self.assertEqual(
             protocol.projected_unique_initial_index_payload_bytes_lower_bound(
                 profile, keys, cases
             ),
-            511_200_000_000,
+            170_400_000_000,
         )
         self.assertEqual(
             protocol.projected_minimum_full_scan_payload_bytes(
                 profile, tracks, variants, cases
             ),
-            1_691_650_560_000_000,
+            2_112_000_000_000,
         )
-        shards = [protocol.fixture_keys_for_shard(keys, 4, index) for index in range(4)]
+        shards = [protocol.fixture_keys_for_shard(keys, 5, index) for index in range(5)]
         self.assertEqual(set().union(*shards), keys)
         self.assertTrue(
             all(
@@ -698,16 +757,16 @@ class ProtocolTests(unittest.TestCase):
             "--profile",
             "release",
         ]
-        with self.assertRaisesRegex(ValueError, "exactly nine canonical shards"):
+        with self.assertRaisesRegex(ValueError, "exactly 5 canonical shards"):
             protocol.main(base)
-        with self.assertRaisesRegex(ValueError, "canonical complete track order"):
-            protocol.main([*base, "--shard-count", "9", "--track", "sustained"])
+        with self.assertRaisesRegex(ValueError, "canonical sentinel track order"):
+            protocol.main([*base, "--shard-count", "5", "--track", "sustained"])
         with self.assertRaisesRegex(ValueError, "canonical seed"):
             protocol.main(
                 [
                     *base,
                     "--shard-count",
-                    "9",
+                    "5",
                     "--seed",
                     str(protocol.RELEASE_SEED + 1),
                 ]
@@ -722,7 +781,7 @@ class ProtocolTests(unittest.TestCase):
                     [
                         *base,
                         "--shard-count",
-                        "9",
+                        "5",
                         "--matrix",
                         str(matrix_path),
                     ]
@@ -737,7 +796,7 @@ class ProtocolTests(unittest.TestCase):
                     [
                         *base,
                         "--shard-count",
-                        "9",
+                        "5",
                         "--policy",
                         str(policy_path),
                     ]

@@ -37,13 +37,17 @@ the remote host's default `python3` is older.
   compaction before retrying the rejected update. It is a state/mechanism
   diagnostic and is not a net-benefit denominator.
 
-The release profile freezes 100M rows, 16-byte/128-byte/vector schemas,
-100/10K/100K logical fragments, 1/32/1024/10K takes, the specified mutation
-ratios, ten paired repeats, and 100-round repeated chains. The smoke profile
-keeps the same protocol with bounded fixtures. Release runs require same-region
-S3; EBS is intentionally smoke-only. Both protocol profiles build the worker
-with Cargo's optimized `release-with-debug` profile. Unoptimized binaries are
-valid only for correctness debugging and never produce performance evidence.
+The bounded smoke profile runs the complete four-track correctness protocol at
+65K rows with 8/64/4096 logical fragments and three paired repeats. The release
+profile is deliberately narrower: five paired repeats over five explicit 100M
+scale hypotheses only—10K-fragment wide compaction, 10K- and 100K-fragment
+skewed narrow compaction, and 10K-fragment scalar/vector indexed compaction.
+This keeps the 100K fanout and the two regressions that motivated the focused
+contract without multiplying every correctness combination by 100M rows.
+Release runs require same-region S3; EBS is intentionally smoke-only. Both
+profiles build the worker with Cargo's optimized `release-with-debug` profile.
+Unoptimized binaries are valid only for correctness debugging and never produce
+performance evidence.
 
 When legacy stable-row-id compaction materializes indexed deletions, the paired
 v2.2 baseline rebuilds every benchmark index inside the measured maintenance
@@ -75,18 +79,14 @@ EXPECTED_COMMIT=$(git rev-parse HEAD) \
 CARGO_TARGET_DIR=/mnt/cargo-target \
 benchmarks/stable_row_address/smoke_remote_systemd.sh install
 
-# Run one fixture-local release shard. Run indices 0 through 8 on independent
+# Run one fixture-local release shard. Run indices 0 through 4 on independent
 # workers; the runner adds the shard suffix to both the S3 and local paths.
 python3 benchmarks/stable_row_address/protocol.py \
   --dataset-root s3://same-region-bucket/prefix \
   --storage s3 \
   --output /mnt/results/stable-row-address-release.jsonl \
   --profile release \
-  --track matrix \
-  --track sustained \
-  --track adversarial_natural \
-  --track adversarial_aligned \
-  --shard-count 9 \
+  --shard-count 5 \
   --shard-index 0
 
 # Resume the exact shard with the same arguments after a host restart.
@@ -95,25 +95,21 @@ python3 benchmarks/stable_row_address/protocol.py \
   --storage s3 \
   --output /mnt/results/stable-row-address-release.jsonl \
   --profile release \
-  --track matrix \
-  --track sustained \
-  --track adversarial_natural \
-  --track adversarial_aligned \
-  --shard-count 9 \
+  --shard-count 5 \
   --shard-index 0 \
   --resume
 
 python3 benchmarks/stable_row_address/protocol_report.py \
-  /mnt/results/stable-row-address-release.shard-000-of-009.jsonl \
-  --markdown /mnt/results/stable-row-address-release.shard-000-of-009.md \
-  --json /mnt/results/stable-row-address-release.shard-000-of-009.report.json
+  /mnt/results/stable-row-address-release.shard-000-of-005.jsonl \
+  --markdown /mnt/results/stable-row-address-release.shard-000-of-005.md \
+  --json /mnt/results/stable-row-address-release.shard-000-of-005.report.json
 
 python3 benchmarks/stable_row_address/protocol_aggregate.py \
-  /mnt/results/stable-row-address-release.shard-*-of-009.jsonl \
+  /mnt/results/stable-row-address-release.shard-*-of-005.jsonl \
   --markdown /mnt/results/stable-row-address-release.aggregate.md \
   --json /mnt/results/stable-row-address-release.aggregate.json
 
-# Install a reboot-persistent serial nine-shard release service. The checkout
+# Install a reboot-persistent serial five-shard release service. The checkout
 # must exactly match EXPECTED_COMMIT; existing shard evidence is resumed. The
 # service stops on failure so the result remains stable for diagnosis.
 DATASET_ROOT=s3://same-region-bucket/prefix \
@@ -127,8 +123,8 @@ benchmarks/stable_row_address/release_remote_systemd.sh install
 
 Use repeated `--case`, `--case-filter`, or `--variant` arguments for focused
 smoke runs. Release evidence always uses the repository matrix, maintenance
-policy, seed, complete track and variant order, and exactly nine canonical
-fixture-local shards. Canonical unindexed and indexed fixtures are created once
+policy, seed, exact sentinel selection, and exactly five canonical fixture-local
+shards. Canonical unindexed and indexed fixtures are created once
 per format/schema/fragment layout and shallow-cloned for every case/repeat,
 sharing unchanged data and index objects. The immutable `.fixture_lineage.jsonl`
 records every source/target edge; the report verifies it against worker records.
@@ -139,7 +135,7 @@ The sidecar records canonical unique-payload, no-dedup logical-payload, and
 minimum full-scan projections before execution; these are recomputed by the
 report instead of trusted. The full-scan projection includes the untimed
 business-ID-to-row-reference scan required by every cold-take probe.
-Nine release shards match the nine canonical data-fixture layouts and therefore
+Five release shards match the five canonical sentinel fixture layouts and therefore
 do not duplicate canonical data across workers. A checkpoint is atomically
 written before and after every worker result and after every case or repeated
 round. A crash after sidecar creation but before the first checkpoint resumes
@@ -158,6 +154,15 @@ The remote wrapper writes `stable-row-address-release.execution-complete` only
 after every runner exits successfully. It writes
 `stable-row-address-release.pass` only after all shard reports and the aggregate
 return `PASS`; that marker binds the exact Git commit and aggregate SHA-256.
+Release execution orders both v2.2 baselines before v2.3 for each measured pair.
+Once both baselines are durable, the v2.3 worker is terminated if its wall time
+exceeds 1.5 times the faster baseline; a five-second floor avoids treating
+process startup noise as a scale regression, and the absolute per-operation
+fallback is 30 minutes. Relative-budget and absolute-budget timeouts have
+distinct failure statuses so a slow baseline is never attributed to v2.3. A
+release decision requires both the full bounded
+`stable-row-address-smoke.pass` marker and the sentinel release marker to bind
+the same commit.
 Every executed relocation references one canonical maintenance plan. The
 track-owned artifact freezes one total-order physical source group, derives
 row boundaries from measured live bytes and the byte target, and records the

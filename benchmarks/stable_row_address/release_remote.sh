@@ -50,6 +50,12 @@ verify_checkout() {
 
 verify_checkout || exit $?
 actual_commit=${EXPECTED_COMMIT}
+release_shard_count=$("${PYTHON}" -c 'import json, pathlib, sys; print(json.loads(pathlib.Path(sys.argv[1]).read_text())["release_contract"]["shard_count"])' "${repository_root}/benchmarks/stable_row_address/workload_matrix.v2.json")
+[[ ${release_shard_count} =~ ^[1-9][0-9]*$ ]] || {
+  echo "release shard count is invalid: ${release_shard_count}" >&2
+  exit 2
+}
+release_shard_suffix=$(printf '%03d' "${release_shard_count}")
 
 bucket_and_prefix=${DATASET_ROOT#s3://}
 bucket=${bucket_and_prefix%%/*}
@@ -73,11 +79,7 @@ protocol=(
   --storage s3
   --output "${output_base}"
   --profile release
-  --track matrix
-  --track sustained
-  --track adversarial_natural
-  --track adversarial_aligned
-  --shard-count 9
+  --shard-count "${release_shard_count}"
 )
 
 run_all() {
@@ -94,8 +96,8 @@ run_all() {
   local -a command
   rm -f "${RESULT_ROOT}/stable-row-address-release.pass" || return 2
   rm -f "${RESULT_ROOT}/stable-row-address-release.execution-complete" || return 2
-  for shard_index in {0..8}; do
-    shard_id=$(printf 'shard-%03d-of-009' "${shard_index}")
+  for ((shard_index = 0; shard_index < release_shard_count; shard_index++)); do
+    shard_id=$(printf 'shard-%03d-of-%03d' "${shard_index}" "${release_shard_count}")
     shard_output="${RESULT_ROOT}/stable-row-address-release.${shard_id}.jsonl"
     command=("${protocol[@]}" --shard-index "${shard_index}")
     if [[ -e ${shard_output} || -e ${shard_output}.protocol.json ]]; then
@@ -106,6 +108,14 @@ run_all() {
       :
     else
       shard_status=$?
+      if [[ ${shard_status} -eq 75 ]]; then
+        echo "${shard_id} exceeded the v2.3 fail-fast runtime budget" >&2
+        return 75
+      fi
+      if [[ ${shard_status} -eq 74 ]]; then
+        echo "${shard_id} exceeded the absolute operation runtime budget" >&2
+        return 74
+      fi
       (( shard_status > status )) && status=${shard_status}
       (( shard_status > 1 )) && execution_incomplete=1
       echo "${shard_id} did not complete successfully (status ${shard_status})" >&2
@@ -127,8 +137,8 @@ report_all() {
   local report_status
   local aggregate_commit
   rm -f "${RESULT_ROOT}/stable-row-address-release.pass" || return 2
-  for shard_index in {0..8}; do
-    shard_id=$(printf 'shard-%03d-of-009' "${shard_index}")
+  for ((shard_index = 0; shard_index < release_shard_count; shard_index++)); do
+    shard_id=$(printf 'shard-%03d-of-%03d' "${shard_index}" "${release_shard_count}")
     input="${RESULT_ROOT}/stable-row-address-release.${shard_id}.jsonl"
     if "${PYTHON}" benchmarks/stable_row_address/protocol_report.py \
       "${input}" \
@@ -144,7 +154,7 @@ report_all() {
     "${RESULT_ROOT}/stable-row-address-release.aggregate.md" \
     "${RESULT_ROOT}/stable-row-address-release.aggregate.json" || return 2
   if "${PYTHON}" benchmarks/stable_row_address/protocol_aggregate.py \
-    "${RESULT_ROOT}"/stable-row-address-release.shard-*-of-009.jsonl \
+    "${RESULT_ROOT}"/stable-row-address-release.shard-*-of-"${release_shard_suffix}".jsonl \
     --expected-commit "${actual_commit}" \
     --execution-marker "${RESULT_ROOT}/stable-row-address-release.execution-complete" \
     --markdown "${RESULT_ROOT}/stable-row-address-release.aggregate.md" \
@@ -195,6 +205,9 @@ release_all() {
   local report_status=0
   local aggregate_verdict
   run_all || run_status=$?
+  if [[ ${run_status} -eq 74 || ${run_status} -eq 75 ]]; then
+    return "${run_status}"
+  fi
   report_all || report_status=$?
   if [[ ${report_status} -eq 1 ]]; then
     verify_checkout || return 2

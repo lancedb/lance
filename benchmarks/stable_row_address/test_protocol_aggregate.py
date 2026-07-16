@@ -57,7 +57,81 @@ def passing_report() -> protocol_report.ReportResult:
     )
 
 
+def make_release_shards() -> list[dict[str, object]]:
+    matrix, _, _ = protocol_report.frozen_matrix()
+    shards = []
+    for index in range(5):
+        tracks, variants, cases = protocol_report.frozen_release_shard_contract(
+            5, index
+        )
+        shard = make_shard(index)
+        shard_id = f"shard-{index:03d}-of-005"
+        shard.update(
+            {
+                "profile": "release",
+                "storage": "s3",
+                "storage_region_attestation": {"bucket_region": "us-east-2"},
+                "base_dataset_root": "s3://bucket/release",
+                "dataset_root": f"s3://bucket/release/{shard_id}",
+                "shard_count": 5,
+                "shard_id": shard_id,
+                "tracks": list(tracks),
+                "variants": list(variants),
+                "matrix_case_names": list(cases),
+                "matrix": matrix,
+            }
+        )
+        shards.append(shard)
+    return shards
+
+
 class ProtocolAggregateTests(unittest.TestCase):
+    def test_release_requires_the_exact_sentinel_union(self) -> None:
+        shards = make_release_shards()
+        with (
+            mock.patch.object(
+                protocol_report,
+                "load_evidence",
+                side_effect=[(shard, [], []) for shard in shards],
+            ),
+            mock.patch.object(
+                protocol_report,
+                "analyze",
+                side_effect=[passing_report() for _ in shards],
+            ),
+        ):
+            exit_code, _, machine = protocol_aggregate.aggregate(
+                [Path(f"{index}.jsonl") for index in range(5)],
+                bootstrap_samples=101,
+            )
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(machine["verdict"], "PASS")
+
+        shards[-1]["matrix_case_names"] = []
+        with (
+            mock.patch.object(
+                protocol_report,
+                "load_evidence",
+                side_effect=[(shard, [], []) for shard in shards],
+            ),
+            mock.patch.object(
+                protocol_report,
+                "analyze",
+                side_effect=[passing_report() for _ in shards],
+            ),
+        ):
+            exit_code, _, machine = protocol_aggregate.aggregate(
+                [Path(f"{index}.jsonl") for index in range(5)],
+                bootstrap_samples=101,
+            )
+        self.assertEqual(exit_code, 2)
+        self.assertTrue(
+            any(
+                "release matrix shard union mismatch" in issue
+                for issue in machine["issues"]
+            )
+        )
+
     def test_release_aggregate_requires_exact_execution_commit_marker(self) -> None:
         shards = [make_shard(0), make_shard(1)]
         with tempfile.TemporaryDirectory() as directory:

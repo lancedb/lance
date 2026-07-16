@@ -138,12 +138,9 @@ def aggregate(
 
         if sidecars[0]["profile"] == "release":
             matrix = sidecars[0]["matrix"]
-            profile = matrix["profiles"]["release"]
+            release_contract = matrix["release_contract"]
             expected_cases = {
-                case.name
-                for case in protocol.iter_matrix_cases(
-                    profile, set(matrix["tracks"]["matrix"]["cases"])
-                )
+                case.name for case in protocol.canonical_release_cases(matrix)
             }
             actual_cases = set(matrix_cases)
             missing_cases = sorted(expected_cases - actual_cases)
@@ -167,12 +164,9 @@ def aggregate(
             }
             expected_units = {
                 (track, variant)
-                for track in (
-                    "sustained",
-                    "adversarial_natural",
-                    "adversarial_aligned",
-                )
-                for variant in ("bare", "scalar", "vector")
+                for track in release_contract["tracks"]
+                if track != "matrix"
+                for variant in release_contract["variants"]
             }
             if repeated_units != expected_units:
                 issues.append(

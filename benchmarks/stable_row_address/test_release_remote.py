@@ -33,8 +33,12 @@ class ReleaseRemoteTests(unittest.TestCase):
         bin_dir = root / "bin"
         repository.mkdir()
         bin_dir.mkdir()
+        matrix = repository / "benchmarks/stable_row_address/workload_matrix.v2.json"
+        matrix.parent.mkdir(parents=True)
+        matrix.write_text('{"release_contract":{"shard_count":5}}', encoding="utf-8")
 
         subprocess.run(["git", "init", "--quiet"], cwd=repository, check=True)
+        subprocess.run(["git", "add", "."], cwd=repository, check=True)
         subprocess.run(
             [
                 "git",
@@ -95,7 +99,9 @@ class ReleaseRemoteTests(unittest.TestCase):
                     )
                     raise SystemExit(int(os.environ["FAKE_AGGREGATE_STATUS"]))
                 if arguments[0] == "-c":
-                    if '["commit"]' in arguments[1]:
+                    if 'release_contract' in arguments[1] and 'shard_count' in arguments[1]:
+                        print("5")
+                    elif '["commit"]' in arguments[1]:
                         print(os.environ["EXPECTED_COMMIT"])
                     elif '["verdict"]' in arguments[1]:
                         print(os.environ["FAKE_AGGREGATE_VERDICT"])
@@ -168,6 +174,40 @@ class ReleaseRemoteTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertFalse((result_root / "stable-row-address-release.pass").exists())
 
+    def test_v23_runtime_regression_stops_remaining_shards(self) -> None:
+        result, result_root, _ = self.run_release(
+            protocol_status=75,
+            report_status=0,
+            aggregate_status=0,
+            aggregate_verdict="PASS",
+        )
+
+        self.assertEqual(result.returncode, 75, result.stderr)
+        self.assertIn("starting shard-000-of-005", result.stderr)
+        self.assertIn("exceeded the v2.3 fail-fast runtime budget", result.stderr)
+        self.assertNotIn("starting shard-001-of-005", result.stderr)
+        self.assertFalse(
+            (result_root / "stable-row-address-release.execution-complete").exists()
+        )
+        self.assertFalse((result_root / "stable-row-address-release.pass").exists())
+
+    def test_absolute_runtime_timeout_stops_remaining_shards(self) -> None:
+        result, result_root, _ = self.run_release(
+            protocol_status=74,
+            report_status=0,
+            aggregate_status=0,
+            aggregate_verdict="PASS",
+        )
+
+        self.assertEqual(result.returncode, 74, result.stderr)
+        self.assertIn("starting shard-000-of-005", result.stderr)
+        self.assertIn("exceeded the absolute operation runtime budget", result.stderr)
+        self.assertNotIn("starting shard-001-of-005", result.stderr)
+        self.assertFalse(
+            (result_root / "stable-row-address-release.execution-complete").exists()
+        )
+        self.assertFalse((result_root / "stable-row-address-release.pass").exists())
+
     def test_successful_execution_owns_pass_marker_creation(self) -> None:
         result, result_root, commit = self.run_release(
             protocol_status=0,
@@ -177,6 +217,8 @@ class ReleaseRemoteTests(unittest.TestCase):
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("starting shard-004-of-005", result.stderr)
+        self.assertNotIn("starting shard-005", result.stderr)
         expected_marker = f"commit={commit}\naggregate_sha256={'0' * 64}\n"
         self.assertEqual(
             (result_root / "stable-row-address-release.pass").read_text(

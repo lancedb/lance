@@ -618,21 +618,13 @@ class ProtocolReportTests(unittest.TestCase):
                 "dataset_root": "s3://bucket/prefix",
             }
         )
-        with self.assertRaisesRegex(ValueError, "exactly nine canonical shards"):
+        with self.assertRaisesRegex(ValueError, "exactly 5 canonical shards"):
             protocol_report.expected_record_provenance(standalone)
 
-        tracks, variants, cases = protocol_report.frozen_release_shard_contract(9, 4)
-        self.assertEqual(
-            tracks,
-            (
-                "matrix",
-                "sustained",
-                "adversarial_natural",
-                "adversarial_aligned",
-            ),
-        )
-        self.assertEqual(variants, ("bare", "scalar"))
-        self.assertEqual(cases[0], "append/narrow16/take-1")
+        tracks, variants, cases = protocol_report.frozen_release_shard_contract(5, 4)
+        self.assertEqual(tracks, ("matrix",))
+        self.assertEqual(variants, ())
+        self.assertEqual(cases, ("compact-10000-to-1/wide128",))
         sidecar = make_sidecar(
             list(tracks),
             variants=list(variants),
@@ -642,10 +634,10 @@ class ProtocolReportTests(unittest.TestCase):
         sidecar.update(
             {
                 "base_dataset_root": "s3://bucket/prefix",
-                "dataset_root": "s3://bucket/prefix/shard-004-of-009",
-                "shard_count": 9,
+                "dataset_root": "s3://bucket/prefix/shard-004-of-005",
+                "shard_count": 5,
                 "shard_index": 4,
-                "shard_id": "shard-004-of-009",
+                "shard_id": "shard-004-of-005",
             }
         )
         protocol_report.validate_frozen_release_selection(sidecar)
@@ -654,19 +646,24 @@ class ProtocolReportTests(unittest.TestCase):
         wrong_release_scheme.update(
             {
                 "base_dataset_root": "/tmp/data",
-                "dataset_root": "/tmp/data/shard-004-of-009",
+                "dataset_root": "/tmp/data/shard-004-of-005",
             }
         )
         with self.assertRaisesRegex(ValueError, "storage=s3"):
             protocol_report.expected_record_provenance(wrong_release_scheme)
 
-        for field in ("tracks", "variants", "matrix_case_names"):
+        wrong_values = {
+            "tracks": [],
+            "variants": ["scalar"],
+            "matrix_case_names": ["compact-100000-skew-to-1/narrow16"],
+        }
+        for field, wrong_value in wrong_values.items():
             reordered = dict(sidecar)
-            reordered[field] = list(reversed(sidecar[field]))
+            reordered[field] = wrong_value
             with self.assertRaisesRegex(ValueError, f"release {field}"):
-                protocol_report.expected_record_provenance(reordered)
+                protocol_report.validate_frozen_release_selection(reordered)
 
-        _, _, shard_zero_cases = protocol_report.frozen_release_shard_contract(9, 0)
+        _, _, shard_zero_cases = protocol_report.frozen_release_shard_contract(5, 0)
         moved = dict(sidecar)
         moved["matrix_case_names"] = [shard_zero_cases[0], *cases[1:]]
         with self.assertRaisesRegex(ValueError, "release matrix_case_names"):
@@ -1762,10 +1759,7 @@ class ProtocolReportTests(unittest.TestCase):
             else:
                 record["duration_ns"] = 100
                 record["layout_index_maintenance_ns"] = 100
-            if (
-                "/repeat-001/" in record["pair_id"]
-                and record["format"] == "v22_stable"
-            ):
+            if "/repeat-001/" in record["pair_id"] and record["format"] == "v22_stable":
                 record["index_storage_bytes_before"] = 99
 
         result = protocol_report.analyze(
@@ -1960,7 +1954,7 @@ class ProtocolReportTests(unittest.TestCase):
         sidecar = make_sidecar(
             ["matrix"],
             matrix_case_names=[
-                "compact-64-to-1/narrow16",
+                "compact-4096-to-1/narrow16",
                 "repeated-compaction-10/narrow16",
             ],
         )
@@ -1991,7 +1985,7 @@ class ProtocolReportTests(unittest.TestCase):
         )
 
     def test_skewed_fixture_audit_checks_exact_fragment_counts(self) -> None:
-        tracks, variants, cases = protocol_report.frozen_release_shard_contract(9, 0)
+        tracks, variants, cases = protocol_report.frozen_release_shard_contract(5, 0)
         sidecar = make_sidecar(
             list(tracks),
             variants=list(variants),
@@ -2000,10 +1994,10 @@ class ProtocolReportTests(unittest.TestCase):
         )
         sidecar.update(
             {
-                "dataset_root": "s3://release-bucket/data/shard-000-of-009",
-                "shard_count": 9,
+                "dataset_root": "s3://release-bucket/data/shard-000-of-005",
+                "shard_count": 5,
                 "shard_index": 0,
-                "shard_id": "shard-000-of-009",
+                "shard_id": "shard-000-of-005",
             }
         )
         case_name = "compact-100000-skew-to-1/narrow16"

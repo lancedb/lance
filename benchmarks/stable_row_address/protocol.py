@@ -26,7 +26,7 @@ import run  # noqa: E402
 import environment_attestation  # noqa: E402
 
 
-DEFAULT_MATRIX = SCRIPT_DIR / "workload_matrix.v1.json"
+DEFAULT_MATRIX = SCRIPT_DIR / "workload_matrix.v2.json"
 PROFILE_FIELDS = {
     "paired_repeats",
     "rows",
@@ -62,14 +62,22 @@ TRACK_FIELDS = {
         "variants",
     },
 }
-RELEASE_TRACK_ORDER = (
+TRACK_ORDER = (
     "matrix",
     "sustained",
     "adversarial_natural",
     "adversarial_aligned",
 )
-RELEASE_VARIANT_ORDER = ("bare", "scalar", "vector")
+VARIANT_ORDER = ("bare", "scalar", "vector")
 RELEASE_SEED = 0x4C414E43455F3233
+RELEASE_CONTRACT_FIELDS = {
+    "shard_count",
+    "operation_timeout_seconds",
+    "fail_fast_runtime_ratio",
+    "tracks",
+    "variants",
+    "matrix_case_names",
+}
 MEASUREMENT_FIELDS = {
     "process_isolation",
     "cold_probe_order",
@@ -95,6 +103,31 @@ SELECTION_RECORD_NAMES = {
 }
 
 
+class PerformanceRegressionTimeout(RuntimeError):
+    """The candidate exceeded the release fail-fast runtime budget."""
+
+
+class OperationTimeout(RuntimeError):
+    """A worker exceeded the absolute per-operation runtime budget."""
+
+
+def execution_format_order(
+    profile_name: str, repeat: int, scope: str, *, dynamic: bool = False
+) -> tuple[str, ...]:
+    """Return the replayable format order, with release baselines before v2.3."""
+
+    order = (
+        run.dynamic_format_order(repeat, scope)
+        if dynamic
+        else run.paired_format_order(repeat, scope)
+    )
+    if profile_name != "release":
+        return order
+    return tuple(
+        format_name for format_name in order if format_name != "v23_logical"
+    ) + ("v23_logical",)
+
+
 def _strict_object(value: Any, fields: set[str], context: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"{context} must be an object")
@@ -117,11 +150,18 @@ def load_matrix(path: Path) -> tuple[dict[str, Any], str, str]:
     matrix = json.loads(path.read_text(encoding="utf-8"))
     matrix = _strict_object(
         matrix,
-        {"schema_version", "name", "profiles", "tracks", "measurement"},
+        {
+            "schema_version",
+            "name",
+            "profiles",
+            "release_contract",
+            "tracks",
+            "measurement",
+        },
         "workload matrix",
     )
-    if matrix["schema_version"] != 1:
-        raise ValueError("workload matrix schema_version must be 1")
+    if matrix["schema_version"] != 2:
+        raise ValueError("workload matrix schema_version must be 2")
     if not isinstance(matrix["name"], str) or not matrix["name"].strip():
         raise ValueError("workload matrix name must be non-empty")
 
@@ -185,6 +225,56 @@ def load_matrix(path: Path) -> tuple[dict[str, Any], str, str]:
     for track_name in ("sustained", "adversarial_natural", "adversarial_aligned"):
         if tracks[track_name]["variants"] != ["bare", "scalar", "vector"]:
             raise ValueError(f"track {track_name} must cover bare/scalar/vector")
+
+    release_contract = _strict_object(
+        matrix["release_contract"], RELEASE_CONTRACT_FIELDS, "release contract"
+    )
+    for field in ("shard_count", "operation_timeout_seconds"):
+        _positive_int(release_contract[field], f"release contract.{field}")
+    fail_fast_runtime_ratio = release_contract["fail_fast_runtime_ratio"]
+    if (
+        not isinstance(fail_fast_runtime_ratio, (int, float))
+        or isinstance(fail_fast_runtime_ratio, bool)
+        or fail_fast_runtime_ratio <= 1
+    ):
+        raise ValueError(
+            "release contract.fail_fast_runtime_ratio must be greater than one"
+        )
+    release_tracks = release_contract["tracks"]
+    if (
+        not isinstance(release_tracks, list)
+        or not release_tracks
+        or len(set(release_tracks)) != len(release_tracks)
+        or any(track not in TRACK_ORDER for track in release_tracks)
+    ):
+        raise ValueError("release contract.tracks must be unique canonical tracks")
+    release_variants = release_contract["variants"]
+    if (
+        not isinstance(release_variants, list)
+        or len(set(release_variants)) != len(release_variants)
+        or any(variant not in VARIANT_ORDER for variant in release_variants)
+    ):
+        raise ValueError("release contract.variants must be unique canonical variants")
+    repeated_tracks = set(release_tracks) - {"matrix"}
+    if repeated_tracks and not release_variants:
+        raise ValueError("release repeated tracks require at least one variant")
+    if not repeated_tracks and release_variants:
+        raise ValueError("release variants require at least one repeated track")
+    release_case_names = release_contract["matrix_case_names"]
+    if (
+        not isinstance(release_case_names, list)
+        or not release_case_names
+        or len(set(release_case_names)) != len(release_case_names)
+        or any(not isinstance(name, str) or not name for name in release_case_names)
+    ):
+        raise ValueError(
+            "release contract.matrix_case_names must be unique non-empty strings"
+        )
+    if "matrix" not in release_tracks:
+        raise ValueError("release contract must include the matrix track")
+
+    canonical_release_cases(matrix)
+    canonical_release_shard_count(matrix)
 
     _strict_object(matrix["measurement"], MEASUREMENT_FIELDS, "measurement")
     canonical = json.dumps(
@@ -916,6 +1006,24 @@ def iter_matrix_cases(
         )
 
 
+def canonical_release_cases(matrix: dict[str, Any]) -> tuple[MatrixCase, ...]:
+    """Resolve the exact scale hypotheses frozen by the release contract."""
+
+    generated = tuple(
+        iter_matrix_cases(
+            matrix["profiles"]["release"], set(matrix["tracks"]["matrix"]["cases"])
+        )
+    )
+    by_name = {case.name: case for case in generated}
+    if len(by_name) != len(generated):
+        raise ValueError("release matrix generation produced duplicate case names")
+    names = matrix["release_contract"]["matrix_case_names"]
+    unknown = sorted(set(names) - set(by_name))
+    if unknown:
+        raise ValueError(f"release contract references unknown cases: {unknown}")
+    return tuple(by_name[name] for name in names)
+
+
 def policy_triggers(
     record: dict[str, Any], policy: dict[str, Any]
 ) -> tuple[bool, dict[str, float]]:
@@ -968,6 +1076,8 @@ class ProtocolRunner:
         matrix_sha256: str,
         shard_id: str,
         resume: bool,
+        operation_timeout_seconds: int | None = None,
+        fail_fast_runtime_ratio: float | None = None,
     ) -> None:
         self.executable = executable
         self.output = output
@@ -986,6 +1096,8 @@ class ProtocolRunner:
         self.take_count = take_count
         self.matrix_sha256 = matrix_sha256
         self.shard_id = shard_id
+        self.operation_timeout_seconds = operation_timeout_seconds
+        self.fail_fast_runtime_ratio = fail_fast_runtime_ratio
         self.records = 0
         self.failures: list[str] = []
         self.boundaries = 0
@@ -1046,6 +1158,68 @@ class ProtocolRunner:
     def close(self) -> None:
         self._sink.close()
         self._lineage_sink.close()
+
+    def _worker_timeout(
+        self, pair_id: str | None, format_name: str | None
+    ) -> float | None:
+        fail_fast_timeout = self._candidate_fail_fast_timeout(pair_id, format_name)
+        timeout = self.operation_timeout_seconds
+        if fail_fast_timeout is None:
+            return timeout
+        return (
+            fail_fast_timeout
+            if timeout is None
+            else min(float(timeout), fail_fast_timeout)
+        )
+
+    def _candidate_fail_fast_timeout(
+        self, pair_id: str | None, format_name: str | None
+    ) -> float | None:
+        if (
+            self.mode != "release"
+            or format_name != "v23_logical"
+            or pair_id is None
+            or self.fail_fast_runtime_ratio is None
+        ):
+            return None
+        baselines = [
+            self._existing_records.get((pair_id, baseline))
+            for baseline in ("v22_no_stable", "v22_stable")
+        ]
+        if any(record is None or record.get("status") != "ok" for record in baselines):
+            return None
+        baseline_seconds = min(record["duration_ns"] for record in baselines) / 1e9
+        return max(5.0, baseline_seconds * self.fail_fast_runtime_ratio)
+
+    def _run_worker(
+        self,
+        command: Sequence[str],
+        *,
+        pair_id: str | None = None,
+        format_name: str | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        fail_fast_timeout = self._candidate_fail_fast_timeout(pair_id, format_name)
+        timeout = self._worker_timeout(pair_id, format_name)
+        try:
+            return subprocess.run(
+                command,
+                cwd=run.REPOSITORY_ROOT,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=None,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as error:
+            if fail_fast_timeout is not None and fail_fast_timeout <= float(timeout):
+                raise PerformanceRegressionTimeout(
+                    "worker exceeded the release performance timeout: "
+                    f"seconds={timeout}, pair_id={pair_id}, format={format_name}, "
+                    f"fail_fast_runtime_ratio={self.fail_fast_runtime_ratio}"
+                ) from error
+            raise OperationTimeout(
+                "worker exceeded the absolute operation timeout: "
+                f"seconds={timeout}, pair_id={pair_id}, format={format_name}"
+            ) from error
 
     def _checkpoint_identity(self) -> dict[str, Any]:
         return {
@@ -1319,13 +1493,7 @@ class ProtocolRunner:
             f"operation={step.operation} format={format_name}",
             file=sys.stderr,
         )
-        result = subprocess.run(
-            command,
-            cwd=run.REPOSITORY_ROOT,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=None,
-        )
+        result = self._run_worker(command, pair_id=pair_id, format_name=format_name)
         if result.returncode != 0:
             raise RuntimeError(
                 f"worker exited with status {result.returncode}: {command[0]}"
@@ -1375,7 +1543,9 @@ class ProtocolRunner:
                 f"index-{index_kind}/"
                 "fixture_clone"
             )
-            order = run.paired_format_order(0, clone_pair_id)
+            order = execution_format_order(
+                getattr(self, "mode", "smoke"), 0, clone_pair_id
+            )
             clone_records = []
             for order_index, format_name in enumerate(order):
                 source_uri = self.fixture_uri(
@@ -1433,7 +1603,9 @@ class ProtocolRunner:
                 f"{self.run_id}/fixtures/{schema_kind}/{fixture_layout_path(segments)}/"
                 f"index-{index_kind}/index_build"
             )
-            order = run.paired_format_order(0, index_pair_id)
+            order = execution_format_order(
+                getattr(self, "mode", "smoke"), 0, index_pair_id
+            )
             index_records = [
                 self.invoke_one(
                     index_step,
@@ -1486,7 +1658,9 @@ class ProtocolRunner:
                     f"{self.run_id}/fixtures/{schema_kind}/{fixture_layout_path(segments)}/"
                     f"index-none/{label}"
                 )
-                order = run.paired_format_order(0, pair_id)
+                order = execution_format_order(
+                    getattr(self, "mode", "smoke"), 0, pair_id
+                )
                 records = [
                     self.invoke_one(
                         step,
@@ -1545,7 +1719,7 @@ class ProtocolRunner:
             index_kind=index_kind,
         )
         pair_id = f"{self.run_id}/{track}/{case}/repeat-{repeat:03d}/{label}"
-        order = run.paired_format_order(repeat, pair_id)
+        order = execution_format_order(getattr(self, "mode", "smoke"), repeat, pair_id)
         records: dict[str, dict[str, Any]] = {}
         for order_index, format_name in enumerate(order):
             source_uri = self.fixture_uri(
@@ -1634,7 +1808,7 @@ class ProtocolRunner:
         target_file_size_bytes: int | None = None,
     ) -> dict[str, dict[str, Any]]:
         pair_id = f"{self.run_id}/{track}/{case}/repeat-{repeat:03d}/{label}"
-        order = run.paired_format_order(repeat, pair_id)
+        order = execution_format_order(getattr(self, "mode", "smoke"), repeat, pair_id)
         if maintenance_plan is not None:
             self.validate_maintenance_plan_formats(
                 step,
@@ -1672,7 +1846,7 @@ class ProtocolRunner:
         label: str,
     ) -> dict[str, dict[str, Any]]:
         pair_id = f"{self.run_id}/{track}/{case}/repeat-{repeat:03d}/{label}"
-        order = run.paired_format_order(repeat, pair_id)
+        order = execution_format_order(getattr(self, "mode", "smoke"), repeat, pair_id)
         take_artifacts = self.prepare_paired_take_ids(
             step,
             track=track,
@@ -1724,13 +1898,7 @@ class ProtocolRunner:
                 max_source_fragments_per_group=max_source_fragments_per_group,
                 target_file_size_bytes=target_file_size_bytes,
             )
-            result = subprocess.run(
-                command,
-                cwd=run.REPOSITORY_ROOT,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=None,
-            )
+            result = self._run_worker(command)
             if result.returncode != 0 or result.stdout.strip():
                 raise RuntimeError(
                     "maintenance plan is not compatible with every paired format: "
@@ -1770,13 +1938,7 @@ class ProtocolRunner:
             order_index=order_index,
             prepare_take_ids_output=output,
         )
-        result = subprocess.run(
-            command,
-            cwd=run.REPOSITORY_ROOT,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=None,
-        )
+        result = self._run_worker(command)
         if result.returncode != 0 or result.stdout.strip():
             raise RuntimeError(
                 "prepare-take-ids failed or emitted stdout: "
@@ -1854,13 +2016,7 @@ class ProtocolRunner:
                 max_source_fragments_per_group=max_source_fragments_per_group,
                 target_file_size_bytes=target_file_size_bytes,
             )
-            result = subprocess.run(
-                command,
-                cwd=run.REPOSITORY_ROOT,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=None,
-            )
+            result = self._run_worker(command)
             if result.returncode != 0 or result.stdout.strip():
                 raise RuntimeError(
                     "prepare-maintenance-plan failed or emitted stdout: "
@@ -2061,7 +2217,7 @@ class ProtocolRunner:
             f"{self.run_id}/{track}/{case}/repeat-{repeat:03d}/"
             f"step-{step_index:03d}/cold-take"
         )
-        order = run.paired_format_order(repeat, pair_id)
+        order = execution_format_order(getattr(self, "mode", "smoke"), repeat, pair_id)
         take_artifacts = self.prepare_paired_take_ids(
             take_step,
             track=track,
@@ -2087,7 +2243,9 @@ class ProtocolRunner:
                 f"{self.run_id}/{track}/{case}/repeat-{repeat:03d}/"
                 f"step-{step_index:03d}/cold-index-take"
             )
-            index_order = run.paired_format_order(repeat, index_pair_id)
+            index_order = execution_format_order(
+                getattr(self, "mode", "smoke"), repeat, index_pair_id
+            )
             for order_index, format_name in enumerate(index_order):
                 self.invoke_one(
                     index_take_step,
@@ -2331,6 +2489,30 @@ def fixture_keys_for_run(
             schema_kind, index_kind = variant_config(variant)
             keys.add((schema_kind, ((profile["rows"], rows_per_fragment),), index_kind))
     return keys
+
+
+def canonical_release_shard_count(matrix: dict[str, Any]) -> int:
+    """Return the fixture-local shard count frozen by the release contract."""
+
+    profile = matrix["profiles"]["release"]
+    contract = matrix["release_contract"]
+    fixture_keys = fixture_keys_for_run(
+        profile,
+        contract["tracks"],
+        contract["variants"],
+        canonical_release_cases(matrix),
+    )
+    data_layouts = {
+        (schema_kind, segments) for schema_kind, segments, _ in fixture_keys
+    }
+    derived = len(data_layouts)
+    declared = contract["shard_count"]
+    if declared != derived:
+        raise ValueError(
+            "release contract.shard_count must equal its distinct fixture layouts: "
+            f"declared={declared}, derived={derived}"
+        )
+    return declared
 
 
 def fixture_keys_for_shard(
@@ -2754,8 +2936,8 @@ def run_adversarial_natural(
                         "pmr-maintenance"
                     )
                     maintenance_pair = f"{runner.run_id}/{maintenance_order_scope}"
-                    maintenance_order = run.dynamic_format_order(
-                        repeat, maintenance_order_scope
+                    maintenance_order = execution_format_order(
+                        runner.mode, repeat, maintenance_order_scope, dynamic=True
                     )
                     candidate_order_index = maintenance_order.index("v23_logical")
                     maintenance = dataclasses.replace(
@@ -2839,8 +3021,11 @@ def run_adversarial_natural(
                 natural_maintenance_scope = (
                     f"{runner.run_id}/{natural_maintenance_order_scope}"
                 )
-                natural_maintenance_order = run.dynamic_format_order(
-                    repeat, natural_maintenance_order_scope
+                natural_maintenance_order = execution_format_order(
+                    runner.mode,
+                    repeat,
+                    natural_maintenance_order_scope,
+                    dynamic=True,
                 )
                 for order_index, format_name in enumerate(natural_maintenance_order):
                     record = scans[format_name]
@@ -2997,8 +3182,8 @@ def run_adversarial_aligned(
                         f"repeat-{repeat:03d}/round-{update_round:03d}/"
                         "aligned-maintenance"
                     )
-                    maintenance_order = run.dynamic_format_order(
-                        repeat, maintenance_order_scope
+                    maintenance_order = execution_format_order(
+                        runner.mode, repeat, maintenance_order_scope, dynamic=True
                     )
                     maintenance_records: dict[str, dict[str, Any]] = {}
                     for order_index, format_name in enumerate(maintenance_order):
@@ -3164,8 +3349,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError("--shard-count must be positive")
     if args.shard_index < 0 or args.shard_index >= args.shard_count:
         raise ValueError("--shard-index must be in 0..shard-count")
-    if args.profile == "release" and args.shard_count != 9:
-        raise ValueError("release profile requires exactly nine canonical shards")
     if args.profile == "release" and args.seed != RELEASE_SEED:
         raise ValueError("release profile requires the canonical seed")
     if args.storage == "ebs" and args.dataset_root.startswith("s3://"):
@@ -3176,6 +3359,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError("release profile requires same-region S3; EBS is smoke-only")
     matrix, matrix_canonical, matrix_sha256 = load_matrix(args.matrix)
     if args.profile == "release":
+        release_shard_count = canonical_release_shard_count(matrix)
+        if args.shard_count != release_shard_count:
+            raise ValueError(
+                "release profile requires exactly "
+                f"{release_shard_count} canonical shards"
+            )
         _, release_matrix_canonical, release_matrix_sha256 = load_matrix(DEFAULT_MATRIX)
         if (
             matrix_canonical != release_matrix_canonical
@@ -3204,34 +3393,40 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise ValueError("release profile requires the repository default policy")
     profile = matrix["profiles"][args.profile]
     if args.profile == "release":
-        if args.track is not None and tuple(args.track) != RELEASE_TRACK_ORDER:
+        release_contract = matrix["release_contract"]
+        release_tracks = tuple(release_contract["tracks"])
+        release_variants = tuple(release_contract["variants"])
+        if args.track is not None and tuple(args.track) != release_tracks:
             raise ValueError(
-                "release profile requires the canonical complete track order"
+                "release profile requires the canonical sentinel track order"
             )
-        if args.variant is not None and tuple(args.variant) != RELEASE_VARIANT_ORDER:
+        if args.variant is not None and tuple(args.variant) != release_variants:
             raise ValueError(
-                "release profile requires the canonical complete variant order"
+                "release profile requires the canonical sentinel variant order"
             )
         if args.case is not None or args.case_filter is not None:
             raise ValueError("release profile does not allow focused matrix selection")
-        tracks = list(RELEASE_TRACK_ORDER)
-        variants = list(RELEASE_VARIANT_ORDER)
+        tracks = list(release_tracks)
+        variants = list(release_variants)
     else:
         tracks = args.track or ["matrix"]
-        variants = args.variant or list(RELEASE_VARIANT_ORDER)
+        variants = args.variant or list(VARIANT_ORDER)
     if len(set(tracks)) != len(tracks):
         raise ValueError("--track values must be unique")
-    selected_matrix_cases = set(args.case or matrix["tracks"]["matrix"]["cases"])
-    unknown_matrix_cases = selected_matrix_cases - set(
-        matrix["tracks"]["matrix"]["cases"]
-    )
-    if unknown_matrix_cases:
-        raise ValueError(f"unknown matrix cases: {sorted(unknown_matrix_cases)}")
-    matrix_cases = [
-        case
-        for case in iter_matrix_cases(profile, selected_matrix_cases)
-        if args.case_filter is None or args.case_filter in case.name
-    ]
+    if args.profile == "release":
+        matrix_cases = list(canonical_release_cases(matrix))
+    else:
+        selected_matrix_cases = set(args.case or matrix["tracks"]["matrix"]["cases"])
+        unknown_matrix_cases = selected_matrix_cases - set(
+            matrix["tracks"]["matrix"]["cases"]
+        )
+        if unknown_matrix_cases:
+            raise ValueError(f"unknown matrix cases: {sorted(unknown_matrix_cases)}")
+        matrix_cases = [
+            case
+            for case in iter_matrix_cases(profile, selected_matrix_cases)
+            if args.case_filter is None or args.case_filter in case.name
+        ]
     if "matrix" in tracks and not matrix_cases:
         raise ValueError("matrix selection produced no cases")
     if "matrix" not in tracks:
@@ -3429,6 +3624,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError(
             f"protocol sidecar does not match invocation: {resume_mismatches}"
         )
+    operation_timeout_seconds = (
+        matrix["release_contract"]["operation_timeout_seconds"]
+        if args.profile == "release"
+        else None
+    )
+    fail_fast_runtime_ratio = (
+        float(matrix["release_contract"]["fail_fast_runtime_ratio"])
+        if args.profile == "release"
+        else None
+    )
     runner = ProtocolRunner(
         executable=executable,
         output=output,
@@ -3450,6 +3655,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         matrix_sha256=matrix_sha256,
         shard_id=shard_id,
         resume=args.resume,
+        operation_timeout_seconds=operation_timeout_seconds,
+        fail_fast_runtime_ratio=fail_fast_runtime_ratio,
     )
     execution_error: Exception | None = None
     try:
@@ -3485,6 +3692,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         write_json_atomic(summary_path, summary)
     print(json.dumps(summary, sort_keys=True), file=sys.stderr)
     if execution_error is not None:
+        if isinstance(execution_error, PerformanceRegressionTimeout):
+            return 75
+        if isinstance(execution_error, OperationTimeout):
+            return 74
         raise execution_error
     return 0 if not runner.failures else 1
 

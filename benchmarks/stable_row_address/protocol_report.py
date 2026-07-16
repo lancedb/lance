@@ -344,20 +344,17 @@ def validate_storage_roots(sidecar: dict[str, Any]) -> None:
 def frozen_release_shard_contract(
     shard_count: int, shard_index: int
 ) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
-    if shard_count != 9 or shard_index not in range(9):
-        raise ValueError("release evidence requires exactly nine canonical shards")
     matrix, _, _ = frozen_matrix()
+    expected_shards = protocol.canonical_release_shard_count(matrix)
+    if shard_count != expected_shards or shard_index not in range(expected_shards):
+        raise ValueError(
+            f"release evidence requires exactly {expected_shards} canonical shards"
+        )
     profile = matrix["profiles"]["release"]
-    release_tracks = (
-        "matrix",
-        "sustained",
-        "adversarial_natural",
-        "adversarial_aligned",
-    )
-    release_variants = ("bare", "scalar", "vector")
-    cases = tuple(
-        protocol.iter_matrix_cases(profile, set(matrix["tracks"]["matrix"]["cases"]))
-    )
+    release_contract = matrix["release_contract"]
+    release_tracks = tuple(release_contract["tracks"])
+    release_variants = tuple(release_contract["variants"])
+    cases = protocol.canonical_release_cases(matrix)
     fixture_keys = {protocol.fixture_key_for_case(case) for case in cases}
     repeated_rows_per_fragment = max(
         1,
@@ -381,7 +378,7 @@ def frozen_release_shard_contract(
             "vector",
         ),
     }
-    fixture_keys.update(variant_layouts.values())
+    fixture_keys.update(variant_layouts[variant] for variant in release_variants)
     data_layouts = sorted(
         {(schema_kind, segments) for schema_kind, segments, _ in fixture_keys}
     )
@@ -626,7 +623,14 @@ def validate_sidecar(value: Any) -> dict[str, Any]:
     temporary_matrix = expected_matrix
     _strict_object(
         temporary_matrix,
-        {"schema_version", "name", "profiles", "tracks", "measurement"},
+        {
+            "schema_version",
+            "name",
+            "profiles",
+            "release_contract",
+            "tracks",
+            "measurement",
+        },
         "embedded matrix",
     )
     profile = temporary_matrix["profiles"].get(value["profile"])
@@ -1292,10 +1296,12 @@ def _expected_record_provenance(
     current_take_count = profile["take_counts"][-1]
 
     def paired_order(repeat: int, pair_id: str) -> tuple[str, ...]:
-        return run.paired_format_order(repeat, pair_id)
+        return protocol.execution_format_order(profile_name, repeat, pair_id)
 
     def dynamic_order(repeat: int, scope: str) -> tuple[str, ...]:
-        return run.dynamic_format_order(repeat, scope)
+        return protocol.execution_format_order(
+            profile_name, repeat, scope, dynamic=True
+        )
 
     def include_optional(pair_id: str) -> bool:
         return optional_pairs is None or pair_id in optional_pairs

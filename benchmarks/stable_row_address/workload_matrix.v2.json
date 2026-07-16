@@ -1,12 +1,12 @@
 {
-  "schema_version": 1,
-  "name": "stable_logical_row_address_release_matrix",
+  "schema_version": 2,
+  "name": "stable_logical_row_address_focused_release_matrix",
   "profiles": {
     "smoke": {
       "paired_repeats": 3,
       "rows": 65536,
       "schemas": ["narrow16", "wide128", "vector"],
-      "logical_fragment_counts": [8, 64],
+      "logical_fragment_counts": [8, 64, 4096],
       "take_counts": [1, 32, 1024],
       "delete_percentages": [1, 50, 90],
       "update_percentages": [1, 50, 90],
@@ -19,7 +19,7 @@
       "random_delete_reclaim_admission": "must_admit"
     },
     "release": {
-      "paired_repeats": 10,
+      "paired_repeats": 5,
       "rows": 100000000,
       "schemas": ["narrow16", "wide128", "vector"],
       "logical_fragment_counts": [100, 10000, 100000],
@@ -34,6 +34,20 @@
       "minimum_sustained_boundaries": 3,
       "random_delete_reclaim_admission": "must_not_admit"
     }
+  },
+  "release_contract": {
+    "shard_count": 5,
+    "operation_timeout_seconds": 1800,
+    "fail_fast_runtime_ratio": 1.5,
+    "tracks": ["matrix"],
+    "variants": [],
+    "matrix_case_names": [
+      "compact-10000-to-1/wide128",
+      "compact-10000-skew-to-1/narrow16",
+      "compact-100000-skew-to-1/narrow16",
+      "indexed-compact-10000-to-1/scalar",
+      "indexed-compact-10000-to-1/vector"
+    ]
   },
   "tracks": {
     "matrix": {
