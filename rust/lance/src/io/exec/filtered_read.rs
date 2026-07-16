@@ -461,40 +461,30 @@ impl std::fmt::Debug for FilteredReadStream {
 }
 
 impl FilteredReadStream {
-    /// Create a new FilteredReadStream from a pre-computed internal plan
+    /// Create a new FilteredReadStream from a pre-computed internal plan.
+    /// A `None` scheduler or fragments is created/loaded here; the
+    /// row-stream path injects its per-query shared ones and a per-batch
+    /// priority offset.
     #[instrument(name = "init_filtered_read_stream", skip_all)]
     async fn try_new(
         dataset: Arc<Dataset>,
         options: FilteredReadOptions,
-        metrics: &ExecutionPlanMetricsSet,
-        plan: FilteredReadInternalPlan,
-    ) -> DataFusionResult<Self> {
-        let global_metrics = Arc::new(FilteredReadGlobalMetrics::new(metrics));
-        let loaded_fragments = Self::load_all_fragments(&dataset, &options).await?;
-        let scan_scheduler = Self::make_scan_scheduler(&dataset, &options);
-        Ok(Self::new_shared(
-            dataset,
-            options,
-            global_metrics,
-            plan,
-            scan_scheduler,
-            &loaded_fragments,
-            0,
-        ))
-    }
-
-    /// Shared with the row-stream path, which injects its per-query
-    /// scheduler, cached fragments, and a per-batch priority offset
-    #[allow(clippy::too_many_arguments)]
-    fn new_shared(
-        dataset: Arc<Dataset>,
-        options: FilteredReadOptions,
         global_metrics: Arc<FilteredReadGlobalMetrics>,
         plan: FilteredReadInternalPlan,
-        scan_scheduler: Arc<ScanScheduler>,
-        loaded_fragments: &[LoadedFragment],
-        priority_offset: u32,
-    ) -> Self {
+        scan_scheduler: Option<Arc<ScanScheduler>>,
+        loaded_fragments: Option<&[LoadedFragment]>,
+        priority_offset: Option<u32>,
+    ) -> DataFusionResult<Self> {
+        let freshly_loaded_fragments;
+        let loaded_fragments = match loaded_fragments {
+            Some(fragments) => fragments,
+            None => {
+                freshly_loaded_fragments = Self::load_all_fragments(&dataset, &options).await?;
+                &freshly_loaded_fragments
+            }
+        };
+        let scan_scheduler =
+            scan_scheduler.unwrap_or_else(|| Self::make_scan_scheduler(&dataset, &options));
         let threading_mode = options.threading_mode;
 
         let io_parallelism = dataset.object_store.io_parallelism();
@@ -523,7 +513,7 @@ impl FilteredReadStream {
             &options,
             scan_scheduler.clone(),
         );
-        if priority_offset != 0 {
+        if let Some(priority_offset) = priority_offset.filter(|offset| *offset != 0) {
             for scoped in &mut scoped_fragments {
                 scoped.priority = scoped.priority.saturating_add(priority_offset);
             }
@@ -564,7 +554,7 @@ impl FilteredReadStream {
                         (fragments, rows)
                     }
                 });
-        Self {
+        Ok(Self {
             output_schema,
             task_stream: Arc::new(AsyncMutex::new(task_stream)),
             scan_scheduler,
@@ -574,7 +564,7 @@ impl FilteredReadStream {
             scan_range_after_filter,
             touched_fragments,
             planned_rows,
-        }
+        })
     }
 
     /// Drain the entire read into batches (used by the row-stream path,
@@ -2229,10 +2219,17 @@ impl FilteredReadExec {
                 )
                 .await
                 .map_err(|e| DataFusionError::External(e.into()))?;
-                let new_running_stream =
-                    FilteredReadStream::try_new(dataset, options, &metrics, plan.clone())
-                        .await
-                        .map_err(|e| DataFusionError::External(e.into()))?;
+                let new_running_stream = FilteredReadStream::try_new(
+                    dataset,
+                    options,
+                    Arc::new(FilteredReadGlobalMetrics::new(&metrics)),
+                    plan.clone(),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .map_err(|e| DataFusionError::External(e.into()))?;
                 let first_stream = new_running_stream.get_stream(&metrics, partition);
                 *running_stream = Some(new_running_stream);
                 first_stream
@@ -2558,15 +2555,16 @@ impl RowStreamRead {
         // I/O priority: earlier batches strictly first (output emits in batch
         // order), fragments keep dataset order within a batch
         let priority_offset = batch_index.saturating_mul(fragments.len() as u32);
-        let read = FilteredReadStream::new_shared(
+        let read = FilteredReadStream::try_new(
             self.dataset.clone(),
             self.source.read_options.clone(),
             self.global_metrics.clone(),
             internal_plan,
-            self.scan_scheduler.clone(),
-            fragments,
-            priority_offset,
-        );
+            Some(self.scan_scheduler.clone()),
+            Some(fragments),
+            Some(priority_offset),
+        )
+        .await?;
         let decode_parallelism = match self.source.read_options.threading_mode {
             FilteredReadThreadingMode::OnePartitionMultipleThreads(n) => n,
             FilteredReadThreadingMode::MultiplePartitions(n) => n,
