@@ -178,7 +178,7 @@ impl CacheBackend for MokaCacheBackend {
         // is async and can't be called from this synchronous context.
         self.cache
             .iter()
-            .map(|(key, entry)| logical_entry_size(key.as_ref(), entry.size_bytes))
+            .map(|(key, entry)| entry_weight(key.as_ref(), entry.size_bytes))
             .sum()
     }
 }

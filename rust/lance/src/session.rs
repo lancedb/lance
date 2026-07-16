@@ -27,7 +27,9 @@ pub(crate) mod index_extension;
 ///
 /// This is intended for diagnostics. It is computed from a weakly consistent
 /// snapshot of backend entry inventory and may race with concurrent cache
-/// insertions or evictions.
+/// insertions or evictions. A summary has total counts and sizes, grouped into
+/// [`CacheGroupSummary`] values, and each group contains
+/// [`CacheComponentSummary`] values.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CacheSummary {
     /// Number of entries included in this summary.
@@ -39,6 +41,10 @@ pub struct CacheSummary {
 }
 
 /// Summary of cache entries under one summary group.
+///
+/// In [`CacheSummary::groups`], index summaries use one group per Lance cache
+/// prefix while metadata summaries may use a synthetic group label to keep
+/// diagnostics compact.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CacheGroupSummary {
     /// Group label.
@@ -55,6 +61,10 @@ pub struct CacheGroupSummary {
 }
 
 /// Summary of one cache component within a cache summary group.
+///
+/// Components are compact key-derived labels paired with a value type. This
+/// keeps common key families, such as IVF partitions or manifest entries,
+/// visible without returning every cache key.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CacheComponentSummary {
     /// Compact component name derived from the cache key.
@@ -309,12 +319,27 @@ impl Session {
     ///
     /// Returns `None` when the configured index cache backend does not support
     /// entry inventory.
-    pub async fn index_cache_summary(&self) -> Option<CacheSummary> {
-        Some(summarize_cache_records(
-            self.index_cache.0.entry_records().await?,
-            cache_prefix_group,
-            index_cache_component,
-        ))
+    ///
+    /// ```
+    /// # use lance::session::Session;
+    /// # async fn example() -> lance::Result<()> {
+    /// let session = Session::default();
+    /// if let Some(summary) = session.index_cache_summary().await? {
+    ///     for group in &summary.groups {
+    ///         for component in &group.components {
+    ///             let _ = (group.cache_prefix.as_str(), component.component.as_str());
+    ///         }
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn index_cache_summary(&self) -> Result<Option<CacheSummary>> {
+        let Some(records) = self.index_cache.0.entry_records().await else {
+            return Ok(None);
+        };
+
+        summarize_cache_records(records, cache_prefix_group, index_cache_component).map(Some)
     }
 
     /// Return an iterator over keys currently held by the metadata cache.
@@ -340,12 +365,25 @@ impl Session {
     ///
     /// Returns `None` when the configured metadata cache backend does not
     /// support entry inventory.
-    pub async fn metadata_cache_summary(&self) -> Option<CacheSummary> {
-        Some(summarize_cache_records(
-            self.metadata_cache.0.entry_records().await?,
-            metadata_cache_group,
-            metadata_cache_component,
-        ))
+    ///
+    /// ```
+    /// # use lance::session::Session;
+    /// # async fn example() -> lance::Result<()> {
+    /// let session = Session::default();
+    /// if let Some(summary) = session.metadata_cache_summary().await? {
+    ///     let total_bytes = summary.total_size_bytes;
+    ///     let total_entries = summary.total_entries;
+    ///     let _ = (total_bytes, total_entries);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn metadata_cache_summary(&self) -> Result<Option<CacheSummary>> {
+        let Some(records) = self.metadata_cache.0.entry_records().await else {
+            return Ok(None);
+        };
+
+        summarize_cache_records(records, metadata_cache_group, metadata_cache_component).map(Some)
     }
 }
 
@@ -370,21 +408,32 @@ fn summarize_cache_records(
     records: impl Iterator<Item = CacheEntryRecord>,
     group_name: fn(&InternalCacheKey) -> String,
     component_name: fn(&InternalCacheKey) -> String,
-) -> CacheSummary {
+) -> Result<CacheSummary> {
     let mut groups = BTreeMap::<String, CacheGroupAccumulator>::new();
     let mut total_entries = 0usize;
     let mut total_size_bytes = 0usize;
 
     for record in records {
-        total_entries = total_entries.saturating_add(1);
-        total_size_bytes = total_size_bytes.saturating_add(record.size_bytes);
+        total_entries = checked_cache_summary_add(total_entries, 1, "total entry count")?;
+        total_size_bytes =
+            checked_cache_summary_add(total_size_bytes, record.size_bytes, "total size bytes")?;
 
-        let group = groups.entry(group_name(&record.key)).or_default();
-        group.entry_count = group.entry_count.saturating_add(1);
-        group.size_bytes = group.size_bytes.saturating_add(record.size_bytes);
+        let group_label = group_name(&record.key);
+        let group = groups.entry(group_label.clone()).or_default();
+        group.entry_count = checked_cache_summary_add(
+            group.entry_count,
+            1,
+            format!("entry count for cache group '{group_label}'"),
+        )?;
+        group.size_bytes = checked_cache_summary_add(
+            group.size_bytes,
+            record.size_bytes,
+            format!("size bytes for cache group '{group_label}'"),
+        )?;
 
         let component = component_name(&record.key);
         let type_name = record.key.type_name().to_string();
+        let component_label = format!("{component}/{type_name}");
         let component_summary = group
             .components
             .entry((component.clone(), type_name.clone()))
@@ -394,13 +443,19 @@ fn summarize_cache_records(
                 entry_count: 0,
                 size_bytes: 0,
             });
-        component_summary.entry_count = component_summary.entry_count.saturating_add(1);
-        component_summary.size_bytes = component_summary
-            .size_bytes
-            .saturating_add(record.size_bytes);
+        component_summary.entry_count = checked_cache_summary_add(
+            component_summary.entry_count,
+            1,
+            format!("entry count for cache component '{component_label}'"),
+        )?;
+        component_summary.size_bytes = checked_cache_summary_add(
+            component_summary.size_bytes,
+            record.size_bytes,
+            format!("size bytes for cache component '{component_label}'"),
+        )?;
     }
 
-    CacheSummary {
+    Ok(CacheSummary {
         total_entries,
         total_size_bytes,
         groups: groups
@@ -412,7 +467,20 @@ fn summarize_cache_records(
                 components: group.components.into_values().collect(),
             })
             .collect(),
-    }
+    })
+}
+
+fn checked_cache_summary_add(
+    current: usize,
+    increment: usize,
+    context: impl AsRef<str>,
+) -> Result<usize> {
+    current.checked_add(increment).ok_or_else(|| {
+        Error::invalid_input(format!(
+            "Cache summary overflow while adding {increment} to {} (current value: {current})",
+            context.as_ref()
+        ))
+    })
 }
 
 fn cache_prefix_group(key: &InternalCacheKey) -> String {
@@ -478,6 +546,7 @@ mod tests {
     };
     use lance_index::vector::VectorIndex;
     use object_store::path::Path;
+    use rstest::rstest;
     use std::borrow::Cow;
     use std::pin::Pin;
     use tokio::io::AsyncWriteExt;
@@ -607,7 +676,7 @@ mod tests {
         let session = Session::new(10_000, 10_000, Default::default());
         let index_uuid = Uuid::nil();
 
-        let ds_index_cache = session.index_cache.for_dataset("memory://dataset");
+        let ds_index_cache = session.index_cache.for_dataset("memory://");
         let index_cache = ds_index_cache.for_index(&index_uuid, None);
         index_cache
             .insert_with_key(&TestKey("ivf-0"), Arc::new(vec![1]))
@@ -619,14 +688,11 @@ mod tests {
             .insert_with_key(&TestKey("page-0"), Arc::new(vec![3]))
             .await;
 
-        let index_summary = session.index_cache_summary().await.unwrap();
+        let index_summary = session.index_cache_summary().await.unwrap().unwrap();
         assert_eq!(index_summary.total_entries, 3);
         assert_eq!(index_summary.groups.len(), 1);
         let index_group = &index_summary.groups[0];
-        assert_eq!(
-            index_group.cache_prefix,
-            format!("memory://dataset/{index_uuid}")
-        );
+        assert_eq!(index_group.cache_prefix, format!("memory:///{index_uuid}"));
         assert_eq!(index_group.entry_count, 3);
         assert_eq!(index_group.components.len(), 2);
         assert_eq!(index_group.components[0].component, "ivf");
@@ -646,7 +712,7 @@ mod tests {
                 .sum::<usize>()
         );
 
-        let ds_metadata_cache = session.metadata_cache.for_dataset("memory://dataset");
+        let ds_metadata_cache = session.metadata_cache.for_dataset("memory://");
         ds_metadata_cache
             .insert_with_key(&TestKey("manifest/1"), Arc::new(vec![4]))
             .await;
@@ -659,7 +725,7 @@ mod tests {
             .insert_with_key(&TestKey(""), Arc::new(vec![6]))
             .await;
 
-        let metadata_summary = session.metadata_cache_summary().await.unwrap();
+        let metadata_summary = session.metadata_cache_summary().await.unwrap().unwrap();
         assert_eq!(metadata_summary.total_entries, 3);
         assert_eq!(metadata_summary.groups.len(), 1);
         let metadata_group = &metadata_summary.groups[0];
@@ -692,23 +758,28 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_cache_key_component_names_are_compact() {
-        let uuid = Uuid::nil();
-
-        assert_eq!(
-            cache_key_component(&format!("frag_reuse/{uuid}"), "FragReuseIndex"),
-            "frag_reuse"
-        );
-        assert_eq!(
-            cache_key_component(&format!("type/{uuid}"), "ScalarIndexDetails"),
-            "type"
-        );
-        assert_eq!(cache_key_component("12", "Vec<IndexMetadata>"), "version");
-        assert_eq!(cache_key_component("12", "Bitmap"), "Bitmap");
-        assert_eq!(cache_key_component("0:default", "FieldData"), "field_data");
-        assert_eq!(cache_key_component("ivf-12", "LegacyIVFPartition"), "ivf");
-        assert_eq!(cache_key_component("some-value", "Bitmap"), "Bitmap");
+    #[rstest]
+    #[case::frag_reuse(
+        "frag_reuse/00000000-0000-0000-0000-000000000000",
+        "FragReuseIndex",
+        "frag_reuse"
+    )]
+    #[case::type_details(
+        "type/00000000-0000-0000-0000-000000000000",
+        "ScalarIndexDetails",
+        "type"
+    )]
+    #[case::index_metadata_version("12", "Vec<IndexMetadata>", "version")]
+    #[case::numeric_bitmap_value("12", "Bitmap", "Bitmap")]
+    #[case::field_data("0:default", "FieldData", "field_data")]
+    #[case::ivf_partition("ivf-12", "LegacyIVFPartition", "ivf")]
+    #[case::scalar_value("some-value", "Bitmap", "Bitmap")]
+    fn test_cache_key_component_names_are_compact(
+        #[case] key: &str,
+        #[case] type_name: &str,
+        #[case] expected_component: &str,
+    ) {
+        assert_eq!(cache_key_component(key, type_name), expected_component);
     }
 
     #[tokio::test]
@@ -719,7 +790,7 @@ mod tests {
             Default::default(),
         );
 
-        assert!(session.index_cache_summary().await.is_none());
+        assert!(session.index_cache_summary().await.unwrap().is_none());
     }
 
     #[tokio::test]

@@ -291,6 +291,31 @@ impl LanceCache {
     /// Returns `None` when the backend does not support entry inventory. The
     /// iterator is intended for diagnostics and may be weakly consistent with
     /// concurrent cache mutations.
+    ///
+    /// ```
+    /// # use std::borrow::Cow;
+    /// # use std::sync::Arc;
+    /// # use lance_core::cache::{CacheKey, LanceCache};
+    /// # struct MyKey;
+    /// # impl CacheKey for MyKey {
+    /// #     type ValueType = Vec<i32>;
+    /// #     fn key(&self) -> Cow<'_, str> { Cow::Borrowed("values") }
+    /// #     fn type_name() -> &'static str { "VecI32" }
+    /// # }
+    /// # async fn example() {
+    /// let cache = LanceCache::with_capacity(1024);
+    /// let dataset_cache = cache.with_key_prefix("dataset");
+    /// dataset_cache.insert_with_key(&MyKey, Arc::new(vec![1, 2, 3])).await;
+    ///
+    /// let records: Vec<_> = dataset_cache
+    ///     .entry_records()
+    ///     .await
+    ///     .expect("Moka supports entry inventory")
+    ///     .collect();
+    /// assert_eq!(records.len(), 1);
+    /// assert!(records[0].key.prefix().starts_with("dataset/"));
+    /// # }
+    /// ```
     pub async fn entry_records(&self) -> Option<CacheEntryRecordIterator<'_>> {
         Some(Box::new(
             self.cache

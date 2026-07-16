@@ -25,7 +25,14 @@ pub type CacheEntry = Arc<dyn Any + Send + Sync>;
 /// Iterator over cache keys currently known to a backend.
 pub type CacheKeyIterator<'a> = Box<dyn Iterator<Item = InternalCacheKey> + Send + 'a>;
 
-/// Iterator over cache entries currently known to a backend.
+/// Iterator over [`CacheEntryRecord`] values currently known to a backend.
+///
+/// ```
+/// # use lance_core::cache::CacheEntryRecordIterator;
+/// fn cached_type_names(records: CacheEntryRecordIterator<'_>) -> Vec<&'static str> {
+///     records.map(|record| record.key.type_name()).collect()
+/// }
+/// ```
 pub type CacheEntryRecordIterator<'a> = Box<dyn Iterator<Item = CacheEntryRecord> + Send + 'a>;
 
 /// Structured cache key passed to [`CacheBackend`] methods.
@@ -75,6 +82,23 @@ impl InternalCacheKey {
 /// `size_bytes` is the backend's per-entry weighted size for capacity
 /// accounting. Backends may include key overhead or physical storage overhead
 /// according to the same accounting they use for eviction.
+///
+/// ```
+/// # use std::sync::Arc;
+/// # use lance_core::cache::{CacheEntryRecord, InternalCacheKey};
+/// let record = CacheEntryRecord {
+///     key: InternalCacheKey::new(
+///         Arc::<str>::from("dataset/"),
+///         Arc::<str>::from("manifest/1"),
+///         "Manifest",
+///     ),
+///     size_bytes: 128,
+/// };
+///
+/// assert_eq!(record.key.prefix(), "dataset/");
+/// assert_eq!(record.key.key(), "manifest/1");
+/// assert_eq!(record.size_bytes, 128);
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CacheEntryRecord {
     pub key: InternalCacheKey,
@@ -144,8 +168,14 @@ pub trait CacheBackend: Send + Sync + std::fmt::Debug {
 
     /// Return an iterator over cache entries currently known to this backend.
     ///
-    /// This is intended for diagnostics and summary APIs. Backends that cannot
-    /// enumerate entries cheaply or accurately should return `None`.
+    /// This is intended for diagnostics and summary APIs such as
+    /// [`LanceCache::entry_records`](super::LanceCache::entry_records).
+    /// Backends that cannot enumerate entries cheaply or accurately should
+    /// return `None`, which callers treat as unsupported inventory rather than
+    /// an empty cache. The default implementation returns `None`.
+    ///
+    /// In-memory backends such as [`MokaCacheBackend`](super::MokaCacheBackend)
+    /// can implement this by returning records from their local inventory.
     async fn entry_records(&self) -> Option<CacheEntryRecordIterator<'_>> {
         None
     }
