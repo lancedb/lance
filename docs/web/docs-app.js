@@ -99,12 +99,15 @@
         { label: "Integrations", items: [
           P("Overview", "integrations/index"),
           P("Apache DataFusion", "integrations/datafusion"),
-          X("PostgreSQL", "https://github.com/lancedb/pglance"),
+          X("Apache Flink", "https://github.com/lance-format/lance-flink"),
+          X("Apache Spark", "https://lance.org/integrations/spark/"),
+          X("DuckDB", "https://lance.org/integrations/duckdb/"),
+          X("Hugging Face", "https://lance.org/integrations/huggingface/"),
+          X("PostgreSQL", "https://github.com/lance-format/pglance"),
           P("PyTorch", "integrations/pytorch"),
+          X("Ray", "https://lance.org/integrations/ray/"),
           P("TensorFlow", "integrations/tensorflow"),
-          X("Apache Spark", "https://lance.org/spark/"),
-          X("Ray", "https://lance.org/ray/"),
-          X("Trino", "https://lance.org/trino/"),
+          X("Trino", "https://lance.org/integrations/trino/"),
         ]},
       ],
     },
@@ -170,25 +173,32 @@
     if (/\.(png|gif|svg|jpg|jpeg|webp)$/i.test(p)) return { asset: CONTENT_BASE + p };
     const cand = findItem(p) ? p : findItem(p + "/index") ? p + "/index" : null;
     if (cand) return { route: cand };
-    return { ext: "https://lance.org/" + p };
+    // Content not bundled in this prototype (subproject docs assembled by
+    // make-full-website.sh) lives on lance.org; mkdocs serves `foo/index.md`
+    // at `foo/`, so drop the trailing `/index` and keep a directory URL.
+    return { ext: "https://lance.org/" + p.replace(/\/index$/, "") + "/" };
   }
 
   function inline(text, baseDir) {
     let out = esc(text);
     const stash = [];
-    out = out.replace(/`([^`]+)`/g, (_, c) => { stash.push("<code>" + c + "</code>"); return "\u0000" + (stash.length - 1) + "\u0000"; });
+    const keep = (html) => { stash.push(html); return "\u0000" + (stash.length - 1) + "\u0000"; };
+    out = out.replace(/`([^`]+)`/g, (_, c) => keep("<code>" + c + "</code>"));
     out = out.replace(/!\[([^\]]*)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g, (_, alt, src) => {
       const r = resolveLink(baseDir, src);
       const url = r.asset || r.ext || src;
-      return '<span class="ld-fig"><img src="' + url + '" alt="' + alt + '" loading="lazy"></span>';
+      return keep('<span class="ld-fig"><img src="' + url + '" alt="' + alt + '" loading="lazy"></span>');
     });
     out = out.replace(/\[([^\]]+)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g, (_, txt, href) => {
       const r = resolveLink(baseDir, href);
-      if (r.route) return '<a href="#/' + r.route + '">' + txt + "</a>";
-      if (r.anchor) return '<a href="#' + r.anchor + '" data-anchor="' + r.anchor + '">' + txt + "</a>";
+      if (r.route) return keep('<a href="#/' + r.route + '">' + txt + "</a>");
+      if (r.anchor) return keep('<a href="#' + r.anchor + '" data-anchor="' + r.anchor + '">' + txt + "</a>");
       const url = r.asset || r.ext;
-      return '<a href="' + url + '" target="_blank" rel="noopener">' + txt + "</a>";
+      return keep('<a href="' + url + '" target="_blank" rel="noopener">' + txt + "</a>");
     });
+    // autolink bare URLs (markdown-authored links are already stashed above)
+    out = out.replace(/(^|[\s(|])(https?:\/\/[^\s<>()|]+?)([.,;:!?]?)(?=$|[\s<>()|])/g, (_, pre, url, tail) =>
+      pre + keep('<a href="' + url + '" target="_blank" rel="noopener">' + url + "</a>") + tail);
     out = out.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
     out = out.replace(/(^|[\s(])\*([^*\s][^*]*)\*/g, "$1<em>$2</em>");
     out = out.replace(/\u0000(\d+)\u0000/g, (_, i) => stash[+i]);

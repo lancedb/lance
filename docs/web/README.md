@@ -28,7 +28,14 @@ Then open <http://localhost:8000/web/>.
 ## Notes
 
 - The markdown renderer covers the mkdocs extensions used in `docs/src`
-  (admonitions, content tabs, tables, `<details>`, proto includes); unsupported
-  external links fall back to `https://lance.org/<path>`.
+  (admonitions, content tabs, tables, `<details>`, proto includes, bare-URL
+  autolinking); pages not bundled in this prototype fall back to
+  `https://lance.org/<path>/`.
 - Navigation lives in `SECTIONS` in `docs-app.js`; adding a page to the site
   means adding it there (mkdocs `.pages` files are not read).
+- Light/dark theme follows `prefers-color-scheme`, is toggleable from the
+  header, and persists in `localStorage` (`ld-theme`).
+- The GitHub star count is fetched from the public GitHub API and cached in
+  `localStorage` for an hour; the button degrades to a plain link offline.
+- Docs pages get a right-hand "On this page" TOC (h2/h3) with a scroll-spy
+  highlight; it hides below 1180px viewports.

@@ -6,6 +6,39 @@
   let route = "home";
   let loadSeq = 0;
 
+  /* ---------- theme ---------- */
+  const themeBtn = $("theme-toggle");
+  if (themeBtn) {
+    themeBtn.addEventListener("click", () => {
+      const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+      document.documentElement.dataset.theme = next;
+      try { localStorage.setItem("ld-theme", next); } catch (e) { /* private mode */ }
+    });
+  }
+
+  /* ---------- GitHub stars ---------- */
+  function showStars(count) {
+    const el = $("gh-stars");
+    if (!el || !(count > 0)) return;
+    const label = count >= 1000 ? (count / 1000).toFixed(1).replace(/\.0$/, "") + "k" : String(count);
+    el.textContent = "★ " + label;
+    el.hidden = false;
+  }
+  (function loadStars() {
+    const TTL = 3600e3;
+    try {
+      const cached = JSON.parse(localStorage.getItem("ld-gh-stars") || "null");
+      if (cached && Date.now() - cached.t < TTL) { showStars(cached.v); return; }
+    } catch (e) { /* fall through to fetch */ }
+    fetch("https://api.github.com/repos/lance-format/lance")
+      .then((r) => { if (!r.ok) throw new Error(r.status); return r.json(); })
+      .then((d) => {
+        showStars(d.stargazers_count);
+        try { localStorage.setItem("ld-gh-stars", JSON.stringify({ v: d.stargazers_count, t: Date.now() })); } catch (e) { /* ignore */ }
+      })
+      .catch(() => { /* rate-limited or offline: button still works without the count */ });
+  })();
+
   function renderTabs(secId) {
     $("top-tabs").innerHTML = LD.SECTIONS.map((s) => {
       const first = s.id === "home" ? "home" : LD.flatSection(s)[0].path;
@@ -47,6 +80,40 @@
         : "");
   }
 
+  /* ---------- right-hand page TOC ---------- */
+  let tocLinks = [];
+  let tocHeadings = [];
+
+  function buildToc() {
+    const toc = $("toc");
+    const heads = Array.from($("article").querySelectorAll("h2[id], h3[id]"));
+    if (heads.length < 2) {
+      toc.hidden = true;
+      toc.innerHTML = "";
+      tocLinks = []; tocHeadings = [];
+      return;
+    }
+    toc.innerHTML = '<div class="ld-toc__label">On this page</div>' + heads.map((h) =>
+      '<a class="ld-toc__' + h.tagName.toLowerCase() + '" href="#' + h.id + '" data-anchor="' + h.id + '">' +
+      h.textContent + "</a>").join("");
+    toc.hidden = false;
+    tocHeadings = heads;
+    tocLinks = Array.from(toc.querySelectorAll("a"));
+    updateToc();
+  }
+
+  function updateToc() {
+    if (!tocHeadings.length) return;
+    let active = 0;
+    for (let i = 0; i < tocHeadings.length; i++) {
+      if (tocHeadings[i].getBoundingClientRect().top <= 90) active = i;
+      else break;
+    }
+    tocLinks.forEach((a, i) => a.classList.toggle("active", i === active));
+  }
+
+  window.addEventListener("scroll", updateToc, { passive: true });
+
   function renderChrome() {
     const secId = route === "home" ? "home" : LD.sectionOf(route);
     const isHome = secId === "home";
@@ -77,6 +144,7 @@
     renderChrome();
     $("article").innerHTML = "";
     $("loading").hidden = false;
+    buildToc();
     window.scrollTo(0, 0);
     const seq = ++loadSeq;
     fetch(LD.CONTENT_BASE + r + ".md")
@@ -85,11 +153,13 @@
         if (seq !== loadSeq) return;
         $("loading").hidden = true;
         $("article").innerHTML = LD.renderMarkdown(md, r).html;
+        buildToc();
       })
       .catch(() => {
         if (seq !== loadSeq) return;
         $("loading").hidden = true;
         $("article").innerHTML = "<p>Failed to load this page.</p>";
+        buildToc();
       });
   }
 
