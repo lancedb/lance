@@ -1480,7 +1480,7 @@ impl IndexWorker {
                     new_posting_memory_size as i64 - old_posting_memory_size as i64;
             }
             Self::apply_delta(&mut self.memory_size, posting_memory_delta);
-        } else if token_num > 0 {
+        } else {
             self.token_ids.sort_unstable();
             let mut iter = self.token_ids.iter();
             let mut current = *iter.next().unwrap();
@@ -2081,6 +2081,7 @@ mod tests {
     use crate::Index;
     use crate::metrics::NoOpMetricsCollector;
     use crate::progress::IndexBuildProgress;
+    use crate::scalar::inverted::{MemBM25Scorer, Scorer};
     use crate::scalar::{IndexFile, IndexReader, IndexWriter, ScalarIndex};
     use arrow_array::{RecordBatch, StringArray, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
@@ -3300,7 +3301,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_empty_string_documents_are_skipped_in_corpus_stats() -> Result<()> {
+    async fn test_zero_token_string_documents_are_skipped_in_corpus_stats() -> Result<()> {
         let index_dir = TempDir::default();
         let store = Arc::new(LanceIndexStore::new(
             ObjectStore::local().into(),
@@ -3308,14 +3309,21 @@ mod tests {
             Arc::new(LanceCache::no_cache()),
         ));
 
-        let batch = make_doc_batch_from_docs(vec![Some(""), Some("   "), None, Some("hello")]);
+        let batch = make_doc_batch_from_docs(vec![
+            Some(""),
+            Some("   "),
+            Some("the"),
+            Some("overlength"),
+            None,
+            Some("hello"),
+        ]);
         let stream = RecordBatchStreamAdapter::new(batch.schema(), stream::iter(vec![Ok(batch)]));
         let params =
             InvertedIndexParams::new("whitespace".to_string(), lance_tokenizer::Language::English)
                 .with_position(false)
-                .remove_stop_words(false)
+                .remove_stop_words(true)
                 .stem(false)
-                .max_token_length(None)
+                .max_token_length(Some(6))
                 .num_workers(1);
 
         let mut builder = InvertedIndexBuilder::new(params);
@@ -3324,8 +3332,26 @@ mod tests {
             .await?;
 
         let index = InvertedIndex::load(store, None, &LanceCache::no_cache()).await?;
-        let stats = index.bm25_stats_for_terms(&["hello".to_string()]).await?;
-        assert_eq!(stats, (1, 1, vec![1]));
+        let (total_tokens, num_docs, token_docs) =
+            index.bm25_stats_for_terms(&["hello".to_string()]).await?;
+        assert_eq!(total_tokens, 1);
+        assert_eq!(num_docs, 1);
+        assert_eq!(token_docs, vec![1]);
+
+        let actual_scorer = MemBM25Scorer::new(
+            total_tokens,
+            num_docs,
+            HashMap::from([("hello".to_string(), token_docs[0])]),
+        );
+        let expected_scorer = MemBM25Scorer::new(1, 1, HashMap::from([("hello".to_string(), 1)]));
+        assert_eq!(
+            actual_scorer.avg_doc_length(),
+            expected_scorer.avg_doc_length()
+        );
+        assert_eq!(
+            actual_scorer.query_weight("hello"),
+            expected_scorer.query_weight("hello")
+        );
 
         Ok(())
     }
