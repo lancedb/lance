@@ -754,29 +754,56 @@ impl ObjectStore for AimdThrottledStore {
     }
 
     async fn rename_opts(&self, from: &Path, to: &Path, opts: RenameOptions) -> OSResult<()> {
-        // Perform copy and delete separately to handle throttling more gracefully.
-        // If the copy succeeds but the delete fails due to throttling, we can retry just
-        // the delete instead of failing because the destination already exists.
         let RenameOptions {
             target_mode,
             extensions,
         } = opts;
-        let copy_mode = match target_mode {
-            RenameTargetMode::Overwrite => CopyMode::Overwrite,
-            RenameTargetMode::Create => CopyMode::Create,
-        };
-        let copy_options = CopyOptions {
-            mode: copy_mode,
-            extensions,
-        };
-        self.write
-            .throttled(|| self.target.copy_opts(from, to, copy_options.clone()))
-            .await?;
 
-        // Delete the source file, with separate retry logic.
-        // Even if this fails, the rename has effectively succeeded (destination exists).
-        // We still try to clean up the source to avoid leaving duplicate data.
-        self.delete.throttled(|| self.target.delete(from)).await
+        match target_mode {
+            RenameTargetMode::Overwrite => {
+                // Delegate to the underlying store to preserve atomic rename
+                // semantics where the store supports them (e.g. local filesystem).
+                self.write
+                    .throttled(|| {
+                        self.target.rename_opts(
+                            from,
+                            to,
+                            RenameOptions {
+                                target_mode,
+                                extensions: extensions.clone(),
+                            },
+                        )
+                    })
+                    .await
+            }
+            RenameTargetMode::Create => {
+                // For rename_if_not_exists, the default object_store implementation
+                // is copy + delete. Perform the two steps under their respective
+                // throttles so they can be retried independently. If copy succeeds
+                // but delete is throttled, the caller's intent is satisfied: the
+                // destination now exists and the data has been committed.
+                let copy_options = CopyOptions {
+                    mode: CopyMode::Create,
+                    extensions: extensions.clone(),
+                };
+                self.write
+                    .throttled(|| self.target.copy_opts(from, to, copy_options.clone()))
+                    .await?;
+
+                // Best-effort cleanup of the source. Failure here does not change
+                // the outcome of the rename, so do not propagate the error.
+                if let Err(err) = self.delete.throttled(|| self.target.delete(from)).await {
+                    warn!(
+                        target: TRACE_OBJECT_STORE_THROTTLE,
+                        source = %from,
+                        destination = %to,
+                        error = %err,
+                        "rename_if_not_exists source cleanup failed after destination was created"
+                    );
+                }
+                Ok(())
+            }
+        }
     }
 }
 
@@ -1902,9 +1929,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_rename_retries_copy_and_delete_independently() {
+    async fn test_rename_if_not_exists_retries_copy_and_delete_independently() {
         // Copy fails twice then succeeds; delete fails once then succeeds.
-        // Both are within max_retries=3, so the rename should ultimately succeed.
+        // Both are within max_retries=3, so the rename_if_not_exists should
+        // ultimately succeed, with copy and delete retried independently.
         let mock = Arc::new(RenameRetryMockStore::new(2, 1));
         let from = Path::from("test/from.txt");
         let to = Path::from("test/to.txt");
@@ -1916,7 +1944,7 @@ mod tests {
         let throttled =
             AimdThrottledStore::new(mock.clone() as Arc<dyn ObjectStore>, config).unwrap();
 
-        throttled.rename(&from, &to).await.unwrap();
+        throttled.rename_if_not_exists(&from, &to).await.unwrap();
 
         // Copy: 2 failures + 1 success. Delete: 1 failure + 1 success.
         assert_eq!(mock.copy_call_count.load(Ordering::Relaxed), 3);
@@ -1929,5 +1957,31 @@ mod tests {
             throttled.head(&from).await,
             Err(object_store::Error::NotFound { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn test_rename_if_not_exists_succeeds_when_delete_throttled() {
+        // Copy succeeds, but delete is throttled beyond max_retries.
+        // The rename must still report success because the destination exists
+        // and the caller's intent has been satisfied.
+        let mock = Arc::new(RenameRetryMockStore::new(0, 10));
+        let from = Path::from("test/from.txt");
+        let to = Path::from("test/to.txt");
+        mock.put(&from, PutPayload::from_static(b"payload"))
+            .await
+            .unwrap();
+
+        let config = AimdThrottleConfig::default();
+        let throttled =
+            AimdThrottledStore::new(mock.clone() as Arc<dyn ObjectStore>, config).unwrap();
+
+        throttled.rename_if_not_exists(&from, &to).await.unwrap();
+
+        // Destination has the data.
+        let bytes = throttled.get(&to).await.unwrap().bytes().await.unwrap();
+        assert_eq!(bytes.as_ref(), b"payload");
+        // Source was not cleaned up because delete kept failing.
+        let bytes = throttled.get(&from).await.unwrap().bytes().await.unwrap();
+        assert_eq!(bytes.as_ref(), b"payload");
     }
 }
