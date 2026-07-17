@@ -1,7 +1,7 @@
 /* Lance Design System — tokens (Swiss editorial: white, ink, brand purple #625EFF).
    Merged from the design project's ds/tokens set; dark theme mirrors the same
    structure with paper rules on ink. */
-@import url("https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap");
+@import url("https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=Roboto+Mono:wght@400;500;600&display=swap");
 
 :root {
   color-scheme: light;
@@ -9,7 +9,7 @@
   /* ---- Typography ---- */
   --font-display: "Space Grotesk", "Segoe UI", sans-serif;
   --font-body: "IBM Plex Sans", "Segoe UI", sans-serif;
-  --font-mono: "JetBrains Mono", "SF Mono", monospace;
+  --font-mono: "Roboto Mono", "SF Mono", monospace;
   --text-base: 16px;
   --leading-body: 1.6;
   --tracking-display: -0.045em;
@@ -61,6 +61,8 @@
 
   /* ---- Layout ---- */
   --container-max: 1200px;
+  --radius-box: 6px;   /* content boxes: code, admonitions, tabs */
+  --radius-chip: 4px;  /* inline code chips */
 
   /* ---- Motion — fast, precise, no bounce ---- */
   --ease-out: cubic-bezier(0.2, 0.8, 0.2, 1);
