@@ -213,9 +213,30 @@ pub fn svd(a: &[f64], m: usize, n: usize) -> Result<(Vec<f64>, Vec<f64>, Vec<f64
             a.len()
         )));
     }
+
+    //Checks that m*n, m*m, and n*n don't overflow usize before they are used
+    let mn = m.checked_mul(n).ok_or_else(|| {
+        Error::invalid_input(format!(
+            "svd: m*n overflows usize (m={m}, n={n}, len={})",
+            a.len()
+        ))
+    })?;
+    let _mm = m.checked_mul(m).ok_or_else(|| {
+        Error::invalid_input(format!(
+            "svd: m*m overflows usize (m={m}, n={n}, len={})",
+            a.len()
+        ))
+    })?;
+    let _nn = n.checked_mul(n).ok_or_else(|| {
+        Error::invalid_input(format!(
+            "svd: n*n overflows usize (m={m}, n={n}, len={})",
+            a.len()
+        ))
+    })?;
+
     //Checks whether the data length of the input matrix A matches the
     //product of the specified number of rows and number of columns
-    if a.len() != m * n {
+    if a.len() != mn {
         return Err(Error::invalid_input(format!(
             "svd: data length {} != m*n ({m}*{n})", a.len()
         )));
