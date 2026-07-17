@@ -6131,12 +6131,75 @@ const fn build_dequantized_doc_lengths() -> [u32; 256] {
     table
 }
 
+#[derive(Debug, Clone)]
+enum NumTokens {
+    Owned(Vec<u32>),
+    Shared(ScalarBuffer<u32>),
+}
+
+impl Default for NumTokens {
+    fn default() -> Self {
+        Self::Owned(Vec::new())
+    }
+}
+
+impl std::ops::Deref for NumTokens {
+    type Target = [u32];
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Owned(values) => values,
+            Self::Shared(values) => values,
+        }
+    }
+}
+
+impl DeepSizeOf for NumTokens {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+        match self {
+            Self::Owned(values) => values.deep_size_of_children(context),
+            Self::Shared(values) => values.deep_size_of_children(context),
+        }
+    }
+}
+
+impl NumTokens {
+    fn with_capacity(capacity: usize) -> Self {
+        Self::Owned(Vec::with_capacity(capacity))
+    }
+
+    fn into_owned(self) -> Vec<u32> {
+        match self {
+            Self::Owned(values) => values,
+            Self::Shared(values) => values.to_vec(),
+        }
+    }
+
+    fn push(&mut self, value: u32) {
+        match self {
+            Self::Owned(values) => values.push(value),
+            Self::Shared(values) => {
+                let mut owned = values.to_vec();
+                owned.push(value);
+                *self = Self::Owned(owned);
+            }
+        }
+    }
+
+    fn memory_size(&self) -> usize {
+        match self {
+            Self::Owned(values) => values.capacity() * std::mem::size_of::<u32>(),
+            Self::Shared(values) => values.inner().capacity(),
+        }
+    }
+}
+
 // DocSet is a mapping from row ids to the number of tokens in the document
 // It's used to sort the documents by the bm25 score
 #[derive(Debug, Clone, Default)]
 pub struct DocSet {
     row_ids: Vec<u64>,
-    num_tokens: Vec<u32>,
+    num_tokens: NumTokens,
     // (row_id, doc_id) pairs sorted by row_id
     inv: Vec<(u64, u32)>,
 
@@ -6301,11 +6364,20 @@ impl DocSet {
     /// `num_tokens_by_row_id` calls, and the per-partition caller
     /// resolves doc_id → row_id for the surviving top-K post-wand.
     pub fn from_num_tokens_only(num_tokens_col: &arrow_array::UInt32Array) -> Self {
-        let num_tokens = num_tokens_col.values().to_vec();
-        let total_tokens = num_tokens.iter().map(|&n| n as u64).sum();
+        let total_tokens = num_tokens_col.values().iter().map(|&n| n as u64).sum();
+        Self::from_cached_num_tokens(num_tokens_col, total_tokens)
+    }
+
+    /// Build a zero-copy num-tokens-only view from an Arrow column and its
+    /// already-computed total. The caller must guarantee that `total_tokens`
+    /// is the sum of `num_tokens_col`.
+    pub(crate) fn from_cached_num_tokens(
+        num_tokens_col: &arrow_array::UInt32Array,
+        total_tokens: u64,
+    ) -> Self {
         Self {
             row_ids: Vec::new(),
-            num_tokens,
+            num_tokens: NumTokens::Shared(num_tokens_col.values().clone()),
             inv: Vec::new(),
             total_tokens,
             scoring_quantized: false,
@@ -6342,7 +6414,7 @@ impl DocSet {
             let total_tokens = num_tokens.iter().map(|&x| x as u64).sum();
             return Ok(Self {
                 row_ids,
-                num_tokens,
+                num_tokens: NumTokens::Owned(num_tokens),
                 inv: Vec::new(),
                 total_tokens,
                 scoring_quantized: false,
@@ -6385,7 +6457,7 @@ impl DocSet {
             let total_tokens = num_tokens.iter().map(|&x| x as u64).sum();
             return Ok(Self {
                 row_ids,
-                num_tokens,
+                num_tokens: NumTokens::Owned(num_tokens),
                 inv,
                 total_tokens,
                 scoring_quantized: false,
@@ -6406,7 +6478,7 @@ impl DocSet {
         let total_tokens = num_tokens.iter().map(|&x| x as u64).sum();
         Ok(Self {
             row_ids,
-            num_tokens,
+            num_tokens: NumTokens::Owned(num_tokens),
             inv,
             total_tokens,
             scoring_quantized: false,
@@ -6420,7 +6492,8 @@ impl DocSet {
         let mut removed = Vec::new();
         let len = self.len();
         let row_ids = std::mem::replace(&mut self.row_ids, Vec::with_capacity(len));
-        let num_tokens = std::mem::replace(&mut self.num_tokens, Vec::with_capacity(len));
+        let num_tokens =
+            std::mem::replace(&mut self.num_tokens, NumTokens::with_capacity(len)).into_owned();
         self.invalidate_norms();
         self.total_tokens = 0;
         for (doc_id, (row_id, num_token)) in std::iter::zip(row_ids, num_tokens).enumerate() {
@@ -6511,7 +6584,7 @@ impl DocSet {
 
     pub(crate) fn memory_size(&self) -> usize {
         self.row_ids.capacity() * std::mem::size_of::<u64>()
-            + self.num_tokens.capacity() * std::mem::size_of::<u32>()
+            + self.num_tokens.memory_size()
             + self.inv.capacity() * std::mem::size_of::<(u64, u32)>()
     }
 }
@@ -7168,6 +7241,53 @@ mod tests {
         let metadata = HashMap::from([(POSTING_BLOCK_SIZE_KEY.to_owned(), "129".to_owned())]);
         let err = parse_posting_block_size(&metadata).unwrap_err();
         assert!(err.to_string().contains("block_size"));
+    }
+
+    #[test]
+    fn test_num_tokens_only_reuses_sliced_arrow_storage() {
+        let docs = {
+            let source = UInt32Array::from(vec![999, 7, 16, 1024, 888]);
+            let sliced = source.slice(1, 3);
+            let mut docs = DocSet::from_num_tokens_only(&sliced);
+
+            let NumTokens::Shared(values) = &docs.num_tokens else {
+                panic!("num-tokens-only DocSet must retain shared Arrow storage");
+            };
+            assert!(values.ptr_eq(sliced.values()));
+            assert_eq!(values.as_ref(), &[7, 16, 1024]);
+            assert_eq!(docs.total_tokens_num(), 1047);
+            docs.set_quantized_scoring(true);
+            assert_eq!(docs.scoring_norms().unwrap().len(), 3);
+            assert_eq!(
+                docs.scoring_num_tokens(0),
+                dequantize_doc_length(quantize_doc_length(7))
+            );
+            assert_eq!(
+                docs.scoring_num_tokens(2),
+                dequantize_doc_length(quantize_doc_length(1024))
+            );
+            docs
+        };
+
+        assert_eq!(docs.len(), 3);
+        assert_eq!(docs.num_tokens(0), 7);
+        assert_eq!(docs.num_tokens(2), 1024);
+    }
+
+    #[test]
+    fn test_cached_num_tokens_uses_supplied_total_and_full_stays_owned() {
+        const CACHED_TOTAL_MARKER: u64 = 123_456;
+
+        let num_tokens = UInt32Array::from(vec![3, 5, 8]);
+        let docs = DocSet::from_cached_num_tokens(&num_tokens, CACHED_TOTAL_MARKER);
+        assert_eq!(docs.total_tokens_num(), CACHED_TOTAL_MARKER);
+        assert!(matches!(&docs.num_tokens, NumTokens::Shared(_)));
+
+        let row_ids = UInt64Array::from(vec![10, 20, 30]);
+        let full = DocSet::from_columns(&row_ids, &num_tokens, false, None).unwrap();
+        assert!(matches!(&full.num_tokens, NumTokens::Owned(_)));
+        assert_eq!(full.total_tokens_num(), 16);
+        assert_eq!(full.row_id(1), 20);
     }
 
     #[test]
@@ -8826,6 +8946,59 @@ mod tests {
 
         let second = index.aggregate_corpus_stats().await.unwrap();
         assert_eq!(second, first);
+    }
+
+    #[tokio::test]
+    async fn test_stats_then_num_tokens_view_reuses_shared_storage() {
+        let (index, _counter, _tmpdir) = load_counted_v2_index(100, LanceCache::no_cache()).await;
+        let partition = index.partitions[0].clone();
+
+        assert_eq!(index.aggregate_corpus_stats().await.unwrap(), (100, 100));
+        assert_eq!(partition.docs.total_tokens_cached(), Some(100));
+
+        let views =
+            futures::future::join_all((0..8).map(|_| partition.docs.ensure_num_tokens_loaded()))
+                .await
+                .into_iter()
+                .collect::<Result<Vec<_>>>()
+                .unwrap();
+        let first = &views[0];
+        assert!(views.iter().all(|view| Arc::ptr_eq(first, view)));
+        assert!(!first.has_row_ids());
+        assert!(matches!(&first.num_tokens, NumTokens::Shared(_)));
+        assert_eq!(first.total_tokens_num(), 100);
+
+        let all_rows = RowAddrMask::all_rows();
+        let wand_view = partition.docs.docs_for_wand(&all_rows).await.unwrap();
+        assert!(Arc::ptr_eq(first, &wand_view));
+
+        let filtered = RowAddrMask::allow_nothing();
+        let full = partition.docs.docs_for_wand(&filtered).await.unwrap();
+        assert!(full.has_row_ids());
+        assert!(matches!(&full.num_tokens, NumTokens::Owned(_)));
+        assert_eq!(full.total_tokens_num(), 100);
+        assert_eq!(
+            partition.docs.resolve_row_ids(&[0, 99]).await.unwrap(),
+            [0, 99]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_total_and_num_tokens_view_initialization() {
+        let (index, _counter, _tmpdir) = load_counted_v2_index(100, LanceCache::no_cache()).await;
+        let docs = index.partitions[0].docs.clone();
+
+        let totals = futures::future::join_all((0..8).map(|_| docs.total_tokens_num()));
+        let views = futures::future::join_all((0..8).map(|_| docs.ensure_num_tokens_loaded()));
+        let (totals, views) = tokio::join!(totals, views);
+
+        let totals = totals.into_iter().collect::<Result<Vec<_>>>().unwrap();
+        assert_eq!(totals, vec![100; 8]);
+        let views = views.into_iter().collect::<Result<Vec<_>>>().unwrap();
+        let first = &views[0];
+        assert!(views.iter().all(|view| Arc::ptr_eq(first, view)));
+        assert!(matches!(&first.num_tokens, NumTokens::Shared(_)));
+        assert_eq!(docs.total_tokens_cached(), Some(100));
     }
 
     #[tokio::test]
