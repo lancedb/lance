@@ -70,6 +70,9 @@
   background: var(--beam-400);
 }
 .ld-header__actions { display: flex; gap: 10px; align-items: center; flex-shrink: 0; }
+/* All header controls share one 34px height regardless of content (icon/text). */
+.ld-header__actions .ld-btn { height: 34px; padding-top: 0; padding-bottom: 0; }
+.ld-header__actions .ld-btn--icon { width: 34px; padding: 0; justify-content: center; }
 
 /* ---------- buttons ---------- */
 .ld-btn {
