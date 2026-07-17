@@ -396,12 +396,23 @@ pub async fn apply_index_range(
         return Ok(IndexApplyStats::default());
     }
 
+    // Every position in the range must exist. `get` returns `None` only for a
+    // position past `committed_len`, so a hole means the caller asked to index a
+    // batch the store never committed. Silently skipping it would let
+    // `insert_batches` advance `indexed_count` past a never-indexed batch —
+    // rows counted visible but absent from every index. Fail loudly; the handler
+    // poisons and reopen rebuilds the indexes from the WAL.
     let stored: Vec<StoredBatch> = (start..end_batch_position)
-        .filter_map(|position| batch_store.get(position).cloned())
-        .collect();
-    if stored.is_empty() {
-        return Ok(IndexApplyStats::default());
-    }
+        .map(|position| {
+            batch_store.get(position).cloned().ok_or_else(|| {
+                Error::internal(format!(
+                    "index apply range [{start}, {end_batch_position}) is missing batch \
+                     position {position}; batch_store committed_len is {}",
+                    batch_store.len()
+                ))
+            })
+        })
+        .collect::<Result<_>>()?;
 
     // `insert_batches` advances `indexed_count` itself, once every index has
     // taken the batch. Time the whole hand-off so the recorded latency reflects
@@ -799,16 +810,24 @@ impl WalFlusher {
             return Ok(empty_flush_result());
         }
 
-        let mut stored_batches: Vec<StoredBatch> =
-            Vec::with_capacity(end_batch_position - start_batch_position);
-        for batch_position in start_batch_position..end_batch_position {
-            if let Some(stored) = batch_store.get(batch_position) {
-                stored_batches.push(stored.clone());
-            }
-        }
-        if stored_batches.is_empty() {
-            return Ok(empty_flush_result());
-        }
+        // Every position in the range must exist. `get` returns `None` only for a
+        // position past `committed_len`, so a hole means we were asked to append a
+        // batch the store never committed. Silently skipping it while still
+        // advancing durability to `end_batch_position` (below) would mark an
+        // un-appended batch durable and lose it on replay — a divergence that
+        // survives the crash and hides from a full scan. Return a terminal error
+        // so `flush` poisons the writer; reopen replays the WAL.
+        let stored_batches: Vec<StoredBatch> = (start_batch_position..end_batch_position)
+            .map(|batch_position| {
+                batch_store.get(batch_position).cloned().ok_or_else(|| {
+                    Error::writer_poisoned(format!(
+                        "WAL flush range [{start_batch_position}, {end_batch_position}) is \
+                         missing batch position {batch_position}; batch_store committed_len is {}",
+                        batch_store.len()
+                    ))
+                })
+            })
+            .collect::<Result<_>>()?;
 
         let record_batches: Vec<RecordBatch> =
             stored_batches.iter().map(|s| s.data.clone()).collect();
@@ -1896,6 +1915,71 @@ mod tests {
         // The index apply alone advances the index cursor.
         apply_all(&batch_store, &indexes).await.unwrap();
         assert_eq!(indexes.indexed_count(), 3);
+    }
+
+    /// A WAL flush asked to cover a range past the store's committed length must
+    /// fail terminally, not silently short-append. The store is append-only, so
+    /// `get` returns `None` only past `committed_len`; skipping that position
+    /// while still advancing durability to `end_batch_position` would mark an
+    /// un-appended batch durable and lose it on replay. The flush must poison
+    /// instead, and durability must not move.
+    #[tokio::test]
+    async fn test_flush_rejects_range_past_committed_len() {
+        let (store, base_path, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let flusher = build_test_flusher(store, &base_path, shard_id, 1);
+
+        let schema = create_test_schema();
+        let batch_store = Arc::new(BatchStore::with_capacity(10));
+        batch_store.append(create_test_batch(&schema, 5)).unwrap();
+        batch_store.append(create_test_batch(&schema, 5)).unwrap();
+
+        // Two batches committed (positions 0, 1); ask to flush through position 2.
+        let err = flusher
+            .flush(&batch_store_source(&batch_store), batch_store.len() + 1)
+            .await
+            .unwrap_err();
+        assert_eq!(err.fence_reason(), Some(FenceReason::PersistenceFailure));
+        assert!(
+            err.to_string().contains("missing batch position 2"),
+            "unexpected error: {err}"
+        );
+
+        // Terminal: the flusher is poisoned and durability never advanced past
+        // what was actually appended.
+        assert!(flusher.check_poisoned().is_err());
+        assert_eq!(flusher.durable(), 0);
+    }
+
+    /// The index-apply path has the same invariant: a range past the committed
+    /// length must error rather than silently under-index and advance the cursor
+    /// past a batch that was never inserted.
+    #[tokio::test]
+    async fn test_index_apply_rejects_range_past_committed_len() {
+        let schema = create_test_schema();
+        let batch_store = Arc::new(BatchStore::with_capacity(10));
+        batch_store.append(create_test_batch(&schema, 5)).unwrap();
+
+        let indexes = Arc::new(IndexStore::new());
+        let cursors = Arc::new(WriterCursors::new(true));
+
+        // One batch committed (position 0); ask to index through position 1.
+        let err = apply_index_range(
+            &cursors,
+            TriggerIndexApply {
+                batch_store: batch_store.clone(),
+                indexes: indexes.clone(),
+                end_batch_position: batch_store.len() + 1,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("missing batch position 1"),
+            "unexpected error: {err}"
+        );
+        // The cursor did not advance past the hole.
+        assert_eq!(indexes.indexed_count(), 0);
     }
 
     #[tokio::test]
