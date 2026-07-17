@@ -855,14 +855,7 @@ async fn test_element_document_bm25_uses_element_corpus() {
     .await
     .unwrap();
 
-    let row = run_fts(
-        &ds,
-        FullTextSearchQuery::new("needle".to_string())
-            .with_column("tags".to_string())
-            .unwrap(),
-        None,
-    )
-    .await;
+    let row = run_fts(&ds, row_match("tags", "needle"), None).await;
     let element = run_fts(&ds, list_element_match("tags", "needle"), None).await;
     let row_scores = row["_score"].as_primitive::<arrow_array::types::Float32Type>();
     let element_scores = element["_score"].as_primitive::<arrow_array::types::Float32Type>();
