@@ -1,244 +1,161 @@
-/* Lance Homepage Styles */
+/* Lance homepage — "Lance Docs" design (hero, stats band, numbered features). */
 
-/* Override with custom color #625EFF site-wide */
-:root > * {
-  --md-primary-fg-color: #625EFF;
-  --md-primary-fg-color--light: #8481FF;
-  --md-primary-fg-color--dark: #4A46CC;
-  --md-accent-fg-color: #625EFF;
-  --md-accent-fg-color--transparent: rgba(98, 94, 255, 0.1);
+.ld-container { max-width: 1200px; margin: 0 auto; padding: 0 32px; }
+
+/* ---------- hero ---------- */
+.ld-hero { padding: 96px 0 72px; }
+.ld-kicker {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  letter-spacing: var(--tracking-caps);
+  text-transform: uppercase;
+  color: var(--beam-600);
+  margin-bottom: 24px;
 }
-
-* {
-  box-sizing: border-box;
+.ld-kicker a { color: inherit; text-decoration: underline; text-underline-offset: 3px; }
+.ld-kicker a:hover { color: var(--beam-700); }
+.ld-hero h1 {
+  font-family: var(--font-display);
+  font-size: clamp(38px, 6vw, 72px);
+  font-weight: 600;
+  letter-spacing: var(--tracking-display);
+  line-height: 0.97;
+  color: var(--fg-1);
+  margin: 0 0 28px;
+  max-width: 900px;
+  text-wrap: balance;
 }
-
-.container {
-  width: 100%;
-  max-width: 1140px;
-  margin-right: auto;
-  margin-left: auto;
-  padding-right: 15px;
-  padding-left: 15px;
+.ld-hero__lead {
+  font-size: 17px;
+  line-height: 1.6;
+  color: var(--fg-2);
+  max-width: 640px;
+  margin: 0 0 36px;
+  text-wrap: pretty;
 }
-
-/* Hero Section - Fullscreen with Background Image */
-.mdx-container {
-  text-align: center;
-  color: #f8f8f8;
-  background: url("../images/lance-mj.png") no-repeat center center;
-  background-size: cover;
-  min-height: 100vh;
-  height: 100vh;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.intro-message {
-  position: relative;
-  padding: 40px 20px;
-  font-family: "Lato", -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
-  max-width: 1000px;
-  margin: 0 auto;
-}
-
-.hero-logo {
+.ld-hero__cta { display: flex; gap: 12px; flex-wrap: wrap; }
+.ld-btn {
   display: inline-flex;
   align-items: center;
-  margin-bottom: 16px;
-}
-
-.hero-logo img {
-  height: 120px;
-  width: auto;
-  margin-right: 24px;
-  margin-top: 12px;
-  filter: drop-shadow(3px 3px 8px rgba(0, 0, 0, 0.9));
-}
-
-.intro-message h1 {
-  font-weight: 400;
-  margin: 0;
-  display: inline-block;
-  text-shadow: 3px 3px 8px rgba(0, 0, 0, 0.9), 1px 1px 3px rgba(0, 0, 0, 1);
-  font-size: 8em;
-  line-height: 1.2;
-  color: #ffffff;
-  vertical-align: middle;
-}
-
-.intro-message h1 sup {
-  font-size: 2rem;
-  text-shadow: 2px 2px 6px rgba(0, 0, 0, 0.9);
-}
-
-.intro-message h3 {
-  font-size: 1.1rem;
-  text-shadow: 2px 2px 6px rgba(0, 0, 0, 0.9), 1px 1px 3px rgba(0, 0, 0, 1);
-  font-weight: 600;
-  margin-bottom: 32px;
-  color: #ffffff;
-}
-
-.intro-divider {
-  width: 400px;
-  max-width: 80%;
-  border-top: 1px solid rgba(255, 255, 255, 0.8);
-  border-bottom: 1px solid rgba(0, 0, 0, 0.2);
-  margin: 24px auto;
-}
-
-.list-inline {
-  padding-left: 0;
-  margin-left: -5px;
-  list-style: none;
-  margin-bottom: 0;
-}
-
-.list-inline li {
-  display: inline-block;
-  padding-right: 5px;
-  padding-left: 5px;
-}
-
-.intro-message .md-button {
-  margin: 8px;
-  padding: 14px 36px;
-  font-size: 1.1rem;
-  font-weight: 600;
-  text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.8);
-  transition: all 0.3s ease;
-}
-
-.intro-message .md-button:hover {
-  transform: translateY(-2px);
-  box-shadow: 0 8px 16px rgba(0, 0, 0, 0.3);
-}
-
-.intro-message .md-button--primary:hover {
-  box-shadow: 0 8px 20px rgba(98, 94, 255, 0.5);
-}
-
-.intro-message .md-button:not(.md-button--primary):hover {
-  box-shadow: 0 8px 20px rgba(255, 255, 255, 0.4);
-}
-
-/* What is Lance Section */
-.lance-intro-section {
-  padding: 80px 0;
-  background-color: rgba(128, 128, 128, 0.03);
-  border-bottom: 1px solid rgba(128, 128, 128, 0.1);
-}
-
-.lance-intro-content {
-  max-width: 900px;
-  margin: 0 auto;
-  text-align: center;
-}
-
-.lance-intro-content h2 {
-  font-size: 36px;
-  font-weight: 500;
-  margin-bottom: 32px;
-  color: var(--md-primary-fg-color);
-}
-
-.lance-intro-content p {
-  font-size: 16px;
-  line-height: 1.8;
-  margin-bottom: 32px;
-  opacity: 0.9;
-  text-align: left;
-}
-
-.lance-paper-link {
-  color: var(--md-primary-fg-color);
+  gap: 8px;
   text-decoration: none;
-}
-
-.lance-paper-link:hover {
-  color: var(--md-primary-fg-color);
-  text-decoration: none;
-}
-
-.lance-intro-content a:hover {
-  color: #757575;
-  text-decoration: none;
-}
-
-.lance-intro-content .md-button {
-  margin-top: 16px;
-  padding: 10px 28px;
+  white-space: nowrap;
+  font-family: var(--font-body);
   font-size: 14px;
-  border: 2px solid currentColor;
-  background-color: transparent;
-  transition: all 0.3s ease;
-}
-
-.lance-intro-content .md-button:hover {
-  color: var(--md-primary-fg-color);
-  background-color: transparent;
-}
-
-/* Feature Sections */
-.lance-feature-section {
-  padding: 80px 0;
-  border-bottom: 1px solid rgba(128, 128, 128, 0.1);
-}
-
-.lance-feature-section:last-child {
-  border-bottom: none;
-}
-
-.lance-feature-content {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 60px;
-}
-
-.lance-feature-text {
-  flex: 1;
-  min-width: 300px;
-}
-
-.lance-feature-text h2 {
-  font-size: 30px;
   font-weight: 500;
-  margin-bottom: 16px;
-  color: var(--md-primary-fg-color);
 }
+.ld-btn--primary { color: #ffffff; background: var(--beam-400); padding: 12px 24px; }
+.ld-btn--primary:hover { background: #4B47E0; color: #ffffff; }
+.ld-btn--outline { color: var(--fg-1); border: 1px solid var(--line-1); padding: 11px 24px; }
+.ld-btn--outline:hover { border-color: var(--beam-400); color: var(--fg-1); }
+.ld-btn--text { color: var(--fg-2); padding: 11px 12px; }
+.ld-btn--text:hover { color: var(--fg-1); }
 
-.lance-feature-text p {
+/* ---------- stats band ---------- */
+.ld-stats {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  border-top: 1px solid var(--line-1);
+  border-bottom: 1px solid var(--line-1);
+}
+.ld-stat { display: block; padding: 28px 32px; text-decoration: none; }
+.ld-stat:first-child { padding-left: 0; }
+.ld-stat:last-child { padding-right: 0; }
+.ld-stat + .ld-stat { border-left: 1px solid var(--line-2); }
+.ld-stat__value {
+  font-family: var(--font-display);
+  font-size: 40px;
+  font-weight: 600;
+  letter-spacing: -0.03em;
+  color: var(--fg-1);
+}
+.ld-stat__value--beam { color: var(--beam-400); }
+.ld-stat__label {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--fg-3);
+  margin-top: 6px;
+  transition: color 120ms ease-out;
+}
+a.ld-stat:hover .ld-stat__label { color: var(--beam-600); }
+
+/* ---------- what is lance ---------- */
+.ld-what { padding: 72px 0 40px; }
+.ld-what h2 {
+  font-family: var(--font-display);
+  font-size: 34px;
+  font-weight: 600;
+  letter-spacing: -0.03em;
+  color: var(--fg-1);
+  margin: 0 0 16px;
+}
+.ld-what p { font-size: 16px; line-height: 1.65; color: var(--fg-2); max-width: 760px; margin: 0 0 12px; text-wrap: pretty; }
+.ld-what a { color: var(--beam-600); text-decoration: underline; text-decoration-thickness: 2px; text-underline-offset: 3px; }
+
+/* ---------- numbered features ---------- */
+.ld-features { padding: 24px 0 96px; }
+.ld-feature {
+  display: grid;
+  grid-template-columns: 90px minmax(0, 1fr) minmax(0, 460px);
+  gap: 40px;
+  align-items: center;
+  border-top: 1px solid var(--line-1);
+  padding: 40px 0;
+}
+.ld-feature__num {
+  font-family: var(--font-mono);
   font-size: 15px;
-  line-height: 1.6;
-  opacity: 0.85;
-  margin-bottom: 16px;
+  color: var(--beam-600);
+  align-self: start;
+  padding-top: 6px;
 }
-
-.lance-feature-text .md-button {
-  font-size: 0.6rem;
-  padding: 0;
-  transition: all 0.3s ease;
+.ld-feature__body h2 {
+  font-family: var(--font-display);
+  font-size: 24px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  color: var(--fg-1);
+  margin: 0 0 12px;
 }
+.ld-feature__body p { font-size: 15px; line-height: 1.65; color: var(--fg-2); margin: 0 0 16px; text-wrap: pretty; }
+.ld-more { font-family: var(--font-mono); font-size: 13px; color: var(--beam-600); text-decoration: none; }
+.ld-more:hover { text-decoration: underline; }
 
-.lance-feature-text .md-button:hover {
-  transform: translateX(4px);
-  color: var(--md-primary-fg-color);
+/* logo grids stay on white in both schemes — the artwork assumes a light background */
+.ld-feature__img { border: 1px solid var(--line-1); padding: 16px; background: #ffffff; }
+.ld-feature__img img { display: block; width: 100%; height: auto; }
+
+/* homepage code windows (always ink-dark, like docs code blocks) */
+.ld-feature__code { border: 1px solid var(--line-1); background: var(--ink-900); min-width: 0; }
+.ld-win { display: flex; gap: 6px; padding: 12px 16px 0; }
+.ld-win i { width: 10px; height: 10px; border-radius: 999px; background: var(--ink-600); }
+.ld-feature__code pre {
+  margin: 0;
+  padding: 14px 20px 18px;
+  overflow-x: auto;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 1.7;
+  color: #EDEBF5;
 }
+.ld-feature__code code { font-family: inherit; background: none; border: none; padding: 0; color: inherit; }
+.ld-feature__code pre ::selection, .ld-feature__code pre::selection { background: rgba(98, 94, 255, 0.55); color: #ffffff; }
+.tok-kw { color: #B8A8FF; }
+.tok-str { color: #7CC0FF; }
+.tok-com { color: #6F6A85; font-style: italic; }
+.tok-num { color: #F2CE6B; }
+.tok-arg { color: #FF95A8; }
+.tok-fn { color: #8FE8CE; }
 
-.lance-feature-demo {
-  flex: 1;
-  min-width: 400px;
-  display: flex;
-  justify-content: center;
-  overflow: hidden;
+/* ---------- responsive ---------- */
+@media (max-width: 960px) {
+  .ld-container { padding: 0 20px; }
+  .ld-hero { padding: 56px 0 48px; }
+  .ld-stats { grid-template-columns: 1fr; }
+  .ld-stat { padding: 20px 0; }
+  .ld-stat + .ld-stat { border-left: 0; border-top: 1px solid var(--line-2); }
+  .ld-feature { grid-template-columns: 1fr; gap: 16px; }
+  .ld-feature__num { padding-top: 0; }
 }
-
-/* Alternating layout */
-.lance-feature-section.reverse .lance-feature-content {
-  flex-direction: row-reverse;
-}
-
-

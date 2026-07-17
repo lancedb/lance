@@ -9,8 +9,11 @@ repo_url: https://github.com/lance-format/lance
 theme:
   name: material
   custom_dir: overrides
-  logo: logo/white.png
+  logo: logo/wide.png
   favicon: logo/logo.png
+  # Fonts are loaded from lance-tokens.css (Space Grotesk / IBM Plex Sans /
+  # JetBrains Mono); keep Material from also pulling Roboto.
+  font: false
   palette:
     - scheme: default
       primary: custom
@@ -59,6 +62,8 @@ markdown_extensions:
         - ..
   - pymdownx.tabbed:
       alternate_style: true
+  # Autolink bare URLs (e.g. repository tables on the community pages).
+  - pymdownx.magiclink
   - attr_list
   - md_in_html
   - tables
@@ -82,6 +87,8 @@ extra:
 copyright: © 2025 Lance Format. All rights reserved.
 
 extra_css:
+  - assets/stylesheets/lance-tokens.css
+  - assets/stylesheets/lance-theme.css
   - assets/stylesheets/home.css
 extra_javascript:
   - assets/javascripts/nav-expand.js
