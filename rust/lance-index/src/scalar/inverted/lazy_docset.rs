@@ -182,14 +182,6 @@ impl LazyDocSet {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn is_full_loaded_for_test(&self) -> bool {
-        match self {
-            Self::Loaded(_) => true,
-            Self::Deferred(d) => d.full.initialized(),
-        }
-    }
-
     /// Sync read of cached `total_tokens`. Returns `None` for a
     /// `Deferred` LazyDocSet that hasn't yet had any of
     /// `total_tokens_num` / `ensure_num_tokens_loaded` / `ensure_loaded`
@@ -375,5 +367,39 @@ impl DeferredDocSet {
         let batch = reader.read_ranges(&ranges, Some(&[ROW_ID])).await?;
         let arr = batch[ROW_ID].as_primitive::<UInt64Type>();
         Ok((0..arr.len()).map(|i| arr.value(i)).collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scalar::lance_format::LanceIndexStore;
+    use lance_core::cache::LanceCache;
+    use lance_core::utils::tempfile::TempObjDir;
+    use lance_io::object_store::ObjectStore;
+
+    #[tokio::test]
+    async fn test_full_docset_is_a_complete_cached_snapshot() {
+        let temp_dir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            temp_dir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let docs = LazyDocSet::new(store, "unused".to_owned(), 3, false, None, false);
+        assert_eq!(docs.total_tokens_cached(), None);
+
+        let row_ids = UInt64Array::from(vec![10, 20, 30]);
+        let num_tokens = UInt32Array::from(vec![3, 5, 8]);
+        let full = Arc::new(DocSet::from_columns(&row_ids, &num_tokens, false, None).unwrap());
+        let LazyDocSet::Deferred(deferred) = &docs else {
+            panic!("expected a deferred DocSet");
+        };
+        deferred.full.set(full.clone()).unwrap();
+
+        let wand_docs = docs.ensure_num_tokens_loaded().await.unwrap();
+        assert!(Arc::ptr_eq(&wand_docs, &full));
+        assert_eq!(wand_docs.total_tokens_num(), 16);
+        assert_eq!(docs.total_tokens_cached(), Some(16));
     }
 }
