@@ -8,8 +8,9 @@ use crate::{Token, TokenStream, Tokenizer};
 /// Tokenizer for code-like text.
 ///
 /// Identifiers are Unicode alphanumeric characters plus `_`. Other characters
-/// are lexical boundaries. When operator indexing is enabled, contiguous
-/// operator characters are emitted as tokens too.
+/// are lexical boundaries. When operator indexing is enabled, recognized
+/// multi-character operators use longest-match tokenization and remaining
+/// operator characters are emitted individually.
 ///
 /// # Examples
 ///
@@ -72,6 +73,12 @@ fn is_operator_char(ch: char) -> bool {
     )
 }
 
+const MULTI_CHAR_OPERATORS: &[&str] = &[
+    ">>>=", "<<=", ">>=", "&&=", "||=", "??=", "**=", "//=", "===", "!==", ">>>", "<=>", "::",
+    "->", "=>", "==", "!=", "<=", ">=", "&&", "||", "++", "--", "+=", "-=", "*=", "/=", "%=", "&=",
+    "|=", "^=", "<<", ">>", "**", "//", "??", ":=", "<-", "|>", "~=",
+];
+
 impl CodeLexTokenStream<'_> {
     fn search_token_end(&mut self, predicate: impl Fn(char) -> bool) -> usize {
         while let Some((_, ch)) = self.chars.peek() {
@@ -85,6 +92,25 @@ impl CodeLexTokenStream<'_> {
             .map(|(offset, _)| *offset)
             .unwrap_or(self.text.len())
     }
+
+    fn operator_token_end(&mut self, offset_from: usize) -> usize {
+        let remaining = &self.text[offset_from..];
+        let operator_len = MULTI_CHAR_OPERATORS
+            .iter()
+            .filter(|operator| remaining.starts_with(**operator))
+            .map(|operator| operator.len())
+            .max()
+            .unwrap_or(1);
+        let token_end = offset_from + operator_len;
+        while self
+            .chars
+            .peek()
+            .is_some_and(|(offset, _)| *offset < token_end)
+        {
+            self.chars.next();
+        }
+        token_end
+    }
 }
 
 impl TokenStream for CodeLexTokenStream<'_> {
@@ -94,7 +120,7 @@ impl TokenStream for CodeLexTokenStream<'_> {
             let token_end = if is_identifier_char(ch) {
                 self.search_token_end(is_identifier_char)
             } else if self.index_operators && is_operator_char(ch) {
-                self.search_token_end(is_operator_char)
+                self.operator_token_end(offset_from)
             } else {
                 continue;
             };
@@ -151,5 +177,15 @@ mod tests {
             .map(|token| token.text.as_str())
             .collect::<Vec<_>>();
         assert_eq!(texts, vec!["a", "::", "b", "!=", "c", "->", "d"]);
+    }
+
+    #[test]
+    fn test_code_lex_tokenizer_splits_adjacent_operators() {
+        let tokens = collect_tokens("value.parse::<usize>()", true);
+        let texts = tokens
+            .iter()
+            .map(|token| token.text.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(texts, vec!["value", "parse", "::", "<", "usize", ">"]);
     }
 }

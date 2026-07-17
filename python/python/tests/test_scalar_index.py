@@ -866,6 +866,53 @@ def test_code_analyzer_full_text_search_with_identifier_splitting(tmp_path):
     assert params["remove_stop_words"] is False
 
 
+def test_code_analyzer_operator_search_matches_rust_turbofish(tmp_path):
+    table = pa.table(
+        {
+            "path": ["turbofish.rs", "comparison.rs"],
+            "code": ["value.parse::<usize>()", "value.parse<usize>()"],
+        }
+    )
+    ds = lance.write_dataset(table, tmp_path)
+    ds.create_scalar_index(
+        "code",
+        index_type="INVERTED",
+        analyzer="code",
+        index_operators=True,
+    )
+
+    results = ds.to_table(
+        columns=["path"],
+        full_text_query=MatchQuery("::", "code", operator=FullTextOperator.OR),
+    )
+    assert results["path"].to_pylist() == ["turbofish.rs"]
+
+
+def test_code_analyzer_exact_identifier_survives_grouped_top_k(tmp_path):
+    table = pa.table(
+        {
+            "path": ["split_0.rs", "split_1.rs", "split_2.rs", "exact.rs"],
+            "code": ["get user name", "get user name", "get user name", "getUserName"],
+        }
+    )
+    ds = lance.write_dataset(table, tmp_path)
+    ds.create_scalar_index(
+        "code",
+        index_type="INVERTED",
+        analyzer="code",
+        split_identifiers=True,
+    )
+
+    results = ds.scanner(
+        columns=["path", "_score"],
+        full_text_query=MatchQuery(
+            "getUserName", "code", operator=FullTextOperator.AND
+        ),
+        limit=1,
+    ).to_table()
+    assert results["path"].to_pylist() == ["exact.rs"]
+
+
 def test_code_analyzer_flags_require_code_analyzer(tmp_path):
     table = pa.table({"text": ["getUserName"]})
     ds = lance.write_dataset(table, tmp_path)
