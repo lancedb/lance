@@ -45,7 +45,7 @@ use {
 };
 
 use crate::vector::utils::SimpleIndex;
-use crate::{Error, Result};
+use lance_core::{Error, Result};
 
 /// KMean initialization method.
 #[derive(Debug, PartialEq)]

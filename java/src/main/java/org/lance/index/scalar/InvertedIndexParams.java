@@ -53,6 +53,7 @@ public final class InvertedIndexParams {
     private Integer minNgramLength;
     private Integer maxNgramLength;
     private Boolean prefixOnly;
+    private Integer blockSize = 128;
     private Boolean skipMerge;
     private Integer formatVersion;
 
@@ -227,6 +228,27 @@ public final class InvertedIndexParams {
     }
 
     /**
+     * Configure the number of documents in each compressed posting block.
+     *
+     * <p>Supported values are {@code 128} and {@code 256}. New indexes default to {@code 128} when
+     * this is not set.
+     *
+     * <p>{@code blockSize = 256} is experimental and may introduce breaking changes. Use {@code
+     * 128} when stable compatibility with the legacy posting layout is required.
+     *
+     * @param blockSize posting block size
+     * @return this builder
+     * @throws IllegalArgumentException if {@code blockSize} is unsupported
+     */
+    public Builder blockSize(int blockSize) {
+      if (blockSize != 128 && blockSize != 256) {
+        throw new IllegalArgumentException("blockSize must be one of 128 or 256");
+      }
+      this.blockSize = blockSize;
+      return this;
+    }
+
+    /**
      * Configure whether to skip the partition merge stage after indexing. If true, skip the
      * partition merge stage after indexing. This can be useful for distributed indexing where merge
      * is handled separately.
@@ -242,15 +264,16 @@ public final class InvertedIndexParams {
     /**
      * Configure the on-disk FTS format version to write when creating a new index.
      *
-     * <p>If unset, Lance chooses the current default format.
+     * <p>If unset, Lance writes v2 for {@code blockSize = 128} and v3 for {@code blockSize = 256}.
+     * {@code formatVersion = 3} is experimental and is only valid with {@code blockSize = 256}.
      *
-     * @param formatVersion FTS format version, must be 1 or 2
+     * @param formatVersion FTS format version, must be 1, 2, or 3
      * @return this builder
      * @throws IllegalArgumentException
      */
     public Builder formatVersion(int formatVersion) {
-      if (formatVersion != 1 && formatVersion != 2) {
-        throw new IllegalArgumentException("formatVersion must be 1 or 2");
+      if (formatVersion != 1 && formatVersion != 2 && formatVersion != 3) {
+        throw new IllegalArgumentException("formatVersion must be 1, 2, or 3");
       }
       this.formatVersion = formatVersion;
       return this;
@@ -258,6 +281,11 @@ public final class InvertedIndexParams {
 
     /** Build a {@link ScalarIndexParams} instance for an inverted index. */
     public ScalarIndexParams build() {
+      if (formatVersion != null) {
+        Preconditions.checkArgument(
+            (blockSize == 256 && formatVersion == 3) || (blockSize == 128 && formatVersion != 3),
+            "formatVersion 3 requires blockSize 256, and blockSize 256 requires formatVersion 3");
+      }
       Map<String, Object> params = new HashMap<>();
       if (baseTokenizer != null) {
         params.put("base_tokenizer", baseTokenizer);
@@ -299,6 +327,9 @@ public final class InvertedIndexParams {
       }
       if (prefixOnly != null) {
         params.put("prefix_only", prefixOnly);
+      }
+      if (blockSize != null) {
+        params.put("block_size", blockSize);
       }
       if (skipMerge != null) {
         params.put("skip_merge", skipMerge);

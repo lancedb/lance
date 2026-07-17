@@ -4,7 +4,8 @@ Also see [root AGENTS.md](../AGENTS.md) for cross-language standards.
 
 ## Compatibility
 
-- All changes must be backwards compatible. Never re-use or change field numbers of existing fields.
+- Protobuf schemas that are part of a stable file format or any other stable persisted contract must remain backwards compatible. Never reuse or change their existing field numbers.
+- Protobuf schemas used exclusively by an unstable file format follow the root file-format stability contract: do not preserve compatibility with prior unstable revisions. Before making a breaking protobuf change, verify that the schema is not shared with a stable format or another persisted contract.
 
 ## Schema Design
 

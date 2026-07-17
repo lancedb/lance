@@ -549,6 +549,7 @@ mod tests {
                 file_size_bytes: CachedFileSize::new(100),
                 base_id: None,
             }],
+            overlays: vec![],
             deletion_file: None,
             row_id_meta: None,
             physical_rows: Some(10),

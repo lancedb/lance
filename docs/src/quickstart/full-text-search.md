@@ -98,6 +98,7 @@ ds.create_scalar_index(
     remove_stop_words=True,       # Remove stop words (language-dependent)
     custom_stop_words=None,       # Optional additional stop words (only used if remove_stop_words=True)
     ascii_folding=True,           # Fold accents to ASCII when possible (e.g., "é" -> "e")
+    block_size=128,               # Posting block size: 128 or 256; 256 is experimental
 )
 ```
 

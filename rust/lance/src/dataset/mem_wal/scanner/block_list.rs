@@ -37,6 +37,7 @@ use crate::dataset::mem_wal::index::encode_pk_tuple;
 use crate::dataset::mem_wal::util::PK_INDEX_DIR;
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 use crate::session::Session;
+use lance_io::object_store::ObjectStoreParams;
 
 /// Default-plugin registry, used only to load the standalone PK BTree by its
 /// `BTreeIndexDetails` type. Built once.
@@ -157,6 +158,7 @@ type ShardGenSets = HashMap<Uuid, Vec<(LsmGeneration, GenMembership)>>;
 pub async fn compute_source_block_lists(
     sources: &[LsmDataSource],
     session: Option<&Arc<Session>>,
+    store_params: Option<&ObjectStoreParams>,
     flushed_cache: Option<&Arc<dyn DatasetCache>>,
 ) -> Result<SourceBlockLists> {
     // Membership per non-base source, grouped by shard (generations are
@@ -188,7 +190,7 @@ pub async fn compute_source_block_lists(
                 generation,
                 ..
             } => flushed_loads.push(async move {
-                let index = open_pk_index(path, session, flushed_cache).await?;
+                let index = open_pk_index(path, session, store_params, flushed_cache).await?;
                 Ok::<_, Error>((*shard_id, *generation, GenMembership::OnDisk(index)))
             }),
         }
@@ -238,6 +240,7 @@ pub async fn compute_source_block_lists(
 pub async fn fresh_tier_block_list(
     sources: &[LsmDataSource],
     session: Option<&Arc<Session>>,
+    store_params: Option<&ObjectStoreParams>,
     flushed_cache: Option<&Arc<dyn DatasetCache>>,
     watermarks: Option<&HashMap<Uuid, FreshTierWatermark>>,
 ) -> Result<Vec<GenMembership>> {
@@ -299,7 +302,8 @@ pub async fn fresh_tier_block_list(
                     let slot = slots.len();
                     slots.push(None);
                     flushed_loads.push(async move {
-                        let index = open_pk_index(path, session, flushed_cache).await?;
+                        let index =
+                            open_pk_index(path, session, store_params, flushed_cache).await?;
                         Ok::<_, Error>((slot, GenMembership::OnDisk(index)))
                     });
                 }
@@ -379,9 +383,10 @@ fn path_cache_uuid(path: &str) -> Uuid {
 async fn open_pk_index(
     path: &str,
     session: Option<&Arc<Session>>,
+    store_params: Option<&ObjectStoreParams>,
     flushed_cache: Option<&Arc<dyn DatasetCache>>,
 ) -> Result<Arc<dyn ScalarIndex>> {
-    let dataset = open_flushed_dataset(path, session, flushed_cache, None).await?;
+    let dataset = open_flushed_dataset(path, session, store_params, flushed_cache, None).await?;
     // Namespace the session index cache by the (immutable) flushed path so this
     // sidecar's pages live alongside every other index instead of a bespoke
     // cache. `fri_uuid` is None — flushed generations carry no fragment-reuse.
@@ -534,7 +539,7 @@ mod tests {
             active_source(shard, 1, &[3]),
         ];
 
-        let memberships = fresh_tier_block_list(&sources, None, None, None)
+        let memberships = fresh_tier_block_list(&sources, None, None, None, None)
             .await
             .unwrap();
 
@@ -555,7 +560,7 @@ mod tests {
             active_source(shard, 2, &[1, 2]),
         ];
 
-        let blocked = Box::pin(compute_source_block_lists(&sources, None, None))
+        let blocked = Box::pin(compute_source_block_lists(&sources, None, None, None))
             .await
             .unwrap();
 
@@ -591,7 +596,7 @@ mod tests {
             active_source(Uuid::new_v4(), 1, &[1, 2]),
         ];
 
-        let blocked = Box::pin(compute_source_block_lists(&sources, None, None))
+        let blocked = Box::pin(compute_source_block_lists(&sources, None, None, None))
             .await
             .unwrap();
 
@@ -619,7 +624,7 @@ mod tests {
             active_source(b, 2, &[2]),
         ];
 
-        let blocked = Box::pin(compute_source_block_lists(&sources, None, None))
+        let blocked = Box::pin(compute_source_block_lists(&sources, None, None, None))
             .await
             .unwrap();
 
@@ -670,7 +675,7 @@ mod tests {
             generation: LsmGeneration::memtable(2),
         };
 
-        let blocked = Box::pin(compute_source_block_lists(&[g1, g2], None, None))
+        let blocked = Box::pin(compute_source_block_lists(&[g1, g2], None, None, None))
             .await
             .unwrap();
 
@@ -708,7 +713,7 @@ mod tests {
         )]
         .into_iter()
         .collect();
-        let sets = fresh_tier_block_list(&sources, None, None, Some(&watermarks))
+        let sets = fresh_tier_block_list(&sources, None, None, None, Some(&watermarks))
             .await
             .unwrap();
         assert!(blocks(&sets, 1).await);
@@ -716,7 +721,7 @@ mod tests {
         assert!(!blocks(&sets, 3).await);
 
         // No watermark → live tier: all three are members.
-        let sets = fresh_tier_block_list(&sources, None, None, None)
+        let sets = fresh_tier_block_list(&sources, None, None, None, None)
             .await
             .unwrap();
         for id in [1, 2, 3] {
@@ -750,7 +755,7 @@ mod tests {
         )]
         .into_iter()
         .collect();
-        let sets = fresh_tier_block_list(&sources, None, None, Some(&watermarks))
+        let sets = fresh_tier_block_list(&sources, None, None, None, Some(&watermarks))
             .await
             .unwrap();
         assert!(blocks(&sets, 1).await); // gen 1, whole
@@ -801,7 +806,7 @@ mod tests {
         )]
         .into_iter()
         .collect();
-        let sets = fresh_tier_block_list(&sources, None, None, Some(&at))
+        let sets = fresh_tier_block_list(&sources, None, None, None, Some(&at))
             .await
             .unwrap();
         assert!(!blocks(&sets, 5).await);
@@ -816,7 +821,7 @@ mod tests {
         )]
         .into_iter()
         .collect();
-        let sets = fresh_tier_block_list(&sources, None, None, Some(&above))
+        let sets = fresh_tier_block_list(&sources, None, None, None, Some(&above))
             .await
             .unwrap();
         assert!(blocks(&sets, 5).await);

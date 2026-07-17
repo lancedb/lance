@@ -73,6 +73,10 @@ pub fn sum_4bit_dist_table(
                 )
             }
         },
+        // SimdSupport::AvxFma and SimdSupport::Avx fall through here:
+        // the AVX2 inner uses `_mm256_shuffle_epi8` / `_mm256_and_si256` /
+        // `_mm256_srli_epi16` / `_mm256_add_epi16` integer ops which
+        // neither AVX nor AVX+FMA provides. Scalar is the correct route.
         _ => sum_4bit_dist_table_scalar(code_len, codes, dist_table, dists),
     }
 }
