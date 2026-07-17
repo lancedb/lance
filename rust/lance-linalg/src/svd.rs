@@ -188,15 +188,20 @@ fn multiply_a_by_vector(a: &[f64], x: &[f64], m: usize, n: usize) -> Vec<f64> {
     (0..m).map(|i| (0..n).map(|j| a[i * n + j] * x[j]).sum()).collect()
 }
 
-//Implements the classical eigendecomposition singular value decomposition (SVD) 
-//algorithm in Rust without using OpenBLAS as a dependency
-//Decomposes an mxn matrix A into U * diag(sigma) * V^T
-//Output: (U, sigma, V^T) where:
-//U is an mxm orthogonal matrix (row-major flat vector)
-//sigma is a vector of lenth min(m,n) where the singular values 
-//are sorted in descending order
-//V^T is an nxn orthogonal matrix (row-major flat vector) 
-//where the rows are right singular vectors
+/// Computes the SVD of an `m x n` row-major matrix `a`, decomposing it into
+/// `U * diag(sigma) * V^T`.
+///
+/// Returns `(u, sigma, vt)` where `u` is `m x m` (row-major), `sigma` has length
+/// `min(m, n)` sorted descending, and `vt` is `n x n` (row-major, rows are right
+/// singular vectors).
+///
+/// # Example
+/// ```
+/// let (u, sigma, vt) = svd(&[1.0, 0.0, 0.0, 1.0], 2, 2)?;
+/// assert_eq!(u, vec![1.0, 0.0, 0.0, 1.0]);
+/// assert_eq!(sigma, vec![1.0, 1.0]);
+/// assert_eq!(vt, vec![1.0, 0.0, 0.0, 1.0]);
+/// ```
 pub fn svd(a: &[f64], m: usize, n: usize) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
     //Checks whether the input matrix A has at least 1 row and at least 1 column
     if a.len() == 0 || m == 0 || n == 0 {
