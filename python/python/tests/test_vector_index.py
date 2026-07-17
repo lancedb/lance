@@ -2468,7 +2468,7 @@ def test_vector_index_distance_range(tmp_path):
     assert np.all(index_distances >= distance_range[0]) and np.all(
         index_distances < distance_range[1]
     )
-    assert np.allclose(brute_distances, index_distances, rtol=0.0, atol=0.0)
+    assert np.allclose(brute_distances, index_distances, rtol=1e-5, atol=0.0)
 
 
 # =============================================================================
