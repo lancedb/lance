@@ -54,6 +54,8 @@
 //! When used in the block compression path, the encoded output is a single buffer:
 //! `[8-byte header: values buffer size][values buffer][run_lengths buffer]`.
 
+#[cfg(feature = "bitpacking")]
+use arrow_array::UInt64Array;
 use arrow_buffer::ArrowNativeType;
 use log::trace;
 
@@ -68,6 +70,8 @@ use crate::encodings::logical::primitive::miniblock::{
 use crate::encodings::physical::block::{CompressionConfig, GeneralBufferCompressor};
 use crate::format::ProtobufUtils21;
 use crate::format::pb21::CompressiveEncoding;
+#[cfg(feature = "bitpacking")]
+use crate::statistics::Stat;
 
 use lance_core::{Error, Result};
 
@@ -991,7 +995,151 @@ impl RleEncoder {
         (values[value_idx].clone(), run_lengths[length_idx].clone())
     }
 
-    pub(crate) fn selected_payload_size(&self, data: &FixedWidthDataBlock) -> Result<u128> {
+    #[cfg(feature = "bitpacking")]
+    /// Computes the exact child-selection cost for singleton runs without
+    /// materializing the RLE value and length buffers.
+    fn singleton_run_selected_payload_size(&self, data: &FixedWidthDataBlock) -> Option<u128> {
+        if !self.use_child_bitpacking
+            || self.values_compression.is_some()
+            || self.run_lengths_compression.is_some()
+        {
+            return None;
+        }
+
+        if data.num_values == 0 {
+            return Some(0);
+        }
+        if !matches!(data.bits_per_value, 8 | 16 | 32 | 64) {
+            return None;
+        }
+
+        let num_values = usize::try_from(data.num_values).ok()?;
+        let bytes_per_value = usize::try_from(data.bits_per_value / 8).ok()?;
+        if num_values.checked_mul(bytes_per_value)? != data.data.len() {
+            return None;
+        }
+
+        let (run_count, packed_value_bits) = {
+            let block_info = data.block_info.0.read().ok()?;
+            let run_counts = block_info
+                .get(&Stat::RunCount)?
+                .as_any()
+                .downcast_ref::<UInt64Array>()?;
+            if run_counts.len() != 1 {
+                return None;
+            }
+            let bit_widths = block_info
+                .get(&Stat::BitWidth)?
+                .as_any()
+                .downcast_ref::<UInt64Array>()?;
+            let packed_value_bits = bit_widths
+                .values()
+                .iter()
+                .copied()
+                .max()
+                .unwrap_or(0)
+                .max(1);
+            (run_counts.value(0), packed_value_bits)
+        };
+        if run_count != data.num_values {
+            return None;
+        }
+        if packed_value_bits > data.bits_per_value {
+            return None;
+        }
+
+        let bytes_per_length = self.run_length_width.bytes_per_value();
+        let bytes_per_run = bytes_per_value.checked_add(bytes_per_length)?;
+        let chunk_values = Self::singleton_run_chunk_values(num_values, bytes_per_run)?;
+
+        let flat_values_size = (num_values as u128) * (bytes_per_value as u128);
+        let flat_lengths_size = (num_values as u128) * (bytes_per_length as u128);
+        let mut selected_size = flat_values_size + flat_lengths_size;
+
+        if let Some(packed_values_size) = Self::singleton_bitpacked_child_size(
+            &chunk_values,
+            data.bits_per_value,
+            packed_value_bits,
+        ) {
+            selected_size = selected_size.min(packed_values_size + flat_lengths_size);
+        }
+        if let Some(packed_lengths_size) = Self::singleton_bitpacked_child_size(
+            &chunk_values,
+            self.run_length_width.bits_per_value(),
+            1,
+        ) {
+            selected_size = selected_size.min(flat_values_size + packed_lengths_size);
+        }
+
+        Some(selected_size)
+    }
+
+    #[cfg(feature = "bitpacking")]
+    fn singleton_run_chunk_values(num_values: usize, bytes_per_run: usize) -> Option<Vec<usize>> {
+        if num_values == 0 {
+            return Some(Vec::new());
+        }
+
+        let max_values = usize::try_from(*MAX_MINIBLOCK_VALUES).ok()?;
+        let max_bytes = usize::try_from(MAX_MINIBLOCK_BYTES).ok()?;
+        let mut chunks = Vec::new();
+        let mut remaining = num_values;
+
+        while remaining > 0 {
+            let candidate_values = remaining.min(max_values);
+            let candidate_bytes = candidate_values.checked_mul(bytes_per_run)?;
+            if remaining <= max_values && candidate_bytes <= max_bytes {
+                chunks.push(candidate_values);
+                break;
+            }
+
+            let mut chunk_values = 1usize << candidate_values.ilog2();
+            while chunk_values > 1 && chunk_values.checked_mul(bytes_per_run)? > max_bytes {
+                chunk_values >>= 1;
+            }
+            if chunk_values <= 1 {
+                return None;
+            }
+
+            chunks.push(chunk_values);
+            remaining -= chunk_values;
+        }
+
+        Some(chunks)
+    }
+
+    #[cfg(feature = "bitpacking")]
+    /// Mirrors the raw-tail choice made by `OutOfLineBitpacking` for each RLE chunk.
+    fn singleton_bitpacked_child_size(
+        chunk_values: &[usize],
+        bits_per_value: u64,
+        packed_bits: u64,
+    ) -> Option<u128> {
+        if packed_bits >= bits_per_value || !matches!(bits_per_value, 8 | 16 | 32 | 64) {
+            return None;
+        }
+
+        let bytes_per_value = (bits_per_value / 8) as u128;
+        let full_block_size = 128u128.checked_mul(packed_bits as u128)?;
+        let mut original_size = 0u128;
+        let mut packed_size = 0u128;
+
+        for &num_values in chunk_values {
+            let num_values = num_values as u128;
+            original_size = original_size.checked_add(num_values.checked_mul(bytes_per_value)?)?;
+
+            let full_blocks = num_values / 1024;
+            let tail_values = num_values % 1024;
+            let full_blocks_size = full_blocks.checked_mul(full_block_size)?;
+            let raw_tail_size = tail_values.checked_mul(bytes_per_value)?;
+            packed_size = packed_size
+                .checked_add(full_blocks_size.checked_add(full_block_size.min(raw_tail_size))?)?;
+        }
+
+        (packed_size < original_size).then_some(packed_size)
+    }
+
+    fn selected_payload_size_materialized(&self, data: &FixedWidthDataBlock) -> Result<u128> {
         let (all_buffers, chunks) =
             self.encode_data(&data.data, data.num_values, data.bits_per_value)?;
         if all_buffers.is_empty() {
@@ -1017,6 +1165,15 @@ impl RleEncoder {
         let (values, run_lengths) =
             Self::select_child_candidates(values_candidates, run_lengths_candidates);
         Ok((values.size as u128).saturating_add(run_lengths.size as u128))
+    }
+
+    pub(crate) fn selected_payload_size(&self, data: &FixedWidthDataBlock) -> Result<u128> {
+        #[cfg(feature = "bitpacking")]
+        if let Some(selected_size) = self.singleton_run_selected_payload_size(data) {
+            return Ok(selected_size);
+        }
+
+        self.selected_payload_size_materialized(data)
     }
 }
 
@@ -1590,6 +1747,7 @@ mod tests {
     use crate::data::DataBlock;
     use crate::encodings::logical::primitive::miniblock::MAX_MINIBLOCK_VALUES;
     use crate::encodings::physical::block::{CompressionConfig, CompressionScheme};
+    use crate::statistics::ComputeStat;
     use crate::{
         buffer::LanceBuffer,
         compression::{BlockCompressor, BlockDecompressor},
@@ -1989,6 +2147,153 @@ mod tests {
             values.extend(std::iter::repeat_n((state >> 32) as i32, run_length));
         }
         values
+    }
+
+    #[cfg(feature = "bitpacking")]
+    fn singleton_test_block(
+        bits_per_value: u64,
+        num_values: usize,
+        packed_bits: u64,
+    ) -> FixedWidthDataBlock {
+        let high = 1u64 << (packed_bits - 1);
+        let values = (0..num_values).map(|idx| {
+            if idx.is_multiple_of(2) {
+                high
+            } else {
+                high - 1
+            }
+        });
+        let data = match bits_per_value {
+            8 => LanceBuffer::reinterpret_vec(values.map(|value| value as u8).collect()),
+            16 => LanceBuffer::reinterpret_vec(values.map(|value| value as u16).collect()),
+            32 => LanceBuffer::reinterpret_vec(values.map(|value| value as u32).collect()),
+            64 => LanceBuffer::reinterpret_vec(values.collect()),
+            _ => unreachable!(),
+        };
+        let mut block = DataBlock::FixedWidth(FixedWidthDataBlock {
+            data,
+            bits_per_value,
+            num_values: num_values as u64,
+            block_info: BlockInfo::default(),
+        });
+        block.compute_stat();
+        match block {
+            DataBlock::FixedWidth(block) => block,
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "bitpacking")]
+    fn test_singleton_payload_size_matches_materialized_selection() {
+        let num_values = [
+            0, 1, 2, 511, 512, 513, 909, 910, 1023, 1024, 1025, 1128, 1411, 1637, 1638, 2047, 2048,
+            2049, 2728, 2729, 4093, 4094, 4095, 4096, 9999,
+        ];
+
+        for run_length_width in [RunLengthWidth::U8, RunLengthWidth::U16, RunLengthWidth::U32] {
+            let encoder = RleEncoder::with_child_encoding(run_length_width, None, None, true);
+            for bits_per_value in [8, 16, 32, 64] {
+                let mut packed_widths =
+                    vec![1, bits_per_value / 2, bits_per_value - 1, bits_per_value];
+                packed_widths.sort_unstable();
+                packed_widths.dedup();
+                for packed_bits in packed_widths {
+                    for num_values in num_values {
+                        let block =
+                            singleton_test_block(bits_per_value, num_values, packed_bits.max(1));
+                        let analytical = encoder.singleton_run_selected_payload_size(&block);
+                        let materialized =
+                            encoder.selected_payload_size_materialized(&block).unwrap();
+                        assert_eq!(
+                            encoder.selected_payload_size(&block).unwrap(),
+                            materialized,
+                            "run_length_width={run_length_width:?}, bits={bits_per_value}, packed_bits={packed_bits}, num_values={num_values}"
+                        );
+                        if let Some(analytical) = analytical {
+                            assert_eq!(
+                                analytical, materialized,
+                                "run_length_width={run_length_width:?}, bits={bits_per_value}, packed_bits={packed_bits}, num_values={num_values}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "bitpacking")]
+    fn test_singleton_payload_size_preserves_tail_selection() {
+        if *MAX_MINIBLOCK_VALUES != 4096 {
+            return;
+        }
+
+        let encoder = RleEncoder::with_child_encoding(RunLengthWidth::U8, None, None, true);
+
+        let smaller_than_inline = singleton_test_block(32, 1025, 8);
+        assert_eq!(
+            encoder.singleton_run_selected_payload_size(&smaller_than_inline),
+            Some(2053)
+        );
+
+        let tied_with_inline = singleton_test_block(32, 1128, 12);
+        assert_eq!(
+            encoder.singleton_run_selected_payload_size(&tied_with_inline),
+            Some(3080)
+        );
+
+        let narrow16_hot_path = singleton_test_block(64, 4096, 27);
+        assert_eq!(
+            encoder.singleton_run_selected_payload_size(&narrow16_hot_path),
+            Some(31744)
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "bitpacking")]
+    fn test_singleton_payload_size_falls_back_for_other_candidates() {
+        let singleton = singleton_test_block(64, 4096, 27);
+        let compressed = RleEncoder::with_child_encoding(
+            RunLengthWidth::U8,
+            Some(CompressionConfig::default()),
+            None,
+            true,
+        );
+        assert_eq!(
+            compressed.singleton_run_selected_payload_size(&singleton),
+            None
+        );
+
+        let mut repeated = DataBlock::FixedWidth(FixedWidthDataBlock {
+            data: LanceBuffer::reinterpret_vec(vec![7u64; 4096]),
+            bits_per_value: 64,
+            num_values: 4096,
+            block_info: BlockInfo::default(),
+        });
+        repeated.compute_stat();
+        let DataBlock::FixedWidth(repeated) = repeated else {
+            unreachable!()
+        };
+        let encoder = RleEncoder::with_child_encoding(RunLengthWidth::U8, None, None, true);
+        assert_eq!(encoder.singleton_run_selected_payload_size(&repeated), None);
+
+        let uncomputed = FixedWidthDataBlock {
+            data: LanceBuffer::reinterpret_vec(vec![1u64, 2, 1, 2]),
+            bits_per_value: 64,
+            num_values: 4,
+            block_info: BlockInfo::default(),
+        };
+        assert_eq!(
+            encoder.singleton_run_selected_payload_size(&uncomputed),
+            None
+        );
+        assert_eq!(
+            encoder.selected_payload_size(&uncomputed).unwrap(),
+            encoder
+                .selected_payload_size_materialized(&uncomputed)
+                .unwrap()
+        );
     }
 
     #[test]
