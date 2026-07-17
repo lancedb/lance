@@ -1,3 +1,6 @@
+//Helpful for printing error messages to determine whether
+//the input (matrix, m, n) for the svd() function is valid
+use lance_core::{Error, Result};
 //Machine epsilon for f64:smallest value where 1.0 + EPS != 1.0
 const EPS: f64 = 2.220_446_049_250_313e-16;
 //Maximum number of Jacobi iteration sweeps before giving up
@@ -202,24 +205,26 @@ fn multiply_a_by_vector(a: &[f64], x: &[f64], m: usize, n: usize) -> Vec<f64> {
 /// assert_eq!(sigma, vec![1.0, 1.0]);
 /// assert_eq!(vt, vec![1.0, 0.0, 0.0, 1.0]);
 /// ```
-pub fn svd(a: &[f64], m: usize, n: usize) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+pub fn svd(a: &[f64], m: usize, n: usize) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>)> {
     //Checks whether the input matrix A has at least 1 row and at least 1 column
-    if a.len() == 0 || m == 0 || n == 0 {
-        println!("Error: Matrix must have at least 1 row and at least 1 column.");
+    if a.is_empty() || m == 0 || n == 0 {
+        return Err(Error::invalid_input(format!(
+            "svd: matrix must have >=1 row and column (m={m}, n={n}, len={})",
+            a.len()
+        )));
     }
     //Checks whether the data length of the input matrix A matches the
     //product of the specified number of rows and number of columns
     if a.len() != m * n {
-        println!("Error: Data length of matrix must match the product of the specified number of rows and number of columns.");
+        return Err(Error::invalid_input(format!(
+            "svd: data length {} != m*n ({m}*{n})", a.len()
+        )));
     }
     //Checks whether the input matrix A contains null or infinite entries
     if !a.iter().all(|x| x.is_finite()) {
-        println!("Error: Matrix must not contain null or infinite entries.");
-    }
-    //If any of the three input validation checks above fails,
-    //all three output matrices are empty.
-    if a.len() == 0 || m == 0 || n == 0 || a.len() != m * n || !a.iter().all(|x| x.is_finite()) {
-        return (vec![], vec![], vec![]);
+        return Err(Error::invalid_input(
+            "svd: matrix contains NaN or infinite entries"
+        ));
     }
 
     //Step 1: Forms A^T A (nxn symmetric positive semi-definite matrix)
@@ -296,5 +301,5 @@ pub fn svd(a: &[f64], m: usize, n: usize) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
         }
     }
 
-    (u, sigma, vt)
+    Ok((u, sigma, vt))
 }
