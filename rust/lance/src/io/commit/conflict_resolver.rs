@@ -37,6 +37,55 @@ pub struct TransactionRebase<'a> {
     conflicting_mem_wal_merged_gens: Vec<MergedGeneration>,
 }
 
+/// The conflict-relevant footprint of a composite [`Operation::UserOperation`],
+/// derived from its constituent actions so a concurrent legacy operation's
+/// existing conflict rules can be reproduced against it.
+#[cfg(feature = "unstable-action-transactions")]
+struct UserOperationFootprint<'a> {
+    /// Mirrors `Operation::UpdateBases::new_bases` (one entry per `AddBases`
+    /// action's bases).
+    added_bases: Vec<&'a lance_table::format::BasePath>,
+    /// Mirrors one `DataReplacementGroup`'s `(fragment_id, fields)` per
+    /// `ReplaceFragmentColumns` action.
+    replaced_columns: Vec<(u64, &'a [i32])>,
+    /// Whether this composite contains a Merge-class action (`AddFields`,
+    /// `ChangeSchema`, or `RefreshRowVersionMetadata`) -- conservatively
+    /// equivalent to `Operation::Merge` for conflict purposes, since its
+    /// existing rules don't inspect the fragment/schema payload, only the
+    /// operation kind.
+    has_merge: bool,
+}
+
+#[cfg(feature = "unstable-action-transactions")]
+fn user_operation_footprint(
+    user_op: &lance_table::transaction::UserOperation,
+) -> UserOperationFootprint<'_> {
+    use lance_table::transaction::Action;
+
+    let mut added_bases = Vec::new();
+    let mut replaced_columns = Vec::new();
+    let mut has_merge = false;
+
+    for action in user_op.actions.iter().flat_map(|ua| &ua.actions) {
+        match action {
+            Action::AddBases(add) => added_bases.extend(add.bases.iter()),
+            Action::ReplaceFragmentColumns(replace) => {
+                replaced_columns.push((replace.fragment_id, replace.field_ids.as_slice()))
+            }
+            Action::AddFields(_)
+            | Action::ChangeSchema(_)
+            | Action::RefreshRowVersionMetadata(_) => has_merge = true,
+            _ => {}
+        }
+    }
+
+    UserOperationFootprint {
+        added_bases,
+        replaced_columns,
+        has_merge,
+    }
+}
+
 impl<'a> TransactionRebase<'a> {
     pub async fn try_new(
         dataset: &Dataset,
@@ -55,6 +104,18 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Clone { .. }
             | Operation::Restore { .. }
             | Operation::UpdateBases { .. } => Ok(Self {
+                transaction,
+                affected_rows,
+                initial_fragments: HashMap::new(),
+                modified_fragment_ids: HashSet::new(),
+                conflicting_frag_reuse_indices: Vec::new(),
+                conflicting_mem_wal_merged_gens: Vec::new(),
+            }),
+            // No row-level rebase bookkeeping is needed: `check_user_operation_txn`
+            // derives conflicts from the operation's constituent actions directly,
+            // and `finish` is a passthrough (retries re-run `build_manifest`).
+            #[cfg(feature = "unstable-action-transactions")]
+            Operation::UserOperation(_) => Ok(Self {
                 transaction,
                 affected_rows,
                 initial_fragments: HashMap::new(),
@@ -235,6 +296,10 @@ impl<'a> TransactionRebase<'a> {
             Operation::UpdateBases { .. } => {
                 self.check_add_bases_txn(other_transaction, other_version)
             }
+            #[cfg(feature = "unstable-action-transactions")]
+            Operation::UserOperation(_) => {
+                self.check_user_operation_txn(other_transaction, other_version)
+            }
         }
     }
 
@@ -326,6 +391,10 @@ impl<'a> TransactionRebase<'a> {
                 }
                 Operation::Merge { .. } => {
                     Err(self.retryable_conflict_err(other_transaction, other_version))
+                }
+                #[cfg(feature = "unstable-action-transactions")]
+                Operation::UserOperation(_) => {
+                    self.check_self_vs_user_operation(other_transaction, other_version)
                 }
                 Operation::Overwrite { .. }
                 | Operation::Restore { .. }
@@ -482,6 +551,10 @@ impl<'a> TransactionRebase<'a> {
                 }
                 Operation::Merge { .. } => {
                     Err(self.retryable_conflict_err(other_transaction, other_version))
+                }
+                #[cfg(feature = "unstable-action-transactions")]
+                Operation::UserOperation(_) => {
+                    self.check_self_vs_user_operation(other_transaction, other_version)
                 }
                 Operation::Overwrite { .. } | Operation::Restore { .. } => {
                     Err(self.incompatible_conflict_err(other_transaction, other_version))
@@ -646,6 +719,10 @@ impl<'a> TransactionRebase<'a> {
                 }
                 Operation::Overwrite { .. } | Operation::Restore { .. } => {
                     Err(self.incompatible_conflict_err(other_transaction, other_version))
+                }
+                #[cfg(feature = "unstable-action-transactions")]
+                Operation::UserOperation(_) => {
+                    self.check_self_vs_user_operation(other_transaction, other_version)
                 }
             }
         } else {
@@ -829,6 +906,10 @@ impl<'a> TransactionRebase<'a> {
                 Operation::Overwrite { .. } | Operation::Restore { .. } => {
                     Err(self.incompatible_conflict_err(other_transaction, other_version))
                 }
+                #[cfg(feature = "unstable-action-transactions")]
+                Operation::UserOperation(_) => {
+                    self.check_self_vs_user_operation(other_transaction, other_version)
+                }
             }
         } else {
             Err(wrong_operation_err(&self.transaction.operation))
@@ -880,6 +961,8 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Update { .. }
             | Operation::Project { .. }
             | Operation::UpdateBases { .. } => Ok(()),
+            #[cfg(feature = "unstable-action-transactions")]
+            Operation::UserOperation(_) => Ok(()),
         }
     }
 
@@ -908,6 +991,8 @@ impl<'a> TransactionRebase<'a> {
             | Operation::UpdateConfig { .. }
             | Operation::Clone { .. }
             | Operation::DataReplacement { .. } => Ok(()),
+            #[cfg(feature = "unstable-action-transactions")]
+            Operation::UserOperation(_) => Ok(()),
         }
     }
 
@@ -1049,6 +1134,10 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::UpdateMemWalState { .. } => {
                     Err(self.incompatible_conflict_err(other_transaction, other_version))
                 }
+                #[cfg(feature = "unstable-action-transactions")]
+                Operation::UserOperation(_) => {
+                    self.check_self_vs_user_operation(other_transaction, other_version)
+                }
             }
         } else {
             Err(wrong_operation_err(&self.transaction.operation))
@@ -1081,6 +1170,10 @@ impl<'a> TransactionRebase<'a> {
             | Operation::UpdateMemWalState { .. } => {
                 Err(self.incompatible_conflict_err(other_transaction, other_version))
             }
+            #[cfg(feature = "unstable-action-transactions")]
+            Operation::UserOperation(_) => {
+                self.check_self_vs_user_operation(other_transaction, other_version)
+            }
         }
     }
 
@@ -1107,6 +1200,8 @@ impl<'a> TransactionRebase<'a> {
             Operation::UpdateMemWalState { .. } => {
                 Err(self.incompatible_conflict_err(other_transaction, other_version))
             }
+            #[cfg(feature = "unstable-action-transactions")]
+            Operation::UserOperation(_) => Ok(()),
         }
     }
 
@@ -1132,6 +1227,8 @@ impl<'a> TransactionRebase<'a> {
             | Operation::UpdateConfig { .. }
             | Operation::UpdateMemWalState { .. }
             | Operation::UpdateBases { .. } => Ok(()),
+            #[cfg(feature = "unstable-action-transactions")]
+            Operation::UserOperation(_) => Ok(()),
         }
     }
 
@@ -1160,6 +1257,10 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Restore { .. }
             | Operation::UpdateMemWalState { .. } => {
                 Err(self.incompatible_conflict_err(other_transaction, other_version))
+            }
+            #[cfg(feature = "unstable-action-transactions")]
+            Operation::UserOperation(_) => {
+                self.check_self_vs_user_operation(other_transaction, other_version)
             }
         }
     }
@@ -1219,6 +1320,8 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::Project { .. }
                 | Operation::UpdateMemWalState { .. }
                 | Operation::UpdateBases { .. } => Ok(()),
+                #[cfg(feature = "unstable-action-transactions")]
+                Operation::UserOperation(_) => Ok(()),
             }
         } else {
             Err(wrong_operation_err(&self.transaction.operation))
@@ -1290,6 +1393,10 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::Project { .. } => {
                     Err(self.incompatible_conflict_err(other_transaction, other_version))
                 }
+                #[cfg(feature = "unstable-action-transactions")]
+                Operation::UserOperation(_) => {
+                    self.check_self_vs_user_operation(other_transaction, other_version)
+                }
             }
         } else {
             Err(wrong_operation_err(&self.transaction.operation))
@@ -1331,12 +1438,383 @@ impl<'a> TransactionRebase<'a> {
                     }
                     Ok(())
                 }
+                #[cfg(feature = "unstable-action-transactions")]
+                Operation::UserOperation(_) => {
+                    self.check_self_vs_user_operation(other_transaction, other_version)
+                }
                 // UpdateBases doesn't conflict with data operations
                 _ => Ok(()),
             }
         } else {
             Err(wrong_operation_err(&self.transaction.operation))
         }
+    }
+
+    /// Conflict check for a composite [`Operation::UserOperation`]: derives its
+    /// conflict footprint from its constituent actions (see
+    /// [`user_operation_footprint`]) and checks that against `other_transaction`,
+    /// reproducing the semantics the legacy `UpdateBases`/`DataReplacement`/`Merge`
+    /// arms already encode elsewhere in this file. Composite-vs-composite
+    /// conflicts iff any action pair conflicts.
+    #[cfg(feature = "unstable-action-transactions")]
+    fn check_user_operation_txn(
+        &mut self,
+        other_transaction: &Transaction,
+        other_version: u64,
+    ) -> Result<()> {
+        let Operation::UserOperation(self_op) = &self.transaction.operation else {
+            return Err(wrong_operation_err(&self.transaction.operation));
+        };
+        let self_fp = user_operation_footprint(self_op);
+        match &other_transaction.operation {
+            Operation::UserOperation(other_op) => {
+                let other_fp = user_operation_footprint(other_op);
+                self.check_footprint_pair(&self_fp, &other_fp, other_transaction, other_version)
+            }
+            _ => self.check_footprint_vs_operation(&self_fp, other_transaction, other_version),
+        }
+    }
+
+    /// Shared handling for "self = a legacy operation, other = a composite
+    /// `UserOperation`": a composite conflicts with a concurrent legacy
+    /// operation iff that operation's own existing rule would conflict with at
+    /// least one of the composite's constituent actions. Reproduces, per
+    /// action-derived footprint piece, the same rule the legacy self-operation
+    /// already applies to a concurrent `UpdateBases`/`DataReplacement`/`Merge`.
+    #[cfg(feature = "unstable-action-transactions")]
+    fn check_self_vs_user_operation(
+        &mut self,
+        other_transaction: &Transaction,
+        other_version: u64,
+    ) -> Result<()> {
+        let Operation::UserOperation(other_op) = &other_transaction.operation else {
+            return Err(wrong_operation_err(&other_transaction.operation));
+        };
+        let fp = user_operation_footprint(other_op);
+        match &self.transaction.operation {
+            Operation::Delete { .. } | Operation::Update { .. } => {
+                if fp.has_merge
+                    || fp
+                        .replaced_columns
+                        .iter()
+                        .any(|(id, _)| self.modified_fragment_ids.contains(id))
+                {
+                    return Err(self.retryable_conflict_err(other_transaction, other_version));
+                }
+                Ok(())
+            }
+            Operation::CreateIndex { new_indices, .. } => {
+                let newly_indexed: HashSet<i32> = new_indices
+                    .iter()
+                    .flat_map(|idx| idx.fields.iter().copied())
+                    .collect();
+                if fp
+                    .replaced_columns
+                    .iter()
+                    .any(|(_, fields)| fields.iter().any(|f| newly_indexed.contains(f)))
+                {
+                    return Err(self.retryable_conflict_err(other_transaction, other_version));
+                }
+                Ok(())
+            }
+            Operation::Rewrite { groups, .. } => {
+                if fp.has_merge {
+                    return Err(self.retryable_conflict_err(other_transaction, other_version));
+                }
+                let touched: HashSet<u64> = groups
+                    .iter()
+                    .flat_map(|g| g.old_fragments.iter().map(|f| f.id))
+                    .collect();
+                if fp
+                    .replaced_columns
+                    .iter()
+                    .any(|(id, _)| touched.contains(id))
+                {
+                    return Err(self.retryable_conflict_err(other_transaction, other_version));
+                }
+                Ok(())
+            }
+            Operation::Overwrite { .. } | Operation::Append { .. } => Ok(()),
+            Operation::DataReplacement { replacements } => {
+                if fp.has_merge {
+                    return Err(self.retryable_conflict_err(other_transaction, other_version));
+                }
+                for replacement in replacements {
+                    for (id, fields) in &fp.replaced_columns {
+                        if replacement.0 == *id
+                            && replacement.1.fields.iter().any(|f| fields.contains(f))
+                        {
+                            return Err(
+                                self.retryable_conflict_err(other_transaction, other_version)
+                            );
+                        }
+                    }
+                }
+                Ok(())
+            }
+            Operation::Merge { .. } => {
+                if fp.has_merge || !fp.replaced_columns.is_empty() {
+                    return Err(self.retryable_conflict_err(other_transaction, other_version));
+                }
+                Ok(())
+            }
+            Operation::Restore { .. } | Operation::ReserveFragments { .. } => Ok(()),
+            Operation::Project { .. } => {
+                if fp.has_merge {
+                    return Err(self.retryable_conflict_err(other_transaction, other_version));
+                }
+                Ok(())
+            }
+            Operation::UpdateConfig { .. } => Ok(()),
+            Operation::UpdateMemWalState { .. } => {
+                if fp.has_merge || !fp.replaced_columns.is_empty() {
+                    return Err(self.incompatible_conflict_err(other_transaction, other_version));
+                }
+                Ok(())
+            }
+            Operation::UpdateBases { new_bases } => {
+                for new_base in new_bases {
+                    for other_base in &fp.added_bases {
+                        if new_base.id != 0 && other_base.id != 0 && new_base.id == other_base.id {
+                            return Err(
+                                self.incompatible_conflict_err(other_transaction, other_version)
+                            );
+                        }
+                        if new_base.name == other_base.name && new_base.name.is_some() {
+                            return Err(
+                                self.incompatible_conflict_err(other_transaction, other_version)
+                            );
+                        }
+                        if new_base.path == other_base.path {
+                            return Err(
+                                self.incompatible_conflict_err(other_transaction, other_version)
+                            );
+                        }
+                    }
+                }
+                Ok(())
+            }
+            Operation::Clone { .. } => Ok(()),
+            Operation::UserOperation(self_op) => {
+                let self_fp = user_operation_footprint(self_op);
+                self.check_footprint_pair(&self_fp, &fp, other_transaction, other_version)
+            }
+        }
+    }
+
+    /// Shared handling for "self = a composite `UserOperation`'s footprint,
+    /// other = a legacy (non-composite) operation". Mirrors the legacy
+    /// `DataReplacement`/`Merge`/`UpdateBases` arms' rules for a concurrent
+    /// `other_transaction`, applied against the footprint pieces present in
+    /// the composite instead of a single operation's payload.
+    #[cfg(feature = "unstable-action-transactions")]
+    fn check_footprint_vs_operation(
+        &self,
+        fp: &UserOperationFootprint,
+        other_transaction: &Transaction,
+        other_version: u64,
+    ) -> Result<()> {
+        if let Operation::UpdateBases {
+            new_bases: other_bases,
+        } = &other_transaction.operation
+        {
+            for base in &fp.added_bases {
+                for other_base in other_bases {
+                    if base.id != 0 && other_base.id != 0 && base.id == other_base.id {
+                        return Err(
+                            self.incompatible_conflict_err(other_transaction, other_version)
+                        );
+                    }
+                    if base.name == other_base.name && base.name.is_some() {
+                        return Err(
+                            self.incompatible_conflict_err(other_transaction, other_version)
+                        );
+                    }
+                    if base.path == other_base.path {
+                        return Err(
+                            self.incompatible_conflict_err(other_transaction, other_version)
+                        );
+                    }
+                }
+            }
+        }
+
+        if !fp.replaced_columns.is_empty() {
+            match &other_transaction.operation {
+                Operation::Append { .. }
+                | Operation::Clone { .. }
+                | Operation::UpdateConfig { .. }
+                | Operation::ReserveFragments { .. }
+                | Operation::Project { .. }
+                | Operation::UpdateBases { .. } => {}
+                Operation::Merge { .. } => {
+                    return Err(self.retryable_conflict_err(other_transaction, other_version));
+                }
+                Operation::Delete {
+                    deleted_fragment_ids,
+                    ..
+                } => {
+                    for (id, _) in &fp.replaced_columns {
+                        if deleted_fragment_ids.contains(id) {
+                            return Err(self.data_replacement_target_removed_err(
+                                *id,
+                                other_transaction,
+                                other_version,
+                            ));
+                        }
+                    }
+                }
+                Operation::Update {
+                    removed_fragment_ids,
+                    updated_fragments,
+                    new_fragments,
+                    fields_modified,
+                    update_mode,
+                    ..
+                } => {
+                    for (id, fields) in &fp.replaced_columns {
+                        if removed_fragment_ids.contains(id) {
+                            return Err(self.data_replacement_target_removed_err(
+                                *id,
+                                other_transaction,
+                                other_version,
+                            ));
+                        }
+                        if !updated_fragments.iter().any(|f| f.id == *id) {
+                            continue;
+                        }
+                        let moved_rows = !new_fragments.is_empty()
+                            && matches!(update_mode, Some(UpdateMode::RewriteRows) | None);
+                        let field_rewritten = fields
+                            .iter()
+                            .any(|f| *f >= 0 && fields_modified.contains(&(*f as u32)));
+                        if moved_rows || field_rewritten {
+                            return Err(
+                                self.retryable_conflict_err(other_transaction, other_version)
+                            );
+                        }
+                    }
+                }
+                Operation::CreateIndex { new_indices, .. } => {
+                    let newly_indexed: HashSet<i32> = new_indices
+                        .iter()
+                        .flat_map(|idx| idx.fields.iter().copied())
+                        .collect();
+                    for (_, fields) in &fp.replaced_columns {
+                        if fields.iter().any(|f| newly_indexed.contains(f)) {
+                            return Err(
+                                self.retryable_conflict_err(other_transaction, other_version)
+                            );
+                        }
+                    }
+                }
+                Operation::Rewrite { groups, .. } => {
+                    for (id, _) in &fp.replaced_columns {
+                        if groups
+                            .iter()
+                            .any(|g| g.old_fragments.iter().any(|f| f.id == *id))
+                        {
+                            return Err(
+                                self.retryable_conflict_err(other_transaction, other_version)
+                            );
+                        }
+                    }
+                }
+                Operation::DataReplacement { replacements } => {
+                    for (id, fields) in &fp.replaced_columns {
+                        for other_replacement in replacements {
+                            if other_replacement.0 == *id
+                                && fields
+                                    .iter()
+                                    .any(|f| other_replacement.1.fields.contains(f))
+                            {
+                                return Err(
+                                    self.retryable_conflict_err(other_transaction, other_version)
+                                );
+                            }
+                        }
+                    }
+                }
+                Operation::Overwrite { .. }
+                | Operation::Restore { .. }
+                | Operation::UpdateMemWalState { .. } => {
+                    return Err(self.incompatible_conflict_err(other_transaction, other_version));
+                }
+                Operation::UserOperation(_) => {
+                    unreachable!("composite-vs-composite is handled by check_footprint_pair")
+                }
+            }
+        }
+
+        if fp.has_merge {
+            match &other_transaction.operation {
+                Operation::CreateIndex { .. }
+                | Operation::ReserveFragments { .. }
+                | Operation::Clone { .. }
+                | Operation::UpdateConfig { .. }
+                | Operation::UpdateBases { .. } => {}
+                Operation::Update { .. }
+                | Operation::Append { .. }
+                | Operation::Delete { .. }
+                | Operation::Rewrite { .. }
+                | Operation::Merge { .. }
+                | Operation::DataReplacement { .. } => {
+                    return Err(self.retryable_conflict_err(other_transaction, other_version));
+                }
+                Operation::Overwrite { .. }
+                | Operation::Restore { .. }
+                | Operation::Project { .. }
+                | Operation::UpdateMemWalState { .. } => {
+                    return Err(self.incompatible_conflict_err(other_transaction, other_version));
+                }
+                Operation::UserOperation(_) => {
+                    unreachable!("composite-vs-composite is handled by check_footprint_pair")
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Composite-vs-composite: conflicts iff any action-derived footprint
+    /// piece from one side conflicts with a piece from the other.
+    #[cfg(feature = "unstable-action-transactions")]
+    fn check_footprint_pair(
+        &self,
+        a: &UserOperationFootprint,
+        b: &UserOperationFootprint,
+        other_transaction: &Transaction,
+        other_version: u64,
+    ) -> Result<()> {
+        for base_a in &a.added_bases {
+            for base_b in &b.added_bases {
+                if base_a.id != 0 && base_b.id != 0 && base_a.id == base_b.id {
+                    return Err(self.incompatible_conflict_err(other_transaction, other_version));
+                }
+                if base_a.name == base_b.name && base_a.name.is_some() {
+                    return Err(self.incompatible_conflict_err(other_transaction, other_version));
+                }
+                if base_a.path == base_b.path {
+                    return Err(self.incompatible_conflict_err(other_transaction, other_version));
+                }
+            }
+        }
+
+        for (id_a, fields_a) in &a.replaced_columns {
+            for (id_b, fields_b) in &b.replaced_columns {
+                if id_a == id_b && fields_a.iter().any(|f| fields_b.contains(f)) {
+                    return Err(self.retryable_conflict_err(other_transaction, other_version));
+                }
+            }
+        }
+
+        if (a.has_merge && (b.has_merge || !b.replaced_columns.is_empty()))
+            || (b.has_merge && !a.replaced_columns.is_empty())
+        {
+            return Err(self.retryable_conflict_err(other_transaction, other_version));
+        }
+
+        Ok(())
     }
 
     fn check_merged_generations_conflict(
@@ -1385,6 +1863,10 @@ impl<'a> TransactionRebase<'a> {
             | Operation::UpdateConfig { .. }
             | Operation::UpdateMemWalState { .. }
             | Operation::UpdateBases { .. } => Ok(self.transaction),
+            // No action-level rebase: retries re-run `build_manifest` against the
+            // latest manifest, which re-mints ids and re-resolves base references.
+            #[cfg(feature = "unstable-action-transactions")]
+            Operation::UserOperation(_) => Ok(self.transaction),
         }
     }
 
@@ -1802,6 +2284,26 @@ mod tests {
         io,
     };
     use lance_table::format::DataFile;
+
+    #[cfg(feature = "unstable-action-transactions")]
+    use lance_table::transaction::{Action, AddBases, ColumnReplacement, ReplaceFragmentColumns};
+
+    #[cfg(feature = "unstable-action-transactions")]
+    fn user_operation_txn(read_version: u64, actions: Vec<Action>) -> Transaction {
+        use lance_table::transaction::{UserAction, UserOperation};
+        Transaction::new_from_version(
+            read_version,
+            Operation::UserOperation(UserOperation {
+                description: "test".to_string(),
+                uuid: Uuid::new_v4().to_string(),
+                read_version,
+                actions: vec![UserAction {
+                    description: "test-action".to_string(),
+                    actions,
+                }],
+            }),
+        )
+    }
 
     async fn test_dataset(num_rows: usize, num_fragments: usize) -> Dataset {
         let write_params = WriteParams {
@@ -3226,6 +3728,8 @@ mod tests {
             | Operation::UpdateBases { .. }
             | Operation::Restore { .. }
             | Operation::UpdateMemWalState { .. } => Box::new(std::iter::empty()),
+            #[cfg(feature = "unstable-action-transactions")]
+            Operation::UserOperation(_) => Box::new(std::iter::empty()),
             Operation::Delete {
                 updated_fragments,
                 deleted_fragment_ids,
@@ -3874,5 +4378,199 @@ mod tests {
         );
 
         assert_eq!(dataset_v2.count_rows(None).await.unwrap(), 5);
+    }
+
+    #[cfg(feature = "unstable-action-transactions")]
+    #[tokio::test]
+    async fn test_user_operation_replace_fragment_columns_conflicts_with_concurrent_merge() {
+        let dataset = test_dataset(10, 2).await;
+
+        let txn1 = user_operation_txn(
+            1,
+            vec![Action::ReplaceFragmentColumns(ReplaceFragmentColumns {
+                fragment_id: 0,
+                field_ids: vec![0],
+                new_data_files: vec![],
+                replacement: ColumnReplacement::InPlace,
+                updated_row_offsets: None,
+            })],
+        );
+
+        let txn2 = Transaction::new_from_version(
+            1,
+            Operation::Merge {
+                fragments: vec![],
+                schema: dataset.schema().clone(),
+            },
+        );
+
+        let mut rebase = TransactionRebase::try_new(&dataset, txn1, None)
+            .await
+            .unwrap();
+        let result = rebase.check_txn(&txn2, 2);
+        assert!(
+            matches!(result, Err(Error::RetryableCommitConflict { .. })),
+            "expected retryable conflict, got {:?}",
+            result
+        );
+    }
+
+    #[cfg(feature = "unstable-action-transactions")]
+    #[tokio::test]
+    async fn test_user_operation_add_bases_conflicts_with_concurrent_update_bases_same_name() {
+        let dataset = test_dataset(10, 2).await;
+
+        let txn1 = user_operation_txn(
+            1,
+            vec![Action::AddBases(AddBases {
+                bases: vec![lance_table::format::BasePath {
+                    id: 0,
+                    path: "s3://bucket1/path1".to_string(),
+                    name: Some("dup".to_string()),
+                    is_dataset_root: false,
+                }],
+            })],
+        );
+
+        let txn2 = Transaction::new_from_version(
+            1,
+            Operation::UpdateBases {
+                new_bases: vec![lance_table::format::BasePath {
+                    id: 0,
+                    path: "s3://bucket2/path2".to_string(),
+                    name: Some("dup".to_string()),
+                    is_dataset_root: false,
+                }],
+            },
+        );
+
+        let mut rebase = TransactionRebase::try_new(&dataset, txn1, None)
+            .await
+            .unwrap();
+        let result = rebase.check_txn(&txn2, 2);
+        assert!(
+            matches!(result, Err(Error::IncompatibleTransaction { .. })),
+            "expected incompatible conflict, got {:?}",
+            result
+        );
+    }
+
+    #[cfg(feature = "unstable-action-transactions")]
+    #[tokio::test]
+    async fn test_user_operation_replace_fragment_columns_no_conflict_with_append() {
+        let dataset = test_dataset(10, 2).await;
+
+        let txn1 = user_operation_txn(
+            1,
+            vec![Action::ReplaceFragmentColumns(ReplaceFragmentColumns {
+                fragment_id: 0,
+                field_ids: vec![0],
+                new_data_files: vec![],
+                replacement: ColumnReplacement::InPlace,
+                updated_row_offsets: None,
+            })],
+        );
+
+        let txn2 = Transaction::new_from_version(1, Operation::Append { fragments: vec![] });
+
+        let mut rebase = TransactionRebase::try_new(&dataset, txn1, None)
+            .await
+            .unwrap();
+        assert!(rebase.check_txn(&txn2, 2).is_ok());
+    }
+
+    #[cfg(feature = "unstable-action-transactions")]
+    #[tokio::test]
+    async fn test_user_operation_vs_user_operation_conflicts_on_overlapping_replace_fragment_columns()
+     {
+        let dataset = test_dataset(10, 2).await;
+
+        let make_replace = || {
+            vec![Action::ReplaceFragmentColumns(ReplaceFragmentColumns {
+                fragment_id: 0,
+                field_ids: vec![0],
+                new_data_files: vec![],
+                replacement: ColumnReplacement::InPlace,
+                updated_row_offsets: None,
+            })]
+        };
+
+        let txn1 = user_operation_txn(1, make_replace());
+        let txn2 = user_operation_txn(1, make_replace());
+
+        let mut rebase = TransactionRebase::try_new(&dataset, txn1, None)
+            .await
+            .unwrap();
+        let result = rebase.check_txn(&txn2, 2);
+        assert!(
+            matches!(result, Err(Error::RetryableCommitConflict { .. })),
+            "expected retryable conflict, got {:?}",
+            result
+        );
+    }
+
+    #[cfg(feature = "unstable-action-transactions")]
+    #[tokio::test]
+    async fn test_user_operation_vs_user_operation_no_conflict_on_disjoint_fragments() {
+        let dataset = test_dataset(10, 2).await;
+
+        let txn1 = user_operation_txn(
+            1,
+            vec![Action::ReplaceFragmentColumns(ReplaceFragmentColumns {
+                fragment_id: 0,
+                field_ids: vec![0],
+                new_data_files: vec![],
+                replacement: ColumnReplacement::InPlace,
+                updated_row_offsets: None,
+            })],
+        );
+        let txn2 = user_operation_txn(
+            1,
+            vec![Action::ReplaceFragmentColumns(ReplaceFragmentColumns {
+                fragment_id: 1,
+                field_ids: vec![0],
+                new_data_files: vec![],
+                replacement: ColumnReplacement::InPlace,
+                updated_row_offsets: None,
+            })],
+        );
+
+        let mut rebase = TransactionRebase::try_new(&dataset, txn1, None)
+            .await
+            .unwrap();
+        assert!(rebase.check_txn(&txn2, 2).is_ok());
+    }
+
+    #[cfg(feature = "unstable-action-transactions")]
+    #[tokio::test]
+    async fn test_merge_txn_conflicts_with_concurrent_user_operation_merge_class() {
+        let dataset = test_dataset(10, 2).await;
+
+        let txn1 = Transaction::new_from_version(
+            1,
+            Operation::Merge {
+                fragments: vec![],
+                schema: dataset.schema().clone(),
+            },
+        );
+
+        let txn2 = user_operation_txn(
+            1,
+            vec![Action::RefreshRowVersionMetadata(
+                lance_table::transaction::RefreshRowVersionMetadata {
+                    fragment_ids: vec![0],
+                },
+            )],
+        );
+
+        let mut rebase = TransactionRebase::try_new(&dataset, txn1, None)
+            .await
+            .unwrap();
+        let result = rebase.check_txn(&txn2, 2);
+        assert!(
+            matches!(result, Err(Error::RetryableCommitConflict { .. })),
+            "expected retryable conflict, got {:?}",
+            result
+        );
     }
 }
