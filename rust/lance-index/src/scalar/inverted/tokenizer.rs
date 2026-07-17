@@ -337,7 +337,6 @@ impl TryFrom<&InvertedIndexParams> for pbold::InvertedIndexDetails {
 
     fn try_from(params: &InvertedIndexParams) -> Result<Self> {
         Ok(Self {
-            lance_tokenizer: params.lance_tokenizer.clone(),
             base_tokenizer: Some(params.base_tokenizer.clone()),
             language: serde_json::to_string(&params.language)?,
             with_position: params.with_position,
@@ -350,10 +349,14 @@ impl TryFrom<&InvertedIndexParams> for pbold::InvertedIndexDetails {
             max_ngram_length: params.max_ngram_length,
             prefix_only: params.prefix_only,
             block_size: Some(params.block_size as u32),
-            split_identifiers: params.split_identifiers,
-            split_on_numerics: Some(params.split_on_numerics),
-            preserve_original: Some(params.preserve_original),
-            index_operators: params.index_operators,
+            code_config: (params.base_tokenizer == "code").then_some(
+                pbold::inverted_index_details::CodeTokenizerConfig {
+                    split_identifiers: params.split_identifiers,
+                    split_on_numerics: Some(params.split_on_numerics),
+                    preserve_original: Some(params.preserve_original),
+                    index_operators: params.index_operators,
+                },
+            ),
         })
     }
 }
@@ -362,6 +365,11 @@ impl TryFrom<&pbold::InvertedIndexDetails> for InvertedIndexParams {
     type Error = Error;
 
     fn try_from(details: &pbold::InvertedIndexDetails) -> Result<Self> {
+        if details.code_config.is_some() && details.base_tokenizer.as_deref() != Some("code") {
+            return Err(Error::invalid_input(
+                "code_config requires base_tokenizer='code'".to_string(),
+            ));
+        }
         if details.base_tokenizer.is_none() && details.language.is_empty() {
             let params = Self {
                 block_size: match details.block_size {
@@ -377,7 +385,6 @@ impl TryFrom<&pbold::InvertedIndexDetails> for InvertedIndexParams {
             Some("code") => Self::code(),
             _ => Self::default(),
         };
-        params.lance_tokenizer = details.lance_tokenizer.clone();
         params.base_tokenizer = details
             .base_tokenizer
             .as_ref()
@@ -401,14 +408,16 @@ impl TryFrom<&pbold::InvertedIndexDetails> for InvertedIndexParams {
             Some(block_size) => validate_block_size(block_size as usize)?,
             None => LEGACY_BLOCK_SIZE,
         };
-        params.split_identifiers = details.split_identifiers;
-        if let Some(split_on_numerics) = details.split_on_numerics {
-            params.split_on_numerics = split_on_numerics;
+        if let Some(code_config) = &details.code_config {
+            params.split_identifiers = code_config.split_identifiers;
+            if let Some(split_on_numerics) = code_config.split_on_numerics {
+                params.split_on_numerics = split_on_numerics;
+            }
+            if let Some(preserve_original) = code_config.preserve_original {
+                params.preserve_original = preserve_original;
+            }
+            params.index_operators = code_config.index_operators;
         }
-        if let Some(preserve_original) = details.preserve_original {
-            params.preserve_original = preserve_original;
-        }
-        params.index_operators = details.index_operators;
         params.validate()?;
         Ok(params)
     }
@@ -994,6 +1003,7 @@ mod tests {
     use crate::pbold;
 
     use super::{InvertedIndexParams, InvertedListFormatVersion, Language};
+    use lance_core::Error;
     use lance_tokenizer::TokenStream;
     use rstest::rstest;
     use serde_json::json;
@@ -1216,8 +1226,9 @@ mod tests {
             .index_operators(true)
             .preserve_original(false);
         let details = crate::pbold::InvertedIndexDetails::try_from(&params).unwrap();
-        assert_eq!(details.split_on_numerics, Some(true));
-        assert_eq!(details.preserve_original, Some(false));
+        let code_config = details.code_config.as_ref().unwrap();
+        assert_eq!(code_config.split_on_numerics, Some(true));
+        assert_eq!(code_config.preserve_original, Some(false));
         let round_tripped = InvertedIndexParams::try_from(&details).unwrap();
         assert_eq!(round_tripped, params);
     }
@@ -1226,12 +1237,36 @@ mod tests {
     fn test_inverted_details_uses_code_defaults_for_absent_flags() {
         let mut details =
             crate::pbold::InvertedIndexDetails::try_from(&InvertedIndexParams::code()).unwrap();
-        details.split_on_numerics = None;
-        details.preserve_original = None;
+        let code_config = details.code_config.as_mut().unwrap();
+        code_config.split_on_numerics = None;
+        code_config.preserve_original = None;
 
         let params = InvertedIndexParams::try_from(&details).unwrap();
         assert!(params.split_on_numerics);
         assert!(params.preserve_original);
+    }
+
+    #[test]
+    fn test_inverted_details_rejects_code_config_for_text_tokenizer() {
+        let mut details =
+            crate::pbold::InvertedIndexDetails::try_from(&InvertedIndexParams::code()).unwrap();
+        details.base_tokenizer = Some("simple".to_string());
+
+        let err = InvertedIndexParams::try_from(&details).unwrap_err();
+        assert!(matches!(&err, Error::InvalidInput { .. }));
+        assert!(
+            err.to_string()
+                .contains("code_config requires base_tokenizer='code'")
+        );
+    }
+
+    #[test]
+    fn test_inverted_details_does_not_persist_document_tokenizer() {
+        let params = InvertedIndexParams::default().lance_tokenizer("json".to_string());
+        let details = crate::pbold::InvertedIndexDetails::try_from(&params).unwrap();
+        let round_tripped = InvertedIndexParams::try_from(&details).unwrap();
+
+        assert_eq!(round_tripped.lance_tokenizer, None);
     }
 
     #[test]
@@ -1300,7 +1335,6 @@ mod tests {
         assert_eq!(details.block_size, Some(256));
 
         let old_details = pbold::InvertedIndexDetails {
-            lance_tokenizer: None,
             base_tokenizer: Some("simple".to_string()),
             language: serde_json::to_string(&Language::English).unwrap(),
             with_position: false,
@@ -1313,10 +1347,7 @@ mod tests {
             max_ngram_length: 3,
             prefix_only: false,
             block_size: None,
-            split_identifiers: false,
-            split_on_numerics: None,
-            preserve_original: None,
-            index_operators: false,
+            code_config: None,
         };
         let params = InvertedIndexParams::try_from(&old_details).unwrap();
         assert_eq!(params.block_size, 128);

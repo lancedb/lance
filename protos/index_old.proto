@@ -26,11 +26,23 @@ message LabelListIndexDetails {}
 message NGramIndexDetails {}
 message ZoneMapIndexDetails {}
 message InvertedIndexDetails {
-  // Document-level tokenizer. It extracts searchable text from the stored value,
-  // e.g. "text" for a plain string or "json" for JSON content. The extracted
-  // text is then passed to base_tokenizer. Absent means text / auto-inferred
-  // legacy behavior.
-  optional string lance_tokenizer = 13;
+  message CodeTokenizerConfig {
+    // Split one lexical identifier into subwords, e.g. getUserName ->
+    // get/user/name.
+    bool split_identifiers = 1;
+    // Split identifier subwords across letter/number boundaries, e.g.
+    // HTML2JSON -> html/2/json. An absent value uses the code tokenizer default;
+    // a present value records the explicit index-time choice.
+    optional bool split_on_numerics = 2;
+    // Keep the complete lexical identifier in addition to subwords, e.g.
+    // user_name plus user/name. An absent value uses the code tokenizer default;
+    // a present value records the explicit index-time choice.
+    optional bool preserve_original = 3;
+    // Index operator tokens such as "::", "->", and "!=". Operators are not
+    // indexed by default because they are often high-frequency noise.
+    bool index_operators = 4;
+  }
+
   // Lexical tokenizer used after document-level text extraction. This is an
   // implementation component such as "simple", "icu", "ngram", or "code".
   // Input-time analyzer profiles are expanded into this field and the concrete
@@ -53,20 +65,8 @@ message InvertedIndexDetails {
   // A present value records the block size used by the index; 256 is only
   // valid with format version 3.
   optional uint32 block_size = 12;
-  // Code tokenizer option. Split one lexical identifier into subwords, e.g.
-  // getUserName -> get/user/name. This changes the indexed term space and must
-  // be persisted for query-time tokenizer reconstruction and segment checks.
-  bool split_identifiers = 14;
-  // Code tokenizer option. Split identifier subwords across letter/number
-  // boundaries, e.g. HTML2JSON -> html/2/json. When absent, use the default for
-  // base_tokenizer; when present, persist the explicit index-time choice.
-  optional bool split_on_numerics = 15;
-  // Code tokenizer option. Keep the complete lexical identifier in addition to
-  // subwords, e.g. user_name plus user/name. When absent, use the default for
-  // base_tokenizer; when present, persist the explicit index-time choice.
-  optional bool preserve_original = 16;
-  // Code tokenizer option. Index operator tokens such as "::", "->", and "!=".
-  // Disabled by default because operators are often high-frequency noise, but
-  // when enabled it changes query semantics and must be persisted.
-  bool index_operators = 17;
+  // Options for base_tokenizer = "code". Presence records the code tokenizer
+  // configuration used to build the index; absence means there is no
+  // code-specific configuration to apply.
+  CodeTokenizerConfig code_config = 13;
 }
