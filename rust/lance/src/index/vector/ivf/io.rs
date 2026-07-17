@@ -25,7 +25,6 @@ use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_file::previous::reader::FileReader as PreviousFileReader;
 use lance_file::previous::writer::FileWriter as PreviousFileWriter;
 use lance_index::metrics::NoOpMetricsCollector;
-use lance_index::scalar::IndexWriter;
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::hnsw::{HnswMetadata, builder::HnswBuildParams};
 use lance_index::vector::ivf::storage::IvfModel;
@@ -584,7 +583,7 @@ async fn build_and_write_hnsw(
 ) -> Result<usize> {
     let batch = params.build(vectors, distance_type).await?.to_batch()?;
     let metadata = batch.schema_ref().metadata().clone();
-    writer.write_record_batch(batch).await?;
+    writer.write(&[batch]).await?;
     Ok(writer.finish_with_metadata(&metadata).await?.num_rows as usize)
 }
 
@@ -597,7 +596,7 @@ async fn build_and_write_pq_storage(
 ) -> Result<()> {
     let storage = spawn_cpu(move || build_pq_storage(metric_type, row_ids, code_array, pq)).await?;
 
-    writer.write_record_batch(storage.batch().clone()).await?;
+    writer.write(&[storage.batch().clone()]).await?;
     writer.finish().await?;
     Ok(())
 }

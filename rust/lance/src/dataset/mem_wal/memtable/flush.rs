@@ -2250,7 +2250,7 @@ mod tests {
             "ProjectionExec: expr=[id@2 as id, text@3 as text, _score@1 as _score]
   Take: ...
     CoalesceBatchesExec: ...
-      MatchQuery: column=text, query=hello",
+      MatchQuery: column=text, query=[hello]",
         )
         .await
         .unwrap();

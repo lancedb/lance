@@ -13,7 +13,7 @@ use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
-use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
+use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, Gauge, MetricsSet};
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::union::UnionExec;
@@ -166,6 +166,9 @@ pub struct FtsIndexMetrics {
     and_candidates_pruned_before_return: Count,
     and_full_scores: Count,
     freqs_collected: Count,
+    /// Wall time (ms) of the exec-local `build_global_bm25_scorer`
+    /// fallback; zero when a preset base scorer was injected.
+    scorer_build_ms: Gauge,
     baseline_metrics: BaselineMetrics,
 }
 
@@ -179,12 +182,17 @@ impl FtsIndexMetrics {
                 .new_count(AND_CANDIDATES_PRUNED_BEFORE_RETURN_METRIC, partition),
             and_full_scores: metrics.new_count(AND_FULL_SCORES_METRIC, partition),
             freqs_collected: metrics.new_count(FREQS_COLLECTED_METRIC, partition),
+            scorer_build_ms: metrics.new_gauge("scorer_build_ms", partition),
             baseline_metrics: BaselineMetrics::new(metrics, partition),
         }
     }
 
     pub fn record_parts_searched(&self, num_parts: usize) {
         self.partitions_searched.add(num_parts);
+    }
+
+    pub fn record_scorer_build(&self, elapsed: std::time::Duration) {
+        self.scorer_build_ms.set(elapsed.as_millis() as usize);
     }
 }
 
@@ -241,7 +249,7 @@ impl DisplayAs for MatchQueryExec {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(
                     f,
-                    "MatchQuery: column={}, query={}",
+                    "MatchQuery: column={}, query=[{}]",
                     self.query.column.as_deref().unwrap_or_default(),
                     self.query.terms
                 )
@@ -373,10 +381,6 @@ impl MatchQueryExec {
 impl ExecutionPlan for MatchQueryExec {
     fn name(&self) -> &str {
         "MatchQueryExec"
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -525,11 +529,16 @@ impl ExecutionPlan for MatchQueryExec {
             let tokens = collect_query_tokens(&query.terms, &mut tokenizer);
             let base_scorer = match preset_base_scorer {
                 Some(scorer) => scorer,
-                None => Arc::new(
-                    build_global_bm25_scorer(&indices, &tokens, &params)
-                        .boxed()
-                        .await?,
-                ),
+                None => {
+                    let scorer_start = std::time::Instant::now();
+                    let scorer = Arc::new(
+                        build_global_bm25_scorer(&indices, &tokens, &params)
+                            .boxed()
+                            .await?,
+                    );
+                    metrics.record_scorer_build(scorer_start.elapsed());
+                    scorer
+                }
             };
 
             pre_filter.wait_for_ready().await?;
@@ -795,10 +804,6 @@ impl ExecutionPlan for FlatMatchFilterExec {
         "FlatMatchFilterExec"
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.input]
     }
@@ -850,7 +855,7 @@ impl ExecutionPlan for FlatMatchFilterExec {
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> DataFusionResult<Statistics> {
+    fn partition_statistics(&self, partition: Option<usize>) -> DataFusionResult<Arc<Statistics>> {
         self.input.partition_statistics(partition)
     }
 
@@ -991,10 +996,6 @@ impl ExecutionPlan for FlatMatchQueryExec {
         "FlatMatchQueryExec"
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.unindexed_input]
     }
@@ -1078,13 +1079,16 @@ impl ExecutionPlan for FlatMatchQueryExec {
                         Some(scorer) => (*scorer).clone(),
                         None => {
                             let query_tokens = collect_query_tokens(&query.terms, &mut tokenizer);
-                            build_global_bm25_scorer(
+                            let scorer_start = std::time::Instant::now();
+                            let scorer = build_global_bm25_scorer(
                                 &indices,
                                 &query_tokens,
                                 &FtsSearchParams::new(),
                             )
                             .boxed()
-                            .await?
+                            .await?;
+                            metrics.record_scorer_build(scorer_start.elapsed());
+                            scorer
                         }
                     };
                     (tokenizer, Some(base_scorer))
@@ -1268,10 +1272,6 @@ impl ExecutionPlan for PhraseQueryExec {
         "PhraseQueryExec"
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         match &self.prefilter_source {
             PreFilterSource::None => vec![],
@@ -1395,11 +1395,16 @@ impl ExecutionPlan for PhraseQueryExec {
             let tokens = collect_query_tokens(&query.terms, &mut tokenizer);
             let base_scorer = match preset_base_scorer {
                 Some(scorer) => scorer,
-                None => Arc::new(
-                    build_global_bm25_scorer(&indices, &tokens, &params)
-                        .boxed()
-                        .await?,
-                ),
+                None => {
+                    let scorer_start = std::time::Instant::now();
+                    let scorer = Arc::new(
+                        build_global_bm25_scorer(&indices, &tokens, &params)
+                            .boxed()
+                            .await?,
+                    );
+                    metrics.record_scorer_build(scorer_start.elapsed());
+                    scorer
+                }
             };
 
             pre_filter.wait_for_ready().await?;
@@ -1519,10 +1524,6 @@ impl BoostQueryExec {
 impl ExecutionPlan for BoostQueryExec {
     fn name(&self) -> &str {
         "BoostQueryExec"
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -1787,10 +1788,6 @@ impl BooleanQueryExec {
 impl ExecutionPlan for BooleanQueryExec {
     fn name(&self) -> &str {
         "BooleanQueryExec"
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -2542,7 +2539,7 @@ mod tests {
             .unwrap()
             .expect("Should slot always returns Some");
         assert!(
-            plan.as_any().downcast_ref::<EmptyExec>().is_some(),
+            plan.downcast_ref::<EmptyExec>().is_some(),
             "expected EmptyExec for empty Should slot, got {plan:?}"
         );
     }
@@ -2570,12 +2567,10 @@ mod tests {
         .unwrap()
         .expect("Should slot always returns Some");
         let repartition = plan
-            .as_any()
             .downcast_ref::<RepartitionExec>()
             .expect("multi-child Should should be wrapped in RepartitionExec");
         let inner = repartition
             .input()
-            .as_any()
             .downcast_ref::<UnionExec>()
             .expect("RepartitionExec should wrap a UnionExec");
         assert_eq!(inner.children().len(), 2);
@@ -2614,7 +2609,7 @@ mod tests {
         // there are N-1 joins.
         let mut joins = 0usize;
         let mut current: Arc<dyn ExecutionPlan> = plan;
-        while let Some(join) = current.clone().as_any().downcast_ref::<HashJoinExec>() {
+        while let Some(join) = current.clone().downcast_ref::<HashJoinExec>() {
             joins += 1;
             current = join.children()[0].clone();
         }
@@ -2630,12 +2625,10 @@ mod tests {
         .unwrap()
         .expect("MustNot slot always returns Some");
         let repartition = plan
-            .as_any()
             .downcast_ref::<RepartitionExec>()
             .expect("multi-child MustNot should be wrapped in RepartitionExec");
         let inner = repartition
             .input()
-            .as_any()
             .downcast_ref::<UnionExec>()
             .expect("RepartitionExec should wrap a UnionExec");
         assert_eq!(inner.children().len(), 2);
