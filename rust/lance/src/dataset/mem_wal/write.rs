@@ -2283,12 +2283,65 @@ impl ShardWriter {
         Ok(())
     }
 
+    /// Send the close-time final WAL flush and await its completion.
+    ///
+    /// Sends directly on the flush channel rather than via
+    /// [`WalFlusher::trigger_flush`]: the latter silently returns `Ok` when the
+    /// flusher's `flush_tx` is unset, which would let close report success
+    /// without ever persisting the final WAL entry. A closed send channel must
+    /// surface as an error here so close never acknowledges durability it did
+    /// not achieve.
+    async fn flush_final_wal(
+        wal_flush_tx: &mpsc::UnboundedSender<TriggerWalFlush>,
+        source: WalFlushSource,
+        end_batch_position: usize,
+    ) -> Result<()> {
+        let done = WatchableOnceCell::new();
+        let mut reader = done.reader();
+        if wal_flush_tx
+            .send(TriggerWalFlush {
+                source,
+                end_batch_position,
+                done: Some(done),
+            })
+            .is_err()
+        {
+            return Err(Error::io("WAL flush channel closed during close"));
+        }
+
+        match reader.await_value().await {
+            Some(Ok(_)) => Ok(()),
+            Some(Err(failure)) => Err(failure.into_error()),
+            None => Err(Error::io(
+                "WAL flush handler exited before reporting durability during close",
+            )),
+        }
+    }
+
+    fn merge_close_stage(
+        close_result: Result<()>,
+        stage: &str,
+        stage_result: Result<()>,
+    ) -> Result<()> {
+        if let (Err(_), Err(stage_error)) = (&close_result, &stage_result) {
+            warn!("Close stage '{stage}' also failed: {stage_error}");
+        }
+        close_result.and(stage_result)
+    }
+
     /// Close the writer gracefully.
     ///
     /// Flushes pending data and shuts down background tasks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if pending WAL data cannot be persisted, an active or
+    /// frozen MemTable cannot be flushed, a flush handler exits before reporting
+    /// completion, or background tasks cannot be shut down.
     #[instrument(name = "sw_close", level = "info", skip_all, fields(shard_id = %self.config.shard_id, epoch = self.epoch))]
     pub async fn close(self) -> Result<()> {
         info!("Closing ShardWriter for shard {}", self.config.shard_id);
+        let mut close_result: Result<()> = Ok(());
 
         match &self.mode {
             WriterMode::MemTable {
@@ -2304,23 +2357,17 @@ impl ShardWriter {
                 drop(st);
 
                 if batch_count > 0 {
-                    let done = WatchableOnceCell::new();
-                    let reader = done.reader();
-                    if writer_state
-                        .wal_flush_tx
-                        .send(TriggerWalFlush {
-                            source: WalFlushSource::BatchStore {
-                                batch_store,
-                                indexes,
-                            },
-                            end_batch_position: batch_count,
-                            done: Some(done),
-                        })
-                        .is_ok()
-                    {
-                        let mut reader = reader;
-                        let _ = reader.await_value().await;
-                    }
+                    let stage_result = Self::flush_final_wal(
+                        &writer_state.wal_flush_tx,
+                        WalFlushSource::BatchStore {
+                            batch_store,
+                            indexes,
+                        },
+                        batch_count,
+                    )
+                    .await;
+                    close_result =
+                        Self::merge_close_stage(close_result, "final WAL flush", stage_result);
                 }
 
                 // Freeze the active memtable (if any rows) so it joins the
@@ -2336,22 +2383,37 @@ impl ShardWriter {
                 // Propagate any freeze error: at close time the caller
                 // has explicitly asked for full durability, so silently
                 // dropping a freeze failure would lose data without any
-                // signal. If freeze fails, surface the error rather than
-                // continuing on to drain only the pre-existing frozen
-                // memtables (whose flushes can still be waited on, but
-                // the caller now knows the close was incomplete).
+                // signal. If freeze fails, its error is recorded as the
+                // first causal failure, but close still drains any
+                // pre-existing frozen MemTable watchers so a successor
+                // failure is logged without replacing the first error.
                 let watchers: Vec<_> = {
                     let mut st = state.write().await;
                     if st.memtable.row_count() > 0 {
-                        writer_state.freeze_memtable(&mut st)?;
+                        let freeze_result = writer_state.freeze_memtable(&mut st).map(|_| ());
+                        close_result = Self::merge_close_stage(
+                            close_result,
+                            "active MemTable freeze",
+                            freeze_result,
+                        );
                     }
                     st.frozen_flush_watchers
                         .iter()
                         .map(|(_, w)| w.clone())
                         .collect()
                 };
-                for mut w in watchers {
-                    let _ = w.await_value().await;
+                for mut watcher in watchers {
+                    let stage_result = match watcher.await_value().await {
+                        Some(durability) => durability.into_result(),
+                        None => Err(Error::io(
+                            "MemTable flush handler exited before reporting completion during close",
+                        )),
+                    };
+                    close_result = Self::merge_close_stage(
+                        close_result,
+                        "frozen MemTable flush watcher",
+                        stage_result,
+                    );
                 }
             }
             WriterMode::WalOnly {
@@ -2364,30 +2426,32 @@ impl ShardWriter {
                 let pending = state.batch_count();
                 let end_position = state.next_batch_position();
                 if pending > 0 {
-                    let done = WatchableOnceCell::new();
-                    let reader = done.reader();
-                    if wal_flush_tx
-                        .send(TriggerWalFlush {
-                            source: WalFlushSource::WalOnly {
-                                state: state.clone(),
-                            },
-                            end_batch_position: end_position,
-                            done: Some(done),
-                        })
-                        .is_ok()
-                    {
-                        let mut reader = reader;
-                        let _ = reader.await_value().await;
-                    }
+                    let stage_result = Self::flush_final_wal(
+                        wal_flush_tx,
+                        WalFlushSource::WalOnly {
+                            state: state.clone(),
+                        },
+                        end_position,
+                    )
+                    .await;
+                    close_result =
+                        Self::merge_close_stage(close_result, "final WAL flush", stage_result);
                 }
             }
         }
 
         // Shutdown background tasks
-        self.task_executor.shutdown_all().await?;
+        let shutdown_result = self.task_executor.shutdown_all().await;
+        let close_result = Self::merge_close_stage(close_result, "task shutdown", shutdown_result);
 
-        info!("ShardWriter closed for shard {}", self.config.shard_id);
-        Ok(())
+        match &close_result {
+            Ok(()) => info!("ShardWriter closed for shard {}", self.config.shard_id),
+            Err(error) => warn!(
+                "ShardWriter close for shard {} failed: {error}",
+                self.config.shard_id
+            ),
+        }
+        close_result
     }
 }
 
@@ -3056,6 +3120,7 @@ mod tests {
     use arrow_array::{Int32Array, StringArray};
     use arrow_schema::{DataType, Field};
     use lance_core::FenceReason;
+    use rstest::rstest;
     use tempfile::TempDir;
 
     async fn create_local_store() -> (Arc<ObjectStore>, Path, String, TempDir) {
@@ -3063,6 +3128,26 @@ mod tests {
         let uri = format!("file://{}", temp_dir.path().display());
         let (store, path) = ObjectStore::from_uri(&uri).await.unwrap();
         (store, path, uri, temp_dir)
+    }
+
+    #[test]
+    fn test_merge_close_stage_preserves_first_error() {
+        let result = ShardWriter::merge_close_stage(
+            Err(Error::io("primary close error")),
+            "secondary close stage",
+            Err(Error::io("secondary close error")),
+        );
+
+        let error = result.expect_err("close must preserve the first error");
+        assert!(matches!(&error, Error::IO { .. }));
+        assert!(
+            error.to_string().contains("primary close error"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            !error.to_string().contains("secondary close error"),
+            "secondary error replaced the primary error: {error}"
+        );
     }
 
     /// Base schema with `id` marked as the unenforced primary key (delete needs
@@ -4307,6 +4392,56 @@ mod tests {
         );
 
         reopened.close().await.unwrap();
+    }
+
+    #[rstest]
+    #[case::memtable(true)]
+    #[case::wal_only(false)]
+    #[tokio::test]
+    async fn test_close_propagates_final_wal_persistence_failure(#[case] enable_memtable: bool) {
+        let (store, base_path, controls) = failing_memory_store().await;
+        let base_uri = "memory:///";
+        let schema = create_test_schema();
+        let config = ShardWriterConfig {
+            shard_id: Uuid::new_v4(),
+            shard_spec_id: 0,
+            durable_write: false,
+            enable_memtable,
+            sync_indexed_write: false,
+            max_wal_buffer_size: usize::MAX,
+            max_wal_flush_interval: None,
+            max_wal_persist_retries: 0,
+            max_memtable_size: usize::MAX,
+            max_unflushed_memtable_bytes: usize::MAX,
+            manifest_scan_batch_size: 2,
+            ..Default::default()
+        };
+        let writer = ShardWriter::open(store, base_path, base_uri, config, schema.clone(), vec![])
+            .await
+            .unwrap();
+        let task_executor = writer.task_executor.clone();
+
+        writer
+            .put(vec![create_test_batch(&schema, 0, 10)])
+            .await
+            .unwrap();
+        controls.fail_wal_puts(usize::MAX);
+
+        let error = writer
+            .close()
+            .await
+            .expect_err("close must propagate the final WAL persistence failure");
+        assert_eq!(error.fence_reason(), Some(FenceReason::PersistenceFailure));
+        assert!(
+            error
+                .to_string()
+                .contains("injected transient WAL put failure"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            task_executor.tasks.read().unwrap().is_empty(),
+            "close must join background tasks before returning an error"
+        );
     }
 
     /// Regression: the memtable flush should successfully fire many
@@ -5567,6 +5702,54 @@ mod tests {
         writer.close().await.unwrap();
     }
 
+    #[tokio::test]
+    async fn test_close_propagates_frozen_memtable_flush_failure() {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = schema_with_pk();
+        let shard_id = Uuid::new_v4();
+        let writer_a = ShardWriter::open(
+            store.clone(),
+            base_path.clone(),
+            base_uri.clone(),
+            memtable_config_with_pk(shard_id),
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+        writer_a
+            .put(vec![create_test_batch(&schema, 0, 10)])
+            .await
+            .unwrap();
+
+        let writer_b = ShardWriter::open(
+            store,
+            base_path,
+            base_uri,
+            memtable_config_with_pk(shard_id),
+            schema,
+            vec![],
+        )
+        .await
+        .unwrap();
+        assert!(writer_b.epoch() > writer_a.epoch());
+
+        let error = writer_a
+            .close()
+            .await
+            .expect_err("close must propagate the fenced MemTable flush");
+        assert!(
+            matches!(error, Error::IO { .. }),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.to_string().contains("Writer fenced"),
+            "unexpected error: {error}"
+        );
+
+        writer_b.close().await.unwrap();
+    }
+
     /// Regression: a transient flush failure must NOT reopen the
     /// concurrent-read-vs-flush hole. The sealed generation stays in the
     /// queryable set (rows intact) until a later flush or WAL replay.
@@ -5815,7 +5998,12 @@ mod shard_writer_tests {
 
         let vector_dim = 32;
         let schema = create_test_schema(vector_dim);
-        let uri = format!("memory://test_multi_segment_index_{}", Uuid::new_v4());
+        // The generation flusher reopens by URI, so this independent open must
+        // resolve to the same in-memory backend. The unique authority isolates the test.
+        let uri = format!(
+            "shared-memory://multi-segment-index-{}/",
+            Uuid::new_v4().simple()
+        );
 
         // Initial fragment + an IVF vector index covering it.
         let initial = create_test_batch(&schema, 0, 256, vector_dim);
@@ -6053,7 +6241,12 @@ mod shard_writer_tests {
 
         let vector_dim = 32;
         let schema = create_test_schema(vector_dim);
-        let uri = format!("memory://test_writer_hnsw_params_{}", Uuid::new_v4());
+        // The generation flusher reopens by URI, so this independent open must
+        // resolve to the same in-memory backend. The unique authority isolates the test.
+        let uri = format!(
+            "shared-memory://writer-hnsw-params-{}/",
+            Uuid::new_v4().simple()
+        );
 
         let initial = create_test_batch(&schema, 0, 256, vector_dim);
         let batches = RecordBatchIterator::new([Ok(initial)], schema.clone());
@@ -6361,7 +6554,12 @@ mod shard_writer_tests {
         let target_id = 1_000i64 + 37;
 
         let schema = create_test_schema(vector_dim);
-        let uri = format!("memory://test_shard_writer_hnsw_{}", Uuid::new_v4());
+        // The generation flusher reopens by URI, so this independent open must
+        // resolve to the same in-memory backend. The unique authority isolates the test.
+        let uri = format!(
+            "shared-memory://shard-writer-hnsw-{}/",
+            Uuid::new_v4().simple()
+        );
 
         let initial_batch = create_test_batch(&schema, 0, 256, vector_dim);
         let batches = RecordBatchIterator::new([Ok(initial_batch)], schema.clone());
