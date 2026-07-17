@@ -1620,7 +1620,7 @@ impl FileFragment {
     }
 
     /// Get the file metadata for this fragment, using the cache if available.
-    async fn get_file_metadata(
+    pub async fn get_file_metadata(
         &self,
         file_scheduler: &FileScheduler,
     ) -> Result<Arc<CachedFileMetadata>> {
@@ -1637,7 +1637,7 @@ impl FileFragment {
         Ok(file_metadata)
     }
 
-    async fn get_file_metadata_index(
+    pub async fn get_file_metadata_index(
         &self,
         file_scheduler: &FileScheduler,
         known_schema: Option<(Arc<Schema>, u64)>,
