@@ -19,9 +19,10 @@ use std::sync::Arc;
 
 use arrow::array::AsArray;
 use arrow::datatypes::{UInt32Type, UInt64Type};
-use arrow_array::{UInt32Array, UInt64Array};
+use arrow_array::{Array, UInt32Array, UInt64Array};
 use lance_core::ROW_ID;
 use lance_core::Result;
+use lance_core::deepsize::DeepSizeOf;
 use tokio::sync::OnceCell;
 
 use crate::scalar::RowIdRemapper;
@@ -102,7 +103,7 @@ impl std::fmt::Debug for LazyDocSet {
     }
 }
 
-impl lance_core::deepsize::DeepSizeOf for LazyDocSet {
+impl DeepSizeOf for LazyDocSet {
     fn deep_size_of_children(&self, ctx: &mut lance_core::deepsize::Context) -> usize {
         match self {
             Self::Loaded(l) => l.docs.deep_size_of_children(ctx),
@@ -117,11 +118,17 @@ impl lance_core::deepsize::DeepSizeOf for LazyDocSet {
                         .unwrap_or(0)
                     + d.num_tokens_col
                         .get()
-                        .map(|arr| arr.len() * std::mem::size_of::<u32>())
+                        .map(|arr| {
+                            let arr: &dyn Array = arr.as_ref();
+                            arr.deep_size_of_children(ctx)
+                        })
                         .unwrap_or(0)
                     + d.row_ids_col
                         .get()
-                        .map(|arr| arr.len() * std::mem::size_of::<u64>())
+                        .map(|arr| {
+                            let arr: &dyn Array = arr.as_ref();
+                            arr.deep_size_of_children(ctx)
+                        })
                         .unwrap_or(0)
             }
         }
@@ -214,9 +221,8 @@ impl LazyDocSet {
     /// Materialize a DocSet that carries num_tokens but no row_ids.
     /// Used by the deferred-row_id scoring path; the per-partition
     /// caller resolves surviving doc_ids -> row_ids post-wand via
-    /// [`Self::resolve_row_ids`]. The result is NOT cached on the
-    /// LazyDocSet -- a later `ensure_loaded` must still produce a
-    /// full DocSet.
+    /// [`Self::resolve_row_ids`]. The tokens-only result is cached separately;
+    /// a later `ensure_loaded` must still produce a full DocSet.
     pub async fn ensure_num_tokens_loaded(&self) -> Result<Arc<DocSet>> {
         match self {
             Self::Loaded(l) => Ok(l.docs.clone()),
@@ -260,18 +266,17 @@ impl DeferredDocSet {
     }
 
     async fn total_tokens_num(&self) -> Result<u64> {
-        if let Some(v) = self.total_tokens.get() {
-            return Ok(*v);
-        }
-        if let Some(full) = self.full.get() {
-            let v = full.total_tokens_num();
-            let _ = self.total_tokens.set(v);
-            return Ok(v);
-        }
-        let col = self.num_tokens_column().await?;
-        let sum: u64 = col.values().iter().map(|&n| n as u64).sum();
-        let _ = self.total_tokens.set(sum);
-        Ok(sum)
+        let total_tokens = self
+            .total_tokens
+            .get_or_try_init(|| async {
+                if let Some(full) = self.full.get() {
+                    return Result::Ok(full.total_tokens_num());
+                }
+                let col = self.num_tokens_column().await?;
+                Result::Ok(col.values().iter().map(|&n| n as u64).sum())
+            })
+            .await?;
+        Ok(*total_tokens)
     }
 
     async fn num_tokens_column(&self) -> Result<Arc<UInt32Array>> {
@@ -328,7 +333,9 @@ impl DeferredDocSet {
             })
             .await?
             .clone();
-        let _ = self.total_tokens.set(docs.total_tokens_num());
+        self.total_tokens
+            .get_or_init(|| async { docs.total_tokens_num() })
+            .await;
         Ok(docs)
     }
 
@@ -336,17 +343,17 @@ impl DeferredDocSet {
         if let Some(full) = self.full.get() {
             return Ok(full.clone());
         }
+        let total_tokens = self.total_tokens_num().await?;
         let docs = self
             .tokens_only
             .get_or_try_init(|| async {
                 let num_tokens = self.num_tokens_column().await?;
-                let mut docs = DocSet::from_num_tokens_only(num_tokens.as_ref());
+                let mut docs = DocSet::from_cached_num_tokens(num_tokens.as_ref(), total_tokens);
                 docs.set_quantized_scoring(self.quantized_scoring);
                 Result::Ok(Arc::new(docs))
             })
             .await?
             .clone();
-        let _ = self.total_tokens.set(docs.total_tokens_num());
         Ok(docs)
     }
 
