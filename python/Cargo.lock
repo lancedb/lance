@@ -4110,6 +4110,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "lance-cache-abi"
+version = "9.1.0-beta.2"
+
+[[package]]
 name = "lance-core"
 version = "9.1.0-beta.2"
 dependencies = [
@@ -4125,6 +4129,7 @@ dependencies = [
  "futures",
  "itertools 0.14.0",
  "lance-arrow",
+ "lance-cache-abi",
  "lance-derive",
  "libc",
  "libm",
