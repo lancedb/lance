@@ -17,6 +17,8 @@ use super::write::merge_insert::inserted_rows::KeyExistenceFilter;
 use crate::dataset::transaction::UpdateMode::{RewriteColumns, RewriteRows};
 use crate::index::mem_wal::update_mem_wal_index_merged_generations;
 use crate::utils::temporal::timestamp_to_nanos;
+#[cfg(feature = "unstable-action-transactions")]
+use lance_core::datatypes::Field;
 use lance_core::datatypes::{
     LANCE_UNENFORCED_CLUSTERING_KEY_POSITION, LANCE_UNENFORCED_PRIMARY_KEY,
     LANCE_UNENFORCED_PRIMARY_KEY_POSITION,
@@ -29,6 +31,11 @@ use lance_index::{frag_reuse::FRAG_REUSE_INDEX_NAME, is_system_index};
 use lance_io::object_store::ObjectStore;
 use lance_table::feature_flags::{FLAG_STABLE_ROW_IDS, apply_feature_flags};
 use lance_table::rowids::read_row_ids;
+#[cfg(feature = "unstable-action-transactions")]
+use lance_table::transaction::{
+    Action, AddBases, AddFields, BaseRef, ChangeSchema, ColumnReplacement, NewDataFile,
+    RefreshRowVersionMetadata, ReplaceFragmentColumns, UserOperation,
+};
 use lance_table::{
     format::{
         BasePath, DataFile, DataStorageFormat, Fragment, IndexFile, IndexMetadata, Manifest,
@@ -453,6 +460,13 @@ pub enum Operation {
         /// The new base paths to add to the manifest.
         new_bases: Vec<BasePath>,
     },
+
+    /// EXPERIMENTAL: an action-based transaction. The ordered action list is
+    /// applied to the manifest atomically, enabling compound commits (e.g.
+    /// updating base paths, replacing fragment columns, and merging schema
+    /// changes in one commit). Gated behind `unstable-action-transactions`.
+    #[cfg(feature = "unstable-action-transactions")]
+    UserOperation(UserOperation),
 }
 
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
@@ -502,6 +516,8 @@ impl std::fmt::Display for Operation {
             Self::Clone { .. } => write!(f, "Clone"),
             Self::UpdateMemWalState { .. } => write!(f, "UpdateMemWalState"),
             Self::UpdateBases { .. } => write!(f, "UpdateBases"),
+            #[cfg(feature = "unstable-action-transactions")]
+            Self::UserOperation(_) => write!(f, "UserOperation"),
         }
     }
 }
@@ -1345,6 +1361,14 @@ impl PartialEq for Operation {
             (Self::Clone { .. }, Self::UpdateBases { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
+            // Two action-based operations compare by content; any pairing with a
+            // non-action operation is unequal (different discriminants). Gated so
+            // the match stays exhaustive without a catch-all when the feature is
+            // off.
+            #[cfg(feature = "unstable-action-transactions")]
+            (Self::UserOperation(a), Self::UserOperation(b)) => a == b,
+            #[cfg(feature = "unstable-action-transactions")]
+            _ => std::mem::discriminant(self) == std::mem::discriminant(other),
         }
     }
 }
@@ -1524,8 +1548,20 @@ impl Operation {
             Self::UpdateMemWalState { .. } => "UpdateMemWalState",
             Self::Clone { .. } => "Clone",
             Self::UpdateBases { .. } => "UpdateBases",
+            #[cfg(feature = "unstable-action-transactions")]
+            Self::UserOperation(_) => "UserOperation",
         }
     }
+}
+
+/// The id of `field` and, recursively, all of its nested children.
+#[cfg(feature = "unstable-action-transactions")]
+fn collect_field_ids(field: &Field) -> Vec<i32> {
+    let mut ids = vec![field.id];
+    for child in &field.children {
+        ids.extend(collect_field_ids(child));
+    }
+    ids
 }
 
 /// Helper function to apply UpdateMap changes to a HashMap<String, String>
@@ -1813,6 +1849,10 @@ impl Transaction {
             Operation::Overwrite { ref schema, .. } => schema.clone(),
             Operation::Merge { ref schema, .. } => schema.clone(),
             Operation::Project { ref schema, .. } => schema.clone(),
+            #[cfg(feature = "unstable-action-transactions")]
+            Operation::UserOperation(ref user_op) => {
+                Self::user_operation_schema(user_op, current_manifest)?
+            }
             _ => {
                 if let Some(current_manifest) = current_manifest {
                     current_manifest.schema.clone()
@@ -1860,6 +1900,20 @@ impl Transaction {
                         self.operation.name()
                     ))
                 });
+
+        // Resolve any `AddBases` actions up front: base ids are minted from the
+        // same counter the legacy `UpdateBases` operation uses, and later actions
+        // in the same operation (`ReplaceFragmentColumns`/`AddFields`) may
+        // reference a just-minted base via `BaseRef::Local` before it exists in
+        // the manifest. The resolved bases are written into `manifest.base_paths`
+        // once the manifest exists, alongside the legacy `UpdateBases` handling.
+        #[cfg(feature = "unstable-action-transactions")]
+        let (user_operation_bases, user_operation_local_base_ids) =
+            if let Operation::UserOperation(user_op) = &self.operation {
+                Self::resolve_user_operation_bases(user_op, current_manifest)?
+            } else {
+                (Vec::new(), HashMap::new())
+            };
 
         match &self.operation {
             Operation::Clone { .. } => {
@@ -2317,6 +2371,18 @@ impl Transaction {
                 // Base paths are handled in the manifest creation section below
                 final_fragments.extend(maybe_existing_fragments?.clone());
             }
+            #[cfg(feature = "unstable-action-transactions")]
+            Operation::UserOperation(user_op) => {
+                final_fragments.extend(maybe_existing_fragments?.clone());
+                let new_version = current_manifest.map(|m| m.version + 1).unwrap_or(1);
+                Self::apply_user_operation(
+                    user_op,
+                    &user_operation_local_base_ids,
+                    new_version,
+                    &mut final_fragments,
+                    &mut final_indices,
+                )?;
+            }
         };
 
         // If a fragment was reserved then it may not belong at the end of the fragments list.
@@ -2360,6 +2426,16 @@ impl Transaction {
         };
 
         manifest.tag.clone_from(&self.tag);
+
+        // Declaring the experimental feature makes `apply_feature_flags` set
+        // FLAG_EXPERIMENTAL, so libraries without the feature refuse to commit.
+        #[cfg(feature = "unstable-action-transactions")]
+        if matches!(self.operation, Operation::UserOperation(_)) {
+            let feature = lance_table::transaction::FEATURE_NAME.to_string();
+            if !manifest.experimental_writer_features.contains(&feature) {
+                manifest.experimental_writer_features.push(feature);
+            }
+        }
 
         if config.auto_set_feature_flags {
             // Internal operations (e.g. CreateIndex) use ManifestWriteConfig::default()
@@ -2548,6 +2624,16 @@ impl Transaction {
             }
         }
 
+        // Write the bases resolved by `AddBases` actions (see
+        // `resolve_user_operation_bases` above `final_fragments`/`final_indices`
+        // handling): ids were already assigned there so `ReplaceFragmentColumns`/
+        // `AddFields` in the same operation could resolve `BaseRef::Local`
+        // against them.
+        #[cfg(feature = "unstable-action-transactions")]
+        for base in &user_operation_bases {
+            manifest.base_paths.insert(base.id, base.clone());
+        }
+
         if let Operation::ReserveFragments { num_fragments } = self.operation {
             manifest.max_fragment_id = Some(manifest.max_fragment_id.unwrap_or(0) + num_fragments);
         }
@@ -2559,6 +2645,589 @@ impl Transaction {
         }
 
         Ok((manifest, final_indices))
+    }
+
+    /// Compute the schema effect of an action-based [`UserOperation`]: an
+    /// [`Action::AddFields`] appends to the current schema, an
+    /// [`Action::ChangeSchema`] replaces it wholesale. Mirrors the pattern
+    /// `Operation::Merge`/`Operation::Project` use to supply their own final
+    /// schema up front, since `build_manifest` needs it before it builds the
+    /// new manifest.
+    #[cfg(feature = "unstable-action-transactions")]
+    fn user_operation_schema(
+        user_op: &UserOperation,
+        current_manifest: Option<&Manifest>,
+    ) -> Result<Schema> {
+        let mut schema = current_manifest
+            .ok_or_else(|| {
+                Error::internal("Cannot create a new dataset without a schema".to_string())
+            })?
+            .schema
+            .clone();
+
+        for action in user_op.actions.iter().flat_map(|ua| &ua.actions) {
+            match action {
+                Action::AddFields(add) => schema.fields.extend(add.new_fields.iter().cloned()),
+                Action::ChangeSchema(change) => schema = change.schema.clone(),
+                _ => {}
+            }
+        }
+
+        Ok(schema)
+    }
+
+    /// Resolve the [`Action::AddBases`] actions in a [`UserOperation`] up
+    /// front, minting ids from the same counter the legacy `UpdateBases`
+    /// operation uses (`base_paths.keys().max() + 1`, or `1` if none).
+    ///
+    /// Returns the resolved bases (to be written into `manifest.base_paths`
+    /// once the manifest exists) and a map from `BaseRef::Local` index (the
+    /// n-th unassigned entry across all `AddBases` actions in the operation,
+    /// 0-indexed) to its assigned id, so `ReplaceFragmentColumns`/`AddFields`
+    /// files later in the same operation can resolve a same-transaction
+    /// `BaseRef::Local`.
+    #[cfg(feature = "unstable-action-transactions")]
+    fn resolve_user_operation_bases(
+        user_op: &UserOperation,
+        current_manifest: Option<&Manifest>,
+    ) -> Result<(Vec<BasePath>, HashMap<u32, u32>)> {
+        let mut base_paths = current_manifest
+            .map(|m| m.base_paths.clone())
+            .unwrap_or_default();
+        let mut resolved_bases = Vec::new();
+        let mut local_to_base_id = HashMap::new();
+        let mut next_local_idx: u32 = 0;
+
+        for action in user_op.actions.iter().flat_map(|ua| &ua.actions) {
+            let Action::AddBases(add) = action else {
+                continue;
+            };
+            for base in &add.bases {
+                if let Some(existing) = base_paths
+                    .values()
+                    .find(|bp| bp.name == base.name || bp.path == base.path)
+                {
+                    return Err(Error::invalid_input(format!(
+                        "Conflict detected: Base path with name '{:?}' or path '{}' already exists. Existing: name='{:?}', path='{}'",
+                        base.name, base.path, existing.name, existing.path
+                    )));
+                }
+
+                let mut base_to_add = base.clone();
+                let is_unassigned = base_to_add.id == 0;
+                if is_unassigned {
+                    base_to_add.id = base_paths.keys().max().map(|&id| id + 1).unwrap_or(1);
+                }
+                base_paths.insert(base_to_add.id, base_to_add.clone());
+                if is_unassigned {
+                    local_to_base_id.insert(next_local_idx, base_to_add.id);
+                    next_local_idx += 1;
+                }
+                resolved_bases.push(base_to_add);
+            }
+        }
+
+        Ok((resolved_bases, local_to_base_id))
+    }
+
+    /// Resolve a [`BaseRef`] to the base id it should stamp onto a
+    /// [`DataFile::base_id`], using the map produced by
+    /// [`Self::resolve_user_operation_bases`].
+    #[cfg(feature = "unstable-action-transactions")]
+    fn resolve_base_ref(
+        base_ref: Option<&BaseRef>,
+        local_to_base_id: &HashMap<u32, u32>,
+    ) -> Result<Option<u32>> {
+        match base_ref {
+            None => Ok(None),
+            Some(BaseRef::Committed(id)) => Ok(Some(*id)),
+            Some(BaseRef::Local(idx)) => {
+                local_to_base_id.get(idx).copied().map(Some).ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "BaseRef::Local({}) does not match any unassigned AddBases entry in \
+                         this operation",
+                        idx
+                    ))
+                })
+            }
+        }
+    }
+
+    /// Apply an action-based [`UserOperation`]'s fragment- and index-level
+    /// effects (`ReplaceFragmentColumns`, `AddFields`, `RefreshRowVersionMetadata`)
+    /// to the in-progress fragment and index lists. `AddBases` and
+    /// `ChangeSchema` are handled separately (see
+    /// [`Self::resolve_user_operation_bases`] and [`Self::user_operation_schema`]
+    /// respectively), since they must run before this step. Re-run per commit
+    /// attempt, so ids and base references are recomputed against the latest
+    /// manifest.
+    #[cfg(feature = "unstable-action-transactions")]
+    fn apply_user_operation(
+        user_op: &UserOperation,
+        local_to_base_id: &HashMap<u32, u32>,
+        new_version: u64,
+        final_fragments: &mut [Fragment],
+        final_indices: &mut [IndexMetadata],
+    ) -> Result<()> {
+        for action in user_op.actions.iter().flat_map(|ua| &ua.actions) {
+            match action {
+                // Resolved up front; nothing left to do here.
+                Action::AddBases(_) => {}
+                Action::ChangeSchema(change) => {
+                    // Drop data files that back no field still present in the
+                    // new schema, mirroring `Operation::Project`'s pruning.
+                    let live_ids: HashSet<i32> =
+                        change.schema.fields_pre_order().map(|f| f.id).collect();
+                    for fragment in final_fragments.iter_mut() {
+                        fragment
+                            .files
+                            .retain(|f| f.fields.iter().any(|id| live_ids.contains(id)));
+                    }
+                }
+                Action::ReplaceFragmentColumns(replace) => {
+                    Self::apply_replace_fragment_columns(
+                        replace,
+                        local_to_base_id,
+                        final_fragments,
+                        final_indices,
+                    )?;
+                }
+                Action::AddFields(add) => {
+                    Self::apply_add_fields(add, local_to_base_id, final_fragments)?;
+                }
+                Action::RefreshRowVersionMetadata(refresh) => {
+                    Self::apply_refresh_row_version_metadata(refresh, final_fragments, new_version);
+                }
+                // `Action` is #[non_exhaustive]; a variant this build predates
+                // (or the `AddFragments` proof-of-shape, not yet wired to this
+                // slice's apply path) cannot be applied.
+                _ => {
+                    return Err(Error::not_supported_source(
+                        "unsupported experimental transaction action".into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply a [`ReplaceFragmentColumns`] action: swap (or, for
+    /// [`ColumnReplacement::Tombstone`], wholesale-replace) the target
+    /// fragment's data files, then invalidate covering index entries for the
+    /// replaced fields on that fragment.
+    #[cfg(feature = "unstable-action-transactions")]
+    fn apply_replace_fragment_columns(
+        replace: &ReplaceFragmentColumns,
+        local_to_base_id: &HashMap<u32, u32>,
+        final_fragments: &mut [Fragment],
+        final_indices: &mut [IndexMetadata],
+    ) -> Result<()> {
+        if replace.updated_row_offsets.is_some() {
+            return Err(Error::not_supported_source(
+                "ReplaceFragmentColumns.updated_row_offsets is reserved for future use and is \
+                 not yet supported"
+                    .into(),
+            ));
+        }
+
+        let mut new_files = Vec::with_capacity(replace.new_data_files.len());
+        for new_data_file in &replace.new_data_files {
+            let mut file = new_data_file.file.clone();
+            file.base_id = Self::resolve_base_ref(new_data_file.base.as_ref(), local_to_base_id)?;
+            new_files.push(file);
+        }
+
+        let fragment = final_fragments
+            .iter_mut()
+            .find(|f| f.id == replace.fragment_id)
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "ReplaceFragmentColumns targets fragment id {} which is not present in the \
+                     manifest",
+                    replace.fragment_id
+                ))
+            })?;
+
+        match replace.replacement {
+            ColumnReplacement::InPlace => {
+                for new_file in &new_files {
+                    // Recomputed per file: an earlier file in this same action may
+                    // have just been pushed as a new (all-NULL-backfill) column,
+                    // which should count as "covered" for a later file.
+                    let covered: HashSet<i32> = fragment
+                        .files
+                        .iter()
+                        .flat_map(|f| f.fields.iter().copied())
+                        .collect();
+                    let mut swapped = false;
+                    for file in fragment.files.iter_mut() {
+                        if file.fields == new_file.fields
+                            && file.file_major_version == new_file.file_major_version
+                            && file.file_minor_version == new_file.file_minor_version
+                        {
+                            file.path = new_file.path.clone();
+                            file.file_size_bytes = new_file.file_size_bytes.clone();
+                            file.base_id = new_file.base_id;
+                            swapped = true;
+                        }
+                    }
+                    if !swapped {
+                        if new_file.fields.iter().all(|id| !covered.contains(id)) {
+                            fragment.files.push(new_file.clone());
+                        } else {
+                            return Err(Error::invalid_input(format!(
+                                "Expected to modify fragment {} but no changes were made. The \
+                                 new data file does not align with any existing data file. \
+                                 Check that the new data file's field ids and file format \
+                                 version match an existing file.",
+                                replace.fragment_id
+                            )));
+                        }
+                    }
+                }
+            }
+            ColumnReplacement::Tombstone => {
+                if new_files.is_empty() {
+                    return Err(Error::invalid_input(format!(
+                        "ReplaceFragmentColumns tombstone replacement for fragment {} carries \
+                         an empty data file list",
+                        replace.fragment_id
+                    )));
+                }
+                fragment.files = new_files;
+            }
+        }
+
+        Self::invalidate_index_coverage(final_indices, &[replace.fragment_id], &replace.field_ids);
+
+        Ok(())
+    }
+
+    /// Apply an [`AddFields`] action's fragment-level effect: append the new
+    /// data files backing the new fields onto their target fragments. Schema
+    /// mutation is handled separately by [`Self::user_operation_schema`].
+    #[cfg(feature = "unstable-action-transactions")]
+    fn apply_add_fields(
+        add: &AddFields,
+        local_to_base_id: &HashMap<u32, u32>,
+        final_fragments: &mut [Fragment],
+    ) -> Result<()> {
+        for (fragment_id, new_data_files) in &add.fragment_files {
+            let fragment = final_fragments
+                .iter_mut()
+                .find(|f| f.id == *fragment_id)
+                .ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "AddFields targets fragment id {} which is not present in the manifest",
+                        fragment_id
+                    ))
+                })?;
+            for new_data_file in new_data_files {
+                let mut file = new_data_file.file.clone();
+                file.base_id =
+                    Self::resolve_base_ref(new_data_file.base.as_ref(), local_to_base_id)?;
+                fragment.files.push(file);
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply a [`RefreshRowVersionMetadata`] action: bump `last_updated_at`
+    /// for each listed fragment, mirroring the implicit refresh the legacy
+    /// `Merge` operation performs on stable-row-id datasets when a fragment's
+    /// columns are merged in place. `created_at` is untouched since these are
+    /// pre-existing fragments, not new ones. A listed fragment id absent from
+    /// the manifest is silently skipped.
+    #[cfg(feature = "unstable-action-transactions")]
+    fn apply_refresh_row_version_metadata(
+        refresh: &RefreshRowVersionMetadata,
+        final_fragments: &mut [Fragment],
+        new_version: u64,
+    ) {
+        for fragment_id in &refresh.fragment_ids {
+            if let Some(fragment) = final_fragments.iter_mut().find(|f| f.id == *fragment_id) {
+                fragment.last_updated_at_version_meta = build_version_meta(fragment, new_version);
+            }
+        }
+    }
+
+    /// Drop `fragment_ids` from the `fragment_bitmap` of every index covering
+    /// any of `field_ids`, since their data for those fragments has changed.
+    #[cfg(feature = "unstable-action-transactions")]
+    fn invalidate_index_coverage(
+        indices: &mut [IndexMetadata],
+        fragment_ids: &[u64],
+        field_ids: &[i32],
+    ) {
+        let fields: HashSet<i32> = field_ids.iter().copied().collect();
+        for index in indices.iter_mut() {
+            if index.fields.iter().any(|id| fields.contains(id))
+                && let Some(bitmap) = index.fragment_bitmap.as_mut()
+            {
+                for fragment_id in fragment_ids {
+                    bitmap.remove(*fragment_id as u32);
+                }
+            }
+        }
+    }
+
+    /// Translate a legacy [`Operation::UpdateBases`] into its action-based
+    /// equivalent: a single [`Action::AddBases`].
+    #[cfg(feature = "unstable-action-transactions")]
+    pub fn actions_from_update_bases(new_bases: &[BasePath]) -> Vec<Action> {
+        vec![Action::AddBases(AddBases {
+            bases: new_bases.to_vec(),
+        })]
+    }
+
+    /// Translate a legacy [`Operation::DataReplacement`] into its action-based
+    /// equivalent: one [`Action::ReplaceFragmentColumns`] per
+    /// [`DataReplacementGroup`], each an in-place, whole-file replacement (the
+    /// only shape this operation produces).
+    #[cfg(feature = "unstable-action-transactions")]
+    pub fn actions_from_data_replacement(replacements: &[DataReplacementGroup]) -> Vec<Action> {
+        replacements
+            .iter()
+            .map(|group| {
+                let mut file = group.1.clone();
+                let base = file.base_id.take().map(BaseRef::Committed);
+                Action::ReplaceFragmentColumns(ReplaceFragmentColumns {
+                    fragment_id: group.0,
+                    field_ids: file.fields.to_vec(),
+                    new_data_files: vec![NewDataFile { base, file }],
+                    replacement: ColumnReplacement::InPlace,
+                    updated_row_offsets: None,
+                })
+            })
+            .collect()
+    }
+
+    /// Translate a legacy [`Operation::Merge`] into its action-based
+    /// equivalent, diffing `fragments`/`schema` against `prior_manifest` to
+    /// recover the delta: a pure column-add ([`Action::AddFields`], +
+    /// [`Action::RefreshRowVersionMetadata`] on stable-row-id datasets), or a
+    /// recast ([`Action::AddFields`] landing the new files + a wholesale
+    /// [`Action::ChangeSchema`] to fix up field identity/types). Errors if the
+    /// merge doesn't decompose into either shape.
+    #[cfg(feature = "unstable-action-transactions")]
+    pub fn actions_from_merge(
+        fragments: &[Fragment],
+        schema: &Schema,
+        prior_manifest: &Manifest,
+    ) -> Result<Vec<Action>> {
+        if let Some(actions) = Self::merge_pure_column_add(fragments, schema, prior_manifest) {
+            return Ok(actions);
+        }
+        if let Some(actions) = Self::merge_recast_columns(fragments, schema, prior_manifest) {
+            return Ok(actions);
+        }
+        Err(Error::not_supported_source(
+            "Merge operation does not decompose into a supported action shape (pure column \
+             add or recast); composite translation is not supported for this Merge"
+                .into(),
+        ))
+    }
+
+    /// Pure column-add shape: `schema` only appends new top-level fields after
+    /// `prior_manifest.schema`, and every fragment's file list only appends
+    /// new trailing files backing those new fields -- everything else about
+    /// each fragment, and the fragment set itself, is unchanged. Returns
+    /// `None` if the merge doesn't fit this shape.
+    #[cfg(feature = "unstable-action-transactions")]
+    fn merge_pure_column_add(
+        fragments: &[Fragment],
+        schema: &Schema,
+        prior_manifest: &Manifest,
+    ) -> Option<Vec<Action>> {
+        let prior_schema = &prior_manifest.schema;
+        if schema.fields.len() <= prior_schema.fields.len()
+            || schema.fields[..prior_schema.fields.len()] != prior_schema.fields[..]
+            || schema.metadata != prior_schema.metadata
+            || fragments.len() != prior_manifest.fragments.len()
+        {
+            return None;
+        }
+
+        let new_fields = schema.fields[prior_schema.fields.len()..].to_vec();
+        let new_field_ids: HashSet<i32> = new_fields.iter().flat_map(collect_field_ids).collect();
+
+        let mut fragment_files = Vec::new();
+        let mut refreshed_fragment_ids = Vec::new();
+        for fragment in fragments {
+            let prior = prior_manifest
+                .fragments
+                .iter()
+                .find(|f| f.id == fragment.id)?;
+            if fragment.files.len() < prior.files.len()
+                || fragment.files[..prior.files.len()] != prior.files[..]
+            {
+                return None;
+            }
+            let new_files = &fragment.files[prior.files.len()..];
+            if !new_files
+                .iter()
+                .all(|f| f.fields.iter().all(|id| new_field_ids.contains(id)))
+            {
+                return None;
+            }
+            let rest_matches = Fragment {
+                files: prior.files.clone(),
+                ..fragment.clone()
+            } == *prior;
+            if !rest_matches {
+                return None;
+            }
+            if !new_files.is_empty() {
+                fragment_files.push((
+                    fragment.id,
+                    new_files
+                        .iter()
+                        .cloned()
+                        .map(|mut file| {
+                            let base = file.base_id.take().map(BaseRef::Committed);
+                            NewDataFile { base, file }
+                        })
+                        .collect(),
+                ));
+                refreshed_fragment_ids.push(fragment.id);
+            }
+        }
+
+        let mut actions = vec![Action::AddFields(AddFields {
+            new_fields,
+            fragment_files,
+        })];
+        if prior_manifest.uses_stable_row_ids() && !refreshed_fragment_ids.is_empty() {
+            actions.push(Action::RefreshRowVersionMetadata(
+                RefreshRowVersionMetadata {
+                    fragment_ids: refreshed_fragment_ids,
+                },
+            ));
+        }
+        Some(actions)
+    }
+
+    /// Recast (column type/encoding change, i.e. `alter_columns`) shape: every
+    /// fragment's files split cleanly into files kept verbatim from
+    /// `prior_manifest` and new files whose fields are all newly-added ids;
+    /// the fragment set is unchanged. Returns `None` if the merge doesn't fit
+    /// this shape (including the pure-narrowing case, which has no new field
+    /// ids and belongs to `Operation::Project` instead).
+    #[cfg(feature = "unstable-action-transactions")]
+    fn merge_recast_columns(
+        fragments: &[Fragment],
+        schema: &Schema,
+        prior_manifest: &Manifest,
+    ) -> Option<Vec<Action>> {
+        let prior_schema = &prior_manifest.schema;
+        if fragments.len() != prior_manifest.fragments.len() {
+            return None;
+        }
+
+        let prior_ids: HashSet<i32> = prior_schema.fields_pre_order().map(|f| f.id).collect();
+        let added_ids: HashSet<i32> = schema
+            .fields_pre_order()
+            .map(|f| f.id)
+            .filter(|id| !prior_ids.contains(id))
+            .collect();
+        if added_ids.is_empty() {
+            return None;
+        }
+
+        let mut fragment_files = Vec::new();
+        let mut new_field_ids_used: HashSet<i32> = HashSet::new();
+        let mut refreshed_fragment_ids = Vec::new();
+        for fragment in fragments {
+            let prior = prior_manifest
+                .fragments
+                .iter()
+                .find(|f| f.id == fragment.id)?;
+
+            let mut kept = Vec::new();
+            let mut new_files = Vec::new();
+            for file in &fragment.files {
+                if prior.files.contains(file) {
+                    kept.push(file.clone());
+                } else if file.fields.iter().all(|id| added_ids.contains(id)) {
+                    new_field_ids_used.extend(file.fields.iter().copied());
+                    new_files.push(file.clone());
+                } else {
+                    return None;
+                }
+            }
+            // `kept` need not be *all* of `prior.files`: the file backing the
+            // recast field is dropped (superseded by a `new_files` entry with
+            // a new field id). It must, however, preserve prior's relative
+            // order among the files that do survive.
+            let prior_filtered_to_kept: Vec<DataFile> = prior
+                .files
+                .iter()
+                .filter(|f| kept.contains(f))
+                .cloned()
+                .collect();
+            if prior_filtered_to_kept != kept {
+                return None;
+            }
+            let merged_order: Vec<DataFile> =
+                kept.iter().chain(new_files.iter()).cloned().collect();
+            if merged_order != fragment.files {
+                return None;
+            }
+            let rest_matches = Fragment {
+                files: prior.files.clone(),
+                ..fragment.clone()
+            } == *prior;
+            if !rest_matches {
+                return None;
+            }
+
+            if !new_files.is_empty() {
+                fragment_files.push((
+                    fragment.id,
+                    new_files
+                        .into_iter()
+                        .map(|mut file| {
+                            let base = file.base_id.take().map(BaseRef::Committed);
+                            NewDataFile { base, file }
+                        })
+                        .collect(),
+                ));
+            }
+            if fragment.files.len() != prior.files.len() {
+                refreshed_fragment_ids.push(fragment.id);
+            }
+        }
+
+        let new_fields: Vec<Field> = {
+            let mut ids: Vec<i32> = new_field_ids_used.into_iter().collect();
+            ids.sort_unstable();
+            ids.into_iter()
+                .filter_map(|id| schema.field_by_id(id))
+                .map(|f| {
+                    let mut f = f.clone();
+                    f.children.clear();
+                    f
+                })
+                .collect()
+        };
+
+        let mut actions = vec![
+            Action::AddFields(AddFields {
+                new_fields,
+                fragment_files,
+            }),
+            Action::ChangeSchema(ChangeSchema {
+                schema: schema.clone(),
+            }),
+        ];
+        if prior_manifest.uses_stable_row_ids() && !refreshed_fragment_ids.is_empty() {
+            actions.push(Action::RefreshRowVersionMetadata(
+                RefreshRowVersionMetadata {
+                    fragment_ids: refreshed_fragment_ids,
+                },
+            ));
+        }
+        Some(actions)
     }
 
     fn register_pure_rewrite_rows_update_frags_in_indices(
@@ -3348,6 +4017,29 @@ impl TryFrom<pb::Transaction> for Transaction {
             })) => Operation::UpdateBases {
                 new_bases: new_bases.into_iter().map(BasePath::from).collect(),
             },
+            #[cfg(feature = "unstable-action-transactions")]
+            Some(pb::transaction::Operation::ExperimentalUserOperation(inner)) => {
+                use prost::Message as _;
+                let user_op =
+                    lance_table::format::pb::UserOperation::decode(inner.payload.as_slice())
+                        .map_err(|e| {
+                            Error::invalid_input(format!(
+                                "invalid experimental UserOperation payload: {}",
+                                e
+                            ))
+                        })?;
+                Operation::UserOperation(user_op.try_into()?)
+            }
+            #[cfg(not(feature = "unstable-action-transactions"))]
+            Some(pb::transaction::Operation::ExperimentalUserOperation(_)) => {
+                // Unreadable without the feature: the payload is an experimental
+                // format this build does not understand.
+                return Err(Error::not_supported_source(
+                    "action-based (experimental) transactions require a build with the \
+                     `unstable-action-transactions` feature"
+                        .into(),
+                ));
+            }
             None => {
                 return Err(Error::internal(
                     "Transaction message did not contain an operation".to_string(),
@@ -3634,6 +4326,14 @@ impl From<&Transaction> for pb::Transaction {
                         .map(|bp: BasePath| -> pb::BasePath { bp.into() })
                         .collect::<Vec<pb::BasePath>>(),
                 })
+            }
+            #[cfg(feature = "unstable-action-transactions")]
+            Operation::UserOperation(user_op) => {
+                use prost::Message as _;
+                let payload = lance_table::format::pb::UserOperation::from(user_op).encode_to_vec();
+                pb::transaction::Operation::ExperimentalUserOperation(
+                    pb::transaction::ExperimentalUserOperation { payload },
+                )
             }
         };
 
@@ -6185,5 +6885,379 @@ mod tests {
         assert!(left.modifies_same_metadata(&same_key));
         assert!(!left.modifies_same_metadata(&different_key));
         assert!(left.modifies_same_metadata(&replace));
+    }
+
+    #[cfg(feature = "unstable-action-transactions")]
+    fn user_operation_txn(read_version: u64, actions: Vec<Action>) -> Transaction {
+        use lance_table::transaction::UserAction;
+        Transaction::new(
+            read_version,
+            Operation::UserOperation(UserOperation {
+                description: "test".to_string(),
+                uuid: Uuid::new_v4().to_string(),
+                read_version,
+                actions: vec![UserAction {
+                    description: "test-action".to_string(),
+                    actions,
+                }],
+            }),
+            None,
+        )
+    }
+
+    #[cfg(feature = "unstable-action-transactions")]
+    #[test]
+    fn update_bases_action_parity_with_legacy_operation() {
+        let manifest = sample_manifest();
+
+        let new_bases = vec![lance_table::format::BasePath {
+            id: 0,
+            path: "s3://bucket/base".to_string(),
+            name: Some("ext".to_string()),
+            is_dataset_root: false,
+        }];
+
+        let legacy_tx = Transaction::new(
+            manifest.version,
+            Operation::UpdateBases {
+                new_bases: new_bases.clone(),
+            },
+            None,
+        );
+        let (legacy_out, _) = legacy_tx
+            .build_manifest(
+                Some(&manifest),
+                vec![],
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap();
+
+        let actions = Transaction::actions_from_update_bases(&new_bases);
+        let composite_tx = user_operation_txn(manifest.version, actions);
+        let (composite_out, _) = composite_tx
+            .build_manifest(
+                Some(&manifest),
+                vec![],
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap();
+
+        assert_eq!(legacy_out.base_paths, composite_out.base_paths);
+    }
+
+    #[cfg(feature = "unstable-action-transactions")]
+    #[test]
+    fn data_replacement_action_parity_with_legacy_operation() {
+        let (major, minor) = LanceFileVersion::Stable.to_numbers();
+        let mk_file = |path: &str, field: i32| {
+            DataFile::new(path, vec![field], vec![0], major, minor, None, None)
+        };
+
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new("id", DataType::Int32, false)]);
+        let lance_schema = LanceSchema::try_from(&arrow_schema).unwrap();
+
+        let fragment = Fragment {
+            id: 0,
+            files: vec![mk_file("before.lance", 0)],
+            deletion_file: None,
+            row_id_meta: None,
+            physical_rows: Some(5),
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+        };
+
+        let manifest = Manifest::new(
+            lance_schema,
+            Arc::new(vec![fragment]),
+            DataStorageFormat::new(LanceFileVersion::V2_0),
+            HashMap::new(),
+        );
+        let current_indices = vec![sample_index_metadata("idx")];
+
+        let replacements = vec![DataReplacementGroup(0, mk_file("after.lance", 0))];
+
+        let legacy_tx = Transaction::new(
+            manifest.version,
+            Operation::DataReplacement {
+                replacements: replacements.clone(),
+            },
+            None,
+        );
+        let (legacy_out, legacy_indices) = legacy_tx
+            .build_manifest(
+                Some(&manifest),
+                current_indices.clone(),
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap();
+
+        let actions = Transaction::actions_from_data_replacement(&replacements);
+        let composite_tx = user_operation_txn(manifest.version, actions);
+        let (composite_out, composite_indices) = composite_tx
+            .build_manifest(
+                Some(&manifest),
+                current_indices,
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap();
+
+        assert_eq!(legacy_out.fragments, composite_out.fragments);
+        assert_eq!(legacy_indices, composite_indices);
+        // The index-invalidation branch must actually be exercised.
+        assert!(
+            legacy_indices[0]
+                .fragment_bitmap
+                .as_ref()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[cfg(feature = "unstable-action-transactions")]
+    #[test]
+    fn data_replacement_all_null_backfill_action_parity_with_legacy_operation() {
+        let (major, minor) = LanceFileVersion::Stable.to_numbers();
+        let mk_file = |path: &str, field: i32| {
+            DataFile::new(path, vec![field], vec![0], major, minor, None, None)
+        };
+
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("value", DataType::Int32, true),
+        ]);
+        let lance_schema = LanceSchema::try_from(&arrow_schema).unwrap();
+
+        // The "value" column (field 1) has no backing file yet: an all-NULL column.
+        let fragment = Fragment {
+            id: 0,
+            files: vec![mk_file("id.lance", 0)],
+            deletion_file: None,
+            row_id_meta: None,
+            physical_rows: Some(5),
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+        };
+
+        let manifest = Manifest::new(
+            lance_schema,
+            Arc::new(vec![fragment]),
+            DataStorageFormat::new(LanceFileVersion::V2_0),
+            HashMap::new(),
+        );
+
+        let replacements = vec![DataReplacementGroup(0, mk_file("value.lance", 1))];
+
+        let legacy_tx = Transaction::new(
+            manifest.version,
+            Operation::DataReplacement {
+                replacements: replacements.clone(),
+            },
+            None,
+        );
+        let (legacy_out, _) = legacy_tx
+            .build_manifest(
+                Some(&manifest),
+                vec![],
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap();
+
+        let actions = Transaction::actions_from_data_replacement(&replacements);
+        let composite_tx = user_operation_txn(manifest.version, actions);
+        let (composite_out, _) = composite_tx
+            .build_manifest(
+                Some(&manifest),
+                vec![],
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap();
+
+        assert_eq!(legacy_out.fragments, composite_out.fragments);
+        assert_eq!(legacy_out.fragments[0].files.len(), 2);
+    }
+
+    #[cfg(feature = "unstable-action-transactions")]
+    #[test]
+    fn merge_pure_add_action_parity_with_legacy_operation_multi_fragment_stable_row_ids() {
+        use lance_table::feature_flags::FLAG_STABLE_ROW_IDS;
+
+        let (major, minor) = LanceFileVersion::Stable.to_numbers();
+        let mk_file = |path: &str, field: i32| {
+            DataFile::new(path, vec![field], vec![0], major, minor, None, None)
+        };
+
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new("id", DataType::Int32, false)]);
+        let lance_schema = LanceSchema::try_from(&arrow_schema).unwrap();
+
+        let row_ids_0 = RowIdSequence::from([0u64, 1, 2].as_slice());
+        let row_ids_1 = RowIdSequence::from([3u64, 4].as_slice());
+
+        // Two fragments; only fragment 0 gets the new column backfilled.
+        let fragment0 = Fragment {
+            id: 0,
+            files: vec![mk_file("id-0.lance", 0)],
+            deletion_file: None,
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&row_ids_0))),
+            physical_rows: Some(3),
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+        };
+        let fragment1 = Fragment {
+            id: 1,
+            files: vec![mk_file("id-1.lance", 0)],
+            deletion_file: None,
+            row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&row_ids_1))),
+            physical_rows: Some(2),
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+        };
+
+        let mut manifest = Manifest::new(
+            lance_schema.clone(),
+            Arc::new(vec![fragment0.clone(), fragment1.clone()]),
+            DataStorageFormat::new(LanceFileVersion::V2_0),
+            HashMap::new(),
+        );
+        manifest.reader_feature_flags |= FLAG_STABLE_ROW_IDS;
+        manifest.next_row_id = 5;
+
+        let mut new_field = Field::new_arrow("value", DataType::Int64, true).unwrap();
+        new_field.id = 1;
+        let mut new_schema = lance_schema;
+        new_schema.fields.push(new_field);
+
+        let merged_fragment0 = Fragment {
+            files: vec![mk_file("id-0.lance", 0), mk_file("value-0.lance", 1)],
+            ..fragment0
+        };
+        let merged_fragments = vec![merged_fragment0, fragment1];
+
+        let legacy_tx = Transaction::new(
+            manifest.version,
+            Operation::Merge {
+                fragments: merged_fragments.clone(),
+                schema: new_schema.clone(),
+            },
+            None,
+        );
+        let (legacy_out, _) = legacy_tx
+            .build_manifest(
+                Some(&manifest),
+                vec![],
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap();
+
+        let actions =
+            Transaction::actions_from_merge(&merged_fragments, &new_schema, &manifest).unwrap();
+        let composite_tx = user_operation_txn(manifest.version, actions);
+        let (composite_out, _) = composite_tx
+            .build_manifest(
+                Some(&manifest),
+                vec![],
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap();
+
+        assert_eq!(legacy_out.fragments, composite_out.fragments);
+        assert_eq!(legacy_out.schema, composite_out.schema);
+
+        // Only the touched fragment (0) gets its last_updated_at refreshed; the
+        // untouched fragment (1) keeps None, matching legacy Merge semantics.
+        assert!(
+            legacy_out.fragments[0]
+                .last_updated_at_version_meta
+                .is_some()
+        );
+        assert!(
+            legacy_out.fragments[1]
+                .last_updated_at_version_meta
+                .is_none()
+        );
+        assert!(legacy_out.fragments[0].created_at_version_meta.is_none());
+    }
+
+    #[cfg(feature = "unstable-action-transactions")]
+    #[test]
+    fn merge_recast_action_parity_with_legacy_operation() {
+        let (major, minor) = LanceFileVersion::Stable.to_numbers();
+        let mk_file = |path: &str, field: i32| {
+            DataFile::new(path, vec![field], vec![0], major, minor, None, None)
+        };
+
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("value", DataType::Int32, true),
+        ]);
+        let lance_schema = LanceSchema::try_from(&arrow_schema).unwrap();
+
+        let fragment = Fragment {
+            id: 0,
+            files: vec![mk_file("id.lance", 0), mk_file("value.lance", 1)],
+            deletion_file: None,
+            row_id_meta: None,
+            physical_rows: Some(5),
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+        };
+
+        let manifest = Manifest::new(
+            lance_schema.clone(),
+            Arc::new(vec![fragment.clone()]),
+            DataStorageFormat::new(LanceFileVersion::V2_0),
+            HashMap::new(),
+        );
+
+        // Recast "value" (field 1) from int32 to int64: new field id 2 replaces it.
+        let mut recast_field = Field::new_arrow("value", DataType::Int64, true).unwrap();
+        recast_field.id = 2;
+        let mut new_schema = lance_schema;
+        new_schema.fields[1] = recast_field;
+
+        let recast_fragment = Fragment {
+            files: vec![mk_file("id.lance", 0), mk_file("value-v2.lance", 2)],
+            ..fragment
+        };
+        let merged_fragments = vec![recast_fragment];
+
+        let legacy_tx = Transaction::new(
+            manifest.version,
+            Operation::Merge {
+                fragments: merged_fragments.clone(),
+                schema: new_schema.clone(),
+            },
+            None,
+        );
+        let (legacy_out, _) = legacy_tx
+            .build_manifest(
+                Some(&manifest),
+                vec![],
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap();
+
+        let actions =
+            Transaction::actions_from_merge(&merged_fragments, &new_schema, &manifest).unwrap();
+        let composite_tx = user_operation_txn(manifest.version, actions);
+        let (composite_out, _) = composite_tx
+            .build_manifest(
+                Some(&manifest),
+                vec![],
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap();
+
+        assert_eq!(legacy_out.fragments, composite_out.fragments);
+        assert_eq!(legacy_out.schema, composite_out.schema);
     }
 }
