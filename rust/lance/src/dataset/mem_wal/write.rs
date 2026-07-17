@@ -1145,11 +1145,6 @@ impl SharedWriterState {
         Ok(next_generation)
     }
 
-    /// Track batch for WAL durability.
-    fn track_batch_for_wal(&self, batch_position: usize) -> super::wal::BatchDurableWatcher {
-        self.wal_flusher.track_batch(batch_position)
-    }
-
     /// Check if memtable flush is needed and trigger if so.
     ///
     /// Takes `&mut WriterState` directly since caller already holds the lock.
@@ -1859,49 +1854,46 @@ impl ShardWriter {
         let start = std::time::Instant::now();
 
         // Acquire write lock for entire operation (atomic approach)
-        let (batch_positions, durable_watcher, batch_store, indexes) = {
+        let (batch_positions, batch_store, indexes) = {
             let mut state = state_lock.write().await;
 
-            // 1. Insert all batches into memtable atomically
             let results = state.memtable.insert_batches_only(batches).await?;
-
-            // Get batch position range
             let start_pos = results.first().map(|(pos, _, _)| *pos).unwrap_or(0);
             let end_pos = results.last().map(|(pos, _, _)| pos + 1).unwrap_or(0);
             let batch_positions = start_pos..end_pos;
 
-            // 2. Track last batch for WAL durability
-            let durable_watcher = writer_state.track_batch_for_wal(end_pos.saturating_sub(1));
-
-            // 3. Check if WAL flush should be triggered
-            writer_state.maybe_trigger_wal_flush(&mut state);
-
-            // 4. Check if memtable flush is needed
-            if let Err(e) = writer_state.maybe_trigger_memtable_flush(&mut state) {
-                warn!("Failed to trigger memtable flush: {}", e);
-            }
-
-            // Get batch_store and indexes while we have the lock (for durable_write case)
+            // INVARIANT: capture the accepting BatchStore/indexes BEFORE calling
+            // maybe_trigger_* below. Those may freeze the active MemTable and
+            // rotate to a new generation, so any capture after them would bind
+            // the request-scoped flush completion to the wrong (new) generation.
+            // Moving these lines down reintroduces cross-generation aliasing (#7760).
             let batch_store = state.memtable.batch_store();
             let indexes = state.memtable.indexes_arc();
 
-            (batch_positions, durable_watcher, batch_store, indexes)
-        }; // Lock released here
+            writer_state.maybe_trigger_wal_flush(&mut state);
+            if let Err(error) = writer_state.maybe_trigger_memtable_flush(&mut state) {
+                warn!("Failed to trigger memtable flush: {}", error);
+            }
+
+            (batch_positions, batch_store, indexes)
+        };
 
         self.stats.record_put(start.elapsed());
 
         // Trigger the flush here (outside the lock) so the watcher can resolve;
         // only the `wait()` is the caller's to schedule.
         let watcher = if self.config.durable_write {
+            let completion = WatchableOnceCell::new();
+            let watcher = BatchDurableWatcher::from_flush_completion(completion.reader());
             self.wal_flusher.trigger_flush(
                 WalFlushSource::BatchStore {
                     batch_store,
                     indexes,
                 },
                 batch_positions.end,
-                None,
+                Some(completion),
             )?;
-            Some(durable_watcher)
+            Some(watcher)
         } else {
             None
         };
@@ -3812,6 +3804,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_coalesced_empty_flush_completes_request_watcher() {
+        let (store, base_path, _base_uri, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let wal_appender = Arc::new(
+            WalAppender::open(store, base_path, shard_id, 0)
+                .await
+                .unwrap(),
+        );
+        let wal_flusher = Arc::new(WalFlusher::new(wal_appender));
+
+        let schema = create_test_schema();
+        let mut memtable = MemTable::new(schema.clone(), 1, vec![]).unwrap();
+        memtable
+            .insert_batches_only(vec![create_test_batch(&schema, 0, 1)])
+            .await
+            .unwrap();
+        let batch_store = memtable.batch_store();
+        let end_batch_position = batch_store.len();
+        let state = Arc::new(RwLock::new(WriterState {
+            memtable,
+            last_flushed_wal_entry_position: 0,
+            frozen_memtable_bytes: 0,
+            frozen_flush_watchers: VecDeque::new(),
+            frozen_memtables: VecDeque::new(),
+            flush_requested: false,
+            wal_flush_trigger_count: 0,
+            last_wal_flush_trigger_time: 0,
+        }));
+        let mut handler = WalFlushHandler::new(wal_flusher, Some(state), new_shared_stats());
+
+        handler
+            .handle(TriggerWalFlush {
+                source: WalFlushSource::BatchStore {
+                    batch_store: batch_store.clone(),
+                    indexes: None,
+                },
+                end_batch_position,
+                done: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            batch_store.max_flushed_batch_position(),
+            Some(end_batch_position - 1),
+            "first flush must cover the request range"
+        );
+
+        let completion = WatchableOnceCell::new();
+        let completion_reader = completion.reader();
+        let mut watcher = BatchDurableWatcher::from_flush_completion(completion.reader());
+        handler
+            .handle(TriggerWalFlush {
+                source: WalFlushSource::BatchStore {
+                    batch_store,
+                    indexes: None,
+                },
+                end_batch_position,
+                done: Some(completion),
+            })
+            .await
+            .unwrap();
+
+        let flush_result = completion_reader
+            .read()
+            .expect("coalesced flush must report request completion")
+            .expect("coalesced flush must complete successfully");
+        assert!(
+            flush_result.entry.is_none(),
+            "already-covered flush must not append another WAL entry"
+        );
+        watcher.wait().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn test_shard_writer_basic_write() {
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
         let schema = create_test_schema();
@@ -4969,6 +5035,50 @@ mod tests {
             .put(vec![create_test_batch(&schema, 2, 1)])
             .await
             .unwrap();
+    }
+
+    /// Regression for #7760 (cross-generation aliasing): gen-1's flush
+    /// publishes the writer-global watermark, which must NOT satisfy the
+    /// gen-2 durable put. With the bug, this `put` returned `Ok` because the
+    /// gen-1 watermark already covered gen-2's local position 0; here gen-2's
+    /// own WAL append is forced to fail, so a correctly request-scoped watcher
+    /// must surface `PersistenceFailure` rather than return success.
+    #[tokio::test]
+    async fn test_durable_watcher_does_not_alias_across_memtable_generations() {
+        let (store, base_path, controls) = failing_memory_store().await;
+        let base_uri = "memory:///";
+        let schema = create_test_schema();
+        let config = ShardWriterConfig {
+            shard_id: Uuid::new_v4(),
+            durable_write: true,
+            sync_indexed_write: false,
+            max_wal_buffer_size: 64 * 1024 * 1024,
+            max_wal_flush_interval: None,
+            max_wal_persist_retries: 0,
+            wal_persist_retry_base_delay: Duration::from_millis(1),
+            max_memtable_size: 64 * 1024 * 1024,
+            manifest_scan_batch_size: 2,
+            ..Default::default()
+        };
+        let writer = ShardWriter::open(store, base_path, base_uri, config, schema.clone(), vec![])
+            .await
+            .unwrap();
+
+        writer
+            .put(vec![create_test_batch(&schema, 0, 1)])
+            .await
+            .unwrap();
+        writer.force_seal_active().await.unwrap();
+        writer.wait_for_flush_drain().await.unwrap();
+
+        controls.fail_wal_puts(usize::MAX);
+        let error = writer
+            .put(vec![create_test_batch(&schema, 1, 1)])
+            .await
+            .expect_err("new generation must wait for its failing WAL flush");
+
+        assert_eq!(error.fence_reason(), Some(FenceReason::PersistenceFailure));
+        assert!(error.to_string().contains("WAL persistence failed"));
     }
 
     /// Replay-on-open recovers durable WAL entries that were never flushed

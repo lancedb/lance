@@ -32,7 +32,8 @@ use uuid::Uuid;
 
 use super::manifest::ShardManifestStore;
 use super::util::{
-    WatchableOnceCell, parse_bit_reversed_filename, shard_wal_path, wal_entry_filename,
+    WatchableOnceCell, WatchableOnceCellReader, parse_bit_reversed_filename, shard_wal_path,
+    wal_entry_filename,
 };
 
 use super::index::IndexStore;
@@ -87,20 +88,33 @@ impl WalFlushFailure {
     }
 }
 
-/// Watcher for batch durability using watermark-based tracking.
+#[derive(Clone)]
+enum BatchDurabilityState {
+    /// Legacy writer-global watermark tracking: durable once the shared
+    /// watermark reaches `target_batch_position`. Used only by publicly
+    /// constructed watchers for compatibility; it is cross-generation and
+    /// therefore unsafe for MemTable durable writes (#7760).
+    Watermark {
+        rx: watch::Receiver<usize>,
+        target_batch_position: usize,
+        terminal_error: Arc<StdMutex<Option<WalFlushFailure>>>,
+    },
+    /// Request-scoped tracking: durable only when the one flush tied to the
+    /// exact accepting `BatchStore` generation reports completion. A watermark
+    /// from a different generation cannot satisfy it.
+    FlushCompletion {
+        reader: WatchableOnceCellReader<std::result::Result<WalFlushResult, WalFlushFailure>>,
+    },
+}
+
+/// Watcher for batch durability.
 ///
-/// Uses a shared watch channel that broadcasts the durable watermark.
-/// The watcher waits until the watermark reaches or exceeds its target batch ID.
+/// Publicly constructed watchers retain watermark-based tracking for
+/// compatibility. MemTable writes use a request-scoped flush completion so a
+/// watermark from another generation cannot acknowledge their data.
 #[derive(Clone)]
 pub struct BatchDurableWatcher {
-    /// Watch receiver for the durable watermark.
-    rx: watch::Receiver<usize>,
-    /// Target batch ID to wait for.
-    target_batch_position: usize,
-    /// Terminal flush failure shared with the flusher. When set, the watermark
-    /// can never reach the target, so `wait` returns this typed error instead of
-    /// blocking forever.
-    terminal_error: Arc<StdMutex<Option<WalFlushFailure>>>,
+    state: BatchDurabilityState,
 }
 
 impl BatchDurableWatcher {
@@ -111,45 +125,110 @@ impl BatchDurableWatcher {
         terminal_error: Arc<StdMutex<Option<WalFlushFailure>>>,
     ) -> Self {
         Self {
-            rx,
-            target_batch_position,
-            terminal_error,
+            state: BatchDurabilityState::Watermark {
+                rx,
+                target_batch_position,
+                terminal_error,
+            },
         }
     }
 
-    /// Wait until the batch is durable.
+    pub(crate) fn from_flush_completion(
+        reader: WatchableOnceCellReader<std::result::Result<WalFlushResult, WalFlushFailure>>,
+    ) -> Self {
+        Self {
+            state: BatchDurabilityState::FlushCompletion { reader },
+        }
+    }
+
+    /// Wait until the watched batch is durable.
     ///
-    /// Returns Ok(()) when `durable_watermark >= target_batch_position`, or
-    /// Err if a terminal flush failure (e.g. a fence) means the watermark can
-    /// never reach the target.
+    /// Watermark-backed watchers return success when the durable watermark
+    /// reaches the target, and return an error for a terminal flush failure or
+    /// closed tracking channel. Request-scoped watchers return success only
+    /// after their flush completes, preserve typed flush failures, and return an
+    /// I/O error if the flush handler exits without reporting completion.
+    ///
+    /// For a non-blocking check see [`Self::is_durable`].
     pub async fn wait(&mut self) -> Result<()> {
-        loop {
-            if let Some(failure) = self.terminal_error.lock().unwrap().clone() {
-                return Err(failure.into_error());
-            }
-            let current = *self.rx.borrow();
-            if current >= self.target_batch_position {
-                return Ok(());
-            }
-            self.rx
-                .changed()
-                .await
-                .map_err(|_| Error::io("Durable watermark channel closed"))?;
+        match &mut self.state {
+            BatchDurabilityState::Watermark {
+                rx,
+                target_batch_position,
+                terminal_error,
+            } => loop {
+                let terminal_failure = terminal_error
+                    .lock()
+                    .map_err(|_| {
+                        Error::internal(
+                            "Batch durability terminal error mutex was poisoned".to_string(),
+                        )
+                    })?
+                    .clone();
+                if let Some(failure) = terminal_failure {
+                    return Err(failure.into_error());
+                }
+                if *rx.borrow() >= *target_batch_position {
+                    return Ok(());
+                }
+                rx.changed()
+                    .await
+                    .map_err(|_| Error::io("Durable watermark channel closed"))?;
+            },
+            BatchDurabilityState::FlushCompletion { reader } => match reader.await_value().await {
+                Some(Ok(_)) => Ok(()),
+                Some(Err(failure)) => Err(failure.into_error()),
+                None => Err(Error::io(
+                    "WAL flush handler exited before reporting durability",
+                )),
+            },
         }
     }
 
     /// Check if the batch is already durable (non-blocking).
+    ///
+    /// Cheaper, non-awaiting counterpart to [`Self::wait`]: returns the
+    /// current state without blocking for the flush to complete.
     pub fn is_durable(&self) -> bool {
-        *self.rx.borrow() >= self.target_batch_position
+        match &self.state {
+            BatchDurabilityState::Watermark {
+                rx,
+                target_batch_position,
+                ..
+            } => *rx.borrow() >= *target_batch_position,
+            BatchDurabilityState::FlushCompletion { reader } => {
+                matches!(reader.read(), Some(Ok(_)))
+            }
+        }
     }
 }
 
 impl std::fmt::Debug for BatchDurableWatcher {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BatchDurableWatcher")
-            .field("target_batch_position", &self.target_batch_position)
-            .field("current_watermark", &*self.rx.borrow())
-            .finish()
+        let mut debug = f.debug_struct("BatchDurableWatcher");
+        match &self.state {
+            BatchDurabilityState::Watermark {
+                rx,
+                target_batch_position,
+                ..
+            } => {
+                debug
+                    .field("backend", &"watermark")
+                    .field("target_batch_position", target_batch_position)
+                    .field("current_watermark", &*rx.borrow());
+            }
+            BatchDurabilityState::FlushCompletion { reader } => {
+                let status = match reader.read() {
+                    None => "pending",
+                    Some(Ok(_)) => "durable",
+                    Some(Err(_)) => "failed",
+                };
+                debug
+                    .field("backend", &"flush_completion")
+                    .field("status", &status);
+            }
+        }
+        debug.finish()
     }
 }
 
@@ -420,6 +499,11 @@ impl WalFlusher {
     ///
     /// Returns a `BatchDurableWatcher` that can be awaited for durability.
     /// The actual batch data is stored in the BatchStore.
+    ///
+    /// The returned watcher is watermark-based: it resolves against the
+    /// writer-global watermark, which is not scoped to a MemTable generation.
+    /// Do not use it for MemTable durable writes (#7760) — the write path uses
+    /// `BatchDurableWatcher::from_flush_completion` instead.
     pub fn track_batch(&self, batch_position: usize) -> BatchDurableWatcher {
         // Return a watcher that waits for this batch to become durable
         // batch_position is 0-indexed, so we wait for watermark > batch_position (i.e., >= batch_position + 1)
@@ -1580,6 +1664,76 @@ mod tests {
 
         // Watcher should not be durable yet
         assert!(!watcher.is_durable());
+    }
+
+    #[tokio::test]
+    async fn test_flush_completion_watcher_reports_success() {
+        let completion = WatchableOnceCell::new();
+        let mut watcher = BatchDurableWatcher::from_flush_completion(completion.reader());
+
+        assert!(!watcher.is_durable());
+        completion.write(Ok(empty_flush_result()));
+
+        watcher.wait().await.unwrap();
+        assert!(watcher.is_durable());
+    }
+
+    #[tokio::test]
+    async fn test_flush_completion_watcher_preserves_typed_failure() {
+        let completion = WatchableOnceCell::new();
+        let mut watcher = BatchDurableWatcher::from_flush_completion(completion.reader());
+        completion.write(Err(WalFlushFailure {
+            fence_reason: Some(FenceReason::PersistenceFailure),
+            message: "injected persistence failure".to_string(),
+        }));
+
+        let error = watcher.wait().await.unwrap_err();
+
+        assert_eq!(error.fence_reason(), Some(FenceReason::PersistenceFailure));
+        assert!(error.to_string().contains("injected persistence failure"));
+        assert!(!watcher.is_durable());
+    }
+
+    #[tokio::test]
+    async fn test_flush_completion_watcher_reports_closed_handler() {
+        let completion =
+            WatchableOnceCell::<std::result::Result<WalFlushResult, WalFlushFailure>>::new();
+        let mut watcher = BatchDurableWatcher::from_flush_completion(completion.reader());
+        drop(completion);
+
+        let error = watcher.wait().await.unwrap_err();
+
+        assert!(matches!(error, Error::IO { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("WAL flush handler exited before reporting durability")
+        );
+        assert!(!watcher.is_durable());
+    }
+
+    #[tokio::test]
+    async fn test_watermark_watcher_reports_poisoned_terminal_error() {
+        let terminal_error = Arc::new(StdMutex::new(None));
+        let terminal_error_to_poison = terminal_error.clone();
+        let poison_result = std::thread::spawn(move || {
+            let _guard = terminal_error_to_poison.lock().unwrap();
+            panic!("poison terminal error mutex");
+        })
+        .join();
+        assert!(poison_result.is_err());
+
+        let (_tx, rx) = watch::channel(0);
+        let mut watcher = BatchDurableWatcher::new(rx, 1, terminal_error);
+
+        let error = watcher.wait().await.unwrap_err();
+
+        assert!(matches!(error, Error::Internal { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("Batch durability terminal error mutex was poisoned")
+        );
     }
 
     // Regression test: track_batch must return a watcher wired to the real
