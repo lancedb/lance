@@ -1,134 +1,49 @@
-{% extends "main.html" %}
+{% extends "base.html" %}
 
-{% block tabs %}
-  {{ super() }}
-
-  <style>
-    /* Prevent horizontal overflow */
-    body { overflow-x: hidden; }
-
-    /* Hide main content and sidebars for the home page */
-    .md-content { display: none; }
-    @media screen and (min-width: 60em) {
-      .md-sidebar--secondary { display: none; }
-    }
-    @media screen and (min-width: 76.25em) {
-      .md-sidebar--primary { display: none; }
-    }
-    .md-main__inner { margin: 0; }
-  </style>
-
-  <script>
-    // Fix palette toggle jumping to bottom of page
-    (function() {
-      // Store scroll position
-      let savedScrollY = 0;
-      let isTogglingPalette = false;
-
-      // Prevent hash-based scrolling for palette changes
-      if ('scrollRestoration' in history) {
-        history.scrollRestoration = 'manual';
-      }
-
-      // Intercept scroll attempts during palette toggle
-      const preventScroll = function() {
-        if (isTogglingPalette) {
-          window.scrollTo(0, savedScrollY);
-        }
-      };
-
-      // Save scroll position and intercept clicks on palette toggle
-      document.addEventListener('click', function(e) {
-        const paletteLabel = e.target.closest('[for^="__palette"]');
-        if (paletteLabel) {
-          savedScrollY = window.scrollY;
-          isTogglingPalette = true;
-
-          // Prevent any scrolling for a brief moment
-          window.addEventListener('scroll', preventScroll, { passive: false });
-
-          setTimeout(function() {
-            isTogglingPalette = false;
-            window.removeEventListener('scroll', preventScroll);
-          }, 100);
-        }
-      }, true);
-
-      // Listen for hash changes from palette toggle
-      window.addEventListener('hashchange', function(e) {
-        if (window.location.hash.startsWith('#__palette')) {
-          e.preventDefault();
-          // Immediately restore scroll position
-          window.scrollTo(0, savedScrollY);
-          // Clean up hash without triggering another hashchange
-          history.replaceState(null, null, window.location.pathname);
-        }
-      }, false);
-
-      // Also handle palette input changes directly
-      document.addEventListener('DOMContentLoaded', function() {
-        const paletteInputs = document.querySelectorAll('input[name="__palette"]');
-        paletteInputs.forEach(function(input) {
-          input.addEventListener('change', function() {
-            window.scrollTo(0, savedScrollY);
-          });
-        });
-      });
-    })();
-  </script>
-
-  <!-- Hero -->
-  <section class="ld-hero">
-    <div class="ld-container">
+{% block container %}
+  <main class="ld-home">
+    <section class="ld-hero">
       <div class="ld-kicker">Lance format · Open source · Apache-2.0 · <a href="https://arxiv.org/abs/2504.15247" target="_blank" rel="noopener">VLDB '25 paper ↗</a></div>
       <h1>The open lakehouse format for multimodal AI.</h1>
       <p class="ld-hero__lead">A file format, table format, and catalog spec for building a complete lakehouse on object storage — vector search, full-text search, random access, and feature engineering for your AI workflows.</p>
       <div class="ld-hero__cta">
-        <a class="ld-btn ld-btn--primary" href="quickstart/">Get started</a>
-        <a class="ld-btn ld-btn--outline" href="format/">Read the spec</a>
-        <a class="ld-btn ld-btn--outline" href="examples/python/llm_training/">Train an LLM</a>
-        <a class="ld-btn ld-btn--text" href="https://discord.gg/lance" target="_blank" rel="noopener">Join Discord →</a>
+        <a class="ld-btn ld-btn--primary ld-btn--lg" href="{{ 'quickstart/' | url }}">Get started</a>
+        <a class="ld-btn ld-btn--outline ld-btn--lg" href="{{ 'format/' | url }}">Read the spec</a>
+        <a class="ld-btn ld-btn--outline ld-btn--lg" href="{{ 'examples/python/llm_training/' | url }}">Train an LLM</a>
+        <a class="ld-btn ld-btn--text ld-btn--lg" href="https://discord.gg/lance" target="_blank" rel="noopener">Join Discord →</a>
       </div>
-    </div>
-  </section>
+    </section>
 
-  <!-- Stats band -->
-  <section class="ld-container">
-    <div class="ld-stats">
-      <div class="ld-stat">
-        <div class="ld-stat__value">100×</div>
-        <div class="ld-stat__label">Faster random access than Parquet</div>
+    <section class="ld-band">
+      <div class="ld-stats">
+        <div class="ld-stat">
+          <div class="ld-stat__value">100×</div>
+          <div class="ld-stat__label">Faster random access than Parquet</div>
+        </div>
+        <div class="ld-stat">
+          <div class="ld-stat__value">1 line</div>
+          <div class="ld-stat__label">To convert Parquet to Lance</div>
+        </div>
+        <a class="ld-stat ld-stat--link" href="https://arxiv.org/abs/2504.15247" target="_blank" rel="noopener">
+          <div class="ld-stat__value ld-stat__value--beam">VLDB '25</div>
+          <div class="ld-stat__label">Peer-reviewed research paper →</div>
+        </a>
       </div>
-      <div class="ld-stat">
-        <div class="ld-stat__value">1 line</div>
-        <div class="ld-stat__label">To convert Parquet to Lance</div>
-      </div>
-      <a class="ld-stat" href="https://arxiv.org/abs/2504.15247" target="_blank" rel="noopener">
-        <div class="ld-stat__value ld-stat__value--beam">VLDB '25</div>
-        <div class="ld-stat__label">Peer-reviewed research paper →</div>
-      </a>
-    </div>
-  </section>
+    </section>
 
-  <!-- What is Lance -->
-  <section class="ld-what">
-    <div class="ld-container">
+    <section class="ld-what">
       <h2>What is Lance?</h2>
-      <p>Lance is a modern, open source lakehouse format for multimodal AI. It brings high-performance vector search, full-text search, random access, and feature engineering to the lakehouse — while keeping SQL analytics, ACID transactions, time travel, and integrations with open engines (Apache Spark, Ray, PyTorch, Trino, DuckDB) and open catalogs (Apache Polaris, Unity Catalog, Apache Gravitino, Hive Metastore).</p>
-      <p>Learn more in the <a href="https://arxiv.org/abs/2504.15247" target="_blank" rel="noopener">research paper</a> published at VLDB 2025.</p>
-    </div>
-  </section>
+      <p class="ld-what__body">Lance is a modern, open source lakehouse format for multimodal AI. It brings high-performance vector search, full-text search, random access, and feature engineering to the lakehouse — while keeping SQL analytics, ACID transactions, time travel, and integrations with open engines (Apache Spark, Ray, PyTorch, Trino, DuckDB) and open catalogs (Apache Polaris, Unity Catalog, Apache Gravitino, Hive Metastore).</p>
+      <p class="ld-what__more">Learn more in the <a class="ld-inline-link" href="https://arxiv.org/abs/2504.15247" target="_blank" rel="noopener">research paper</a> published at VLDB 2025.</p>
+    </section>
 
-  <!-- Features -->
-  <section class="ld-features">
-    <div class="ld-container">
-
+    <section class="ld-features">
       <div class="ld-feature">
         <div class="ld-feature__num">01</div>
         <div class="ld-feature__body">
-          <h2>Expressive hybrid search</h2>
+          <h3>Expressive hybrid search</h3>
           <p>Combine vector similarity, full-text search (BM25), and SQL analytics on the same dataset. All query types are accelerated by secondary indexes that are part of the Lance specification.</p>
-          <a class="ld-more" href="quickstart/vector-search/">Learn more →</a>
+          <a class="ld-more" href="{{ 'quickstart/vector-search/' | url }}">Learn more →</a>
         </div>
         <div class="ld-feature__code">
           <div class="ld-win" aria-hidden="true"><i></i><i></i><i></i></div>
@@ -152,9 +67,9 @@ ds.to_table(
       <div class="ld-feature">
         <div class="ld-feature__num">02</div>
         <div class="ld-feature__body">
-          <h2>Lightning-fast random access</h2>
+          <h3>Lightning-fast random access</h3>
           <p>100x faster random access than Parquet or Iceberg. An optimized file format plus row addressing and secondary indexes let you fetch individual records across files instantly — for ML serving, sampling, and interactive apps.</p>
-          <a class="ld-more" href="guide/read_and_write/">Learn more →</a>
+          <a class="ld-more" href="{{ 'guide/read_and_write/' | url }}">Learn more →</a>
         </div>
         <div class="ld-feature__code">
           <div class="ld-win" aria-hidden="true"><i></i><i></i><i></i></div>
@@ -173,9 +88,9 @@ ds.sample(<span class="tok-num">1000</span>, <span class="tok-arg">columns=</spa
       <div class="ld-feature">
         <div class="ld-feature__num">03</div>
         <div class="ld-feature__body">
-          <h2>Native multimodal data</h2>
+          <h3>Native multimodal data</h3>
           <p>Store images, videos, audio, text, and embeddings alongside tabular data in one format. Blob encoding handles large binary objects with lazy loading; optimized vector storage accelerates similarity search.</p>
-          <a class="ld-more" href="guide/blob/">Learn more →</a>
+          <a class="ld-more" href="{{ 'guide/blob/' | url }}">Learn more →</a>
         </div>
         <div class="ld-feature__code">
           <div class="ld-win" aria-hidden="true"><i></i><i></i><i></i></div>
@@ -197,9 +112,9 @@ blobs = ds.take_blobs(<span class="tok-str">"video"</span>, <span class="tok-arg
       <div class="ld-feature">
         <div class="ld-feature__num">04</div>
         <div class="ld-feature__body">
-          <h2>Data evolution &gt; schema evolution</h2>
+          <h3>Data evolution &gt; schema evolution</h3>
           <p>Backfilling column values normally forces a full table rewrite. Lance supports efficient schema evolution with backfill — adding a column with data is just writing new Lance files to the table.</p>
-          <a class="ld-more" href="guide/data_evolution/">Learn more →</a>
+          <a class="ld-more" href="{{ 'guide/data_evolution/' | url }}">Learn more →</a>
         </div>
         <div class="ld-feature__code">
           <div class="ld-win" aria-hidden="true"><i></i><i></i><i></i></div>
@@ -219,21 +134,14 @@ dataset.add_columns(add_embeddings)</code></pre>
       <div class="ld-feature">
         <div class="ld-feature__num">05</div>
         <div class="ld-feature__body">
-          <h2>Rich ecosystem integrations</h2>
+          <h3>Rich ecosystem integrations</h3>
           <p>Works with Pandas, Polars, Ray, and PyTorch for processing and ML. Connects to Apache DataFusion, DuckDB, Apache Spark, Trino, and Apache Flink for SQL analytics and distributed processing.</p>
-          <a class="ld-more" href="integrations/">View integrations →</a>
+          <a class="ld-more" href="{{ 'integrations/' | url }}">View integrations →</a>
         </div>
         <div class="ld-feature__img">
-          <img src="assets/images/ecosystem-integrations.png" alt="Lance ecosystem integrations" loading="lazy">
+          <img src="{{ 'assets/images/ecosystem-integrations.png' | url }}" alt="Lance ecosystem integrations" loading="lazy">
         </div>
       </div>
-
-    </div>
-  </section>
-
-{% endblock %}
-
-{% block content %}{% endblock %}
-{% block footer %}
-  {{ super() }}
+    </section>
+  </main>
 {% endblock %}
