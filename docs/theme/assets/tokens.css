@@ -52,12 +52,25 @@
   --surface-card: #FFFFFF;
   --surface-overlay: #F5F4F8;
   --surface-header: rgba(255, 255, 255, 0.88);
-  --surface-code: #14111D; /* code blocks stay ink-dark */
+  --surface-code: #F5F4F8; /* light code surface */
   --surface-inline-code: rgba(20, 17, 29, 0.05);
 
   --text-body: var(--fg-1);
   --text-secondary: var(--fg-2);
   --text-muted: var(--fg-3);
+
+  /* ---- Syntax highlighting (Pygments), light theme ---- */
+  --code-fg: #2A2635;
+  --code-kw: #7C3AED;     /* keywords, builtins */
+  --code-str: #0B62C4;    /* strings */
+  --code-com: #6E6A80;    /* comments */
+  --code-num: #9A6700;    /* numbers */
+  --code-fn: #0F766E;     /* functions, decorators */
+  --code-name: #2A2635;   /* class/module names, headings */
+  --code-tag: #BE123C;    /* HTML tags, attributes */
+  --code-punct: #57534E;  /* operators, punctuation, output */
+  --code-prompt: #8A8499; /* REPL prompts */
+  --code-hll: rgba(98, 94, 255, 0.12); /* highlighted line */
 
   /* ---- Layout ---- */
   --container-max: 1200px;
@@ -95,6 +108,19 @@
   --surface-header: rgba(14, 12, 20, 0.85);
   --surface-code: #14111D;
   --surface-inline-code: rgba(237, 235, 245, 0.08);
+
+  /* ---- Syntax highlighting (Pygments), dark theme (on ink) ---- */
+  --code-fg: #EDEBF5;
+  --code-kw: #B8A8FF;
+  --code-str: #7CC0FF;
+  --code-com: #6F6A85;
+  --code-num: #F2CE6B;
+  --code-fn: #8FE8CE;
+  --code-name: #EDEBF5;
+  --code-tag: #FF95A8;
+  --code-punct: #B7B1C6;
+  --code-prompt: #6F6A85;
+  --code-hll: rgba(98, 94, 255, 0.22);
 }
 
 /* ---- Minimal base ---- */

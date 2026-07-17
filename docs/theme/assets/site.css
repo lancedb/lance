@@ -451,31 +451,32 @@
 .ld-copy:hover { color: var(--beam-700); }
 .ld-code .highlight { margin: 0; }
 .ld-code pre { margin: 0; background: var(--surface-code); padding: 16px 18px; overflow-x: auto; }
-.ld-code pre code { background: none; border: none; padding: 0; font-size: 13px; line-height: 1.6; color: #EDEBF5; }
-/* Dark code surfaces need an explicit light selection color in every theme. */
-.ld-code pre ::selection, .ld-code pre::selection,
+.ld-code pre code { background: none; border: none; padding: 0; font-size: 13px; line-height: 1.6; color: var(--code-fg); }
+/* Ink code surfaces (dark-theme docs blocks + the always-dark homepage windows)
+   need an explicit light selection color; light-theme docs blocks use the default. */
+:root[data-theme="dark"] .ld-code pre ::selection, :root[data-theme="dark"] .ld-code pre::selection,
 .ld-feature__code pre ::selection, .ld-feature__code pre::selection {
   background: rgba(98, 94, 255, 0.55);
   color: #ffffff;
 }
 
-/* Pygments tokens on the ink surface */
-.highlight .k, .highlight .kn, .highlight .kd, .highlight .kt, .highlight .kr, .highlight .kp, .highlight .ow { color: #B8A8FF; }
-.highlight .kc { color: #B8A8FF; }
-.highlight .s, .highlight .s1, .highlight .s2, .highlight .sb, .highlight .sd, .highlight .sa, .highlight .se, .highlight .si, .highlight .sx, .highlight .sr, .highlight .ss, .highlight .sh { color: #7CC0FF; }
-.highlight .c, .highlight .c1, .highlight .cm, .highlight .ch, .highlight .cs, .highlight .cp, .highlight .cpf { color: #6F6A85; font-style: italic; }
-.highlight .m, .highlight .mi, .highlight .mf, .highlight .mh, .highlight .mo, .highlight .mb, .highlight .il { color: #F2CE6B; }
-.highlight .nf, .highlight .fm, .highlight .nd, .highlight .ne { color: #8FE8CE; }
-.highlight .nc, .highlight .nn { color: #EDEBF5; font-weight: 500; }
-.highlight .nb, .highlight .bp { color: #B8A8FF; }
-.highlight .nt { color: #FF95A8; }
-.highlight .na { color: #FF95A8; }
-.highlight .o { color: #B7B1C6; }
-.highlight .p { color: #B7B1C6; }
-.highlight .gp { color: #6F6A85; }
-.highlight .go { color: #B7B1C6; }
-.highlight .gh, .highlight .gu { color: #EDEBF5; font-weight: 600; }
-.highlight .hll { background: rgba(98, 94, 255, 0.22); display: block; }
+/* Pygments tokens — colors resolve per theme via the --code-* palette */
+.highlight .k, .highlight .kn, .highlight .kd, .highlight .kt, .highlight .kr, .highlight .kp, .highlight .ow { color: var(--code-kw); }
+.highlight .kc { color: var(--code-kw); }
+.highlight .s, .highlight .s1, .highlight .s2, .highlight .sb, .highlight .sd, .highlight .sa, .highlight .se, .highlight .si, .highlight .sx, .highlight .sr, .highlight .ss, .highlight .sh { color: var(--code-str); }
+.highlight .c, .highlight .c1, .highlight .cm, .highlight .ch, .highlight .cs, .highlight .cp, .highlight .cpf { color: var(--code-com); font-style: italic; }
+.highlight .m, .highlight .mi, .highlight .mf, .highlight .mh, .highlight .mo, .highlight .mb, .highlight .il { color: var(--code-num); }
+.highlight .nf, .highlight .fm, .highlight .nd, .highlight .ne { color: var(--code-fn); }
+.highlight .nc, .highlight .nn { color: var(--code-name); font-weight: 500; }
+.highlight .nb, .highlight .bp { color: var(--code-kw); }
+.highlight .nt { color: var(--code-tag); }
+.highlight .na { color: var(--code-tag); }
+.highlight .o { color: var(--code-punct); }
+.highlight .p { color: var(--code-punct); }
+.highlight .gp { color: var(--code-prompt); }
+.highlight .go { color: var(--code-punct); }
+.highlight .gh, .highlight .gu { color: var(--code-name); font-weight: 600; }
+.highlight .hll { background: var(--code-hll); display: block; }
 
 /* mermaid diagrams: white plate (rendered by JS) */
 .ld-article pre.mermaid, .ld-article div.mermaid {
