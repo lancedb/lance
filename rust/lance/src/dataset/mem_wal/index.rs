@@ -110,9 +110,17 @@ enum PkIndex {
 /// through `put`: `MemTable::insert_batches_only` does a full `Arc<Schema>`
 /// equality check, so a batch that would trip one is rejected before it reaches
 /// the batch store, let alone the WAL.
+///
+/// It also rejects a config whose `field_id` names a different column than its
+/// `column`. Index *selection* keys off `field_id` — a single-column PK reuses
+/// the BTree whose `field_id` matches its key — so a config resolved only by name
+/// could be bound under the wrong identity, serving stale reads and flushing the
+/// wrong column into the durable PK sidecar. `lance_schema` supplies the
+/// authoritative name→id mapping.
 pub fn validate_index_configs(
     configs: &[MemIndexConfig],
     schema: &ArrowSchema,
+    lance_schema: &LanceSchema,
     pk_columns: &[String],
 ) -> Result<()> {
     for config in configs {
@@ -184,6 +192,25 @@ pub fn validate_index_configs(
                     )));
                 }
             },
+        }
+
+        // The column resolves, but index selection keys off `field_id`, not name.
+        // A config whose `field_id` identifies a *different* column would be bound
+        // under the wrong identity (e.g. reused as the single-column PK index), so
+        // reject any `field_id` that does not name the resolved column.
+        let resolved_field_id = lance_schema
+            .field(column)
+            .expect("column resolved in the Arrow schema is present in the Lance schema")
+            .id;
+        if resolved_field_id != config.field_id() {
+            return Err(Error::invalid_input(format!(
+                "index '{}' is configured with field_id {} but its column '{}' has field_id {} \
+                 in the shard schema",
+                config.name(),
+                config.field_id(),
+                column,
+                resolved_field_id,
+            )));
         }
     }
 
@@ -1677,6 +1704,10 @@ mod tests {
     #[case::btree_missing_column(MemIndexConfig::BTree(BTreeIndexConfig {
         name: "idx".into(), field_id: 9, column: "nope".into(),
     }), Some("not in the shard schema"))]
+    // Column exists, but its field_id names a *different* column ("id" is 0, not 1).
+    #[case::btree_field_id_column_mismatch(MemIndexConfig::BTree(BTreeIndexConfig {
+        name: "idx".into(), field_id: 1, column: "id".into(),
+    }), Some("has field_id 0"))]
     #[case::fts_ok(MemIndexConfig::Fts(FtsIndexConfig::new(
         "idx".into(), 1, "description".into(),
     )), None)]
@@ -1703,7 +1734,8 @@ mod tests {
         #[case] expected_error: Option<&str>,
     ) {
         let schema = vector_schema();
-        let result = validate_index_configs(&[config], &schema, &[]);
+        let lance_schema = LanceSchema::try_from(schema.as_ref()).unwrap();
+        let result = validate_index_configs(&[config], &schema, &lance_schema, &[]);
         match expected_error {
             None => result.expect("valid config must pass validation"),
             Some(fragment) => {
@@ -1732,25 +1764,27 @@ mod tests {
                 true,
             ),
         ]));
+        let lance_schema = LanceSchema::try_from(schema.as_ref()).unwrap();
 
-        validate_index_configs(&[], &schema, &["id".into(), "name".into()])
+        validate_index_configs(&[], &schema, &lance_schema, &["id".into(), "name".into()])
             .expect("Int32 + Utf8 composite PK must be encodable");
 
-        let err = validate_index_configs(&[], &schema, &["id".into(), "coords".into()])
-            .expect_err("a FixedSizeList PK column has no order-preserving encoding");
+        let err =
+            validate_index_configs(&[], &schema, &lance_schema, &["id".into(), "coords".into()])
+                .expect_err("a FixedSizeList PK column has no order-preserving encoding");
         assert!(
             err.to_string().contains("order-preserving key encoding"),
             "error must name the reason, got {err}"
         );
 
         // A single-column PK of the same type is fine: it aliases a BTree.
-        validate_index_configs(&[], &schema, &["coords".into()])
+        validate_index_configs(&[], &schema, &lance_schema, &["coords".into()])
             .expect("single-column PK aliases a BTree and accepts any type");
 
         // But every PK column must exist. A single-column PK naming an absent
         // column is rejected here, not left to fail deterministically on every
         // later index build and WAL replay.
-        let err = validate_index_configs(&[], &schema, &["missing".into()])
+        let err = validate_index_configs(&[], &schema, &lance_schema, &["missing".into()])
             .expect_err("a single-column PK on an absent column must be rejected");
         assert!(
             err.to_string().contains("not in the shard schema"),

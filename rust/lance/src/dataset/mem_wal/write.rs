@@ -1209,34 +1209,33 @@ impl SharedWriterState {
         let mut old_memtable = std::mem::replace(&mut state.memtable, new_memtable);
         old_memtable.freeze(last_wal_entry_position);
 
+        // Set up completion tracking on the outgoing table before it is retained
+        // and before any fallible dispatch, so the retained table already carries
+        // its cells and a failed send below can poison-and-return without leaving
+        // partial state to unwind.
+        let _memtable_flush_watcher = old_memtable.create_memtable_flush_completion();
+
         // The outgoing memtable may still owe an index apply — the puts that
         // filled it triggered one, but the task need not have drained yet, and
         // this is the last chance to name that store. Its L0 flush is gated on
         // the WAL append (below), not on indexing, so without this its tail could
         // stay unindexed and invisible for the rest of its life.
-        if let Some(old_indexes) = old_memtable.indexes_arc()
-            && old_indexes.indexed_count() < old_batch_store.len()
-        {
-            self.trigger_index_apply(old_batch_store.clone(), old_indexes, old_batch_store.len())?;
-        }
-        let _memtable_flush_watcher = old_memtable.create_memtable_flush_completion();
+        let pending_index_apply = match old_memtable.indexes_arc() {
+            Some(old_indexes) if old_indexes.indexed_count() < old_batch_store.len() => {
+                Some((old_batch_store.clone(), old_indexes, old_batch_store.len()))
+            }
+            _ => None,
+        };
 
-        if pending_wal_range.is_some() {
+        let pending_wal_flush = if pending_wal_range.is_some() {
             let completion_cell: WatchableOnceCell<
                 std::result::Result<WalFlushResult, WalFlushFailure>,
             > = WatchableOnceCell::new();
-            let completion_reader = completion_cell.reader();
-            old_memtable.set_wal_flush_completion(completion_reader);
-
-            let end_batch_position = old_batch_store.len();
-            self.wal_flusher.trigger_flush(
-                WalFlushSource::BatchStore {
-                    batch_store: old_batch_store,
-                },
-                end_batch_position,
-                Some(completion_cell),
-            )?;
-        }
+            old_memtable.set_wal_flush_completion(completion_cell.reader());
+            Some((old_batch_store.len(), completion_cell))
+        } else {
+            None
+        };
 
         let frozen_size = old_memtable.estimated_size();
         state.frozen_memtable_bytes += frozen_size;
@@ -1250,13 +1249,37 @@ impl SharedWriterState {
 
         let frozen_memtable = Arc::new(old_memtable);
 
-        // Keep this generation queryable past its manifest commit (swept after
-        // the grace by `SweepExpired`). Arc refcount, not a copy — the flush
-        // task holds it alive for the whole drain anyway.
+        // Retain the outgoing table in the read view *before* the fallible
+        // dispatches below. `state.memtable` was already replaced, so a failed
+        // send that returned here without this push would drop the table and its
+        // accepted rows would silently vanish from every scan. Keep it queryable
+        // past its manifest commit too (swept after the grace by `SweepExpired`);
+        // Arc refcount, not a copy — the flush task holds it alive anyway.
         state.frozen_memtables.push_back(FrozenMemTable {
             memtable: frozen_memtable.clone(),
             flushed_at_ms: None,
         });
+
+        // Dispatch can only fail if a background task's channel is already closed,
+        // i.e. the writer is being torn down. Poison so the read path fails fast
+        // with the typed error instead of serving the retained-but-never-durable
+        // tail, then return — the table stays in the read view.
+        if let Some((batch_store, indexes, end_batch_position)) = pending_index_apply {
+            self.trigger_index_apply(batch_store, indexes, end_batch_position)
+                .inspect_err(|e| self.wal_flusher.poison(e))?;
+        }
+
+        if let Some((end_batch_position, completion_cell)) = pending_wal_flush {
+            self.wal_flusher
+                .trigger_flush(
+                    WalFlushSource::BatchStore {
+                        batch_store: old_batch_store,
+                    },
+                    end_batch_position,
+                    Some(completion_cell),
+                )
+                .inspect_err(|e| self.wal_flusher.poison(e))?;
+        }
 
         debug!(
             "Frozen memtable generation {}, pending_count = {}",
@@ -1496,6 +1519,47 @@ impl ShardWriter {
             config.manifest_scan_batch_size,
         ));
 
+        // Derive PK metadata and run every side-effect-free validation *before*
+        // claiming the epoch. `claim_epoch` durably bumps the stored epoch and,
+        // for a successor, `write_fence_sentinel` fences the predecessor — so an
+        // open doomed by purely local input (a bad flush interval, an index config
+        // that disagrees with the schema) must fail here, before it can knock the
+        // healthy incumbent off the shard. Memtable-only: WAL-only mode has no
+        // indexes and no memtable ticker to validate.
+        let memtable_validation = if config.enable_memtable {
+            let lance_schema = Schema::try_from(schema.as_ref())?;
+            let pk_fields = lance_schema.unenforced_primary_key();
+            let pk_field_ids: Vec<i32> = pk_fields.iter().map(|f| f.id).collect();
+            let pk_columns: Vec<String> = pk_fields.iter().map(|f| f.name.clone()).collect();
+
+            // A durable writer with no flush ticker cannot make progress. The WAL
+            // append is timer-, size-, and freeze-driven now — the put path no
+            // longer triggers its own — so with no ticker a durable put below the
+            // size threshold waits on an append that nothing will ever make. Reject
+            // the combination rather than deadlock on it.
+            if config.durable_write
+                && config
+                    .max_wal_flush_interval
+                    .is_none_or(|interval| interval.is_zero())
+            {
+                return Err(Error::invalid_input(
+                    "durable_write requires a non-zero max_wal_flush_interval: the WAL append is \
+                     driven by that ticker, so without it a durable put would wait forever for an \
+                     append that never happens",
+                ));
+            }
+
+            // Reject an index config that disagrees with the schema *before* a
+            // single row is accepted. Such a config fails deterministically on
+            // every insert, including inserts replayed from the WAL — so once a row
+            // is durable the shard can never reopen. Fail the open instead.
+            validate_index_configs(&index_configs, schema.as_ref(), &lance_schema, &pk_columns)?;
+
+            Some((pk_field_ids, pk_columns))
+        } else {
+            None
+        };
+
         // Claim the shard (epoch-based fencing) — done once, then shared
         // with the WalAppender via `with_claimed_epoch`.
         let (epoch, manifest) = manifest_store.claim_epoch(config.shard_spec_id).await?;
@@ -1552,11 +1616,15 @@ impl ShardWriter {
         let task_executor = Arc::new(TaskExecutor::new());
 
         let mode = if config.enable_memtable {
+            let (pk_field_ids, pk_columns) = memtable_validation
+                .expect("memtable_validation is Some when enable_memtable is true");
             Self::open_memtable_mode(
                 &config,
                 &schema,
                 &manifest,
                 &index_configs,
+                pk_field_ids,
+                pk_columns,
                 wal_flusher.clone(),
                 wal_flush_tx,
                 wal_flush_rx,
@@ -1598,6 +1666,8 @@ impl ShardWriter {
         schema: &Arc<ArrowSchema>,
         manifest: &ShardManifest,
         index_configs: &[MemIndexConfig],
+        pk_field_ids: Vec<i32>,
+        pk_columns: Vec<String>,
         wal_flusher: Arc<WalFlusher>,
         wal_flush_tx: mpsc::UnboundedSender<TriggerWalFlush>,
         wal_flush_rx: mpsc::UnboundedReceiver<TriggerWalFlush>,
@@ -1610,34 +1680,9 @@ impl ShardWriter {
         stats: SharedWriteStats,
         task_executor: &Arc<TaskExecutor>,
     ) -> Result<WriterMode> {
-        // Create MemTable with primary key field IDs from schema
-        let lance_schema = Schema::try_from(schema.as_ref())?;
-        let pk_fields = lance_schema.unenforced_primary_key();
-        let pk_field_ids: Vec<i32> = pk_fields.iter().map(|f| f.id).collect();
-        let pk_columns: Vec<String> = pk_fields.iter().map(|f| f.name.clone()).collect();
-
-        // A durable writer with no flush ticker cannot make progress. The WAL
-        // append is timer-, size-, and freeze-driven now — the put path no longer
-        // triggers its own — so with no ticker a durable put below the size
-        // threshold waits on an append that nothing will ever make. Reject the
-        // combination rather than deadlock on it.
-        if config.durable_write
-            && config
-                .max_wal_flush_interval
-                .is_none_or(|interval| interval.is_zero())
-        {
-            return Err(Error::invalid_input(
-                "durable_write requires a non-zero max_wal_flush_interval: the WAL append is \
-                 driven by that ticker, so without it a durable put would wait forever for an \
-                 append that never happens",
-            ));
-        }
-
-        // Reject an index config that disagrees with the schema *before* a
-        // single row is accepted. Such a config fails deterministically on every
-        // insert, including inserts replayed from the WAL — so once a row is
-        // durable the shard can never reopen. Fail the open instead.
-        validate_index_configs(index_configs, schema.as_ref(), &pk_columns)?;
+        // PK metadata and index/interval validation were resolved in `open`
+        // before the epoch was claimed (a doomed open must not fence the
+        // incumbent first).
 
         // Build a fresh, cursor-bound memtable at a given generation and
         // writer-global coordinate. Replay calls this for the first memtable and
@@ -5277,6 +5322,117 @@ mod tests {
             .put(vec![create_test_batch(&schema, 2, 1)])
             .await
             .unwrap();
+    }
+
+    /// A doomed open must fail on local validation *before* it claims the epoch,
+    /// so it cannot fence the healthy writer already serving the shard. The
+    /// durable-write/flush-interval and index-config checks used to run *after*
+    /// `claim_epoch` (and, for a successor, after `write_fence_sentinel`), so a
+    /// rejected open still bumped the stored epoch and fenced the incumbent.
+    #[tokio::test]
+    async fn test_doomed_open_does_not_fence_incumbent() {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = schema_with_pk();
+        let shard_id = Uuid::new_v4();
+
+        let writer_a = ShardWriter::open(
+            store.clone(),
+            base_path.clone(),
+            base_uri.clone(),
+            memtable_config_with_pk(shard_id),
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+        writer_a
+            .put(vec![create_test_batch(&schema, 0, 1)])
+            .await
+            .unwrap();
+
+        // A durable writer with no flush interval is rejected — the put path no
+        // longer triggers its own append, so it would deadlock. On the old path
+        // this rejection landed only after the epoch had already been claimed.
+        let doomed_config = ShardWriterConfig {
+            max_wal_flush_interval: None,
+            ..memtable_config_with_pk(shard_id)
+        };
+        let err = ShardWriter::open(
+            store.clone(),
+            base_path.clone(),
+            base_uri.clone(),
+            doomed_config,
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .map(|_| ())
+        .expect_err("durable_write with no flush interval must be rejected");
+        assert!(
+            err.to_string().contains("max_wal_flush_interval"),
+            "unexpected error: {err}"
+        );
+
+        // The incumbent is untouched: not fenced, still accepting writes.
+        writer_a.check_fenced().await.unwrap();
+        writer_a
+            .put(vec![create_test_batch(&schema, 1, 1)])
+            .await
+            .unwrap();
+        writer_a.close().await.unwrap();
+    }
+
+    /// A failed dispatch during `freeze_memtable` must not drop the outgoing
+    /// table's rows from the read view. The active memtable is replaced before
+    /// the WAL-flush and index-apply sends; a send that failed (background tasks
+    /// gone) used to return before the outgoing table was retained in
+    /// `frozen_memtables`, so its accepted rows silently vanished — a scan
+    /// returned 0 rows with no error. The writer must instead retain the table
+    /// and poison, so reads fail fast rather than serve a divergent snapshot.
+    #[tokio::test]
+    async fn test_freeze_dispatch_failure_retains_rows_and_poisons() {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = schema_with_pk();
+        let shard_id = Uuid::new_v4();
+
+        // Non-durable + no ticker: the put is read-your-writes (waits for its
+        // index apply) but nothing is WAL-flushed, so the freeze below still owes
+        // a WAL append.
+        let config = ShardWriterConfig {
+            durable_write: false,
+            max_wal_flush_interval: None,
+            ..memtable_config_with_pk(shard_id)
+        };
+        let writer = ShardWriter::open(store, base_path, base_uri, config, schema.clone(), vec![])
+            .await
+            .unwrap();
+
+        writer
+            .put(vec![create_test_batch(&schema, 0, 10)])
+            .await
+            .unwrap();
+        assert_eq!(writer.memtable_stats().await.unwrap().row_count, 10);
+
+        // Tear the background tasks down out from under the writer, so the
+        // freeze's dispatch sends hit closed channels.
+        writer.abort().await.unwrap();
+
+        let err = writer
+            .force_seal_active()
+            .await
+            .expect_err("force_seal_active must surface the failed dispatch");
+        assert!(
+            err.to_string().contains("channel closed"),
+            "unexpected error: {err}"
+        );
+
+        // The failure poisoned the writer: reads fail fast instead of returning a
+        // silent zero-row snapshot of a shard whose rows were dropped.
+        assert!(
+            writer.scan().await.is_err(),
+            "a poisoned writer must reject reads, not serve a divergent snapshot"
+        );
+        assert!(writer.in_memory_memtable_refs().await.is_err());
     }
 
     /// A WAL holding more batches than one memtable's capacity must reopen.
