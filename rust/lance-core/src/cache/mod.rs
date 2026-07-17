@@ -55,14 +55,7 @@ pub use codec::{
     CacheCodec, CacheCodecImpl, CacheDecode, CacheMissReason, MAGIC, has_cache_envelope,
 };
 pub use entry_io::{CacheEntryReader, CacheEntryWriter};
-pub use lance_cache_abi::{
-    DYNAMIC_CACHE_ABI_VERSION, DYNAMIC_CACHE_BACKEND_INIT_SYMBOL, DYNAMIC_CACHE_STATUS_ERROR,
-    DYNAMIC_CACHE_STATUS_HIT, DYNAMIC_CACHE_STATUS_MISS, DYNAMIC_CACHE_STATUS_OK,
-    DynamicCacheBackendInitFn, DynamicCacheBackendVTable, DynamicCacheByteSlice,
-    DynamicCacheClearFn, DynamicCacheCreateFn, DynamicCacheDestroyFn, DynamicCacheFreeBytesFn,
-    DynamicCacheGetFn, DynamicCacheGetResult, DynamicCacheInsertFn, DynamicCacheInvalidatePrefixFn,
-    DynamicCacheKey, DynamicCacheMeasureFn, DynamicCacheOwnedBytes,
-};
+pub use lance_cache_abi as dynamic_cache_abi;
 pub use moka::MokaCacheBackend;
 
 use std::borrow::Cow;
