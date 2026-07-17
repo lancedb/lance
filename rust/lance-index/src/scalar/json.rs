@@ -8,22 +8,24 @@ use std::{
 };
 
 use arrow_array::{Array, LargeBinaryArray, RecordBatch, StructArray, UInt8Array};
-use arrow_schema::{DataType, Field, Field as ArrowField, Schema};
+use arrow_schema::{DataType, Field, Field as ArrowField, Schema, SortOptions};
 use async_trait::async_trait;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::{
     execution::SendableRecordBatchStream,
-    physical_plan::{ExecutionPlan, projection::ProjectionExec},
+    physical_plan::{ExecutionPlan, projection::ProjectionExec, sorts::sort::SortExec},
 };
 use datafusion_common::{ScalarValue, config::ConfigOptions};
 use datafusion_expr::{Expr, Operator, ScalarUDF};
 use datafusion_physical_expr::{
-    PhysicalExpr, ScalarFunctionExpr,
+    PhysicalExpr, PhysicalSortExpr, ScalarFunctionExpr,
     expressions::{Column, Literal},
 };
 use futures::StreamExt;
 use lance_core::deepsize::DeepSizeOf;
-use lance_datafusion::exec::{LanceExecutionOptions, OneShotExec, get_session_context};
+use lance_datafusion::exec::{
+    LanceExecutionOptions, OneShotExec, execute_plan, get_session_context,
+};
 use lance_datafusion::udf::json::JsonbType;
 use prost::Message;
 use roaring::RoaringBitmap;
@@ -40,7 +42,8 @@ use crate::{
         UpdateCriteria,
         expression::{IndexedExpression, ScalarIndexExpr, ScalarIndexSearch, ScalarQueryParser},
         registry::{
-            BasicTrainer, ScalarIndexPlugin, TrainingCriteria, TrainingRequest, VALUE_COLUMN_NAME,
+            BasicTrainer, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
+            VALUE_COLUMN_NAME,
         },
     },
 };
@@ -354,13 +357,28 @@ impl ScalarQueryParser for JsonQueryParser {
 pub struct JsonTrainingRequest {
     parameters: JsonIndexParameters,
     target_request: Box<dyn TrainingRequest>,
+    criteria: TrainingCriteria,
 }
 
 impl JsonTrainingRequest {
     pub fn new(parameters: JsonIndexParameters, target_request: Box<dyn TrainingRequest>) -> Self {
+        let target_criteria = target_request.criteria();
+        // The scanner can only sort its output by the raw JSON column, not by the value
+        // at `path` that this plugin extracts from it, so a `Values`-ordered scan here
+        // would sort by the wrong key and still need re-sorting after extraction. Ask
+        // for unordered input instead and let `train_index` sort the extracted value
+        // stream itself, once, right before handing it to the target trainer.
+        let ordering = match target_criteria.ordering {
+            TrainingOrdering::Values => TrainingOrdering::None,
+            other => other,
+        };
+        let mut criteria = TrainingCriteria::new(ordering);
+        criteria.needs_row_ids = target_criteria.needs_row_ids;
+        criteria.needs_row_addrs = target_criteria.needs_row_addrs;
         Self {
             parameters,
             target_request,
+            criteria,
         }
     }
 }
@@ -371,7 +389,7 @@ impl TrainingRequest for JsonTrainingRequest {
     }
 
     fn criteria(&self) -> &TrainingCriteria {
-        self.target_request.criteria()
+        &self.criteria
     }
 }
 
@@ -665,6 +683,35 @@ impl JsonIndexPlugin {
             futures::stream::iter(converted_batches.into_iter().map(Ok)),
         )))
     }
+
+    /// Sort a `(value, row_id)` stream ascending by value.
+    ///
+    /// Target index types that require `TrainingOrdering::Values` (e.g. btree, whose
+    /// per-page min/max stats are taken from the first/last row of each page) need this
+    /// as the only sort in the JSON training path: `JsonTrainingRequest` requests
+    /// unordered input from the scanner, since the scanner can only sort on the raw
+    /// JSON column, not on the value at `path`.
+    async fn sort_stream_by_value(
+        data: SendableRecordBatchStream,
+    ) -> Result<SendableRecordBatchStream> {
+        let input = Arc::new(OneShotExec::new(data));
+        let value_idx = input.schema().index_of(VALUE_COLUMN_NAME)?;
+        let sort_expr = PhysicalSortExpr {
+            expr: Arc::new(Column::new(VALUE_COLUMN_NAME, value_idx)),
+            options: SortOptions {
+                descending: false,
+                nulls_first: true,
+            },
+        };
+        let plan = Arc::new(SortExec::new([sort_expr].into(), input));
+        execute_plan(
+            plan,
+            LanceExecutionOptions {
+                use_spilling: true,
+                ..Default::default()
+            },
+        )
+    }
 }
 
 #[async_trait]
@@ -719,6 +766,17 @@ impl BasicTrainer for JsonIndexPlugin {
         // Convert the stream to properly typed values based on inferred type
         let converted_stream =
             Self::convert_stream_by_type(data_stream, inferred_type.clone()).await?;
+
+        // `JsonTrainingRequest::criteria()` asked the scanner for unordered input (see
+        // its constructor), since the scanner can only sort on the raw JSON column, not
+        // on the value at `path`. If the target index needs value-ordered input, this is
+        // the one place that sort happens: on the extracted value, after extraction.
+        let converted_stream =
+            if request.target_request.criteria().ordering == TrainingOrdering::Values {
+                Self::sort_stream_by_value(converted_stream).await?
+            } else {
+                converted_stream
+            };
 
         // Update the target request with inferred type
         let registry = self.registry()?;
@@ -837,8 +895,11 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scalar::SargableQuery;
     use arrow_array::{ArrayRef, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
+    use rstest::rstest;
+    use std::ops::Bound;
     use std::sync::Arc;
 
     // Note: The old test_detect_json_value_type test has been removed as we now use
@@ -977,5 +1038,143 @@ mod tests {
                 .unwrap();
 
         assert_eq!(inferred_type, DataType::Utf8);
+    }
+
+    /// Regression test for https://github.com/lance-format/lance/issues/7485.
+    ///
+    /// A JSON-path btree index over float values returned wrong results because the
+    /// btree trainer assumes its input arrives sorted by value (page min/max come from
+    /// the first/last row of each page), but the value at `path` is extracted by this
+    /// plugin *after* the scanner has already produced its rows, so a scan sorted on
+    /// the raw JSON column does not sort the extracted value. This exercises the fix
+    /// end to end: `JsonTrainingRequest::criteria()` must ask for unordered input (so
+    /// the scanner does not waste time sorting on the wrong key), and `train_index` must
+    /// sort the extracted value stream itself before training the target btree.
+    ///
+    /// Rows are fed in raw storage order (not sorted by value) to simulate what an
+    /// unordered scan would produce.
+    ///
+    /// Each case below runs a spilling `SortExec` that reserves a non-spillable merge
+    /// buffer from the process-wide cached DataFusion memory pool (see
+    /// `get_session_context`); running the cases concurrently contends for that shared
+    /// pool and can spuriously exhaust it, so this guard serializes them.
+    static FLOAT_INDEX_CASE_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[rstest]
+    #[case::range_gt_zero(
+        SargableQuery::Range(Bound::Excluded(ScalarValue::Float64(Some(0.0))), Bound::Unbounded),
+        vec![0, 1]
+    )]
+    #[case::range_gte_page_min(
+        SargableQuery::Range(Bound::Included(ScalarValue::Float64(Some(10.5))), Bound::Unbounded),
+        vec![0, 1]
+    )]
+    #[case::equals_non_exact_float(
+        SargableQuery::Equals(ScalarValue::Float64(Some(40.1))),
+        vec![1]
+    )]
+    #[case::equals_exact_float(SargableQuery::Equals(ScalarValue::Float64(Some(10.5))), vec![0])]
+    #[case::range_covers_all(
+        SargableQuery::Range(Bound::Unbounded, Bound::Excluded(ScalarValue::Float64(Some(100.0)))),
+        vec![0, 1, 2]
+    )]
+    #[tokio::test]
+    async fn test_json_float_btree_index_unsorted_input(
+        #[case] query: SargableQuery,
+        #[case] expected: Vec<u64>,
+    ) {
+        let _guard = FLOAT_INDEX_CASE_GUARD.lock().await;
+
+        use crate::metrics::NoOpMetricsCollector;
+        use crate::progress::noop_progress;
+        use crate::registry::IndexPluginRegistry;
+        use crate::scalar::lance_format::LanceIndexStore;
+        use arrow_array::{LargeBinaryArray, UInt64Array};
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        use futures::stream;
+        use lance_core::cache::LanceCache;
+        use lance_core::utils::tempfile::TempObjDir;
+        use lance_io::object_store::ObjectStore;
+        use lance_select::RowAddrTreeMap;
+
+        // row0=10.5, row1=40.1, row2=-3.2: storage order does not match ascending value
+        // order (-3.2, 10.5, 40.1), so a btree trained on this order without an explicit
+        // value sort would record a corrupted page max of -3.2.
+        let json_data = [
+            r#"{"latitude": 10.5}"#,
+            r#"{"latitude": 40.1}"#,
+            r#"{"latitude": -3.2}"#,
+        ];
+        let jsonb: Vec<Vec<u8>> = json_data
+            .iter()
+            .map(|s| s.parse::<jsonb::OwnedJsonb>().unwrap().to_vec())
+            .collect();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(VALUE_COLUMN_NAME, DataType::LargeBinary, true),
+            Field::new(ROW_ID, DataType::UInt64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(LargeBinaryArray::from(
+                    jsonb.iter().map(|v| Some(v.as_slice())).collect::<Vec<_>>(),
+                )) as ArrayRef,
+                Arc::new(UInt64Array::from(vec![0u64, 1, 2])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let data = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::iter(vec![Ok(batch)]),
+        )) as SendableRecordBatchStream;
+
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let registry = IndexPluginRegistry::with_default_plugins();
+        let plugin = registry.get_plugin_by_name("json").unwrap();
+        let trainer = plugin.basic_trainer().unwrap();
+        let request = trainer
+            .new_training_request(
+                r#"{"target_index_type":"btree","path":"latitude"}"#,
+                &Field::new(VALUE_COLUMN_NAME, DataType::LargeBinary, true),
+            )
+            .unwrap();
+
+        // The scanner must be asked for unordered input: only this plugin knows the
+        // order of the extracted value, so sorting on the raw JSON column would be
+        // wasted work that still leaves the extracted stream unsorted.
+        assert_eq!(request.criteria().ordering, TrainingOrdering::None);
+
+        let created = trainer
+            .train_index(data, store.as_ref(), request, None, noop_progress())
+            .await
+            .unwrap();
+
+        let index = plugin
+            .load_index(
+                store.clone(),
+                &created.index_details,
+                None,
+                &LanceCache::no_cache(),
+            )
+            .await
+            .unwrap();
+
+        let json_query = JsonQuery::new(Arc::new(query.clone()), "latitude".to_string());
+        let result = index
+            .search(&json_query, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(
+            result,
+            SearchResult::exact(RowAddrTreeMap::from_iter(expected.iter().copied())),
+            "query {query:?}"
+        );
     }
 }
