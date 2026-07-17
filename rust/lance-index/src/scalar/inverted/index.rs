@@ -7157,7 +7157,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use std::collections::HashMap;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     use crate::scalar::inverted::tokenizer::document_tokenizer::TextTokenizer;
     use lance_tokenizer::{Language, SimpleTokenizer, StopWordFilter, TextAnalyzer};
@@ -8712,10 +8712,40 @@ mod tests {
     }
 
     #[derive(Debug)]
+    struct DocsOpenControl {
+        docs_file: String,
+        block_next_open: AtomicBool,
+        fail_next_open: AtomicBool,
+        open_started: tokio::sync::Notify,
+        release_open: tokio::sync::Notify,
+    }
+
+    impl DocsOpenControl {
+        fn new(docs_file: String) -> Self {
+            Self {
+                docs_file,
+                block_next_open: AtomicBool::new(false),
+                fail_next_open: AtomicBool::new(false),
+                open_started: tokio::sync::Notify::new(),
+                release_open: tokio::sync::Notify::new(),
+            }
+        }
+
+        fn block_next(&self) {
+            self.block_next_open.store(true, Ordering::SeqCst);
+        }
+
+        fn fail_next(&self) {
+            self.fail_next_open.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[derive(Debug)]
     struct CountingStore {
         inner: Arc<dyn IndexStore>,
         posting_file: String,
         counter: Arc<PostingMetadataCounter>,
+        docs_open_control: Option<Arc<DocsOpenControl>>,
     }
 
     impl DeepSizeOf for CountingStore {
@@ -8734,6 +8764,7 @@ mod tests {
                 inner: self.inner.clone(),
                 posting_file: self.posting_file.clone(),
                 counter: self.counter.clone(),
+                docs_open_control: self.docs_open_control.clone(),
             })
         }
         fn io_parallelism(&self) -> usize {
@@ -8744,6 +8775,7 @@ mod tests {
                 inner: self.inner.with_io_priority(io_priority),
                 posting_file: self.posting_file.clone(),
                 counter: self.counter.clone(),
+                docs_open_control: self.docs_open_control.clone(),
             })
         }
         async fn new_index_file(
@@ -8754,6 +8786,19 @@ mod tests {
             self.inner.new_index_file(name, schema).await
         }
         async fn open_index_file(&self, name: &str) -> Result<Arc<dyn IndexReader>> {
+            if let Some(control) = self
+                .docs_open_control
+                .as_ref()
+                .filter(|control| name == control.docs_file)
+            {
+                if control.fail_next_open.swap(false, Ordering::SeqCst) {
+                    return Err(Error::io("injected docs-file open failure"));
+                }
+                if control.block_next_open.swap(false, Ordering::SeqCst) {
+                    control.open_started.notify_one();
+                    control.release_open.notified().await;
+                }
+            }
             let reader = self.inner.open_index_file(name).await?;
             if name == self.posting_file {
                 Ok(Arc::new(CountingPostingReader {
@@ -8804,6 +8849,14 @@ mod tests {
         num_tokens: usize,
         cache: LanceCache,
     ) -> (Arc<InvertedIndex>, Arc<PostingMetadataCounter>, TempObjDir) {
+        load_counted_v2_index_with_docs_open_control(num_tokens, cache, None).await
+    }
+
+    async fn load_counted_v2_index_with_docs_open_control(
+        num_tokens: usize,
+        cache: LanceCache,
+        docs_open_control: Option<Arc<DocsOpenControl>>,
+    ) -> (Arc<InvertedIndex>, Arc<PostingMetadataCounter>, TempObjDir) {
         let tmpdir = TempObjDir::default();
         let inner_store = Arc::new(LanceIndexStore::new(
             ObjectStore::local().into(),
@@ -8846,6 +8899,7 @@ mod tests {
             inner: inner_store,
             posting_file: posting_file_path(0),
             counter: counter.clone(),
+            docs_open_control,
         });
         let index = InvertedIndex::load(counting_store, None, &cache)
             .await
@@ -8998,6 +9052,79 @@ mod tests {
         let first = &views[0];
         assert!(views.iter().all(|view| Arc::ptr_eq(first, view)));
         assert!(matches!(&first.num_tokens, NumTokens::Shared(_)));
+        assert_eq!(docs.total_tokens_cached(), Some(100));
+    }
+
+    #[tokio::test]
+    async fn test_cancelled_stats_initialization_cannot_publish_partial_docset_state() {
+        let control = Arc::new(DocsOpenControl::new(doc_file_path(0)));
+        let (index, _counter, _tmpdir) = load_counted_v2_index_with_docs_open_control(
+            100,
+            LanceCache::no_cache(),
+            Some(control.clone()),
+        )
+        .await;
+        let docs = index.partitions[0].docs.clone();
+
+        control.block_next();
+        let stats_task = tokio::spawn({
+            let docs = docs.clone();
+            async move { docs.total_tokens_num().await }
+        });
+        control.open_started.notified().await;
+
+        let full_task = tokio::spawn({
+            let docs = docs.clone();
+            async move { docs.ensure_loaded().await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !docs.is_full_loaded_for_test() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("full DocSet should be published while the stats read is blocked");
+
+        // Before num-tokens state was published as one snapshot, cancelling
+        // both tasks here could leave `full` initialized but `total_tokens`
+        // empty. The next WAND getter would accept that partial state.
+        if !full_task.is_finished() {
+            full_task.abort();
+        }
+        let _ = full_task.await;
+        stats_task.abort();
+        assert!(stats_task.await.unwrap_err().is_cancelled());
+
+        let wand_docs = docs.ensure_num_tokens_loaded().await.unwrap();
+        assert!(wand_docs.has_row_ids());
+        assert_eq!(wand_docs.total_tokens_num(), 100);
+        assert_eq!(docs.total_tokens_cached(), Some(100));
+    }
+
+    #[tokio::test]
+    async fn test_failed_num_tokens_snapshot_initialization_can_retry() {
+        let control = Arc::new(DocsOpenControl::new(doc_file_path(0)));
+        let (index, _counter, _tmpdir) = load_counted_v2_index_with_docs_open_control(
+            100,
+            LanceCache::no_cache(),
+            Some(control.clone()),
+        )
+        .await;
+        let docs = index.partitions[0].docs.clone();
+
+        control.fail_next();
+        let error = docs.total_tokens_num().await.unwrap_err();
+        assert!(matches!(error, Error::IO { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("injected docs-file open failure")
+        );
+        assert_eq!(docs.total_tokens_cached(), None);
+
+        let wand_docs = docs.ensure_num_tokens_loaded().await.unwrap();
+        assert!(!wand_docs.has_row_ids());
+        assert_eq!(wand_docs.total_tokens_num(), 100);
         assert_eq!(docs.total_tokens_cached(), Some(100));
     }
 

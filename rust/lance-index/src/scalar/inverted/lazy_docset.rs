@@ -50,6 +50,16 @@ pub struct LoadedDocSet {
     total_tokens: u64,
 }
 
+/// Atomically published num-tokens state for deferred scoring.
+///
+/// Keeping the Arrow column and the zero-copy `DocSet` view that carries its
+/// total in one `OnceCell` prevents cancellation from exposing a partially
+/// initialized scoring cache.
+struct NumTokensSnapshot {
+    column: Arc<UInt32Array>,
+    docs: Arc<DocSet>,
+}
+
 /// Store-backed DocSet view that loads on demand and caches.
 ///
 /// Holds the [`IndexStore`] and docs-file path rather than an open
@@ -70,19 +80,13 @@ pub struct DeferredDocSet {
     quantized_scoring: bool,
     /// Doc count cached at construction so `len()` stays sync + IO-free.
     num_rows: usize,
-    /// `sum(num_tokens)` cached on first compute.
-    total_tokens: OnceCell<u64>,
-    /// `NUM_TOKEN_COL` arrow buffer cached on first read.
-    num_tokens_col: OnceCell<Arc<UInt32Array>>,
+    /// `NUM_TOKEN_COL` and its zero-copy scoring view carrying the cached sum,
+    /// published together on first read.
+    num_tokens: OnceCell<NumTokensSnapshot>,
     /// `ROW_ID` arrow buffer cached on first read.
     row_ids_col: OnceCell<Arc<UInt64Array>>,
     /// Full DocSet, materialized on first `ensure_loaded`.
     full: OnceCell<Arc<DocSet>>,
-    /// num_tokens-only DocSet, materialized on first
-    /// `ensure_num_tokens_loaded`. Cached because wand scoring calls this
-    /// once per query per partition; rebuilding it copied the whole
-    /// num_tokens column (tens of MB per partition) on every query.
-    tokens_only: OnceCell<Arc<DocSet>>,
 }
 
 impl std::fmt::Debug for LazyDocSet {
@@ -96,7 +100,11 @@ impl std::fmt::Debug for LazyDocSet {
             Self::Deferred(d) => f
                 .debug_struct("LazyDocSet::Deferred")
                 .field("num_rows", &d.num_rows)
-                .field("total_tokens_loaded", &d.total_tokens.initialized())
+                .field(
+                    "total_tokens_loaded",
+                    &(d.num_tokens.initialized() || d.full.initialized()),
+                )
+                .field("num_tokens_loaded", &d.num_tokens.initialized())
                 .field("full_loaded", &d.full.initialized())
                 .finish(),
         }
@@ -112,15 +120,12 @@ impl DeepSizeOf for LazyDocSet {
                     .get()
                     .map(|d| d.deep_size_of_children(ctx))
                     .unwrap_or(0)
-                    + d.tokens_only
+                    + d.num_tokens
                         .get()
-                        .map(|d| d.deep_size_of_children(ctx))
-                        .unwrap_or(0)
-                    + d.num_tokens_col
-                        .get()
-                        .map(|arr| {
-                            let arr: &dyn Array = arr.as_ref();
-                            arr.deep_size_of_children(ctx)
+                        .map(|snapshot| {
+                            let arr: &dyn Array = snapshot.column.as_ref();
+                            snapshot.docs.deep_size_of_children(ctx)
+                                + arr.deep_size_of_children(ctx)
                         })
                         .unwrap_or(0)
                     + d.row_ids_col
@@ -152,11 +157,9 @@ impl LazyDocSet {
             frag_reuse_index,
             quantized_scoring,
             num_rows,
-            total_tokens: OnceCell::new(),
-            num_tokens_col: OnceCell::new(),
+            num_tokens: OnceCell::new(),
             row_ids_col: OnceCell::new(),
             full: OnceCell::new(),
-            tokens_only: OnceCell::new(),
         }))
     }
 
@@ -179,6 +182,14 @@ impl LazyDocSet {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn is_full_loaded_for_test(&self) -> bool {
+        match self {
+            Self::Loaded(_) => true,
+            Self::Deferred(d) => d.full.initialized(),
+        }
+    }
+
     /// Sync read of cached `total_tokens`. Returns `None` for a
     /// `Deferred` LazyDocSet that hasn't yet had any of
     /// `total_tokens_num` / `ensure_num_tokens_loaded` / `ensure_loaded`
@@ -187,7 +198,15 @@ impl LazyDocSet {
     pub fn total_tokens_cached(&self) -> Option<u64> {
         match self {
             Self::Loaded(l) => Some(l.total_tokens),
-            Self::Deferred(d) => d.total_tokens.get().copied(),
+            Self::Deferred(d) => d
+                .full
+                .get()
+                .map(|docs| docs.total_tokens_num())
+                .or_else(|| {
+                    d.num_tokens
+                        .get()
+                        .map(|snapshot| snapshot.docs.total_tokens_num())
+                }),
         }
     }
 
@@ -266,32 +285,29 @@ impl DeferredDocSet {
     }
 
     async fn total_tokens_num(&self) -> Result<u64> {
-        let total_tokens = self
-            .total_tokens
-            .get_or_try_init(|| async {
-                if let Some(full) = self.full.get() {
-                    return Result::Ok(full.total_tokens_num());
-                }
-                let col = self.num_tokens_column().await?;
-                Result::Ok(col.values().iter().map(|&n| n as u64).sum())
-            })
-            .await?;
-        Ok(*total_tokens)
+        if let Some(full) = self.full.get() {
+            return Ok(full.total_tokens_num());
+        }
+        Ok(self.num_tokens_snapshot().await?.docs.total_tokens_num())
     }
 
-    async fn num_tokens_column(&self) -> Result<Arc<UInt32Array>> {
-        self.num_tokens_col
+    async fn num_tokens_snapshot(&self) -> Result<&NumTokensSnapshot> {
+        self.num_tokens
             .get_or_try_init(|| async {
                 let reader = self.reader().await?;
                 let batch = reader
                     .read_range(0..self.num_rows, Some(&[NUM_TOKEN_COL]))
                     .await?;
-                Result::Ok(Arc::new(
-                    batch[NUM_TOKEN_COL].as_primitive::<UInt32Type>().clone(),
-                ))
+                let column = Arc::new(batch[NUM_TOKEN_COL].as_primitive::<UInt32Type>().clone());
+                let total_tokens = column.values().iter().map(|&n| n as u64).sum();
+                let mut docs = DocSet::from_cached_num_tokens(column.as_ref(), total_tokens);
+                docs.set_quantized_scoring(self.quantized_scoring);
+                Result::Ok(NumTokensSnapshot {
+                    column,
+                    docs: Arc::new(docs),
+                })
             })
             .await
-            .cloned()
     }
 
     async fn row_ids_column(&self) -> Result<Arc<UInt64Array>> {
@@ -311,12 +327,11 @@ impl DeferredDocSet {
             .get_or_try_init(|| async {
                 // If the stats path already pulled NUM_TOKEN_COL,
                 // read only ROW_ID and rebuild from the two columns.
-                let mut docs = if self.num_tokens_col.get().is_some() {
-                    let num_tokens = self.num_tokens_column().await?;
+                let mut docs = if let Some(num_tokens) = self.num_tokens.get() {
                     let row_ids = self.row_ids_column().await?;
                     DocSet::from_columns(
                         row_ids.as_ref(),
-                        num_tokens.as_ref(),
+                        num_tokens.column.as_ref(),
                         self.is_legacy,
                         self.frag_reuse_index.clone(),
                     )?
@@ -333,9 +348,6 @@ impl DeferredDocSet {
             })
             .await?
             .clone();
-        self.total_tokens
-            .get_or_init(|| async { docs.total_tokens_num() })
-            .await;
         Ok(docs)
     }
 
@@ -343,18 +355,7 @@ impl DeferredDocSet {
         if let Some(full) = self.full.get() {
             return Ok(full.clone());
         }
-        let total_tokens = self.total_tokens_num().await?;
-        let docs = self
-            .tokens_only
-            .get_or_try_init(|| async {
-                let num_tokens = self.num_tokens_column().await?;
-                let mut docs = DocSet::from_cached_num_tokens(num_tokens.as_ref(), total_tokens);
-                docs.set_quantized_scoring(self.quantized_scoring);
-                Result::Ok(Arc::new(docs))
-            })
-            .await?
-            .clone();
-        Ok(docs)
+        Ok(self.num_tokens_snapshot().await?.docs.clone())
     }
 
     async fn resolve_row_ids(&self, doc_ids: &[u32]) -> Result<Vec<u64>> {
