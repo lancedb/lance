@@ -3,8 +3,9 @@
 use lance_core::{Error, Result};
 //Machine epsilon for f64:smallest value where 1.0 + EPS != 1.0
 const EPS: f64 = 2.220_446_049_250_313e-16;
-//Maximum number of Jacobi iteration sweeps before giving up
-const MAX_JACOBI_SWEEPS: usize = 200;
+//Maximum number of Jacobi sweeps before giving up, when not
+//scaled by dimension
+const MAX_JACOBI_SWEEPS: usize = 100;
 
 //Creates an nxn identity matrix (row-major flat vector)
 fn create_identity_matrix(n: usize) -> Vec<f64> {
@@ -66,57 +67,91 @@ fn apply_givens_rotation_from_right(v: &mut [f64], n: usize, p: usize, q: usize,
 //by repeatedly applying Givens rotation to zero out off-diagonal entries.
 //Input: a - summetric nxn matrix (row-major flat vector)
 //Output: (eigenvalues, V) where the columns of V are the eigenvectors
-fn jacobi_eigen(a: &[f64], n: usize) -> (Vec<f64>, Vec<f64>) {
+fn jacobi_eigen(a: &[f64], n: usize) -> Result<(Vec<f64>, Vec<f64>)> {
     //Copy of the matrix; this copy will be diagonalized in-place.
     let mut s = a.to_vec();
     //Accumulates the product of all Givens rotations
     let mut v = create_identity_matrix(n);
 
-    for _ in 0..MAX_JACOBI_SWEEPS {
-        //Finds the largest off-diagonal entry s[p,q]
-        //This is the entry we will zero out in this iteration sweep.
-        let mut max_val = 0.0f64;
-        let mut p = 0;
-        let mut q = 1;
-        for i in 0..n {
-            for j in i + 1..n {
-                let val = s[i * n + j].abs();
-                if val > max_val {
-                    max_val = val;
-                    p = i;
-                    q = j;
-                }
-            }
-        }
-
-        //If all off-diagonal entries are negligibly small, the matrix is
-        //diagonal and the eigenvalues are on the diagonal.
-        if max_val < EPS * 1e4 {
-            break;
-        }
-
-        //Computes the Jacobi rotation angle theta that zeros out s[p,q]
-        let s_pq = s[p * n + q];
-        let diff = s[q * n + q] - s[p * n + p];
-        let theta = if diff.abs() < EPS {
-            std::f64::consts::FRAC_PI_4
-        } else {
-            0.5 * (2.0 * s_pq / diff).atan()
-        };
-        let (sn, c) = theta.sin_cos();
-
-        //Applies the Givens rotation: S ← G^T * S * G
-        //This zeroes out s[p,q] and s[q,p] while updating the rest of the matrix.
-        jacobi_rotate(&mut s, n, p, q, c, sn);
-
-        //Accumulates the rotation into V: V ← V * G
-        //At convergence, V's columns are the eigenvectors of the original matrix.
-        apply_givens_rotation_from_right(&mut v, n, p, q, c, sn);
+    //There is nothing to do for 1x1 matrices due to there being no off-diagonal entries.
+    if n <= 1 {
+        let eigenvalues: Vec<f64> = (0..n).map(|i| s[i * n + i]).collect();
+        return Ok((eigenvalues, v));
     }
 
-    //Extract eigenvalues from the diagonal of the now-diagonalized matrix
+    //Uses the Frobenius norm of the input matrix as a scale reference for convergence
+    let norm: f64 = s.iter().map(|&x| x * x).sum::<f64>().sqrt();
+    if norm < EPS {
+        let eigenvalues: Vec<f64> = (0..n).map(|i| s[i * n + i]).collect();
+        return Ok((eigenvalues, v));
+    }
+
+    //Relative tolerance: off-diagonal entries (and the overall off-diagonal
+    //Frobenius norm) smaller than this, relative to the matrix's own scale,
+    //are converged
+    let relative_tolerance = EPS * norm * (n as f64);
+
+    //Scales the sweep budget with the matrix dimension
+    //Larger matrices need more sweeps and individual rotations to
+    //fully diagonalize.
+    let max_sweeps = MAX_JACOBI_SWEEPS.max(n * n);
+
+    let mut converged = false;
+    for _sweep in 0..max_sweeps {
+        //This is one full cyclic sweep.
+        //It visits each (p, q) pair with p < q exactly once,
+        //applying a rotation when the entry is not already negligible.
+        for p in 0..n {
+            for q in p + 1..n {
+                let s_pq = s[p * n + q];
+                if s_pq.abs() <= relative_tolerance {
+                    continue;
+                }
+ 
+                //Computes the Jacobi rotation angle theta that zeros out s[p,q]
+                let diff = s[q * n + q] - s[p * n + p];
+                let theta = if diff.abs() < EPS {
+                    std::f64::consts::FRAC_PI_4
+                } else {
+                    0.5 * (2.0 * s_pq / diff).atan()
+                };
+                let (sn, c) = theta.sin_cos();
+ 
+                //Applies the Givens rotation: S ← G^T * S * G
+                //This zeroes out s[p,q] and s[q,p] while updating the rest of the matrix.
+                jacobi_rotate(&mut s, n, p, q, c, sn);
+ 
+                //Accumulates the rotation into V: V ← V * G
+                //At convergence, V's columns are the eigenvectors of the original matrix.
+                apply_givens_rotation_from_right(&mut v, n, p, q, c, sn);
+            }
+        }
+ 
+        //Recomputes the off-diagonal Frobenius norm after the full sweep to
+        //determine whether another sweep is needed
+        let mut off_diag_sq = 0.0f64;
+        for p in 0..n {
+            for q in p + 1..n {
+                off_diag_sq += s[p * n + q] * s[p * n + q];
+            }
+        }
+        if off_diag_sq.sqrt() < relative_tolerance {
+            converged = true;
+            break;
+        }
+    }
+
+    //Checks whether the Jacobi eigensolver converged within the 
+    //maximum number of sweeps
+    if !converged {
+        return Err(Error::invalid_input(format!(
+            "svd: Jacobi eigensolver failed to converge within {max_sweeps} sweeps for a {n}x{n} matrix"
+        )));
+    }
+
+    //Extracts eigenvalues from the diagonal of the now-diagonalized matrix
     let eigenvalues: Vec<f64> = (0..n).map(|i| s[i * n + i]).collect();
-    (eigenvalues, v)
+    Ok((eigenvalues, v))
 }
 
 //Computes C = A^T A where A is a mxn row-major flat vector
