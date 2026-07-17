@@ -383,6 +383,8 @@ class Step:
             return "same_postcondition_bounded_recluster"
         if self.operation in {"index_build", "index_take", "index_optimize"}:
             return INDEX_RECORD_NAMES[self.index_kind]
+        if self.operation == "row_id_scan":
+            return "full_scan_business_id_and_row_id_selection"
         return "native_dataset_api"
 
     def implementation_path_for_format(self, format_name: str) -> str:
@@ -1440,6 +1442,7 @@ class ProtocolRunner:
         pair_id: str,
         order_index: int,
         take_ids_input: Path | None = None,
+        prepare_take_ids_output: Path | None = None,
         dataset_uri_override: str | None = None,
         source_dataset_uri: str | None = None,
         maintenance_plan: tuple[Path, str] | None = None,
@@ -1477,6 +1480,7 @@ class ProtocolRunner:
             repeat=repeat,
             order_index=order_index,
             take_ids_input=take_ids_input,
+            prepare_take_ids_output=prepare_take_ids_output,
             source_dataset_uri=source_dataset_uri,
             maintenance_plan_input=(
                 maintenance_plan[0] if maintenance_plan is not None else None
@@ -1926,23 +1930,30 @@ class ProtocolRunner:
             / f"{format_name}.json"
         )
         output.parent.mkdir(parents=True, exist_ok=True)
-        if output.exists():
-            return output
-        pair_id = f"{self.run_id}/{track}/{case}/repeat-{repeat:03d}/{label}/prepare"
-        command = self._command(
-            dataclasses.replace(step, operation="take"),
-            uri=self.dataset_uri(track, case, repeat, format_name),
+        pair_id = (
+            f"{self.run_id}/{track}/{case}/repeat-{repeat:03d}/{label}/row-id-scan"
+        )
+        key = (pair_id, format_name)
+        if output.exists() and key not in self._existing_records:
+            raise RuntimeError(
+                "take-ID artifact exists without its durable row-id-scan record: "
+                f"{output}; restart this shard under a fresh prefix"
+            )
+        scan_step = dataclasses.replace(step, operation="row_id_scan")
+        record = self.invoke_one(
+            scan_step,
+            track=track,
+            case=case,
+            repeat=repeat,
             format_name=format_name,
             pair_id=pair_id,
-            repeat=repeat,
             order_index=order_index,
             prepare_take_ids_output=output,
         )
-        result = self._run_worker(command)
-        if result.returncode != 0 or result.stdout.strip():
+        if record["status"] != "ok" or not output.is_file():
             raise RuntimeError(
-                "prepare-take-ids failed or emitted stdout: "
-                f"status={result.returncode}, stdout={result.stdout!r}"
+                "row-id-scan did not produce a durable take-ID artifact: "
+                f"status={record['status']}, output={output}"
             )
         return output
 

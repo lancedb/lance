@@ -2971,6 +2971,54 @@ impl PackedLogicalDomainRun {
         Ok(Some((ordinal, local)))
     }
 
+    fn logical_addresses_for_slot_range(
+        &self,
+        start: u64,
+        len: usize,
+    ) -> Result<Option<Vec<LogicalRowAddress>>> {
+        let len = u64::try_from(len)
+            .map_err(|_| Error::invalid_input("PackedRun slot range length exceeds u64"))?;
+        let end = start
+            .checked_add(len)
+            .ok_or_else(|| Error::invalid_input("PackedRun slot range end overflow"))?;
+        if end > self.total_slot_count()? {
+            return Ok(None);
+        }
+        let capacity = usize::try_from(len)
+            .map_err(|_| Error::invalid_input("PackedRun slot range length exceeds usize"))?;
+        if capacity == 0 {
+            return Ok(Some(Vec::new()));
+        }
+
+        let Some((mut ordinal, mut local_slot)) = self.ordinal_for_slot_offset(start)? else {
+            return Ok(None);
+        };
+        let mut logical_fragment_id = self.logical_fragment_id_at(ordinal)?;
+        let mut slot_count = self.slot_count_at(ordinal)?;
+        let mut addresses = Vec::with_capacity(capacity);
+        for _ in 0..capacity {
+            if local_slot == slot_count {
+                ordinal = ordinal.checked_add(1).ok_or_else(|| {
+                    Error::invalid_input("PackedRun domain ordinal overflow while streaming")
+                })?;
+                if ordinal >= self.domain_count {
+                    return Err(Error::invalid_input(
+                        "PackedRun slot range exceeds its encoded domains",
+                    ));
+                }
+                logical_fragment_id = self.logical_fragment_id_at(ordinal)?;
+                slot_count = self.slot_count_at(ordinal)?;
+                local_slot = 0;
+            }
+            addresses.push(LogicalRowAddress::try_new_from_parts(
+                logical_fragment_id,
+                local_slot,
+            )?);
+            local_slot += 1;
+        }
+        Ok(Some(addresses))
+    }
+
     fn compressed_slice(&self, start: u32, end: u32) -> Result<Option<Self>> {
         if start >= end || end > self.domain_count {
             return Err(Error::invalid_input(
@@ -5054,6 +5102,79 @@ impl RowAddressRouter {
     }
 
     pub fn physical_to_logical_many(
+        &self,
+        addresses: &[RowAddress],
+    ) -> Result<Vec<PhysicalToLogicalResolution>> {
+        if let Some(resolved) = self.physical_to_logical_contiguous_packed_run(addresses)? {
+            return Ok(resolved);
+        }
+        self.physical_to_logical_many_scalar(addresses)
+    }
+
+    fn physical_to_logical_contiguous_packed_run(
+        &self,
+        addresses: &[RowAddress],
+    ) -> Result<Option<Vec<PhysicalToLogicalResolution>>> {
+        let Some(first) = addresses.first().copied() else {
+            return Ok(Some(Vec::new()));
+        };
+        if addresses.windows(2).any(|pair| {
+            pair[0].fragment_id() != pair[1].fragment_id()
+                || pair[0].row_offset().checked_add(1) != Some(pair[1].row_offset())
+        }) {
+            return Ok(None);
+        }
+
+        // Preserve the scalar path's native-domain precedence even if corrupt
+        // metadata were to describe the same physical fragment in both places.
+        if self
+            .native_by_physical
+            .binary_search_by_key(&first.fragment_id(), |index| {
+                self.native_domains[*index as usize].1
+            })
+            .is_ok()
+        {
+            return Ok(None);
+        }
+
+        let Some(destination_entry) = self
+            .layout
+            .destination_index
+            .binary_search_by_key(&first.fragment_id(), |entry| entry.physical_fragment_id)
+            .ok()
+            .map(|index| &self.layout.destination_index[index])
+        else {
+            return Ok(None);
+        };
+        let [placement_index] = destination_entry.placement_indices.as_slice() else {
+            return Ok(None);
+        };
+        let RowAddressPlacement::PackedRun(placement) =
+            &self.layout.placements[*placement_index as usize]
+        else {
+            return Ok(None);
+        };
+        if placement.destination_fragment_id != first.fragment_id()
+            || first.row_offset() < placement.destination_start
+        {
+            return Ok(None);
+        }
+        let start = u64::from(first.row_offset() - placement.destination_start);
+        let Some(logical) = placement
+            .domains
+            .logical_addresses_for_slot_range(start, addresses.len())?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(
+            logical
+                .into_iter()
+                .map(PhysicalToLogicalResolution::Logical)
+                .collect(),
+        ))
+    }
+
+    fn physical_to_logical_many_scalar(
         &self,
         addresses: &[RowAddress],
     ) -> Result<Vec<PhysicalToLogicalResolution>> {
@@ -13198,6 +13319,247 @@ mod tests {
             vec![PlacementResolution::Mapped {
                 locator: PhysicalRowLocator::Physical(RowAddress::new_from_parts(50, 9_999))
             }]
+        );
+    }
+
+    fn nonuniform_100k_packed_run_router() -> RowAddressRouter {
+        let sources = (0..100_000)
+            .map(|logical_fragment_id| {
+                domain(
+                    logical_fragment_id,
+                    if logical_fragment_id < 50_000 {
+                        999
+                    } else {
+                        1_001
+                    },
+                )
+            })
+            .collect();
+        let target = fragment(42, 100_000_000, None);
+        let mut layout = RowAddressLayout::new(Uuid::new_v4());
+        layout.placements = vec![RowAddressPlacement::PackedRun(
+            PackedRunRowAddressPlacement::from_sources(sources, 42, 0).unwrap(),
+        )];
+        layout
+            .refresh_physical_ownership_summary(&target, &RoaringBitmap::new())
+            .unwrap();
+        layout.refresh_fingerprint_with_fragments(std::slice::from_ref(&target), Some(99_999));
+        RowAddressRouter::try_new(
+            Arc::new(layout),
+            std::slice::from_ref(&target),
+            Some(99_999),
+        )
+        .unwrap()
+    }
+
+    fn contiguous_physical_addresses(
+        physical_fragment_id: u32,
+        start: u32,
+        len: usize,
+    ) -> Vec<RowAddress> {
+        (0..len)
+            .map(|offset| {
+                RowAddress::new_from_parts(
+                    physical_fragment_id,
+                    start + u32::try_from(offset).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn packed_run_bulk_inverse_matches_scalar_across_domain_and_batch_boundaries() {
+        let router = nonuniform_100k_packed_run_router();
+        const SLOT_COUNT_TRANSITION: u32 = 50_000 * 999;
+
+        let domain_boundary = contiguous_physical_addresses(42, SLOT_COUNT_TRANSITION - 4, 12);
+        assert!(
+            router
+                .physical_to_logical_contiguous_packed_run(&domain_boundary)
+                .unwrap()
+                .is_some()
+        );
+        let bulk = router.physical_to_logical_many(&domain_boundary).unwrap();
+        assert_eq!(
+            bulk,
+            router
+                .physical_to_logical_many_scalar(&domain_boundary)
+                .unwrap()
+        );
+        assert_eq!(
+            bulk,
+            (995..999)
+                .map(|slot| {
+                    PhysicalToLogicalResolution::Logical(
+                        LogicalRowAddress::try_new_from_parts(49_999, slot).unwrap(),
+                    )
+                })
+                .chain((0..8).map(|slot| {
+                    PhysicalToLogicalResolution::Logical(
+                        LogicalRowAddress::try_new_from_parts(50_000, slot).unwrap(),
+                    )
+                }))
+                .collect::<Vec<_>>()
+        );
+
+        const BATCH_SIZE: usize = 8_192;
+        let first_batch_start = SLOT_COUNT_TRANSITION - 4_096;
+        for batch_start in [
+            first_batch_start,
+            first_batch_start + u32::try_from(BATCH_SIZE).unwrap(),
+        ] {
+            let batch = contiguous_physical_addresses(42, batch_start, BATCH_SIZE);
+            assert!(
+                router
+                    .physical_to_logical_contiguous_packed_run(&batch)
+                    .unwrap()
+                    .is_some()
+            );
+            assert_eq!(
+                router.physical_to_logical_many(&batch).unwrap(),
+                router.physical_to_logical_many_scalar(&batch).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn packed_run_bulk_inverse_falls_back_to_scalar_for_other_shapes() {
+        let packed_router = nonuniform_100k_packed_run_router();
+        for addresses in [
+            vec![
+                RowAddress::new_from_parts(42, 100),
+                RowAddress::new_from_parts(42, 102),
+                RowAddress::new_from_parts(42, 101),
+            ],
+            vec![
+                RowAddress::new_from_parts(42, 100),
+                RowAddress::new_from_parts(42, 100),
+            ],
+            vec![
+                RowAddress::new_from_parts(42, 100),
+                RowAddress::new_from_parts(43, 101),
+            ],
+        ] {
+            assert!(
+                packed_router
+                    .physical_to_logical_contiguous_packed_run(&addresses)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                packed_router.physical_to_logical_many(&addresses).unwrap(),
+                packed_router
+                    .physical_to_logical_many_scalar(&addresses)
+                    .unwrap()
+            );
+        }
+
+        let multi_target = fragment(77, 4, None);
+        let mut multi_layout = RowAddressLayout::new(Uuid::new_v4());
+        multi_layout.placements = vec![
+            RowAddressPlacement::Direct(DirectRowAddressPlacement {
+                source: domain(200, 2),
+                destination_fragment_id: 77,
+                destination_start: 0,
+                excluded: None,
+            }),
+            RowAddressPlacement::Direct(DirectRowAddressPlacement {
+                source: domain(201, 2),
+                destination_fragment_id: 77,
+                destination_start: 2,
+                excluded: None,
+            }),
+        ];
+        multi_layout
+            .refresh_physical_ownership_summary(&multi_target, &RoaringBitmap::new())
+            .unwrap();
+        multi_layout
+            .refresh_fingerprint_with_fragments(std::slice::from_ref(&multi_target), Some(201));
+        let multi_router = RowAddressRouter::try_new(
+            Arc::new(multi_layout),
+            std::slice::from_ref(&multi_target),
+            Some(201),
+        )
+        .unwrap();
+        let multi_addresses = contiguous_physical_addresses(77, 0, 4);
+        assert!(
+            multi_router
+                .physical_to_logical_contiguous_packed_run(&multi_addresses)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            multi_router
+                .physical_to_logical_many(&multi_addresses)
+                .unwrap(),
+            multi_router
+                .physical_to_logical_many_scalar(&multi_addresses)
+                .unwrap()
+        );
+
+        let explicit_source = domain(300, 2);
+        let explicit_target = fragment(88, 2, None);
+        let first_logical = LogicalRowAddress::try_new_from_parts(300, 0).unwrap();
+        let last_logical = LogicalRowAddress::try_new_from_parts(300, 1).unwrap();
+        let mut explicit_layout = RowAddressLayout::new(Uuid::new_v4());
+        explicit_layout.placements = vec![RowAddressPlacement::ExplicitMap(
+            ExplicitMapRowAddressPlacement {
+                sources: vec![SparseSelectionSource {
+                    source: explicit_source,
+                    selection: Arc::new(
+                        LogicalRowAddressSelection::from_full_domains(&[explicit_source]).unwrap(),
+                    ),
+                    excluded: None,
+                }],
+                object_path: "data/_row_addresses/locator.lance".to_owned(),
+                object_size: 128,
+                pages: vec![ExplicitMapPage {
+                    first_logical_address: first_logical.raw(),
+                    last_logical_address: last_logical.raw(),
+                    row_start: 0,
+                    row_count: 2,
+                    content_fingerprint: vec![11; ROW_ADDRESS_LAYOUT_FINGERPRINT_SIZE],
+                }],
+                destinations: vec![ExplicitMapDestination {
+                    physical_fragment_id: 88,
+                    destination_start: 0,
+                    row_count: 2,
+                    row_id_file_path: "data/_row_addresses/row_ids.lance".to_owned(),
+                    row_id_file_size: 64,
+                    row_id_pages: vec![ExplicitMapRowIdPage {
+                        row_start: 0,
+                        row_count: 2,
+                        content_fingerprint: vec![12; ROW_ADDRESS_LAYOUT_FINGERPRINT_SIZE],
+                    }],
+                }],
+                base_id: None,
+            },
+        )];
+        explicit_layout
+            .refresh_physical_ownership_summary(&explicit_target, &RoaringBitmap::new())
+            .unwrap();
+        explicit_layout
+            .refresh_fingerprint_with_fragments(std::slice::from_ref(&explicit_target), Some(300));
+        let explicit_router = RowAddressRouter::try_new(
+            Arc::new(explicit_layout),
+            std::slice::from_ref(&explicit_target),
+            Some(300),
+        )
+        .unwrap();
+        let explicit_addresses = contiguous_physical_addresses(88, 0, 2);
+        assert!(
+            explicit_router
+                .physical_to_logical_contiguous_packed_run(&explicit_addresses)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            explicit_router
+                .physical_to_logical_many(&explicit_addresses)
+                .unwrap(),
+            explicit_router
+                .physical_to_logical_many_scalar(&explicit_addresses)
+                .unwrap()
         );
     }
 

@@ -112,6 +112,7 @@ def operation_from_pair(pair_id: str) -> str:
         "index-catch-up": "index_optimize",
         "cold-open": "open",
         "cold-scan": "scan",
+        "row-id-scan": "row_id_scan",
         "cold-take": "take",
         "cold-index-take": "index_take",
         "policy-maintenance": "default_compaction",
@@ -530,6 +531,43 @@ def append_reclaim_preflights(
 
 
 class ProtocolReportTests(unittest.TestCase):
+    def test_row_id_scan_pairs_are_frozen_and_report_gated(self) -> None:
+        sidecar = make_sidecar(["sustained"], variants=["bare"])
+        expected_pairs = protocol_report.expected_complete_pair_ids(sidecar)
+        row_id_scan_pairs = {
+            pair_id for pair_id in expected_pairs if pair_id.endswith("/row-id-scan")
+        }
+        cold_take_pairs = {
+            pair_id for pair_id in expected_pairs if pair_id.endswith("/cold-take")
+        }
+        self.assertEqual(
+            row_id_scan_pairs,
+            {f"{pair_id}/row-id-scan" for pair_id in cold_take_pairs},
+        )
+
+        provenance = protocol_report.expected_record_provenance(sidecar)
+        for pair_id in row_id_scan_pairs:
+            for format_name in run.FORMATS:
+                record = provenance[(pair_id, format_name)]
+                self.assertEqual(record["operation"], "row_id_scan")
+                self.assertEqual(
+                    record["implementation_path"],
+                    "full_scan_business_id_and_row_id_selection",
+                )
+
+        result = protocol_report.analyze(
+            sidecar, complete_records(sidecar), bootstrap_samples=101
+        )
+        self.assertFalse(
+            any("row-id-scan" in failure for failure in result.machine["failures"])
+        )
+        self.assertTrue(
+            any(
+                gate["scope"].endswith("/cold-take/row-id-scan")
+                for gate in result.machine["gates"]
+            )
+        )
+
     def test_machine_report_is_bound_to_the_source_commit(self) -> None:
         sidecar = make_sidecar(["matrix"], matrix_case_names=[])
         result = protocol_report.analyze(sidecar, [], bootstrap_samples=101)
@@ -1053,6 +1091,15 @@ class ProtocolReportTests(unittest.TestCase):
                                 ),
                             )
                         )
+                    if label == "cold-take":
+                        for format_name in run.FORMATS:
+                            records.append(
+                                make_record(
+                                    sidecar,
+                                    f"{post_pair_id}/row-id-scan",
+                                    format_name,
+                                )
+                            )
         bind_exact_provenance(sidecar, records)
         result = protocol_report.analyze(sidecar, records, bootstrap_samples=101)
         self.assertEqual(result.verdict, "PASS")

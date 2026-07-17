@@ -191,6 +191,7 @@ TIMING_SCOPES = {
     "index_optimize": "cold_session_open_and_index_optimize_commit",
     "open": "dataset_open_and_contract_validation",
     "scan": "dataset_open_contract_validation_and_full_scan",
+    "row_id_scan": "cold_session_open_contract_validation_and_full_id_row_id_scan_selection_and_artifact_write",
     "take": "cold_session_open_and_take_rows_with_prepared_ids",
 }
 SCHEMA_NAMES = {
@@ -1219,6 +1220,8 @@ def _implementation_path(
         )
     if operation in {"index_build", "index_take", "index_optimize"}:
         return INDEX_NAMES[index_kind]
+    if operation == "row_id_scan":
+        return "full_scan_business_id_and_row_id_selection"
     return "native_dataset_api"
 
 
@@ -1468,6 +1471,22 @@ def _expected_record_provenance(
         step: int,
     ) -> None:
         prefix = f"{run_id}/{track}/{case}/repeat-{repeat:03d}/step-{step:03d}"
+        cold_take_pair = f"{prefix}/cold-take"
+        add(
+            f"{cold_take_pair}/row-id-scan",
+            paired_order(repeat, cold_take_pair),
+            operation="row_id_scan",
+            repeat=repeat,
+            rows_per_fragment=rows_per_fragment,
+            take_count=take_count,
+            expected_rows=expected_rows,
+            step=step,
+            schema_kind=schema_kind,
+            index_kind=index_kind,
+            uri_for_format=lambda format_name: workload_uri(
+                track, case, repeat, format_name
+            ),
+        )
         operations = [
             ("cold-open", "open"),
             ("cold-scan", "scan"),
@@ -1602,14 +1621,30 @@ def _expected_record_provenance(
                                 track="matrix",
                                 case=case_name,
                             )
+                        step_pair = (
+                            f"{prefix}/step-{step_index:03d}/{step_value.operation}"
+                        )
+                        if step_value.operation == "index_take":
+                            add_step(
+                                f"{step_pair}/row-id-scan",
+                                paired_order(repeat, step_pair),
+                                step_value,
+                                operation="row_id_scan",
+                                repeat=repeat,
+                                rows_per_fragment=case.rows_per_fragment,
+                                take_count=current_take_count,
+                                track="matrix",
+                                case=case_name,
+                                step_number=step_index,
+                            )
                         add_step(
-                            f"{prefix}/step-{step_index:03d}/{step_value.operation}",
+                            step_pair,
                             (
                                 ("v23_logical",)
                                 if step_value.operation == "recluster"
                                 else paired_order(
                                     repeat,
-                                    f"{prefix}/step-{step_index:03d}/{step_value.operation}",
+                                    step_pair,
                                 )
                             ),
                             step_value,
@@ -2218,6 +2253,11 @@ def expected_complete_pair_ids(sidecar: dict[str, Any]) -> set[str]:
         else:
             expected.add(f"{fixture_prefix}/fixture_clone")
             expected.add(f"{fixture_prefix}/index_build")
+    expected.update(
+        f"{pair_id}/row-id-scan"
+        for pair_id in tuple(expected)
+        if pair_id.endswith(("/cold-take", "/index_take"))
+    )
     return expected
 
 
@@ -2958,7 +2998,7 @@ def is_explicit_matrix_diagnostic(
 ) -> bool:
     if operation in EXPLICIT_MATRIX_DIAGNOSTIC_OPERATIONS:
         return True
-    if operation not in {"open", "scan", "take", "index_take"}:
+    if operation not in {"open", "scan", "row_id_scan", "take", "index_take"}:
         return False
     matrix = sidecar["matrix"]
     profile = matrix["profiles"][sidecar["profile"]]
@@ -2993,6 +3033,7 @@ def standard_scope_is_gated(
             "default_compaction",
             "open",
             "scan",
+            "row_id_scan",
             "take",
             "index_take",
         }
@@ -3035,7 +3076,7 @@ def add_standard_pair_gates(
         samples.sort(key=lambda pair: pair["v23_logical"]["round"])
         operation = samples[0]["v23_logical"]["operation"]
         metrics = list(STANDARD_METRICS)
-        if operation in {"open", "take", "index_take"}:
+        if operation in {"open", "row_id_scan", "take", "index_take"}:
             metrics.extend(PLACEMENT_METADATA_REQUEST_METRICS)
         if sidecar["storage"] == "s3":
             metrics.extend(

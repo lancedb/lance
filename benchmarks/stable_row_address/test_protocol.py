@@ -77,6 +77,34 @@ class ProtocolTests(unittest.TestCase):
         ):
             runner._run_worker(["worker"], pair_id="pair", format_name="v23_logical")
 
+    def test_release_row_id_scan_uses_the_paired_fail_fast_budget(self) -> None:
+        runner = object.__new__(protocol.ProtocolRunner)
+        runner.mode = "release"
+        runner.operation_timeout_seconds = 1800
+        runner.fail_fast_runtime_ratio = 1.5
+        pair_id = "run-1/matrix/case/repeat-000/step-001/cold-take/row-id-scan"
+        runner._existing_records = {
+            (pair_id, "v22_no_stable"): {
+                "status": "ok",
+                "duration_ns": 4_000_000_000,
+            },
+            (pair_id, "v22_stable"): {
+                "status": "ok",
+                "duration_ns": 3_000_000_000,
+            },
+        }
+
+        self.assertEqual(runner._worker_timeout(pair_id, "v23_logical"), 5.0)
+        with (
+            mock.patch.object(
+                protocol.subprocess,
+                "run",
+                side_effect=protocol.subprocess.TimeoutExpired(["worker"], 5),
+            ),
+            self.assertRaises(protocol.PerformanceRegressionTimeout),
+        ):
+            runner._run_worker(["worker"], pair_id=pair_id, format_name="v23_logical")
+
     def test_protocol_format_order_is_independent_of_phases_per_repeat(self) -> None:
         step = protocol.Step("open", expected_rows=1)
 
@@ -504,6 +532,81 @@ class ProtocolTests(unittest.TestCase):
 
         runner.invoke_one.assert_not_called()
         self.assertEqual(len(runner.failures), 1)
+
+    def test_prepare_take_ids_is_a_durable_row_id_scan_record(self) -> None:
+        runner = object.__new__(protocol.ProtocolRunner)
+        runner.run_id = "run-1"
+        runner._existing_records = {}
+
+        with tempfile.TemporaryDirectory() as directory:
+            runner.take_ids_root = Path(directory)
+
+            def invoke_one(
+                step: protocol.Step,
+                *,
+                prepare_take_ids_output: Path,
+                **_: object,
+            ) -> dict[str, object]:
+                prepare_take_ids_output.write_text(
+                    json.dumps({"user_ids": [7], "row_ids": [11]}),
+                    encoding="utf-8",
+                )
+                return {"status": "ok"}
+
+            runner.invoke_one = mock.Mock(side_effect=invoke_one)
+            artifact = runner.prepare_take_ids(
+                protocol.Step("take", 100, step=2),
+                track="matrix",
+                case="case",
+                repeat=0,
+                format_name="v22_no_stable",
+                label="step-002/cold-take",
+                order_index=0,
+            )
+
+            self.assertTrue(artifact.is_file())
+            call = runner.invoke_one.call_args
+            self.assertEqual(call.args[0].operation, "row_id_scan")
+            self.assertEqual(
+                call.kwargs["pair_id"],
+                "run-1/matrix/case/repeat-000/step-002/cold-take/row-id-scan",
+            )
+            self.assertEqual(call.kwargs["prepare_take_ids_output"], artifact)
+
+    def test_prepare_take_ids_rejects_artifact_without_durable_record(self) -> None:
+        runner = object.__new__(protocol.ProtocolRunner)
+        runner.run_id = "run-1"
+        runner._existing_records = {}
+        runner.invoke_one = mock.Mock()
+
+        with tempfile.TemporaryDirectory() as directory:
+            runner.take_ids_root = Path(directory)
+            artifact = (
+                runner.take_ids_root
+                / "matrix"
+                / "case"
+                / "repeat-000"
+                / "step-002"
+                / "cold-take"
+                / "v22_no_stable.json"
+            )
+            artifact.parent.mkdir(parents=True)
+            artifact.write_text("{}", encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                RuntimeError, "artifact exists without its durable row-id-scan record"
+            ):
+                runner.prepare_take_ids(
+                    protocol.Step("take", 100, step=2),
+                    track="matrix",
+                    case="case",
+                    repeat=0,
+                    format_name="v22_no_stable",
+                    label="step-002/cold-take",
+                    order_index=0,
+                )
+
+        runner.invoke_one.assert_not_called()
 
     def test_matrix_index_take_uses_paired_artifact_path(self) -> None:
         runner = mock.Mock(spec=protocol.ProtocolRunner)

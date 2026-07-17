@@ -49,6 +49,7 @@ WORKER_OPERATIONS = (
     "index_optimize",
     "open",
     "scan",
+    "row_id_scan",
     "take",
 )
 TIMING_SCOPES = {
@@ -72,6 +73,7 @@ TIMING_SCOPES = {
     "index_optimize": "cold_session_open_and_index_optimize_commit",
     "open": "dataset_open_and_contract_validation",
     "scan": "dataset_open_contract_validation_and_full_scan",
+    "row_id_scan": "cold_session_open_contract_validation_and_full_id_row_id_scan_selection_and_artifact_write",
     "take": "cold_session_open_and_take_rows_with_prepared_ids",
 }
 SHA_PATTERN = re.compile(r"[0-9a-f]{40}\Z")

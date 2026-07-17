@@ -191,12 +191,16 @@ enum Operation {
     IndexOptimize,
     Open,
     Scan,
+    RowIdScan,
     Take,
 }
 
 impl Operation {
     fn is_read_path(self) -> bool {
-        matches!(self, Self::Open | Self::Scan | Self::Take | Self::IndexTake)
+        matches!(
+            self,
+            Self::Open | Self::Scan | Self::RowIdScan | Self::Take | Self::IndexTake
+        )
     }
 
     fn name(self) -> &'static str {
@@ -221,6 +225,7 @@ impl Operation {
             Self::IndexOptimize => "index_optimize",
             Self::Open => "open",
             Self::Scan => "scan",
+            Self::RowIdScan => "row_id_scan",
             Self::Take => "take",
         }
     }
@@ -257,6 +262,9 @@ impl Operation {
             Self::IndexOptimize => "cold_session_open_and_index_optimize_commit",
             Self::Open => "dataset_open_and_contract_validation",
             Self::Scan => "dataset_open_contract_validation_and_full_scan",
+            Self::RowIdScan => {
+                "cold_session_open_contract_validation_and_full_id_row_id_scan_selection_and_artifact_write"
+            }
             Self::Take => "cold_session_open_and_take_rows_with_prepared_ids",
         }
     }
@@ -433,7 +441,8 @@ struct Args {
     #[arg(long)]
     policy_version: u64,
 
-    /// Write an untimed row-ID fixture and exit without a benchmark record.
+    /// Write a row-ID fixture. `row-id-scan` records the full scan while
+    /// `take` retains the legacy untimed standalone-runner setup.
     #[arg(long, conflicts_with = "take_ids_input")]
     prepare_take_ids_output: Option<PathBuf>,
 
@@ -820,7 +829,9 @@ fn actual_attempts_cover_operation(operation: Operation, metrics: ObjectMetrics)
         Operation::DefaultCompactionPreflight => {
             metrics.actual_get_attempts + metrics.actual_head_attempts > 0
         }
-        Operation::Scan | Operation::Take | Operation::IndexTake => metrics.actual_get_attempts > 0,
+        Operation::Scan | Operation::RowIdScan | Operation::Take | Operation::IndexTake => {
+            metrics.actual_get_attempts > 0
+        }
     }
 }
 
@@ -891,7 +902,9 @@ fn main() -> BenchResult<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    if let Some(output) = &args.prepare_take_ids_output {
+    if args.operation == Operation::Take
+        && let Some(output) = &args.prepare_take_ids_output
+    {
         runtime.block_on(write_take_ids_artifact(
             &args,
             output,
@@ -1209,18 +1222,22 @@ fn validate_args(args: &Args) -> BenchResult<()> {
     if args.order_index >= 3 {
         return Err("--order-index must be in 0..3".into());
     }
-    let has_take_ids = args.prepare_take_ids_output.is_some() || args.take_ids_input.is_some();
-    if matches!(args.operation, Operation::Take | Operation::IndexTake) && !has_take_ids {
-        return Err(
-            "take and index-take operations require --take-ids-input or --prepare-take-ids-output"
-                .into(),
-        );
+    let has_prepare_take_ids = args.prepare_take_ids_output.is_some();
+    let has_take_ids_input = args.take_ids_input.is_some();
+    if args.operation == Operation::Take && !has_prepare_take_ids && !has_take_ids_input {
+        return Err("take requires --take-ids-input or --prepare-take-ids-output".into());
     }
-    if !matches!(args.operation, Operation::Take | Operation::IndexTake) && has_take_ids {
-        return Err("take-ID arguments require --operation=take or index-take".into());
-    }
-    if args.operation == Operation::IndexTake && args.prepare_take_ids_output.is_some() {
+    if args.operation == Operation::IndexTake && !has_take_ids_input {
         return Err("index-take requires --take-ids-input".into());
+    }
+    if args.operation == Operation::RowIdScan && !has_prepare_take_ids {
+        return Err("row-id-scan requires --prepare-take-ids-output".into());
+    }
+    if has_prepare_take_ids && !matches!(args.operation, Operation::Take | Operation::RowIdScan) {
+        return Err("--prepare-take-ids-output requires --operation=take or row-id-scan".into());
+    }
+    if has_take_ids_input && !matches!(args.operation, Operation::Take | Operation::IndexTake) {
+        return Err("--take-ids-input requires --operation=take or index-take".into());
     }
     let has_plan_output = args.prepare_maintenance_plan_output.is_some();
     let has_plan_input = args.maintenance_plan_input.is_some();
@@ -1330,6 +1347,7 @@ fn implementation_path(args: &Args) -> &'static str {
         Operation::IndexBuild | Operation::IndexTake | Operation::IndexOptimize => {
             args.index_kind.name()
         }
+        Operation::RowIdScan => "full_scan_business_id_and_row_id_selection",
         _ => "native_dataset_api",
     }
 }
@@ -3140,6 +3158,13 @@ async fn execute(
                 },
             ))
         }
+        Operation::RowIdScan => {
+            let output = args
+                .prepare_take_ids_output
+                .as_deref()
+                .ok_or("validated row-id-scan output is missing")?;
+            write_take_ids_artifact(args, output, tracker).await
+        }
         Operation::Take => {
             let PreparedOperation::Take { row_ids, .. } = prepared else {
                 return Err("take operation is missing prepared row IDs".into());
@@ -3435,7 +3460,7 @@ fn stable_name_hash(value: &str) -> u64 {
 async fn collect_take_ids(
     args: &Args,
     tracker: Arc<IOTracker>,
-) -> BenchResult<(Vec<u64>, Vec<u64>)> {
+) -> BenchResult<(Dataset, Vec<u64>, Vec<u64>)> {
     let dataset = open_dataset(args, tracker).await?;
     args.format.validate_dataset_header(&dataset)?;
     let mut scanner = dataset.scan();
@@ -3487,15 +3512,15 @@ async fn collect_take_ids(
     selected.sort_unstable_by_key(|(hash, user_id, _)| (*hash, *user_id));
     let user_ids = selected.iter().map(|(_, user_id, _)| *user_id).collect();
     let row_ids = selected.into_iter().map(|(_, _, row_id)| row_id).collect();
-    Ok((user_ids, row_ids))
+    Ok((dataset, user_ids, row_ids))
 }
 
 async fn write_take_ids_artifact(
     args: &Args,
     output: &Path,
     tracker: Arc<IOTracker>,
-) -> BenchResult<()> {
-    let (user_ids, row_ids) = collect_take_ids(args, tracker).await?;
+) -> BenchResult<ExecutedOperation> {
+    let (dataset, user_ids, row_ids) = collect_take_ids(args, tracker).await?;
     let artifact = TakeIdsArtifact {
         schema_version: 1,
         run_id: args.run_id.clone(),
@@ -3530,7 +3555,14 @@ async fn write_take_ids_artifact(
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
     }
-    result
+    result?;
+    Ok(ExecutedOperation::new(
+        dataset,
+        OperationOutcome {
+            result_rows: Some(args.expected_rows as u64),
+            ..Default::default()
+        },
+    ))
 }
 
 fn read_take_ids_artifact(args: &Args) -> BenchResult<PreparedOperation> {
