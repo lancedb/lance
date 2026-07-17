@@ -13,12 +13,49 @@ use lance::{
     BlobDescriptor, BlobDescriptorArrayBuilder, BlobRange, DedicatedBlobWriter, PackedBlobWriter,
 };
 use pyo3::{
-    Bound, PyResult,
-    exceptions::PyValueError,
+    Bound, PyErr, PyResult,
+    exceptions::{PyRuntimeError, PyValueError},
     pyclass, pymethods,
     types::{PyAny, PyAnyMethods, PyDict, PyList, PyListMethods, PyModule, PyTypeMethods},
 };
-use std::{borrow::Cow, sync::Arc};
+use std::{
+    borrow::Cow,
+    sync::{Arc, Mutex},
+};
+
+fn with_writer<W, R>(
+    inner: &Mutex<Option<W>>,
+    writer_name: &str,
+    operation: impl FnOnce(&W) -> R,
+) -> PyResult<R> {
+    let guard = inner.lock().map_err(|_| poisoned_writer(writer_name))?;
+    let writer = guard.as_ref().ok_or_else(|| finished_writer(writer_name))?;
+    Ok(operation(writer))
+}
+
+fn writer_mut<'a, W>(inner: &'a mut Mutex<Option<W>>, writer_name: &str) -> PyResult<&'a mut W> {
+    inner
+        .get_mut()
+        .map_err(|_| poisoned_writer(writer_name))?
+        .as_mut()
+        .ok_or_else(|| finished_writer(writer_name))
+}
+
+fn take_writer<W>(inner: &mut Mutex<Option<W>>, writer_name: &str) -> PyResult<W> {
+    inner
+        .get_mut()
+        .map_err(|_| poisoned_writer(writer_name))?
+        .take()
+        .ok_or_else(|| finished_writer(writer_name))
+}
+
+fn finished_writer(writer_name: &str) -> PyErr {
+    PyValueError::new_err(format!("{writer_name} is already finished"))
+}
+
+fn poisoned_writer(writer_name: &str) -> PyErr {
+    PyRuntimeError::new_err(format!("{writer_name} lock is poisoned"))
+}
 
 /// Reconstruct the PyArrow equivalent of [`BlobDescriptorArrayBuilder::field`].
 ///
@@ -237,10 +274,10 @@ impl PyBlobDescriptorArrayBuilder {
     }
 }
 
-#[pyclass(name = "PackedBlobWriter", skip_from_py_object, unsendable)]
+#[pyclass(name = "PackedBlobWriter", skip_from_py_object)]
 pub struct PyPackedBlobWriter {
     field: Option<Field>,
-    inner: Option<PackedBlobWriter>,
+    inner: Mutex<Option<PackedBlobWriter>>,
 }
 
 impl PyPackedBlobWriter {
@@ -255,20 +292,20 @@ impl PyPackedBlobWriter {
                 .infer_error()?;
         Ok(Self {
             field: None,
-            inner: Some(inner),
+            inner: Mutex::new(Some(inner)),
         })
     }
 
-    fn inner(&self) -> PyResult<&PackedBlobWriter> {
-        self.inner
-            .as_ref()
-            .ok_or_else(|| PyValueError::new_err("PackedBlobWriter is already finished"))
+    fn with_inner<R>(&self, operation: impl FnOnce(&PackedBlobWriter) -> R) -> PyResult<R> {
+        with_writer(&self.inner, "PackedBlobWriter", operation)
     }
 
     fn inner_mut(&mut self) -> PyResult<&mut PackedBlobWriter> {
-        self.inner
-            .as_mut()
-            .ok_or_else(|| PyValueError::new_err("PackedBlobWriter is already finished"))
+        writer_mut(&mut self.inner, "PackedBlobWriter")
+    }
+
+    fn take_inner(&mut self) -> PyResult<PackedBlobWriter> {
+        take_writer(&mut self.inner, "PackedBlobWriter")
     }
 }
 
@@ -276,12 +313,12 @@ impl PyPackedBlobWriter {
 impl PyPackedBlobWriter {
     #[getter]
     pub fn blob_id(&self) -> PyResult<u32> {
-        Ok(self.inner()?.blob_id())
+        self.with_inner(PackedBlobWriter::blob_id)
     }
 
     #[getter]
     pub fn path(&self) -> PyResult<String> {
-        Ok(self.inner()?.path().to_string())
+        self.with_inner(|writer| writer.path().to_string())
     }
 
     /// The descriptor field associated with the array returned by
@@ -328,10 +365,7 @@ impl PyPackedBlobWriter {
     pub fn write_blobs(&mut self, payloads: &Bound<'_, PyAny>) -> PyResult<()> {
         let payloads = extract_blob_payloads(payloads)?;
         let result = {
-            let writer = self
-                .inner
-                .as_mut()
-                .ok_or_else(|| PyValueError::new_err("PackedBlobWriter is already finished"))?;
+            let writer = self.inner_mut()?;
             rt().block_on(None, async {
                 for payloads in payloads {
                     match payloads.data_type() {
@@ -357,17 +391,14 @@ impl PyPackedBlobWriter {
                 // KeyboardInterrupt drops the async batch future. Remove the core
                 // writer as well so RAII cleanup runs and a completed prefix cannot
                 // be reused as a new batch.
-                self.inner.take();
+                self.take_inner()?;
                 Err(error)
             }
         }
     }
 
     pub fn finish(&mut self) -> PyResult<Vec<PyBlobDescriptor>> {
-        let inner = self
-            .inner
-            .take()
-            .ok_or_else(|| PyValueError::new_err("PackedBlobWriter is already finished"))?;
+        let inner = self.take_inner()?;
         let values = rt().block_on(None, inner.finish())?.infer_error()?;
         Ok(values.into_iter().map(Into::into).collect())
     }
@@ -403,10 +434,7 @@ impl PyPackedBlobWriter {
         py: pyo3::Python<'py>,
         field_name: String,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self
-            .inner
-            .take()
-            .ok_or_else(|| PyValueError::new_err("PackedBlobWriter is already finished"))?;
+        let inner = self.take_inner()?;
         let values = rt().block_on(None, inner.finish())?.infer_error()?;
         let mut builder = BlobDescriptorArrayBuilder::new(field_name);
         builder.extend(values).infer_error()?;
@@ -418,9 +446,9 @@ impl PyPackedBlobWriter {
     }
 }
 
-#[pyclass(name = "DedicatedBlobWriter", skip_from_py_object, unsendable)]
+#[pyclass(name = "DedicatedBlobWriter", skip_from_py_object)]
 pub struct PyDedicatedBlobWriter {
-    inner: Option<DedicatedBlobWriter>,
+    inner: Mutex<Option<DedicatedBlobWriter>>,
 }
 
 impl PyDedicatedBlobWriter {
@@ -433,19 +461,21 @@ impl PyDedicatedBlobWriter {
             DedicatedBlobWriter::try_new(object_store.as_ref().clone(), data_file_path, blob_id)
                 .await
                 .infer_error()?;
-        Ok(Self { inner: Some(inner) })
+        Ok(Self {
+            inner: Mutex::new(Some(inner)),
+        })
     }
 
-    fn inner(&self) -> PyResult<&DedicatedBlobWriter> {
-        self.inner
-            .as_ref()
-            .ok_or_else(|| PyValueError::new_err("DedicatedBlobWriter is already finished"))
+    fn with_inner<R>(&self, operation: impl FnOnce(&DedicatedBlobWriter) -> R) -> PyResult<R> {
+        with_writer(&self.inner, "DedicatedBlobWriter", operation)
     }
 
     fn inner_mut(&mut self) -> PyResult<&mut DedicatedBlobWriter> {
-        self.inner
-            .as_mut()
-            .ok_or_else(|| PyValueError::new_err("DedicatedBlobWriter is already finished"))
+        writer_mut(&mut self.inner, "DedicatedBlobWriter")
+    }
+
+    fn take_inner(&mut self) -> PyResult<DedicatedBlobWriter> {
+        take_writer(&mut self.inner, "DedicatedBlobWriter")
     }
 }
 
@@ -453,12 +483,12 @@ impl PyDedicatedBlobWriter {
 impl PyDedicatedBlobWriter {
     #[getter]
     pub fn blob_id(&self) -> PyResult<u32> {
-        Ok(self.inner()?.blob_id())
+        self.with_inner(DedicatedBlobWriter::blob_id)
     }
 
     #[getter]
     pub fn path(&self) -> PyResult<String> {
-        Ok(self.inner()?.path().to_string())
+        self.with_inner(|writer| writer.path().to_string())
     }
 
     pub fn write(&mut self, data: Vec<u8>) -> PyResult<()> {
@@ -467,10 +497,7 @@ impl PyDedicatedBlobWriter {
     }
 
     pub fn finish(&mut self) -> PyResult<PyBlobDescriptor> {
-        let inner = self
-            .inner
-            .take()
-            .ok_or_else(|| PyValueError::new_err("DedicatedBlobWriter is already finished"))?;
+        let inner = self.take_inner()?;
         let value = rt().block_on(None, inner.finish())?.infer_error()?;
         Ok(value.into())
     }
