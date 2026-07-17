@@ -91,7 +91,9 @@ use crate::index::scalar_logical::scalar_index_fragment_bitmap;
 use crate::index::vector::utils::{
     default_distance_type_for, get_vector_dim, get_vector_type, validate_distance_type_for,
 };
-use crate::io::exec::filtered_read::{FilteredReadExec, FilteredReadOptions};
+use crate::io::exec::filtered_read::{
+    FilteredReadExec, FilteredReadOptions, FilteredReadThreadingMode,
+};
 use crate::io::exec::fts::{
     BoostQueryExec, FlatMatchFilterExec, FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec,
 };
@@ -1371,8 +1373,12 @@ impl Scanner {
         self
     }
 
-    /// Set the prefetch size.
-    /// Ignored in v2 and newer format
+    /// Set the number of batches to decode concurrently.
+    ///
+    /// This bounds the decode fan-out of the scan: at most this many batch-decode
+    /// tasks run in flight at once. Defaults to `get_num_compute_intensive_cpus()`.
+    ///
+    /// `nbatches` must be greater than zero.
     pub fn batch_readahead(&mut self, nbatches: usize) -> &mut Self {
         self.batch_readahead = nbatches;
         self
@@ -1742,7 +1748,7 @@ impl Scanner {
                     .field(&column.column_name)
                     .ok_or(Error::invalid_input(format!(
                         "Column {} not found",
-                        &column.column_name
+                        column.column_name
                     )))?;
             }
         }
@@ -2218,6 +2224,9 @@ impl Scanner {
     }
 
     #[allow(clippy::type_complexity)]
+    // TODO(datafusion-54): migrate off the deprecated
+    // create_aggregate_expr_and_maybe_filter to LoweredAggregateBuilder.
+    #[allow(deprecated)]
     fn build_physical_aggregate_expr(
         &self,
         expr: &Expr,
@@ -2342,11 +2351,12 @@ impl Scanner {
             MaterializationStyle::AllLate => false,
             MaterializationStyle::AllEarlyExcept(ref cols) => !cols.contains(&(field.id as u32)),
             MaterializationStyle::Heuristic => {
-                if field.is_blob() {
-                    // By default, blobs are loaded as descriptions, and so should be early
-                    //
-                    // TODO: Once we make blob handling configurable, we should use the blob
-                    // handling setting here.
+                if field.is_blob() && self.blob_handling.returns_description(field) {
+                    // A blob returned as a description (offset + size) is tiny, so it is
+                    // cheaper to read eagerly. When blob_handling materializes the full
+                    // binary value instead (e.g. `all_binary`), fall through to the
+                    // width-based heuristic so a selective filter can late-materialize it
+                    // rather than reading the whole column.
                     return true;
                 }
 
@@ -2394,6 +2404,12 @@ impl Scanner {
     }
 
     fn validate_options(&self) -> Result<()> {
+        if self.batch_readahead == 0 {
+            return Err(Error::invalid_input_source(
+                "batch_readahead must be greater than 0, got 0".into(),
+            ));
+        }
+
         if self.include_deleted_rows && !self.projection_plan.physical_projection.with_row_id {
             return Err(Error::invalid_input_source(
                 "include_deleted_rows is set but with_row_id is false".into(),
@@ -2905,6 +2921,11 @@ impl Scanner {
         if let Some(batch_size) = self.batch_size {
             read_options = read_options.with_batch_size(batch_size as u32);
         }
+
+        // Bound the decode fan-out by `batch_readahead`.
+        read_options = read_options.with_threading_mode(
+            FilteredReadThreadingMode::OnePartitionMultipleThreads(self.batch_readahead),
+        );
 
         if let Some(file_reader_options) = self.resolved_file_reader_options() {
             read_options = read_options.with_file_reader_options(file_reader_options);
@@ -10264,6 +10285,160 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         assert_io_lt!(io_stats, read_bytes, index_scan_bytes);
     }
 
+    #[tokio::test]
+    async fn test_blob_all_binary_late_materialization() {
+        // A selective filter that projects a blob column with `blob_handling=all_binary`
+        // must late-materialize the blob (take only the matched rows) rather than eagerly
+        // reading the whole column. Blobs returned as descriptions stay eager (they are
+        // tiny), but full binary values should follow the width-based heuristic like any
+        // other wide column.
+        use lance_io::assert_io_lt;
+        use lance_table::io::commit::RenameCommitHandler;
+
+        // 8KB stays under the 64KB inline threshold, so the blob is a normal column in
+        // the data file rather than a dedicated blob file.
+        let blob_meta = std::collections::HashMap::from([(
+            "lance-encoding:blob".to_string(),
+            "true".to_string(),
+        )]);
+        let blobs = array::rand_fixedbin(ByteCount::from(8 * 1024), true).with_metadata(blob_meta);
+        let data = gen_batch()
+            .col("filterme", array::step::<UInt64Type>())
+            .col("blobs", blobs)
+            .into_reader_rows(RowCount::from(500), BatchCount::from(8));
+
+        let dataset = Dataset::write(
+            data,
+            "memory://test",
+            Some(WriteParams {
+                commit_handler: Some(Arc::new(RenameCommitHandler)),
+                data_storage_version: Some(LanceFileVersion::Stable),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Baseline: read the blob column as binary for the whole table.
+        let _ = dataset.object_store.as_ref().io_stats_incremental(); // reset
+        dataset
+            .scan()
+            .project(&["blobs"])
+            .unwrap()
+            .blob_handling(BlobHandling::AllBinary)
+            .try_into_batch()
+            .await
+            .unwrap();
+        let full_scan_bytes = dataset
+            .object_store
+            .as_ref()
+            .io_stats_incremental()
+            .read_bytes;
+
+        // A filter matching a single row out of 4000 should read far less than the whole
+        // column: only the filter leaf plus the one materialized blob.
+        dataset
+            .scan()
+            .project(&["blobs"])
+            .unwrap()
+            .blob_handling(BlobHandling::AllBinary)
+            .filter("filterme = 100")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let io_stats = dataset.object_store.as_ref().io_stats_incremental();
+        assert_io_lt!(io_stats, read_bytes, full_scan_bytes);
+    }
+
+    #[tokio::test]
+    async fn test_nested_blob_all_binary_late_materialization() {
+        // Same as above, but the blob is a leaf *inside* a struct and the filter is on a
+        // sibling leaf. Materialization is decided per leaf (fields_pre_order), so the
+        // nested blob must late-materialize under `all_binary` just like a top-level one.
+        use lance_io::assert_io_lt;
+        use lance_table::io::commit::RenameCommitHandler;
+
+        let blob_meta = std::collections::HashMap::from([(
+            "lance-encoding:blob".to_string(),
+            "true".to_string(),
+        )]);
+        let a_field = ArrowField::new("a", DataType::Int32, false);
+        let blob_field =
+            ArrowField::new("blob", DataType::LargeBinary, false).with_metadata(blob_meta);
+        let struct_fields: Fields = vec![a_field, blob_field].into();
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "s",
+            DataType::Struct(struct_fields.clone()),
+            false,
+        )]));
+
+        let rows_per_batch = 500usize;
+        let batches: Vec<RecordBatch> = (0..8)
+            .map(|b| {
+                let base = (b * rows_per_batch) as i32;
+                let a = Arc::new(Int32Array::from_iter_values(
+                    base..base + rows_per_batch as i32,
+                ));
+                // Vary the payload per row so it does not collapse under compression.
+                let blobs: Vec<Vec<u8>> = (0..rows_per_batch)
+                    .map(|r| {
+                        let seed = (base as usize + r).wrapping_mul(2654435761);
+                        (0usize..8 * 1024)
+                            .map(|i| (i.wrapping_mul(31).wrapping_add(seed) & 0xff) as u8)
+                            .collect()
+                    })
+                    .collect();
+                let blob = Arc::new(arrow_array::LargeBinaryArray::from_iter_values(
+                    blobs.iter().map(|v| v.as_slice()),
+                ));
+                let s = StructArray::new(struct_fields.clone(), vec![a, blob as ArrayRef], None);
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(s)]).unwrap()
+            })
+            .collect();
+
+        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+        let dataset = Dataset::write(
+            reader,
+            "memory://test",
+            Some(WriteParams {
+                commit_handler: Some(Arc::new(RenameCommitHandler)),
+                data_storage_version: Some(LanceFileVersion::Stable),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let _ = dataset.object_store.as_ref().io_stats_incremental(); // reset
+        dataset
+            .scan()
+            .project(&["s"])
+            .unwrap()
+            .blob_handling(BlobHandling::AllBinary)
+            .try_into_batch()
+            .await
+            .unwrap();
+        let full_scan_bytes = dataset
+            .object_store
+            .as_ref()
+            .io_stats_incremental()
+            .read_bytes;
+
+        dataset
+            .scan()
+            .project(&["s"])
+            .unwrap()
+            .blob_handling(BlobHandling::AllBinary)
+            .filter("s.a = 100")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let io_stats = dataset.object_store.as_ref().io_stats_incremental();
+        assert_io_lt!(io_stats, read_bytes, full_scan_bytes);
+    }
+
     #[rstest]
     #[tokio::test]
     async fn test_project_nested(
@@ -11076,7 +11251,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         let expected = r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
-      MatchQuery: column=s, query=hello"#;
+      MatchQuery: column=s, query=[hello]"#;
         assert_plan_equals(
             &dataset.dataset,
             |scan| {
@@ -11110,8 +11285,8 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
       BoostQuery: negative_boost=1
-        MatchQuery: column=s, query=hello
-        MatchQuery: column=s, query=world"#;
+        MatchQuery: column=s, query=[hello]
+        MatchQuery: column=s, query=[world]"#;
         assert_plan_equals(
             &dataset.dataset,
             |scan| {
@@ -11133,7 +11308,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
-      MatchQuery: column=s, query=hello
+      MatchQuery: column=s, query=[hello]
         CoalescePartitionsExec
           UnionExec
             MaterializeIndex: query=[i > 10]@i_idx(BTree)
@@ -11144,7 +11319,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
-      MatchQuery: column=s, query=hello
+      MatchQuery: column=s, query=[hello]
         LanceRead: uri=..., projection=[], num_fragments=5, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=--
           ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"#
         };
@@ -11173,7 +11348,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
       SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
         CoalescePartitionsExec
           UnionExec
-            MatchQuery: column=s, query=hello
+            MatchQuery: column=s, query=[hello]
             FlatMatchQuery: column=s, query=hello
               LanceScan: uri=..., projection=[s], row_id=true, row_addr=false, ordered=true, range=None"#
         } else {
@@ -11183,7 +11358,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
       SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
         CoalescePartitionsExec
           UnionExec
-            MatchQuery: column=s, query=hello
+            MatchQuery: column=s, query=[hello]
             FlatMatchQuery: column=s, query=hello
               LanceRead: uri=..., projection=[s], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=--, refine_filter=--"#
         };
@@ -11203,7 +11378,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         let expected = r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
-      MatchQuery: column=s, query=hello"#;
+      MatchQuery: column=s, query=[hello]"#;
         assert_plan_equals(
             &dataset.dataset,
             |scan| {
@@ -11230,7 +11405,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
       SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
         CoalescePartitionsExec
           UnionExec
-            MatchQuery: column=s, query=hello
+            MatchQuery: column=s, query=[hello]
               CoalescePartitionsExec
                 UnionExec
                   MaterializeIndex: query=[i > 10]@i_idx(BTree)
@@ -11253,7 +11428,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
       SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
         CoalescePartitionsExec
           UnionExec
-            MatchQuery: column=s, query=hello
+            MatchQuery: column=s, query=[hello]
               LanceRead: uri=..., projection=[], num_fragments=5, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=--
                 ScalarIndexQuery: query=[i > 10]@i_idx(BTree)
             FlatMatchQuery: column=s, query=hello
@@ -12519,7 +12694,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
     }
 
     fn find_filtered_read(plan: &dyn ExecutionPlan) -> Option<&FilteredReadExec> {
-        if let Some(f) = plan.as_any().downcast_ref::<FilteredReadExec>() {
+        if let Some(f) = plan.downcast_ref::<FilteredReadExec>() {
             return Some(f);
         }
         for child in plan.children() {
@@ -12554,6 +12729,47 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         let filtered = find_filtered_read(plan.as_ref())
             .expect("expected a FilteredReadExec in the scan plan");
         assert_eq!(filtered.options().io_buffer_size_bytes, Some(7777));
+    }
+
+    #[tokio::test]
+    async fn test_batch_readahead_bounds_decode_concurrency() {
+        let data = lance_datagen::gen_batch()
+            .col("x", lance_datagen::array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(8), BatchCount::from(1));
+        let dataset = Dataset::write(data, "memory://test_batch_readahead_concurrency", None)
+            .await
+            .unwrap();
+
+        // Default: threading mode falls back to get_num_compute_intensive_cpus().
+        let plan = dataset.scan().create_plan().await.unwrap();
+        let filtered = find_filtered_read(plan.as_ref())
+            .expect("expected a FilteredReadExec in the scan plan");
+        assert_eq!(
+            filtered.options().threading_mode,
+            FilteredReadThreadingMode::OnePartitionMultipleThreads(get_num_compute_intensive_cpus()),
+        );
+
+        // Explicit batch_readahead(N) bounds the decode fan-out to N.
+        let mut scanner = dataset.scan();
+        scanner.batch_readahead(3);
+        let plan = scanner.create_plan().await.unwrap();
+        let filtered = find_filtered_read(plan.as_ref())
+            .expect("expected a FilteredReadExec in the scan plan");
+        assert_eq!(
+            filtered.options().threading_mode,
+            FilteredReadThreadingMode::OnePartitionMultipleThreads(3),
+        );
+
+        let mut scanner = dataset.scan();
+        scanner.batch_readahead(0);
+        let Err(Error::InvalidInput { source, .. }) = scanner.create_plan().await else {
+            panic!("expected batch_readahead=0 to be rejected");
+        };
+        assert!(
+            source
+                .to_string()
+                .contains("batch_readahead must be greater than 0")
+        );
     }
 
     // The env var key scopes serial_test's lock so this test only blocks others

@@ -1949,8 +1949,7 @@ impl StructuralBatchDecodeStream {
                     next_task.into_batch(emitted_batch_size_warning)?
                 };
                 let num_rows = batch.num_rows() as u64;
-                if num_rows > 0 {
-                    let bpr = data_size / num_rows;
+                if let Some(bpr) = data_size.checked_div(num_rows) {
                     let prev = bytes_per_row_feedback.load(Ordering::Relaxed);
                     let next = if prev == 0 || bpr >= prev {
                         // First batch or actual size is larger than estimate:

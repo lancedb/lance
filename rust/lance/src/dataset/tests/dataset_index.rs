@@ -4113,3 +4113,50 @@ async fn test_manifest_read_recovers_from_stale_size() {
     assert_eq!(indices.len(), 1);
     assert_eq!(indices[0].name, "id_idx");
 }
+
+/// `load_segment_params` must match the fully opened segment's params,
+/// including `custom_stop_words` — the field `InvertedIndexDetails` loses.
+#[tokio::test]
+async fn test_load_segment_params_full_fidelity() {
+    use crate::index::DatasetIndexInternalExt;
+    use lance_index::metrics::NoOpMetricsCollector;
+    use lance_index::scalar::inverted::InvertedIndex;
+
+    let batch = RecordBatch::try_new(
+        arrow_schema::Schema::new(vec![Field::new("text", DataType::Utf8, false)]).into(),
+        vec![Arc::new(StringArray::from(vec![
+            "the quick brown fox",
+            "lazy dogs sleep",
+        ]))],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let stream = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    let mut dataset = Dataset::write(stream, "memory://test/segment_params", None)
+        .await
+        .unwrap();
+
+    let params = InvertedIndexParams::default().custom_stop_words(Some(vec!["quick".to_string()]));
+    dataset
+        .create_index(&["text"], IndexType::Inverted, None, &params, true)
+        .await
+        .unwrap();
+
+    let segments = crate::index::scalar::load_segments(&dataset, "text")
+        .await
+        .unwrap()
+        .expect("FTS index segments");
+    let read = crate::index::scalar::load_segment_params(&dataset, &segments[0])
+        .await
+        .unwrap();
+
+    let generic = dataset
+        .open_generic_index("text", &segments[0].uuid, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    let opened = generic
+        .as_any()
+        .downcast_ref::<InvertedIndex>()
+        .expect("inverted index");
+    assert_eq!(&read, opened.params());
+}

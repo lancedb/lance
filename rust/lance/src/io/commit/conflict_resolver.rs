@@ -7,7 +7,7 @@ use crate::index::mem_wal::{load_mem_wal_index_details, new_mem_wal_index_meta};
 use crate::io::deletion::read_dataset_deletion_file;
 use crate::{
     Dataset,
-    dataset::transaction::{Operation, Transaction, UpdateMode},
+    dataset::transaction::{DataOverlayGroup, Operation, Transaction, UpdateMode},
 };
 use futures::{StreamExt, TryStreamExt};
 use lance_core::{Error, Result, utils::deletion::DeletionVector};
@@ -15,7 +15,9 @@ use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use lance_index::mem_wal::{MEM_WAL_INDEX_NAME, MergedGeneration};
 use lance_select::{RowAddrTreeMap, RowSetOps};
 use lance_table::format::IndexMetadata;
+use lance_table::format::overlay::OverlayCoverage;
 use lance_table::{format::Fragment, io::deletion::write_deletion_file};
+use roaring::RoaringBitmap;
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
@@ -137,6 +139,21 @@ impl<'a> TransactionRebase<'a> {
                     conflicting_mem_wal_merged_gens: Vec::new(),
                 })
             }
+            Operation::DataOverlay { groups } => {
+                let modified_fragment_ids =
+                    groups.iter().map(|g| g.fragment_id).collect::<HashSet<_>>();
+                let initial_fragments =
+                    initial_fragments_for_rebase(dataset, &transaction, &modified_fragment_ids)
+                        .await;
+                Ok(Self {
+                    transaction,
+                    affected_rows,
+                    initial_fragments,
+                    modified_fragment_ids,
+                    conflicting_frag_reuse_indices: Vec::new(),
+                    conflicting_mem_wal_merged_gens: Vec::new(),
+                })
+            }
             Operation::Merge { fragments, .. } => {
                 let modified_fragment_ids = fragments.iter().map(|f| f.id).collect::<HashSet<_>>();
                 let initial_fragments =
@@ -219,6 +236,9 @@ impl<'a> TransactionRebase<'a> {
             Operation::DataReplacement { .. } => {
                 self.check_data_replacement_txn(other_transaction, other_version)
             }
+            Operation::DataOverlay { .. } => {
+                self.check_data_overlay_txn(other_transaction, other_version)
+            }
             Operation::Merge { .. } => self.check_merge_txn(other_transaction, other_version),
             Operation::Restore { .. } => self.check_restore_txn(other_transaction, other_version),
             Operation::ReserveFragments { .. } => {
@@ -251,6 +271,10 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::Project { .. }
                 | Operation::Append { .. }
                 | Operation::UpdateConfig { .. }
+                // A concurrent overlay is inert against the rows we delete
+                // (deletions take precedence over overlays) and otherwise
+                // preserves physical offsets, so it never conflicts.
+                | Operation::DataOverlay { .. }
                 | Operation::UpdateBases { .. } => Ok(()),
                 Operation::Rewrite { groups, .. } => {
                     if groups
@@ -346,6 +370,8 @@ impl<'a> TransactionRebase<'a> {
         if let Operation::Update {
             inserted_rows_filter: self_inserted_rows_filter,
             merged_generations: self_merged_generations,
+            new_fragments: self_new_fragments,
+            update_mode: self_update_mode,
             ..
         } = &self.transaction.operation
         {
@@ -399,6 +425,49 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::Clone { .. }
                 | Operation::UpdateConfig { .. }
                 | Operation::UpdateBases { .. } => Ok(()),
+                Operation::DataOverlay { groups } => {
+                    // Our update recomputed rows from the pre-overlay base, so if
+                    // it commits over an overlay it would silently undo the
+                    // overlay's values for any cell it recomputed. A row-moving
+                    // update (RewriteRows) relocates the rows it touches out to
+                    // new fragments; only the rows it actually moved lose their
+                    // overlay, so we conflict only when the moved rows intersect
+                    // the overlay's coverage. An in-place column rewrite
+                    // (RewriteColumns) preserves offsets and just tombstones the
+                    // overlaid fields at build time, so it never conflicts.
+                    let moves_rows = !self_new_fragments.is_empty()
+                        && matches!(self_update_mode, Some(UpdateMode::RewriteRows) | None);
+                    if !moves_rows {
+                        return Ok(());
+                    }
+                    // `affected_rows` holds the physical offsets (per fragment)
+                    // this update moved. The overlay's coverage is in the same
+                    // physical-offset space, so we can intersect the two in
+                    // memory. Without affected rows we cannot be precise, so we
+                    // fall back to a fragment-granular conflict.
+                    for group in groups {
+                        if !self.modified_fragment_ids.contains(&group.fragment_id) {
+                            continue;
+                        }
+                        let Some(affected_rows) = self.affected_rows else {
+                            return Err(
+                                self.retryable_conflict_err(other_transaction, other_version)
+                            );
+                        };
+                        let Some(moved) =
+                            affected_rows.get_fragment_bitmap(group.fragment_id as u32)
+                        else {
+                            continue;
+                        };
+                        let coverage = overlay_group_coverage(group);
+                        if !(moved & &coverage).is_empty() {
+                            return Err(
+                                self.retryable_conflict_err(other_transaction, other_version)
+                            );
+                        }
+                    }
+                    Ok(())
+                }
                 Operation::Append { .. } => {
                     // If current transaction has primary key conflict detection,
                     // we can't safely commit against an Append because we don't
@@ -514,6 +583,10 @@ impl<'a> TransactionRebase<'a> {
             match &other_transaction.operation {
                 Operation::Append { .. }
                 | Operation::Clone { .. }
+                // An overlay committed after this index's version is newer than
+                // the index; the query path excludes its covered cells via the
+                // version gate, so the build does not conflict.
+                | Operation::DataOverlay { .. }
                 | Operation::UpdateBases { .. } => Ok(()),
                 Operation::CreateIndex {
                     new_indices: created_indices,
@@ -688,6 +761,20 @@ impl<'a> TransactionRebase<'a> {
                         .iter()
                         .map(|f| f.id)
                         .chain(deleted_fragment_ids.iter().copied())
+                        .any(|id| self.modified_fragment_ids.contains(&id))
+                    {
+                        Err(self.retryable_conflict_err(other_transaction, other_version))
+                    } else {
+                        Ok(())
+                    }
+                }
+                Operation::DataOverlay { groups } => {
+                    // Rewriting a fragment changes its physical row addresses, so
+                    // an overlay addressed by physical offset on that fragment is
+                    // invalidated and must be re-applied against the new base.
+                    if groups
+                        .iter()
+                        .map(|g| g.fragment_id)
                         .any(|id| self.modified_fragment_ids.contains(&id))
                     {
                         Err(self.retryable_conflict_err(other_transaction, other_version))
@@ -874,6 +961,7 @@ impl<'a> TransactionRebase<'a> {
             | Operation::CreateIndex { .. }
             | Operation::Rewrite { .. }
             | Operation::DataReplacement { .. }
+            | Operation::DataOverlay { .. }
             | Operation::Merge { .. }
             | Operation::Restore { .. }
             | Operation::ReserveFragments { .. }
@@ -907,7 +995,8 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Merge { .. }
             | Operation::UpdateConfig { .. }
             | Operation::Clone { .. }
-            | Operation::DataReplacement { .. } => Ok(()),
+            | Operation::DataReplacement { .. }
+            | Operation::DataOverlay { .. } => Ok(()),
         }
     }
 
@@ -923,6 +1012,9 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::UpdateConfig { .. }
                 | Operation::ReserveFragments { .. }
                 | Operation::Project { .. }
+                // Both a column replacement and an overlay preserve physical row
+                // addresses; the overlay is newer and wins its covered cells.
+                | Operation::DataOverlay { .. }
                 | Operation::UpdateBases { .. } => Ok(()),
                 Operation::Merge { .. } => {
                     // Merge rewrites the whole fragment list; always conflict
@@ -1055,6 +1147,119 @@ impl<'a> TransactionRebase<'a> {
         }
     }
 
+    /// Conflict checks for our DataOverlay transaction against a concurrent one.
+    ///
+    /// Overlays are intentionally permissive (see the Data Overlay Files spec):
+    /// they stack with other overlays and tolerate appends, index builds, data
+    /// replacement, deletes, and in-place column rewrites (Update with
+    /// `RewriteColumns`), because overlay coverage is addressed by physical offset
+    /// and the version gate keeps indexes correct. A concurrent operation
+    /// conflicts when it takes precedence over the overlay for cells the overlay
+    /// covers, dropping the overlay's values: retryably when it rewrites the
+    /// physical layout of one of our fragments (Rewrite, Merge) or re-creates the
+    /// covered rows from the pre-overlay base (a row-moving Update — checked
+    /// row-by-row in `finish_data_overlay`), or removes an overlaid fragment
+    /// outright (a Delete / Update that drops the fragment); and incompatibly for
+    /// whole-dataset replacements (Overwrite / Restore) and MemWAL state updates
+    /// (UpdateMemWalState), which do not rebase against data operations.
+    fn check_data_overlay_txn(
+        &mut self,
+        other_transaction: &Transaction,
+        other_version: u64,
+    ) -> Result<()> {
+        match &other_transaction.operation {
+            Operation::Append { .. }
+            | Operation::CreateIndex { .. }
+            | Operation::ReserveFragments { .. }
+            | Operation::Project { .. }
+            | Operation::UpdateConfig { .. }
+            | Operation::UpdateBases { .. }
+            | Operation::Clone { .. }
+            | Operation::DataReplacement { .. }
+            | Operation::DataOverlay { .. } => Ok(()),
+            // A concurrent Delete only tombstones rows via a deletion vector,
+            // which preserves physical offsets; the overlay value for a deleted
+            // offset is simply inert. Conflict only if the whole overlaid
+            // fragment was removed, orphaning the overlay.
+            Operation::Delete {
+                deleted_fragment_ids,
+                ..
+            } => {
+                if deleted_fragment_ids
+                    .iter()
+                    .any(|id| self.modified_fragment_ids.contains(id))
+                {
+                    Err(self.retryable_conflict_err(other_transaction, other_version))
+                } else {
+                    Ok(())
+                }
+            }
+            // A concurrent Update that removed an overlaid fragment orphans the
+            // overlay outright — conflict. A row-moving update (RewriteRows)
+            // deletes the rows it touches and re-creates them in new fragments;
+            // the update took precedence and the re-created rows were computed
+            // from the pre-overlay base, so the overlay's values for those cells
+            // are lost. That is a per-row problem, not an offset one: only the
+            // moved rows are affected. Comparing the moved rows against the
+            // overlay's coverage needs the update's deletion vectors, so we mark
+            // the fragment here and verify row-by-row in `finish_data_overlay`.
+            // An in-place column rewrite (RewriteColumns) preserves rows and just
+            // tombstones the overlaid fields at build time, so it never conflicts.
+            Operation::Update {
+                removed_fragment_ids,
+                updated_fragments,
+                new_fragments,
+                update_mode,
+                ..
+            } => {
+                let removed_ours = removed_fragment_ids
+                    .iter()
+                    .any(|id| self.modified_fragment_ids.contains(id));
+                if removed_ours {
+                    return Err(self.retryable_conflict_err(other_transaction, other_version));
+                }
+                let moves_rows = !new_fragments.is_empty()
+                    && matches!(update_mode, Some(UpdateMode::RewriteRows) | None);
+                if moves_rows {
+                    for updated in updated_fragments {
+                        if let Some((_, needs_row_check)) =
+                            self.initial_fragments.get_mut(&updated.id)
+                        {
+                            *needs_row_check = true;
+                        }
+                    }
+                }
+                Ok(())
+            }
+            Operation::Rewrite { groups, .. } => {
+                // A rewrite (compaction / fold) of a fragment we are overlaying
+                // changes its physical row addresses, so our offsets would be
+                // invalid. Conflict only if it touches one of our fragments.
+                let touches_our_fragment = groups
+                    .iter()
+                    .flat_map(|g| g.old_fragments.iter())
+                    .any(|f| self.modified_fragment_ids.contains(&f.id));
+                if touches_our_fragment {
+                    Err(self.retryable_conflict_err(other_transaction, other_version))
+                } else {
+                    Ok(())
+                }
+            }
+            Operation::Merge { .. } => {
+                // Merge rewrites the whole fragment list; always conflict.
+                Err(self.retryable_conflict_err(other_transaction, other_version))
+            }
+            // Overwrite/Restore replace the dataset; UpdateMemWalState does not
+            // rebase against data operations (mirroring check_update_mem_wal_state_txn,
+            // which likewise treats a concurrent DataOverlay as incompatible).
+            Operation::Overwrite { .. }
+            | Operation::Restore { .. }
+            | Operation::UpdateMemWalState { .. } => {
+                Err(self.incompatible_conflict_err(other_transaction, other_version))
+            }
+        }
+    }
+
     fn check_merge_txn(
         &mut self,
         other_transaction: &Transaction,
@@ -1072,7 +1277,8 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Delete { .. }
             | Operation::Rewrite { .. }
             | Operation::Merge { .. }
-            | Operation::DataReplacement { .. } => {
+            | Operation::DataReplacement { .. }
+            | Operation::DataOverlay { .. } => {
                 Err(self.retryable_conflict_err(other_transaction, other_version))
             }
             Operation::Overwrite { .. }
@@ -1096,6 +1302,7 @@ impl<'a> TransactionRebase<'a> {
             | Operation::CreateIndex { .. }
             | Operation::Rewrite { .. }
             | Operation::DataReplacement { .. }
+            | Operation::DataOverlay { .. }
             | Operation::Merge { .. }
             | Operation::Restore { .. }
             | Operation::ReserveFragments { .. }
@@ -1124,6 +1331,7 @@ impl<'a> TransactionRebase<'a> {
             | Operation::CreateIndex { .. }
             | Operation::Rewrite { .. }
             | Operation::DataReplacement { .. }
+            | Operation::DataOverlay { .. }
             | Operation::Merge { .. }
             | Operation::ReserveFragments { .. }
             | Operation::Update { .. }
@@ -1148,6 +1356,7 @@ impl<'a> TransactionRebase<'a> {
             | Operation::UpdateConfig { .. }
             | Operation::CreateIndex { .. }
             | Operation::DataReplacement { .. }
+            | Operation::DataOverlay { .. }
             | Operation::Rewrite { .. }
             | Operation::Clone { .. }
             | Operation::ReserveFragments { .. }
@@ -1212,6 +1421,7 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::CreateIndex { .. }
                 | Operation::Rewrite { .. }
                 | Operation::DataReplacement { .. }
+                | Operation::DataOverlay { .. }
                 | Operation::Merge { .. }
                 | Operation::Restore { .. }
                 | Operation::ReserveFragments { .. }
@@ -1284,6 +1494,7 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::Overwrite { .. }
                 | Operation::Delete { .. }
                 | Operation::DataReplacement { .. }
+                | Operation::DataOverlay { .. }
                 | Operation::Merge { .. }
                 | Operation::Restore { .. }
                 | Operation::Clone { .. }
@@ -1374,6 +1585,7 @@ impl<'a> TransactionRebase<'a> {
             }
             Operation::CreateIndex { .. } => self.finish_create_index(dataset).await,
             Operation::Rewrite { .. } => self.finish_rewrite(dataset).await,
+            Operation::DataOverlay { .. } => self.finish_data_overlay(dataset).await,
             Operation::Append { .. }
             | Operation::Overwrite { .. }
             | Operation::DataReplacement { .. }
@@ -1548,6 +1760,90 @@ impl<'a> TransactionRebase<'a> {
                 ..self.transaction
             })
         }
+    }
+
+    /// Verify no concurrent row-moving Update dropped the values of any cell
+    /// this overlay covers. `check_data_overlay_txn` flags (via the
+    /// `initial_fragments` needs-check bool) each overlaid fragment on which a
+    /// concurrent RewriteRows update relocated rows; here we read the deletion
+    /// vectors and conflict only when the moved rows intersect the overlay's
+    /// coverage.
+    ///
+    /// The moved rows are computed as the current deletion vector minus the
+    /// read-time one. In the rare case where both a concurrent Delete and a
+    /// concurrent Update touched the same flagged fragment, the Delete's rows are
+    /// also counted and may trigger an unnecessary retry — never data loss. Pure
+    /// concurrent deletes leave the fragment unflagged and are not examined here.
+    async fn finish_data_overlay(self, dataset: &Dataset) -> Result<Transaction> {
+        let fragments_to_check: HashSet<u64> = self
+            .initial_fragments
+            .iter()
+            .filter_map(|(id, (_, needs_check))| needs_check.then_some(*id))
+            .collect();
+        if fragments_to_check.is_empty() {
+            return Ok(Transaction {
+                read_version: dataset.manifest.version,
+                ..self.transaction
+            });
+        }
+
+        // Coverage (physical offsets, unioned across fields) per flagged fragment.
+        let Operation::DataOverlay { groups } = &self.transaction.operation else {
+            return Err(wrong_operation_err(&self.transaction.operation));
+        };
+        let mut coverage_by_fragment: HashMap<u64, RoaringBitmap> = HashMap::new();
+        for group in groups {
+            if !fragments_to_check.contains(&group.fragment_id) {
+                continue;
+            }
+            *coverage_by_fragment.entry(group.fragment_id).or_default() |=
+                overlay_group_coverage(group);
+        }
+
+        for (fragment_id, coverage) in coverage_by_fragment {
+            let Some(current_fragment) = dataset
+                .fragments()
+                .as_slice()
+                .iter()
+                .find(|f| f.id == fragment_id)
+            else {
+                // The fragment is gone entirely; the overlay is orphaned.
+                return Err(crate::Error::retryable_commit_conflict_source(
+                    dataset.manifest.version,
+                    format!(
+                        "This {} transaction was preempted: overlaid fragment {} was removed by a concurrent transaction. Please retry.",
+                        self.transaction.uuid, fragment_id
+                    )
+                    .into(),
+                ));
+            };
+            let current_deletions =
+                read_fragment_deletion_bitmap(dataset, current_fragment).await?;
+            let initial_deletions = match self.initial_fragments.get(&fragment_id) {
+                Some((initial_fragment, _)) => {
+                    read_fragment_deletion_bitmap(dataset, initial_fragment).await?
+                }
+                None => RoaringBitmap::new(),
+            };
+            let moved_rows = &current_deletions - &initial_deletions;
+            let conflicting = &moved_rows & &coverage;
+            if !conflicting.is_empty() {
+                let sample: Vec<u32> = conflicting.iter().take(5).collect();
+                return Err(crate::Error::retryable_commit_conflict_source(
+                    dataset.manifest.version,
+                    format!(
+                        "This {} transaction was preempted by a concurrent update that moved overlaid rows on fragment {} (offsets {:?}). Please retry.",
+                        self.transaction.uuid, fragment_id, sample.as_slice()
+                    )
+                    .into(),
+                ));
+            }
+        }
+
+        Ok(Transaction {
+            read_version: dataset.manifest.version,
+            ..self.transaction
+        })
     }
 
     async fn finish_create_index(mut self, dataset: &Dataset) -> Result<Transaction> {
@@ -1772,6 +2068,40 @@ async fn initial_fragments_for_rebase(
         })
         .map(|fragment| (fragment.id, (fragment.clone(), false)))
         .collect::<HashMap<_, _>>()
+}
+
+/// Read a fragment's deletion vector as a bitmap of physical offsets, or an
+/// empty bitmap when the fragment has no deletion file.
+async fn read_fragment_deletion_bitmap(
+    dataset: &Dataset,
+    fragment: &Fragment,
+) -> Result<RoaringBitmap> {
+    match &fragment.deletion_file {
+        Some(deletion_file) => {
+            let dv = read_dataset_deletion_file(dataset, fragment.id, deletion_file).await?;
+            Ok(RoaringBitmap::from(dv.as_ref()))
+        }
+        None => Ok(RoaringBitmap::new()),
+    }
+}
+
+/// The physical offsets a group's overlays cover, unioned across every overlay
+/// and every field. This is the set of cells whose values the overlay supplies,
+/// used to test whether a concurrent row-moving Update actually invalidates the
+/// overlay.
+fn overlay_group_coverage(group: &DataOverlayGroup) -> RoaringBitmap {
+    let mut union = RoaringBitmap::new();
+    for overlay in &group.overlays {
+        match &overlay.coverage {
+            OverlayCoverage::Shared(bitmap) => union |= bitmap.as_ref(),
+            OverlayCoverage::PerField(bitmaps) => {
+                for bitmap in bitmaps {
+                    union |= bitmap.as_ref();
+                }
+            }
+        }
+    }
+    union
 }
 
 fn wrong_operation_err(op: &Operation) -> Error {
@@ -2782,6 +3112,442 @@ mod tests {
     }
 
     #[test]
+    fn test_data_overlay_conflicts() {
+        use crate::dataset::transaction::{DataOverlayGroup, UpdateMode};
+        use ConflictResult::*;
+        use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
+        use roaring::RoaringBitmap;
+
+        // Our transaction overlays fragment 1.
+        let overlay_op = |fragment_id: u64| Operation::DataOverlay {
+            groups: vec![DataOverlayGroup {
+                fragment_id,
+                overlays: vec![DataOverlayFile {
+                    data_file: DataFile::new_legacy_from_fields("overlay.lance", vec![0], None),
+                    coverage: OverlayCoverage::dense(RoaringBitmap::from_iter([0u32])),
+                    committed_version: 0,
+                }],
+            }],
+        };
+        let update_removing = |removed_fragment_ids: Vec<u64>| Operation::Update {
+            removed_fragment_ids,
+            updated_fragments: vec![],
+            new_fragments: vec![],
+            fields_modified: vec![],
+            merged_generations: Vec::new(),
+            fields_for_preserving_frag_bitmap: vec![],
+            update_mode: None,
+            inserted_rows_filter: None,
+            updated_fragment_offsets: None,
+        };
+        let delete = |updated: Vec<Fragment>, deleted: Vec<u64>| Operation::Delete {
+            updated_fragments: updated,
+            deleted_fragment_ids: deleted,
+            predicate: "x > 2".to_string(),
+        };
+        // A row-moving update (RewriteRows) relocates the updated rows into
+        // new_fragments; an in-place column rewrite (RewriteColumns) leaves rows
+        // where they are.
+        let update_moving = |updated: Vec<Fragment>, new: Vec<Fragment>| Operation::Update {
+            removed_fragment_ids: vec![],
+            updated_fragments: updated,
+            new_fragments: new,
+            fields_modified: vec![],
+            merged_generations: Vec::new(),
+            fields_for_preserving_frag_bitmap: vec![],
+            update_mode: Some(UpdateMode::RewriteRows),
+            inserted_rows_filter: None,
+            updated_fragment_offsets: None,
+        };
+        let update_rewrite_columns = |updated: Vec<Fragment>| Operation::Update {
+            removed_fragment_ids: vec![],
+            updated_fragments: updated,
+            new_fragments: vec![],
+            fields_modified: vec![0],
+            merged_generations: Vec::new(),
+            fields_for_preserving_frag_bitmap: vec![],
+            update_mode: Some(UpdateMode::RewriteColumns),
+            inserted_rows_filter: None,
+            updated_fragment_offsets: None,
+        };
+        let rewrite_of = |old: &Fragment| Operation::Rewrite {
+            groups: vec![RewriteGroup {
+                old_fragments: vec![old.clone()],
+                new_fragments: vec![],
+            }],
+            rewritten_indices: vec![],
+            frag_reuse_index: None,
+        };
+
+        let fragment0 = Fragment::new(0);
+        let fragment1 = Fragment::new(1);
+
+        // Each case is checked against our overlay on fragment 1.
+        let cases: Vec<(Operation, ConflictResult)> = vec![
+            // Permissive: preserves physical offsets / leaves fragment 1 in place.
+            (
+                Operation::Append {
+                    fragments: vec![fragment0.clone()],
+                },
+                Compatible,
+            ),
+            (
+                Operation::CreateIndex {
+                    new_indices: vec![],
+                    removed_indices: vec![],
+                },
+                Compatible,
+            ),
+            (
+                Operation::DataReplacement {
+                    replacements: vec![DataReplacementGroup(
+                        1,
+                        DataFile::new_legacy_from_fields("r.lance", vec![0], None),
+                    )],
+                },
+                Compatible,
+            ),
+            // Another overlay on the same fragment stacks rather than conflicts.
+            (overlay_op(1), Compatible),
+            // A Delete only tombstones rows (deletion vector) on fragment 1, and
+            // an in-place column rewrite preserves offsets, so both are compatible.
+            (delete(vec![fragment1.clone()], vec![]), Compatible),
+            (update_rewrite_columns(vec![fragment1.clone()]), Compatible),
+            (update_removing(vec![2]), Compatible),
+            // ...but removing our overlaid fragment 1 orphans the overlay -> conflict.
+            (delete(vec![], vec![1]), Retryable),
+            (update_removing(vec![1]), Retryable),
+            // A row-moving update re-creates the rows it touches from the
+            // pre-overlay base. Whether that actually drops any overlaid cell is
+            // a per-row question answered in `finish_data_overlay` (see
+            // test_data_overlay_finish_conflicts_with_row_moving_update), so the
+            // check itself defers rather than conflicting; a moving update on any
+            // fragment is compatible at this stage.
+            (
+                update_moving(vec![fragment1.clone()], vec![fragment0.clone()]),
+                Compatible,
+            ),
+            (
+                update_moving(vec![fragment0.clone()], vec![fragment0.clone()]),
+                Compatible,
+            ),
+            // Rewriting fragment 1 invalidates its physical offsets -> conflict;
+            // a rewrite of a different fragment does not.
+            (rewrite_of(&fragment1), Retryable),
+            (rewrite_of(&fragment0), Compatible),
+            // Merge rewrites the whole fragment list; Restore replaces the dataset.
+            (
+                Operation::Merge {
+                    fragments: vec![fragment1.clone()],
+                    schema: lance_core::datatypes::Schema::default(),
+                },
+                Retryable,
+            ),
+            (Operation::Restore { version: 1 }, NotCompatible),
+            // Overwrite/Restore replace the dataset, and UpdateMemWalState does
+            // not rebase against data operations — all hard conflicts.
+            (
+                Operation::Overwrite {
+                    fragments: vec![fragment0.clone()],
+                    schema: lance_core::datatypes::Schema::default(),
+                    config_upsert_values: None,
+                    initial_bases: None,
+                },
+                NotCompatible,
+            ),
+            (
+                Operation::UpdateMemWalState {
+                    merged_generations: vec![],
+                },
+                NotCompatible,
+            ),
+        ];
+
+        for (other, expected) in cases {
+            let mut rebase = TransactionRebase {
+                transaction: Transaction::new(0, overlay_op(1), None),
+                initial_fragments: HashMap::new(),
+                modified_fragment_ids: modified_fragment_ids(&overlay_op(1))
+                    .collect::<HashSet<_>>(),
+                affected_rows: None,
+                conflicting_frag_reuse_indices: Vec::new(),
+                conflicting_mem_wal_merged_gens: Vec::new(),
+            };
+            let other_txn = Transaction::new(0, other.clone(), None);
+            let result = rebase.check_txn(&other_txn, 1);
+            match expected {
+                Compatible => assert!(
+                    result.is_ok(),
+                    "overlay should be compatible with {other:?}, got {result:?}"
+                ),
+                Retryable => assert!(
+                    matches!(result, Err(Error::RetryableCommitConflict { .. })),
+                    "overlay should retryably conflict with {other:?}, got {result:?}"
+                ),
+                NotCompatible => assert!(
+                    matches!(result, Err(Error::IncompatibleTransaction { .. })),
+                    "overlay should be incompatible with {other:?}, got {result:?}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn test_rewrite_conflicts_with_data_overlay() {
+        // Reverse direction of test_data_overlay_conflicts: our transaction is a
+        // Rewrite and a concurrent DataOverlay has already committed. A rewrite
+        // changes the physical row addresses of the fragments it touches, so an
+        // overlay on one of those fragments is invalidated (retryable); an
+        // overlay on any other fragment is unaffected.
+        use crate::dataset::transaction::DataOverlayGroup;
+        use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
+        use roaring::RoaringBitmap;
+
+        let overlay_on = |fragment_id: u64| Operation::DataOverlay {
+            groups: vec![DataOverlayGroup {
+                fragment_id,
+                overlays: vec![DataOverlayFile {
+                    data_file: DataFile::new_legacy_from_fields("overlay.lance", vec![0], None),
+                    coverage: OverlayCoverage::dense(RoaringBitmap::from_iter([0u32])),
+                    committed_version: 0,
+                }],
+            }],
+        };
+        // Our transaction rewrites fragment 1.
+        let rewrite_op = Operation::Rewrite {
+            groups: vec![RewriteGroup {
+                old_fragments: vec![Fragment::new(1)],
+                new_fragments: vec![],
+            }],
+            rewritten_indices: vec![],
+            frag_reuse_index: None,
+        };
+
+        for (other, expect_conflict) in [(overlay_on(1), true), (overlay_on(0), false)] {
+            let mut rebase = TransactionRebase {
+                transaction: Transaction::new(0, rewrite_op.clone(), None),
+                initial_fragments: HashMap::new(),
+                modified_fragment_ids: modified_fragment_ids(&rewrite_op).collect::<HashSet<_>>(),
+                affected_rows: None,
+                conflicting_frag_reuse_indices: Vec::new(),
+                conflicting_mem_wal_merged_gens: Vec::new(),
+            };
+            let other_txn = Transaction::new(0, other.clone(), None);
+            let result = rebase.check_txn(&other_txn, 1);
+            if expect_conflict {
+                assert!(
+                    matches!(result, Err(Error::RetryableCommitConflict { .. })),
+                    "rewrite of fragment 1 should retryably conflict with {other:?}, got {result:?}"
+                );
+            } else {
+                assert!(
+                    result.is_ok(),
+                    "rewrite of fragment 1 should not conflict with {other:?}, got {result:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_update_conflicts_with_data_overlay() {
+        // Reverse direction of test_data_overlay_conflicts: our transaction is an
+        // Update and a concurrent DataOverlay has already committed. A row-moving
+        // update relocates the rows it touches, so an overlay on one of those
+        // fragments can no longer be applied (retryable); an overlay on any other
+        // fragment, or an in-place column rewrite, is compatible.
+        use crate::dataset::transaction::{DataOverlayGroup, UpdateMode};
+        use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
+        use roaring::RoaringBitmap;
+
+        let overlay_on = |fragment_id: u64| Operation::DataOverlay {
+            groups: vec![DataOverlayGroup {
+                fragment_id,
+                overlays: vec![DataOverlayFile {
+                    data_file: DataFile::new_legacy_from_fields("overlay.lance", vec![0], None),
+                    coverage: OverlayCoverage::dense(RoaringBitmap::from_iter([0u32])),
+                    committed_version: 0,
+                }],
+            }],
+        };
+        // Our update always touches fragment 1.
+        let update =
+            |update_mode: Option<UpdateMode>, new_fragments: Vec<Fragment>| Operation::Update {
+                removed_fragment_ids: vec![],
+                updated_fragments: vec![Fragment::new(1)],
+                new_fragments,
+                fields_modified: vec![0],
+                merged_generations: Vec::new(),
+                fields_for_preserving_frag_bitmap: vec![],
+                update_mode,
+                inserted_rows_filter: None,
+                updated_fragment_offsets: None,
+            };
+
+        // The overlay covers physical offset 0 of its fragment. Row addresses
+        // pack the fragment id in the high 32 bits and the offset in the low 32.
+        let rows_on = |fragment_id: u64, offsets: &[u32]| {
+            let mut map = RowAddrTreeMap::new();
+            map.insert_bitmap(
+                fragment_id as u32,
+                RoaringBitmap::from_iter(offsets.iter().copied()),
+            );
+            map
+        };
+
+        // (update, committed overlay, moved rows the update carries, expect conflict)
+        let cases = [
+            // Row-moving update whose moved rows include the overlaid cell -> the
+            // update would undo the overlay, so conflict.
+            (
+                update(Some(UpdateMode::RewriteRows), vec![Fragment::new(2)]),
+                overlay_on(1),
+                Some(rows_on(1, &[0])),
+                true,
+            ),
+            // ...but if the moved rows miss the overlaid cell, the overlay survives.
+            (
+                update(Some(UpdateMode::RewriteRows), vec![Fragment::new(2)]),
+                overlay_on(1),
+                Some(rows_on(1, &[5])),
+                false,
+            ),
+            // An overlay on a fragment the update did not touch is fine.
+            (
+                update(Some(UpdateMode::RewriteRows), vec![Fragment::new(2)]),
+                overlay_on(0),
+                Some(rows_on(1, &[0])),
+                false,
+            ),
+            // An in-place column rewrite preserves rows -> compatible.
+            (
+                update(Some(UpdateMode::RewriteColumns), vec![]),
+                overlay_on(1),
+                Some(rows_on(1, &[0])),
+                false,
+            ),
+            // Without affected rows we cannot be precise, so a row-moving update
+            // on the overlaid fragment falls back to a conservative conflict.
+            (
+                update(Some(UpdateMode::RewriteRows), vec![Fragment::new(2)]),
+                overlay_on(1),
+                None,
+                true,
+            ),
+        ];
+
+        for (update_op, other, affected_rows, expect_conflict) in cases {
+            let mut rebase = TransactionRebase {
+                transaction: Transaction::new(0, update_op.clone(), None),
+                initial_fragments: HashMap::new(),
+                modified_fragment_ids: modified_fragment_ids(&update_op).collect::<HashSet<_>>(),
+                affected_rows: affected_rows.as_ref(),
+                conflicting_frag_reuse_indices: Vec::new(),
+                conflicting_mem_wal_merged_gens: Vec::new(),
+            };
+            let other_txn = Transaction::new(0, other.clone(), None);
+            let result = rebase.check_txn(&other_txn, 1);
+            if expect_conflict {
+                assert!(
+                    matches!(result, Err(Error::RetryableCommitConflict { .. })),
+                    "update should retryably conflict with {other:?}, got {result:?}"
+                );
+            } else {
+                assert!(
+                    result.is_ok(),
+                    "update should be compatible with {other:?}, got {result:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[rstest::rstest]
+    #[case::coverage_overlaps_moved_row(vec![0u32], true)]
+    #[case::coverage_disjoint_from_moved_row(vec![3u32], false)]
+    async fn test_data_overlay_finish_conflicts_with_row_moving_update(
+        #[case] coverage_offsets: Vec<u32>,
+        #[case] expect_conflict: bool,
+    ) {
+        // 5 rows in one fragment. A concurrent RewriteRows update moves row 0 out
+        // to a new fragment (deleting it from fragment 0). Our overlay on fragment
+        // 0 conflicts only when its coverage includes the moved row; the decision
+        // is made in finish, which reads the deletion vectors.
+        use crate::dataset::transaction::{DataOverlayGroup, UpdateMode};
+        use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
+        use roaring::RoaringBitmap;
+
+        let dataset = test_dataset(5, 1).await;
+        let mut fragment = dataset.fragments().as_slice()[0].clone();
+
+        let moved_fragment = Fragment::new(0)
+            .with_file(
+                "moved.lance",
+                vec![0],
+                vec![0],
+                &LanceFileVersion::Stable,
+                NonZero::new(10),
+            )
+            .with_physical_rows(1);
+        let update_op = Operation::Update {
+            updated_fragments: vec![apply_deletion(&[0], &mut fragment, &dataset).await],
+            removed_fragment_ids: vec![],
+            new_fragments: vec![moved_fragment],
+            fields_modified: vec![],
+            merged_generations: Vec::new(),
+            fields_for_preserving_frag_bitmap: vec![],
+            update_mode: Some(UpdateMode::RewriteRows),
+            inserted_rows_filter: None,
+            updated_fragment_offsets: None,
+        };
+        let update_txn = Transaction::new_from_version(dataset.manifest.version, update_op);
+
+        let overlay_op = Operation::DataOverlay {
+            groups: vec![DataOverlayGroup {
+                fragment_id: 0,
+                overlays: vec![DataOverlayFile {
+                    data_file: DataFile::new_legacy_from_fields("overlay.lance", vec![0], None),
+                    coverage: OverlayCoverage::dense(RoaringBitmap::from_iter(coverage_offsets)),
+                    committed_version: 0,
+                }],
+            }],
+        };
+        let overlay_txn = Transaction::new_from_version(dataset.manifest.version, overlay_op);
+
+        // Commit the update so the latest dataset reflects the moved (deleted) row.
+        let latest_dataset = CommitBuilder::new(Arc::new(dataset.clone()))
+            .execute(update_txn.clone())
+            .await
+            .unwrap();
+
+        let mut rebase = TransactionRebase::try_new(&dataset, overlay_txn.clone(), None)
+            .await
+            .unwrap();
+        // The check defers the row-level decision to finish, flagging fragment 0.
+        rebase.check_txn(&update_txn, 1).unwrap();
+        assert_eq!(
+            rebase
+                .initial_fragments
+                .iter()
+                .map(|(id, (_, needs_check))| (*id, *needs_check))
+                .collect::<Vec<_>>(),
+            vec![(0, true)],
+        );
+
+        let res = rebase.finish(&latest_dataset).await;
+        if expect_conflict {
+            assert!(
+                matches!(res, Err(crate::Error::RetryableCommitConflict { .. })),
+                "overlay covering the moved row should conflict, got {res:?}"
+            );
+        } else {
+            assert!(
+                res.is_ok(),
+                "overlay disjoint from the moved row should succeed, got {res:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_create_index_conflicts_only_on_same_name() {
         let index0 = IndexMetadata {
             uuid: uuid::Uuid::new_v4(),
@@ -3255,6 +4021,7 @@ mod tests {
             Operation::DataReplacement { replacements } => {
                 Box::new(replacements.iter().map(|r| r.0))
             }
+            Operation::DataOverlay { groups } => Box::new(groups.iter().map(|g| g.fragment_id)),
         }
     }
 

@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{
-    any::Any,
-    sync::{Arc, Mutex},
-};
+use std::sync::{Arc, Mutex};
 
 use arrow_schema::{Schema, SchemaRef};
 use async_trait::async_trait;
@@ -82,10 +79,6 @@ impl LanceTableProvider {
 
 #[async_trait]
 impl TableProvider for LanceTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.full_schema.clone()
     }

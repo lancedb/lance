@@ -1669,9 +1669,9 @@ impl DirectoryNamespace {
 
         if needs_sort {
             if descending {
-                table_versions.sort_by(|a, b| b.version.cmp(&a.version));
+                table_versions.sort_by_key(|v| std::cmp::Reverse(v.version));
             } else {
-                table_versions.sort_by(|a, b| a.version.cmp(&b.version));
+                table_versions.sort_by_key(|v| v.version);
             }
         }
 
@@ -2403,7 +2403,7 @@ impl DirectoryNamespace {
     }
 
     fn table_full_uri(&self, table_name: &str) -> String {
-        format!("{}/{}.lance", &self.root, table_name)
+        format!("{}/{}.lance", self.root, table_name)
     }
 
     /// Get the object store path for a table (relative to base_path)

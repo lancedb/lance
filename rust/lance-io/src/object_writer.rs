@@ -392,25 +392,23 @@ impl AsyncWrite for ObjectWriter {
                     let fut = Box::pin(async move { store.put_multipart(path.as_ref()).await });
                     self.state = UploadState::CreatingUpload(fut);
                 }
+                // TODO: Make max concurrency configurable from storage options.
                 UploadState::InProgress {
                     upload,
                     part_idx,
                     futures,
                     ..
-                } => {
-                    // TODO: Make max concurrency configurable from storage options.
-                    if futures.len() < max_upload_parallelism() {
-                        let data = Self::next_part_buffer(
-                            &mut mut_self.buffer,
-                            *part_idx,
-                            mut_self.use_constant_size_upload_parts,
-                        );
-                        futures.spawn(
-                            Self::put_part(upload.as_mut(), data, *part_idx, None)
-                                .instrument(tracing::Span::current()),
-                        );
-                        *part_idx += 1;
-                    }
+                } if futures.len() < max_upload_parallelism() => {
+                    let data = Self::next_part_buffer(
+                        &mut mut_self.buffer,
+                        *part_idx,
+                        mut_self.use_constant_size_upload_parts,
+                    );
+                    futures.spawn(
+                        Self::put_part(upload.as_mut(), data, *part_idx, None)
+                            .instrument(tracing::Span::current()),
+                    );
+                    *part_idx += 1;
                 }
                 _ => {}
             }

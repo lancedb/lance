@@ -12,7 +12,6 @@
 //! false positives that require rechecking.
 //!
 //!
-use crate::Any;
 use crate::pbold;
 use crate::scalar::expression::{SargableQueryParser, ScalarQueryParser};
 use crate::scalar::registry::{
@@ -26,6 +25,7 @@ use lance_arrow_stats::StatisticsAccumulator;
 use lance_core::cache::{LanceCache, WeakLanceCache};
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use serde::{Deserialize, Serialize};
+use std::any::Any;
 use std::sync::LazyLock;
 
 use arrow_array::{
@@ -265,10 +265,8 @@ impl ZoneMapIndex {
                                     return Ok(zone.nan_count > 0);
                                 }
                             }
-                            ScalarValue::Float64(Some(f)) => {
-                                if f.is_nan() {
-                                    return Ok(zone.nan_count > 0);
-                                }
+                            ScalarValue::Float64(Some(f)) if f.is_nan() => {
+                                return Ok(zone.nan_count > 0);
                             }
                             _ => {}
                         }
@@ -295,10 +293,8 @@ impl ZoneMapIndex {
                                     return Ok(false); // Nothing is greater than NaN
                                 }
                             }
-                            ScalarValue::Float64(Some(f)) => {
-                                if f.is_nan() {
-                                    return Ok(false); // Nothing is greater than NaN
-                                }
+                            ScalarValue::Float64(Some(f)) if f.is_nan() => {
+                                return Ok(false); // Nothing is greater than NaN
                             }
                             _ => {}
                         }
@@ -322,10 +318,8 @@ impl ZoneMapIndex {
                                     return Ok(zone.nan_count > 0 || zone_min <= e);
                                 }
                             }
-                            ScalarValue::Float64(Some(f)) => {
-                                if f.is_nan() {
-                                    return Ok(zone.nan_count > 0 || zone_min <= e);
-                                }
+                            ScalarValue::Float64(Some(f)) if f.is_nan() => {
+                                return Ok(zone.nan_count > 0 || zone_min <= e);
                             }
                             _ => {}
                         }
@@ -345,10 +339,8 @@ impl ZoneMapIndex {
                                     return Ok(true);
                                 }
                             }
-                            ScalarValue::Float64(Some(f)) => {
-                                if f.is_nan() {
-                                    return Ok(true);
-                                }
+                            ScalarValue::Float64(Some(f)) if f.is_nan() => {
+                                return Ok(true);
                             }
                             _ => {}
                         }

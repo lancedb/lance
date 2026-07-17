@@ -489,13 +489,12 @@ fn fix_schema(manifest: &mut Manifest) -> Result<()> {
     }
 
     // Now, we need to remap the field ids to be unique.
-    let mut field_id_seed = manifest.max_field_id() + 1;
     let mut old_field_id_mapping: HashMap<i32, i32> = HashMap::new();
     let mut fields_with_duplicate_ids = fields_with_duplicate_ids.into_iter().collect::<Vec<_>>();
     fields_with_duplicate_ids.sort_unstable();
-    for field_id in fields_with_duplicate_ids {
+    for (field_id_seed, field_id) in (manifest.max_field_id() + 1..).zip(fields_with_duplicate_ids)
+    {
         old_field_id_mapping.insert(field_id, field_id_seed);
-        field_id_seed += 1;
     }
 
     let mut fragments = manifest.fragments.as_ref().clone();
@@ -1691,6 +1690,7 @@ mod tests {
                     DataFile::new_legacy_from_fields("path1", vec![0, 1, 2], None),
                     DataFile::new_legacy_from_fields("unused", vec![9], None),
                 ],
+                overlays: vec![],
                 deletion_file: None,
                 row_id_meta: None,
                 physical_rows: None,
@@ -1703,6 +1703,7 @@ mod tests {
                     DataFile::new_legacy_from_fields("path2", vec![0, 1, 2], None),
                     DataFile::new_legacy_from_fields("path3", vec![2], None),
                 ],
+                overlays: vec![],
                 deletion_file: None,
                 row_id_meta: None,
                 physical_rows: None,
@@ -1740,6 +1741,7 @@ mod tests {
                     vec![0, 1, 10],
                     None,
                 )],
+                overlays: vec![],
                 deletion_file: None,
                 row_id_meta: None,
                 physical_rows: None,
@@ -1752,6 +1754,7 @@ mod tests {
                     DataFile::new_legacy_from_fields("path2", vec![0, 1, 2], None),
                     DataFile::new_legacy_from_fields("path3", vec![10], None),
                 ],
+                overlays: vec![],
                 deletion_file: None,
                 row_id_meta: None,
                 physical_rows: None,
@@ -1842,6 +1845,7 @@ mod tests {
         let fragment = Fragment {
             id: 0,
             files: vec![data_file],
+            overlays: vec![],
             deletion_file: None,
             row_id_meta: None,
             physical_rows: Some(100),
