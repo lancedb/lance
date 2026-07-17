@@ -10,7 +10,8 @@ dependencies = [
     "pygments>=2.16",
     "mkdocs-protobuf>=0.1.0",
     "mkdocs-linkcheck>=1.0.0",
-    "mkdocs-awesome-pages-plugin>=2.10.1"
+    "mkdocs-awesome-pages-plugin>=2.10.1",
+    "requests>=2.31.0"  # mkdocs-linkcheck imports it but doesn't declare it
 ]
 
 [tool.uv]
