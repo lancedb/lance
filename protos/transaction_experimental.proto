@@ -3,6 +3,7 @@
 
 syntax = "proto3";
 
+import "file.proto";
 import "table.proto";
 
 package lance.table;
@@ -60,12 +61,20 @@ message UserAction {
 // A granular change to the manifest. Traditional operations decompose into an
 // ordered list of these.
 //
-// EXPERIMENTAL: only `AddFragments` is defined so far, as a proof of shape.
-// The remaining actions (RemoveFragments, UpdateDeletionVector, AddIndex, ...)
-// land in follow-up vertical slices.
+// EXPERIMENTAL: `AddFragments` is a proof of shape; `AddBases`,
+// `ReplaceFragmentColumns`, `AddFields`, `ChangeSchema`, and
+// `RefreshRowVersionMetadata` are the first real vertical slice, covering the
+// decomposition of `Transaction.UpdateBases`, `Transaction.DataReplacement`,
+// and `Transaction.Merge`. The remaining actions (RemoveFragments,
+// UpdateDeletionVector, AddIndex, ...) land in follow-up vertical slices.
 message Action {
   oneof action {
     AddFragments add_fragments = 1;
+    AddBases add_bases = 2;
+    ReplaceFragmentColumns replace_fragment_columns = 3;
+    AddFields add_fields = 4;
+    ChangeSchema change_schema = 5;
+    RefreshRowVersionMetadata refresh_row_version_metadata = 6;
   }
 }
 
@@ -77,4 +86,93 @@ message AddFragments {
   // The new fragments to append. Fragment IDs are not carried here; they are
   // assigned at apply time from the manifest's counters (late binding).
   repeated DataFragment fragments = 1;
+}
+
+// A symbolic reference to a base path that may not be committed yet: either an
+// already-committed base id, or a same-operation `AddBases` placeholder
+// resolved to its assigned id at apply time. This is the base-id analog of
+// `NewFragment.local_id`.
+message BaseRef {
+  oneof reference {
+    // An already-committed base path id.
+    uint32 committed = 1;
+    // The n-th unassigned (`id == 0`) base path minted by an `AddBases` action
+    // in the same operation (0-indexed, in the order such entries are
+    // encountered scanning the operation's actions top-to-bottom).
+    uint32 local = 2;
+  }
+}
+
+// Add new base paths to the manifest.
+//
+// Mirrors `Transaction.UpdateBases`: a base with `id == 0` is unassigned and is
+// allocated from the manifest's base-id counter at apply time.
+message AddBases {
+  repeated BasePath bases = 1;
+}
+
+// A data file paired with a symbolic reference to the base it lives under.
+//
+// `file.base_id` is ignored and must be unset: the real value is stamped in at
+// apply time once `base` is resolved. `base` absent means the dataset's
+// default base.
+message NewDataFile {
+  optional BaseRef base = 1;
+  DataFile file = 2;
+}
+
+// How `ReplaceFragmentColumns` installs `new_data_files` onto the target
+// fragment.
+enum ColumnReplacement {
+  // Swap data files that match an existing file's fields and format version;
+  // a file whose fields are entirely uncovered by any existing file (e.g. an
+  // all-NULL column being backfilled) is appended instead.
+  IN_PLACE = 0;
+  // `new_data_files` is the fragment's complete post-rewrite file list,
+  // installed verbatim.
+  TOMBSTONE = 1;
+}
+
+// Replace some of a fragment's data files with new ones.
+//
+// Covers the per-fragment replacement in `Transaction.DataReplacement`.
+message ReplaceFragmentColumns {
+  uint64 fragment_id = 1;
+  // The field ids covered by `new_data_files`. Used for conflict detection and
+  // to invalidate covering index entries for `fragment_id`.
+  repeated int32 field_ids = 2;
+  repeated NewDataFile new_data_files = 3;
+  ColumnReplacement replacement = 4;
+  // Reserved for a future partial-row-level replacement; always absent in the
+  // current translation from `Transaction.DataReplacement`, which replaces
+  // whole files.
+  optional bytes updated_row_offsets = 5;
+}
+
+// New fields, and any new data files that back them, added to the schema.
+message AddFields {
+  repeated lance.file.Field new_fields = 1;
+  repeated FragmentFiles fragment_files = 2;
+
+  message FragmentFiles {
+    uint64 fragment_id = 1;
+    repeated NewDataFile files = 2;
+  }
+}
+
+// Replace the manifest schema wholesale.
+//
+// Used alongside `AddFields` for the "recast" (column type/encoding change)
+// shape of `Transaction.Merge`: `AddFields` lands the new data files on the
+// affected fragments, and this action fixes up field identity/types.
+message ChangeSchema {
+  repeated lance.file.Field fields = 1;
+  map<string, bytes> schema_metadata = 2;
+}
+
+// Refresh row-version metadata (last-updated / created-at) for fragments whose
+// columns were merged in place, mirroring the implicit refresh
+// `Transaction.Merge` performs on stable-row-id datasets.
+message RefreshRowVersionMetadata {
+  repeated uint64 fragment_ids = 1;
 }
