@@ -13,6 +13,7 @@ use lance_core::utils::deletion::DeletionVector;
 use lance_core::{Error, Result};
 use lance_index::IndexType;
 use lance_index::mem_wal::{FlushedGeneration, ShardManifest};
+use lance_index::scalar::inverted::INVERTED_INDEX_VERSION_V4;
 use lance_index::scalar::{IndexStore, ScalarIndexParams};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_table::format::IndexMetadata;
@@ -776,7 +777,6 @@ impl MemTableFlusher {
             })?;
 
             let fragment_ids: roaring::RoaringBitmap = dataset.fragment_bitmap.as_ref().clone();
-            let format_version = fts_cfg.params.resolved_format_version();
 
             let index_meta = IndexMetadata {
                 uuid: index_uuid,
@@ -785,7 +785,7 @@ impl MemTableFlusher {
                 dataset_version: dataset.version().version,
                 fragment_bitmap: Some(fragment_ids),
                 index_details: Some(Arc::new(index_details)),
-                index_version: format_version.index_version() as i32,
+                index_version: INVERTED_INDEX_VERSION_V4 as i32,
                 created_at: None,
                 base_id: None,
                 files: None,
@@ -1192,6 +1192,7 @@ mod tests {
     use super::*;
     use arrow_array::{Int32Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use lance_index::scalar::inverted::INVERTED_INDEX_VERSION_V4;
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -2192,6 +2193,7 @@ mod tests {
 
         assert_eq!(indices.len(), 1);
         assert_eq!(indices[0].name, "text_fts");
+        assert_eq!(indices[0].index_version, INVERTED_INDEX_VERSION_V4 as i32);
 
         // Verify FTS query returns correct results
         // Searching for "hello" should find the first document

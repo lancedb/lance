@@ -148,7 +148,6 @@ impl InvertedIndexPlugin {
         });
 
         params.validate_format_version()?;
-        let format_version = params.resolved_format_version();
         let details = pbold::InvertedIndexDetails::try_from(&params)?;
         let mut inverted_index =
             InvertedIndexBuilder::new_with_fragment_mask(params, fragment_mask)
@@ -156,7 +155,7 @@ impl InvertedIndexPlugin {
         let files = inverted_index.update(data, index_store, None).await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&details).unwrap(),
-            index_version: format_version.index_version(),
+            index_version: INVERTED_INDEX_VERSION_V4,
             files,
         })
     }
@@ -268,7 +267,7 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
     }
 
     fn version(&self) -> u32 {
-        max_supported_fts_format_version().index_version()
+        INVERTED_INDEX_VERSION_V4
     }
 
     fn new_query_parser(
@@ -320,12 +319,9 @@ mod tests {
     use crate::scalar::{BuiltinIndexType, ScalarIndexParams};
 
     #[test]
-    fn test_plugin_version_tracks_max_supported_format() {
+    fn test_plugin_version_tracks_current_index_version() {
         let plugin = InvertedIndexPlugin;
-        assert_eq!(
-            plugin.version(),
-            max_supported_fts_format_version().index_version()
-        );
+        assert_eq!(plugin.version(), INVERTED_INDEX_VERSION_V4);
     }
 
     #[test]

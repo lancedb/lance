@@ -86,13 +86,18 @@ use crate::{FtsPrewarmOptions, Index};
 use crate::{prefilter::PreFilter, scalar::inverted::iter::take_fst_keys};
 use std::str::FromStr;
 
+// Manifest compatibility versions. Versions 0-3 historically coincided with
+// physical layout revisions. Version 4 is the first version managed
+// independently from the physical posting layout.
 // Version 0: Arrow TokenSetFormat (legacy)
 // Version 1: Fst TokenSetFormat with per-doc compressed positions
 // Version 2: Fst TokenSetFormat with shared posting-list position streams.
 // Version 3: Version 2 layout with 256-document physical posting blocks.
+// Version 4: Code analyzer support.
 pub const INVERTED_INDEX_VERSION_V1: u32 = 1;
 pub const INVERTED_INDEX_VERSION_V2: u32 = 2;
 pub const INVERTED_INDEX_VERSION_V3: u32 = 3;
+pub const INVERTED_INDEX_VERSION_V4: u32 = 4;
 pub const TOKENS_FILE: &str = "tokens.lance";
 pub const INVERT_LIST_FILE: &str = "invert.lance";
 pub const DOCS_FILE: &str = "docs.lance";
@@ -546,7 +551,7 @@ impl InvertedIndex {
                 TokenSetFormat::Arrow,
                 InvertedListFormatVersion::V1 | InvertedListFormatVersion::V2,
             ) => 0,
-            (_, format_version) => format_version.index_version(),
+            _ => INVERTED_INDEX_VERSION_V4,
         }
     }
 
@@ -11047,7 +11052,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_update_preserves_loaded_v2_format_version() -> Result<()> {
+    async fn test_update_preserves_v2_layout_with_v4_index_version() -> Result<()> {
         let src_dir = TempObjDir::default();
         let dest_dir = TempObjDir::default();
         let src_store = Arc::new(LanceIndexStore::new(
@@ -11102,7 +11107,8 @@ mod tests {
         writer.finish_with_metadata(metadata).await.unwrap();
 
         let index = InvertedIndex::load(src_store, None, &LanceCache::no_cache()).await?;
-        assert_eq!(index.index_version(), format_version.index_version());
+        assert_eq!(index.format_version(), format_version);
+        assert_eq!(index.index_version(), INVERTED_INDEX_VERSION_V4);
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("doc", DataType::Utf8, true),
@@ -11116,10 +11122,11 @@ mod tests {
             .update(Box::pin(stream), dest_store.as_ref(), None)
             .await?;
 
-        assert_eq!(created.index_version, format_version.index_version());
+        assert_eq!(created.index_version, INVERTED_INDEX_VERSION_V4);
 
         let updated = InvertedIndex::load(dest_store, None, &LanceCache::no_cache()).await?;
-        assert_eq!(updated.index_version(), format_version.index_version());
+        assert_eq!(updated.format_version(), format_version);
+        assert_eq!(updated.index_version(), INVERTED_INDEX_VERSION_V4);
         assert_eq!(updated.partitions.len(), 2);
         for partition in &updated.partitions {
             assert_eq!(
@@ -11172,25 +11179,16 @@ mod tests {
 
         let index = InvertedIndex::load(src_store, None, &LanceCache::no_cache()).await?;
         assert_eq!(index.format_version(), InvertedListFormatVersion::V3);
-        assert_eq!(
-            index.index_version(),
-            InvertedListFormatVersion::V3.index_version()
-        );
+        assert_eq!(index.index_version(), INVERTED_INDEX_VERSION_V4);
 
         let created = index
             .update(empty_doc_stream(), dest_store.as_ref(), None)
             .await?;
-        assert_eq!(
-            created.index_version,
-            InvertedListFormatVersion::V3.index_version()
-        );
+        assert_eq!(created.index_version, INVERTED_INDEX_VERSION_V4);
 
         let updated = InvertedIndex::load(dest_store, None, &LanceCache::no_cache()).await?;
         assert_eq!(updated.format_version(), InvertedListFormatVersion::V3);
-        assert_eq!(
-            updated.index_version(),
-            InvertedListFormatVersion::V3.index_version()
-        );
+        assert_eq!(updated.index_version(), INVERTED_INDEX_VERSION_V4);
 
         Ok(())
     }
