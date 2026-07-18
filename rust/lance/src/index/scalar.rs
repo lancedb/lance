@@ -11,7 +11,7 @@ pub(crate) mod inverted;
 pub(crate) mod label_list;
 pub(crate) mod zonemap;
 
-pub use inverted::{load_segment_details, load_segments};
+pub use inverted::{load_segment_details, load_segment_params, load_segments};
 
 pub use crate::index::scalar_logical::{LogicalScalarIndex, load_named_scalar_segments};
 
@@ -35,6 +35,7 @@ use lance_core::datatypes::Field;
 use lance_core::utils::tracing::{IO_TYPE_OPEN_SCALAR, TRACE_IO_EVENTS};
 use lance_core::{Error, ROW_ADDR, ROW_ID, Result};
 use lance_datafusion::exec::LanceExecutionOptions;
+use lance_index::frag_reuse::FragReuseIndexHandle;
 use lance_index::metrics::{MetricsCollector, NoOpMetricsCollector};
 use lance_index::pbold::{
     BTreeIndexDetails, BitmapIndexDetails, InvertedIndexDetails, LabelListIndexDetails,
@@ -460,7 +461,7 @@ pub async fn open_scalar_index(
         .for_index(&index.uuid, frag_reuse_index.as_ref().map(|f| &f.uuid));
 
     let frag_reuse_index: Option<Arc<dyn RowIdRemapper>> =
-        frag_reuse_index.map(|f| f as Arc<dyn RowIdRemapper>);
+        frag_reuse_index.map(|f| Arc::new(FragReuseIndexHandle(f)) as Arc<dyn RowIdRemapper>);
 
     // Runs only on a cold miss, and at most once even under concurrent opens
     // (the plugin coalesces). The compat check lives here because a warm hit was

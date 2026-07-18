@@ -386,6 +386,106 @@ pub(crate) fn select_segment_for_single_rebalance(
     Ok(selected.map(|candidate| candidate.segment_id))
 }
 
+fn validate_shared_vector_model(indices: &[Arc<dyn VectorIndex>], operation: &str) -> Result<()> {
+    let Some(first) = indices.first() else {
+        return Ok(());
+    };
+    if indices.len() == 1 {
+        return Ok(());
+    }
+
+    let first_metric = first.metric_type();
+    let first_index_type = first.sub_index_type();
+    let first_centroids = first.ivf_model().centroids_array();
+    let first_quantizer = first.quantizer();
+    let first_quantizer_type = first_quantizer.quantization_type();
+
+    for (idx, index) in indices.iter().enumerate().skip(1) {
+        if index.metric_type() != first_metric {
+            return Err(Error::index(format!(
+                "{operation}: vector index segment {idx} has metric {:?}, expected {:?}",
+                index.metric_type(),
+                first_metric
+            )));
+        }
+        let index_type = index.sub_index_type();
+        if std::mem::discriminant(&index_type.0) != std::mem::discriminant(&first_index_type.0)
+            || index_type.1 != first_index_type.1
+        {
+            return Err(Error::index(format!(
+                "{operation}: vector index segment {idx} has type {:?}, expected {:?}",
+                index_type, first_index_type
+            )));
+        }
+        match (first_centroids, index.ivf_model().centroids_array()) {
+            (Some(expected), Some(actual)) if expected.to_data() != actual.to_data() => {
+                return Err(Error::index(format!(
+                    "{operation}: vector index segments do not share IVF centroids"
+                )));
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(Error::index(format!(
+                    "{operation}: vector index segments do not share IVF centroids"
+                )));
+            }
+            _ => {}
+        }
+
+        let quantizer = index.quantizer();
+        if quantizer.quantization_type() != first_quantizer_type {
+            return Err(Error::index(format!(
+                "{operation}: vector index segment {idx} has quantizer {:?}, expected {:?}",
+                quantizer.quantization_type(),
+                first_quantizer_type
+            )));
+        }
+        if !shared_quantizer_model(&first_quantizer, &quantizer) {
+            return Err(Error::index(format!(
+                "{operation}: vector index segments do not share quantizer metadata"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn shared_quantizer_model(left: &Quantizer, right: &Quantizer) -> bool {
+    match (left, right) {
+        (Quantizer::Flat(left), Quantizer::Flat(right)) => {
+            left.metadata(None).dim == right.metadata(None).dim
+        }
+        (Quantizer::FlatBin(left), Quantizer::FlatBin(right)) => {
+            left.metadata(None).dim == right.metadata(None).dim
+        }
+        (Quantizer::Product(left), Quantizer::Product(right)) => {
+            left.num_sub_vectors == right.num_sub_vectors
+                && left.num_bits == right.num_bits
+                && left.dimension == right.dimension
+                && left.distance_type == right.distance_type
+                && left.codebook.to_data() == right.codebook.to_data()
+        }
+        (Quantizer::Scalar(left), Quantizer::Scalar(right)) => {
+            left.metadata(None) == right.metadata(None)
+        }
+        (Quantizer::Rabit(left), Quantizer::Rabit(right)) => {
+            let left = left.metadata(None);
+            let right = right.metadata(None);
+            left.rotation_type == right.rotation_type
+                && left.code_dim == right.code_dim
+                && left.num_bits == right.num_bits
+                && left.packed == right.packed
+                && left.query_estimator == right.query_estimator
+                && left.fast_rotation_signs == right.fast_rotation_signs
+                && match (&left.rotate_mat, &right.rotate_mat) {
+                    (Some(left), Some(right)) => left.to_data() == right.to_data(),
+                    (None, None) => true,
+                    _ => false,
+                }
+        }
+        _ => false,
+    }
+}
+
 // TODO: move to `lance-index` crate.
 ///
 /// Returns (new_uuid, num_indices_merged, files)
@@ -407,6 +507,7 @@ pub(crate) async fn optimize_vector_indices(
     // try cast to v1 IVFIndex,
     // fallback to v2 IVFIndex if it's not v1 IVFIndex
     if !existing_indices[0].as_any().is::<IVFIndex>() {
+        validate_shared_vector_model(&existing_indices, "optimizing vector index")?;
         return optimize_vector_indices_v2(
             &dataset,
             unindexed,
@@ -4583,6 +4684,41 @@ mod tests {
     use crate::utils::test::copy_test_data_to_tmp;
 
     const DIM: usize = 32;
+
+    #[test]
+    fn test_shared_quantizer_model_compares_skipped_payloads() {
+        let codebook = |offset| {
+            let values = Float32Array::from_iter_values((0..32).map(|v| v as f32 + offset));
+            FixedSizeListArray::try_new_from_values(values, 2).unwrap()
+        };
+        let pq1 = Quantizer::Product(ProductQuantizer::new(
+            1,
+            4,
+            2,
+            codebook(0.0),
+            DistanceType::L2,
+        ));
+        let pq2 = Quantizer::Product(ProductQuantizer::new(
+            1,
+            4,
+            2,
+            codebook(100.0),
+            DistanceType::L2,
+        ));
+        assert!(!shared_quantizer_model(&pq1, &pq2));
+
+        let rq1 = Quantizer::Rabit(RabitQuantizer::new_with_rotation::<Float32Type>(
+            1,
+            8,
+            lance_index::vector::bq::RQRotationType::Matrix,
+        ));
+        let rq2 = Quantizer::Rabit(RabitQuantizer::new_with_rotation::<Float32Type>(
+            1,
+            8,
+            lance_index::vector::bq::RQRotationType::Matrix,
+        ));
+        assert!(!shared_quantizer_model(&rq1, &rq2));
+    }
 
     async fn compute_test_ivf_loss(dataset: &Dataset, column: &str, ivf: &IvfModel) -> f64 {
         let centroids = ivf

@@ -900,7 +900,7 @@ impl TryFrom<pb::Manifest> for Manifest {
             Some(format) => DataStorageFormat::from(format),
         };
 
-        let schema = Schema::from(fields_with_meta);
+        let schema = Schema::try_from(fields_with_meta)?;
 
         Ok(Self {
             schema,
@@ -1316,6 +1316,7 @@ mod tests {
                     vec![0, 1, 2],
                     None,
                 )],
+                overlays: vec![],
                 deletion_file: None,
                 row_id_meta: None,
                 physical_rows: None,
@@ -1328,6 +1329,7 @@ mod tests {
                     DataFile::new_legacy_from_fields("path2", vec![0, 1, 43], None),
                     DataFile::new_legacy_from_fields("path3", vec![2], None),
                 ],
+                overlays: vec![],
                 deletion_file: None,
                 row_id_meta: None,
                 physical_rows: None,

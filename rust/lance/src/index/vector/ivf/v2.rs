@@ -2072,6 +2072,7 @@ mod tests {
     use lance_file::reader::{FileReader, FileReaderOptions};
     use lance_file::writer::FileWriter;
     use lance_index::IndexType;
+    use lance_index::optimize::OptimizeOptions;
     use lance_index::progress::IndexBuildProgress;
     use lance_index::vector::DIST_COL;
     use lance_index::vector::hnsw::builder::HnswBuildParams;
@@ -2086,7 +2087,6 @@ mod tests {
         storage::STORAGE_METADATA_KEY,
     };
     use lance_index::{INDEX_AUXILIARY_FILE_NAME, metrics::NoOpMetricsCollector};
-    use lance_index::{optimize::OptimizeOptions, scalar::IndexReader};
     use lance_io::{
         object_store::ObjectStore,
         scheduler::{ScanScheduler, SchedulerConfig},
@@ -5284,9 +5284,22 @@ mod tests {
 
         // Rewrite auxiliary file with PQ codebook inlined into schema metadata.
         let mut metadata = reader.schema().metadata.clone();
-        let batch = reader
-            .read_range(0..reader.num_rows() as usize, None)
+        let projection = lance_file::reader::ReaderProjection::from_whole_schema(
+            reader.schema(),
+            reader.metadata().version(),
+        );
+        let batches = reader
+            .read_stream_projected(
+                lance_io::ReadBatchParams::RangeFull,
+                u32::MAX,
+                u32::MAX,
+                projection,
+                lance_encoding::decoder::FilterExpression::no_filter(),
+            )
             .await?;
+        use futures::TryStreamExt as _;
+        let batches = batches.try_collect::<Vec<_>>().await?;
+        let batch = arrow::compute::concat_batches(&batches[0].schema(), &batches)?;
         let new_aux_path = new_dir.clone().join(INDEX_AUXILIARY_FILE_NAME);
         let mut writer = FileWriter::try_new(
             obj_store.create(&new_aux_path).await?,
