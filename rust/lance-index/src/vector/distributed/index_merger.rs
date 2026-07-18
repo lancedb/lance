@@ -1100,12 +1100,6 @@ pub async fn merge_partial_vector_auxiliary_files(
                     rq_meta_parsed.parse_buffer(rotate_mat_bytes)?;
                 }
                 validate_rq_num_bits(rq_meta_parsed.num_bits)?;
-                if rq_meta_parsed.packed {
-                    return Err(Error::index(format!(
-                        "Distributed RQ merge: source shard {idx} stores packed RQ codes; expected row-major distributed shard"
-                    )));
-                }
-
                 let d0 = rq_meta_parsed.rotated_dim();
                 if d0 == 0 {
                     return Err(Error::index(
@@ -2300,12 +2294,16 @@ mod tests {
             }
         }
 
+        let row_major_codes =
+            FixedSizeListArray::try_new_from_values(UInt8Array::from(codes), num_bytes as i32)?;
+        let rq_codes = if metadata.packed {
+            pack_codes(&row_major_codes)
+        } else {
+            row_major_codes
+        };
         let mut columns: Vec<Arc<dyn Array>> = vec![
             Arc::new(UInt64Array::from(row_ids)),
-            Arc::new(FixedSizeListArray::try_new_from_values(
-                UInt8Array::from(codes),
-                num_bytes as i32,
-            )?),
+            Arc::new(rq_codes),
             Arc::new(Float32Array::from(add_factors)),
             Arc::new(Float32Array::from(scale_factors)),
         ];
@@ -2656,13 +2654,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_merge_ivf_rq_rejects_packed_source_shard() {
+    async fn test_merge_ivf_rq_accepts_packed_source_shard() {
         let object_store = ObjectStore::memory();
         let index_dir = Path::from("index/uuid_rq_packed");
 
         let partial0 = index_dir.clone().join("partial_0");
         let aux0 = partial0.clone().join(INDEX_AUXILIARY_FILE_NAME);
-        let lengths = vec![2_u32, 1_u32];
+        let lengths = vec![64_u32];
 
         let rq_meta = RabitQuantizationMetadata {
             rotate_mat: None,
@@ -2693,24 +2691,13 @@ mod tests {
             crate::progress::noop_progress(),
         )
         .await;
-        match res {
-            Err(Error::Index { message, .. }) => {
-                assert!(
-                    message.contains("source shard 0"),
-                    "unexpected message: {}",
-                    message
-                );
-                assert!(
-                    message.contains("packed RQ codes"),
-                    "unexpected message: {}",
-                    message
-                );
-            }
-            other => panic!(
-                "expected Error::Index for packed RQ source shard, got {:?}",
-                other
-            ),
-        }
+        res.unwrap();
+        assert!(
+            object_store
+                .exists(&index_dir.join(INDEX_AUXILIARY_FILE_NAME))
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
