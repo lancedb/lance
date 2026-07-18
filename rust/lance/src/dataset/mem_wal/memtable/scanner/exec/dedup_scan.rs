@@ -16,7 +16,6 @@
 //! forward-aligned mask. A single `filter_record_batch` over the original
 //! batch then emits the survivors with no per-column reverse copy.
 
-use std::any::Any;
 use std::collections::HashSet;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
@@ -155,10 +154,6 @@ impl ExecutionPlan for MemTableDedupScanExec {
         "MemTableDedupScanExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.output_schema.clone()
     }
@@ -280,12 +275,12 @@ impl ExecutionPlan for MemTableDedupScanExec {
         )))
     }
 
-    fn partition_statistics(&self, _partition: Option<usize>) -> DataFusionResult<Statistics> {
-        Ok(Statistics {
+    fn partition_statistics(&self, _partition: Option<usize>) -> DataFusionResult<Arc<Statistics>> {
+        Ok(Arc::new(Statistics {
             num_rows: Precision::Absent,
             total_byte_size: Precision::Absent,
             column_statistics: vec![],
-        })
+        }))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {

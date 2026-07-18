@@ -329,6 +329,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(language_model_home))?;
     m.add_wrapped(wrap_pyfunction!(bytes_read_counter))?;
     m.add_wrapped(wrap_pyfunction!(iops_counter))?;
+    m.add_wrapped(wrap_pyfunction!(simd_info))?;
     m.add_wrapped(wrap_pyfunction!(stable_version))?;
     // Debug functions
     m.add_wrapped(wrap_pyfunction!(debug::format_schema))?;
@@ -345,6 +346,37 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
 #[pyfunction(name = "iops_counter")]
 fn iops_counter() -> PyResult<u64> {
     Ok(::lance::io::iops_counter())
+}
+
+/// Returns a dict describing which SIMD tier the lance runtime dispatches to
+/// on this host, plus the raw CPU feature flags it detected.
+///
+/// Mirrors `pyarrow.runtime_info()`: a cheap, transparent way to verify that
+/// the host is hitting the expected SIMD tier (e.g., `"avx512_fp16"`,
+/// `"avx2"`) when debugging vector-search performance.
+///
+/// Returns:
+///   {
+///     "tier": str,                      # e.g. "avx2", "avx_fma", "neon", "none"
+///     "target_arch": str,               # e.g. "x86_64", "aarch64", "loongarch64"
+///     "host_features": list[str],       # raw CPU feature flags (x86_64 only)
+///   }
+///
+/// Examples:
+///   >>> import lance
+///   >>> info = lance.simd_info()
+///   >>> sorted(info)
+///   ['host_features', 'target_arch', 'tier']
+///   >>> isinstance(info["tier"], str)
+///   True
+#[pyfunction]
+pub fn simd_info(py: Python<'_>) -> PyResult<Py<PyAny>> {
+    let info = lance_core::utils::cpu::simd_info();
+    let dict = pyo3::types::PyDict::new(py);
+    dict.set_item("tier", info.tier.to_string())?;
+    dict.set_item("target_arch", info.target_arch)?;
+    dict.set_item("host_features", info.host_features)?;
+    Ok(dict.into())
 }
 
 #[pyfunction(name = "bytes_read_counter")]

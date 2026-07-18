@@ -452,7 +452,15 @@ impl RleEncoder {
             };
 
             if values_processed == 0 {
-                break;
+                // A non-final chunk needs at least two values because log_num_values == 0
+                // identifies the final chunk. Report an error instead of returning partial data.
+                return Err(Error::internal(format!(
+                    "RLE encoder made no progress: values_remaining={values_remaining}, \
+                     offset={offset}, data_len={}, bits_per_value={bits_per_value}, \
+                     max_miniblock_values={}",
+                    data.len(),
+                    *MAX_MINIBLOCK_VALUES
+                )));
             }
 
             let log_num_values = if is_last_chunk {
@@ -1595,6 +1603,8 @@ mod tests {
         compression::{BlockCompressor, BlockDecompressor},
     };
     use arrow_array::Int32Array;
+    use rstest::rstest;
+
     // ========== Core Functionality Tests ==========
 
     #[test]
@@ -2084,7 +2094,72 @@ mod tests {
         }
     }
 
+    #[rstest]
+    #[case::u8_lengths(RunLengthWidth::U8)]
+    #[case::u16_lengths(RunLengthWidth::U16)]
+    #[case::u32_lengths(RunLengthWidth::U32)]
+    fn test_miniblock_chunk_counts_match_encoded_runs(#[case] run_length_width: RunLengthWidth) {
+        // This pattern crosses the 2,048-value boundary in the middle of a two-value run.
+        let levels = (0..4098)
+            .map(|index| if index % 3 == 0 { 1u16 } else { 0u16 })
+            .collect::<Vec<_>>();
+        let num_values = levels.len() as u64;
+        let encoder = RleEncoder::with_run_length_width(run_length_width);
+        let (buffers, chunks) = encoder
+            .encode_data(
+                &LanceBuffer::reinterpret_vec(levels),
+                num_values,
+                u16::BITS as u64,
+            )
+            .unwrap();
+
+        assert_eq!(buffers.len(), 2);
+        let bytes_per_length = run_length_width.bytes_per_value();
+        let mut values_offset = 0usize;
+        let mut lengths_offset = 0usize;
+        let mut values_processed = 0u64;
+
+        for chunk in &chunks {
+            let values_size = chunk.buffer_sizes[0] as usize;
+            let lengths_size = chunk.buffer_sizes[1] as usize;
+            let lengths_end = lengths_offset + lengths_size;
+            let chunk_lengths = &buffers[1].as_ref()[lengths_offset..lengths_end];
+            let length_chunks = chunk_lengths.chunks_exact(bytes_per_length);
+            assert!(length_chunks.remainder().is_empty());
+            let num_runs = length_chunks.len();
+            let encoded_values = length_chunks
+                .map(|bytes| run_length_width.read_length(bytes))
+                .sum::<u64>();
+            let declared_values = chunk.num_values(values_processed, num_values);
+
+            assert_eq!(values_size, num_runs * size_of::<u16>());
+            assert_eq!(encoded_values, declared_values);
+
+            values_offset += values_size;
+            lengths_offset = lengths_end;
+            values_processed += declared_values;
+        }
+
+        assert_eq!(values_processed, num_values);
+        assert_eq!(values_offset, buffers[0].len());
+        assert_eq!(lengths_offset, buffers[1].len());
+    }
+
     // ========== Error Handling Tests ==========
+
+    #[test]
+    fn test_encoder_rejects_zero_progress() {
+        let error = RleEncoder::new()
+            .encode_data(&LanceBuffer::empty(), 1, u16::BITS as u64)
+            .unwrap_err();
+
+        assert!(
+            matches!(&error, Error::Internal { .. }),
+            "expected internal error, got: {error:?}"
+        );
+        assert!(error.to_string().contains("made no progress"));
+        assert!(error.to_string().contains("values_remaining=1"));
+    }
 
     #[test]
     fn test_invalid_buffer_count() {

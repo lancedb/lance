@@ -75,7 +75,11 @@ from .types import _coerce_reader
 from .udf import BatchUDF, normalize_transform
 from .udf import BatchUDFCheckpoint as BatchUDFCheckpoint
 from .udf import batch_udf as batch_udf
-from .util import _target_partition_size_to_num_partitions, td_to_micros
+from .util import (
+    _normalize_index_segment_ids,
+    _target_partition_size_to_num_partitions,
+    td_to_micros,
+)
 
 if TYPE_CHECKING:
     from pyarrow._compute import Expression
@@ -3406,8 +3410,10 @@ class LanceDataset(pa.dataset.Dataset):
         format_version: int or str, optional
             This is for the ``INVERTED`` / ``FTS`` index. Explicit on-disk FTS
             format version to write when creating a new index. Accepts ``1``,
-            ``2``, ``"v1"``, or ``"v2"``. If unset, Lance chooses the current
-            default format.
+            ``2``, ``3``, ``"v1"``, ``"v2"``, or ``"v3"``. If unset, Lance
+            writes v2 for ``block_size=128`` and v3 for ``block_size=256``.
+            ``format_version=3`` is experimental and is only valid with
+            ``block_size=256``.
 
         with_position: bool, default False
             This is for the ``INVERTED`` index. If True, the index will store the
@@ -3415,6 +3421,12 @@ class LanceDataset(pa.dataset.Dataset):
             query. This will significantly increase the index size.
             It won't impact the performance of non-phrase queries even if it is set to
             True.
+        block_size: int, default 128
+            This is for the ``INVERTED`` index. Number of documents per compressed
+            posting block. Must be one of ``128`` or ``256``.
+            ``block_size=256`` is experimental and may introduce breaking changes.
+            Use ``128`` when stable compatibility with the legacy posting layout is
+            required.
         memory_limit: int, optional
             This is for the ``INVERTED`` index. Total build-time memory limit in MiB.
             If set, Lance divides this budget evenly across the workers. If unset,
@@ -4364,20 +4376,10 @@ class LanceDataset(pa.dataset.Dataset):
             named logical index. Use :meth:`describe_indices` to inspect logical
             indices and obtain segment UUIDs from ``IndexDescription.segments``.
         """
-        if index_segments is not None:
-            segment_ids = []
-            for segment_id in index_segments:
-                if isinstance(segment_id, (str, uuid.UUID)):
-                    segment_ids.append(str(segment_id))
-                else:
-                    raise TypeError(
-                        "index_segments must be an iterable of str or uuid.UUID. "
-                        f"Got {type(segment_id)} instead."
-                    )
-            index_segments = segment_ids
-
         return self._ds.prewarm_index(
-            name, with_position=with_position, index_segments=index_segments
+            name,
+            with_position=with_position,
+            index_segments=_normalize_index_segment_ids(index_segments),
         )
 
     def merge_index_metadata(
@@ -6030,6 +6032,76 @@ class LanceOperation:
         replacements: List[LanceOperation.DataReplacementGroup]
 
     @dataclass
+    class DataOverlayFile:
+        """
+        An overlay file supplying new values for a subset of
+        ``(physical offset, field)`` cells of a fragment, resolved on read and
+        layered over the base data without rewriting the base files.
+
+        The overlay is dense or sparse depending on the shape of ``offsets``:
+        pass a flat ``List[int]`` for a dense overlay (one offset list shared by
+        every field in ``data_file``) or a ``List[List[int]]`` for a sparse
+        overlay (one offset list per field, in the order of the file's fields).
+        Offsets are **physical** row offsets (positions in the base files,
+        counting deleted rows), like deletion vectors.
+
+        Attributes
+        ----------
+        data_file : DataFile
+            The Lance data file storing the overlay's new cell values — one
+            value column per covered field. The value at each covered offset is
+            stored at the rank (0-based count of covered offsets below it) of
+            that offset in the field's coverage.
+        offsets : Union[List[int], List[List[int]]]
+            The covered physical row offsets. A flat list is dense coverage
+            (shared by every field); a list of per-field lists is sparse
+            coverage (in field order). Each list must be strictly ascending
+            with no duplicates, since the Nth offset maps to the Nth value row
+            in ``data_file``; a non-ascending list raises ``ValueError``.
+        committed_version : Optional[int]
+            The dataset version at which this overlay became effective. Leave as
+            ``None`` when creating an overlay to commit — the commit stamps it.
+            It is populated when reading an existing fragment's overlays so they
+            round-trip through :class:`FragmentMetadata`.
+        """
+
+        data_file: DataFile
+        offsets: Union[List[int], List[List[int]]]
+        committed_version: Optional[int] = None
+
+    @dataclass
+    class DataOverlayGroup:
+        """
+        Overlay files to append to a single fragment.
+
+        Attributes
+        ----------
+        fragment_id : int
+            The id of the fragment the overlays apply to.
+        overlays : List[LanceOperation.DataOverlayFile]
+            The overlay files to append, ordered oldest-first (a later entry is
+            newer and wins where coverage overlaps).
+        """
+
+        fragment_id: int
+        overlays: List[LanceOperation.DataOverlayFile]
+
+    @dataclass
+    class DataOverlay(BaseOperation):
+        """
+        Operation that appends data overlay files to fragments.
+
+        Overlays are appended to each fragment's existing overlays (overlays
+        written by concurrent commits are preserved) and resolved on read
+        over the base data without rewriting it.
+
+        If multiple groups target the same data then the values in the
+        latest group take precedence.
+        """
+
+        groups: List[LanceOperation.DataOverlayGroup]
+
+    @dataclass
     class Project(BaseOperation):
         """
         Operation that project columns.
@@ -6463,19 +6535,7 @@ class ScannerBuilder:
     def with_index_segments(
         self, index_segments: Optional[Iterable[Union[str, uuid.UUID]]]
     ) -> ScannerBuilder:
-        if index_segments is not None:
-            segment_ids = []
-            for segment_id in index_segments:
-                if isinstance(segment_id, (str, uuid.UUID)):
-                    segment_ids.append(str(segment_id))
-                else:
-                    raise TypeError(
-                        "index_segments must be an iterable of str or uuid.UUID. "
-                        f"Got {type(segment_id)} instead."
-                    )
-            index_segments = segment_ids
-
-        self._index_segments = index_segments
+        self._index_segments = _normalize_index_segment_ids(index_segments)
         return self
 
     def nearest(
