@@ -5634,6 +5634,19 @@ class SqlQueryBuilder:
             The name the relation is registered under in the query.
         data: pyarrow.Table or pyarrow.RecordBatchReader
             The in-memory relation to register. Must be non-empty.
+
+        Examples
+        --------
+        Register an in-memory relation and semi-join it in the query::
+
+            ids = pa.table({"id": [1, 2, 3]})
+            batches = (
+                dataset.sql("SELECT * FROM d WHERE id IN (SELECT id FROM ids)")
+                .table_name("d")
+                .register_arrow("ids", ids)
+                .build()
+                .to_batch_records()
+            )
         """
         self._builder = self._builder.register_arrow(name, data)
         return self

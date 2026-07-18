@@ -190,6 +190,31 @@ public class SqlQueryTest {
     }
   }
 
+  @Test
+  public void testRegisterArrowValidationAndReuse() throws Exception {
+    // registerArrow rejects invalid inputs at the boundary.
+    try (VectorSchemaRoot ids = idTable(1, 2);
+        ArrowArrayStream stream = toStream(ids)) {
+      SqlQuery q = dataset.sql("select id from " + NAME).tableName(NAME);
+      Assertions.assertThrows(IllegalArgumentException.class, () -> q.registerArrow("", stream));
+      Assertions.assertThrows(IllegalArgumentException.class, () -> q.registerArrow(null, stream));
+      Assertions.assertThrows(IllegalArgumentException.class, () -> q.registerArrow("ids", null));
+    }
+
+    // A query with registered relations is single-use: the registered stream is consumed on the first call, so a
+    // second intoBatchRecords() throws rather than handing JNI a dead stream.
+    try (VectorSchemaRoot ids = idTable(1, 2);
+        ArrowArrayStream stream = toStream(ids)) {
+      SqlQuery q =
+          dataset
+              .sql("select id from " + NAME + " where id in (select id from ids)")
+              .tableName(NAME)
+              .registerArrow("ids", stream);
+      q.intoBatchRecords().close();
+      Assertions.assertThrows(IllegalStateException.class, q::intoBatchRecords);
+    }
+  }
+
   /** Build a single-column (`id`: Int32) in-memory relation. */
   private VectorSchemaRoot idTable(int... ids) {
     Schema schema =

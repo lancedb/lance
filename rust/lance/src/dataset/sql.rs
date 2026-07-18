@@ -58,6 +58,43 @@ impl SqlQueryBuilder {
     /// Register an additional table named `name` in the query's DataFusion context, joinable alongside the
     /// dataset. Accepts any `TableProvider`, such as a `MemTable` (an in-memory Arrow relation), another Lance
     /// dataset's `LanceTableProvider`, or a view. May be called more than once; a later duplicate name wins.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use std::sync::Arc;
+    /// # use tokio::runtime::Runtime;
+    /// # use arrow_array::{RecordBatch, RecordBatchIterator, Int32Array};
+    /// # use arrow_schema::{Schema, Field, DataType};
+    /// # use datafusion::datasource::MemTable;
+    /// # use lance::dataset::{WriteParams, Dataset};
+    /// #
+    /// # let rt = Runtime::new().unwrap();
+    /// # rt.block_on(async {
+    /// # let test_dir = tempfile::tempdir().unwrap();
+    /// # let uri = test_dir.path().to_str().unwrap().to_string();
+    /// # let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+    /// # let batch = RecordBatch::try_new(
+    /// #     schema.clone(),
+    /// #     vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+    /// # ).unwrap();
+    /// # let reader = RecordBatchIterator::new(vec![batch.clone()].into_iter().map(Ok), schema.clone());
+    /// # let dataset = Dataset::write(reader, &uri, Some(WriteParams::default())).await.unwrap();
+    /// #
+    /// // Register any `TableProvider` (here a `MemTable`) and join it in the query.
+    /// let ids = Arc::new(MemTable::try_new(schema.clone(), vec![vec![batch]]).unwrap());
+    /// let batches = dataset
+    ///     .sql("SELECT id FROM data WHERE id IN (SELECT id FROM ids)")
+    ///     .table_name("data")
+    ///     .register_table("ids", ids)
+    ///     .build()
+    ///     .await?
+    ///     .into_batch_records()
+    ///     .await?;
+    /// # assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
+    /// # Ok::<(), lance_core::Error>(())
+    /// # }).unwrap();
+    /// ```
     pub fn register_table(mut self, name: &str, provider: Arc<dyn TableProvider>) -> Self {
         self.extra_tables.push((name.to_string(), provider));
         self
@@ -66,6 +103,45 @@ impl SqlQueryBuilder {
     /// Convenience over [`Self::register_table`] that wraps in-memory Arrow `batches` in a `MemTable`. `batches`
     /// must be non-empty (the schema is derived from the first batch); for an empty relation, build a `MemTable`
     /// yourself and pass it to [`Self::register_table`].
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use std::sync::Arc;
+    /// # use tokio::runtime::Runtime;
+    /// # use arrow_array::{RecordBatch, RecordBatchIterator, Int32Array};
+    /// # use arrow_schema::{Schema, Field, DataType};
+    /// # use lance::dataset::{WriteParams, Dataset};
+    /// #
+    /// # let rt = Runtime::new().unwrap();
+    /// # rt.block_on(async {
+    /// # let test_dir = tempfile::tempdir().unwrap();
+    /// # let uri = test_dir.path().to_str().unwrap().to_string();
+    /// # let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+    /// # let batch = RecordBatch::try_new(
+    /// #     schema.clone(),
+    /// #     vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4]))],
+    /// # ).unwrap();
+    /// # let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+    /// # let dataset = Dataset::write(reader, &uri, Some(WriteParams::default())).await.unwrap();
+    /// #
+    /// // A caller-supplied relation to semi-join against the dataset.
+    /// let ids = RecordBatch::try_new(
+    ///     Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
+    ///     vec![Arc::new(Int32Array::from(vec![2, 3]))],
+    /// ).unwrap();
+    /// let batches = dataset
+    ///     .sql("SELECT id FROM data WHERE id IN (SELECT id FROM ids)")
+    ///     .table_name("data")
+    ///     .register_arrow("ids", vec![ids])?
+    ///     .build()
+    ///     .await?
+    ///     .into_batch_records()
+    ///     .await?;
+    /// # assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+    /// # Ok::<(), lance_core::Error>(())
+    /// # }).unwrap();
+    /// ```
     pub fn register_arrow(self, name: &str, batches: Vec<RecordBatch>) -> lance_core::Result<Self> {
         let schema = batches.first().map(|b| b.schema()).ok_or_else(|| {
             lance_core::Error::invalid_input(
@@ -118,8 +194,14 @@ impl SqlQueryBuilder {
             provider = provider.with_blob_handling(blob_handling);
         }
         ctx.register_table(self.table_name, Arc::new(provider))?;
-        for (name, provider) in self.extra_tables {
-            ctx.register_table(name, provider)?;
+        // Register the extra tables, keeping the LAST provider for a name registered more than once (registering
+        // the same name into the context twice would otherwise error). Iterate in reverse and skip names already
+        // registered, so a later duplicate wins.
+        let mut registered = std::collections::HashSet::new();
+        for (name, provider) in self.extra_tables.into_iter().rev() {
+            if registered.insert(name.clone()) {
+                ctx.register_table(name, provider)?;
+            }
         }
         register_functions(&ctx);
         let df = ctx.sql(&self.sql).await?;
@@ -502,7 +584,7 @@ mod tests {
     fn collect_ids(batches: &[RecordBatch]) -> Vec<i32> {
         batches
             .iter()
-            .flat_map(|b| b.column(0).as_primitive::<Int32Type>().values().to_vec())
+            .flat_map(|b| b["id"].as_primitive::<Int32Type>().values().to_vec())
             .collect()
     }
 
@@ -537,11 +619,38 @@ mod tests {
             .into_batch_records()
             .await
             .unwrap();
-        pretty_assertions::assert_eq!(counted[0].column(0).as_primitive::<Int64Type>().value(0), 4);
+        pretty_assertions::assert_eq!(counted[0]["n"].as_primitive::<Int64Type>().value(0), 4);
 
-        // register_arrow with no batches cannot derive a schema, so it returns an error (not a silent skip).
-        let err = ds.sql("SELECT 1").table_name("t").register_arrow("ids", vec![]);
-        assert_true!(err.is_err());
+        // Registering the same name twice: the later relation replaces the earlier one.
+        let dup = ds
+            .sql("SELECT id FROM ids ORDER BY id")
+            .table_name("t")
+            .register_arrow("ids", vec![ids_batch(vec![1, 2])])
+            .unwrap()
+            .register_arrow("ids", vec![ids_batch(vec![7, 8, 9])])
+            .unwrap()
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+        pretty_assertions::assert_eq!(collect_ids(&dup), vec![7, 8, 9]);
+
+        // register_arrow with no batches cannot derive a schema, so it returns an InvalidInput error.
+        let err = ds
+            .sql("SELECT 1")
+            .table_name("t")
+            .register_arrow("ids", vec![])
+            .unwrap_err();
+        assert!(
+            matches!(err, lance_core::Error::InvalidInput { .. }),
+            "expected InvalidInput, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("schema"),
+            "message should mention the missing schema: {err}"
+        );
     }
 
     #[tokio::test]

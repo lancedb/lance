@@ -5648,17 +5648,20 @@ def test_dataset_sql(tmp_path: Path):
     assert pa.Table.from_batches(complex_result) == expected_complex
 
 
-def test_dataset_sql_register_arrow(tmp_path: Path):
+@pytest.mark.parametrize("as_reader", [False, True], ids=["table", "reader"])
+def test_dataset_sql_register_arrow(tmp_path: Path, as_reader: bool):
     table = pa.table({"id": [1, 2, 3, 4, 5], "value": ["a", "b", "c", "d", "e"]})
     ds = lance.write_dataset(table, tmp_path / "test")
 
-    # A subset of ids to join against, including one id (99) not in the dataset.
+    # A subset of ids to join against, including one id (99) not in the dataset. Exercise both accepted input
+    # forms: a pyarrow Table and a RecordBatchReader.
     ids = pa.table({"id": [4, 2, 99]})
+    data = ids.to_reader() if as_reader else ids
 
     result = (
         ds.sql("SELECT id FROM t WHERE id IN (SELECT id FROM ids) ORDER BY id")
         .table_name("t")
-        .register_arrow("ids", ids)
+        .register_arrow("ids", data)
         .build()
         .to_batch_records()
     )
@@ -5666,6 +5669,18 @@ def test_dataset_sql_register_arrow(tmp_path: Path):
     # Only the intersection, in ascending order.
     expected = pa.table({"id": [2, 4]})
     assert pa.Table.from_batches(result) == expected
+
+
+def test_dataset_sql_register_arrow_empty(tmp_path: Path):
+    table = pa.table({"id": [1, 2, 3]})
+    ds = lance.write_dataset(table, tmp_path / "test")
+
+    # An empty relation has no batches to derive a schema from, so registration raises (translated to ValueError
+    # by the PyO3 binding).
+    schema = pa.schema([("id", pa.int64())])
+    empty = pa.RecordBatchReader.from_batches(schema, [])
+    with pytest.raises(ValueError):
+        ds.sql("SELECT id FROM ids").table_name("t").register_arrow("ids", empty)
 
 
 def test_file_reader_options(tmp_path: Path):

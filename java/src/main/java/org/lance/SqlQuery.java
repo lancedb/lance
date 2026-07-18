@@ -33,6 +33,7 @@ public class SqlQuery {
   private boolean withRowAddr = false;
   private final List<String> extraTableNames = new ArrayList<>();
   private final List<Long> extraStreamAddresses = new ArrayList<>();
+  private boolean consumed = false;
 
   public SqlQuery(Dataset dataset, String sql) {
     this.dataset = dataset;
@@ -51,8 +52,19 @@ public class SqlQuery {
    * {@link ArrowArrayStream} handle and should close it afterwards (typically via try-with-resources), as with
    * {@code MergeInsert}. May be called multiple times to register multiple tables; if a name is registered twice,
    * the later registration replaces the earlier one at query time (DataFusion register semantics).
+   *
+   * <p>Because the registered stream is consumed on the first {@link #intoBatchRecords()} call, a query with
+   * registered relations is single-use; calling {@link #intoBatchRecords()} a second time throws.
+   *
+   * @throws IllegalArgumentException if {@code name} is null or blank, or {@code stream} is null
    */
   public SqlQuery registerArrow(String name, ArrowArrayStream stream) {
+    if (name == null || name.trim().isEmpty()) {
+      throw new IllegalArgumentException("table name must be non-empty");
+    }
+    if (stream == null) {
+      throw new IllegalArgumentException("stream must not be null");
+    }
     this.extraTableNames.add(name);
     this.extraStreamAddresses.add(stream.memoryAddress());
     return this;
@@ -69,6 +81,16 @@ public class SqlQuery {
   }
 
   public ArrowReader intoBatchRecords() throws IOException {
+    if (consumed) {
+      throw new IllegalStateException(
+          "intoBatchRecords() was already called on this SqlQuery; a query with registered Arrow relations is "
+              + "single-use because the registered streams are consumed. Build a new query and re-register them.");
+    }
+    // A query with registered streams is one-shot: the native call consumes the streams, so mark it consumed
+    // regardless of outcome to prevent a later call from handing JNI dead stream pointers.
+    if (!extraTableNames.isEmpty()) {
+      consumed = true;
+    }
     try (ArrowArrayStream s = ArrowArrayStream.allocateNew(dataset.allocator())) {
       intoBatchRecords(
           dataset,
