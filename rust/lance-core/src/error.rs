@@ -905,14 +905,18 @@ pub fn get_caller_location() -> &'static std::panic::Location<'static> {
 /// Wrap an error in a new error type that implements Clone
 ///
 /// This is useful when two threads/streams share a common fallible source
-/// The base error will always have the full error.  Any cloned results will
-/// only have Error::Cloned with the to_string of the base error.
+/// Definite not-found errors preserve their variant so compatibility fallbacks
+/// can distinguish them from transient I/O failures. Other cloned results use
+/// Error::Cloned with the string representation of the base error.
 pub struct CloneableError(pub Error);
 
 impl Clone for CloneableError {
     #[track_caller]
     fn clone(&self) -> Self {
-        Self(Error::cloned(self.0.to_string()))
+        match &self.0 {
+            Error::NotFound { uri, .. } => Self(Error::not_found(uri.clone())),
+            error => Self(Error::cloned(error.to_string())),
+        }
     }
 }
 
@@ -929,6 +933,19 @@ impl<T: Clone> From<Result<T>> for CloneableResult<T> {
 mod test {
     use super::*;
     use std::fmt;
+
+    #[test]
+    fn cloneable_error_preserves_not_found_variant() {
+        let original = CloneableError(Error::not_found("metadata.lance"));
+        let cloned = original.clone();
+        assert!(matches!(original.0, Error::NotFound { .. }));
+        assert!(matches!(cloned.0, Error::NotFound { .. }));
+
+        let original = CloneableError(Error::timeout("metadata read timed out"));
+        let cloned = original.clone();
+        assert!(matches!(original.0, Error::Timeout { .. }));
+        assert!(matches!(cloned.0, Error::Cloned { .. }));
+    }
 
     #[test]
     fn test_caller_location_capture() {
