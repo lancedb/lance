@@ -51,7 +51,7 @@ public class SqlQuery {
    * stream during the native call (it takes ownership of the underlying C stream); the caller still owns the
    * {@link ArrowArrayStream} handle and should close it afterwards (typically via try-with-resources), as with
    * {@code MergeInsert}. May be called multiple times to register multiple tables; if a name is registered twice,
-   * the later registration replaces the earlier one at query time (DataFusion register semantics).
+   * the later registration replaces the earlier one (deduplicated when the query is built).
    *
    * <p>Because the registered stream is consumed on the first {@link #intoBatchRecords()} call, a query with
    * registered relations is single-use; calling {@link #intoBatchRecords()} a second time throws.
@@ -60,10 +60,10 @@ public class SqlQuery {
    */
   public SqlQuery registerArrow(String name, ArrowArrayStream stream) {
     if (name == null || name.trim().isEmpty()) {
-      throw new IllegalArgumentException("table name must be non-empty");
+      throw new IllegalArgumentException("registerArrow: table name must be non-empty, got: " + name);
     }
     if (stream == null) {
-      throw new IllegalArgumentException("stream must not be null");
+      throw new IllegalArgumentException("registerArrow: stream must not be null (table name: " + name + ")");
     }
     this.extraTableNames.add(name);
     this.extraStreamAddresses.add(stream.memoryAddress());

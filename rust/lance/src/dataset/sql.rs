@@ -143,12 +143,12 @@ impl SqlQueryBuilder {
     /// # }).unwrap();
     /// ```
     pub fn register_arrow(self, name: &str, batches: Vec<RecordBatch>) -> lance_core::Result<Self> {
+        let n_batches = batches.len();
         let schema = batches.first().map(|b| b.schema()).ok_or_else(|| {
-            lance_core::Error::invalid_input(
-                "register_arrow requires a non-empty relation to derive a schema; \
-                 use register_table with a MemTable for an empty relation"
-                    .to_string(),
-            )
+            lance_core::Error::invalid_input(format!(
+                "register_arrow for table '{name}' requires a non-empty relation to derive a schema \
+                 (received {n_batches} batches); use register_table with a MemTable for an empty relation"
+            ))
         })?;
         Ok(self.register_table(name, Arc::new(MemTable::try_new(schema, vec![batches])?)))
     }
