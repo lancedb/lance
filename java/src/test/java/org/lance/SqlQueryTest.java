@@ -212,6 +212,13 @@ public class SqlQueryTest {
               .registerArrow("ids", stream);
       q.intoBatchRecords().close();
       Assertions.assertThrows(IllegalStateException.class, q::intoBatchRecords);
+
+      // Registering another relation after the query is consumed is also rejected (would be unexecutable).
+      try (VectorSchemaRoot more = idTable(3);
+          ArrowArrayStream moreStream = toStream(more)) {
+        Assertions.assertThrows(
+            IllegalStateException.class, () -> q.registerArrow("more", moreStream));
+      }
     }
   }
 

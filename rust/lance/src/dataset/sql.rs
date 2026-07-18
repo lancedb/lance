@@ -199,6 +199,11 @@ impl SqlQueryBuilder {
         // registered, so a later duplicate wins.
         let mut registered = std::collections::HashSet::new();
         for (name, provider) in self.extra_tables.into_iter().rev() {
+            if name.trim().is_empty() {
+                return Err(lance_core::Error::invalid_input(format!(
+                    "registered table name must be non-empty, got '{name}'"
+                )));
+            }
             if registered.insert(name.clone()) {
                 ctx.register_table(name, provider)?;
             }
@@ -687,5 +692,21 @@ mod tests {
             .await
             .unwrap();
         pretty_assertions::assert_eq!(collect_ids(&results), Vec::<i32>::new());
+
+        // A blank relation name is rejected when the query is built.
+        let blank = Arc::new(MemTable::try_new(ids_batch(vec![]).schema(), vec![vec![]]).unwrap());
+        let err = ds
+            .sql("SELECT 1")
+            .table_name("t")
+            .register_table("  ", blank)
+            .build()
+            .await
+            .err()
+            .expect("expected an error for a blank table name");
+        assert!(
+            matches!(&err, lance_core::Error::InvalidInput { .. }),
+            "expected InvalidInput, got {err:?}"
+        );
+        assert!(err.to_string().contains("non-empty"), "message should mention the empty name: {err}");
     }
 }

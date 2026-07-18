@@ -57,8 +57,13 @@ public class SqlQuery {
    * registered relations is single-use; calling {@link #intoBatchRecords()} a second time throws.
    *
    * @throws IllegalArgumentException if {@code name} is null or blank, or {@code stream} is null
+   * @throws IllegalStateException if the query was already run via {@link #intoBatchRecords()}
    */
   public SqlQuery registerArrow(String name, ArrowArrayStream stream) {
+    if (consumed) {
+      throw new IllegalStateException(
+          "registerArrow cannot be called after intoBatchRecords(); build a new query and re-register relations.");
+    }
     if (name == null || name.trim().isEmpty()) {
       throw new IllegalArgumentException("registerArrow: table name must be non-empty, got: " + name);
     }
@@ -86,12 +91,12 @@ public class SqlQuery {
           "intoBatchRecords() was already called on this SqlQuery; a query with registered Arrow relations is "
               + "single-use because the registered streams are consumed. Build a new query and re-register them.");
     }
-    // A query with registered streams is one-shot: the native call consumes the streams, so mark it consumed
-    // regardless of outcome to prevent a later call from handing JNI dead stream pointers.
-    if (!extraTableNames.isEmpty()) {
-      consumed = true;
-    }
     try (ArrowArrayStream s = ArrowArrayStream.allocateNew(dataset.allocator())) {
+      // A query with registered streams is one-shot: the native call below consumes them. Mark it consumed here,
+      // just before the native call, so a failure in the output-stream allocation above does not brick a retry.
+      if (!extraTableNames.isEmpty()) {
+        consumed = true;
+      }
       intoBatchRecords(
           dataset,
           sql,
