@@ -1351,11 +1351,6 @@ pub async fn merge_partial_vector_auxiliary_files(
                 };
                 let mut pm: ProductQuantizationMetadata = serde_json::from_str(&pm_json)
                     .map_err(|e| Error::index(format!("PQ metadata parse error: {}", e)))?;
-                if pm.transposed {
-                    return Err(Error::index(format!(
-                        "Distributed PQ merge: source shard {idx} stores transposed PQ codes; expected row-major distributed shard"
-                    )));
-                }
                 if pm.codebook.is_none() {
                     let tensor_bytes = reader
                         .read_global_buffer(pm.codebook_position as u32)
@@ -2458,7 +2453,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_merge_ivf_pq_rejects_transposed_source_shard() {
+    async fn test_merge_ivf_pq_accepts_transposed_source_shard() {
         let object_store = ObjectStore::memory();
         let index_dir = Path::from("index/uuid_pq_transposed");
 
@@ -2497,24 +2492,13 @@ mod tests {
             crate::progress::noop_progress(),
         )
         .await;
-        match res {
-            Err(Error::Index { message, .. }) => {
-                assert!(
-                    message.contains("source shard 0"),
-                    "unexpected message: {}",
-                    message
-                );
-                assert!(
-                    message.contains("transposed PQ codes"),
-                    "unexpected message: {}",
-                    message
-                );
-            }
-            other => panic!(
-                "expected Error::Index for transposed PQ source shard, got {:?}",
-                other
-            ),
-        }
+        res.unwrap();
+        assert!(
+            object_store
+                .exists(&index_dir.join(INDEX_AUXILIARY_FILE_NAME))
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
