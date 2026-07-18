@@ -48,7 +48,6 @@ use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::utils::tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS};
 use lance_core::{Error, ROW_ID, ROW_ID_FIELD, Result};
 use lance_select::{RowAddrMask, RowAddrTreeMap};
-use object_store::Error as ObjectStoreError;
 use roaring::RoaringBitmap;
 use std::sync::LazyLock;
 use tokio::{sync::OnceCell, task::spawn_blocking};
@@ -127,27 +126,6 @@ pub const POSITIONS_LAYOUT_SHARED_STREAM_V2: &str = "shared_stream_v2";
 pub const POSITIONS_CODEC_VARINT_DOC_DELTA_V2: &str = "varint_doc_delta_v2";
 pub const POSITIONS_CODEC_PACKED_DELTA_V1: &str = "packed_delta_v1";
 pub const DELETED_FRAGMENTS_COL: &str = "deleted_fragments";
-
-fn is_missing_index_file_error(error: &Error) -> bool {
-    match error {
-        Error::NotFound { .. } => true,
-        Error::IO { source, .. } | Error::Wrapped { error: source, .. } => {
-            is_missing_index_file_source(source.as_ref())
-        }
-        _ => false,
-    }
-}
-
-fn is_missing_index_file_source(source: &(dyn std::error::Error + 'static)) -> bool {
-    if let Some(error) = source.downcast_ref::<Error>() {
-        return is_missing_index_file_error(error);
-    }
-    if let Some(error) = source.downcast_ref::<ObjectStoreError>() {
-        return matches!(error, ObjectStoreError::NotFound { .. })
-            || std::error::Error::source(error).is_some_and(is_missing_index_file_source);
-    }
-    source.source().is_some_and(is_missing_index_file_source)
-}
 
 // Just a heuristic when we need to pre-allocate memory for tokens
 pub const ESTIMATED_MAX_TOKENS_PER_ROW: usize = 4 * 1024;
@@ -1240,7 +1218,7 @@ impl InvertedIndex {
                     .ok_or(Error::index("params not found in metadata".to_owned()))?;
                 Ok(serde_json::from_str::<InvertedIndexParams>(params)?)
             }
-            Err(error) if is_missing_index_file_error(&error) => {
+            Err(error) if error.is_not_found() => {
                 // Legacy format: params live in the tokens file (see
                 // `load_legacy_index`).
                 let reader = store.open_index_file(TOKENS_FILE).await?;
@@ -7189,18 +7167,10 @@ mod tests {
 
     #[test]
     fn params_legacy_fallback_only_accepts_missing_metadata() {
-        assert!(is_missing_index_file_error(&Error::not_found(
-            METADATA_FILE
-        )));
-        assert!(is_missing_index_file_error(&Error::wrapped(Box::new(
-            Error::not_found(METADATA_FILE),
-        ))));
-        assert!(!is_missing_index_file_error(&Error::timeout(
-            "metadata read timed out"
-        )));
-        assert!(!is_missing_index_file_error(&Error::io(
-            "metadata read was denied"
-        )));
+        assert!(Error::not_found(METADATA_FILE).is_not_found());
+        assert!(Error::wrapped(Box::new(Error::not_found(METADATA_FILE))).is_not_found());
+        assert!(!Error::timeout("metadata read timed out").is_not_found());
+        assert!(!Error::io("metadata read was denied").is_not_found());
     }
 
     async fn write_single_partition_index(
