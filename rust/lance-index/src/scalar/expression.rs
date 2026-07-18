@@ -1688,21 +1688,22 @@ impl ScalarIndexExpr {
         &self,
         index_loader: &dyn ScalarIndexLoader,
         metrics: &dyn MetricsCollector,
+        limit: Option<usize>,
     ) -> Result<NullableIndexExprResult> {
         match self {
             Self::Not(inner) => {
-                let result = inner.evaluate_nullable(index_loader, metrics).await?;
+                let result = inner.evaluate_nullable(index_loader, metrics, None).await?;
                 Ok(!result)
             }
             Self::And(lhs, rhs) => {
-                let lhs_result = lhs.evaluate_nullable(index_loader, metrics);
-                let rhs_result = rhs.evaluate_nullable(index_loader, metrics);
+                let lhs_result = lhs.evaluate_nullable(index_loader, metrics, None);
+                let rhs_result = rhs.evaluate_nullable(index_loader, metrics, None);
                 let (lhs_result, rhs_result) = try_join!(lhs_result, rhs_result)?;
                 Ok(lhs_result & rhs_result)
             }
             Self::Or(lhs, rhs) => {
-                let lhs_result = lhs.evaluate_nullable(index_loader, metrics);
-                let rhs_result = rhs.evaluate_nullable(index_loader, metrics);
+                let lhs_result = lhs.evaluate_nullable(index_loader, metrics, None);
+                let rhs_result = rhs.evaluate_nullable(index_loader, metrics, None);
                 let (lhs_result, rhs_result) = try_join!(lhs_result, rhs_result)?;
                 Ok(lhs_result | rhs_result)
             }
