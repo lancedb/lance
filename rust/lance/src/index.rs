@@ -888,12 +888,13 @@ impl Dataset {
     /// [`CommitBuilder`](crate::dataset::CommitBuilder) to commit the returned
     /// [`Transaction`].
     ///
-    /// The transaction is a snapshot built against the current dataset version,
-    /// so commit it promptly. A concurrent index creation with the same name is
-    /// rejected at commit time with a retryable conflict, but other concurrent
-    /// changes to the same index between staging and commit — a compaction/rewrite
-    /// that remaps it, or dropping/renaming the indexed column — are not
-    /// conflict-checked and may leave a duplicate or stale index entry.
+    /// The transaction is a snapshot built against the current dataset version.
+    /// Conflicting concurrent changes are rejected at commit time: creating or
+    /// dropping a same-name index between staging and commit fails the commit
+    /// with a retryable conflict, and dropping the indexed column fails it as
+    /// incompatible. A concurrent compaction/rewrite that defers index
+    /// remapping is not conflict-checked and may leave a duplicate index
+    /// entry, so commit promptly.
     ///
     /// # Side effects
     ///
@@ -7259,6 +7260,135 @@ mod tests {
         assert_eq!(
             indices.iter().map(|i| i.uuid).collect::<HashSet<_>>(),
             HashSet::from([seg0.uuid, seg1.uuid]),
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_existing_index_segments_transaction_conflicts_with_index_drop() {
+        use crate::dataset::CommitBuilder;
+        use lance_datagen::{BatchCount, RowCount, array};
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .col(
+                "vector",
+                array::rand_vec::<arrow_array::types::Float32Type>(8.into()),
+            )
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let mut dataset = Dataset::write(reader, test_dir.path().to_str().unwrap(), None)
+            .await
+            .unwrap();
+        let field_id = dataset.schema().field("vector").unwrap().id;
+
+        // Publish an initial index covering the whole dataset.
+        let initial = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            field_id,
+            Uuid::new_v4(),
+            [0_u32],
+            b"initial",
+        )
+        .await;
+        dataset
+            .commit_existing_index_segments(
+                "vector_idx",
+                "vector",
+                vec![segment_from_metadata(&initial)],
+            )
+            .await
+            .unwrap();
+
+        // Stage a replacement for the published index.
+        let replacement = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            field_id,
+            Uuid::new_v4(),
+            [0_u32],
+            b"replacement",
+        )
+        .await;
+        let transaction = dataset
+            .build_existing_index_segments_transaction(
+                "vector_idx",
+                "vector",
+                vec![segment_from_metadata(&replacement)],
+            )
+            .await
+            .unwrap();
+
+        // The index is dropped before the staged transaction commits.
+        dataset.drop_index("vector_idx").await.unwrap();
+
+        // Committing the staged transaction must not resurrect the dropped index.
+        let err = CommitBuilder::new(Arc::new(dataset.clone()))
+            .execute(transaction)
+            .await
+            .expect_err("staged index commit over a concurrent drop must conflict");
+        assert!(
+            matches!(err, Error::RetryableCommitConflict { .. }),
+            "expected a retryable commit conflict, got: {err}"
+        );
+        assert!(
+            dataset
+                .load_indices_by_name("vector_idx")
+                .await
+                .unwrap()
+                .is_empty(),
+            "the dropped index must stay dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_existing_index_segments_transaction_conflicts_with_column_drop() {
+        use crate::dataset::CommitBuilder;
+        use lance_datagen::{BatchCount, RowCount, array};
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .col(
+                "vector",
+                array::rand_vec::<arrow_array::types::Float32Type>(8.into()),
+            )
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let mut dataset = Dataset::write(reader, test_dir.path().to_str().unwrap(), None)
+            .await
+            .unwrap();
+        let field_id = dataset.schema().field("vector").unwrap().id;
+
+        let seg = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            field_id,
+            Uuid::new_v4(),
+            [0_u32],
+            b"seg",
+        )
+        .await;
+        let transaction = dataset
+            .build_existing_index_segments_transaction(
+                "vector_idx",
+                "vector",
+                vec![segment_from_metadata(&seg)],
+            )
+            .await
+            .unwrap();
+
+        // The indexed column is dropped before the staged transaction commits.
+        dataset.drop_columns(&["vector"]).await.unwrap();
+
+        // Committing the staged transaction must not publish index metadata for
+        // a field that no longer exists.
+        let err = CommitBuilder::new(Arc::new(dataset))
+            .execute(transaction)
+            .await
+            .expect_err("staged index commit for a dropped column must fail");
+        assert!(
+            matches!(err, Error::IncompatibleTransaction { .. }),
+            "expected an incompatible transaction error, got: {err}"
         );
     }
 

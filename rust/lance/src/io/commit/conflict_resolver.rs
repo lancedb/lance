@@ -501,7 +501,7 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::UpdateBases { .. } => Ok(()),
                 Operation::CreateIndex {
                     new_indices: created_indices,
-                    ..
+                    removed_indices: other_removed_indices,
                 } => {
                     let self_has_frag_reuse = new_indices
                         .iter()
@@ -523,6 +523,13 @@ impl<'a> TransactionRebase<'a> {
                             created_indices
                                 .iter()
                                 .any(|created_index| created_index.name == new_index.name)
+                                // A concurrent transaction that removed a same-name
+                                // index (e.g. drop_index) invalidates this snapshot:
+                                // committing anyway would silently re-create the
+                                // index that was just removed.
+                                || other_removed_indices
+                                    .iter()
+                                    .any(|removed_index| removed_index.name == new_index.name)
                         });
 
                     if (self_has_frag_reuse && other_has_frag_reuse)
@@ -537,10 +544,23 @@ impl<'a> TransactionRebase<'a> {
                 // Although some of the rows we indexed may have been deleted / moved,
                 // row ids are still valid, so we allow this optimistically.
                 Operation::Delete { .. } | Operation::Update { .. } => Ok(()),
-                // Merge, reserve, and project don't change row ids, so this should be fine.
+                // Merge and reserve don't change row ids, so this should be fine.
                 Operation::Merge { .. } => Ok(()),
                 Operation::ReserveFragments { .. } => Ok(()),
-                Operation::Project { .. } => Ok(()),
+                // A projection doesn't change row ids either, but it can drop the
+                // indexed column. Committing this index afterwards would publish
+                // metadata referencing a field that no longer exists.
+                Operation::Project { schema } => {
+                    let missing_field = new_indices
+                        .iter()
+                        .flat_map(|idx| idx.fields.iter())
+                        .any(|field_id| schema.field_by_id(*field_id).is_none());
+                    if missing_field {
+                        Err(self.incompatible_conflict_err(other_transaction, other_version))
+                    } else {
+                        Ok(())
+                    }
+                }
                 // Should be compatible with rewrite if it didn't move the rows
                 // we indexed. If it did, we could retry.
                 // TODO: this will change with stable row ids.
