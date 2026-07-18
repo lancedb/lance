@@ -13,17 +13,32 @@
  */
 package org.lance;
 
+import org.apache.arrow.c.ArrowArrayStream;
+import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.IntVector;
+import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowReader;
+import org.apache.arrow.vector.ipc.ArrowStreamReader;
+import org.apache.arrow.vector.ipc.ArrowStreamWriter;
+import org.apache.arrow.vector.types.pojo.ArrowType;
+import org.apache.arrow.vector.types.pojo.Field;
+import org.apache.arrow.vector.types.pojo.Schema;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
 
 public class SqlQueryTest {
   private static final String NAME = "sqlquery_test_dataset";
@@ -107,5 +122,55 @@ public class SqlQueryTest {
         "Schema<id: Int(32, true), name: Utf8, _rowid: Int(64, false), _rowaddr: Int(64, false)>",
         reader.getVectorSchemaRoot().getSchema().toString());
     reader.close();
+  }
+
+  @Test
+  public void testRegisterArrow() throws Exception {
+    // An additional in-memory Arrow relation (column `id`) to semi-join against the dataset; 100 is absent.
+    Schema idSchema =
+        new Schema(Collections.singletonList(Field.nullable("id", new ArrowType.Int(32, true))));
+    try (VectorSchemaRoot ids = VectorSchemaRoot.create(idSchema, allocator)) {
+      ids.allocateNew();
+      IntVector idVector = (IntVector) ids.getVector("id");
+      int[] wanted = {1, 5, 39, 100};
+      for (int i = 0; i < wanted.length; i++) {
+        idVector.setSafe(i, wanted[i]);
+      }
+      ids.setRowCount(wanted.length);
+
+      // The native side consumes the stream; we allocate and close it (try-with-resources).
+      try (ArrowArrayStream stream = toStream(ids)) {
+        ArrowReader reader =
+            dataset
+                .sql("select id from " + NAME + " where id in (select id from filter_ids) order by id")
+                .tableName(NAME)
+                .registerArrow("filter_ids", stream)
+                .intoBatchRecords();
+        List<Integer> got = new ArrayList<>();
+        while (reader.loadNextBatch()) {
+          VectorSchemaRoot root = reader.getVectorSchemaRoot();
+          for (int i = 0; i < root.getRowCount(); i++) {
+            got.add((Integer) root.getVector(0).getObject(i));
+          }
+        }
+        reader.close();
+        // 100 is not in the dataset; the rest are the intersection, in order.
+        Assertions.assertEquals(Arrays.asList(1, 5, 39), got);
+      }
+    }
+  }
+
+  /** Serialize a single-batch root to a self-contained Arrow C-Data stream (mirrors MergeInsertTest). */
+  private ArrowArrayStream toStream(VectorSchemaRoot root) throws IOException {
+    ByteArrayOutputStream out = new ByteArrayOutputStream();
+    try (ArrowStreamWriter writer = new ArrowStreamWriter(root, null, out)) {
+      writer.start();
+      writer.writeBatch();
+      writer.end();
+    }
+    ArrowStreamReader reader = new ArrowStreamReader(new ByteArrayInputStream(out.toByteArray()), allocator);
+    ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator);
+    Data.exportArrayStream(allocator, reader, stream);
+    return stream;
   }
 }

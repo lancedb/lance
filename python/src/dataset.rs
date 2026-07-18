@@ -4093,6 +4093,26 @@ impl SqlQueryBuilder {
         })
     }
 
+    /// Register an in-memory Arrow relation that the SQL query can join.
+    ///
+    /// The relation is exposed under `name` and can be referenced like any other
+    /// table in the query. The `data` may be a pyarrow `Table` or
+    /// `RecordBatchReader` (ingested the same way as `add`/`merge_insert`), and
+    /// must be non-empty since the schema is derived from its batches.
+    #[pyo3(signature = (name, data))]
+    fn register_arrow(&self, name: &str, data: &Bound<PyAny>) -> PyResult<Self> {
+        let reader = convert_reader(data)?;
+        let batches = reader
+            .collect::<std::result::Result<Vec<RecordBatch>, _>>()
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        let builder = self
+            .builder
+            .clone()
+            .register_arrow(name, batches)
+            .infer_error()?;
+        Ok(Self { builder })
+    }
+
     /// Build the SQL query.
     fn build(&self) -> PyResult<SqlQuery> {
         Ok(SqlQuery {

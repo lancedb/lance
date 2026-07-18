@@ -6,6 +6,7 @@ use crate::datafusion::LanceTableProvider;
 use crate::dataset::utils::SchemaAdapter;
 use arrow_array::RecordBatch;
 use datafusion::dataframe::DataFrame;
+use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::prelude::SessionContext;
 use futures::TryStreamExt;
@@ -33,6 +34,12 @@ pub struct SqlQueryBuilder {
 
     /// Override how blob columns are materialized for this query.
     pub(crate) blob_handling: Option<BlobHandling>,
+
+    /// Additional tables to register in the DataFusion context before running the query (name to provider).
+    /// This lets a `Dataset.sql` query join a caller-supplied relation, such as an in-memory `MemTable` (for
+    /// example a ranked id set to semi-join), another Lance dataset (`LanceTableProvider`), or a custom
+    /// `TableProvider`.
+    pub(crate) extra_tables: Vec<(String, Arc<dyn TableProvider>)>,
 }
 
 impl SqlQueryBuilder {
@@ -44,7 +51,30 @@ impl SqlQueryBuilder {
             with_row_id: false,
             with_row_addr: false,
             blob_handling: None,
+            extra_tables: Vec::new(),
         }
+    }
+
+    /// Register an additional table named `name` in the query's DataFusion context, joinable alongside the
+    /// dataset. Accepts any `TableProvider`, such as a `MemTable` (an in-memory Arrow relation), another Lance
+    /// dataset's `LanceTableProvider`, or a view. May be called more than once; a later duplicate name wins.
+    pub fn register_table(mut self, name: &str, provider: Arc<dyn TableProvider>) -> Self {
+        self.extra_tables.push((name.to_string(), provider));
+        self
+    }
+
+    /// Convenience over [`Self::register_table`] that wraps in-memory Arrow `batches` in a `MemTable`. `batches`
+    /// must be non-empty (the schema is derived from the first batch); for an empty relation, build a `MemTable`
+    /// yourself and pass it to [`Self::register_table`].
+    pub fn register_arrow(self, name: &str, batches: Vec<RecordBatch>) -> lance_core::Result<Self> {
+        let schema = batches.first().map(|b| b.schema()).ok_or_else(|| {
+            lance_core::Error::invalid_input(
+                "register_arrow requires a non-empty relation to derive a schema; \
+                 use register_table with a MemTable for an empty relation"
+                    .to_string(),
+            )
+        })?;
+        Ok(self.register_table(name, Arc::new(MemTable::try_new(schema, vec![batches])?)))
     }
 
     /// The table name to register in the datafusion context.
@@ -88,6 +118,9 @@ impl SqlQueryBuilder {
             provider = provider.with_blob_handling(blob_handling);
         }
         ctx.register_table(self.table_name, Arc::new(provider))?;
+        for (name, provider) in self.extra_tables {
+            ctx.register_table(name, provider)?;
+        }
         register_functions(&ctx);
         let df = ctx.sql(&self.sql).await?;
         Ok(SqlQuery::new(df))
@@ -146,6 +179,7 @@ mod tests {
     use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StringArray};
     use arrow_schema::Schema as ArrowSchema;
     use arrow_schema::{DataType, Field};
+    use datafusion::datasource::MemTable;
     use lance_arrow::ARROW_EXT_NAME_KEY;
     use lance_arrow::json::ARROW_JSON_EXT_NAME;
     use lance_core::datatypes::BlobHandling;
@@ -448,5 +482,101 @@ mod tests {
         pretty_assertions::assert_eq!(batch.num_rows(), 1);
         pretty_assertions::assert_eq!(batch.num_columns(), 1);
         pretty_assertions::assert_eq!(batch.column(0).as_primitive::<Int32Type>().value(0), 1);
+    }
+
+    /// A dataset with an `id` column = 0..=99 across 10 fragments (for the register-table tests below).
+    async fn ids_dataset(uri: &str) -> Dataset {
+        gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .into_dataset(uri, FragmentCount::from(10), FragmentRowCount::from(10))
+            .await
+            .unwrap()
+    }
+
+    /// A one-batch relation `(id: Int32)` from `ids`.
+    fn ids_batch(ids: Vec<i32>) -> RecordBatch {
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new("id", DataType::Int32, false)]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(ids))]).unwrap()
+    }
+
+    fn collect_ids(batches: &[RecordBatch]) -> Vec<i32> {
+        batches
+            .iter()
+            .flat_map(|b| b.column(0).as_primitive::<Int32Type>().values().to_vec())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_sql_register_arrow() {
+        let ds = ids_dataset("memory://test_sql_register_arrow").await;
+
+        // Semi-join against a registered in-memory relation; 200 is absent from the dataset.
+        let results = ds
+            .sql("SELECT id FROM t WHERE id IN (SELECT id FROM ids) ORDER BY id")
+            .table_name("t")
+            .register_arrow("ids", vec![ids_batch(vec![5, 10, 42, 200])])
+            .unwrap()
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+        // 200 is dropped (not in the dataset); the rest are the intersection, in order.
+        pretty_assertions::assert_eq!(collect_ids(&results), vec![5, 10, 42]);
+
+        // The registered relation is also selectable directly.
+        let counted = ds
+            .sql("SELECT count(*) AS n FROM ids")
+            .table_name("t")
+            .register_arrow("ids", vec![ids_batch(vec![5, 10, 42, 200])])
+            .unwrap()
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+        pretty_assertions::assert_eq!(counted[0].column(0).as_primitive::<Int64Type>().value(0), 4);
+
+        // register_arrow with no batches cannot derive a schema, so it returns an error (not a silent skip).
+        let err = ds.sql("SELECT 1").table_name("t").register_arrow("ids", vec![]);
+        assert_true!(err.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_sql_register_table_provider() {
+        let ds = ids_dataset("memory://test_sql_register_table_provider").await;
+        let schema = ids_batch(vec![]).schema();
+
+        // The general path: register any TableProvider (here a MemTable) and join it.
+        let table = Arc::new(MemTable::try_new(schema.clone(), vec![vec![ids_batch(vec![7, 88])]]).unwrap());
+        let results = ds
+            .sql("SELECT id FROM t WHERE id IN (SELECT id FROM ids) ORDER BY id")
+            .table_name("t")
+            .register_table("ids", table)
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+        pretty_assertions::assert_eq!(collect_ids(&results), vec![7, 88]);
+
+        // An empty registered relation is a valid table (schema, zero rows), so the semi-join returns zero rows
+        // rather than a "table not found" error. (`vec![vec![]]` is one partition with no batches; MemTable
+        // requires at least one partition.)
+        let empty = Arc::new(MemTable::try_new(schema, vec![vec![]]).unwrap());
+        let results = ds
+            .sql("SELECT id FROM t WHERE id IN (SELECT id FROM ids)")
+            .table_name("t")
+            .register_table("ids", empty)
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+        pretty_assertions::assert_eq!(collect_ids(&results), Vec::<i32>::new());
     }
 }

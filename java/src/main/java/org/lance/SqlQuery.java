@@ -29,6 +29,8 @@ public class SqlQuery {
   private String table = DEFAULT_TABLE_NAME;
   private boolean withRowId = false;
   private boolean withRowAddr = false;
+  private String extraTableName = null;
+  private long extraStreamAddress = 0L;
 
   public SqlQuery(Dataset dataset, String sql) {
     this.dataset = dataset;
@@ -37,6 +39,19 @@ public class SqlQuery {
 
   public SqlQuery tableName(String tableName) {
     this.table = tableName;
+    return this;
+  }
+
+  /**
+   * Register an additional in-memory Arrow relation (exported to {@code stream} via the C Data Interface) as a
+   * table named {@code name}, joinable in the SQL alongside the dataset. {@link #intoBatchRecords()} consumes the
+   * stream during the native call (it takes ownership of the underlying C stream); the caller still owns the
+   * {@link ArrowArrayStream} handle and should close it afterwards (typically via try-with-resources), as with
+   * {@code MergeInsert}. Only one extra table is supported per query; the last call wins.
+   */
+  public SqlQuery registerArrow(String name, ArrowArrayStream stream) {
+    this.extraTableName = name;
+    this.extraStreamAddress = stream.memoryAddress();
     return this;
   }
 
@@ -53,7 +68,14 @@ public class SqlQuery {
   public ArrowReader intoBatchRecords() throws IOException {
     try (ArrowArrayStream s = ArrowArrayStream.allocateNew(dataset.allocator())) {
       intoBatchRecords(
-          dataset, sql, Optional.ofNullable(table), withRowId, withRowAddr, s.memoryAddress());
+          dataset,
+          sql,
+          Optional.ofNullable(table),
+          withRowId,
+          withRowAddr,
+          s.memoryAddress(),
+          Optional.ofNullable(extraTableName),
+          extraStreamAddress);
       return Data.importArrayStream(dataset.allocator(), s);
     }
   }
@@ -64,7 +86,9 @@ public class SqlQuery {
       Optional<String> tableName,
       boolean withRowId,
       boolean withRowAddr,
-      long streamAddress)
+      long streamAddress,
+      Optional<String> extraTableName,
+      long extraStreamAddress)
       throws IOException;
 
   @Override

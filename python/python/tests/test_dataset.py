@@ -5648,6 +5648,26 @@ def test_dataset_sql(tmp_path: Path):
     assert pa.Table.from_batches(complex_result) == expected_complex
 
 
+def test_dataset_sql_register_arrow(tmp_path: Path):
+    table = pa.table({"id": [1, 2, 3, 4, 5], "value": ["a", "b", "c", "d", "e"]})
+    ds = lance.write_dataset(table, tmp_path / "test")
+
+    # A subset of ids to join against, including one id (99) not in the dataset.
+    ids = pa.table({"id": [4, 2, 99]})
+
+    result = (
+        ds.sql("SELECT id FROM t WHERE id IN (SELECT id FROM ids) ORDER BY id")
+        .table_name("t")
+        .register_arrow("ids", ids)
+        .build()
+        .to_batch_records()
+    )
+
+    # Only the intersection, in ascending order.
+    expected = pa.table({"id": [2, 4]})
+    assert pa.Table.from_batches(result) == expected
+
+
 def test_file_reader_options(tmp_path: Path):
     """Test cache_repetition_index and validate_on_decode options"""
     # Create a dataset with large repetitive strings to test cache_repetition_index

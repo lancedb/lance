@@ -5618,6 +5618,26 @@ class SqlQueryBuilder:
         self._builder = self._builder.blob_handling(blob_handling)
         return self
 
+    def register_arrow(
+        self, name: str, data: Union[pa.Table, pa.RecordBatchReader]
+    ) -> "SqlQueryBuilder":
+        """
+        Register an in-memory Arrow relation that the query can join.
+
+        The relation is exposed under ``name`` and can be referenced like any
+        other table in the SQL (for example joined or used in a subquery). It
+        must be non-empty, since the schema is derived from the provided data.
+
+        Parameters
+        ----------
+        name: str
+            The name the relation is registered under in the query.
+        data: pyarrow.Table or pyarrow.RecordBatchReader
+            The in-memory relation to register. Must be non-empty.
+        """
+        self._builder = self._builder.register_arrow(name, data)
+        return self
+
     def build(self) -> SqlQuery:
         """
         Build the query.
