@@ -1734,7 +1734,25 @@ impl ScalarIndexExpr {
         metrics: &dyn MetricsCollector,
     ) -> Result<IndexExprResult> {
         Ok(self
-            .evaluate_nullable(index_loader, metrics)
+            .evaluate_nullable(index_loader, metrics, None)
+            .await?
+            .drop_nulls())
+    }
+
+    /// Like [`Self::evaluate`] but pushes a `limit` hint into the index search so it can
+    /// stop once it has found at least `limit` matches.
+    ///
+    /// See [`crate::scalar::ScalarIndex::search_limited`] for the rules on when a limit
+    /// may be pushed down.
+    #[instrument(level = "debug", skip_all)]
+    pub async fn evaluate_limited(
+        &self,
+        index_loader: &dyn ScalarIndexLoader,
+        metrics: &dyn MetricsCollector,
+        limit: Option<usize>,
+    ) -> Result<IndexExprResult> {
+        Ok(self
+            .evaluate_nullable(index_loader, metrics, limit)
             .await?
             .drop_nulls())
     }
