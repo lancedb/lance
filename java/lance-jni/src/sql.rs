@@ -23,8 +23,8 @@ pub extern "system" fn Java_org_lance_SqlQuery_intoBatchRecords(
     with_row_id: jboolean,
     with_row_addr: jboolean,
     stream_addr: jlong,
-    extra_table_name: JObject,
-    extra_stream_addr: jlong,
+    extra_table_names: JObject,
+    extra_stream_addrs: JObject,
 ) {
     ok_or_throw_without_return!(
         env,
@@ -36,8 +36,8 @@ pub extern "system" fn Java_org_lance_SqlQuery_intoBatchRecords(
             with_row_id,
             with_row_addr,
             stream_addr,
-            extra_table_name,
-            extra_stream_addr,
+            extra_table_names,
+            extra_stream_addrs,
         )
         .map_err(|e| Error::input_error(e.to_string()))
     )
@@ -52,8 +52,8 @@ fn inner_into_batch_records(
     with_row_id: jboolean,
     with_row_addr: jboolean,
     stream_addr: jlong,
-    extra_table_name: JObject,
-    extra_stream_addr: jlong,
+    extra_table_names: JObject,
+    extra_stream_addrs: JObject,
 ) -> Result<()> {
     let builder = sql_builder(
         env,
@@ -62,8 +62,8 @@ fn inner_into_batch_records(
         table_name,
         with_row_id,
         with_row_addr,
-        extra_table_name,
-        extra_stream_addr,
+        extra_table_names,
+        extra_stream_addrs,
     )?;
 
     let stream = block_on(async move {
@@ -86,12 +86,15 @@ fn sql_builder(
     table_name: JObject,
     with_row_id: jboolean,
     with_row_addr: jboolean,
-    extra_table_name: JObject,
-    extra_stream_addr: jlong,
+    extra_table_names: JObject,
+    extra_stream_addrs: JObject,
 ) -> Result<SqlQueryBuilder> {
     let sql_str = sql.extract(env)?;
     let table_str = env.get_string_opt(&table_name)?;
-    let extra_name = env.get_string_opt(&extra_table_name)?;
+    // Read every env-derived input before taking the dataset guard below, which holds a mutable borrow of `env`
+    // for its lifetime (a second `env` borrow while it is alive would not compile).
+    let names = env.get_strings(&extra_table_names)?;
+    let addrs = env.get_longs(&extra_stream_addrs)?;
 
     let dataset_guard =
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
@@ -106,12 +109,10 @@ fn sql_builder(
         builder = builder.table_name(table.as_str())
     }
 
-    // An additional in-memory Arrow relation (the caller exported it to a C-Data stream). Import it to
-    // RecordBatches and register it under `extra_name`, so the SQL can semi-join it natively.
-    if extra_stream_addr != 0 {
-        let name = extra_name
-            .ok_or_else(|| Error::input_error("extra table stream given without a name".to_string()))?;
-        let stream_ptr = extra_stream_addr as *mut FFI_ArrowArrayStream;
+    // Register each caller-supplied relation (parallel name/address lists, read above). Each stream was exported
+    // to a C-Data stream on the Java side; import it to RecordBatches and register it under its name.
+    for (name, addr) in names.into_iter().zip(addrs) {
+        let stream_ptr = addr as *mut FFI_ArrowArrayStream;
         let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr)? };
         let mut batches = Vec::new();
         for batch in reader {

@@ -19,6 +19,8 @@ import org.apache.arrow.c.Data;
 import org.apache.arrow.vector.ipc.ArrowReader;
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Optional;
 
 public class SqlQuery {
@@ -29,8 +31,8 @@ public class SqlQuery {
   private String table = DEFAULT_TABLE_NAME;
   private boolean withRowId = false;
   private boolean withRowAddr = false;
-  private String extraTableName = null;
-  private long extraStreamAddress = 0L;
+  private final List<String> extraTableNames = new ArrayList<>();
+  private final List<Long> extraStreamAddresses = new ArrayList<>();
 
   public SqlQuery(Dataset dataset, String sql) {
     this.dataset = dataset;
@@ -47,11 +49,12 @@ public class SqlQuery {
    * table named {@code name}, joinable in the SQL alongside the dataset. {@link #intoBatchRecords()} consumes the
    * stream during the native call (it takes ownership of the underlying C stream); the caller still owns the
    * {@link ArrowArrayStream} handle and should close it afterwards (typically via try-with-resources), as with
-   * {@code MergeInsert}. Only one extra table is supported per query; the last call wins.
+   * {@code MergeInsert}. May be called multiple times to register multiple tables; if a name is registered twice,
+   * the later registration replaces the earlier one at query time (DataFusion register semantics).
    */
   public SqlQuery registerArrow(String name, ArrowArrayStream stream) {
-    this.extraTableName = name;
-    this.extraStreamAddress = stream.memoryAddress();
+    this.extraTableNames.add(name);
+    this.extraStreamAddresses.add(stream.memoryAddress());
     return this;
   }
 
@@ -74,8 +77,8 @@ public class SqlQuery {
           withRowId,
           withRowAddr,
           s.memoryAddress(),
-          Optional.ofNullable(extraTableName),
-          extraStreamAddress);
+          extraTableNames,
+          extraStreamAddresses);
       return Data.importArrayStream(dataset.allocator(), s);
     }
   }
@@ -87,8 +90,8 @@ public class SqlQuery {
       boolean withRowId,
       boolean withRowAddr,
       long streamAddress,
-      Optional<String> extraTableName,
-      long extraStreamAddress)
+      List<String> extraTableNames,
+      List<Long> extraStreamAddresses)
       throws IOException;
 
   @Override

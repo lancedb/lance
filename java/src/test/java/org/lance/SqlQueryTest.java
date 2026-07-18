@@ -160,6 +160,50 @@ public class SqlQueryTest {
     }
   }
 
+  @Test
+  public void testRegisterArrowMultiple() throws Exception {
+    // Register two relations in one query and join both; only ids in the dataset and in both survive.
+    try (VectorSchemaRoot a = idTable(1, 2, 3, 10);
+        VectorSchemaRoot b = idTable(2, 3, 4, 10);
+        ArrowArrayStream sa = toStream(a);
+        ArrowArrayStream sb = toStream(b)) {
+      ArrowReader reader =
+          dataset
+              .sql(
+                  "select id from "
+                      + NAME
+                      + " where id in (select id from a) and id in (select id from b) order by id")
+              .tableName(NAME)
+              .registerArrow("a", sa)
+              .registerArrow("b", sb)
+              .intoBatchRecords();
+      List<Integer> got = new ArrayList<>();
+      while (reader.loadNextBatch()) {
+        VectorSchemaRoot root = reader.getVectorSchemaRoot();
+        for (int i = 0; i < root.getRowCount(); i++) {
+          got.add((Integer) root.getVector(0).getObject(i));
+        }
+      }
+      reader.close();
+      // a = {1,2,3,10}, b = {2,3,4,10}, dataset ids 0..39, so the intersection is {2,3,10}.
+      Assertions.assertEquals(Arrays.asList(2, 3, 10), got);
+    }
+  }
+
+  /** Build a single-column (`id`: Int32) in-memory relation. */
+  private VectorSchemaRoot idTable(int... ids) {
+    Schema schema =
+        new Schema(Collections.singletonList(Field.nullable("id", new ArrowType.Int(32, true))));
+    VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator);
+    root.allocateNew();
+    IntVector idVector = (IntVector) root.getVector("id");
+    for (int i = 0; i < ids.length; i++) {
+      idVector.setSafe(i, ids[i]);
+    }
+    root.setRowCount(ids.length);
+    return root;
+  }
+
   /** Serialize a single-batch root to a self-contained Arrow C-Data stream (mirrors MergeInsertTest). */
   private ArrowArrayStream toStream(VectorSchemaRoot root) throws IOException {
     ByteArrayOutputStream out = new ByteArrayOutputStream();
