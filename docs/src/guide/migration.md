@@ -8,15 +8,15 @@ migrate.
 
 ## 9.0.0
 
-* Newly created FTS / inverted indexes now default to format v2 instead of v1.
+* Newly created FTS / inverted indexes now default to format v4 instead of v1.
   The `LANCE_FTS_FORMAT_VERSION` environment variable no longer controls the
-  format used for newly created indexes. Users who need a specific index layout
-  should pass the index creation parameter `format_version` explicitly.
+  format used for newly created indexes. Users who need a specific older index
+  layout should pass the index creation parameter `format_version` explicitly.
 
 * This affects users who create FTS / inverted indexes and need those indexes to
   be readable by older Lance versions, or who depend on the v1 index layout. In
   those cases, pass `format_version=1` when creating the index. Otherwise, newly
-  created indexes will use v2 by default, and older Lance readers may not be able
+  created indexes will use v4 by default, and older Lance readers may not be able
   to read them.
 
   ```python

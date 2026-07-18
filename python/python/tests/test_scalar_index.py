@@ -1271,7 +1271,7 @@ def test_create_scalar_index_fts_block_size(dataset):
     )
     indices = dataset.describe_indices()
     doc_index = next(index for index in indices if index.name == "doc_idx")
-    assert doc_index.segments[0].index_version == 3
+    assert doc_index.segments[0].index_version == 4
 
     row = dataset.take(indices=[0], columns=["doc"])
     query = row.column(0)[0].as_py().split(" ")[0]
@@ -5390,7 +5390,7 @@ def test_json_inverted_match_query(tmp_path):
 
 @pytest.mark.parametrize(
     ("format_version", "expected_format_version"),
-    [(1, 1), (2, 2), ("v1", 1), ("v2", 2)],
+    [(1, 1), (2, 2), (4, 4), ("v1", 1), ("v2", 2), ("v4", 4)],
 )
 def test_describe_indices(tmp_path, format_version, expected_format_version):
     data = pa.table(
@@ -5520,7 +5520,7 @@ def test_describe_indices(tmp_path, format_version, expected_format_version):
         assert index.num_rows_indexed == 50
 
 
-def test_create_inverted_index_defaults_to_v2_and_ignores_env(tmp_path, monkeypatch):
+def test_create_inverted_index_defaults_to_v4_and_ignores_env(tmp_path, monkeypatch):
     monkeypatch.setenv("LANCE_FTS_FORMAT_VERSION", "1")
     data = pa.table({"text": ["document about lance database"]})
     ds = lance.write_dataset(data, tmp_path)
@@ -5528,7 +5528,7 @@ def test_create_inverted_index_defaults_to_v2_and_ignores_env(tmp_path, monkeypa
     ds.create_scalar_index("text", index_type="INVERTED")
 
     indices = ds.describe_indices()
-    assert indices[0].segments[0].index_version == 2
+    assert indices[0].segments[0].index_version == 4
 
 
 def test_create_inverted_index_rejects_invalid_format_version(tmp_path):
@@ -5536,7 +5536,7 @@ def test_create_inverted_index_rejects_invalid_format_version(tmp_path):
     ds = lance.write_dataset(data, tmp_path)
 
     with pytest.raises(ValueError, match="unsupported FTS format version"):
-        ds.create_scalar_index("text", index_type="INVERTED", format_version="v4")
+        ds.create_scalar_index("text", index_type="INVERTED", format_version="v5")
 
     with pytest.raises(ValueError, match="format_version=3"):
         ds.create_scalar_index("text", index_type="INVERTED", format_version="v3")

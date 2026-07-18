@@ -86,14 +86,11 @@ use crate::{FtsPrewarmOptions, Index};
 use crate::{prefilter::PreFilter, scalar::inverted::iter::take_fst_keys};
 use std::str::FromStr;
 
-// Manifest compatibility versions. Versions 0-3 historically coincided with
-// physical layout revisions. Version 4 is the first version managed
-// independently from the physical posting layout.
 // Version 0: Arrow TokenSetFormat (legacy)
 // Version 1: Fst TokenSetFormat with per-doc compressed positions
 // Version 2: Fst TokenSetFormat with shared posting-list position streams.
 // Version 3: Version 2 layout with 256-document physical posting blocks.
-// Version 4: Code analyzer support.
+// Version 4: Code analyzer support with configurable posting block sizes.
 pub const INVERTED_INDEX_VERSION_V1: u32 = 1;
 pub const INVERTED_INDEX_VERSION_V2: u32 = 2;
 pub const INVERTED_INDEX_VERSION_V3: u32 = 3;
@@ -152,7 +149,7 @@ pub fn resolve_fts_format_version(
 }
 
 pub fn default_fts_format_version() -> InvertedListFormatVersion {
-    InvertedListFormatVersion::V2
+    InvertedListFormatVersion::V4
 }
 
 pub fn current_fts_format_version() -> InvertedListFormatVersion {
@@ -160,15 +157,16 @@ pub fn current_fts_format_version() -> InvertedListFormatVersion {
 }
 
 pub fn max_supported_fts_format_version() -> InvertedListFormatVersion {
-    InvertedListFormatVersion::V3
+    InvertedListFormatVersion::V4
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum InvertedListFormatVersion {
     V1,
-    #[default]
     V2,
     V3,
+    #[default]
+    V4,
 }
 
 impl InvertedListFormatVersion {
@@ -204,25 +202,26 @@ impl InvertedListFormatVersion {
             Self::V1 => INVERTED_INDEX_VERSION_V1,
             Self::V2 => INVERTED_INDEX_VERSION_V2,
             Self::V3 => INVERTED_INDEX_VERSION_V3,
+            Self::V4 => INVERTED_INDEX_VERSION_V4,
         }
     }
 
     pub fn posting_tail_codec(self) -> PostingTailCodec {
         match self {
             Self::V1 => PostingTailCodec::Fixed32,
-            Self::V2 | Self::V3 => PostingTailCodec::VarintDelta,
+            Self::V2 | Self::V3 | Self::V4 => PostingTailCodec::VarintDelta,
         }
     }
 
     pub fn position_codec(self) -> Option<PositionStreamCodec> {
         match self {
             Self::V1 => None,
-            Self::V2 | Self::V3 => Some(PositionStreamCodec::PackedDelta),
+            Self::V2 | Self::V3 | Self::V4 => Some(PositionStreamCodec::PackedDelta),
         }
     }
 
     pub fn uses_shared_position_stream(self) -> bool {
-        matches!(self, Self::V2 | Self::V3)
+        matches!(self, Self::V2 | Self::V3 | Self::V4)
     }
 }
 
@@ -234,8 +233,9 @@ impl FromStr for InvertedListFormatVersion {
             "1" | "v1" | "V1" => Ok(Self::V1),
             "2" | "v2" | "V2" => Ok(Self::V2),
             "3" | "v3" | "V3" => Ok(Self::V3),
+            "4" | "v4" | "V4" => Ok(Self::V4),
             other => Err(Error::index(format!(
-                "unsupported FTS format version {}, expected 1, 2, or 3",
+                "unsupported FTS format version {}, expected 1, 2, 3, or 4",
                 other
             ))),
         }
@@ -246,11 +246,7 @@ pub fn default_fts_format_version_for_block_size(
     block_size: usize,
 ) -> Result<InvertedListFormatVersion> {
     validate_block_size(block_size)?;
-    match block_size {
-        LEGACY_BLOCK_SIZE => Ok(InvertedListFormatVersion::V2),
-        256 => Ok(InvertedListFormatVersion::V3),
-        _ => unreachable!("validate_block_size limits supported block sizes"),
-    }
+    Ok(InvertedListFormatVersion::V4)
 }
 
 pub fn validate_format_version_block_size(
@@ -260,7 +256,8 @@ pub fn validate_format_version_block_size(
     validate_block_size(block_size)?;
     match (format_version, block_size) {
         (InvertedListFormatVersion::V1 | InvertedListFormatVersion::V2, LEGACY_BLOCK_SIZE)
-        | (InvertedListFormatVersion::V3, 256) => Ok(()),
+        | (InvertedListFormatVersion::V3, 256)
+        | (InvertedListFormatVersion::V4, _) => Ok(()),
         (InvertedListFormatVersion::V1 | InvertedListFormatVersion::V2, 256) => {
             Err(Error::invalid_input(format!(
                 "FTS format_version={} is incompatible with block_size=256; use format_version=3",
@@ -551,7 +548,7 @@ impl InvertedIndex {
                 TokenSetFormat::Arrow,
                 InvertedListFormatVersion::V1 | InvertedListFormatVersion::V2,
             ) => 0,
-            _ => INVERTED_INDEX_VERSION_V4,
+            (_, format_version) => format_version.index_version(),
         }
     }
 
@@ -667,8 +664,7 @@ impl InvertedIndex {
         let mut builder = InvertedIndexBuilder::new(first.params.clone()).with_progress(progress);
         builder = builder
             .with_token_set_format(first.token_set_format)
-            .with_format_version(first.format_version())
-            .with_posting_tail_codec(first.posting_tail_codec());
+            .with_format_version(first.format_version());
         let files = builder
             .update_from_segments(new_data, dest_store, segments, old_data_filter)
             .await?;
@@ -7917,10 +7913,10 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_fts_format_version_defaults_to_v2() {
+    fn test_resolve_fts_format_version_defaults_to_v4() {
         assert_eq!(
             resolve_fts_format_version(None).unwrap(),
-            InvertedListFormatVersion::V2
+            InvertedListFormatVersion::V4
         );
         assert_eq!(
             resolve_fts_format_version(Some("2")).unwrap(),
@@ -7929,6 +7925,10 @@ mod tests {
         assert_eq!(
             resolve_fts_format_version(Some("3")).unwrap(),
             InvertedListFormatVersion::V3
+        );
+        assert_eq!(
+            resolve_fts_format_version(Some("4")).unwrap(),
+            InvertedListFormatVersion::V4
         );
     }
 
@@ -8632,6 +8632,8 @@ mod tests {
     #[case::v1(InvertedListFormatVersion::V1, LEGACY_BLOCK_SIZE)]
     #[case::v2(InvertedListFormatVersion::V2, LEGACY_BLOCK_SIZE)]
     #[case::v3(InvertedListFormatVersion::V3, 256)]
+    #[case::v4_128(InvertedListFormatVersion::V4, LEGACY_BLOCK_SIZE)]
+    #[case::v4_256(InvertedListFormatVersion::V4, 256)]
     #[tokio::test]
     async fn test_prewarm_streams_in_chunks_preserves_content(
         #[case] format_version: InvertedListFormatVersion,
@@ -8732,7 +8734,7 @@ mod tests {
             "single partition must be streamed in more than one chunk, got {chunk_count}"
         );
 
-        if format_version == InvertedListFormatVersion::V3 {
+        if block_size == 256 {
             let (start, end) = inverted_list.group_range_for_token(0).unwrap();
             let group = inverted_list
                 .index_cache
@@ -8742,18 +8744,18 @@ mod tests {
                     inverted_list.has_impacts,
                 ))
                 .await
-                .expect("v3 prewarm should populate the packed group cache");
+                .expect("256-document blocks should populate the packed group cache");
             assert!(group.is_packed());
             let (max_score, length) = inverted_list.bulk_metadata_for_token(0);
             let PostingList::Compressed(posting) =
                 group.posting_list(0, max_score, length).unwrap().unwrap()
             else {
-                panic!("expected compressed v3 posting list");
+                panic!("expected compressed posting list");
             };
             assert_eq!(posting.block_size, 256);
             assert!(
                 posting.impacts.is_some(),
-                "v3 packed prewarm must preserve impact skip data"
+                "packed prewarm must preserve impact skip data"
             );
         }
 
@@ -11225,7 +11227,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_update_preserves_v2_layout_with_v4_index_version() -> Result<()> {
+    async fn test_update_preserves_v2_format_version() -> Result<()> {
         let src_dir = TempObjDir::default();
         let dest_dir = TempObjDir::default();
         let src_store = Arc::new(LanceIndexStore::new(
@@ -11281,7 +11283,7 @@ mod tests {
 
         let index = InvertedIndex::load(src_store, None, &LanceCache::no_cache()).await?;
         assert_eq!(index.format_version(), format_version);
-        assert_eq!(index.index_version(), INVERTED_INDEX_VERSION_V4);
+        assert_eq!(index.index_version(), INVERTED_INDEX_VERSION_V2);
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("doc", DataType::Utf8, true),
@@ -11295,11 +11297,11 @@ mod tests {
             .update(Box::pin(stream), dest_store.as_ref(), None)
             .await?;
 
-        assert_eq!(created.index_version, INVERTED_INDEX_VERSION_V4);
+        assert_eq!(created.index_version, INVERTED_INDEX_VERSION_V2);
 
         let updated = InvertedIndex::load(dest_store, None, &LanceCache::no_cache()).await?;
         assert_eq!(updated.format_version(), format_version);
-        assert_eq!(updated.index_version(), INVERTED_INDEX_VERSION_V4);
+        assert_eq!(updated.index_version(), INVERTED_INDEX_VERSION_V2);
         assert_eq!(updated.partitions.len(), 2);
         for partition in &updated.partitions {
             assert_eq!(
@@ -11312,7 +11314,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_block_size_256_writes_v3_metadata_and_index_version() -> Result<()> {
+    async fn test_block_size_256_writes_v4_metadata_and_index_version() -> Result<()> {
         let src_dir = TempObjDir::default();
         let dest_dir = TempObjDir::default();
         let src_store = Arc::new(LanceIndexStore::new(
@@ -11328,7 +11330,7 @@ mod tests {
 
         let params = InvertedIndexParams::default().block_size(256)?;
         let format_version = params.resolved_format_version();
-        assert_eq!(format_version, InvertedListFormatVersion::V3);
+        assert_eq!(format_version, InvertedListFormatVersion::V4);
 
         let mut partition = InnerBuilder::new_with_format_version_and_block_size(
             0,
@@ -11351,7 +11353,7 @@ mod tests {
         write_test_metadata(&src_store, vec![0], params).await;
 
         let index = InvertedIndex::load(src_store, None, &LanceCache::no_cache()).await?;
-        assert_eq!(index.format_version(), InvertedListFormatVersion::V3);
+        assert_eq!(index.format_version(), InvertedListFormatVersion::V4);
         assert_eq!(index.index_version(), INVERTED_INDEX_VERSION_V4);
 
         let created = index
@@ -11360,7 +11362,7 @@ mod tests {
         assert_eq!(created.index_version, INVERTED_INDEX_VERSION_V4);
 
         let updated = InvertedIndex::load(dest_store, None, &LanceCache::no_cache()).await?;
-        assert_eq!(updated.format_version(), InvertedListFormatVersion::V3);
+        assert_eq!(updated.format_version(), InvertedListFormatVersion::V4);
         assert_eq!(updated.index_version(), INVERTED_INDEX_VERSION_V4);
 
         Ok(())
@@ -11383,12 +11385,13 @@ mod tests {
 
         let index = write_single_partition_index(
             src_store,
-            InvertedIndexParams::default(),
+            InvertedIndexParams::default().format_version(InvertedListFormatVersion::V2),
             TokenSetFormat::Arrow,
             "hello",
             100,
         )
         .await?;
+        assert_eq!(index.index_version(), 0);
         let created = InvertedIndex::merge_segments(
             &[index],
             empty_doc_stream(),
@@ -11400,6 +11403,7 @@ mod tests {
 
         assert_eq!(created.index_version, 0);
         let merged = InvertedIndex::load(dest_store, None, &LanceCache::no_cache()).await?;
+        assert_eq!(merged.index_version(), 0);
         assert_eq!(merged.token_set_format, TokenSetFormat::Arrow);
 
         let tokens = Arc::new(Tokens::new(vec!["hello".to_string()], DocType::Text));
@@ -11410,6 +11414,55 @@ mod tests {
             .bm25_search(tokens, params, Operator::Or, prefilter, metrics, None)
             .await?;
         assert_eq!(row_ids, vec![100]);
+
+        Ok(())
+    }
+
+    #[rstest::rstest]
+    #[case::v1(InvertedListFormatVersion::V1, LEGACY_BLOCK_SIZE)]
+    #[case::v2(InvertedListFormatVersion::V2, LEGACY_BLOCK_SIZE)]
+    #[case::v3(InvertedListFormatVersion::V3, 256)]
+    #[case::v4_128(InvertedListFormatVersion::V4, LEGACY_BLOCK_SIZE)]
+    #[case::v4_256(InvertedListFormatVersion::V4, 256)]
+    #[tokio::test]
+    async fn test_merge_segments_preserves_format_version(
+        #[case] format_version: InvertedListFormatVersion,
+        #[case] block_size: usize,
+    ) -> Result<()> {
+        let src_dir = TempObjDir::default();
+        let dest_dir = TempObjDir::default();
+        let src_store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            src_dir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let dest_store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            dest_dir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let params = InvertedIndexParams::default()
+            .block_size(block_size)?
+            .format_version(format_version);
+
+        let index =
+            write_single_partition_index(src_store, params, TokenSetFormat::Fst, "hello", 100)
+                .await?;
+        assert_eq!(index.format_version(), format_version);
+
+        let created = InvertedIndex::merge_segments(
+            &[index],
+            empty_doc_stream(),
+            dest_store.as_ref(),
+            None,
+            crate::progress::noop_progress(),
+        )
+        .await?;
+        assert_eq!(created.index_version, format_version.index_version());
+
+        let merged = InvertedIndex::load(dest_store, None, &LanceCache::no_cache()).await?;
+        assert_eq!(merged.format_version(), format_version);
+        assert_eq!(merged.index_version(), format_version.index_version());
 
         Ok(())
     }

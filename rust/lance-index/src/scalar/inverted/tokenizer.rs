@@ -158,8 +158,7 @@ pub struct InvertedIndexParams {
     /// On-disk FTS format version to write when creating a new index.
     ///
     /// This is a build-time only parameter and is not persisted with the index.
-    /// If unset, Lance writes v2 for `block_size = 128` and v3 for
-    /// `block_size = 256`.
+    /// If unset, Lance writes v4 for either supported block size.
     /// `format_version = 3` is experimental and is only valid with
     /// `block_size = 256`.
     #[serde(
@@ -484,7 +483,7 @@ where
         serde_json::Value::Number(value) => {
             let Some(format_version) = value.as_u64() else {
                 return Err(serde::de::Error::custom(format!(
-                    "FTS format_version must be 1, 2, or 3, got {value}"
+                    "FTS format_version must be 1, 2, 3, or 4, got {value}"
                 )));
             };
             resolve_fts_format_version(Some(&format_version.to_string()))
@@ -492,7 +491,7 @@ where
                 .map_err(serde::de::Error::custom)
         }
         other => Err(serde::de::Error::custom(format!(
-            "FTS format_version must be 1, 2, or 3, got {other}"
+            "FTS format_version must be 1, 2, 3, or 4, got {other}"
         ))),
     }
 }
@@ -797,9 +796,9 @@ impl InvertedIndexParams {
 
     /// Set the on-disk FTS format version to use when creating a new index.
     ///
-    /// If unset, Lance writes v2 for `block_size = 128` and v3 for
-    /// `block_size = 256`. Existing indexes keep their own on-disk format
-    /// during update and optimize operations.
+    /// If unset, Lance writes v4 for either supported block size. Existing
+    /// indexes keep their own on-disk format during update and optimize
+    /// operations.
     /// `format_version = 3` is experimental and is only valid with
     /// `block_size = 256`.
     pub fn format_version(mut self, format_version: InvertedListFormatVersion) -> Self {
@@ -1076,10 +1075,10 @@ mod tests {
     }
 
     #[test]
-    fn test_default_format_version_resolves_to_v2() {
+    fn test_default_format_version_resolves_to_v4() {
         assert_eq!(
             InvertedIndexParams::default().resolved_format_version(),
-            InvertedListFormatVersion::V2
+            InvertedListFormatVersion::V4
         );
     }
 
@@ -1130,13 +1129,13 @@ mod tests {
     }
 
     #[test]
-    fn test_block_size_256_defaults_to_v3() {
+    fn test_block_size_256_defaults_to_v4() {
         assert_eq!(
             InvertedIndexParams::default()
                 .block_size(256)
                 .unwrap()
                 .resolved_format_version(),
-            InvertedListFormatVersion::V3
+            InvertedListFormatVersion::V4
         );
     }
 
@@ -1278,6 +1277,16 @@ mod tests {
         InvertedIndexParams::default()
             .block_size(256)
             .unwrap()
+            .validate_format_version()
+            .unwrap();
+        InvertedIndexParams::default()
+            .format_version(InvertedListFormatVersion::V4)
+            .validate_format_version()
+            .unwrap();
+        InvertedIndexParams::default()
+            .block_size(256)
+            .unwrap()
+            .format_version(InvertedListFormatVersion::V4)
             .validate_format_version()
             .unwrap();
 
