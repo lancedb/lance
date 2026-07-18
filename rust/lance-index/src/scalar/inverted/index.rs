@@ -1218,10 +1218,14 @@ impl InvertedIndex {
                     .ok_or(Error::index("params not found in metadata".to_owned()))?;
                 Ok(serde_json::from_str::<InvertedIndexParams>(params)?)
             }
-            Err(error) if error.is_not_found() => {
+            Err(metadata_error) => {
                 // Legacy format: params live in the tokens file (see
-                // `load_legacy_index`).
-                let reader = store.open_index_file(TOKENS_FILE).await?;
+                // `load_legacy_index`). Some S3 configurations return 403 for
+                // a missing object, so the readable legacy file is the
+                // authoritative format probe.
+                let Ok(reader) = store.open_index_file(TOKENS_FILE).await else {
+                    return Err(metadata_error);
+                };
                 Ok(reader
                     .schema()
                     .metadata
@@ -1230,7 +1234,6 @@ impl InvertedIndex {
                     .transpose()?
                     .unwrap_or_default())
             }
-            Err(error) => Err(error),
         }
     }
 
@@ -7165,12 +7168,120 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn params_legacy_fallback_only_accepts_missing_metadata() {
-        assert!(Error::not_found(METADATA_FILE).is_not_found());
-        assert!(Error::wrapped(Box::new(Error::not_found(METADATA_FILE))).is_not_found());
-        assert!(!Error::timeout("metadata read timed out").is_not_found());
-        assert!(!Error::io("metadata read was denied").is_not_found());
+    #[derive(Debug)]
+    struct MetadataAccessDeniedStore {
+        inner: Arc<dyn IndexStore>,
+    }
+
+    impl DeepSizeOf for MetadataAccessDeniedStore {
+        fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+            self.inner.deep_size_of_children(context)
+        }
+    }
+
+    #[async_trait]
+    impl IndexStore for MetadataAccessDeniedStore {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn clone_arc(&self) -> Arc<dyn IndexStore> {
+            Arc::new(Self {
+                inner: self.inner.clone(),
+            })
+        }
+
+        fn io_parallelism(&self) -> usize {
+            self.inner.io_parallelism()
+        }
+
+        async fn new_index_file(
+            &self,
+            name: &str,
+            schema: Arc<Schema>,
+        ) -> Result<Box<dyn crate::scalar::IndexWriter>> {
+            self.inner.new_index_file(name, schema).await
+        }
+
+        async fn open_index_file(&self, name: &str) -> Result<Arc<dyn IndexReader>> {
+            if name == METADATA_FILE {
+                Err(Error::io("metadata access denied"))
+            } else {
+                self.inner.open_index_file(name).await
+            }
+        }
+
+        fn with_io_priority(&self, io_priority: u64) -> Arc<dyn IndexStore> {
+            Arc::new(Self {
+                inner: self.inner.with_io_priority(io_priority),
+            })
+        }
+
+        async fn copy_index_file(
+            &self,
+            name: &str,
+            dest_store: &dyn IndexStore,
+        ) -> Result<crate::scalar::IndexFile> {
+            self.inner.copy_index_file(name, dest_store).await
+        }
+
+        async fn rename_index_file(
+            &self,
+            name: &str,
+            new_name: &str,
+        ) -> Result<crate::scalar::IndexFile> {
+            self.inner.rename_index_file(name, new_name).await
+        }
+
+        async fn delete_index_file(&self, name: &str) -> Result<()> {
+            self.inner.delete_index_file(name).await
+        }
+
+        async fn list_files_with_sizes(&self) -> Result<Vec<crate::scalar::IndexFile>> {
+            self.inner.list_files_with_sizes().await
+        }
+    }
+
+    #[tokio::test]
+    async fn params_legacy_fallback_probes_tokens_after_metadata_access_denied() {
+        let tmpdir = TempObjDir::default();
+        let inner: Arc<dyn IndexStore> = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let expected = InvertedIndexParams::default();
+        let metadata = HashMap::from([(
+            "tokenizer".to_owned(),
+            serde_json::to_string(&expected).unwrap(),
+        )]);
+        let mut writer = inner
+            .new_index_file(TOKENS_FILE, Arc::new(Schema::empty()))
+            .await
+            .unwrap();
+        writer.finish_with_metadata(metadata).await.unwrap();
+        let store = MetadataAccessDeniedStore { inner };
+
+        let actual = InvertedIndex::load_params(&store).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(actual).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn params_legacy_probe_preserves_metadata_error_when_tokens_are_missing() {
+        let tmpdir = TempObjDir::default();
+        let inner: Arc<dyn IndexStore> = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let store = MetadataAccessDeniedStore { inner };
+
+        let error = InvertedIndex::load_params(&store).await.unwrap_err();
+        assert!(matches!(error, Error::IO { .. }));
+        assert!(error.to_string().contains("metadata access denied"));
     }
 
     async fn write_single_partition_index(
