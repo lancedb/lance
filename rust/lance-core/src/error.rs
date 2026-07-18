@@ -961,6 +961,9 @@ impl Clone for CloneableError {
             Error::NotFound { uri, .. } => Self(Error::wrapped(Box::new(DisplayError(
                 Error::not_found(uri.clone()),
             )))),
+            error if error.is_not_found() => Self(Error::wrapped(Box::new(DisplayError(
+                Error::not_found(error.to_string()),
+            )))),
             Error::Timeout { message, .. } => Self(Error::timeout(message.clone())),
             Error::IO { source, .. } => Self(Error::io(source.to_string())),
             error => Self(Error::cloned(error.to_string())),
@@ -987,9 +990,18 @@ mod test {
     fn cloneable_error_preserves_not_found_contract() {
         let original = CloneableError(Error::not_found("metadata.lance"));
         let cloned = original.clone();
+        let cloned_again = cloned.clone();
         assert!(matches!(original.0, Error::NotFound { .. }));
         assert!(cloned.0.is_not_found());
+        assert!(cloned_again.0.is_not_found());
         assert!(cloned.0.to_string().to_lowercase().contains("not found"));
+        assert!(
+            cloned_again
+                .0
+                .to_string()
+                .to_lowercase()
+                .contains("not found")
+        );
         assert!(
             format!("{:?}", cloned.0)
                 .to_lowercase()
