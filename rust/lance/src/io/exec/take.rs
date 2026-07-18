@@ -13,7 +13,11 @@ use arrow_array::{Array, BooleanArray, UInt32Array};
 use arrow_array::{RecordBatch, UInt64Array};
 use arrow_schema::{Schema as ArrowSchema, SchemaRef};
 use datafusion::common::Statistics;
+use datafusion::common::config::ConfigOptions;
 use datafusion::error::{DataFusionError, Result};
+use datafusion::physical_plan::filter_pushdown::{
+    ChildPushdownResult, FilterDescription, FilterPushdownPhase, FilterPushdownPropagation,
+};
 use datafusion::physical_plan::metrics::{
     BaselineMetrics, Count, ExecutionPlanMetricsSet, MetricBuilder, MetricValue, MetricsSet,
 };
@@ -21,7 +25,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
 };
-use datafusion_physical_expr::EquivalenceProperties;
+use datafusion_physical_expr::{EquivalenceProperties, PhysicalExpr};
 use futures::FutureExt;
 use futures::stream::{FuturesOrdered, Stream, StreamExt, TryStreamExt};
 use lance_arrow::RecordBatchExt;
@@ -695,6 +699,30 @@ impl ExecutionPlan for TakeExec {
     fn supports_limit_pushdown(&self) -> bool {
         true
     }
+
+    // A `TakeExec` fetches extra ("late materialized") columns for the rows produced
+    // by its input, so it is transparent to filters that reference only the input's
+    // columns. Forwarding those filters down lets a dynamic filter (e.g. a TopK or
+    // hash-join filter) reach the underlying scan, which then drops rows before the
+    // take fetches their wide columns. Filters that reference take-added columns are
+    // marked unsupported by `from_child` and stay above the take.
+    fn gather_filters_for_pushdown(
+        &self,
+        _phase: FilterPushdownPhase,
+        parent_filters: Vec<Arc<dyn PhysicalExpr>>,
+        _config: &ConfigOptions,
+    ) -> Result<FilterDescription> {
+        FilterDescription::from_children(parent_filters, &self.children())
+    }
+
+    fn handle_child_pushdown_result(
+        &self,
+        _phase: FilterPushdownPhase,
+        child_pushdown_result: ChildPushdownResult,
+        _config: &ConfigOptions,
+    ) -> Result<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
+        Ok(FilterPushdownPropagation::if_all(child_pushdown_result))
+    }
 }
 
 #[cfg(test)]
@@ -811,6 +839,74 @@ mod tests {
         assert_eq!(
             schema.fields.iter().map(|f| f.name()).collect::<Vec<_>>(),
             vec!["i", ROW_ID, "s"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_take_filter_pushdown_pass_through() {
+        use datafusion::physical_plan::filter_pushdown::PushedDown;
+        use datafusion_expr::Operator;
+        use datafusion_physical_expr::expressions::{BinaryExpr, col, lit};
+
+        let TestFixture { dataset, .. } = test_fixture().await;
+
+        // Input scans "i" (+ row id); the take adds the wider "s" column.
+        let scan_arrow_schema = ArrowSchema::new(vec![Field::new("i", DataType::Int32, false)]);
+        let scan_schema = Arc::new(Schema::try_from(&scan_arrow_schema).unwrap());
+        let config = LanceScanConfig {
+            with_row_id: true,
+            ..Default::default()
+        };
+        let input = Arc::new(LanceScanExec::new(
+            dataset.clone(),
+            dataset.fragments().clone(),
+            None,
+            scan_schema,
+            config,
+        ));
+        let projection = dataset
+            .empty_projection()
+            .union_column("s", OnMissing::Error)
+            .unwrap();
+        let take_exec: Arc<dyn ExecutionPlan> = Arc::new(
+            TakeExec::try_new(dataset, input, projection)
+                .unwrap()
+                .unwrap(),
+        );
+
+        let out_schema = take_exec.schema();
+        // A filter on "i" is produced by the input, so it routes down; a filter on the
+        // take-added "s" cannot, so it stays above the take.
+        let filter_i: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            col("i", &out_schema).unwrap(),
+            Operator::Lt,
+            lit(5i32),
+        ));
+        let filter_s: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            col("s", &out_schema).unwrap(),
+            Operator::Eq,
+            lit("str-1"),
+        ));
+
+        let desc = take_exec
+            .gather_filters_for_pushdown(
+                FilterPushdownPhase::Post,
+                vec![filter_i, filter_s],
+                &ConfigOptions::default(),
+            )
+            .unwrap();
+
+        let per_child = desc.parent_filters();
+        assert_eq!(per_child.len(), 1, "TakeExec has a single child");
+        let routed = &per_child[0];
+        assert_eq!(routed.len(), 2);
+        assert!(
+            matches!(routed[0].discriminant, PushedDown::Yes),
+            "filter on input column should route down to the scan"
+        );
+        assert!(
+            matches!(routed[1].discriminant, PushedDown::No),
+            "filter on a take-added column must stay above the take"
         );
     }
 
