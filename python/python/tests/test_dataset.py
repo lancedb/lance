@@ -5109,8 +5109,83 @@ def test_data_overlay_sparse_per_field(tmp_path: Path):
     assert result.column("val").to_pylist()[2] == 20
 
 
+def test_data_overlay_offsets_accept_bitmap(tmp_path: Path):
+    from lance.bitmap import bitmap
+
+    base_dir = tmp_path / "test"
+    table = pa.table(
+        {
+            "id": pa.array(range(10), pa.int32()),
+            "val": pa.array([i * 10 for i in range(10)], pa.int32()),
+        }
+    )
+    dataset = lance.write_dataset(table, base_dir)
+
+    # Dense coverage as a single Bitmap.
+    dense_file = _write_overlay_file(
+        dataset,
+        base_dir,
+        "dense.lance",
+        pa.table({"val": pa.array([111, 444], pa.int32())}),
+        fields=[1],
+    )
+    dataset = lance.LanceDataset.commit(
+        dataset,
+        lance.LanceOperation.DataOverlay(
+            [
+                lance.LanceOperation.DataOverlayGroup(
+                    0,
+                    [
+                        lance.LanceOperation.DataOverlayFile(
+                            dense_file, offsets=bitmap([1, 4])
+                        )
+                    ],
+                )
+            ]
+        ),
+        read_version=dataset.version,
+    )
+    result = dataset.to_table()
+    assert result.column("val").to_pylist() == [0, 111, 20, 30, 444, 50, 60, 70, 80, 90]
+
+    # Sparse coverage as a list of Bitmaps.
+    sparse_file = _write_overlay_file(
+        dataset,
+        base_dir,
+        "sparse.lance",
+        pa.table(
+            {
+                "id": pa.array([777], pa.int32()),
+                "val": pa.array([330], pa.int32()),
+            }
+        ),
+        fields=[0, 1],
+    )
+    dataset = lance.LanceDataset.commit(
+        dataset,
+        lance.LanceOperation.DataOverlay(
+            [
+                lance.LanceOperation.DataOverlayGroup(
+                    0,
+                    [
+                        lance.LanceOperation.DataOverlayFile(
+                            sparse_file, offsets=[bitmap([2]), bitmap([3])]
+                        )
+                    ],
+                )
+            ]
+        ),
+        read_version=dataset.version,
+    )
+    result = dataset.to_table()
+    assert result.column("id").to_pylist()[2] == 777
+    assert result.column("val").to_pylist()[3] == 330
+
+
 def test_data_overlay_round_trips_through_fragment_metadata(tmp_path: Path):
     import json
+
+    from lance.bitmap import bitmap as Bitmap
 
     base_dir = tmp_path / "test"
     table = pa.table(
@@ -5141,6 +5216,7 @@ def test_data_overlay_round_trips_through_fragment_metadata(tmp_path: Path):
     # Reading the fragment surfaces its overlays, stamped with the commit version.
     metadata = dataset.get_fragments()[0].metadata
     assert len(metadata.overlays) == 1
+    assert isinstance(metadata.overlays[0].offsets, Bitmap)
     assert metadata.overlays[0].offsets == [1, 4]
     assert metadata.overlays[0].committed_version == overlay_version
 
@@ -5174,9 +5250,10 @@ def test_data_overlay_rejects_invalid_offsets(tmp_path: Path):
         fields=[0],
     )
 
-    # offsets is neither a flat list of ints (dense) nor a list of per-field int
-    # lists (sparse), so the coverage shape can't be resolved.
-    with pytest.raises(ValueError, match="offsets must be a list"):
+    # offsets is neither a Bitmap/flat list of ints (dense) nor a list of
+    # Bitmaps/per-field int lists (sparse), so the coverage shape can't be
+    # resolved.
+    with pytest.raises(ValueError, match="offsets must be a Bitmap or list"):
         lance.LanceDataset.commit(
             dataset,
             lance.LanceOperation.DataOverlay(

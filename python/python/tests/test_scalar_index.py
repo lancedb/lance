@@ -179,6 +179,8 @@ def test_list_indices_characterization(indexed_dataset: lance.LanceDataset):
     Index dataclasses. This characterization test guards the dict keys and
     values so the deprecated method stays backwards compatible.
     """
+    from lance.bitmap import bitmap as Bitmap
+
     with pytest.warns(DeprecationWarning):
         indices = indexed_dataset.list_indices()
 
@@ -199,7 +201,7 @@ def test_list_indices_characterization(indexed_dataset: lance.LanceDataset):
         assert set(idx) == expected_keys
         assert isinstance(idx["uuid"], str) and len(idx["uuid"]) > 0
         assert isinstance(idx["fields"], list)
-        assert isinstance(idx["fragment_ids"], set)
+        assert isinstance(idx["fragment_ids"], Bitmap)
         assert isinstance(idx["version"], int)
         assert idx["type"] != "Unknown"
         assert idx["base_id"] is None

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use crate::bitmap::PyBitmap;
 use crate::dataset::DatasetBasePath;
 use crate::schema::LanceSchema;
 use crate::utils::{PyLance, class_name, export_vec, extract_vec};
@@ -14,7 +15,6 @@ use lance::datatypes::Schema;
 use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
 use lance_table::format::{BasePath, DataFile, Fragment, IndexFile, IndexMetadata};
 use pyo3::exceptions::PyValueError;
-use pyo3::types::PySet;
 use pyo3::{Bound, FromPyObject, PyAny, PyResult, Python};
 use pyo3::{intern, prelude::*};
 use roaring::RoaringBitmap;
@@ -71,13 +71,7 @@ impl FromPyObject<'_, '_> for PyLance<IndexMetadata> {
         let fragment_ids = ob.getattr("fragment_ids")?;
         let created_at = ob.getattr("created_at")?.extract()?;
 
-        let fragment_ids_ref: &Bound<'_, PySet> = fragment_ids.cast()?;
-        let fragment_bitmap = Some(
-            fragment_ids_ref
-                .into_iter()
-                .map(|id| id.extract::<u32>())
-                .collect::<PyResult<RoaringBitmap>>()?,
-        );
+        let fragment_bitmap = Some(extract_bitmap(&fragment_ids)?);
         let base_id: Option<u32> = ob
             .getattr("base_id")?
             .extract::<Option<i64>>()?
@@ -124,16 +118,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&IndexMetadata> {
         let fields = &self.0.fields;
         let dataset_version = self.0.dataset_version;
         let index_version = self.0.index_version;
-        let fragment_ids = self.0.fragment_bitmap.as_ref().map_or_else(
-            || PySet::empty(py).unwrap(),
-            |bitmap| {
-                let set = PySet::empty(py).unwrap();
-                for id in bitmap.iter() {
-                    set.add(id).unwrap();
-                }
-                set
-            },
-        );
+        let fragment_ids = PyBitmap::new(self.0.fragment_bitmap.clone().unwrap_or_default());
         let created_at = self.0.created_at;
         let base_id = self.0.base_id.map(|id| id as i64);
         let files = self
@@ -207,11 +192,23 @@ impl<'py> IntoPyObject<'py> for PyLance<&DataReplacementGroup> {
     }
 }
 
+// Accept either a `Bitmap` (constructed canonically, so already sorted and
+// deduplicated) or a legacy raw int iterable/`PySet`/etc.
+fn extract_bitmap(ob: &Bound<'_, PyAny>) -> PyResult<RoaringBitmap> {
+    if let Ok(bitmap) = ob.extract::<PyBitmap>() {
+        return Ok((*bitmap.0).clone());
+    }
+    ob.try_iter()?
+        .map(|item| item?.extract::<u32>())
+        .collect::<PyResult<RoaringBitmap>>()
+}
+
 // The Nth offset in an overlay list positionally maps to the Nth value row in
 // `data_file`, but `RoaringBitmap` stores offsets in ascending order and drops
-// duplicates. A caller-supplied list that isn't strictly ascending would be
-// silently reordered, breaking that mapping, so reject it here instead. This can
-// go away once we expose RoaringBitmap directly to Python (issue #7695).
+// duplicates. A caller-supplied raw `Vec<u32>` that isn't strictly ascending
+// would be silently reordered, breaking that mapping, so reject it here
+// instead. This validation is unnecessary for a `Bitmap`, since it is
+// canonically sorted and deduplicated by construction (issue #7695).
 fn bitmap_from_sorted_offsets(offsets: Vec<u32>) -> PyResult<RoaringBitmap> {
     if offsets.windows(2).any(|w| w[0] >= w[1]) {
         return Err(PyValueError::new_err(
@@ -228,11 +225,15 @@ impl FromPyObject<'_, '_> for PyLance<DataOverlayFile> {
         let data_file = ob.getattr("data_file")?.extract::<PyLance<DataFile>>()?.0;
         let offsets = ob.getattr("offsets")?;
 
-        // A flat list of offsets is a dense overlay (one coverage shared by every
-        // field); a list of per-field lists is a sparse overlay. Differentiate by
-        // shape, trying the dense form first.
-        let coverage = if let Ok(shared) = offsets.extract::<Vec<u32>>() {
+        // A `Bitmap` or flat list of offsets is a dense overlay (one coverage
+        // shared by every field); a list of `Bitmap`s or per-field lists is a
+        // sparse overlay. Differentiate by shape, trying the dense form first.
+        let coverage = if let Ok(bitmap) = offsets.extract::<PyBitmap>() {
+            OverlayCoverage::dense((*bitmap.0).clone())
+        } else if let Ok(shared) = offsets.extract::<Vec<u32>>() {
             OverlayCoverage::dense(bitmap_from_sorted_offsets(shared)?)
+        } else if let Ok(per_field) = offsets.extract::<Vec<PyBitmap>>() {
+            OverlayCoverage::sparse(per_field.into_iter().map(|b| (*b.0).clone()).collect())
         } else if let Ok(per_field) = offsets.extract::<Vec<Vec<u32>>>() {
             OverlayCoverage::sparse(
                 per_field
@@ -242,8 +243,9 @@ impl FromPyObject<'_, '_> for PyLance<DataOverlayFile> {
             )
         } else {
             return Err(PyValueError::new_err(
-                "DataOverlayFile.offsets must be a list of ints (dense coverage shared by \
-                 every field) or a list of per-field int lists (sparse coverage)",
+                "DataOverlayFile.offsets must be a Bitmap or list of ints (dense coverage \
+                 shared by every field) or a list of Bitmaps or per-field int lists (sparse \
+                 coverage)",
             ));
         };
 
@@ -281,15 +283,17 @@ impl<'py> IntoPyObject<'py> for PyLance<&DataOverlayFile> {
 
         let committed_version = self.0.committed_version;
 
-        // Mirror the read side: a dense overlay becomes a flat list of offsets, a
-        // sparse overlay a list of per-field lists.
+        // Mirror the read side: a dense overlay becomes a single Bitmap, a
+        // sparse overlay a list of per-field Bitmaps.
         match &self.0.coverage {
             OverlayCoverage::Shared(bitmap) => {
-                let offsets: Vec<u32> = bitmap.iter().collect();
+                // `bitmap` is already an `Arc<RoaringBitmap>` — cloning it is a
+                // cheap refcount bump, not a deep copy.
+                let offsets = PyBitmap(bitmap.clone());
                 cls.call1((data_file, offsets, committed_version))
             }
             OverlayCoverage::PerField(bitmaps) => {
-                let offsets: Vec<Vec<u32>> = bitmaps.iter().map(|b| b.iter().collect()).collect();
+                let offsets: Vec<PyBitmap> = bitmaps.iter().cloned().map(PyBitmap).collect();
                 cls.call1((data_file, offsets, committed_version))
             }
         }
