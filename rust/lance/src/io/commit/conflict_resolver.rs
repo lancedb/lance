@@ -506,13 +506,18 @@ impl<'a> TransactionRebase<'a> {
                     let self_has_frag_reuse = new_indices
                         .iter()
                         .any(|idx| idx.name == FRAG_REUSE_INDEX_NAME);
+                    // Scan the other transaction's removals too: a removal-only
+                    // transaction (e.g. drop_index) that dropped a singleton must
+                    // not be silently undone by a staged re-creation.
                     let other_has_frag_reuse = created_indices
                         .iter()
+                        .chain(other_removed_indices.iter())
                         .any(|idx| idx.name == FRAG_REUSE_INDEX_NAME);
                     let self_has_mem_wal =
                         new_indices.iter().any(|idx| idx.name == MEM_WAL_INDEX_NAME);
                     let other_has_mem_wal = created_indices
                         .iter()
+                        .chain(other_removed_indices.iter())
                         .any(|idx| idx.name == MEM_WAL_INDEX_NAME);
                     let has_regular_name_conflict = new_indices
                         .iter()
@@ -3771,5 +3776,62 @@ mod tests {
         );
 
         assert_eq!(dataset_v2.count_rows(None).await.unwrap(), 5);
+    }
+
+    #[tokio::test]
+    async fn test_create_index_conflicts_with_concurrent_index_removal() {
+        fn index_meta(name: &str) -> IndexMetadata {
+            IndexMetadata {
+                uuid: Uuid::new_v4(),
+                name: name.to_string(),
+                fields: vec![0],
+                dataset_version: 1,
+                fragment_bitmap: Some([0u32].into_iter().collect()),
+                index_details: None,
+                index_version: 0,
+                created_at: None,
+                base_id: None,
+                files: None,
+            }
+        }
+
+        let dataset = test_dataset(10, 1).await;
+        // Regular names and both system singletons: a removal-only concurrent
+        // transaction (e.g. drop_index) must conflict with a staged creation of
+        // the same index instead of letting the commit resurrect it.
+        for name in ["my_idx", FRAG_REUSE_INDEX_NAME, MEM_WAL_INDEX_NAME] {
+            let staged = Transaction::new(
+                dataset.manifest.version,
+                Operation::CreateIndex {
+                    new_indices: vec![index_meta(name)],
+                    removed_indices: vec![],
+                },
+                None,
+            );
+            let removal_only = Transaction::new(
+                dataset.manifest.version,
+                Operation::CreateIndex {
+                    new_indices: vec![],
+                    removed_indices: vec![index_meta(name)],
+                },
+                None,
+            );
+
+            let mut rebase = TransactionRebase::try_new(&dataset, staged, None)
+                .await
+                .unwrap();
+            let err = rebase
+                .check_txn(&removal_only, dataset.manifest.version + 1)
+                .unwrap_err();
+            assert!(
+                matches!(err, Error::RetryableCommitConflict { .. }),
+                "{name}: expected a retryable commit conflict, got: {err}"
+            );
+            assert!(
+                err.to_string()
+                    .contains("preempted by concurrent transaction CreateIndex"),
+                "{name}: conflict message must identify the concurrent CreateIndex, got: {err}"
+            );
+        }
     }
 }

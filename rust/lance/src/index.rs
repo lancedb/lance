@@ -893,8 +893,9 @@ impl Dataset {
     /// dropping a same-name index between staging and commit fails the commit
     /// with a retryable conflict, and dropping the indexed column fails it as
     /// incompatible. A concurrent compaction/rewrite that defers index
-    /// remapping is not conflict-checked and may leave a duplicate index
-    /// entry, so commit promptly.
+    /// remapping is not conflict-checked; the committed segments may then
+    /// cover already-compacted fragments until the deferred remap catches up,
+    /// so commit promptly.
     ///
     /// # Side effects
     ///
@@ -7332,6 +7333,11 @@ mod tests {
             "expected a retryable commit conflict, got: {err}"
         );
         assert!(
+            err.to_string()
+                .contains("preempted by concurrent transaction CreateIndex"),
+            "conflict message must identify the concurrent CreateIndex removal, got: {err}"
+        );
+        assert!(
             dataset
                 .load_indices_by_name("vector_idx")
                 .await
@@ -7389,6 +7395,11 @@ mod tests {
         assert!(
             matches!(err, Error::IncompatibleTransaction { .. }),
             "expected an incompatible transaction error, got: {err}"
+        );
+        assert!(
+            err.to_string()
+                .contains("incompatible with concurrent transaction Project"),
+            "conflict message must identify the concurrent Project, got: {err}"
         );
     }
 
