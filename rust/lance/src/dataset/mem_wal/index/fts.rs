@@ -960,10 +960,20 @@ impl FtsMemIndex {
 
     /// Create a new FTS index with custom tokenizer parameters.
     pub fn with_params(field_id: i32, column_name: String, params: InvertedIndexParams) -> Self {
-        let pool = TokenizerPool::new(&params, Self::DEFAULT_TOKENIZER_POOL_CAP)
-            .expect("Failed to build tokenizer");
+        Self::try_with_params(field_id, column_name, params)
+            .expect("invalid MemWAL FTS index parameters")
+    }
+
+    /// Try to create a new FTS index with custom tokenizer parameters.
+    pub fn try_with_params(
+        field_id: i32,
+        column_name: String,
+        params: InvertedIndexParams,
+    ) -> Result<Self> {
+        params.validate_format_version()?;
+        let pool = TokenizerPool::new(&params, Self::DEFAULT_TOKENIZER_POOL_CAP)?;
         let writer_tokenizer = pool.template.box_clone();
-        Self {
+        Ok(Self {
             field_id,
             column_name,
             params,
@@ -972,7 +982,7 @@ impl FtsMemIndex {
             state: ArcSwap::from(IndexState::empty()),
             freeze_threshold_rows: Self::DEFAULT_FREEZE_THRESHOLD_ROWS,
             merge: Arc::new(Mutex::new(None)),
-        }
+        })
     }
 
     /// Override the tail freeze threshold (docs) — the analogue of Lucene's
@@ -1764,6 +1774,7 @@ impl FtsMemIndex {
 
         let st = self.state.load_full();
         let with_position = self.params.has_positions();
+        let block_size = self.params.posting_block_size();
         let format_version = self.params.resolved_format_version();
         let posting_tail_codec = format_version.posting_tail_codec();
         let total_rows_u64 = total_rows as u64;
@@ -1783,11 +1794,12 @@ impl FtsMemIndex {
             }
         }
         if all_docs.is_empty() {
-            return Ok(InnerBuilder::new_with_format_version(
+            return Ok(InnerBuilder::new_with_format_version_and_block_size(
                 partition_id,
                 with_position,
                 Default::default(),
                 format_version,
+                block_size,
             ));
         }
 
@@ -1873,10 +1885,13 @@ impl FtsMemIndex {
             docs_for_term.sort_by_key(|(doc_id, _, _)| *doc_id);
             let token_id = tokens.add(token) as usize;
             debug_assert_eq!(token_id, posting_lists.len());
-            posting_lists.push(PostingListBuilder::new_with_posting_tail_codec(
-                with_position,
-                posting_tail_codec,
-            ));
+            posting_lists.push(
+                PostingListBuilder::new_with_posting_tail_codec_and_block_size(
+                    with_position,
+                    posting_tail_codec,
+                    block_size,
+                ),
+            );
             let plb = &mut posting_lists[token_id];
             for (doc_id, freq, pos) in docs_for_term {
                 let recorder = if with_position {
@@ -1888,11 +1903,12 @@ impl FtsMemIndex {
             }
         }
 
-        let mut builder = InnerBuilder::new_with_format_version(
+        let mut builder = InnerBuilder::new_with_format_version_and_block_size(
             partition_id,
             with_position,
             Default::default(),
             format_version,
+            block_size,
         );
         builder.set_tokens(tokens);
         builder.set_docs(docs);
@@ -2332,12 +2348,23 @@ impl FtsIndexConfig {
         column: String,
         params: InvertedIndexParams,
     ) -> Self {
-        Self {
+        Self::try_with_params(name, field_id, column, params)
+            .expect("invalid MemWAL FTS index config parameters")
+    }
+
+    pub fn try_with_params(
+        name: String,
+        field_id: i32,
+        column: String,
+        params: InvertedIndexParams,
+    ) -> Result<Self> {
+        params.validate_format_version()?;
+        Ok(Self {
             name,
             field_id,
             column,
             params,
-        }
+        })
     }
 }
 
@@ -4664,6 +4691,18 @@ mod tests {
         let builder = index.to_index_builder(42, 3).unwrap();
         // The builder can be consumed by callers; we just check it built.
         assert!(builder.id() > 0 || builder.id() == 42);
+    }
+
+    #[test]
+    fn test_to_index_builder_supports_block_size_256() {
+        let schema = create_test_schema();
+        let params = InvertedIndexParams::default().block_size(256).unwrap();
+        let index = FtsMemIndex::try_with_params(1, "description".to_string(), params).unwrap();
+        let batch = create_test_batch(&schema);
+        index.insert(&batch, 0).unwrap();
+
+        let builder = index.to_index_builder(42, 3).unwrap();
+        assert_eq!(builder.id(), 42);
     }
 
     #[test]

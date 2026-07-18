@@ -1113,7 +1113,7 @@ impl MergeInsertJob {
         // sort node so each input batch fits in the memory pool.
         let capped_plan = sorted_plan
             .transform_down(|node| {
-                if node.as_any().downcast_ref::<SortExec>().is_some() {
+                if node.downcast_ref::<SortExec>().is_some() {
                     let children = node.children();
                     let new_children: Vec<Arc<dyn ExecutionPlan>> = children
                         .into_iter()
@@ -1787,8 +1787,7 @@ impl MergeInsertJob {
 
         // Extract merge stats from the execution plan
         let (stats, transaction, affected_rows, inserted_rows_filter) = if let Some(full_exec) =
-            plan.as_any()
-                .downcast_ref::<exec::FullSchemaMergeInsertExec>()
+            plan.downcast_ref::<exec::FullSchemaMergeInsertExec>()
         {
             let stats = full_exec.merge_stats().ok_or_else(|| {
                 Error::internal("Merge stats not available - execution may not have completed")
@@ -1799,10 +1798,7 @@ impl MergeInsertJob {
             let affected_rows = full_exec.affected_rows().map(RowAddrTreeMap::from);
             let inserted_rows_filter = full_exec.inserted_rows_filter();
             (stats, transaction, affected_rows, inserted_rows_filter)
-        } else if let Some(delete_exec) = plan
-            .as_any()
-            .downcast_ref::<exec::DeleteOnlyMergeInsertExec>()
-        {
+        } else if let Some(delete_exec) = plan.downcast_ref::<exec::DeleteOnlyMergeInsertExec>() {
             let stats = delete_exec.merge_stats().ok_or_else(|| {
                 Error::internal("Merge stats not available - execution may not have completed")
             })?;
@@ -7920,7 +7916,12 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
         let plan = merge_insert_job.explain_plan(None, false).await.unwrap();
         assert!(plan.contains("HashJoinExec"));
         assert!(plan.contains("join_type=Full"));
-        assert!(plan.contains("projection=[_rowid"));
+        assert!(
+            plan.lines().any(|line| line.contains("HashJoinExec")
+                && line.contains("projection=[")
+                && line.contains("_rowid")),
+            "join should push down a projection that retains _rowid: {plan}"
+        );
         assert!(
             plan.contains("LanceRead: uri=") && plan.contains("projection=[id]"),
             "target-side scan should prune the FSL payload from the join build side: {plan}"
@@ -7988,7 +7989,12 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
         let plan = merge_insert_job.explain_plan(None, false).await.unwrap();
         assert!(plan.contains("HashJoinExec"));
         assert!(plan.contains("join_type=Full"));
-        assert!(plan.contains("projection=[_rowid"));
+        assert!(
+            plan.lines().any(|line| line.contains("HashJoinExec")
+                && line.contains("projection=[")
+                && line.contains("_rowid")),
+            "join should push down a projection that retains _rowid: {plan}"
+        );
         assert!(
             plan.contains("LanceRead: uri=") && plan.contains("projection=[id]"),
             "target-side scan should prune the FSL payload from the join build side even when a scalar index exists: {plan}"

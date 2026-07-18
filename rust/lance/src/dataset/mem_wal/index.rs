@@ -149,12 +149,12 @@ impl MemIndexConfig {
         };
         let params = params.format_version(Self::fts_format_version_from_metadata(index_meta)?);
 
-        Ok(Self::Fts(FtsIndexConfig::with_params(
+        Ok(Self::Fts(FtsIndexConfig::try_with_params(
             index_meta.name.clone(),
             field_id,
             column,
             params,
-        )))
+        )?))
     }
 
     /// Create an HNSW vector index config.
@@ -205,8 +205,9 @@ impl MemIndexConfig {
             // the maintained-index path can only write the modern format.
             0 | 1 => Ok(InvertedListFormatVersion::V1),
             2 => Ok(InvertedListFormatVersion::V2),
+            3 => Ok(InvertedListFormatVersion::V3),
             version => Err(Error::invalid_input(format!(
-                "FTS index '{}' has unsupported index_version {}; expected 0, 1, or 2",
+                "FTS index '{}' has unsupported index_version {}; expected 0, 1, 2, or 3",
                 index_meta.name, version
             ))),
         }
@@ -352,8 +353,11 @@ impl IndexStore {
                     registry.hnsw_indexes.insert(c.name.clone(), index);
                 }
                 MemIndexConfig::Fts(c) => {
-                    let index =
-                        FtsMemIndex::with_params(c.field_id, c.column.clone(), c.params.clone());
+                    let index = FtsMemIndex::try_with_params(
+                        c.field_id,
+                        c.column.clone(),
+                        c.params.clone(),
+                    )?;
                     registry.fts_indexes.insert(c.name.clone(), index);
                 }
             }
@@ -452,13 +456,16 @@ impl IndexStore {
         field_id: i32,
         column: String,
         params: InvertedIndexParams,
-    ) {
+    ) -> Result<()> {
         assert!(
             self.pk_index.is_none() || self.pk_is_empty(),
             "FTS indexes must be configured before inserting rows into a PK memtable"
         );
-        self.fts_indexes
-            .insert(name, FtsMemIndex::with_params(field_id, column, params));
+        self.fts_indexes.insert(
+            name,
+            FtsMemIndex::try_with_params(field_id, column, params)?,
+        );
+        Ok(())
     }
 
     /// Maintain a primary-key index so the memtable can answer "newest visible
@@ -1043,8 +1050,21 @@ mod tests {
     fn fts_index_metadata(index_version: i32) -> IndexMetadata {
         let details =
             pbold::InvertedIndexDetails::try_from(&InvertedIndexParams::default()).unwrap();
-        let mut value = Vec::new();
-        details.encode(&mut value).unwrap();
+        fts_index_metadata_with_details(index_version, Some(details))
+    }
+
+    fn fts_index_metadata_with_details(
+        index_version: i32,
+        details: Option<pbold::InvertedIndexDetails>,
+    ) -> IndexMetadata {
+        let index_details = details.map(|details| {
+            let mut value = Vec::new();
+            details.encode(&mut value).unwrap();
+            Arc::new(prost_types::Any {
+                type_url: "type.googleapis.com/lance.index.InvertedIndexDetails".to_string(),
+                value,
+            })
+        });
 
         IndexMetadata {
             uuid: Uuid::new_v4(),
@@ -1052,10 +1072,7 @@ mod tests {
             name: "desc_idx".to_string(),
             dataset_version: 1,
             fragment_bitmap: None,
-            index_details: Some(Arc::new(prost_types::Any {
-                type_url: "type.googleapis.com/lance.index.InvertedIndexDetails".to_string(),
-                value,
-            })),
+            index_details,
             index_version,
             created_at: None,
             base_id: None,
@@ -1386,11 +1403,69 @@ mod tests {
         let arrow_schema = create_test_schema();
         let schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
 
-        let err = MemIndexConfig::fts_from_metadata(&fts_index_metadata(3), &schema).unwrap_err();
+        let err = MemIndexConfig::fts_from_metadata(&fts_index_metadata(4), &schema).unwrap_err();
         assert!(
-            err.to_string().contains("unsupported index_version 3"),
+            err.to_string().contains("unsupported index_version 4"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn fts_from_metadata_rejects_v3_without_256_block_size() {
+        let arrow_schema = create_test_schema();
+        let schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
+
+        let missing_details =
+            MemIndexConfig::fts_from_metadata(&fts_index_metadata_with_details(3, None), &schema)
+                .unwrap_err();
+        assert!(
+            missing_details
+                .to_string()
+                .contains("requires block_size=256"),
+            "{missing_details}"
+        );
+        assert!(
+            missing_details.to_string().contains("got 128"),
+            "{missing_details}"
+        );
+
+        let default_details =
+            MemIndexConfig::fts_from_metadata(&fts_index_metadata(3), &schema).unwrap_err();
+        assert!(
+            default_details
+                .to_string()
+                .contains("requires block_size=256"),
+            "{default_details}"
+        );
+        assert!(
+            default_details.to_string().contains("got 128"),
+            "{default_details}"
+        );
+    }
+
+    #[test]
+    fn fts_from_metadata_accepts_v3_with_256_block_size() {
+        let arrow_schema = create_test_schema();
+        let schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
+        let params = InvertedIndexParams::default().block_size(256).unwrap();
+        let details = pbold::InvertedIndexDetails::try_from(&params).unwrap();
+
+        let config = MemIndexConfig::fts_from_metadata(
+            &fts_index_metadata_with_details(3, Some(details)),
+            &schema,
+        )
+        .unwrap();
+
+        match config {
+            MemIndexConfig::Fts(config) => {
+                assert_eq!(
+                    config.params.resolved_format_version(),
+                    InvertedListFormatVersion::V3
+                );
+                assert_eq!(config.params.posting_block_size(), 256);
+            }
+            _ => unreachable!("fts metadata should create an FTS config"),
+        }
     }
 
     #[test]

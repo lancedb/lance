@@ -31,7 +31,7 @@ from lance._dataset.sharded_batch_iterator import ShardedBatchIterator
 from lance.commit import CommitConflictError
 from lance.dataset import LANCE_COMMIT_MESSAGE_KEY, AutoCleanupConfig
 from lance.debug import format_fragment
-from lance.file import stable_version
+from lance.file import LanceFileWriter, stable_version
 from lance.schema import LanceSchema
 from lance.util import validate_vector_index
 
@@ -4961,6 +4961,281 @@ def test_data_replacement(tmp_path: Path):
         }
     )
     assert tbl == expected
+
+
+def _write_overlay_file(
+    dataset, base_dir: Path, name: str, batch: pa.Table, fields: List[int]
+):
+    """Write an overlay value file (one value column per covered field, no key
+    column) and return a DataFile mapping its columns to the given dataset
+    `fields`. The file version is copied from a base data file."""
+    path = base_dir / "data" / name
+    with LanceFileWriter(str(path)) as writer:
+        writer.write_batch(batch)
+    base_df = dataset.get_fragments()[0].metadata.files[0]
+    return lance.fragment.DataFile(
+        path=name,
+        fields=fields,
+        column_indices=list(range(len(fields))),
+        file_major_version=base_df.file_major_version,
+        file_minor_version=base_df.file_minor_version,
+        file_size_bytes=os.path.getsize(path),
+    )
+
+
+def test_data_overlay_dense(tmp_path: Path):
+    base_dir = tmp_path / "test"
+    table = pa.table(
+        {
+            "id": pa.array(range(10), pa.int32()),
+            "val": pa.array([i * 10 for i in range(10)], pa.int32()),
+        }
+    )
+    dataset = lance.write_dataset(table, base_dir)
+
+    # Overlay `val` at physical offsets {1, 4} with new values.
+    data_file = _write_overlay_file(
+        dataset,
+        base_dir,
+        "ov.lance",
+        pa.table({"val": pa.array([111, 444], pa.int32())}),
+        fields=[1],
+    )
+    assert data_file.fields == [1]  # `val` is field id 1
+
+    overlay = lance.LanceOperation.DataOverlayFile(data_file, offsets=[1, 4])
+    op = lance.LanceOperation.DataOverlay(
+        [lance.LanceOperation.DataOverlayGroup(0, [overlay])]
+    )
+    dataset = lance.LanceDataset.commit(dataset, op, read_version=dataset.version)
+
+    result = dataset.to_table()
+    assert result.column("val").to_pylist() == [0, 111, 20, 30, 444, 50, 60, 70, 80, 90]
+    # The unrelated `id` column is untouched.
+    assert result.column("id").to_pylist() == list(range(10))
+
+
+def test_data_overlay_newest_wins(tmp_path: Path):
+    base_dir = tmp_path / "test"
+    table = pa.table(
+        {
+            "id": pa.array(range(10), pa.int32()),
+            "val": pa.array([i * 10 for i in range(10)], pa.int32()),
+        }
+    )
+    dataset = lance.write_dataset(table, base_dir)
+
+    older = _write_overlay_file(
+        dataset,
+        base_dir,
+        "older.lance",
+        pa.table({"val": pa.array([111, 444], pa.int32())}),
+        fields=[1],
+    )
+    dataset = lance.LanceDataset.commit(
+        dataset,
+        lance.LanceOperation.DataOverlay(
+            [
+                lance.LanceOperation.DataOverlayGroup(
+                    0,
+                    [lance.LanceOperation.DataOverlayFile(older, offsets=[1, 4])],
+                )
+            ]
+        ),
+        read_version=dataset.version,
+    )
+    # A newer overlay re-covers offset 1; it must win there.
+    newer = _write_overlay_file(
+        dataset,
+        base_dir,
+        "newer.lance",
+        pa.table({"val": pa.array([999], pa.int32())}),
+        fields=[1],
+    )
+    dataset = lance.LanceDataset.commit(
+        dataset,
+        lance.LanceOperation.DataOverlay(
+            [
+                lance.LanceOperation.DataOverlayGroup(
+                    0, [lance.LanceOperation.DataOverlayFile(newer, offsets=[1])]
+                )
+            ]
+        ),
+        read_version=dataset.version,
+    )
+
+    val = dataset.to_table().column("val").to_pylist()
+    assert val[1] == 999  # newest overlay wins
+    assert val[4] == 444  # only the older overlay covers offset 4
+
+
+def test_data_overlay_sparse_per_field(tmp_path: Path):
+    base_dir = tmp_path / "test"
+    table = pa.table(
+        {
+            "id": pa.array(range(10), pa.int32()),
+            "val": pa.array([i * 10 for i in range(10)], pa.int32()),
+        }
+    )
+    dataset = lance.write_dataset(table, base_dir)
+
+    # Sparse overlay: `id` covers offset {2}, `val` covers offset {3}. The value
+    # file carries one value per field (rank 0 of each field's coverage).
+    data_file = _write_overlay_file(
+        dataset,
+        base_dir,
+        "sparse.lance",
+        pa.table(
+            {
+                "id": pa.array([777], pa.int32()),
+                "val": pa.array([330], pa.int32()),
+            }
+        ),
+        fields=[0, 1],
+    )
+    assert data_file.fields == [0, 1]
+
+    overlay = lance.LanceOperation.DataOverlayFile(data_file, offsets=[[2], [3]])
+    op = lance.LanceOperation.DataOverlay(
+        [lance.LanceOperation.DataOverlayGroup(0, [overlay])]
+    )
+    dataset = lance.LanceDataset.commit(dataset, op, read_version=dataset.version)
+
+    result = dataset.to_table()
+    assert result.column("id").to_pylist()[2] == 777
+    assert result.column("val").to_pylist()[3] == 330
+    # Fields resolve independently: id at offset 3 and val at offset 2 fall through.
+    assert result.column("id").to_pylist()[3] == 3
+    assert result.column("val").to_pylist()[2] == 20
+
+
+def test_data_overlay_round_trips_through_fragment_metadata(tmp_path: Path):
+    import json
+
+    base_dir = tmp_path / "test"
+    table = pa.table(
+        {
+            "id": pa.array(range(10), pa.int32()),
+            "val": pa.array([i * 10 for i in range(10)], pa.int32()),
+        }
+    )
+    dataset = lance.write_dataset(table, base_dir)
+
+    data_file = _write_overlay_file(
+        dataset,
+        base_dir,
+        "ov.lance",
+        pa.table({"val": pa.array([111, 444], pa.int32())}),
+        fields=[1],
+    )
+    overlay = lance.LanceOperation.DataOverlayFile(data_file, offsets=[1, 4])
+    dataset = lance.LanceDataset.commit(
+        dataset,
+        lance.LanceOperation.DataOverlay(
+            [lance.LanceOperation.DataOverlayGroup(0, [overlay])]
+        ),
+        read_version=dataset.version,
+    )
+    overlay_version = dataset.version
+
+    # Reading the fragment surfaces its overlays, stamped with the commit version.
+    metadata = dataset.get_fragments()[0].metadata
+    assert len(metadata.overlays) == 1
+    assert metadata.overlays[0].offsets == [1, 4]
+    assert metadata.overlays[0].committed_version == overlay_version
+
+    # The overlays survive a JSON round-trip of the metadata.
+    restored = lance.fragment.FragmentMetadata.from_json(json.dumps(metadata.to_json()))
+    assert len(restored.overlays) == 1
+    assert restored.overlays[0].offsets == [1, 4]
+    assert restored.overlays[0].committed_version == overlay_version
+
+    # A commit that round-trips the fragment (here an Overwrite) must keep the
+    # overlays, so the overlay still resolves on read instead of being dropped.
+    dataset = lance.LanceDataset.commit(
+        dataset,
+        lance.LanceOperation.Overwrite(dataset.schema, [restored]),
+        read_version=dataset.version,
+    )
+    result = dataset.to_table()
+    assert result.column("val").to_pylist() == [0, 111, 20, 30, 444, 50, 60, 70, 80, 90]
+    assert result.column("id").to_pylist() == list(range(10))
+
+
+def test_data_overlay_rejects_invalid_offsets(tmp_path: Path):
+    base_dir = tmp_path / "test"
+    table = pa.table({"val": pa.array([0, 1, 2], pa.int32())})
+    dataset = lance.write_dataset(table, base_dir)
+    data_file = _write_overlay_file(
+        dataset,
+        base_dir,
+        "ov.lance",
+        pa.table({"val": pa.array([9], pa.int32())}),
+        fields=[0],
+    )
+
+    # offsets is neither a flat list of ints (dense) nor a list of per-field int
+    # lists (sparse), so the coverage shape can't be resolved.
+    with pytest.raises(ValueError, match="offsets must be a list"):
+        lance.LanceDataset.commit(
+            dataset,
+            lance.LanceOperation.DataOverlay(
+                [
+                    lance.LanceOperation.DataOverlayGroup(
+                        0,
+                        [
+                            lance.LanceOperation.DataOverlayFile(
+                                data_file, offsets=[0, [1]]
+                            )
+                        ],
+                    )
+                ]
+            ),
+            read_version=dataset.version,
+        )
+
+
+@pytest.mark.parametrize(
+    "offsets",
+    [
+        [2, 1],  # dense, descending
+        [1, 1],  # dense, duplicate
+        [[2, 1]],  # sparse, descending
+        [[1, 1]],  # sparse, duplicate
+    ],
+)
+def test_data_overlay_rejects_unsorted_offsets(tmp_path: Path, offsets):
+    # Offsets map positionally to value rows in data_file. A RoaringBitmap would
+    # silently reorder/dedup them, so a non-ascending list must be rejected up
+    # front rather than corrupting the row mapping.
+    base_dir = tmp_path / "test"
+    table = pa.table({"val": pa.array([0, 1, 2], pa.int32())})
+    dataset = lance.write_dataset(table, base_dir)
+    data_file = _write_overlay_file(
+        dataset,
+        base_dir,
+        "ov.lance",
+        pa.table({"val": pa.array([9, 9], pa.int32())}),
+        fields=[0],
+    )
+
+    with pytest.raises(ValueError, match="strictly ascending"):
+        lance.LanceDataset.commit(
+            dataset,
+            lance.LanceOperation.DataOverlay(
+                [
+                    lance.LanceOperation.DataOverlayGroup(
+                        0,
+                        [
+                            lance.LanceOperation.DataOverlayFile(
+                                data_file, offsets=offsets
+                            )
+                        ],
+                    )
+                ]
+            ),
+            read_version=dataset.version,
+        )
 
 
 def test_schema_project_drop_column(tmp_path: Path):

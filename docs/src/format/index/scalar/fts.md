@@ -43,6 +43,8 @@ An FTS index may contain multiple partitions. Each partition has its own set of 
 | `_length`              | UInt32                  | false    | Number of documents containing the token                         |
 | `_compressed_position` | List<List<LargeBinary>> | true     | Optional compressed position lists for phrase queries            |
 
+The posting-list file schema metadata includes `posting_block_size`, the number of documents encoded per compressed posting block. Older indexes that do not have this metadata use the legacy block size `128`.
+
 ### Metadata File Schema
 
 The metadata file contains JSON-serialized configuration and partition information:
@@ -67,6 +69,7 @@ The metadata file contains JSON-serialized configuration and partition informati
 | `min_gram`          | UInt32  | 2         | Minimum n-gram length (only for ngram tokenizer)               |
 | `max_gram`          | UInt32  | 15        | Maximum n-gram length (only for ngram tokenizer)               |
 | `prefix_only`       | Boolean | false     | Generate only prefix n-grams (only for ngram tokenizer)        |
+| `block_size`        | UInt32  | 128       | Documents per compressed posting block. Must be 128 or 256. Missing values from older indexes read as 128. `256` is experimental and may introduce breaking changes. |
 
 ## Tokenizers
 

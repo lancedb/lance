@@ -199,6 +199,10 @@ fn select_backend() -> CosineU8AccumFn {
         if is_x86_feature_detected!("avx2") {
             return |a, b| unsafe { x86::cosine_u8_accum_avx2(a, b) };
         }
+        // AvxFma and Avx hosts (AMD Piledriver / Steamroller, Intel Sandy
+        // Bridge / Ivy Bridge) fall through to scalar: the AVX2 inner uses
+        // `vpmaddubsw` / `vpmaddwd` integer ops which neither AVX nor
+        // AVX+FMA provides.
     }
 
     cosine_u8_accum_scalar
