@@ -1202,11 +1202,6 @@ pub async fn merge_partial_vector_auxiliary_files(
                 };
                 let mut pm: ProductQuantizationMetadata = serde_json::from_str(&pm_json)
                     .map_err(|e| Error::index(format!("PQ metadata parse error: {}", e)))?;
-                if pm.transposed {
-                    return Err(Error::index(format!(
-                        "Distributed PQ merge: source shard {idx} stores transposed PQ codes; expected row-major distributed shard"
-                    )));
-                }
                 // Load codebook from global buffer if not present
                 if pm.codebook.is_none() {
                     let tensor_bytes = reader
