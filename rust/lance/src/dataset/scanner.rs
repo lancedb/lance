@@ -9077,6 +9077,56 @@ mod test {
                 "expected ngram index usage for `{filter}`, got plan:\n{plan_str}"
             );
         }
+
+        // contains with >= 3 characters (uses index)
+        assert_eq!(
+            matched(&dataset, "contains(s, 'rhino')").await,
+            ["rhino", "rhino horn", "rhinos nose"]
+        );
+        assert_eq!(
+            matched(&dataset, "contains(s, 'cat')").await,
+            ["cat", "cat dog", "catalog", "category", "scatter"]
+        );
+
+        // contains with < 3 characters (must NOT use index, i.e., falls back to full scan, and returns correct results)
+        assert_eq!(
+            matched(&dataset, "contains(s, 'ca')").await,
+            ["cat", "cat dog", "catalog", "category", "scatter"]
+        );
+        assert_eq!(
+            matched(&dataset, "contains(s, 'a')").await,
+            [
+                "cat", "cat dog", "catalog", "category", "dogma", "elephant", "scatter"
+            ]
+        );
+
+        // Verify index is used for contains >= 3 characters, but NOT used for < 3 characters
+        for filter in ["contains(s, 'rhino')", "contains(s, 'cat')"] {
+            let mut scan = dataset.scan();
+            scan.filter(filter).unwrap();
+            let plan = scan.create_plan().await.unwrap();
+            let plan_str = format!(
+                "{}",
+                datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
+            );
+            assert!(
+                plan_str.contains("ScalarIndexQuery") && plan_str.contains("NGram"),
+                "expected ngram index usage for `{filter}`, got plan:\n{plan_str}"
+            );
+        }
+        for filter in ["contains(s, 'ca')", "contains(s, 'a')"] {
+            let mut scan = dataset.scan();
+            scan.filter(filter).unwrap();
+            let plan = scan.create_plan().await.unwrap();
+            let plan_str = format!(
+                "{}",
+                datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
+            );
+            assert!(
+                !plan_str.contains("ScalarIndexQuery"),
+                "expected NO ngram index usage for `{filter}`, got plan:\n{plan_str}"
+            );
+        }
     }
 
     #[tokio::test]
