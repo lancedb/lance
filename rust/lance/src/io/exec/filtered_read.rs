@@ -7,10 +7,14 @@ use std::{ops::Range, sync::Arc};
 
 use arrow_array::RecordBatch;
 use arrow_schema::{Schema as ArrowSchema, SchemaRef};
+use datafusion::common::config::ConfigOptions;
 use datafusion::common::runtime::SpawnedTask;
 use datafusion::common::stats::Precision;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::physical_plan::filter_pushdown::{
+    ChildPushdownResult, FilterPushdownPhase, FilterPushdownPropagation, PushedDown,
+};
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::stream::{RecordBatchReceiverStream, RecordBatchStreamAdapter};
 use datafusion::physical_plan::{
@@ -18,7 +22,8 @@ use datafusion::physical_plan::{
     execution_plan::{Boundedness, EmissionType},
 };
 use datafusion_expr::Expr;
-use datafusion_physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr};
+use datafusion_physical_expr::utils::collect_columns;
+use datafusion_physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr, conjunction};
 use datafusion_physical_plan::Statistics;
 use datafusion_physical_plan::filter::FilterExec;
 use datafusion_physical_plan::metrics::{BaselineMetrics, Count, MetricsSet, Time};
@@ -1358,6 +1363,21 @@ impl FilteredReadStream {
         }
     }
 
+    // Apply filters pushed down from parent operators to the fully-projected output
+    // batches. `predicate` references only output columns, so it is applied after the
+    // read/projection stage rather than fused into the per-fragment scan filter.
+    fn apply_pushdown_filters(
+        stream: SendableRecordBatchStream,
+        predicate: Arc<dyn PhysicalExpr>,
+    ) -> SendableRecordBatchStream {
+        let schema = stream.schema();
+        let filtered = stream.map(move |batch| {
+            let batch = batch?;
+            datafusion_physical_plan::filter::batch_filter(&batch, &predicate)
+        });
+        Box::pin(RecordBatchStreamAdapter::new(schema, filtered))
+    }
+
     fn apply_soft_limit<S>(stream: S, limit: u64) -> impl Stream<Item = Result<ReadBatchFut>>
     where
         S: Stream<Item = Result<ReadBatchFut>>,
@@ -1689,6 +1709,12 @@ pub struct FilteredReadExec {
     // When execute is first called we will initialize the FilteredReadStream.  In order to support
     // multiple partitions, each partition will share the stream.
     running_stream: Arc<AsyncMutex<Option<FilteredReadStream>>>,
+    // Filters pushed down from parent operators via DataFusion's physical filter-pushdown
+    // protocol (e.g. TopK / hash-join dynamic filters). These are evaluated against the
+    // output schema per batch at execute time. Because a dynamic filter can tighten during
+    // execution (a TopK threshold moves as its heap fills), we re-read the current predicate
+    // on every batch rather than snapshotting it at plan time.
+    pushdown_filters: Vec<Arc<dyn PhysicalExpr>>,
 }
 
 /// Public plan for distributed execution - uses bitmap for flexibility
@@ -1814,6 +1840,7 @@ impl FilteredReadExec {
             metrics,
             index_input,
             plan: Arc::new(OnceCell::new()),
+            pushdown_filters: Vec::new(),
         })
     }
 
@@ -1950,6 +1977,12 @@ impl FilteredReadExec {
         let metrics = self.metrics.clone();
         let index_input = self.index_input.clone();
         let plan_cell = self.plan.clone();
+        // A conjunction of the filters pushed down from parent operators. Built once, but
+        // evaluated per batch: a `DynamicFilterPhysicalExpr` re-reads its current (possibly
+        // tightened) predicate on every `evaluate`, so a TopK threshold that moves during
+        // execution is honored without rebuilding this expression.
+        let pushdown_predicate = (!self.pushdown_filters.is_empty())
+            .then(|| conjunction(self.pushdown_filters.iter().cloned()));
 
         let stream = futures::stream::once(async move {
             let mut running_stream = running_stream_lock.lock().await;
@@ -2011,6 +2044,10 @@ impl FilteredReadExec {
                 }
                 (None, None) => inner,
             };
+            let stream = match pushdown_predicate {
+                Some(predicate) => FilteredReadStream::apply_pushdown_filters(stream, predicate),
+                None => stream,
+            };
             DataFusionResult::<SendableRecordBatchStream>::Ok(stream)
         })
         .try_flatten();
@@ -2047,11 +2084,22 @@ impl DisplayAs for FilteredReadExec {
             .map(|f| f.name.as_str())
             .collect::<Vec<_>>()
             .join(", ");
+        let pushdown_filters = if self.pushdown_filters.is_empty() {
+            String::new()
+        } else {
+            let exprs = self
+                .pushdown_filters
+                .iter()
+                .map(|f| f.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(", pushdown_filters=[{exprs}]")
+        };
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(
                     f,
-                    "LanceRead: uri={}, projection=[{}], num_fragments={}, range_before={:?}, range_after={:?}, row_id={}, row_addr={}, full_filter={}, refine_filter={}",
+                    "LanceRead: uri={}, projection=[{}], num_fragments={}, range_before={:?}, range_after={:?}, row_id={}, row_addr={}, full_filter={}, refine_filter={}{}",
                     self.dataset.data_dir(),
                     columns,
                     self.options
@@ -2073,12 +2121,13 @@ impl DisplayAs for FilteredReadExec {
                         .as_ref()
                         .map(|i| i.to_string())
                         .unwrap_or("--".to_string()),
+                    pushdown_filters,
                 )
             }
             DisplayFormatType::TreeRender => {
                 write!(
                     f,
-                    "LanceRead\nuri={}\nprojection=[{}]\nnum_fragments={}\nrange_before={:?}\nrange_after={:?}\nrow_id={}\nrow_addr={}\nfull_filter={}\nrefine_filter={}",
+                    "LanceRead\nuri={}\nprojection=[{}]\nnum_fragments={}\nrange_before={:?}\nrange_after={:?}\nrow_id={}\nrow_addr={}\nfull_filter={}\nrefine_filter={}{}",
                     self.dataset.data_dir(),
                     columns,
                     self.options
@@ -2100,6 +2149,7 @@ impl DisplayAs for FilteredReadExec {
                         .as_ref()
                         .map(|i| i.to_string())
                         .unwrap_or("true".to_string()),
+                    pushdown_filters,
                 )
             }
         }
@@ -2264,6 +2314,7 @@ impl ExecutionPlan for FilteredReadExec {
                 running_stream: Arc::new(AsyncMutex::new(None)),
                 index_input,
                 plan: Arc::new(OnceCell::new()),
+                pushdown_filters: self.pushdown_filters.clone(),
             }))
         }
     }
@@ -2330,7 +2381,10 @@ impl ExecutionPlan for FilteredReadExec {
             updated_options,
             self.index_input.clone(),
         ) {
-            Ok(exec) => Some(Arc::new(exec)),
+            Ok(mut exec) => {
+                exec.pushdown_filters = self.pushdown_filters.clone();
+                Some(Arc::new(exec))
+            }
             Err(e) => {
                 log::warn!(
                     "Failed to create FilteredReadExec for {} with fetch limit: {}",
@@ -2340,6 +2394,69 @@ impl ExecutionPlan for FilteredReadExec {
                 None
             }
         }
+    }
+
+    // We accept filters offered by our parents (the routing/analysis happens in the
+    // parent's `gather_filters_for_pushdown`, so by the time they reach us they are
+    // already remapped to our output schema). We absorb any filter whose columns are
+    // all produced by this scan and apply it per batch at execute time. This mirrors
+    // `DataSourceExec`, which likewise leaves `gather_filters_for_pushdown` at its
+    // default and does all the work here.
+    fn handle_child_pushdown_result(
+        &self,
+        phase: FilterPushdownPhase,
+        child_pushdown_result: ChildPushdownResult,
+        _config: &ConfigOptions,
+    ) -> DataFusionResult<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
+        // Only absorb Post-phase filters (dynamic filters from TopK / hash joins). Pre-phase
+        // static predicates are already handled by Lance's logical filter plan (baked into
+        // `full_filter`), so absorbing them here would double-apply. This also keeps the scan
+        // out of the way of static filter pushdown on the merge_insert path, which runs the
+        // default DataFusion optimizer (both phases).
+        if phase != FilterPushdownPhase::Post {
+            return Ok(FilterPushdownPropagation::if_all(child_pushdown_result));
+        }
+
+        let output_schema = self.schema();
+        let column_in_schema = |column: &datafusion_physical_expr::expressions::Column| {
+            output_schema
+                .fields()
+                .get(column.index())
+                .is_some_and(|field| field.name() == column.name())
+        };
+
+        let mut new_filters = self.pushdown_filters.clone();
+        let mut support = Vec::with_capacity(child_pushdown_result.parent_filters.len());
+        let mut absorbed_any = false;
+        for parent in &child_pushdown_result.parent_filters {
+            let evaluable = collect_columns(&parent.filter).iter().all(column_in_schema);
+            if evaluable {
+                new_filters.push(Arc::clone(&parent.filter));
+                support.push(PushedDown::Yes);
+                absorbed_any = true;
+            } else {
+                support.push(PushedDown::No);
+            }
+        }
+
+        if !absorbed_any {
+            return Ok(FilterPushdownPropagation::if_all(child_pushdown_result));
+        }
+
+        let new_node = Arc::new(Self {
+            dataset: self.dataset.clone(),
+            options: self.options.clone(),
+            properties: self.properties.clone(),
+            metrics: self.metrics.clone(),
+            index_input: self.index_input.clone(),
+            plan: Arc::new(OnceCell::new()),
+            running_stream: Arc::new(AsyncMutex::new(None)),
+            pushdown_filters: new_filters,
+        });
+        Ok(
+            FilterPushdownPropagation::with_parent_pushdown_result(support)
+                .with_updated_node(new_node as Arc<dyn ExecutionPlan>),
+        )
     }
 }
 
@@ -4172,5 +4289,105 @@ mod tests {
         let capped_result = concat_batches(&schema2, &batches2).unwrap();
 
         assert_eq!(default_result.num_rows(), capped_result.num_rows());
+    }
+
+    async fn dataset_with_value_column() -> (TempStrDir, Arc<Dataset>) {
+        use arrow_array::Int64Array;
+        let tmp = TempStrDir::default();
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "value",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from_iter_values(0..200))],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema.clone());
+        let dataset = Dataset::write(reader, tmp.as_str(), None).await.unwrap();
+        (tmp, Arc::new(dataset))
+    }
+
+    #[tokio::test]
+    async fn test_handle_child_pushdown_result_absorbs_dynamic_filter() {
+        use datafusion::physical_plan::display::DisplayableExecutionPlan;
+        use datafusion_expr::Operator;
+        use datafusion_physical_expr::expressions::{
+            BinaryExpr, DynamicFilterPhysicalExpr, col, lit,
+        };
+        use datafusion_physical_plan::filter_pushdown::{
+            ChildFilterPushdownResult, ChildPushdownResult,
+        };
+
+        let (_tmp, dataset) = dataset_with_value_column().await;
+        let options = FilteredReadOptions::basic_full_read(&dataset);
+        let exec = Arc::new(FilteredReadExec::try_new(dataset.clone(), options, None).unwrap());
+
+        let schema = exec.schema();
+        let value_col = col("value", &schema).unwrap();
+        // A dynamic filter starts as `true` (nothing pruned) and is tightened by its producer.
+        let dynamic = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![Arc::clone(&value_col)],
+            lit(true),
+        ));
+        let dynamic_expr: Arc<dyn PhysicalExpr> = dynamic.clone();
+
+        let offer = |phase| {
+            (exec.clone() as Arc<dyn ExecutionPlan>).handle_child_pushdown_result(
+                phase,
+                ChildPushdownResult {
+                    parent_filters: vec![ChildFilterPushdownResult {
+                        filter: Arc::clone(&dynamic_expr),
+                        child_results: vec![],
+                    }],
+                    self_filters: vec![],
+                },
+                &ConfigOptions::default(),
+            )
+        };
+
+        // Pre phase is declined: static filters remain the logical plan's responsibility.
+        let pre = offer(FilterPushdownPhase::Pre).unwrap();
+        assert!(pre.updated_node.is_none());
+        assert!(matches!(pre.filters.as_slice(), [PushedDown::No]));
+
+        // Post phase absorbs the dynamic filter and rewrites the node. Each call returns an
+        // independent node (fresh cached stream), so we build one per execution below.
+        let post = offer(FilterPushdownPhase::Post).unwrap();
+        assert!(matches!(post.filters.as_slice(), [PushedDown::Yes]));
+        let node_before = post.updated_node.expect("node should be rewritten");
+        assert!(
+            format!(
+                "{}",
+                DisplayableExecutionPlan::new(node_before.as_ref()).one_line()
+            )
+            .contains("pushdown_filters=["),
+            "rewritten node should display the absorbed filter"
+        );
+        let node_after = offer(FilterPushdownPhase::Post)
+            .unwrap()
+            .updated_node
+            .unwrap();
+
+        // While the filter is still `true`, nothing is dropped.
+        assert_eq!(execute_and_count(&node_before).await, 200);
+
+        // The predicate is read at execute time, so tightening it after pushdown (as a TopK /
+        // hash join would once its threshold / build side is known) takes effect: only value < 50.
+        dynamic
+            .update(Arc::new(BinaryExpr::new(
+                value_col,
+                Operator::Lt,
+                lit(50i64),
+            )))
+            .unwrap();
+        assert_eq!(execute_and_count(&node_after).await, 50);
+    }
+
+    async fn execute_and_count(plan: &Arc<dyn ExecutionPlan>) -> usize {
+        let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+        batches.iter().map(|b| b.num_rows()).sum()
     }
 }

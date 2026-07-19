@@ -12457,6 +12457,81 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
     }
 
     #[tokio::test]
+    async fn test_topk_dynamic_filter_pushdown() {
+        // A `SortExec` with a fetch (TopK) produces a dynamic filter that DataFusion's
+        // Post-phase `FilterPushdown` rule threads down into `FilteredReadExec`. This checks
+        // both that the filter reaches the scan and that the results stay correct (the pushed
+        // filter must never drop a row that belongs in the top-k).
+        use arrow_array::Int64Array;
+        let n = 4000i64;
+        // Distinct values that decrease as rows are written, so the ordering does not match the
+        // physical row order and the top-k spans every fragment.
+        let id_array = Int64Array::from_iter_values(0..n);
+        let value_array = Int64Array::from_iter_values((0..n).map(|i| n - i));
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int64, false),
+            ArrowField::new("value", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(id_array), Arc::new(value_array)],
+        )
+        .unwrap();
+        let test_dir = TempStrDir::default();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema.clone());
+        let dataset = Dataset::write(
+            reader,
+            &test_dir,
+            Some(WriteParams {
+                max_rows_per_file: 1000,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.fragments().len(), 4);
+
+        let make_scanner = || {
+            let mut scanner = dataset.scan();
+            scanner
+                .project(&["id", "value"])
+                .unwrap()
+                .order_by(Some(vec![ColumnOrdering {
+                    column_name: "value".to_string(),
+                    ascending: true,
+                    nulls_first: true,
+                }]))
+                .unwrap();
+            scanner.limit(Some(10), None).unwrap();
+            scanner
+        };
+
+        // The dynamic filter is threaded into the LanceRead node.
+        let plan = make_scanner().explain_plan(true).await.unwrap();
+        assert!(
+            plan.contains("pushdown_filters=[DynamicFilter"),
+            "expected a pushed-down dynamic filter on LanceRead, got plan:\n{plan}"
+        );
+
+        // Results are the ten smallest values, in order, regardless of the pushed filter.
+        let batches = make_scanner()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let batch = concat_batches(&batches[0].schema(), &batches).unwrap();
+        assert_eq!(batch.num_rows(), 10);
+        let values = batch
+            .column_by_name("value")
+            .unwrap()
+            .as_primitive::<Int64Type>()
+            .values();
+        assert_eq!(values, &(1..=10).collect::<Vec<i64>>());
+    }
+
+    #[tokio::test]
     async fn test_limit_with_ordering_not_pushed_down() {
         // This test verifies the fix for a bug where limit/offset could be pushed down
         // even when ordering was specified. When ordering is present, we need to load

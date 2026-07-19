@@ -180,5 +180,15 @@ pub fn get_physical_optimizer() -> PhysicalOptimizer {
         // Insert exchange nodes (RepartitionExec, CoalescePartitionsExec) where needed
         // to satisfy distribution requirements as exec nodes migrate to multi-partition output.
         Arc::new(datafusion::physical_optimizer::enforce_distribution::EnforceDistribution::new()),
+        // Post-phase filter pushdown wires the dynamic filters produced by upstream operators
+        // (e.g. a TopK `SortExec` or a hash join) into `FilteredReadExec`, so the scan can drop
+        // rows before they flow up into a downstream `TakeExec` / sort. Runs last (after
+        // `LimitPushdown` has turned `SortExec` into a TopK that emits a dynamic filter). Only
+        // the Post phase is installed: static `WHERE` predicates are already handled by Lance's
+        // logical filter plan, and running the Pre phase here would double-apply them.
+        Arc::new(
+            datafusion::physical_optimizer::filter_pushdown::FilterPushdown::new_post_optimization(
+            ),
+        ),
     ])
 }
