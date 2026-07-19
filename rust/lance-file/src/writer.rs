@@ -272,7 +272,13 @@ pub(crate) fn verify_field_nullability(
             // count of nulls it adds on top of the mask is the count of nulls
             // not covered by a null ancestor.
             (Some(nulls), Some(mask)) => NullBuffer::union(Some(nulls), Some(mask))
-                .map(|combined| combined.null_count() - mask.null_count())
+                .map(|combined| {
+                    debug_assert!(
+                        combined.null_count() >= mask.null_count(),
+                        "the union of two null buffers cannot have fewer nulls than either input"
+                    );
+                    combined.null_count() - mask.null_count()
+                })
                 .unwrap_or(0),
             _ => arr.null_count(),
         };
@@ -1798,6 +1804,135 @@ mod tests {
         )]));
         let bad_batch =
             RecordBatch::try_new(bad_schema, vec![Arc::new(bad_position) as ArrayRef]).unwrap();
+
+        let fs = FsFixture::default();
+        let mut writer = FileWriter::try_new(
+            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            lance_schema,
+            options,
+        )
+        .unwrap();
+        let err = writer
+            .write_batch(&bad_batch)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("non-null"),
+            "expected nullability error, got: {err}"
+        );
+    }
+
+    /// The masked-null acceptance recurses through nested structs: a null at
+    /// any depth is accepted as long as some ancestor struct masks it, and the
+    /// mask accumulates across levels (grandparent ∪ parent).  Nulls that no
+    /// ancestor masks are still rejected, at any depth.
+    #[tokio::test]
+    async fn test_masked_nulls_in_nested_structs() {
+        use crate::testing::read_lance_file;
+        use arrow_array::{Array, Float64Array, StructArray, cast::AsArray};
+        use arrow_buffer::NullBuffer;
+        use arrow_schema::Fields;
+        use lance_encoding::decoder::FilterExpression;
+
+        // outer (nullable) > mid (non-null struct) > x (non-null f64)
+        let leaf_fields = Fields::from(vec![ArrowField::new("x", DataType::Float64, false)]);
+        let mid_field = ArrowField::new("mid", DataType::Struct(leaf_fields.clone()), false);
+        let outer_fields = Fields::from(vec![mid_field]);
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "outer",
+            DataType::Struct(outer_fields.clone()),
+            true,
+        )]));
+        let lance_schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
+
+        // Rows 1 and 3 are null outer structs; mid and x carry nulls at exactly
+        // those slots — masked only by the GRANDPARENT (outer), which exercises
+        // the accumulated ancestor mask on the recursive path.
+        let xs = Float64Array::from(vec![Some(1.0), None, Some(3.0), None, Some(5.0)]);
+        let outer_nulls = NullBuffer::from(vec![true, false, true, false, true]);
+        let mid = StructArray::try_new(
+            leaf_fields.clone(),
+            vec![Arc::new(xs) as ArrayRef],
+            Some(outer_nulls.clone()),
+        )
+        .unwrap();
+        let outer = StructArray::try_new(
+            outer_fields,
+            vec![Arc::new(mid) as ArrayRef],
+            Some(outer_nulls),
+        )
+        .unwrap();
+        let batch = RecordBatch::try_new(arrow_schema, vec![Arc::new(outer) as ArrayRef]).unwrap();
+
+        let fs = FsFixture::default();
+        let options = FileWriterOptions {
+            format_version: Some(LanceFileVersion::V2_1),
+            ..Default::default()
+        };
+        let mut writer = FileWriter::try_new(
+            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            lance_schema.clone(),
+            options.clone(),
+        )
+        .unwrap();
+        writer.write_batch(&batch).await.unwrap();
+        writer.add_schema_metadata("foo", "bar");
+        writer.finish().await.unwrap();
+
+        let batches = read_lance_file(
+            &fs,
+            Arc::<DecoderPlugins>::default(),
+            FilterExpression::no_filter(),
+        )
+        .await;
+        assert_eq!(batches.len(), 1);
+        let outer = batches[0].column(0).as_struct();
+        let mid = outer.column(0).as_struct();
+        let xs = mid.column(0).as_primitive::<Float64Type>();
+        for (idx, valid, x) in [
+            (0, true, 1.0),
+            (1, false, 0.0),
+            (2, true, 3.0),
+            (3, false, 0.0),
+            (4, true, 5.0),
+        ] {
+            assert_eq!(outer.is_valid(idx), valid);
+            if valid {
+                assert_eq!(xs.value(idx), x);
+            }
+        }
+
+        // A leaf null under VALID outer and mid structs is unmasked at every
+        // level and stays rejected.  (Arrow refuses to build that shape with
+        // non-nullable fields, so declare them nullable on the arrays and let
+        // the writer validate against its schema.)
+        let leaf_nullable = Fields::from(vec![ArrowField::new("x", DataType::Float64, true)]);
+        let mid_nullable = Fields::from(vec![ArrowField::new(
+            "mid",
+            DataType::Struct(leaf_nullable.clone()),
+            true,
+        )]);
+        let xs = Float64Array::from(vec![Some(1.0), None]);
+        let mid = StructArray::try_new(
+            leaf_nullable,
+            vec![Arc::new(xs) as ArrayRef],
+            Some(NullBuffer::from(vec![true, true])),
+        )
+        .unwrap();
+        let outer = StructArray::try_new(
+            mid_nullable.clone(),
+            vec![Arc::new(mid) as ArrayRef],
+            Some(NullBuffer::from(vec![true, true])),
+        )
+        .unwrap();
+        let bad_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "outer",
+            DataType::Struct(mid_nullable),
+            true,
+        )]));
+        let bad_batch =
+            RecordBatch::try_new(bad_schema, vec![Arc::new(outer) as ArrayRef]).unwrap();
 
         let fs = FsFixture::default();
         let mut writer = FileWriter::try_new(
