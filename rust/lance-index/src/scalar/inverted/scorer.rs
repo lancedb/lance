@@ -27,6 +27,16 @@ pub trait Scorer: Send + Sync {
     fn doc_weight_cache_key(&self) -> Option<u64> {
         None
     }
+
+    /// The doc-length-dependent BM25 denominator addend, when `doc_weight`
+    /// factors as `(K1 + 1) * freq / (freq + addend)`; `None` for scorers
+    /// without that shape. Scoring hot loops use this to bake a per-norm-code
+    /// addend cache (Lucene's norm cache), which is bit-identical to calling
+    /// `doc_weight` because both paths evaluate the same expressions.
+    fn doc_norm(&self, doc_tokens: u32) -> Option<f32> {
+        let _ = doc_tokens;
+        None
+    }
 }
 
 impl<T: Scorer + ?Sized> Scorer for Arc<T> {
@@ -45,11 +55,29 @@ impl<T: Scorer + ?Sized> Scorer for Arc<T> {
     fn doc_weight_cache_key(&self) -> Option<u64> {
         self.as_ref().doc_weight_cache_key()
     }
+
+    fn doc_norm(&self, doc_tokens: u32) -> Option<f32> {
+        self.as_ref().doc_norm(doc_tokens)
+    }
+}
+
+/// The frequency-dependent half of the BM25 doc weight; `doc_norm` is the
+/// doc-length addend (from [`Scorer::doc_norm`] or a per-norm-code cache).
+#[inline]
+pub(super) fn bm25_doc_weight_with_norm(freq: u32, doc_norm: f32) -> f32 {
+    let freq = freq as f32;
+    (K1 + 1.0) * freq / (freq + doc_norm)
 }
 
 // BM25 parameters
 pub const K1: f32 = 1.2;
 pub const B: f32 = 0.75;
+
+#[inline]
+fn bm25_doc_norm(doc_tokens: u32, avg_doc_length: f32) -> f32 {
+    let doc_tokens = doc_tokens as f32;
+    K1 * (1.0 - B + B * doc_tokens / avg_doc_length)
+}
 
 #[derive(Debug, Clone)]
 pub struct MemBM25Scorer {
@@ -112,10 +140,12 @@ impl Scorer for MemBM25Scorer {
     }
 
     fn doc_weight(&self, freq: u32, doc_tokens: u32) -> f32 {
-        let freq = freq as f32;
-        let doc_tokens = doc_tokens as f32;
-        let doc_norm = K1 * (1.0 - B + B * doc_tokens / self.avg_doc_length());
-        (K1 + 1.0) * freq / (freq + doc_norm)
+        let doc_norm = bm25_doc_norm(doc_tokens, self.avg_doc_length());
+        bm25_doc_weight_with_norm(freq, doc_norm)
+    }
+
+    fn doc_norm(&self, doc_tokens: u32) -> Option<f32> {
+        Some(bm25_doc_norm(doc_tokens, self.avg_doc_length()))
     }
 
     fn doc_weight_upper_bound(&self) -> Option<f32> {
@@ -184,10 +214,12 @@ impl Scorer for IndexBM25Scorer<'_> {
     }
 
     fn doc_weight(&self, freq: u32, doc_tokens: u32) -> f32 {
-        let freq = freq as f32;
-        let doc_tokens = doc_tokens as f32;
-        let doc_norm = K1 * (1.0 - B + B * doc_tokens / self.avg_doc_length);
-        (K1 + 1.0) * freq / (freq + doc_norm)
+        let doc_norm = bm25_doc_norm(doc_tokens, self.avg_doc_length);
+        bm25_doc_weight_with_norm(freq, doc_norm)
+    }
+
+    fn doc_norm(&self, doc_tokens: u32) -> Option<f32> {
+        Some(bm25_doc_norm(doc_tokens, self.avg_doc_length))
     }
 
     fn doc_weight_upper_bound(&self) -> Option<f32> {
