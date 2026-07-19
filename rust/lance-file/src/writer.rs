@@ -1775,7 +1775,12 @@ mod tests {
             },
         )
         .unwrap();
-        let err = writer.write_batch(&batch).await.unwrap_err().to_string();
+        let err = writer.write_batch(&batch).await.unwrap_err();
+        assert!(
+            matches!(err, lance_core::Error::InvalidInput { .. }),
+            "expected InvalidInput, got: {err:?}"
+        );
+        let err = err.to_string();
         assert!(
             err.contains("non-null"),
             "expected nullability error, got: {err}"
@@ -1812,11 +1817,12 @@ mod tests {
             options,
         )
         .unwrap();
-        let err = writer
-            .write_batch(&bad_batch)
-            .await
-            .unwrap_err()
-            .to_string();
+        let err = writer.write_batch(&bad_batch).await.unwrap_err();
+        assert!(
+            matches!(err, lance_core::Error::InvalidInput { .. }),
+            "expected InvalidInput, got: {err:?}"
+        );
+        let err = err.to_string();
         assert!(
             err.contains("non-null"),
             "expected nullability error, got: {err}"
@@ -1941,11 +1947,12 @@ mod tests {
             options,
         )
         .unwrap();
-        let err = writer
-            .write_batch(&bad_batch)
-            .await
-            .unwrap_err()
-            .to_string();
+        let err = writer.write_batch(&bad_batch).await.unwrap_err();
+        assert!(
+            matches!(err, lance_core::Error::InvalidInput { .. }),
+            "expected InvalidInput, got: {err:?}"
+        );
+        let err = err.to_string();
         assert!(
             err.contains("non-null"),
             "expected nullability error, got: {err}"
