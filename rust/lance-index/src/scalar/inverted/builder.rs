@@ -1825,16 +1825,16 @@ pub(crate) fn inverted_list_schema_for_version_with_block_size_and_impacts(
         InvertedListFormatVersion::V1 => {
             inverted_list_schema_v1(with_position, block_size, with_impacts)
         }
-        InvertedListFormatVersion::V2 | InvertedListFormatVersion::V3 => {
-            inverted_list_schema_with_tail_codec_and_position_codec(
-                with_position,
-                format_version,
-                PostingTailCodec::VarintDelta,
-                Some(PositionStreamCodec::PackedDelta),
-                block_size,
-                with_impacts,
-            )
-        }
+        InvertedListFormatVersion::V2
+        | InvertedListFormatVersion::V3
+        | InvertedListFormatVersion::V4 => inverted_list_schema_with_tail_codec_and_position_codec(
+            with_position,
+            format_version,
+            PostingTailCodec::VarintDelta,
+            Some(PositionStreamCodec::PackedDelta),
+            block_size,
+            with_impacts,
+        ),
     }
 }
 
@@ -2105,7 +2105,6 @@ async fn merge_metadata_files(
     let mut params = None;
     let mut token_set_format = None;
     let mut format_version = None;
-    let mut posting_tail_codec = None;
     let mut deleted_fragments = RoaringBitmap::new();
     progress
         .stage_start(
@@ -2146,9 +2145,6 @@ async fn merge_metadata_files(
         }
         if format_version.is_none() {
             format_version = Some(parse_format_version_from_metadata(metadata)?);
-        }
-        if posting_tail_codec.is_none() {
-            posting_tail_codec = Some(parse_posting_tail_codec(metadata)?);
         }
 
         if reader.num_rows() > 0 {
@@ -2215,8 +2211,7 @@ async fn merge_metadata_files(
         None,
         deleted_fragments,
     )
-    .with_format_version(format_version.unwrap_or(InvertedListFormatVersion::V1))
-    .with_posting_tail_codec(posting_tail_codec.unwrap_or(PostingTailCodec::Fixed32));
+    .with_format_version(format_version.unwrap_or(InvertedListFormatVersion::V1));
     progress
         .stage_start("write_merged_metadata", Some(1), "files")
         .await?;
@@ -2922,6 +2917,10 @@ mod tests {
         expected_partitions.dedup();
         let remapped_partitions = (0..expected_partitions.len() as u64).collect::<Vec<_>>();
         assert_eq!(written_partitions, remapped_partitions);
+        assert_eq!(
+            parse_format_version_from_metadata(metadata)?,
+            InvertedListFormatVersion::V4
+        );
 
         for (new_id, old_id) in expected_partitions.iter().enumerate() {
             assert_partition_file_markers(base_store.as_ref(), new_id as u64, *old_id).await?;

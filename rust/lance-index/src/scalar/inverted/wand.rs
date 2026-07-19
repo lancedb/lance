@@ -339,6 +339,43 @@ fn scorer_upper_bound<S: Scorer + ?Sized>(query_weight: f32, scorer: &S) -> f32 
     }
 }
 
+/// Per-term data retained after same-position postings are unioned.
+#[derive(Debug)]
+pub(super) struct GroupedTermScorer {
+    query_weight: f32,
+    freqs_by_posting_doc_id: Vec<(u64, u32)>,
+}
+
+impl GroupedTermScorer {
+    pub(super) fn new(query_weight: f32, posting: &PostingList) -> Self {
+        let freqs_by_posting_doc_id = posting
+            .iter()
+            .map(|(posting_doc_id, freq, _)| (posting_doc_id, freq))
+            .collect();
+        Self {
+            query_weight,
+            freqs_by_posting_doc_id,
+        }
+    }
+
+    pub(super) fn query_weight(&self) -> f32 {
+        self.query_weight
+    }
+
+    pub(super) fn frequency(&self, posting_doc_id: u64) -> Option<u32> {
+        self.freqs_by_posting_doc_id
+            .binary_search_by_key(&posting_doc_id, |(doc_id, _)| *doc_id)
+            .ok()
+            .map(|index| self.freqs_by_posting_doc_id[index].1)
+    }
+
+    fn score<S: Scorer + ?Sized>(&self, posting_doc_id: u64, doc_length: u32, scorer: &S) -> f32 {
+        self.frequency(posting_doc_id)
+            .map(|freq| self.query_weight * scorer.doc_weight(freq, doc_length))
+            .unwrap_or_default()
+    }
+}
+
 pub struct PostingIterator {
     token: String,
     token_id: u32,
@@ -351,6 +388,12 @@ pub struct PostingIterator {
     block_idx: usize,
     current_doc: Option<DocInfo>,
     approximate_upper_bound: f32,
+    // Stored block maxima may use partition-local statistics. Queries scored
+    // with corpus-wide statistics must use a scorer-provided bound instead.
+    use_scorer_upper_bound: bool,
+    // The union posting drives iteration and pruning; these terms produce the
+    // exact score for each candidate document.
+    grouped_terms: Option<Arc<[GroupedTermScorer]>>,
     // Position cursors temporarily own this buffer and return it on drop. This
     // keeps repeated cursor creation allocation-free without lending a slice
     // out of the interior-mutable compressed state.
@@ -788,11 +831,23 @@ impl PostingIterator {
             block_idx: 0,
             current_doc: None,
             approximate_upper_bound,
+            use_scorer_upper_bound: false,
+            grouped_terms: None,
             position_scratch: RefCell::new(Some(Vec::new())),
             compressed,
         };
         posting.refresh_current_doc();
         posting
+    }
+
+    pub(super) fn with_scorer_upper_bound(mut self) -> Self {
+        self.use_scorer_upper_bound = true;
+        self
+    }
+
+    pub(super) fn with_grouped_terms(mut self, terms: Arc<[GroupedTermScorer]>) -> Self {
+        self.grouped_terms = Some(terms);
+        self
     }
 
     #[inline]
@@ -830,6 +885,9 @@ impl PostingIterator {
                     &mut compressed.block_max_window.impact_score_cache,
                 );
         }
+        if self.use_scorer_upper_bound {
+            return scorer_upper_bound(self.query_weight, scorer);
+        }
         if let PostingList::Compressed(ref list) = self.list
             && list.block_size == MAX_POSTING_BLOCK_SIZE
         {
@@ -840,7 +898,18 @@ impl PostingIterator {
 
     #[inline]
     fn score<S: Scorer + ?Sized>(&self, scorer: &S, freq: u32, doc_length: u32) -> f32 {
+        if let (Some(grouped_terms), Some(doc)) = (&self.grouped_terms, self.current_doc) {
+            return grouped_terms
+                .iter()
+                .map(|term| term.score(doc.doc_id(), doc_length, scorer))
+                .sum();
+        }
         self.query_weight * scorer.doc_weight(freq, doc_length)
+    }
+
+    #[inline]
+    fn has_grouped_terms(&self) -> bool {
+        self.grouped_terms.is_some()
     }
 
     #[inline]
@@ -1147,10 +1216,16 @@ impl PostingIterator {
                 if let Some(impacts) = list.impacts.as_ref() {
                     return self.impact_level0(impacts, scorer).1;
                 }
+                if self.use_scorer_upper_bound {
+                    return scorer_upper_bound(self.query_weight, scorer);
+                }
                 if list.block_size == MAX_POSTING_BLOCK_SIZE {
                     return scorer_upper_bound(self.query_weight, scorer);
                 }
                 list.block_max_score(self.block_idx)
+            }
+            PostingList::Plain(_) if self.use_scorer_upper_bound => {
+                scorer_upper_bound(self.query_weight, scorer)
             }
             PostingList::Plain(_) => self.approximate_upper_bound,
         }
@@ -1177,6 +1252,12 @@ impl PostingIterator {
                         };
                     }
                 }
+                if self.use_scorer_upper_bound {
+                    return BlockMaxScore {
+                        score: scorer_upper_bound(self.query_weight, scorer),
+                        blocks_scanned: 0,
+                    };
+                }
                 let compressed = unsafe { &mut *self.compressed_state_ptr() };
                 compressed.block_max_window.max_score_up_to(
                     list,
@@ -1187,7 +1268,11 @@ impl PostingIterator {
                 )
             }
             PostingList::Plain(_) => BlockMaxScore {
-                score: self.approximate_upper_bound,
+                score: if self.use_scorer_upper_bound {
+                    scorer_upper_bound(self.query_weight, scorer)
+                } else {
+                    self.approximate_upper_bound
+                },
                 blocks_scanned: 0,
             },
         }
@@ -1738,10 +1823,9 @@ impl<'a, S: Scorer> Wand<'a, S> {
             && self.operator == Operator::Or
             && params.phrase_slop.is_none()
             && !self.head.is_empty()
-            && self
-                .head
-                .iter()
-                .all(|posting| posting.posting.is_compressed())
+            && self.head.iter().all(|posting| {
+                posting.posting.is_compressed() && !posting.posting.has_grouped_terms()
+            })
         {
             return self.maxscore_search(params, mask, metrics);
         }
@@ -1752,7 +1836,10 @@ impl<'a, S: Scorer> Wand<'a, S> {
         // `next()` leapfrogging through boxed iterators.
         if self.operator == Operator::And
             && !self.lead.is_empty()
-            && self.lead.iter().all(|posting| posting.is_compressed())
+            && self
+                .lead
+                .iter()
+                .all(|posting| posting.is_compressed() && !posting.has_grouped_terms())
             && self
                 .bulk_and_mode_override
                 .unwrap_or_else(|| *BULK_AND_MODE)
