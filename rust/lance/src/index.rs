@@ -1119,11 +1119,13 @@ impl Dataset {
     /// The transaction is a snapshot built against the current dataset version.
     /// Conflicting concurrent changes are rejected at commit time: creating or
     /// dropping a same-name index between staging and commit fails the commit
-    /// with a retryable conflict, and dropping the indexed column fails it as
-    /// incompatible. A concurrent compaction/rewrite that defers index
-    /// remapping is not conflict-checked; the committed segments may then
-    /// cover already-compacted fragments until the deferred remap catches up,
-    /// so commit promptly.
+    /// with a retryable conflict, and a schema change that drops or re-ids the
+    /// indexed column (e.g. [`Dataset::drop_columns`] or an
+    /// [`Dataset::alter_columns`] type cast) fails it as incompatible. A
+    /// concurrent compaction/rewrite that defers index remapping is not
+    /// conflict-checked; the committed segments may then cover
+    /// already-compacted fragments until the deferred remap catches up, so
+    /// commit promptly.
     ///
     /// # Side effects
     ///
@@ -7660,6 +7662,145 @@ mod tests {
             err.to_string()
                 .contains("incompatible with concurrent transaction Project"),
             "conflict message must identify the concurrent Project, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_existing_index_segments_transaction_conflicts_with_column_cast() {
+        use crate::dataset::{ColumnAlteration, CommitBuilder};
+        use lance_datagen::{BatchCount, RowCount, array};
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .col(
+                "vector",
+                array::rand_vec::<arrow_array::types::Float32Type>(8.into()),
+            )
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let mut dataset = Dataset::write(reader, test_dir.path().to_str().unwrap(), None)
+            .await
+            .unwrap();
+        let field_id = dataset.schema().field("id").unwrap().id;
+
+        let seg = write_vector_segment_metadata(
+            &dataset,
+            "id_idx",
+            field_id,
+            Uuid::new_v4(),
+            [0_u32],
+            b"seg",
+        )
+        .await;
+        let transaction = dataset
+            .build_existing_index_segments_transaction(
+                "id_idx",
+                "id",
+                vec![segment_from_metadata(&seg)],
+            )
+            .await
+            .unwrap();
+
+        // A type cast commits Operation::Merge and assigns the column a new
+        // field id, so the staged transaction's field no longer exists.
+        dataset
+            .alter_columns(&[
+                ColumnAlteration::new("id".into()).cast_to(arrow_schema::DataType::Int64)
+            ])
+            .await
+            .unwrap();
+        assert!(dataset.schema().field_by_id(field_id).is_none());
+
+        let err = CommitBuilder::new(Arc::new(dataset))
+            .execute(transaction)
+            .await
+            .expect_err("staged index commit for a re-identified column must fail");
+        assert!(
+            matches!(err, Error::IncompatibleTransaction { .. }),
+            "expected an incompatible transaction error, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("no longer exists in the schema"),
+            "conflict message must identify the missing field, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_drop_index_conflicts_with_concurrent_replacement() {
+        use lance_datagen::{BatchCount, RowCount, array};
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .col(
+                "vector",
+                array::rand_vec::<arrow_array::types::Float32Type>(8.into()),
+            )
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let mut dataset = Dataset::write(reader, test_dir.path().to_str().unwrap(), None)
+            .await
+            .unwrap();
+        let field_id = dataset.schema().field("vector").unwrap().id;
+
+        let initial = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            field_id,
+            Uuid::new_v4(),
+            [0_u32],
+            b"initial",
+        )
+        .await;
+        dataset
+            .commit_existing_index_segments(
+                "vector_idx",
+                "vector",
+                vec![segment_from_metadata(&initial)],
+            )
+            .await
+            .unwrap();
+
+        // A stale handle prepares to drop while the index is replaced.
+        let mut stale = dataset.clone();
+        let replacement = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            field_id,
+            Uuid::new_v4(),
+            [0_u32],
+            b"replacement",
+        )
+        .await;
+        dataset
+            .commit_existing_index_segments(
+                "vector_idx",
+                "vector",
+                vec![segment_from_metadata(&replacement)],
+            )
+            .await
+            .unwrap();
+
+        // The stale drop must conflict instead of silently no-op'ing (its
+        // removal targets a UUID the replacement already removed).
+        let err = stale
+            .drop_index("vector_idx")
+            .await
+            .expect_err("a drop racing a same-name replacement must conflict");
+        assert!(
+            matches!(err, Error::RetryableCommitConflict { .. }),
+            "expected a retryable commit conflict, got: {err}"
+        );
+
+        // Retrying against the latest version drops the replacement for real.
+        stale.checkout_latest().await.unwrap();
+        stale.drop_index("vector_idx").await.unwrap();
+        assert!(
+            stale
+                .load_indices_by_name("vector_idx")
+                .await
+                .unwrap()
+                .is_empty(),
+            "the retried drop must remove the replaced index"
         );
     }
 
