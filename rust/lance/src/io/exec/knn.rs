@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::any::Any;
+#[cfg(test)]
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -827,10 +828,6 @@ impl ExecutionPlan for KNNVectorDistanceExec {
         "KNNVectorDistanceExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     /// Flat KNN inherits the schema from input node, and add one distance column.
     fn schema(&self) -> arrow_schema::SchemaRef {
         self.output_schema.clone()
@@ -946,7 +943,7 @@ impl ExecutionPlan for KNNVectorDistanceExec {
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> DataFusionResult<Statistics> {
+    fn partition_statistics(&self, partition: Option<usize>) -> DataFusionResult<Arc<Statistics>> {
         let inner_stats = self.input.partition_statistics(partition)?;
         let input_schema = self.input.schema();
         let input_stats_by_name = inner_stats
@@ -983,11 +980,11 @@ impl ExecutionPlan for KNNVectorDistanceExec {
                 }
             })
             .collect::<Vec<_>>();
-        Ok(Statistics {
+        Ok(Arc::new(Statistics {
             num_rows: inner_stats.num_rows,
             column_statistics,
             ..Statistics::new_unknown(self.schema().as_ref())
-        })
+        }))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -1223,10 +1220,6 @@ impl ExecutionPlan for ANNIvfPartitionExec {
         "ANNIVFPartitionExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         KNN_PARTITION_SCHEMA.clone()
     }
@@ -1235,11 +1228,11 @@ impl ExecutionPlan for ANNIvfPartitionExec {
         &self.properties
     }
 
-    fn partition_statistics(&self, _partition: Option<usize>) -> DataFusionResult<Statistics> {
-        Ok(Statistics {
+    fn partition_statistics(&self, _partition: Option<usize>) -> DataFusionResult<Arc<Statistics>> {
+        Ok(Arc::new(Statistics {
             num_rows: Precision::Exact(self.query.minimum_nprobes),
             ..Statistics::new_unknown(self.schema().as_ref())
-        })
+        }))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -1841,10 +1834,6 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
         "ANNSubIndexExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> arrow_schema::SchemaRef {
         KNN_INDEX_SCHEMA.clone()
     }
@@ -2041,8 +2030,8 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
     fn partition_statistics(
         &self,
         partition: Option<usize>,
-    ) -> DataFusionResult<datafusion::physical_plan::Statistics> {
-        Ok(Statistics {
+    ) -> DataFusionResult<Arc<datafusion::physical_plan::Statistics>> {
+        Ok(Arc::new(Statistics {
             num_rows: Precision::Exact(
                 self.query.k
                     * self.query.refine_factor.unwrap_or(1) as usize
@@ -2054,7 +2043,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                         .unwrap_or(&1),
             ),
             ..Statistics::new_unknown(self.schema().as_ref())
-        })
+        }))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -2135,10 +2124,6 @@ impl DisplayAs for MultivectorScoringExec {
 impl ExecutionPlan for MultivectorScoringExec {
     fn name(&self) -> &str {
         "MultivectorScoringExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn schema(&self) -> arrow_schema::SchemaRef {
@@ -2288,6 +2273,8 @@ impl ExecutionPlan for MultivectorScoringExec {
 mod tests {
     use super::*;
 
+    use std::any::Any;
+
     use crate::index::DatasetIndexExt;
     use arrow::compute::{concat_batches, sort_to_indices, take_record_batch};
     use arrow::datatypes::Float32Type;
@@ -2319,6 +2306,7 @@ mod tests {
 
     use crate::dataset::{WriteMode, WriteParams};
     use crate::index::vector::VectorIndexParams;
+    use crate::index::vector::ivf::v2::STREAMING_SEARCH_BATCH_SIZE;
     use crate::io::exec::testing::TestingExec;
 
     fn base_query() -> Query {
@@ -2492,7 +2480,7 @@ mod tests {
             Box::new(self.row_ids.iter())
         }
 
-        async fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
+        async fn remap(&mut self, _mapping: &RowAddrRemap) -> Result<()> {
             Ok(())
         }
 
@@ -2632,7 +2620,6 @@ mod tests {
             _metrics: Arc<dyn lance_index::metrics::MetricsCollector>,
         ) -> Result<SendableRecordBatchStream> {
             let (batch_tx, batch_rx) = mpsc::channel(1);
-            let batch_tx_for_search = batch_tx.clone();
             let prepared_partition_ids = (start_idx..end_idx)
                 .map(|idx| partitions.value(idx) as usize)
                 .collect::<Vec<_>>();
@@ -2640,42 +2627,74 @@ mod tests {
                 .lock()
                 .unwrap()
                 .extend(prepared_partition_ids.iter().copied());
+            // Mirror the production streaming path (v2.rs): search prepared partitions
+            // in batches of STREAMING_SEARCH_BATCH_SIZE, one `spawn_cpu` per batch, with
+            // the channel send in async code so no CPU-pool thread parks (#7642).
             tokio::spawn(async move {
-                let search_result = spawn_cpu(move || -> DataFusionResult<()> {
-                    for partition_id in prepared_partition_ids {
-                        if control
-                            .as_ref()
-                            .is_some_and(|control| control.should_stop())
-                        {
-                            return Ok(());
+                for chunk in prepared_partition_ids.chunks(*STREAMING_SEARCH_BATCH_SIZE) {
+                    if control
+                        .as_ref()
+                        .is_some_and(|control| control.should_stop())
+                        || batch_tx.is_closed()
+                    {
+                        return;
+                    }
+                    let chunk = chunk.to_vec();
+                    let index = self.clone();
+                    let control_for_search = control.clone();
+                    let cancel_probe = batch_tx.clone();
+                    let search_output = spawn_cpu(move || {
+                        let mut outputs: Vec<DataFusionResult<RecordBatch>> =
+                            Vec::with_capacity(chunk.len());
+                        let mut stopped = false;
+                        for partition_id in chunk {
+                            if control_for_search
+                                .as_ref()
+                                .is_some_and(|control| control.should_stop())
+                                || cancel_probe.is_closed()
+                            {
+                                stopped = true;
+                                break;
+                            }
+                            match index
+                                .search_prepared_partition(
+                                    Box::new(partition_id),
+                                    &lance_index::metrics::NoOpMetricsCollector,
+                                )
+                                .map_err(datafusion::error::DataFusionError::from)
+                            {
+                                Ok(batch) => {
+                                    if let Some(control) = control_for_search.as_ref() {
+                                        control.record_batch(&batch);
+                                    }
+                                    outputs.push(Ok(batch));
+                                }
+                                Err(err) => {
+                                    outputs.push(Err(err));
+                                    stopped = true;
+                                    break;
+                                }
+                            }
                         }
-                        let batch = self
-                            .search_prepared_partition(
-                                Box::new(partition_id),
-                                &lance_index::metrics::NoOpMetricsCollector,
-                            )
-                            .map_err(datafusion::error::DataFusionError::from);
-                        match batch {
-                            Ok(batch) => {
-                                if let Some(control) = control.as_ref() {
-                                    control.record_batch(&batch);
-                                }
-                                if batch_tx_for_search.blocking_send(Ok(batch)).is_err() {
-                                    return Ok(());
-                                }
-                            }
-                            Err(err) => {
-                                let _ = batch_tx_for_search.blocking_send(Err(err));
-                                return Ok(());
-                            }
+                        Ok::<_, datafusion::error::DataFusionError>((outputs, stopped))
+                    })
+                    .await;
+
+                    let (outputs, stopped) = match search_output {
+                        Ok(output) => output,
+                        Err(err) => {
+                            let _ = batch_tx.send(Err(err)).await;
+                            return;
+                        }
+                    };
+                    for output in outputs {
+                        if batch_tx.send(output).await.is_err() {
+                            return;
                         }
                     }
-                    Ok(())
-                })
-                .await;
-
-                if let Err(err) = search_result {
-                    let _ = batch_tx.send(Err(err)).await;
+                    if stopped {
+                        return;
+                    }
                 }
             });
 
@@ -2710,7 +2729,7 @@ mod tests {
             Box::new(self.row_ids.iter())
         }
 
-        async fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
+        async fn remap(&mut self, _mapping: &RowAddrRemap) -> Result<()> {
             Ok(())
         }
 
@@ -2869,19 +2888,29 @@ mod tests {
         );
     }
 
+    // All partitions fit in a single search batch, so they are searched in one
+    // `spawn_cpu` dispatch and therefore share one cpu thread. The partition count
+    // adapts to the configured batch size so the single-batch property holds under
+    // any valid `LANCE_IVF_STREAMING_SEARCH_BATCH_SIZE`, including 1.
     #[tokio::test]
     async fn test_sequential_initial_search_prepares_all_then_searches_on_one_cpu_thread() {
+        let num_partitions = 3.min(*STREAMING_SEARCH_BATCH_SIZE);
+        let row_ids = (0..num_partitions).map(|i| 10 + i as u64).collect();
         let (index, prepared_partitions, searched_partitions, search_threads) =
-            prepared_index(vec![10, 11, 12]);
+            prepared_index(row_ids);
         let mut query = base_query();
-        query.minimum_nprobes = 3;
+        query.minimum_nprobes = num_partitions;
         let state = Arc::new(ANNIvfEarlySearchResults::new(1, query.k));
 
+        let partition_idx = (0..num_partitions as u32).collect::<Vec<_>>();
+        let q_c_dists = (0..num_partitions)
+            .map(|i| i as f32 * 0.1)
+            .collect::<Vec<_>>();
         let batches = ANNIvfSubIndexExec::initial_search(
             index,
             query,
-            Arc::new(UInt32Array::from(vec![0, 1, 2])),
-            Arc::new(Float32Array::from(vec![0.1, 0.2, 0.3])),
+            Arc::new(UInt32Array::from(partition_idx)),
+            Arc::new(Float32Array::from(q_c_dists)),
             empty_prefilter().await,
             prepared_metrics(),
             state,
@@ -2891,11 +2920,12 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(batches.len(), 3);
-        assert_eq!(*prepared_partitions.lock().unwrap(), vec![0, 1, 2]);
-        assert_eq!(*searched_partitions.lock().unwrap(), vec![0, 1, 2]);
+        let expected: Vec<usize> = (0..num_partitions).collect();
+        assert_eq!(batches.len(), num_partitions);
+        assert_eq!(*prepared_partitions.lock().unwrap(), expected);
+        assert_eq!(*searched_partitions.lock().unwrap(), expected);
         let search_threads = search_threads.lock().unwrap().clone();
-        assert_eq!(search_threads.len(), 3);
+        assert_eq!(search_threads.len(), num_partitions);
         assert!(
             search_threads.iter().all(|name| name.contains("lance-cpu")),
             "expected prepared searches to run on the cpu runtime, got threads {search_threads:?}",
@@ -2903,6 +2933,52 @@ mod tests {
         assert!(
             search_threads.iter().all(|name| name == &search_threads[0]),
             "expected all prepared searches to reuse one cpu thread, got threads {search_threads:?}",
+        );
+    }
+
+    // Regression guard for the batched streaming search (#7642): with more partitions
+    // than a single batch, the search spans multiple `spawn_cpu` dispatches. Verify that
+    // every partition is still prepared and searched in order across the batch boundary,
+    // and that all search work stays on the cpu runtime.
+    //
+    // Note: this does not reproduce the single-thread-pool deadlock the async recv/send
+    // fixes -- that requires a 1-thread CPU pool, which is a process-global singleton and
+    // impractical to force in a unit test (same limitation noted for the #7423 fix).
+    #[tokio::test]
+    async fn test_sequential_search_spans_multiple_cpu_batches() {
+        let num_partitions = *STREAMING_SEARCH_BATCH_SIZE + 3;
+        let row_ids = (0..num_partitions).map(|i| i as u64 * 10).collect();
+        let (index, prepared_partitions, searched_partitions, search_threads) =
+            prepared_index(row_ids);
+        let mut query = base_query();
+        query.minimum_nprobes = num_partitions;
+        let state = Arc::new(ANNIvfEarlySearchResults::new(1, query.k));
+
+        let partition_idx = (0..num_partitions as u32).collect::<Vec<_>>();
+        let q_c_dists = (0..num_partitions).map(|i| i as f32).collect::<Vec<_>>();
+        let batches = ANNIvfSubIndexExec::initial_search(
+            index,
+            query,
+            Arc::new(UInt32Array::from(partition_idx.clone())),
+            Arc::new(Float32Array::from(q_c_dists)),
+            empty_prefilter().await,
+            prepared_metrics(),
+            state,
+            usize::MAX,
+        )
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+        let expected: Vec<usize> = (0..num_partitions).collect();
+        assert_eq!(batches.len(), num_partitions);
+        assert_eq!(*prepared_partitions.lock().unwrap(), expected);
+        assert_eq!(*searched_partitions.lock().unwrap(), expected);
+        let search_threads = search_threads.lock().unwrap().clone();
+        assert_eq!(search_threads.len(), num_partitions);
+        assert!(
+            search_threads.iter().all(|name| name.contains("lance-cpu")),
+            "expected prepared searches to run on the cpu runtime, got threads {search_threads:?}",
         );
     }
 

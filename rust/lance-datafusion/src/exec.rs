@@ -6,6 +6,7 @@
 use std::{
     collections::HashMap,
     fmt::{self, Formatter},
+    num::NonZero,
     sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
@@ -14,7 +15,6 @@ use chrono::{DateTime, Utc};
 
 use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
-use datafusion::physical_plan::metrics::MetricType;
 use datafusion::{
     catalog::streaming::StreamingTable,
     dataframe::DataFrame,
@@ -36,6 +36,7 @@ use datafusion::{
         streaming::PartitionStream,
     },
 };
+use datafusion::{execution::memory_pool::TrackConsumersPool, physical_plan::metrics::MetricType};
 use datafusion_common::{DataFusionError, Statistics};
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
 
@@ -152,10 +153,6 @@ impl ExecutionPlan for OneShotExec {
         "OneShotExec"
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn schema(&self) -> arrow_schema::SchemaRef {
         self.schema.clone()
     }
@@ -243,10 +240,6 @@ impl ExecutionPlan for TracedExec {
         "TracedExec"
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
@@ -310,7 +303,7 @@ impl std::fmt::Debug for LanceExecutionOptions {
     }
 }
 
-const DEFAULT_LANCE_MEM_POOL_SIZE_PER_PARTITION: u64 = 100 * 1024 * 1024;
+const DEFAULT_LANCE_MEM_POOL_SIZE_PER_PARTITION: u64 = 150 * 1024 * 1024;
 const DEFAULT_LANCE_MAX_TEMP_DIRECTORY_SIZE: u64 = 100 * 1024 * 1024 * 1024; // 100GB
 
 impl LanceExecutionOptions {
@@ -366,12 +359,21 @@ pub fn new_session_context(options: &LanceExecutionOptions) -> SessionContext {
         session_config = session_config.with_target_partitions(target_partition);
     }
     if options.use_spilling() {
+        // The default 10MB sort spill reservation seems to be too small for many common cases.
+        //
+        // There currently is no reasonable guidance provided by DataFusion for setting this value.
+        // We bump this to 40MB but try a smaller value if the mem pool is small.
+        let sort_spill_reservation_bytes =
+            (options.mem_pool_size() / 3).min(40 * 1024 * 1024) as usize;
+        session_config =
+            session_config.with_sort_spill_reservation_bytes(sort_spill_reservation_bytes);
         let disk_manager_builder = DiskManagerBuilder::default()
             .with_max_temp_directory_size(options.max_temp_directory_size());
         runtime_env_builder = runtime_env_builder
             .with_disk_manager_builder(disk_manager_builder)
-            .with_memory_pool(Arc::new(FairSpillPool::new(
-                options.mem_pool_size() as usize
+            .with_memory_pool(Arc::new(TrackConsumersPool::new(
+                FairSpillPool::new(options.mem_pool_size() as usize),
+                NonZero::try_from(16).unwrap(),
             )));
     }
     let runtime_env = runtime_env_builder.build_arc().unwrap();
@@ -640,7 +642,8 @@ pub async fn analyze_plan(
     let analyze = Arc::new(AnalyzeExec::new(
         true,
         true,
-        vec![MetricType::SUMMARY],
+        vec![MetricType::Summary],
+        None,
         plan,
         schema,
     ));
@@ -894,10 +897,6 @@ impl ExecutionPlan for StrictBatchSizeExec {
         "StrictBatchSizeExec"
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn properties(&self) -> &Arc<PlanProperties> {
         self.input.properties()
     }
@@ -938,7 +937,7 @@ impl ExecutionPlan for StrictBatchSizeExec {
     fn partition_statistics(
         &self,
         partition: Option<usize>,
-    ) -> datafusion_common::Result<Statistics> {
+    ) -> datafusion_common::Result<std::sync::Arc<Statistics>> {
         self.input.partition_statistics(partition)
     }
 
@@ -998,10 +997,6 @@ impl DisplayAs for HardCapBatchSizeExec {
 impl ExecutionPlan for HardCapBatchSizeExec {
     fn name(&self) -> &str {
         "HardCapBatchSizeExec"
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
@@ -1065,7 +1060,7 @@ impl ExecutionPlan for HardCapBatchSizeExec {
     fn partition_statistics(
         &self,
         partition: Option<usize>,
-    ) -> datafusion_common::Result<Statistics> {
+    ) -> datafusion_common::Result<std::sync::Arc<Statistics>> {
         self.input.partition_statistics(partition)
     }
 

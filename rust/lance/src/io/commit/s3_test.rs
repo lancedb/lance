@@ -341,7 +341,10 @@ async fn test_ddb_open_iops() {
     // Checkout original version
     dataset.checkout_version(1).await.unwrap();
     let io_stats = dataset.object_store.as_ref().io_stats_incremental();
-    // Checkout: 1 IOPS: manifest file
-    assert_io_eq!(io_stats, read_iops, 1);
+    // Checkout: 0 read IOPS. Version 1's manifest was already loaded and cached
+    // on this Session when the dataset was opened above, so the checkout serves
+    // the manifest body from the metadata cache. Version resolution is handled
+    // in DynamoDB and issues no S3 read.
+    assert_io_eq!(io_stats, read_iops, 0);
     assert_io_eq!(io_stats, write_iops, 0);
 }

@@ -61,5 +61,9 @@ features = ["protoc"]
 name = "reader"
 harness = false
 
+[[bench]]
+name = "schema"
+harness = false
+
 [lints]
 workspace = true

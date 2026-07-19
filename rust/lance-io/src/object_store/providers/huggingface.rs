@@ -223,7 +223,7 @@ impl ObjectStoreProvider for HuggingfaceStoreProvider {
 
     fn extract_path(&self, url: &Url) -> Result<Path> {
         let parsed = parse_hf_url(url)?;
-        Path::parse(&parsed.relative_path).map_err(|_| {
+        Path::from_url_path(&parsed.relative_path).map_err(|_| {
             Error::invalid_input(format!("Invalid path in Huggingface URL: {}", url.path()))
         })
     }

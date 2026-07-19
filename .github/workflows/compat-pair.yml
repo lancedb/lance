@@ -1,7 +1,7 @@
 # On-demand cross-version index compatibility run between two arbitrary refs.
 #
-# The PR path lives in python.yml (compat-sequence job), which ages the two previous
-# majors into the PR head reusing the prebuilt wheel. This workflow is the manual escape
+# The scheduled path lives in nightly_run.yml (compat-sequence job), which ages the two
+# previous majors into HEAD nightly. This workflow is the manual escape
 # hatch for any other pairing: each ref (version, sha, branch, or tag) is provisioned by
 # the framework -- a published release installs a wheel, anything else is built from a
 # worktree via maturin -- so two arbitrary refs can be compared even when neither has a

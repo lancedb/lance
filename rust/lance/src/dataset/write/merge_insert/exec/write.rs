@@ -30,14 +30,14 @@ use crate::dataset::write::merge_insert::inserted_rows::{
 };
 use crate::dataset::write::merge_insert::{
     MERGE_SOURCE_SENTINEL, SourceDedupeBehavior, create_duplicate_row_error,
-    format_key_values_on_columns,
+    format_key_values_on_columns, resolve_target_bases,
 };
 use crate::{
     Dataset,
     dataset::{
         transaction::{Operation, Transaction},
         write::{
-            WriteParams,
+            WriteParams, cleanup_data_fragments,
             merge_insert::{
                 MERGE_ACTION_COLUMN, MergeInsertParams, MergeStats, assign_action::Action,
                 exec::MergeInsertMetrics,
@@ -103,6 +103,29 @@ impl MergeState {
                 // Delete action - only delete, don't write back
                 if !row_addr_array.is_null(row_idx) {
                     let row_addr = row_addr_array.value(row_idx);
+                    let row_id = row_id_array.value(row_idx);
+
+                    // A source with duplicate keys matches the same target row
+                    // more than once; apply the same dedupe policy as updates.
+                    // (Target-only deletes from `delete_not_matched_by_source`
+                    // also reach here but never duplicate, so they never trip
+                    // `Fail`.)
+                    if !self.processed_row_ids.insert(row_id) {
+                        match self.source_dedupe_behavior {
+                            SourceDedupeBehavior::Fail => {
+                                return Err(create_duplicate_row_error(
+                                    batch,
+                                    row_idx,
+                                    &self.on_columns,
+                                ));
+                            }
+                            SourceDedupeBehavior::FirstSeen => {
+                                self.metrics.num_skipped_duplicates.add(1);
+                                return Ok(None); // Skip this duplicate row
+                            }
+                        }
+                    }
+
                     self.delete_row_addrs.insert(row_addr);
                     self.metrics.num_deleted_rows.add(1);
                 }
@@ -774,10 +797,6 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
         "FullSchemaMergeInsertExec"
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn schema(&self) -> arrow_schema::SchemaRef {
         Arc::new(arrow_schema::Schema::empty())
     }
@@ -866,6 +885,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
 
         // Use flat_map to handle the async write operation
         let dataset = self.dataset.clone();
+        let params = self.params.clone();
         let merge_stats_holder = self.merge_stats.clone();
         let transaction_holder = self.transaction.clone();
         let affected_rows_holder = self.affected_rows.clone();
@@ -879,6 +899,9 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
 
         let result_stream = stream::once(async move {
             // Step 2: Write new fragments using the filtered data (inserts + updates)
+            let target_bases_info = resolve_target_bases(&dataset, &params).await?;
+            // Keep a copy so failures after the write can clean up routed files.
+            let cleanup_bases = target_bases_info.clone();
             let (mut new_fragments, _) = write_fragments_internal(
                 Some(&dataset),
                 dataset.object_store.clone(),
@@ -886,31 +909,44 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
                 dataset.schema().clone(),
                 write_data_stream,
                 WriteParams::default(),
-                None, // Merge insert doesn't use target_bases
+                target_bases_info,
             )
             .await?;
 
-            if let Some(row_id_sequence) = updating_row_ids.lock().unwrap().row_id_sequence() {
-                let fragment_sizes = new_fragments
-                    .iter()
-                    .map(|f| f.physical_rows.unwrap() as u64);
+            let row_id_result: lance_core::Result<()> = (|| {
+                if let Some(row_id_sequence) = updating_row_ids.lock().unwrap().row_id_sequence() {
+                    let fragment_sizes = new_fragments
+                        .iter()
+                        .map(|f| f.physical_rows.unwrap() as u64);
 
-                let sequences = lance_table::rowids::rechunk_sequences(
-                    [row_id_sequence.clone()],
-                    fragment_sizes,
-                    true,
-                )
-                .map_err(|e| {
-                    Error::internal(format!(
-                        "Captured row ids not equal to number of rows written: {}",
-                        e
-                    ))
-                })?;
+                    let sequences = lance_table::rowids::rechunk_sequences(
+                        [row_id_sequence.clone()],
+                        fragment_sizes,
+                        true,
+                    )
+                    .map_err(|e| {
+                        Error::internal(format!(
+                            "Captured row ids not equal to number of rows written: {}",
+                            e
+                        ))
+                    })?;
 
-                for (fragment, sequence) in new_fragments.iter_mut().zip(sequences) {
-                    let serialized = lance_table::rowids::write_row_ids(&sequence);
-                    fragment.row_id_meta = Some(RowIdMeta::Inline(serialized));
+                    for (fragment, sequence) in new_fragments.iter_mut().zip(sequences) {
+                        let serialized = lance_table::rowids::write_row_ids(&sequence);
+                        fragment.row_id_meta = Some(RowIdMeta::Inline(serialized));
+                    }
                 }
+                Ok(())
+            })();
+            if let Err(e) = row_id_result {
+                cleanup_data_fragments(
+                    &dataset.object_store,
+                    &dataset.base,
+                    cleanup_bases.as_deref(),
+                    &new_fragments,
+                )
+                .await;
+                return Err(e.into());
             }
 
             // Step 2.5: Calculate write metrics from new fragments
@@ -932,7 +968,21 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
             };
 
             let (updated_fragments, removed_fragment_ids) =
-                apply_deletions(&dataset, &delete_row_addrs_clone).await?;
+                match apply_deletions(&dataset, &delete_row_addrs_clone).await {
+                    Ok(result) => result,
+                    Err(e) => {
+                        // The new data files are not committed; remove them (including
+                        // ones routed to target bases) before surfacing the error.
+                        cleanup_data_fragments(
+                            &dataset.object_store,
+                            &dataset.base,
+                            cleanup_bases.as_deref(),
+                            &new_fragments,
+                        )
+                        .await;
+                        return Err(e.into());
+                    }
+                };
 
             // Step 4: Create the transaction operation
             let operation = Operation::Update {
@@ -941,10 +991,14 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
                 new_fragments,
                 fields_modified: vec![], // No fields are modified in schema for upsert
                 merged_generations,
+                // Use the full pre-order field list (not just top-level `fields`) so
+                // that nested leaf field ids are included. A merge_insert rewrites whole
+                // rows, so every field is potentially modified; omitting nested ids would
+                // let `register_pure_rewrite_rows_update_frags_in_indices` wrongly extend a
+                // nested-field index over the rewritten fragment, silently dropping rows.
                 fields_for_preserving_frag_bitmap: dataset
                     .schema()
-                    .fields
-                    .iter()
+                    .fields_pre_order()
                     .map(|f| f.id as u32)
                     .collect(),
                 update_mode: Some(RewriteRows),

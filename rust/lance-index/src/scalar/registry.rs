@@ -7,66 +7,28 @@ use std::sync::Arc;
 use arrow_schema::Field;
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
+use futures::future::BoxFuture;
 use lance_core::{
     Result,
-    cache::{LanceCache, UnsizedCacheKey},
+    cache::{CacheKey, LanceCache, UnsizedCacheKey},
+    deepsize::DeepSizeOf,
 };
 
 use crate::progress::IndexBuildProgress;
 use crate::registry::IndexPluginRegistry;
-use crate::{
-    frag_reuse::FragReuseIndex,
-    scalar::{CreatedIndex, IndexStore, ScalarIndex, expression::ScalarQueryParser},
-};
+use crate::scalar::RowIdRemapper;
+use crate::scalar::{CreatedIndex, IndexStore, ScalarIndex, expression::ScalarQueryParser};
+// Re-export training types that were previously defined here
+pub use crate::scalar::{TrainingCriteria, TrainingOrdering};
 
 pub const VALUE_COLUMN_NAME: &str = "value";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TrainingOrdering {
-    /// The input will arrive sorted by the value column in ascending order
-    Values,
-    /// The input will arrive sorted by the address column in ascending order
-    Addresses,
-    /// The input will arrive in an arbitrary order
-    None,
-}
-
-#[derive(Debug, Clone)]
-pub struct TrainingCriteria {
-    pub ordering: TrainingOrdering,
-    pub needs_row_ids: bool,
-    pub needs_row_addrs: bool,
-}
-
-impl TrainingCriteria {
-    pub fn new(ordering: TrainingOrdering) -> Self {
-        Self {
-            ordering,
-            needs_row_ids: false,
-            needs_row_addrs: false,
-        }
-    }
-
-    pub fn with_row_id(mut self) -> Self {
-        self.needs_row_ids = true;
-        self
-    }
-
-    pub fn with_row_addr(mut self) -> Self {
-        self.needs_row_addrs = true;
-        self
-    }
-}
-
-/// A trait that describes what criteria is needed to train an index
+/// A trait object for plugin-specific training parameters and data requirements.
 ///
-/// The training process has two steps.  First, the parameters are given to the
-/// plugin and it creates a TrainingRequest.  Then, the caller prepares the training
-/// data and calls train_index.
-///
-/// The call to train_index will include the training request.  This allows the plugin
-/// to stash any deserialized parameter info in the request and fetch it later during
-/// training by downcasting to the appropriate type.
+/// Returned by [`BasicTrainer::new_training_request`]. The caller uses
+/// [`criteria`](Self::criteria) to prepare the training data stream, then passes
+/// the request back to [`BasicTrainer::train_index`], which may downcast
+/// it to the plugin-specific concrete type to recover parsed parameters.
 pub trait TrainingRequest: std::any::Any + Send + Sync {
     fn as_any(&self) -> &dyn std::any::Any;
     fn criteria(&self) -> &TrainingCriteria;
@@ -93,26 +55,35 @@ impl TrainingRequest for DefaultTrainingRequest {
     }
 }
 
-/// A trait for scalar index plugins
+/// Implemented by indexes that can train on a stream of column data.
+///
+/// The training process has two stages. In the first stage, the caller provides
+/// index parameters and receives a [`TrainingRequest`] that describes what criteria
+/// the training data must satisfy (e.g. sort order, row-ID availability). In the
+/// second stage, the caller prepares the data accordingly and calls
+/// [`train_index`](Self::train_index).
+///
+/// Any scalar index plugin that builds from a column data stream should implement
+/// this trait.
 #[async_trait]
-pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
-    /// Creates a new training request from the given parameters
+pub trait BasicTrainer: Send + Sync {
+    /// Creates a new training request from the given parameters.
     ///
-    /// This training request specifies the criteria that the data must satisfy to train the index.
-    /// For example, does the index require the input data to be sorted?
+    /// The returned request specifies the criteria the training data must satisfy.
+    /// It is the caller's responsibility to prepare data that meets those criteria
+    /// before calling [`train_index`](Self::train_index).
     fn new_training_request(&self, params: &str, field: &Field)
     -> Result<Box<dyn TrainingRequest>>;
 
-    /// Train a new index
+    /// Train a new index from a prepared data stream.
     ///
-    /// The provided data must fulfill all the criteria returned by `training_criteria`.
-    /// It is the caller's responsibility to ensure this.
+    /// The provided data must fulfill all the criteria returned by
+    /// [`new_training_request`](Self::new_training_request). It is the caller's
+    /// responsibility to ensure this.
     ///
-    /// Returns index details that describe the index.  These details can potentially be
-    /// useful for planning (although this will currently require inside information on
-    /// the index type) and they will need to be provided when loading the index.
-    ///
-    /// It is the caller's responsibility to store these details somewhere.
+    /// Returns index details describing the index. These details may be useful for
+    /// planning and must be provided when loading the index. It is the caller's
+    /// responsibility to store them.
     async fn train_index(
         &self,
         data: SendableRecordBatchStream,
@@ -121,6 +92,36 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
         fragment_ids: Option<Vec<u32>>,
         progress: Arc<dyn IndexBuildProgress>,
     ) -> Result<CreatedIndex>;
+}
+
+/// A trait for scalar index plugins
+#[async_trait]
+pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
+    /// Returns this plugin's [`BasicTrainer`] implementation, if any.
+    ///
+    /// Training an index can be a complex process.  For example, a btree index might
+    /// be trained using a shuffler from a distributed OLAP system such as
+    /// Spark or Ray.  A vector index can be trained by sampling the column to create
+    /// a kmeans model and then streaming the vectors to assign partitions.  Encapsulating
+    /// the entire set of possible approaches is beyond what this trait can model.
+    /// This is especially true because this is a low-level crate with no concept of a table
+    /// or a dataset.
+    ///
+    /// However, in many cases, an index can be trained on a (potentially sorted) stream
+    /// of column data.  There is also significant utility in being able to provide users
+    /// with a simple generic "create an index" API.
+    ///
+    /// This method is a compromise.  Indexes that support training on a stream of column
+    /// data should override this to return `Some(self)`.  Indexes that need their own
+    /// individualized training approaches should return `None` and provide their own
+    /// methods for training.
+    ///
+    /// An index can take both approaches.  Providing a simple (but maybe less
+    /// efficient) stream-based trainer while also providing more specialized index
+    /// creation methods elsewhere.
+    fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
+        None
+    }
 
     /// A short name for the index
     ///
@@ -158,7 +159,7 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
         &self,
         index_store: Arc<dyn IndexStore>,
         index_details: &prost_types::Any,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>>;
 
@@ -170,14 +171,14 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
     /// The default implementation reads an in-memory `Arc<dyn ScalarIndex>` entry.
     /// Plugins whose index has a serializable representation should override this
     /// (together with [`put_in_cache`](Self::put_in_cache)) to store that
-    /// representation under a sized [`CacheKey`](lance_core::cache::CacheKey) with
+    /// representation under a sized [`CacheKey`] with
     /// a codec, and reconstruct the index here. `index_store` and
     /// `frag_reuse_index` are provided so the override can rebuild the index
     /// without re-reading metadata.
     async fn get_from_cache(
         &self,
         _index_store: Arc<dyn IndexStore>,
-        _frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        _frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Option<Arc<dyn ScalarIndex>>> {
         Ok(cache.get_unsized_with_key(&ScalarIndexCacheKey).await)
@@ -194,6 +195,31 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
             .insert_unsized_with_key(&ScalarIndexCacheKey, index)
             .await;
         Ok(())
+    }
+
+    /// Open an index through the cache, awaiting `load` only on a miss.
+    ///
+    /// The default read-through / write-back over
+    /// [`get_from_cache`](Self::get_from_cache) and
+    /// [`put_in_cache`](Self::put_in_cache) does not coalesce concurrent cold
+    /// opens; plugins with a serializable form should override with
+    /// [`single_flight_open`] so one shared load populates the sized state key.
+    async fn get_or_insert_in_cache(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        cache: &LanceCache,
+        load: ScalarIndexLoad<'_>,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        if let Some(index) = self
+            .get_from_cache(index_store, frag_reuse_index, cache)
+            .await?
+        {
+            return Ok(index);
+        }
+        let index = load.await?;
+        self.put_in_cache(cache, index.clone()).await?;
+        Ok(index)
     }
 
     /// Optional hook allowing a plugin to provide statistics without loading the index.
@@ -217,6 +243,48 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
         // Return an empty JSON object as the default implementation
         Ok(serde_json::json!({}))
     }
+}
+
+/// A boxed, `Send` future performing the storage-level load of a scalar index
+/// (compat checks, `load_index`, metrics).
+///
+/// Passed to [`ScalarIndexPlugin::get_or_insert_in_cache`], which awaits it at
+/// most once on a cache miss and drops it un-awaited on a warm hit.
+pub type ScalarIndexLoad<'a> = BoxFuture<'a, Result<Arc<dyn ScalarIndex>>>;
+
+/// Single-flight open helper for plugins with a serializable form.
+///
+/// Concurrent cold opens of the same index coalesce onto one `load`: it runs
+/// once, `to_state` converts the opened index to its sized state, and the state
+/// is cached under `state_key` (persisted via the key's
+/// [`CacheCodec`](lance_core::cache::CacheCodec)). Every caller — warm hits
+/// included — then rebuilds the index from the shared state via `from_state`, an
+/// IO-free reconstruct.
+///
+/// `to_state` / `from_state` mirror the plugin's
+/// [`put_in_cache`](ScalarIndexPlugin::put_in_cache) /
+/// [`get_from_cache`](ScalarIndexPlugin::get_from_cache), keeping the state
+/// representation defined in one place.
+pub async fn single_flight_open<K, ToState, FromState>(
+    cache: &LanceCache,
+    state_key: K,
+    load: ScalarIndexLoad<'_>,
+    to_state: ToState,
+    from_state: FromState,
+) -> Result<Arc<dyn ScalarIndex>>
+where
+    K: CacheKey + Send,
+    K::ValueType: DeepSizeOf + Send + Sync + 'static,
+    ToState: FnOnce(&dyn ScalarIndex) -> Result<K::ValueType> + Send,
+    FromState: FnOnce(Arc<K::ValueType>) -> Result<Arc<dyn ScalarIndex>> + Send,
+{
+    let state = cache
+        .get_or_insert_with_key(state_key, move || async move {
+            let index = load.await?;
+            to_state(index.as_ref())
+        })
+        .await?;
+    from_state(state)
 }
 
 /// In-memory cache key for a whole `Arc<dyn ScalarIndex>`.

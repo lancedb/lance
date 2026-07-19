@@ -1,18 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
+import gc
 import importlib
 import io
+import queue
 import subprocess
 import sys
 import tarfile
 import textwrap
+import threading
+import uuid
+from pathlib import Path
 
 import lance
 import pandas as pd
 import pyarrow as pa
 import pytest
 from lance import Blob, BlobColumn, BlobFile, DatasetBasePath
+from lance.file import LanceFileSession
 from lance.fragment import write_fragments
 
 lance_dataset_module = importlib.import_module("lance.dataset")
@@ -43,6 +49,11 @@ def _external_blob_table(blob_path, payload=b"hello"):
     blob_path.parent.mkdir(parents=True, exist_ok=True)
     blob_path.write_bytes(payload)
     return pa.table({"blob": lance.blob_array([blob_path.as_uri()])})
+
+
+def _blob_sidecar_path(data_dir, data_file_key, blob_id):
+    sidecar_name = f"{int(f'{blob_id:032b}'[::-1], 2):032b}.blob"
+    return data_dir / data_file_key / sidecar_name
 
 
 def _add_columns_blob_v2_values(tmp_path):
@@ -169,6 +180,40 @@ def test_scan_blob_as_binary(tmp_path):
 
     tbl = ds.scanner(columns=["blobs"], blob_handling="all_binary").to_table()
     assert tbl.column("blobs").to_pylist() == values
+
+
+def test_v2_0_blob_descriptor_projection_and_reads(tmp_path):
+    values = [b"abc", b"defgh", b"ijklmnop"]
+    blob_field = pa.field(
+        "blob", pa.large_binary(), metadata={"lance-encoding:blob": "true"}
+    )
+    schema = pa.schema([pa.field("id", pa.int32()), blob_field])
+    table = pa.table(
+        {"id": [0, 1, 2], "blob": values},
+        schema=schema,
+    )
+    ds = lance.write_dataset(table, tmp_path / "test_ds", data_storage_version="2.0")
+
+    for blob_handling in [None, "all_descriptions", "blobs_descriptions"]:
+        kwargs = {} if blob_handling is None else {"blob_handling": blob_handling}
+        descriptions = ds.scanner(columns=["blob"], **kwargs).to_table().column("blob")
+        chunk = descriptions.chunk(0)
+        assert chunk.type == pa.struct(
+            [
+                pa.field("position", pa.uint64()),
+                pa.field("size", pa.uint64()),
+            ]
+        )
+        assert chunk.field("size").to_pylist() == [3, 5, 8]
+
+    tbl = ds.scanner(columns=["blob"], blob_handling="all_binary").to_table()
+    assert tbl.column("blob").to_pylist() == values
+    assert [blob.read() for blob in ds.take_blobs("blob", indices=[0, 1, 2])] == values
+    assert ds.read_blobs("blob", indices=[0, 1, 2]) == [
+        (0, b"abc"),
+        (1, b"defgh"),
+        (2, b"ijklmnop"),
+    ]
 
 
 def test_fragment_scan_blob_as_binary(tmp_path):
@@ -588,10 +633,14 @@ def test_blob_field_threshold_metadata():
         "blob",
         inline_size_threshold=16 * 1024,
         dedicated_size_threshold=2 * 1024 * 1024,
+        pack_file_size_threshold=512 * 1024 * 1024,
     )
 
     assert field.metadata[b"lance-encoding:blob-inline-size-threshold"] == b"16384"
     assert field.metadata[b"lance-encoding:blob-dedicated-size-threshold"] == b"2097152"
+    assert (
+        field.metadata[b"lance-encoding:blob-pack-file-size-threshold"] == b"536870912"
+    )
 
 
 @pytest.mark.parametrize(
@@ -644,6 +693,30 @@ def test_blob_field_threshold_metadata():
             OverflowError,
             "dedicated_size_threshold must fit in a Rust usize",
             id="overflow_dedicated",
+        ),
+        pytest.param(
+            {"pack_file_size_threshold": 0},
+            ValueError,
+            "pack_file_size_threshold must be positive",
+            id="zero_pack_file",
+        ),
+        pytest.param(
+            {"pack_file_size_threshold": -1},
+            ValueError,
+            "pack_file_size_threshold must be positive",
+            id="negative_pack_file",
+        ),
+        pytest.param(
+            {"pack_file_size_threshold": True},
+            TypeError,
+            "pack_file_size_threshold must be an int",
+            id="bool_pack_file",
+        ),
+        pytest.param(
+            {"pack_file_size_threshold": 2**100},
+            OverflowError,
+            "pack_file_size_threshold must fit in a Rust usize",
+            id="overflow_pack_file",
         ),
     ],
 )
@@ -704,6 +777,50 @@ def test_blob_extension_append_rejects_explicit_threshold_mismatch(tmp_path):
     lance.write_dataset(initial, dataset_path, data_storage_version="2.2")
 
     append_schema = pa.schema([lance.blob_field("blob", inline_size_threshold=1024)])
+    append = pa.table(
+        {"blob": lance.blob_array([b"x" * 2048])},
+        schema=append_schema,
+    )
+
+    with pytest.raises(
+        OSError, match="Cannot append data with blob threshold metadata"
+    ):
+        lance.write_dataset(append, dataset_path, mode="append")
+
+
+def test_blob_extension_pack_file_threshold_metadata_persists_after_reopen(
+    tmp_path: Path,
+):
+    dataset_path = tmp_path / "test_ds_v2_pack_file_threshold_persists"
+    threshold = 512 * 1024 * 1024
+    schema = pa.schema([lance.blob_field("blob", pack_file_size_threshold=threshold)])
+    table = pa.table({"blob": lance.blob_array([b"x"])}, schema=schema)
+
+    lance.write_dataset(table, dataset_path, data_storage_version="2.2")
+    reopened = lance.dataset(dataset_path)
+
+    assert (
+        reopened.schema.field("blob").metadata[
+            b"lance-encoding:blob-pack-file-size-threshold"
+        ]
+        == str(threshold).encode()
+    )
+
+
+def test_blob_extension_append_rejects_pack_file_threshold_mismatch(tmp_path: Path):
+    dataset_path = tmp_path / "test_ds_v2_append_pack_file_mismatch"
+    initial_schema = pa.schema(
+        [lance.blob_field("blob", pack_file_size_threshold=512 * 1024 * 1024)]
+    )
+    initial = pa.table(
+        {"blob": lance.blob_array([b"x" * 2048])},
+        schema=initial_schema,
+    )
+    lance.write_dataset(initial, dataset_path, data_storage_version="2.2")
+
+    append_schema = pa.schema(
+        [lance.blob_field("blob", pack_file_size_threshold=256 * 1024 * 1024)]
+    )
     append = pa.table(
         {"blob": lance.blob_array([b"x" * 2048])},
         schema=append_schema,
@@ -941,6 +1058,366 @@ def test_blob_extension_add_columns_all_nulls_blob_v2(tmp_path):
 
     assert ds.to_table(columns=["blob"]).column("blob").to_pylist() == [None] * 4
     assert ds.take_blobs("blob", indices=range(4)) == []
+
+
+def test_blob_descriptor_array_builder_writes_prepared_packed_blob_for_data_replacement(
+    tmp_path,
+):
+    dataset_uri = tmp_path / "test_blob_descriptor_array_builder_data_replacement"
+    logical_schema = pa.schema(
+        [
+            pa.field("id", pa.uint32(), nullable=False),
+            lance.blob_field("blob"),
+        ]
+    )
+    initial = pa.table(
+        [
+            pa.array([0], type=pa.uint32()),
+            lance.blob_array([b"initial"]),
+        ],
+        schema=logical_schema,
+    )
+    ds = lance.write_dataset(initial, dataset_uri, data_storage_version="2.2")
+
+    file_id = str(uuid.uuid4())
+    data_file_name = f"{file_id}.lance"
+    blob_id = 1
+    blob_path = _blob_sidecar_path(dataset_uri / "data", file_id, blob_id)
+
+    files = LanceFileSession(dataset_uri / "data")
+    blob_writer = lance.BlobDescriptorArrayBuilder("blob")
+    packed = files.open_packed_blob_writer(data_file_name, blob_id)
+    assert packed.path.endswith(blob_path.relative_to(dataset_uri).as_posix())
+    packed.write_blob(b"replacement")
+    blob_writer.extend(packed.finish())
+
+    physical_schema = pa.schema(
+        [
+            pa.field("id", pa.uint32(), nullable=False),
+            blob_writer.field,
+        ]
+    )
+    replacement = pa.record_batch(
+        [
+            pa.array([1], type=pa.uint32()),
+            blob_writer.finish(),
+        ],
+        schema=physical_schema,
+    )
+
+    with files.open_writer(
+        data_file_name, schema=physical_schema, version="2.2"
+    ) as file_writer:
+        file_writer.write_batch(replacement)
+
+    data_file = lance.fragment.DataFile.create(ds, data_file_name)
+    operation = lance.LanceOperation.DataReplacement(
+        [lance.LanceOperation.DataReplacementGroup(0, data_file)]
+    )
+    ds = lance.LanceDataset.commit(ds, operation, read_version=ds.version)
+
+    assert ds.to_table(columns=["id"]).column("id").to_pylist() == [1]
+    blobs = ds.take_blobs("blob", indices=[0])
+    assert len(blobs) == 1
+    assert blobs[0].readall() == b"replacement"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param(b"payload", id="bytes"),
+        pytest.param(bytearray(b"payload"), id="bytearray"),
+        pytest.param(memoryview(b"payload"), id="memoryview"),
+        pytest.param(list(b"payload"), id="integer_sequence"),
+    ],
+)
+def test_packed_blob_writer_scalar_buffer_inputs(tmp_path, payload):
+    file_id = str(uuid.uuid4())
+    blob_id = 7
+    files = LanceFileSession(tmp_path)
+    packed = files.open_packed_blob_writer(f"{file_id}.lance", blob_id)
+
+    packed.write_blob(payload)
+    descriptors = packed.finish()
+
+    assert [repr(descriptor) for descriptor in descriptors] == [
+        "Packed { blob_id: 7, offset: 0, size: 7 }"
+    ]
+    assert _blob_sidecar_path(tmp_path, file_id, blob_id).read_bytes() == b"payload"
+
+
+@pytest.mark.parametrize("array_type", [pa.binary(), pa.large_binary()])
+@pytest.mark.parametrize("as_chunked", [False, True], ids=["array", "chunked_array"])
+@pytest.mark.parametrize(
+    "values,slice_offset,slice_length,expected_values,expected_data",
+    [
+        pytest.param(
+            [b"prefix", b"a", None, b"", b"bc", b"suffix"],
+            1,
+            4,
+            [b"a", None, b"", b"bc"],
+            b"abc",
+            id="interleaved_null",
+        ),
+        pytest.param(
+            [b"prefix", b"a", b"", b"bc", b"suffix"],
+            1,
+            3,
+            [b"a", b"", b"bc"],
+            b"abc",
+            id="all_valid",
+        ),
+        pytest.param(
+            [b"prefix", None, None, b"suffix"],
+            1,
+            2,
+            [None, None],
+            b"",
+            id="all_null",
+        ),
+        pytest.param(
+            [b"prefix", b"suffix"],
+            1,
+            0,
+            [],
+            b"",
+            id="empty",
+        ),
+    ],
+)
+def test_packed_blob_writer_bulk_arrow_array(
+    tmp_path,
+    array_type,
+    as_chunked,
+    values,
+    slice_offset,
+    slice_length,
+    expected_values,
+    expected_data,
+):
+    file_id = str(uuid.uuid4())
+    data_file_name = f"{file_id}.lance"
+    blob_id = 7
+    payloads = pa.array(values, type=array_type).slice(slice_offset, slice_length)
+    if as_chunked:
+        split_at = max(1, len(payloads) // 2)
+        payloads = pa.chunked_array(
+            [payloads.slice(0, split_at), payloads.slice(split_at)]
+        )
+
+    files = LanceFileSession(tmp_path)
+    packed = files.open_packed_blob_writer(data_file_name, blob_id)
+    with pytest.raises(ValueError, match="available after finish_array"):
+        packed.field
+    packed.write_blobs(payloads)
+    descriptors = packed.finish_array("image_bytes")
+    descriptor_field = packed.field
+
+    expected_descriptors = []
+    position = 0
+    for value in expected_values:
+        if value is None:
+            expected_descriptors.append(None)
+        else:
+            expected_descriptors.append(
+                {
+                    "kind": 1,
+                    "data": None,
+                    "uri": None,
+                    "blob_id": blob_id,
+                    "blob_size": len(value),
+                    "position": position,
+                }
+            )
+            position += len(value)
+
+    assert descriptors.to_pylist() == expected_descriptors
+    assert descriptor_field == lance.BlobDescriptorArrayBuilder("image_bytes").field
+    assert descriptor_field.metadata[b"ARROW:extension:name"] == b"lance.blob.v2"
+    assert pa.record_batch(
+        [descriptors], schema=pa.schema([descriptor_field])
+    ).num_rows == len(expected_values)
+    assert _blob_sidecar_path(tmp_path, file_id, blob_id).read_bytes() == expected_data
+
+
+@pytest.mark.parametrize(
+    "array_type,offset_type",
+    [
+        pytest.param(pa.binary(), pa.int32(), id="binary"),
+        pytest.param(pa.large_binary(), pa.int64(), id="large_binary"),
+    ],
+)
+def test_packed_blob_writer_bulk_excludes_physical_null_bytes(
+    tmp_path, array_type, offset_type
+):
+    offsets = pa.array([0, 1, 5, 5, 7], type=offset_type).buffers()[1]
+    payloads = pa.Array.from_buffers(
+        array_type,
+        4,
+        [
+            pa.py_buffer(bytes([0b00001101])),
+            offsets,
+            pa.py_buffer(b"aJUNKbc"),
+        ],
+    )
+    file_id = str(uuid.uuid4())
+    blob_id = 7
+    files = LanceFileSession(tmp_path)
+    packed = files.open_packed_blob_writer(f"{file_id}.lance", blob_id)
+
+    packed.write_blobs(payloads)
+    descriptors = packed.finish_array("image_bytes")
+
+    assert descriptors.to_pylist() == [
+        {
+            "kind": 1,
+            "data": None,
+            "uri": None,
+            "blob_id": blob_id,
+            "blob_size": 1,
+            "position": 0,
+        },
+        None,
+        {
+            "kind": 1,
+            "data": None,
+            "uri": None,
+            "blob_id": blob_id,
+            "blob_size": 0,
+            "position": 1,
+        },
+        {
+            "kind": 1,
+            "data": None,
+            "uri": None,
+            "blob_id": blob_id,
+            "blob_size": 2,
+            "position": 1,
+        },
+    ]
+    assert _blob_sidecar_path(tmp_path, file_id, blob_id).read_bytes() == b"abc"
+
+
+@pytest.mark.parametrize(
+    "array_type,offset_type",
+    [
+        pytest.param(pa.binary(), pa.int32(), id="binary"),
+        pytest.param(pa.large_binary(), pa.int64(), id="large_binary"),
+    ],
+)
+@pytest.mark.parametrize("as_chunked", [False, True], ids=["array", "chunked_array"])
+def test_packed_blob_writer_bulk_rejects_non_monotonic_offsets(
+    tmp_path, array_type, offset_type, as_chunked
+):
+    offsets = pa.array([0, 2, 1, 2], type=offset_type).buffers()[1]
+    malformed = pa.Array.from_buffers(
+        array_type,
+        3,
+        [None, offsets, pa.py_buffer(b"ab")],
+    )
+    payloads = malformed
+    expected_context = "Packed blob payload array"
+    if as_chunked:
+        payloads = pa.chunked_array([pa.array([b"valid"], type=array_type), malformed])
+        expected_context = "Packed blob payload chunk 1"
+
+    file_id = str(uuid.uuid4())
+    blob_id = 7
+    files = LanceFileSession(tmp_path)
+    packed = files.open_packed_blob_writer(f"{file_id}.lance", blob_id)
+
+    with pytest.raises(ValueError, match="invalid Arrow data") as error:
+        packed.write_blobs(payloads)
+    assert expected_context in str(error.value)
+    assert "non-monotonic offset" in str(error.value)
+
+    packed.write_blob(b"still usable")
+    descriptors = packed.finish_array("blob")
+    assert len(descriptors) == 1
+    assert (
+        _blob_sidecar_path(tmp_path, file_id, blob_id).read_bytes() == b"still usable"
+    )
+
+
+def test_packed_blob_writer_mixed_calls_preserve_legacy_finish_alignment(tmp_path):
+    file_id = str(uuid.uuid4())
+    blob_id = 7
+    files = LanceFileSession(tmp_path)
+    packed = files.open_packed_blob_writer(f"{file_id}.lance", blob_id)
+
+    packed.write_blob(b"s")
+    packed.write_blobs(pa.array([b"a", None, b""], type=pa.binary()))
+    packed.write_blobs(pa.array([None, b"bc"], type=pa.large_binary()))
+    descriptors = packed.finish()
+
+    assert [repr(descriptor) for descriptor in descriptors] == [
+        "Packed { blob_id: 7, offset: 0, size: 1 }",
+        "Packed { blob_id: 7, offset: 1, size: 1 }",
+        "Null",
+        "Packed { blob_id: 7, offset: 2, size: 0 }",
+        "Null",
+        "Packed { blob_id: 7, offset: 2, size: 2 }",
+    ]
+    assert _blob_sidecar_path(tmp_path, file_id, blob_id).read_bytes() == b"sabc"
+
+
+@pytest.mark.parametrize(
+    "payloads",
+    [
+        pytest.param(pa.array([1, 2], type=pa.int32()), id="array"),
+        pytest.param(pa.chunked_array([[1], [2]], type=pa.int32()), id="chunked_array"),
+        pytest.param([b"not an Arrow array"], id="python_list"),
+    ],
+)
+def test_packed_blob_writer_bulk_rejects_non_binary_array(tmp_path, payloads):
+    files = LanceFileSession(tmp_path)
+    packed = files.open_packed_blob_writer("data-file.lance", 1)
+
+    with pytest.raises(ValueError, match="Binary") as error:
+        packed.write_blobs(payloads)
+    if isinstance(payloads, pa.Array):
+        assert "chunk" not in str(error.value)
+
+    packed.write_blob(b"still usable")
+    assert len(packed.finish_array("blob")) == 1
+
+
+@pytest.mark.parametrize(
+    "open_writer",
+    [
+        pytest.param("open_packed_blob_writer", id="packed"),
+        pytest.param("open_dedicated_blob_writer", id="dedicated"),
+    ],
+)
+def test_failed_blob_writer_traceback_can_be_released_on_another_thread(
+    tmp_path, monkeypatch, open_writer
+):
+    failures = queue.Queue()
+
+    def fail_with_live_writer():
+        files = LanceFileSession(tmp_path)
+        writer = getattr(files, open_writer)("data-file.lance", 1)
+        assert writer.blob_id == 1
+        try:
+            raise OSError("simulated object-store write failure")
+        except OSError as error:
+            # The traceback retains this frame and its local writer, matching a
+            # writer-thread failure handed to an owning thread for propagation.
+            failures.put(error)
+
+    writer_thread = threading.Thread(target=fail_with_live_writer)
+    writer_thread.start()
+    writer_thread.join(timeout=10)
+    assert not writer_thread.is_alive()
+
+    unraisable = []
+    monkeypatch.setattr(sys, "unraisablehook", unraisable.append)
+    error = failures.get_nowait()
+    assert str(error) == "simulated object-store write failure"
+    del error
+    gc.collect()
+
+    assert unraisable == []
 
 
 def test_blob_extension_write_fragments_external_denied_by_default(tmp_path):

@@ -44,6 +44,7 @@ use futures::{
 use io::write_hnsw_quantization_index_partitions;
 use lance_arrow::*;
 use lance_core::deepsize::DeepSizeOf;
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::{
     Error, ROW_ID_FIELD, Result,
     cache::{LanceCache, UnsizedCacheKey, WeakLanceCache},
@@ -385,6 +386,106 @@ pub(crate) fn select_segment_for_single_rebalance(
     Ok(selected.map(|candidate| candidate.segment_id))
 }
 
+fn validate_shared_vector_model(indices: &[Arc<dyn VectorIndex>], operation: &str) -> Result<()> {
+    let Some(first) = indices.first() else {
+        return Ok(());
+    };
+    if indices.len() == 1 {
+        return Ok(());
+    }
+
+    let first_metric = first.metric_type();
+    let first_index_type = first.sub_index_type();
+    let first_centroids = first.ivf_model().centroids_array();
+    let first_quantizer = first.quantizer();
+    let first_quantizer_type = first_quantizer.quantization_type();
+
+    for (idx, index) in indices.iter().enumerate().skip(1) {
+        if index.metric_type() != first_metric {
+            return Err(Error::index(format!(
+                "{operation}: vector index segment {idx} has metric {:?}, expected {:?}",
+                index.metric_type(),
+                first_metric
+            )));
+        }
+        let index_type = index.sub_index_type();
+        if std::mem::discriminant(&index_type.0) != std::mem::discriminant(&first_index_type.0)
+            || index_type.1 != first_index_type.1
+        {
+            return Err(Error::index(format!(
+                "{operation}: vector index segment {idx} has type {:?}, expected {:?}",
+                index_type, first_index_type
+            )));
+        }
+        match (first_centroids, index.ivf_model().centroids_array()) {
+            (Some(expected), Some(actual)) if expected.to_data() != actual.to_data() => {
+                return Err(Error::index(format!(
+                    "{operation}: vector index segments do not share IVF centroids"
+                )));
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(Error::index(format!(
+                    "{operation}: vector index segments do not share IVF centroids"
+                )));
+            }
+            _ => {}
+        }
+
+        let quantizer = index.quantizer();
+        if quantizer.quantization_type() != first_quantizer_type {
+            return Err(Error::index(format!(
+                "{operation}: vector index segment {idx} has quantizer {:?}, expected {:?}",
+                quantizer.quantization_type(),
+                first_quantizer_type
+            )));
+        }
+        if !shared_quantizer_model(&first_quantizer, &quantizer) {
+            return Err(Error::index(format!(
+                "{operation}: vector index segments do not share quantizer metadata"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn shared_quantizer_model(left: &Quantizer, right: &Quantizer) -> bool {
+    match (left, right) {
+        (Quantizer::Flat(left), Quantizer::Flat(right)) => {
+            left.metadata(None).dim == right.metadata(None).dim
+        }
+        (Quantizer::FlatBin(left), Quantizer::FlatBin(right)) => {
+            left.metadata(None).dim == right.metadata(None).dim
+        }
+        (Quantizer::Product(left), Quantizer::Product(right)) => {
+            left.num_sub_vectors == right.num_sub_vectors
+                && left.num_bits == right.num_bits
+                && left.dimension == right.dimension
+                && left.distance_type == right.distance_type
+                && left.codebook.to_data() == right.codebook.to_data()
+        }
+        (Quantizer::Scalar(left), Quantizer::Scalar(right)) => {
+            left.metadata(None) == right.metadata(None)
+        }
+        (Quantizer::Rabit(left), Quantizer::Rabit(right)) => {
+            let left = left.metadata(None);
+            let right = right.metadata(None);
+            left.rotation_type == right.rotation_type
+                && left.code_dim == right.code_dim
+                && left.num_bits == right.num_bits
+                && left.packed == right.packed
+                && left.query_estimator == right.query_estimator
+                && left.fast_rotation_signs == right.fast_rotation_signs
+                && match (&left.rotate_mat, &right.rotate_mat) {
+                    (Some(left), Some(right)) => left.to_data() == right.to_data(),
+                    (None, None) => true,
+                    _ => false,
+                }
+        }
+        _ => false,
+    }
+}
+
 // TODO: move to `lance-index` crate.
 ///
 /// Returns (new_uuid, num_indices_merged, files)
@@ -406,6 +507,7 @@ pub(crate) async fn optimize_vector_indices(
     // try cast to v1 IVFIndex,
     // fallback to v2 IVFIndex if it's not v1 IVFIndex
     if !existing_indices[0].as_any().is::<IVFIndex>() {
+        validate_shared_vector_model(&existing_indices, "optimizing vector index")?;
         return optimize_vector_indices_v2(
             &dataset,
             unindexed,
@@ -958,13 +1060,12 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
     writer.add_metadata(IVF_PARTITION_KEY, &hnsw_metadata_json.to_string());
 
     ivf_mut.write(&mut writer).await?;
-    let index_size = writer.tell().await? as u64;
-    writer.finish().await?;
+    // `finish` writes the footer and returns the authoritative on-disk size.
+    let index_size = writer.finish().await?.size_bytes;
 
     // Write the aux file
     aux_ivf.write(&mut aux_writer).await?;
-    let aux_size = aux_writer.tell().await? as u64;
-    aux_writer.finish().await?;
+    let aux_size = aux_writer.finish().await?.size_bytes;
 
     Ok((
         existing_indices.len() - start_pos,
@@ -1244,7 +1345,7 @@ impl VectorIndex for IVFIndex {
         todo!("this method is for only IVF_HNSW_* index");
     }
 
-    async fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
+    async fn remap(&mut self, _mapping: &RowAddrRemap) -> Result<()> {
         // This will be needed if we want to clean up IVF to allow more than just
         // one layer (e.g. IVF -> IVF -> PQ).  We need to pass on the call to
         // remap to the lower layers.
@@ -1719,7 +1820,7 @@ impl RemapPageTask {
         mut self,
         reader: Arc<dyn Reader>,
         index: &IVFIndex,
-        mapping: &HashMap<u64, Option<u64>>,
+        mapping: &RowAddrRemap,
     ) -> Result<Self> {
         let mut page = index
             .sub_index
@@ -1765,7 +1866,7 @@ pub(crate) async fn remap_index_file_v3(
     dataset: &Dataset,
     new_uuid: &Uuid,
     index: Arc<dyn VectorIndex>,
-    mapping: &HashMap<u64, Option<u64>>,
+    mapping: &RowAddrRemap,
     column: String,
 ) -> Result<Vec<IndexFile>> {
     let dataset = dataset.clone();
@@ -1864,7 +1965,7 @@ pub(crate) async fn remap_index_file(
     new_uuid: &Uuid,
     old_version: u64,
     index: &IVFIndex,
-    mapping: &HashMap<u64, Option<u64>>,
+    mapping: &RowAddrRemap,
     name: String,
     column: String,
     transforms: Vec<pb::Transform>,
@@ -1892,7 +1993,7 @@ pub(crate) async fn remap_index_file(
 
     let tasks = generate_remap_tasks(&index.ivf.offsets, &index.ivf.lengths)?;
 
-    let mut task_stream = stream::iter(tasks.into_iter())
+    let mut task_stream = stream::iter(tasks)
         .map(|task| task.load_and_remap(reader.clone(), index, mapping))
         .buffered(object_store.io_parallelism());
 
@@ -4267,19 +4368,26 @@ async fn train_streaming_coreset_ivf_model(
 
     let coreset_len = coreset.len();
     let (coreset_data, coreset_weights, coreset_losses) = coreset.into_fsl_parts(dimension)?;
-    let weighted_hierarchical_params = WeightedHierarchicalKMeansParams {
-        dimension,
-        target_k: num_partitions,
-        metric_type: DistanceType::L2,
-        max_iters: params.max_iters,
-        on_progress: on_progress.clone(),
+    // Scope `weighted_hierarchical_params` so the `on_progress` clone it holds
+    // (which owns a clone of `progress_tx`) is dropped as soon as training
+    // returns. Otherwise it would outlive the `progress_worker.await` below,
+    // keeping a channel sender alive so `progress_rx.recv()` never returns
+    // `None` and the progress worker — and thus this function — hangs forever.
+    let mut centroids = {
+        let weighted_hierarchical_params = WeightedHierarchicalKMeansParams {
+            dimension,
+            target_k: num_partitions,
+            metric_type: DistanceType::L2,
+            max_iters: params.max_iters,
+            on_progress: on_progress.clone(),
+        };
+        train_weighted_hierarchical_f32_kmeans(
+            &coreset_data,
+            &coreset_weights,
+            &coreset_losses,
+            &weighted_hierarchical_params,
+        )?
     };
-    let mut centroids = train_weighted_hierarchical_f32_kmeans(
-        &coreset_data,
-        &coreset_weights,
-        &coreset_losses,
-        &weighted_hierarchical_params,
-    )?;
     let refine_iters = 3;
     if refine_iters > 0 {
         let refined = refine_weighted_f32_kmeans(
@@ -4576,6 +4684,41 @@ mod tests {
     use crate::utils::test::copy_test_data_to_tmp;
 
     const DIM: usize = 32;
+
+    #[test]
+    fn test_shared_quantizer_model_compares_skipped_payloads() {
+        let codebook = |offset| {
+            let values = Float32Array::from_iter_values((0..32).map(|v| v as f32 + offset));
+            FixedSizeListArray::try_new_from_values(values, 2).unwrap()
+        };
+        let pq1 = Quantizer::Product(ProductQuantizer::new(
+            1,
+            4,
+            2,
+            codebook(0.0),
+            DistanceType::L2,
+        ));
+        let pq2 = Quantizer::Product(ProductQuantizer::new(
+            1,
+            4,
+            2,
+            codebook(100.0),
+            DistanceType::L2,
+        ));
+        assert!(!shared_quantizer_model(&pq1, &pq2));
+
+        let rq1 = Quantizer::Rabit(RabitQuantizer::new_with_rotation::<Float32Type>(
+            1,
+            8,
+            lance_index::vector::bq::RQRotationType::Matrix,
+        ));
+        let rq2 = Quantizer::Rabit(RabitQuantizer::new_with_rotation::<Float32Type>(
+            1,
+            8,
+            lance_index::vector::bq::RQRotationType::Matrix,
+        ));
+        assert!(!shared_quantizer_model(&rq1, &rq2));
+    }
 
     async fn compute_test_ivf_loss(dataset: &Dataset, column: &str, ivf: &IvfModel) -> f64 {
         let centroids = ivf
@@ -5143,7 +5286,7 @@ mod tests {
             &new_uuid,
             dataset_mut.version().version,
             ivf_index,
-            &mapping,
+            &RowAddrRemap::direct(mapping),
             INDEX_NAME.to_string(),
             WellKnownIvfPqData::COLUMN.to_string(),
             vec![],
@@ -5658,6 +5801,94 @@ mod tests {
             compute_test_ivf_loss(&dataset, "vector", &ivf_model)
                 .await
                 .is_finite()
+        );
+    }
+
+    /// Regression test for a hang in the streaming *coreset* trainer
+    /// (`train_streaming_coreset_ivf_model`, taken when `num_partitions > 256`).
+    ///
+    /// That function spawns a `progress_worker` task that loops on
+    /// `progress_rx.recv()` and only terminates once every clone of the mpsc
+    /// sender is dropped. The `on_progress` closure owns a sender clone, and
+    /// `WeightedHierarchicalKMeansParams` used to retain an `on_progress` clone
+    /// that outlived the `progress_worker.await` at the end of the function.
+    /// With a live sender remaining, `recv()` never returned `None`, the worker
+    /// never finished, and the trainer hung forever after all compute was done.
+    ///
+    /// The build is wrapped in a timeout so the regression fails fast rather
+    /// than hanging the test process indefinitely.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_streaming_coreset_ivf_training_terminates() {
+        use lance_index::progress::IndexBuildProgress;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::Duration;
+
+        #[derive(Debug, Default)]
+        struct CountingProgress {
+            progress_calls: AtomicU64,
+        }
+
+        #[async_trait::async_trait]
+        impl IndexBuildProgress for CountingProgress {
+            async fn stage_start(&self, _: &str, _: Option<u64>, _: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn stage_progress(&self, _: &str, _: u64) -> Result<()> {
+                self.progress_calls.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            async fn stage_complete(&self, _: &str) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        const SMALL_DIM: usize = 8;
+
+        let test_dir = TempStrDir::default();
+        let uri = format!("{}/ds", test_dir.as_str());
+        let reader = gen_batch()
+            .col("id", array::step::<UInt64Type>())
+            .col(
+                "vector",
+                array::rand_vec::<Float32Type>((SMALL_DIM as u32).into()),
+            )
+            .into_reader_rows(RowCount::from(2048), BatchCount::from(4));
+        let dataset = Dataset::write(reader, &uri, None).await.unwrap();
+
+        // > 256 partitions routes through `train_streaming_coreset_ivf_model`.
+        let mut params = IvfBuildParams::new(257);
+        params.sample_rate = 8;
+        params.streaming_sample_rate = Some(4);
+        params.streaming_refine_passes = 1;
+        params.max_iters = 2;
+
+        let progress = Arc::new(CountingProgress::default());
+
+        let ivf_model = tokio::time::timeout(
+            Duration::from_secs(120),
+            build_ivf_model(
+                &dataset,
+                "vector",
+                SMALL_DIM,
+                MetricType::L2,
+                &params,
+                None,
+                progress.clone(),
+            ),
+        )
+        .await
+        .expect(
+            "streaming coreset IVF training hung: progress worker never terminated after training",
+        )
+        .unwrap();
+
+        assert_eq!(ivf_model.num_partitions(), 257);
+        assert_eq!(ivf_model.dimension(), SMALL_DIM);
+        // The progress worker must have processed reports and then joined
+        // cleanly (proven by `build_ivf_model` returning at all).
+        assert!(
+            progress.progress_calls.load(Ordering::Relaxed) > 0,
+            "expected the progress worker to receive at least one report"
         );
     }
 
@@ -6563,5 +6794,81 @@ mod tests {
 
         let indices = dataset.load_indices().await.unwrap();
         assert!(!indices.is_empty(), "should have at least one index");
+    }
+
+    #[tokio::test]
+    async fn test_optimize_ivf_hnsw_records_actual_file_sizes() {
+        // Regression test: `optimize_ivf_hnsw_indices` must record the on-disk
+        // file sizes, which are only known after `finish()` writes the footer.
+        const DIM: usize = 16;
+        let data = gen_batch()
+            .col(
+                "vec",
+                array::rand_vec::<Float32Type>(Dimension::from(DIM as u32)),
+            )
+            .into_batch_rows(RowCount::from(1_000))
+            .unwrap();
+        let schema = data.schema();
+
+        let mut dataset = InsertBuilder::new("memory://")
+            .execute(vec![data])
+            .await
+            .unwrap();
+
+        // Legacy file version keeps the index on the v1 path that goes through
+        // `optimize_ivf_hnsw_indices`.
+        let mut params = VectorIndexParams::with_ivf_hnsw_sq_params(
+            MetricType::L2,
+            IvfBuildParams::new(2),
+            HnswBuildParams::default().num_edges(50),
+            SQBuildParams::default(),
+        );
+        params.version(IndexFileVersion::Legacy);
+        dataset
+            .create_index(&["vec"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+
+        // Append unindexed data so `optimize_indices` has something to merge.
+        let more = gen_batch()
+            .col(
+                "vec",
+                array::rand_vec::<Float32Type>(Dimension::from(DIM as u32)),
+            )
+            .into_batch_rows(RowCount::from(500))
+            .unwrap();
+        let more = RecordBatch::try_new(schema.clone(), more.columns().to_vec()).unwrap();
+        let mut dataset = InsertBuilder::new(Arc::new(dataset))
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            })
+            .execute(vec![more])
+            .await
+            .unwrap();
+
+        dataset.optimize_indices(&Default::default()).await.unwrap();
+
+        let indices = dataset.load_indices().await.unwrap();
+        let index = indices.first().expect("should have an index");
+        let files = index
+            .files
+            .as_ref()
+            .expect("optimized index should record file sizes");
+        assert!(!files.is_empty(), "index should record at least one file");
+
+        let indices_dir = dataset.indices_dir().join(index.uuid.to_string());
+        for file in files {
+            let actual = dataset
+                .object_store
+                .size(&indices_dir.clone().join(file.path.as_str()))
+                .await
+                .unwrap();
+            assert_eq!(
+                file.size_bytes, actual,
+                "recorded size for {} must match the on-disk size",
+                file.path
+            );
+        }
     }
 }

@@ -26,7 +26,7 @@ impl FlatTransformer {
 
 impl Transformer for FlatTransformer {
     #[instrument(name = "FlatTransformer::transform", level = "debug", skip_all)]
-    fn transform(&self, batch: &RecordBatch) -> crate::Result<RecordBatch> {
+    fn transform(&self, batch: &RecordBatch) -> lance_core::Result<RecordBatch> {
         let input_arr = batch
             .column_by_name(&self.input_column)
             .ok_or(Error::index(format!(

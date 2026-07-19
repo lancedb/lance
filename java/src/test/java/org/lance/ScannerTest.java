@@ -422,25 +422,32 @@ public class ScannerTest {
       TestUtils.SimpleTestDataset testDataset =
           new TestUtils.SimpleTestDataset(allocator, datasetPath);
       testDataset.createEmptyDataset().close();
-      int totalRows = 1000;
-      int batchSize = 100;
-      int batchReadahead = 5;
-      try (Dataset dataset = testDataset.write(1, totalRows)) {
+
+      int totalRows = 2000;
+      int maxRowsPerFile = 100; // ~20 fragments
+      List<FragmentMetadata> fragments = testDataset.createNewFragment(totalRows, maxRowsPerFile);
+      assertTrue(fragments.size() > 1, "expected multiple fragments, got " + fragments.size());
+
+      FragmentOperation.Append append = new FragmentOperation.Append(fragments);
+      try (Dataset dataset = Dataset.commit(allocator, datasetPath, append, Optional.of(1L))) {
+        int batchReadahead = 2; // far below the default (num compute CPUs)
         try (LanceScanner scanner =
             dataset.newScan(
-                new ScanOptions.Builder()
-                    .batchSize(batchSize)
-                    .batchReadahead(batchReadahead)
-                    .build())) {
-          // This test is more about ensuring that the batchReadahead parameter is accepted
-          // and doesn't cause errors. The actual effect of batchReadahead might not be
-          // directly observable in this test.
+                new ScanOptions.Builder().batchSize(50).batchReadahead(batchReadahead).build())) {
           try (ArrowReader reader = scanner.scanBatches()) {
             int rowCount = 0;
+            long idSum = 0;
             while (reader.loadNextBatch()) {
-              rowCount += reader.getVectorSchemaRoot().getRowCount();
+              VectorSchemaRoot root = reader.getVectorSchemaRoot();
+              IntVector ids = (IntVector) root.getVector("id");
+              for (int i = 0; i < root.getRowCount(); i++) {
+                idSum += ids.get(i);
+              }
+              rowCount += root.getRowCount();
             }
             assertEquals(totalRows, rowCount);
+            // ids are the contiguous range [0, totalRows)
+            assertEquals((long) totalRows * (totalRows - 1) / 2, idSum);
           }
         }
       }

@@ -28,6 +28,11 @@ message CompressedPostingHeader {
   PositionStorage position_storage = 4;
   // Only meaningful when position_storage == POSITION_STORAGE_SHARED.
   PositionStreamCodec position_stream_codec = 5;
+  // Number of documents in each compressed posting block. Older cache entries
+  // omit this field and decode as the legacy 128-doc block size.
+  uint32 block_size = 6;
+  // Whether an impact IPC section follows the posting/position sections.
+  bool has_impacts = 7;
 }
 
 // Header for a serialized `PlainPostingList` cache entry. Followed by an Arrow

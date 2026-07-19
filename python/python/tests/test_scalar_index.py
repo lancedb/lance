@@ -949,6 +949,39 @@ def test_create_scalar_index_fts_alias(dataset):
     assert any(idx.index_type == "Inverted" for idx in dataset.describe_indices())
 
 
+def test_create_scalar_index_fts_block_size(dataset):
+    dataset.create_scalar_index(
+        "doc", index_type="INVERTED", with_position=False, block_size=256
+    )
+    indices = dataset.describe_indices()
+    doc_index = next(index for index in indices if index.name == "doc_idx")
+    assert doc_index.segments[0].index_version == 3
+
+    row = dataset.take(indices=[0], columns=["doc"])
+    query = row.column(0)[0].as_py().split(" ")[0]
+    results = dataset.scanner(columns=["doc"], full_text_query=query).to_table()
+    assert results.num_rows > 0
+
+    with pytest.raises(ValueError, match="block_size"):
+        dataset.create_scalar_index(
+            "doc", index_type="INVERTED", name="doc_invalid_129", block_size=129
+        )
+
+    with pytest.raises(ValueError, match="block_size"):
+        dataset.create_scalar_index(
+            "doc", index_type="INVERTED", name="doc_invalid_512", block_size=512
+        )
+
+    with pytest.raises(ValueError, match="block_size=256"):
+        dataset.create_scalar_index(
+            "doc",
+            index_type="INVERTED",
+            name="doc_invalid_v2_256",
+            block_size=256,
+            format_version=2,
+        )
+
+
 def test_multi_index_create(tmp_path):
     dataset = lance.write_dataset(
         pa.table({"ints": range(1024)}), tmp_path, max_rows_per_file=100
@@ -1869,6 +1902,55 @@ def test_icu_tokenizer(tmp_path):
     assert results["_rowid"].to_pylist() == [0]
 
 
+def test_icu_tokenizer_split_on_non_alphanumeric_default(tmp_path):
+    data = pa.table({"text": ["hello_world"]})
+    ds = lance.write_dataset(data, tmp_path, mode="overwrite")
+    ds.create_scalar_index(
+        "text",
+        "INVERTED",
+        base_tokenizer="icu",
+        stem=False,
+        remove_stop_words=False,
+    )
+
+    results = ds.to_table(full_text_query="hello", prefilter=True, with_row_id=True)
+    assert results.num_rows == 0
+
+    results = ds.to_table(
+        full_text_query="hello_world", prefilter=True, with_row_id=True
+    )
+    assert results["_rowid"].to_pylist() == [0]
+
+
+def test_icu_tokenizer_split_on_non_alphanumeric(tmp_path):
+    data = pa.table(
+        {
+            "text": [
+                "hello_world こんにちは世界",
+                "alpha.beta",
+            ],
+        }
+    )
+    ds = lance.write_dataset(data, tmp_path, mode="overwrite")
+    ds.create_scalar_index(
+        "text",
+        "INVERTED",
+        base_tokenizer="icu/split",
+        stem=False,
+        remove_stop_words=False,
+    )
+
+    for query, expected_row_ids in [
+        ("hello", [0]),
+        ("world", [0]),
+        ("世界", [0]),
+        ("alpha", [1]),
+        ("beta", [1]),
+    ]:
+        results = ds.to_table(full_text_query=query, prefilter=True, with_row_id=True)
+        assert results["_rowid"].to_pylist() == expected_row_ids
+
+
 def test_jieba_invalid_user_dict_tokenizer(tmp_path):
     set_language_model_path()
     data = pa.table(
@@ -2116,6 +2198,87 @@ def test_zonemap_zone_size(tmp_path: Path):
     assert small_bytes_read < large_bytes_read
 
 
+@pytest.mark.parametrize("index_type", ["ZONEMAP", "BLOOMFILTER"])
+def test_address_domain_index_with_stable_row_ids(tmp_path: Path, index_type):
+    """Regression test for issue #7434.
+
+    Address-domain scalar indices (zonemap, bloom filter) report matches as
+    physical row addresses. On a stable-row-id dataset a row's stable id differs
+    from its physical address in every fragment except fragment 0, so the index
+    result must be translated back to the row-id domain before it prefilters the
+    scan. Without that translation the index silently drops matching rows in
+    fragments other than fragment 0 (often returning an empty result).
+    """
+
+    # A single value "a" is placed in non-adjacent fragments (0, 2, 4) so its
+    # matching rows span multiple fragments and diverge from fragment 0.
+    def block(v, n):
+        return [v] * n
+
+    vals = (
+        block("a", 5_000)
+        + block("b", 5_000)
+        + block("a", 5_000)
+        + block("c", 5_000)
+        + block("a", 5_000)
+    )
+    tbl = pa.table({"category": pa.array(vals, pa.string()), "id": range(len(vals))})
+    ds = lance.write_dataset(
+        tbl, tmp_path, max_rows_per_file=5_000, enable_stable_row_ids=True
+    )
+    assert ds.has_stable_row_ids
+    assert len(ds.get_fragments()) == 5
+
+    true_count = ds.scanner(
+        filter="category = 'a'", use_scalar_index=False
+    ).count_rows()
+    assert true_count == 15_000
+
+    ds.create_scalar_index("category", index_type=index_type, replace=True)
+
+    # The index must be consulted and must return the same rows as a full scan.
+    assert "ScalarIndexQuery" in ds.scanner(filter="category = 'a'").explain_plan()
+    indexed = ds.to_table(filter="category = 'a'", columns=["id"])
+    assert indexed.num_rows == true_count
+    assert sorted(indexed["id"].to_pylist()) == sorted(
+        ds.to_table(filter="category = 'a'", columns=["id"], use_scalar_index=False)[
+            "id"
+        ].to_pylist()
+    )
+
+
+def test_zonemap_with_stable_row_ids_after_compaction(tmp_path: Path):
+    """Zonemap results stay correct after a compaction relocates rows under
+    stable row ids (physical address != stable id for the surviving rows)."""
+    ds = lance.write_dataset(
+        pa.table({"x": range(0, 5_000)}),
+        tmp_path,
+        max_rows_per_file=5_000,
+        enable_stable_row_ids=True,
+    )
+    ds = lance.write_dataset(
+        pa.table({"x": range(5_000, 10_000)}),
+        tmp_path,
+        mode="append",
+        max_rows_per_file=5_000,
+        enable_stable_row_ids=True,
+    )
+    # Delete part of the first fragment, then compact so surviving rows keep
+    # their small stable ids but move to a freshly numbered fragment.
+    ds.delete("x >= 1000 AND x < 2000")
+    ds.optimize.compact_files(target_rows_per_fragment=100_000)
+    ds = lance.dataset(tmp_path)
+    assert len(ds.get_fragments()) == 1
+
+    ds.create_scalar_index("x", index_type="ZONEMAP")
+
+    filter_expr = "x >= 6000 AND x <= 6500"
+    assert "ScalarIndexQuery" in ds.scanner(filter=filter_expr).explain_plan()
+    expected = ds.to_table(filter=filter_expr, use_scalar_index=False)["x"].to_pylist()
+    actual = ds.to_table(filter=filter_expr)["x"].to_pylist()
+    assert sorted(actual) == sorted(expected) == list(range(6000, 6501))
+
+
 def test_zonemap_deletion_handling(tmp_path: Path):
     """Test zonemap deletion handling"""
     data = pa.table(
@@ -2143,6 +2306,33 @@ def test_zonemap_deletion_handling(tmp_path: Path):
     assert ds.to_table(filter="value = False").num_rows == 0
     ids = ds.to_table(filter="value = True")["id"].to_pylist()
     assert ids == [0, 2, 4, 6, 8]
+
+
+@pytest.mark.parametrize("index_type", ["ZONEMAP", "BLOOMFILTER"])
+def test_address_domain_index_not_query_with_stable_row_ids(tmp_path: Path, index_type):
+    """Regression test: != queries return correct results on stable-row-id datasets.
+
+    Address-domain indices (zonemap, bloom filter) search returns physical row
+    addresses. Translation to row IDs happens at the Query leaf before the NOT
+    node is evaluated, so the NOT operates on a correctly translated AllowList.
+    Without the address-to-row-id translation the AllowList contains wrong IDs,
+    and the subsequent NOT excludes the wrong rows.
+    """
+    vals = list(range(5_000)) + list(range(5_000, 10_000))
+    tbl = pa.table({"x": vals})
+    ds = lance.write_dataset(
+        tbl, tmp_path, max_rows_per_file=5_000, enable_stable_row_ids=True
+    )
+    assert ds.has_stable_row_ids
+
+    ds.create_scalar_index("x", index_type=index_type, replace=True)
+
+    # Without address translation the NOT excludes the wrong rows, producing an
+    # incorrect result set rather than crashing.
+    expected = ds.to_table(filter="x != 42", use_scalar_index=False)["x"].to_pylist()
+    actual = ds.to_table(filter="x != 42")["x"].to_pylist()
+    assert sorted(actual) == sorted(expected)
+    assert len(actual) == 9_999
 
 
 def test_zonemap_index_remapping(tmp_path: Path):
@@ -2738,6 +2928,15 @@ def test_index_prewarm(tmp_path: Path):
 
     ds = lance.dataset(phrase_path)
     ds.prewarm_index("fts_idx", with_position=True)
+    cache_entries_after_prewarm = ds._ds.index_cache_entry_count()
+    results = ds.to_table(full_text_query=PhraseQuery("word word", "fts"))
+    assert results.num_rows == test_table_size
+    cache_entries_after_query = ds._ds.index_cache_entry_count()
+    assert cache_entries_after_query == cache_entries_after_prewarm
+
+    segment_uuid = ds.describe_indices()[0].segments[0].uuid
+    ds = lance.dataset(phrase_path)
+    ds.prewarm_index("fts_idx", with_position=True, index_segments=[segment_uuid])
     cache_entries_after_prewarm = ds._ds.index_cache_entry_count()
     results = ds.to_table(full_text_query=PhraseQuery("word word", "fts"))
     assert results.num_rows == test_table_size
@@ -4670,6 +4869,77 @@ def test_nested_field_fts_index(tmp_path):
     assert results.num_rows == 50
 
 
+def test_multiple_nested_field_fts_indices_e2e(tmp_path):
+    """Test FTS queries against multiple indexed nested string fields."""
+
+    def make_table(ids, text_values, summary_values):
+        return pa.table(
+            {
+                "id": ids,
+                "data": pa.StructArray.from_arrays(
+                    [
+                        pa.array(text_values, type=pa.string()),
+                        pa.array(summary_values, type=pa.string()),
+                    ],
+                    names=["text", "summary"],
+                ),
+            }
+        )
+
+    def result_ids(query):
+        return sorted(ds.to_table(full_text_query=query)["id"].to_pylist())
+
+    ds = lance.write_dataset(
+        make_table(
+            [0, 1, 2, 3],
+            [
+                "lance nested alpha",
+                "plain text",
+                None,
+                "phrase target here",
+            ],
+            [
+                "metadata only",
+                "database nested beta",
+                "lance beta",
+                "other",
+            ],
+        ),
+        tmp_path,
+    )
+
+    ds.create_scalar_index("data.text", index_type="INVERTED", with_position=True)
+    ds.create_scalar_index("data.summary", index_type="INVERTED", with_position=False)
+
+    indexed_fields = {
+        tuple(index.field_names)
+        for index in ds.describe_indices()
+        if index.index_type == "Inverted"
+    }
+    assert indexed_fields == {("data.text",), ("data.summary",)}
+
+    assert result_ids(MatchQuery("alpha", "data.text")) == [0]
+    assert result_ids(MatchQuery("beta", "data.summary")) == [1, 2]
+    assert result_ids("lance") == [0, 2]
+    assert result_ids(MultiMatchQuery("nested", ["data.text", "data.summary"])) == [
+        0,
+        1,
+    ]
+    assert result_ids(PhraseQuery("phrase target", "data.text")) == [3]
+
+    ds = lance.write_dataset(
+        make_table(
+            [4, 5],
+            ["fresh lance append", "plain append"],
+            ["other", "fresh beta append"],
+        ),
+        tmp_path,
+        mode="append",
+    )
+
+    assert result_ids("fresh") == [4, 5]
+
+
 def test_nested_field_bitmap_index(tmp_path):
     """Test BITMAP index creation and querying on nested fields"""
     # Create dataset with nested categorical field
@@ -4802,9 +5072,11 @@ def test_json_inverted_match_query(tmp_path):
     assert results.num_rows == 1
 
 
-@pytest.mark.parametrize("fts_format_version", ["1", "2"])
-def test_describe_indices(tmp_path, monkeypatch, fts_format_version):
-    monkeypatch.setenv("LANCE_FTS_FORMAT_VERSION", fts_format_version)
+@pytest.mark.parametrize(
+    ("format_version", "expected_format_version"),
+    [(1, 1), (2, 2), ("v1", 1), ("v2", 2)],
+)
+def test_describe_indices(tmp_path, format_version, expected_format_version):
     data = pa.table(
         {
             "id": range(100),
@@ -4820,7 +5092,7 @@ def test_describe_indices(tmp_path, monkeypatch, fts_format_version):
         }
     )
     ds = lance.write_dataset(data, tmp_path)
-    ds.create_scalar_index("text", index_type="INVERTED")
+    ds.create_scalar_index("text", index_type="INVERTED", format_version=format_version)
     indices = ds.describe_indices()
     assert len(indices) == 1
 
@@ -4834,7 +5106,7 @@ def test_describe_indices(tmp_path, monkeypatch, fts_format_version):
     assert indices[0].segments[0].uuid is not None
     assert indices[0].segments[0].fragment_ids == {0}
     assert indices[0].segments[0].dataset_version_at_last_update == 1
-    assert indices[0].segments[0].index_version == int(fts_format_version)
+    assert indices[0].segments[0].index_version == expected_format_version
     assert indices[0].segments[0].created_at is not None
     assert isinstance(indices[0].segments[0].created_at, datetime)
     assert indices[0].segments[0].size_bytes is not None
@@ -4931,6 +5203,28 @@ def test_describe_indices(tmp_path, monkeypatch, fts_format_version):
     indices = ds.describe_indices()
     for index in indices:
         assert index.num_rows_indexed == 50
+
+
+def test_create_inverted_index_defaults_to_v2_and_ignores_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("LANCE_FTS_FORMAT_VERSION", "1")
+    data = pa.table({"text": ["document about lance database"]})
+    ds = lance.write_dataset(data, tmp_path)
+
+    ds.create_scalar_index("text", index_type="INVERTED")
+
+    indices = ds.describe_indices()
+    assert indices[0].segments[0].index_version == 2
+
+
+def test_create_inverted_index_rejects_invalid_format_version(tmp_path):
+    data = pa.table({"text": ["document about lance database"]})
+    ds = lance.write_dataset(data, tmp_path)
+
+    with pytest.raises(ValueError, match="unsupported FTS format version"):
+        ds.create_scalar_index("text", index_type="INVERTED", format_version="v4")
+
+    with pytest.raises(ValueError, match="format_version=3"):
+        ds.create_scalar_index("text", index_type="INVERTED", format_version="v3")
 
 
 def test_vector_filter_fts_search(tmp_path):
@@ -5050,3 +5344,28 @@ def test_vector_filter_fts_search(tmp_path):
     )
     with pytest.raises(ValueError):
         scanner.to_table()
+
+
+@pytest.mark.parametrize("index_type", ["BTREE", "BITMAP", "ZONEMAP"])
+def test_large_string_scalar_index(tmp_path, index_type):
+    """large_string (LargeUtf8) must be accepted by BTREE, BITMAP, and ZONEMAP."""
+    table = pa.table(
+        {
+            "id": pa.array([1, 2, 3], pa.int32()),
+            "category": pa.array(["alpha", "beta", "alpha"], pa.large_string()),
+        }
+    )
+    ds = lance.write_dataset(table, tmp_path)
+    assert ds.schema.field("category").type == pa.large_string()
+
+    # Must not raise TypeError
+    ds.create_scalar_index("category", index_type=index_type)
+
+    indices = ds.describe_indices()
+    assert any("category" in idx.field_names for idx in indices), (
+        f"{index_type} index for large_string column not found in describe_indices()"
+    )
+
+    result = ds.scanner(filter="category = 'alpha'").to_table()
+    assert result.num_rows == 2
+    assert set(result.column("id").to_pylist()) == {1, 3}

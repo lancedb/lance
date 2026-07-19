@@ -97,6 +97,22 @@ public class MemWalTest {
     return root;
   }
 
+  /** Build a single-batch root carrying only the {@code id} primary key, for deletes. */
+  private static VectorSchemaRoot keysRoot(BufferAllocator allocator, long[] ids) {
+    VectorSchemaRoot root =
+        VectorSchemaRoot.create(
+            new Schema(
+                Collections.singletonList(Field.nullable("id", new ArrowType.Int(64, true)))),
+            allocator);
+    BigIntVector idVector = (BigIntVector) root.getVector("id");
+    idVector.allocateNew(ids.length);
+    for (int i = 0; i < ids.length; i++) {
+      idVector.set(i, ids[i]);
+    }
+    root.setRowCount(ids.length);
+    return root;
+  }
+
   /** Build a single-batch append-only root without primary-key metadata. */
   private static VectorSchemaRoot appendOnlyRoot(
       BufferAllocator allocator, long[] ids, String prefix) {
@@ -383,6 +399,52 @@ public class MemWalTest {
   }
 
   @Test
+  void testShardWriterDeleteMasksBaseRow(@TempDir Path tempDir) throws Exception {
+    String path = tempDir.resolve("base").toString();
+    String shardId = UUID.randomUUID().toString();
+    try (BufferAllocator allocator = new RootAllocator();
+        Dataset dataset = writeLookupDataset(allocator, path, new long[] {1, 2, 3}, "base")) {
+      dataset.initializeMemWal(new InitializeMemWalParams());
+
+      ShardWriterConfig config =
+          new ShardWriterConfig()
+              .withDurableWrite(true)
+              .withSyncIndexedWrite(true)
+              .withMaxWalBufferSize(1)
+              .withMaxWalFlushIntervalMs(10);
+
+      try (ShardWriter writer = dataset.memWalWriter(shardId, config)) {
+        try (VectorSchemaRoot root = lookupRoot(allocator, new long[] {4}, "writer");
+            ArrowReader reader = toReader(allocator, root)) {
+          writer.put(reader);
+        }
+        try (VectorSchemaRoot keys = keysRoot(allocator, new long[] {2});
+            ArrowReader reader = toReader(allocator, keys)) {
+          writer.delete(reader);
+        }
+
+        Map<Long, String> byId = Collections.emptyMap();
+        long deadline = System.currentTimeMillis() + 10_000;
+        while (System.currentTimeMillis() < deadline) {
+          try (LsmScanner scanner = writer.lsmScanner();
+              ArrowReader reader = scanner.scanBatches()) {
+            byId = readByName(reader);
+          }
+          if (!byId.containsKey(2L) && "writer_4".equals(byId.get(4L))) {
+            break;
+          }
+          Thread.sleep(50);
+        }
+
+        assertEquals("base_1", byId.get(1L));
+        assertFalse(byId.containsKey(2L), "deleted base row should be masked by the tombstone");
+        assertEquals("base_3", byId.get(3L));
+        assertEquals("writer_4", byId.get(4L));
+      }
+    }
+  }
+
+  @Test
   void testLsmScannerFromSnapshots(@TempDir Path tempDir) throws Exception {
     String basePath = tempDir.resolve("base").toString();
     String shardId = UUID.randomUUID().toString();
@@ -405,6 +467,14 @@ public class MemWalTest {
         assertEquals("base_1", byId.get(1L));
         assertEquals("gen1_2", byId.get(2L), "Flushed generation must win over base");
         assertEquals("base_3", byId.get(3L));
+      }
+
+      try (LsmScanner scanner =
+              LsmScanner.fromSnapshots(dataset, Collections.singletonList(snapshot))
+                  .limit(Optional.empty(), Optional.of(1L));
+          ArrowReader reader = scanner.scanBatches()) {
+        Map<Long, String> byId = readByName(reader);
+        assertEquals(2, byId.size(), "Offset-only LSM scan should not require a limit");
       }
     }
   }
@@ -569,6 +639,40 @@ public class MemWalTest {
           }
           double recall = (double) found / queryIds.length;
           assertTrue(recall >= 0.5, "vector search recall too low: " + recall);
+        }
+
+        try (LsmVectorSearchPlanner planner =
+                new LsmVectorSearchPlanner(
+                    dataset, Collections.emptyList(), "vec", null, null, "id >= 200");
+            Float4Vector query = new Float4Vector("q", allocator)) {
+          int filteredQueryId = 250;
+          query.allocateNew(VDIM);
+          for (int d = 0; d < VDIM; d++) {
+            query.set(d, (float) (filteredQueryId * VDIM + d));
+          }
+          query.setValueCount(VDIM);
+
+          int filteredRows = 0;
+          boolean foundFilteredNearest = false;
+          try (ExecutionPlan plan =
+                  planner.planSearch(query, 20, 2, Collections.singletonList("id"), false);
+              ArrowReader reader = plan.toReader()) {
+            while (reader.loadNextBatch()) {
+              VectorSchemaRoot result = reader.getVectorSchemaRoot();
+              IntVector ids = (IntVector) result.getVector("id");
+              for (int i = 0; i < result.getRowCount(); i++) {
+                int id = ids.get(i);
+                assertTrue(id >= 200, "filtered vector search returned id " + id);
+                if (id == filteredQueryId) {
+                  foundFilteredNearest = true;
+                }
+                filteredRows++;
+              }
+            }
+          }
+          assertTrue(filteredRows > 0, "filtered vector search should return rows");
+          assertTrue(
+              foundFilteredNearest, "filtered vector search recall missed id " + filteredQueryId);
         }
       } finally {
         dataset.close();

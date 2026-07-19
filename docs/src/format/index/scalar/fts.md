@@ -43,6 +43,8 @@ An FTS index may contain multiple partitions. Each partition has its own set of 
 | `_length`              | UInt32                  | false    | Number of documents containing the token                         |
 | `_compressed_position` | List<List<LargeBinary>> | true     | Optional compressed position lists for phrase queries            |
 
+The posting-list file schema metadata includes `posting_block_size`, the number of documents encoded per compressed posting block. Older indexes that do not have this metadata use the legacy block size `128`.
+
 ### Metadata File Schema
 
 The metadata file contains JSON-serialized configuration and partition information:
@@ -67,6 +69,7 @@ The metadata file contains JSON-serialized configuration and partition informati
 | `min_gram`          | UInt32  | 2         | Minimum n-gram length (only for ngram tokenizer)               |
 | `max_gram`          | UInt32  | 15        | Maximum n-gram length (only for ngram tokenizer)               |
 | `prefix_only`       | Boolean | false     | Generate only prefix n-grams (only for ngram tokenizer)        |
+| `block_size`        | UInt32  | 128       | Documents per compressed posting block. Must be 128 or 256. Missing values from older indexes read as 128. `256` is experimental and may introduce breaking changes. |
 
 ## Tokenizers
 
@@ -81,6 +84,7 @@ The full text search index supports multiple tokenizer types for different text 
 | **raw**        | No tokenization, treats entire text as single token                       | Exact matching         |
 | **ngram**      | Breaks text into overlapping character sequences                          | Substring/fuzzy search |
 | **icu**        | ICU dictionary-based Unicode word segmentation                            | Mixed-language text    |
+| **icu/split**  | ICU segmentation with simple-style delimiter splitting                    | Mixed-language identifiers |
 | **jieba/***    | Chinese text tokenizer with word segmentation                             | Chinese text           |
 | **lindera/***  | Japanese text tokenizer with morphological analysis                       | Japanese text          |
 
@@ -88,8 +92,10 @@ The full text search index supports multiple tokenizer types for different text 
 
 The ICU tokenizer uses Unicode word boundary rules and dictionary-based segmentation for complex scripts. It is useful for mixed-language text where the default `simple` tokenizer would keep an unspaced CJK span as one large token.
 
+By default, Lance preserves ICU word segments as returned by ICU. Use `base_tokenizer: "icu/split"` to split ICU word segments again on non-alphanumeric delimiters such as underscores and punctuation. For example, `hello_world こんにちは世界` is tokenized as `hello`, `world`, `こんにちは`, and `世界`.
+
 - **Models**: Uses compiled ICU4X segmenter data bundled with Lance
-- **Usage**: Specify as `icu`
+- **Usage**: Specify as `icu`, or `icu/split` to split punctuation-delimited identifiers
 - **Features**:
   - Unicode-aware word boundary detection
   - Dictionary-based segmentation for Chinese, Japanese, Khmer, Lao, Myanmar, and Thai
