@@ -2,29 +2,27 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! PROTOTYPE benchmark (discussion lance-format/lance#7499): add-column / backfill
-//! write amplification, flat manifest vs Bε-tree — **fine-grained commit** regime.
+//! write amplification, flat manifest vs the recursive self-balancing Bε-tree.
 //!
-//! Realistic embedding backfill commits touch only a handful of fragments at a
-//! time (GPU compute trickles in), so a full backfill over N fragments is N/F
-//! commits — up to hundreds of thousands. Flat rewrites the whole (growing)
-//! manifest on *every* commit regardless of F, so its full-backfill write is
-//! (N/F) × manifest — petabytes at F=10, N=1M. We therefore measure **per-commit**
-//! cost and **extrapolate** the full backfill:
-//!   - flat: run a small uniform sample (`FLAT_SAMPLE_COMMITS`) — every commit is
-//!     the same full-manifest rewrite — and extrapolate ×(N/F).
-//!   - Bε-tree: run `BETREE_COMMITS` commits (enough to reach steady state with
-//!     several flushes), measure per-commit + cumulative, extrapolate ×(N/F).
+//! Realistic embedding backfill commits touch only a handful of fragments (F) at
+//! a time, so a full backfill over N fragments is N/F commits — up to hundreds of
+//! thousands. Flat rewrites the whole (growing) manifest every commit regardless
+//! of F, so its full-backfill write is (N/F) × manifest — petabytes at F=10,
+//! N=1M. We measure per-commit cost and extrapolate:
+//!   - flat: run a small uniform sample and extrapolate ×(N/F).
+//!   - Bε-tree: run `BETREE_COMMITS` commits (steady state incl. splits), measure
+//!     per-commit + cumulative, extrapolate ×(N/F).
 //!
 //! Data-file names use Lance's real 50-char format (see `support.rs`).
 //!
 //! ## Configuration (env)
 //! - `BASE_URI`             s3://… / s3://…--x-s3 / local path. Default: temp dir.
 //! - `NUM_FRAGMENTS`        bootstrap fragment count (N). Default 5000.
-//! - `FRAGMENTS_PER_COMMIT` comma sweep of F (fragments touched per commit). Default "10,100".
+//! - `FRAGMENTS_PER_COMMIT` comma sweep of F. Default "10,100".
+//! - `NODE_SIZE_MB`         comma sweep of the Bε-tree target node size B in MiB (fractional ok). Default "4,10".
+//! - `FANOUT`               internal-node fanout (split above / merge below fanout/4). Default 16.
 //! - `BETREE_COMMITS`       Bε-tree commits to run per config (M). Default 3000.
-//! - `FLAT_SAMPLE_COMMITS`  flat commits to sample (uniform). Default 20.
-//! - `BUFFER_CAP_MB`        comma sweep of ε (root buffer cap) in MiB, fractional ok. Default "1".
-//! - `NUM_CHILDREN`         children the id space is partitioned into. Default 24 (~10 MiB nodes at N=1M).
+//! - `FLAT_SAMPLE_COMMITS`  flat commits to sample. Default 20.
 //! - `S3_EXPRESS`           "true" for S3 Express directory buckets.
 //! - `AWS_REGION`           required for S3.
 
@@ -93,7 +91,6 @@ fn bench_schema() -> Schema {
     Schema::try_from(&arrow).unwrap()
 }
 
-/// Storage options + S3-Express flag derived from the URI / env.
 fn storage_params(uri: &str, io: &IOTracker) -> ObjectStoreParams {
     let mut params = ObjectStoreParams {
         object_store_wrapper: Some(Arc::new(io.clone())),
@@ -135,7 +132,6 @@ async fn build_store(
         .expect("failed to build object store");
     let scheduler =
         ScanScheduler::new(object_store.clone(), SchedulerConfig::default_for_testing());
-    // Zero-capacity cache so cold-open reads hit storage (not a warm cache).
     let cache = Arc::new(LanceCache::with_capacity(0));
     (object_store, base, scheduler, cache)
 }
@@ -155,7 +151,6 @@ fn mean(xs: &[f64]) -> f64 {
     xs.iter().sum::<f64>() / xs.len() as f64
 }
 
-/// The fragment id window touched by commit `c` at `f` fragments/commit.
 fn commit_window(c: u64, f: u64, n: u64) -> std::ops::Range<u64> {
     let start = (c * f).min(n);
     let end = (start + f).min(n);
@@ -165,12 +160,14 @@ fn commit_window(c: u64, f: u64, n: u64) -> std::ops::Range<u64> {
 #[derive(Default)]
 struct RunResult {
     layout: &'static str,
-    buffer_cap_mib: f64,
+    node_size_mib: f64,
     commits_run: u64,
-    /// Bytes written across the measured commits (excludes bootstrap).
     backfill_write_bytes: u64,
     bootstrap_write_bytes: u64,
     flushes: u64,
+    splits: u64,
+    merges: u64,
+    height: u32,
     commit_mean_ms: f64,
     commit_p50_ms: f64,
     commit_p99_ms: f64,
@@ -183,7 +180,6 @@ impl RunResult {
     fn per_commit_write_bytes(&self) -> f64 {
         self.backfill_write_bytes as f64 / self.commits_run.max(1) as f64
     }
-    /// Extrapolated total write to backfill all N fragments (N/F commits + bootstrap).
     fn full_backfill_write_bytes(&self, n: u64, f: u64) -> f64 {
         let total_commits = n.div_ceil(f) as f64;
         self.bootstrap_write_bytes as f64 + self.per_commit_write_bytes() * total_commits
@@ -203,8 +199,6 @@ async fn run_flat(uri: &str, n: u64, f: u64, sample_commits: u64) -> RunResult {
     );
     let bootstrap_write_bytes = flat.write().await.expect("flat bootstrap");
 
-    // Every flat commit is the same full-manifest rewrite, so a small sample
-    // characterizes per-commit cost; we extrapolate the full backfill.
     let commits = sample_commits.min(n.div_ceil(f));
     let mut commit_ms: Vec<f64> = Vec::with_capacity(commits as usize);
     let mut backfill_write_bytes = 0u64;
@@ -220,7 +214,6 @@ async fn run_flat(uri: &str, n: u64, f: u64, sample_commits: u64) -> RunResult {
         commit_ms.push(start.elapsed().as_secs_f64() * 1000.0);
     }
 
-    // Cold-open only to verify correctness (the touched fragments gained a file).
     let final_version = flat.version();
     let manifest = FlatBaseline::cold_open(&object_store, &base, final_version)
         .await
@@ -231,17 +224,16 @@ async fn run_flat(uri: &str, n: u64, f: u64, sample_commits: u64) -> RunResult {
     commit_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
     RunResult {
         layout: "flat",
-        buffer_cap_mib: 0.0,
         commits_run: commits,
         backfill_write_bytes,
         bootstrap_write_bytes,
-        flushes: 0,
         commit_mean_ms,
         commit_p50_ms: percentile(&commit_ms, 50.0),
         commit_p99_ms: percentile(&commit_ms, 99.0),
         commit_max_ms: commit_ms.last().copied().unwrap_or(0.0),
         materialized_fragments: manifest.fragments.len(),
         total_data_files,
+        ..Default::default()
     }
 }
 
@@ -251,33 +243,34 @@ async fn run_betree(
     n: u64,
     f: u64,
     m_commits: u64,
-    buffer_cap_bytes: u64,
-    num_children: usize,
+    node_bytes: u64,
+    fanout: u32,
 ) -> RunResult {
     let io = IOTracker::default();
     let (object_store, base, scheduler, cache) = build_store(uri, &io).await;
     let fragments: Vec<Fragment> = (0..n).map(make_fragment).collect();
 
+    let config = BeTreeConfig {
+        target_node_bytes: node_bytes,
+        fanout,
+        min_flush_bytes: node_bytes / 16,
+    };
     let (mut tree, boot) = BeTree::bootstrap(
         object_store.clone(),
         base.clone(),
         scheduler.clone(),
         cache.clone(),
-        BeTreeConfig {
-            buffer_cap_bytes,
-            num_children,
-        },
+        config,
         fragments,
         Vec::new(),
     )
     .await
     .expect("betree bootstrap");
-    let bootstrap_write_bytes = boot.child_bytes + boot.root_bytes;
 
     let commits = m_commits.min(n.div_ceil(f));
     let mut commit_ms: Vec<f64> = Vec::with_capacity(commits as usize);
     let mut backfill_write_bytes = 0u64;
-    let mut flushes = 0u64;
+    let (mut flushes, mut splits, mut merges, mut height) = (0u64, 0u64, 0u64, 0u32);
     for c in 0..commits {
         let actions: Vec<_> = commit_window(c, f, n)
             .map(|id| action::add_data_file(id, &make_backfill_data_file(id, 0)))
@@ -285,17 +278,17 @@ async fn run_betree(
         let start = Instant::now();
         let stats = tree.commit(actions).await.expect("betree commit");
         commit_ms.push(start.elapsed().as_secs_f64() * 1000.0);
-        backfill_write_bytes += stats.write_bytes();
-        if stats.flushed {
-            flushes += 1;
-        }
+        backfill_write_bytes += stats.io_write_bytes;
+        flushes += stats.flushes;
+        splits += stats.splits;
+        merges += stats.merges;
+        height = stats.height;
     }
     println!(
-        "  [betree cap={:.2} MiB, {num_children} children] flushes in {commits} commits: {flushes}",
-        buffer_cap_bytes as f64 / MIB as f64
+        "  [betree B={:.2} MiB, fanout {fanout}] {commits} commits: {flushes} flushes, {splits} splits, {merges} merges, height {height}",
+        node_bytes as f64 / MIB as f64
     );
 
-    // Cold-open only to verify correctness.
     let frags = BeTree::cold_open(object_store.clone(), base.clone(), scheduler, cache)
         .await
         .expect("betree cold open");
@@ -305,11 +298,14 @@ async fn run_betree(
     commit_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
     RunResult {
         layout: "betree",
-        buffer_cap_mib: buffer_cap_bytes as f64 / MIB as f64,
+        node_size_mib: node_bytes as f64 / MIB as f64,
         commits_run: commits,
         backfill_write_bytes,
-        bootstrap_write_bytes,
+        bootstrap_write_bytes: boot.io_write_bytes,
         flushes,
+        splits,
+        merges,
+        height,
         commit_mean_ms,
         commit_p50_ms: percentile(&commit_ms, 50.0),
         commit_p99_ms: percentile(&commit_ms, 99.0),
@@ -320,8 +316,6 @@ async fn run_betree(
 }
 
 fn print_result(r: &RunResult, n: u64, f: u64) {
-    // Correctness: the fragments touched by the measured commits gained exactly
-    // one data file each; the rest keep their single base file.
     let touched = (r.commits_run * f).min(n) as usize;
     assert_eq!(
         r.materialized_fragments, n as usize,
@@ -340,11 +334,11 @@ fn print_result(r: &RunResult, n: u64, f: u64) {
     let label = if r.layout == "flat" {
         "flat".to_string()
     } else {
-        format!("betree/{:.2}MiB", r.buffer_cap_mib)
+        format!("betree/B={:.1}MiB", r.node_size_mib)
     };
     println!(
-        "  {:<14} per-commit write={:>9.3} MiB | commit mean={:>8.2} p50={:>8.2} p99={:>8.2} max={:>8.2} ms \
-         | full-backfill write~={:>9.2} GiB ({} flushes/{} commits)",
+        "  {:<16} per-commit write={:>9.3} MiB | commit mean={:>8.2} p50={:>8.2} p99={:>8.2} max={:>8.2} ms \
+         | full-backfill~={:>9.2} GiB | h={} flushes={} splits={} merges={}",
         label,
         r.per_commit_write_bytes() / MIB as f64,
         r.commit_mean_ms,
@@ -352,8 +346,10 @@ fn print_result(r: &RunResult, n: u64, f: u64) {
         r.commit_p99_ms,
         r.commit_max_ms,
         r.full_backfill_write_bytes(n, f) / (1024.0 * MIB as f64),
+        r.height,
         r.flushes,
-        r.commits_run,
+        r.splits,
+        r.merges,
     );
 }
 
@@ -367,17 +363,16 @@ fn bench_betree_backfill(c: &mut Criterion) {
     });
     let n = env_u64("NUM_FRAGMENTS", 5000);
     let f_sweep = env_sweep_u64("FRAGMENTS_PER_COMMIT", "10,100");
-    let cap_sweep = env_sweep_f64("BUFFER_CAP_MB", "1");
+    let node_sweep = env_sweep_f64("NODE_SIZE_MB", "4,10");
+    let fanout = env_usize("FANOUT", 16) as u32;
     let betree_commits = env_u64("BETREE_COMMITS", 3000);
     let flat_sample = env_u64("FLAT_SAMPLE_COMMITS", 20);
-    let num_children = env_usize("NUM_CHILDREN", 24);
     let run_tag = &Uuid::new_v4().to_string()[..8];
 
-    println!("=== Bε-tree fine-grained backfill benchmark ===");
+    println!("=== recursive Bε-tree fine-grained backfill benchmark ===");
     println!("base_uri={base_uri}");
     println!(
-        "N={n} fragments_per_commit_sweep={f_sweep:?} cap_sweep={cap_sweep:?} MiB \
-         num_children={num_children} betree_commits={betree_commits} flat_sample={flat_sample} run_tag={run_tag}"
+        "N={n} fragments_per_commit={f_sweep:?} node_size_sweep={node_sweep:?} MiB fanout={fanout} betree_commits={betree_commits} flat_sample={flat_sample} run_tag={run_tag}"
     );
     println!();
 
@@ -390,10 +385,10 @@ fn bench_betree_backfill(c: &mut Criterion) {
         let flat = runtime.block_on(run_flat(&flat_uri, n, f, flat_sample));
         print_result(&flat, n, f);
 
-        for &cap_mib in &cap_sweep {
-            let cap_bytes = (cap_mib * MIB as f64) as u64;
+        for &node_mib in &node_sweep {
+            let node_bytes = (node_mib * MIB as f64) as u64;
             let betree_uri = format!(
-                "{}/{run_tag}/f{f}/betree{cap_mib}",
+                "{}/{run_tag}/f{f}/betreeB{node_mib}",
                 base_uri.trim_end_matches('/')
             );
             let betree = runtime.block_on(run_betree(
@@ -401,8 +396,8 @@ fn bench_betree_backfill(c: &mut Criterion) {
                 n,
                 f,
                 betree_commits,
-                cap_bytes,
-                num_children,
+                node_bytes,
+                fanout,
             ));
             print_result(&betree, n, f);
             let write_ratio = flat.full_backfill_write_bytes(n, f)
@@ -411,7 +406,7 @@ fn bench_betree_backfill(c: &mut Criterion) {
                 flat.per_commit_write_bytes() / betree.per_commit_write_bytes().max(1.0);
             let mean_speedup = flat.commit_mean_ms / betree.commit_mean_ms.max(0.001);
             println!(
-                "  => cap={cap_mib} MiB: full-backfill {write_ratio:.0}x fewer write bytes \
+                "  => B={node_mib} MiB: full-backfill {write_ratio:.0}x fewer write bytes \
                  ({per_commit_ratio:.0}x per commit), {mean_speedup:.1}x lower mean commit latency \
                  (flat {:.0}ms vs betree {:.0}ms)",
                 flat.commit_mean_ms, betree.commit_mean_ms
@@ -420,9 +415,6 @@ fn bench_betree_backfill(c: &mut Criterion) {
         println!();
     }
 
-    // The printed table + logs are this bench's authoritative output; a single
-    // S3 backfill sweep is far too heavy for Criterion's sampling harness, so we
-    // register no (misleading) Criterion metric.
     let _ = c;
 }
 

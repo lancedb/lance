@@ -3,10 +3,14 @@
 
 // PROTOTYPE ONLY (discussion lance-format/lance#7499).
 //
-// Bε-tree manifest prototype messages. Not a stable format; exists solely to
-// benchmark the write-amplification of the add-column / backfill workflow
-// against today's flat manifest. Reuses lance.table.{DataFragment,DataFile,
+// Full recursive, self-balancing Bε-tree manifest. Not a stable format; exists
+// to benchmark the counter-proposal. Reuses lance.table.{DataFragment,DataFile,
 // DeletionFile} so fragment byte sizes and (de)serialization are authentic.
+//
+// Node kinds:
+//   - Leaf     : a tabular Lance file (frag_id, fragment_pb) — the actual data.
+//   - Internal : this protobuf (ChildRef pivots + a TaggedAction ε-buffer).
+//   - Root     : the manifest — an InternalNode plus table metadata.
 
 syntax = "proto3";
 
@@ -14,17 +18,16 @@ package lance.table;
 
 import "table.proto";
 
-// A reference from the root to a child node. A child is a tabular Lance file
-// that owns a contiguous fragment-id range.
+// A pointer from a parent to a child node, with pivot bounds (the child owns the
+// contiguous key range [min_key, max_key]) and enough metadata to route + cost.
 message ChildRef {
-  // Path to the child Lance file, relative to the dataset root.
-  string node_path = 1;
-  uint64 min_frag_id = 2;
-  uint64 max_frag_id = 3;
-  uint64 num_fragments = 4;
-  uint64 num_rows = 5;
-  // Serialized byte size of the child Lance file (for cold-open cost modeling).
-  uint64 byte_size = 6;
+  string node_path = 1;    // path to the child file, relative to the dataset root
+  uint64 min_key = 2;      // smallest fragment id in the subtree
+  uint64 max_key = 3;      // largest fragment id in the subtree
+  uint64 num_keys = 4;     // fragments in the subtree
+  uint64 byte_size = 5;    // logical bytes of the child (leaf split/merge metric)
+  uint32 height = 6;       // 0 = leaf, >0 = internal
+  uint32 fanout_used = 7;  // direct children of the child (0 for a leaf); internal split/merge metric
 }
 
 // AddDataFile is the backfill / add-column action: attach a new DataFile to an
@@ -44,7 +47,7 @@ message AddDeletionFile {
   DeletionFile deletion_file = 2;
 }
 
-// A single ε-buffer message.
+// A single ε-buffer message, keyed by the fragment id it targets.
 message FragmentAction {
   oneof action {
     DataFragment add_fragment = 1;
@@ -55,14 +58,30 @@ message FragmentAction {
   }
 }
 
-// The root node: table metadata + child refs + the inline ε-buffer.
-// A commit appends to fragment_actions and rewrites only this (small) object.
+// A buffered message with its message sequence number (msn). Newer msn wins for
+// the same key; buffers are kept sorted by (target_key, msn).
+message TaggedAction {
+  uint64 msn = 1;
+  FragmentAction action = 2;
+}
+
+// An internal node: child pivots + this node's ε-buffer. Stored as a standalone
+// protobuf object `_bt/node/{uuid}.node`.
+message InternalNode {
+  repeated ChildRef children = 1;
+  repeated TaggedAction buffer = 2;
+}
+
+// The root node = the manifest. An internal node plus table-level metadata.
 message BeTreeRoot {
   uint64 version = 1;
   repeated ChildRef children = 2;
-  // The root ε-buffer (inline). Flushed to children when it exceeds the cap.
-  repeated FragmentAction fragment_actions = 3;
-  uint64 buffer_cap_bytes = 4;
-  // Opaque serialized table schema (table-level metadata the root carries).
+  repeated TaggedAction buffer = 3;
+  // Next message sequence number to assign (monotonic).
+  uint64 next_msn = 4;
+  // Opaque serialized table schema.
   bytes schema_pb = 5;
+  // Config echoed so readers can interpret the tree (bytes / fanout targets).
+  uint64 target_node_bytes = 6;
+  uint32 fanout = 7;
 }
