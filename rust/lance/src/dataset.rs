@@ -1602,7 +1602,7 @@ impl Dataset {
         .await
     }
 
-    pub(crate) async fn apply_commit(
+    pub async fn apply_commit(
         &mut self,
         transaction: Transaction,
         write_config: &ManifestWriteConfig,
@@ -3420,6 +3420,204 @@ impl Dataset {
         schema_evolution::add_columns(self, transforms, read_columns, batch_size).await
     }
 
+    /// Write new column data for a single fragment, returning a `DataReplacementGroup`
+    /// that can be committed with `commit_data_replacements`.
+    ///
+    /// This is the building block for distributed column writes: each worker
+    /// writes its assigned fragments independently, then one worker commits all
+    /// the replacements atomically.
+    ///
+    /// The `data` iterator must produce exactly the physical row count for the
+    /// fragment (including nulls for filtered-out rows).
+    pub async fn write_fragment_column(
+        &self,
+        fragment_id: u64,
+        data: impl Iterator<Item = Result<RecordBatch>> + Send,
+        schema: &lance_core::datatypes::Schema,
+    ) -> Result<transaction::DataReplacementGroup> {
+        self.write_fragment_column_stream(fragment_id, stream::iter(data), schema)
+            .await
+    }
+
+    /// Streaming variant of [`Self::write_fragment_column`]: pulls batches from
+    /// an async `Stream` one at a time. A caller that assembles the replacement
+    /// column from many out-of-line sources (e.g. checkpoint files fetched from
+    /// an object store) then holds only one batch in memory rather than
+    /// materializing the whole column up front. The iterator entry point above
+    /// wraps a synchronous iterator as a stream.
+    pub async fn write_fragment_column_stream(
+        &self,
+        fragment_id: u64,
+        data: impl Stream<Item = Result<RecordBatch>> + Send,
+        schema: &lance_core::datatypes::Schema,
+    ) -> Result<transaction::DataReplacementGroup> {
+        use lance_file::writer::{FileWriter, FileWriterOptions};
+        use lance_table::format::DataFile;
+        use uuid::Uuid;
+
+        let file_name = format!("{}.lance", Uuid::new_v4());
+        let path = self.data_dir().join(file_name.as_str());
+
+        let format_version = self.manifest.data_storage_format.lance_file_version()?;
+
+        let writer = self.object_store.create(&path).await?;
+        let mut file_writer = FileWriter::try_new(
+            writer,
+            schema.clone(),
+            FileWriterOptions {
+                format_version: Some(format_version),
+                ..Default::default()
+            },
+        )?;
+
+        let mut data = std::pin::pin!(data);
+        while let Some(batch_result) = data.next().await {
+            let batch = batch_result?;
+            file_writer.write_batch(&batch).await?;
+        }
+        let field_id_mapping = file_writer.field_id_to_column_indices().to_vec();
+        file_writer.finish().await?;
+        let field_ids: Vec<i32> = field_id_mapping
+            .iter()
+            .map(|(field_id, _)| *field_id as i32)
+            .collect();
+        let column_indices: Vec<i32> = field_id_mapping
+            .iter()
+            .map(|(_, column_index)| *column_index as i32)
+            .collect();
+
+        let (major, minor) = match file_writer.version().resolve() {
+            lance_encoding::version::LanceFileVersion::Legacy => (0, 1),
+            version => version.to_numbers(),
+        };
+
+        let data_file = DataFile {
+            path: file_name,
+            fields: field_ids.into(),
+            column_indices: column_indices.into(),
+            file_major_version: major,
+            file_minor_version: minor,
+            file_size_bytes: Default::default(),
+            base_id: None,
+        };
+
+        Ok(transaction::DataReplacementGroup(fragment_id, data_file))
+    }
+
+    /// Commit a set of `DataReplacementGroup`s as a new dataset version.
+    ///
+    /// Each group adds a new data file to its fragment. Use with
+    /// `write_fragment_column` for distributed column writes.
+    /// Commit per-fragment column writes as a new dataset version using Merge.
+    ///
+    /// Takes the DataReplacementGroups (mapping fragment_id -> data file),
+    /// merges the new data files into the existing fragment metadata,
+    /// and extends the schema with the new column.
+    pub async fn commit_column_writes(
+        &mut self,
+        replacements: Vec<transaction::DataReplacementGroup>,
+        new_column_schema: &lance_core::datatypes::Schema,
+        transaction_properties: Option<Arc<std::collections::HashMap<String, String>>>,
+    ) -> Result<()> {
+        use lance_table::format::Fragment;
+
+        let replacement_map: std::collections::HashMap<u64, &lance_table::format::DataFile> =
+            replacements.iter().map(|r| (r.0, &r.1)).collect();
+
+        // Merge-vs-Merge conflicts are not rebased automatically; the
+        // conflict resolver asks the caller to retry. Rebuild the fragment
+        // list and schema from the latest version each attempt so a
+        // concurrent column commit's data files are preserved.
+        const MAX_COMMIT_RETRIES: usize = 5;
+        let mut attempt = 0;
+        loop {
+            // Build new schema = existing + new columns. Skip fields that
+            // are already present (incremental column writes: the column
+            // exists in the schema and only fragments missing its data
+            // file are written).
+            let mut schema = self.schema().clone();
+            for field in &new_column_schema.fields {
+                if schema.field_by_id(field.id).is_none() {
+                    schema.fields.push(field.clone());
+                }
+            }
+
+            let mut fragments = Vec::new();
+            let mut applied = 0usize;
+            for frag in self.get_fragments() {
+                let frag_id = frag.id() as u64;
+                let mut new_frag: Fragment = frag.metadata().clone();
+                if let Some(data_file) = replacement_map.get(&frag_id) {
+                    applied += 1;
+                    // Tombstone the replaced fields in existing files (same
+                    // mechanism as the update-columns path) so the new file
+                    // is authoritative for fragments that already covered
+                    // the column (e.g. inserts that wrote nulls inline).
+                    let replaced: std::collections::HashSet<i32> =
+                        data_file.fields.iter().copied().collect();
+                    for file in &mut new_frag.files {
+                        let new_fields: std::sync::Arc<[i32]> = file
+                            .fields
+                            .iter()
+                            .map(|field| if replaced.contains(field) { -2 } else { *field })
+                            .collect::<Vec<_>>()
+                            .into();
+                        file.fields = new_fields;
+                    }
+                    new_frag
+                        .files
+                        .retain(|file| file.fields.iter().any(|&field| field != -2));
+                    new_frag.files.push((*data_file).clone());
+                }
+                fragments.push(new_frag);
+            }
+
+            // Data-integrity guard: every replacement MUST land on a current
+            // fragment. If some don't (the rebase above checked out a version
+            // where a concurrent compaction rewrote those fragments into new
+            // ids), the replacement column files for the orphaned fragments
+            // would be silently dropped, committing a column with missing
+            // (null) data. Fail loudly instead so the caller re-derives the
+            // column against the current fragments (the per-fragment write
+            // keys on fragment id + source signature, both of which change on
+            // compaction, so a re-run recomputes correctly). Without this the
+            // failure was a silent partial backfill.
+            if applied < replacement_map.len() {
+                return Err(Error::internal(format!(
+                    "commit_column_writes: {} of {} column replacements reference fragments no \
+                     longer in the dataset (concurrent compaction rewrote them after the column \
+                     was computed); refusing to commit a partial column. Re-run the backfill \
+                     against the current fragments.",
+                    replacement_map.len() - applied,
+                    replacement_map.len(),
+                )));
+            }
+
+            let operation = transaction::Operation::Merge { fragments, schema };
+            let mut transaction =
+                transaction::Transaction::new(self.manifest.version, operation, None);
+            transaction.transaction_properties = transaction_properties.clone();
+            match self
+                .apply_commit(transaction, &Default::default(), &Default::default())
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(e)
+                    if attempt < MAX_COMMIT_RETRIES
+                        && e.to_string().contains("Retryable commit conflict") =>
+                {
+                    attempt += 1;
+                    log::info!(
+                        "commit_column_writes: retryable conflict (attempt {}), rebasing on latest",
+                        attempt
+                    );
+                    self.checkout_latest().await?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     /// Modify columns in the dataset, changing their name, type, or nullability.
     ///
     /// If only changing the name or nullability of a column, this is a zero-copy
@@ -3814,7 +4012,7 @@ impl DatasetTakeRows for Dataset {
 }
 
 #[derive(Debug)]
-pub(crate) struct ManifestWriteConfig {
+pub struct ManifestWriteConfig {
     auto_set_feature_flags: bool,              // default true
     timestamp: Option<SystemTime>,             // default None
     use_stable_row_ids: bool,                  // default false
