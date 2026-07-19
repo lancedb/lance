@@ -82,7 +82,7 @@ async fn build_age_index(dataset: &mut Dataset) {
 /// Write an overlay file covering `fields` of `fragment_id` with `coverage` and the given
 /// per-field value columns, then commit it as a `DataOverlay` transaction. `name` makes
 /// the overlay file unique.
-async fn commit_overlay(
+pub(super) async fn commit_overlay(
     dataset: Dataset,
     name: &str,
     fragment_id: u64,
@@ -1332,4 +1332,166 @@ async fn bench_index_query_overlay_overhead() {
 
         println!("{num_vec_overlays:>12}  {ann_ms:>10.1}");
     }
+}
+
+/// A stale column write staged against a multi-field base file must not
+/// erase a concurrently committed overlay on the same field.
+#[rstest]
+#[case::address_row_ids(false)]
+#[case::stable_row_ids(true)]
+#[tokio::test]
+async fn test_stale_column_write_rejected_over_concurrent_overlay(#[case] stable_row_ids: bool) {
+    let mut dataset = create_base_dataset_with(stable_row_ids).await;
+    let age_schema = lance_core::datatypes::Schema {
+        fields: vec![dataset.schema().field("age").unwrap().clone()],
+        metadata: Default::default(),
+    };
+    let staged_arrow = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "age",
+        DataType::Int32,
+        true,
+    )]));
+    let staged =
+        RecordBatch::try_new(staged_arrow, vec![Arc::new(Int32Array::from(vec![50; 6]))]).unwrap();
+    let stale = dataset
+        .write_fragment_column(0, futures::stream::iter([Ok(staged)]), &age_schema)
+        .await
+        .unwrap();
+
+    let _ = commit_overlay(
+        dataset.clone(),
+        "concurrent_overlay",
+        0,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter(0u32..6)),
+        vec![Arc::new(Int32Array::from(vec![30; 6])) as ArrayRef],
+    )
+    .await;
+
+    let result = dataset.commit_column_writes(vec![stale], None).await;
+    assert!(result.is_err(), "stale write must not erase the overlay");
+    dataset.checkout_latest().await.unwrap();
+    let batch = dataset
+        .scan()
+        .project(&["age"])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    use arrow::array::AsArray;
+    let ages = batch["age"].as_primitive::<arrow::datatypes::Int32Type>();
+    assert_eq!(&ages.values()[0..6], &[30; 6]);
+}
+
+/// A concurrent Merge can change an existing overlay's coverage while
+/// keeping its file path. Path-only identity would miss it; the stale
+/// column write must still be rejected.
+#[tokio::test]
+async fn test_stale_column_write_rejected_over_overlay_coverage_change() {
+    let mut stale = commit_overlay(
+        create_base_dataset().await,
+        "same_path_overlay",
+        0,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([0u32])),
+        vec![Arc::new(Int32Array::from(vec![777])) as ArrayRef],
+    )
+    .await;
+    let age_schema = lance_core::datatypes::Schema {
+        fields: vec![stale.schema().field("age").unwrap().clone()],
+        metadata: Default::default(),
+    };
+    let staged_arrow = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "age",
+        DataType::Int32,
+        true,
+    )]));
+    let staged =
+        RecordBatch::try_new(staged_arrow, vec![Arc::new(Int32Array::from(vec![50; 6]))]).unwrap();
+    let replacement = stale
+        .write_fragment_column(0, futures::stream::iter([Ok(staged)]), &age_schema)
+        .await
+        .unwrap();
+
+    // Concurrent Merge moves the overlay's coverage from offset 0 to offset 1
+    // without changing its path.
+    let concurrent = stale.clone();
+    let read_version = concurrent.version().version;
+    let schema = concurrent.schema().clone();
+    let mut fragments: Vec<_> = concurrent
+        .get_fragments()
+        .into_iter()
+        .map(|fragment| fragment.metadata().clone())
+        .collect();
+    fragments[0].overlays[0].coverage = OverlayCoverage::dense(RoaringBitmap::from_iter([1u32]));
+    Dataset::commit(
+        WriteDestination::Dataset(Arc::new(concurrent)),
+        Operation::Merge { fragments, schema },
+        Some(read_version),
+        None,
+        None,
+        Arc::new(Default::default()),
+        false,
+    )
+    .await
+    .unwrap();
+
+    let result = stale.commit_column_writes(vec![replacement], None).await;
+    assert!(
+        result.is_err(),
+        "stale write must not erase the moved overlay coverage"
+    );
+}
+
+/// A concurrent Merge can remap a base file's column indices while keeping
+/// its path. The witness includes the field's routing, so the stale column
+/// write must be rejected.
+#[tokio::test]
+async fn test_stale_column_write_rejected_over_base_mapping_change() {
+    let mut stale = create_base_dataset().await;
+    let age_schema = lance_core::datatypes::Schema {
+        fields: vec![stale.schema().field("age").unwrap().clone()],
+        metadata: Default::default(),
+    };
+    let staged_arrow = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "age",
+        DataType::Int32,
+        true,
+    )]));
+    let staged =
+        RecordBatch::try_new(staged_arrow, vec![Arc::new(Int32Array::from(vec![50; 6]))]).unwrap();
+    let replacement = stale
+        .write_fragment_column(0, futures::stream::iter([Ok(staged)]), &age_schema)
+        .await
+        .unwrap();
+
+    // Concurrent Merge swaps the two-column base file's mapping in place.
+    let concurrent = stale.clone();
+    let read_version = concurrent.version().version;
+    let schema = concurrent.schema().clone();
+    let mut fragments: Vec<_> = concurrent
+        .get_fragments()
+        .into_iter()
+        .map(|fragment| fragment.metadata().clone())
+        .collect();
+    assert_eq!(fragments[0].files[0].fields.as_ref(), &[0, 1]);
+    assert_eq!(fragments[0].files[0].column_indices.as_ref(), &[0, 1]);
+    fragments[0].files[0].column_indices = Arc::from([1, 0]);
+    Dataset::commit(
+        WriteDestination::Dataset(Arc::new(concurrent)),
+        Operation::Merge { fragments, schema },
+        Some(read_version),
+        None,
+        None,
+        Arc::new(Default::default()),
+        false,
+    )
+    .await
+    .unwrap();
+
+    let result = stale.commit_column_writes(vec![replacement], None).await;
+    assert!(
+        result.is_err(),
+        "stale write must not clobber the remapped base file"
+    );
 }

@@ -56,6 +56,7 @@ use super::progress::{NoopFragmentWriteProgress, WriteFragmentProgress};
 use super::transaction::Transaction;
 use super::utils::SchemaAdapter;
 
+pub(crate) mod column_writes;
 mod commit;
 pub mod delete;
 mod insert;

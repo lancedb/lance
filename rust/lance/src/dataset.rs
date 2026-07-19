@@ -3641,6 +3641,26 @@ impl Dataset {
         Ok(transaction::DataReplacementGroup(fragment_id, data_file))
     }
 
+    /// Commit per-fragment column writes from [`Self::write_fragment_column`]
+    /// as a new dataset version, merging each data file into its fragment and
+    /// extending the schema with the staged columns in one atomic commit.
+    ///
+    /// The staged files are the source of truth: their footers supply the
+    /// column schema and the dataset version the writes were prepared
+    /// against. Columns that already existed at prepare time are incremental
+    /// rewrites (prior coverage in the fragment is tombstoned so the new file
+    /// is authoritative); columns that were new must still be unclaimed at
+    /// commit time. A new non-nullable column must cover every live fragment.
+    /// Every replacement must reference a current fragment; if a concurrent
+    /// operation rewrote one, the commit fails and the caller must recompute.
+    pub async fn commit_column_writes(
+        &mut self,
+        replacements: Vec<transaction::DataReplacementGroup>,
+        transaction_properties: Option<Arc<HashMap<String, String>>>,
+    ) -> Result<()> {
+        write::column_writes::commit_column_writes(self, replacements, transaction_properties).await
+    }
+
     /// Modify columns in the dataset, changing their name, type, or nullability.
     ///
     /// If only changing the name or nullability of a column, this is a zero-copy
