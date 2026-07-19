@@ -14,6 +14,7 @@ rust-version.workspace = true
 [dependencies]
 lance-arrow.workspace = true
 lance-core.workspace = true
+lance-encoding.workspace = true
 lance-file.workspace = true
 lance-select.workspace = true
 lance-io.workspace = true
@@ -48,6 +49,8 @@ uuid.workspace = true
 [dev-dependencies]
 lance-datagen.workspace = true
 lance-testing.workspace = true
+# Enable the S3 (incl. S3 Express) object-store provider for the betree_backfill bench.
+lance-io = { workspace = true, features = ["aws"] }
 arrow-schema.workspace = true
 criterion.workspace = true
 pretty_assertions.workspace = true
@@ -72,6 +75,11 @@ harness = false
 
 [[bench]]
 name = "manifest_intern"
+harness = false
+
+# PROTOTYPE (discussion #7499): Bε-tree vs flat manifest backfill write amplification.
+[[bench]]
+name = "betree_backfill"
 harness = false
 
 [lints]

@@ -1,0 +1,68 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+// PROTOTYPE ONLY (discussion lance-format/lance#7499).
+//
+// Bε-tree manifest prototype messages. Not a stable format; exists solely to
+// benchmark the write-amplification of the add-column / backfill workflow
+// against today's flat manifest. Reuses lance.table.{DataFragment,DataFile,
+// DeletionFile} so fragment byte sizes and (de)serialization are authentic.
+
+syntax = "proto3";
+
+package lance.table;
+
+import "table.proto";
+
+// A reference from the root to a child node. A child is a tabular Lance file
+// that owns a contiguous fragment-id range.
+message ChildRef {
+  // Path to the child Lance file, relative to the dataset root.
+  string node_path = 1;
+  uint64 min_frag_id = 2;
+  uint64 max_frag_id = 3;
+  uint64 num_fragments = 4;
+  uint64 num_rows = 5;
+  // Serialized byte size of the child Lance file (for cold-open cost modeling).
+  uint64 byte_size = 6;
+}
+
+// AddDataFile is the backfill / add-column action: attach a new DataFile to an
+// existing fragment. A "data replacement" is RemoveDataFile + AddDataFile.
+message AddDataFile {
+  uint64 frag_id = 1;
+  DataFile file = 2;
+}
+
+message RemoveDataFile {
+  uint64 frag_id = 1;
+  string path = 2;
+}
+
+message AddDeletionFile {
+  uint64 frag_id = 1;
+  DeletionFile deletion_file = 2;
+}
+
+// A single ε-buffer message.
+message FragmentAction {
+  oneof action {
+    DataFragment add_fragment = 1;
+    uint64 remove_fragment = 2;
+    AddDataFile add_data_file = 3;
+    RemoveDataFile remove_data_file = 4;
+    AddDeletionFile add_deletion_file = 5;
+  }
+}
+
+// The root node: table metadata + child refs + the inline ε-buffer.
+// A commit appends to fragment_actions and rewrites only this (small) object.
+message BeTreeRoot {
+  uint64 version = 1;
+  repeated ChildRef children = 2;
+  // The root ε-buffer (inline). Flushed to children when it exceeds the cap.
+  repeated FragmentAction fragment_actions = 3;
+  uint64 buffer_cap_bytes = 4;
+  // Opaque serialized table schema (table-level metadata the root carries).
+  bytes schema_pb = 5;
+}
