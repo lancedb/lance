@@ -278,8 +278,8 @@ pub(crate) fn verify_field_nullability(
         };
         if unmasked_null_count > 0 {
             return Err(Error::invalid_input(format!(
-                "The field `{}` contained null values even though the field is marked non-null in the schema",
-                field.name
+                "The field `{}` contained null values even though the field is marked non-null in the schema ({} null value(s) not masked by a null ancestor struct)",
+                field.name, unmasked_null_count
             )));
         }
     }
