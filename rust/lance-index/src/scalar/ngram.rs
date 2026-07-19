@@ -120,7 +120,7 @@ fn tokenize_visitor(tokenizer: &TextAnalyzer, text: &str, mut visitor: impl FnMu
 const ALPHA_SPAN: usize = 37;
 const MAX_TOKEN: usize = ALPHA_SPAN.pow(2) + ALPHA_SPAN;
 const MIN_TOKEN: usize = 0;
-const NGRAM_N: usize = 3;
+pub(crate) const NGRAM_N: usize = 3;
 
 // Convert an ngram (string) to a token (u32).  This helps avoid heap allocations
 // and it makes it easier to partition the tokens for shuffling
