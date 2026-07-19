@@ -13,7 +13,7 @@ use crate::dataset::transaction::{DataReplacementGroup, Operation};
 use crate::dataset::{AutoCleanupParams, MergeInsertBuilder, ProjectionRequest, UpdateBuilder};
 use crate::index::DatasetIndexExt;
 use crate::{Dataset, Error};
-use lance_core::ROW_ADDR;
+use lance_core::{ROW_ADDR, datatypes::Schema as LanceSchema};
 use lance_index::IndexType;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::FullTextSearchQuery;
@@ -4291,4 +4291,102 @@ async fn test_merge_insert_target_all_bases() {
     for row in expected_new {
         assert!(all_rows.contains(&row), "missing row {:?}", row);
     }
+}
+
+/// Lance schema for new nullable Int32 columns with fresh sequential field ids.
+fn new_int32_columns_schema(dataset: &Dataset, names: &[&str]) -> LanceSchema {
+    let fields: Vec<ArrowField> = names
+        .iter()
+        .map(|name| ArrowField::new(*name, DataType::Int32, true))
+        .collect();
+    let mut schema = LanceSchema::try_from(&ArrowSchema::new(fields)).unwrap();
+    let base_id = dataset.manifest.max_field_id() + 1;
+    for (offset, field) in schema.fields.iter_mut().enumerate() {
+        field.id = base_id + offset as i32;
+    }
+    schema
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_write_fragment_column_metadata(
+    #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)]
+    data_storage_version: LanceFileVersion,
+) {
+    let batch = arrow_array::record_batch!(("id", Int32, [1, 2])).unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+    let dataset = Dataset::write(
+        reader,
+        "memory://",
+        Some(WriteParams {
+            data_storage_version: Some(data_storage_version),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    // One new column streamed as two batches: the returned DataFile must
+    // record the writer's field/column layout and the dataset's file version.
+    let b1 = arrow_array::record_batch!(("value", Int32, [1])).unwrap();
+    let b2 = arrow_array::record_batch!(("value", Int32, [2])).unwrap();
+    let lance_schema = new_int32_columns_schema(&dataset, &["value"]);
+    let field_id = lance_schema.fields[0].id;
+
+    let fragment_id = dataset.get_fragments()[0].id() as u64;
+    let DataReplacementGroup(replaced_fragment, data_file) = dataset
+        .write_fragment_column(
+            fragment_id,
+            futures::stream::iter([Ok(b1), Ok(b2)]),
+            &lance_schema,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(replaced_fragment, fragment_id);
+    assert_eq!(data_file.fields.as_ref(), &[field_id]);
+    assert_eq!(data_file.fields.len(), data_file.column_indices.len());
+    assert!(data_file.path.ends_with(".lance"));
+    assert_eq!(
+        (data_file.file_major_version, data_file.file_minor_version),
+        ConcreteFileVersion::from(data_storage_version).to_data_file_numbers()
+    );
+}
+
+#[tokio::test]
+async fn test_write_fragment_column_rejects_row_count_mismatch() {
+    let batch = arrow_array::record_batch!(("id", Int32, [1, 2])).unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+    let dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+    let lance_schema = new_int32_columns_schema(&dataset, &["value"]);
+    let fragment_id = dataset.get_fragments()[0].id() as u64;
+
+    // Too short and too long: both must be rejected before a commit is possible.
+    for wrong_len in [
+        arrow_array::record_batch!(("value", Int32, [7])).unwrap(),
+        arrow_array::record_batch!(("value", Int32, [7, 8, 9])).unwrap(),
+    ] {
+        let err = dataset
+            .write_fragment_column(
+                fragment_id,
+                futures::stream::iter([Ok(wrong_len)]),
+                &lance_schema,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("physical rows"),
+            "expected row-count mismatch error, got: {err}"
+        );
+    }
+
+    let ok = arrow_array::record_batch!(("value", Int32, [1, 2])).unwrap();
+    let err = dataset
+        .write_fragment_column(99, futures::stream::iter([Ok(ok)]), &lance_schema)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("not found"),
+        "expected missing-fragment error, got: {err}"
+    );
 }

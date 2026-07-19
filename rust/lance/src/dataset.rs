@@ -29,6 +29,7 @@ use lance_core::utils::tracing::{
 use lance_datafusion::projection::ProjectionPlan;
 use lance_file::reader::{FileReader, FileReaderOptions};
 use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
+use lance_file::writer::FileWriterOptions;
 use lance_index::{IndexType, progress::IndexBuildProgress};
 use lance_io::object_store::{
     ChainedWrappingObjectStore, LanceNamespaceStorageOptionsProvider, ObjectStore,
@@ -151,6 +152,10 @@ pub use write::{
 pub(crate) const INDICES_DIR: &str = "_indices";
 pub(crate) const DATA_DIR: &str = "data";
 pub(crate) const TRANSACTIONS_DIR: &str = "_transactions";
+/// Schema metadata key stamped on files staged by
+/// [`Dataset::write_fragment_column`]: the dataset version the column data
+/// was prepared against.
+pub(crate) const COLUMN_WRITE_READ_VERSION_METADATA_KEY: &str = "lance:column_write:read_version";
 
 // We default to 6GB for the index cache, since indices are often large but
 // worth caching.
@@ -3553,6 +3558,87 @@ impl Dataset {
         batch_size: Option<u32>,
     ) -> Result<()> {
         schema_evolution::add_columns(self, transforms, read_columns, batch_size).await
+    }
+
+    /// Write new column data for a single fragment as a standalone data file,
+    /// without committing it, and return the
+    /// [`DataReplacementGroup`](transaction::DataReplacementGroup) describing it.
+    ///
+    /// `data` must produce exactly the fragment's physical row count, including
+    /// nulls for rows that are not being populated. Batches are pulled from the
+    /// stream one at a time, so the full column need not be held in memory.
+    ///
+    /// The staged file records `schema` and the dataset version it was
+    /// prepared against; committing validates against that record, not
+    /// caller-supplied copies.
+    pub async fn write_fragment_column(
+        &self,
+        fragment_id: u64,
+        data: impl Stream<Item = Result<RecordBatch>> + Send,
+        schema: &lance_core::datatypes::Schema,
+    ) -> Result<transaction::DataReplacementGroup> {
+        let fragment = self.get_fragment(fragment_id as usize).ok_or_else(|| {
+            Error::invalid_input(format!("fragment {fragment_id} not found in dataset"))
+        })?;
+        let expected_rows = fragment.physical_rows().await? as u64;
+
+        let file_name = format!("{}.lance", fragment::write::generate_random_filename());
+        let path = self.data_dir().join(file_name.as_str());
+
+        let file_version =
+            ConcreteFileVersion::from(self.manifest.data_storage_format.lance_file_version()?);
+
+        let writer = self.object_store.create(&path).await?;
+        let mut file_writer = lance_file::versions::create_writer(
+            file_version,
+            writer,
+            schema.clone(),
+            FileWriterOptions::default(),
+        )?;
+        file_writer.add_schema_metadata(
+            COLUMN_WRITE_READ_VERSION_METADATA_KEY,
+            self.manifest.version.to_string(),
+        );
+
+        let mut data = std::pin::pin!(data);
+        while let Some(batch_result) = data.next().await {
+            let batch = batch_result?;
+            file_writer.write_batch(&batch).await?;
+        }
+        let field_id_mapping = file_writer.field_id_to_column_indices().to_vec();
+        let summary = file_writer.finish().await?;
+        if summary.num_rows != expected_rows {
+            if let Err(delete_error) = self.object_store.delete(&path).await {
+                log::warn!("failed to delete staged column file '{path}': {delete_error}");
+            }
+            return Err(Error::invalid_input(format!(
+                "column data for fragment {fragment_id} has {} rows but the fragment has {} \
+                 physical rows",
+                summary.num_rows, expected_rows
+            )));
+        }
+        let field_ids: Vec<i32> = field_id_mapping
+            .iter()
+            .map(|(field_id, _)| *field_id as i32)
+            .collect();
+        let column_indices: Vec<i32> = field_id_mapping
+            .iter()
+            .map(|(_, column_index)| *column_index as i32)
+            .collect();
+
+        let (major, minor) = file_version.to_data_file_numbers();
+
+        let data_file = DataFile {
+            path: file_name,
+            fields: field_ids.into(),
+            column_indices: column_indices.into(),
+            file_major_version: major,
+            file_minor_version: minor,
+            file_size_bytes: CachedFileSize::new(summary.size_bytes),
+            base_id: None,
+        };
+
+        Ok(transaction::DataReplacementGroup(fragment_id, data_file))
     }
 
     /// Modify columns in the dataset, changing their name, type, or nullability.
