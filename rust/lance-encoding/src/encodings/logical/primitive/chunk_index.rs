@@ -3,10 +3,12 @@
 
 //! Compact per-page chunk index for the mini-block structural encoding.
 //!
-//! Replaces two parallel per-chunk arrays (`Vec<ChunkMeta>` + a repetition index
-//! of blocks, ~48 bytes/chunk) with the non-redundant cumulative quantities
-//! alone, deriving the rest.  The scheduler looks chunks up by index (byte range,
-//! leaf value count) and by row (which chunk holds a row).
+//! The chunk index is stored on disk in an extremely compressed form that
+//! requires a lot of CPU to work with.  However, extracting it out to its full
+//! width can be RAM-intensive.  As a compromise we extract into a prefix-sum
+//! array that we fit into `u32` if possible and we avoid storing per-block row
+//! counts when those are redundant.  The scheduler looks chunks up by index
+//! (byte range, leaf value count) and by row (which chunk holds a row).
 //!
 //! ```text
 //! MiniBlockChunkIndex
@@ -26,7 +28,7 @@ use lance_core::cache::{Context, DeepSizeOf};
 /// Cumulative (prefix-sum) array of length `num_chunks + 1` (entry `0` is `0`,
 /// the last entry is the grand total).  Stored as `u32` when the total fits,
 /// else `u64`.
-#[derive(Debug)]
+#[derive(Debug, DeepSizeOf)]
 pub enum PrefixSums {
     U32(Vec<u32>),
     U64(Vec<u64>),
@@ -136,26 +138,18 @@ impl PrefixSums {
     }
 }
 
-impl DeepSizeOf for PrefixSums {
-    fn deep_size_of_children(&self, context: &mut Context) -> usize {
-        match self {
-            Self::U32(values) => values.deep_size_of_children(context),
-            Self::U64(values) => values.deep_size_of_children(context),
-        }
-    }
-}
-
 /// Leaf value counts per chunk, needed to decode.  Tracked only for nested
 /// pages; flat pages read items off the row mapping (rows == items).
-#[derive(Debug)]
+#[derive(Debug, DeepSizeOf)]
 pub enum ItemCounts {
     /// Every non-last chunk holds the same number of values.
     Uniform {
         values_per_chunk: u64,
         last_chunk_values: u64,
     },
-    /// `log2` of the value count of each chunk; the last chunk is handled via
-    /// `last_chunk_values`.
+    /// `log2` of each chunk's value count, stored as one byte per chunk rather
+    /// than the full count because this index stays cached in RAM; the last
+    /// chunk is handled via `last_chunk_values`.
     PerChunkLog {
         logs: Vec<u8>,
         last_chunk_values: u64,
@@ -185,15 +179,6 @@ impl ItemCounts {
                     1u64 << logs[i]
                 }
             }
-        }
-    }
-}
-
-impl DeepSizeOf for ItemCounts {
-    fn deep_size_of_children(&self, context: &mut Context) -> usize {
-        match self {
-            Self::Uniform { .. } => 0,
-            Self::PerChunkLog { logs, .. } => logs.deep_size_of_children(context),
         }
     }
 }
@@ -243,8 +228,8 @@ impl DeepSizeOf for RowMapping {
     }
 }
 
-/// Compact per-page chunk index that replaces the previous `Vec<ChunkMeta>`
-/// plus repetition-index representation.  See the module docs for the layout.
+/// Compact per-page chunk index that avoids fully materializing the repetition
+/// index into u64's to save RAM.  See the module docs for the layout.
 #[derive(Debug)]
 pub struct MiniBlockChunkIndex {
     base: u64,
