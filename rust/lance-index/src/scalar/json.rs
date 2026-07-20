@@ -368,11 +368,12 @@ impl JsonTrainingRequest {
         // would sort by the wrong key and still need re-sorting after extraction. Ask
         // for unordered input instead and let `train_index` sort the extracted value
         // stream itself, once, right before handing it to the target trainer.
-        let ordering = match target_criteria.ordering {
-            TrainingOrdering::Values => TrainingOrdering::None,
-            other => other,
-        };
-        let mut criteria = TrainingCriteria::new(ordering);
+        //
+        // This is safe for `Addresses` too: `scan_training_data` only special-cases
+        // `Values` (it calls `order_by` only then); an `Addresses` or `None` criteria
+        // both fall through to the same unordered-scan behavior, since the scan already
+        // returns rows in row-address order by default.
+        let mut criteria = TrainingCriteria::new(TrainingOrdering::None);
         criteria.needs_row_ids = target_criteria.needs_row_ids;
         criteria.needs_row_addrs = target_criteria.needs_row_addrs;
         Self {
