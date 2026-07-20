@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use futures::Future;
 
 use crate::Result;
+use crate::error::CloneableError;
 
 use super::CacheCodec;
 use super::backend::{CacheBackend, CacheEntry, CacheKeyIterator, InternalCacheKey};
@@ -88,37 +89,25 @@ impl CacheBackend for MokaCacheBackend {
         loader: Pin<Box<dyn Future<Output = Result<(CacheEntry, usize)>> + Send + 'a>>,
         _codec: Option<CacheCodec>,
     ) -> Result<(CacheEntry, bool)> {
-        // Use moka's built-in dedup: optionally_get_with runs the init future
-        // at most once per key, even under concurrent access.
-        let (error_tx, error_rx) = tokio::sync::oneshot::channel();
-
         // Track whether the loader actually ran (= cache miss).
         let was_miss = Arc::new(AtomicBool::new(false));
         let was_miss_clone = was_miss.clone();
 
         let init = async move {
             was_miss_clone.store(true, Ordering::Relaxed);
-            match loader.await {
-                Ok((entry, size_bytes)) => Some(MokaCacheEntry { entry, size_bytes }),
-                Err(e) => {
-                    let _ = error_tx.send(e);
-                    None
-                }
-            }
+            loader
+                .await
+                .map(|(entry, size_bytes)| MokaCacheEntry { entry, size_bytes })
+                .map_err(CloneableError)
         };
 
         let owned_key = key.clone();
-        match self.cache.optionally_get_with(owned_key, init).await {
-            Some(record) => {
+        match self.cache.try_get_with(owned_key, init).await {
+            Ok(record) => {
                 let was_cached = !was_miss.load(Ordering::Relaxed);
                 Ok((record.entry, was_cached))
             }
-            None => match error_rx.await {
-                Ok(err) => Err(err),
-                Err(_) => Err(crate::Error::internal(
-                    "Failed to retrieve error from cache loader",
-                )),
-            },
+            Err(error) => Err(Arc::unwrap_or_clone(error).0),
         }
     }
 
