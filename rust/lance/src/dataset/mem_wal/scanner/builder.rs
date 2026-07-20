@@ -629,9 +629,6 @@ impl LsmScanner {
             )
         })?;
         let base_schema = self.schema();
-        base_schema.field_with_name(&column).map_err(|_| {
-            Error::invalid_input(format!("Column '{}' not found in schema", column))
-        })?;
         let query_limit = query
             .limit
             .map(|limit| {
@@ -922,6 +919,12 @@ impl std::fmt::Debug for LsmScanner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_array::{Int32Array, ListArray, StringArray, StructArray, UInt32Array};
+    use arrow_buffer::{OffsetBuffer, ScalarBuffer};
+    use arrow_schema::{Field, Fields};
+    use lance_index::scalar::inverted::{DOC_INDEX_COL, DocumentGranularity, InvertedIndexParams};
+
+    use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 
     #[test]
     fn test_lsm_scanner_builder() {
@@ -1806,6 +1809,103 @@ mod tests {
             rows, 1,
             "facade FTS should surface the memtable 'zebra' row"
         );
+    }
+
+    #[tokio::test]
+    async fn full_text_search_supports_nested_list_element_path() {
+        let doc_fields = Fields::from(vec![Field::new("content", DataType::Utf8, true)]);
+        let doc_values = StructArray::new(
+            doc_fields.clone(),
+            vec![Arc::new(StringArray::from(vec!["alpha", "beta", "alpha"]))],
+            None,
+        );
+        let doc_item = Arc::new(Field::new("item", DataType::Struct(doc_fields), true));
+        let docs = ListArray::new(
+            doc_item.clone(),
+            OffsetBuffer::new(ScalarBuffer::from(vec![0_i32, 1, 3])),
+            Arc::new(doc_values),
+            None,
+        );
+        let group_fields = Fields::from(vec![Field::new("docs", DataType::List(doc_item), true)]);
+        let group_values = StructArray::new(group_fields.clone(), vec![Arc::new(docs)], None);
+        let group_item = Arc::new(Field::new("item", DataType::Struct(group_fields), true));
+        let groups = ListArray::new(
+            group_item,
+            OffsetBuffer::new(ScalarBuffer::from(vec![0_i32, 2])),
+            Arc::new(group_values),
+            None,
+        );
+        let schema = pk_schema_with(Field::new("groups", groups.data_type().clone(), true));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![7])), Arc::new(groups)],
+        )
+        .unwrap();
+
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut indexes = IndexStore::new();
+        indexes.enable_pk_index(&[("id".to_string(), 0)]);
+        indexes
+            .add_fts_with_params(
+                "content_list_element_fts".to_string(),
+                1,
+                "groups.docs.content".to_string(),
+                InvertedIndexParams::default()
+                    .document_granularity(DocumentGranularity::ListElement),
+            )
+            .unwrap();
+        let (batch_position, row_offset, _) = batch_store.append(batch.clone()).unwrap();
+        indexes
+            .insert_with_batch_position(&batch, row_offset, Some(batch_position))
+            .unwrap();
+
+        let scanner = LsmScanner::without_base_table(
+            schema.clone(),
+            "memory://nested_fts",
+            vec![],
+            vec!["id".to_string()],
+        )
+        .with_in_memory_memtables(
+            Uuid::new_v4(),
+            InMemoryMemTables {
+                active: InMemoryMemTableRef {
+                    batch_store,
+                    index_store: Arc::new(indexes),
+                    schema,
+                    generation: 1,
+                },
+                frozen: vec![],
+            },
+        )
+        .project(&["id"])
+        .unwrap()
+        .full_text_search(
+            FullTextSearchQuery::new("alpha".to_string())
+                .with_column("groups.docs.content".to_string())
+                .unwrap(),
+        )
+        .unwrap();
+
+        let batch = scanner.try_into_batch().await.unwrap();
+        let ids = batch["id"].as_any().downcast_ref::<Int32Array>().unwrap();
+        let coordinates = batch[DOC_INDEX_COL]
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        let mut hits = (0..batch.num_rows())
+            .map(|row| {
+                let coordinate = coordinates
+                    .value(row)
+                    .as_any()
+                    .downcast_ref::<UInt32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec();
+                (ids.value(row), coordinate)
+            })
+            .collect::<Vec<_>>();
+        hits.sort_unstable();
+        assert_eq!(hits, vec![(7, vec![0, 0]), (7, vec![1, 1])]);
     }
 
     /// Empty search results must still preserve the execution plan schema.
