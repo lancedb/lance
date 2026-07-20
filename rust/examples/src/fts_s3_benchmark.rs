@@ -9,6 +9,7 @@
 
 #![allow(clippy::print_stdout)]
 
+use std::collections::HashMap;
 use std::error::Error;
 use std::fs;
 use std::hash::{Hash, Hasher};
@@ -18,12 +19,20 @@ use std::time::Instant;
 
 use arrow::array::{Array, AsArray};
 use arrow::datatypes::{Float32Type, UInt64Type};
+use async_trait::async_trait;
 use clap::Parser;
 use futures::{StreamExt, TryStreamExt};
 use lance::Dataset;
 use lance::dataset::builder::DatasetBuilder;
-use lance::index::DatasetIndexExt;
-use lance_index::{FtsPrewarmOptions, PrewarmOptions, scalar::FullTextSearchQuery};
+use lance::index::{DatasetIndexExt, DatasetIndexInternalExt};
+use lance_core::utils::address::RowAddress;
+use lance_index::metrics::{MetricsCollector, NoOpMetricsCollector};
+use lance_index::prefilter::PreFilter;
+use lance_index::scalar::inverted::query::{FtsSearchParams, Operator, collect_query_tokens};
+use lance_index::scalar::inverted::{InvertedIndex, MemBM25Scorer};
+use lance_index::scalar::{FullTextSearchQuery, ScalarIndex};
+use lance_index::{FtsPrewarmOptions, PrewarmOptions};
+use lance_select::{RowAddrMask, RowAddrTreeMap};
 use serde_json::{Value, json};
 
 type AnyError = Box<dyn Error + Send + Sync>;
@@ -91,6 +100,12 @@ struct Args {
     #[arg(long)]
     index_cache_size_gib: Option<usize>,
 
+    /// Select every Nth physical row through a synthetic FTS prefilter. This
+    /// bypasses scalar-filter construction so the benchmark isolates indexed
+    /// FTS visibility and address projection.
+    #[arg(long)]
+    filter_stride: Option<u32>,
+
     /// Permit queries with no results. By default they fail the run so an
     /// accidentally irrelevant panel cannot produce plausible timings.
     #[arg(long, default_value_t = false)]
@@ -107,6 +122,40 @@ struct QueryMeasurement {
     score_bits: Vec<u32>,
     result_hash: String,
     peak_rss_kib: Option<u64>,
+}
+
+#[derive(Debug)]
+struct StaticPreFilter {
+    mask: Arc<RowAddrMask>,
+}
+
+#[async_trait]
+impl PreFilter for StaticPreFilter {
+    async fn wait_for_ready(&self) -> lance_core::Result<()> {
+        Ok(())
+    }
+
+    fn is_empty(&self) -> bool {
+        false
+    }
+
+    fn mask(&self) -> Arc<RowAddrMask> {
+        self.mask.clone()
+    }
+
+    fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {
+        row_ids
+            .enumerate()
+            .filter_map(|(index, row_id)| self.mask.selected(*row_id).then_some(index as u64))
+            .collect()
+    }
+}
+
+#[derive(Debug)]
+struct FilteredSearchContext {
+    indices: Vec<Arc<dyn ScalarIndex>>,
+    prefilter: Arc<StaticPreFilter>,
+    selected_rows: u64,
 }
 
 fn emit(value: Value) {
@@ -155,7 +204,7 @@ fn linux_memory_kib(field: &str) -> Option<u64> {
     })
 }
 
-async fn run_query(
+async fn run_scanner_query(
     dataset: &Dataset,
     column: &str,
     query: &str,
@@ -212,6 +261,197 @@ async fn run_query(
     Ok((latency_ms, row_ids, score_bits))
 }
 
+async fn build_filter_mask(dataset: &Dataset, stride: u32) -> AnyResult<(Arc<RowAddrMask>, u64)> {
+    if stride == 0 {
+        return Err("--filter-stride must be greater than zero".into());
+    }
+    let fragments = futures::stream::iter(dataset.get_fragments())
+        .map(|fragment| async move {
+            let fragment_id = u32::try_from(fragment.id())?;
+            let physical_rows = u32::try_from(fragment.physical_rows().await?)?;
+            Ok::<_, AnyError>((fragment_id, physical_rows))
+        })
+        .buffer_unordered(16)
+        .try_collect::<Vec<_>>()
+        .await?;
+
+    let mut addresses = RowAddrTreeMap::new();
+    let mut selected_rows = 0_u64;
+    for (fragment_id, physical_rows) in fragments {
+        for row_offset in (0..physical_rows).step_by(stride as usize) {
+            addresses.insert(u64::from(RowAddress::new_from_parts(
+                fragment_id,
+                row_offset,
+            )));
+            selected_rows += 1;
+        }
+    }
+    Ok((
+        Arc::new(RowAddrMask::from_allowed(addresses)),
+        selected_rows,
+    ))
+}
+
+async fn open_filtered_context(
+    dataset: &Dataset,
+    column: &str,
+    index_name: &str,
+    stride: u32,
+) -> AnyResult<FilteredSearchContext> {
+    let (mask, selected_rows) = build_filter_mask(dataset, stride).await?;
+    let metadata = dataset.load_indices().await?;
+    let matching = metadata
+        .iter()
+        .filter(|index| index.name == index_name)
+        .collect::<Vec<_>>();
+    if matching.is_empty() {
+        return Err(format!("dataset does not contain index {index_name:?}").into());
+    }
+
+    let mut indices = Vec::with_capacity(matching.len());
+    for index in matching {
+        let opened = dataset
+            .open_scalar_index(column, &index.uuid, &NoOpMetricsCollector)
+            .await?;
+        if opened.as_any().downcast_ref::<InvertedIndex>().is_none() {
+            return Err(format!("index segment {} is not an inverted index", index.uuid).into());
+        }
+        indices.push(opened);
+    }
+    Ok(FilteredSearchContext {
+        indices,
+        prefilter: Arc::new(StaticPreFilter { mask }),
+        selected_rows,
+    })
+}
+
+async fn global_scorer(
+    indices: &[Arc<dyn ScalarIndex>],
+    terms: &[String],
+) -> AnyResult<MemBM25Scorer> {
+    let mut total_tokens = 0_u64;
+    let mut num_docs = 0_usize;
+    let mut token_docs =
+        HashMap::<String, usize>::from_iter(terms.iter().cloned().map(|term| (term, 0)));
+    for index in indices {
+        let inverted = index
+            .as_any()
+            .downcast_ref::<InvertedIndex>()
+            .expect("index type checked while opening filtered benchmark context");
+        let (segment_tokens, segment_docs, segment_token_docs) =
+            inverted.bm25_stats_for_terms(terms).await?;
+        total_tokens = total_tokens
+            .checked_add(segment_tokens)
+            .ok_or("global token count overflow")?;
+        num_docs = num_docs
+            .checked_add(segment_docs)
+            .ok_or("global document count overflow")?;
+        for (term, count) in terms.iter().zip(segment_token_docs) {
+            *token_docs
+                .get_mut(term)
+                .expect("scorer term initialized above") += count;
+        }
+    }
+    Ok(MemBM25Scorer::new(total_tokens, num_docs, token_docs))
+}
+
+async fn run_filtered_query(
+    context: &FilteredSearchContext,
+    query: &str,
+    k: usize,
+    allow_empty: bool,
+) -> AnyResult<(f64, Vec<u64>, Vec<u32>)> {
+    let started = Instant::now();
+    let first = context
+        .indices
+        .first()
+        .ok_or("filtered benchmark has no index segments")?
+        .as_any()
+        .downcast_ref::<InvertedIndex>()
+        .expect("index type checked while opening filtered benchmark context");
+    let mut tokenizer = first.tokenizer();
+    let tokens = Arc::new(collect_query_tokens(query, &mut tokenizer));
+    let mut terms = Vec::new();
+    for token in tokens.as_ref() {
+        if !terms.contains(token) {
+            terms.push(token.clone());
+        }
+    }
+    let scorer = Arc::new(global_scorer(&context.indices, &terms).await?);
+    let params = Arc::new(FtsSearchParams::new().with_limit(Some(k)));
+    let metrics: Arc<dyn MetricsCollector> = Arc::new(NoOpMetricsCollector);
+    let searches = context.indices.iter().cloned().map(|index| {
+        let tokens = tokens.clone();
+        let params = params.clone();
+        let prefilter = context.prefilter.clone();
+        let metrics = metrics.clone();
+        let scorer = scorer.clone();
+        async move {
+            let inverted = index
+                .as_any()
+                .downcast_ref::<InvertedIndex>()
+                .expect("index type checked while opening filtered benchmark context");
+            inverted
+                .bm25_search(
+                    tokens,
+                    params,
+                    Operator::Or,
+                    prefilter,
+                    metrics,
+                    Some(scorer.as_ref()),
+                )
+                .await
+        }
+    });
+    let segment_results = futures::stream::iter(searches)
+        .buffer_unordered(context.indices.len().max(1))
+        .try_collect::<Vec<_>>()
+        .await?;
+
+    let mut results = segment_results
+        .into_iter()
+        .flat_map(|(row_ids, scores)| row_ids.into_iter().zip(scores))
+        .collect::<Vec<_>>();
+    results.sort_unstable_by(|(left_row, left_score), (right_row, right_score)| {
+        right_score
+            .total_cmp(left_score)
+            .then_with(|| left_row.cmp(right_row))
+    });
+    results.truncate(k);
+    let latency_ms = started.elapsed().as_secs_f64() * 1_000.0;
+    let (row_ids, scores): (Vec<_>, Vec<_>) = results.into_iter().unzip();
+    if row_ids.is_empty() && !allow_empty {
+        return Err(
+            "filtered FTS query returned no rows; use --allow-empty only when intentional".into(),
+        );
+    }
+    if row_ids
+        .iter()
+        .any(|row_id| !context.prefilter.mask.selected(*row_id))
+    {
+        return Err("filtered FTS query returned a row outside the synthetic mask".into());
+    }
+    Ok((
+        latency_ms,
+        row_ids,
+        scores.into_iter().map(f32::to_bits).collect(),
+    ))
+}
+
+async fn run_query(
+    dataset: &Dataset,
+    filtered: Option<&FilteredSearchContext>,
+    column: &str,
+    query: &str,
+    k: usize,
+    allow_empty: bool,
+) -> AnyResult<(f64, Vec<u64>, Vec<u32>)> {
+    match filtered {
+        Some(context) => run_filtered_query(context, query, k, allow_empty).await,
+        None => run_scanner_query(dataset, column, query, k, allow_empty).await,
+    }
+}
+
 fn percentile(values: &[f64], percentile: f64) -> Option<f64> {
     if values.is_empty() {
         return None;
@@ -249,6 +489,7 @@ async fn main() -> AnyResult<()> {
         "prewarm_index": args.prewarm_index,
         "prewarm_positions": args.prewarm_positions,
         "index_cache_size_gib": args.index_cache_size_gib,
+        "filter_stride": args.filter_stride,
         "hostname": std::env::var("HOSTNAME").ok(),
         "available_parallelism": std::thread::available_parallelism().map(usize::from).ok(),
         "package_version": env!("CARGO_PKG_VERSION"),
@@ -331,9 +572,40 @@ async fn main() -> AnyResult<()> {
         }));
     }
 
+    let filtered = if let Some(stride) = args.filter_stride {
+        let index_name = args
+            .expected_index
+            .as_deref()
+            .ok_or("--filter-stride requires --expected-index")?;
+        let setup_started = Instant::now();
+        let context =
+            Arc::new(open_filtered_context(&dataset, &args.column, index_name, stride).await?);
+        emit(json!({
+            "event": "filter_ready",
+            "label": args.label,
+            "stride": stride,
+            "selected_rows": context.selected_rows,
+            "segment_count": context.indices.len(),
+            "setup_ms": setup_started.elapsed().as_secs_f64() * 1_000.0,
+            "rss_kib": linux_memory_kib("VmRSS:"),
+            "peak_rss_kib": linux_memory_kib("VmHWM:"),
+        }));
+        Some(context)
+    } else {
+        None
+    };
+
     for _ in 0..args.warmup_rounds {
         for query in &queries {
-            let _ = run_query(&dataset, &args.column, query, args.k, args.allow_empty).await?;
+            let _ = run_query(
+                &dataset,
+                filtered.as_deref(),
+                &args.column,
+                query,
+                args.k,
+                args.allow_empty,
+            )
+            .await?;
         }
     }
 
@@ -351,10 +623,18 @@ async fn main() -> AnyResult<()> {
     let mut measurements = futures::stream::iter(jobs)
         .map(|(round, query_index, query)| {
             let dataset = dataset.clone();
+            let filtered = filtered.clone();
             let column = args.column.clone();
             async move {
-                let (latency_ms, row_ids, score_bits) =
-                    run_query(&dataset, &column, &query, args.k, args.allow_empty).await?;
+                let (latency_ms, row_ids, score_bits) = run_query(
+                    &dataset,
+                    filtered.as_deref(),
+                    &column,
+                    &query,
+                    args.k,
+                    args.allow_empty,
+                )
+                .await?;
                 Ok::<_, AnyError>(QueryMeasurement {
                     round,
                     query_index,
