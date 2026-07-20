@@ -20,6 +20,7 @@ INDEX_NAME=${LANCE_FTS_BENCH_INDEX:-full_content_idx}
 EXPECTED_ROWS=${LANCE_FTS_BENCH_EXPECTED_ROWS:-100000000}
 COLD_TRIALS=${LANCE_FTS_BENCH_COLD_TRIALS:-2}
 WARM_RUNS=${LANCE_FTS_BENCH_WARM_RUNS:-2}
+WARMUP_ROUNDS=${LANCE_FTS_BENCH_WARMUP_ROUNDS:-1}
 WARM_ROUNDS=${LANCE_FTS_BENCH_WARM_ROUNDS:-5}
 THROUGHPUT_CONCURRENCY=${LANCE_FTS_BENCH_CONCURRENCY:-8}
 THROUGHPUT_ROUNDS=${LANCE_FTS_BENCH_THROUGHPUT_ROUNDS:-5}
@@ -58,6 +59,12 @@ cp "$QUERY_FILE" "$RUN_DIR/queries.txt"
   echo "text_column=$TEXT_COLUMN"
   echo "index_name=$INDEX_NAME"
   echo "expected_rows=$EXPECTED_ROWS"
+  echo "cold_trials=$COLD_TRIALS"
+  echo "warm_runs=$WARM_RUNS"
+  echo "warmup_rounds=$WARMUP_ROUNDS"
+  echo "warm_rounds=$WARM_ROUNDS"
+  echo "throughput_concurrency=$THROUGHPUT_CONCURRENCY"
+  echo "throughput_rounds=$THROUGHPUT_ROUNDS"
   echo "baseline_commit=$BASELINE_COMMIT"
   echo "candidate_commit=$CANDIDATE_COMMIT"
   echo "aws_region=${AWS_REGION:-${AWS_DEFAULT_REGION:-unset}}"
@@ -142,7 +149,7 @@ for ((run = 0; run < WARM_RUNS; run++)); do
       "warm-${variant}-run-${run}" \
       "$RUN_DIR/results/warm_${variant}.jsonl" \
       --query-file "$RUN_DIR/queries.txt" \
-      --warmup-rounds 1 \
+      --warmup-rounds "$WARMUP_ROUNDS" \
       --measured-rounds "$WARM_ROUNDS" \
       --concurrency 1
   done
@@ -160,7 +167,7 @@ for ((run = 0; run < WARM_RUNS; run++)); do
       "throughput-${variant}-run-${run}" \
       "$RUN_DIR/results/throughput_${variant}.jsonl" \
       --query-file "$RUN_DIR/queries.txt" \
-      --warmup-rounds 1 \
+      --warmup-rounds "$WARMUP_ROUNDS" \
       --measured-rounds "$THROUGHPUT_ROUNDS" \
       --concurrency "$THROUGHPUT_CONCURRENCY"
   done
