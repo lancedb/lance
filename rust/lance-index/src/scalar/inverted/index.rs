@@ -1285,7 +1285,7 @@ impl InvertedIndex {
                     .metadata
                     .get("params")
                     .ok_or(Error::index("params not found in metadata".to_owned()))?;
-                let params = serde_json::from_str::<InvertedIndexParams>(params)?;
+                let mut params = serde_json::from_str::<InvertedIndexParams>(params)?;
                 let partitions = reader
                     .schema()
                     .metadata
@@ -1351,21 +1351,11 @@ impl InvertedIndex {
                         "FTS partitions have inconsistent document coordinate ranks".to_string(),
                     ));
                 }
-                match params.get_document_granularity() {
-                    DocumentGranularity::Row if coordinate_rank != 0 => {
-                        return Err(Error::index(
-                            "row-document FTS metadata has persisted document coordinates"
-                                .to_string(),
-                        ));
-                    }
-                    DocumentGranularity::ListElement if coordinate_rank == 0 => {
-                        return Err(Error::index(
-                            "ListElement FTS metadata is missing persisted document coordinates"
-                                .to_string(),
-                        ));
-                    }
-                    _ => {}
-                }
+                params.document_granularity = if coordinate_rank == 0 {
+                    DocumentGranularity::Row
+                } else {
+                    DocumentGranularity::ListElement
+                };
 
                 let tokenizer = params.build()?;
                 Ok(Arc::new(Self {

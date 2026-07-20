@@ -302,18 +302,26 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
     async fn load_index(
         &self,
         index_store: Arc<dyn IndexStore>,
-        _index_details: &prost_types::Any,
+        index_details: &prost_types::Any,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
         let index = InvertedIndex::load(index_store, frag_reuse_index, cache).await?;
+        let details = index_details.to_msg::<pbold::InvertedIndexDetails>()?;
+        let expected_granularity = DocumentGranularity::try_from(details.document_granularity)?;
+        let physical_granularity = index.params().get_document_granularity();
+        if physical_granularity != expected_granularity {
+            return Err(Error::index(format!(
+                "FTS document granularity in index details is {expected_granularity:?}, but the physical document schema implies {physical_granularity:?}"
+            )));
+        }
         Ok(index as Arc<dyn ScalarIndex>)
     }
 
     fn details_as_json(&self, details: &prost_types::Any) -> Result<serde_json::Value> {
         let index_details = details.to_msg::<pbold::InvertedIndexDetails>()?;
         let index_params = InvertedIndexParams::try_from(&index_details)?;
-        Ok(serde_json::json!(&index_params))
+        Ok(index_params.to_details_json()?)
     }
 }
 
@@ -326,6 +334,20 @@ mod tests {
     fn test_plugin_version_tracks_current_index_version() {
         let plugin = InvertedIndexPlugin;
         assert_eq!(plugin.version(), INVERTED_INDEX_VERSION_V4);
+    }
+
+    #[test]
+    fn test_details_json_includes_document_granularity() {
+        let details = pbold::InvertedIndexDetails {
+            document_granularity: pbold::inverted_index_details::DocumentGranularity::ListElement
+                as i32,
+            ..Default::default()
+        };
+        let details = prost_types::Any::from_msg(&details).unwrap();
+
+        let json = InvertedIndexPlugin.details_as_json(&details).unwrap();
+
+        assert_eq!(json["document_granularity"], "list_element");
     }
 
     #[test]

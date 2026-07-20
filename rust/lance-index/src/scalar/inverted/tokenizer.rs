@@ -103,9 +103,12 @@ impl From<DocumentGranularity> for PbDocumentGranularity {
 /// Tokenizer configs
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct InvertedIndexParams {
-    /// The logical document boundary. Missing serialized values default to
-    /// row documents for backwards compatibility.
-    #[serde(default)]
+    /// The logical document boundary used while creating an index.
+    ///
+    /// This is persisted in `InvertedIndexDetails`, not in the tokenizer
+    /// params stored inside the physical index. Creation JSON adds it back
+    /// explicitly in [`Self::to_training_json`].
+    #[serde(default, skip_serializing)]
     pub(crate) document_granularity: DocumentGranularity,
     /// Document-level tokenizer.
     ///
@@ -933,9 +936,22 @@ impl InvertedIndexParams {
         validate_format_version_block_size(self.resolved_format_version(), self.block_size)
     }
 
+    /// Serialize user-visible params, including logical index identity fields.
+    pub(crate) fn to_details_json(&self) -> serde_json::Result<serde_json::Value> {
+        let mut value = serde_json::to_value(self)?;
+        let object = value
+            .as_object_mut()
+            .expect("inverted index params should serialize to a JSON object");
+        object.insert(
+            "document_granularity".to_string(),
+            serde_json::to_value(self.document_granularity)?,
+        );
+        Ok(value)
+    }
+
     /// Serialize params for the build/training path, including build-only fields.
     pub fn to_training_json(&self) -> serde_json::Result<serde_json::Value> {
-        let mut value = serde_json::to_value(self)?;
+        let mut value = self.to_details_json()?;
         let object = value
             .as_object_mut()
             .expect("inverted index params should serialize to a JSON object");
@@ -1122,12 +1138,14 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn test_build_only_fields_are_not_serialized() {
+    fn test_physical_params_omit_creation_only_fields() {
         let params = InvertedIndexParams::default()
+            .document_granularity(DocumentGranularity::ListElement)
             .memory_limit_mb(4096)
             .num_workers(7)
             .format_version(InvertedListFormatVersion::V1);
         let json = serde_json::to_value(&params).unwrap();
+        assert!(json.get("document_granularity").is_none());
         assert!(json.get("memory_limit").is_none());
         assert!(json.get("num_workers").is_none());
         assert!(json.get("format_version").is_none());
@@ -1161,12 +1179,17 @@ mod tests {
     }
 
     #[test]
-    fn test_training_json_serializes_build_only_fields() {
+    fn test_training_json_serializes_creation_fields() {
         let params = InvertedIndexParams::default()
+            .document_granularity(DocumentGranularity::ListElement)
             .memory_limit_mb(4096)
             .num_workers(3)
             .format_version(InvertedListFormatVersion::V1);
         let json = params.to_training_json().unwrap();
+        assert_eq!(
+            json.get("document_granularity"),
+            Some(&serde_json::Value::from("list_element"))
+        );
         assert_eq!(
             json.get("memory_limit"),
             Some(&serde_json::Value::from(4096))
@@ -1337,7 +1360,8 @@ mod tests {
         let params = InvertedIndexParams::code()
             .with_position(true)
             .index_operators(true)
-            .preserve_original(false);
+            .preserve_original(false)
+            .format_version(InvertedListFormatVersion::V4);
         let details = crate::pbold::InvertedIndexDetails::try_from(&params).unwrap();
         let code_config = details.code_config.as_ref().unwrap();
         assert_eq!(code_config.split_on_numerics, Some(true));
