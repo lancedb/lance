@@ -1424,6 +1424,7 @@ impl PostingIterator {
 /// Validate the dense-DocId boundary before any document-length lookup.
 /// Modern postings are sorted, so decoding only the final physical block is
 /// sufficient to validate their maximum DocId.
+#[cfg(test)]
 pub(super) fn validate_modern_posting_doc_ids(
     posting: &PostingList,
     token: &str,

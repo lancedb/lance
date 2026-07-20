@@ -2330,12 +2330,6 @@ impl InvertedPartition {
             .try_collect::<Vec<_>>()
             .await?;
 
-        if self.docs.modern().is_some() {
-            for (_, token, _, posting) in &loaded_postings {
-                validate_modern_posting_doc_ids(posting, token, num_docs)?;
-            }
-        }
-
         let needs_union = loaded_postings
             .windows(2)
             .any(|window| window[0].2 == window[1].2);
