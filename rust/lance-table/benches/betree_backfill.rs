@@ -414,17 +414,22 @@ async fn run_scale(
         flat_manifest_bytes as f64 / boot.io_write_bytes.max(1) as f64,
     );
 
+    let mut final_added = 0u64;
     if backfill_columns > 0 {
-        let commits_per_col = n.div_ceil(f);
+        // A bounded per-commit sample (a full column would be N/F commits — up to
+        // 100K at N=1M) is enough to characterize per-commit write at scale.
+        const SAMPLE: u64 = 200;
+        let sample = SAMPLE.min(n.div_ceil(f));
         let mut per_commit: Vec<f64> = Vec::new();
-        let (mut bytes, mut flushes, mut splits, mut merges) = (0u64, 0u64, 0u64, 0u64);
+        let (mut bytes, mut flushes, mut splits, mut merges, mut added) = (0u64, 0, 0, 0, 0u64);
         for col in 0..backfill_columns {
-            for c in 0..commits_per_col {
+            for c in 0..sample {
                 let actions: Vec<_> = commit_window(c, f, n)
                     .map(|id| {
                         action::add_data_file(id, &make_backfill_data_file(id, base_files + col))
                     })
                     .collect();
+                added += actions.len() as u64;
                 let start = Instant::now();
                 let s = tree.commit(actions).await.expect("scale commit");
                 per_commit.push(start.elapsed().as_secs_f64() * 1000.0);
@@ -436,17 +441,19 @@ async fn run_scale(
         }
         per_commit.sort_by(|a, b| a.partial_cmp(b).unwrap());
         println!(
-            "             backfill {backfill_columns} col(s) at scale: per-commit write={:.3} MiB \
+            "             backfill sample ({} commits) at scale: per-commit write={:.3} MiB \
              mean={:.2}ms p50={:.2} p99={:.2} | flushes={flushes} splits={splits} merges={merges} height={}",
+            per_commit.len(),
             bytes as f64 / per_commit.len().max(1) as f64 / MIB as f64,
             mean(&per_commit),
             percentile(&per_commit, 50.0),
             percentile(&per_commit, 99.0),
             tree.height(),
         );
+        final_added = added;
     }
 
-    let final_files = total_files + n * backfill_columns as u64;
+    let final_files = total_files + final_added;
     if final_files <= MATERIALIZE_CAP {
         let t = Instant::now();
         let frags = BeTree::cold_open(object_store, base, scheduler, cache)
