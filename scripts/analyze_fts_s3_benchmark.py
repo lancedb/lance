@@ -6,10 +6,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import struct
 from collections import defaultdict
 from pathlib import Path
 from statistics import mean
 from typing import Any
+
+CanonicalResult = tuple[tuple[int, int], ...]
+ParityResult = tuple[CanonicalResult, int | None, int]
 
 
 def percentile(values: list[float], percent: float) -> float | None:
@@ -35,7 +40,7 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
     return records
 
 
-def canonical_result(record: dict[str, Any]) -> tuple[tuple[int, int], ...]:
+def canonical_result(record: dict[str, Any]) -> CanonicalResult:
     row_ids = record.get("row_ids")
     score_bits = record.get("score_bits")
     if not isinstance(row_ids, list) or not isinstance(score_bits, list):
@@ -43,6 +48,26 @@ def canonical_result(record: dict[str, Any]) -> tuple[tuple[int, int], ...]:
     if len(row_ids) != len(score_bits):
         raise ValueError("query record has different row and score counts")
     return tuple(sorted(zip(row_ids, score_bits)))
+
+
+def score_from_bits(bits: int) -> float:
+    score = struct.unpack("!f", struct.pack("!I", bits))[0]
+    if not math.isfinite(score):
+        raise ValueError(f"query record contains a non-finite score: {bits}")
+    return score
+
+
+def parity_result(
+    record: dict[str, Any],
+) -> ParityResult:
+    result = canonical_result(record)
+    if not result:
+        return (), None, 0
+
+    cutoff_score = min((score for _, score in result), key=score_from_bits)
+    above_cutoff = tuple(pair for pair in result if pair[1] != cutoff_score)
+    cutoff_count = len(result) - len(above_cutoff)
+    return above_cutoff, cutoff_score, cutoff_count
 
 
 def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
@@ -87,14 +112,20 @@ def main() -> int:
             data[(phase, variant)] = read_jsonl(path)
 
     parity_failures: list[dict[str, Any]] = []
+    cutoff_ties: list[dict[str, Any]] = []
     for phase in ("cold", "warm", "throughput"):
-        by_variant: dict[str, dict[str, set[tuple[tuple[int, int], ...]]]] = {}
+        by_variant: dict[str, dict[str, set[ParityResult]]] = {}
+        raw_by_variant: dict[str, dict[str, set[CanonicalResult]]] = {}
         for variant in ("baseline", "candidate"):
-            results: dict[str, set[tuple[tuple[int, int], ...]]] = defaultdict(set)
+            results: dict[str, set[ParityResult]] = defaultdict(set)
+            raw_results: dict[str, set[CanonicalResult]] = defaultdict(set)
             for record in data[(phase, variant)]:
                 if record.get("event") == "query":
-                    results[str(record["query"])].add(canonical_result(record))
+                    query = str(record["query"])
+                    results[query].add(parity_result(record))
+                    raw_results[query].add(canonical_result(record))
             by_variant[variant] = results
+            raw_by_variant[variant] = raw_results
 
         queries = set(by_variant["baseline"]) | set(by_variant["candidate"])
         for query in sorted(queries):
@@ -110,6 +141,22 @@ def main() -> int:
                         "equal": baseline == candidate,
                     }
                 )
+            else:
+                baseline_raw = raw_by_variant["baseline"].get(query, set())
+                candidate_raw = raw_by_variant["candidate"].get(query, set())
+                if (
+                    len(baseline_raw) != 1
+                    or len(candidate_raw) != 1
+                    or baseline_raw != candidate_raw
+                ):
+                    cutoff_ties.append(
+                        {
+                            "phase": phase,
+                            "query": query,
+                            "baseline_variants": len(baseline_raw),
+                            "candidate_variants": len(candidate_raw),
+                        }
+                    )
 
     phases: dict[str, Any] = {}
     for phase in ("cold", "warm", "throughput"):
@@ -142,6 +189,7 @@ def main() -> int:
         "parity": {
             "ok": not parity_failures,
             "failures": parity_failures,
+            "cutoff_ties": cutoff_ties,
         },
         "phases": phases,
     }
