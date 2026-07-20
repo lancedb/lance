@@ -136,6 +136,8 @@
   color: var(--beam-600);
   margin-bottom: 24px;
 }
+/* Wrap only between segments (at the · separators), never inside one. */
+.ld-kicker span, .ld-kicker a { white-space: nowrap; }
 .ld-kicker a { color: inherit; text-decoration: underline; text-underline-offset: 3px; }
 .ld-kicker a:hover { color: var(--beam-700); }
 .ld-hero h1 {
