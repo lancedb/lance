@@ -1314,10 +1314,11 @@ impl DatasetIndexExt for Dataset {
     async fn load_indices(&self) -> Result<Arc<Vec<IndexMetadata>>> {
         let metadata_key = IndexMetadataKey {
             version: self.version().version,
+            store_identity: &self.object_store.store_prefix,
         };
-        let mut indices = match self.index_cache.get_with_key(&metadata_key).await {
-            Some(indices) => indices,
-            None => {
+        let mut indices = self
+            .index_cache
+            .get_or_insert_with_key(metadata_key, || async {
                 let mut loaded_indices = read_manifest_indexes(
                     &self.object_store,
                     &self.manifest_location,
@@ -1325,13 +1326,9 @@ impl DatasetIndexExt for Dataset {
                 )
                 .await?;
                 retain_supported_indices(&mut loaded_indices);
-                let loaded_indices = Arc::new(loaded_indices);
-                self.index_cache
-                    .insert_with_key(&metadata_key, loaded_indices.clone())
-                    .await;
-                loaded_indices
-            }
-        };
+                Ok(loaded_indices)
+            })
+            .await?;
 
         // Infer details for legacy vector indices (once per index name, concurrently).
         // This may run on indices that were opportunistically cached during Dataset::open
@@ -4352,6 +4349,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_load_indices_singleflights_concurrent_cache_misses() {
+        let session = Arc::new(Session::default());
+        let write_params = WriteParams {
+            session: Some(session.clone()),
+            ..Default::default()
+        };
+        let test_dir = TempStrDir::default();
+        let schema = Arc::new(Schema::new(vec![Field::new("tag", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["a", "b", "c"]))],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &test_dir,
+            Some(write_params),
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["tag"],
+                IndexType::Bitmap,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        session.index_cache.clear().await;
+        let before = session.index_cache_stats().await;
+        let results = futures::future::join_all((0..32).map(|_| dataset.load_indices())).await;
+        assert!(results.iter().all(|result| result.is_ok()));
+        let after = session.index_cache_stats().await;
+
+        assert_eq!(after.misses - before.misses, 1);
+        assert_eq!(after.hits - before.hits, 31);
+    }
+
+    #[tokio::test]
     async fn test_remap_empty() {
         let data = gen_batch()
             .col("int", array::step::<Int32Type>())
@@ -4737,6 +4776,7 @@ mod tests {
         // We commit by doing a delete("false") after replacing the cached indices.
         let metadata_key = crate::session::index_caches::IndexMetadataKey {
             version: dataset.version().version,
+            store_identity: &dataset.object_store.store_prefix,
         };
         dataset
             .index_cache
