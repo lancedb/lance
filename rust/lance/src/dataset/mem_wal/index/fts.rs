@@ -578,6 +578,7 @@ struct BatchMeta {
     batch_position: usize,
     row_offset: u64,
     /// `doc_lengths[i]` is the token count of the row at `row_offset + i`.
+    /// Zero entries preserve row-position alignment but are not documents.
     doc_lengths: Vec<u32>,
     rows: u32,
 }
@@ -674,7 +675,7 @@ struct Snapshot {
     /// visible_count` for any snapshot the writer has stored (each publish
     /// appends one entry and bumps `visible_count`).
     batches: BatchLog,
-    /// `Σ batches[i].rows` for `i < visible_count`.
+    /// Number of non-zero-token documents for `i < visible_count`.
     cumulative_doc_count: u64,
     /// `Σ batches[i].doc_lengths.iter().sum()` for `i < visible_count`.
     cumulative_total_tokens: u64,
@@ -846,6 +847,7 @@ impl TailIndex {
         term_builders: FxHashMap<Arc<str>, BatchTermBuilder>,
         with_position: bool,
     ) {
+        let doc_count = doc_lengths.iter().filter(|&&len| len > 0).count() as u64;
         let mut cache = self
             .writer_term_cache
             .lock()
@@ -875,7 +877,7 @@ impl TailIndex {
         self.snapshot.store(Arc::new(Snapshot {
             visible_count: cur.visible_count + 1,
             batches: cur.batches.pushed(new_meta),
-            cumulative_doc_count: cur.cumulative_doc_count + rows as u64,
+            cumulative_doc_count: cur.cumulative_doc_count + doc_count,
             cumulative_total_tokens: cur.cumulative_total_tokens + total_tokens,
         }));
     }
@@ -1139,24 +1141,13 @@ impl FtsMemIndex {
 
     fn insert_batch(&self, batch: &RecordBatch, row_offset: u64) -> Result<()> {
         let st = self.state.load_full();
-        let batch_position = st.tail.next_position();
 
         let Some(col_idx) = batch
             .schema()
             .column_with_name(&self.column_name)
             .map(|(idx, _)| idx)
         else {
-            // Column missing: nothing to index, but publish an empty batch so
-            // the tail's visibility counters keep up with the writer.
-            st.tail.append_batch(
-                batch_position,
-                row_offset,
-                batch.num_rows() as u32,
-                vec![0; batch.num_rows()],
-                0,
-                FxHashMap::default(),
-                self.params.has_positions(),
-            );
+            // A missing column has no searchable documents.
             return Ok(());
         };
 
@@ -1207,10 +1198,15 @@ impl FtsMemIndex {
             total_tokens += doc_token_count as u64;
         }
 
+        if total_tokens == 0 {
+            return Ok(());
+        }
+
         // Drop the tokenizer guard before publishing so we don't hold it
         // across the snapshot install.
         drop(tok_guard);
 
+        let batch_position = st.tail.next_position();
         st.tail.append_batch(
             batch_position,
             row_offset,
@@ -1905,8 +1901,9 @@ impl FtsMemIndex {
     /// Export the in-memory FTS index to an `InnerBuilder` ready to be
     /// written to disk.
     ///
-    /// Doc row positions are kept in insert order to match the forward-written
-    /// flush data file 1:1. `total_rows` is used only to validate positions.
+    /// Documents are kept in insert order and retain their positions in the
+    /// forward-written flush data file; zero-token rows are omitted.
+    /// `total_rows` is used only to validate positions.
     pub fn to_index_builder(
         &self,
         partition_id: u64,
@@ -1933,7 +1930,10 @@ impl FtsMemIndex {
         let tail_snap = st.tail.snapshot();
         for batch in tail_snap.batches.iter().take(tail_snap.visible_count) {
             for i in 0..batch.rows as usize {
-                all_docs.push((batch.row_offset + i as u64, batch.doc_lengths[i]));
+                let num_tokens = batch.doc_lengths[i];
+                if num_tokens > 0 {
+                    all_docs.push((batch.row_offset + i as u64, num_tokens));
+                }
             }
         }
         if all_docs.is_empty() {
@@ -1946,8 +1946,8 @@ impl FtsMemIndex {
             ));
         }
 
-        // Step 2: assign doc_ids in ascending insert-position order, so the
-        // stored row positions line up 1:1 with the forward-written data file.
+        // Step 2: assign doc_ids in ascending insert-position order while
+        // preserving each document's position in the forward-written data file.
         let mut entries: Vec<(u64, u32)> = Vec::with_capacity(all_docs.len());
         for (original, num_tokens) in &all_docs {
             if *original >= total_rows_u64 {
@@ -3260,7 +3260,11 @@ impl Partition {
         for batch in snap.batches.iter().take(snap.visible_count) {
             for i in 0..batch.rows as usize {
                 let rp = batch.row_offset + i as u64;
-                let doc_id = docs.append(rp, batch.doc_lengths[i]);
+                let num_tokens = batch.doc_lengths[i];
+                if num_tokens == 0 {
+                    continue;
+                }
+                let doc_id = docs.append(rp, num_tokens);
                 pos_to_doc.insert(rp, doc_id);
             }
         }
@@ -4087,6 +4091,91 @@ mod tests {
             rows(index.search_with_options(&query, partition_only)),
             vec![0, 1]
         );
+    }
+
+    #[test]
+    fn test_zero_token_documents_are_skipped_across_memwal_paths() {
+        let params =
+            InvertedIndexParams::new("whitespace".to_string(), lance_tokenizer::Language::English)
+                .remove_stop_words(true)
+                .stem(false)
+                .max_token_length(Some(6));
+        let schema = create_test_schema();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![0, 1, 2, 3, 4, 5])),
+                Arc::new(StringArray::from(vec![
+                    Some(""),
+                    Some("   "),
+                    Some("the"),
+                    Some("overlength"),
+                    None,
+                    Some("hello"),
+                ])),
+            ],
+        )
+        .unwrap();
+        let index = FtsMemIndex::with_params(1, "description".to_string(), params.clone());
+        index.insert(&batch, 0).unwrap();
+
+        assert_eq!(index.doc_count(), 1);
+        let st = index.state.load_full();
+        let tail_snap = st.tail.snapshot();
+        let tokens = vec!["hello".to_string()];
+        let tail_scorer = build_scorer(&st, &tail_snap, &tokens, true);
+        let expected_scorer = MemBM25Scorer::new(1, 1, HashMap::from([("hello".to_string(), 1)]));
+        assert_eq!(tail_scorer.total_tokens, 1);
+        assert_eq!(tail_scorer.num_docs(), 1);
+        assert_eq!(tail_scorer.num_docs_containing_token("hello"), 1);
+        assert_eq!(
+            tail_scorer.avg_doc_length(),
+            expected_scorer.avg_doc_length()
+        );
+        assert_eq!(
+            tail_scorer.query_weight("hello"),
+            expected_scorer.query_weight("hello")
+        );
+        let tail_results = index.search("hello");
+        assert_eq!(rows(tail_results.clone()), vec![5]);
+        let tail_score = tail_results[0].score;
+        assert!(!index.to_index_builder(0, 6).unwrap().is_empty());
+
+        index.flush();
+        let st = index.state.load_full();
+        assert_eq!(st.partitions.len(), 1);
+        assert_eq!(
+            st.partitions[0]
+                .docs
+                .iter()
+                .map(|(row_id, num_tokens)| (*row_id, *num_tokens))
+                .collect::<Vec<_>>(),
+            vec![(5, 1)]
+        );
+        let frozen_scorer = build_scorer(&st, &st.tail.snapshot(), &tokens, true);
+        assert_eq!(frozen_scorer.total_tokens, 1);
+        assert_eq!(frozen_scorer.num_docs(), 1);
+        assert_eq!(frozen_scorer.num_docs_containing_token("hello"), 1);
+        assert_eq!(
+            frozen_scorer.avg_doc_length(),
+            expected_scorer.avg_doc_length()
+        );
+        assert_eq!(
+            frozen_scorer.query_weight("hello"),
+            expected_scorer.query_weight("hello")
+        );
+        let frozen_results = index.search("hello");
+        assert_eq!(rows(frozen_results.clone()), vec![5]);
+        assert!((frozen_results[0].score - tail_score).abs() < f32::EPSILON);
+
+        let all_zero_batch = batch.slice(0, 5);
+        let all_zero_index = FtsMemIndex::with_params(1, "description".to_string(), params);
+        all_zero_index.insert(&all_zero_batch, 0).unwrap();
+        assert!(all_zero_index.is_empty());
+        assert_eq!(all_zero_index.doc_count(), 0);
+        assert!(all_zero_index.to_index_builder(0, 5).unwrap().is_empty());
+        all_zero_index.flush();
+        assert!(all_zero_index.state.load().partitions.is_empty());
     }
 
     fn create_phrase_test_batch(schema: &ArrowSchema) -> RecordBatch {

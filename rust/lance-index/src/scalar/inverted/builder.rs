@@ -1362,7 +1362,7 @@ impl IndexWorker {
                     .filter_map(|(doc, row_id)| doc.map(|doc| (doc, *row_id)));
 
                 for (doc, row_id) in docs {
-                    self.process_document(row_id, DocumentSource::Text(doc), false)
+                    self.process_document(row_id, DocumentSource::Text(doc))
                         .await?;
                 }
             }
@@ -1406,7 +1406,7 @@ impl IndexWorker {
                 continue;
             };
 
-            self.process_document(*row_id, DocumentSource::StringList(doc.as_ref()), true)
+            self.process_document(*row_id, DocumentSource::StringList(doc.as_ref()))
                 .await?;
         }
 
@@ -1432,12 +1432,7 @@ impl IndexWorker {
         doc
     }
 
-    async fn process_document(
-        &mut self,
-        row_id: u64,
-        document: DocumentSource<'_>,
-        skip_empty_document: bool,
-    ) -> Result<()> {
+    async fn process_document(&mut self, row_id: u64, document: DocumentSource<'_>) -> Result<()> {
         let with_position = self.has_position();
         let builder_was_empty = self.builder.docs.is_empty();
         let old_temporary_memory_size = self.temporary_memory_size();
@@ -1545,7 +1540,7 @@ impl IndexWorker {
             self.builder.tokens.memory_size() as u64,
         );
 
-        if skip_empty_document && token_num == 0 {
+        if token_num == 0 {
             self.last_token_count = 0;
             self.trim_temporary_buffers();
             self.adjust_tracked_memory_size(
@@ -1596,7 +1591,7 @@ impl IndexWorker {
                     new_posting_memory_size as i64 - old_posting_memory_size as i64;
             }
             Self::apply_delta(&mut self.memory_size, posting_memory_delta);
-        } else if token_num > 0 {
+        } else {
             self.token_ids.sort_unstable();
             let mut iter = self.token_ids.iter();
             let mut current = *iter.next().unwrap();
@@ -2277,8 +2272,10 @@ pub fn document_input(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Index;
     use crate::metrics::NoOpMetricsCollector;
     use crate::progress::IndexBuildProgress;
+    use crate::scalar::inverted::{MemBM25Scorer, Scorer};
     use crate::scalar::{IndexFile, IndexReader, IndexWriter, ScalarIndex};
     use arrow_array::{RecordBatch, StringArray, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
@@ -2308,6 +2305,17 @@ mod tests {
         ]));
         let docs = Arc::new(StringArray::from(vec![Some(doc)]));
         let row_ids = Arc::new(UInt64Array::from(vec![row_id]));
+        RecordBatch::try_new(schema, vec![docs, row_ids]).unwrap()
+    }
+
+    fn make_doc_batch_from_docs(docs: Vec<Option<&str>>) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("doc", DataType::Utf8, true),
+            Field::new(ROW_ID, DataType::UInt64, false),
+        ]));
+        let num_rows = docs.len();
+        let docs = Arc::new(StringArray::from(docs));
+        let row_ids = Arc::new(UInt64Array::from_iter_values(0..num_rows as u64));
         RecordBatch::try_new(schema, vec![docs, row_ids]).unwrap()
     }
 
@@ -3488,6 +3496,126 @@ mod tests {
         assert_eq!(freq, 2);
         assert!(positions.is_none());
         assert!(iter.next().is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_zero_token_string_documents_are_skipped_in_corpus_stats() -> Result<()> {
+        let index_dir = TempDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            index_dir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let batch = make_doc_batch_from_docs(vec![
+            Some(""),
+            Some("   "),
+            Some("the"),
+            Some("overlength"),
+            None,
+            Some("hello"),
+        ]);
+        let stream = RecordBatchStreamAdapter::new(batch.schema(), stream::iter(vec![Ok(batch)]));
+        let params =
+            InvertedIndexParams::new("whitespace".to_string(), lance_tokenizer::Language::English)
+                .with_position(false)
+                .remove_stop_words(true)
+                .stem(false)
+                .max_token_length(Some(6))
+                .num_workers(1);
+
+        let mut builder = InvertedIndexBuilder::new(params);
+        builder
+            .update(Box::pin(stream), store.as_ref(), None)
+            .await?;
+
+        let index = InvertedIndex::load(store, None, &LanceCache::no_cache()).await?;
+        let (total_tokens, num_docs, token_docs) =
+            index.bm25_stats_for_terms(&["hello".to_string()]).await?;
+        assert_eq!(total_tokens, 1);
+        assert_eq!(num_docs, 1);
+        assert_eq!(token_docs, vec![1]);
+
+        let actual_scorer = MemBM25Scorer::new(
+            total_tokens,
+            num_docs,
+            HashMap::from([("hello".to_string(), token_docs[0])]),
+        );
+        let expected_scorer = MemBM25Scorer::new(1, 1, HashMap::from([("hello".to_string(), 1)]));
+        assert_eq!(
+            actual_scorer.avg_doc_length(),
+            expected_scorer.avg_doc_length()
+        );
+        assert_eq!(
+            actual_scorer.query_weight("hello"),
+            expected_scorer.query_weight("hello")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_all_empty_string_documents_build_empty_index() -> Result<()> {
+        let index_dir = TempDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            index_dir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let batch = make_doc_batch_from_docs(vec![Some(""), Some("   "), None]);
+        let stream = RecordBatchStreamAdapter::new(batch.schema(), stream::iter(vec![Ok(batch)]));
+        let params =
+            InvertedIndexParams::new("whitespace".to_string(), lance_tokenizer::Language::English)
+                .with_position(false)
+                .remove_stop_words(false)
+                .stem(false)
+                .max_token_length(None)
+                .num_workers(1);
+
+        let mut builder = InvertedIndexBuilder::new(params);
+        builder
+            .update(Box::pin(stream), store.as_ref(), None)
+            .await?;
+
+        let index = InvertedIndex::load(store, None, &LanceCache::no_cache()).await?;
+        assert!(index.partitions.is_empty());
+        let statistics = index.statistics()?;
+        assert_eq!(statistics["num_tokens"], 0);
+        assert_eq!(statistics["num_docs"], 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_all_empty_string_documents_do_not_create_tail_partition() -> Result<()> {
+        let tokenizer = InvertedIndexParams::default().build()?;
+        let store = Arc::new(CountingStore::new());
+        let id_alloc = Arc::new(AtomicU64::new(0));
+        let mut worker = IndexWorker::new(
+            tokenizer,
+            store,
+            id_alloc,
+            IndexWorkerConfig {
+                with_position: false,
+                format_version: InvertedListFormatVersion::V1,
+                fragment_mask: None,
+                token_set_format: TokenSetFormat::default(),
+                worker_memory_limit_bytes: u64::MAX,
+                block_size: InvertedIndexParams::default().block_size,
+            },
+        )
+        .await?;
+
+        worker
+            .process_batch(make_doc_batch_from_docs(vec![Some(""), Some("   "), None]))
+            .await?;
+        let output = worker.finish().await?;
+
+        assert!(output.partitions.is_empty());
+        assert!(output.tail_partition.is_none());
 
         Ok(())
     }
