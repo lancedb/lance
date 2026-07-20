@@ -772,6 +772,10 @@ impl BasicTrainer for JsonIndexPlugin {
         // its constructor), since the scanner can only sort on the raw JSON column, not
         // on the value at `path`. If the target index needs value-ordered input, this is
         // the one place that sort happens: on the extracted value, after extraction.
+        //
+        // Deliberately `request.target_request.criteria()` here, not `request.criteria()`:
+        // the latter is `JsonTrainingRequest`'s own criteria, which is always `None` (that's
+        // what asked the scanner for unordered input above) and would never take this branch.
         let converted_stream =
             if request.target_request.criteria().ordering == TrainingOrdering::Values {
                 Self::sort_stream_by_value(converted_stream).await?
@@ -1088,12 +1092,9 @@ mod tests {
 
         use crate::metrics::NoOpMetricsCollector;
         use crate::progress::noop_progress;
-        use crate::registry::IndexPluginRegistry;
         use crate::scalar::lance_format::LanceIndexStore;
         use arrow_array::{LargeBinaryArray, UInt64Array};
-        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
         use futures::stream;
-        use lance_core::cache::LanceCache;
         use lance_core::utils::tempfile::TempObjDir;
         use lance_io::object_store::ObjectStore;
         use lance_select::RowAddrTreeMap;
