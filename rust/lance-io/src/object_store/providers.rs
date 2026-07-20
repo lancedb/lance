@@ -338,7 +338,8 @@ impl Default for ObjectStoreRegistry {
         {
             let aws = Arc::new(aws::AwsStoreProvider);
             providers.insert("s3".into(), aws.clone());
-            providers.insert("s3+ddb".into(), aws);
+            providers.insert("s3+ddb".into(), aws.clone());
+            providers.insert("s3+sql".into(), aws);
         }
         #[cfg(feature = "azure")]
         {

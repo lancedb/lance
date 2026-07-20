@@ -145,6 +145,7 @@ fp16kernels = ["lance-linalg/fp16kernels"]
 cli = ["dep:clap", "lzma-sys/static"]
 dynamodb = ["lance-table/dynamodb", "dep:aws-sdk-dynamodb"]
 dynamodb_tests = ["dynamodb"]
+sql_store = ["lance-table/sql_store"]
 substrait = ["lance-datafusion/substrait"]
 protoc = [
     "dep:protobuf-src",

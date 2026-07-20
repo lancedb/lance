@@ -196,6 +196,7 @@ serde = { version = "^1" }
 serde_json = { version = "1" }
 semver = "1.0"
 serial_test = "3"
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "any", "postgres", "mysql", "sqlite"] }
 snafu = "0.9"
 strum = "0.26"
 lindera = { version = "3.0.7" }
