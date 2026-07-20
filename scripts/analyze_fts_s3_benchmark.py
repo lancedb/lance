@@ -42,7 +42,7 @@ def canonical_result(record: dict[str, Any]) -> tuple[tuple[int, int], ...]:
         raise ValueError("query record is missing row_ids or score_bits")
     if len(row_ids) != len(score_bits):
         raise ValueError("query record has different row and score counts")
-    return tuple(sorted(zip(row_ids, score_bits, strict=True)))
+    return tuple(sorted(zip(row_ids, score_bits)))
 
 
 def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
