@@ -44,7 +44,7 @@ if [[ ! -f "$QUERY_FILE" ]]; then
   exit 2
 fi
 
-mkdir -p "$RUN_DIR/bin" "$RUN_DIR/results" "$RUN_DIR/timing" "$BINARY_CACHE_ROOT/commits" "$BINARY_CACHE_ROOT/target"
+mkdir -p "$RUN_DIR/bin" "$RUN_DIR/results" "$RUN_DIR/timing" "$BINARY_CACHE_ROOT/commits" "$BINARY_CACHE_ROOT/targets"
 
 BASELINE_COMMIT=$(git rev-parse "$BASELINE_REF^{commit}")
 CANDIDATE_COMMIT=$(git rev-parse "$CANDIDATE_REF^{commit}")
@@ -92,12 +92,12 @@ build_binary() {
     mkdir -p "$(dirname "$cached_binary")"
     (
       cd "$source_dir"
-      CARGO_TARGET_DIR="$BINARY_CACHE_ROOT/target" cargo build \
+      CARGO_TARGET_DIR="$BINARY_CACHE_ROOT/targets/$commit" cargo build \
         -p lance-examples \
         --example fts_s3_benchmark \
         --profile release-with-debug
     )
-    cp "$BINARY_CACHE_ROOT/target/release-with-debug/examples/fts_s3_benchmark" \
+    cp "$BINARY_CACHE_ROOT/targets/$commit/release-with-debug/examples/fts_s3_benchmark" \
       "$cached_binary"
   fi
   cp "$cached_binary" "$RUN_DIR/bin/$output_name"
