@@ -16,6 +16,10 @@ name = "full_text_search"
 path = "src/full_text_search.rs"
 
 [[example]]
+name = "fts_s3_benchmark"
+path = "src/fts_s3_benchmark.rs"
+
+[[example]]
 name = "hnsw"
 path = "src/hnsw.rs"
 
@@ -52,3 +56,4 @@ hf-hub = "0.4.2"
 parquet = { version = "58.0.0", default-features = false, features = ["arrow", "async"] }
 tokenizers = "0.15.2"
 rand.workspace = true
+serde_json.workspace = true
