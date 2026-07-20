@@ -306,7 +306,7 @@ impl BeTree {
                     .map(|(i, b)| (i, node::buffer_bytes(b)))
                     .max_by_key(|(_, b)| *b)
                     .unwrap_or((0, 0));
-                if best < self.config.min_flush_bytes {
+                if best < self.config.min_flush_bytes() {
                     // No child worth flushing to — reassemble and stop (caller may split).
                     buffer = buckets.into_iter().flatten().collect();
                     break;
@@ -343,6 +343,12 @@ impl BeTree {
                 node::apply_actions(&mut map, incoming)?;
                 let new_frags: Vec<Fragment> = map.into_values().collect();
 
+                // A fully-emptied leaf is dropped from its parent — keeping it would
+                // create a phantom ChildRef with min_key=0 that corrupts the
+                // sorted-by-min_key invariant `child_index_for` relies on.
+                if new_frags.is_empty() {
+                    return Ok((vec![], acc));
+                }
                 if node::leaf_logical_bytes(&new_frags) >= self.config.split_ceiling() {
                     let mut refs = Vec::new();
                     for piece in
@@ -374,6 +380,11 @@ impl BeTree {
                 let (children, a) = self.merge_small_children(children).await?;
                 acc.add(a);
 
+                // An internal node whose children all vanished is dropped too (same
+                // phantom-min_key=0 hazard as an empty leaf).
+                if children.is_empty() {
+                    return Ok((vec![], acc));
+                }
                 if children.len() as u32 > self.config.fanout
                     || node::internal_logical_bytes(&children, &buffer)
                         >= self.config.split_ceiling()
@@ -586,11 +597,7 @@ impl BeTree {
         let root = store.read_root(version).await?;
         let tree = Self {
             store,
-            config: BeTreeConfig {
-                target_node_bytes: root.target_node_bytes,
-                fanout: root.fanout,
-                min_flush_bytes: root.target_node_bytes / 16,
-            },
+            config: BeTreeConfig::new(root.target_node_bytes, root.fanout),
             version: root.version,
             children: root.children,
             buffer: root.buffer,

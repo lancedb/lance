@@ -71,11 +71,7 @@ mod tests {
         let f: u64 = 10; // fragments per commit
         let columns: u32 = 3;
         // Tiny nodes so the tree is several levels deep and splits under backfill.
-        let config = BeTreeConfig {
-            target_node_bytes: 16 * 1024,
-            fanout: 4,
-            min_flush_bytes: 1024,
-        };
+        let config = BeTreeConfig::new(16 * 1024, 4);
 
         let tempdir = TempObjDir::default();
         let betree_base = tempdir.clone().join("betree");
@@ -159,20 +155,16 @@ mod tests {
         assert_eq!(cold.len(), n as usize);
     }
 
-    /// Bulk-deleting a contiguous prefix empties leaves, so the tree must MERGE
-    /// (coalesce underflowing nodes) — and materialize the correct remainder.
+    /// Sparsely deleting 4 of every 5 fragments shrinks each leaf below the merge
+    /// floor *without* emptying it, so the tree must MERGE (coalesce underflowing
+    /// nodes) — and materialize the correct remainder. Also guards the empty-node
+    /// routing invariant: an emptied node must be dropped, not kept with min_key=0.
     #[tokio::test]
     async fn recursive_betree_merges_on_bulk_delete() {
         let n: u64 = 3_000;
-        let remove: u64 = 2_400; // delete ids [0, 2400); keep [2400, 3000)
         let f: u64 = 20;
-        // Small nodes + wide fanout: a shallow tree so removes reach leaves (a
-        // deep tree buffers the shrinking flush batch before it reaches height 0).
-        let config = BeTreeConfig {
-            target_node_bytes: 4 * 1024,
-            fanout: 32,
-            min_flush_bytes: 256,
-        };
+        // Small nodes + wide fanout: a shallow tree so removes reach leaves.
+        let config = BeTreeConfig::new(4 * 1024, 32);
 
         let tempdir = TempObjDir::default();
         let base = tempdir.clone().join("betree");
@@ -191,24 +183,78 @@ mod tests {
         .await
         .unwrap();
 
+        // Remove 4 of every 5 fragments (keep id % 5 == 4): each leaf keeps ~1/5,
+        // dropping below the merge floor → coalesces with neighbors.
         let mut merges = 0u64;
-        for c in 0..(remove / f) {
-            let start = c * f;
-            let actions: Vec<_> = (start..start + f).map(action::remove_fragment).collect();
+        for c in 0..(n / f) {
+            let actions: Vec<_> = (c * f..c * f + f)
+                .filter(|id| id % 5 != 4)
+                .map(action::remove_fragment)
+                .collect();
             merges += tree.commit(actions).await.unwrap().merges;
         }
         assert!(
             merges > 0,
-            "emptying leaves should have coalesced underflowing nodes"
+            "shrinking leaves below the merge floor should have coalesced them"
         );
 
         // Materialize the correct remainder (buffered removes are applied too).
         let mut remaining = tree.materialize().await.unwrap();
         remaining.sort_by_key(|f| f.id);
-        assert_eq!(remaining.len(), (n - remove) as usize);
+        assert_eq!(remaining.len(), (n / 5) as usize);
+        assert!(
+            remaining.iter().all(|f| f.id % 5 == 4),
+            "only every fifth fragment survives"
+        );
+    }
+
+    /// Regression: aggressively flushing a full-prefix delete (tiny min_flush)
+    /// fully empties leaves. An emptied node must be *dropped* from its parent,
+    /// not kept with min_key=0 — otherwise it sorts to the front and low-id
+    /// removes misroute to it and no-op, resurrecting deleted fragments.
+    #[tokio::test]
+    async fn recursive_betree_empty_leaves_do_not_resurrect() {
+        let n: u64 = 3_000;
+        let remove: u64 = 2_400; // delete ids [0, 2400); keep [2400, 3000)
+        let f: u64 = 20;
+        // Force the pathological case: tiny flush gate → leaves empty completely.
+        let config = BeTreeConfig {
+            target_node_bytes: 4 * 1024,
+            fanout: 32,
+            min_flush_override: Some(64),
+        };
+
+        let tempdir = TempObjDir::default();
+        let base = tempdir.clone().join("betree");
+        let (object_store, scheduler, cache) = test_env();
+        let fragments: Vec<Fragment> = (0..n).map(make_fragment).collect();
+        let (mut tree, _boot) = BeTree::bootstrap(
+            object_store.clone(),
+            base.clone(),
+            scheduler.clone(),
+            cache.clone(),
+            config,
+            fragments,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+        for c in 0..(remove / f) {
+            let actions: Vec<_> = (c * f..c * f + f).map(action::remove_fragment).collect();
+            tree.commit(actions).await.unwrap();
+        }
+
+        let mut remaining = tree.materialize().await.unwrap();
+        remaining.sort_by_key(|f| f.id);
+        assert_eq!(
+            remaining.len(),
+            (n - remove) as usize,
+            "removes must not be lost"
+        );
         assert!(
             remaining.iter().all(|f| f.id >= remove),
-            "only the kept suffix survives"
+            "the deleted prefix must not resurrect"
         );
     }
 }

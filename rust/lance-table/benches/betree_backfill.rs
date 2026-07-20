@@ -253,11 +253,7 @@ async fn run_betree(
     let (object_store, base, scheduler, cache) = build_store(uri, &io).await;
     let fragments: Vec<Fragment> = (0..n).map(make_fragment).collect();
 
-    let config = BeTreeConfig {
-        target_node_bytes: node_bytes,
-        fanout,
-        min_flush_bytes: node_bytes / 16,
-    };
+    let config = BeTreeConfig::new(node_bytes, fanout);
     let (mut tree, boot) = BeTree::bootstrap(
         object_store.clone(),
         base.clone(),
@@ -374,11 +370,7 @@ async fn run_scale(
     const MATERIALIZE_CAP: u64 = 150_000_000;
     let io = IOTracker::default();
     let (object_store, base, scheduler, cache) = build_store(uri, &io).await;
-    let config = BeTreeConfig {
-        target_node_bytes: node_bytes,
-        fanout,
-        min_flush_bytes: node_bytes / 16,
-    };
+    let config = BeTreeConfig::new(node_bytes, fanout);
     let total_files = n * base_files as u64;
 
     let t0 = Instant::now();
@@ -494,11 +486,7 @@ async fn run_deep_flush(
 ) {
     let io = IOTracker::default();
     let (object_store, base, scheduler, cache) = build_store(uri, &io).await;
-    let config = BeTreeConfig {
-        target_node_bytes: node_bytes,
-        fanout,
-        min_flush_bytes: node_bytes / 16,
-    };
+    let config = BeTreeConfig::new(node_bytes, fanout);
     let (mut tree, boot) = BeTree::bootstrap_generate(
         object_store.clone(),
         base.clone(),

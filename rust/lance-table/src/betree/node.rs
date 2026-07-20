@@ -20,16 +20,19 @@ use lance_core::{Error, Result};
 pub const DEFAULT_TARGET_NODE_BYTES: u64 = 10 * 1024 * 1024;
 pub const DEFAULT_FANOUT: u32 = 16;
 
-/// Bε-tree tuning knobs (byte-based, per the literature: ε=1/2, ~10 MiB nodes,
-/// fanout 16, flush gate B/16, split ≥ B into ~0.5 B pieces, merge ≤ 0.25 B).
+/// Bε-tree tuning knobs. The two independent knobs are the target node size `B`
+/// and the `fanout` (= B^ε); everything else — the flush gate, split pieces,
+/// merge floor — derives from them (byte-based, per the literature: ε=1/2,
+/// ~10 MiB nodes, fanout 16, split ≥ B into ~0.5 B pieces, merge ≤ 0.25 B).
 #[derive(Debug, Clone)]
 pub struct BeTreeConfig {
     /// Target node size `B`.
     pub target_node_bytes: u64,
-    /// Max children of an internal node before it splits (`B^ε` ≈ 16).
+    /// Max children of an internal node before it splits (`B^ε`).
     pub fanout: u32,
-    /// Amortization gate: never flush a child slice smaller than this (`B/16`).
-    pub min_flush_bytes: u64,
+    /// Optional override of the flush gate. `None` (the norm) derives it as
+    /// `B/fanout` — see [`Self::min_flush_bytes`].
+    pub min_flush_override: Option<u64>,
 }
 
 impl Default for BeTreeConfig {
@@ -37,12 +40,22 @@ impl Default for BeTreeConfig {
         Self {
             target_node_bytes: DEFAULT_TARGET_NODE_BYTES,
             fanout: DEFAULT_FANOUT,
-            min_flush_bytes: DEFAULT_TARGET_NODE_BYTES / 16,
+            min_flush_override: None,
         }
     }
 }
 
 impl BeTreeConfig {
+    /// Build a config from the two primary knobs (`B`, `fanout`); the flush gate
+    /// derives as `B/fanout`.
+    pub fn new(target_node_bytes: u64, fanout: u32) -> Self {
+        Self {
+            target_node_bytes,
+            fanout,
+            min_flush_override: None,
+        }
+    }
+
     /// A node splits when its logical bytes reach this.
     pub fn split_ceiling(&self) -> u64 {
         self.target_node_bytes
@@ -58,6 +71,17 @@ impl BeTreeConfig {
     /// Adjacent children are coalesced while their combined bytes stay ≤ 0.6 B.
     pub fn coalesce_ceiling(&self) -> u64 {
         self.target_node_bytes * 3 / 5
+    }
+    /// The amortization gate: never flush a child slice smaller than this.
+    ///
+    /// Derived as `B/fanout` — a full ε-buffer (~B) split across `fanout`
+    /// children leaves ~B/fanout in the fullest, so this is the natural "fair
+    /// share" threshold and it scales correctly with fanout. (A hardcoded B/16
+    /// silently assumed fanout 16: at higher fanout the buffer spreads thinner
+    /// than the gate, so flushes never fire and the tree degrades to split-only.)
+    pub fn min_flush_bytes(&self) -> u64 {
+        self.min_flush_override
+            .unwrap_or_else(|| self.target_node_bytes / self.fanout.max(1) as u64)
     }
 }
 
