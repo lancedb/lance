@@ -6964,12 +6964,13 @@ async fn tokenize_and_count(
                                 .extend(std::iter::repeat_n(0, query_tokens.len()));
 
                             let Some(doc) = doc else {
-                                append_counts(*row_id, 0, &temp_query_token_counts);
                                 continue;
                             };
 
                             let all_tokens = count_text(doc, &mut temp_query_token_counts);
-                            append_counts(*row_id, all_tokens, &temp_query_token_counts);
+                            if all_tokens > 0 {
+                                append_counts(*row_id, all_tokens, &temp_query_token_counts);
+                            }
                         }
                     }
                     DataType::List(_) => {
@@ -11757,6 +11758,60 @@ mod tests {
         assert!(
             elapsed_compute.value() > 0,
             "elapsed_compute should have been populated; got 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn flat_bm25_skips_zero_token_documents_from_corpus_stats() {
+        let schema = Arc::new(Schema::new(vec![
+            ROW_ID_FIELD.clone(),
+            Field::new("text", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(UInt64Array::from(vec![0_u64, 1, 2, 3, 4, 5])) as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    Some(""),
+                    Some("   "),
+                    Some("the"),
+                    Some("overlength"),
+                    None,
+                    Some("hello"),
+                ])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let params = InvertedIndexParams::new("whitespace".to_string(), Language::English)
+            .remove_stop_words(true)
+            .stem(false)
+            .max_token_length(Some(6));
+        let query_tokens = Arc::new(Tokens::new(vec!["hello".to_string()], DocType::Text));
+
+        let counted_input = tokenize_and_count(
+            stream::iter(vec![Ok(batch)]),
+            params.build().unwrap(),
+            query_tokens.clone(),
+            1,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(counted_input.num_rows(), 1);
+        assert_eq!(
+            counted_input[ROW_ID].as_primitive::<UInt64Type>().values(),
+            &[5]
+        );
+        let scorer = initialize_scorer(None, query_tokens.as_ref(), &counted_input);
+        let expected_scorer = MemBM25Scorer::new(1, 1, HashMap::from([("hello".to_string(), 1)]));
+        assert_eq!(scorer.total_tokens, 1);
+        assert_eq!(scorer.num_docs(), 1);
+        assert_eq!(scorer.num_docs_containing_token("hello"), 1);
+        assert_eq!(scorer.avg_doc_length(), expected_scorer.avg_doc_length());
+        assert_eq!(
+            scorer.query_weight("hello"),
+            expected_scorer.query_weight("hello")
         );
     }
 
