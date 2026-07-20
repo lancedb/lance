@@ -3748,11 +3748,11 @@ mod tests {
             // A take that hits the coverage does need the file, so it now fails with
             // a not-found error naming the missing overlay file.
             let err = frag.take(&[5], &val_only).await.unwrap_err();
-            let err = format!("{err:?}");
+            let message = format!("{err:?}");
             assert!(
-                err.contains("miss.lance") && err.to_lowercase().contains("not found"),
+                err.is_not_found() && message.contains("miss.lance"),
                 "take hitting the overlay's coverage should fail with a not-found error \
-                 for its missing file, got: {err}",
+                 for its missing file, got: {message}",
             );
         }
 
@@ -4192,11 +4192,11 @@ mod tests {
             // Projecting the overlaid `val` column does need the file, so it fails
             // with a not-found error naming the missing overlay file.
             let err = frag.take(&[0], &val_only).await.unwrap_err();
-            let err = format!("{err:?}");
+            let message = format!("{err:?}");
             assert!(
-                err.contains("valov.lance") && err.to_lowercase().contains("not found"),
+                err.is_not_found() && message.contains("valov.lance"),
                 "projecting the overlaid column should fail with a not-found error \
-                 for its missing file, got: {err}",
+                 for its missing file, got: {message}",
             );
         }
 
