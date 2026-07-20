@@ -158,7 +158,7 @@ impl InvertedIndexPlugin {
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&details).unwrap(),
             index_version: if is_element_document {
-                INVERTED_INDEX_VERSION_ELEMENT_DOCUMENT
+                INVERTED_INDEX_VERSION_V4
             } else {
                 format_version.index_version()
             },
@@ -273,7 +273,7 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
     }
 
     fn version(&self) -> u32 {
-        INVERTED_INDEX_VERSION_ELEMENT_DOCUMENT
+        INVERTED_INDEX_VERSION_V4
     }
 
     fn new_query_parser(
@@ -323,9 +323,9 @@ mod tests {
     use crate::scalar::{BuiltinIndexType, ScalarIndexParams};
 
     #[test]
-    fn test_plugin_version_tracks_max_supported_format() {
+    fn test_plugin_version_tracks_current_index_version() {
         let plugin = InvertedIndexPlugin;
-        assert_eq!(plugin.version(), INVERTED_INDEX_VERSION_ELEMENT_DOCUMENT);
+        assert_eq!(plugin.version(), INVERTED_INDEX_VERSION_V4);
     }
 
     #[test]
