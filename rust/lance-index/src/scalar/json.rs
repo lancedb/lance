@@ -900,7 +900,7 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scalar::SargableQuery;
+    use crate::scalar::{SargableQuery, TextQuery};
     use arrow_array::{ArrayRef, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use rstest::rstest;
@@ -1045,6 +1045,86 @@ mod tests {
         assert_eq!(inferred_type, DataType::Utf8);
     }
 
+    /// Trains a JSON-path index of `target_index_type` over `json_docs` (fed to the
+    /// trainer in exactly the given order, with row ids `0..json_docs.len()`) and
+    /// returns the loaded index. `store` is a caller-owned `LanceIndexStore` so the
+    /// caller controls how long the backing `TempObjDir` stays alive.
+    async fn train_and_load_json_index(
+        store: Arc<dyn IndexStore>,
+        target_index_type: &str,
+        path: &str,
+        json_docs: &[&str],
+    ) -> Arc<dyn ScalarIndex> {
+        use crate::progress::noop_progress;
+        use arrow_array::{LargeBinaryArray, UInt64Array};
+        use futures::stream;
+
+        let jsonb: Vec<Vec<u8>> = json_docs
+            .iter()
+            .map(|s| s.parse::<jsonb::OwnedJsonb>().unwrap().to_vec())
+            .collect();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(VALUE_COLUMN_NAME, DataType::LargeBinary, true),
+            Field::new(ROW_ID, DataType::UInt64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(LargeBinaryArray::from(
+                    jsonb.iter().map(|v| Some(v.as_slice())).collect::<Vec<_>>(),
+                )) as ArrayRef,
+                Arc::new(UInt64Array::from_iter_values(0..json_docs.len() as u64)) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let data = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::iter(vec![Ok(batch)]),
+        )) as SendableRecordBatchStream;
+
+        let registry = IndexPluginRegistry::with_default_plugins();
+        let plugin = registry.get_plugin_by_name("json").unwrap();
+        let trainer = plugin.basic_trainer().unwrap();
+        let params = format!(r#"{{"target_index_type":"{target_index_type}","path":"{path}"}}"#);
+        let request = trainer
+            .new_training_request(
+                &params,
+                &Field::new(VALUE_COLUMN_NAME, DataType::LargeBinary, true),
+            )
+            .unwrap();
+
+        // The scanner must be asked for unordered input: only this plugin knows the
+        // order of the extracted value, so sorting on the raw JSON column would be
+        // wasted work that either goes unused (non-`Values` targets) or still leaves
+        // the extracted stream unsorted (`Values` targets, see below).
+        assert_eq!(request.criteria().ordering, TrainingOrdering::None);
+
+        let created = trainer
+            .train_index(data, store.as_ref(), request, None, noop_progress())
+            .await
+            .unwrap();
+
+        plugin
+            .load_index(store, &created.index_details, None, &LanceCache::no_cache())
+            .await
+            .unwrap()
+    }
+
+    fn local_json_index_store() -> (Arc<dyn IndexStore>, lance_core::utils::tempfile::TempObjDir) {
+        use crate::scalar::lance_format::LanceIndexStore;
+        use lance_core::utils::tempfile::TempObjDir;
+        use lance_io::object_store::ObjectStore;
+
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        )) as Arc<dyn IndexStore>;
+        (store, tmpdir)
+    }
+
     /// Regression test for https://github.com/lance-format/lance/issues/7485.
     ///
     /// A JSON-path btree index over float values returned wrong results because the
@@ -1089,84 +1169,24 @@ mod tests {
         #[case] expected: Vec<u64>,
     ) {
         let _guard = FLOAT_INDEX_CASE_GUARD.lock().await;
-
         use crate::metrics::NoOpMetricsCollector;
-        use crate::progress::noop_progress;
-        use crate::scalar::lance_format::LanceIndexStore;
-        use arrow_array::{LargeBinaryArray, UInt64Array};
-        use futures::stream;
-        use lance_core::utils::tempfile::TempObjDir;
-        use lance_io::object_store::ObjectStore;
         use lance_select::RowAddrTreeMap;
 
         // row0=10.5, row1=40.1, row2=-3.2: storage order does not match ascending value
         // order (-3.2, 10.5, 40.1), so a btree trained on this order without an explicit
         // value sort would record a corrupted page max of -3.2.
-        let json_data = [
-            r#"{"latitude": 10.5}"#,
-            r#"{"latitude": 40.1}"#,
-            r#"{"latitude": -3.2}"#,
-        ];
-        let jsonb: Vec<Vec<u8>> = json_data
-            .iter()
-            .map(|s| s.parse::<jsonb::OwnedJsonb>().unwrap().to_vec())
-            .collect();
-
-        let schema = Arc::new(Schema::new(vec![
-            Field::new(VALUE_COLUMN_NAME, DataType::LargeBinary, true),
-            Field::new(ROW_ID, DataType::UInt64, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(LargeBinaryArray::from(
-                    jsonb.iter().map(|v| Some(v.as_slice())).collect::<Vec<_>>(),
-                )) as ArrayRef,
-                Arc::new(UInt64Array::from(vec![0u64, 1, 2])) as ArrayRef,
+        let (store, _tmpdir) = local_json_index_store();
+        let index = train_and_load_json_index(
+            store,
+            "btree",
+            "latitude",
+            &[
+                r#"{"latitude": 10.5}"#,
+                r#"{"latitude": 40.1}"#,
+                r#"{"latitude": -3.2}"#,
             ],
         )
-        .unwrap();
-        let data = Box::pin(RecordBatchStreamAdapter::new(
-            schema,
-            stream::iter(vec![Ok(batch)]),
-        )) as SendableRecordBatchStream;
-
-        let tmpdir = TempObjDir::default();
-        let store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
-            tmpdir.clone(),
-            Arc::new(LanceCache::no_cache()),
-        ));
-
-        let registry = IndexPluginRegistry::with_default_plugins();
-        let plugin = registry.get_plugin_by_name("json").unwrap();
-        let trainer = plugin.basic_trainer().unwrap();
-        let request = trainer
-            .new_training_request(
-                r#"{"target_index_type":"btree","path":"latitude"}"#,
-                &Field::new(VALUE_COLUMN_NAME, DataType::LargeBinary, true),
-            )
-            .unwrap();
-
-        // The scanner must be asked for unordered input: only this plugin knows the
-        // order of the extracted value, so sorting on the raw JSON column would be
-        // wasted work that still leaves the extracted stream unsorted.
-        assert_eq!(request.criteria().ordering, TrainingOrdering::None);
-
-        let created = trainer
-            .train_index(data, store.as_ref(), request, None, noop_progress())
-            .await
-            .unwrap();
-
-        let index = plugin
-            .load_index(
-                store.clone(),
-                &created.index_details,
-                None,
-                &LanceCache::no_cache(),
-            )
-            .await
-            .unwrap();
+        .await;
 
         let json_query = JsonQuery::new(Arc::new(query.clone()), "latitude".to_string());
         let result = index
@@ -1177,6 +1197,127 @@ mod tests {
             result,
             SearchResult::exact(RowAddrTreeMap::from_iter(expected.iter().copied())),
             "query {query:?}"
+        );
+    }
+
+    /// Regression test for a null value at `path` surviving `sort_stream_by_value`.
+    ///
+    /// `sort_stream_by_value` sorts the extracted `(value, row_id)` stream with
+    /// `nulls_first: true`. This checks that a null row's row_id stays paired with its
+    /// (null) value through that sort -- if the sort ever reordered values without their
+    /// row_ids, a null-valued row could be attributed to the wrong id -- and that the
+    /// resulting btree still answers `IsNull` and non-null range/equality queries
+    /// correctly with nulls mixed in and fed out of value order.
+    ///
+    /// Row 1's `path` is missing entirely, which is what actually produces a null in the
+    /// extracted value column (`extract_json_path_with_type` returns `None`, which
+    /// `json_extract_with_type_impl` turns into an arrow-null). An explicit JSON `null`
+    /// literal at `path` (e.g. `{"v": null}`) is a different, pre-existing case that
+    /// `convert_stream_by_type` does not yet handle (it tries to deserialize the JSONB
+    /// `null` bytes as the inferred type and errors) -- unrelated to this fix, so it's
+    /// out of scope here.
+    #[tokio::test]
+    async fn test_json_btree_index_null_at_path() {
+        use crate::metrics::NoOpMetricsCollector;
+        use lance_select::RowAddrTreeMap;
+
+        let _guard = FLOAT_INDEX_CASE_GUARD.lock().await;
+        let (store, _tmpdir) = local_json_index_store();
+        let index = train_and_load_json_index(
+            store,
+            "btree",
+            "v",
+            &[
+                r#"{"v": 40.1}"#,  // row 0
+                r#"{"other": 1}"#, // row 1: path missing -> null
+                r#"{"v": -3.2}"#,  // row 2
+                r#"{"v": 10.5}"#,  // row 3
+            ],
+        )
+        .await;
+
+        let search = |query: SargableQuery| {
+            let index = index.clone();
+            let json_query = JsonQuery::new(Arc::new(query), "v".to_string());
+            async move {
+                index
+                    .search(&json_query, &NoOpMetricsCollector)
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // Range/equality queries carry row 1 in `nulls` (three-valued logic: `NULL > 0`
+        // is unknown, not false -- see `NullableRowAddrSet`), which is pre-existing
+        // btree/framework behavior. Asserting it exactly here is exactly the property
+        // this test targets: row 1's row_id must stay paired with its null value
+        // through `sort_stream_by_value`, not just be excluded from `selected`.
+        assert_eq!(
+            search(SargableQuery::IsNull()).await,
+            SearchResult::exact(RowAddrTreeMap::from_iter([1u64])),
+            "IsNull"
+        );
+        assert_eq!(
+            search(SargableQuery::Range(
+                Bound::Excluded(ScalarValue::Float64(Some(0.0))),
+                Bound::Unbounded,
+            ))
+            .await,
+            SearchResult::exact(RowAddrTreeMap::from_iter([0u64, 3]))
+                .with_nulls(RowAddrTreeMap::from_iter([1u64])),
+            "> 0"
+        );
+        assert_eq!(
+            search(SargableQuery::Equals(ScalarValue::Float64(Some(40.1)))).await,
+            SearchResult::exact(RowAddrTreeMap::from_iter([0u64]))
+                .with_nulls(RowAddrTreeMap::from_iter([1u64])),
+            "= 40.1"
+        );
+        assert_eq!(
+            search(SargableQuery::Range(
+                Bound::Unbounded,
+                Bound::Excluded(ScalarValue::Float64(Some(100.0))),
+            ))
+            .await,
+            SearchResult::exact(RowAddrTreeMap::from_iter([0u64, 2, 3]))
+                .with_nulls(RowAddrTreeMap::from_iter([1u64])),
+            "< 100 (null is neither < 100 nor >= 100)"
+        );
+    }
+
+    /// Regression coverage for the non-`Values`-ordering branch in `train_index`: a
+    /// JSON-path index over a target that does not need value-ordered input (ngram
+    /// requires `TrainingOrdering::None`) must skip `sort_stream_by_value` entirely and
+    /// still produce correct results from rows fed out of value order.
+    #[tokio::test]
+    async fn test_json_ngram_index_skips_value_sort() {
+        use crate::metrics::NoOpMetricsCollector;
+        use lance_select::RowAddrTreeMap;
+
+        let (store, _tmpdir) = local_json_index_store();
+        let index = train_and_load_json_index(
+            store,
+            "ngram",
+            "tag",
+            &[
+                r#"{"tag": "unique-charlie"}"#,
+                r#"{"tag": "unique-alpha"}"#,
+                r#"{"tag": "unique-bravo"}"#,
+            ],
+        )
+        .await;
+
+        let json_query = JsonQuery::new(
+            Arc::new(TextQuery::StringContains("unique-bravo".to_string())),
+            "tag".to_string(),
+        );
+        let result = index
+            .search(&json_query, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(
+            result,
+            SearchResult::at_most(RowAddrTreeMap::from_iter([2u64])),
         );
     }
 }
