@@ -2308,11 +2308,13 @@ class LanceDataset(pa.dataset.Dataset):
         --------
         Read two disjoint ranges from the same row index:
 
-        >>> dataset.read_blob_ranges(
-        ...     "images",
-        ...     requests=[(7, 0, 1024), (7, 4096, 1024)],
-        ...     selector="indices",
-        ... )
+        .. code-block:: python
+
+            dataset.read_blob_ranges(
+                "images",
+                requests=[(7, 0, 1024), (7, 4096, 1024)],
+                selector="indices",
+            )
 
         Returns
         -------
