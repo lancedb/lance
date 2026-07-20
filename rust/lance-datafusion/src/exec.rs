@@ -26,12 +26,14 @@ use datafusion::{
         runtime_env::RuntimeEnvBuilder,
     },
     physical_plan::{
-        DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
+        DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
+        SendableRecordBatchStream,
         analyze::AnalyzeExec,
         coalesce_partitions::CoalescePartitionsExec,
         display::DisplayableExecutionPlan,
         execution_plan::{Boundedness, CardinalityEffect, EmissionType},
         metrics::MetricValue,
+        sorts::sort_preserving_merge::SortPreservingMergeExec,
         stream::RecordBatchStreamAdapter,
         streaming::PartitionStream,
     },
@@ -612,8 +614,17 @@ pub fn execute_plan(
     // Coalesce to a single partition if the optimizer left more than one.
     // EnforceDistribution may remove RepartitionExec(1) nodes when the parent
     // declares UnspecifiedDistribution, leaving multi-partition plans here.
+    //
+    // If the plan carries an output ordering (e.g. a top-k `SortExec` whose
+    // result was later repartitioned to parallelize downstream operators),
+    // a plain `CoalescePartitionsExec` would scramble that order because it
+    // merges partitions in scheduling-dependent order. Use an order-preserving
+    // merge in that case instead, mirroring what `EnforceDistribution` itself
+    // does when it needs to merge an ordered, multi-partition plan.
     let plan: Arc<dyn ExecutionPlan> = if plan.properties().partitioning.partition_count() == 1 {
         plan
+    } else if let Some(ordering) = plan.output_ordering() {
+        Arc::new(SortPreservingMergeExec::new(ordering.clone(), plan))
     } else {
         Arc::new(CoalescePartitionsExec::new(plan))
     };
