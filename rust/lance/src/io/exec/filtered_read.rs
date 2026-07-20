@@ -459,7 +459,7 @@ impl FilteredReadStream {
         options: FilteredReadOptions,
         metrics: &ExecutionPlanMetricsSet,
         plan: FilteredReadInternalPlan,
-        cached_fragments: Option<Arc<Vec<LoadedFragment>>>,
+        cached_fragments: Option<Arc<Vec<Arc<FileFragment>>>>,
     ) -> DataFusionResult<Self> {
         let global_metrics = Arc::new(FilteredReadGlobalMetrics::new(metrics));
 
@@ -483,9 +483,9 @@ impl FilteredReadStream {
             io_parallelism
         );
 
-        let loaded_fragments = match cached_fragments {
+        let fragment_handles = match cached_fragments {
             // Planning already loaded every fragment; don't repeat it
-            Some(loaded) => loaded,
+            Some(handles) => handles,
             None => {
                 // Ideally we don't need to collect here but if we don't we get "implementation of FnOnce is
                 // not general enough" false positives from rustc
@@ -499,12 +499,16 @@ impl FilteredReadStream {
                         ))
                     })
                     .collect::<Vec<_>>();
+                let loaded = futures::stream::iter(frag_futs)
+                    // Cannot use unordered because we need to populate logical_offset based on user-provided order
+                    .try_buffered(io_parallelism)
+                    .try_collect::<Vec<_>>()
+                    .await?;
                 Arc::new(
-                    futures::stream::iter(frag_futs)
-                        // Cannot use unordered because we need to populate logical_offset based on user-provided order
-                        .try_buffered(io_parallelism)
-                        .try_collect::<Vec<_>>()
-                        .await?,
+                    loaded
+                        .into_iter()
+                        .map(|loaded: LoadedFragment| loaded.fragment)
+                        .collect(),
                 )
             }
         };
@@ -530,7 +534,7 @@ impl FilteredReadStream {
         // Convert plan to scoped fragments for I/O
         let scoped_fragments = Self::plan_to_scoped_fragments(
             &plan,
-            &loaded_fragments,
+            &fragment_handles,
             &dataset,
             &options,
             scan_scheduler.clone(),
@@ -787,7 +791,7 @@ impl FilteredReadStream {
 
     fn plan_to_scoped_fragments(
         plan: &FilteredReadInternalPlan,
-        fragments: &[LoadedFragment],
+        fragments: &[Arc<FileFragment>],
         dataset: &Dataset,
         options: &FilteredReadOptions,
         scan_scheduler: Arc<ScanScheduler>,
@@ -804,7 +808,7 @@ impl FilteredReadStream {
         let mut scoped_fragments = Vec::new();
 
         for (priority, fragment) in fragments.iter().enumerate() {
-            let fragment_id = fragment.fragment.id() as u32;
+            let fragment_id = fragment.id() as u32;
 
             // Check if this fragment is in the plan
             if let Some(ranges) = plan.rows.get(&fragment_id) {
@@ -816,7 +820,7 @@ impl FilteredReadStream {
                 let filter = plan.filters.get(&fragment_id).map(|f| (**f).clone());
 
                 scoped_fragments.push(ScopedFragmentRead {
-                    fragment: fragment.fragment.clone(),
+                    fragment: fragment.clone(),
                     ranges: ranges.clone(),
                     projection: projection.clone(),
                     with_deleted_rows: options.with_deleted_rows,
@@ -1686,13 +1690,15 @@ impl FilteredReadOptions {
 /// In the future, we may introduce high-level cardinality statistics similar to those used by query
 /// engines like Postgres.  This might allow us to know, without executing an index search, that a scan
 /// would be better.  In that case we accept the force_scan hint to skip the index search.
-/// A resolved plan together with the fragment metadata loaded to compute it,
-/// so stream construction reuses the load instead of repeating it. The
+/// A resolved plan together with the fragment handles it was computed over
+/// (in priority order), so stream construction reuses them instead of
+/// reloading every fragment. Only the handles are kept; planning-only
+/// metadata (deletion vectors, row-id sequences) is not retained. The
 /// distributed path (`with_plan`, plan computed on another node) carries no
 /// fragments and the stream loads them itself.
 struct PlannedRead {
     plan: FilteredReadInternalPlan,
-    loaded_fragments: Option<Arc<Vec<LoadedFragment>>>,
+    fragments: Option<Arc<Vec<Arc<FileFragment>>>>,
 }
 
 impl std::fmt::Debug for PlannedRead {
@@ -1875,7 +1881,7 @@ impl FilteredReadExec {
         let plan_cell = Arc::new(OnceCell::new());
         let _ = plan_cell.set(PlannedRead {
             plan: internal_plan,
-            loaded_fragments: None,
+            fragments: None,
         });
         Ok(Self {
             plan: plan_cell,
@@ -1929,13 +1935,18 @@ impl FilteredReadExec {
                     .try_collect::<Vec<_>>()
                     .await?;
 
-                // Plan the scan; keep the loaded fragments so stream
-                // construction doesn't reload every fragment
+                // Plan the scan; keep only the fragment handles so stream
+                // construction doesn't reload every fragment. Planning-only
+                // metadata drops here rather than living as long as the exec.
                 let plan =
                     FilteredReadStream::plan_scan(&loaded_fragments, &evaluated_index, options);
+                let fragment_handles = loaded_fragments
+                    .into_iter()
+                    .map(|loaded| loaded.fragment)
+                    .collect();
                 Ok(PlannedRead {
                     plan,
-                    loaded_fragments: Some(Arc::new(loaded_fragments)),
+                    fragments: Some(Arc::new(fragment_handles)),
                 })
             })
             .await
@@ -2003,7 +2014,7 @@ impl FilteredReadExec {
                     options,
                     &metrics,
                     planned.plan.clone(),
-                    planned.loaded_fragments.clone(),
+                    planned.fragments.clone(),
                 )
                 .await
                 .map_err(|e| DataFusionError::External(e.into()))?;
