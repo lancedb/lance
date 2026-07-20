@@ -714,7 +714,7 @@ struct Snapshot {
     /// visible_count` for any snapshot the writer has stored (each publish
     /// appends one entry and bumps `visible_count`).
     batches: BatchLog,
-    /// `Σ batches[i].documents.len()` for `i < visible_count`.
+    /// Number of non-zero-token documents for `i < visible_count`.
     cumulative_doc_count: u64,
     /// `Σ batches[i].documents[*].num_tokens` for `i < visible_count`.
     cumulative_total_tokens: u64,
@@ -1211,7 +1211,6 @@ impl FtsMemIndex {
 
     fn insert_batch(&self, batch: &RecordBatch, row_offset: u64) -> Result<()> {
         let st = self.state.load_full();
-        let batch_position = st.tail.next_position();
         let document_position_start = st.tail.doc_count();
         if self.resolved_field.get().is_none() {
             let schema = LanceSchema::try_from(batch.schema().as_ref())?;
@@ -1243,8 +1242,10 @@ impl FtsMemIndex {
         let mut index_document = |key: DocumentKey, text: &str| -> Result<()> {
             let document_position = document_position_start + documents.len() as u64;
             let num_tokens = index_text(text, document_position, tokenizer, &mut term_builders)?;
-            documents.push(DocumentMetadata { key, num_tokens });
-            total_tokens += num_tokens as u64;
+            if num_tokens > 0 {
+                documents.push(DocumentMetadata { key, num_tokens });
+                total_tokens += num_tokens as u64;
+            }
             Ok(())
         };
 
@@ -1258,10 +1259,15 @@ impl FtsMemIndex {
             )?;
         }
 
+        if total_tokens == 0 {
+            return Ok(());
+        }
+
         // Drop the tokenizer guard before publishing so we don't hold it
         // across the snapshot install.
         drop(tok_guard);
 
+        let batch_position = st.tail.next_position();
         st.tail.append_batch(
             batch_position,
             document_position_start,
@@ -1961,8 +1967,9 @@ impl FtsMemIndex {
     /// Export the in-memory FTS index to an `InnerBuilder` ready to be
     /// written to disk.
     ///
-    /// Doc row positions are kept in insert order to match the forward-written
-    /// flush data file 1:1. `total_rows` is used only to validate positions.
+    /// Documents are kept in insert order and retain their positions in the
+    /// forward-written flush data file; zero-token rows are omitted.
+    /// `total_rows` is used only to validate positions.
     pub fn to_index_builder(
         &self,
         partition_id: u64,
@@ -2002,8 +2009,8 @@ impl FtsMemIndex {
             ));
         }
 
-        // Step 2: assign doc_ids in ascending insert-position order, so the
-        // stored row positions line up 1:1 with the forward-written data file.
+        // Step 2: assign doc_ids in ascending insert-position order while
+        // preserving each document's position in the forward-written data file.
         let mut entries: Vec<(DocumentKey, u32)> = Vec::with_capacity(all_docs.len());
         for (key, num_tokens) in &all_docs {
             if key.row_position >= total_rows_u64 {
@@ -4120,7 +4127,7 @@ mod tests {
         assert_eq!(index.source_column_name(), "tags");
 
         index.insert(&create_element_test_batch(), 0).unwrap();
-        assert_eq!(index.doc_count(), 6);
+        assert_eq!(index.doc_count(), 4);
 
         let mut beta = index.search("beta");
         beta.sort_by_key(|entry| (entry.row_position, entry.doc_index.clone()));
@@ -4260,7 +4267,7 @@ mod tests {
     }
 
     #[test]
-    fn test_zero_token_element_documents_remain_addressable_after_flush() {
+    fn test_zero_token_element_documents_are_skipped_after_flush() {
         let mut tags = ListBuilder::new(StringBuilder::new());
         tags.values().append_null();
         tags.values().append_value("");
@@ -4286,8 +4293,8 @@ mod tests {
         index.insert(&batch, 0).unwrap();
         index.flush();
 
-        assert!(!index.is_empty());
-        assert_eq!(index.doc_count(), 3);
+        assert!(index.is_empty());
+        assert_eq!(index.doc_count(), 0);
         assert!(index.search("missing").is_empty());
     }
 
@@ -4456,6 +4463,91 @@ mod tests {
             rows(index.search_with_options(&query, partition_only)),
             vec![0, 1]
         );
+    }
+
+    #[test]
+    fn test_zero_token_documents_are_skipped_across_memwal_paths() {
+        let params =
+            InvertedIndexParams::new("whitespace".to_string(), lance_tokenizer::Language::English)
+                .remove_stop_words(true)
+                .stem(false)
+                .max_token_length(Some(6));
+        let schema = create_test_schema();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![0, 1, 2, 3, 4, 5])),
+                Arc::new(StringArray::from(vec![
+                    Some(""),
+                    Some("   "),
+                    Some("the"),
+                    Some("overlength"),
+                    None,
+                    Some("hello"),
+                ])),
+            ],
+        )
+        .unwrap();
+        let index = FtsMemIndex::with_params(1, "description".to_string(), params.clone());
+        index.insert(&batch, 0).unwrap();
+
+        assert_eq!(index.doc_count(), 1);
+        let st = index.state.load_full();
+        let tail_snap = st.tail.snapshot();
+        let tokens = vec!["hello".to_string()];
+        let tail_scorer = build_scorer(&st, &tail_snap, &tokens, true);
+        let expected_scorer = MemBM25Scorer::new(1, 1, HashMap::from([("hello".to_string(), 1)]));
+        assert_eq!(tail_scorer.total_tokens, 1);
+        assert_eq!(tail_scorer.num_docs(), 1);
+        assert_eq!(tail_scorer.num_docs_containing_token("hello"), 1);
+        assert_eq!(
+            tail_scorer.avg_doc_length(),
+            expected_scorer.avg_doc_length()
+        );
+        assert_eq!(
+            tail_scorer.query_weight("hello"),
+            expected_scorer.query_weight("hello")
+        );
+        let tail_results = index.search("hello");
+        assert_eq!(rows(tail_results.clone()), vec![5]);
+        let tail_score = tail_results[0].score;
+        assert!(!index.to_index_builder(0, 6).unwrap().is_empty());
+
+        index.flush();
+        let st = index.state.load_full();
+        assert_eq!(st.partitions.len(), 1);
+        assert_eq!(
+            st.partitions[0]
+                .docs
+                .iter()
+                .map(|(row_id, num_tokens)| (*row_id, *num_tokens))
+                .collect::<Vec<_>>(),
+            vec![(5, 1)]
+        );
+        let frozen_scorer = build_scorer(&st, &st.tail.snapshot(), &tokens, true);
+        assert_eq!(frozen_scorer.total_tokens, 1);
+        assert_eq!(frozen_scorer.num_docs(), 1);
+        assert_eq!(frozen_scorer.num_docs_containing_token("hello"), 1);
+        assert_eq!(
+            frozen_scorer.avg_doc_length(),
+            expected_scorer.avg_doc_length()
+        );
+        assert_eq!(
+            frozen_scorer.query_weight("hello"),
+            expected_scorer.query_weight("hello")
+        );
+        let frozen_results = index.search("hello");
+        assert_eq!(rows(frozen_results.clone()), vec![5]);
+        assert!((frozen_results[0].score - tail_score).abs() < f32::EPSILON);
+
+        let all_zero_batch = batch.slice(0, 5);
+        let all_zero_index = FtsMemIndex::with_params(1, "description".to_string(), params);
+        all_zero_index.insert(&all_zero_batch, 0).unwrap();
+        assert!(all_zero_index.is_empty());
+        assert_eq!(all_zero_index.doc_count(), 0);
+        assert!(all_zero_index.to_index_builder(0, 5).unwrap().is_empty());
+        all_zero_index.flush();
+        assert!(all_zero_index.state.load().partitions.is_empty());
     }
 
     fn create_phrase_test_batch(schema: &ArrowSchema) -> RecordBatch {
