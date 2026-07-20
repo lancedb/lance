@@ -139,11 +139,14 @@ impl MemIndexConfig {
 
         // Extract InvertedIndexParams from index_details if available
         let params = if let Some(details_any) = &index_meta.index_details {
-            if let Ok(details) = pbold::InvertedIndexDetails::decode(details_any.value.as_slice()) {
-                InvertedIndexParams::try_from(&details)?
-            } else {
-                InvertedIndexParams::default()
-            }
+            let details = pbold::InvertedIndexDetails::decode(details_any.value.as_slice())
+                .map_err(|err| {
+                    Error::io(format!(
+                        "failed to decode InvertedIndexDetails for MemWAL FTS index '{}': {}",
+                        index_meta.name, err
+                    ))
+                })?;
+            InvertedIndexParams::try_from(&details)?
         } else {
             InvertedIndexParams::default()
         };
@@ -206,8 +209,9 @@ impl MemIndexConfig {
             0 | 1 => Ok(InvertedListFormatVersion::V1),
             2 => Ok(InvertedListFormatVersion::V2),
             3 => Ok(InvertedListFormatVersion::V3),
+            4 => Ok(InvertedListFormatVersion::V4),
             version => Err(Error::invalid_input(format!(
-                "FTS index '{}' has unsupported index_version {}; expected 0, 1, 2, or 3",
+                "FTS index '{}' has unsupported index_version {}; expected 0, 1, 2, 3, or 4",
                 index_meta.name, version
             ))),
         }
@@ -1381,6 +1385,7 @@ mod tests {
             (0, InvertedListFormatVersion::V1),
             (1, InvertedListFormatVersion::V1),
             (2, InvertedListFormatVersion::V2),
+            (4, InvertedListFormatVersion::V4),
         ] {
             let config =
                 MemIndexConfig::fts_from_metadata(&fts_index_metadata(index_version), &schema)
@@ -1403,9 +1408,9 @@ mod tests {
         let arrow_schema = create_test_schema();
         let schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
 
-        let err = MemIndexConfig::fts_from_metadata(&fts_index_metadata(4), &schema).unwrap_err();
+        let err = MemIndexConfig::fts_from_metadata(&fts_index_metadata(5), &schema).unwrap_err();
         assert!(
-            err.to_string().contains("unsupported index_version 4"),
+            err.to_string().contains("unsupported index_version 5"),
             "{err}"
         );
     }
