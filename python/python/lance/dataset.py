@@ -6001,12 +6001,12 @@ class LanceOperation:
         layered over the base data without rewriting the base files.
 
         The overlay is dense or sparse depending on the shape of ``offsets``:
-        pass a single :class:`~lance.bitmap.Bitmap` (or flat ``List[int]``) for
-        a dense overlay (one offset set shared by every field in
-        ``data_file``), or a list of ``Bitmap``/``List[int]`` for a sparse
-        overlay (one offset set per field, in the order of the file's fields).
-        Offsets are **physical** row offsets (positions in the base files,
-        counting deleted rows), like deletion vectors.
+        pass a single iterable of ints (e.g. a :class:`~lance.bitmap.Bitmap`
+        or a ``List[int]``) for a dense overlay (one offset set shared by
+        every field in ``data_file``), or a list of int iterables for a
+        sparse overlay (one offset set per field, in the order of the file's
+        fields). Offsets are **physical** row offsets (positions in the base
+        files, counting deleted rows), like deletion vectors.
 
         Attributes
         ----------
@@ -6015,15 +6015,14 @@ class LanceOperation:
             value column per covered field. The value at each covered offset is
             stored at the rank (0-based count of covered offsets below it) of
             that offset in the field's coverage.
-        offsets : Union[Bitmap, List[Bitmap], List[int], List[List[int]]]
-            The covered physical row offsets. A single ``Bitmap``/flat
-            ``List[int]`` is dense coverage (shared by every field); a list of
-            ``Bitmap``/per-field lists is sparse coverage (in field order).
-            When passing a raw ``List[int]``/``List[List[int]]``, each list
-            must be strictly ascending with no duplicates, since the Nth
-            offset maps to the Nth value row in ``data_file``; a non-ascending
-            list raises ``ValueError``. A ``Bitmap`` has no such restriction —
-            it is always canonically sorted and deduplicated.
+        offsets : Iterable[int] | List[Iterable[int]]
+            The covered physical row offsets. A single int iterable is dense
+            coverage (shared by every field); a list of int iterables is
+            sparse coverage (in field order). Offsets are always resolved in
+            ascending order — the smallest covered offset maps to row 0 of
+            ``data_file``, the next-smallest to row 1, and so on — regardless
+            of the order values are given in, so a plain ``List[int]`` need
+            not be pre-sorted.
         committed_version : Optional[int]
             The dataset version at which this overlay became effective. Leave as
             ``None`` when creating an overlay to commit — the commit stamps it.
@@ -6032,7 +6031,7 @@ class LanceOperation:
         """
 
         data_file: DataFile
-        offsets: Union[Bitmap, List[Bitmap], List[int], List[List[int]]]
+        offsets: Union[Iterable[int], List[Iterable[int]]]
         committed_version: Optional[int] = None
 
     @dataclass

@@ -192,8 +192,10 @@ impl<'py> IntoPyObject<'py> for PyLance<&DataReplacementGroup> {
     }
 }
 
-// Accept either a `Bitmap` (constructed canonically, so already sorted and
-// deduplicated) or a legacy raw int iterable/`PySet`/etc.
+// Accept either a `Bitmap` (cheap `Arc` clone) or any other iterable of ints
+// (a `set`, `list`, etc.), collected in whatever order the iterable yields —
+// `RoaringBitmap` itself defines the canonical (ascending, deduplicated)
+// order, so there's no separate ordering contract to validate here.
 fn extract_bitmap(ob: &Bound<'_, PyAny>) -> PyResult<RoaringBitmap> {
     if let Ok(bitmap) = ob.extract::<PyBitmap>() {
         return Ok((*bitmap.0).clone());
@@ -203,49 +205,28 @@ fn extract_bitmap(ob: &Bound<'_, PyAny>) -> PyResult<RoaringBitmap> {
         .collect::<PyResult<RoaringBitmap>>()
 }
 
-// The Nth offset in an overlay list positionally maps to the Nth value row in
-// `data_file`, but `RoaringBitmap` stores offsets in ascending order and drops
-// duplicates. A caller-supplied raw `Vec<u32>` that isn't strictly ascending
-// would be silently reordered, breaking that mapping, so reject it here
-// instead. This validation is unnecessary for a `Bitmap`, since it is
-// canonically sorted and deduplicated by construction (issue #7695).
-fn bitmap_from_sorted_offsets(offsets: Vec<u32>) -> PyResult<RoaringBitmap> {
-    if offsets.windows(2).any(|w| w[0] >= w[1]) {
-        return Err(PyValueError::new_err(
-            "DataOverlayFile.offsets must be strictly ascending with no duplicates; \
-             each offset positionally maps to a value row in data_file",
-        ));
-    }
-    Ok(RoaringBitmap::from_sorted_iter(offsets).expect("offsets verified strictly ascending"))
-}
-
 impl FromPyObject<'_, '_> for PyLance<DataOverlayFile> {
     type Error = PyErr;
     fn extract(ob: Borrowed<'_, '_, PyAny>) -> PyResult<Self> {
         let data_file = ob.getattr("data_file")?.extract::<PyLance<DataFile>>()?.0;
         let offsets = ob.getattr("offsets")?;
 
-        // A `Bitmap` or flat list of offsets is a dense overlay (one coverage
-        // shared by every field); a list of `Bitmap`s or per-field lists is a
-        // sparse overlay. Differentiate by shape, trying the dense form first.
-        let coverage = if let Ok(bitmap) = offsets.extract::<PyBitmap>() {
-            OverlayCoverage::dense((*bitmap.0).clone())
-        } else if let Ok(shared) = offsets.extract::<Vec<u32>>() {
-            OverlayCoverage::dense(bitmap_from_sorted_offsets(shared)?)
-        } else if let Ok(per_field) = offsets.extract::<Vec<PyBitmap>>() {
-            OverlayCoverage::sparse(per_field.into_iter().map(|b| (*b.0).clone()).collect())
-        } else if let Ok(per_field) = offsets.extract::<Vec<Vec<u32>>>() {
-            OverlayCoverage::sparse(
-                per_field
-                    .into_iter()
-                    .map(bitmap_from_sorted_offsets)
-                    .collect::<PyResult<Vec<_>>>()?,
-            )
+        // A `Bitmap`/flat iterable of ints is a dense overlay (one coverage
+        // shared by every field); an iterable of `Bitmap`/int iterables is a
+        // sparse overlay (one per field). Differentiate by shape, trying the
+        // dense form first: it fails to extract if `offsets`' elements aren't
+        // ints (e.g. they're themselves iterables), falling through to sparse.
+        let coverage = if let Ok(bitmap) = extract_bitmap(&offsets) {
+            OverlayCoverage::dense(bitmap)
+        } else if let Ok(per_field) = offsets
+            .try_iter()
+            .and_then(|it| it.map(|item| extract_bitmap(&item?)).collect())
+        {
+            OverlayCoverage::sparse(per_field)
         } else {
             return Err(PyValueError::new_err(
-                "DataOverlayFile.offsets must be a Bitmap or list of ints (dense coverage \
-                 shared by every field) or a list of Bitmaps or per-field int lists (sparse \
-                 coverage)",
+                "DataOverlayFile.offsets must be an iterable of ints (dense coverage shared \
+                 by every field) or an iterable of per-field int iterables (sparse coverage)",
             ));
         };
 

@@ -86,6 +86,17 @@ def test_len_iter_contains():
     assert sorted(b) == [1, 2, 4]
 
 
+def test_iter_is_lazy():
+    """`iter()` returns a dedicated streaming iterator (not a `list_iterator`
+    over a pre-built list), yielding values one at a time on demand."""
+    b = bitmap(range(1000))
+    it = iter(b)
+    assert type(it).__name__ == "BitmapIterator"
+    assert next(it) == 0
+    assert next(it) == 1
+    assert list(it) == list(range(2, 1000))
+
+
 def test_equality():
     assert bitmap([1, 2, 3]) == bitmap([3, 2, 1])
     assert bitmap([1, 2, 3]) == {1, 2, 3}

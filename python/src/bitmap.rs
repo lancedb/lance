@@ -10,8 +10,24 @@ use arrow_schema::DataType;
 use pyo3::basic::CompareOp;
 use pyo3::exceptions::{PyNotImplementedError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyList};
+use pyo3::types::PyBytes;
 use roaring::RoaringBitmap;
+
+/// A lazy, streaming iterator over a `Bitmap`'s values — yields one Python
+/// `int` per `__next__` call rather than materializing them all up front.
+#[pyclass(name = "BitmapIterator", module = "lance.bitmap")]
+pub struct PyBitmapIter(roaring::bitmap::IntoIter);
+
+#[pymethods]
+impl PyBitmapIter {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(mut slf: PyRefMut<'_, Self>) -> Option<u32> {
+        slf.0.next()
+    }
+}
 
 /// A set of non-negative integers backed by a `RoaringBitmap`.
 ///
@@ -38,7 +54,8 @@ fn i64_to_u32(value: i64) -> PyResult<u32> {
 }
 
 /// Read an integer pyarrow array's values into a `RoaringBitmap`, without
-/// going through per-value Python objects.
+/// going through per-value Python objects or an intermediate `Vec` — each
+/// arm collects straight from the array's native buffer into the bitmap.
 fn bitmap_from_pyarrow(ob: &Bound<'_, PyAny>) -> PyResult<RoaringBitmap> {
     let data = ArrayData::from_pyarrow_bound(ob)?;
     if data.null_count() > 0 {
@@ -47,60 +64,59 @@ fn bitmap_from_pyarrow(ob: &Bound<'_, PyAny>) -> PyResult<RoaringBitmap> {
         ));
     }
     let array = make_array(data);
-    let values: Vec<u32> = match array.data_type() {
-        DataType::UInt8 => array
+    match array.data_type() {
+        DataType::UInt8 => Ok(array
             .as_primitive::<arrow::datatypes::UInt8Type>()
             .values()
             .iter()
             .map(|v| *v as u32)
-            .collect(),
-        DataType::UInt16 => array
+            .collect()),
+        DataType::UInt16 => Ok(array
             .as_primitive::<arrow::datatypes::UInt16Type>()
             .values()
             .iter()
             .map(|v| *v as u32)
-            .collect(),
-        DataType::UInt32 => array
+            .collect()),
+        DataType::UInt32 => Ok(array
             .as_primitive::<arrow::datatypes::UInt32Type>()
             .values()
-            .to_vec(),
+            .iter()
+            .copied()
+            .collect()),
         DataType::UInt64 => array
             .as_primitive::<arrow::datatypes::UInt64Type>()
             .values()
             .iter()
             .map(|v| i64_to_u32(*v as i64))
-            .collect::<PyResult<_>>()?,
+            .collect(),
         DataType::Int8 => array
             .as_primitive::<arrow::datatypes::Int8Type>()
             .values()
             .iter()
             .map(|v| i64_to_u32(*v as i64))
-            .collect::<PyResult<_>>()?,
+            .collect(),
         DataType::Int16 => array
             .as_primitive::<arrow::datatypes::Int16Type>()
             .values()
             .iter()
             .map(|v| i64_to_u32(*v as i64))
-            .collect::<PyResult<_>>()?,
+            .collect(),
         DataType::Int32 => array
             .as_primitive::<arrow::datatypes::Int32Type>()
             .values()
             .iter()
             .map(|v| i64_to_u32(*v as i64))
-            .collect::<PyResult<_>>()?,
+            .collect(),
         DataType::Int64 => array
             .as_primitive::<arrow::datatypes::Int64Type>()
             .values()
             .iter()
             .map(|v| i64_to_u32(*v))
-            .collect::<PyResult<_>>()?,
-        other => {
-            return Err(PyValueError::new_err(format!(
-                "Bitmap can only be constructed from an integer pyarrow array, got {other:?}"
-            )));
-        }
-    };
-    Ok(RoaringBitmap::from_iter(values))
+            .collect(),
+        other => Err(PyValueError::new_err(format!(
+            "Bitmap can only be constructed from an integer pyarrow array, got {other:?}"
+        ))),
+    }
 }
 
 #[pymethods]
@@ -141,9 +157,12 @@ impl PyBitmap {
         }
     }
 
-    fn __iter__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let list = PyList::new(py, self.0.iter())?;
-        Ok(list.try_iter()?.into_any())
+    fn __iter__(&self, py: Python<'_>) -> PyResult<Py<PyBitmapIter>> {
+        // Cloning the bitmap here is a native Rust-side copy of its compressed
+        // containers, not a per-value Python allocation — the point is that
+        // `PyBitmapIter` then streams values lazily instead of eagerly
+        // building a Python list of boxed ints up front.
+        Py::new(py, PyBitmapIter((*self.0).clone().into_iter()))
     }
 
     fn __repr__(&self) -> String {

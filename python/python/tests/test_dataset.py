@@ -5250,10 +5250,9 @@ def test_data_overlay_rejects_invalid_offsets(tmp_path: Path):
         fields=[0],
     )
 
-    # offsets is neither a Bitmap/flat list of ints (dense) nor a list of
-    # Bitmaps/per-field int lists (sparse), so the coverage shape can't be
-    # resolved.
-    with pytest.raises(ValueError, match="offsets must be a Bitmap or list"):
+    # offsets is neither an iterable of ints (dense) nor an iterable of int
+    # iterables (sparse), so the coverage shape can't be resolved.
+    with pytest.raises(ValueError, match="offsets must be an iterable"):
         lance.LanceDataset.commit(
             dataset,
             lance.LanceOperation.DataOverlay(
@@ -5276,15 +5275,14 @@ def test_data_overlay_rejects_invalid_offsets(tmp_path: Path):
     "offsets",
     [
         [2, 1],  # dense, descending
-        [1, 1],  # dense, duplicate
         [[2, 1]],  # sparse, descending
-        [[1, 1]],  # sparse, duplicate
     ],
 )
-def test_data_overlay_rejects_unsorted_offsets(tmp_path: Path, offsets):
-    # Offsets map positionally to value rows in data_file. A RoaringBitmap would
-    # silently reorder/dedup them, so a non-ascending list must be rejected up
-    # front rather than corrupting the row mapping.
+def test_data_overlay_accepts_any_offset_order(tmp_path: Path, offsets):
+    """Offsets are always resolved in ascending order (the smallest covered
+    offset maps to value-file row 0, the next-smallest to row 1, ...)
+    regardless of what order the caller lists them in — an out-of-order list
+    is accepted and resolves identically to a pre-sorted one."""
     base_dir = tmp_path / "test"
     table = pa.table({"val": pa.array([0, 1, 2], pa.int32())})
     dataset = lance.write_dataset(table, base_dir)
@@ -5292,27 +5290,23 @@ def test_data_overlay_rejects_unsorted_offsets(tmp_path: Path, offsets):
         dataset,
         base_dir,
         "ov.lance",
-        pa.table({"val": pa.array([9, 9], pa.int32())}),
+        pa.table({"val": pa.array([100, 200], pa.int32())}),
         fields=[0],
     )
 
-    with pytest.raises(ValueError, match="strictly ascending"):
-        lance.LanceDataset.commit(
-            dataset,
-            lance.LanceOperation.DataOverlay(
-                [
-                    lance.LanceOperation.DataOverlayGroup(
-                        0,
-                        [
-                            lance.LanceOperation.DataOverlayFile(
-                                data_file, offsets=offsets
-                            )
-                        ],
-                    )
-                ]
-            ),
-            read_version=dataset.version,
-        )
+    overlay = lance.LanceOperation.DataOverlayFile(data_file, offsets=offsets)
+    dataset = lance.LanceDataset.commit(
+        dataset,
+        lance.LanceOperation.DataOverlay(
+            [lance.LanceOperation.DataOverlayGroup(0, [overlay])]
+        ),
+        read_version=dataset.version,
+    )
+
+    result = dataset.to_table().column("val").to_pylist()
+    # rank 0 (offset 1) -> value row 0 (100); rank 1 (offset 2) -> value row 1 (200)
+    assert result[1] == 100
+    assert result[2] == 200
 
 
 def test_schema_project_drop_column(tmp_path: Path):
