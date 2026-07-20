@@ -1314,10 +1314,11 @@ impl DatasetIndexExt for Dataset {
     async fn load_indices(&self) -> Result<Arc<Vec<IndexMetadata>>> {
         let metadata_key = IndexMetadataKey {
             version: self.version().version,
+            store_identity: &self.object_store.store_prefix,
         };
-        let mut indices = match self.index_cache.get_with_key(&metadata_key).await {
-            Some(indices) => indices,
-            None => {
+        let mut indices = self
+            .index_cache
+            .get_or_insert_with_key(metadata_key, || async {
                 let mut loaded_indices = read_manifest_indexes(
                     &self.object_store,
                     &self.manifest_location,
@@ -1325,13 +1326,9 @@ impl DatasetIndexExt for Dataset {
                 )
                 .await?;
                 retain_supported_indices(&mut loaded_indices);
-                let loaded_indices = Arc::new(loaded_indices);
-                self.index_cache
-                    .insert_with_key(&metadata_key, loaded_indices.clone())
-                    .await;
-                loaded_indices
-            }
-        };
+                Ok(loaded_indices)
+            })
+            .await?;
 
         // Infer details for legacy vector indices (once per index name, concurrently).
         // This may run on indices that were opportunistically cached during Dataset::open
@@ -2897,6 +2894,7 @@ mod tests {
     use lance_datagen::{BatchCount, ByteCount, Dimension, RowCount, array};
     use lance_index::pbold::BTreeIndexDetails;
     use lance_index::scalar::bitmap::BITMAP_LOOKUP_NAME;
+    use lance_index::scalar::inverted::INVERTED_INDEX_VERSION_V4;
     use lance_index::scalar::{
         BuiltinIndexType, FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams,
     };
@@ -4351,6 +4349,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_load_indices_singleflights_concurrent_cache_misses() {
+        let session = Arc::new(Session::default());
+        let write_params = WriteParams {
+            session: Some(session.clone()),
+            ..Default::default()
+        };
+        let test_dir = TempStrDir::default();
+        let schema = Arc::new(Schema::new(vec![Field::new("tag", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["a", "b", "c"]))],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &test_dir,
+            Some(write_params),
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["tag"],
+                IndexType::Bitmap,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        session.index_cache.clear().await;
+        let before = session.index_cache_stats().await;
+        let results = futures::future::join_all((0..32).map(|_| dataset.load_indices())).await;
+        assert!(results.iter().all(|result| result.is_ok()));
+        let after = session.index_cache_stats().await;
+
+        assert_eq!(after.misses - before.misses, 1);
+        assert_eq!(after.hits - before.hits, 31);
+    }
+
+    #[tokio::test]
     async fn test_remap_empty() {
         let data = gen_batch()
             .col("int", array::step::<Int32Type>())
@@ -4736,6 +4776,7 @@ mod tests {
         // We commit by doing a delete("false") after replacing the cached indices.
         let metadata_key = crate::session::index_caches::IndexMetadataKey {
             version: dataset.version().version,
+            store_identity: &dataset.object_store.store_prefix,
         };
         dataset
             .index_cache
@@ -4961,6 +5002,65 @@ mod tests {
             stats["num_unindexed_rows"], 0,
             "Empty index should indexed all rows"
         );
+    }
+
+    #[tokio::test]
+    async fn test_optimize_empty_code_fts_index_preserves_params() {
+        let dir = TempStrDir::default();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("code", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values([0, 1])),
+                Arc::new(StringArray::from_iter_values([
+                    "fn GetUserEmail() {}",
+                    "fn ParseConfig() {}",
+                ])),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(reader, &dir, None).await.unwrap();
+
+        let params = InvertedIndexParams::default()
+            .analyzer("code")
+            .unwrap()
+            .split_identifiers(true)
+            .preserve_original(false);
+        dataset
+            .create_index_builder(&["code"], IndexType::Inverted, &params)
+            .name("code_idx".to_string())
+            .train(false)
+            .await
+            .unwrap();
+
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1);
+        assert_eq!(indices[0].index_version, INVERTED_INDEX_VERSION_V4 as i32);
+
+        dataset.optimize_indices(&Default::default()).await.unwrap();
+
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1);
+        assert_eq!(indices[0].index_version, INVERTED_INDEX_VERSION_V4 as i32);
+
+        let stats: serde_json::Value =
+            serde_json::from_str(&dataset.index_statistics("code_idx").await.unwrap()).unwrap();
+        assert_eq!(stats["num_unindexed_rows"], 0);
+
+        let result = dataset
+            .scan()
+            .project(&["id"])
+            .unwrap()
+            .full_text_search(FullTextSearchQuery::new("email".to_string()))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(result["id"].as_primitive::<Int32Type>().values(), &[0]);
     }
 
     /// Helper function to check if an index is being used in a query plan

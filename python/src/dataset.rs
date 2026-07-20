@@ -70,6 +70,7 @@ use lance_core::datatypes::BlobHandling;
 use lance_datafusion::utils::reader_to_stream;
 use lance_encoding::decoder::DecoderConfig;
 use lance_file::reader::FileReaderOptions;
+use lance_index::scalar::inverted::InvertedListFormatVersion;
 use lance_index::scalar::inverted::query::Occur;
 use lance_index::scalar::inverted::query::{
     BooleanQuery, BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Operator, PhraseQuery,
@@ -78,7 +79,6 @@ use lance_index::{
     FtsPrewarmOptions, IndexParams, IndexType, PrewarmOptions,
     optimize::OptimizeOptions,
     progress::{IndexBuildProgress, NoopIndexBuildProgress},
-    scalar::inverted::InvertedListFormatVersion,
     scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams},
     vector::{
         ApproxMode, DEFAULT_QUERY_PARALLELISM, Query as VectorQuery,
@@ -2421,19 +2421,106 @@ impl Dataset {
             "INVERTED" | "FTS" => {
                 let mut params = InvertedIndexParams::default();
                 if let Some(kwargs) = kwargs {
+                    let allowed_kwargs = [
+                        "analyzer",
+                        "with_position",
+                        "base_tokenizer",
+                        "language",
+                        "max_token_length",
+                        "lower_case",
+                        "stem",
+                        "remove_stop_words",
+                        "custom_stop_words",
+                        "ascii_folding",
+                        "min_ngram_length",
+                        "max_ngram_length",
+                        "prefix_only",
+                        "block_size",
+                        "split_identifiers",
+                        "split_on_numerics",
+                        "preserve_original",
+                        "index_operators",
+                        "memory_limit",
+                        "num_workers",
+                        "format_version",
+                        "fragment_ids",
+                        "index_uuid",
+                        "progress_callback",
+                    ];
+                    for (key, _) in kwargs.iter() {
+                        let key: String = key.extract()?;
+                        if !allowed_kwargs.contains(&key.as_str()) {
+                            return Err(PyValueError::new_err(format!(
+                                "unknown FTS index parameter '{}'",
+                                key
+                            )));
+                        }
+                    }
+
+                    let analyzer: Option<String> = kwargs
+                        .get_item("analyzer")?
+                        .map(|value| value.extract())
+                        .transpose()?;
+                    let base_tokenizer: Option<String> = kwargs
+                        .get_item("base_tokenizer")?
+                        .map(|value| value.extract())
+                        .transpose()?;
+
+                    match (analyzer.as_deref(), base_tokenizer.as_deref()) {
+                        (Some("text"), Some("code")) => {
+                            return Err(PyValueError::new_err(
+                                "base_tokenizer='code' requires analyzer='code'",
+                            ));
+                        }
+                        (Some("code"), Some(base_tokenizer)) if base_tokenizer != "code" => {
+                            return Err(PyValueError::new_err(format!(
+                                "analyzer='code' requires base_tokenizer='code', got '{}'",
+                                base_tokenizer
+                            )));
+                        }
+                        _ => {}
+                    }
+
+                    let uses_code_analyzer = match analyzer.as_deref() {
+                        Some("code") => true,
+                        Some("text") | None => base_tokenizer.as_deref() == Some("code"),
+                        Some(_) => true,
+                    };
+                    if !uses_code_analyzer {
+                        for flag in [
+                            "split_identifiers",
+                            "split_on_numerics",
+                            "preserve_original",
+                            "index_operators",
+                        ] {
+                            if let Some(value) = kwargs.get_item(flag)?
+                                && value.extract::<bool>()?
+                            {
+                                return Err(PyValueError::new_err(
+                                    "code analyzer flags require analyzer='code'",
+                                ));
+                            }
+                        }
+                    }
+
+                    if let Some(analyzer) = analyzer {
+                        params = params
+                            .analyzer(&analyzer)
+                            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+                    }
                     if let Some(with_position) = kwargs.get_item("with_position")? {
                         params = params.with_position(with_position.extract()?);
                     }
-                    if let Some(base_tokenizer) = kwargs.get_item("base_tokenizer")? {
-                        params = params.base_tokenizer(base_tokenizer.extract()?);
+                    if let Some(base_tokenizer) = base_tokenizer {
+                        params = params.base_tokenizer(base_tokenizer);
                     }
                     if let Some(language) = kwargs.get_item("language")? {
                         let language: PyBackedStr =
                             language.cast::<PyString>()?.clone().try_into()?;
-                        params = params.language(&language).map_err(|e| {
+                        params = params.language(&language).map_err(|err| {
                             PyValueError::new_err(format!(
-                                "can't set tokenizer language to {}: {:?}",
-                                language, e
+                                "can't set tokenizer language to {}: {}",
+                                language, err
                             ))
                         })?;
                     }
@@ -2449,8 +2536,8 @@ impl Dataset {
                     if let Some(remove_stop_words) = kwargs.get_item("remove_stop_words")? {
                         params = params.remove_stop_words(remove_stop_words.extract()?);
                     }
-                    if let Some(stop_words_file) = kwargs.get_item("custom_stop_words")? {
-                        params = params.custom_stop_words(stop_words_file.extract()?);
+                    if let Some(custom_stop_words) = kwargs.get_item("custom_stop_words")? {
+                        params = params.custom_stop_words(custom_stop_words.extract()?);
                     }
                     if let Some(ascii_folding) = kwargs.get_item("ascii_folding")? {
                         params = params.ascii_folding(ascii_folding.extract()?);
@@ -2469,6 +2556,18 @@ impl Dataset {
                             .block_size(block_size.extract()?)
                             .map_err(|e| PyValueError::new_err(e.to_string()))?;
                     }
+                    if let Some(split_identifiers) = kwargs.get_item("split_identifiers")? {
+                        params = params.split_identifiers(split_identifiers.extract()?);
+                    }
+                    if let Some(split_on_numerics) = kwargs.get_item("split_on_numerics")? {
+                        params = params.split_on_numerics(split_on_numerics.extract()?);
+                    }
+                    if let Some(preserve_original) = kwargs.get_item("preserve_original")? {
+                        params = params.preserve_original(preserve_original.extract()?);
+                    }
+                    if let Some(index_operators) = kwargs.get_item("index_operators")? {
+                        params = params.index_operators(index_operators.extract()?);
+                    }
                     if let Some(memory_limit) = kwargs.get_item("memory_limit")? {
                         params = params.memory_limit_mb(memory_limit.extract()?);
                     }
@@ -2484,7 +2583,7 @@ impl Dataset {
                             value.to_string()
                         } else {
                             return Err(PyValueError::new_err(
-                                "format_version must be 1, 2, 3, 'v1', 'v2', or 'v3'",
+                                "format_version must be 1, 2, 3, 4, 'v1', 'v2', 'v3', or 'v4'",
                             ));
                         };
                         let format_version = value
