@@ -36,6 +36,7 @@ name = "write_read_ds"
 path = "src/write_read_ds.rs"
 
 [dependencies]
+async-trait.workspace = true
 arrow = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-select = { workspace = true }
@@ -47,6 +48,7 @@ lance-index = { workspace = true }
 lance-core = { workspace = true }
 lance-linalg = { workspace = true }
 lance-datagen = { workspace = true }
+lance-select = { workspace = true }
 object_store = {workspace = true}
 tempfile = { workspace = true }
 tokio = { workspace = true }
