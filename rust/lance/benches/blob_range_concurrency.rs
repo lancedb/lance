@@ -44,6 +44,10 @@ type BenchResult<T> = Result<T, BenchError>;
 #[derive(Debug, Parser)]
 #[command(about = "Reproduce concurrent BlobFile range reads against object storage")]
 struct Cli {
+    /// Added automatically by `cargo bench` for custom harnesses.
+    #[arg(long = "bench", global = true, hide = true)]
+    _bench: bool,
+
     #[command(subcommand)]
     command: Command,
 }
