@@ -55,6 +55,7 @@ pub use codec::{
     CacheCodec, CacheCodecImpl, CacheDecode, CacheMissReason, MAGIC, has_cache_envelope,
 };
 pub use entry_io::{CacheEntryReader, CacheEntryWriter};
+pub use lance_cache_abi as dynamic_cache_abi;
 pub use moka::MokaCacheBackend;
 
 use std::borrow::Cow;
