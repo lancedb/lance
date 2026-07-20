@@ -27,7 +27,7 @@ message ChildRef {
   uint64 num_keys = 4;     // fragments in the subtree
   uint64 byte_size = 5;    // logical bytes of the child (leaf split/merge metric)
   uint32 height = 6;       // 0 = leaf, >0 = internal
-  uint32 fanout_used = 7;  // direct children of the child (0 for a leaf); internal split/merge metric
+  uint32 num_children = 7;  // direct children of the child (0 for a leaf); internal split/merge metric
 }
 
 // AddDataFile is the backfill / add-column action: attach a new DataFile to an
@@ -81,7 +81,7 @@ message BeTreeRoot {
   uint64 next_msn = 4;
   // Opaque serialized table schema.
   bytes schema_pb = 5;
-  // Config echoed so readers can interpret the tree (bytes / fanout targets).
-  uint64 target_node_bytes = 6;
-  uint32 fanout = 7;
+  // Config echoed so readers can interpret the tree (node-size + branching-factor limits).
+  uint64 max_node_bytes = 6;
+  uint32 max_children_per_node = 7;
 }

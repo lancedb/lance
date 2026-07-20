@@ -29,7 +29,7 @@ pub mod store;
 pub mod support;
 pub mod tree;
 
-pub use node::{BeTreeConfig, DEFAULT_FANOUT, DEFAULT_TARGET_NODE_BYTES};
+pub use node::{BeTreeConfig, DEFAULT_MAX_CHILDREN_PER_NODE, DEFAULT_MAX_NODE_BYTES};
 pub use tree::{BeTree, BootstrapStats, CommitStats};
 
 #[cfg(test)]
@@ -62,7 +62,7 @@ mod tests {
         .unwrap()
     }
 
-    /// A multi-column backfill over a multi-level Bε-tree grows leaves past B, so
+    /// A multi-column backfill over a multi-level Bε-tree grows leaves past max_node_bytes, so
     /// the tree must SPLIT — and still materialize the exact same fragment state
     /// as the flat manifest.
     #[tokio::test]
@@ -119,7 +119,7 @@ mod tests {
         }
         assert!(
             total_splits > 0,
-            "growing leaves past B should have split the tree"
+            "growing leaves past max_node_bytes should have split the tree"
         );
 
         // Materialized Bε-tree state == flat manifest state.
@@ -163,7 +163,7 @@ mod tests {
     async fn recursive_betree_merges_on_bulk_delete() {
         let n: u64 = 3_000;
         let f: u64 = 20;
-        // Small nodes + wide fanout: a shallow tree so removes reach leaves.
+        // Small nodes + wide branching factor: a shallow tree so removes reach leaves.
         let config = BeTreeConfig::new(4 * 1024, 32);
 
         let tempdir = TempObjDir::default();
@@ -219,8 +219,8 @@ mod tests {
         let f: u64 = 20;
         // Force the pathological case: tiny flush gate → leaves empty completely.
         let config = BeTreeConfig {
-            target_node_bytes: 4 * 1024,
-            fanout: 32,
+            max_node_bytes: 4 * 1024,
+            max_children_per_node: 32,
             min_flush_override: Some(64),
         };
 

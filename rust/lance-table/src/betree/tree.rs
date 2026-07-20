@@ -122,7 +122,7 @@ impl BeTree {
     }
 
     /// Bootstrap by *streaming* `num_fragments` fragments from `gen` (called with
-    /// ids 0..num_fragments, in order), packing them into ~0.5 B leaves without
+    /// ids 0..num_fragments, in order), packing them into ~0.5x-max_node_bytes leaves without
     /// ever holding the whole fragment list — this is what lets the tree reach
     /// billion-data-file scale (fat fragments) within a bounded memory budget.
     #[allow(clippy::too_many_arguments)]
@@ -167,10 +167,10 @@ impl BeTree {
         }
         let num_leaves = layer.len() as u64;
 
-        // Internal layers until the top fits under fanout.
-        while layer.len() as u32 > config.fanout {
+        // Internal layers until the top fits under max_children_per_node.
+        while layer.len() as u32 > config.max_children_per_node {
             let mut next: Vec<pb::ChildRef> = Vec::new();
-            for group in layer.chunks(config.fanout as usize) {
+            for group in layer.chunks(config.max_children_per_node as usize) {
                 let w = store.write_internal(group.to_vec(), Vec::new()).await?;
                 io += w.io_bytes;
                 next.push(w.child_ref);
@@ -210,8 +210,8 @@ impl BeTree {
             buffer: self.buffer.clone(),
             next_msn: self.next_msn,
             schema_pb: self.schema_pb.clone(),
-            target_node_bytes: self.config.target_node_bytes,
-            fanout: self.config.fanout,
+            max_node_bytes: self.config.max_node_bytes,
+            max_children_per_node: self.config.max_children_per_node,
         }
     }
 
@@ -242,7 +242,7 @@ impl BeTree {
         self.buffer = buffer;
 
         // Grow: if the root still overflows, split it and lift a new root over the pieces.
-        if self.children.len() as u32 > self.config.fanout
+        if self.children.len() as u32 > self.config.max_children_per_node
             || node::internal_logical_bytes(&self.children, &self.buffer)
                 >= self.config.split_ceiling()
         {
@@ -250,7 +250,7 @@ impl BeTree {
                 std::mem::take(&mut self.children),
                 std::mem::take(&mut self.buffer),
                 self.config.split_piece_bytes(),
-                self.config.fanout,
+                self.config.max_children_per_node,
             );
             let mut new_children = Vec::with_capacity(pieces.len());
             for (ch, buf) in pieces {
@@ -385,7 +385,7 @@ impl BeTree {
                 if children.is_empty() {
                     return Ok((vec![], acc));
                 }
-                if children.len() as u32 > self.config.fanout
+                if children.len() as u32 > self.config.max_children_per_node
                     || node::internal_logical_bytes(&children, &buffer)
                         >= self.config.split_ceiling()
                 {
@@ -394,7 +394,7 @@ impl BeTree {
                         children,
                         buffer,
                         self.config.split_piece_bytes(),
-                        self.config.fanout,
+                        self.config.max_children_per_node,
                     ) {
                         let w = self.store.write_internal(ch, buf).await?;
                         acc.io_bytes += w.io_bytes;
@@ -412,8 +412,8 @@ impl BeTree {
     }
 
     /// Coalesce runs of adjacent children when one underflows (leaf ≤ 0.25 B;
-    /// internal < fanout/4 children), bounded so the merged node stays valid
-    /// (leaves ≤ 0.6 B; internal ≤ fanout children). Reads/writes the merged
+    /// internal < max_children_per_node/4 children), bounded so the merged node stays valid
+    /// (leaves ≤ 0.6 B; internal ≤ max_children_per_node children). Reads/writes the merged
     /// node(s). Leaves concat fragments; internal nodes concat children + buffers.
     async fn merge_small_children(
         &self,
@@ -432,20 +432,20 @@ impl BeTree {
             let is_leaf = children[i].height == 0;
             let mut group = vec![children[i].clone()];
             let mut bytes = children[i].byte_size;
-            let mut fan = children[i].fanout_used;
+            let mut fan = children[i].num_children;
             let mut j = i + 1;
             while j < children.len() {
                 let c = &children[j];
                 let fits = if is_leaf {
                     bytes + c.byte_size <= self.config.coalesce_ceiling()
                 } else {
-                    fan + c.fanout_used <= self.config.fanout
+                    fan + c.num_children <= self.config.max_children_per_node
                 };
                 if !fits {
                     break;
                 }
                 bytes += c.byte_size;
-                fan += c.fanout_used;
+                fan += c.num_children;
                 group.push(c.clone());
                 j += 1;
             }
@@ -597,7 +597,7 @@ impl BeTree {
         let root = store.read_root(version).await?;
         let tree = Self {
             store,
-            config: BeTreeConfig::new(root.target_node_bytes, root.fanout),
+            config: BeTreeConfig::new(root.max_node_bytes, root.max_children_per_node),
             version: root.version,
             children: root.children,
             buffer: root.buffer,

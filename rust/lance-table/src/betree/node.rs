@@ -17,71 +17,80 @@ use crate::format::Fragment;
 use crate::format::pb::{self, fragment_action::Action};
 use lance_core::{Error, Result};
 
-pub const DEFAULT_TARGET_NODE_BYTES: u64 = 10 * 1024 * 1024;
-pub const DEFAULT_FANOUT: u32 = 16;
+pub const DEFAULT_MAX_NODE_BYTES: u64 = 10 * 1024 * 1024;
+pub const DEFAULT_MAX_CHILDREN_PER_NODE: u32 = 16;
 
-/// Bε-tree tuning knobs. The two independent knobs are the target node size `B`
-/// and the `fanout` (= B^ε); everything else — the flush gate, split pieces,
-/// merge floor — derives from them (byte-based, per the literature: ε=1/2,
-/// ~10 MiB nodes, fanout 16, split ≥ B into ~0.5 B pieces, merge ≤ 0.25 B).
+/// Bε-tree tuning knobs. There are exactly two independent knobs:
+///
+/// * `max_node_bytes` — the node-size limit (call it `B`): a node splits when its
+///   logical content exceeds this many bytes.
+/// * `max_children_per_node` — the branching factor (`B^ε` in the literature): an
+///   internal node splits when it points to more children than this, and merges
+///   below a quarter of it.
+///
+/// Everything else (the flush gate, split-piece size, merge floor) derives from
+/// those two. Defaults follow the literature: ε=1/2, ~10 MiB nodes,
+/// `max_children_per_node` = 16, split at `B` into ~0.5·B pieces, merge ≤ 0.25·B.
 #[derive(Debug, Clone)]
 pub struct BeTreeConfig {
-    /// Target node size `B`.
-    pub target_node_bytes: u64,
-    /// Max children of an internal node before it splits (`B^ε`).
-    pub fanout: u32,
+    /// Node-size limit `B`: a node splits when its logical bytes exceed this.
+    pub max_node_bytes: u64,
+    /// Branching factor: the max child pointers an internal node may hold before
+    /// it splits (it merges below `max_children_per_node / 4`).
+    pub max_children_per_node: u32,
     /// Optional override of the flush gate. `None` (the norm) derives it as
-    /// `B/fanout` — see [`Self::min_flush_bytes`].
+    /// `max_node_bytes / max_children_per_node` — see [`Self::min_flush_bytes`].
     pub min_flush_override: Option<u64>,
 }
 
 impl Default for BeTreeConfig {
     fn default() -> Self {
         Self {
-            target_node_bytes: DEFAULT_TARGET_NODE_BYTES,
-            fanout: DEFAULT_FANOUT,
+            max_node_bytes: DEFAULT_MAX_NODE_BYTES,
+            max_children_per_node: DEFAULT_MAX_CHILDREN_PER_NODE,
             min_flush_override: None,
         }
     }
 }
 
 impl BeTreeConfig {
-    /// Build a config from the two primary knobs (`B`, `fanout`); the flush gate
-    /// derives as `B/fanout`.
-    pub fn new(target_node_bytes: u64, fanout: u32) -> Self {
+    /// Build a config from the two primary knobs; the flush gate derives as
+    /// `max_node_bytes / max_children_per_node`.
+    pub fn new(max_node_bytes: u64, max_children_per_node: u32) -> Self {
         Self {
-            target_node_bytes,
-            fanout,
+            max_node_bytes,
+            max_children_per_node,
             min_flush_override: None,
         }
     }
 
-    /// A node splits when its logical bytes reach this.
+    /// A node splits when its logical bytes reach this (= `max_node_bytes`).
     pub fn split_ceiling(&self) -> u64 {
-        self.target_node_bytes
+        self.max_node_bytes
     }
-    /// Split output pieces target ~0.5 B (so a just-split node isn't near-full).
+    /// Split output pieces target ~0.5·`max_node_bytes` (so a just-split node isn't near-full).
     pub fn split_piece_bytes(&self) -> u64 {
-        self.target_node_bytes / 2
+        self.max_node_bytes / 2
     }
-    /// A node underflows (is a merge candidate) at ≤ 0.25 B.
+    /// A node underflows (is a merge candidate) at ≤ 0.25·`max_node_bytes`.
     pub fn merge_floor(&self) -> u64 {
-        self.target_node_bytes / 4
+        self.max_node_bytes / 4
     }
-    /// Adjacent children are coalesced while their combined bytes stay ≤ 0.6 B.
+    /// Adjacent children are coalesced while their combined bytes stay ≤ 0.6·`max_node_bytes`.
     pub fn coalesce_ceiling(&self) -> u64 {
-        self.target_node_bytes * 3 / 5
+        self.max_node_bytes * 3 / 5
     }
     /// The amortization gate: never flush a child slice smaller than this.
     ///
-    /// Derived as `B/fanout` — a full ε-buffer (~B) split across `fanout`
-    /// children leaves ~B/fanout in the fullest, so this is the natural "fair
-    /// share" threshold and it scales correctly with fanout. (A hardcoded B/16
-    /// silently assumed fanout 16: at higher fanout the buffer spreads thinner
-    /// than the gate, so flushes never fire and the tree degrades to split-only.)
+    /// Derived as `max_node_bytes / max_children_per_node` — a full ε-buffer split
+    /// across all children leaves that much in the fullest, so this is the natural
+    /// "fair share" threshold and it scales correctly with the branching factor.
+    /// (A hardcoded `B/16` silently assumed 16 children: at a higher branching
+    /// factor the buffer spreads thinner than the gate, so flushes never fire and
+    /// the tree degrades to split-only.)
     pub fn min_flush_bytes(&self) -> u64 {
         self.min_flush_override
-            .unwrap_or_else(|| self.target_node_bytes / self.fanout.max(1) as u64)
+            .unwrap_or_else(|| self.max_node_bytes / self.max_children_per_node.max(1) as u64)
     }
 }
 
@@ -146,7 +155,7 @@ pub fn leaf_ref(node_path: String, fragments: &[Fragment], byte_size: u64) -> pb
         num_keys: fragments.len() as u64,
         byte_size,
         height: 0,
-        fanout_used: 0,
+        num_children: 0,
     }
 }
 
@@ -161,17 +170,17 @@ pub fn internal_ref(node_path: String, children: &[pb::ChildRef], byte_size: u64
         num_keys,
         byte_size,
         height,
-        fanout_used: children.len() as u32,
+        num_children: children.len() as u32,
     }
 }
 
 /// Is this child underflowing (a merge candidate)? Leaves by bytes (≤ 0.25 B),
-/// internal nodes by direct-child count (< fanout/4).
+/// internal nodes by direct-child count (< max_children_per_node/4).
 pub fn is_underflow(child: &pb::ChildRef, config: &BeTreeConfig) -> bool {
     if child.height == 0 {
         child.byte_size <= config.merge_floor()
     } else {
-        child.fanout_used < (config.fanout / 4).max(1)
+        child.num_children < (config.max_children_per_node / 4).max(1)
     }
 }
 
@@ -245,7 +254,7 @@ pub fn buffer_bytes(buffer: &[pb::TaggedAction]) -> u64 {
 }
 
 /// Split a sorted fragment list into `⌈total/piece_bytes⌉` contiguous pieces of
-/// roughly equal bytes (~0.5 B each — no tiny tail, so no split-then-merge churn).
+/// roughly equal bytes (~0.5x-max_node_bytes each — no tiny tail, so no split-then-merge churn).
 pub fn split_leaf_fragments(fragments: Vec<Fragment>, piece_bytes: u64) -> Vec<Vec<Fragment>> {
     let total = leaf_logical_bytes(&fragments);
     let num_pieces = total.div_ceil(piece_bytes.max(1)).max(1) as usize;
@@ -272,18 +281,18 @@ pub fn split_leaf_fragments(fragments: Vec<Fragment>, piece_bytes: u64) -> Vec<V
 }
 
 /// Split an internal node's (children, buffer) into contiguous pieces of roughly
-/// equal size (≤ `piece_bytes` and ≤ `fanout` children each). The buffer follows
+/// equal size (≤ `piece_bytes` and ≤ `max_children_per_node` children each). The buffer follows
 /// its child by key range. Used when an internal node overflows.
 pub fn split_internal(
     children: Vec<pb::ChildRef>,
     buffer: Vec<pb::TaggedAction>,
     piece_bytes: u64,
-    fanout: u32,
+    max_children_per_node: u32,
 ) -> Vec<(Vec<pb::ChildRef>, Vec<pb::TaggedAction>)> {
-    // Enough pieces to satisfy both the byte and fanout ceilings, then cut evenly.
+    // Enough pieces to satisfy both the byte and max_children_per_node ceilings, then cut evenly.
     let total: u64 = children.iter().map(|c| c.byte_size).sum();
     let by_bytes = total.div_ceil(piece_bytes.max(1));
-    let by_fanout = (children.len() as u64).div_ceil(fanout.max(1) as u64);
+    let by_fanout = (children.len() as u64).div_ceil(max_children_per_node.max(1) as u64);
     let num_pieces = by_bytes.max(by_fanout).max(1) as usize;
     let target_bytes = total / num_pieces as u64;
     let target_count = children.len().div_ceil(num_pieces);

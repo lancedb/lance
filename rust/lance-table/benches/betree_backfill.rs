@@ -19,8 +19,8 @@
 //! - `BASE_URI`             s3://… / s3://…--x-s3 / local path. Default: temp dir.
 //! - `NUM_FRAGMENTS`        bootstrap fragment count (N). Default 5000.
 //! - `FRAGMENTS_PER_COMMIT` comma sweep of F. Default "10,100".
-//! - `NODE_SIZE_MB`         comma sweep of the Bε-tree target node size B in MiB (fractional ok). Default "4,10".
-//! - `FANOUT`               internal-node fanout (split above / merge below fanout/4). Default 16.
+//! - `NODE_SIZE_MB`         comma sweep of the node-size limit (max_node_bytes) in MiB (fractional ok). Default "4,10".
+//! - `FANOUT`               branching factor max_children_per_node (split above, merge below a quarter of it). Default 16.
 //! - `BETREE_COMMITS`       Bε-tree commits to run per config (M). Default 3000.
 //! - `FLAT_SAMPLE_COMMITS`  flat commits to sample. Default 20.
 //! - `S3_EXPRESS`           "true" for S3 Express directory buckets.
@@ -247,13 +247,13 @@ async fn run_betree(
     f: u64,
     m_commits: u64,
     node_bytes: u64,
-    fanout: u32,
+    max_children_per_node: u32,
 ) -> RunResult {
     let io = IOTracker::default();
     let (object_store, base, scheduler, cache) = build_store(uri, &io).await;
     let fragments: Vec<Fragment> = (0..n).map(make_fragment).collect();
 
-    let config = BeTreeConfig::new(node_bytes, fanout);
+    let config = BeTreeConfig::new(node_bytes, max_children_per_node);
     let (mut tree, boot) = BeTree::bootstrap(
         object_store.clone(),
         base.clone(),
@@ -284,7 +284,7 @@ async fn run_betree(
         height = stats.height;
     }
     println!(
-        "  [betree B={:.2} MiB, fanout {fanout}] {commits} commits: {flushes} flushes, {splits} splits, {merges} merges, height {height}",
+        "  [betree B={:.2} MiB, max_children_per_node {max_children_per_node}] {commits} commits: {flushes} flushes, {splits} splits, {merges} merges, height {height}",
         node_bytes as f64 / MIB as f64
     );
 
@@ -362,7 +362,7 @@ async fn run_scale(
     n: u64,
     base_files: u32,
     node_bytes: u64,
-    fanout: u32,
+    max_children_per_node: u32,
     backfill_columns: u32,
     f: u64,
 ) {
@@ -370,7 +370,7 @@ async fn run_scale(
     const MATERIALIZE_CAP: u64 = 150_000_000;
     let io = IOTracker::default();
     let (object_store, base, scheduler, cache) = build_store(uri, &io).await;
-    let config = BeTreeConfig::new(node_bytes, fanout);
+    let config = BeTreeConfig::new(node_bytes, max_children_per_node);
     let total_files = n * base_files as u64;
 
     let t0 = Instant::now();
@@ -480,13 +480,13 @@ async fn run_deep_flush(
     n: u64,
     base_files: u32,
     node_bytes: u64,
-    fanout: u32,
+    max_children_per_node: u32,
     f: u64,
     commits: u64,
 ) {
     let io = IOTracker::default();
     let (object_store, base, scheduler, cache) = build_store(uri, &io).await;
-    let config = BeTreeConfig::new(node_bytes, fanout);
+    let config = BeTreeConfig::new(node_bytes, max_children_per_node);
     let (mut tree, boot) = BeTree::bootstrap_generate(
         object_store.clone(),
         base.clone(),
@@ -500,7 +500,7 @@ async fn run_deep_flush(
     .await
     .expect("deep bootstrap");
     println!(
-        "  [B={:.0} MiB, fanout {fanout}] bootstrap {n} frags x {base_files} files: \
+        "  [B={:.0} MiB, max_children_per_node {max_children_per_node}] bootstrap {n} frags x {base_files} files: \
          {} leaves, height {}, {:.2} GiB",
         node_bytes as f64 / MIB as f64,
         boot.num_leaves,
@@ -581,7 +581,7 @@ fn bench_betree_backfill(c: &mut Criterion) {
     let n = env_u64("NUM_FRAGMENTS", 5000);
     let f_sweep = env_sweep_u64("FRAGMENTS_PER_COMMIT", "10,100");
     let node_sweep = env_sweep_f64("NODE_SIZE_MB", "4,10");
-    let fanout = env_usize("FANOUT", 16) as u32;
+    let max_children_per_node = env_usize("FANOUT", 16) as u32;
     let betree_commits = env_u64("BETREE_COMMITS", 3000);
     let flat_sample = env_u64("FLAT_SAMPLE_COMMITS", 20);
     let run_tag = &Uuid::new_v4().to_string()[..8];
@@ -596,7 +596,7 @@ fn bench_betree_backfill(c: &mut Criterion) {
         println!("=== recursive Bε-tree DEEP-FLUSH benchmark ===");
         println!(
             "base_uri={base_uri}\nN={n} base_files_per_fragment={base_files} node_size_sweep={node_sweep:?} MiB \
-             fanout={fanout} F={f} deep_flush_commits={deep_commits} run_tag={run_tag}\n"
+             max_children_per_node={max_children_per_node} F={f} deep_flush_commits={deep_commits} run_tag={run_tag}\n"
         );
         for &node_mib in &node_sweep {
             let uri = format!(
@@ -608,7 +608,7 @@ fn bench_betree_backfill(c: &mut Criterion) {
                 n,
                 base_files.max(2),
                 (node_mib * MIB as f64) as u64,
-                fanout,
+                max_children_per_node,
                 f,
                 deep_commits,
             ));
@@ -623,7 +623,7 @@ fn bench_betree_backfill(c: &mut Criterion) {
         println!("=== recursive Bε-tree AT-SCALE benchmark ===");
         println!(
             "base_uri={base_uri}\nN={n} base_files_per_fragment={base_files} node_size_sweep={node_sweep:?} MiB \
-             fanout={fanout} backfill_columns={backfill_columns} F={f} run_tag={run_tag}\n"
+             max_children_per_node={max_children_per_node} backfill_columns={backfill_columns} F={f} run_tag={run_tag}\n"
         );
         for &node_mib in &node_sweep {
             let uri = format!(
@@ -635,7 +635,7 @@ fn bench_betree_backfill(c: &mut Criterion) {
                 n,
                 base_files,
                 (node_mib * MIB as f64) as u64,
-                fanout,
+                max_children_per_node,
                 backfill_columns,
                 f,
             ));
@@ -647,7 +647,7 @@ fn bench_betree_backfill(c: &mut Criterion) {
     println!("=== recursive Bε-tree fine-grained backfill benchmark ===");
     println!("base_uri={base_uri}");
     println!(
-        "N={n} fragments_per_commit={f_sweep:?} node_size_sweep={node_sweep:?} MiB fanout={fanout} betree_commits={betree_commits} flat_sample={flat_sample} run_tag={run_tag}"
+        "N={n} fragments_per_commit={f_sweep:?} node_size_sweep={node_sweep:?} MiB max_children_per_node={max_children_per_node} betree_commits={betree_commits} flat_sample={flat_sample} run_tag={run_tag}"
     );
     println!();
 
@@ -672,7 +672,7 @@ fn bench_betree_backfill(c: &mut Criterion) {
                 f,
                 betree_commits,
                 node_bytes,
-                fanout,
+                max_children_per_node,
             ));
             print_result(&betree, n, f);
             let write_ratio = flat.full_backfill_write_bytes(n, f)
