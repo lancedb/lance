@@ -1862,7 +1862,7 @@ impl InvertedPartition {
         let token_file = store.open_index_file(&token_file_path(id)).await?;
         let tokens = TokenSet::load(token_file, token_set_format).await?;
         let invert_list_file = store.open_index_file(&posting_file_path(id)).await?;
-        let inverted_list = PostingListReader::try_new(invert_list_file, index_cache).await?;
+        let mut inverted_list = PostingListReader::try_new(invert_list_file, index_cache).await?;
         let docs_path = doc_file_path(id);
         let docs_reader = store.open_index_file(&docs_path).await?;
         let docs = PartitionDocuments::try_new(
@@ -1872,6 +1872,7 @@ impl InvertedPartition {
             frag_reuse_index,
             inverted_list.block_size() == MAX_POSTING_BLOCK_SIZE,
         )?;
+        inverted_list.modern_num_docs = Some(docs.len());
 
         Ok(Self {
             id,
@@ -2329,12 +2330,6 @@ impl InvertedPartition {
             .buffered(self.store.io_parallelism())
             .try_collect::<Vec<_>>()
             .await?;
-
-        if self.docs.modern().is_some() {
-            for (_, token, _, posting) in &loaded_postings {
-                validate_modern_posting_doc_ids(posting, token, num_docs)?;
-            }
-        }
 
         let needs_union = loaded_postings
             .windows(2)
@@ -2986,6 +2981,12 @@ pub struct PostingListReader {
     /// index or relying on persisted grouping metadata.
     grouping: PostingGrouping,
 
+    /// Modern postings contain dense DocIds into the partition document table.
+    /// Cache successful boundary validation per immutable token so repeated
+    /// queries do not decode the final posting block again.
+    modern_doc_id_validations: Option<Arc<[AtomicBool]>>,
+    modern_num_docs: Option<usize>,
+
     index_cache: WeakLanceCache,
 }
 
@@ -3059,7 +3060,16 @@ impl DeepSizeOf for PostingListReader {
                 })
                 .unwrap_or(0),
         };
-        metadata_size + self.grouping.deep_size_of_children(context)
+        let validation_size = self
+            .modern_doc_id_validations
+            .as_ref()
+            .map(|validations| {
+                validations
+                    .len()
+                    .saturating_mul(std::mem::size_of::<AtomicBool>())
+            })
+            .unwrap_or(0);
+        metadata_size + self.grouping.deep_size_of_children(context) + validation_size
     }
 }
 
@@ -3093,6 +3103,12 @@ impl PostingListReader {
 
         let is_legacy_layout = matches!(&metadata, PostingMetadata::LegacyV1 { .. });
         let grouping = PostingGrouping::for_reader(is_legacy_layout, reader.num_rows());
+        let modern_doc_id_validations = (!is_legacy_layout).then(|| {
+            (0..reader.num_rows())
+                .map(|_| AtomicBool::new(false))
+                .collect::<Vec<_>>()
+                .into()
+        });
 
         Ok(Self {
             reader,
@@ -3103,6 +3119,8 @@ impl PostingListReader {
             block_size,
             positions_layout,
             grouping,
+            modern_doc_id_validations,
+            modern_num_docs: None,
             index_cache: WeakLanceCache::from(index_cache),
         })
     }
@@ -3388,6 +3406,8 @@ impl PostingListReader {
                 .clone(),
         };
 
+        self.ensure_modern_posting_validated(token_id, &posting)?;
+
         if is_phrase_query && !posting.has_position() {
             // hit the cache and when the cache was populated, the positions column was not loaded
             let positions = self.read_positions(token_id).await?;
@@ -3395,6 +3415,26 @@ impl PostingListReader {
         }
 
         Ok(posting)
+    }
+
+    fn ensure_modern_posting_validated(&self, token_id: u32, posting: &PostingList) -> Result<()> {
+        let (Some(validations), Some(num_docs)) =
+            (&self.modern_doc_id_validations, self.modern_num_docs)
+        else {
+            return Ok(());
+        };
+        let validation = validations.get(token_id as usize).ok_or_else(|| {
+            Error::index(format!(
+                "modern FTS token id {token_id} is outside validation state [0, {})",
+                validations.len()
+            ))
+        })?;
+        if validation.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        validate_modern_posting_doc_ids(posting, &format!("token id {token_id}"), num_docs)?;
+        validation.store(true, Ordering::Release);
+        Ok(())
     }
 
     /// Map a token id to its cache group's row range `[start, end)`, or `None`
@@ -12232,6 +12272,61 @@ mod tests {
 
     fn posting_entries(posting: &PostingList) -> Vec<(u64, u32)> {
         posting.iter().map(|(doc, freq, _)| (doc, freq)).collect()
+    }
+
+    #[tokio::test]
+    async fn test_modern_posting_validation_is_cached_per_token() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
+        builder.tokens.add("term".to_owned());
+        let mut valid_builder = PostingListBuilder::new(false);
+        valid_builder.add(0, PositionRecorder::Count(1));
+        builder.posting_lists.push(valid_builder);
+        builder.docs.append(1000, 1);
+        builder.write(store.as_ref()).await.unwrap();
+
+        let reader = store.open_index_file(&posting_file_path(0)).await.unwrap();
+        let mut posting_reader = PostingListReader::try_new(reader, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        posting_reader.modern_num_docs = Some(1);
+        let validation = &posting_reader
+            .modern_doc_id_validations
+            .as_ref()
+            .expect("modern readers have per-token validation state")[0];
+        assert!(!validation.load(Ordering::Acquire));
+
+        let mut corrupt_builder = PostingListBuilder::new(false);
+        corrupt_builder.add(1, PositionRecorder::Count(1));
+        let corrupt_batch = corrupt_builder.to_batch(vec![1.0]).unwrap();
+        let corrupt_posting = PostingList::from_batch(&corrupt_batch, Some(1.0), Some(1)).unwrap();
+        let error = posting_reader
+            .ensure_modern_posting_validated(0, &corrupt_posting)
+            .unwrap_err();
+        assert!(matches!(error, Error::Index { .. }));
+        assert!(error.to_string().contains("DocId 1"));
+        assert!(error.to_string().contains("[0, 1)"));
+        assert!(!validation.load(Ordering::Acquire));
+
+        let first = posting_reader
+            .posting_list(0, false, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(posting_entries(&first), vec![(0, 1)]);
+        assert!(validation.load(Ordering::Acquire));
+
+        let second = posting_reader
+            .posting_list(0, false, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(posting_entries(&second), vec![(0, 1)]);
+        assert!(validation.load(Ordering::Acquire));
     }
 
     /// Runtime synthetic grouping must return correct posting lists for every
