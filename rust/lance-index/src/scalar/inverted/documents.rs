@@ -738,6 +738,27 @@ impl PartitionDocuments {
         }
     }
 
+    /// Resolve one DocId without I/O when the address projection is cached.
+    pub(crate) fn cached_address(&self, doc_id: DocId) -> Option<Result<u64>> {
+        if doc_id.as_usize() >= self.num_docs {
+            return Some(Err(corrupt_docs(
+                &self.path,
+                format!(
+                    "candidate DocId {} is outside [0, {})",
+                    doc_id.get(),
+                    self.num_docs
+                ),
+            )));
+        }
+        let projection = self.projection.get()?;
+        Some(projection.address(doc_id).ok_or_else(|| {
+            corrupt_docs(
+                &self.path,
+                format!("candidate DocId {} is not live", doc_id.get()),
+            )
+        }))
+    }
+
     /// Resolve final global top-k DocIds to current row addresses.
     pub(crate) async fn resolve_addresses(&self, doc_ids: &[DocId]) -> Result<Vec<u64>> {
         if doc_ids.is_empty() {
@@ -755,16 +776,12 @@ impl PartitionDocuments {
                 ));
             }
         }
-        if let Some(projection) = self.projection.get() {
+        if self.projection.get().is_some() {
             return doc_ids
                 .iter()
                 .map(|&doc_id| {
-                    projection.address(doc_id).ok_or_else(|| {
-                        corrupt_docs(
-                            &self.path,
-                            format!("candidate DocId {} is not live", doc_id.get()),
-                        )
-                    })
+                    self.cached_address(doc_id)
+                        .expect("checked address projection must remain cached")
                 })
                 .collect();
         }
@@ -1478,6 +1495,13 @@ mod tests {
             AddressDocIdLookup::Identity
         ));
         assert!(Arc::ptr_eq(&first_lookup, &second_lookup));
+        assert_eq!(
+            documents
+                .cached_address(DocId::new(1))
+                .expect("projection is cached")
+                .expect("document is live"),
+            20
+        );
         assert_eq!(counts.length_rows.load(Ordering::Relaxed), 3);
         assert_eq!(counts.address_rows.load(Ordering::Relaxed), 3);
     }

@@ -1213,6 +1213,31 @@ impl InvertedIndex {
         }
 
         let ranked = ranked.into_sorted_vec();
+        let mut cached_addresses = Vec::with_capacity(ranked.len());
+        let mut all_addresses_cached = true;
+        for Reverse(candidate) in &ranked {
+            let partition_ordinal = (candidate.row_id >> 32) as usize;
+            let doc_id = DocId::new(candidate.row_id as u32);
+            let documents = self.partitions[partition_ordinal]
+                .docs
+                .modern()
+                .expect("modern search only contains modern partition candidates");
+            match documents.cached_address(doc_id) {
+                Some(address) => cached_addresses.push(address?),
+                None => {
+                    all_addresses_cached = false;
+                    break;
+                }
+            }
+        }
+        if all_addresses_cached {
+            let scores = ranked
+                .into_iter()
+                .map(|Reverse(candidate)| candidate.score.0)
+                .collect();
+            return Ok((cached_addresses, scores));
+        }
+
         let mut addresses = vec![0_u64; ranked.len()];
         let mut by_partition = BTreeMap::<usize, Vec<(usize, DocId)>>::new();
         for (rank, Reverse(candidate)) in ranked.iter().enumerate() {
