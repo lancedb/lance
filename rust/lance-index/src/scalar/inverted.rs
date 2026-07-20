@@ -3,12 +3,12 @@
 
 pub mod builder;
 mod cache_codec;
+mod documents;
 mod encoding;
 mod impact;
 mod index;
 mod iter;
 pub mod json;
-mod lazy_docset;
 pub mod parser;
 pub mod query;
 mod scorer;
