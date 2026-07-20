@@ -6,11 +6,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use arrow_array::{ArrayRef, RecordBatch};
+use arrow_array::{Array, ArrayRef, RecordBatch, StructArray, make_array};
 
 use arrow_buffer::NullBuffer;
-use arrow_data::ArrayData;
-use arrow_schema::DataType;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use futures::StreamExt;
 use futures::stream::FuturesOrdered;
@@ -261,16 +259,20 @@ static WARNED_ON_UNSTABLE_API: AtomicBool = AtomicBool::new(false);
 /// null would read back unmasked and fail `StructArray::try_new` at decode
 /// time.
 pub(crate) fn verify_field_nullability(
-    arr: &ArrayData,
+    arr: &dyn Array,
     field: &Field,
     ancestor_nulls: Option<&NullBuffer>,
     allow_masked_child_nulls: bool,
 ) -> Result<()> {
-    if !field.nullable && arr.null_count() > 0 {
-        let unmasked_null_count = match (arr.nulls(), ancestor_nulls) {
-            // `union` marks a slot null if it is null in either input, so the
-            // count of nulls it adds on top of the mask is the count of nulls
-            // not covered by a null ancestor.
+    // Logical nulls, not the physical buffer: read-back validation
+    // (`StructArray::try_new`) uses `logical_nulls()`, and indirection types
+    // (dictionary, run-end, union) carry logical nulls with no physical buffer
+    // — e.g. a non-null key pointing at a null dictionary value. A physical-only
+    // check would accept data that then fails to read back.
+    let logical = arr.logical_nulls();
+    if !field.nullable {
+        let unmasked_null_count = match (logical.as_ref(), ancestor_nulls) {
+            (None, _) => 0,
             (Some(nulls), Some(mask)) => NullBuffer::union(Some(nulls), Some(mask))
                 .map(|combined| {
                     debug_assert!(
@@ -280,7 +282,7 @@ pub(crate) fn verify_field_nullability(
                     combined.null_count() - mask.null_count()
                 })
                 .unwrap_or(0),
-            _ => arr.null_count(),
+            (Some(nulls), None) => nulls.null_count(),
         };
         if unmasked_null_count > 0 {
             return Err(Error::invalid_input(format!(
@@ -290,18 +292,25 @@ pub(crate) fn verify_field_nullability(
         }
     }
 
-    if allow_masked_child_nulls && matches!(arr.data_type(), DataType::Struct(_)) {
-        let child_mask = NullBuffer::union(ancestor_nulls, arr.nulls());
-        for (child_field, child_arr) in field.children.iter().zip(arr.child_data()) {
-            // Struct child data is not sliced by the parent's offset; align it
-            // with the parent's validity window before recursing.
-            let child_arr = child_arr.slice(arr.offset(), arr.len());
-            verify_field_nullability(&child_arr, child_field, child_mask.as_ref(), true)?;
+    if let Some(struct_arr) = arr
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .filter(|_| allow_masked_child_nulls)
+    {
+        let child_mask = NullBuffer::union(ancestor_nulls, struct_arr.nulls());
+        for (child_field, child) in field.children.iter().zip(struct_arr.columns()) {
+            // Struct columns aren't sliced by the struct's own offset; align
+            // them with the parent's validity window before recursing.
+            let child = child.slice(struct_arr.offset(), struct_arr.len());
+            verify_field_nullability(child.as_ref(), child_field, child_mask.as_ref(), true)?;
         }
-    } else {
-        for (child_field, child_arr) in field.children.iter().zip(arr.child_data()) {
-            verify_field_nullability(child_arr, child_field, None, allow_masked_child_nulls)?;
-        }
+        return Ok(());
+    }
+
+    let data = arr.to_data();
+    for (child_field, child_data) in field.children.iter().zip(data.child_data()) {
+        let child = make_array(child_data.clone());
+        verify_field_nullability(child.as_ref(), child_field, None, allow_masked_child_nulls)?;
     }
 
     Ok(())
@@ -478,7 +487,7 @@ impl FileWriter {
             .iter()
             .zip(self.schema.as_ref().unwrap().fields.iter())
         {
-            verify_field_nullability(&col.to_data(), field, None, allow_masked_child_nulls)?;
+            verify_field_nullability(col.as_ref(), field, None, allow_masked_child_nulls)?;
         }
         Ok(())
     }
@@ -720,7 +729,7 @@ impl FileWriter {
             ));
         }
         verify_field_nullability(
-            &array.to_data(),
+            array.as_ref(),
             field,
             None,
             self.version().resolve() >= LanceFileVersion::V2_1,
@@ -1957,6 +1966,138 @@ mod tests {
             err.contains("non-null"),
             "expected nullability error, got: {err}"
         );
+    }
+
+    /// The check reasons about *logical* nulls, not physical ones — matching the
+    /// `StructArray::try_new` validation applied on read-back. A non-nullable
+    /// dictionary child whose key is non-null but points at a null dictionary
+    /// value carries a logical null with no physical null buffer on the keys;
+    /// if the parent struct does not mask that row it must be rejected at write
+    /// time, otherwise the file would be un-readable.
+    /// Reproduces the review finding on <https://github.com/lance-format/lance/pull/7844>.
+    #[tokio::test]
+    async fn test_logical_nulls_in_non_nullable_dictionary_child() {
+        use arrow_array::{Array, DictionaryArray, Int32Array, StructArray, types::Int32Type};
+        use arrow_buffer::NullBuffer;
+        use arrow_schema::Fields;
+
+        // Dictionary child `d`: values=[10, null], keys=[0, 1, null].
+        //   row 0 -> values[0]=10   (not null)
+        //   row 1 -> values[1]=null (LOGICAL null, key itself is non-null)
+        //   row 2 -> key null        (physical + logical null)
+        let values = Int32Array::from(vec![Some(10), None]);
+        let keys = Int32Array::from(vec![Some(0), Some(1), None]);
+        let dict = DictionaryArray::<Int32Type>::try_new(keys, Arc::new(values)).unwrap();
+
+        // The child is declared nullable *on the array* so Arrow will build it
+        // (StructArray::try_new is exactly the read-back validation we're
+        // reproducing — it rejects the non-nullable form outright). The writer's
+        // own schema below marks it non-null, which is what must be enforced.
+        let dict_type = dict.data_type().clone();
+        let batch_children = Fields::from(vec![ArrowField::new("d", dict_type.clone(), true)]);
+        // Parent struct validity [true, true, false]: masks row 2 only.
+        // Row 1's logical null is NOT masked -> must be rejected.
+        let position = StructArray::try_new(
+            batch_children.clone(),
+            vec![Arc::new(dict) as ArrayRef],
+            Some(NullBuffer::from(vec![true, true, false])),
+        )
+        .unwrap();
+        let batch_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "s",
+            DataType::Struct(batch_children),
+            true,
+        )]));
+        let batch =
+            RecordBatch::try_new(batch_schema, vec![Arc::new(position) as ArrayRef]).unwrap();
+
+        // Writer schema: child `d` is non-nullable.
+        let writer_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "s",
+            DataType::Struct(Fields::from(vec![ArrowField::new("d", dict_type, false)])),
+            true,
+        )]));
+        let lance_schema = LanceSchema::try_from(writer_schema.as_ref()).unwrap();
+
+        let fs = FsFixture::default();
+        let mut writer = FileWriter::try_new(
+            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            lance_schema,
+            FileWriterOptions {
+                format_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let err = writer.write_batch(&batch).await.unwrap_err();
+        assert!(
+            matches!(err, lance_core::Error::InvalidInput { .. }),
+            "expected InvalidInput (unmasked logical null), got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("non-null"),
+            "expected nullability error, got: {err}"
+        );
+    }
+
+    /// A non-nullable struct holding a *nullable* child that legitimately
+    /// contains nulls must be accepted: the child's nulls are its own right, not
+    /// a violation of the struct's non-nullability. Guards against folding a
+    /// child's logical nulls into the parent's node-level check.
+    #[tokio::test]
+    async fn test_non_null_struct_with_nullable_child_having_nulls() {
+        use crate::testing::read_lance_file;
+        use arrow_array::{Array, Int32Array, StructArray, cast::AsArray, types::Int32Type};
+        use arrow_schema::Fields;
+        use lance_encoding::decoder::FilterExpression;
+
+        // struct `s` (non-null) { id: i32 non-null, name: i32 NULLABLE with nulls }
+        let child_fields = Fields::from(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("name", DataType::Int32, true),
+        ]);
+        let ids = Int32Array::from(vec![1, 2, 3]);
+        let names = Int32Array::from(vec![Some(10), None, Some(30)]);
+        let s = StructArray::try_new(
+            child_fields.clone(),
+            vec![Arc::new(ids) as ArrayRef, Arc::new(names) as ArrayRef],
+            None, // struct itself is never null
+        )
+        .unwrap();
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "s",
+            DataType::Struct(child_fields),
+            false,
+        )]));
+        let lance_schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
+        let batch = RecordBatch::try_new(arrow_schema, vec![Arc::new(s) as ArrayRef]).unwrap();
+
+        let fs = FsFixture::default();
+        let mut writer = FileWriter::try_new(
+            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            lance_schema,
+            FileWriterOptions {
+                format_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        writer.write_batch(&batch).await.unwrap();
+        writer.add_schema_metadata("foo", "bar");
+        writer.finish().await.unwrap();
+
+        let batches = read_lance_file(
+            &fs,
+            Arc::<DecoderPlugins>::default(),
+            FilterExpression::no_filter(),
+        )
+        .await;
+        let s = batches[0].column(0).as_struct();
+        let names = s.column(1).as_primitive::<Int32Type>();
+        assert!(s.is_valid(0) && s.is_valid(1) && s.is_valid(2));
+        assert_eq!(names.value(0), 10);
+        assert!(names.is_null(1));
+        assert_eq!(names.value(2), 30);
     }
 
     /// The blocking read path applies the same projection-length validation as

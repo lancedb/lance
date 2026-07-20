@@ -143,7 +143,7 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
         for (col, field) in batch.columns().iter().zip(self.schema.fields.iter()) {
             // The legacy format does not encode struct validity, so masked
             // child nulls cannot roundtrip and stay rejected.
-            crate::writer::verify_field_nullability(&col.to_data(), field, None, false)?;
+            crate::writer::verify_field_nullability(col.as_ref(), field, None, false)?;
         }
         Ok(())
     }
