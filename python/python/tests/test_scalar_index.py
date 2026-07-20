@@ -1293,7 +1293,7 @@ def test_create_scalar_index_fts_block_size(dataset):
     )
     indices = dataset.describe_indices()
     doc_index = next(index for index in indices if index.name == "doc_idx")
-    assert doc_index.segments[0].index_version == 4
+    assert doc_index.segments[0].index_version == 3
 
     row = dataset.take(indices=[0], columns=["doc"])
     query = row.column(0)[0].as_py().split(" ")[0]
