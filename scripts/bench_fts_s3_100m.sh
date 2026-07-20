@@ -27,6 +27,7 @@ THROUGHPUT_ROUNDS=${LANCE_FTS_BENCH_THROUGHPUT_ROUNDS:-5}
 PREWARM_INDEX=${LANCE_FTS_BENCH_PREWARM_INDEX:-}
 PREWARM_POSITIONS=${LANCE_FTS_BENCH_PREWARM_POSITIONS:-false}
 INDEX_CACHE_SIZE_GIB=${LANCE_FTS_BENCH_INDEX_CACHE_SIZE_GIB:-}
+FILTER_STRIDE=${LANCE_FTS_BENCH_FILTER_STRIDE:-}
 
 REPO_ROOT=$(git rev-parse --show-toplevel)
 QUERY_FILE=${LANCE_FTS_BENCH_QUERY_FILE:-$REPO_ROOT/rust/examples/fts_100m_queries.txt}
@@ -71,6 +72,7 @@ cp "$QUERY_FILE" "$RUN_DIR/queries.txt"
   echo "prewarm_index=${PREWARM_INDEX:-unset}"
   echo "prewarm_positions=$PREWARM_POSITIONS"
   echo "index_cache_size_gib=${INDEX_CACHE_SIZE_GIB:-default}"
+  echo "filter_stride=${FILTER_STRIDE:-unset}"
   echo "baseline_commit=$BASELINE_COMMIT"
   echo "candidate_commit=$CANDIDATE_COMMIT"
   echo "aws_region=${AWS_REGION:-${AWS_DEFAULT_REGION:-unset}}"
@@ -117,6 +119,9 @@ elif [[ "$PREWARM_POSITIONS" != "false" ]]; then
 fi
 if [[ -n "$INDEX_CACHE_SIZE_GIB" ]]; then
   COMMON_ARGS+=(--index-cache-size-gib "$INDEX_CACHE_SIZE_GIB")
+fi
+if [[ -n "$FILTER_STRIDE" ]]; then
+  COMMON_ARGS+=(--filter-stride "$FILTER_STRIDE")
 fi
 
 run_benchmark() {
