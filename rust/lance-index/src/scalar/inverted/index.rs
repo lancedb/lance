@@ -89,12 +89,10 @@ use std::str::FromStr;
 // Version 0: Arrow TokenSetFormat (legacy)
 // Version 1: Fst TokenSetFormat with per-doc compressed positions
 // Version 2: Fst TokenSetFormat with shared posting-list position streams.
-// Version 3: Version 2 layout with 256-document physical posting blocks.
-// Version 4: Code analyzer support with configurable posting block sizes.
+// Version 3: Version 2 layout with configurable posting blocks and analyzer metadata.
 pub const INVERTED_INDEX_VERSION_V1: u32 = 1;
 pub const INVERTED_INDEX_VERSION_V2: u32 = 2;
 pub const INVERTED_INDEX_VERSION_V3: u32 = 3;
-pub const INVERTED_INDEX_VERSION_V4: u32 = 4;
 pub const TOKENS_FILE: &str = "tokens.lance";
 pub const INVERT_LIST_FILE: &str = "invert.lance";
 pub const DOCS_FILE: &str = "docs.lance";
@@ -149,7 +147,7 @@ pub fn resolve_fts_format_version(
 }
 
 pub fn default_fts_format_version() -> InvertedListFormatVersion {
-    InvertedListFormatVersion::V4
+    InvertedListFormatVersion::V2
 }
 
 pub fn current_fts_format_version() -> InvertedListFormatVersion {
@@ -157,16 +155,15 @@ pub fn current_fts_format_version() -> InvertedListFormatVersion {
 }
 
 pub fn max_supported_fts_format_version() -> InvertedListFormatVersion {
-    InvertedListFormatVersion::V4
+    InvertedListFormatVersion::V3
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum InvertedListFormatVersion {
     V1,
+    #[default]
     V2,
     V3,
-    #[default]
-    V4,
 }
 
 impl InvertedListFormatVersion {
@@ -202,26 +199,25 @@ impl InvertedListFormatVersion {
             Self::V1 => INVERTED_INDEX_VERSION_V1,
             Self::V2 => INVERTED_INDEX_VERSION_V2,
             Self::V3 => INVERTED_INDEX_VERSION_V3,
-            Self::V4 => INVERTED_INDEX_VERSION_V4,
         }
     }
 
     pub fn posting_tail_codec(self) -> PostingTailCodec {
         match self {
             Self::V1 => PostingTailCodec::Fixed32,
-            Self::V2 | Self::V3 | Self::V4 => PostingTailCodec::VarintDelta,
+            Self::V2 | Self::V3 => PostingTailCodec::VarintDelta,
         }
     }
 
     pub fn position_codec(self) -> Option<PositionStreamCodec> {
         match self {
             Self::V1 => None,
-            Self::V2 | Self::V3 | Self::V4 => Some(PositionStreamCodec::PackedDelta),
+            Self::V2 | Self::V3 => Some(PositionStreamCodec::PackedDelta),
         }
     }
 
     pub fn uses_shared_position_stream(self) -> bool {
-        matches!(self, Self::V2 | Self::V3 | Self::V4)
+        matches!(self, Self::V2 | Self::V3)
     }
 }
 
@@ -233,9 +229,8 @@ impl FromStr for InvertedListFormatVersion {
             "1" | "v1" | "V1" => Ok(Self::V1),
             "2" | "v2" | "V2" => Ok(Self::V2),
             "3" | "v3" | "V3" => Ok(Self::V3),
-            "4" | "v4" | "V4" => Ok(Self::V4),
             other => Err(Error::index(format!(
-                "unsupported FTS format version {}, expected 1, 2, 3, or 4",
+                "unsupported FTS format version {}, expected 1, 2, or 3",
                 other
             ))),
         }
@@ -246,7 +241,11 @@ pub fn default_fts_format_version_for_block_size(
     block_size: usize,
 ) -> Result<InvertedListFormatVersion> {
     validate_block_size(block_size)?;
-    Ok(InvertedListFormatVersion::V4)
+    match block_size {
+        LEGACY_BLOCK_SIZE => Ok(InvertedListFormatVersion::V2),
+        256 => Ok(InvertedListFormatVersion::V3),
+        _ => unreachable!("validate_block_size limits supported block sizes"),
+    }
 }
 
 pub fn validate_format_version_block_size(
@@ -256,17 +255,13 @@ pub fn validate_format_version_block_size(
     validate_block_size(block_size)?;
     match (format_version, block_size) {
         (InvertedListFormatVersion::V1 | InvertedListFormatVersion::V2, LEGACY_BLOCK_SIZE)
-        | (InvertedListFormatVersion::V3, 256)
-        | (InvertedListFormatVersion::V4, _) => Ok(()),
+        | (InvertedListFormatVersion::V3, _) => Ok(()),
         (InvertedListFormatVersion::V1 | InvertedListFormatVersion::V2, 256) => {
             Err(Error::invalid_input(format!(
                 "FTS format_version={} is incompatible with block_size=256; use format_version=3",
                 format_version.index_version()
             )))
         }
-        (InvertedListFormatVersion::V3, other) => Err(Error::invalid_input(format!(
-            "FTS format_version=3 requires block_size=256, got {other}"
-        ))),
         _ => unreachable!("validate_block_size limits supported block sizes"),
     }
 }
@@ -449,7 +444,8 @@ pub(super) fn parse_format_version_from_metadata(
 ) -> Result<InvertedListFormatVersion> {
     if let Some(value) = metadata.get(FTS_FORMAT_VERSION_KEY) {
         let format_version = InvertedListFormatVersion::from_str(value)?;
-        validate_format_version_block_size(format_version, parse_posting_block_size(metadata)?)?;
+        let block_size = parse_posting_block_size(metadata)?;
+        validate_format_version_block_size(format_version, block_size)?;
         return Ok(format_version);
     }
     let block_size = parse_posting_block_size(metadata)?;
@@ -1729,7 +1725,7 @@ impl InvertedPartition {
             num_docs,
             false,
             frag_reuse_index,
-            // V3 (256-doc block) partitions score with quantized doc lengths.
+            // 256-document blocks score with quantized document lengths.
             inverted_list.block_size() == MAX_POSTING_BLOCK_SIZE,
         ));
 
@@ -4942,7 +4938,7 @@ impl CompressedPostingList {
     }
 
     pub fn block_max_score(&self, block_idx: usize) -> f32 {
-        // 256-doc (V3) blocks store no per-block max score: their impact
+        // 256-document blocks store no per-block max score: their impact
         // skip data supplies the tight per-block bound, so callers on that
         // path never reach here. Fall back to the list-level max, which is
         // still a valid (looser) bound for any block.
@@ -6262,11 +6258,11 @@ impl Ord for RawDocInfo {
     }
 }
 
-/// Lucene SmallFloat-style doc-length quantization for V3 scoring and impact
+/// Lucene SmallFloat-style document-length quantization for 256-document-block scoring and impact
 /// norms: a 4-mantissa-bit float-like byte code. Values 0-7 are exact; larger
 /// values keep their top four significand bits (relative error <= 6.25%) and
 /// decode to their bucket floor. The floor only ever shortens a doc, so impact
-/// bounds remain conservative for exact-scoring V2 as well as quantized V3.
+/// bounds remain conservative for exact scoring as well as quantized scoring.
 pub(super) fn quantize_doc_length(value: u32) -> u8 {
     let num_bits = 32 - value.leading_zeros();
     if num_bits < 4 {
@@ -6381,7 +6377,7 @@ pub struct DocSet {
 
     total_tokens: u64,
 
-    // V3 (256-doc block) partitions score with quantized doc lengths: the
+    // 256-document-block partitions score with quantized document lengths: the
     // flag is set at partition load and the byte-norm slab bakes lazily on
     // first scoring use (shared by clones of the loaded set). 128-block
     // partitions never set the flag and keep exact scoring.
@@ -6697,13 +6693,13 @@ impl DocSet {
         self.num_tokens[doc_id as usize]
     }
 
-    /// Enable quantized doc-length scoring (V3 / 256-doc block partitions).
+    /// Enable quantized document-length scoring for 256-document-block partitions.
     pub fn set_quantized_scoring(&mut self, quantized: bool) {
         self.scoring_quantized = quantized;
     }
 
-    /// The quantized doc-length slab when this set scores quantized (V3
-    /// partitions), baked on first use; `None` for exact-scoring sets.
+    /// The quantized document-length slab when this set scores quantized,
+    /// baked on first use; `None` for exact-scoring sets.
     pub fn scoring_norms(&self) -> Option<&[u8]> {
         if !self.scoring_quantized {
             return None;
@@ -6720,8 +6716,8 @@ impl DocSet {
         )
     }
 
-    /// Doc length as scoring sees it: the quantized bucket floor for V3
-    /// partitions, the exact value otherwise.
+    /// Document length as scoring sees it: the quantized bucket floor for
+    /// 256-document-block partitions, the exact value otherwise.
     #[inline]
     pub fn scoring_num_tokens(&self, doc_id: u32) -> u32 {
         match self.scoring_norms() {
@@ -8034,10 +8030,10 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_fts_format_version_defaults_to_v4() {
+    fn test_resolve_fts_format_version_defaults_to_v2() {
         assert_eq!(
             resolve_fts_format_version(None).unwrap(),
-            InvertedListFormatVersion::V4
+            InvertedListFormatVersion::V2
         );
         assert_eq!(
             resolve_fts_format_version(Some("2")).unwrap(),
@@ -8047,10 +8043,7 @@ mod tests {
             resolve_fts_format_version(Some("3")).unwrap(),
             InvertedListFormatVersion::V3
         );
-        assert_eq!(
-            resolve_fts_format_version(Some("4")).unwrap(),
-            InvertedListFormatVersion::V4
-        );
+        assert!(resolve_fts_format_version(Some("4")).is_err());
     }
 
     #[test]
@@ -8753,8 +8746,6 @@ mod tests {
     #[case::v1(InvertedListFormatVersion::V1, LEGACY_BLOCK_SIZE)]
     #[case::v2(InvertedListFormatVersion::V2, LEGACY_BLOCK_SIZE)]
     #[case::v3(InvertedListFormatVersion::V3, 256)]
-    #[case::v4_128(InvertedListFormatVersion::V4, LEGACY_BLOCK_SIZE)]
-    #[case::v4_256(InvertedListFormatVersion::V4, 256)]
     #[tokio::test]
     async fn test_prewarm_streams_in_chunks_preserves_content(
         #[case] format_version: InvertedListFormatVersion,
@@ -11435,7 +11426,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_block_size_256_writes_v4_metadata_and_index_version() -> Result<()> {
+    async fn test_block_size_256_writes_v3_metadata_and_index_version() -> Result<()> {
         let src_dir = TempObjDir::default();
         let dest_dir = TempObjDir::default();
         let src_store = Arc::new(LanceIndexStore::new(
@@ -11451,7 +11442,7 @@ mod tests {
 
         let params = InvertedIndexParams::default().block_size(256)?;
         let format_version = params.resolved_format_version();
-        assert_eq!(format_version, InvertedListFormatVersion::V4);
+        assert_eq!(format_version, InvertedListFormatVersion::V3);
 
         let mut partition = InnerBuilder::new_with_format_version_and_block_size(
             0,
@@ -11474,17 +11465,17 @@ mod tests {
         write_test_metadata(&src_store, vec![0], params).await;
 
         let index = InvertedIndex::load(src_store, None, &LanceCache::no_cache()).await?;
-        assert_eq!(index.format_version(), InvertedListFormatVersion::V4);
-        assert_eq!(index.index_version(), INVERTED_INDEX_VERSION_V4);
+        assert_eq!(index.format_version(), InvertedListFormatVersion::V3);
+        assert_eq!(index.index_version(), INVERTED_INDEX_VERSION_V3);
 
         let created = index
             .update(empty_doc_stream(), dest_store.as_ref(), None)
             .await?;
-        assert_eq!(created.index_version, INVERTED_INDEX_VERSION_V4);
+        assert_eq!(created.index_version, INVERTED_INDEX_VERSION_V3);
 
         let updated = InvertedIndex::load(dest_store, None, &LanceCache::no_cache()).await?;
-        assert_eq!(updated.format_version(), InvertedListFormatVersion::V4);
-        assert_eq!(updated.index_version(), INVERTED_INDEX_VERSION_V4);
+        assert_eq!(updated.format_version(), InvertedListFormatVersion::V3);
+        assert_eq!(updated.index_version(), INVERTED_INDEX_VERSION_V3);
 
         Ok(())
     }
@@ -11542,9 +11533,8 @@ mod tests {
     #[rstest::rstest]
     #[case::v1(InvertedListFormatVersion::V1, LEGACY_BLOCK_SIZE)]
     #[case::v2(InvertedListFormatVersion::V2, LEGACY_BLOCK_SIZE)]
-    #[case::v3(InvertedListFormatVersion::V3, 256)]
-    #[case::v4_128(InvertedListFormatVersion::V4, LEGACY_BLOCK_SIZE)]
-    #[case::v4_256(InvertedListFormatVersion::V4, 256)]
+    #[case::v3_128(InvertedListFormatVersion::V3, LEGACY_BLOCK_SIZE)]
+    #[case::v3_256(InvertedListFormatVersion::V3, 256)]
     #[tokio::test]
     async fn test_merge_segments_preserves_format_version(
         #[case] format_version: InvertedListFormatVersion,

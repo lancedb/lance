@@ -2894,7 +2894,7 @@ mod tests {
     use lance_datagen::{BatchCount, ByteCount, Dimension, RowCount, array};
     use lance_index::pbold::BTreeIndexDetails;
     use lance_index::scalar::bitmap::BITMAP_LOOKUP_NAME;
-    use lance_index::scalar::inverted::INVERTED_INDEX_VERSION_V4;
+    use lance_index::scalar::inverted::INVERTED_INDEX_VERSION_V3;
     use lance_index::scalar::{
         BuiltinIndexType, FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams,
     };
@@ -5004,8 +5004,11 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::block_size_128(128)]
+    #[case::block_size_256(256)]
     #[tokio::test]
-    async fn test_optimize_empty_code_fts_index_preserves_params() {
+    async fn test_optimize_empty_code_fts_index_preserves_params(#[case] block_size: usize) {
         let dir = TempStrDir::default();
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int32, false),
@@ -5028,6 +5031,8 @@ mod tests {
         let params = InvertedIndexParams::default()
             .analyzer("code")
             .unwrap()
+            .block_size(block_size)
+            .unwrap()
             .split_identifiers(true)
             .preserve_original(false);
         dataset
@@ -5039,13 +5044,13 @@ mod tests {
 
         let indices = dataset.load_indices().await.unwrap();
         assert_eq!(indices.len(), 1);
-        assert_eq!(indices[0].index_version, INVERTED_INDEX_VERSION_V4 as i32);
+        assert_eq!(indices[0].index_version, INVERTED_INDEX_VERSION_V3 as i32);
 
         dataset.optimize_indices(&Default::default()).await.unwrap();
 
         let indices = dataset.load_indices().await.unwrap();
         assert_eq!(indices.len(), 1);
-        assert_eq!(indices[0].index_version, INVERTED_INDEX_VERSION_V4 as i32);
+        assert_eq!(indices[0].index_version, INVERTED_INDEX_VERSION_V3 as i32);
 
         let stats: serde_json::Value =
             serde_json::from_str(&dataset.index_statistics("code_idx").await.unwrap()).unwrap();

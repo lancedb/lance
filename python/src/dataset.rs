@@ -2583,7 +2583,7 @@ impl Dataset {
                             value.to_string()
                         } else {
                             return Err(PyValueError::new_err(
-                                "format_version must be 1, 2, 3, 4, 'v1', 'v2', 'v3', or 'v4'",
+                                "format_version must be 1, 2, 3, 'v1', 'v2', or 'v3'",
                             ));
                         };
                         let format_version = value
