@@ -28,6 +28,7 @@ PREWARM_INDEX=${LANCE_FTS_BENCH_PREWARM_INDEX:-}
 PREWARM_POSITIONS=${LANCE_FTS_BENCH_PREWARM_POSITIONS:-false}
 INDEX_CACHE_SIZE_GIB=${LANCE_FTS_BENCH_INDEX_CACHE_SIZE_GIB:-}
 FILTER_STRIDE=${LANCE_FTS_BENCH_FILTER_STRIDE:-}
+ALLOW_EMPTY=${LANCE_FTS_BENCH_ALLOW_EMPTY:-false}
 BINARY_CACHE_ROOT=${LANCE_FTS_BENCH_BINARY_CACHE_ROOT:-$OUTPUT_ROOT/binary-cache}
 
 REPO_ROOT=$(git rev-parse --show-toplevel)
@@ -74,6 +75,7 @@ cp "$QUERY_FILE" "$RUN_DIR/queries.txt"
   echo "prewarm_positions=$PREWARM_POSITIONS"
   echo "index_cache_size_gib=${INDEX_CACHE_SIZE_GIB:-default}"
   echo "filter_stride=${FILTER_STRIDE:-unset}"
+  echo "allow_empty=$ALLOW_EMPTY"
   echo "binary_cache_root=$BINARY_CACHE_ROOT"
   echo "baseline_commit=$BASELINE_COMMIT"
   echo "candidate_commit=$CANDIDATE_COMMIT"
@@ -130,6 +132,12 @@ if [[ -n "$INDEX_CACHE_SIZE_GIB" ]]; then
 fi
 if [[ -n "$FILTER_STRIDE" ]]; then
   COMMON_ARGS+=(--filter-stride "$FILTER_STRIDE")
+fi
+if [[ "$ALLOW_EMPTY" == "true" ]]; then
+  COMMON_ARGS+=(--allow-empty)
+elif [[ "$ALLOW_EMPTY" != "false" ]]; then
+  echo "LANCE_FTS_BENCH_ALLOW_EMPTY must be true or false" >&2
+  exit 2
 fi
 
 run_benchmark() {
