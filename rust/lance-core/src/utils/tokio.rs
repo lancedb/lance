@@ -60,6 +60,13 @@ fn parse_env_usize(name: &str, raw: &str, min: usize) -> Result<usize, String> {
     Ok(value)
 }
 
+/// Number of CPU cores held back for I/O and control tasks.
+///
+/// Overridable via the `LANCE_IO_CORE_RESERVATION` environment variable;
+/// defaults to `2` when unset. `0` is allowed (reserve nothing);
+/// [`get_num_compute_intensive_cpus`] subtracts this from the core count to
+/// size the compute pool. A non-integer value panics on first access with an
+/// error naming the variable.
 pub static IO_CORE_RESERVATION: LazyLock<usize> =
     LazyLock::new(|| match std::env::var("LANCE_IO_CORE_RESERVATION") {
         Ok(raw) => {
