@@ -1,0 +1,11 @@
+# Broad single-term, multi-term, and five-term OR queries for the 100M corpus.
+technology
+research
+climate change
+machine learning
+software data system
+technology research data development information
+government health education public policy
+business market company financial industry
+science energy climate environment research
+computer software data system information
