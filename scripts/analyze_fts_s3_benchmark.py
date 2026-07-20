@@ -101,10 +101,16 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("results", type=Path)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--phases",
+        nargs="+",
+        choices=("cold", "warm", "throughput"),
+        default=("cold", "warm", "throughput"),
+    )
     args = parser.parse_args()
 
     data: dict[tuple[str, str], list[dict[str, Any]]] = {}
-    for phase in ("cold", "warm", "throughput"):
+    for phase in args.phases:
         for variant in ("baseline", "candidate"):
             path = args.results / f"{phase}_{variant}.jsonl"
             if not path.is_file():
@@ -113,7 +119,7 @@ def main() -> int:
 
     parity_failures: list[dict[str, Any]] = []
     cutoff_ties: list[dict[str, Any]] = []
-    for phase in ("cold", "warm", "throughput"):
+    for phase in args.phases:
         by_variant: dict[str, dict[str, set[ParityResult]]] = {}
         raw_by_variant: dict[str, dict[str, set[CanonicalResult]]] = {}
         for variant in ("baseline", "candidate"):
@@ -159,7 +165,7 @@ def main() -> int:
                     )
 
     phases: dict[str, Any] = {}
-    for phase in ("cold", "warm", "throughput"):
+    for phase in args.phases:
         baseline = summarize(data[(phase, "baseline")])
         candidate = summarize(data[(phase, "candidate")])
         phases[phase] = {
