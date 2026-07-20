@@ -4339,6 +4339,7 @@ async fn merge_rejects_reserved_system_column_names(#[case] reserved_name: &str)
         .merge(right, "i", "i2")
         .await
         .expect_err("merge bringing in a reserved column name should fail");
+    assert!(matches!(&err, Error::InvalidInput { .. }), "{err:?}");
     assert!(
         err.to_string().contains("reserved name"),
         "unexpected merge error for {reserved_name}: {err}"

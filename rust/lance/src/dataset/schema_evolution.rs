@@ -2097,6 +2097,10 @@ mod test {
             .await
             .expect_err("add_columns with a reserved name should fail");
         assert!(
+            matches!(&add_err, Error::InvalidInput { .. }),
+            "{add_err:?}"
+        );
+        assert!(
             add_err.to_string().contains("reserved name"),
             "unexpected add_columns error for {reserved_name}: {add_err}"
         );
@@ -2106,6 +2110,10 @@ mod test {
             .alter_columns(&[ColumnAlteration::new("id".into()).rename(reserved_name.into())])
             .await
             .expect_err("alter_columns rename to a reserved name should fail");
+        assert!(
+            matches!(&rename_err, Error::InvalidInput { .. }),
+            "{rename_err:?}"
+        );
         assert!(
             rename_err.to_string().contains("reserved name"),
             "unexpected alter_columns error for {reserved_name}: {rename_err}"

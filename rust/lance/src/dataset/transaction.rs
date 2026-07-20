@@ -6712,6 +6712,7 @@ mod tests {
 
         let err = run_merge_build_manifest(&manifest, with_reserved)
             .expect_err("a newly introduced reserved name must be rejected");
+        assert!(matches!(&err, Error::InvalidInput { .. }), "{err:?}");
         assert!(
             err.to_string().contains("reserved name"),
             "unexpected error: {err}"
