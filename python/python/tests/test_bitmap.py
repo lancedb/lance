@@ -43,6 +43,7 @@ def test_construct_from_bitmap():
         pa.uint8(),
         pa.uint16(),
         pa.uint32(),
+        pa.uint64(),
     ],
 )
 def test_construct_from_pyarrow_array(arrow_type):
@@ -77,6 +78,16 @@ def test_construct_from_pyarrow_rejects_out_of_range():
         bitmap(arr)
 
 
+def test_construct_from_pyarrow_rejects_out_of_range_uint64():
+    # A u64 value that doesn't fit in u32 must be reported as its actual
+    # value, not silently wrapped (e.g. through a signed cast) into a
+    # misleading negative number.
+    huge = 2**64 - 1
+    arr = pa.array([huge], type=pa.uint64())
+    with pytest.raises(ValueError, match=str(huge)):
+        bitmap(arr)
+
+
 def test_len_iter_contains():
     b = bitmap([1, 2, 4])
     assert len(b) == 3
@@ -102,6 +113,17 @@ def test_equality():
     assert bitmap([1, 2, 3]) == {1, 2, 3}
     assert bitmap([1, 2, 3]) != bitmap([1, 2])
     assert bitmap([1, 2, 3]) != {1, 2}
+
+
+def test_equality_against_incompatible_type_is_false_not_error():
+    # Comparing to a value that isn't a Bitmap or an iterable of ints (e.g. a
+    # bare int) is simply unequal, matching normal Python `==` semantics —
+    # it must not raise just because the type differs.
+    b = bitmap([1, 2, 3])
+    assert (b == 5) is False
+    assert (b != 5) is True
+    assert (b == "not iterable") is False
+    assert (b != "not iterable") is True
 
 
 def test_repr():

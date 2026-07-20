@@ -195,7 +195,11 @@ impl<'py> IntoPyObject<'py> for PyLance<&DataReplacementGroup> {
 // Accept either a `Bitmap` (cheap `Arc` clone) or any other iterable of ints
 // (a `set`, `list`, etc.), collected in whatever order the iterable yields —
 // `RoaringBitmap` itself defines the canonical (ascending, deduplicated)
-// order, so there's no separate ordering contract to validate here.
+// order, so there's no separate ordering contract to validate here. Note
+// that a `RoaringBitmap` is a set: a caller-supplied iterable with a
+// duplicate offset silently collapses to one entry, so a caller relying on
+// a 1:1 offset-to-value-row mapping (see `DataOverlayFile.offsets` below)
+// must not repeat an offset.
 fn extract_bitmap(ob: &Bound<'_, PyAny>) -> PyResult<RoaringBitmap> {
     if let Ok(bitmap) = ob.extract::<PyBitmap>() {
         return Ok((*bitmap.0).clone());
@@ -203,6 +207,15 @@ fn extract_bitmap(ob: &Bound<'_, PyAny>) -> PyResult<RoaringBitmap> {
     ob.try_iter()?
         .map(|item| item?.extract::<u32>())
         .collect::<PyResult<RoaringBitmap>>()
+}
+
+// Extract `offsets` as a sparse (per-field) coverage: an iterable of
+// `Bitmap`s/int iterables, one per field.
+fn extract_sparse_bitmaps(offsets: &Bound<'_, PyAny>) -> PyResult<Vec<RoaringBitmap>> {
+    offsets
+        .try_iter()?
+        .map(|item| extract_bitmap(&item?))
+        .collect()
 }
 
 impl FromPyObject<'_, '_> for PyLance<DataOverlayFile> {
@@ -218,10 +231,7 @@ impl FromPyObject<'_, '_> for PyLance<DataOverlayFile> {
         // ints (e.g. they're themselves iterables), falling through to sparse.
         let coverage = if let Ok(bitmap) = extract_bitmap(&offsets) {
             OverlayCoverage::dense(bitmap)
-        } else if let Ok(per_field) = offsets
-            .try_iter()
-            .and_then(|it| it.map(|item| extract_bitmap(&item?)).collect())
-        {
+        } else if let Ok(per_field) = extract_sparse_bitmaps(&offsets) {
             OverlayCoverage::sparse(per_field)
         } else {
             return Err(PyValueError::new_err(

@@ -53,6 +53,14 @@ fn i64_to_u32(value: i64) -> PyResult<u32> {
     })
 }
 
+fn u64_to_u32(value: u64) -> PyResult<u32> {
+    u32::try_from(value).map_err(|_| {
+        PyValueError::new_err(format!(
+            "Bitmap values must fit in an unsigned 32-bit integer, got {value}"
+        ))
+    })
+}
+
 /// Read an integer pyarrow array's values into a `RoaringBitmap`, without
 /// going through per-value Python objects or an intermediate `Vec` — each
 /// arm collects straight from the array's native buffer into the bitmap.
@@ -87,7 +95,7 @@ fn bitmap_from_pyarrow(ob: &Bound<'_, PyAny>) -> PyResult<RoaringBitmap> {
             .as_primitive::<arrow::datatypes::UInt64Type>()
             .values()
             .iter()
-            .map(|v| i64_to_u32(*v as i64))
+            .map(|v| u64_to_u32(*v))
             .collect(),
         DataType::Int8 => array
             .as_primitive::<arrow::datatypes::Int8Type>()
@@ -132,6 +140,11 @@ impl PyBitmap {
         if let Ok(existing) = values.extract::<Self>() {
             return Ok(existing);
         }
+        // A pyarrow `Array` supports the `__arrow_c_array__` Arrow C Data
+        // Interface export directly; a `ChunkedArray` doesn't (it only
+        // supports the streaming `__arrow_c_stream__` form), so detect it by
+        // its `combine_chunks()` method and flatten it to a single `Array`
+        // first.
         if values.hasattr("combine_chunks")? {
             let combined = values.call_method0("combine_chunks")?;
             return Ok(Self::new(bitmap_from_pyarrow(&combined)?));
@@ -182,17 +195,23 @@ impl PyBitmap {
     }
 
     fn __richcmp__(&self, other: &Bound<'_, PyAny>, op: CompareOp) -> PyResult<bool> {
-        let other = if let Ok(other) = other.extract::<Self>() {
-            (*other.0).clone()
+        // A value that isn't a Bitmap or an iterable of ints (e.g. `5`) is
+        // simply unequal, matching `__contains__` and normal Python `==`
+        // semantics — it shouldn't raise just because the type differs.
+        let other_bitmap = if let Ok(other) = other.extract::<Self>() {
+            Some((*other.0).clone())
         } else {
-            other
-                .try_iter()?
-                .map(|item| item?.extract::<u32>())
-                .collect::<PyResult<RoaringBitmap>>()?
+            other.try_iter().ok().and_then(|it| {
+                it.map(|item| item?.extract::<u32>())
+                    .collect::<PyResult<RoaringBitmap>>()
+                    .ok()
+            })
         };
-        match op {
-            CompareOp::Eq => Ok(*self.0 == other),
-            CompareOp::Ne => Ok(*self.0 != other),
+        match (op, other_bitmap) {
+            (CompareOp::Eq, Some(other)) => Ok(*self.0 == other),
+            (CompareOp::Eq, None) => Ok(false),
+            (CompareOp::Ne, Some(other)) => Ok(*self.0 != other),
+            (CompareOp::Ne, None) => Ok(true),
             _ => Err(PyNotImplementedError::new_err(
                 "Only == and != are supported",
             )),
