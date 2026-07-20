@@ -549,6 +549,7 @@ mod tests {
                 file_size_bytes: CachedFileSize::new(100),
                 base_id: None,
             }],
+            overlays: vec![],
             deletion_file: None,
             row_id_meta: None,
             physical_rows: Some(10),
@@ -629,8 +630,11 @@ mod tests {
         assert_eq!(new_ds.manifest().version, 7);
         // Session should still be re-used
         // However, the dataset needs to be loaded and the read version checked out.
+        // The read version's manifest body is served from the session cache (it
+        // was cached when v1 was first created), so the checkout only pays the
+        // version-resolution head, not a manifest read.
         let io_stats = dataset.object_store.as_ref().io_stats_incremental();
-        assert_io_eq!(io_stats, read_iops, 4, "load dataset + check version");
+        assert_io_eq!(io_stats, read_iops, 3, "load dataset + check version");
         assert_io_eq!(io_stats, write_iops, 2, "write txn + manifest");
 
         // Commit transaction with URI and new session. Re-use the store

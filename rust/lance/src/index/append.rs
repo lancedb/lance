@@ -11,8 +11,8 @@ use lance_index::{
     optimize::OptimizeOptions,
     progress::NoopIndexBuildProgress,
     scalar::{
-        CreatedIndex, OldIndexDataFilter, ScalarIndex, inverted::InvertedIndex,
-        lance_format::LanceIndexStore,
+        CreatedIndex, OldIndexDataFilter, ScalarIndex, index_files_to_table,
+        inverted::InvertedIndex, lance_format::LanceIndexStore, table_files_to_index,
     },
 };
 use lance_select::{RowAddrTreeMap, RowSetOps};
@@ -592,7 +592,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 CreatedIndex {
                     index_details: vector_index_details_default(),
                     index_version: lance_index::IndexType::Vector.version() as u32,
-                    files,
+                    files: table_files_to_index(files),
                 },
             ))
         } else {
@@ -655,7 +655,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     // index_version <= our max supported version, so we can safely
                     // write the current library's version for this index type.
                     index_version: lance_index::IndexType::Vector.version() as u32,
-                    files,
+                    files: table_files_to_index(files),
                 },
             ))
         }
@@ -734,7 +734,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                         new_fragment_bitmap: dataset.fragment_bitmap.as_ref().clone(),
                         new_index_version: created_index.index_version as i32,
                         new_index_details: created_index.index_details,
-                        files: created_index.files,
+                        files: index_files_to_table(created_index.files),
                     }));
                 }
 
@@ -850,7 +850,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
         new_fragment_bitmap,
         new_index_version: created_index.index_version as i32,
         new_index_details: created_index.index_details,
-        files: created_index.files,
+        files: index_files_to_table(created_index.files),
     }))
 }
 
@@ -863,8 +863,10 @@ mod tests {
     use arrow::datatypes::{Float32Type, UInt32Type};
     use arrow_array::cast::AsArray;
     use arrow_array::{
-        FixedSizeListArray, Int32Array, RecordBatch, RecordBatchIterator, StringArray, UInt32Array,
+        ArrayRef, FixedSizeListArray, Int32Array, RecordBatch, RecordBatchIterator, StringArray,
+        UInt32Array,
     };
+    use arrow_buffer::{BooleanBufferBuilder, NullBuffer};
     use arrow_schema::{DataType, Field, Schema};
     use futures::TryStreamExt;
     use lance_arrow::FixedSizeListArrayExt;
@@ -1003,6 +1005,118 @@ mod tests {
             num_rows += index.num_rows();
         }
         assert_eq!(num_rows, 2000);
+    }
+
+    #[tokio::test]
+    async fn test_optimize_append_preserves_case_sensitive_nullable_vector_column() {
+        const DIM: usize = 64;
+        const ROWS: usize = 1000;
+
+        fn make_vectors(rows: usize, dim: usize, include_null: bool) -> FixedSizeListArray {
+            if include_null {
+                let mut nulls_builder = BooleanBufferBuilder::new(rows);
+                for row_idx in 0..rows {
+                    nulls_builder.append(row_idx != 0);
+                }
+                let nulls = NullBuffer::new(nulls_builder.finish());
+                FixedSizeListArray::try_new(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    dim as i32,
+                    Arc::new(generate_random_array(rows * dim)),
+                    Some(nulls),
+                )
+                .unwrap()
+            } else {
+                FixedSizeListArray::try_new_from_values(
+                    generate_random_array(rows * dim),
+                    dim as i32,
+                )
+                .unwrap()
+            }
+        }
+
+        fn make_batch(
+            schema: Arc<Schema>,
+            start_id: u32,
+            vectors: Arc<FixedSizeListArray>,
+        ) -> RecordBatch {
+            let columns: Vec<ArrayRef> = vec![
+                Arc::new(UInt32Array::from_iter_values(
+                    start_id..start_id + ROWS as u32,
+                )) as ArrayRef,
+                vectors as ArrayRef,
+            ];
+            RecordBatch::try_new(schema, columns).unwrap()
+        }
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let vector_type = DataType::FixedSizeList(
+            Arc::new(Field::new("item", DataType::Float32, true)),
+            DIM as i32,
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt32, false),
+            Field::new("VECTOR", vector_type, true),
+        ]));
+
+        let initial_vectors = Arc::new(make_vectors(ROWS, DIM, false));
+        let initial_batch = make_batch(schema.clone(), 0, initial_vectors);
+        let batches = RecordBatchIterator::new(std::iter::once(Ok(initial_batch)), schema.clone());
+        let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+
+        let params = VectorIndexParams::with_ivf_pq_params(
+            MetricType::L2,
+            IvfBuildParams::new(2),
+            PQBuildParams {
+                num_sub_vectors: 2,
+                ..Default::default()
+            },
+        );
+        dataset
+            .create_index(&["VECTOR"], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+
+        let appended_vectors = Arc::new(make_vectors(ROWS, DIM, true));
+        let query = appended_vectors.value(5);
+        let appended_batch = make_batch(schema.clone(), ROWS as u32, appended_vectors);
+        let batches = RecordBatchIterator::new(std::iter::once(Ok(appended_batch)), schema);
+        dataset.append(batches, None).await.unwrap();
+
+        let index_name = dataset.load_indices().await.unwrap()[0].name.clone();
+        assert!(
+            !dataset
+                .unindexed_fragments(&index_name)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+
+        let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        assert!(
+            dataset
+                .unindexed_fragments(&index_name)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let mut scanner = dataset.scan();
+        scanner
+            .nearest("VECTOR", query.as_primitive::<Float32Type>(), 10)
+            .unwrap();
+        let results = scanner.try_into_batch().await.unwrap();
+        assert_eq!(
+            results.num_rows(),
+            10,
+            "expected the requested k=10 nearest-neighbor results"
+        );
     }
 
     /// Regression: a second `OptimizeOptions::append()` call on a steady-state
@@ -1213,7 +1327,23 @@ mod tests {
         assert_eq!(results.num_rows(), 2);
         let mut id_arr = results["id"].as_primitive::<UInt32Type>().values().to_vec();
         id_arr.sort();
-        assert_eq!(id_arr, vec![0, 1000]);
+        // For exact indexes (e.g. IvfFlat) the top-2 nearest neighbors of the
+        // query vector are deterministic (id 0 in the first delta and id 1000
+        // in the second delta, since the same vector is duplicated across
+        // the two fragments). For approximate indexes (e.g. IvfPq, IvfHnswSq)
+        // the returned ids are not guaranteed to be exactly [0, 1000]; the key
+        // property this test verifies is that both delta indices are queried
+        // (i.e. one result comes from each delta), so we only assert that.
+        let is_approximate = !matches!(index_params.index_type(), IndexType::IvfFlat);
+        if is_approximate {
+            assert!(
+                id_arr[0] < TOTAL as u32 && id_arr[1] >= TOTAL as u32,
+                "expected one result from each delta index, got {:?}",
+                id_arr
+            );
+        } else {
+            assert_eq!(id_arr, vec![0, 1000]);
+        }
     }
 
     #[tokio::test]

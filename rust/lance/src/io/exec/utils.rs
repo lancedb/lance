@@ -421,10 +421,6 @@ impl ExecutionPlan for ReplayExec {
         "ReplayExec"
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn schema(&self) -> arrow_schema::SchemaRef {
         self.input.schema()
     }

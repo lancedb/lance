@@ -87,6 +87,25 @@ from .trace import capture_trace_events as capture_trace_events
 from .trace import shutdown_tracing as shutdown_tracing
 from .trace import trace_to_chrome as trace_to_chrome
 
+class MetricPoint:
+    name: str
+    kind: str
+    attributes: Dict[str, str]
+    value: Optional[float]
+    buckets: Optional[List[Tuple[str, int]]]
+    count: Optional[int]
+    sum: Optional[float]
+
+class MetricDescription:
+    name: str
+    kind: str
+    unit: Optional[str]
+    description: str
+
+def register_lance_metrics_recorder() -> bool: ...
+def lance_metrics_catalog() -> List[MetricDescription]: ...
+def snapshot_lance_metrics() -> List[MetricPoint]: ...
+
 class CleanupStats:
     bytes_removed: int
     old_versions: int
@@ -141,8 +160,15 @@ class PackedBlobWriter:
     def blob_id(self) -> int: ...
     @property
     def path(self) -> str: ...
+    @property
+    def field(self) -> pa.Field: ...
     def write_blob(self, data: bytes) -> None: ...
+    def write_blobs(
+        self,
+        payloads: Union[pa.BinaryArray, pa.LargeBinaryArray, pa.ChunkedArray],
+    ) -> None: ...
     def finish(self) -> List[BlobDescriptor]: ...
+    def finish_array(self, field_name: str) -> pa.StructArray: ...
 
 class DedicatedBlobWriter:
     @property
@@ -253,6 +279,7 @@ class LanceColumnStatistics:
 
 class _Session:
     def size_bytes(self) -> int: ...
+    def index_cache_size_bytes(self) -> int: ...
 
 class LanceBlobFile:
     def close(self): ...
@@ -470,7 +497,13 @@ class _Dataset:
         kwargs: Optional[Dict[str, Any]] = None,
     ): ...
     def drop_index(self, name: str): ...
-    def prewarm_index(self, name: str, *, with_position: bool = False): ...
+    def prewarm_index(
+        self,
+        name: str,
+        *,
+        with_position: bool = False,
+        index_segments: Optional[List[str]] = None,
+    ): ...
     def merge_index_metadata(
         self,
         index_uuid: str,
@@ -542,8 +575,13 @@ class _Dataset:
         index_name: str,
         partition_id: int,
         hamming_threshold: int,
+        index_segments: Optional[List[str]] = None,
     ) -> pa.RecordBatchReader: ...
-    def get_ivf_partition_info(self, index_name: str) -> List[dict]: ...
+    def get_ivf_partition_info(
+        self,
+        index_name: str,
+        index_segments: Optional[List[str]] = None,
+    ) -> List[dict]: ...
     def hamming_clustering_for_sample(
         self,
         column: str,
@@ -705,6 +743,7 @@ class _ShardSnapshot:
 class _ShardWriter:
     shard_id: str
     def put(self, data: Any) -> None: ...
+    def delete(self, keys: Any) -> None: ...
     def close(self) -> None: ...
     def stats(self) -> Dict[str, Any]: ...
     def memtable_stats(self) -> Dict[str, Any]: ...

@@ -4,6 +4,7 @@
 pub mod builder;
 mod cache_codec;
 mod encoding;
+mod impact;
 mod index;
 mod iter;
 pub mod json;
@@ -91,7 +92,7 @@ pub async fn build_global_bm25_scorer(
     let (mut total_tokens, mut num_docs, first_token_docs) =
         first_index.bm25_stats_for_terms(&terms).await?;
     let mut token_docs = HashMap::with_capacity(terms.len());
-    for (term, count) in terms.iter().cloned().zip(first_token_docs.into_iter()) {
+    for (term, count) in terms.iter().cloned().zip(first_token_docs) {
         token_docs.insert(term, count);
     }
 
@@ -100,7 +101,7 @@ pub async fn build_global_bm25_scorer(
             index.bm25_stats_for_terms(&terms).await?;
         total_tokens += segment_total_tokens;
         num_docs += segment_num_docs;
-        for (term, count) in terms.iter().zip(segment_token_docs.into_iter()) {
+        for (term, count) in terms.iter().zip(segment_token_docs) {
             *token_docs
                 .get_mut(term)
                 .expect("global scorer terms should already be initialized") += count;
@@ -146,6 +147,7 @@ impl InvertedIndexPlugin {
             }
         });
 
+        params.validate_format_version()?;
         let format_version = params.resolved_format_version();
         let details = pbold::InvertedIndexDetails::try_from(&params)?;
         let mut inverted_index =
@@ -211,7 +213,7 @@ impl BasicTrainer for InvertedIndexPlugin {
                 .into()))
         }
 
-        let params = serde_json::from_str::<InvertedIndexParams>(params)?;
+        let params = InvertedIndexParams::from_training_json(params)?;
         Ok(Box::new(InvertedIndexTrainingRequest::new(params)))
     }
 
@@ -266,7 +268,7 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
     }
 
     fn version(&self) -> u32 {
-        max_supported_fts_format_version().index_version()
+        INVERTED_INDEX_VERSION_V4
     }
 
     fn new_query_parser(
@@ -315,13 +317,43 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scalar::{BuiltinIndexType, ScalarIndexParams};
 
     #[test]
-    fn test_plugin_version_tracks_max_supported_format() {
+    fn test_plugin_version_tracks_current_index_version() {
         let plugin = InvertedIndexPlugin;
-        assert_eq!(
-            plugin.version(),
-            max_supported_fts_format_version().index_version()
-        );
+        assert_eq!(plugin.version(), INVERTED_INDEX_VERSION_V4);
+    }
+
+    #[test]
+    fn test_new_training_request_defaults_missing_block_size_to_128() {
+        let plugin = InvertedIndexPlugin;
+        let field = Field::new("text", DataType::Utf8, true);
+
+        let cases = [
+            (
+                ScalarIndexParams::for_builtin(BuiltinIndexType::Inverted),
+                false,
+            ),
+            (ScalarIndexParams::new("inverted".to_string()), false),
+            (
+                ScalarIndexParams::new("inverted".to_string())
+                    .with_params(&serde_json::json!({ "with_position": true })),
+                true,
+            ),
+        ];
+
+        for (params, expected_with_position) in cases {
+            let request = plugin
+                .new_training_request(params.params.as_deref().unwrap_or("{}"), &field)
+                .unwrap();
+            let request = request
+                .as_any()
+                .downcast_ref::<InvertedIndexTrainingRequest>()
+                .unwrap();
+
+            assert_eq!(request.parameters.posting_block_size(), DEFAULT_BLOCK_SIZE);
+            assert_eq!(request.parameters.has_positions(), expected_with_position);
+        }
     }
 }

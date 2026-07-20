@@ -35,8 +35,10 @@ byteorder.workspace = true
 bytes.workspace = true
 chrono.workspace = true
 futures.workspace = true
+goosefs-sdk = { workspace = true, optional = true }
 http.workspace = true
 log.workspace = true
+metrics = { workspace = true, optional = true }
 moka.workspace = true
 pin-project.workspace = true
 prost.workspace = true
@@ -60,6 +62,7 @@ rstest.workspace = true
 mock_instant.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tracing-mock = { workspace = true }
+metrics-util = { workspace = true }
 
 [[bench]]
 name = "scheduler"
@@ -67,13 +70,15 @@ harness = false
 
 [features]
 default = ["aws", "azure", "gcp"]
+metrics = ["dep:metrics"]
 gcs-test = []
 goosefs-test = []
 gcp = ["object_store/gcp", "dep:opendal", "opendal/services-gcs", "dep:object_store_opendal"]
 aws = ["object_store/aws", "dep:aws-config", "dep:aws-credential-types", "dep:opendal", "opendal/services-s3", "dep:object_store_opendal"]
 azure = ["object_store/azure", "dep:opendal", "opendal/services-azblob", "opendal/services-azdls", "dep:object_store_opendal"]
 oss = ["dep:opendal", "opendal/services-oss", "dep:object_store_opendal"]
-goosefs = ["dep:opendal", "opendal/services-goosefs", "dep:object_store_opendal"]
+# Pin goosefs-sdk until a release fixes the missing CString import in 0.1.6's Linux backend.
+goosefs = ["dep:goosefs-sdk", "dep:opendal", "opendal/services-goosefs", "dep:object_store_opendal"]
 tencent = ["dep:opendal", "opendal/services-cos", "dep:object_store_opendal"]
 huggingface = ["dep:opendal", "opendal/services-huggingface", "dep:object_store_opendal"]
 tos = ["dep:opendal", "opendal/services-tos", "dep:object_store_opendal"]

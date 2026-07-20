@@ -12,6 +12,7 @@ use crate::dataset::WriteMode::Overwrite;
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::{ManifestWriteConfig, write_manifest_file};
 use crate::session::Session;
+use crate::session::caches::ManifestKey;
 use crate::{Dataset, Error, Result};
 use lance_table::format::DataStorageFormat;
 
@@ -869,6 +870,76 @@ async fn test_load_manifest_iops() {
     // The manifest body is served from the cache instead of being read from storage.
     let io_stats = _dataset.object_store.as_ref().io_stats_incremental();
     assert_io_eq!(io_stats, read_iops, 1);
+}
+
+#[tokio::test]
+async fn test_checkout_removed_version_not_served_from_cache() {
+    let test_uri = TempStrDir::default();
+    let session = Arc::new(Session::default());
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "i",
+        DataType::Int32,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from_iter_values(0..10_i32))],
+    )
+    .unwrap();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+        &test_uri,
+        Some(WriteParams {
+            session: Some(session.clone()),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let version = dataset.manifest().version;
+    let location = dataset.manifest_location().clone();
+    let cache = session.metadata_cache.for_dataset(&dataset.uri);
+
+    assert!(
+        cache
+            .get_with_key(&ManifestKey {
+                version,
+                e_tag: location.e_tag.as_deref(),
+            })
+            .await
+            .is_some(),
+        "manifest should be cached after the write"
+    );
+    dataset.checkout_version(version).await.unwrap();
+
+    // Remove the version from storage, as cleanup (or a manual delete) would.
+    dataset.object_store.delete(&location.path).await.unwrap();
+
+    let resolved = dataset
+        .commit_handler
+        .resolve_version_location(&dataset.base, version, &dataset.object_store.inner)
+        .await
+        .unwrap();
+    assert!(
+        resolved.size.is_none(),
+        "resolving a removed version must fall back to a size-less location, got {:?}",
+        resolved.size
+    );
+
+    cache
+        .insert_with_key(
+            &ManifestKey {
+                version,
+                e_tag: None,
+            },
+            Arc::new(dataset.manifest().clone()),
+        )
+        .await;
+    assert!(
+        dataset.checkout_version(version).await.is_err(),
+        "checkout of a version removed from storage must not be served from cache"
+    );
 }
 
 #[rstest]

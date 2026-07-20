@@ -1402,6 +1402,20 @@ pub trait ScalarIndexLoader: Send + Sync {
         index_name: &str,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn ScalarIndex>>;
+
+    /// Translate an address-domain index result into the row-id domain
+    ///
+    /// Address-domain indices (see [`ScalarIndex::results_are_row_addresses`])
+    /// report matches as physical row addresses. The default returns `result`
+    /// unchanged, which is correct when addresses and row ids coincide (no
+    /// stable row ids). A dataset with stable row ids overrides this to remap
+    /// addresses to stable row ids via its per-fragment row-id sequences.
+    async fn row_addr_result_to_row_ids(
+        &self,
+        result: NullableIndexExprResult,
+    ) -> Result<NullableIndexExprResult> {
+        Ok(result)
+    }
 }
 
 /// This represents a search into a scalar index
@@ -1648,12 +1662,16 @@ impl std::fmt::Display for ScalarIndexExpr {
     }
 }
 
-impl From<SearchResult> for NullableIndexExprResult {
-    fn from(result: SearchResult) -> Self {
-        match result {
-            SearchResult::Exact(mask) => Self::exact(NullableRowAddrMask::AllowList(mask)),
-            SearchResult::AtMost(mask) => Self::at_most(NullableRowAddrMask::AllowList(mask)),
-            SearchResult::AtLeast(mask) => Self::at_least(NullableRowAddrMask::AllowList(mask)),
+fn search_result_to_nullable(result: SearchResult) -> NullableIndexExprResult {
+    match result {
+        SearchResult::Exact(mask) => {
+            NullableIndexExprResult::exact(NullableRowAddrMask::AllowList(mask))
+        }
+        SearchResult::AtMost(mask) => {
+            NullableIndexExprResult::at_most(NullableRowAddrMask::AllowList(mask))
+        }
+        SearchResult::AtLeast(mask) => {
+            NullableIndexExprResult::at_least(NullableRowAddrMask::AllowList(mask))
         }
     }
 }
@@ -1693,7 +1711,15 @@ impl ScalarIndexExpr {
                     .load_index(&search.column, &search.index_name, metrics)
                     .await?;
                 let search_result = index.search(search.query.as_ref(), metrics).await?;
-                Ok(search_result.into())
+                let result = search_result_to_nullable(search_result);
+                if index.results_are_row_addresses() {
+                    // Translate address-domain results to the row-id domain
+                    // before combining or scanning; otherwise stable-row-id
+                    // datasets silently drop matches (issue #7434).
+                    index_loader.row_addr_result_to_row_ids(result).await
+                } else {
+                    Ok(result)
+                }
             }
         }
     }
@@ -1838,7 +1864,7 @@ fn maybe_scalar(expr: &Expr, expected_type: &DataType) -> Option<ScalarValue> {
         // In this case we need to extract the value, apply the cast, and then test the casted value
         Expr::Cast(cast) => match cast.expr.as_ref() {
             Expr::Literal(value, _) => {
-                let casted = value.cast_to(&cast.data_type).ok()?;
+                let casted = value.cast_to(cast.field.data_type()).ok()?;
                 safe_coerce_scalar(&casted, expected_type)
             }
             _ => None,
@@ -2426,9 +2452,10 @@ mod tests {
         let state = ctx.state();
         let mut expr = state.create_logical_expr(expr, &df_schema).unwrap();
         if optimize {
-            let simplify_context = SimplifyContext::default()
+            let simplify_context = SimplifyContext::builder()
                 .with_schema(Arc::new(df_schema))
-                .with_query_execution_start_time(Some(Utc::now()));
+                .with_query_execution_start_time(Some(Utc::now()))
+                .build();
             let simplifier =
                 datafusion::optimizer::simplify_expressions::ExprSimplifier::new(simplify_context);
             expr = simplifier.simplify(expr).unwrap();
@@ -3302,9 +3329,10 @@ mod tests {
             .unwrap();
 
         // Apply DataFusion simplification (this may convert starts_with to LIKE)
-        let simplify_context = SimplifyContext::default()
+        let simplify_context = SimplifyContext::builder()
             .with_schema(Arc::new(df_schema))
-            .with_query_execution_start_time(Some(Utc::now()));
+            .with_query_execution_start_time(Some(Utc::now()))
+            .build();
         let simplifier =
             datafusion::optimizer::simplify_expressions::ExprSimplifier::new(simplify_context);
         let simplified_expr = simplifier.simplify(expr).unwrap();

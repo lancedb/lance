@@ -60,7 +60,7 @@ use roaring::RoaringBitmap;
 use rowids::get_row_id_index;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Debug;
 use std::num::NonZero;
 use std::ops::Range;
@@ -80,6 +80,7 @@ pub mod index;
 pub mod mem_wal;
 mod metadata;
 pub mod optimize;
+pub(crate) mod overlay;
 pub mod progress;
 pub mod refs;
 pub(crate) mod rowids;
@@ -227,6 +228,23 @@ impl From<&Manifest> for Version {
             metadata: m.summary().into(),
         }
     }
+}
+
+/// The transaction that produced a version of the dataset, along with the
+/// version's commit timestamp.
+///
+/// Returned by [`Dataset::read_version_transaction`], which reads this
+/// information directly from storage without checking out the version.
+#[derive(Debug, Clone)]
+pub struct VersionTransaction {
+    /// Version number.
+    pub version: u64,
+
+    /// Timestamp the version was committed, in UTC.
+    pub timestamp: DateTime<Utc>,
+
+    /// The transaction that produced this version, if one was recorded.
+    pub transaction: Option<Transaction>,
 }
 
 /// Customize read behavior of a dataset.
@@ -599,7 +617,7 @@ impl Dataset {
             return Ok(self.clone());
         }
 
-        let manifest = Self::load_manifest(
+        let manifest = Self::get_manifest(
             self.object_store.as_ref(),
             &manifest_location,
             &new_location.uri,
@@ -625,7 +643,7 @@ impl Dataset {
             self.object_store.clone(),
             new_location.path,
             new_location.uri,
-            Arc::new(manifest),
+            manifest,
             manifest_location,
             self.session.clone(),
             self.commit_handler.clone(),
@@ -723,6 +741,7 @@ impl Dataset {
             let ds_index_cache = session.index_cache.for_dataset(uri);
             let metadata_key = crate::session::index_caches::IndexMetadataKey {
                 version: manifest_location.version,
+                store_identity: &object_store.store_prefix,
             };
             ds_index_cache
                 .insert_with_key(&metadata_key, Arc::new(indices))
@@ -765,6 +784,11 @@ impl Dataset {
         uri: &str,
         session: &Session,
     ) -> Result<Arc<Manifest>> {
+        if manifest_location.size.is_none() {
+            return Ok(Arc::new(
+                Self::load_manifest(object_store, manifest_location, uri, session).await?,
+            ));
+        }
         let metadata_cache = session.metadata_cache.for_dataset(uri);
         let manifest_key = ManifestKey {
             version: manifest_location.version,
@@ -1181,27 +1205,9 @@ impl Dataset {
             return Ok(Some((*transaction).clone()));
         }
 
-        // Prefer inline transaction from manifest when available
-        let transaction = if let Some(pos) = self.manifest.transaction_section {
-            let reader = if let Some(size) = self.manifest_location.size {
-                self.object_store
-                    .open_with_size(&self.manifest_location.path, size as usize)
-                    .await?
-            } else {
-                self.object_store.open(&self.manifest_location.path).await?
-            };
-
-            let tx: pb::Transaction = read_message(reader.as_ref(), pos).await?;
-            Transaction::try_from(tx).map(Some)?
-        } else if let Some(path) = &self.manifest.transaction_file {
-            // Fallback: read external transaction file if present
-            let path = self.transactions_dir().join(path.as_str());
-            let data = self.object_store.inner.get(&path).await?.bytes().await?;
-            let transaction = lance_table::format::pb::Transaction::decode(data)?;
-            Transaction::try_from(transaction).map(Some)?
-        } else {
-            None
-        };
+        let transaction = self
+            .read_transaction_from_storage(&self.manifest, &self.manifest_location)
+            .await?;
 
         if let Some(tx) = transaction.as_ref() {
             self.metadata_cache
@@ -1211,13 +1217,134 @@ impl Dataset {
         Ok(transaction)
     }
 
+    /// Read the transaction recorded by `manifest` directly from storage,
+    /// without consulting or populating any session cache.
+    async fn read_transaction_from_storage(
+        &self,
+        manifest: &Manifest,
+        manifest_location: &ManifestLocation,
+    ) -> Result<Option<Transaction>> {
+        // Prefer inline transaction from manifest when available
+        if let Some(pos) = manifest.transaction_section {
+            let reader = match manifest_location.size {
+                Some(size) => {
+                    self.object_store
+                        .open_with_size(&manifest_location.path, size as usize)
+                        .await?
+                }
+                None => self.object_store.open(&manifest_location.path).await?,
+            };
+
+            // A concurrent overwrite can leave the listed size too small; retry
+            // once with the true size.
+            let tx: pb::Transaction = match read_message(reader.as_ref(), pos).await {
+                Err(e)
+                    if manifest_location.size.is_some()
+                        && e.to_string().contains("file size is too small") =>
+                {
+                    let reader = self.object_store.open(&manifest_location.path).await?;
+                    read_message(reader.as_ref(), pos).await?
+                }
+                other => other?,
+            };
+            Transaction::try_from(tx).map(Some)
+        } else if let Some(path) = &manifest.transaction_file {
+            // Fallback: read external transaction file if present
+            let path = self.transactions_dir().join(path.as_str());
+            let data = self.object_store.inner.get(&path).await?.bytes().await?;
+            let transaction = lance_table::format::pb::Transaction::decode(data)?;
+            Transaction::try_from(transaction).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Read the transaction (if any) and commit timestamp of a version of the
+    /// dataset. `version` is a version number on this dataset's current branch.
+    ///
+    /// Reads the version's manifest transiently: no historical `Dataset` is
+    /// constructed, no `IndexSection` is decoded, and no session cache is read
+    /// or written, so scanning many historical versions does not fill the
+    /// shared caches.
+    ///
+    /// Returns an error if the version does not exist (for example, if it has
+    /// been cleaned up).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # async fn example(dataset: &Dataset) -> Result<()> {
+    /// let record = dataset.read_version_transaction(5).await?;
+    /// let committed_at = record.timestamp;
+    /// let operation = record.transaction.as_ref().map(|t| t.operation.name());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn read_version_transaction(&self, version: u64) -> Result<VersionTransaction> {
+        // Resolve against this dataset's current branch.
+        let manifest_location = self
+            .commit_handler
+            .resolve_version_location(&self.base, version, &self.object_store.inner)
+            .await?;
+
+        // Keep the DatasetNotFound variant callers expect for a missing version.
+        let manifest = read_manifest(
+            &self.object_store,
+            &manifest_location.path,
+            manifest_location.size,
+        )
+        .await
+        .map_err(|e| match &e {
+            Error::NotFound { uri, .. } => Error::dataset_not_found(uri.clone(), box_error(e)),
+            _ => e,
+        })?;
+
+        // The resolved manifest must belong to this dataset's branch. A
+        // mismatch means the commit handler resolved against a different chain
+        // (for example an external manifest store that ignores
+        // branch-qualified paths); error loudly rather than hand back another
+        // branch's transaction.
+        if manifest.branch != self.manifest.branch {
+            return Err(Error::internal(format!(
+                "reading version {} on branch '{}' resolved a manifest belonging to branch '{}'",
+                version,
+                refs::normalize_branch(self.manifest.branch.as_deref()),
+                refs::normalize_branch(manifest.branch.as_deref()),
+            )));
+        }
+
+        let transaction = self
+            .read_transaction_from_storage(&manifest, &manifest_location)
+            .await?;
+
+        Ok(VersionTransaction {
+            version: manifest.version,
+            timestamp: manifest.timestamp(),
+            transaction,
+        })
+    }
+
     /// Read the transaction file for this version of the dataset.
     ///
     /// If there was no transaction file written for this version of the dataset
     /// then this will return None.
+    ///
+    /// Does not populate the session caches; see
+    /// [`Self::read_version_transaction`].
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # async fn example(dataset: &Dataset) -> Result<()> {
+    /// let transaction = dataset.read_transaction_by_version(5).await?;
+    /// let operation = transaction.as_ref().map(|t| t.operation.name());
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn read_transaction_by_version(&self, version: u64) -> Result<Option<Transaction>> {
-        let dataset_version = self.checkout_version(version).await?;
-        dataset_version.read_transaction().await
+        Ok(self.read_version_transaction(version).await?.transaction)
     }
 
     /// List transactions for the dataset, up to a maximum number.
@@ -1711,26 +1838,7 @@ impl Dataset {
                     ));
                 }
 
-                let selected_fragment_ids = fragment_ids.iter().copied().collect::<BTreeSet<_>>();
-                let selected_fragments = self
-                    .get_fragments()
-                    .into_iter()
-                    .filter(|fragment| selected_fragment_ids.contains(&(fragment.id() as u32)))
-                    .collect::<Vec<_>>();
-
-                if selected_fragments.len() != selected_fragment_ids.len() {
-                    let present_fragment_ids = selected_fragments
-                        .iter()
-                        .map(|fragment| fragment.id() as u32)
-                        .collect::<HashSet<_>>();
-                    let missing_fragment_ids = selected_fragment_ids
-                        .into_iter()
-                        .filter(|fragment_id| !present_fragment_ids.contains(fragment_id))
-                        .collect::<Vec<_>>();
-                    return Err(Error::invalid_input(format!(
-                        "Dataset::sample received fragment ids that are not part of the current dataset version: {missing_fragment_ids:?}",
-                    )));
-                }
+                let selected_fragments = self.get_fragments_from_ids(fragment_ids)?;
 
                 let num_rows = stream::iter(selected_fragments.iter().cloned())
                     .map(|fragment| async move { fragment.count_rows(None).await })
@@ -2304,6 +2412,13 @@ impl Dataset {
         }
     }
 
+    /// The `ObjectStoreParams` this dataset was opened with, or `None` when
+    /// opened without explicit params. Lets a caller re-open a derived path
+    /// (e.g. a MemWAL flushed generation) with the same store this dataset used.
+    pub fn store_params(&self) -> Option<&ObjectStoreParams> {
+        self.store_params.as_deref()
+    }
+
     pub(crate) async fn object_store_for_data_file(
         &self,
         data_file: &DataFile,
@@ -2540,37 +2655,108 @@ impl Dataset {
         &self.manifest.fragments
     }
 
-    // Gets a filtered list of fragments from ids in O(N) time instead of using
-    // `get_fragment` which would require O(N^2) time.
-    pub fn get_frags_from_ordered_ids(&self, ordered_ids: &[u32]) -> Vec<Option<FileFragment>> {
-        let mut fragments = Vec::with_capacity(ordered_ids.len());
-        let mut id_iter = ordered_ids.iter();
-        let mut id = id_iter.next();
-        // This field is just used to assert the ids are in order
-        let mut last_id: i64 = -1;
-        for frag in self.manifest.fragments.iter() {
-            let mut the_id = if let Some(id) = id { *id } else { break };
-            // Assert the given ids are, in fact, in order
-            assert!(the_id as i64 > last_id);
-            // For any IDs we've passed we can assume that no fragment exists any longer
-            // with that ID.
-            while the_id < frag.id as u32 {
-                fragments.push(None);
-                last_id = the_id as i64;
-                id = id_iter.next();
-                the_id = if let Some(id) = id { *id } else { break };
-            }
+    pub(crate) fn normalize_fragment_ids(fragment_ids: &[u32]) -> Vec<u32> {
+        let mut ids = fragment_ids.to_vec();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
 
-            if the_id == frag.id as u32 {
-                fragments.push(Some(FileFragment::new(
-                    Arc::new(self.clone()),
-                    frag.clone(),
-                )));
-                last_id = the_id as i64;
-                id = id_iter.next();
-            }
+    pub(crate) fn get_fragments_from_ids(&self, fragment_ids: &[u32]) -> Result<Vec<FileFragment>> {
+        let ordered_ids = Self::normalize_fragment_ids(fragment_ids);
+        let fragments = self.get_frags_from_ordered_ids(&ordered_ids);
+        if let Some(missing_id) = fragments
+            .iter()
+            .zip(ordered_ids.iter())
+            .find_map(|(fragment, fragment_id)| fragment.is_none().then_some(*fragment_id))
+        {
+            return Err(Error::invalid_input(format!(
+                "Unknown fragment id {missing_id} in fragment filter; not part of the current dataset version"
+            )));
         }
-        fragments
+
+        Ok(fragments.into_iter().flatten().collect())
+    }
+
+    pub(crate) fn get_existing_fragments_from_ids(
+        &self,
+        fragment_ids: &[u32],
+    ) -> Vec<FileFragment> {
+        let ordered_ids = Self::normalize_fragment_ids(fragment_ids);
+        self.get_frags_from_ordered_ids(&ordered_ids)
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
+    pub(crate) fn get_fragment_metadata_from_ids(
+        &self,
+        fragment_ids: &[u32],
+    ) -> Result<Vec<Fragment>> {
+        Ok(self
+            .get_fragments_from_ids(fragment_ids)?
+            .into_iter()
+            .map(|fragment| fragment.metadata().clone())
+            .collect())
+    }
+
+    pub(crate) fn get_existing_fragment_metadata_from_ids(
+        &self,
+        fragment_ids: &[u32],
+    ) -> Vec<Fragment> {
+        self.get_existing_fragments_from_ids(fragment_ids)
+            .into_iter()
+            .map(|fragment| fragment.metadata().clone())
+            .collect()
+    }
+
+    pub(crate) async fn count_rows_in_fragments(&self, fragment_ids: &[u32]) -> Result<usize> {
+        let fragments = self.get_fragments_from_ids(fragment_ids)?;
+        self.count_rows_in_resolved_fragments(fragments).await
+    }
+
+    pub(crate) async fn count_rows_in_existing_fragments(
+        &self,
+        fragment_ids: &[u32],
+    ) -> Result<usize> {
+        let fragments = self.get_existing_fragments_from_ids(fragment_ids);
+        self.count_rows_in_resolved_fragments(fragments).await
+    }
+
+    async fn count_rows_in_resolved_fragments(
+        &self,
+        fragments: Vec<FileFragment>,
+    ) -> Result<usize> {
+        let counts = stream::iter(fragments)
+            .map(|fragment| async move { fragment.count_rows(None).await })
+            .buffer_unordered(16)
+            .try_collect::<Vec<_>>()
+            .await?;
+        Ok(counts.iter().sum())
+    }
+
+    /// Resolves fragments for the given ids without scanning the manifest.
+    ///
+    /// The ids do not need to be sorted or deduplicated. Each id is resolved
+    /// independently via the fragment bitmap.
+    pub fn get_frags_from_ordered_ids(&self, ordered_ids: &[u32]) -> Vec<Option<FileFragment>> {
+        let dataset = Arc::new(self.clone());
+        ordered_ids
+            .iter()
+            .map(|id| {
+                if !self.fragment_bitmap.contains(*id) {
+                    return None;
+                }
+                let fragment_index = self.fragment_bitmap.rank(*id) as usize - 1;
+                let fragment = self.manifest.fragments.get(fragment_index)?;
+                debug_assert_eq!(
+                    fragment.id, *id as u64,
+                    "fragment_bitmap rank({id}) resolved to fragment {}, but fragment_bitmap and manifest.fragments are expected to stay in sync",
+                    fragment.id
+                );
+                Some(FileFragment::new(dataset.clone(), fragment.clone()))
+            })
+            .collect()
     }
 
     // This method filters deleted items from `addr_or_ids` using `addrs` as a reference
@@ -2774,7 +2960,7 @@ impl Dataset {
                     self.manifest_location.path.clone(),
                     format!(
                         "Duplicate index id {} found in dataset {:?}",
-                        &index.uuid, self.base
+                        index.uuid, self.base
                     ),
                 ));
             }

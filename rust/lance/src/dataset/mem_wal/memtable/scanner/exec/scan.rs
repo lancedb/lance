@@ -3,7 +3,6 @@
 
 //! MemTableScanExec - Full table scan with MVCC visibility filtering.
 
-use std::any::Any;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
@@ -194,10 +193,6 @@ impl ExecutionPlan for MemTableScanExec {
         "MemTableScanExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.output_schema.clone()
     }
@@ -339,14 +334,14 @@ impl ExecutionPlan for MemTableScanExec {
         )))
     }
 
-    fn partition_statistics(&self, _partition: Option<usize>) -> DataFusionResult<Statistics> {
+    fn partition_statistics(&self, _partition: Option<usize>) -> DataFusionResult<Arc<Statistics>> {
         // Report statistics as Absent to avoid DataFusion analysis bugs
         // with selectivity calculation on in-memory tables.
-        Ok(Statistics {
+        Ok(Arc::new(Statistics {
             num_rows: Precision::Absent,
             total_byte_size: Precision::Absent,
             column_statistics: vec![],
-        })
+        }))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {

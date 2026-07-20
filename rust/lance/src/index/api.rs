@@ -167,6 +167,25 @@ pub trait DatasetIndexExt {
         ))
     }
 
+    /// Prewarm selected physical segments of an index by name.
+    async fn prewarm_index_segments(&self, _name: &str, _segment_ids: &[Uuid]) -> Result<()> {
+        Err(Error::not_supported(
+            "segment-level prewarm is not supported by this dataset implementation".to_owned(),
+        ))
+    }
+
+    /// Prewarm selected physical segments of an index by name with additional options.
+    async fn prewarm_index_segments_with_options(
+        &self,
+        _name: &str,
+        _segment_ids: &[Uuid],
+        _options: &PrewarmOptions,
+    ) -> Result<()> {
+        Err(Error::not_supported(
+            "prewarm options are not supported by this dataset implementation".to_owned(),
+        ))
+    }
+
     /// Read all indices of this Dataset version.
     ///
     /// The indices are lazy loaded and cached in memory within the `Dataset` instance.

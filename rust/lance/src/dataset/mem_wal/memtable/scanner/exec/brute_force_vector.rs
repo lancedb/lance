@@ -11,7 +11,6 @@
 //! or new rows in the window between commit and next memtable rotation), this
 //! exec keeps KNN correct by computing exact distances row-by-row.
 
-use std::any::Any;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
@@ -426,10 +425,6 @@ impl ExecutionPlan for MemTableBruteForceVectorExec {
         "MemTableBruteForceVectorExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.output_schema.clone()
     }
@@ -466,12 +461,12 @@ impl ExecutionPlan for MemTableBruteForceVectorExec {
         )))
     }
 
-    fn partition_statistics(&self, _partition: Option<usize>) -> DataFusionResult<Statistics> {
-        Ok(Statistics {
+    fn partition_statistics(&self, _partition: Option<usize>) -> DataFusionResult<Arc<Statistics>> {
+        Ok(Arc::new(Statistics {
             num_rows: Precision::Exact(self.query.k),
             total_byte_size: Precision::Absent,
             column_statistics: vec![],
-        })
+        }))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {

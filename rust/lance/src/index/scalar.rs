@@ -11,7 +11,7 @@ pub(crate) mod inverted;
 pub(crate) mod label_list;
 pub(crate) mod zonemap;
 
-pub use inverted::{load_segment_details, load_segments};
+pub use inverted::{load_segment_details, load_segment_params, load_segments};
 
 pub use crate::index::scalar_logical::{LogicalScalarIndex, load_named_scalar_segments};
 
@@ -35,6 +35,7 @@ use lance_core::datatypes::Field;
 use lance_core::utils::tracing::{IO_TYPE_OPEN_SCALAR, TRACE_IO_EVENTS};
 use lance_core::{Error, ROW_ADDR, ROW_ID, Result};
 use lance_datafusion::exec::LanceExecutionOptions;
+use lance_index::frag_reuse::FragReuseIndexHandle;
 use lance_index::metrics::{MetricsCollector, NoOpMetricsCollector};
 use lance_index::pbold::{
     BTreeIndexDetails, BitmapIndexDetails, InvertedIndexDetails, LabelListIndexDetails,
@@ -460,7 +461,7 @@ pub async fn open_scalar_index(
         .for_index(&index.uuid, frag_reuse_index.as_ref().map(|f| &f.uuid));
 
     let frag_reuse_index: Option<Arc<dyn RowIdRemapper>> =
-        frag_reuse_index.map(|f| f as Arc<dyn RowIdRemapper>);
+        frag_reuse_index.map(|f| Arc::new(FragReuseIndexHandle(f)) as Arc<dyn RowIdRemapper>);
 
     // Runs only on a cold miss, and at most once even under concurrent opens
     // (the plugin coalesces). The compat check lives here because a warm hit was
@@ -2302,6 +2303,72 @@ mod tests {
         assert_eq!(
             count_banana_rows, 0,
             "Should have 0 rows with value='banana' after deletion"
+        );
+    }
+
+    // End-to-end: create index → delete a whole fragment → search (via index) →
+    // update index → search again.  No deleted rows should ever appear.
+    #[tokio::test]
+    async fn test_zonemap_search_with_deleted_fragment_before_and_after_update() {
+        use arrow::datatypes::Int32Type;
+        use lance_datagen::array;
+        use lance_index::IndexType;
+        use lance_index::optimize::OptimizeOptions;
+        use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
+
+        // 3 fragments × 10 rows: id 0-9 (frag 0), 10-19 (frag 1), 20-29 (frag 2).
+        let mut ds = lance_datagen::gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(3), FragmentRowCount::from(10))
+            .await
+            .unwrap();
+
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap);
+        ds.create_index(&["id"], IndexType::Scalar, None, &params, false)
+            .await
+            .unwrap();
+
+        // Delete the middle fragment entirely.
+        ds.delete("id >= 10 AND id < 20").await.unwrap();
+
+        // Helper: run a filter scan and return the sorted id values.
+        async fn live_ids(ds: &crate::Dataset) -> Vec<i32> {
+            let batch = ds
+                .scan()
+                .filter("id >= 0")
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            let mut ids: Vec<i32> = batch["id"]
+                .as_any()
+                .downcast_ref::<arrow_array::Int32Array>()
+                .unwrap()
+                .values()
+                .to_vec();
+            ids.sort_unstable();
+            ids
+        }
+
+        // --- Before index update ---
+        let ids = live_ids(&ds).await;
+        assert_eq!(ids.len(), 20, "expected 20 live rows before index update");
+        assert!(
+            ids.iter().all(|&id| !(10..20).contains(&id)),
+            "deleted fragment rows (id 10-19) must not appear before index update; got: {:?}",
+            ids
+        );
+
+        // Update the zone map index to reflect the deletion.
+        ds.optimize_indices(&OptimizeOptions::new()).await.unwrap();
+
+        // --- After index update ---
+        let ids = live_ids(&ds).await;
+        assert_eq!(ids.len(), 20, "expected 20 live rows after index update");
+        assert!(
+            ids.iter().all(|&id| !(10..20).contains(&id)),
+            "deleted fragment rows (id 10-19) must not appear after index update; got: {:?}",
+            ids
         );
     }
 }

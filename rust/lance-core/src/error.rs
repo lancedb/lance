@@ -8,6 +8,52 @@ use snafu::{IntoError as _, Location, Snafu};
 
 type BoxedError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
+#[cfg(feature = "backtrace")]
+mod backtrace_support {
+    use std::backtrace::Backtrace;
+
+    use snafu::{AsBacktrace, GenerateImplicitData};
+
+    #[derive(Debug)]
+    pub struct MaybeBacktrace(pub Option<Backtrace>);
+
+    impl GenerateImplicitData for MaybeBacktrace {
+        fn generate() -> Self {
+            Self(<Option<Backtrace>>::generate())
+        }
+    }
+
+    impl AsBacktrace for MaybeBacktrace {
+        fn as_backtrace(&self) -> Option<&Backtrace> {
+            self.0.as_ref()
+        }
+    }
+}
+
+#[cfg(not(feature = "backtrace"))]
+mod backtrace_support {
+    use std::backtrace::Backtrace;
+
+    use snafu::{AsBacktrace, GenerateImplicitData};
+
+    #[derive(Debug)]
+    pub struct MaybeBacktrace;
+
+    impl GenerateImplicitData for MaybeBacktrace {
+        fn generate() -> Self {
+            Self
+        }
+    }
+
+    impl AsBacktrace for MaybeBacktrace {
+        fn as_backtrace(&self) -> Option<&Backtrace> {
+            None
+        }
+    }
+}
+
+use backtrace_support::MaybeBacktrace;
+
 /// Error for when a requested field is not found in a schema.
 ///
 /// This error computes suggestions lazily (only when displayed) to avoid
@@ -81,18 +127,24 @@ pub enum Error {
         source: BoxedError,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("Dataset already exists: {uri}, {location}"))]
     DatasetAlreadyExists {
         uri: String,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("Append with different schema: {difference}, location: {location}"))]
     SchemaMismatch {
         difference: String,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("Dataset at path {path} was not found: {source}, {location}"))]
     DatasetNotFound {
@@ -100,6 +152,8 @@ pub enum Error {
         source: BoxedError,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("Encountered corrupt file {path}: {source}, {location}"))]
     CorruptFile {
@@ -107,13 +161,16 @@ pub enum Error {
         source: BoxedError,
         #[snafu(implicit)]
         location: Location,
-        // TODO: add backtrace?
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("Not supported: {source}, {location}"))]
     NotSupported {
         source: BoxedError,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("Commit conflict for version {version}: {source}, {location}"))]
     CommitConflict {
@@ -121,12 +178,16 @@ pub enum Error {
         source: BoxedError,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("Incompatible transaction: {source}, {location}"))]
     IncompatibleTransaction {
         source: BoxedError,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("Retryable commit conflict for version {version}: {source}, {location}"))]
     RetryableCommitConflict {
@@ -134,12 +195,16 @@ pub enum Error {
         source: BoxedError,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("Too many concurrent writers. {message}, {location}"))]
     TooMuchWriteContention {
         message: String,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("Operation timed out: {message}, {location}"))]
     Timeout {
@@ -154,54 +219,72 @@ pub enum Error {
         message: String,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("A prerequisite task failed: {message}, {location}"))]
     PrerequisiteFailed {
         message: String,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("Unprocessable: {message}, {location}"))]
     Unprocessable {
         message: String,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("LanceError(Arrow): {message}, {location}"))]
     Arrow {
         message: String,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("LanceError(Schema): {message}, {location}"))]
     Schema {
         message: String,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("Not found: {uri}, {location}"))]
     NotFound {
         uri: String,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("LanceError(IO): {source}, {location}"))]
     IO {
         source: BoxedError,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("LanceError(Index): {message}, {location}"))]
     Index {
         message: String,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("Lance index not found: {identity}, {location}"))]
     IndexNotFound {
         identity: String,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("Cannot infer storage location from: {message}"))]
     InvalidTableLocation { message: String },
@@ -209,21 +292,28 @@ pub enum Error {
     Stop,
     #[snafu(display("Wrapped error: {error}, {location}"))]
     Wrapped {
+        #[snafu(source)]
         error: BoxedError,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("Cloned error: {message}, {location}"))]
     Cloned {
         message: String,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("Query Execution error: {message}, {location}"))]
     Execution {
         message: String,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("Ref is invalid: {message}"))]
     InvalidRef { message: String },
@@ -242,12 +332,16 @@ pub enum Error {
         minor_version: u16,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     #[snafu(display("Namespace error: {source}, {location}"))]
     Namespace {
         source: BoxedError,
         #[snafu(implicit)]
         location: Location,
+        #[snafu(implicit)]
+        backtrace: MaybeBacktrace,
     },
     /// External error passed through from user code.
     ///
@@ -283,6 +377,65 @@ pub enum Error {
 }
 
 impl Error {
+    /// Returns the captured Rust backtrace, if available.
+    ///
+    /// Requires the `backtrace` feature to be enabled at compile time
+    /// and `RUST_BACKTRACE=1` at runtime.
+    #[cfg(feature = "backtrace")]
+    pub fn backtrace(&self) -> Option<&std::backtrace::Backtrace> {
+        match self {
+            Self::InvalidInput { backtrace, .. }
+            | Self::DatasetAlreadyExists { backtrace, .. }
+            | Self::SchemaMismatch { backtrace, .. }
+            | Self::DatasetNotFound { backtrace, .. }
+            | Self::CorruptFile { backtrace, .. }
+            | Self::NotSupported { backtrace, .. }
+            | Self::CommitConflict { backtrace, .. }
+            | Self::IncompatibleTransaction { backtrace, .. }
+            | Self::RetryableCommitConflict { backtrace, .. }
+            | Self::TooMuchWriteContention { backtrace, .. }
+            | Self::Internal { backtrace, .. }
+            | Self::PrerequisiteFailed { backtrace, .. }
+            | Self::Unprocessable { backtrace, .. }
+            | Self::Arrow { backtrace, .. }
+            | Self::Schema { backtrace, .. }
+            | Self::NotFound { backtrace, .. }
+            | Self::IO { backtrace, .. }
+            | Self::Index { backtrace, .. }
+            | Self::IndexNotFound { backtrace, .. }
+            | Self::Wrapped { backtrace, .. }
+            | Self::Cloned { backtrace, .. }
+            | Self::Execution { backtrace, .. }
+            | Self::VersionConflict { backtrace, .. }
+            | Self::Namespace { backtrace, .. } => {
+                use snafu::AsBacktrace;
+                backtrace.as_backtrace()
+            }
+            // Variants without a backtrace field — listed explicitly so that
+            // adding a new variant with a backtrace field triggers a compiler error.
+            Self::InvalidTableLocation { .. }
+            | Self::Stop
+            | Self::InvalidRef { .. }
+            | Self::RefConflict { .. }
+            | Self::RefNotFound { .. }
+            | Self::Cleanup { .. }
+            | Self::VersionNotFound { .. }
+            | Self::External { .. }
+            | Self::FieldNotFound { .. }
+            | Self::Timeout { .. }
+            | Self::DiskCapExceeded { .. }
+            | Self::Fenced { .. } => None,
+        }
+    }
+
+    /// Returns the captured Rust backtrace, if available.
+    ///
+    /// Always returns `None` when the `backtrace` feature is not enabled.
+    #[cfg(not(feature = "backtrace"))]
+    pub fn backtrace(&self) -> Option<&std::backtrace::Backtrace> {
+        None
+    }
+
     #[track_caller]
     pub fn corrupt_file(path: object_store::path::Path, message: impl Into<String>) -> Self {
         CorruptFileSnafu { path }.into_error(message.into().into())
@@ -367,9 +520,20 @@ impl Error {
         NotFoundSnafu { uri: uri.into() }.build()
     }
 
+    /// Return whether this error or one of its typed sources is a missing object.
+    pub fn is_not_found(&self) -> bool {
+        match self {
+            Self::NotFound { .. } => true,
+            Self::IO { source, .. } | Self::Wrapped { error: source, .. } => {
+                error_source_is_not_found(source.as_ref())
+            }
+            _ => false,
+        }
+    }
+
     #[track_caller]
     pub fn wrapped(error: BoxedError) -> Self {
-        WrappedSnafu { error }.build()
+        WrappedSnafu.into_error(error)
     }
 
     #[track_caller]
@@ -548,6 +712,17 @@ impl Error {
     }
 }
 
+fn error_source_is_not_found(source: &(dyn std::error::Error + 'static)) -> bool {
+    if let Some(error) = source.downcast_ref::<Error>() {
+        return error.is_not_found();
+    }
+    if let Some(error) = source.downcast_ref::<object_store::Error>() {
+        return matches!(error, object_store::Error::NotFound { .. })
+            || std::error::Error::source(error).is_some_and(error_source_is_not_found);
+    }
+    source.source().is_some_and(error_source_is_not_found)
+}
+
 pub trait LanceOptionExt<T> {
     /// Unwraps an option, returning an internal error if the option is None.
     ///
@@ -611,7 +786,11 @@ impl From<std::io::Error> for Error {
 impl From<object_store::Error> for Error {
     #[track_caller]
     fn from(e: object_store::Error) -> Self {
-        Self::io_source(box_error(e))
+        match e {
+            // source intentionally dropped; Error::NotFound carries only the path
+            object_store::Error::NotFound { path, .. } => Self::not_found(path),
+            other => Self::io_source(box_error(other)),
+        }
     }
 }
 
@@ -749,14 +928,46 @@ pub fn get_caller_location() -> &'static std::panic::Location<'static> {
 /// Wrap an error in a new error type that implements Clone
 ///
 /// This is useful when two threads/streams share a common fallible source
-/// The base error will always have the full error.  Any cloned results will
-/// only have Error::Cloned with the to_string of the base error.
+/// Definite not-found errors preserve typed source-chain detection and their
+/// human-readable representation. Timeout and I/O errors preserve their error
+/// categories. Other cloned results use Error::Cloned with the string
+/// representation of the base error.
 pub struct CloneableError(pub Error);
+
+struct DisplayError(Error);
+
+impl fmt::Debug for DisplayError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+impl fmt::Display for DisplayError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl std::error::Error for DisplayError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
 
 impl Clone for CloneableError {
     #[track_caller]
     fn clone(&self) -> Self {
-        Self(Error::cloned(self.0.to_string()))
+        match &self.0 {
+            Error::NotFound { uri, .. } => Self(Error::wrapped(Box::new(DisplayError(
+                Error::not_found(uri.clone()),
+            )))),
+            error if error.is_not_found() => Self(Error::wrapped(Box::new(DisplayError(
+                Error::not_found(error.to_string()),
+            )))),
+            Error::Timeout { message, .. } => Self(Error::timeout(message.clone())),
+            Error::IO { source, .. } => Self(Error::io(source.to_string())),
+            error => Self(Error::cloned(error.to_string())),
+        }
     }
 }
 
@@ -772,7 +983,55 @@ impl<T: Clone> From<Result<T>> for CloneableResult<T> {
 #[cfg(test)]
 mod test {
     use super::*;
+    use std::error::Error as _;
     use std::fmt;
+
+    #[test]
+    fn cloneable_error_preserves_not_found_contract() {
+        let original = CloneableError(Error::not_found("metadata.lance"));
+        let cloned = original.clone();
+        let cloned_again = cloned.clone();
+        assert!(matches!(original.0, Error::NotFound { .. }));
+        assert!(cloned.0.is_not_found());
+        assert!(cloned_again.0.is_not_found());
+        assert!(cloned.0.to_string().to_lowercase().contains("not found"));
+        assert!(
+            cloned_again
+                .0
+                .to_string()
+                .to_lowercase()
+                .contains("not found")
+        );
+        assert!(
+            format!("{:?}", cloned.0)
+                .to_lowercase()
+                .contains("not found")
+        );
+        assert!(cloned.0.source().is_some_and(|source| source.is::<Error>()
+            || source.source().is_some_and(|source| source.is::<Error>())));
+        let downstream_error = Error::wrapped(Box::new(Error::io_source(Box::new(
+            object_store::Error::Generic {
+                store: "N/A",
+                source: Box::new(cloned.0),
+            },
+        ))));
+        assert!(downstream_error.is_not_found());
+        assert!(
+            format!("{downstream_error:?}")
+                .to_lowercase()
+                .contains("not found")
+        );
+
+        let original = CloneableError(Error::timeout("metadata read timed out"));
+        let cloned = original.clone();
+        assert!(matches!(original.0, Error::Timeout { .. }));
+        assert!(matches!(cloned.0, Error::Timeout { .. }));
+
+        let original = CloneableError(Error::io("metadata read was denied"));
+        let cloned = original.clone();
+        assert!(matches!(original.0, Error::IO { .. }));
+        assert!(matches!(cloned.0, Error::IO { .. }));
+    }
 
     #[test]
     fn test_caller_location_capture() {
@@ -793,6 +1052,41 @@ mod test {
             }
             #[allow(unreachable_patterns)]
             _ => panic!("expected ObjectStore error"),
+        }
+    }
+
+    #[test]
+    fn test_caller_location_capture_not_found() {
+        let current_fn = get_caller_location();
+        let f: Box<dyn Fn() -> Result<()>> = Box::new(|| {
+            Err(object_store::Error::NotFound {
+                path: "some/path".to_string(),
+                source: "not found".into(),
+            })?;
+            Ok(())
+        });
+        match f().unwrap_err() {
+            Error::NotFound { location, .. } => {
+                // +2 is the beginning of object_store::Error::NotFound...
+                assert_eq!(location.line(), current_fn.line() + 2, "{}", location)
+            }
+            #[allow(unreachable_patterns)]
+            other => panic!("expected NotFound, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_object_store_not_found_converts_to_not_found() {
+        let os_err = object_store::Error::NotFound {
+            path: "test/path".to_string(),
+            source: "no such file".into(),
+        };
+        let lance_err: Error = os_err.into();
+        match lance_err {
+            Error::NotFound { uri, .. } => {
+                assert_eq!(uri, "test/path");
+            }
+            other => panic!("Expected NotFound, got {:?}", other),
         }
     }
 
@@ -1047,5 +1341,69 @@ mod test {
             }
             _ => panic!("Expected InvalidInput variant, got {:?}", recovered),
         }
+    }
+
+    #[test]
+    fn test_backtrace_accessor() {
+        // Verify that backtrace() returns the expected result based on feature state
+        let err = Error::io("test backtrace");
+        let bt = err.backtrace();
+        #[cfg(feature = "backtrace")]
+        {
+            // With the backtrace feature enabled, whether a backtrace is captured
+            // depends on the RUST_BACKTRACE env var at runtime. We just verify
+            // the accessor doesn't panic and returns a valid Option.
+            let _ = bt;
+        }
+        #[cfg(not(feature = "backtrace"))]
+        {
+            // Without the backtrace feature, this must always be None.
+            assert!(bt.is_none());
+        }
+    }
+
+    #[test]
+    fn test_backtrace_captured_when_feature_enabled() {
+        // Test that backtrace is actually captured when the feature is on and
+        // RUST_BACKTRACE=1 is set in the environment before the process starts.
+        //
+        // NOTE: std::backtrace::Backtrace caches the RUST_BACKTRACE env check,
+        // so set_var at runtime does not reliably enable capture. This test
+        // verifies the accessor works correctly in both cases:
+        // - If RUST_BACKTRACE=1 was set before the test binary started, we get Some.
+        // - If not, we get None (even with the feature on), which is expected.
+        #[cfg(feature = "backtrace")]
+        {
+            let err = Error::io("backtrace capture test");
+            if std::env::var("RUST_BACKTRACE").is_ok() {
+                assert!(
+                    err.backtrace().is_some(),
+                    "Expected a backtrace when RUST_BACKTRACE=1 and backtrace feature is enabled"
+                );
+            }
+            // When RUST_BACKTRACE is not set, backtrace() may return None even
+            // with the feature enabled — this is correct runtime gating behavior.
+        }
+        #[cfg(not(feature = "backtrace"))]
+        {
+            let err = Error::io("backtrace capture test");
+            assert!(err.backtrace().is_none());
+        }
+    }
+
+    #[test]
+    fn test_backtrace_returns_none_for_variants_without_location() {
+        let err = Error::InvalidTableLocation {
+            message: "test".to_string(),
+        };
+        assert!(err.backtrace().is_none());
+
+        let err = Error::InvalidRef {
+            message: "test".to_string(),
+        };
+        assert!(err.backtrace().is_none());
+
+        let err = Error::Stop;
+        assert!(err.backtrace().is_none());
     }
 }

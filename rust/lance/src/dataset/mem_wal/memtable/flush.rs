@@ -14,7 +14,7 @@ use lance_core::{Error, Result};
 use lance_index::IndexType;
 use lance_index::mem_wal::{FlushedGeneration, ShardManifest};
 use lance_index::scalar::{IndexStore, ScalarIndexParams};
-use lance_io::object_store::ObjectStore;
+use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_table::format::IndexMetadata;
 use lance_table::io::commit::write_manifest_file_to_path;
 use lance_table::io::deletion::write_deletion_file;
@@ -28,10 +28,14 @@ use uuid::Uuid;
 use super::super::index::MemIndexConfig;
 use super::super::memtable::MemTable;
 use crate::Dataset;
+use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::mem_wal::manifest::ShardManifestStore;
 use crate::dataset::mem_wal::scanner::GenerationWarmer;
 use crate::dataset::mem_wal::scanner::exec::{compute_pk_hash, validate_pk_types};
-use crate::dataset::mem_wal::util::{flushed_memtable_path, generate_random_hash};
+use crate::dataset::mem_wal::util::{
+    derived_store_params, flushed_memtable_path, generate_random_hash,
+};
+use crate::session::Session;
 
 #[derive(Debug, Clone)]
 pub struct FlushResult {
@@ -72,6 +76,13 @@ pub struct MemTableFlusher {
     /// When present, each new generation is warmed before it is committed, so
     /// the first query sees zero cold reads. `None` => no warming.
     warmer: Option<Arc<dyn GenerationWarmer>>,
+    /// Store params the base dataset was opened with, reused for the flusher's
+    /// own opens + writes. Used verbatim only for the base's own URI; generation
+    /// URIs go through [`derived_store_params`]. `None` opens by URI alone.
+    store_params: Option<ObjectStoreParams>,
+    /// Session for those opens, sharing the base's store registry. `None` opens
+    /// with a fresh session.
+    session: Option<Arc<Session>>,
 }
 
 impl MemTableFlusher {
@@ -89,6 +100,8 @@ impl MemTableFlusher {
             shard_id,
             manifest_store,
             warmer: None,
+            store_params: None,
+            session: None,
         }
     }
 
@@ -96,6 +109,51 @@ impl MemTableFlusher {
     pub fn with_warmer(mut self, warmer: Option<Arc<dyn GenerationWarmer>>) -> Self {
         self.warmer = warmer;
         self
+    }
+
+    /// Set the store params + session used for derived-URI opens. Injected by
+    /// `mem_wal_writer` from the base `Dataset`.
+    pub fn with_storage_context(
+        mut self,
+        store_params: Option<ObjectStoreParams>,
+        session: Option<Arc<Session>>,
+    ) -> Self {
+        self.store_params = store_params;
+        self.session = session;
+        self
+    }
+
+    /// Open the base table, reusing the injected store params verbatim — they
+    /// were resolved for exactly this URI, so a path-bound `object_store`
+    /// binding still points where it should.
+    async fn open_base(&self) -> Result<Dataset> {
+        self.open_uri(&self.base_uri, self.store_params.clone())
+            .await
+    }
+
+    /// Open a flushed generation under `_mem_wal/`. The params must be adapted
+    /// first: a path-bound store binding would redirect the open at the base
+    /// table (see [`derived_store_params`]).
+    async fn open_generation(&self, uri: &str) -> Result<Dataset> {
+        self.open_uri(uri, self.store_params.as_ref().map(derived_store_params))
+            .await
+    }
+
+    /// Open `uri` with the injected session, or by URI alone when nothing was
+    /// injected.
+    async fn open_uri(
+        &self,
+        uri: &str,
+        store_params: Option<ObjectStoreParams>,
+    ) -> Result<Dataset> {
+        let mut builder = DatasetBuilder::from_uri(uri);
+        if let Some(params) = store_params {
+            builder = builder.with_store_params(params);
+        }
+        if let Some(session) = &self.session {
+            builder = builder.with_session(session.clone());
+        }
+        builder.load().await
     }
 
     /// Warm a just-written generation before it is committed. Best-effort: a
@@ -139,7 +197,7 @@ impl MemTableFlusher {
     /// In production MemWAL is always initialized on a real dataset, so the base
     /// version is inherited; other open errors are propagated.
     async fn base_storage_version(&self) -> Result<lance_file::version::LanceFileVersion> {
-        match Dataset::open(&self.base_uri).await {
+        match self.open_base().await {
             Ok(dataset) => dataset.manifest().data_storage_format.lance_file_version(),
             Err(Error::DatasetNotFound { .. }) => {
                 Ok(lance_file::version::LanceFileVersion::default())
@@ -194,7 +252,7 @@ impl MemTableFlusher {
         // generation exposes newest-per-PK on every read path.
         if !deleted.is_empty() {
             let uri = self.path_to_uri(&gen_path);
-            let dataset = Dataset::open(&uri).await?;
+            let dataset = self.open_generation(&uri).await?;
             self.finalize_generation(&dataset, &deleted, None).await?;
         }
 
@@ -303,6 +361,12 @@ impl MemTableFlusher {
         let write_params = WriteParams {
             max_rows_per_file: usize::MAX,
             data_storage_version: Some(self.base_storage_version().await?),
+            // Write the generation through the base's store params + session so it
+            // uses the same store the base was opened with. Adapted for the
+            // generation URI: a path-bound store binding would send this write at
+            // the base table's own path (see [`derived_store_params`]).
+            store_params: self.store_params.as_ref().map(derived_store_params),
+            session: self.session.clone(),
             ..Default::default()
         };
         Dataset::write(reader, &uri, Some(write_params)).await?;
@@ -420,7 +484,7 @@ impl MemTableFlusher {
         // Open the dataset once for all index building. Dataset::write already
         // created a v1 manifest with the fragment data.
         let uri = self.path_to_uri(&gen_path);
-        let mut dataset = Dataset::open(&uri).await?;
+        let mut dataset = self.open_generation(&uri).await?;
 
         // Collect all index metadata without committing individually.
         // We write a single manifest containing both data and all indexes.
@@ -749,8 +813,9 @@ impl MemTableFlusher {
         use std::sync::Arc;
 
         use lance_index::scalar::inverted::{
-            POSITIONS_CODEC_KEY, POSITIONS_CODEC_PACKED_DELTA_V1, POSITIONS_LAYOUT_KEY,
-            POSITIONS_LAYOUT_SHARED_STREAM_V2, POSTING_TAIL_CODEC_KEY, TokenSetFormat,
+            FTS_FORMAT_VERSION_KEY, POSITIONS_CODEC_KEY, POSITIONS_CODEC_PACKED_DELTA_V1,
+            POSITIONS_LAYOUT_KEY, POSITIONS_LAYOUT_SHARED_STREAM_V2, POSTING_BLOCK_SIZE_KEY,
+            POSTING_TAIL_CODEC_KEY, TokenSetFormat,
         };
 
         // Create metadata with params and partitions in schema metadata (this is what InvertedIndex expects)
@@ -765,6 +830,14 @@ impl MemTableFlusher {
             (
                 POSTING_TAIL_CODEC_KEY.to_string(),
                 format_version.posting_tail_codec().as_str().to_string(),
+            ),
+            (
+                FTS_FORMAT_VERSION_KEY.to_string(),
+                format_version.index_version().to_string(),
+            ),
+            (
+                POSTING_BLOCK_SIZE_KEY.to_string(),
+                config.params.posting_block_size().to_string(),
             ),
         ]
         .into_iter()
@@ -1119,6 +1192,7 @@ mod tests {
     use super::*;
     use arrow_array::{Int32Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use lance_index::scalar::inverted::INVERTED_INDEX_VERSION_V4;
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -2119,6 +2193,7 @@ mod tests {
 
         assert_eq!(indices.len(), 1);
         assert_eq!(indices[0].name, "text_fts");
+        assert_eq!(indices[0].index_version, INVERTED_INDEX_VERSION_V4 as i32);
 
         // Verify FTS query returns correct results
         // Searching for "hello" should find the first document
@@ -2174,7 +2249,7 @@ mod tests {
             "ProjectionExec: expr=[id@2 as id, text@3 as text, _score@1 as _score]
   Take: ...
     CoalesceBatchesExec: ...
-      MatchQuery: column=text, query=hello",
+      MatchQuery: column=text, query=[hello]",
         )
         .await
         .unwrap();

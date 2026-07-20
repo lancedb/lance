@@ -91,7 +91,7 @@ rustls-pki-types = { version = "1", optional = true }
 # Azure credential vending dependencies (optional, enabled by "credential-vendor-azure" feature)
 chrono = { workspace = true, optional = true }
 hmac = { version = "0.12", optional = true }
-quick-xml = { version = "0.38", optional = true }
+quick-xml = { version = "0.40", optional = true }
 
 [dev-dependencies]
 opendal = { workspace = true, features = ["services-goosefs"] }

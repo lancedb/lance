@@ -7,7 +7,7 @@ use std::fmt::Formatter;
 use std::slice;
 
 use arrow_array::{Array, FixedSizeBinaryArray, builder::BooleanBufferBuilder};
-use arrow_buffer::MutableBuffer;
+use arrow_buffer::{Buffer, MutableBuffer};
 use arrow_data::ArrayData;
 use arrow_schema::{ArrowError, DataType, Field as ArrowField};
 use half::bf16;
@@ -164,19 +164,18 @@ impl FromIterator<bf16> for BFloat16Array {
 
 impl From<Vec<bf16>> for BFloat16Array {
     fn from(data: Vec<bf16>) -> Self {
-        let mut buffer = MutableBuffer::with_capacity(data.len() * 2);
-
-        // Write each value's little-endian bytes straight into the buffer. Going
-        // through an intermediate `Vec` per element would allocate once per value.
-        for val in &data {
-            buffer.extend_from_slice(&val.to_bits().to_le_bytes());
-        }
-
+        let len = data.len();
+        // Zero-copy: `bf16` is `#[repr(transparent)]` over `u16` and derives
+        // `bytemuck::Pod`, so `cast_vec` reinterprets the allocation in place —
+        // no per-element copy or heap alloc. The crate-root `compile_error!`
+        // pins `target_endian = "little"`, so the resulting bytes match the
+        // `FixedSizeBinary(2)` on-disk order Lance writes elsewhere.
+        let raw: Vec<u16> = bytemuck::cast_vec(data);
         let array_data = ArrayData::builder(DataType::FixedSizeBinary(2))
-            .len(data.len())
-            .add_buffer(buffer.into());
-        // SAFETY: the buffer contains exactly `2 * data.len()` bytes — each
-        // `bf16` writes its two little-endian bytes once — matching the
+            .len(len)
+            .add_buffer(Buffer::from_vec(raw));
+        // SAFETY: the value buffer contains exactly `2 * len` bytes — one
+        // `u16` per element after the layout-compatible cast — matching the
         // `FixedSizeBinary(2)` storage layout. No null buffer is attached, so
         // every element is logically valid.
         let array_data = unsafe { array_data.build_unchecked() };
@@ -284,9 +283,10 @@ impl FloatArray<BFloat16Type> for FixedSizeBinaryArray {
     /// - `value_length()` must be 2 (the `FixedSizeBinary(2)` storage shape
     ///   used by [`BFloat16Array`]). Asserted at entry.
     /// - The value buffer must be at least 2-byte aligned. Lance's in-tree
-    ///   constructors always satisfy this (every value buffer goes through
-    ///   `MutableBuffer`, which is aligned to arrow-buffer's `ALIGNMENT`
-    ///   constant — ≥32 bytes on every supported target). Externally-built
+    ///   constructors always satisfy this: value buffers are built either via
+    ///   `MutableBuffer` (aligned to arrow-buffer's `ALIGNMENT` constant, ≥32
+    ///   bytes) or via `Buffer::from_vec::<u16>` (aligned to `align_of::<u16>()`
+    ///   == 2); both meet `bf16`'s 2-byte requirement. Externally-built
     ///   `FixedSizeBinaryArray`s arriving via FFI, IPC, or
     ///   `Buffer::from_custom_allocation` are not required by arrow-rs to be
     ///   aligned beyond a single byte; passing one to this method violates the
@@ -329,8 +329,8 @@ impl FloatArray<BFloat16Type> for FixedSizeBinaryArray {
         //   (arrow-data `data.rs`), so arrow-rs alone does not guarantee
         //   2-byte alignment. Lance's in-tree construction paths build value
         //   buffers via `MutableBuffer` (arrow-buffer `ALIGNMENT` constant,
-        //   ≥32 bytes on every supported target), which trivially satisfies
-        //   `bf16`'s 2-byte requirement.
+        //   ≥32 bytes) or `Buffer::from_vec::<u16>` (2-byte aligned), both of
+        //   which satisfy `bf16`'s 2-byte requirement.
         // - The returned slice borrows from `self`; the underlying ref-counted,
         //   immutable Arrow buffer cannot be mutated or freed for the slice's
         //   lifetime.
@@ -360,6 +360,16 @@ mod tests {
         let array2 = BFloat16Array::from(values.clone());
         assert_eq!(array, array2);
         assert_eq!(array.len(), 3);
+
+        // Pin the raw little-endian bytes emitted by `From<Vec<bf16>>` (rewritten to
+        // reinterpret the Vec via `bytemuck::cast_vec`), so a layout/byte-order
+        // regression is caught directly rather than only through Debug formatting.
+        // bf16 is the high 16 bits of the f32: 1.0->0x3F80, 2.0->0x4000, 3.0->0x4040.
+        let inner = array2.clone().into_inner();
+        let raw_bytes: Vec<u8> = (0..inner.len())
+            .flat_map(|i| inner.value(i).to_vec())
+            .collect();
+        assert_eq!(raw_bytes, vec![0x80, 0x3F, 0x00, 0x40, 0x40, 0x40]);
 
         let expected_fmt = "BFloat16Array\n[\n  1.0,\n  2.0,\n  3.0,\n]";
         assert_eq!(expected_fmt, format!("{:?}", array));

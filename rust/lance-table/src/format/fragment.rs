@@ -13,6 +13,7 @@ use lance_io::utils::CachedFileSize;
 use object_store::path::Path;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use super::overlay::{DataOverlayFile, sort_overlays_newest_last};
 use crate::format::pb;
 
 use crate::rowids::version::{
@@ -375,6 +376,15 @@ impl DataFileFieldInterner {
                 .into_iter()
                 .map(|f| self.intern_data_file(f))
                 .collect::<Result<_>>()?,
+            overlays: {
+                let mut overlays = p
+                    .overlays
+                    .into_iter()
+                    .map(DataOverlayFile::try_from)
+                    .collect::<Result<Vec<_>>>()?;
+                sort_overlays_newest_last(&mut overlays);
+                overlays
+            },
             deletion_file: p.deletion_file.map(DeletionFile::try_from).transpose()?,
             row_id_meta: p.row_id_sequence.map(RowIdMeta::try_from).transpose()?,
             physical_rows,
@@ -483,6 +493,12 @@ pub struct Fragment {
     /// Files within the fragment.
     pub files: Vec<DataFile>,
 
+    /// Overlay files supplying new values for a subset of cells without
+    /// rewriting the base data files. Order is significant: a later entry is
+    /// newer than an earlier one. See [`DataOverlayFile`] for resolution rules.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub overlays: Vec<DataOverlayFile>,
+
     /// Optional file with deleted local row offsets.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deletion_file: Option<DeletionFile>,
@@ -510,6 +526,7 @@ impl Fragment {
         Self {
             id,
             files: vec![],
+            overlays: vec![],
             deletion_file: None,
             row_id_meta: None,
             physical_rows: None,
@@ -549,6 +566,7 @@ impl Fragment {
         Self {
             id,
             files: vec![DataFile::new_legacy(path, schema, None, None)],
+            overlays: vec![],
             deletion_file: None,
             physical_rows,
             row_id_meta: None,
@@ -669,6 +687,15 @@ impl TryFrom<pb::DataFragment> for Fragment {
                 .into_iter()
                 .map(DataFile::try_from)
                 .collect::<Result<_>>()?,
+            overlays: {
+                let mut overlays = p
+                    .overlays
+                    .into_iter()
+                    .map(DataOverlayFile::try_from)
+                    .collect::<Result<Vec<_>>>()?;
+                sort_overlays_newest_last(&mut overlays);
+                overlays
+            },
             deletion_file: p.deletion_file.map(DeletionFile::try_from).transpose()?,
             row_id_meta: p.row_id_sequence.map(RowIdMeta::try_from).transpose()?,
             physical_rows,
@@ -716,6 +743,7 @@ impl From<&Fragment> for pb::DataFragment {
         Self {
             id: f.id,
             files: f.files.iter().map(pb::DataFile::from).collect(),
+            overlays: f.overlays.iter().map(pb::DataOverlayFile::from).collect(),
             deletion_file,
             row_id_sequence,
             physical_rows: f.physical_rows.unwrap_or_default() as u64,
@@ -728,11 +756,107 @@ impl From<&Fragment> for pb::DataFragment {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::format::overlay::OverlayCoverage;
     use arrow_schema::{
         DataType, Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema,
     };
     use object_store::path::Path;
+    use roaring::RoaringBitmap;
     use serde_json::{Value, json};
+
+    #[test]
+    fn test_data_overlay_roundtrip() {
+        // A fragment carrying a dense overlay round-trips through protobuf and
+        // back, and the parsed coverage bitmap is recovered per field.
+        let mut bitmap = RoaringBitmap::new();
+        bitmap.insert(1);
+        bitmap.insert(3);
+
+        let overlay = DataOverlayFile {
+            data_file: DataFile::new_legacy_from_fields("overlay-0.lance", vec![3], None),
+            coverage: OverlayCoverage::dense(bitmap.clone()),
+            committed_version: 7,
+        };
+        let mut fragment = Fragment::new(0);
+        fragment.files = vec![DataFile::new_legacy_from_fields(
+            "base.lance",
+            vec![1, 3],
+            None,
+        )];
+        fragment.overlays = vec![overlay];
+
+        let proto = pb::DataFragment::from(&fragment);
+        assert_eq!(proto.overlays.len(), 1);
+        let round_tripped = Fragment::try_from(proto).unwrap();
+        assert_eq!(round_tripped, fragment);
+
+        // Dense coverage applies to every field.
+        let recovered = round_tripped.overlays[0].coverage_for_field(0).unwrap();
+        assert_eq!(*recovered, bitmap);
+        assert_eq!(
+            *round_tripped.overlays[0].coverage_for_field(5).unwrap(),
+            bitmap
+        );
+    }
+
+    #[test]
+    fn test_data_overlay_sparse_per_field_coverage() {
+        // A sparse overlay carries one bitmap per field, recovered by position.
+        let name_coverage = RoaringBitmap::from_iter([2u32, 3]);
+        let embedding_coverage = RoaringBitmap::from_iter([1u32]);
+        let overlay = DataOverlayFile {
+            data_file: DataFile::new_legacy_from_fields("overlay-1.lance", vec![2, 4], None),
+            coverage: OverlayCoverage::sparse(vec![
+                name_coverage.clone(),
+                embedding_coverage.clone(),
+            ]),
+            committed_version: 3,
+        };
+        let mut fragment = Fragment::new(1);
+        fragment.overlays = vec![overlay];
+
+        let round_tripped = Fragment::try_from(pb::DataFragment::from(&fragment)).unwrap();
+        assert_eq!(
+            *round_tripped.overlays[0].coverage_for_field(0).unwrap(),
+            name_coverage
+        );
+        assert_eq!(
+            *round_tripped.overlays[0].coverage_for_field(1).unwrap(),
+            embedding_coverage
+        );
+    }
+
+    #[test]
+    fn test_overlays_sorted_newest_last_on_load() {
+        // Overlays load stable-sorted by committed_version (newest last), with
+        // list position preserved as the tiebreak for equal versions.
+        let mk = |version: u64, field: i32| DataOverlayFile {
+            data_file: DataFile::new_legacy_from_fields("o.lance", vec![field], None),
+            coverage: OverlayCoverage::dense(RoaringBitmap::from_iter([0u32])),
+            committed_version: version,
+        };
+        let mut fragment = Fragment::new(0);
+        // Written out of order: v5, v2, v2 (second), v3.
+        fragment.overlays = vec![mk(5, 1), mk(2, 2), mk(2, 3), mk(3, 4)];
+
+        let loaded = Fragment::try_from(pb::DataFragment::from(&fragment)).unwrap();
+        let versions: Vec<u64> = loaded
+            .overlays
+            .iter()
+            .map(|o| o.committed_version)
+            .collect();
+        assert_eq!(versions, vec![2, 2, 3, 5]);
+        // Stable: the two v2 overlays keep their original relative order (field 2
+        // before field 3).
+        assert_eq!(
+            loaded.overlays[0].data_file.fields.as_ref(),
+            [2i32].as_slice()
+        );
+        assert_eq!(
+            loaded.overlays[1].data_file.fields.as_ref(),
+            [3i32].as_slice()
+        );
+    }
 
     #[test]
     fn test_new_fragment() {
