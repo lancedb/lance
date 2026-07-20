@@ -1535,8 +1535,8 @@ mod tests {
         let schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
         let tags = schema.field("tags").unwrap();
         for (block_size, expected_format_version) in [
-            (128, InvertedListFormatVersion::V2),
-            (256, InvertedListFormatVersion::V3),
+            (128, InvertedListFormatVersion::V4),
+            (256, InvertedListFormatVersion::V4),
         ] {
             let params = InvertedIndexParams::default()
                 .block_size(block_size)

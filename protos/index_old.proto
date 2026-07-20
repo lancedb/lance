@@ -78,6 +78,6 @@ message InvertedIndexDetails {
   // legacy row-document behavior when this field is absent.
   DocumentGranularity document_granularity = 14;
   // The posting-list payload format. This is separate from index_version,
-  // which is an element-document compatibility marker for version 4.
+  // which identifies the overall inverted-index layout.
   optional uint32 posting_format_version = 15;
 }

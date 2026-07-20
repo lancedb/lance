@@ -1522,20 +1522,20 @@ impl FtsMemIndex {
         include_tail: bool,
         tail_skip: bool,
     ) -> Vec<FtsEntry> {
-        let mut result_map: Option<HashMap<RowPosition, f32>> = None;
+        let mut result_map: Option<HashMap<DocumentKey, f32>> = None;
         for group in query_position_groups(query_tokens) {
             let group_results =
                 self.search_match_strings(st, &group, Operator::Or, None, include_tail, tail_skip);
             let group_map = group_results
                 .into_iter()
-                .map(|entry| (entry.row_position, entry.score))
+                .map(|entry| (entry.key(), entry.score))
                 .collect::<HashMap<_, _>>();
             let Some(current) = result_map.as_mut() else {
                 result_map = Some(group_map);
                 continue;
             };
-            current.retain(|row_position, score| {
-                if let Some(group_score) = group_map.get(row_position) {
+            current.retain(|key, score| {
+                if let Some(group_score) = group_map.get(key) {
                     *score += group_score;
                     true
                 } else {
@@ -1550,8 +1550,9 @@ impl FtsMemIndex {
         let mut results = result_map
             .unwrap_or_default()
             .into_iter()
-            .map(|(row_position, score)| FtsEntry {
-                row_position,
+            .map(|(key, score)| FtsEntry {
+                row_position: key.row_position,
+                doc_index: public_doc_index(&key.doc_index),
                 score,
             })
             .collect::<Vec<_>>();
@@ -2510,7 +2511,7 @@ fn merge_phrase_group<K>(
     group_docs: HashMap<K, PhraseGroupDoc>,
 ) -> bool
 where
-    K: Copy + Eq + std::hash::Hash,
+    K: Eq + std::hash::Hash,
 {
     let Some(current) = candidates.as_mut() else {
         *candidates = Some(
@@ -2551,7 +2552,7 @@ fn phrase_search_tail_groups(
     slop: u32,
     scorer: &MemBM25Scorer,
 ) -> Vec<FtsEntry> {
-    let mut candidates: Option<HashMap<RowPosition, PhraseCandidate>> = None;
+    let mut candidates: Option<HashMap<DocumentKey, PhraseCandidate>> = None;
     for (group_idx, group) in groups.iter().enumerate() {
         let group_docs = tail_phrase_group_docs(snap, terms, group, scorer);
         if group_docs.is_empty()
@@ -2565,8 +2566,9 @@ fn phrase_search_tail_groups(
         .unwrap_or_default()
         .into_iter()
         .filter(|(_, candidate)| phrase_matches(&candidate.positions_by_group, slop))
-        .map(|(row_position, candidate)| FtsEntry {
-            row_position,
+        .map(|(key, candidate)| FtsEntry {
+            row_position: key.row_position,
+            doc_index: public_doc_index(&key.doc_index),
             score: candidate.score,
         })
         .collect()
@@ -2577,8 +2579,8 @@ fn tail_phrase_group_docs(
     terms: &SkipMap<Arc<str>, Arc<ArcSwap<TermSlice>>>,
     group: &[String],
     scorer: &MemBM25Scorer,
-) -> HashMap<RowPosition, PhraseGroupDoc> {
-    let mut docs: HashMap<RowPosition, PhraseGroupDoc> = HashMap::new();
+) -> HashMap<DocumentKey, PhraseGroupDoc> {
+    let mut docs: HashMap<DocumentKey, PhraseGroupDoc> = HashMap::new();
     for token in group {
         let Some(entry) = terms.get(token.as_str()) else {
             continue;
@@ -2595,12 +2597,15 @@ fn tail_phrase_group_docs(
             let Some(positions) = &chunk.positions else {
                 continue;
             };
-            for (i, &row_position) in chunk.row_positions.iter().enumerate() {
-                let entry = docs.entry(row_position).or_default();
+            for (i, &document_position) in chunk.row_positions.iter().enumerate() {
+                let Some(document) = meta.document(document_position) else {
+                    continue;
+                };
+                let entry = docs.entry(document.key.clone()).or_default();
                 entry
                     .positions
                     .extend_from_slice(positions.doc_positions(i));
-                let dl = meta.dl(row_position).unwrap_or(1);
+                let dl = document.num_tokens;
                 entry.score += qw * scorer.doc_weight(chunk.frequencies[i], dl);
             }
         }
@@ -3734,6 +3739,7 @@ impl Partition {
             .filter(|(_, candidate)| phrase_matches(&candidate.positions_by_group, slop))
             .map(|(doc, candidate)| FtsEntry {
                 row_position: self.docs.row_id(doc),
+                doc_index: public_doc_index(&self.docs.doc_index(doc)),
                 score: candidate.score,
             })
             .collect()
@@ -4335,6 +4341,58 @@ mod tests {
             .collect::<Vec<_>>();
         rows.sort_unstable();
         assert_eq!(rows, vec![0, 1]);
+    }
+
+    #[test]
+    fn test_code_analyzer_queries_keep_element_document_identity() {
+        let mut tags = ListBuilder::new(StringBuilder::new());
+        tags.values().append_value("get");
+        tags.values().append_value("x user name");
+        tags.append(true);
+        tags.values().append_value("getUserName");
+        tags.append(true);
+        let tags = tags.finish();
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![Field::new(
+                "tags",
+                tags.data_type().clone(),
+                true,
+            )])),
+            vec![Arc::new(tags)],
+        )
+        .unwrap();
+        let index = FtsMemIndex::try_with_params(
+            1,
+            "tags".to_string(),
+            InvertedIndexParams::code()
+                .with_position(true)
+                .split_identifiers(true)
+                .document_granularity(DocumentGranularity::ListElement),
+        )
+        .unwrap();
+        index.insert(&batch, 0).unwrap();
+
+        let and_query = FtsQueryExpr::match_query_with_operator("getUserName", Operator::And);
+        let phrase_query = FtsQueryExpr::phrase("getUserName");
+        for entries in [
+            index.search_query(&and_query),
+            index.search_query(&phrase_query),
+        ] {
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].row_position, 1);
+            assert_eq!(entries[0].doc_index, Some(vec![0]));
+        }
+
+        index.flush();
+        let partition_only = SearchOptions::new().with_include_tail(false);
+        for entries in [
+            index.search_with_options(&and_query, partition_only.clone()),
+            index.search_with_options(&phrase_query, partition_only),
+        ] {
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].row_position, 1);
+            assert_eq!(entries[0].doc_index, Some(vec![0]));
+        }
     }
 
     fn tail_positions_for(index: &FtsMemIndex, term: &str, row_position: RowPosition) -> Vec<u32> {

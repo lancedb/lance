@@ -466,7 +466,7 @@ mod tests {
             temp_dir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
-        let docs = LazyDocSet::new(store, "unused".to_owned(), 3, false, None, false);
+        let docs = LazyDocSet::new(store, "unused".to_owned(), 3, false, None, false, 0);
         assert_eq!(docs.total_tokens_cached(), None);
 
         let row_ids = UInt64Array::from(vec![10, 20, 30]);

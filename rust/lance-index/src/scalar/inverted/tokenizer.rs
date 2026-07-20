@@ -1459,7 +1459,7 @@ mod tests {
         let params =
             InvertedIndexParams::default().document_granularity(DocumentGranularity::ListElement);
         let details = pbold::InvertedIndexDetails::try_from(&params).unwrap();
-        assert_eq!(details.posting_format_version, Some(2));
+        assert_eq!(details.posting_format_version, Some(4));
         assert_eq!(
             details.document_granularity,
             PbDocumentGranularity::ListElement as i32
