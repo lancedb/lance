@@ -21,8 +21,9 @@ use arrow::datatypes::{Float32Type, UInt64Type};
 use clap::Parser;
 use futures::{StreamExt, TryStreamExt};
 use lance::Dataset;
+use lance::dataset::builder::DatasetBuilder;
 use lance::index::DatasetIndexExt;
-use lance_index::scalar::FullTextSearchQuery;
+use lance_index::{FtsPrewarmOptions, PrewarmOptions, scalar::FullTextSearchQuery};
 use serde_json::{Value, json};
 
 type AnyError = Box<dyn Error + Send + Sync>;
@@ -77,6 +78,18 @@ struct Args {
     /// Optional index name assertion. At least one segment must have this name.
     #[arg(long)]
     expected_index: Option<String>,
+
+    /// Index name passed to Dataset::prewarm_index before any measured query.
+    #[arg(long)]
+    prewarm_index: Option<String>,
+
+    /// Also prewarm FTS positions for phrase queries.
+    #[arg(long, default_value_t = false, requires = "prewarm_index")]
+    prewarm_positions: bool,
+
+    /// Dataset index-cache capacity in GiB.
+    #[arg(long)]
+    index_cache_size_gib: Option<usize>,
 
     /// Permit queries with no results. By default they fail the run so an
     /// accidentally irrelevant panel cannot produce plausible timings.
@@ -233,13 +246,23 @@ async fn main() -> AnyResult<()> {
         "warmup_rounds": args.warmup_rounds,
         "measured_rounds": args.measured_rounds,
         "concurrency": args.concurrency,
+        "prewarm_index": args.prewarm_index,
+        "prewarm_positions": args.prewarm_positions,
+        "index_cache_size_gib": args.index_cache_size_gib,
         "hostname": std::env::var("HOSTNAME").ok(),
         "available_parallelism": std::thread::available_parallelism().map(usize::from).ok(),
         "package_version": env!("CARGO_PKG_VERSION"),
     }));
 
     let open_started = Instant::now();
-    let dataset = Dataset::open(&args.uri).await?;
+    let mut dataset_builder = DatasetBuilder::from_uri(&args.uri);
+    if let Some(cache_size_gib) = args.index_cache_size_gib {
+        let cache_size_bytes = cache_size_gib
+            .checked_mul(1024 * 1024 * 1024)
+            .ok_or("--index-cache-size-gib overflows usize")?;
+        dataset_builder = dataset_builder.with_index_cache_size_bytes(cache_size_bytes);
+    }
+    let dataset = dataset_builder.load().await?;
     let open_ms = open_started.elapsed().as_secs_f64() * 1_000.0;
     let row_count = dataset.count_rows(None).await?;
     if let Some(expected) = args.expected_rows
@@ -277,6 +300,36 @@ async fn main() -> AnyResult<()> {
         "rss_kib": linux_memory_kib("VmRSS:"),
         "peak_rss_kib": linux_memory_kib("VmHWM:"),
     }));
+
+    if let Some(index_name) = &args.prewarm_index {
+        let cache_before = dataset.session().index_cache_stats().await;
+        let prewarm_started = Instant::now();
+        if args.prewarm_positions {
+            dataset
+                .prewarm_index_with_options(
+                    index_name,
+                    &PrewarmOptions::Fts(FtsPrewarmOptions::new().with_position(true)),
+                )
+                .await?;
+        } else {
+            dataset.prewarm_index(index_name).await?;
+        }
+        let prewarm_ms = prewarm_started.elapsed().as_secs_f64() * 1_000.0;
+        let cache_after = dataset.session().index_cache_stats().await;
+        emit(json!({
+            "event": "prewarm_complete",
+            "label": args.label,
+            "index": index_name,
+            "with_positions": args.prewarm_positions,
+            "prewarm_ms": prewarm_ms,
+            "index_cache_entries_before": cache_before.num_entries,
+            "index_cache_entries_after": cache_after.num_entries,
+            "index_cache_size_bytes_before": cache_before.size_bytes,
+            "index_cache_size_bytes_after": cache_after.size_bytes,
+            "rss_kib": linux_memory_kib("VmRSS:"),
+            "peak_rss_kib": linux_memory_kib("VmHWM:"),
+        }));
+    }
 
     for _ in 0..args.warmup_rounds {
         for query in &queries {

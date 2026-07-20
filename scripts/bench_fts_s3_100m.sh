@@ -24,6 +24,9 @@ WARMUP_ROUNDS=${LANCE_FTS_BENCH_WARMUP_ROUNDS:-1}
 WARM_ROUNDS=${LANCE_FTS_BENCH_WARM_ROUNDS:-5}
 THROUGHPUT_CONCURRENCY=${LANCE_FTS_BENCH_CONCURRENCY:-8}
 THROUGHPUT_ROUNDS=${LANCE_FTS_BENCH_THROUGHPUT_ROUNDS:-5}
+PREWARM_INDEX=${LANCE_FTS_BENCH_PREWARM_INDEX:-}
+PREWARM_POSITIONS=${LANCE_FTS_BENCH_PREWARM_POSITIONS:-false}
+INDEX_CACHE_SIZE_GIB=${LANCE_FTS_BENCH_INDEX_CACHE_SIZE_GIB:-}
 
 REPO_ROOT=$(git rev-parse --show-toplevel)
 QUERY_FILE=${LANCE_FTS_BENCH_QUERY_FILE:-$REPO_ROOT/rust/examples/fts_100m_queries.txt}
@@ -65,6 +68,9 @@ cp "$QUERY_FILE" "$RUN_DIR/queries.txt"
   echo "warm_rounds=$WARM_ROUNDS"
   echo "throughput_concurrency=$THROUGHPUT_CONCURRENCY"
   echo "throughput_rounds=$THROUGHPUT_ROUNDS"
+  echo "prewarm_index=${PREWARM_INDEX:-unset}"
+  echo "prewarm_positions=$PREWARM_POSITIONS"
+  echo "index_cache_size_gib=${INDEX_CACHE_SIZE_GIB:-default}"
   echo "baseline_commit=$BASELINE_COMMIT"
   echo "candidate_commit=$CANDIDATE_COMMIT"
   echo "aws_region=${AWS_REGION:-${AWS_DEFAULT_REGION:-unset}}"
@@ -100,6 +106,18 @@ COMMON_ARGS=(
   --expected-rows "$EXPECTED_ROWS"
   --expected-index "$INDEX_NAME"
 )
+if [[ -n "$PREWARM_INDEX" ]]; then
+  COMMON_ARGS+=(--prewarm-index "$PREWARM_INDEX")
+fi
+if [[ "$PREWARM_POSITIONS" == "true" ]]; then
+  COMMON_ARGS+=(--prewarm-positions)
+elif [[ "$PREWARM_POSITIONS" != "false" ]]; then
+  echo "LANCE_FTS_BENCH_PREWARM_POSITIONS must be true or false" >&2
+  exit 2
+fi
+if [[ -n "$INDEX_CACHE_SIZE_GIB" ]]; then
+  COMMON_ARGS+=(--index-cache-size-gib "$INDEX_CACHE_SIZE_GIB")
+fi
 
 run_benchmark() {
   local binary=$1
@@ -173,8 +191,21 @@ for ((run = 0; run < WARM_RUNS; run++)); do
   done
 done
 
+PHASES=()
+if (( COLD_TRIALS > 0 )); then
+  PHASES+=(cold)
+fi
+if (( WARM_RUNS > 0 )); then
+  PHASES+=(warm throughput)
+fi
+if (( ${#PHASES[@]} == 0 )); then
+  echo "benchmark must enable at least one phase" >&2
+  exit 2
+fi
+
 python3 "$RUN_DIR/source-candidate/scripts/analyze_fts_s3_benchmark.py" \
   "$RUN_DIR/results" \
+  --phases "${PHASES[@]}" \
   --output "$RUN_DIR/summary.json"
 
 echo "$RUN_DIR"
