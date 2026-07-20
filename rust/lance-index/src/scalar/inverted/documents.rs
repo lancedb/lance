@@ -13,8 +13,10 @@ use std::sync::{Arc, OnceLock};
 use arrow::buffer::ScalarBuffer;
 use arrow_array::{Array, RecordBatch, UInt32Array, UInt64Array};
 use lance_core::deepsize::DeepSizeOf;
+use lance_core::utils::address::RowAddress;
+use lance_core::utils::tokio::spawn_cpu;
 use lance_core::{Error, ROW_ID, Result};
-use lance_select::RowAddrMask;
+use lance_select::{RowAddrMask, RowAddrSelection, RowAddrTreeMap};
 use object_store::path::Path;
 use roaring::RoaringBitmap;
 use tokio::sync::OnceCell;
@@ -185,6 +187,140 @@ impl DeepSizeOf for AddressValues {
     }
 }
 
+/// A compact address-sorted view of the live DocIds in a projection.
+///
+/// Most newly built partitions already store addresses in DocId order, so the
+/// identity variant adds no per-document memory. Remapped or otherwise
+/// unsorted projections keep only a u32 permutation instead of duplicating
+/// the u64 address column.
+#[derive(Debug)]
+enum AddressDocIdLookup {
+    Identity,
+    Sorted(Box<[u32]>),
+}
+
+impl DeepSizeOf for AddressDocIdLookup {
+    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
+        match self {
+            Self::Identity => 0,
+            Self::Sorted(doc_ids) => std::mem::size_of_val(doc_ids.as_ref()),
+        }
+    }
+}
+
+impl AddressDocIdLookup {
+    fn build(projection: &VersionAddressProjection) -> Self {
+        if projection.live_docs.is_none()
+            && (1..projection.addresses.len())
+                .all(|index| projection.addresses.get(index - 1) <= projection.addresses.get(index))
+        {
+            return Self::Identity;
+        }
+
+        let mut doc_ids = match projection.live_docs.as_ref() {
+            Some(live_docs) => live_docs.iter().collect::<Vec<_>>(),
+            None => (0..projection.addresses.len() as u32).collect::<Vec<_>>(),
+        };
+        doc_ids.sort_unstable_by_key(|&doc_id| projection.addresses.get(doc_id as usize));
+        Self::Sorted(doc_ids.into_boxed_slice())
+    }
+
+    fn len(&self, projection: &VersionAddressProjection) -> usize {
+        match self {
+            Self::Identity => projection.addresses.len(),
+            Self::Sorted(doc_ids) => doc_ids.len(),
+        }
+    }
+
+    fn doc_id_at(&self, position: usize) -> u32 {
+        match self {
+            Self::Identity => position as u32,
+            Self::Sorted(doc_ids) => doc_ids[position],
+        }
+    }
+
+    fn address_at(&self, projection: &VersionAddressProjection, position: usize) -> u64 {
+        projection.addresses.get(self.doc_id_at(position) as usize)
+    }
+
+    fn partition_point(
+        &self,
+        projection: &VersionAddressProjection,
+        mut predicate: impl FnMut(u64) -> bool,
+    ) -> usize {
+        let mut left = 0;
+        let mut right = self.len(projection);
+        while left < right {
+            let middle = left + (right - left) / 2;
+            if predicate(self.address_at(projection, middle)) {
+                left = middle + 1;
+            } else {
+                right = middle;
+            }
+        }
+        left
+    }
+
+    fn insert_address_range(
+        &self,
+        projection: &VersionAddressProjection,
+        start: u64,
+        end: u64,
+        selected: &mut RoaringBitmap,
+    ) {
+        let first = self.partition_point(projection, |address| address < start);
+        let after_last = self.partition_point(projection, |address| address <= end);
+        for position in first..after_last {
+            selected.insert(self.doc_id_at(position));
+        }
+    }
+
+    fn matching_doc_ids(
+        &self,
+        projection: &VersionAddressProjection,
+        addresses: &RowAddrTreeMap,
+    ) -> RoaringBitmap {
+        let mut selected = RoaringBitmap::new();
+        for (&fragment_id, selection) in addresses.iter() {
+            match selection {
+                RowAddrSelection::Full => {
+                    let start = u64::from(RowAddress::new_from_parts(fragment_id, 0));
+                    let end = u64::from(RowAddress::new_from_parts(fragment_id, u32::MAX));
+                    self.insert_address_range(projection, start, end, &mut selected);
+                }
+                RowAddrSelection::Partial(offsets) => {
+                    let mut offsets = offsets.iter();
+                    while let Some(range) = offsets.next_range() {
+                        let start =
+                            u64::from(RowAddress::new_from_parts(fragment_id, *range.start()));
+                        let end = u64::from(RowAddress::new_from_parts(fragment_id, *range.end()));
+                        self.insert_address_range(projection, start, end, &mut selected);
+                    }
+                }
+            }
+        }
+        selected
+    }
+
+    fn visibility(
+        &self,
+        projection: &VersionAddressProjection,
+        mask: &RowAddrMask,
+    ) -> DocVisibility {
+        match mask {
+            RowAddrMask::AllowList(allowed) => {
+                DocVisibility::Selected(self.matching_doc_ids(projection, allowed))
+            }
+            RowAddrMask::BlockList(blocked) => {
+                let blocked = self.matching_doc_ids(projection, blocked);
+                let mut selected = projection.live_doc_ids();
+                selected -= &blocked;
+                DocVisibility::Selected(selected)
+            }
+        }
+    }
+}
+
 /// Addresses projected into the dataset version that opened the index.
 #[derive(Debug)]
 pub(super) struct VersionAddressProjection {
@@ -192,6 +328,7 @@ pub(super) struct VersionAddressProjection {
     /// `None` means every slot is live.  Deleted documents retain their DocId
     /// slot but are absent from this bitmap.
     live_docs: Option<RoaringBitmap>,
+    doc_ids_by_address: OnceCell<Arc<AddressDocIdLookup>>,
 }
 
 impl DeepSizeOf for VersionAddressProjection {
@@ -201,6 +338,11 @@ impl DeepSizeOf for VersionAddressProjection {
                 .live_docs
                 .as_ref()
                 .map(|live| live.serialized_size())
+                .unwrap_or(0)
+            + self
+                .doc_ids_by_address
+                .get()
+                .map(|lookup| lookup.deep_size_of_children(context))
                 .unwrap_or(0)
     }
 }
@@ -229,6 +371,7 @@ impl VersionAddressProjection {
             return Ok(Self {
                 addresses: AddressValues::Shared(raw.values().clone()),
                 live_docs: None,
+                doc_ids_by_address: OnceCell::new(),
             });
         };
 
@@ -250,6 +393,7 @@ impl VersionAddressProjection {
         Ok(Self {
             addresses: AddressValues::Owned(addresses),
             live_docs: Some(live_docs),
+            doc_ids_by_address: OnceCell::new(),
         })
     }
 
@@ -265,19 +409,32 @@ impl VersionAddressProjection {
         }
     }
 
-    fn visibility(&self, mask: &RowAddrMask) -> DocVisibility {
-        if mask.is_select_all() && self.live_docs.is_none() {
-            return DocVisibility::All;
-        }
-        let selected = (0..self.addresses.len())
-            .filter_map(|doc_id| {
-                let doc_id = DocId::new(doc_id as u32);
-                self.address(doc_id)
-                    .filter(|address| mask.selected(*address))
-                    .map(|_| doc_id.get())
+    fn live_doc_ids(&self) -> RoaringBitmap {
+        self.live_docs
+            .clone()
+            .unwrap_or_else(|| (0..self.addresses.len() as u32).collect())
+    }
+
+    async fn doc_ids_by_address(self: &Arc<Self>) -> Result<Arc<AddressDocIdLookup>> {
+        self.doc_ids_by_address
+            .get_or_try_init(|| {
+                let projection = self.clone();
+                async move {
+                    spawn_cpu(move || Result::Ok(Arc::new(AddressDocIdLookup::build(&projection))))
+                        .await
+                }
             })
-            .collect();
-        DocVisibility::Selected(selected)
+            .await
+            .cloned()
+    }
+
+    async fn materialize_visibility(
+        self: &Arc<Self>,
+        mask: Arc<RowAddrMask>,
+    ) -> Result<DocVisibility> {
+        let lookup = self.doc_ids_by_address().await?;
+        let projection = self.clone();
+        spawn_cpu(move || Result::Ok(lookup.visibility(&projection, &mask))).await
     }
 }
 
@@ -286,6 +443,10 @@ impl VersionAddressProjection {
 pub(super) enum DocVisibility {
     All,
     Selected(RoaringBitmap),
+    Filtered {
+        projection: Arc<VersionAddressProjection>,
+        mask: Arc<RowAddrMask>,
+    },
 }
 
 impl DocVisibility {
@@ -294,6 +455,9 @@ impl DocVisibility {
         match self {
             Self::All => true,
             Self::Selected(selected) => selected.contains(doc_id.get()),
+            Self::Filtered { projection, mask } => projection
+                .address(doc_id)
+                .is_some_and(|address| mask.selected(address)),
         }
     }
 
@@ -301,6 +465,7 @@ impl DocVisibility {
         match self {
             Self::All => total_docs,
             Self::Selected(selected) => selected.len() as usize,
+            Self::Filtered { .. } => total_docs,
         }
     }
 
@@ -310,8 +475,8 @@ impl DocVisibility {
 
     pub(crate) fn iter(&self) -> Option<impl Iterator<Item = DocId> + '_> {
         match self {
-            Self::All => None,
             Self::Selected(selected) => Some(selected.iter().map(DocId::new)),
+            Self::All | Self::Filtered { .. } => None,
         }
     }
 }
@@ -550,11 +715,26 @@ impl PartitionDocuments {
             .cloned()
     }
 
-    pub(crate) async fn visibility(&self, mask: &RowAddrMask) -> Result<DocVisibility> {
+    pub(crate) async fn visibility(
+        &self,
+        mask: Arc<RowAddrMask>,
+        materialize_selected: bool,
+    ) -> Result<DocVisibility> {
+        if mask.max_len() == Some(0) {
+            return Ok(DocVisibility::Selected(RoaringBitmap::new()));
+        }
         if mask.is_select_all() && self.remapper.is_none() {
-            Ok(DocVisibility::All)
+            return Ok(DocVisibility::All);
+        }
+
+        let projection = self.projection().await?;
+        if mask.is_select_all() {
+            return Ok(DocVisibility::Selected(projection.live_doc_ids()));
+        }
+        if materialize_selected {
+            projection.materialize_visibility(mask).await
         } else {
-            Ok(self.projection().await?.visibility(mask))
+            Ok(DocVisibility::Filtered { projection, mask })
         }
     }
 
@@ -628,7 +808,7 @@ impl PartitionDocuments {
                 format!("{ROW_ID} contains null values"),
             ));
         }
-        let addresses = address_column.values().to_vec();
+        let addresses = address_column.values();
         if use_bulk && addresses.len() != self.num_docs {
             return Err(corrupt_docs(
                 &self.path,
@@ -658,7 +838,7 @@ impl PartitionDocuments {
         } else {
             let by_doc_id = unique
                 .into_iter()
-                .zip(addresses)
+                .zip(addresses.iter().copied())
                 .collect::<std::collections::HashMap<_, _>>();
             doc_ids
                 .iter()
@@ -681,7 +861,7 @@ impl PartitionDocuments {
 
     pub(crate) async fn prewarm(&self) -> Result<()> {
         self.lengths().await?;
-        self.projection().await?;
+        self.projection().await?.doc_ids_by_address().await?;
         Ok(())
     }
 }
@@ -1061,49 +1241,127 @@ mod tests {
     }
 
     #[test]
-    fn visibility_uses_doc_ids() {
+    fn live_documents_use_doc_ids() {
         let projection = VersionAddressProjection {
             addresses: AddressValues::Owned(vec![10, 20, 30]),
             live_docs: Some(RoaringBitmap::from_iter([0, 2])),
+            doc_ids_by_address: OnceCell::new(),
         };
-        let mask = RowAddrMask::all_rows();
-        let DocVisibility::Selected(selected) = projection.visibility(&mask) else {
-            panic!("remapped projection must preserve its live-doc bitmap")
-        };
+        let selected = projection.live_doc_ids();
         assert_eq!(selected.iter().collect::<Vec<_>>(), vec![0, 2]);
     }
 
-    #[test]
-    fn remap_preserves_doc_id_slots_and_filters_in_current_address_domain() {
+    #[tokio::test]
+    async fn remap_preserves_doc_id_slots_and_filters_in_current_address_domain() {
         let raw = UInt64Array::from(vec![10, 20, 30, 40]);
         let remapper = TestRemapper {
             mapping: HashMap::from([(10, Some(100)), (20, None), (30, Some(300))]),
         };
-        let projection = VersionAddressProjection::try_new(&raw, 4, Some(&remapper), "docs")
-            .expect("valid projection");
+        let projection = Arc::new(
+            VersionAddressProjection::try_new(&raw, 4, Some(&remapper), "docs")
+                .expect("valid projection"),
+        );
 
         assert_eq!(projection.address(DocId::new(0)), Some(100));
         assert_eq!(projection.address(DocId::new(1)), None);
         assert_eq!(projection.address(DocId::new(2)), Some(300));
         assert_eq!(projection.address(DocId::new(3)), Some(40));
 
-        let DocVisibility::Selected(all_live) = projection.visibility(&RowAddrMask::all_rows())
-        else {
-            panic!("a remapped projection must retain a live-doc bitmap")
-        };
+        let all_live = projection.live_doc_ids();
         assert_eq!(all_live.iter().collect::<Vec<_>>(), vec![0, 2, 3]);
 
-        let allowed = RowAddrMask::from_allowed(RowAddrTreeMap::from_iter([100, 40]));
-        let DocVisibility::Selected(selected) = projection.visibility(&allowed) else {
+        let allowed = Arc::new(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter([
+            100, 40,
+        ])));
+        let DocVisibility::Selected(selected) = projection
+            .materialize_visibility(allowed)
+            .await
+            .expect("valid allow-list")
+        else {
             panic!("allow-list must compile to DocIds")
         };
         assert_eq!(selected.iter().collect::<Vec<_>>(), vec![0, 3]);
 
-        let blocked = RowAddrMask::from_block(RowAddrTreeMap::from_iter([300]));
-        let DocVisibility::Selected(selected) = projection.visibility(&blocked) else {
+        let first_lookup = projection
+            .doc_ids_by_address()
+            .await
+            .expect("cached address lookup");
+        let blocked = Arc::new(RowAddrMask::from_block(RowAddrTreeMap::from_iter([300])));
+        let DocVisibility::Selected(selected) = projection
+            .materialize_visibility(blocked)
+            .await
+            .expect("valid block-list")
+        else {
             panic!("block-list must compile to DocIds")
         };
         assert_eq!(selected.iter().collect::<Vec<_>>(), vec![0, 3]);
+        let second_lookup = projection
+            .doc_ids_by_address()
+            .await
+            .expect("cached address lookup");
+        assert!(Arc::ptr_eq(&first_lookup, &second_lookup));
+    }
+
+    #[tokio::test]
+    async fn materialized_visibility_handles_unsorted_duplicate_addresses_and_full_fragments() {
+        let row_address = |fragment_id, row_offset| {
+            u64::from(RowAddress::new_from_parts(fragment_id, row_offset))
+        };
+        let projection = Arc::new(VersionAddressProjection {
+            addresses: AddressValues::Owned(vec![
+                row_address(2, 5),
+                row_address(1, 2),
+                row_address(1, 2),
+                row_address(1, 4),
+            ]),
+            live_docs: None,
+            doc_ids_by_address: OnceCell::new(),
+        });
+
+        let allowed = Arc::new(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter([
+            row_address(1, 2),
+            row_address(1, 3),
+            row_address(1, 4),
+        ])));
+        let DocVisibility::Selected(selected) = projection
+            .materialize_visibility(allowed)
+            .await
+            .expect("valid allow-list")
+        else {
+            panic!("allow-list must compile to DocIds")
+        };
+        assert_eq!(selected.iter().collect::<Vec<_>>(), vec![1, 2, 3]);
+
+        let mut full_fragment = RowAddrTreeMap::new();
+        full_fragment.insert_fragment(2);
+        let DocVisibility::Selected(selected) = projection
+            .materialize_visibility(Arc::new(RowAddrMask::from_allowed(full_fragment)))
+            .await
+            .expect("valid full-fragment allow-list")
+        else {
+            panic!("allow-list must compile to DocIds")
+        };
+        assert_eq!(selected.iter().collect::<Vec<_>>(), vec![0]);
+    }
+
+    #[test]
+    fn lazy_visibility_projects_only_candidate_doc_ids() {
+        let projection = Arc::new(VersionAddressProjection {
+            addresses: AddressValues::Owned(vec![10, 20, 30]),
+            live_docs: Some(RoaringBitmap::from_iter([0, 2])),
+            doc_ids_by_address: OnceCell::new(),
+        });
+        let visibility = DocVisibility::Filtered {
+            projection: projection.clone(),
+            mask: Arc::new(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter([
+                20, 30,
+            ]))),
+        };
+
+        assert!(!visibility.selected(DocId::new(0)));
+        assert!(!visibility.selected(DocId::new(1)));
+        assert!(visibility.selected(DocId::new(2)));
+        assert!(!projection.doc_ids_by_address.initialized());
     }
 
     #[test]
@@ -1190,6 +1448,38 @@ mod tests {
         assert_eq!(counts.address_rows.load(Ordering::Relaxed), 0);
         assert!(documents.lengths_loaded());
         assert!(!documents.projection_loaded());
+    }
+
+    #[tokio::test]
+    async fn prewarm_loads_document_columns_and_address_lookup_once() {
+        let (_directory, store) = test_store();
+        let path = "docs.lance";
+        write_documents(
+            store.as_ref(),
+            path,
+            UInt64Array::from(vec![10, 20, 30]),
+            UInt32Array::from(vec![2, 3, 5]),
+            Some("10"),
+        )
+        .await;
+        let (counting, counts) = counted_store(store, path);
+        let documents = open_documents(counting, path, None).await.unwrap();
+
+        documents.prewarm().await.unwrap();
+        let projection = documents.projection().await.unwrap();
+        let first_lookup = projection.doc_ids_by_address().await.unwrap();
+        documents.prewarm().await.unwrap();
+        let second_lookup = projection.doc_ids_by_address().await.unwrap();
+
+        assert!(documents.lengths_loaded());
+        assert!(documents.projection_loaded());
+        assert!(matches!(
+            first_lookup.as_ref(),
+            AddressDocIdLookup::Identity
+        ));
+        assert!(Arc::ptr_eq(&first_lookup, &second_lookup));
+        assert_eq!(counts.length_rows.load(Ordering::Relaxed), 3);
+        assert_eq!(counts.address_rows.load(Ordering::Relaxed), 3);
     }
 
     #[tokio::test]

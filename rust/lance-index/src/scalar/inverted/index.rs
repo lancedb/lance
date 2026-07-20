@@ -1144,7 +1144,17 @@ impl InvertedIndex {
                     let documents = part.docs.modern().cloned().ok_or_else(|| {
                         Error::internal("modern index contains legacy partition documents")
                     })?;
-                    let visibility = Arc::new(documents.visibility(mask.as_ref()).await?);
+                    let materialize_selected = operator == Operator::Or
+                        && mask.max_len().is_some_and(|selected| {
+                            u128::from(selected).saturating_mul(100)
+                                <= u128::from(*FLAT_SEARCH_PERCENT_THRESHOLD)
+                                    .saturating_mul(documents.len() as u128)
+                        });
+                    let visibility = Arc::new(
+                        documents
+                            .visibility(mask.clone(), materialize_selected)
+                            .await?,
+                    );
                     if visibility.is_empty() {
                         return Result::Ok((partition_ordinal, PartitionCandidates::empty()));
                     }
@@ -1213,16 +1223,26 @@ impl InvertedIndex {
                 .or_default()
                 .push((rank, doc_id));
         }
-        for (partition_ordinal, entries) in by_partition {
-            let documents = self.partitions[partition_ordinal]
-                .docs
-                .modern()
-                .expect("modern search only groups modern partitions");
-            let doc_ids = entries
-                .iter()
-                .map(|(_, doc_id)| *doc_id)
-                .collect::<Vec<_>>();
-            let resolved = documents.resolve_addresses(&doc_ids).await?;
+        let address_reads = by_partition
+            .into_iter()
+            .map(|(partition_ordinal, entries)| {
+                let documents = self.partitions[partition_ordinal]
+                    .docs
+                    .modern()
+                    .cloned()
+                    .expect("modern search only groups modern partitions");
+                async move {
+                    let doc_ids = entries
+                        .iter()
+                        .map(|(_, doc_id)| *doc_id)
+                        .collect::<Vec<_>>();
+                    let resolved = documents.resolve_addresses(&doc_ids).await?;
+                    Result::Ok((entries, resolved))
+                }
+            });
+        let mut address_reads =
+            stream::iter(address_reads).buffer_unordered(self.store.io_parallelism().max(1));
+        while let Some((entries, resolved)) = address_reads.try_next().await? {
             for ((rank, _), address) in entries.into_iter().zip(resolved) {
                 addresses[rank] = address;
             }
@@ -9591,15 +9611,21 @@ mod tests {
 
         let all_rows = RowAddrMask::all_rows();
         assert!(matches!(
-            documents.visibility(&all_rows).await.unwrap(),
+            documents
+                .visibility(Arc::new(all_rows), false)
+                .await
+                .unwrap(),
             DocVisibility::All
         ));
         assert!(!documents.projection_loaded());
 
         let filtered = RowAddrMask::allow_nothing();
-        let visibility = documents.visibility(&filtered).await.unwrap();
+        let visibility = documents
+            .visibility(Arc::new(filtered), true)
+            .await
+            .unwrap();
         assert!(visibility.is_empty());
-        assert!(documents.projection_loaded());
+        assert!(!documents.projection_loaded());
         assert_eq!(
             documents
                 .resolve_addresses(&[DocId::new(0), DocId::new(99)])
@@ -10427,10 +10453,7 @@ mod tests {
 
         let documents = partition.docs.modern().unwrap();
         let lengths = documents.lengths().await.unwrap();
-        let visibility = documents
-            .visibility(NoFilter.mask().as_ref())
-            .await
-            .unwrap();
+        let visibility = documents.visibility(NoFilter.mask(), false).await.unwrap();
         partition
             .bm25_search_modern(
                 lengths.as_ref(),
