@@ -195,11 +195,16 @@ impl<'py> IntoPyObject<'py> for PyLance<&DataReplacementGroup> {
 // Accept either a `Bitmap` (cheap `Arc` clone) or any other iterable of ints
 // (a `set`, `list`, etc.), collected in whatever order the iterable yields —
 // `RoaringBitmap` itself defines the canonical (ascending, deduplicated)
-// order, so there's no separate ordering contract to validate here. Note
-// that a `RoaringBitmap` is a set: a caller-supplied iterable with a
-// duplicate offset silently collapses to one entry, so a caller relying on
-// a 1:1 offset-to-value-row mapping (see `DataOverlayFile.offsets` below)
-// must not repeat an offset.
+// order, so there's no separate ordering contract to validate here.
+//
+// Deliberate footgun, not an oversight: a `RoaringBitmap` is a set, so a
+// duplicate value in the input silently collapses to one entry. That's
+// harmless for `IndexMetadata.fragment_bitmap` (just a set of fragment
+// ids), but for `DataOverlayFile.offsets` (see its docstring in
+// dataset.py) it would silently shift every later offset onto the wrong
+// row of the value file. This is intentionally left unvalidated — it's a
+// low-level API and callers are expected to pass distinct offsets — but
+// don't remove this comment without also updating that docstring.
 fn extract_bitmap(ob: &Bound<'_, PyAny>) -> PyResult<RoaringBitmap> {
     if let Ok(bitmap) = ob.extract::<PyBitmap>() {
         return Ok((*bitmap.0).clone());

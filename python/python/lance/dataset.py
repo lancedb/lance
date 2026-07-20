@@ -6023,6 +6023,12 @@ class LanceOperation:
             ``data_file``, the next-smallest to row 1, and so on — regardless
             of the order values are given in, so a plain ``List[int]`` need
             not be pre-sorted.
+
+            This is a low-level API with no built-in protection against a
+            duplicate offset: since the coverage is stored as a set, a
+            repeated offset silently collapses to one entry, shifting every
+            later offset onto the wrong row of ``data_file`` with no error.
+            Callers are responsible for passing distinct offsets.
         committed_version : Optional[int]
             The dataset version at which this overlay became effective. Leave as
             ``None`` when creating an overlay to commit — the commit stamps it.
