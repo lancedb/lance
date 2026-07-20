@@ -1709,6 +1709,21 @@ impl FilteredReadOptions {
     }
 }
 
+/// A resolved plan plus the fragment handles it was computed over (in
+/// priority order), so stream construction reuses them instead of
+/// reloading. Only handles are kept — planning-only metadata (deletion
+/// vectors, row-id sequences) is not retained. `with_plan` carries none.
+struct PlannedRead {
+    plan: FilteredReadInternalPlan,
+    fragments: Option<Arc<Vec<Arc<FileFragment>>>>,
+}
+
+impl std::fmt::Debug for PlannedRead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PlannedRead").finish()
+    }
+}
+
 /// A plan node that reads a dataset, applying an optional filter and projection.
 ///
 /// This node may execute a scan or it may execute a take.  By default, it picks the best
@@ -1723,23 +1738,6 @@ impl FilteredReadOptions {
 /// In the future, we may introduce high-level cardinality statistics similar to those used by query
 /// engines like Postgres.  This might allow us to know, without executing an index search, that a scan
 /// would be better.  In that case we accept the force_scan hint to skip the index search.
-/// A resolved plan together with the fragment handles it was computed over
-/// (in priority order), so stream construction reuses them instead of
-/// reloading every fragment. Only the handles are kept; planning-only
-/// metadata (deletion vectors, row-id sequences) is not retained. The
-/// distributed path (`with_plan`, plan computed on another node) carries no
-/// fragments and the stream loads them itself.
-struct PlannedRead {
-    plan: FilteredReadInternalPlan,
-    fragments: Option<Arc<Vec<Arc<FileFragment>>>>,
-}
-
-impl std::fmt::Debug for PlannedRead {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PlannedRead").finish()
-    }
-}
-
 #[derive(Debug)]
 pub struct FilteredReadExec {
     dataset: Arc<Dataset>,
@@ -2084,9 +2082,6 @@ impl FilteredReadExec {
 
     /// Set the pre-computed plan for execution
     pub async fn with_plan(self, plan: FilteredReadPlan) -> Result<Self> {
-        // Distributed path: the plan was computed elsewhere (e.g. on a query
-        // node), so no fragment metadata is cached; stream construction
-        // loads it itself.
         let mut rows = BTreeMap::new();
         for (fragment_id, selection) in plan.rows.iter() {
             let ranges = match selection {
@@ -2170,9 +2165,8 @@ impl FilteredReadExec {
                     .try_collect::<Vec<_>>()
                     .await?;
 
-                // Plan the scan; keep only the fragment handles so stream
-                // construction doesn't reload every fragment. Planning-only
-                // metadata drops here rather than living as long as the exec.
+                // Plan the scan; keep the fragment handles so stream
+                // construction doesn't reload every fragment
                 let plan =
                     FilteredReadStream::plan_scan(&loaded_fragments, &evaluated_index, options);
                 let fragment_handles = loaded_fragments
@@ -2377,8 +2371,6 @@ const ROW_STREAM_CONCURRENT_BATCHES: usize = 4;
 struct StreamFragments {
     /// All dataset (or scoped) fragments, in dataset order
     fragments: Vec<LoadedFragment>,
-    /// The fragments' file handles, shared with each batch's read stream
-    handles: Arc<Vec<Arc<FileFragment>>>,
     /// Fragment id → position in `fragments`
     positions: HashMap<u32, usize>,
     /// Each fragment's row-id span, for skipping fragments a batch cannot
@@ -2447,15 +2439,8 @@ impl RowStreamRead {
                     .iter()
                     .map(|fragment| fragment.row_id_sequence.row_id_range())
                     .collect();
-                let handles = Arc::new(
-                    fragments
-                        .iter()
-                        .map(|fragment| fragment.fragment.clone())
-                        .collect(),
-                );
                 Ok(StreamFragments {
                     fragments,
-                    handles,
                     positions,
                     id_spans,
                 })
@@ -2592,7 +2577,13 @@ impl RowStreamRead {
         internal_plan: FilteredReadInternalPlan,
         batch_index: u32,
     ) -> DataFusionResult<RecordBatch> {
-        let fragment_handles = self.load_fragments().await?.handles.clone();
+        let fragments = &self.load_fragments().await?.fragments;
+        let fragment_handles = Arc::new(
+            fragments
+                .iter()
+                .map(|fragment| fragment.fragment.clone())
+                .collect::<Vec<_>>(),
+        );
         // I/O priority: earlier batches strictly first (output emits in batch
         // order), fragments keep dataset order within a batch
         let priority_offset = batch_index.saturating_mul(fragment_handles.len() as u32);
