@@ -264,16 +264,16 @@ public final class InvertedIndexParams {
     /**
      * Configure the on-disk FTS format version to write when creating a new index.
      *
-     * <p>If unset, Lance writes v2 for {@code blockSize = 128} and v3 for {@code blockSize = 256}.
-     * {@code formatVersion = 3} is experimental and is only valid with {@code blockSize = 256}.
+     * <p>If unset, Lance writes v4 for either supported block size. {@code formatVersion = 3} is
+     * experimental and is only valid with {@code blockSize = 256}.
      *
-     * @param formatVersion FTS format version, must be 1, 2, or 3
+     * @param formatVersion FTS format version, must be 1, 2, 3, or 4
      * @return this builder
      * @throws IllegalArgumentException
      */
     public Builder formatVersion(int formatVersion) {
-      if (formatVersion != 1 && formatVersion != 2 && formatVersion != 3) {
-        throw new IllegalArgumentException("formatVersion must be 1, 2, or 3");
+      if (formatVersion != 1 && formatVersion != 2 && formatVersion != 3 && formatVersion != 4) {
+        throw new IllegalArgumentException("formatVersion must be 1, 2, 3, or 4");
       }
       this.formatVersion = formatVersion;
       return this;
@@ -283,8 +283,10 @@ public final class InvertedIndexParams {
     public ScalarIndexParams build() {
       if (formatVersion != null) {
         Preconditions.checkArgument(
-            (blockSize == 256 && formatVersion == 3) || (blockSize == 128 && formatVersion != 3),
-            "formatVersion 3 requires blockSize 256, and blockSize 256 requires formatVersion 3");
+            formatVersion == 4
+                || (blockSize == 256 && formatVersion == 3)
+                || (blockSize == 128 && formatVersion != 3),
+            "formatVersion 3 requires blockSize 256, and legacy formats require blockSize 128");
       }
       Map<String, Object> params = new HashMap<>();
       if (baseTokenizer != null) {
