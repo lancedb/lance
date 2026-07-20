@@ -42,6 +42,7 @@ pub const LEGACY_BLOCK_SIZE: usize = 128;
 /// This intentionally matches [`LEGACY_BLOCK_SIZE`] today but may evolve independently.
 pub const DEFAULT_BLOCK_SIZE: usize = 128;
 pub const VALID_BLOCK_SIZES: [usize; 2] = [128, 256];
+const LANCE_FTS_FORMAT_VERSION_ENV_KEY: &str = "LANCE_FTS_FORMAT_VERSION";
 
 /// Tokenizer configs
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -158,7 +159,9 @@ pub struct InvertedIndexParams {
     /// On-disk FTS format version to write when creating a new index.
     ///
     /// This is a build-time only parameter and is not persisted with the index.
-    /// If unset, Lance writes v4 for either supported block size.
+    /// If unset, new index creation falls back to
+    /// `LANCE_FTS_FORMAT_VERSION`, then v4 when the environment variable is
+    /// also unset.
     /// `format_version = 3` is experimental and is only valid with
     /// `block_size = 256`.
     #[serde(
@@ -496,6 +499,26 @@ where
     }
 }
 
+fn resolve_creation_format_version(
+    explicit: Option<InvertedListFormatVersion>,
+) -> Result<InvertedListFormatVersion> {
+    if let Some(format_version) = explicit {
+        return Ok(format_version);
+    }
+
+    match env::var(LANCE_FTS_FORMAT_VERSION_ENV_KEY) {
+        Ok(value) => resolve_fts_format_version(Some(&value)).map_err(|err| {
+            Error::invalid_input(format!(
+                "invalid {LANCE_FTS_FORMAT_VERSION_ENV_KEY} value {value:?}: {err}"
+            ))
+        }),
+        Err(env::VarError::NotPresent) => resolve_fts_format_version(None),
+        Err(env::VarError::NotUnicode(value)) => Err(Error::invalid_input(format!(
+            "invalid {LANCE_FTS_FORMAT_VERSION_ENV_KEY} value {value:?}: expected UTF-8 value 1, 2, 3, or 4"
+        ))),
+    }
+}
+
 fn deserialize_explicit_option<'de, D, T>(
     deserializer: D,
 ) -> std::result::Result<Option<Option<T>>, D::Error>
@@ -796,9 +819,10 @@ impl InvertedIndexParams {
 
     /// Set the on-disk FTS format version to use when creating a new index.
     ///
-    /// If unset, Lance writes v4 for either supported block size. Existing
-    /// indexes keep their own on-disk format during update and optimize
-    /// operations.
+    /// If unset, new index creation falls back to
+    /// `LANCE_FTS_FORMAT_VERSION`, then v4 when the environment variable is
+    /// also unset. Existing indexes keep their own on-disk format during
+    /// update and optimize operations.
     /// `format_version = 3` is experimental and is only valid with
     /// `block_size = 256`.
     pub fn format_version(mut self, format_version: InvertedListFormatVersion) -> Self {
@@ -848,8 +872,8 @@ impl InvertedIndexParams {
         Ok(value)
     }
 
-    /// Deserialize params for new index training, using current creation defaults
-    /// for omitted fields.
+    /// Deserialize params for new index training, using the environment
+    /// compatibility fallback and current creation defaults for omitted fields.
     pub(crate) fn from_training_json(params: &str) -> Result<Self> {
         let supplied = serde_json::from_str::<serde_json::Value>(params)?;
         let mut value = serde_json::to_value(Self::default())?;
@@ -862,7 +886,8 @@ impl InvertedIndexParams {
             .expect("inverted index params should serialize to a JSON object");
         object.extend(supplied.clone());
 
-        let params: Self = serde_json::from_value(value)?;
+        let mut params: Self = serde_json::from_value(value)?;
+        params.format_version = Some(resolve_creation_format_version(params.format_version)?);
         params.validate_format_version()?;
         Ok(params)
     }

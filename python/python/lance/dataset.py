@@ -3371,7 +3371,8 @@ class LanceDataset(pa.dataset.Dataset):
             This is for the ``INVERTED`` / ``FTS`` index. Explicit on-disk FTS
             format version to write when creating a new index. Accepts ``1``,
             ``2``, ``3``, ``4``, ``"v1"``, ``"v2"``, ``"v3"``, or ``"v4"``.
-            If unset, Lance writes v4 for either supported block size.
+            If unset, Lance uses ``LANCE_FTS_FORMAT_VERSION`` when present and
+            otherwise writes v4.
             ``format_version=3`` is experimental and is only valid with
             ``block_size=256``.
 
