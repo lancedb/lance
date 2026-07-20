@@ -19,9 +19,10 @@ from .dependencies import (
 )
 from .dependencies import numpy as np
 from .log import LOGGER
-from .util import MetricType, _normalize_metric_type
+from .util import MetricType, _normalize_index_segment_ids, _normalize_metric_type
 
 if TYPE_CHECKING:
+    import uuid
     from pathlib import Path
 
     from . import LanceDataset
@@ -761,13 +762,17 @@ def hamming_clustering_for_ivf_partition(
     index_name: str,
     partition_id: int,
     hamming_threshold: int,
+    *,
+    index_segments: Optional[Iterable[Union[str, uuid.UUID]]] = None,
 ) -> pa.RecordBatchReader:
     """
     Perform hamming clustering on a partition of an IVF_FLAT index.
 
-    Loads a partition from an IVF_FLAT index on a hash column, computes
-    pairwise hamming distances between all hashes in the partition,
-    filters by threshold, and clusters the results using union-find.
+    Loads a partition from every segment of an IVF_FLAT index on a hash
+    column, computes pairwise hamming distances between all hashes in the
+    combined partition, filters by threshold, and clusters the results using
+    union-find. All segments of the logical index must share the same global
+    IVF centroids; an error is raised if they do not.
 
     Parameters
     ----------
@@ -779,6 +784,11 @@ def hamming_clustering_for_ivf_partition(
         The partition ID within the IVF_FLAT index
     hamming_threshold : int
         Maximum hamming distance to consider as similar
+    index_segments : iterable of str or uuid.UUID, optional
+        If specified, only these physical index segment UUIDs of the named
+        logical index contribute rows. Use
+        :meth:`LanceDataset.describe_indices` to obtain segment UUIDs from
+        ``IndexDescription.segments``. Defaults to all segments.
 
     Returns
     -------
@@ -789,16 +799,24 @@ def hamming_clustering_for_ivf_partition(
         - 'duplicates': list<uint64> - List of duplicate row IDs in each cluster
     """
     return dataset._ds.hamming_clustering_for_ivf_partition(
-        index_name, partition_id, hamming_threshold
+        index_name,
+        partition_id,
+        hamming_threshold,
+        _normalize_index_segment_ids(index_segments),
     )
 
 
 def get_ivf_partition_info(
     dataset: "LanceDataset",
     index_name: str,
+    *,
+    index_segments: Optional[Iterable[Union[str, uuid.UUID]]] = None,
 ) -> List[dict]:
     """
     Get partition information for an IVF_FLAT index.
+
+    Partition sizes are aggregated across all segments of the logical index
+    unless a subset is selected via ``index_segments``.
 
     Parameters
     ----------
@@ -806,13 +824,18 @@ def get_ivf_partition_info(
         The Lance dataset containing the hash column with an IVF_FLAT index.
     index_name : str
         Name of the IVF_FLAT index
+    index_segments : iterable of str or uuid.UUID, optional
+        If specified, only these physical index segment UUIDs of the named
+        logical index contribute to the sizes. Defaults to all segments.
 
     Returns
     -------
     list[dict]
         List of partition info dicts with 'partition_id' and 'size'
     """
-    return dataset._ds.get_ivf_partition_info(index_name)
+    return dataset._ds.get_ivf_partition_info(
+        index_name, _normalize_index_segment_ids(index_segments)
+    )
 
 
 def hamming_clustering_for_sample(
@@ -833,7 +856,8 @@ def hamming_clustering_for_sample(
     dataset : LanceDataset
         The Lance dataset containing the hash column.
     column : str
-        Name of the hash column (must be FixedSizeList<UInt8, 8>)
+        Name of the hash column (must be FixedSizeList<UInt8, N> where N is a
+        positive multiple of 8 bytes)
     sample_size : int, optional
         Number of rows to sample. If None, uses all rows.
     hamming_threshold : int, default 10
@@ -875,7 +899,8 @@ def hamming_clustering_for_range(
     dataset : LanceDataset
         The Lance dataset containing the hash column.
     column : str
-        Name of the hash column (must be FixedSizeList<UInt8, 8>)
+        Name of the hash column (must be FixedSizeList<UInt8, N> where N is a
+        positive multiple of 8 bytes)
     fragment_id : int
         The fragment ID to read from
     start_row : int

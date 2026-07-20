@@ -27,7 +27,6 @@
 //! Already-blocked rows are dropped from the key set before probing older
 //! generations, preserving the per-row short-circuit.
 
-use std::any::Any;
 use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -107,10 +106,6 @@ impl DisplayAs for PkBlockFilterExec {
 impl ExecutionPlan for PkBlockFilterExec {
     fn name(&self) -> &str {
         "PkBlockFilterExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn schema(&self) -> SchemaRef {

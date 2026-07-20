@@ -7,6 +7,7 @@ use uuid::Uuid;
 mod fragment;
 mod index;
 mod manifest;
+pub mod overlay;
 mod transaction;
 
 pub use crate::rowids::version::{

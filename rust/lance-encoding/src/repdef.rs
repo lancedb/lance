@@ -122,9 +122,9 @@ use crate::buffer::LanceBuffer;
 
 pub type LevelBuffer = Vec<u16>;
 
-/// A contiguous top-level-row range that can be encoded as one structural page.
+/// A top-level-row range whose dense rep/def stream fits one mini-block page.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct StructuralPageSplit {
+pub(crate) struct MiniBlockRepDefSplit {
     /// Top-level row offset, relative to the original unsplit page.
     pub(crate) row_start: u64,
     /// Number of top-level rows in this split.
@@ -137,15 +137,15 @@ pub(crate) struct StructuralPageSplit {
     pub(crate) num_values: u64,
 }
 
-/// Planner result for structural page budget handling.
+/// Dense mini-block rep/def budget result for one accumulated page.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum StructuralPagePlan {
-    /// The original page can be encoded as-is.
-    Fits,
-    /// The original page should be split on top-level row boundaries.
-    Split(Vec<StructuralPageSplit>),
-    /// One top-level row is larger than the requested structural page budget.
-    UnsplittableOverBudget(u64),
+pub(crate) enum MiniBlockRepDefBudget {
+    /// The dense rep/def stream fits one mini-block structural page.
+    WithinBudget,
+    /// The dense rep/def stream fits after splitting on top-level row boundaries.
+    RequiresPageSplit(Vec<MiniBlockRepDefSplit>),
+    /// A single top-level row has this many rep/def levels and exceeds the budget.
+    SingleRowOverBudget(u64),
 }
 
 // As we build def levels we add this to special values to indicate that they
@@ -806,21 +806,20 @@ impl SerializerContext {
         max_levels_per_page: Option<u64>,
         num_rows: u64,
         num_values: u64,
-    ) -> Result<StructuralPagePlan> {
+    ) -> Result<MiniBlockRepDefBudget> {
         // Extremely sparse lists can have many rep/def levels for very few
         // visible leaf values.  If this ratio becomes too skewed then a
-        // miniblock structural chunk can exceed its packed rep/def metadata
-        // budget even though the value buffers are small.  We detect that case
-        // while normalizing special def levels and split the structural page on
-        // top-level row boundaries so each emitted page stays within the
-        // miniblock structural budget.
+        // mini-block rep/def chunk can exceed its packed metadata budget even
+        // though the value buffers are small.  We detect that case while
+        // normalizing special def levels and split on top-level row boundaries
+        // so each emitted dense mini-block page stays within the budget.
         if self.def_levels.is_empty() {
-            return Ok(StructuralPagePlan::Fits);
+            return Ok(MiniBlockRepDefBudget::WithinBudget);
         }
 
         if self.rep_levels.is_empty() {
             self.normalize_specials();
-            return Ok(StructuralPagePlan::Fits);
+            return Ok(MiniBlockRepDefBudget::WithinBudget);
         }
 
         if self.rep_levels.len() != self.def_levels.len() {
@@ -833,12 +832,12 @@ impl SerializerContext {
 
         let Some(max_levels_per_page) = max_levels_per_page else {
             self.normalize_specials();
-            return Ok(StructuralPagePlan::Fits);
+            return Ok(MiniBlockRepDefBudget::WithinBudget);
         };
 
         if num_values == 0 {
             self.normalize_specials();
-            return Ok(StructuralPagePlan::Fits);
+            return Ok(MiniBlockRepDefBudget::WithinBudget);
         }
 
         let max_schema_rep = def_meaning.iter().filter(|level| level.is_list()).count() as u16;
@@ -847,7 +846,7 @@ impl SerializerContext {
 
         if !should_plan {
             self.normalize_specials();
-            return Ok(StructuralPagePlan::Fits);
+            return Ok(MiniBlockRepDefBudget::WithinBudget);
         }
 
         let max_visible_level = max_visible_level.unwrap();
@@ -855,7 +854,7 @@ impl SerializerContext {
         let mut counted_rows = 0u64;
         let mut counted_values = 0u64;
         let mut saw_structural_overhead = false;
-        let mut unsplittable_over_budget = None;
+        let mut single_row_over_budget_levels = None;
 
         let mut current_row_level_start = None;
         let mut current_row_num_values = 0u64;
@@ -876,14 +875,14 @@ impl SerializerContext {
                 saw_structural_overhead |= row_has_structural_overhead;
 
                 if row_has_structural_overhead && row_num_levels > max_levels_per_page {
-                    unsplittable_over_budget = Some(row_num_levels);
+                    single_row_over_budget_levels = Some(row_num_levels);
                 }
 
                 if current_page_num_rows > 0
                     && (current_page_has_structural_overhead || row_has_structural_overhead)
                     && current_page_num_levels + row_num_levels > max_levels_per_page
                 {
-                    splits.push(StructuralPageSplit {
+                    splits.push(MiniBlockRepDefSplit {
                         row_start: current_page_row_start,
                         num_rows: current_page_num_rows,
                         level_range: current_page_level_start..current_page_level_end,
@@ -966,14 +965,14 @@ impl SerializerContext {
             )));
         }
         if !saw_structural_overhead {
-            return Ok(StructuralPagePlan::Fits);
+            return Ok(MiniBlockRepDefBudget::WithinBudget);
         }
-        if let Some(row_num_levels) = unsplittable_over_budget {
-            return Ok(StructuralPagePlan::UnsplittableOverBudget(row_num_levels));
+        if let Some(row_num_levels) = single_row_over_budget_levels {
+            return Ok(MiniBlockRepDefBudget::SingleRowOverBudget(row_num_levels));
         }
 
         if current_page_num_rows > 0 {
-            splits.push(StructuralPageSplit {
+            splits.push(MiniBlockRepDefSplit {
                 row_start: current_page_row_start,
                 num_rows: current_page_num_rows,
                 level_range: current_page_level_start..current_page_level_end,
@@ -983,9 +982,9 @@ impl SerializerContext {
         }
 
         if splits.len() > 1 {
-            Ok(StructuralPagePlan::Split(splits))
+            Ok(MiniBlockRepDefBudget::RequiresPageSplit(splits))
         } else {
-            Ok(StructuralPagePlan::Fits)
+            Ok(MiniBlockRepDefBudget::WithinBudget)
         }
     }
 
@@ -1023,12 +1022,12 @@ impl SerializerContext {
         )
     }
 
-    fn build_with_structural_plan(
+    fn build_with_miniblock_repdef_budget(
         mut self,
         max_levels_per_page: Option<u64>,
         num_rows: u64,
         num_values: u64,
-    ) -> Result<(SerializedRepDefs, StructuralPagePlan)> {
+    ) -> Result<(SerializedRepDefs, MiniBlockRepDefBudget)> {
         if self.current_len == 0 {
             return Ok((
                 SerializedRepDefs::new_with_fixed_size_list_levels(
@@ -1037,7 +1036,7 @@ impl SerializerContext {
                     self.def_meaning,
                     self.has_fsl,
                 ),
-                StructuralPagePlan::Fits,
+                MiniBlockRepDefBudget::WithinBudget,
             ));
         }
 
@@ -1046,7 +1045,7 @@ impl SerializerContext {
             .into_iter()
             .rev()
             .collect::<Vec<_>>();
-        let plan = self.normalize_specials_and_plan_splits(
+        let budget = self.normalize_specials_and_plan_splits(
             &def_meaning,
             max_levels_per_page,
             num_rows,
@@ -1071,7 +1070,7 @@ impl SerializerContext {
                 def_meaning,
                 self.has_fsl,
             ),
-            plan,
+            budget,
         ))
     }
 }
@@ -1412,15 +1411,15 @@ impl RepDefBuilder {
         Self::serialize_builders(builders).0.build()
     }
 
-    /// Converts gathered structural buffers into rep/def levels and an encode-time plan.
-    pub(crate) fn serialize_with_structural_plan(
+    /// Converts gathered structural buffers into rep/def levels and a mini-block budget result.
+    pub(crate) fn serialize_with_miniblock_repdef_budget(
         builders: Vec<Self>,
         max_levels_for_bits: impl FnOnce(u64) -> u64,
         num_rows: u64,
         num_values: u64,
-    ) -> Result<(SerializedRepDefs, StructuralPagePlan)> {
+    ) -> Result<(SerializedRepDefs, MiniBlockRepDefBudget)> {
         let (context, bits_per_level) = Self::serialize_builders(builders);
-        context.build_with_structural_plan(
+        context.build_with_miniblock_repdef_budget(
             bits_per_level.map(max_levels_for_bits),
             num_rows,
             num_values,

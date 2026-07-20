@@ -60,7 +60,7 @@ use crate::{
 use crate::{
     repdef::{
         CompositeRepDefUnraveler, ControlWordIterator, ControlWordParser, DefinitionInterpretation,
-        RepDefSlicer, SerializedRepDefs, StructuralPagePlan, build_control_word_iterator,
+        MiniBlockRepDefBudget, RepDefSlicer, SerializedRepDefs, build_control_word_iterator,
     },
     utils::accumulation::AccumulationQueue,
 };
@@ -4458,7 +4458,7 @@ struct DictEncodingBudget {
     max_encoded_size: usize,
 }
 
-// A primitive page after optional structural splitting.
+// A primitive page after applying the dense mini-block rep/def budget.
 struct PrimitivePageData {
     // Arrow leaf arrays that contain this page's visible values.
     arrays: Vec<ArrayRef>,
@@ -4468,8 +4468,8 @@ struct PrimitivePageData {
     row_number: u64,
     // Number of top-level rows in this page.
     num_rows: u64,
-    // Present when one top-level row is too large for one miniblock rep/def chunk.
-    unsplittable_miniblock_levels: Option<u64>,
+    // Present when one top-level row is too large for one mini-block rep/def page.
+    single_row_miniblock_repdef_levels: Option<u64>,
 }
 
 // Immutable encoder state shared by per-page encode tasks.
@@ -5963,33 +5963,33 @@ impl PrimitiveStructuralEncoder {
         Ok(sliced)
     }
 
-    fn split_structural_pages_for_miniblock_budget(
+    fn split_pages_for_miniblock_repdef_budget(
         arrays: Vec<ArrayRef>,
         repdef: SerializedRepDefs,
-        plan: StructuralPagePlan,
+        budget: MiniBlockRepDefBudget,
         row_number: u64,
         num_rows: u64,
     ) -> Result<Vec<PrimitivePageData>> {
-        if plan == StructuralPagePlan::Fits {
+        if budget == MiniBlockRepDefBudget::WithinBudget {
             return Ok(vec![PrimitivePageData {
                 arrays,
                 repdef,
                 row_number,
                 num_rows,
-                unsplittable_miniblock_levels: None,
+                single_row_miniblock_repdef_levels: None,
             }]);
         }
-        if let StructuralPagePlan::UnsplittableOverBudget(num_levels) = plan {
+        if let MiniBlockRepDefBudget::SingleRowOverBudget(num_levels) = budget {
             return Ok(vec![PrimitivePageData {
                 arrays,
                 repdef,
                 row_number,
                 num_rows,
-                unsplittable_miniblock_levels: Some(num_levels),
+                single_row_miniblock_repdef_levels: Some(num_levels),
             }]);
         }
 
-        let StructuralPagePlan::Split(splits) = plan else {
+        let MiniBlockRepDefBudget::RequiresPageSplit(splits) = budget else {
             unreachable!();
         };
 
@@ -6002,7 +6002,7 @@ impl PrimitiveStructuralEncoder {
                 repdef,
                 row_number: row_number + split.row_start,
                 num_rows: split.num_rows,
-                unsplittable_miniblock_levels: None,
+                single_row_miniblock_repdef_levels: None,
             });
         }
         Ok(pages)
@@ -6024,7 +6024,7 @@ impl PrimitiveStructuralEncoder {
             repdef,
             row_number,
             num_rows,
-            unsplittable_miniblock_levels,
+            single_row_miniblock_repdef_levels,
         } = page;
         let num_values = arrays.iter().map(|arr| arr.len() as u64).sum();
 
@@ -6107,7 +6107,7 @@ impl PrimitiveStructuralEncoder {
             );
         }
 
-        if let Some(num_levels) = unsplittable_miniblock_levels {
+        if let Some(num_levels) = single_row_miniblock_repdef_levels {
             let requested_encoding = encoding_metadata
                 .get(STRUCTURAL_ENCODING_META_KEY)
                 .map(|requested| requested.to_lowercase());
@@ -6334,16 +6334,17 @@ impl PrimitiveStructuralEncoder {
         let num_values = arrays.iter().map(|arr| arr.len() as u64).sum();
         let is_simple_validity = repdefs.iter().all(|rd| rd.is_simple_validity());
         let has_repdef_info = repdefs.iter().any(|rd| !rd.is_empty());
-        let (repdef, structural_plan) = RepDefBuilder::serialize_with_structural_plan(
-            repdefs,
-            miniblock::max_repdef_levels_per_chunk,
-            num_rows,
-            num_values,
-        )?;
-        let pages = Self::split_structural_pages_for_miniblock_budget(
+        let (repdef, miniblock_repdef_budget) =
+            RepDefBuilder::serialize_with_miniblock_repdef_budget(
+                repdefs,
+                miniblock::max_repdef_levels_per_chunk,
+                num_rows,
+                num_values,
+            )?;
+        let pages = Self::split_pages_for_miniblock_repdef_budget(
             arrays,
             repdef,
-            structural_plan,
+            miniblock_repdef_budget,
             row_number,
             num_rows,
         )?;

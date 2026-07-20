@@ -355,11 +355,7 @@ impl RowIdSequence {
             while (index - rows_passed) >= cur_seg_len {
                 rows_passed += cur_seg_len;
                 cur_seg = seg_iter.next();
-                if let Some(cur_seg) = cur_seg {
-                    cur_seg_len = cur_seg.len();
-                } else {
-                    return None;
-                }
+                cur_seg_len = cur_seg?.len();
             }
 
             Some(cur_seg.unwrap().get(index - rows_passed).unwrap())

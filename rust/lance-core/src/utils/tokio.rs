@@ -66,11 +66,15 @@ static RUNTIME_INSTALLED: atomic::AtomicBool = atomic::AtomicBool::new(false);
 
 static ATFORK_INSTALLED: atomic::AtomicBool = atomic::AtomicBool::new(false);
 
-fn global_cpu_runtime() -> &'static mut Runtime {
+fn global_cpu_runtime() -> &'static Runtime {
     loop {
         let ptr = CPU_RUNTIME.load(Ordering::SeqCst);
         if !ptr.is_null() {
-            return unsafe { &mut *ptr };
+            // SAFETY: `ptr` was produced by `Box::into_raw` below and is only ever
+            // reset to null by `atfork_tokio_child` in the forked child (single-
+            // threaded, async-signal context). The `Box` is never reclaimed, so the
+            // `Runtime` lives for the rest of the process.
+            return unsafe { &*ptr };
         }
         if !RUNTIME_INSTALLED.fetch_or(true, Ordering::SeqCst) {
             break;
@@ -82,7 +86,9 @@ fn global_cpu_runtime() -> &'static mut Runtime {
     }
     let new_ptr = Box::into_raw(Box::new(create_runtime()));
     CPU_RUNTIME.store(new_ptr, Ordering::SeqCst);
-    unsafe { &mut *new_ptr }
+    // SAFETY: `new_ptr` was just obtained from `Box::into_raw`, so it is non-null,
+    // aligned, and points to a live `Runtime` that is never reclaimed.
+    unsafe { &*new_ptr }
 }
 
 /// After a fork() operation, force re-creation of the BackgroundExecutor. Note: this function

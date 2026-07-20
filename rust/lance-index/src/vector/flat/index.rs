@@ -570,7 +570,7 @@ mod tests {
             .zip(dists.values().iter())
             .map(|(row_id, dist)| (*row_id, *dist))
             .collect::<Vec<_>>();
-        results.sort_by(|left, right| left.0.cmp(&right.0));
+        results.sort_by_key(|left| left.0);
         results
     }
 
@@ -579,7 +579,7 @@ mod tests {
             .into_iter()
             .map(|node| (node.id, node.dist.0))
             .collect::<Vec<_>>();
-        results.sort_by(|left, right| left.0.cmp(&right.0));
+        results.sort_by_key(|left| left.0);
         results
     }
 
