@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
+import gc
 import importlib
 import io
+import queue
 import subprocess
 import sys
 import tarfile
 import textwrap
+import threading
 import uuid
 from pathlib import Path
 
@@ -1377,6 +1380,44 @@ def test_packed_blob_writer_bulk_rejects_non_binary_array(tmp_path, payloads):
 
     packed.write_blob(b"still usable")
     assert len(packed.finish_array("blob")) == 1
+
+
+@pytest.mark.parametrize(
+    "open_writer",
+    [
+        pytest.param("open_packed_blob_writer", id="packed"),
+        pytest.param("open_dedicated_blob_writer", id="dedicated"),
+    ],
+)
+def test_failed_blob_writer_traceback_can_be_released_on_another_thread(
+    tmp_path, monkeypatch, open_writer
+):
+    failures = queue.Queue()
+
+    def fail_with_live_writer():
+        files = LanceFileSession(tmp_path)
+        writer = getattr(files, open_writer)("data-file.lance", 1)
+        assert writer.blob_id == 1
+        try:
+            raise OSError("simulated object-store write failure")
+        except OSError as error:
+            # The traceback retains this frame and its local writer, matching a
+            # writer-thread failure handed to an owning thread for propagation.
+            failures.put(error)
+
+    writer_thread = threading.Thread(target=fail_with_live_writer)
+    writer_thread.start()
+    writer_thread.join(timeout=10)
+    assert not writer_thread.is_alive()
+
+    unraisable = []
+    monkeypatch.setattr(sys, "unraisablehook", unraisable.append)
+    error = failures.get_nowait()
+    assert str(error) == "simulated object-store write failure"
+    del error
+    gc.collect()
+
+    assert unraisable == []
 
 
 def test_blob_extension_write_fragments_external_denied_by_default(tmp_path):

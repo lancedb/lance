@@ -28,9 +28,9 @@ use crate::scalar::inverted::{
 };
 pub use lance_tokenizer::Language;
 use lance_tokenizer::{
-    AsciiFoldingFilter, IcuTokenizer, LowerCaser, NgramTokenizer, RawTokenizer, RemoveLongFilter,
-    SimpleTokenizer, Stemmer, StopWordFilter, TextAnalyzer, TextAnalyzerBuilder,
-    WhitespaceTokenizer,
+    AsciiFoldingFilter, CodeLexTokenizer, IcuTokenizer, LowerCaser, NgramTokenizer, RawTokenizer,
+    RemoveLongFilter, SimpleTokenizer, Stemmer, StopWordFilter, TextAnalyzer, TextAnalyzerBuilder,
+    WhitespaceTokenizer, WordDelimiterFilter,
 };
 
 /// Posting block size for indexes whose metadata predates configurable block sizes.
@@ -44,17 +44,26 @@ pub const DEFAULT_BLOCK_SIZE: usize = 128;
 pub const VALID_BLOCK_SIZES: [usize; 2] = [128, 256];
 
 /// Tokenizer configs
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct InvertedIndexParams {
-    /// lance tokenizer takes care of different data types, such as text, json, etc.
-    /// - 'text': parsing input documents into tokens
-    /// - 'json': parsing input json string into tokens
-    /// - none: auto type inference
+    /// Document-level tokenizer.
+    ///
+    /// This decides how Lance extracts searchable text from the stored value:
+    /// - `text`: plain string documents
+    /// - `json`: JSON string documents
+    /// - `None`: infer from the Arrow field type during index build
+    ///
+    /// The extracted text is then passed to `base_tokenizer`.
     pub(crate) lance_tokenizer: Option<String>,
-    /// base tokenizer:
+
+    /// Lexical tokenizer used after document-level text extraction.
+    ///
+    /// Client-facing analyzer profiles are resolved into this field and the
+    /// concrete filter options before params are persisted.
     /// - `simple`: splits tokens on whitespace and punctuation
     /// - `whitespace`: splits tokens on whitespace
     /// - `raw`: no tokenization
+    /// - `code`: code-aware lexical tokenization
     /// - `icu`: ICU dictionary-based word segmentation
     /// - `icu/split`: ICU segmentation with simple-style delimiter splitting
     /// - `lindera/*`: Lindera tokenizer
@@ -71,7 +80,6 @@ pub struct InvertedIndexParams {
     /// This can significantly increase the size of the index
     /// If false, only store the frequency of the term in the document
     /// Default is false
-    #[serde(default)]
     pub(crate) with_position: bool,
 
     /// maximum token length
@@ -80,15 +88,12 @@ pub struct InvertedIndexParams {
     pub(crate) max_token_length: Option<usize>,
 
     /// whether lower case tokens
-    #[serde(default = "bool_true")]
     pub(crate) lower_case: bool,
 
     /// whether apply stemming
-    #[serde(default = "bool_true")]
     pub(crate) stem: bool,
 
     /// whether remove stop words
-    #[serde(default = "bool_true")]
     pub(crate) remove_stop_words: bool,
 
     /// use customized stop words.
@@ -97,19 +102,15 @@ pub struct InvertedIndexParams {
     pub(crate) custom_stop_words: Option<Vec<String>>,
 
     /// ascii folding
-    #[serde(default = "bool_true")]
     pub(crate) ascii_folding: bool,
 
     /// min ngram length
-    #[serde(default = "default_min_ngram_length")]
     pub(crate) min_ngram_length: u32,
 
     /// max ngram length
-    #[serde(default = "default_max_ngram_length")]
     pub(crate) max_ngram_length: u32,
 
     /// whether prefix only
-    #[serde(default)]
     pub(crate) prefix_only: bool,
 
     /// Number of documents in each compressed posting block.
@@ -117,11 +118,19 @@ pub struct InvertedIndexParams {
     /// Missing serialized values come from indexes written before this
     /// parameter existed and must read as 128 for backwards compatibility. New
     /// indexes currently default to 128.
-    #[serde(
-        default = "legacy_block_size",
-        deserialize_with = "deserialize_block_size"
-    )]
     pub(crate) block_size: usize,
+
+    /// Split code identifiers into subwords.
+    pub(crate) split_identifiers: bool,
+
+    /// Split identifier subwords at letter/number boundaries.
+    pub(crate) split_on_numerics: bool,
+
+    /// Index a complete identifier in addition to subwords.
+    pub(crate) preserve_original: bool,
+
+    /// Index code operators such as `::`, `->`, and `!=`.
+    pub(crate) index_operators: bool,
 
     /// Total memory limit in MiB for the build stage.
     ///
@@ -149,8 +158,7 @@ pub struct InvertedIndexParams {
     /// On-disk FTS format version to write when creating a new index.
     ///
     /// This is a build-time only parameter and is not persisted with the index.
-    /// If unset, Lance writes v2 for `block_size = 128` and v3 for
-    /// `block_size = 256`.
+    /// If unset, Lance writes v4 for either supported block size.
     /// `format_version = 3` is experimental and is only valid with
     /// `block_size = 256`.
     #[serde(
@@ -160,6 +168,167 @@ pub struct InvertedIndexParams {
         deserialize_with = "deserialize_format_version"
     )]
     pub(crate) format_version: Option<InvertedListFormatVersion>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawInvertedIndexParams {
+    // Input-only preset expanded before constructing normalized params.
+    analyzer: Option<String>,
+    lance_tokenizer: Option<String>,
+    base_tokenizer: Option<String>,
+    language: Option<Language>,
+    with_position: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_explicit_option")]
+    max_token_length: Option<Option<usize>>,
+    lower_case: Option<bool>,
+    stem: Option<bool>,
+    remove_stop_words: Option<bool>,
+    custom_stop_words: Option<Vec<String>>,
+    ascii_folding: Option<bool>,
+    min_ngram_length: Option<u32>,
+    max_ngram_length: Option<u32>,
+    prefix_only: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_optional_block_size")]
+    block_size: Option<usize>,
+    split_identifiers: Option<bool>,
+    split_on_numerics: Option<bool>,
+    preserve_original: Option<bool>,
+    index_operators: Option<bool>,
+    #[serde(rename = "memory_limit", alias = "worker_memory_limit_mb")]
+    memory_limit_mb: Option<u64>,
+    #[serde(rename = "num_workers")]
+    num_workers: Option<usize>,
+    #[serde(
+        rename = "format_version",
+        default,
+        deserialize_with = "deserialize_format_version"
+    )]
+    format_version: Option<InvertedListFormatVersion>,
+}
+
+impl<'de> Deserialize<'de> for InvertedIndexParams {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        RawInvertedIndexParams::deserialize(deserializer)?
+            .resolve()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+impl RawInvertedIndexParams {
+    fn resolve(self) -> Result<InvertedIndexParams> {
+        let analyzer = match (
+            self.analyzer.as_deref().map(normalize_analyzer),
+            self.base_tokenizer.as_deref(),
+        ) {
+            (Some(Ok(analyzer)), _) => analyzer,
+            (Some(Err(err)), _) => return Err(err),
+            (None, Some("code")) => "code",
+            (None, _) => "text",
+        };
+
+        if analyzer == "text" && self.base_tokenizer.as_deref() == Some("code") {
+            return Err(Error::invalid_input(
+                "base_tokenizer='code' requires analyzer='code'".to_string(),
+            ));
+        }
+        if analyzer == "code"
+            && let Some(base_tokenizer) = self.base_tokenizer.as_deref()
+            && base_tokenizer != "code"
+        {
+            return Err(Error::invalid_input(format!(
+                "analyzer='code' requires base_tokenizer='code', got '{}'",
+                base_tokenizer
+            )));
+        }
+        if analyzer == "text"
+            && matches!(
+                (
+                    self.split_identifiers,
+                    self.split_on_numerics,
+                    self.preserve_original,
+                    self.index_operators,
+                ),
+                (Some(true), _, _, _)
+                    | (_, Some(true), _, _)
+                    | (_, _, Some(true), _)
+                    | (_, _, _, Some(true))
+            )
+        {
+            return Err(Error::invalid_input(
+                "code analyzer flags require analyzer='code'".to_string(),
+            ));
+        }
+
+        let mut params = match analyzer {
+            "code" => InvertedIndexParams::code(),
+            "text" => InvertedIndexParams::default(),
+            _ => unreachable!("analyzer is normalized above"),
+        };
+
+        if let Some(lance_tokenizer) = self.lance_tokenizer {
+            params.lance_tokenizer = Some(lance_tokenizer);
+        }
+        if let Some(base_tokenizer) = self.base_tokenizer {
+            params.base_tokenizer = base_tokenizer;
+        }
+        if let Some(language) = self.language {
+            params.language = language;
+        }
+        if let Some(with_position) = self.with_position {
+            params.with_position = with_position;
+        }
+        if let Some(max_token_length) = self.max_token_length {
+            params.max_token_length = max_token_length;
+        }
+        if let Some(lower_case) = self.lower_case {
+            params.lower_case = lower_case;
+        }
+        if let Some(stem) = self.stem {
+            params.stem = stem;
+        }
+        if let Some(remove_stop_words) = self.remove_stop_words {
+            params.remove_stop_words = remove_stop_words;
+        }
+        if let Some(custom_stop_words) = self.custom_stop_words {
+            params.custom_stop_words = Some(custom_stop_words);
+        }
+        if let Some(ascii_folding) = self.ascii_folding {
+            params.ascii_folding = ascii_folding;
+        }
+        if let Some(min_ngram_length) = self.min_ngram_length {
+            params.min_ngram_length = min_ngram_length;
+        }
+        if let Some(max_ngram_length) = self.max_ngram_length {
+            params.max_ngram_length = max_ngram_length;
+        }
+        if let Some(prefix_only) = self.prefix_only {
+            params.prefix_only = prefix_only;
+        }
+        if let Some(block_size) = self.block_size {
+            params.block_size = validate_block_size(block_size)?;
+        }
+        if let Some(split_identifiers) = self.split_identifiers {
+            params.split_identifiers = split_identifiers;
+        }
+        if let Some(split_on_numerics) = self.split_on_numerics {
+            params.split_on_numerics = split_on_numerics;
+        }
+        if let Some(preserve_original) = self.preserve_original {
+            params.preserve_original = preserve_original;
+        }
+        if let Some(index_operators) = self.index_operators {
+            params.index_operators = index_operators;
+        }
+        params.memory_limit_mb = self.memory_limit_mb;
+        params.num_workers = self.num_workers;
+        params.format_version = self.format_version;
+        params.validate()?;
+        Ok(params)
+    }
 }
 
 impl TryFrom<&InvertedIndexParams> for pbold::InvertedIndexDetails {
@@ -179,6 +348,14 @@ impl TryFrom<&InvertedIndexParams> for pbold::InvertedIndexDetails {
             max_ngram_length: params.max_ngram_length,
             prefix_only: params.prefix_only,
             block_size: Some(params.block_size as u32),
+            code_config: (params.base_tokenizer == "code").then_some(
+                pbold::inverted_index_details::CodeTokenizerConfig {
+                    split_identifiers: params.split_identifiers,
+                    split_on_numerics: Some(params.split_on_numerics),
+                    preserve_original: Some(params.preserve_original),
+                    index_operators: params.index_operators,
+                },
+            ),
         })
     }
 }
@@ -187,38 +364,73 @@ impl TryFrom<&pbold::InvertedIndexDetails> for InvertedIndexParams {
     type Error = Error;
 
     fn try_from(details: &pbold::InvertedIndexDetails) -> Result<Self> {
-        let defaults = Self::default();
-        Ok(Self {
-            lance_tokenizer: defaults.lance_tokenizer,
-            base_tokenizer: details
-                .base_tokenizer
-                .as_ref()
-                .cloned()
-                .unwrap_or_else(|| "simple".to_string()),
-            language: serde_json::from_str(details.language.as_str())?,
-            with_position: details.with_position,
-            max_token_length: details.max_token_length.map(|l| l as usize),
-            lower_case: details.lower_case,
-            stem: details.stem,
-            remove_stop_words: details.remove_stop_words,
-            custom_stop_words: defaults.custom_stop_words,
-            ascii_folding: details.ascii_folding,
-            min_ngram_length: details.min_ngram_length,
-            max_ngram_length: details.max_ngram_length,
-            prefix_only: details.prefix_only,
-            block_size: match details.block_size {
-                Some(block_size) => validate_block_size(block_size as usize)?,
-                None => LEGACY_BLOCK_SIZE,
-            },
-            memory_limit_mb: defaults.memory_limit_mb,
-            num_workers: defaults.num_workers,
-            format_version: defaults.format_version,
-        })
+        if details.code_config.is_some() && details.base_tokenizer.as_deref() != Some("code") {
+            return Err(Error::invalid_input(
+                "code_config requires base_tokenizer='code'".to_string(),
+            ));
+        }
+        if details.base_tokenizer.is_none() && details.language.is_empty() {
+            let params = Self {
+                block_size: match details.block_size {
+                    Some(block_size) => validate_block_size(block_size as usize)?,
+                    None => LEGACY_BLOCK_SIZE,
+                },
+                ..Self::default()
+            };
+            return Ok(params);
+        }
+
+        let mut params = match details.base_tokenizer.as_deref() {
+            Some("code") => Self::code(),
+            _ => Self::default(),
+        };
+        params.base_tokenizer = details
+            .base_tokenizer
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| params.base_tokenizer.clone());
+        params.language = if details.language.is_empty() {
+            params.language
+        } else {
+            serde_json::from_str(details.language.as_str())?
+        };
+        params.with_position = details.with_position;
+        params.max_token_length = details.max_token_length.map(|l| l as usize);
+        params.lower_case = details.lower_case;
+        params.stem = details.stem;
+        params.remove_stop_words = details.remove_stop_words;
+        params.ascii_folding = details.ascii_folding;
+        params.min_ngram_length = details.min_ngram_length;
+        params.max_ngram_length = details.max_ngram_length;
+        params.prefix_only = details.prefix_only;
+        params.block_size = match details.block_size {
+            Some(block_size) => validate_block_size(block_size as usize)?,
+            None => LEGACY_BLOCK_SIZE,
+        };
+        if let Some(code_config) = &details.code_config {
+            params.split_identifiers = code_config.split_identifiers;
+            if let Some(split_on_numerics) = code_config.split_on_numerics {
+                params.split_on_numerics = split_on_numerics;
+            }
+            if let Some(preserve_original) = code_config.preserve_original {
+                params.preserve_original = preserve_original;
+            }
+            params.index_operators = code_config.index_operators;
+        }
+        params.validate()?;
+        Ok(params)
     }
 }
 
-fn bool_true() -> bool {
-    true
+fn normalize_analyzer(analyzer: &str) -> Result<&'static str> {
+    match analyzer {
+        "text" => Ok("text"),
+        "code" => Ok("code"),
+        other => Err(Error::invalid_input(format!(
+            "unknown analyzer '{}', expected 'text' or 'code'",
+            other
+        ))),
+    }
 }
 
 fn default_min_ngram_length() -> u32 {
@@ -227,10 +439,6 @@ fn default_min_ngram_length() -> u32 {
 
 fn default_max_ngram_length() -> u32 {
     3
-}
-
-fn legacy_block_size() -> usize {
-    LEGACY_BLOCK_SIZE
 }
 
 fn invalid_block_size_message(block_size: usize) -> String {
@@ -245,12 +453,16 @@ pub fn validate_block_size(block_size: usize) -> Result<usize> {
     }
 }
 
-fn deserialize_block_size<'de, D>(deserializer: D) -> std::result::Result<usize, D::Error>
+fn deserialize_optional_block_size<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<usize>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    let block_size = usize::deserialize(deserializer)?;
-    validate_block_size(block_size).map_err(serde::de::Error::custom)
+    Option::<usize>::deserialize(deserializer)?
+        .map(validate_block_size)
+        .transpose()
+        .map_err(serde::de::Error::custom)
 }
 
 fn deserialize_format_version<'de, D>(
@@ -271,7 +483,7 @@ where
         serde_json::Value::Number(value) => {
             let Some(format_version) = value.as_u64() else {
                 return Err(serde::de::Error::custom(format!(
-                    "FTS format_version must be 1, 2, or 3, got {value}"
+                    "FTS format_version must be 1, 2, 3, or 4, got {value}"
                 )));
             };
             resolve_fts_format_version(Some(&format_version.to_string()))
@@ -279,9 +491,19 @@ where
                 .map_err(serde::de::Error::custom)
         }
         other => Err(serde::de::Error::custom(format!(
-            "FTS format_version must be 1, 2, or 3, got {other}"
+            "FTS format_version must be 1, 2, 3, or 4, got {other}"
         ))),
     }
+}
+
+fn deserialize_explicit_option<'de, D, T>(
+    deserializer: D,
+) -> std::result::Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
 }
 
 impl Default for InvertedIndexParams {
@@ -297,6 +519,7 @@ impl InvertedIndexParams {
     /// - `simple`: splits tokens on whitespace and punctuation, default
     /// - `whitespace`: splits tokens on whitespace
     /// - `raw`: no tokenization
+    /// - `code`: code identifier tokenization
     /// - `ngram`: N-Gram tokenizer
     /// - `icu`: ICU dictionary-based word segmentation
     /// - `icu/split`: ICU segmentation with simple-style delimiter splitting
@@ -307,7 +530,7 @@ impl InvertedIndexParams {
     /// this is not used for `lindera/*` and `jieba/*` tokenizers.
     /// Default to `English`.
     pub fn new(base_tokenizer: String, language: Language) -> Self {
-        Self {
+        let mut params = Self {
             lance_tokenizer: None,
             base_tokenizer,
             language,
@@ -322,10 +545,81 @@ impl InvertedIndexParams {
             max_ngram_length: default_max_ngram_length(),
             prefix_only: false,
             block_size: DEFAULT_BLOCK_SIZE,
+            split_identifiers: false,
+            split_on_numerics: false,
+            preserve_original: false,
+            index_operators: false,
             memory_limit_mb: None,
             num_workers: None,
             format_version: None,
+        };
+        if params.base_tokenizer == "code" {
+            params.apply_code_defaults();
         }
+        params
+    }
+
+    fn apply_text_defaults(&mut self) {
+        self.base_tokenizer = "simple".to_string();
+        self.split_identifiers = false;
+        self.split_on_numerics = false;
+        self.preserve_original = false;
+        self.lower_case = true;
+        self.ascii_folding = true;
+        self.stem = true;
+        self.remove_stop_words = true;
+        self.index_operators = false;
+    }
+
+    fn apply_code_defaults(&mut self) {
+        self.base_tokenizer = "code".to_string();
+        self.split_identifiers = false;
+        self.split_on_numerics = true;
+        self.preserve_original = true;
+        self.lower_case = true;
+        self.ascii_folding = true;
+        self.stem = false;
+        self.remove_stop_words = false;
+        self.index_operators = false;
+    }
+
+    /// Create parameters for the code analyzer profile.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lance_index::scalar::InvertedIndexParams;
+    ///
+    /// let tokenizer = InvertedIndexParams::code().build();
+    /// assert!(tokenizer.is_ok());
+    /// ```
+    pub fn code() -> Self {
+        Self::new("code".to_string(), Language::English)
+    }
+
+    /// Apply an analyzer profile to the concrete tokenizer parameters.
+    ///
+    /// The profile name is an input-time preset and is not persisted. Explicit
+    /// options applied after this method override the profile defaults.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lance_index::scalar::InvertedIndexParams;
+    ///
+    /// let params = InvertedIndexParams::default()
+    ///     .analyzer("code")?
+    ///     .split_identifiers(true);
+    /// assert!(params.build().is_ok());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn analyzer(mut self, analyzer: &str) -> Result<Self> {
+        match normalize_analyzer(analyzer)? {
+            "text" => self.apply_text_defaults(),
+            "code" => self.apply_code_defaults(),
+            _ => unreachable!("analyzer is normalized above"),
+        }
+        Ok(self)
     }
 
     pub fn lance_tokenizer(mut self, lance_tokenizer: String) -> Self {
@@ -333,8 +627,25 @@ impl InvertedIndexParams {
         self
     }
 
+    /// Set the lexical tokenizer implementation.
+    ///
+    /// Setting this to `"code"` selects the code analyzer defaults.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lance_index::scalar::InvertedIndexParams;
+    ///
+    /// let params = InvertedIndexParams::default()
+    ///     .base_tokenizer("code".to_string())
+    ///     .split_identifiers(true);
+    /// assert!(params.build().is_ok());
+    /// ```
     pub fn base_tokenizer(mut self, base_tokenizer: String) -> Self {
         self.base_tokenizer = base_tokenizer;
+        if self.base_tokenizer == "code" {
+            self.apply_code_defaults();
+        }
         self
     }
 
@@ -387,6 +698,43 @@ impl InvertedIndexParams {
 
     pub fn ascii_folding(mut self, ascii_folding: bool) -> Self {
         self.ascii_folding = ascii_folding;
+        self
+    }
+
+    /// Set whether code identifiers are split into subwords.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lance_index::scalar::InvertedIndexParams;
+    ///
+    /// let params = InvertedIndexParams::code()
+    ///     .split_identifiers(true)
+    ///     .split_on_numerics(false)
+    ///     .preserve_original(false)
+    ///     .index_operators(true);
+    /// assert!(params.build().is_ok());
+    /// ```
+    pub fn split_identifiers(mut self, split_identifiers: bool) -> Self {
+        self.split_identifiers = split_identifiers;
+        self
+    }
+
+    /// Set whether identifier subwords are split at letter/number boundaries.
+    pub fn split_on_numerics(mut self, split_on_numerics: bool) -> Self {
+        self.split_on_numerics = split_on_numerics;
+        self
+    }
+
+    /// Set whether the complete identifier is indexed alongside subwords.
+    pub fn preserve_original(mut self, preserve_original: bool) -> Self {
+        self.preserve_original = preserve_original;
+        self
+    }
+
+    /// Set whether operator tokens such as `::`, `->`, and `!=` are indexed.
+    pub fn index_operators(mut self, index_operators: bool) -> Self {
+        self.index_operators = index_operators;
         self
     }
 
@@ -448,9 +796,9 @@ impl InvertedIndexParams {
 
     /// Set the on-disk FTS format version to use when creating a new index.
     ///
-    /// If unset, Lance writes v2 for `block_size = 128` and v3 for
-    /// `block_size = 256`. Existing indexes keep their own on-disk format
-    /// during update and optimize operations.
+    /// If unset, Lance writes v4 for either supported block size. Existing
+    /// indexes keep their own on-disk format during update and optimize
+    /// operations.
     /// `format_version = 3` is experimental and is only valid with
     /// `block_size = 256`.
     pub fn format_version(mut self, format_version: InvertedListFormatVersion) -> Self {
@@ -520,6 +868,7 @@ impl InvertedIndexParams {
     }
 
     pub fn build(&self) -> Result<Box<dyn LanceTokenizer>> {
+        self.validate()?;
         let mut builder = self.build_base_tokenizer()?;
         if let Some(max_token_length) = self.max_token_length {
             builder = builder.filter_dynamic(RemoveLongFilter::limit(max_token_length));
@@ -564,11 +913,37 @@ impl InvertedIndexParams {
         }
     }
 
+    fn validate(&self) -> Result<()> {
+        validate_block_size(self.block_size)?;
+        if self.base_tokenizer != "code"
+            && (self.split_identifiers
+                || self.split_on_numerics
+                || self.preserve_original
+                || self.index_operators)
+        {
+            return Err(Error::invalid_input(
+                "code analyzer flags require base_tokenizer='code'".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     fn build_base_tokenizer(&self) -> Result<TextAnalyzerBuilder> {
         match self.base_tokenizer.as_str() {
             "simple" => Ok(TextAnalyzer::builder(SimpleTokenizer::default()).dynamic()),
             "whitespace" => Ok(TextAnalyzer::builder(WhitespaceTokenizer::default()).dynamic()),
             "raw" => Ok(TextAnalyzer::builder(RawTokenizer::default()).dynamic()),
+            "code" => {
+                let mut builder =
+                    TextAnalyzer::builder(CodeLexTokenizer::new(self.index_operators)).dynamic();
+                if self.split_identifiers {
+                    builder = builder.filter_dynamic(WordDelimiterFilter::new(
+                        self.preserve_original,
+                        self.split_on_numerics,
+                    ));
+                }
+                Ok(builder)
+            }
             "icu" => Ok(TextAnalyzer::builder(IcuTokenizer::default()).dynamic()),
             "icu/split" => {
                 Ok(TextAnalyzer::builder(IcuTokenizer::default().with_simple_split()).dynamic())
@@ -626,9 +1001,11 @@ pub fn language_model_home() -> Option<PathBuf> {
 mod tests {
     use crate::pbold;
 
-    use super::{InvertedIndexParams, InvertedListFormatVersion};
-    use lance_tokenizer::{Language, TokenStream};
+    use super::{InvertedIndexParams, InvertedListFormatVersion, Language};
+    use lance_core::Error;
+    use lance_tokenizer::TokenStream;
     use rstest::rstest;
+    use serde_json::json;
 
     #[test]
     fn test_build_only_fields_are_not_serialized() {
@@ -688,22 +1065,207 @@ mod tests {
     }
 
     #[test]
-    fn test_default_format_version_resolves_to_v2() {
+    fn test_training_json_preserves_disabled_max_token_length() {
+        let params = InvertedIndexParams::default().max_token_length(None);
+        let json = params.to_training_json().unwrap();
+        assert_eq!(json.get("max_token_length"), Some(&serde_json::Value::Null));
+
+        let params: InvertedIndexParams = serde_json::from_value(json).unwrap();
+        assert_eq!(params.max_token_length, None);
+    }
+
+    #[test]
+    fn test_default_format_version_resolves_to_v4() {
         assert_eq!(
             InvertedIndexParams::default().resolved_format_version(),
-            InvertedListFormatVersion::V2
+            InvertedListFormatVersion::V4
         );
     }
 
     #[test]
-    fn test_block_size_256_defaults_to_v3() {
+    fn test_code_analyzer_resolves_defaults() {
+        let params: InvertedIndexParams = serde_json::from_value(json!({
+            "analyzer": "code"
+        }))
+        .unwrap();
+        assert_eq!(params.base_tokenizer, "code");
+        assert!(!params.split_identifiers);
+        assert!(params.split_on_numerics);
+        assert!(params.preserve_original);
+        assert!(params.lower_case);
+        assert!(params.ascii_folding);
+        assert!(!params.stem);
+        assert!(!params.remove_stop_words);
+        assert!(!params.index_operators);
+    }
+
+    #[test]
+    fn test_analyzer_profile_resolves_to_persisted_params() {
+        let from_profile: InvertedIndexParams = serde_json::from_value(json!({
+            "analyzer": "code",
+            "split_identifiers": true,
+            "preserve_original": false
+        }))
+        .unwrap();
+        let from_base_tokenizer: InvertedIndexParams = serde_json::from_value(json!({
+            "base_tokenizer": "code",
+            "split_identifiers": true,
+            "preserve_original": false
+        }))
+        .unwrap();
+        let from_constructor = InvertedIndexParams::new("code".to_string(), Language::English)
+            .split_identifiers(true)
+            .preserve_original(false);
+
+        assert_eq!(from_profile, from_base_tokenizer);
+        assert_eq!(from_profile, from_constructor);
+
+        let persisted = serde_json::to_value(&from_profile).unwrap();
+        assert!(persisted.get("analyzer").is_none());
+        assert_eq!(
+            serde_json::from_value::<InvertedIndexParams>(persisted).unwrap(),
+            from_profile
+        );
+    }
+
+    #[test]
+    fn test_block_size_256_defaults_to_v4() {
         assert_eq!(
             InvertedIndexParams::default()
                 .block_size(256)
                 .unwrap()
                 .resolved_format_version(),
-            InvertedListFormatVersion::V3
+            InvertedListFormatVersion::V4
         );
+    }
+
+    #[test]
+    fn test_text_analyzer_replaces_code_defaults() {
+        let params = InvertedIndexParams::code().analyzer("text").unwrap();
+        assert_eq!(params, InvertedIndexParams::default());
+    }
+
+    #[test]
+    fn test_code_analyzer_rejects_conflicting_base_tokenizer() {
+        let err = serde_json::from_value::<InvertedIndexParams>(json!({
+            "analyzer": "code",
+            "base_tokenizer": "simple"
+        }))
+        .unwrap_err();
+        assert!(err.to_string().contains("requires base_tokenizer='code'"));
+    }
+
+    #[test]
+    fn test_build_code_tokenizer_does_not_split_identifiers_by_default() {
+        let mut tokenizer = InvertedIndexParams::code().build().unwrap();
+        let mut stream = tokenizer.token_stream_for_doc(
+            "getUserName XMLHttpRequest parseHTML2JSON utf8_reader SCREAMING_SNAKE_CASE",
+        );
+        let mut tokens = Vec::new();
+        stream.process(&mut |token| {
+            tokens.push((token.text.clone(), token.position, token.position_length))
+        });
+        assert_eq!(
+            tokens,
+            vec![
+                ("getusername".to_string(), 0, 1),
+                ("xmlhttprequest".to_string(), 1, 1),
+                ("parsehtml2json".to_string(), 2, 1),
+                ("utf8_reader".to_string(), 3, 1),
+                ("screaming_snake_case".to_string(), 4, 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_build_code_tokenizer_with_identifier_splitting() {
+        let mut tokenizer = InvertedIndexParams::code()
+            .split_identifiers(true)
+            .build()
+            .unwrap();
+        let mut stream = tokenizer.token_stream_for_doc(
+            "getUserName XMLHttpRequest parseHTML2JSON utf8_reader SCREAMING_SNAKE_CASE",
+        );
+        let mut tokens = Vec::new();
+        stream.process(&mut |token| {
+            tokens.push((token.text.clone(), token.position, token.position_length))
+        });
+        assert_eq!(
+            tokens,
+            vec![
+                ("getusername".to_string(), 0, 3),
+                ("get".to_string(), 0, 1),
+                ("user".to_string(), 1, 1),
+                ("name".to_string(), 2, 1),
+                ("xmlhttprequest".to_string(), 3, 3),
+                ("xml".to_string(), 3, 1),
+                ("http".to_string(), 4, 1),
+                ("request".to_string(), 5, 1),
+                ("parsehtml2json".to_string(), 6, 4),
+                ("parse".to_string(), 6, 1),
+                ("html".to_string(), 7, 1),
+                ("2".to_string(), 8, 1),
+                ("json".to_string(), 9, 1),
+                ("utf8_reader".to_string(), 10, 3),
+                ("utf".to_string(), 10, 1),
+                ("8".to_string(), 11, 1),
+                ("reader".to_string(), 12, 1),
+                ("screaming_snake_case".to_string(), 13, 3),
+                ("screaming".to_string(), 13, 1),
+                ("snake".to_string(), 14, 1),
+                ("case".to_string(), 15, 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_inverted_details_round_trip_code_params() {
+        let params = InvertedIndexParams::code()
+            .with_position(true)
+            .index_operators(true)
+            .preserve_original(false);
+        let details = crate::pbold::InvertedIndexDetails::try_from(&params).unwrap();
+        let code_config = details.code_config.as_ref().unwrap();
+        assert_eq!(code_config.split_on_numerics, Some(true));
+        assert_eq!(code_config.preserve_original, Some(false));
+        let round_tripped = InvertedIndexParams::try_from(&details).unwrap();
+        assert_eq!(round_tripped, params);
+    }
+
+    #[test]
+    fn test_inverted_details_uses_code_defaults_for_absent_flags() {
+        let mut details =
+            crate::pbold::InvertedIndexDetails::try_from(&InvertedIndexParams::code()).unwrap();
+        let code_config = details.code_config.as_mut().unwrap();
+        code_config.split_on_numerics = None;
+        code_config.preserve_original = None;
+
+        let params = InvertedIndexParams::try_from(&details).unwrap();
+        assert!(params.split_on_numerics);
+        assert!(params.preserve_original);
+    }
+
+    #[test]
+    fn test_inverted_details_rejects_code_config_for_text_tokenizer() {
+        let mut details =
+            crate::pbold::InvertedIndexDetails::try_from(&InvertedIndexParams::code()).unwrap();
+        details.base_tokenizer = Some("simple".to_string());
+
+        let err = InvertedIndexParams::try_from(&details).unwrap_err();
+        assert!(matches!(&err, Error::InvalidInput { .. }));
+        assert!(
+            err.to_string()
+                .contains("code_config requires base_tokenizer='code'")
+        );
+    }
+
+    #[test]
+    fn test_inverted_details_does_not_persist_document_tokenizer() {
+        let params = InvertedIndexParams::default().lance_tokenizer("json".to_string());
+        let details = crate::pbold::InvertedIndexDetails::try_from(&params).unwrap();
+        let round_tripped = InvertedIndexParams::try_from(&details).unwrap();
+
+        assert_eq!(round_tripped.lance_tokenizer, None);
     }
 
     #[test]
@@ -715,6 +1277,16 @@ mod tests {
         InvertedIndexParams::default()
             .block_size(256)
             .unwrap()
+            .validate_format_version()
+            .unwrap();
+        InvertedIndexParams::default()
+            .format_version(InvertedListFormatVersion::V4)
+            .validate_format_version()
+            .unwrap();
+        InvertedIndexParams::default()
+            .block_size(256)
+            .unwrap()
+            .format_version(InvertedListFormatVersion::V4)
             .validate_format_version()
             .unwrap();
 
@@ -784,6 +1356,7 @@ mod tests {
             max_ngram_length: 3,
             prefix_only: false,
             block_size: None,
+            code_config: None,
         };
         let params = InvertedIndexParams::try_from(&old_details).unwrap();
         assert_eq!(params.block_size, 128);
