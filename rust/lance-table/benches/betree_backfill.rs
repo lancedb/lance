@@ -46,7 +46,10 @@ use lance_io::object_store::{
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::tracking_store::IOTracker;
 use lance_table::betree::flat_baseline::FlatBaseline;
-use lance_table::betree::support::{make_backfill_data_file, make_fragment};
+use lance_table::betree::node::fragment_logical_bytes;
+use lance_table::betree::support::{
+    make_backfill_data_file, make_fragment, make_fragment_with_files,
+};
 use lance_table::betree::{BeTree, BeTreeConfig, action};
 use lance_table::format::Fragment;
 use object_store::path::Path;
@@ -353,6 +356,120 @@ fn print_result(r: &RunResult, n: u64, f: u64) {
     );
 }
 
+/// Billion-scale mode: bootstrap N fragments each already holding `base_files`
+/// data files (streaming, so memory stays bounded), then measure the recursive
+/// tree's structure + cost at that scale. Flat is reported analytically because
+/// its single-object manifest (N × base_files entries) is infeasibly large.
+#[allow(clippy::too_many_arguments)]
+async fn run_scale(
+    uri: &str,
+    n: u64,
+    base_files: u32,
+    node_bytes: u64,
+    fanout: u32,
+    backfill_columns: u32,
+    f: u64,
+) {
+    // Full materialize builds every fragment in RAM; skip past this many files.
+    const MATERIALIZE_CAP: u64 = 150_000_000;
+    let io = IOTracker::default();
+    let (object_store, base, scheduler, cache) = build_store(uri, &io).await;
+    let config = BeTreeConfig {
+        target_node_bytes: node_bytes,
+        fanout,
+        min_flush_bytes: node_bytes / 16,
+    };
+    let total_files = n * base_files as u64;
+
+    let t0 = Instant::now();
+    let (mut tree, boot) = BeTree::bootstrap_generate(
+        object_store.clone(),
+        base.clone(),
+        scheduler.clone(),
+        cache.clone(),
+        config,
+        n,
+        |id| make_fragment_with_files(id, base_files),
+        Vec::new(),
+    )
+    .await
+    .expect("scale bootstrap");
+    let bootstrap_secs = t0.elapsed().as_secs_f64();
+
+    // Analytical flat manifest size = one DataFragment proto per fragment.
+    let flat_manifest_bytes = fragment_logical_bytes(&make_fragment_with_files(0, base_files)) * n;
+
+    println!(
+        "  [B={:.1} MiB] bootstrap {total_files} data files ({n} frags x {base_files} files): \
+         betree {:.2} GiB in {} leaves, height {}, {:.1}s",
+        node_bytes as f64 / MIB as f64,
+        boot.io_write_bytes as f64 / (1024.0 * MIB as f64),
+        boot.num_leaves,
+        boot.height,
+        bootstrap_secs,
+    );
+    println!(
+        "             flat manifest would be ~{:.2} GiB (single object) => betree columnar leaves are {:.0}x smaller",
+        flat_manifest_bytes as f64 / (1024.0 * MIB as f64),
+        flat_manifest_bytes as f64 / boot.io_write_bytes.max(1) as f64,
+    );
+
+    if backfill_columns > 0 {
+        let commits_per_col = n.div_ceil(f);
+        let mut per_commit: Vec<f64> = Vec::new();
+        let (mut bytes, mut flushes, mut splits, mut merges) = (0u64, 0u64, 0u64, 0u64);
+        for col in 0..backfill_columns {
+            for c in 0..commits_per_col {
+                let actions: Vec<_> = commit_window(c, f, n)
+                    .map(|id| {
+                        action::add_data_file(id, &make_backfill_data_file(id, base_files + col))
+                    })
+                    .collect();
+                let start = Instant::now();
+                let s = tree.commit(actions).await.expect("scale commit");
+                per_commit.push(start.elapsed().as_secs_f64() * 1000.0);
+                bytes += s.io_write_bytes;
+                flushes += s.flushes;
+                splits += s.splits;
+                merges += s.merges;
+            }
+        }
+        per_commit.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        println!(
+            "             backfill {backfill_columns} col(s) at scale: per-commit write={:.3} MiB \
+             mean={:.2}ms p50={:.2} p99={:.2} | flushes={flushes} splits={splits} merges={merges} height={}",
+            bytes as f64 / per_commit.len().max(1) as f64 / MIB as f64,
+            mean(&per_commit),
+            percentile(&per_commit, 50.0),
+            percentile(&per_commit, 99.0),
+            tree.height(),
+        );
+    }
+
+    let final_files = total_files + n * backfill_columns as u64;
+    if final_files <= MATERIALIZE_CAP {
+        let t = Instant::now();
+        let frags = BeTree::cold_open(object_store, base, scheduler, cache)
+            .await
+            .expect("scale cold open");
+        let secs = t.elapsed().as_secs_f64();
+        let got: u64 = frags.iter().map(|fr| fr.files.len() as u64).sum();
+        assert_eq!(frags.len() as u64, n, "scale lost fragments");
+        assert_eq!(got, final_files, "scale wrong data-file count");
+        println!(
+            "             cold-open (full materialize) {secs:.2}s: {} fragments / {got} data files verified",
+            frags.len()
+        );
+    } else {
+        println!(
+            "             cold-open full materialize skipped (>{}M data files exceeds RAM); \
+             bootstrap+backfill verified structurally",
+            MATERIALIZE_CAP / 1_000_000
+        );
+    }
+    println!();
+}
+
 fn bench_betree_backfill(c: &mut Criterion) {
     let runtime = Runtime::new().expect("tokio runtime");
 
@@ -368,6 +485,35 @@ fn bench_betree_backfill(c: &mut Criterion) {
     let betree_commits = env_u64("BETREE_COMMITS", 3000);
     let flat_sample = env_u64("FLAT_SAMPLE_COMMITS", 20);
     let run_tag = &Uuid::new_v4().to_string()[..8];
+
+    // Scale mode: bootstrap fat fragments (many data files) to reach billion-scale.
+    let base_files = env_usize("BASE_FILES_PER_FRAGMENT", 1) as u32;
+    let backfill_columns = env_usize("BACKFILL_COLUMNS", 1) as u32;
+    if base_files > 1 {
+        let f = *f_sweep.first().unwrap_or(&100);
+        println!("=== recursive Bε-tree AT-SCALE benchmark ===");
+        println!(
+            "base_uri={base_uri}\nN={n} base_files_per_fragment={base_files} node_size_sweep={node_sweep:?} MiB \
+             fanout={fanout} backfill_columns={backfill_columns} F={f} run_tag={run_tag}\n"
+        );
+        for &node_mib in &node_sweep {
+            let uri = format!(
+                "{}/{run_tag}/scaleB{node_mib}",
+                base_uri.trim_end_matches('/')
+            );
+            runtime.block_on(run_scale(
+                &uri,
+                n,
+                base_files,
+                (node_mib * MIB as f64) as u64,
+                fanout,
+                backfill_columns,
+                f,
+            ));
+        }
+        let _ = c;
+        return;
+    }
 
     println!("=== recursive Bε-tree fine-grained backfill benchmark ===");
     println!("base_uri={base_uri}");

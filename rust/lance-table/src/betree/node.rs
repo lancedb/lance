@@ -76,12 +76,14 @@ pub struct InternalNode {
     pub buffer: Vec<pb::TaggedAction>,
 }
 
+/// Logical (uncompressed) byte size of a single fragment — the split/merge unit.
+pub fn fragment_logical_bytes(fragment: &Fragment) -> u64 {
+    pb::DataFragment::from(fragment).encoded_len() as u64
+}
+
 /// Logical (uncompressed) byte size of a leaf — the split/merge metric.
 pub fn leaf_logical_bytes(fragments: &[Fragment]) -> u64 {
-    fragments
-        .iter()
-        .map(|f| pb::DataFragment::from(f).encoded_len() as u64)
-        .sum()
+    fragments.iter().map(fragment_logical_bytes).sum()
 }
 
 /// Logical byte size of an internal node = its encoded protobuf size.

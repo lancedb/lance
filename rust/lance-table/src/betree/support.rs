@@ -83,3 +83,14 @@ pub fn make_backfill_data_file(frag_id: u64, col: u32) -> DataFile {
         None,
     )
 }
+
+/// A fragment already holding `num_files` data files (1 base + `num_files-1`
+/// backfilled columns). Models an already-wide table — used to reach
+/// billion-data-file scale without replaying millions of backfill commits.
+pub fn make_fragment_with_files(id: u64, num_files: u32) -> Fragment {
+    let mut fragment = make_fragment(id);
+    for col in 0..num_files.saturating_sub(1) {
+        fragment.files.push(make_backfill_data_file(id, col));
+    }
+    fragment
+}

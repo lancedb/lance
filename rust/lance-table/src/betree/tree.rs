@@ -82,8 +82,7 @@ pub struct BeTree {
 }
 
 impl BeTree {
-    /// Bootstrap a balanced tree bottom-up: pack fragments into ~0.5 B leaves,
-    /// then group refs into internal layers (≤ fanout each) until one root remains.
+    /// Bootstrap a balanced tree from a full fragment list (held in memory).
     #[allow(clippy::too_many_arguments)]
     pub async fn bootstrap(
         object_store: Arc<ObjectStore>,
@@ -100,18 +99,66 @@ impl BeTree {
             ));
         }
         fragments.sort_by_key(|f| f.id);
+        let n = fragments.len() as u64;
+        let mut iter = fragments.into_iter();
+        Self::bootstrap_generate(
+            object_store,
+            base,
+            scheduler,
+            cache,
+            config,
+            n,
+            move |_| iter.next().unwrap(),
+            schema_pb,
+        )
+        .await
+    }
+
+    /// Bootstrap by *streaming* `num_fragments` fragments from `gen` (called with
+    /// ids 0..num_fragments, in order), packing them into ~0.5 B leaves without
+    /// ever holding the whole fragment list — this is what lets the tree reach
+    /// billion-data-file scale (fat fragments) within a bounded memory budget.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn bootstrap_generate<F: FnMut(u64) -> Fragment>(
+        object_store: Arc<ObjectStore>,
+        base: Path,
+        scheduler: Arc<ScanScheduler>,
+        cache: Arc<LanceCache>,
+        config: BeTreeConfig,
+        num_fragments: u64,
+        mut gen_fn: F,
+        schema_pb: Vec<u8>,
+    ) -> Result<(Self, BootstrapStats)> {
+        if num_fragments == 0 {
+            return Err(Error::invalid_input(
+                "BeTree::bootstrap requires at least one fragment",
+            ));
+        }
         let store = NodeStore::new(object_store, base, scheduler, cache);
+        let target = config.split_piece_bytes();
 
         let mut io = 0u64;
-        // Leaf layer.
-        let leaf_chunks = node::split_leaf_fragments(fragments, config.split_piece_bytes());
-        let num_leaves = leaf_chunks.len() as u64;
-        let mut layer: Vec<pb::ChildRef> = Vec::with_capacity(leaf_chunks.len());
-        for chunk in &leaf_chunks {
-            let w = store.write_leaf(chunk).await?;
+        let mut layer: Vec<pb::ChildRef> = Vec::new();
+        let mut buf: Vec<Fragment> = Vec::new();
+        let mut buf_bytes = 0u64;
+        for id in 0..num_fragments {
+            let f = gen_fn(id);
+            buf_bytes += node::fragment_logical_bytes(&f);
+            buf.push(f);
+            if buf_bytes >= target {
+                let w = store.write_leaf(&buf).await?;
+                io += w.io_bytes;
+                layer.push(w.child_ref);
+                buf.clear();
+                buf_bytes = 0;
+            }
+        }
+        if !buf.is_empty() {
+            let w = store.write_leaf(&buf).await?;
             io += w.io_bytes;
             layer.push(w.child_ref);
         }
+        let num_leaves = layer.len() as u64;
 
         // Internal layers until the top fits under fanout.
         while layer.len() as u32 > config.fanout {
