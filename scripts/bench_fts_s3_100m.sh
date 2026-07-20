@@ -28,6 +28,7 @@ PREWARM_INDEX=${LANCE_FTS_BENCH_PREWARM_INDEX:-}
 PREWARM_POSITIONS=${LANCE_FTS_BENCH_PREWARM_POSITIONS:-false}
 INDEX_CACHE_SIZE_GIB=${LANCE_FTS_BENCH_INDEX_CACHE_SIZE_GIB:-}
 FILTER_STRIDE=${LANCE_FTS_BENCH_FILTER_STRIDE:-}
+BINARY_CACHE_ROOT=${LANCE_FTS_BENCH_BINARY_CACHE_ROOT:-$OUTPUT_ROOT/binary-cache}
 
 REPO_ROOT=$(git rev-parse --show-toplevel)
 QUERY_FILE=${LANCE_FTS_BENCH_QUERY_FILE:-$REPO_ROOT/rust/examples/fts_100m_queries.txt}
@@ -43,7 +44,7 @@ if [[ ! -f "$QUERY_FILE" ]]; then
   exit 2
 fi
 
-mkdir -p "$RUN_DIR/bin" "$RUN_DIR/results" "$RUN_DIR/timing" "$RUN_DIR/target"
+mkdir -p "$RUN_DIR/bin" "$RUN_DIR/results" "$RUN_DIR/timing" "$BINARY_CACHE_ROOT/commits" "$BINARY_CACHE_ROOT/target"
 
 BASELINE_COMMIT=$(git rev-parse "$BASELINE_REF^{commit}")
 CANDIDATE_COMMIT=$(git rev-parse "$CANDIDATE_REF^{commit}")
@@ -73,6 +74,7 @@ cp "$QUERY_FILE" "$RUN_DIR/queries.txt"
   echo "prewarm_positions=$PREWARM_POSITIONS"
   echo "index_cache_size_gib=${INDEX_CACHE_SIZE_GIB:-default}"
   echo "filter_stride=${FILTER_STRIDE:-unset}"
+  echo "binary_cache_root=$BINARY_CACHE_ROOT"
   echo "baseline_commit=$BASELINE_COMMIT"
   echo "candidate_commit=$CANDIDATE_COMMIT"
   echo "aws_region=${AWS_REGION:-${AWS_DEFAULT_REGION:-unset}}"
@@ -84,19 +86,25 @@ cp "$QUERY_FILE" "$RUN_DIR/queries.txt"
 build_binary() {
   local source_dir=$1
   local output_name=$2
-  (
-    cd "$source_dir"
-    CARGO_TARGET_DIR="$RUN_DIR/target" cargo build \
-      -p lance-examples \
-      --example fts_s3_benchmark \
-      --profile release-with-debug
-  )
-  cp "$RUN_DIR/target/release-with-debug/examples/fts_s3_benchmark" \
-    "$RUN_DIR/bin/$output_name"
+  local commit=$3
+  local cached_binary="$BINARY_CACHE_ROOT/commits/$commit/fts_s3_benchmark"
+  if [[ ! -x "$cached_binary" ]]; then
+    mkdir -p "$(dirname "$cached_binary")"
+    (
+      cd "$source_dir"
+      CARGO_TARGET_DIR="$BINARY_CACHE_ROOT/target" cargo build \
+        -p lance-examples \
+        --example fts_s3_benchmark \
+        --profile release-with-debug
+    )
+    cp "$BINARY_CACHE_ROOT/target/release-with-debug/examples/fts_s3_benchmark" \
+      "$cached_binary"
+  fi
+  cp "$cached_binary" "$RUN_DIR/bin/$output_name"
 }
 
-build_binary "$RUN_DIR/source-baseline" baseline
-build_binary "$RUN_DIR/source-candidate" candidate
+build_binary "$RUN_DIR/source-baseline" baseline "$BASELINE_COMMIT"
+build_binary "$RUN_DIR/source-candidate" candidate "$CANDIDATE_COMMIT"
 
 export AWS_REGION=${AWS_REGION:-us-east-1}
 export AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-$AWS_REGION}
