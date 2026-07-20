@@ -28,7 +28,7 @@
 
 #![allow(clippy::print_stdout)]
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::sync::Arc;
 use std::time::Instant;
@@ -477,6 +477,111 @@ async fn run_scale(
     println!();
 }
 
+/// Deep-flush mode: bootstrap a multi-level tree, then drive a sustained backfill
+/// heavy enough that the root ε-buffer fills repeatedly and flushes **cascade
+/// into internal nodes** (not just the root). Measures how deep flushes go
+/// (`max_flush_depth`), the flush-depth histogram, per-commit write, and — after
+/// the run — how full internal ε-buffers actually got (byte size per level).
+#[allow(clippy::too_many_arguments)]
+async fn run_deep_flush(
+    uri: &str,
+    n: u64,
+    base_files: u32,
+    node_bytes: u64,
+    fanout: u32,
+    f: u64,
+    commits: u64,
+) {
+    let io = IOTracker::default();
+    let (object_store, base, scheduler, cache) = build_store(uri, &io).await;
+    let config = BeTreeConfig {
+        target_node_bytes: node_bytes,
+        fanout,
+        min_flush_bytes: node_bytes / 16,
+    };
+    let (mut tree, boot) = BeTree::bootstrap_generate(
+        object_store.clone(),
+        base.clone(),
+        scheduler.clone(),
+        cache.clone(),
+        config,
+        n,
+        |id| make_fragment_with_files(id, base_files),
+        Vec::new(),
+    )
+    .await
+    .expect("deep bootstrap");
+    println!(
+        "  [B={:.0} MiB, fanout {fanout}] bootstrap {n} frags x {base_files} files: \
+         {} leaves, height {}, {:.2} GiB",
+        node_bytes as f64 / MIB as f64,
+        boot.num_leaves,
+        boot.height,
+        boot.io_write_bytes as f64 / (1024.0 * MIB as f64),
+    );
+
+    let windows = n.div_ceil(f);
+    let mut per_commit: Vec<f64> = Vec::new();
+    let (mut bytes, mut flushes, mut splits, mut merges) = (0u64, 0u64, 0u64, 0u64);
+    let mut depth_hist = [0u64; 16];
+    let mut max_depth = 0u32;
+    for c in 0..commits {
+        let w = c % windows; // cycle across the whole key space
+        let col = base_files + (c / windows) as u32; // a fresh column each full cycle
+        let actions: Vec<_> = commit_window(w, f, n)
+            .map(|id| action::add_data_file(id, &make_backfill_data_file(id, col)))
+            .collect();
+        let start = Instant::now();
+        let s = tree.commit(actions).await.expect("deep commit");
+        per_commit.push(start.elapsed().as_secs_f64() * 1000.0);
+        bytes += s.io_write_bytes;
+        flushes += s.flushes;
+        splits += s.splits;
+        merges += s.merges;
+        let d = (s.max_flush_depth as usize).min(depth_hist.len() - 1);
+        depth_hist[d] += 1;
+        max_depth = max_depth.max(s.max_flush_depth);
+    }
+    per_commit.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    println!(
+        "             {commits} commits (F={f}): {flushes} flushes, {splits} splits, {merges} merges, \
+         **max_flush_depth={max_depth}**, height {}",
+        tree.height()
+    );
+    println!(
+        "             flush-depth histogram (commits by deepest flush level): {:?}",
+        &depth_hist[..=(max_depth as usize).min(depth_hist.len() - 1)]
+    );
+    println!(
+        "             per-commit write: mean={:.3} MiB p50={:.2}ms p99={:.2}ms max={:.2}ms",
+        bytes as f64 / commits.max(1) as f64 / MIB as f64,
+        percentile(&per_commit, 50.0),
+        percentile(&per_commit, 99.0),
+        per_commit.last().copied().unwrap_or(0.0),
+    );
+
+    // How full did internal ε-buffers get, per level?
+    let sizes = tree.internal_node_sizes().await.expect("node sizes");
+    let mut by_h: BTreeMap<u32, Vec<u64>> = BTreeMap::new();
+    for (h, b) in sizes {
+        by_h.entry(h).or_default().push(b);
+    }
+    for (h, v) in by_h.iter().rev() {
+        let min = *v.iter().min().unwrap();
+        let max = *v.iter().max().unwrap();
+        let mean = v.iter().sum::<u64>() / v.len() as u64;
+        println!(
+            "             internal h={h}: {} node(s), size min={:.3} mean={:.3} max={:.3} MiB (B={:.0} MiB)",
+            v.len(),
+            min as f64 / MIB as f64,
+            mean as f64 / MIB as f64,
+            max as f64 / MIB as f64,
+            node_bytes as f64 / MIB as f64,
+        );
+    }
+    println!();
+}
+
 fn bench_betree_backfill(c: &mut Criterion) {
     let runtime = Runtime::new().expect("tokio runtime");
 
@@ -493,9 +598,38 @@ fn bench_betree_backfill(c: &mut Criterion) {
     let flat_sample = env_u64("FLAT_SAMPLE_COMMITS", 20);
     let run_tag = &Uuid::new_v4().to_string()[..8];
 
-    // Scale mode: bootstrap fat fragments (many data files) to reach billion-scale.
     let base_files = env_usize("BASE_FILES_PER_FRAGMENT", 1) as u32;
     let backfill_columns = env_usize("BACKFILL_COLUMNS", 1) as u32;
+
+    // Deep-flush mode: sustained backfill that cascades flushes into internal nodes.
+    let deep_commits = env_u64("DEEP_FLUSH_COMMITS", 0);
+    if deep_commits > 0 {
+        let f = *f_sweep.first().unwrap_or(&1000);
+        println!("=== recursive Bε-tree DEEP-FLUSH benchmark ===");
+        println!(
+            "base_uri={base_uri}\nN={n} base_files_per_fragment={base_files} node_size_sweep={node_sweep:?} MiB \
+             fanout={fanout} F={f} deep_flush_commits={deep_commits} run_tag={run_tag}\n"
+        );
+        for &node_mib in &node_sweep {
+            let uri = format!(
+                "{}/{run_tag}/deepB{node_mib}",
+                base_uri.trim_end_matches('/')
+            );
+            runtime.block_on(run_deep_flush(
+                &uri,
+                n,
+                base_files.max(2),
+                (node_mib * MIB as f64) as u64,
+                fanout,
+                f,
+                deep_commits,
+            ));
+        }
+        let _ = c;
+        return;
+    }
+
+    // Scale mode: bootstrap fat fragments (many data files) to reach billion-scale.
     if base_files > 1 {
         let f = *f_sweep.first().unwrap_or(&100);
         println!("=== recursive Bε-tree AT-SCALE benchmark ===");

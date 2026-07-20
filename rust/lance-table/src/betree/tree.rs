@@ -33,6 +33,9 @@ struct WriteAcc {
     flushes: u64,
     splits: u64,
     merges: u64,
+    /// Deepest tree level at which a flush occurred this commit (0 = root only).
+    /// >0 proves multi-level flushing (internal ε-buffers filled and flushed down).
+    max_flush_depth: u32,
 }
 
 impl WriteAcc {
@@ -41,6 +44,7 @@ impl WriteAcc {
         self.flushes += o.flushes;
         self.splits += o.splits;
         self.merges += o.merges;
+        self.max_flush_depth = self.max_flush_depth.max(o.max_flush_depth);
     }
 }
 
@@ -67,6 +71,9 @@ pub struct CommitStats {
     pub splits: u64,
     pub merges: u64,
     pub height: u32,
+    /// Deepest level flushed this commit (0 = root buffer only; ≥1 = cascaded
+    /// into internal nodes — the deep-flush regime).
+    pub max_flush_depth: u32,
 }
 
 /// A writer session over a recursive Bε-tree. Holds only the root (child refs +
@@ -226,10 +233,10 @@ impl BeTree {
 
         let mut acc = WriteAcc::default();
 
-        // Flush the root buffer down as far as it will go.
+        // Flush the root buffer down as far as it will go (root is depth 0).
         let children = std::mem::take(&mut self.children);
         let buffer = std::mem::take(&mut self.buffer);
-        let (children, buffer, a) = self.flush_internal(children, buffer).await?;
+        let (children, buffer, a) = self.flush_internal(children, buffer, 0).await?;
         acc.add(a);
         self.children = children;
         self.buffer = buffer;
@@ -271,16 +278,19 @@ impl BeTree {
             splits: acc.splits,
             merges: acc.merges,
             height: self.height(),
+            max_flush_depth: acc.max_flush_depth,
         })
     }
 
     /// Flush an internal node's buffer to its children while it overflows,
-    /// picking the fullest child each round (gated at `min_flush`). Returns the
-    /// (possibly split) children and the residual buffer.
+    /// picking the fullest child each round (gated at `min_flush`). `depth` is
+    /// this node's level below the root (0 = root). Returns the (possibly split)
+    /// children and the residual buffer.
     fn flush_internal(
         &self,
         mut children: Vec<pb::ChildRef>,
         mut buffer: Vec<pb::TaggedAction>,
+        depth: u32,
     ) -> BoxFuture<'_, Result<FlushResult>> {
         Box::pin(async move {
             let mut acc = WriteAcc::default();
@@ -304,22 +314,24 @@ impl BeTree {
                 let chosen = std::mem::take(&mut buckets[idx]);
                 buffer = buckets.into_iter().flatten().collect();
 
-                let (new_refs, a) = self.ingest(children[idx].clone(), chosen).await?;
+                let (new_refs, a) = self.ingest(children[idx].clone(), chosen, depth).await?;
                 acc.add(a);
                 acc.flushes += 1;
+                acc.max_flush_depth = acc.max_flush_depth.max(depth);
                 children.splice(idx..idx + 1, new_refs);
             }
             Ok((children, buffer, acc))
         })
     }
 
-    /// Push `incoming` messages into the subtree rooted at `child`; apply at a
-    /// leaf, recurse+buffer at an internal node; split on overflow. Returns the
-    /// child ref(s) that now represent the subtree (>1 if it split).
+    /// Push `incoming` messages into the subtree rooted at `child` (at `depth`
+    /// below the root); apply at a leaf, recurse+buffer at an internal node;
+    /// split on overflow. Returns the child ref(s) that now represent the subtree.
     fn ingest(
         &self,
         child: pb::ChildRef,
         incoming: Vec<pb::TaggedAction>,
+        depth: u32,
     ) -> BoxFuture<'_, Result<IngestResult>> {
         Box::pin(async move {
             let mut acc = WriteAcc::default();
@@ -354,7 +366,9 @@ impl BeTree {
                     mut buffer,
                 } = self.store.read_internal(&child).await?;
                 buffer.extend(incoming);
-                let (children, buffer, a) = self.flush_internal(children, buffer).await?;
+                // This node is one level deeper than the parent that flushed to it.
+                let (children, buffer, a) =
+                    self.flush_internal(children, buffer, depth + 1).await?;
                 acc.add(a);
                 // Rebalance: coalesce any underflowing children before checking split.
                 let (children, a) = self.merge_small_children(children).await?;
@@ -484,6 +498,36 @@ impl BeTree {
         self.collect(&self.children, &mut map, &mut actions).await?;
         node::apply_actions(&mut map, actions)?;
         Ok(map.into_values().collect())
+    }
+
+    /// Walk the tree and collect `(height, logical_bytes)` for every internal node
+    /// (root included). Used to measure how full internal ε-buffers are — a node
+    /// near `B` is holding a big buffer, a node near its ref-only size is "cold".
+    pub async fn internal_node_sizes(&self) -> Result<Vec<(u32, u64)>> {
+        let mut out = vec![(
+            self.height(),
+            node::internal_logical_bytes(&self.children, &self.buffer),
+        )];
+        self.collect_internal_sizes(self.children.clone(), &mut out)
+            .await?;
+        Ok(out)
+    }
+
+    fn collect_internal_sizes<'a>(
+        &'a self,
+        children: Vec<pb::ChildRef>,
+        out: &'a mut Vec<(u32, u64)>,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            for c in &children {
+                if c.height > 0 {
+                    out.push((c.height, c.byte_size));
+                    let node = self.store.read_internal(c).await?;
+                    self.collect_internal_sizes(node.children, out).await?;
+                }
+            }
+            Ok(())
+        })
     }
 
     fn collect<'a>(
