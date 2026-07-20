@@ -1089,7 +1089,9 @@ impl BlobSource {
     /// Drain currently queued requests and submit them as scheduler batches.
     ///
     /// Each loop iteration grabs the queued requests with a short mutex hold and
-    /// immediately releases the lock before any I/O is awaited.
+    /// dispatches them without waiting for earlier batches to finish. Awaiting a
+    /// batch here would hold later, naturally staggered callers behind its I/O.
+    /// [`FileScheduler`] owns the concurrency and backpressure for dispatched I/O.
     async fn drain_pending_reads(self: Arc<Self>, scheduler: FileScheduler) {
         loop {
             let batch = {
@@ -1100,7 +1102,10 @@ impl BlobSource {
                 }
                 std::mem::take(&mut pending_reads.requests)
             };
-            fulfill_pending_blob_reads(&scheduler, batch).await;
+            let scheduler = scheduler.clone();
+            tokio::spawn(async move {
+                fulfill_pending_blob_reads(&scheduler, batch).await;
+            });
         }
     }
 }
