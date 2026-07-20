@@ -403,6 +403,14 @@ class _Dataset:
         io_buffer_size: Optional[int] = None,
         preserve_order: Optional[bool] = None,
     ) -> List[Tuple[int, bytes]]: ...
+    def read_blob_ranges(
+        self,
+        requests: List[Tuple[int, int, int]],
+        blob_column: str,
+        selector: Literal["ids", "addresses", "indices"],
+        io_buffer_size: Optional[int] = None,
+        preserve_order: Optional[bool] = None,
+    ) -> List[Tuple[int, int, bytes]]: ...
     def take_scan(
         self,
         row_slices: Iterable[Tuple[int, int]],
