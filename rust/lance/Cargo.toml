@@ -227,6 +227,10 @@ name = "take_blob"
 harness = false
 
 [[bench]]
+name = "blob_range_concurrency"
+harness = false
+
+[[bench]]
 name = "random_access"
 harness = false
 
