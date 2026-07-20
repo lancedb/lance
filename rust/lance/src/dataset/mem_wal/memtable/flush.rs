@@ -2247,9 +2247,8 @@ mod tests {
         crate::utils::test::assert_plan_node_equals(
             plan,
             "ProjectionExec: expr=[id@2 as id, text@3 as text, _score@1 as _score]
-  Take: ...
-    CoalesceBatchesExec: ...
-      MatchQuery: column=text, query=[hello]",
+  LanceRead: ..., source=stream(_rowid)
+    MatchQuery: column=text, query=[hello]",
         )
         .await
         .unwrap();
