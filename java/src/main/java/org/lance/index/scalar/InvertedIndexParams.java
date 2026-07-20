@@ -264,8 +264,8 @@ public final class InvertedIndexParams {
     /**
      * Configure the on-disk FTS format version to write when creating a new index.
      *
-     * <p>If unset, Lance writes v4 for either supported block size. {@code formatVersion = 3} is
-     * experimental and is only valid with {@code blockSize = 256}.
+     * <p>If unset, Lance uses {@code LANCE_FTS_FORMAT_VERSION} when present and otherwise writes
+     * v4. {@code formatVersion = 3} is experimental and is only valid with {@code blockSize = 256}.
      *
      * @param formatVersion FTS format version, must be 1, 2, 3, or 4
      * @return this builder

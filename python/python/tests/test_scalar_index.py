@@ -7,6 +7,8 @@ import random
 import re
 import shutil
 import string
+import subprocess
+import sys
 import uuid
 import zipfile
 from datetime import date, datetime, timedelta
@@ -5520,15 +5522,92 @@ def test_describe_indices(tmp_path, format_version, expected_format_version):
         assert index.num_rows_indexed == 50
 
 
-def test_create_inverted_index_defaults_to_v4_and_ignores_env(tmp_path, monkeypatch):
-    monkeypatch.setenv("LANCE_FTS_FORMAT_VERSION", "1")
-    data = pa.table({"text": ["document about lance database"]})
-    ds = lance.write_dataset(data, tmp_path)
+def _run_fts_format_creation_probe(
+    tmp_path, env_value, creation_options=None, expected_format_version=None
+):
+    script = """
+import json
+import sys
 
-    ds.create_scalar_index("text", index_type="INVERTED")
+import lance
+import pyarrow as pa
 
-    indices = ds.describe_indices()
-    assert indices[0].segments[0].index_version == 4
+dataset = lance.write_dataset(
+    pa.table({"text": ["document about lance database"]}), sys.argv[1]
+)
+dataset.create_scalar_index(
+    "text", index_type="INVERTED", **json.loads(sys.argv[2])
+)
+expected_format_version = json.loads(sys.argv[3])
+if expected_format_version is not None:
+    actual_format_version = dataset.describe_indices()[0].segments[0].index_version
+    assert actual_format_version == expected_format_version
+"""
+    env = os.environ.copy()
+    if env_value is None:
+        env.pop("LANCE_FTS_FORMAT_VERSION", None)
+    else:
+        env["LANCE_FTS_FORMAT_VERSION"] = env_value
+    return subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            script,
+            str(tmp_path),
+            json.dumps(creation_options or {}),
+            json.dumps(expected_format_version),
+        ],
+        capture_output=True,
+        env=env,
+        text=True,
+    )
+
+
+@pytest.mark.parametrize(
+    ("env_value", "creation_options", "expected_format_version"),
+    [
+        ("1", {}, 1),
+        ("2", {}, 2),
+        ("3", {"block_size": 256}, 3),
+        ("4", {}, 4),
+    ],
+)
+def test_create_inverted_index_uses_env_format_version(
+    tmp_path, env_value, creation_options, expected_format_version
+):
+    result = _run_fts_format_creation_probe(
+        tmp_path,
+        env_value,
+        creation_options,
+        expected_format_version,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_create_inverted_index_explicit_format_version_overrides_env(tmp_path):
+    result = _run_fts_format_creation_probe(
+        tmp_path,
+        "invalid",
+        {"format_version": 1},
+        1,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_create_inverted_index_defaults_to_v4_without_env(tmp_path):
+    result = _run_fts_format_creation_probe(tmp_path, None, expected_format_version=4)
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_create_inverted_index_rejects_invalid_env_format_version(tmp_path):
+    result = _run_fts_format_creation_probe(tmp_path, "invalid")
+
+    assert result.returncode != 0
+    assert "LANCE_FTS_FORMAT_VERSION" in result.stderr
+    assert "invalid" in result.stderr
 
 
 def test_create_inverted_index_rejects_invalid_format_version(tmp_path):
