@@ -20,6 +20,7 @@ RUN_ID=$(date -u +%Y%m%dT%H%M%SZ)
 RUN_DIR=$OUTPUT_ROOT/$RUN_ID
 RUNS=${LANCE_FTS_BENCH_RUNS:-2}
 ROUNDS=${LANCE_FTS_BENCH_ROUNDS:-1000}
+CONCURRENCY=${LANCE_FTS_BENCH_CONCURRENCY:-8}
 
 for binary in "$BASELINE_BINARY" "$CANDIDATE_BINARY"; do
   if [[ ! -x "$binary" ]]; then
@@ -43,7 +44,7 @@ cp "$QUERY_FILE" "$RUN_DIR/queries.txt"
   echo "runs=$RUNS"
   echo "rounds=$ROUNDS"
   echo "query_count=$(grep -Ec '^[^#[:space:]]' "$RUN_DIR/queries.txt")"
-  echo "concurrency=8"
+  echo "concurrency=$CONCURRENCY"
   echo "prewarm_index=full_content_idx"
   echo "index_cache_size_gib=192"
   uname -a
@@ -74,7 +75,7 @@ run_variant() {
       --query-file "$RUN_DIR/queries.txt" \
       --warmup-rounds 0 \
       --measured-rounds "$ROUNDS" \
-      --concurrency 8 \
+      --concurrency "$CONCURRENCY" \
       >> "$RUN_DIR/results/throughput_$variant.jsonl" \
       2>> "$RUN_DIR/results/stderr.log"
 }
