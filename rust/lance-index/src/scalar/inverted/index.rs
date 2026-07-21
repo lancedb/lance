@@ -8507,12 +8507,171 @@ mod tests {
         );
     }
 
+    /// Counts docs-file ROW_ID reads so the test below can assert the
+    /// caching contract of deferred row_id resolution: one full-column read
+    /// per resolving partition on first use, zero scattered single-row reads,
+    /// and zero additional reads on subsequent queries.
+    #[derive(Debug, Default)]
+    struct DocsRowIdReadCounter {
+        full_column_reads: std::sync::atomic::AtomicUsize,
+        scattered_reads: std::sync::atomic::AtomicUsize,
+    }
+
+    impl DocsRowIdReadCounter {
+        fn full_column_reads(&self) -> usize {
+            self.full_column_reads
+                .load(std::sync::atomic::Ordering::Relaxed)
+        }
+        fn scattered_reads(&self) -> usize {
+            self.scattered_reads
+                .load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    struct DocsRowIdCountingReader {
+        inner: Arc<dyn IndexReader>,
+        counter: Arc<DocsRowIdReadCounter>,
+    }
+
+    #[async_trait]
+    impl IndexReader for DocsRowIdCountingReader {
+        async fn read_record_batch(&self, n: u64, batch_size: u64) -> Result<RecordBatch> {
+            self.inner.read_record_batch(n, batch_size).await
+        }
+        async fn read_global_buffer(&self, index: u32) -> Result<bytes::Bytes> {
+            self.inner.read_global_buffer(index).await
+        }
+        async fn read_range(
+            &self,
+            range: std::ops::Range<usize>,
+            projection: Option<&[&str]>,
+        ) -> Result<RecordBatch> {
+            if projection
+                .map(|cols| cols.contains(&lance_core::ROW_ID))
+                .unwrap_or(false)
+            {
+                self.counter
+                    .full_column_reads
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            self.inner.read_range(range, projection).await
+        }
+        async fn read_ranges(
+            &self,
+            ranges: &[std::ops::Range<usize>],
+            projection: Option<&[&str]>,
+        ) -> Result<RecordBatch> {
+            if projection
+                .map(|cols| cols.contains(&lance_core::ROW_ID))
+                .unwrap_or(false)
+            {
+                self.counter
+                    .scattered_reads
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            self.inner.read_ranges(ranges, projection).await
+        }
+        async fn num_batches(&self, batch_size: u64) -> u32 {
+            self.inner.num_batches(batch_size).await
+        }
+        fn num_rows(&self) -> usize {
+            self.inner.num_rows()
+        }
+        fn schema(&self) -> &lance_core::datatypes::Schema {
+            self.inner.schema()
+        }
+    }
+
+    #[derive(Debug)]
+    struct DocsRowIdCountingStore {
+        inner: Arc<dyn IndexStore>,
+        counter: Arc<DocsRowIdReadCounter>,
+    }
+
+    impl DeepSizeOf for DocsRowIdCountingStore {
+        fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+            self.inner.deep_size_of_children(context)
+        }
+    }
+
+    #[async_trait]
+    impl IndexStore for DocsRowIdCountingStore {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn clone_arc(&self) -> Arc<dyn IndexStore> {
+            Arc::new(Self {
+                inner: self.inner.clone(),
+                counter: self.counter.clone(),
+            })
+        }
+        fn io_parallelism(&self) -> usize {
+            self.inner.io_parallelism()
+        }
+        fn with_io_priority(&self, io_priority: u64) -> Arc<dyn IndexStore> {
+            Arc::new(Self {
+                inner: self.inner.with_io_priority(io_priority),
+                counter: self.counter.clone(),
+            })
+        }
+        async fn new_index_file(
+            &self,
+            name: &str,
+            schema: Arc<arrow_schema::Schema>,
+        ) -> Result<Box<dyn crate::scalar::IndexWriter>> {
+            self.inner.new_index_file(name, schema).await
+        }
+        async fn open_index_file(&self, name: &str) -> Result<Arc<dyn IndexReader>> {
+            let reader = self.inner.open_index_file(name).await?;
+            if name.ends_with(DOCS_FILE) {
+                Ok(Arc::new(DocsRowIdCountingReader {
+                    inner: reader,
+                    counter: self.counter.clone(),
+                }))
+            } else {
+                Ok(reader)
+            }
+        }
+        async fn copy_index_file(
+            &self,
+            name: &str,
+            dest_store: &dyn IndexStore,
+        ) -> Result<crate::scalar::IndexFile> {
+            self.inner.copy_index_file(name, dest_store).await
+        }
+        async fn copy_index_file_to(
+            &self,
+            name: &str,
+            new_name: &str,
+            dest_store: &dyn IndexStore,
+        ) -> Result<crate::scalar::IndexFile> {
+            self.inner
+                .copy_index_file_to(name, new_name, dest_store)
+                .await
+        }
+        async fn rename_index_file(
+            &self,
+            name: &str,
+            new_name: &str,
+        ) -> Result<crate::scalar::IndexFile> {
+            self.inner.rename_index_file(name, new_name).await
+        }
+        async fn delete_index_file(&self, name: &str) -> Result<()> {
+            self.inner.delete_index_file(name).await
+        }
+        async fn list_files_with_sizes(&self) -> Result<Vec<crate::scalar::IndexFile>> {
+            self.inner.list_files_with_sizes().await
+        }
+    }
+
     #[tokio::test]
     async fn test_bm25_search_many_partitions_resolves_exact_row_ids() {
         // Regression test for deferred row_id resolution: with many partitions
         // (including one whose only token does not match the query), a search
         // must resolve every candidate's row_id exactly once and correctly.
-        // Exercises DeferredDocSet::resolve_row_ids' cached whole-column path.
+        // Also asserts the caching contract: each resolving partition reads the
+        // ROW_ID column exactly once (one full-column read, no scattered
+        // single-row reads), and subsequent queries perform no further reads.
         let tmpdir = TempObjDir::default();
         let store = Arc::new(LanceIndexStore::new(
             ObjectStore::local().into(),
@@ -8521,7 +8680,8 @@ mod tests {
         ));
 
         const NUM_MATCHING_PARTITIONS: u64 = 40;
-        let mut expected_row_ids: Vec<u64> = Vec::new();
+        let mut expected_row_ids: Vec<u64> =
+            Vec::with_capacity((NUM_MATCHING_PARTITIONS * 3) as usize);
         for pid in 0..NUM_MATCHING_PARTITIONS {
             let mut builder = InnerBuilder::new(pid, false, TokenSetFormat::default());
             builder.tokens.add("pipeline".to_owned());
@@ -8567,11 +8727,20 @@ mod tests {
             .unwrap();
         writer.finish_with_metadata(metadata).await.unwrap();
 
+        // Load through a store that counts docs-file ROW_ID reads.
+        let counter = Arc::new(DocsRowIdReadCounter::default());
+        let inner_store: Arc<dyn IndexStore> = store.clone();
+        let counting_store: Arc<dyn IndexStore> = Arc::new(DocsRowIdCountingStore {
+            inner: inner_store,
+            counter: counter.clone(),
+        });
         let cache = Arc::new(LanceCache::with_capacity(64 * 1024 * 1024));
-        let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
+        let index = InvertedIndex::load(counting_store, None, cache.as_ref())
             .await
             .unwrap();
         assert_eq!(index.partitions.len(), 41);
+        assert_eq!(counter.full_column_reads(), 0);
+        assert_eq!(counter.scattered_reads(), 0);
 
         // Every matching doc must come back exactly once with a correct row_id.
         let tokens = Arc::new(Tokens::new(vec!["pipeline".to_owned()], DocType::Text));
@@ -8597,7 +8766,22 @@ mod tests {
         assert_eq!(scores.len(), row_ids.len());
         assert!(scores.iter().all(|s| *s > 0.0));
 
-        // Top-k smaller than the total: exactly k results.
+        // Caching contract: one full-column ROW_ID read per resolving
+        // partition, no scattered single-row reads. The non-matching
+        // partition must not read its ROW_ID column at all.
+        assert_eq!(
+            counter.full_column_reads(),
+            NUM_MATCHING_PARTITIONS as usize,
+            "each resolving partition reads the ROW_ID column exactly once"
+        );
+        assert_eq!(
+            counter.scattered_reads(),
+            0,
+            "resolution must not issue scattered single-row reads"
+        );
+
+        // Top-k smaller than the total: exactly k results, and the cached
+        // columns serve resolution with no further docs-file reads.
         let params_k = Arc::new(FtsSearchParams::new().with_limit(Some(7)));
         let (row_ids_k, scores_k) = index
             .bm25_search(tokens, params_k, Operator::Or, prefilter, metrics, None)
@@ -8606,6 +8790,12 @@ mod tests {
         assert_eq!(row_ids_k.len(), 7);
         assert_eq!(scores_k.len(), 7);
         assert!(row_ids_k.iter().all(|id| expected_row_ids.contains(id)));
+        assert_eq!(
+            counter.full_column_reads(),
+            NUM_MATCHING_PARTITIONS as usize,
+            "subsequent queries must not re-read the ROW_ID column"
+        );
+        assert_eq!(counter.scattered_reads(), 0);
     }
 
     #[tokio::test]
