@@ -1561,13 +1561,61 @@ pub(super) trait WandDocuments {
     fn flat_doc_length(&self, doc_id: u64, document_key: u64, compressed: bool) -> u32;
 }
 
-pub(super) struct ModernWandDocuments<'a> {
-    lengths: &'a DocLengths,
-    visibility: &'a DocVisibility,
+pub(super) trait ModernVisibility {
+    fn selected(&self, doc_id: DocId) -> bool;
+    fn len(&self, total_docs: usize) -> usize;
+    fn iter(&self) -> Option<Box<dyn Iterator<Item = DocId> + '_>>;
 }
 
-impl<'a> ModernWandDocuments<'a> {
-    pub(crate) fn new(lengths: &'a DocLengths, visibility: &'a DocVisibility) -> Self {
+pub(super) struct AllModernDocuments;
+
+impl ModernVisibility for AllModernDocuments {
+    #[inline]
+    fn selected(&self, _doc_id: DocId) -> bool {
+        true
+    }
+
+    fn len(&self, total_docs: usize) -> usize {
+        total_docs
+    }
+
+    fn iter(&self) -> Option<Box<dyn Iterator<Item = DocId> + '_>> {
+        None
+    }
+}
+
+impl ModernVisibility for &DocVisibility {
+    #[inline]
+    fn selected(&self, doc_id: DocId) -> bool {
+        DocVisibility::selected(self, doc_id)
+    }
+
+    fn len(&self, total_docs: usize) -> usize {
+        DocVisibility::len(self, total_docs)
+    }
+
+    fn iter(&self) -> Option<Box<dyn Iterator<Item = DocId> + '_>> {
+        DocVisibility::iter(self)
+            .map(|doc_ids| Box::new(doc_ids) as Box<dyn Iterator<Item = DocId>>)
+    }
+}
+
+pub(super) struct ModernWandDocuments<'a, V> {
+    lengths: &'a DocLengths,
+    visibility: V,
+}
+
+impl<'a> ModernWandDocuments<'a, AllModernDocuments> {
+    pub(crate) fn all(lengths: &'a DocLengths) -> Self {
+        Self {
+            lengths,
+            visibility: AllModernDocuments,
+        }
+    }
+}
+
+impl<'a> ModernWandDocuments<'a, &'a DocVisibility> {
+    pub(crate) fn filtered(lengths: &'a DocLengths, visibility: &'a DocVisibility) -> Self {
         Self {
             lengths,
             visibility,
@@ -1575,7 +1623,7 @@ impl<'a> ModernWandDocuments<'a> {
     }
 }
 
-impl WandDocuments for ModernWandDocuments<'_> {
+impl<V: ModernVisibility> WandDocuments for ModernWandDocuments<'_, V> {
     type Candidate = DocId;
 
     fn len(&self) -> usize {

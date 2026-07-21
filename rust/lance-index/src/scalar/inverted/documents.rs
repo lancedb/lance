@@ -454,6 +454,10 @@ pub(super) enum DocVisibility {
 }
 
 impl DocVisibility {
+    pub(crate) fn is_all(&self) -> bool {
+        matches!(self, Self::All)
+    }
+
     #[inline]
     pub(crate) fn selected(&self, doc_id: DocId) -> bool {
         match self {
