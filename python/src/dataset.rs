@@ -135,11 +135,50 @@ fn read_blobs_to_python(
         .collect()
 }
 
+fn read_blob_ranges_to_python(
+    py: Python<'_>,
+    ranges: Vec<lance::dataset::ReadBlobRange>,
+) -> Vec<(usize, u64, Py<PyBytes>)> {
+    ranges
+        .into_iter()
+        .map(|range| {
+            (
+                range.request_index,
+                range.row_address,
+                PyBytes::new(py, &range.data).unbind(),
+            )
+        })
+        .collect()
+}
+
+fn blob_range_requests_from_tuples(
+    requests: Vec<(u64, u64, u64)>,
+) -> Vec<lance::dataset::BlobRangeRequest> {
+    requests
+        .into_iter()
+        .map(|(row, offset, length)| lance::dataset::BlobRangeRequest::new(row, offset, length))
+        .collect()
+}
+
 fn configure_read_blobs_builder(
     mut builder: lance::dataset::ReadBlobsBuilder,
     io_buffer_size: Option<u64>,
     preserve_order: Option<bool>,
 ) -> lance::dataset::ReadBlobsBuilder {
+    if let Some(bytes) = io_buffer_size {
+        builder = builder.with_io_buffer_size_bytes(bytes);
+    }
+    if let Some(preserve) = preserve_order {
+        builder = builder.preserve_order(preserve);
+    }
+    builder
+}
+
+fn configure_read_blob_ranges_builder(
+    mut builder: lance::dataset::ReadBlobRangesBuilder,
+    io_buffer_size: Option<u64>,
+    preserve_order: Option<bool>,
+) -> lance::dataset::ReadBlobRangesBuilder {
     if let Some(bytes) = io_buffer_size {
         builder = builder.with_io_buffer_size_bytes(bytes);
     }
@@ -1659,6 +1698,40 @@ impl Dataset {
             .block_on(Some(self_.py()), builder.execute())?
             .infer_error()?;
         Ok(read_blobs_to_python(self_.py(), blobs))
+    }
+
+    #[pyo3(signature=(
+        requests,
+        blob_column,
+        selector,
+        io_buffer_size=None,
+        preserve_order=None
+    ))]
+    fn read_blob_ranges(
+        self_: PyRef<'_, Self>,
+        requests: Vec<(u64, u64, u64)>,
+        blob_column: &str,
+        selector: &str,
+        io_buffer_size: Option<u64>,
+        preserve_order: Option<bool>,
+    ) -> PyResult<Vec<(usize, u64, Py<PyBytes>)>> {
+        let requests = blob_range_requests_from_tuples(requests);
+        let builder = self_.ds.read_blob_ranges(blob_column).infer_error()?;
+        let builder = match selector {
+            "ids" => builder.with_row_ids(requests),
+            "addresses" => builder.with_row_addresses(requests),
+            "indices" => builder.with_row_indices(requests),
+            selector => {
+                return Err(PyValueError::new_err(format!(
+                    "selector must be one of 'ids', 'addresses', or 'indices', got {selector:?}"
+                )));
+            }
+        };
+        let builder = configure_read_blob_ranges_builder(builder, io_buffer_size, preserve_order);
+        let ranges = rt()
+            .block_on(Some(self_.py()), builder.execute())?
+            .infer_error()?;
+        Ok(read_blob_ranges_to_python(self_.py(), ranges))
     }
 
     #[pyo3(signature = (row_slices, columns = None, batch_readahead = 10))]
