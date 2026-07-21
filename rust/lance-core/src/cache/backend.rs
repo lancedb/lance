@@ -4,9 +4,22 @@
 //! Backend interface for cache implementors.
 //!
 //! This module defines the trait that custom cache backends must implement,
-//! along with the key and entry types they operate on. Most callers should
+//! along with the entry type they operate on. Most callers should
 //! use [`LanceCache`](super::LanceCache) instead of interacting with
 //! backends directly.
+//!
+//! # Migrating custom backends
+//!
+//! Cache keys are opaque 16-byte values. Store
+//! [`InternalCacheKey::as_bytes`] directly instead of decomposing a logical
+//! prefix, key string, and Rust type name. The physical namespace must also
+//! include [`CACHE_KEY_FORMAT`](super::CACHE_KEY_FORMAT), so a future key
+//! protocol produces cold misses instead of aliases. Persistent or tiered
+//! backends can route serializable values with [`CacheCodec::type_id`].
+//!
+//! Prefix invalidation and key inventory are intentionally not part of this
+//! interface: one-way digests cannot support either operation without
+//! retaining the logical strings that fixed-size keys are designed to remove.
 
 use std::any::Any;
 use std::pin::Pin;
@@ -17,55 +30,10 @@ use futures::Future;
 
 use crate::Result;
 
-use super::CacheCodec;
+use super::{CacheCodec, InternalCacheKey};
 
 /// A type-erased cache entry.
 pub type CacheEntry = Arc<dyn Any + Send + Sync>;
-
-/// Iterator over cache keys currently known to a backend.
-pub type CacheKeyIterator<'a> = Box<dyn Iterator<Item = InternalCacheKey> + Send + 'a>;
-
-/// Structured cache key passed to [`CacheBackend`] methods.
-///
-/// CacheBackend impls receive these ready-made from [`LanceCache`](super::LanceCache)
-/// — you do not construct them yourself. Composed of three parts:
-/// - **prefix**: scopes the key to a dataset or index (e.g. `"s3://bucket/dataset/"`)
-/// - **key**: identifies the specific entry (e.g. `"42"` for a version number)
-/// - **type_name**: distinguishes different value types stored under the same
-///   user key (e.g. `"Vec<IndexMetadata>"`)
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
-pub struct InternalCacheKey {
-    prefix: Arc<str>,
-    key: Arc<str>,
-    type_name: &'static str,
-}
-
-impl InternalCacheKey {
-    pub fn new(prefix: Arc<str>, key: Arc<str>, type_name: &'static str) -> Self {
-        Self {
-            prefix,
-            key,
-            type_name,
-        }
-    }
-
-    pub fn prefix(&self) -> &str {
-        &self.prefix
-    }
-
-    pub fn key(&self) -> &str {
-        &self.key
-    }
-
-    pub fn type_name(&self) -> &'static str {
-        self.type_name
-    }
-
-    /// Returns true if this key's prefix starts with the given string.
-    pub fn starts_with(&self, prefix: &str) -> bool {
-        self.prefix.starts_with(prefix)
-    }
-}
 
 /// Low-level pluggable cache backend.
 ///
@@ -113,20 +81,8 @@ pub trait CacheBackend: Send + Sync + std::fmt::Debug {
         codec: Option<CacheCodec>,
     ) -> Result<(CacheEntry, bool)>;
 
-    /// Remove all entries whose prefix starts with the given string.
-    async fn invalidate_prefix(&self, prefix: &str);
-
     /// Remove all entries.
     async fn clear(&self);
-
-    /// Return an iterator over cache keys currently known to this backend.
-    ///
-    /// Backends that cannot enumerate keys cheaply or accurately should return
-    /// `None`. An empty iterator means key inventory is supported and the
-    /// cache currently has no entries.
-    async fn keys(&self) -> Option<CacheKeyIterator<'_>> {
-        None
-    }
 
     /// Number of entries currently stored (may flush pending operations).
     async fn num_entries(&self) -> usize;

@@ -23,8 +23,8 @@ use lance_core::deepsize::DeepSizeOf;
 use lance_core::{
     Error, ROW_ID, Result,
     cache::{
-        CacheCodec, CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheKey, LanceCache,
-        WeakLanceCache,
+        CacheCodec, CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheKey, CacheKeySchema,
+        KeyBuilder, LanceCache, WeakLanceCache,
     },
     error::LanceOptionExt,
     utils::tokio::get_num_compute_intensive_cpus,
@@ -133,6 +133,18 @@ pub struct BitmapIndex {
 #[derive(Debug, Clone)]
 pub struct BitmapKey {
     value: OrderableScalarValue,
+    row_offset: u64,
+}
+
+impl BitmapKey {
+    fn try_new(value: OrderableScalarValue, row_offset: usize) -> Result<Self> {
+        let row_offset = u64::try_from(row_offset).map_err(|_| {
+            Error::internal(format!(
+                "bitmap row offset {row_offset} does not fit in u64"
+            ))
+        })?;
+        Ok(Self { value, row_offset })
+    }
 }
 
 impl CacheKey for BitmapKey {
@@ -144,6 +156,14 @@ impl CacheKey for BitmapKey {
 
     fn type_name() -> &'static str {
         "Bitmap"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.scalar.bitmap-row-offset-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_u64(self.row_offset);
     }
 
     fn codec() -> Option<CacheCodec> {
@@ -335,6 +355,14 @@ impl CacheKey for BitmapIndexStateKey {
         "BitmapIndexState"
     }
 
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.scalar.bitmap-index-state-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_variant(0);
+    }
+
     fn codec() -> Option<CacheCodec> {
         Some(CacheCodec::from_impl::<BitmapIndexState>())
     }
@@ -446,7 +474,11 @@ impl BitmapIndex {
             return Ok(self.null_map.clone());
         }
 
-        let cache_key = BitmapKey { value: key.clone() };
+        let row_offset = match self.index_map.get(key) {
+            Some(loc) => *loc,
+            None => return Ok(Arc::new(RowAddrTreeMap::default())),
+        };
+        let cache_key = BitmapKey::try_new(key.clone(), row_offset)?;
 
         if let Some(cached) = self.index_cache.get_with_key(&cache_key).await {
             return Ok(cached);
@@ -456,11 +488,6 @@ impl BitmapIndex {
         if let Some(metrics) = metrics {
             metrics.record_part_load();
         }
-
-        let row_offset = match self.index_map.get(key) {
-            Some(loc) => *loc,
-            None => return Ok(Arc::new(RowAddrTreeMap::default())),
-        };
 
         let page_lookup_file = self.lazy_reader.get().await?;
         let batch = page_lookup_file
@@ -602,7 +629,12 @@ impl Index for BitmapIndex {
                     bitmap = frag_reuse_index_ref.remap_row_addrs_tree_map(&bitmap);
                 }
 
-                let cache_key = BitmapKey { value: key };
+                let row_offset = start_row.checked_add(idx).ok_or_else(|| {
+                    Error::internal(format!(
+                        "bitmap row offset overflow: start_row={start_row}, idx={idx}"
+                    ))
+                })?;
+                let cache_key = BitmapKey::try_new(key, row_offset)?;
                 self.index_cache
                     .insert_with_key(&cache_key, Arc::new(bitmap))
                     .await;
@@ -1994,6 +2026,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_bitmap_cache_key_uses_row_offset_identity() {
+        let cache = LanceCache::with_capacity(1024);
+        let value = OrderableScalarValue(ScalarValue::Int32(Some(7)));
+        let first = BitmapKey::try_new(value.clone(), 3).unwrap();
+        let second = BitmapKey::try_new(value, 4).unwrap();
+
+        cache
+            .insert_with_key(&first, Arc::new(RowAddrTreeMap::default()))
+            .await;
+
+        assert!(cache.get_with_key(&second).await.is_none());
+    }
+
+    #[tokio::test]
     async fn test_bitmap_lazy_loading_and_cache() {
         // Create a temporary directory for the index
         let tmpdir = TempObjDir::default();
@@ -2397,12 +2443,12 @@ mod tests {
             .unwrap();
 
         // Verify no bitmaps are cached yet
-        let cache_key_red = BitmapKey {
-            value: OrderableScalarValue(ScalarValue::Utf8(Some("red".to_string()))),
-        };
-        let cache_key_blue = BitmapKey {
-            value: OrderableScalarValue(ScalarValue::Utf8(Some("blue".to_string()))),
-        };
+        let red = OrderableScalarValue(ScalarValue::Utf8(Some("red".to_string())));
+        let blue = OrderableScalarValue(ScalarValue::Utf8(Some("blue".to_string())));
+        let cache_key_red =
+            BitmapKey::try_new(red.clone(), *index.index_map.get(&red).unwrap()).unwrap();
+        let cache_key_blue =
+            BitmapKey::try_new(blue.clone(), *index.index_map.get(&blue).unwrap()).unwrap();
 
         assert!(
             cache
@@ -2696,6 +2742,7 @@ mod tests {
             }
             _ => panic!("Expected Exact search result"),
         }
+        let entries_after_value_lookup = cache.size().await;
 
         // Test 2: Search for null values - should return allow=[2], null=None
         let query = SargableQuery::IsNull();
@@ -2724,6 +2771,11 @@ mod tests {
             }
             _ => panic!("Expected Exact search result"),
         }
+        assert_eq!(
+            cache.size().await,
+            entries_after_value_lookup,
+            "null bitmap lookup should bypass the per-value cache"
+        );
 
         // Test 3: Range query - should return matching rows and null_list
         let query = SargableQuery::Range(

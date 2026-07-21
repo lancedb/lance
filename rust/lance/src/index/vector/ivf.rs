@@ -47,7 +47,7 @@ use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::{
     Error, ROW_ID_FIELD, Result,
-    cache::{LanceCache, UnsizedCacheKey, WeakLanceCache},
+    cache::{CacheKeySchema, KeyBuilder, LanceCache, UnsizedCacheKey, WeakLanceCache},
     traits::DatasetTakeRows,
     utils::parse::parse_env_as_bool,
     utils::tracing::{IO_TYPE_LOAD_VECTOR_PART, TRACE_IO_EVENTS},
@@ -156,6 +156,14 @@ impl UnsizedCacheKey for LegacyIVFPartitionKey {
 
     fn type_name() -> &'static str {
         "LegacyIVFPartition"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.index.legacy-ivf-partition-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_u64(self.partition_id as u64);
     }
 }
 

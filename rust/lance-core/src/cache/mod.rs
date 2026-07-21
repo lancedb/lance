@@ -10,30 +10,14 @@
 //! describe what you're caching and its type.
 //!
 //! To make a value type serializable (so persistent backends can store it),
-//! implement [`CacheCodecImpl`] on the type, then override [`CacheKey::codec`]:
-//!
-//! ```ignore
-//! impl CacheCodecImpl for MyData {
-//!     fn serialize(&self, w: &mut dyn Write) -> Result<()> { /* ... */ }
-//!     fn deserialize(data: &Bytes) -> Result<Self> { /* ... */ }
-//! }
-//!
-//! impl CacheKey for MyDataKey {
-//!     type ValueType = MyData;
-//!     fn key(&self) -> Cow<'_, str> { /* ... */ }
-//!     fn type_name() -> &'static str { "MyData" }
-//!     fn codec() -> Option<CacheCodec> {
-//!         Some(CacheCodec::from_impl::<MyData>())
-//!     }
-//! }
-//! ```
+//! implement [`CacheCodecImpl`] on the type, then override [`CacheKey::codec`].
 //!
 //! ## For backend implementors
 //!
 //! Implement [`CacheBackend`] to provide a custom storage layer (disk, Redis,
-//! etc.). Backends receive [`InternalCacheKey`] keys and type-erased
-//! [`CacheEntry`] values — the typed wrapping is handled by [`LanceCache`].
-//! See the [`backend`] module for details.
+//! etc.). Backends receive opaque, fixed-size [`InternalCacheKey`] values and
+//! type-erased [`CacheEntry`] values. The typed wrapping is handled by
+//! [`LanceCache`]. See the [`backend`] module for migration details.
 //!
 //! ## Serialization flow
 //!
@@ -48,48 +32,35 @@
 pub mod backend;
 pub mod codec;
 mod entry_io;
+mod key;
 mod moka;
 
-pub use backend::{CacheBackend, CacheEntry, CacheKeyIterator, InternalCacheKey};
+pub use backend::{CacheBackend, CacheEntry};
 pub use codec::{
     CacheCodec, CacheCodecImpl, CacheDecode, CacheMissReason, MAGIC, has_cache_envelope,
 };
 pub use entry_io::{CacheEntryReader, CacheEntryWriter};
+pub use key::{CACHE_KEY_FORMAT, CacheKeySchema, CacheNamespace, InternalCacheKey, KeyBuilder};
 pub use moka::MokaCacheBackend;
 
 use std::borrow::Cow;
 use std::sync::{
-    Arc,
+    Arc, Weak,
     atomic::{AtomicU64, Ordering},
 };
 
-use futures::{Future, FutureExt};
+use futures::Future;
 
-use crate::Result;
+use crate::{Error, Result};
 
 pub use crate::deepsize::{Context, DeepSizeOf};
 
-// ---------------------------------------------------------------------------
-// CacheKey / UnsizedCacheKey — typed key traits for cache users
-// ---------------------------------------------------------------------------
-
 /// Typed cache key for sized value types.
 ///
-/// Implement this trait to define a new type of cached entry. [`LanceCache`]
-/// uses the key string and type name to construct an [`InternalCacheKey`]
-/// for the backend.
-///
-/// # Example
-///
-/// ```ignore
-/// struct MyKey { id: u64 }
-///
-/// impl CacheKey for MyKey {
-///     type ValueType = MyData;
-///     fn key(&self) -> Cow<'_, str> { self.id.to_string().into() }
-///     fn type_name() -> &'static str { "MyData" }
-/// }
-/// ```
+/// Existing implementations can continue returning a logical string from
+/// [`key`](Self::key). Performance-sensitive implementations should also
+/// provide a stable schema and stream typed fields through
+/// [`write_key`](Self::write_key), avoiding construction of that string.
 pub trait CacheKey {
     type ValueType: 'static;
 
@@ -98,13 +69,33 @@ pub trait CacheKey {
     /// Short, stable string identifying this value type.
     ///
     /// Two `CacheKey` impls that store different `ValueType`s **must** return
-    /// different type names; if they collide, gets will silently return `None`
-    /// due to failed downcasts.
+    /// different type names.
     ///
     /// Use a short literal (e.g. `"Vec<IndexMetadata>"`), not
     /// `std::any::type_name` — the latter is not guaranteed stable across
     /// compiler versions or build configurations.
     fn type_name() -> &'static str;
+
+    /// Stable identity included in the physical key.
+    ///
+    /// The compatibility default preserves existing implementations by using
+    /// their author-assigned [`type_name`](Self::type_name).
+    fn stable_type_id() -> &'static str {
+        Self::type_name()
+    }
+
+    /// Versioned schema for the logical key fields.
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::LEGACY_TEXT
+    }
+
+    /// Stream the logical key fields into the canonical key builder.
+    ///
+    /// The compatibility default hashes the existing string key. In-tree hot
+    /// paths override this with typed, allocation-free field encoding.
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_str(self.key().as_ref());
+    }
 
     /// Optional codec for serializing/deserializing this key's value type.
     ///
@@ -134,26 +125,44 @@ pub trait UnsizedCacheKey {
     /// Short, stable string identifying this value type.
     /// See [`CacheKey::type_name`] for requirements.
     fn type_name() -> &'static str;
-}
 
-// ---------------------------------------------------------------------------
-// Internal helpers
-// ---------------------------------------------------------------------------
+    /// Stable identity included in the physical key.
+    fn stable_type_id() -> &'static str {
+        Self::type_name()
+    }
+
+    /// Versioned schema for the logical key fields.
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::LEGACY_TEXT
+    }
+
+    /// Stream the logical key fields into the canonical key builder.
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_str(self.key().as_ref());
+    }
+}
 
 /// Size of a cached `Arc<T>`, accounting for the Arc overhead (two atomic counters).
 fn cache_entry_size<T: DeepSizeOf + ?Sized>(value: &T) -> usize {
     value.deep_size_of() + std::mem::size_of::<std::sync::atomic::AtomicUsize>() * 2
 }
 
-/// Build an [`InternalCacheKey`] from a cache's prefix, a user key string,
-/// and a type name.
-fn build_key(prefix: &Arc<str>, key: &str, type_name: &'static str) -> InternalCacheKey {
-    InternalCacheKey::new(prefix.clone(), Arc::from(key), type_name)
+#[derive(Debug)]
+struct CacheState {
+    backend: Arc<dyn CacheBackend>,
+    hits: AtomicU64,
+    misses: AtomicU64,
 }
 
-// ---------------------------------------------------------------------------
-// LanceCache — typed wrapper around dyn CacheBackend
-// ---------------------------------------------------------------------------
+impl CacheState {
+    fn new(backend: Arc<dyn CacheBackend>) -> Self {
+        Self {
+            backend,
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+        }
+    }
+}
 
 /// Typed cache wrapper that handles key construction and type safety.
 ///
@@ -161,196 +170,91 @@ fn build_key(prefix: &Arc<str>, key: &str, type_name: &'static str) -> InternalC
 /// [`MokaCacheBackend`]; pass a custom backend via [`LanceCache::with_backend`].
 #[derive(Clone)]
 pub struct LanceCache {
-    cache: Arc<dyn CacheBackend>,
-    prefix: Arc<str>,
-    hits: Arc<AtomicU64>,
-    misses: Arc<AtomicU64>,
+    state: Arc<CacheState>,
+    namespace: key::CacheNamespace,
 }
 
 impl std::fmt::Debug for LanceCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LanceCache")
-            .field("cache", &self.cache)
-            .finish()
+            .field("backend", &self.state.backend)
+            .finish_non_exhaustive()
     }
 }
 
 impl DeepSizeOf for LanceCache {
     fn deep_size_of_children(&self, _: &mut Context) -> usize {
-        self.cache.approx_size_bytes()
+        self.state.backend.approx_size_bytes()
     }
 }
 
 impl LanceCache {
     pub fn with_capacity(capacity: usize) -> Self {
-        Self {
-            cache: Arc::new(MokaCacheBackend::with_capacity(capacity)),
-            prefix: Arc::from(""),
-            hits: Arc::new(AtomicU64::new(0)),
-            misses: Arc::new(AtomicU64::new(0)),
-        }
+        Self::with_backend(Arc::new(MokaCacheBackend::with_capacity(capacity)))
     }
 
     /// Create a cache backed by a custom [`CacheBackend`].
     pub fn with_backend(backend: Arc<dyn CacheBackend>) -> Self {
         Self {
-            cache: backend,
-            prefix: Arc::from(""),
-            hits: Arc::new(AtomicU64::new(0)),
-            misses: Arc::new(AtomicU64::new(0)),
+            state: Arc::new(CacheState::new(backend)),
+            namespace: key::CacheNamespace::root(),
         }
     }
 
     pub fn no_cache() -> Self {
-        Self {
-            cache: Arc::new(MokaCacheBackend::no_cache()),
-            prefix: Arc::from(""),
-            hits: Arc::new(AtomicU64::new(0)),
-            misses: Arc::new(AtomicU64::new(0)),
-        }
+        Self::with_backend(Arc::new(MokaCacheBackend::no_cache()))
     }
 
-    /// Create a cache with the given backend and an exact prefix string.
-    /// Unlike `with_key_prefix`, this sets the prefix verbatim (no trailing slash added).
-    pub fn with_backend_and_prefix(backend: Arc<dyn CacheBackend>, prefix: String) -> Self {
-        Self {
-            cache: backend,
-            prefix: Arc::from(prefix),
-            hits: Arc::new(AtomicU64::new(0)),
-            misses: Arc::new(AtomicU64::new(0)),
-        }
-    }
-
-    /// Appends a prefix to the cache key.
+    /// Derive a child namespace for all keys in the returned cache handle.
+    ///
+    /// Each call adds one framed hierarchy segment. Consequently,
+    /// `cache.with_key_prefix("a").with_key_prefix("b")` is deliberately
+    /// distinct from `cache.with_key_prefix("a/b")`.
     pub fn with_key_prefix(&self, prefix: &str) -> Self {
         Self {
-            cache: self.cache.clone(),
-            prefix: Arc::from(format!("{}{}/", self.prefix, prefix)),
-            hits: self.hits.clone(),
-            misses: self.misses.clone(),
+            state: self.state.clone(),
+            namespace: self.namespace.child(prefix),
         }
-    }
-
-    /// Invalidate all entries whose prefix starts with the given string.
-    pub async fn invalidate_prefix(&self, prefix: &str) {
-        let full_prefix = format!("{}{}", self.prefix, prefix);
-        self.cache.invalidate_prefix(&full_prefix).await;
     }
 
     pub async fn size(&self) -> usize {
-        self.cache.num_entries().await
+        self.state.backend.num_entries().await
     }
 
     pub fn approx_size(&self) -> usize {
-        self.cache.approx_num_entries()
+        self.state.backend.approx_num_entries()
     }
 
     pub async fn size_bytes(&self) -> usize {
-        self.cache.size_bytes().await
+        self.state.backend.size_bytes().await
     }
-
-    /// Return an iterator over keys currently stored under this cache's prefix.
-    ///
-    /// Returns `None` when the backend does not support key inventory. The
-    /// iterator is intended for diagnostics and may be weakly consistent with
-    /// concurrent cache mutations.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # use std::{borrow::Cow, sync::Arc};
-    /// # use lance_core::cache::{CacheKey, LanceCache};
-    /// # struct MyKey;
-    /// # impl CacheKey for MyKey {
-    /// #     type ValueType = Vec<i32>;
-    /// #     fn key(&self) -> Cow<'_, str> { Cow::Borrowed("my-key") }
-    /// #     fn type_name() -> &'static str { "VecI32" }
-    /// # }
-    /// # async fn example() {
-    /// let cache = LanceCache::with_capacity(1024);
-    /// cache.insert_with_key(&MyKey, Arc::new(vec![1, 2, 3])).await;
-    ///
-    /// let mut keys = cache.keys().await.expect("Moka supports key inventory");
-    /// assert_eq!(keys.next().unwrap().key(), "my-key");
-    /// # }
-    /// ```
-    pub async fn keys(&self) -> Option<CacheKeyIterator<'_>> {
-        Some(Box::new(
-            self.cache
-                .keys()
-                .await?
-                .filter(|key| key.starts_with(&self.prefix)),
-        ))
-    }
-
-    // -- Sized insert/get (internal, shared by sized and unsized paths) --------
-
-    async fn insert_with_id<T: DeepSizeOf + Send + Sync + 'static>(
-        &self,
-        key: &str,
-        type_name: &'static str,
-        codec: Option<CacheCodec>,
-        metadata: Arc<T>,
-    ) {
-        let size = cache_entry_size(&*metadata);
-        let cache_key = build_key(&self.prefix, key, type_name);
-        self.cache.insert(&cache_key, metadata, size, codec).await;
-    }
-
-    async fn get_with_id<T: Send + Sync + 'static>(
-        &self,
-        key: &str,
-        type_name: &'static str,
-        codec: Option<CacheCodec>,
-    ) -> Option<Arc<T>> {
-        let cache_key = build_key(&self.prefix, key, type_name);
-        if let Some(entry) = self.cache.get(&cache_key, codec).await {
-            match entry.downcast::<T>() {
-                Ok(val) => {
-                    self.hits.fetch_add(1, Ordering::Relaxed);
-                    Some(val)
-                }
-                Err(_) => {
-                    // Type mismatch: the backend returned a different concrete
-                    // type than expected (e.g. a disk cache may store
-                    // intermediate state). Treat as a miss.
-                    self.misses.fetch_add(1, Ordering::Relaxed);
-                    None
-                }
-            }
-        } else {
-            self.misses.fetch_add(1, Ordering::Relaxed);
-            None
-        }
-    }
-
-    // -- Stats / clear --------------------------------------------------------
 
     pub async fn stats(&self) -> CacheStats {
         CacheStats {
-            hits: self.hits.load(Ordering::Relaxed),
-            misses: self.misses.load(Ordering::Relaxed),
-            num_entries: self.cache.num_entries().await,
-            size_bytes: self.cache.size_bytes().await,
+            hits: self.state.hits.load(Ordering::Relaxed),
+            misses: self.state.misses.load(Ordering::Relaxed),
+            num_entries: self.state.backend.num_entries().await,
+            size_bytes: self.state.backend.size_bytes().await,
         }
     }
 
     pub async fn clear(&self) {
-        self.cache.clear().await;
-        self.hits.store(0, Ordering::Relaxed);
-        self.misses.store(0, Ordering::Relaxed);
+        self.state.backend.clear().await;
+        self.state.hits.store(0, Ordering::Relaxed);
+        self.state.misses.store(0, Ordering::Relaxed);
     }
-
-    // -- CacheKey-based methods -----------------------------------------------
 
     pub async fn insert_with_key<K>(&self, cache_key: &K, metadata: Arc<K::ValueType>)
     where
         K: CacheKey,
         K::ValueType: DeepSizeOf + Send + Sync + 'static,
     {
-        self.insert_with_id(&cache_key.key(), K::type_name(), K::codec(), metadata)
-            .boxed()
-            .await
+        let size = cache_entry_size(metadata.as_ref());
+        let key = self.sized_key(cache_key);
+        self.state
+            .backend
+            .insert(&key, metadata, size, K::codec())
+            .await;
     }
 
     pub async fn get_with_key<K>(&self, cache_key: &K) -> Option<Arc<K::ValueType>>
@@ -358,9 +262,25 @@ impl LanceCache {
         K: CacheKey,
         K::ValueType: DeepSizeOf + Send + Sync + 'static,
     {
-        self.get_with_id::<K::ValueType>(&cache_key.key(), K::type_name(), K::codec())
-            .boxed()
-            .await
+        let key = self.sized_key(cache_key);
+        let Some(entry) = self.state.backend.get(&key, K::codec()).await else {
+            self.state.misses.fetch_add(1, Ordering::Relaxed);
+            return None;
+        };
+        match entry.downcast::<K::ValueType>() {
+            Ok(value) => {
+                self.state.hits.fetch_add(1, Ordering::Relaxed);
+                Some(value)
+            }
+            Err(_) => {
+                log::warn!(
+                    "cache backend returned a value with the wrong concrete type for key type {:?}",
+                    K::stable_type_id()
+                );
+                self.state.misses.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        }
     }
 
     pub async fn get_or_insert_with_key<K, F, Fut>(
@@ -374,27 +294,31 @@ impl LanceCache {
         F: FnOnce() -> Fut + Send,
         Fut: Future<Output = Result<K::ValueType>> + Send,
     {
-        let key = build_key(&self.prefix, &cache_key.key(), K::type_name());
-
+        let key = self.sized_key(&cache_key);
         let typed_loader = Box::pin(async move {
-            let value = loader().await?;
-            let arc = Arc::new(value);
-            let size = cache_entry_size(&*arc);
-            Ok((arc as CacheEntry, size))
+            let value = Arc::new(loader().await?);
+            let size = cache_entry_size(value.as_ref());
+            Ok((value as CacheEntry, size))
         });
 
         let (entry, was_cached) = self
-            .cache
+            .state
+            .backend
             .get_or_insert(&key, typed_loader, K::codec())
             .await?;
-
+        let entry = entry.downcast::<K::ValueType>().map_err(|_| {
+            self.state.misses.fetch_add(1, Ordering::Relaxed);
+            Error::io(format!(
+                "cache backend returned a value with the wrong concrete type for key type {:?}",
+                K::stable_type_id()
+            ))
+        })?;
         if was_cached {
-            self.hits.fetch_add(1, Ordering::Relaxed);
+            self.state.hits.fetch_add(1, Ordering::Relaxed);
         } else {
-            self.misses.fetch_add(1, Ordering::Relaxed);
+            self.state.misses.fetch_add(1, Ordering::Relaxed);
         }
-
-        Ok(entry.downcast::<K::ValueType>().unwrap())
+        Ok(entry)
     }
 
     pub async fn insert_unsized_with_key<K>(&self, cache_key: &K, metadata: Arc<K::ValueType>)
@@ -402,9 +326,10 @@ impl LanceCache {
         K: UnsizedCacheKey,
         K::ValueType: DeepSizeOf + Send + Sync + 'static,
     {
-        self.insert_with_id(&cache_key.key(), K::type_name(), None, Arc::new(metadata))
-            .boxed()
-            .await
+        let metadata = Arc::new(metadata);
+        let size = cache_entry_size(metadata.as_ref());
+        let key = self.unsized_key(cache_key);
+        self.state.backend.insert(&key, metadata, size, None).await;
     }
 
     pub async fn get_unsized_with_key<K>(&self, cache_key: &K) -> Option<Arc<K::ValueType>>
@@ -412,50 +337,61 @@ impl LanceCache {
         K: UnsizedCacheKey,
         K::ValueType: DeepSizeOf + Send + Sync + 'static,
     {
-        let outer = self
-            .get_with_id::<Arc<K::ValueType>>(&cache_key.key(), K::type_name(), None)
-            .boxed()
-            .await?;
-        Some(outer.as_ref().clone())
+        let key = self.unsized_key(cache_key);
+        let Some(entry) = self.state.backend.get(&key, None).await else {
+            self.state.misses.fetch_add(1, Ordering::Relaxed);
+            return None;
+        };
+        match entry.downcast::<Arc<K::ValueType>>() {
+            Ok(value) => {
+                self.state.hits.fetch_add(1, Ordering::Relaxed);
+                Some(value.as_ref().clone())
+            }
+            Err(_) => {
+                log::warn!(
+                    "cache backend returned a value with the wrong concrete type for unsized key type {:?}",
+                    K::stable_type_id()
+                );
+                self.state.misses.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        }
+    }
+
+    fn sized_key<K: CacheKey>(&self, cache_key: &K) -> InternalCacheKey {
+        let mut builder = KeyBuilder::new(self.namespace, K::stable_type_id(), K::schema());
+        cache_key.write_key(&mut builder);
+        builder.finish()
+    }
+
+    fn unsized_key<K: UnsizedCacheKey>(&self, cache_key: &K) -> InternalCacheKey {
+        let mut builder = KeyBuilder::new(self.namespace, K::stable_type_id(), K::schema());
+        cache_key.write_key(&mut builder);
+        builder.finish()
     }
 }
-
-// ---------------------------------------------------------------------------
-// WeakLanceCache
-// ---------------------------------------------------------------------------
 
 /// A weak reference to a LanceCache, used by indices to avoid circular references.
 /// When the original cache is dropped, operations on this will gracefully no-op.
 #[derive(Clone, Debug)]
 pub struct WeakLanceCache {
-    inner: std::sync::Weak<dyn CacheBackend>,
-    prefix: Arc<str>,
-    hits: Arc<AtomicU64>,
-    misses: Arc<AtomicU64>,
+    state: Weak<CacheState>,
+    namespace: key::CacheNamespace,
 }
 
 impl WeakLanceCache {
     pub fn from(cache: &LanceCache) -> Self {
         Self {
-            inner: Arc::downgrade(&cache.cache),
-            prefix: cache.prefix.clone(),
-            hits: cache.hits.clone(),
-            misses: cache.misses.clone(),
+            state: Arc::downgrade(&cache.state),
+            namespace: cache.namespace,
         }
     }
 
     pub fn with_key_prefix(&self, prefix: &str) -> Self {
         Self {
-            inner: self.inner.clone(),
-            prefix: Arc::from(format!("{}{}/", self.prefix, prefix)),
-            hits: self.hits.clone(),
-            misses: self.misses.clone(),
+            state: self.state.clone(),
+            namespace: self.namespace.child(prefix),
         }
-    }
-
-    /// The key prefix used for all entries in this cache.
-    pub fn prefix(&self) -> &str {
-        &self.prefix
     }
 
     pub async fn get_with_key<K>(&self, cache_key: &K) -> Option<Arc<K::ValueType>>
@@ -463,15 +399,7 @@ impl WeakLanceCache {
         K: CacheKey,
         K::ValueType: DeepSizeOf + Send + Sync + 'static,
     {
-        let cache = self.inner.upgrade()?;
-        let key = build_key(&self.prefix, &cache_key.key(), K::type_name());
-        if let Some(entry) = cache.get(&key, K::codec()).await {
-            self.hits.fetch_add(1, Ordering::Relaxed);
-            Some(entry.downcast::<K::ValueType>().unwrap())
-        } else {
-            self.misses.fetch_add(1, Ordering::Relaxed);
-            None
-        }
+        self.upgrade()?.get_with_key(cache_key).await
     }
 
     pub async fn insert_with_key<K>(&self, cache_key: &K, value: Arc<K::ValueType>) -> bool
@@ -479,15 +407,12 @@ impl WeakLanceCache {
         K: CacheKey,
         K::ValueType: DeepSizeOf + Send + Sync + 'static,
     {
-        if let Some(cache) = self.inner.upgrade() {
-            let size = cache_entry_size(&*value);
-            let key = build_key(&self.prefix, &cache_key.key(), K::type_name());
-            cache.insert(&key, value, size, K::codec()).await;
-            true
-        } else {
+        let Some(cache) = self.upgrade() else {
             log::warn!("WeakLanceCache: cache no longer available, unable to insert item");
-            false
-        }
+            return false;
+        };
+        cache.insert_with_key(cache_key, value).await;
+        true
     }
 
     /// Get or insert an item, computing it if necessary.
@@ -504,25 +429,11 @@ impl WeakLanceCache {
         F: FnOnce() -> Fut + Send,
         Fut: Future<Output = Result<K::ValueType>> + Send,
     {
-        if let Some(cache) = self.inner.upgrade() {
-            let key = build_key(&self.prefix, &cache_key.key(), K::type_name());
-            let typed_loader = Box::pin(async move {
-                let value = loader().await?;
-                let arc = Arc::new(value);
-                let size = cache_entry_size(&*arc);
-                Ok((arc as CacheEntry, size))
-            });
-            let (entry, was_cached) = cache.get_or_insert(&key, typed_loader, K::codec()).await?;
-            if was_cached {
-                self.hits.fetch_add(1, Ordering::Relaxed);
-            } else {
-                self.misses.fetch_add(1, Ordering::Relaxed);
-            }
-            Ok(entry.downcast::<K::ValueType>().unwrap())
-        } else {
+        let Some(cache) = self.upgrade() else {
             log::warn!("WeakLanceCache: cache no longer available, computing without caching");
-            loader().await.map(Arc::new)
-        }
+            return loader().await.map(Arc::new);
+        };
+        cache.get_or_insert_with_key(cache_key, loader).await
     }
 
     pub async fn get_unsized_with_key<K>(&self, cache_key: &K) -> Option<Arc<K::ValueType>>
@@ -530,16 +441,7 @@ impl WeakLanceCache {
         K: UnsizedCacheKey,
         K::ValueType: DeepSizeOf + Send + Sync + 'static,
     {
-        let cache = self.inner.upgrade()?;
-        let key = build_key(&self.prefix, &cache_key.key(), K::type_name());
-        if let Some(entry) = cache.get(&key, None).await {
-            entry
-                .downcast::<Arc<K::ValueType>>()
-                .ok()
-                .map(|arc| arc.as_ref().clone())
-        } else {
-            None
-        }
+        self.upgrade()?.get_unsized_with_key(cache_key).await
     }
 
     pub async fn insert_unsized_with_key<K>(&self, cache_key: &K, value: Arc<K::ValueType>)
@@ -547,20 +449,20 @@ impl WeakLanceCache {
         K: UnsizedCacheKey,
         K::ValueType: DeepSizeOf + Send + Sync + 'static,
     {
-        if let Some(cache) = self.inner.upgrade() {
-            let wrapper = Arc::new(value);
-            let size = cache_entry_size(&*wrapper);
-            let key = build_key(&self.prefix, &cache_key.key(), K::type_name());
-            cache.insert(&key, wrapper, size, None).await;
-        } else {
+        let Some(cache) = self.upgrade() else {
             log::warn!("WeakLanceCache: cache no longer available, unable to insert unsized item");
-        }
+            return;
+        };
+        cache.insert_unsized_with_key(cache_key, value).await;
+    }
+
+    fn upgrade(&self) -> Option<LanceCache> {
+        Some(LanceCache {
+            state: self.state.upgrade()?,
+            namespace: self.namespace,
+        })
     }
 }
-
-// ---------------------------------------------------------------------------
-// CacheStats
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
 pub struct CacheStats {
@@ -594,490 +496,599 @@ impl CacheStats {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::Poll;
+
     use super::*;
-    use crate::Error;
-    use std::collections::{BTreeSet, HashMap};
-    use std::marker::PhantomData;
-    use std::sync::atomic::AtomicUsize;
 
-    struct TestKey<T: 'static> {
-        key: String,
-        _phantom: PhantomData<T>,
-    }
-
-    impl<T: 'static> TestKey<T> {
-        fn new(key: &str) -> Self {
-            Self {
-                key: key.to_string(),
-                _phantom: PhantomData,
+    async fn report_first_pending<F>(
+        future: F,
+        parked: tokio::sync::oneshot::Sender<()>,
+    ) -> F::Output
+    where
+        F: Future,
+    {
+        tokio::pin!(future);
+        let mut parked = Some(parked);
+        futures::future::poll_fn(|cx| match future.as_mut().poll(cx) {
+            Poll::Pending => {
+                if let Some(parked) = parked.take() {
+                    let _ = parked.send(());
+                }
+                Poll::Pending
             }
+            Poll::Ready(output) => Poll::Ready(output),
+        })
+        .await
+    }
+
+    #[derive(Clone)]
+    struct VersionedTestKey<const SCHEMA_VERSION: u32> {
+        id: u64,
+    }
+
+    type TestKey = VersionedTestKey<1>;
+    type TestKeyV2 = VersionedTestKey<2>;
+
+    impl<const SCHEMA_VERSION: u32> VersionedTestKey<SCHEMA_VERSION> {
+        fn new(id: u64) -> Self {
+            Self { id }
         }
     }
 
-    impl<T: 'static> CacheKey for TestKey<T> {
-        type ValueType = T;
-        fn key(&self) -> std::borrow::Cow<'_, str> {
-            std::borrow::Cow::Borrowed(&self.key)
+    impl<const SCHEMA_VERSION: u32> CacheKey for VersionedTestKey<SCHEMA_VERSION> {
+        type ValueType = Vec<u32>;
+
+        fn key(&self) -> Cow<'_, str> {
+            self.id.to_string().into()
         }
+
         fn type_name() -> &'static str {
-            std::any::type_name::<T>()
+            "test.VecU32"
+        }
+
+        fn schema() -> CacheKeySchema {
+            CacheKeySchema::new("test.vec-u32-key", SCHEMA_VERSION)
+        }
+
+        fn write_key(&self, builder: &mut KeyBuilder) {
+            builder.write_u64(self.id);
         }
     }
 
-    /// Test helper: an UnsizedCacheKey for trait object values.
-    struct TestUnsizedKey<T: 'static + ?Sized> {
-        key: String,
-        _phantom: PhantomData<T>,
-    }
+    struct LegacyBridgeKey(&'static str);
 
-    impl<T: 'static + ?Sized> TestUnsizedKey<T> {
-        fn new(key: &str) -> Self {
-            Self {
-                key: key.to_string(),
-                _phantom: PhantomData,
-            }
-        }
-    }
+    impl CacheKey for LegacyBridgeKey {
+        type ValueType = Vec<u32>;
 
-    impl<T: 'static + ?Sized> UnsizedCacheKey for TestUnsizedKey<T> {
-        type ValueType = T;
-        fn key(&self) -> std::borrow::Cow<'_, str> {
-            std::borrow::Cow::Borrowed(&self.key)
+        fn key(&self) -> Cow<'_, str> {
+            Cow::Borrowed(self.0)
         }
+
         fn type_name() -> &'static str {
-            std::any::type_name::<T>()
+            "test.LegacyBridge"
         }
     }
 
-    fn key_fields(keys: &[InternalCacheKey]) -> BTreeSet<(String, String, &'static str)> {
-        keys.iter()
-            .map(|key| {
-                (
-                    key.prefix().to_string(),
-                    key.key().to_string(),
-                    key.type_name(),
-                )
-            })
-            .collect()
-    }
+    struct ExplicitBridgeKey(&'static str);
 
-    #[tokio::test]
-    async fn test_cache_bytes() {
-        let item = Arc::new(vec![1, 2, 3]);
-        let item_size = item.deep_size_of();
-        let capacity = 10 * item_size;
-        let cache = LanceCache::with_capacity(capacity);
+    impl CacheKey for ExplicitBridgeKey {
+        type ValueType = Vec<u32>;
 
-        cache
-            .insert_with_key(&TestKey::<Vec<i32>>::new("key"), item.clone())
-            .await;
-        assert_eq!(cache.size().await, 1);
-
-        let retrieved = cache
-            .get_with_key(&TestKey::<Vec<i32>>::new("key"))
-            .await
-            .unwrap();
-        assert_eq!(*retrieved, *item);
-
-        for i in 0..20 {
-            cache
-                .insert_with_key(
-                    &TestKey::<Vec<i32>>::new(&format!("key_{}", i)),
-                    Arc::new(vec![i, i, i]),
-                )
-                .await;
-        }
-        assert!(cache.size_bytes().await <= capacity);
-    }
-
-    #[tokio::test]
-    async fn test_cache_weighs_key_footprint() {
-        // Weighted size charges the key's unique bytes, not just the value.
-        let cache = LanceCache::with_capacity(usize::MAX);
-        let key = "k".repeat(10_000);
-        let value = Arc::new(vec![1_i32]);
-        let expected =
-            std::mem::size_of::<InternalCacheKey>() + key.len() + cache_entry_size(&*value);
-        cache
-            .insert_with_key(&TestKey::<Vec<i32>>::new(&key), value)
-            .await;
-        assert_eq!(cache.size_bytes().await, expected);
-    }
-
-    #[tokio::test]
-    async fn test_cache_shared_prefix_not_charged_per_entry() {
-        // The shared prefix contributes nothing per entry (it isn't freed on a
-        // single eviction); only struct + unique key + value are charged.
-        let cache = LanceCache::with_capacity(usize::MAX).with_key_prefix(&"p".repeat(10_000));
-        for i in 0..100 {
-            cache
-                .insert_with_key(
-                    &TestKey::<Vec<i32>>::new(&i.to_string()),
-                    Arc::new(vec![1_i32]),
-                )
-                .await;
-        }
-        let value_cost = cache_entry_size(&vec![1_i32]);
-        let key_bytes: usize = (0..100).map(|i| i.to_string().len()).sum();
-        let expected = 100 * (std::mem::size_of::<InternalCacheKey>() + value_cost) + key_bytes;
-        assert_eq!(cache.size_bytes().await, expected);
-    }
-
-    #[tokio::test]
-    async fn test_cache_trait_objects() {
-        #[derive(Debug, DeepSizeOf)]
-        struct MyType(i32);
-
-        trait MyTrait: DeepSizeOf + Send + Sync + std::any::Any {
-            fn as_any(&self) -> &dyn std::any::Any;
+        fn key(&self) -> Cow<'_, str> {
+            Cow::Borrowed(self.0)
         }
 
-        impl MyTrait for MyType {
-            fn as_any(&self) -> &dyn std::any::Any {
-                self
+        fn type_name() -> &'static str {
+            "test.LegacyBridge"
+        }
+
+        fn write_key(&self, builder: &mut KeyBuilder) {
+            builder.write_str(self.0);
+        }
+    }
+
+    trait TestDynValue: DeepSizeOf + Send + Sync {
+        fn values(&self) -> &[u32];
+    }
+
+    impl TestDynValue for Vec<u32> {
+        fn values(&self) -> &[u32] {
+            self
+        }
+    }
+
+    struct LegacyUnsizedBridgeKey(&'static str);
+
+    impl UnsizedCacheKey for LegacyUnsizedBridgeKey {
+        type ValueType = dyn TestDynValue;
+
+        fn key(&self) -> Cow<'_, str> {
+            Cow::Borrowed(self.0)
+        }
+
+        fn type_name() -> &'static str {
+            "test.LegacyUnsizedBridge"
+        }
+    }
+
+    struct ExplicitUnsizedBridgeKey(&'static str);
+
+    impl UnsizedCacheKey for ExplicitUnsizedBridgeKey {
+        type ValueType = dyn TestDynValue;
+
+        fn key(&self) -> Cow<'_, str> {
+            Cow::Borrowed(self.0)
+        }
+
+        fn type_name() -> &'static str {
+            "test.LegacyUnsizedBridge"
+        }
+
+        fn write_key(&self, builder: &mut KeyBuilder) {
+            builder.write_str(self.0);
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct HashMapBackend {
+        entries: tokio::sync::Mutex<HashMap<InternalCacheKey, (CacheEntry, usize)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl CacheBackend for HashMapBackend {
+        async fn get(
+            &self,
+            key: &InternalCacheKey,
+            _codec: Option<CacheCodec>,
+        ) -> Option<CacheEntry> {
+            self.entries
+                .lock()
+                .await
+                .get(key)
+                .map(|(entry, _)| entry.clone())
+        }
+
+        async fn insert(
+            &self,
+            key: &InternalCacheKey,
+            entry: CacheEntry,
+            size_bytes: usize,
+            _codec: Option<CacheCodec>,
+        ) {
+            self.entries.lock().await.insert(*key, (entry, size_bytes));
+        }
+
+        async fn get_or_insert<'a>(
+            &self,
+            key: &InternalCacheKey,
+            loader: Pin<Box<dyn Future<Output = Result<(CacheEntry, usize)>> + Send + 'a>>,
+            codec: Option<CacheCodec>,
+        ) -> Result<(CacheEntry, bool)> {
+            if let Some(entry) = self.get(key, codec).await {
+                return Ok((entry, true));
             }
+            let (entry, size_bytes) = loader.await?;
+            self.insert(key, entry.clone(), size_bytes, codec).await;
+            Ok((entry, false))
         }
 
-        let item: Arc<dyn MyTrait> = Arc::new(MyType(42));
-        let cache = LanceCache::with_capacity(1000);
-        cache
-            .insert_unsized_with_key(&TestUnsizedKey::<dyn MyTrait>::new("test"), item)
-            .await;
+        async fn clear(&self) {
+            self.entries.lock().await.clear();
+        }
 
-        let retrieved = cache
-            .get_unsized_with_key(&TestUnsizedKey::<dyn MyTrait>::new("test"))
-            .await
-            .unwrap();
-        assert_eq!(retrieved.as_any().downcast_ref::<MyType>().unwrap().0, 42);
+        async fn num_entries(&self) -> usize {
+            self.entries.lock().await.len()
+        }
+
+        async fn size_bytes(&self) -> usize {
+            self.entries
+                .lock()
+                .await
+                .values()
+                .map(|(_, size_bytes)| size_bytes)
+                .sum()
+        }
+    }
+
+    #[derive(Debug)]
+    struct WrongTypeBackend;
+
+    #[async_trait::async_trait]
+    impl CacheBackend for WrongTypeBackend {
+        async fn get(
+            &self,
+            _key: &InternalCacheKey,
+            _codec: Option<CacheCodec>,
+        ) -> Option<CacheEntry> {
+            Some(Arc::new(String::from("wrong type")))
+        }
+
+        async fn insert(
+            &self,
+            _key: &InternalCacheKey,
+            _entry: CacheEntry,
+            _size_bytes: usize,
+            _codec: Option<CacheCodec>,
+        ) {
+        }
+
+        async fn get_or_insert<'a>(
+            &self,
+            _key: &InternalCacheKey,
+            _loader: Pin<Box<dyn Future<Output = Result<(CacheEntry, usize)>> + Send + 'a>>,
+            _codec: Option<CacheCodec>,
+        ) -> Result<(CacheEntry, bool)> {
+            Ok((Arc::new(String::from("wrong type")), true))
+        }
+
+        async fn clear(&self) {}
+
+        async fn num_entries(&self) -> usize {
+            0
+        }
+
+        async fn size_bytes(&self) -> usize {
+            0
+        }
     }
 
     #[tokio::test]
-    async fn test_cache_stats_basic() {
-        let cache = LanceCache::with_capacity(1000);
-        assert_eq!(cache.stats().await.hits, 0);
-
-        // Miss
-        assert!(
-            cache
-                .get_with_key(&TestKey::<Vec<i32>>::new("x"))
-                .await
-                .is_none()
-        );
-        assert_eq!(cache.stats().await.misses, 1);
-
-        // Insert then hit
-        cache
-            .insert_with_key(&TestKey::new("k"), Arc::new(vec![1, 2, 3]))
+    async fn typed_roundtrip_stats_clear_and_namespace_isolation() {
+        let cache = LanceCache::with_capacity(4096);
+        let left = cache.with_key_prefix("left");
+        let right = cache.with_key_prefix("right");
+        left.insert_with_key(&TestKey::new(7), Arc::new(vec![1, 2, 3]))
             .await;
-        assert!(
-            cache
-                .get_with_key(&TestKey::<Vec<i32>>::new("k"))
-                .await
-                .is_some()
+
+        assert_eq!(
+            left.get_with_key(&TestKey::new(7)).await.as_deref(),
+            Some(&vec![1, 2, 3])
         );
-        assert_eq!(cache.stats().await.hits, 1);
+        assert!(right.get_with_key(&TestKey::new(7)).await.is_none());
+        let stats = cache.stats().await;
+        assert_eq!((stats.hits, stats.misses, stats.num_entries), (1, 1, 1));
+
+        cache.clear().await;
+        let stats = left.stats().await;
+        assert_eq!((stats.hits, stats.misses, stats.num_entries), (0, 0, 0));
     }
 
     #[tokio::test]
-    async fn test_cache_stats_with_prefixes() {
-        let base = LanceCache::with_capacity(1000);
-        let prefixed = base.with_key_prefix("ns");
+    async fn strong_and_weak_handles_share_state_and_namespace() {
+        let cache = LanceCache::with_capacity(4096);
+        let child = cache.with_key_prefix("child");
+        let weak = WeakLanceCache::from(&child);
 
         assert!(
-            prefixed
-                .get_with_key(&TestKey::<Vec<i32>>::new("k"))
+            weak.insert_with_key(&TestKey::new(1), Arc::new(vec![1]))
                 .await
-                .is_none()
         );
-        assert_eq!(base.stats().await.misses, 1);
-
-        prefixed
-            .insert_with_key(&TestKey::new("k"), Arc::new(vec![1]))
+        assert_eq!(
+            child.get_with_key(&TestKey::new(1)).await.as_deref(),
+            Some(&vec![1])
+        );
+        child
+            .insert_with_key(&TestKey::new(2), Arc::new(vec![2]))
             .await;
-        assert!(
-            prefixed
-                .get_with_key(&TestKey::<Vec<i32>>::new("k"))
-                .await
-                .is_some()
+        assert_eq!(
+            weak.get_with_key(&TestKey::new(2)).await.as_deref(),
+            Some(&vec![2])
         );
-        assert_eq!(base.stats().await.hits, 1);
+        assert_eq!((cache.stats().await.hits, cache.size().await), (2, 2));
     }
 
     #[tokio::test]
-    async fn test_cache_keys_with_prefixes() {
-        let base = LanceCache::with_capacity(1000);
-        let prefixed = base.with_key_prefix("ns");
-        let nested = prefixed.with_key_prefix("index");
-        let other = base.with_key_prefix("ns-other");
-
-        base.insert_with_key(&TestKey::new("root"), Arc::new(vec![0]))
-            .await;
-        prefixed
-            .insert_with_key(&TestKey::new("child"), Arc::new(vec![1]))
-            .await;
+    async fn nested_namespace_segments_do_not_alias_combined_segments() {
+        let cache = LanceCache::with_capacity(4096);
+        let nested = cache.with_key_prefix("a").with_key_prefix("b");
+        let combined = cache.with_key_prefix("a/b");
         nested
-            .insert_with_key(&TestKey::new("nested"), Arc::new(vec![2]))
+            .insert_with_key(&TestKey::new(1), Arc::new(vec![10]))
             .await;
-        other
-            .insert_with_key(&TestKey::new("other"), Arc::new(vec![3]))
-            .await;
-
-        let base_keys = base.keys().await.unwrap().collect::<Vec<_>>();
-        assert_eq!(
-            key_fields(&base_keys),
-            BTreeSet::from([
-                (
-                    "".to_string(),
-                    "root".to_string(),
-                    TestKey::<Vec<i32>>::type_name()
-                ),
-                (
-                    "ns/".to_string(),
-                    "child".to_string(),
-                    TestKey::<Vec<i32>>::type_name()
-                ),
-                (
-                    "ns/index/".to_string(),
-                    "nested".to_string(),
-                    TestKey::<Vec<i32>>::type_name()
-                ),
-                (
-                    "ns-other/".to_string(),
-                    "other".to_string(),
-                    TestKey::<Vec<i32>>::type_name()
-                ),
-            ])
-        );
-
-        let prefixed_keys = prefixed.keys().await.unwrap().collect::<Vec<_>>();
-        assert_eq!(
-            key_fields(&prefixed_keys),
-            BTreeSet::from([
-                (
-                    "ns/".to_string(),
-                    "child".to_string(),
-                    TestKey::<Vec<i32>>::type_name()
-                ),
-                (
-                    "ns/index/".to_string(),
-                    "nested".to_string(),
-                    TestKey::<Vec<i32>>::type_name()
-                ),
-            ])
-        );
+        assert!(combined.get_with_key(&TestKey::new(1)).await.is_none());
     }
 
     #[tokio::test]
-    async fn test_cache_keys_reflect_invalidation_and_clear() {
-        let base = LanceCache::with_capacity(1000);
-        let prefixed = base.with_key_prefix("ns");
-        let other = base.with_key_prefix("other");
-
-        prefixed
-            .insert_with_key(&TestKey::new("child"), Arc::new(vec![1]))
-            .await;
-        other
-            .insert_with_key(&TestKey::new("other"), Arc::new(vec![2]))
-            .await;
-        assert_eq!(base.keys().await.unwrap().count(), 2);
-
-        prefixed.invalidate_prefix("").await;
-        let keys = base.keys().await.unwrap().collect::<Vec<_>>();
-        assert_eq!(
-            key_fields(&keys),
-            BTreeSet::from([(
-                "other/".to_string(),
-                "other".to_string(),
-                TestKey::<Vec<i32>>::type_name()
-            )])
-        );
-
-        base.clear().await;
-        assert_eq!(base.keys().await.unwrap().count(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_cache_get_or_insert() {
-        let cache = LanceCache::with_capacity(1000);
-
-        let v: Arc<Vec<i32>> = cache
-            .get_or_insert_with_key(TestKey::<Vec<i32>>::new("k"), || async {
-                Ok(vec![1, 2, 3])
-            })
-            .await
-            .unwrap();
-        assert_eq!(*v, vec![1, 2, 3]);
-        assert_eq!(cache.stats().await.misses, 1);
-        assert_eq!(cache.stats().await.hits, 0);
-
-        // Second call should not invoke loader and should be a hit
-        let v: Arc<Vec<i32>> = cache
-            .get_or_insert_with_key(TestKey::<Vec<i32>>::new("k"), || async {
-                panic!("should not be called")
-            })
-            .await
-            .unwrap();
-        assert_eq!(*v, vec![1, 2, 3]);
-        assert_eq!(cache.stats().await.hits, 1);
-    }
-
-    #[tokio::test]
-    async fn test_cache_coalesces_concurrent_loader_errors() {
-        let cache = LanceCache::with_capacity(1000);
-        let barrier = Arc::new(tokio::sync::Barrier::new(5));
-        let loader_calls = Arc::new(AtomicUsize::new(0));
-
-        let results = futures::future::join_all((0..5).map(|_| {
-            let cache = cache.clone();
-            let barrier = barrier.clone();
-            let loader_calls = loader_calls.clone();
-            async move {
-                barrier.wait().await;
-                cache
-                    .get_or_insert_with_key(TestKey::<Vec<i32>>::new("error"), || async move {
-                        loader_calls.fetch_add(1, Ordering::Relaxed);
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                        Err(Error::timeout("metadata read timed out"))
-                    })
-                    .await
-            }
-        }))
-        .await;
-
-        assert_eq!(loader_calls.load(Ordering::Relaxed), 1);
-        assert!(
-            results
-                .iter()
-                .all(|result| matches!(result, Err(Error::Timeout { .. })))
-        );
-    }
-
-    #[tokio::test]
-    async fn test_custom_backend() {
-        use async_trait::async_trait;
-        use tokio::sync::Mutex;
-
-        #[derive(Debug)]
-        struct HashMapBackend {
-            map: Mutex<HashMap<InternalCacheKey, (CacheEntry, usize)>>,
-        }
-
-        impl HashMapBackend {
-            fn new() -> Self {
-                Self {
-                    map: Mutex::new(HashMap::new()),
-                }
-            }
-        }
-
-        #[async_trait]
-        impl CacheBackend for HashMapBackend {
-            async fn get(
-                &self,
-                key: &InternalCacheKey,
-                _codec: Option<CacheCodec>,
-            ) -> Option<CacheEntry> {
-                self.map.lock().await.get(key).map(|(e, _)| e.clone())
-            }
-            async fn insert(
-                &self,
-                key: &InternalCacheKey,
-                entry: CacheEntry,
-                size_bytes: usize,
-                _codec: Option<CacheCodec>,
-            ) {
-                self.map
-                    .lock()
-                    .await
-                    .insert(key.clone(), (entry, size_bytes));
-            }
-            async fn get_or_insert<'a>(
-                &self,
-                key: &InternalCacheKey,
-                loader: std::pin::Pin<
-                    Box<dyn futures::Future<Output = Result<(CacheEntry, usize)>> + Send + 'a>,
-                >,
-                _codec: Option<CacheCodec>,
-            ) -> Result<(CacheEntry, bool)> {
-                if let Some((entry, _)) = self.map.lock().await.get(key) {
-                    Ok((entry.clone(), true))
-                } else {
-                    let (entry, size) = loader.await?;
-                    self.map
-                        .lock()
-                        .await
-                        .insert(key.clone(), (entry.clone(), size));
-                    Ok((entry, false))
-                }
-            }
-            async fn invalidate_prefix(&self, prefix: &str) {
-                self.map.lock().await.retain(|k, _| !k.starts_with(prefix));
-            }
-            async fn clear(&self) {
-                self.map.lock().await.clear();
-            }
-            async fn num_entries(&self) -> usize {
-                self.map.lock().await.len()
-            }
-            async fn size_bytes(&self) -> usize {
-                self.map.lock().await.values().map(|(_, s)| *s).sum()
-            }
-        }
-
-        let cache = LanceCache::with_backend(Arc::new(HashMapBackend::new()));
-
+    async fn schema_change_produces_a_cold_miss() {
+        let cache = LanceCache::with_capacity(4096);
         cache
-            .insert_with_key(&TestKey::new("k"), Arc::new(vec![1, 2, 3]))
+            .insert_with_key(&TestKey::new(1), Arc::new(vec![10]))
             .await;
-        assert!(
-            cache
-                .get_with_key(&TestKey::<Vec<i32>>::new("k"))
-                .await
-                .is_some()
-        );
-        // Different type at same key = miss
-        assert!(
-            cache
-                .get_with_key(&TestKey::<Vec<u8>>::new("k"))
-                .await
-                .is_none()
-        );
-        assert!(cache.keys().await.is_none());
+        assert!(cache.get_with_key(&TestKeyV2::new(1)).await.is_none());
     }
 
     #[tokio::test]
-    async fn test_get_or_insert_dedup() {
-        use std::sync::atomic::AtomicUsize;
+    async fn default_string_bridge_matches_explicit_legacy_encoding() {
+        let cache = LanceCache::with_capacity(4096);
+        cache
+            .insert_with_key(&LegacyBridgeKey("same"), Arc::new(vec![10]))
+            .await;
+        assert_eq!(
+            cache
+                .get_with_key(&ExplicitBridgeKey("same"))
+                .await
+                .as_deref(),
+            Some(&vec![10])
+        );
+    }
 
-        let load_count = Arc::new(AtomicUsize::new(0));
-        let cache = LanceCache::with_capacity(10000);
+    #[tokio::test]
+    async fn unsized_default_string_bridge_matches_explicit_legacy_encoding() {
+        let cache = LanceCache::with_capacity(4096);
+        let value: Arc<dyn TestDynValue> = Arc::new(vec![10, 20]);
+        cache
+            .insert_unsized_with_key(&LegacyUnsizedBridgeKey("same"), value)
+            .await;
 
-        let (barrier_tx, _) = tokio::sync::broadcast::channel::<()>(1);
-        let mut handles = Vec::new();
-        for _ in 0..5 {
+        let cached = cache
+            .get_unsized_with_key(&ExplicitUnsizedBridgeKey("same"))
+            .await
+            .unwrap();
+        assert_eq!(cached.values(), &[10, 20]);
+    }
+
+    #[tokio::test]
+    async fn custom_backend_receives_opaque_keys_and_shared_clear() {
+        let backend = Arc::new(HashMapBackend::default());
+        let cache = LanceCache::with_backend(backend.clone());
+        let child = cache.with_key_prefix("child");
+        let value = Arc::new(vec![1, 2, 3]);
+        let value_size = cache_entry_size(value.as_ref());
+
+        child.insert_with_key(&TestKey::new(7), value).await;
+        assert_eq!(
+            child.get_with_key(&TestKey::new(7)).await.as_deref(),
+            Some(&vec![1, 2, 3])
+        );
+        assert_eq!(backend.entries.lock().await.len(), 1);
+        assert_eq!(cache.size_bytes().await, value_size);
+
+        cache.clear().await;
+        assert!(backend.entries.lock().await.is_empty());
+        assert_eq!(child.stats().await.hits, 0);
+    }
+
+    #[tokio::test]
+    async fn backend_type_collisions_are_contextual_misses_or_errors() {
+        let cache = LanceCache::with_backend(Arc::new(WrongTypeBackend));
+
+        assert!(cache.get_with_key(&TestKey::new(1)).await.is_none());
+        let error = cache
+            .get_or_insert_with_key(TestKey::new(2), || async { Ok(vec![2]) })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("test.VecU32"));
+        let stats = cache.stats().await;
+        assert_eq!((stats.hits, stats.misses), (0, 2));
+    }
+
+    #[tokio::test]
+    async fn moka_weight_includes_the_fixed_physical_key() {
+        let value = Arc::new(vec![0_u32; 3]);
+        let expected = cache_entry_size(value.as_ref())
+            .checked_add(std::mem::size_of::<InternalCacheKey>())
+            .unwrap();
+        let cache = LanceCache::with_capacity(expected * 2);
+        cache.insert_with_key(&TestKey::new(1), value).await;
+        assert_eq!(cache.size_bytes().await, expected);
+    }
+
+    #[tokio::test]
+    async fn no_cache_computes_each_time() {
+        let cache = LanceCache::no_cache();
+        let loads = Arc::new(AtomicUsize::new(0));
+        for _ in 0..2 {
+            let loads = loads.clone();
+            let value = cache
+                .get_or_insert_with_key(TestKey::new(1), move || async move {
+                    loads.fetch_add(1, Ordering::SeqCst);
+                    Ok(vec![42])
+                })
+                .await
+                .unwrap();
+            assert_eq!(value.as_slice(), &[42]);
+        }
+        assert_eq!(loads.load(Ordering::SeqCst), 2);
+        assert_eq!(cache.size().await, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn single_flight_coalesces_success_after_contenders_are_parked() {
+        const CONTENDERS: usize = 4;
+
+        let cache = Arc::new(LanceCache::with_capacity(4096));
+        let loader_calls = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+
+        let owner = {
             let cache = cache.clone();
-            let load_count = load_count.clone();
-            let mut barrier_rx = barrier_tx.subscribe();
-            handles.push(tokio::spawn(async move {
-                barrier_rx.recv().await.ok();
+            let loader_calls = loader_calls.clone();
+            let release = release.clone();
+            tokio::spawn(async move {
                 cache
-                    .get_or_insert_with_key(TestKey::<Vec<i32>>::new("key"), || {
-                        let load_count = load_count.clone();
-                        async move {
-                            load_count.fetch_add(1, Ordering::SeqCst);
-                            tokio::task::yield_now().await;
-                            Ok(vec![1, 2, 3])
-                        }
+                    .get_or_insert_with_key(TestKey::new(10), move || async move {
+                        loader_calls.fetch_add(1, Ordering::SeqCst);
+                        let _ = started_tx.send(());
+                        release.notified().await;
+                        Ok(vec![10])
                     })
                     .await
+            })
+        };
+        started_rx.await.unwrap();
+
+        let mut contenders = Vec::new();
+        let mut parked = Vec::new();
+        for _ in 0..CONTENDERS {
+            let cache = cache.clone();
+            let loader_calls = loader_calls.clone();
+            let (parked_tx, parked_rx) = tokio::sync::oneshot::channel();
+            parked.push(parked_rx);
+            contenders.push(tokio::spawn(async move {
+                report_first_pending(
+                    cache.get_or_insert_with_key(TestKey::new(10), move || async move {
+                        loader_calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(vec![99])
+                    }),
+                    parked_tx,
+                )
+                .await
             }));
         }
-        barrier_tx.send(()).unwrap();
-        for h in handles {
-            let result: Arc<Vec<i32>> = h.await.unwrap().unwrap();
-            assert_eq!(*result, vec![1, 2, 3]);
+        for parked in parked {
+            parked
+                .await
+                .expect("contender completed instead of parking behind owner");
         }
+        assert_eq!(loader_calls.load(Ordering::SeqCst), 1);
+        assert!(contenders.iter().all(|handle| !handle.is_finished()));
 
-        assert_eq!(load_count.load(Ordering::SeqCst), 1);
+        release.notify_one();
+        assert_eq!(owner.await.unwrap().unwrap().as_slice(), &[10]);
+        for contender in contenders {
+            assert_eq!(contender.await.unwrap().unwrap().as_slice(), &[10]);
+        }
+        let stats = cache.stats().await;
+        assert_eq!((stats.hits, stats.misses), (CONTENDERS as u64, 1),);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn single_flight_coalesces_errors_after_contenders_are_parked() {
+        const CONTENDERS: usize = 4;
+
+        let cache = Arc::new(LanceCache::with_capacity(4096));
+        let loader_calls = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+
+        let owner = {
+            let cache = cache.clone();
+            let loader_calls = loader_calls.clone();
+            let release = release.clone();
+            tokio::spawn(async move {
+                cache
+                    .get_or_insert_with_key(TestKey::new(20), move || async move {
+                        loader_calls.fetch_add(1, Ordering::SeqCst);
+                        let _ = started_tx.send(());
+                        release.notified().await;
+                        Err(Error::timeout("owner loader timed out"))
+                    })
+                    .await
+            })
+        };
+        started_rx.await.unwrap();
+
+        let mut contenders = Vec::new();
+        let mut parked = Vec::new();
+        for _ in 0..CONTENDERS {
+            let cache = cache.clone();
+            let loader_calls = loader_calls.clone();
+            let (parked_tx, parked_rx) = tokio::sync::oneshot::channel();
+            parked.push(parked_rx);
+            contenders.push(tokio::spawn(async move {
+                report_first_pending(
+                    cache.get_or_insert_with_key(TestKey::new(20), move || async move {
+                        loader_calls.fetch_add(1, Ordering::SeqCst);
+                        Err(Error::timeout("contender loader timed out"))
+                    }),
+                    parked_tx,
+                )
+                .await
+            }));
+        }
+        for parked in parked {
+            parked
+                .await
+                .expect("contender completed instead of parking behind owner");
+        }
+        assert_eq!(loader_calls.load(Ordering::SeqCst), 1);
+        assert!(contenders.iter().all(|handle| !handle.is_finished()));
+
+        release.notify_one();
+        assert!(matches!(owner.await.unwrap(), Err(Error::Timeout { .. })));
+        for contender in contenders {
+            assert!(matches!(
+                contender.await.unwrap(),
+                Err(Error::Timeout { .. })
+            ));
+        }
+        assert_eq!(loader_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn single_flight_retries_after_the_owner_is_cancelled() {
+        let cache = Arc::new(LanceCache::with_capacity(4096));
+        let loader_calls = Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+
+        let owner = {
+            let cache = cache.clone();
+            let loader_calls = loader_calls.clone();
+            tokio::spawn(async move {
+                cache
+                    .get_or_insert_with_key(TestKey::new(30), move || async move {
+                        loader_calls.fetch_add(1, Ordering::SeqCst);
+                        let _ = started_tx.send(());
+                        std::future::pending::<()>().await;
+                        Ok(vec![30])
+                    })
+                    .await
+            })
+        };
+        started_rx.await.unwrap();
+
+        let (parked_tx, parked_rx) = tokio::sync::oneshot::channel();
+        let contender = {
+            let cache = cache.clone();
+            let loader_calls = loader_calls.clone();
+            tokio::spawn(async move {
+                report_first_pending(
+                    cache.get_or_insert_with_key(TestKey::new(30), move || async move {
+                        loader_calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(vec![31])
+                    }),
+                    parked_tx,
+                )
+                .await
+            })
+        };
+        parked_rx
+            .await
+            .expect("contender completed instead of parking behind owner");
+        assert_eq!(loader_calls.load(Ordering::SeqCst), 1);
+        assert!(!contender.is_finished());
+
+        owner.abort();
+        assert!(owner.await.unwrap_err().is_cancelled());
+        let value = tokio::time::timeout(std::time::Duration::from_secs(5), contender)
+            .await
+            .expect("contender remained parked after owner cancellation")
+            .unwrap()
+            .unwrap();
+        assert_eq!(value.as_slice(), &[31]);
+        assert_eq!(loader_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn expired_weak_cache_degrades_without_retaining_state() {
+        let cache = LanceCache::with_capacity(4096);
+        let weak = WeakLanceCache::from(&cache);
+        drop(cache);
+
+        assert!(weak.get_with_key(&TestKey::new(1)).await.is_none());
+        assert!(
+            !weak
+                .insert_with_key(&TestKey::new(1), Arc::new(vec![1]))
+                .await
+        );
+        let value = weak
+            .get_or_insert_with_key(TestKey::new(1), || async { Ok(vec![7]) })
+            .await
+            .unwrap();
+        assert_eq!(value.as_slice(), &[7]);
     }
 }

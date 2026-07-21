@@ -32,7 +32,7 @@ use itertools::Itertools;
 use lance_arrow::DataTypeExt;
 use lance_arrow::deepcopy::deep_copy_nulls;
 use lance_core::{
-    cache::{CacheKey, Context, DeepSizeOf},
+    cache::{CacheKey, CacheKeySchema, Context, DeepSizeOf, KeyBuilder},
     error::{Error, LanceOptionExt},
     utils::bit::pad_bytes,
 };
@@ -3511,6 +3511,15 @@ impl CacheKey for FieldDataCacheKey {
 
     fn type_name() -> &'static str {
         "FieldData"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.encoding.logical.primitive.field-data-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_u32(self.column_index);
+        builder.write_str(&self.view_tag);
     }
 }
 

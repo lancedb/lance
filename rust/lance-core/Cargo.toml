@@ -18,6 +18,7 @@ arrow-data.workspace = true
 arrow-schema.workspace = true
 async-trait.workspace = true
 lance-arrow.workspace = true
+blake3.workspace = true
 byteorder.workspace = true
 bytes.workspace = true
 datafusion-common = { workspace = true, optional = true }
@@ -51,6 +52,7 @@ log.workspace = true
 libc = { version = "0.2" }
 
 [dev-dependencies]
+criterion.workspace = true
 proptest.workspace = true
 rstest.workspace = true
 
@@ -60,6 +62,10 @@ rstest.workspace = true
 # is still gated by RUST_BACKTRACE=1.
 backtrace = []
 datafusion = ["dep:datafusion-common", "dep:datafusion-sql"]
+
+[[bench]]
+name = "cache_keys"
+harness = false
 
 [lints]
 workspace = true

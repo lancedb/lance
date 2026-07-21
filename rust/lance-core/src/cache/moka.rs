@@ -11,8 +11,8 @@ use futures::Future;
 use crate::Result;
 use crate::error::CloneableError;
 
-use super::CacheCodec;
-use super::backend::{CacheBackend, CacheEntry, CacheKeyIterator, InternalCacheKey};
+use super::backend::{CacheBackend, CacheEntry};
+use super::{CacheCodec, InternalCacheKey};
 
 /// Internal record stored in the moka cache.
 #[derive(Clone, Debug)]
@@ -21,10 +21,16 @@ struct MokaCacheEntry {
     size_bytes: usize,
 }
 
-/// Per-entry key cost for eviction: the struct plus the unique `key` bytes.
-/// Excludes the shared `prefix` `Arc<str>`, which isn't freed per eviction.
-fn key_footprint(key: &InternalCacheKey) -> usize {
-    std::mem::size_of::<InternalCacheKey>() + key.key().len()
+/// Per-entry key cost for eviction.
+fn key_footprint(_key: &InternalCacheKey) -> usize {
+    std::mem::size_of::<InternalCacheKey>()
+}
+
+fn entry_weight(key: &InternalCacheKey, size_bytes: usize) -> u32 {
+    key_footprint(key)
+        .saturating_add(size_bytes)
+        .try_into()
+        .unwrap_or(u32::MAX)
 }
 
 /// Default [`CacheBackend`] backed by a [moka](https://crates.io/crates/moka) cache.
@@ -48,12 +54,8 @@ impl MokaCacheBackend {
         let cache = moka::future::Cache::builder()
             .max_capacity(capacity as u64)
             .weigher(|key: &InternalCacheKey, entry: &MokaCacheEntry| {
-                key_footprint(key)
-                    .saturating_add(entry.size_bytes)
-                    .try_into()
-                    .unwrap_or(u32::MAX)
+                entry_weight(key, entry.size_bytes)
             })
-            .support_invalidation_closures()
             .build();
         Self { cache }
     }
@@ -79,7 +81,7 @@ impl CacheBackend for MokaCacheBackend {
         _codec: Option<CacheCodec>,
     ) {
         self.cache
-            .insert(key.clone(), MokaCacheEntry { entry, size_bytes })
+            .insert(*key, MokaCacheEntry { entry, size_bytes })
             .await;
     }
 
@@ -101,7 +103,7 @@ impl CacheBackend for MokaCacheBackend {
                 .map_err(CloneableError)
         };
 
-        let owned_key = key.clone();
+        let owned_key = *key;
         match self.cache.try_get_with(owned_key, init).await {
             Ok(record) => {
                 let was_cached = !was_miss.load(Ordering::Relaxed);
@@ -111,23 +113,9 @@ impl CacheBackend for MokaCacheBackend {
         }
     }
 
-    async fn invalidate_prefix(&self, prefix: &str) {
-        let prefix = prefix.to_owned();
-        self.cache
-            .invalidate_entries_if(move |key, _value| key.starts_with(&prefix))
-            .expect("Cache configured correctly");
-    }
-
     async fn clear(&self) {
         self.cache.invalidate_all();
         self.cache.run_pending_tasks().await;
-    }
-
-    async fn keys(&self) -> Option<CacheKeyIterator<'_>> {
-        self.cache.run_pending_tasks().await;
-        Some(Box::new(
-            self.cache.iter().map(|(key, _)| key.as_ref().clone()),
-        ))
     }
 
     async fn num_entries(&self) -> usize {
@@ -152,5 +140,17 @@ impl CacheBackend for MokaCacheBackend {
             .iter()
             .map(|(key, entry)| key_footprint(key.as_ref()) + entry.size_bytes)
             .sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn entry_weights_are_exact_and_saturate_at_moka_limit() {
+        let key = InternalCacheKey::from_bytes([0; 16]);
+        assert_eq!(entry_weight(&key, 7), 23);
+        assert_eq!(entry_weight(&key, usize::MAX), u32::MAX);
     }
 }

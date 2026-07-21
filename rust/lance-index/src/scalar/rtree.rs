@@ -29,7 +29,7 @@ use geoarrow_array::builder::RectBuilder;
 use geoarrow_array::{GeoArrowArray, GeoArrowArrayAccessor, IntoArrow};
 use geoarrow_schema::{Dimension, RectType};
 use lance_arrow::RecordBatchExt;
-use lance_core::cache::{CacheKey, LanceCache, WeakLanceCache};
+use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder, LanceCache, WeakLanceCache};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
@@ -251,6 +251,20 @@ impl CacheKey for RTreeCacheKey {
 
     fn type_name() -> &'static str {
         "RTree"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.scalar.rtree-entry-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        match self {
+            Self::Page(page_id) => {
+                builder.write_variant(0);
+                builder.write_u64(*page_id);
+            }
+            Self::Nulls => builder.write_variant(1),
+        }
     }
 }
 

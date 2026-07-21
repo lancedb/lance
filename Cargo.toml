@@ -110,6 +110,7 @@ half = { "version" = "2.1", default-features = false, features = [
 lance-bitpacking = { version = "=9.1.0-beta.7", path = "./rust/compression/bitpacking" }
 bitpacking = "0.9"
 bitvec = "1"
+blake3 = "1.8.5"
 bytemuck = { version = "1", default-features = false, features = [
     "extern_crate_alloc",
 ] }
