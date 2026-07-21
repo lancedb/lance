@@ -259,29 +259,23 @@ mod tests {
 
     #[test]
     fn test_slot_backoff_large_unit_does_not_overflow() {
-        // `slot_i * unit` as a u32 product overflows once unit exceeds
-        // `u32::MAX / (MAX_SLOTS - 1)`; the u64 widening must prevent that. Pin a
-        // lower bound so a reverted widening fails here even in release builds
-        // (where the u32 product would wrap to a smaller value) rather than only
-        // in debug (where it panics).
-        let unit = u32::MAX; // far above the u32-overflow threshold
+        // With unit = u32::MAX, any slot >= 2 makes the old u32 `slot_i * unit`
+        // product overflow: a debug panic, or in release a wrap to a value that
+        // is no longer a multiple of unit. The u64 widening keeps every backoff
+        // an exact multiple of unit. Seed the RNG so the drawn slots — and thus
+        // this check — are deterministic rather than dependent on random draws.
+        let unit = u32::MAX;
         let mut backoff = SlotBackoff::default().with_unit(unit);
-        // Drive attempts into the capped regime, then require a non-zero slot so
-        // the product is actually exercised.
-        let mut saw_nonzero = false;
-        for _ in 0..200 {
+        backoff.rng = rand::rngs::SmallRng::seed_from_u64(0);
+        let mut saw_high_slot = false;
+        for _ in 0..64 {
             let backoff_ms = backoff.next_backoff().as_millis();
-            if backoff_ms > 0 {
-                // A wrapped u32 product would be < unit; the true product is a
-                // multiple of unit, so this lower bound catches truncation.
-                assert!(backoff_ms >= unit as u128, "{backoff_ms} wrapped");
-                saw_nonzero = true;
-            }
+            // `slot_i * unit` is always a multiple of unit; a wrapped u32
+            // product is not.
+            assert_eq!(backoff_ms % unit as u128, 0, "{backoff_ms} wrapped");
+            saw_high_slot |= backoff_ms >= 2 * unit as u128;
         }
-        assert!(
-            saw_nonzero,
-            "expected at least one non-zero slot in 200 draws"
-        );
+        assert!(saw_high_slot, "expected a slot >= 2 in 64 seeded draws");
     }
 
     #[test]
