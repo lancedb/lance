@@ -882,6 +882,30 @@ impl SessionContextExt for SessionContext {
 /// Multi-partition providers are coalesced into a single partition. This adapts a
 /// re-scannable provider back into the one stream the writer pipeline consumes;
 /// re-scanning the same provider (e.g. on a write retry) yields a fresh stream.
+///
+/// # Examples
+///
+/// ```
+/// # use std::sync::Arc;
+/// # use arrow_array::{Int32Array, RecordBatch};
+/// # use arrow_schema::{DataType, Field, Schema};
+/// # use datafusion::catalog::TableProvider;
+/// # use datafusion::datasource::MemTable;
+/// # use futures::TryStreamExt;
+/// # use lance_datafusion::exec::provider_to_stream;
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+/// let batch =
+///     RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1, 2, 3]))])?;
+/// let provider: Arc<dyn TableProvider> = Arc::new(MemTable::try_new(schema, vec![vec![batch]])?);
+///
+/// // A re-scannable provider yields a fresh stream on each call.
+/// let batches: Vec<RecordBatch> = provider_to_stream(provider).await?.try_collect().await?;
+/// assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
+/// # Ok(())
+/// # }
+/// ```
 pub async fn provider_to_stream(
     provider: Arc<dyn TableProvider>,
 ) -> Result<SendableRecordBatchStream> {
