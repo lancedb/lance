@@ -77,6 +77,16 @@ impl Backoff {
     }
 }
 
+/// Upper bound on the number of retry slots.
+///
+/// Slots double each attempt to spread contending writers apart, but past a few
+/// hundred the count already exceeds any realistic number of concurrent
+/// committers, so further doubling only inflates the wait without reducing
+/// collisions. Capping the count also bounds a single backoff to
+/// `(MAX_SLOTS - 1) * unit` instead of letting it grow without limit as
+/// `attempt` climbs.
+const MAX_SLOTS: u32 = 128;
+
 /// SlotBackoff is a backoff strategy that randomly chooses a time slot to retry.
 ///
 /// This is useful when you have multiple tasks that can't overlap, and each
@@ -138,10 +148,15 @@ impl SlotBackoff {
     }
 
     pub fn next_backoff(&mut self) -> Duration {
-        let num_slots = self.base.saturating_pow(self.attempt + self.starting_i);
+        let num_slots = self
+            .base
+            .saturating_pow(self.attempt.saturating_add(self.starting_i))
+            .min(MAX_SLOTS);
         let slot_i = self.rng.random_range(0..num_slots);
         self.attempt += 1;
-        Duration::from_millis((slot_i * self.unit) as u64)
+        // Widen before multiplying: `unit` is the first-attempt latency, which
+        // can be large enough that a `u32` slot * unit product would overflow.
+        Duration::from_millis(slot_i as u64 * self.unit as u64)
     }
 }
 
@@ -227,5 +242,45 @@ mod tests {
             );
             assert_eq!(backoff.attempt(), 3);
         }
+    }
+
+    #[test]
+    fn test_slot_backoff_high_attempt_is_bounded() {
+        // Without the slot cap the wait grows unbounded with `attempt`. The cap
+        // holds every backoff to `(MAX_SLOTS - 1) * unit`.
+        let unit = 100_000; // 100s first attempt
+        let mut backoff = SlotBackoff::default().with_unit(unit);
+        let max_backoff = Duration::from_millis((MAX_SLOTS - 1) as u64 * unit as u64);
+        for _ in 0..40 {
+            assert!(backoff.next_backoff() <= max_backoff);
+        }
+        assert_eq!(backoff.attempt(), 40);
+    }
+
+    #[test]
+    fn test_slot_backoff_large_unit_does_not_overflow() {
+        // `slot_i * unit` as a u32 product overflows once unit exceeds
+        // `u32::MAX / (MAX_SLOTS - 1)`; the u64 widening must prevent that. Pin a
+        // lower bound so a reverted widening fails here even in release builds
+        // (where the u32 product would wrap to a smaller value) rather than only
+        // in debug (where it panics).
+        let unit = u32::MAX; // far above the u32-overflow threshold
+        let mut backoff = SlotBackoff::default().with_unit(unit);
+        // Drive attempts into the capped regime, then require a non-zero slot so
+        // the product is actually exercised.
+        let mut saw_nonzero = false;
+        for _ in 0..200 {
+            let backoff_ms = backoff.next_backoff().as_millis();
+            if backoff_ms > 0 {
+                // A wrapped u32 product would be < unit; the true product is a
+                // multiple of unit, so this lower bound catches truncation.
+                assert!(backoff_ms >= unit as u128, "{backoff_ms} wrapped");
+                saw_nonzero = true;
+            }
+        }
+        assert!(
+            saw_nonzero,
+            "expected at least one non-zero slot in 200 draws"
+        );
     }
 }
