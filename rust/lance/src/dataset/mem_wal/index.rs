@@ -23,6 +23,7 @@ mod pk_key;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Instant;
 
 use datafusion::common::ScalarValue;
 
@@ -892,8 +893,6 @@ impl IndexStore {
         &self,
         batches: &[StoredBatch],
     ) -> Result<std::collections::HashMap<String, std::time::Duration>> {
-        use std::time::Instant;
-
         if batches.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
