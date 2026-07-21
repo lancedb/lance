@@ -172,8 +172,8 @@ pub struct InvertedIndexParams {
     pub(crate) format_version: Option<InvertedListFormatVersion>,
 }
 
+// Unknown fields must remain ignored because these params are persisted across Lance versions.
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RawInvertedIndexParams {
     // Input-only preset expanded before constructing normalized params.
     analyzer: Option<String>,
@@ -1388,6 +1388,23 @@ mod tests {
         let err = InvertedIndexParams::from_training_json(r#"{"format_version": -1}"#).unwrap_err();
         assert!(matches!(&err, lance_core::Error::Arrow { .. }));
         assert!(err.to_string().contains("got -1"));
+    }
+
+    #[test]
+    fn test_training_json_ignores_unknown_fields() {
+        let params = InvertedIndexParams::from_training_json(
+            r#"{
+                "lower_case": false,
+                "skip_merge": true,
+                "future_parameter": {"enabled": true}
+            }"#,
+        )
+        .unwrap();
+
+        assert!(!params.lower_case);
+        let normalized = params.to_training_json().unwrap();
+        assert!(normalized.get("skip_merge").is_none());
+        assert!(normalized.get("future_parameter").is_none());
     }
 
     #[test]

@@ -7547,6 +7547,37 @@ mod tests {
         assert!(error.to_string().contains("metadata access denied"));
     }
 
+    #[tokio::test]
+    async fn params_metadata_ignores_unknown_fields() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let expected = InvertedIndexParams::default();
+        let mut params = serde_json::to_value(&expected).unwrap();
+        let params = params.as_object_mut().unwrap();
+        params.insert("skip_merge".to_owned(), true.into());
+        params.insert(
+            "future_parameter".to_owned(),
+            serde_json::json!({ "enabled": true }),
+        );
+        let metadata =
+            HashMap::from([("params".to_owned(), serde_json::to_string(params).unwrap())]);
+        let mut writer = store
+            .new_index_file(METADATA_FILE, Arc::new(Schema::empty()))
+            .await
+            .unwrap();
+        writer.finish_with_metadata(metadata).await.unwrap();
+
+        let actual = InvertedIndex::load_params(store.as_ref()).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(actual).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+    }
+
     async fn write_single_partition_index(
         store: Arc<LanceIndexStore>,
         params: InvertedIndexParams,
