@@ -359,14 +359,8 @@ impl DeferredDocSet {
         if let Some(arr) = self.row_ids_col.get() {
             return Ok(doc_ids.iter().map(|&d| arr.value(d as usize)).collect());
         }
-        let ranges: Vec<std::ops::Range<usize>> = doc_ids
-            .iter()
-            .map(|&d| d as usize..d as usize + 1)
-            .collect();
-        let reader = self.reader().await?;
-        let batch = reader.read_ranges(&ranges, Some(&[ROW_ID])).await?;
-        let arr = batch[ROW_ID].as_primitive::<UInt64Type>();
-        Ok((0..arr.len()).map(|i| arr.value(i)).collect())
+        let arr = self.row_ids_column().await?;
+        Ok(doc_ids.iter().map(|&d| arr.value(d as usize)).collect())
     }
 }
 

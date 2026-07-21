@@ -8508,6 +8508,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_bm25_search_many_partitions_resolves_exact_row_ids() {
+        // Regression test for deferred row_id resolution: with many partitions
+        // (including one whose only token does not match the query), a search
+        // must resolve every candidate's row_id exactly once and correctly.
+        // Exercises DeferredDocSet::resolve_row_ids' cached whole-column path.
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        const NUM_MATCHING_PARTITIONS: u64 = 40;
+        let mut expected_row_ids: Vec<u64> = Vec::new();
+        for pid in 0..NUM_MATCHING_PARTITIONS {
+            let mut builder = InnerBuilder::new(pid, false, TokenSetFormat::default());
+            builder.tokens.add("pipeline".to_owned());
+            builder.posting_lists.push(PostingListBuilder::new(false));
+            let ndocs = (pid % 3) + 1;
+            for d in 0..ndocs {
+                builder.posting_lists[0].add(d as u32, PositionRecorder::Count(1));
+                let row_id = pid * 1000 + d;
+                builder.docs.append(row_id, 1);
+                expected_row_ids.push(row_id);
+            }
+            builder.write(store.as_ref()).await.unwrap();
+        }
+        // A partition whose only token does NOT match the query.
+        let mut empty_builder =
+            InnerBuilder::new(NUM_MATCHING_PARTITIONS, false, TokenSetFormat::default());
+        empty_builder.tokens.add("unrelated".to_owned());
+        empty_builder
+            .posting_lists
+            .push(PostingListBuilder::new(false));
+        empty_builder.posting_lists[0].add(0, PositionRecorder::Count(1));
+        empty_builder.docs.append(999_999, 1);
+        empty_builder.write(store.as_ref()).await.unwrap();
+
+        let all_partitions: Vec<u64> = (0..=NUM_MATCHING_PARTITIONS).collect();
+        let metadata = std::collections::HashMap::from_iter(vec![
+            (
+                "partitions".to_owned(),
+                serde_json::to_string(&all_partitions).unwrap(),
+            ),
+            (
+                "params".to_owned(),
+                serde_json::to_string(&InvertedIndexParams::default()).unwrap(),
+            ),
+            (
+                TOKEN_SET_FORMAT_KEY.to_owned(),
+                TokenSetFormat::default().to_string(),
+            ),
+        ]);
+        let mut writer = store
+            .new_index_file(METADATA_FILE, Arc::new(arrow_schema::Schema::empty()))
+            .await
+            .unwrap();
+        writer.finish_with_metadata(metadata).await.unwrap();
+
+        let cache = Arc::new(LanceCache::with_capacity(64 * 1024 * 1024));
+        let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(index.partitions.len(), 41);
+
+        // Every matching doc must come back exactly once with a correct row_id.
+        let tokens = Arc::new(Tokens::new(vec!["pipeline".to_owned()], DocType::Text));
+        let params = Arc::new(FtsSearchParams::new().with_limit(Some(1000)));
+        let prefilter = Arc::new(NoFilter);
+        let metrics = Arc::new(NoOpMetricsCollector);
+        let (row_ids, scores) = index
+            .bm25_search(
+                tokens.clone(),
+                params,
+                Operator::Or,
+                prefilter.clone(),
+                metrics.clone(),
+                None,
+            )
+            .await
+            .unwrap();
+        let mut got = row_ids.clone();
+        got.sort_unstable();
+        let mut want = expected_row_ids.clone();
+        want.sort_unstable();
+        assert_eq!(got, want, "every matching doc resolved exactly once");
+        assert_eq!(scores.len(), row_ids.len());
+        assert!(scores.iter().all(|s| *s > 0.0));
+
+        // Top-k smaller than the total: exactly k results.
+        let params_k = Arc::new(FtsSearchParams::new().with_limit(Some(7)));
+        let (row_ids_k, scores_k) = index
+            .bm25_search(tokens, params_k, Operator::Or, prefilter, metrics, None)
+            .await
+            .unwrap();
+        assert_eq!(row_ids_k.len(), 7);
+        assert_eq!(scores_k.len(), 7);
+        assert!(row_ids_k.iter().all(|id| expected_row_ids.contains(id)));
+    }
+
+    #[tokio::test]
     async fn test_modern_prewarm_packs_group_with_shared_posting_buffer() {
         let tmpdir = TempObjDir::default();
         let store = Arc::new(LanceIndexStore::new(
