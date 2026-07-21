@@ -595,8 +595,10 @@ impl CacheStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Error;
     use std::collections::{BTreeSet, HashMap};
     use std::marker::PhantomData;
+    use std::sync::atomic::AtomicUsize;
 
     struct TestKey<T: 'static> {
         key: String,
@@ -917,6 +919,37 @@ mod tests {
             .unwrap();
         assert_eq!(*v, vec![1, 2, 3]);
         assert_eq!(cache.stats().await.hits, 1);
+    }
+
+    #[tokio::test]
+    async fn test_cache_coalesces_concurrent_loader_errors() {
+        let cache = LanceCache::with_capacity(1000);
+        let barrier = Arc::new(tokio::sync::Barrier::new(5));
+        let loader_calls = Arc::new(AtomicUsize::new(0));
+
+        let results = futures::future::join_all((0..5).map(|_| {
+            let cache = cache.clone();
+            let barrier = barrier.clone();
+            let loader_calls = loader_calls.clone();
+            async move {
+                barrier.wait().await;
+                cache
+                    .get_or_insert_with_key(TestKey::<Vec<i32>>::new("error"), || async move {
+                        loader_calls.fetch_add(1, Ordering::Relaxed);
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        Err(Error::timeout("metadata read timed out"))
+                    })
+                    .await
+            }
+        }))
+        .await;
+
+        assert_eq!(loader_calls.load(Ordering::Relaxed), 1);
+        assert!(
+            results
+                .iter()
+                .all(|result| matches!(result, Err(Error::Timeout { .. })))
+        );
     }
 
     #[tokio::test]

@@ -543,7 +543,7 @@ impl TakeExec {
     ///
     /// If this happens the order of the new nested fields will match the order defined in
     /// the dataset schema.
-    fn calculate_output_schema(
+    pub(crate) fn calculate_output_schema(
         dataset_schema: &Schema,
         input_schema: &ArrowSchema,
         projection: &Projection,
@@ -596,10 +596,6 @@ impl TakeExec {
 impl ExecutionPlan for TakeExec {
     fn name(&self) -> &str {
         "TakeExec"
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 
     fn schema(&self) -> SchemaRef {
@@ -685,11 +681,11 @@ impl ExecutionPlan for TakeExec {
     fn partition_statistics(
         &self,
         partition: Option<usize>,
-    ) -> Result<datafusion::physical_plan::Statistics> {
-        Ok(Statistics {
+    ) -> Result<Arc<datafusion::physical_plan::Statistics>> {
+        Ok(Arc::new(Statistics {
             num_rows: self.input.partition_statistics(partition)?.num_rows,
             ..Statistics::new_unknown(self.schema().as_ref())
-        })
+        }))
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {

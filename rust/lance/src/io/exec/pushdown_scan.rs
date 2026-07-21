@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::HashMap;
-use std::{any::Any, sync::Arc};
+use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Int64Type, UInt64Type};
@@ -157,10 +157,6 @@ impl LancePushdownScanExec {
 impl ExecutionPlan for LancePushdownScanExec {
     fn name(&self) -> &str {
         "LancePushdownScanExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn schema(&self) -> SchemaRef {
@@ -672,7 +668,7 @@ impl FragmentScanner {
                 .collect();
             let schema =
                 Arc::new(ArrowSchema::from(self.predicate_projection.as_ref()).try_into()?);
-            let context = SimplifyContext::default().with_schema(schema);
+            let context = SimplifyContext::builder().with_schema(schema).build();
             let mut simplifier = ExprSimplifier::new(context);
 
             let mut predicates = Vec::with_capacity(num_batches);

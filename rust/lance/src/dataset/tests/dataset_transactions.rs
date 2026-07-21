@@ -272,6 +272,39 @@ pub(super) fn assert_results<T: Array + PartialEq + 'static>(
     )
 }
 
+fn gen_rows() -> impl arrow_array::RecordBatchReader + Send + 'static {
+    lance_datagen::gen_batch()
+        .col("key", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(10), BatchCount::from(1))
+}
+
+/// Write a dataset with `versions` versions of 10 rows each.
+async fn write_versions(uri: &str, versions: usize, enable_v2_manifest_paths: bool) -> Dataset {
+    let mut ds = Dataset::write(
+        gen_rows(),
+        uri,
+        Some(WriteParams {
+            enable_v2_manifest_paths,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    for _ in 1..versions {
+        ds.append(
+            gen_rows(),
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                enable_v2_manifest_paths,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    }
+    ds
+}
+
 #[tokio::test]
 async fn test_inline_transaction() {
     use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator};
@@ -382,6 +415,197 @@ async fn test_inline_transaction() {
     assert!(ds_new.manifest.transaction_file.is_some());
     let read_tx = ds_new.read_transaction().await.unwrap().unwrap();
     assert_eq!(read_tx, tx);
+
+    // The direct read takes the same external-file fallback.
+    let version_transaction = ds_new
+        .read_version_transaction(location.version)
+        .await
+        .unwrap();
+    assert_eq!(version_transaction.transaction, Some(tx));
+}
+
+#[tokio::test]
+async fn test_read_version_transaction_does_not_populate_caches() {
+    use lance_index::IndexType;
+    use lance_index::scalar::ScalarIndexParams;
+
+    let test_uri = TempStrDir::default();
+    let mut dataset = write_versions(&test_uri, 1, true).await;
+    // Index the table so historical manifests carry an IndexSection that a
+    // caching read path would decode.
+    dataset
+        .create_index(
+            &["key"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap(); // version 2
+    for _ in 0..18 {
+        dataset
+            .append(
+                gen_rows(),
+                Some(WriteParams {
+                    mode: WriteMode::Append,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+    }
+    let latest_version = dataset.version().version;
+    assert_eq!(latest_version, 20);
+
+    // Fresh session so any cache insertion by the API under test shows as growth.
+    let session = Arc::new(Session::default());
+    let dataset = DatasetBuilder::from_uri(&test_uri)
+        .with_session(session.clone())
+        .load()
+        .await
+        .unwrap();
+
+    let metadata_stats_before = session.metadata_cache_stats().await;
+    let index_stats_before = session.index_cache_stats().await;
+
+    let mut actual = Vec::with_capacity(latest_version as usize);
+    for version in 1..=latest_version {
+        let version_transaction = dataset.read_version_transaction(version).await.unwrap();
+        assert_eq!(version_transaction.version, version);
+        actual.push(version_transaction);
+    }
+
+    let metadata_stats_after = session.metadata_cache_stats().await;
+    let index_stats_after = session.index_cache_stats().await;
+    assert_eq!(
+        metadata_stats_after.num_entries,
+        metadata_stats_before.num_entries
+    );
+    assert_eq!(
+        metadata_stats_after.size_bytes,
+        metadata_stats_before.size_bytes
+    );
+    assert_eq!(
+        index_stats_after.num_entries,
+        index_stats_before.num_entries
+    );
+    assert_eq!(index_stats_after.size_bytes, index_stats_before.size_bytes);
+
+    // Results match a full checkout.
+    for version_transaction in &actual {
+        let checked_out = dataset
+            .checkout_version(version_transaction.version)
+            .await
+            .unwrap();
+        assert_eq!(
+            version_transaction.transaction,
+            checked_out.read_transaction().await.unwrap()
+        );
+        assert_eq!(
+            version_transaction.timestamp,
+            checked_out.version().timestamp
+        );
+        assert!(version_transaction.transaction.is_some());
+    }
+
+    // A missing (e.g. cleaned up) version errors as DatasetNotFound, matching
+    // the historical checkout_version-based contract of the public API.
+    let err = dataset.read_version_transaction(9999).await.unwrap_err();
+    assert!(
+        matches!(err, crate::Error::DatasetNotFound { .. }),
+        "expected DatasetNotFound for a missing version, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_read_transaction_recovers_from_stale_manifest_size() {
+    let test_uri = TempStrDir::default();
+    let ds = write_versions(&test_uri, 1, true).await;
+    let manifest = ds.manifest().clone();
+    // Only meaningful for the inline path; a plain write inlines the transaction.
+    assert!(manifest.transaction_section.is_some());
+
+    // A size at/under the transaction offset makes the first read_message fail
+    // "file size is too small"; only the retry at the true size can recover.
+    let mut stale = ds.manifest_location().clone();
+    stale.size = Some(1);
+    let recovered = ds
+        .read_transaction_from_storage(&manifest, &stale)
+        .await
+        .unwrap();
+    assert_eq!(recovered, ds.read_transaction().await.unwrap());
+    assert!(recovered.is_some());
+}
+
+#[tokio::test]
+async fn test_read_version_transaction_v1_manifest_naming() {
+    let test_uri = TempStrDir::default();
+    let ds = write_versions(&test_uri, 3, false).await;
+    assert_eq!(
+        ds.manifest_location().naming_scheme,
+        ManifestNamingScheme::V1
+    );
+
+    for version in 1..=3 {
+        let version_transaction = ds.read_version_transaction(version).await.unwrap();
+        let checked_out = ds.checkout_version(version).await.unwrap();
+        assert_eq!(
+            version_transaction.transaction,
+            checked_out.read_transaction().await.unwrap()
+        );
+        assert_eq!(
+            version_transaction.timestamp,
+            checked_out.version().timestamp
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_read_version_transaction_on_branch() {
+    let test_uri = TempStrDir::default();
+    let mut main_ds = write_versions(&test_uri, 1, true).await;
+    let branch_ds = main_ds.create_branch("dev", 1, None).await.unwrap();
+
+    // Commit on the branch.
+    let branch_ds = Dataset::write(
+        gen_rows(),
+        branch_ds.uri(),
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(branch_ds.manifest().branch.as_deref(), Some("dev"));
+
+    // Versions resolve against the branch chain and match a full checkout.
+    for version in branch_ds.versions().await.unwrap() {
+        let version_transaction = branch_ds
+            .read_version_transaction(version.version)
+            .await
+            .unwrap();
+        assert_eq!(version_transaction.version, version.version);
+        assert_eq!(version_transaction.timestamp, version.timestamp);
+        let checked_out = branch_ds.checkout_version(version.version).await.unwrap();
+        assert_eq!(checked_out.manifest().branch.as_deref(), Some("dev"));
+        assert_eq!(
+            version_transaction.transaction,
+            checked_out.read_transaction().await.unwrap()
+        );
+    }
+
+    // The append on the branch is the branch's own transaction.
+    let latest = branch_ds.version().version;
+    let version_transaction = branch_ds.read_version_transaction(latest).await.unwrap();
+    assert!(matches!(
+        version_transaction.transaction,
+        Some(Transaction {
+            operation: Operation::Append { .. },
+            ..
+        })
+    ));
 }
 
 #[tokio::test]

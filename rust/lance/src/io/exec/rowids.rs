@@ -242,10 +242,6 @@ impl ExecutionPlan for AddRowAddrExec {
         "AddRowAddrExec"
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn schema(&self) -> Arc<Schema> {
         self.output_schema.clone()
     }
@@ -291,8 +287,8 @@ impl ExecutionPlan for AddRowAddrExec {
     fn partition_statistics(
         &self,
         partition: Option<usize>,
-    ) -> Result<datafusion::physical_plan::Statistics> {
-        let mut stats = self.input.partition_statistics(partition)?;
+    ) -> Result<Arc<datafusion::physical_plan::Statistics>> {
+        let mut stats = Arc::unwrap_or_clone(self.input.partition_statistics(partition)?);
 
         let row_id_col_stats = stats.column_statistics.get(self.rowid_pos).ok_or_else(|| {
             DataFusionError::Internal("RowAddrExec: rowid column stats not found".into())
@@ -327,7 +323,7 @@ impl ExecutionPlan for AddRowAddrExec {
             .column_statistics
             .insert(self.rowaddr_pos, row_addr_col_stats);
 
-        Ok(stats)
+        Ok(Arc::new(stats))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -506,10 +502,6 @@ impl ExecutionPlan for AddRowOffsetExec {
         "AddRowOffsetExec"
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
@@ -526,7 +518,7 @@ impl ExecutionPlan for AddRowOffsetExec {
         vec![false]
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
         self.input.partition_statistics(partition)
     }
 

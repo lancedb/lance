@@ -397,6 +397,8 @@ impl Ord for OrderableScalarValue {
                 panic!("Attempt to compare List with non-List")
             }
             (LargeList(_), _) => todo!(),
+            (ListView(_), _) => todo!(),
+            (LargeListView(_), _) => todo!(),
             (Map(_), Map(_)) => todo!(),
             (Map(left), Null) => {
                 if left.is_null(0) {
@@ -2562,9 +2564,7 @@ pub async fn train_btree_index(
     Ok(vec![pages_file, lookup_file])
 }
 
-fn find_single_partition_files(
-    files: &[lance_table::format::IndexFile],
-) -> Result<Option<(&str, &str)>> {
+fn find_single_partition_files(files: &[super::IndexFile]) -> Result<Option<(&str, &str)>> {
     let lookup_files = files
         .iter()
         .filter_map(|file| {
@@ -6285,7 +6285,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_btree_index_state_reconstruct_applies_frag_reuse_index() {
-        use crate::frag_reuse::{FragReuseIndex, FragReuseIndexDetails};
+        use crate::frag_reuse::{FragReuseIndex, FragReuseIndexDetails, FragReuseIndexHandle};
         use std::collections::HashMap;
         use uuid::Uuid;
 
@@ -6318,11 +6318,11 @@ mod tests {
         // Querying for value == 0 should now return row 5000, confirming reconstruct threaded
         // the FragReuseIndex through to the rebuilt BTreeIndex.
         let frag_reuse_index: Arc<dyn crate::scalar::RowIdRemapper> =
-            Arc::new(FragReuseIndex::new(
+            Arc::new(FragReuseIndexHandle(Arc::new(FragReuseIndex::new(
                 Uuid::new_v4(),
                 vec![HashMap::from([(0u64, Some(5000u64))])],
                 FragReuseIndexDetails { versions: vec![] },
-            ));
+            ))));
         let reconstructed = state
             .reconstruct(
                 test_store.clone(),
