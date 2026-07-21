@@ -3655,8 +3655,10 @@ impl PostingListReader {
                 .clone(),
         };
 
-        self.ensure_modern_posting_validated(token_id, &posting)
-            .await?;
+        if !self.modern_posting_is_validated(token_id)? {
+            self.ensure_modern_posting_validated(token_id, &posting)
+                .await?;
+        }
 
         if is_phrase_query && !posting.has_position() {
             // hit the cache and when the cache was populated, the positions column was not loaded
@@ -3689,6 +3691,21 @@ impl PostingListReader {
             })
             .await
             .map(|_| ())
+    }
+
+    #[inline]
+    fn modern_posting_is_validated(&self, token_id: u32) -> Result<bool> {
+        let (Some(validations), Some(_)) = (&self.modern_doc_id_validations, self.modern_num_docs)
+        else {
+            return Ok(true);
+        };
+        let validation = validations.get(token_id as usize).ok_or_else(|| {
+            Error::index(format!(
+                "modern FTS token id {token_id} is outside validation state [0, {})",
+                validations.len()
+            ))
+        })?;
+        Ok(validation.get().is_some())
     }
 
     fn validate_modern_posting(
@@ -12744,6 +12761,7 @@ mod tests {
             .as_ref()
             .expect("modern readers have per-token validation state")[0];
         assert!(validation.get().is_none());
+        assert!(!posting_reader.modern_posting_is_validated(0).unwrap());
 
         let mut corrupt_builder = PostingListBuilder::new(false);
         corrupt_builder.add(1, PositionRecorder::Count(1));
@@ -12757,6 +12775,7 @@ mod tests {
         assert!(error.to_string().contains("DocId 1"));
         assert!(error.to_string().contains("[0, 1)"));
         assert!(validation.get().is_none());
+        assert!(!posting_reader.modern_posting_is_validated(0).unwrap());
 
         let first = posting_reader
             .posting_list(0, false, &NoOpMetricsCollector)
@@ -12764,6 +12783,7 @@ mod tests {
             .unwrap();
         assert_eq!(posting_entries(&first), vec![(0, 1)]);
         assert!(validation.get().is_some());
+        assert!(posting_reader.modern_posting_is_validated(0).unwrap());
 
         let second = posting_reader
             .posting_list(0, false, &NoOpMetricsCollector)
