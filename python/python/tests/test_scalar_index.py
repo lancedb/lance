@@ -628,13 +628,13 @@ def test_partly_indexed_prefiltered_search(tmp_path):
     plan = make_vec_search(ds).explain_plan()
     assert "ScalarIndexQuery" in plan
     assert "KNNVectorDistance" not in plan
-    assert "LanceRead" not in plan
+    assert "num_fragments" not in plan  # no scan; the take prints as LanceRead
     assert make_vec_search(ds).to_table().num_rows == 6
 
     plan = make_fts_search(ds).explain_plan()
     assert "ScalarIndexQuery" in plan
     assert "KNNVectorDistance" not in plan
-    assert "LanceRead" not in plan
+    assert "num_fragments" not in plan  # no scan; the take prints as LanceRead
     assert make_fts_search(ds).to_table().num_rows == 6
 
     # Add new data (including 6 more results)
@@ -810,10 +810,17 @@ def test_full_text_search(dataset, with_position, base_tokenizer):
         )
 
 
-def test_code_analyzer_does_not_split_identifiers_by_default(tmp_path):
+@pytest.mark.parametrize("block_size", [128, 256])
+def test_code_analyzer_does_not_split_identifiers_by_default(tmp_path, block_size):
     table = pa.table({"code": ["GetUserName", "GetUserEmail", "user"]})
     ds = lance.write_dataset(table, tmp_path)
-    ds.create_scalar_index("code", index_type="INVERTED", analyzer="code")
+    ds.create_scalar_index(
+        "code",
+        index_type="INVERTED",
+        analyzer="code",
+        block_size=block_size,
+    )
+    assert ds.describe_indices()[0].segments[0].index_version == 3
 
     results = ds.to_table(
         columns=["code"],
@@ -925,6 +932,19 @@ def test_code_analyzer_flags_require_code_analyzer(tmp_path):
             "text",
             index_type="INVERTED",
             split_identifiers=True,
+        )
+
+
+def test_code_analyzer_requires_fts_v3(tmp_path):
+    table = pa.table({"code": ["getUserName"]})
+    ds = lance.write_dataset(table, tmp_path)
+
+    with pytest.raises(ValueError, match="requires FTS format_version=3"):
+        ds.create_scalar_index(
+            "code",
+            index_type="INVERTED",
+            analyzer="code",
+            format_version=2,
         )
 
 
@@ -1274,7 +1294,7 @@ def test_create_scalar_index_fts_block_size(dataset):
     )
     indices = dataset.describe_indices()
     doc_index = next(index for index in indices if index.name == "doc_idx")
-    assert doc_index.segments[0].index_version == 4
+    assert doc_index.segments[0].index_version == 3
 
     row = dataset.take(indices=[0], columns=["doc"])
     query = row.column(0)[0].as_py().split(" ")[0]
@@ -5523,7 +5543,7 @@ def test_json_inverted_match_query(tmp_path):
 
 @pytest.mark.parametrize(
     ("format_version", "expected_format_version"),
-    [(1, 1), (2, 2), (4, 4), ("v1", 1), ("v2", 2), ("v4", 4)],
+    [(1, 1), (2, 2), (3, 3), ("v1", 1), ("v2", 2), ("v3", 3)],
 )
 def test_describe_indices(tmp_path, format_version, expected_format_version):
     data = pa.table(
@@ -5699,8 +5719,8 @@ if expected_format_version is not None:
     [
         ("1", {}, 1),
         ("2", {}, 2),
+        ("3", {}, 3),
         ("3", {"block_size": 256}, 3),
-        ("4", {}, 4),
     ],
 )
 def test_create_inverted_index_uses_env_format_version(
@@ -5727,8 +5747,8 @@ def test_create_inverted_index_explicit_format_version_overrides_env(tmp_path):
     assert result.returncode == 0, result.stderr
 
 
-def test_create_inverted_index_defaults_to_v4_without_env(tmp_path):
-    result = _run_fts_format_creation_probe(tmp_path, None, expected_format_version=4)
+def test_create_text_inverted_index_defaults_to_v2_without_env(tmp_path):
+    result = _run_fts_format_creation_probe(tmp_path, None, expected_format_version=2)
 
     assert result.returncode == 0, result.stderr
 
@@ -5748,8 +5768,8 @@ def test_create_inverted_index_rejects_invalid_format_version(tmp_path):
     with pytest.raises(ValueError, match="unsupported FTS format version"):
         ds.create_scalar_index("text", index_type="INVERTED", format_version="v5")
 
-    with pytest.raises(ValueError, match="format_version=3"):
-        ds.create_scalar_index("text", index_type="INVERTED", format_version="v3")
+    with pytest.raises(ValueError, match="unsupported FTS format version"):
+        ds.create_scalar_index("text", index_type="INVERTED", format_version="v4")
 
 
 def test_vector_filter_fts_search(tmp_path):

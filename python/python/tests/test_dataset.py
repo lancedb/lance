@@ -4687,16 +4687,20 @@ def test_late_materialization_param(tmp_path: Path):
     )
     filt = "filter % 2 == 0"
 
-    assert "(values)" in dataset.scanner(
-        filter=filt, late_materialization=None
-    ).explain_plan(True)
+    # A late-materialized column is fetched by a row-stream read
+    # (`projection=[values], source=stream`); an eager column appears in the
+    # scan projection
+    late = "projection=[values], source=stream"
+    assert late in dataset.scanner(filter=filt, late_materialization=None).explain_plan(
+        True
+    )
     assert ", values" in dataset.scanner(
         filter=filt, late_materialization=False
     ).explain_plan(True)
-    assert "(values)" in dataset.scanner(
-        filter=filt, late_materialization=True
-    ).explain_plan(True)
-    assert "(values)" in dataset.scanner(
+    assert late in dataset.scanner(filter=filt, late_materialization=True).explain_plan(
+        True
+    )
+    assert late in dataset.scanner(
         filter=filt, late_materialization=["values"]
     ).explain_plan(True)
     assert ", values" in dataset.scanner(

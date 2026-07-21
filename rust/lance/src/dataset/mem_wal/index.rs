@@ -32,7 +32,6 @@ use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::{Error, Result};
 use lance_index::pbold;
 use lance_index::scalar::InvertedIndexParams;
-use lance_index::scalar::inverted::InvertedListFormatVersion;
 use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_linalg::distance::DistanceType;
 use lance_table::format::IndexMetadata;
@@ -146,7 +145,7 @@ impl MemIndexConfig {
                 ))
             })?
         } else {
-            pbold::InvertedIndexDetails::try_from(&InvertedIndexParams::default())?
+            pbold::InvertedIndexDetails::default()
         };
         let details =
             crate::index::scalar::inverted::normalize_inverted_details(index_meta, details)?;
@@ -156,16 +155,6 @@ impl MemIndexConfig {
             field_id,
             params.get_document_granularity(),
         )?;
-        let format_version = if index_meta.index_version == 4
-            && params.get_document_granularity().is_list_element()
-        {
-            // Index version 4 gates element-document readers independently
-            // from the posting-list payload version recorded in details.
-            params.resolved_format_version()
-        } else {
-            Self::fts_format_version_from_metadata(index_meta)?
-        };
-        let params = params.format_version(format_version);
 
         Ok(Self::Fts(
             FtsIndexConfig::try_with_params(
@@ -215,23 +204,6 @@ impl MemIndexConfig {
                 "Unsupported index type for MemWAL: {}. Supported: BTree, Inverted, Vector",
                 type_url
             )))
-        }
-    }
-
-    fn fts_format_version_from_metadata(
-        index_meta: &IndexMetadata,
-    ) -> Result<InvertedListFormatVersion> {
-        match index_meta.index_version {
-            // Legacy Arrow FTS indexes did not use the v1/v2 metadata values, but
-            // the maintained-index path can only write the modern format.
-            0 | 1 => Ok(InvertedListFormatVersion::V1),
-            2 => Ok(InvertedListFormatVersion::V2),
-            3 => Ok(InvertedListFormatVersion::V3),
-            4 => Ok(InvertedListFormatVersion::V4),
-            version => Err(Error::invalid_input(format!(
-                "FTS index '{}' has unsupported index_version {}; expected 0, 1, 2, 3, or 4",
-                index_meta.name, version
-            ))),
         }
     }
 
@@ -1074,6 +1046,7 @@ mod tests {
     use super::*;
     use arrow_array::{Int32Array, StringArray};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use lance_index::scalar::inverted::InvertedListFormatVersion;
     use log::warn;
     use std::sync::Arc;
     use uuid::Uuid;
@@ -1120,9 +1093,7 @@ mod tests {
     }
 
     fn fts_index_metadata(index_version: i32) -> IndexMetadata {
-        let details =
-            pbold::InvertedIndexDetails::try_from(&InvertedIndexParams::default()).unwrap();
-        fts_index_metadata_with_details(index_version, Some(details))
+        fts_index_metadata_with_details(index_version, None)
     }
 
     fn fts_index_metadata_with_details(
@@ -1491,7 +1462,7 @@ mod tests {
             (0, InvertedListFormatVersion::V1),
             (1, InvertedListFormatVersion::V1),
             (2, InvertedListFormatVersion::V2),
-            (4, InvertedListFormatVersion::V4),
+            (3, InvertedListFormatVersion::V3),
         ] {
             let config =
                 MemIndexConfig::fts_from_metadata(&fts_index_metadata(index_version), &schema)
@@ -1514,15 +1485,15 @@ mod tests {
         let arrow_schema = create_test_schema();
         let schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
 
-        let err = MemIndexConfig::fts_from_metadata(&fts_index_metadata(5), &schema).unwrap_err();
+        let err = MemIndexConfig::fts_from_metadata(&fts_index_metadata(4), &schema).unwrap_err();
         assert!(
-            err.to_string().contains("unsupported index_version 5"),
+            err.to_string().contains("unsupported index_version 4"),
             "{err}"
         );
     }
 
     #[test]
-    fn fts_from_metadata_accepts_element_document_version() {
+    fn fts_from_metadata_accepts_element_document_v3_capability() {
         let arrow_schema = Arc::new(ArrowSchema::new(vec![
             Field::new("id", DataType::Int32, false),
             Field::new("name", DataType::Utf8, true),
@@ -1535,8 +1506,8 @@ mod tests {
         let schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
         let tags = schema.field("tags").unwrap();
         for (block_size, expected_format_version) in [
-            (128, InvertedListFormatVersion::V4),
-            (256, InvertedListFormatVersion::V4),
+            (128, InvertedListFormatVersion::V2),
+            (256, InvertedListFormatVersion::V3),
         ] {
             let params = InvertedIndexParams::default()
                 .block_size(block_size)
@@ -1545,7 +1516,7 @@ mod tests {
                     lance_index::scalar::inverted::DocumentGranularity::ListElement,
                 );
             let details = pbold::InvertedIndexDetails::try_from(&params).unwrap();
-            let mut metadata = fts_index_metadata_with_details(4, Some(details));
+            let mut metadata = fts_index_metadata_with_details(3, Some(details));
             metadata.fields = vec![tags.id];
             let config = MemIndexConfig::fts_from_metadata(&metadata, &schema).unwrap();
 
@@ -1566,36 +1537,27 @@ mod tests {
     }
 
     #[test]
-    fn fts_from_metadata_rejects_v3_without_256_block_size() {
+    fn fts_from_metadata_accepts_v3_with_legacy_block_size() {
         let arrow_schema = create_test_schema();
         let schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
+        let mut legacy_details =
+            pbold::InvertedIndexDetails::try_from(&InvertedIndexParams::default()).unwrap();
+        legacy_details.posting_format_version = None;
 
-        let missing_details =
-            MemIndexConfig::fts_from_metadata(&fts_index_metadata_with_details(3, None), &schema)
-                .unwrap_err();
-        assert!(
-            missing_details
-                .to_string()
-                .contains("requires block_size=256"),
-            "{missing_details}"
-        );
-        assert!(
-            missing_details.to_string().contains("got 128"),
-            "{missing_details}"
-        );
-
-        let default_details =
-            MemIndexConfig::fts_from_metadata(&fts_index_metadata(3), &schema).unwrap_err();
-        assert!(
-            default_details
-                .to_string()
-                .contains("requires block_size=256"),
-            "{default_details}"
-        );
-        assert!(
-            default_details.to_string().contains("got 128"),
-            "{default_details}"
-        );
+        for metadata in [
+            fts_index_metadata(3),
+            fts_index_metadata_with_details(3, Some(legacy_details)),
+        ] {
+            let config = MemIndexConfig::fts_from_metadata(&metadata, &schema).unwrap();
+            let MemIndexConfig::Fts(config) = config else {
+                unreachable!("FTS metadata should create an FTS config");
+            };
+            assert_eq!(
+                config.params.resolved_format_version(),
+                InvertedListFormatVersion::V3
+            );
+            assert_eq!(config.params.posting_block_size(), 128);
+        }
     }
 
     #[test]

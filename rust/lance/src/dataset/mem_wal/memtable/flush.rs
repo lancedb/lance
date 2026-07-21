@@ -772,7 +772,7 @@ impl MemTableFlusher {
             let fragment_ids: roaring::RoaringBitmap = dataset.fragment_bitmap.as_ref().clone();
             let format_version = fts_cfg.params.resolved_format_version();
             let index_version = if fts_cfg.params.get_document_granularity().is_list_element() {
-                lance_index::scalar::inverted::INVERTED_INDEX_VERSION_V4
+                lance_index::scalar::inverted::INVERTED_INDEX_VERSION_V3
             } else {
                 format_version.index_version()
             };
@@ -1191,7 +1191,7 @@ mod tests {
     use super::*;
     use arrow_array::{Int32Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
-    use lance_index::scalar::inverted::INVERTED_INDEX_VERSION_V4;
+    use lance_index::scalar::inverted::INVERTED_INDEX_VERSION_V2;
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -2192,7 +2192,7 @@ mod tests {
 
         assert_eq!(indices.len(), 1);
         assert_eq!(indices[0].name, "text_fts");
-        assert_eq!(indices[0].index_version, INVERTED_INDEX_VERSION_V4 as i32);
+        assert_eq!(indices[0].index_version, INVERTED_INDEX_VERSION_V2 as i32);
 
         // Verify FTS query returns correct results
         // Searching for "hello" should find the first document
@@ -2246,9 +2246,8 @@ mod tests {
         crate::utils::test::assert_plan_node_equals(
             plan,
             "ProjectionExec: expr=[id@2 as id, text@3 as text, _score@1 as _score]
-  Take: ...
-    CoalesceBatchesExec: ...
-      MatchQuery: column=text, query=[hello]",
+  LanceRead: ..., source=stream(_rowid)
+    MatchQuery: column=text, query=[hello]",
         )
         .await
         .unwrap();

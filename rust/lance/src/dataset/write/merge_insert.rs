@@ -61,7 +61,9 @@ use crate::{
     },
     index::DatasetIndexInternalExt,
     io::exec::{
-        AddRowAddrExec, Planner, TakeExec, project,
+        AddRowAddrExec, Planner, TakeExec,
+        filtered_read::{FilteredReadExec, FilteredReadOptions},
+        project,
         scalar_index::{IndexLookup, MapIndexExec},
         utils::ReplayExec,
     },
@@ -831,24 +833,35 @@ impl MergeInsertJob {
             index_mapper_input,
         ));
 
-        // If requested, add row addresses to the output
-        if add_row_addr {
-            let pos = index_mapper.schema().fields().len(); // Add to end
-            index_mapper = Arc::new(AddRowAddrExec::try_new(
-                index_mapper,
-                self.dataset.clone(),
-                pos,
-            )?);
-        }
-
-        // 4 - Take the mapped row ids
+        // 4 - Take the mapped row ids (TakeExec stays for legacy storage:
+        //     the v1 reader cannot serve a FilteredReadExec)
         let projection = self
             .dataset
             .empty_projection()
             .union_arrow_schema(schema.as_ref(), OnMissing::Error)?;
-        let mut target =
+        let mut target: Arc<dyn ExecutionPlan> = if self.dataset.is_legacy_storage() {
+            if add_row_addr {
+                let pos = index_mapper.schema().fields().len(); // Add to end
+                index_mapper = Arc::new(AddRowAddrExec::try_new(
+                    index_mapper,
+                    self.dataset.clone(),
+                    pos,
+                )?);
+            }
             Arc::new(TakeExec::try_new(self.dataset.clone(), index_mapper, projection)?.unwrap())
-                as Arc<dyn ExecutionPlan>;
+        } else {
+            // Keep the mapped row ids; the read synthesizes the row addresses
+            // if requested (no AddRowAddrExec needed)
+            let mut projection = projection.with_row_id();
+            if add_row_addr {
+                projection = projection.with_row_addr();
+            }
+            Arc::new(FilteredReadExec::try_new(
+                self.dataset.clone(),
+                FilteredReadOptions::new(projection),
+                Some(index_mapper),
+            )?)
+        };
 
         // 5 - Take puts the row id and row addr at the beginning.  A full scan (used when there is
         //     no scalar index) puts the row id and addr at the end.  We need to match these up so

@@ -223,10 +223,9 @@ pub struct InvertedIndexParams {
     ///
     /// This is a build-time only parameter and is not persisted with the index.
     /// If unset, new index creation falls back to
-    /// `LANCE_FTS_FORMAT_VERSION`, then v4 when the environment variable is
-    /// also unset.
-    /// `format_version = 3` is experimental and is only valid with
-    /// `block_size = 256`.
+    /// `LANCE_FTS_FORMAT_VERSION`. Without either override, text analysis with
+    /// 128-document blocks writes v2, while code analysis or 256-document blocks
+    /// write v3.
     #[serde(
         rename = "format_version",
         skip_serializing,
@@ -236,8 +235,8 @@ pub struct InvertedIndexParams {
     pub(crate) format_version: Option<InvertedListFormatVersion>,
 }
 
+// Unknown fields must remain ignored because these params are persisted across Lance versions.
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RawInvertedIndexParams {
     // Input-only preset expanded before constructing normalized params.
     analyzer: Option<String>,
@@ -565,7 +564,7 @@ where
         serde_json::Value::Number(value) => {
             let Some(format_version) = value.as_u64() else {
                 return Err(serde::de::Error::custom(format!(
-                    "FTS format_version must be 1, 2, 3, or 4, got {value}"
+                    "FTS format_version must be 1, 2, or 3, got {value}"
                 )));
             };
             resolve_fts_format_version(Some(&format_version.to_string()))
@@ -573,13 +572,14 @@ where
                 .map_err(serde::de::Error::custom)
         }
         other => Err(serde::de::Error::custom(format!(
-            "FTS format_version must be 1, 2, 3, or 4, got {other}"
+            "FTS format_version must be 1, 2, or 3, got {other}"
         ))),
     }
 }
 
 fn resolve_creation_format_version(
     explicit: Option<InvertedListFormatVersion>,
+    default: InvertedListFormatVersion,
 ) -> Result<InvertedListFormatVersion> {
     if let Some(format_version) = explicit {
         return Ok(format_version);
@@ -591,9 +591,9 @@ fn resolve_creation_format_version(
                 "invalid {LANCE_FTS_FORMAT_VERSION_ENV_KEY} value {value:?}: {err}"
             ))
         }),
-        Err(env::VarError::NotPresent) => resolve_fts_format_version(None),
+        Err(env::VarError::NotPresent) => Ok(default),
         Err(env::VarError::NotUnicode(value)) => Err(Error::invalid_input(format!(
-            "invalid {LANCE_FTS_FORMAT_VERSION_ENV_KEY} value {value:?}: expected UTF-8 value 1, 2, 3, or 4"
+            "invalid {LANCE_FTS_FORMAT_VERSION_ENV_KEY} value {value:?}: expected UTF-8 value 1, 2, or 3"
         ))),
     }
 }
@@ -911,29 +911,40 @@ impl InvertedIndexParams {
     /// Set the on-disk FTS format version to use when creating a new index.
     ///
     /// If unset, new index creation falls back to
-    /// `LANCE_FTS_FORMAT_VERSION`, then v4 when the environment variable is
-    /// also unset. Existing indexes keep their own on-disk format during
-    /// update and optimize operations.
-    /// `format_version = 3` is experimental and is only valid with
-    /// `block_size = 256`.
+    /// `LANCE_FTS_FORMAT_VERSION`. Without either override, text analysis with
+    /// 128-document blocks writes v2, while code analysis or 256-document blocks
+    /// write v3. Existing indexes keep their own format during update and
+    /// optimize operations.
     pub fn format_version(mut self, format_version: InvertedListFormatVersion) -> Self {
         self.format_version = Some(format_version);
         self
     }
 
     /// Resolve the requested FTS format version, falling back to the default for
-    /// the configured block size.
+    /// the configured analyzer and block size.
     pub fn resolved_format_version(&self) -> InvertedListFormatVersion {
         self.format_version.unwrap_or_else(|| {
-            default_fts_format_version_for_block_size(self.block_size)
-                .expect("InvertedIndexParams block_size must be validated before use")
+            if self.base_tokenizer == "code" {
+                InvertedListFormatVersion::V3
+            } else {
+                default_fts_format_version_for_block_size(self.block_size)
+                    .expect("InvertedIndexParams block_size must be validated before use")
+            }
         })
     }
 
     /// Validate that the requested FTS format version can safely encode the
     /// configured posting block size.
     pub fn validate_format_version(&self) -> Result<()> {
-        validate_format_version_block_size(self.resolved_format_version(), self.block_size)
+        let format_version = self.resolved_format_version();
+        validate_format_version_block_size(format_version, self.block_size)?;
+        if self.base_tokenizer == "code" && format_version != InvertedListFormatVersion::V3 {
+            return Err(Error::invalid_input(format!(
+                "base_tokenizer='code' requires FTS format_version=3, got {}",
+                format_version.index_version()
+            )));
+        }
+        Ok(())
     }
 
     /// Serialize user-visible params, including logical index identity fields.
@@ -977,7 +988,7 @@ impl InvertedIndexParams {
     }
 
     /// Deserialize params for new index training, using the environment
-    /// compatibility fallback and current creation defaults for omitted fields.
+    /// override and current creation defaults for omitted fields.
     pub(crate) fn from_training_json(params: &str) -> Result<Self> {
         let supplied = serde_json::from_str::<serde_json::Value>(params)?;
         let mut value = serde_json::to_value(Self::default())?;
@@ -991,7 +1002,11 @@ impl InvertedIndexParams {
         object.extend(supplied.clone());
 
         let mut params: Self = serde_json::from_value(value)?;
-        params.format_version = Some(resolve_creation_format_version(params.format_version)?);
+        let default_format_version = params.resolved_format_version();
+        params.format_version = Some(resolve_creation_format_version(
+            params.format_version,
+            default_format_version,
+        )?);
         params.validate_format_version()?;
         Ok(params)
     }
@@ -1212,10 +1227,10 @@ mod tests {
     }
 
     #[test]
-    fn test_default_format_version_resolves_to_v4() {
+    fn test_default_format_version_resolves_to_v2() {
         assert_eq!(
             InvertedIndexParams::default().resolved_format_version(),
-            InvertedListFormatVersion::V4
+            InvertedListFormatVersion::V2
         );
     }
 
@@ -1266,14 +1281,44 @@ mod tests {
     }
 
     #[test]
-    fn test_block_size_256_defaults_to_v4() {
+    fn test_block_size_256_defaults_to_v3() {
         assert_eq!(
             InvertedIndexParams::default()
                 .block_size(256)
                 .unwrap()
                 .resolved_format_version(),
-            InvertedListFormatVersion::V4
+            InvertedListFormatVersion::V3
         );
+    }
+
+    #[test]
+    fn test_code_analyzer_defaults_to_v3_for_supported_block_sizes() {
+        assert_eq!(
+            InvertedIndexParams::code().resolved_format_version(),
+            InvertedListFormatVersion::V3
+        );
+        assert_eq!(
+            InvertedIndexParams::code()
+                .block_size(256)
+                .unwrap()
+                .resolved_format_version(),
+            InvertedListFormatVersion::V3
+        );
+    }
+
+    #[test]
+    fn test_training_json_uses_v3_for_code_analyzer_and_supported_block_sizes() {
+        for block_size in [128, 256] {
+            let params = InvertedIndexParams::from_training_json(
+                &serde_json::json!({
+                    "base_tokenizer": "code",
+                    "block_size": block_size,
+                })
+                .to_string(),
+            )
+            .unwrap();
+            assert_eq!(params.format_version, Some(InvertedListFormatVersion::V3));
+        }
     }
 
     #[test]
@@ -1361,7 +1406,7 @@ mod tests {
             .with_position(true)
             .index_operators(true)
             .preserve_original(false)
-            .format_version(InvertedListFormatVersion::V4);
+            .format_version(InvertedListFormatVersion::V3);
         let details = crate::pbold::InvertedIndexDetails::try_from(&params).unwrap();
         let code_config = details.code_config.as_ref().unwrap();
         assert_eq!(code_config.split_on_numerics, Some(true));
@@ -1418,13 +1463,13 @@ mod tests {
             .validate_format_version()
             .unwrap();
         InvertedIndexParams::default()
-            .format_version(InvertedListFormatVersion::V4)
+            .format_version(InvertedListFormatVersion::V3)
             .validate_format_version()
             .unwrap();
         InvertedIndexParams::default()
             .block_size(256)
             .unwrap()
-            .format_version(InvertedListFormatVersion::V4)
+            .format_version(InvertedListFormatVersion::V3)
             .validate_format_version()
             .unwrap();
 
@@ -1436,11 +1481,11 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("block_size=256"));
 
-        let err = InvertedIndexParams::default()
-            .format_version(InvertedListFormatVersion::V3)
+        let err = InvertedIndexParams::code()
+            .format_version(InvertedListFormatVersion::V2)
             .validate_format_version()
             .unwrap_err();
-        assert!(err.to_string().contains("format_version=3"));
+        assert!(err.to_string().contains("requires FTS format_version=3"));
     }
 
     #[test]
@@ -1456,6 +1501,23 @@ mod tests {
         let err = InvertedIndexParams::from_training_json(r#"{"format_version": -1}"#).unwrap_err();
         assert!(matches!(&err, lance_core::Error::Arrow { .. }));
         assert!(err.to_string().contains("got -1"));
+    }
+
+    #[test]
+    fn test_training_json_ignores_unknown_fields() {
+        let params = InvertedIndexParams::from_training_json(
+            r#"{
+                "lower_case": false,
+                "skip_merge": true,
+                "future_parameter": {"enabled": true}
+            }"#,
+        )
+        .unwrap();
+
+        assert!(!params.lower_case);
+        let normalized = params.to_training_json().unwrap();
+        assert!(normalized.get("skip_merge").is_none());
+        assert!(normalized.get("future_parameter").is_none());
     }
 
     #[test]
@@ -1508,7 +1570,7 @@ mod tests {
         let params =
             InvertedIndexParams::default().document_granularity(DocumentGranularity::ListElement);
         let details = pbold::InvertedIndexDetails::try_from(&params).unwrap();
-        assert_eq!(details.posting_format_version, Some(4));
+        assert_eq!(details.posting_format_version, Some(2));
         assert_eq!(
             details.document_granularity,
             PbDocumentGranularity::ListElement as i32

@@ -388,7 +388,7 @@ async fn test_element_document_fts_flat_indexed_and_mixed() {
         .unwrap();
     assert_eq!(
         element_index.index_version,
-        lance_index::scalar::inverted::INVERTED_INDEX_VERSION_V4 as i32
+        lance_index::scalar::inverted::INVERTED_INDEX_VERSION_V3 as i32
     );
     let element_index = ds
         .open_scalar_index("tags", &element_index.uuid, &NoOpMetricsCollector)

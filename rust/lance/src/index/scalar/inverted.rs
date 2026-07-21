@@ -23,8 +23,7 @@ use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::pbold::InvertedIndexDetails;
 use lance_index::scalar::index_files_to_table;
 use lance_index::scalar::inverted::{
-    DocumentGranularity, InvertedIndex, InvertedIndexParams, LEGACY_BLOCK_SIZE,
-    default_fts_format_version_for_block_size, doc_index_storage_column,
+    DocumentGranularity, InvertedIndex, InvertedIndexParams, doc_index_storage_column,
 };
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::registry::VALUE_COLUMN_NAME;
@@ -700,21 +699,18 @@ pub(crate) fn normalize_inverted_details(
     index: &IndexMetadata,
     mut details: InvertedIndexDetails,
 ) -> Result<InvertedIndexDetails> {
+    if !matches!(index.index_version, 0..=3) {
+        return Err(Error::invalid_input(format!(
+            "FTS index '{}' has unsupported index_version {}; expected 0, 1, 2, or 3",
+            index.name, index.index_version
+        )));
+    }
     if details.posting_format_version.is_none() {
         let posting_format_version = match index.index_version {
             0 | 1 => 1,
             2 => 2,
             3 => 3,
-            4 => default_fts_format_version_for_block_size(
-                details.block_size.unwrap_or(LEGACY_BLOCK_SIZE as u32) as usize,
-            )?
-            .index_version(),
-            version => {
-                return Err(Error::invalid_input(format!(
-                    "FTS index {} has unsupported index version {version}",
-                    index.name
-                )));
-            }
+            _ => unreachable!("index version was validated above"),
         };
         details.posting_format_version = Some(posting_format_version);
     }
@@ -1036,6 +1032,27 @@ mod tests {
             DocumentGranularity::Row
         );
         assert_eq!(details.posting_format_version, Some(3));
+    }
+
+    #[test]
+    fn normalize_rejects_unreleased_v4_metadata() {
+        let metadata = IndexMetadata {
+            uuid: Uuid::new_v4(),
+            fields: vec![1],
+            name: "tags_idx".to_string(),
+            dataset_version: 1,
+            fragment_bitmap: None,
+            index_details: None,
+            index_version: 4,
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+        let details = InvertedIndexDetails::try_from(&InvertedIndexParams::default()).unwrap();
+
+        let err = normalize_inverted_details(&metadata, details).unwrap_err();
+
+        assert!(err.to_string().contains("unsupported index_version 4"));
     }
 
     #[test]

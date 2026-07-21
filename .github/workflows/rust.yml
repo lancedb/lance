@@ -85,7 +85,7 @@ jobs:
 
   linux-build:
     runs-on: "ubuntu-24.04-8x"
-    timeout-minutes: 60
+    timeout-minutes: 75
     env:
       # Need up-to-date compilers for kernels
       CC: clang
