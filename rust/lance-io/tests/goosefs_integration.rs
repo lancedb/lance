@@ -224,12 +224,14 @@ async fn test_diag_lance_io_write_modes() {
         Err(e) => eprintln!("[DIAG] Read FAILED: {:?}", e),
     }
 
-    // Test 2: PutMode::Create (if_not_exists)
+    // PutMode::Create (if_not_exists) — required by
+    // ConditionalPutCommitHandler for concurrent-safe manifest commits.
+    let create_path = object_store::path::Path::parse("test_create.txt").unwrap();
     eprintln!("[DIAG] Writing with PutMode::Create (if_not_exists)...");
-    match object_store
+    object_store
         .inner
         .put_opts(
-            &object_store::path::Path::parse("test_create.txt").unwrap(),
+            &create_path,
             bytes::Bytes::from("conditional write!").into(),
             object_store::PutOptions {
                 mode: object_store::PutMode::Create,
@@ -237,12 +239,30 @@ async fn test_diag_lance_io_write_modes() {
             },
         )
         .await
-    {
-        Ok(_) => eprintln!("[DIAG] PutMode::Create succeeded! ✅"),
-        Err(e) => {
-            eprintln!("[DIAG] PutMode::Create FAILED: {:?}", e);
-        }
-    }
+        .expect("PutMode::Create should succeed for a new path");
+    eprintln!("[DIAG] PutMode::Create succeeded! ✅");
+
+    eprintln!("[DIAG] Second PutMode::Create on same path (expect AlreadyExists)...");
+    let conflict = object_store
+        .inner
+        .put_opts(
+            &create_path,
+            bytes::Bytes::from("should not overwrite").into(),
+            object_store::PutOptions {
+                mode: object_store::PutMode::Create,
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            conflict,
+            Err(object_store::Error::AlreadyExists { .. })
+                | Err(object_store::Error::Precondition { .. })
+        ),
+        "second PutMode::Create must fail with AlreadyExists/Precondition, got: {conflict:?}"
+    );
+    eprintln!("[DIAG] PutMode::Create conflict correctly rejected! ✅");
 
     // Test 3: rename_if_not_exists
     eprintln!("[DIAG] Testing rename_if_not_exists...");

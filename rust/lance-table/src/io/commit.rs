@@ -1112,9 +1112,8 @@ pub async fn commit_handler_from_url(
 
     match url.scheme() {
         "file" | "file-object-store" => Ok(local_handler),
-        "s3" | "gs" | "az" | "abfss" | "memory" | "oss" | "cos" | "tos" | "shared-memory" => {
-            Ok(Arc::new(ConditionalPutCommitHandler))
-        }
+        "s3" | "gs" | "az" | "abfss" | "memory" | "oss" | "cos" | "tos" | "shared-memory"
+        | "goosefs" => Ok(Arc::new(ConditionalPutCommitHandler)),
         #[cfg(not(feature = "dynamodb"))]
         "s3+ddb" => Err(Error::invalid_input_source(
             "`s3+ddb://` scheme requires `dynamodb` feature to be enabled".into(),
@@ -2033,6 +2032,7 @@ mod tests {
     #[case::oss("oss://bucket-a/ds")]
     #[case::cos("cos://bucket-a/ds")]
     #[case::tos("tos://bucket-a/ds")]
+    #[case::goosefs("goosefs://bucket-a/ds")]
     async fn test_commit_handler_from_url_conditional_put_schemes(#[case] url: &str) {
         // Every scheme whose store supports atomic put-if-not-exists must
         // route to ConditionalPutCommitHandler — otherwise concurrent writers
