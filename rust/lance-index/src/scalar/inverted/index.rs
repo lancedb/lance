@@ -695,6 +695,8 @@ pub struct InvertedIndex {
     pub(crate) partitions: Vec<Arc<InvertedPartition>>,
     corpus_stats: Arc<OnceCell<(u64, usize)>>,
     prewarm_state: Arc<Mutex<InvertedPrewarmState>>,
+    /// One-way publication: document projections never leave memory after loading.
+    document_projections_resident: Arc<AtomicBool>,
     // Fragments which are contained in the index, but no longer in the dataset.
     // These should be pruned at search time since we don't prune them at update time.
     deleted_fragments: RoaringBitmap,
@@ -1216,12 +1218,20 @@ impl InvertedIndex {
     }
 
     fn has_resident_document_projections(&self) -> bool {
-        self.partitions.iter().all(|partition| {
+        if self.document_projections_resident.load(Ordering::Acquire) {
+            return true;
+        }
+        let resident = self.partitions.iter().all(|partition| {
             partition
                 .docs
                 .modern()
                 .is_some_and(|documents| documents.projection_loaded())
-        })
+        });
+        if resident {
+            self.document_projections_resident
+                .store(true, Ordering::Release);
+        }
+        resident
     }
 
     async fn bm25_search_modern_resident(
@@ -1306,11 +1316,9 @@ impl InvertedIndex {
                                 <= u128::from(*FLAT_SEARCH_PERCENT_THRESHOLD)
                                     .saturating_mul(documents.len() as u128)
                         });
-                    let visibility = Arc::new(
-                        documents
-                            .visibility(mask.clone(), materialize_selected)
-                            .await?,
-                    );
+                    let visibility = documents
+                        .visibility(mask.clone(), materialize_selected)
+                        .await?;
                     if visibility.is_empty() {
                         return Result::Ok((partition_ordinal, PartitionCandidates::empty()));
                     }
@@ -1336,7 +1344,7 @@ impl InvertedIndex {
                     let candidates = spawn_cpu(move || {
                         part_for_wand.bm25_search_modern(
                             lengths.as_ref(),
-                            visibility.as_ref(),
+                            &visibility,
                             params.as_ref(),
                             operator,
                             postings,
@@ -1520,6 +1528,7 @@ impl InvertedIndex {
             })],
             corpus_stats: Arc::new(OnceCell::new()),
             prewarm_state: Arc::new(Mutex::new(InvertedPrewarmState::default())),
+            document_projections_resident: Arc::new(AtomicBool::new(false)),
             deleted_fragments: RoaringBitmap::new(),
         }))
     }
@@ -1642,6 +1651,7 @@ impl InvertedIndex {
                     partitions,
                     corpus_stats: Arc::new(OnceCell::new()),
                     prewarm_state: Arc::new(Mutex::new(InvertedPrewarmState::default())),
+                    document_projections_resident: Arc::new(AtomicBool::new(false)),
                     deleted_fragments,
                 }))
             }
@@ -3234,6 +3244,8 @@ pub struct PostingListReader {
     /// Cache successful boundary validation per immutable token so repeated
     /// queries do not decode the final posting block again.
     modern_doc_id_validations: Option<Arc<[OnceCell<()>]>>,
+    /// Skips per-token readiness checks once the whole immutable table is validated.
+    modern_postings_validated: AtomicBool,
     modern_num_docs: Option<usize>,
 
     index_cache: WeakLanceCache,
@@ -3369,6 +3381,7 @@ impl PostingListReader {
             positions_layout,
             grouping,
             modern_doc_id_validations,
+            modern_postings_validated: AtomicBool::new(false),
             modern_num_docs: None,
             index_cache: WeakLanceCache::from(index_cache),
         })
@@ -3695,6 +3708,9 @@ impl PostingListReader {
 
     #[inline]
     fn modern_posting_is_validated(&self, token_id: u32) -> Result<bool> {
+        if self.modern_postings_validated.load(Ordering::Acquire) {
+            return Ok(true);
+        }
         let (Some(validations), Some(_)) = (&self.modern_doc_id_validations, self.modern_num_docs)
         else {
             return Ok(true);
@@ -3733,9 +3749,18 @@ impl PostingListReader {
     }
 
     fn modern_posting_validation_ready(&self) -> bool {
-        self.modern_doc_id_validations
+        if self.modern_postings_validated.load(Ordering::Acquire) {
+            return true;
+        }
+        let ready = self
+            .modern_doc_id_validations
             .as_ref()
-            .is_none_or(|validations| validations.iter().all(|state| state.get().is_some()))
+            .is_none_or(|validations| validations.iter().all(|state| state.get().is_some()));
+        if ready {
+            self.modern_postings_validated
+                .store(true, Ordering::Release);
+        }
+        ready
     }
 
     /// Map a token id to its cache group's row range `[start, end)`, or `None`
@@ -10839,6 +10864,7 @@ mod tests {
             .collect::<Result<Vec<_>>>()
             .unwrap();
         assert!(index.has_resident_document_projections());
+        assert!(index.document_projections_resident.load(Ordering::Acquire));
         assert!(index.corpus_stats.initialized());
         assert!(index.partitions.iter().all(|partition| {
             partition.docs.query_ready()
@@ -12886,6 +12912,11 @@ mod tests {
             .await
             .unwrap();
         assert!(posting_reader.modern_posting_validation_ready());
+        assert!(
+            posting_reader
+                .modern_postings_validated
+                .load(Ordering::Acquire)
+        );
 
         for token in 0..num_tokens {
             let (start, end) = posting_reader.group_range_for_token(token).unwrap();
