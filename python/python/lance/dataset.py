@@ -2267,6 +2267,70 @@ class LanceDataset(pa.dataset.Dataset):
             )
         return self._ds.read_blobs_by_indices(selection_values, blob_column, **kwargs)
 
+    def read_blob_ranges(
+        self,
+        blob_column: str,
+        requests: Sequence[Tuple[int, int, int]],
+        *,
+        selector: Literal["ids", "addresses", "indices"],
+        io_buffer_size: Optional[int] = None,
+        preserve_order: Optional[bool] = None,
+    ) -> List[Tuple[int, int, bytes]]:
+        """
+        Read row-specific blob-local byte ranges with one planned API call.
+
+        Each request is a ``(row, offset, length)`` tuple. ``selector`` defines
+        whether every ``row`` value is interpreted as a stable row ID, physical
+        row address, or dataset index. Repeat a row value to read multiple ranges
+        from the same blob. Planning, range validation, physical-source grouping,
+        request coalescing, and bounded I/O scheduling all happen in Rust; this
+        method does not use a Python thread pool.
+
+        Null blob requests produce no result. Empty ranges on non-null blobs
+        return empty bytes without issuing payload I/O. By default results
+        preserve the input order among non-null requests.
+
+        Parameters
+        ----------
+        blob_column : str
+            The name of the blob column to read.
+        requests : Sequence[Tuple[int, int, int]]
+            Complete ``(row, offset, length)`` requests.
+        selector : {"ids", "addresses", "indices"}
+            Interpretation of every request's ``row`` value.
+        io_buffer_size : int, optional
+            Override the scheduler I/O buffer size used while materializing ranges.
+        preserve_order : bool, optional
+            If True, returned results follow request order. If False,
+            ``request_index`` still identifies every result.
+
+        Examples
+        --------
+        Read two disjoint ranges from the same row index:
+
+        .. code-block:: python
+
+            dataset.read_blob_ranges(
+                "images",
+                requests=[(7, 0, 1024), (7, 4096, 1024)],
+                selector="indices",
+            )
+
+        Returns
+        -------
+        results : List[Tuple[int, int, bytes]]
+            ``(request_index, row_address, data)`` for each non-null request.
+            The Python list retains all returned payload bytes in memory; peak
+            result memory is therefore proportional to their total logical size.
+        """
+        return self._ds.read_blob_ranges(
+            list(requests),
+            blob_column,
+            selector,
+            io_buffer_size=io_buffer_size,
+            preserve_order=preserve_order,
+        )
+
     def head(self, num_rows, **kwargs):
         """
         Load the first N rows of the dataset.
