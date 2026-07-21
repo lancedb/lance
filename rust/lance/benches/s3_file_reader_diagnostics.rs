@@ -580,6 +580,7 @@ fn page_layout_kind(encoding: &PageEncoding) -> &'static str {
             Some(pb21::page_layout::Layout::ConstantLayout(_)) => "constant",
             Some(pb21::page_layout::Layout::FullZipLayout(_)) => "fullzip",
             Some(pb21::page_layout::Layout::BlobLayout(_)) => "blob",
+            Some(pb21::page_layout::Layout::SparseLayout(_)) => "sparse",
             None => "missing",
         },
     }
