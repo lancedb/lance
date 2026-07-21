@@ -298,7 +298,7 @@ pub struct WalEntry {
 }
 
 /// Result of a WAL flush. Append-only: index application runs on its own task
-/// (see [`apply_index_range`]), which records its own stats, so this no longer
+/// (see `apply_index_range`), which records its own stats, so this no longer
 /// carries index-update timing or row counts.
 #[derive(Debug, Clone)]
 pub struct WalFlushResult {
@@ -352,7 +352,7 @@ impl std::fmt::Debug for TriggerIndexApply {
     }
 }
 
-/// What an [`apply_index_range`] call actually indexed. `rows_indexed == 0`
+/// What an `apply_index_range` call actually indexed. `rows_indexed == 0`
 /// marks a routine coalesced no-op (the range was already covered) that must
 /// not be recorded as an index update.
 #[derive(Debug, Default, Clone, Copy)]
