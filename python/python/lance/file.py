@@ -584,7 +584,7 @@ class LanceFileWriter:
         if self.closed:
             return
         self.closed = True
-        summary = self._writer.finish_with_summary()
+        summary = self._writer.finish()
         self.size_bytes = summary.size_bytes
         return summary.num_rows
 

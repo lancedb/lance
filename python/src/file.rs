@@ -367,18 +367,11 @@ impl LanceFileWriter {
         .infer_error()
     }
 
-    pub fn finish(&self) -> PyResult<u64> {
-        rt().block_on(None, async {
-            self.inner.lock().await.finish().await.map(|s| s.num_rows)
-        })?
-        .infer_error()
-    }
-
-    /// Finish the file and return both the row count and the final file size
+    /// Finish the file and return the row count and the final file size
     ///
     /// The size is reported by the object writer once the file has been closed
     /// and so it is accurate for object stores as well as local filesystems.
-    pub fn finish_with_summary(&self) -> PyResult<LanceFileWriteSummary> {
+    pub fn finish(&self) -> PyResult<LanceFileWriteSummary> {
         let summary = rt()
             .block_on(None, async { self.inner.lock().await.finish().await })?
             .infer_error()?;
