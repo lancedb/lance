@@ -2892,7 +2892,7 @@ mod tests {
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::gen_batch;
     use lance_datagen::{BatchCount, ByteCount, Dimension, RowCount, array};
-    use lance_index::pbold::BTreeIndexDetails;
+    use lance_index::pbold::{BTreeIndexDetails, InvertedIndexDetails};
     use lance_index::scalar::bitmap::BITMAP_LOOKUP_NAME;
     use lance_index::scalar::inverted::INVERTED_INDEX_VERSION_V3;
     use lance_index::scalar::{
@@ -5051,6 +5051,19 @@ mod tests {
         let indices = dataset.load_indices().await.unwrap();
         assert_eq!(indices.len(), 1);
         assert_eq!(indices[0].index_version, INVERTED_INDEX_VERSION_V3 as i32);
+        let details = indices[0]
+            .index_details
+            .as_ref()
+            .expect("optimized FTS index should retain index details")
+            .to_msg::<InvertedIndexDetails>()
+            .unwrap();
+        assert_eq!(details.base_tokenizer.as_deref(), Some("code"));
+        assert_eq!(details.block_size, Some(block_size as u32));
+        let code_config = details
+            .code_config
+            .expect("optimized code FTS index should retain code configuration");
+        assert!(code_config.split_identifiers);
+        assert_eq!(code_config.preserve_original, Some(false));
 
         let stats: serde_json::Value =
             serde_json::from_str(&dataset.index_statistics("code_idx").await.unwrap()).unwrap();

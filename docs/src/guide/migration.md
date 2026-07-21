@@ -8,20 +8,14 @@ migrate.
 
 ## 9.0.0
 
-* FTS format v3 is the capability gate for the code analyzer and 256-document
-  posting blocks. Code analyzer configuration is persisted in index details and
-  changes token generation, not the posting or position file schema. With
-  128-document blocks, v3 uses the same physical schema and codecs as v2.
+* Unless overridden, newly created FTS indexes use format v2. The code analyzer
+  and `block_size=256` require format v3, so readers must support v3 before an
+  index using either option is created.
 
-* Posting block size is a physical encoding parameter. It is persisted in index
-  metadata because 256-document blocks use different compression, impact data,
-  and scoring behavior. Format v3 supports both 128- and 256-document blocks.
-
-* Format selection follows this priority: an explicit index creation parameter
-  `format_version`, then the `LANCE_FTS_FORMAT_VERSION` environment variable,
-  then v3 for the code analyzer or 256-document posting blocks, and v2 otherwise.
-  Formats v1 and v2 support only 128-document posting blocks and cannot be used
-  with the code analyzer.
+* To keep new indexes readable by nodes that support at most format v1 or v2,
+  set `format_version` in the index creation parameters, or set
+  `LANCE_FTS_FORMAT_VERSION` for a rollout-wide override. Formats v1 and v2
+  require the text analyzer and `block_size=128`.
 
 * Operations that maintain an existing FTS index, including append, incremental
   indexing, optimize, and mem-wal maintained-index flush, preserve its format
