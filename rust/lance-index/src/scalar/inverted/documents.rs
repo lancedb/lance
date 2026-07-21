@@ -491,6 +491,7 @@ pub(super) struct PartitionDocuments {
     remapper: Option<Arc<dyn RowIdRemapper>>,
     lengths: OnceCell<Arc<DocLengths>>,
     projection: OnceCell<Arc<VersionAddressProjection>>,
+    prewarm_complete: OnceCell<()>,
 }
 
 /// Load-boundary discriminator between the read-only legacy representation and
@@ -631,6 +632,7 @@ impl PartitionDocuments {
             remapper,
             lengths: OnceCell::new(),
             projection: OnceCell::new(),
+            prewarm_complete: OnceCell::new(),
         })
     }
 
@@ -643,13 +645,39 @@ impl PartitionDocuments {
         self.lengths.initialized()
     }
 
-    #[cfg(test)]
     pub(crate) fn projection_loaded(&self) -> bool {
         self.projection.initialized()
     }
 
     async fn reader(&self) -> Result<Arc<dyn IndexReader>> {
         self.store.open_index_file(&self.path).await
+    }
+
+    fn lengths_from_batch(&self, batch: &RecordBatch) -> Result<Arc<DocLengths>> {
+        let column = required_u32_column(batch, NUM_TOKEN_COL, &self.path)?;
+        if column.null_count() != 0 {
+            return Err(corrupt_docs(
+                &self.path,
+                format!("{NUM_TOKEN_COL} contains null values"),
+            ));
+        }
+        Ok(Arc::new(DocLengths::try_new(
+            column.values().clone(),
+            self.num_docs,
+            self.persisted_total_tokens,
+            self.quantized_scoring,
+            &self.path,
+        )?))
+    }
+
+    fn projection_from_batch(&self, batch: &RecordBatch) -> Result<Arc<VersionAddressProjection>> {
+        let column = required_u64_column(batch, ROW_ID, &self.path)?;
+        Ok(Arc::new(VersionAddressProjection::try_new(
+            column,
+            self.num_docs,
+            self.remapper.as_deref(),
+            &self.path,
+        )?))
     }
 
     pub(crate) async fn stats(&self) -> Result<PartitionStats> {
@@ -679,20 +707,7 @@ impl PartitionDocuments {
                 let batch = reader
                     .read_range(0..self.num_docs, Some(&[NUM_TOKEN_COL]))
                     .await?;
-                let column = required_u32_column(&batch, NUM_TOKEN_COL, &self.path)?;
-                if column.null_count() != 0 {
-                    return Err(corrupt_docs(
-                        &self.path,
-                        format!("{NUM_TOKEN_COL} contains null values"),
-                    ));
-                }
-                Ok(Arc::new(DocLengths::try_new(
-                    column.values().clone(),
-                    self.num_docs,
-                    self.persisted_total_tokens,
-                    self.quantized_scoring,
-                    &self.path,
-                )?))
+                self.lengths_from_batch(&batch)
             })
             .await
             .cloned()
@@ -703,13 +718,7 @@ impl PartitionDocuments {
             .get_or_try_init(|| async {
                 let reader = self.reader().await?;
                 let batch = reader.read_range(0..self.num_docs, Some(&[ROW_ID])).await?;
-                let column = required_u64_column(&batch, ROW_ID, &self.path)?;
-                Ok(Arc::new(VersionAddressProjection::try_new(
-                    column,
-                    self.num_docs,
-                    self.remapper.as_deref(),
-                    &self.path,
-                )?))
+                self.projection_from_batch(&batch)
             })
             .await
             .cloned()
@@ -859,9 +868,56 @@ impl PartitionDocuments {
         DocSet::load(self.reader().await?, false, self.remapper.clone()).await
     }
 
+    /// Resolve one DocId synchronously when its current-version projection is resident.
+    pub(crate) fn cached_row_address(&self, doc_id: DocId) -> Result<Option<RowAddress>> {
+        let Some(projection) = self.projection.get() else {
+            return Ok(None);
+        };
+        if doc_id.as_usize() >= self.num_docs {
+            return Err(corrupt_docs(
+                &self.path,
+                format!(
+                    "candidate DocId {} is outside [0, {})",
+                    doc_id.get(),
+                    self.num_docs
+                ),
+            ));
+        }
+        projection
+            .address(doc_id)
+            .map(RowAddress::new_from_u64)
+            .map(Some)
+            .ok_or_else(|| {
+                corrupt_docs(
+                    &self.path,
+                    format!("candidate DocId {} is not live", doc_id.get()),
+                )
+            })
+    }
+
     pub(crate) async fn prewarm(&self) -> Result<()> {
-        self.lengths().await?;
-        self.projection().await?.doc_ids_by_address().await?;
+        self.prewarm_complete
+            .get_or_try_init(|| async {
+                if self.lengths.get().is_none() && self.projection.get().is_none() {
+                    let reader = self.reader().await?;
+                    let batch = reader
+                        .read_range(0..self.num_docs, Some(&[ROW_ID, NUM_TOKEN_COL]))
+                        .await?;
+                    let lengths = self.lengths_from_batch(&batch)?;
+                    let projection = self.projection_from_batch(&batch)?;
+
+                    // A concurrent single-column request may win either OnceCell.
+                    // Awaiting the accessors below joins that initialization without
+                    // replacing the already-published value.
+                    let _ = self.lengths.set(lengths);
+                    let _ = self.projection.set(projection);
+                }
+
+                self.lengths().await?;
+                self.projection().await?.doc_ids_by_address().await?;
+                Result::Ok(())
+            })
+            .await?;
         Ok(())
     }
 }
@@ -955,6 +1011,7 @@ mod tests {
 
     #[derive(Debug, Default)]
     struct DocumentReadCounts {
+        open_calls: AtomicUsize,
         range_calls: AtomicUsize,
         ranges_calls: AtomicUsize,
         rows: AtomicUsize,
@@ -1069,6 +1126,7 @@ mod tests {
         async fn open_index_file(&self, name: &str) -> Result<Arc<dyn IndexReader>> {
             let reader = self.inner.open_index_file(name).await?;
             if name == self.target {
+                self.counts.open_calls.fetch_add(1, Ordering::Relaxed);
                 Ok(Arc::new(CountingReader {
                     inner: reader,
                     counts: self.counts.clone(),
@@ -1465,7 +1523,11 @@ mod tests {
         let (counting, counts) = counted_store(store, path);
         let documents = open_documents(counting, path, None).await.unwrap();
 
-        documents.prewarm().await.unwrap();
+        futures::future::join_all((0..8).map(|_| documents.prewarm()))
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
         let projection = documents.projection().await.unwrap();
         let first_lookup = projection.doc_ids_by_address().await.unwrap();
         documents.prewarm().await.unwrap();
@@ -1478,6 +1540,37 @@ mod tests {
             AddressDocIdLookup::Identity
         ));
         assert!(Arc::ptr_eq(&first_lookup, &second_lookup));
+        assert_eq!(
+            documents.cached_row_address(DocId::new(1)).unwrap(),
+            Some(RowAddress::new_from_u64(20))
+        );
+        assert_eq!(counts.open_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(counts.range_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(counts.length_rows.load(Ordering::Relaxed), 3);
+        assert_eq!(counts.address_rows.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn prewarm_reuses_an_already_loaded_document_column() {
+        let (_directory, store) = test_store();
+        let path = "docs.lance";
+        write_documents(
+            store.as_ref(),
+            path,
+            UInt64Array::from(vec![10, 20, 30]),
+            UInt32Array::from(vec![2, 3, 5]),
+            Some("10"),
+        )
+        .await;
+        let (counting, counts) = counted_store(store, path);
+        let documents = open_documents(counting, path, None).await.unwrap();
+
+        documents.lengths().await.unwrap();
+        documents.prewarm().await.unwrap();
+        documents.prewarm().await.unwrap();
+
+        assert_eq!(counts.open_calls.load(Ordering::Relaxed), 3);
+        assert_eq!(counts.range_calls.load(Ordering::Relaxed), 2);
         assert_eq!(counts.length_rows.load(Ordering::Relaxed), 3);
         assert_eq!(counts.address_rows.load(Ordering::Relaxed), 3);
     }
@@ -1598,5 +1691,15 @@ mod tests {
                 .to_string()
                 .contains("_rowid contains null")
         );
+        assert!(
+            documents
+                .prewarm()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("_rowid contains null")
+        );
+        assert!(!documents.lengths_loaded());
+        assert!(!documents.projection_loaded());
     }
 }

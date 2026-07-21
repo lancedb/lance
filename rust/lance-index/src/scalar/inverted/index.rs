@@ -290,6 +290,17 @@ impl<C> PartitionCandidates<C> {
     }
 }
 
+struct ModernSearchRequest<'a> {
+    tokens: Arc<Tokens>,
+    params: Arc<FtsSearchParams>,
+    operator: Operator,
+    mask: Arc<RowAddrMask>,
+    metrics: Arc<dyn MetricsCollector>,
+    scorer: &'a MemBM25Scorer,
+    impact_scorer: Arc<MemBM25Scorer>,
+    limit: usize,
+}
+
 fn push_scored_key(
     candidates: &mut BinaryHeap<Reverse<ScoredDoc>>,
     limit: usize,
@@ -970,7 +981,7 @@ impl InvertedIndex {
             )
             .await
         } else {
-            self.bm25_search_modern(
+            self.bm25_search_modern(ModernSearchRequest {
                 tokens,
                 params,
                 operator,
@@ -979,7 +990,7 @@ impl InvertedIndex {
                 scorer,
                 impact_scorer,
                 limit,
-            )
+            })
             .await
         }
     }
@@ -1086,18 +1097,59 @@ impl InvertedIndex {
             .unzip())
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn bm25_search_modern(
         &self,
-        tokens: Arc<Tokens>,
-        params: Arc<FtsSearchParams>,
-        operator: Operator,
-        mask: Arc<RowAddrMask>,
-        metrics: Arc<dyn MetricsCollector>,
-        scorer: &MemBM25Scorer,
-        impact_scorer: Arc<MemBM25Scorer>,
-        limit: usize,
+        request: ModernSearchRequest<'_>,
     ) -> Result<(Vec<u64>, Vec<f32>)> {
+        // Select a concrete completion path before candidate search.  The
+        // fully resident future never builds deferred address-read state, while
+        // a cold query keeps DocIds until its final bounded I/O phase.
+        if self.has_resident_document_projections() {
+            self.bm25_search_modern_resident(request).await
+        } else {
+            self.bm25_search_modern_deferred(request).await
+        }
+    }
+
+    fn has_resident_document_projections(&self) -> bool {
+        self.partitions.iter().all(|partition| {
+            partition
+                .docs
+                .modern()
+                .is_some_and(|documents| documents.projection_loaded())
+        })
+    }
+
+    async fn bm25_search_modern_resident(
+        &self,
+        request: ModernSearchRequest<'_>,
+    ) -> Result<(Vec<u64>, Vec<f32>)> {
+        let ranked = self.bm25_search_modern_candidates(request).await?;
+        self.resolve_resident_modern_candidates(ranked)
+    }
+
+    async fn bm25_search_modern_deferred(
+        &self,
+        request: ModernSearchRequest<'_>,
+    ) -> Result<(Vec<u64>, Vec<f32>)> {
+        let ranked = self.bm25_search_modern_candidates(request).await?;
+        self.resolve_deferred_modern_candidates(ranked).await
+    }
+
+    async fn bm25_search_modern_candidates(
+        &self,
+        request: ModernSearchRequest<'_>,
+    ) -> Result<Vec<Reverse<ScoredDoc>>> {
+        let ModernSearchRequest {
+            tokens,
+            params,
+            operator,
+            mask,
+            metrics,
+            scorer,
+            impact_scorer,
+            limit,
+        } = request;
         if self.partitions.len() > u32::MAX as usize {
             return Err(Error::index(format!(
                 "FTS partition count {} exceeds candidate identity capacity",
@@ -1212,7 +1264,44 @@ impl InvertedIndex {
             }
         }
 
-        let ranked = ranked.into_sorted_vec();
+        Ok(ranked.into_sorted_vec())
+    }
+
+    fn resolve_resident_modern_candidates(
+        &self,
+        ranked: Vec<Reverse<ScoredDoc>>,
+    ) -> Result<(Vec<u64>, Vec<f32>)> {
+        let mut addresses = Vec::with_capacity(ranked.len());
+        let mut scores = Vec::with_capacity(ranked.len());
+        for Reverse(candidate) in ranked {
+            let partition_ordinal = (candidate.row_id >> 32) as usize;
+            let doc_id = DocId::new(candidate.row_id as u32);
+            let documents = self
+                .partitions
+                .get(partition_ordinal)
+                .and_then(|partition| partition.docs.modern())
+                .ok_or_else(|| {
+                    Error::internal(format!(
+                        "resident FTS candidate DocId {} references missing modern partition ordinal {partition_ordinal}",
+                        doc_id.get()
+                    ))
+                })?;
+            let address = documents.cached_row_address(doc_id)?.ok_or_else(|| {
+                Error::internal(format!(
+                    "resident FTS candidate DocId {} in partition ordinal {partition_ordinal} lost its cached address projection",
+                    doc_id.get()
+                ))
+            })?;
+            addresses.push(address.into());
+            scores.push(candidate.score.0);
+        }
+        Ok((addresses, scores))
+    }
+
+    async fn resolve_deferred_modern_candidates(
+        &self,
+        ranked: Vec<Reverse<ScoredDoc>>,
+    ) -> Result<(Vec<u64>, Vec<f32>)> {
         let mut addresses = vec![0_u64; ranked.len()];
         let mut by_partition = BTreeMap::<usize, Vec<(usize, DocId)>>::new();
         for (rank, Reverse(candidate)) in ranked.iter().enumerate() {
@@ -1223,23 +1312,27 @@ impl InvertedIndex {
                 .or_default()
                 .push((rank, doc_id));
         }
-        let address_reads = by_partition
-            .into_iter()
-            .map(|(partition_ordinal, entries)| {
-                let documents = self.partitions[partition_ordinal]
-                    .docs
-                    .modern()
-                    .cloned()
-                    .expect("modern search only groups modern partitions");
-                async move {
-                    let doc_ids = entries
-                        .iter()
-                        .map(|(_, doc_id)| *doc_id)
-                        .collect::<Vec<_>>();
-                    let resolved = documents.resolve_addresses(&doc_ids).await?;
-                    Result::Ok((entries, resolved))
-                }
+        let mut address_reads = Vec::with_capacity(by_partition.len());
+        for (partition_ordinal, entries) in by_partition {
+            let documents = self
+                .partitions
+                .get(partition_ordinal)
+                .and_then(|partition| partition.docs.modern())
+                .cloned()
+                .ok_or_else(|| {
+                    Error::internal(format!(
+                        "deferred FTS candidates reference missing modern partition ordinal {partition_ordinal}"
+                    ))
+                })?;
+            address_reads.push(async move {
+                let doc_ids = entries
+                    .iter()
+                    .map(|(_, doc_id)| *doc_id)
+                    .collect::<Vec<_>>();
+                let resolved = documents.resolve_addresses(&doc_ids).await?;
+                Result::Ok((entries, resolved))
             });
+        }
         let mut address_reads =
             stream::iter(address_reads).buffer_unordered(self.store.io_parallelism().max(1));
         while let Some((entries, resolved)) = address_reads.try_next().await? {
@@ -10423,6 +10516,48 @@ mod tests {
         let cache = LanceCache::with_capacity(4096);
         let index = InvertedIndex::load(store, None, &cache).await.unwrap();
         (tmpdir, index)
+    }
+
+    #[tokio::test]
+    async fn test_prewarmed_modern_search_uses_resident_address_projection() {
+        let (_tmpdir, index) = load_global_scoring_test_index(true).await;
+        let tokens = Arc::new(Tokens::new(vec!["alpha".to_owned()], DocType::Text));
+        let params = Arc::new(FtsSearchParams::new().with_limit(Some(2)));
+
+        assert!(!index.has_resident_document_projections());
+        let deferred = index
+            .bm25_search(
+                tokens.clone(),
+                params.clone(),
+                Operator::Or,
+                Arc::new(NoFilter),
+                Arc::new(NoOpMetricsCollector),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(!index.has_resident_document_projections());
+
+        for partition in &index.partitions {
+            partition.docs.modern().unwrap().prewarm().await.unwrap();
+        }
+        assert!(index.has_resident_document_projections());
+
+        let resident = index
+            .bm25_search(
+                tokens,
+                params,
+                Operator::Or,
+                Arc::new(NoFilter),
+                Arc::new(NoOpMetricsCollector),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(resident, deferred);
+        assert_eq!(resident.0.len(), 2);
+        assert!(resident.0.contains(&100));
+        assert!(resident.0.contains(&200));
     }
 
     async fn search_test_impact_partition(
