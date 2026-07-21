@@ -591,6 +591,33 @@ def test_read_blob_ranges_mixed_sources_preserves_request_identity(
     assert results == expected
 
 
+def test_read_blob_ranges_skips_blob_v1_nulls(tmp_path):
+    schema = pa.schema(
+        [
+            pa.field(
+                "blobs",
+                pa.large_binary(),
+                metadata={"lance-encoding:blob": "true"},
+            ),
+            pa.field("idx", pa.uint64()),
+        ]
+    )
+    dataset = lance.write_dataset(
+        pa.table({"blobs": [None, b"", b"abc"], "idx": range(3)}, schema=schema),
+        tmp_path / "blob_v1_nulls",
+        data_storage_version="2.0",
+    )
+    addresses = _blob_row_addresses(dataset)
+
+    results = dataset.read_blob_ranges(
+        "blobs",
+        [(0, 0, 0), (0, 0, 1), (1, 0, 0), (2, 1, 1)],
+        selector="indices",
+    )
+
+    assert results == [(2, addresses[1], b""), (3, addresses[2], b"b")]
+
+
 def test_read_blob_ranges_without_preserve_order_keeps_request_identity(
     dataset_with_mixed_blob_v2,
 ):

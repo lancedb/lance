@@ -2277,7 +2277,7 @@ class LanceDataset(pa.dataset.Dataset):
         preserve_order: Optional[bool] = None,
     ) -> List[Tuple[int, int, bytes]]:
         """
-        Read row-specific blob-local byte ranges with one planned I/O operation.
+        Read row-specific blob-local byte ranges with one planned API call.
 
         Each request is a ``(row, offset, length)`` tuple. ``selector`` defines
         whether every ``row`` value is interpreted as a stable row ID, physical
