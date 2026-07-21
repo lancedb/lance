@@ -14,7 +14,7 @@ import os
 # Data overlay support is gated off in release builds unless this is set (it is
 # always on in debug builds). Benchmarks usually run against a release build, so
 # enable it here, before lance is imported, or reading overlay datasets fails.
-os.environ.setdefault("LANCE_ENABLE_DATA_OVERLAY_FILES", "1")
+os.environ.setdefault("LANCE_ENABLE_UNSTABLE_DATA_OVERLAY_FILES", "1")
 
 from typing import List, Optional, Tuple  # noqa: E402
 from urllib.parse import urlparse  # noqa: E402
@@ -165,7 +165,7 @@ def commit_overlay_layers(
                     fragment_id=frag.fragment_id,
                     overlays=[
                         lance.LanceOperation.DataOverlayFile(
-                            data_file=df, shared_offsets=offsets
+                            data_file=df, offsets=offsets
                         )
                     ],
                 )
