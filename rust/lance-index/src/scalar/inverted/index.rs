@@ -2790,16 +2790,29 @@ impl InvertedPartition {
         metrics: &dyn MetricsCollector,
         shared_threshold: Arc<AtomicU32>,
     ) -> Result<Vec<DocCandidate<DocId>>> {
-        let documents = ModernWandDocuments::new(lengths, visibility);
-        self.bm25_search_with_documents(
-            &documents,
-            params,
-            operator,
-            postings,
-            impact_scorer,
-            metrics,
-            shared_threshold,
-        )
+        if visibility.is_all() {
+            let documents = ModernWandDocuments::all(lengths);
+            self.bm25_search_with_documents(
+                &documents,
+                params,
+                operator,
+                postings,
+                impact_scorer,
+                metrics,
+                shared_threshold,
+            )
+        } else {
+            let documents = ModernWandDocuments::filtered(lengths, visibility);
+            self.bm25_search_with_documents(
+                &documents,
+                params,
+                operator,
+                postings,
+                impact_scorer,
+                metrics,
+                shared_threshold,
+            )
+        }
     }
 
     #[instrument(level = "debug", skip_all)]
