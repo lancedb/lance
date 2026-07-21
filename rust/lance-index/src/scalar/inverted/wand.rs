@@ -555,7 +555,7 @@ impl BlockMaxWindow {
             };
         }
 
-        // V3 postings score quantized doc lengths, which can be shorter than
+        // 256-document-block postings score quantized document lengths, which can be shorter than
         // the exact lengths used to bake a legacy max score. Without impacts,
         // use the score-independent BM25 ceiling instead of that stale bound.
         if list.block_size == MAX_POSTING_BLOCK_SIZE {
@@ -1752,7 +1752,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
 
     /// Per-search norm→BM25-denominator cache (Lucene's norm cache): the doc
     /// byte-norm slab plus the 256 possible denominator addends. Available
-    /// when the DocSet scores quantized (V3 partitions) and the scorer
+    /// when the DocSet scores quantized (256-document-block partitions) and the scorer
     /// factors `doc_weight` as `(K1+1)*freq/(freq + addend)`. Scoring through
     /// the cache is bit-identical to `scorer.doc_weight`, because both
     /// evaluate the same expressions on the same quantized lengths.
@@ -6079,7 +6079,7 @@ mod tests {
     }
 
     #[test]
-    fn test_v3_without_impacts_uses_conservative_quantized_score_bound() {
+    fn test_256_document_blocks_without_impacts_use_conservative_quantized_score_bound() {
         let exact_doc_length = 300;
         let quantized_doc_length = super::super::index::dequantize_doc_length(
             super::super::index::quantize_doc_length(exact_doc_length),
@@ -6125,7 +6125,7 @@ mod tests {
     }
 
     #[test]
-    fn test_v3_without_impacts_unknown_scorer_uses_infinite_bound() {
+    fn test_256_document_blocks_without_impacts_unknown_scorer_uses_infinite_bound() {
         let doc_ids = [0_u32];
         let frequencies = [10_u32];
         let blocks = compress_posting_list_with_tail_codec_and_block_size(

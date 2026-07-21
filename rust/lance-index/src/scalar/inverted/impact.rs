@@ -994,7 +994,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_and_v3_impacts_use_identical_encoding() {
+    fn posting_block_sizes_use_identical_impact_encoding() {
         let docs = vec![(3, 1, 100), (9, 2, 40), (200, 7, 80)];
         let mut v2_builder = ImpactSkipDataBuilder::with_capacity(1, 128);
         v2_builder.append_block(&docs).unwrap();

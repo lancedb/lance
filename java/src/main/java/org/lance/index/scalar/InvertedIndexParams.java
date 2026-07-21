@@ -67,6 +67,7 @@ public final class InvertedIndexParams {
      *   <li>{@code "whitespace"}: splits tokens on whitespace
      *   <li>{@code "raw"}: no tokenization
      *   <li>{@code "ngram"}: N-Gram tokenizer
+     *   <li>{@code "code"}: code-aware tokenizer
      *   <li>{@code "icu"}: ICU dictionary-based Unicode word segmentation
      *   <li>{@code "icu/split"}: ICU segmentation with simple-style delimiter splitting
      *   <li>{@code "lindera/*"}: Lindera tokenizer
@@ -233,8 +234,8 @@ public final class InvertedIndexParams {
      * <p>Supported values are {@code 128} and {@code 256}. New indexes default to {@code 128} when
      * this is not set.
      *
-     * <p>{@code blockSize = 256} is experimental and may introduce breaking changes. Use {@code
-     * 128} when stable compatibility with the legacy posting layout is required.
+     * <p>{@code blockSize = 256} requires FTS format v3. Format v3 also supports the default {@code
+     * blockSize = 128}.
      *
      * @param blockSize posting block size
      * @return this builder
@@ -264,16 +265,18 @@ public final class InvertedIndexParams {
     /**
      * Configure the on-disk FTS format version to write when creating a new index.
      *
-     * <p>If unset, Lance uses {@code LANCE_FTS_FORMAT_VERSION} when present and otherwise writes
-     * v4. {@code formatVersion = 3} is experimental and is only valid with {@code blockSize = 256}.
+     * <p>If unset, Lance uses {@code LANCE_FTS_FORMAT_VERSION} when present and otherwise selects
+     * v3 for the code analyzer or {@code blockSize = 256}, and v2 for other indexes. Format v3
+     * supports both posting block sizes. Formats v1 and v2 support only {@code blockSize = 128} and
+     * cannot be used with the code analyzer.
      *
-     * @param formatVersion FTS format version, must be 1, 2, 3, or 4
+     * @param formatVersion FTS format version, must be 1, 2, or 3
      * @return this builder
      * @throws IllegalArgumentException
      */
     public Builder formatVersion(int formatVersion) {
-      if (formatVersion != 1 && formatVersion != 2 && formatVersion != 3 && formatVersion != 4) {
-        throw new IllegalArgumentException("formatVersion must be 1, 2, 3, or 4");
+      if (formatVersion != 1 && formatVersion != 2 && formatVersion != 3) {
+        throw new IllegalArgumentException("formatVersion must be 1, 2, or 3");
       }
       this.formatVersion = formatVersion;
       return this;
@@ -283,10 +286,10 @@ public final class InvertedIndexParams {
     public ScalarIndexParams build() {
       if (formatVersion != null) {
         Preconditions.checkArgument(
-            formatVersion == 4
-                || (blockSize == 256 && formatVersion == 3)
-                || (blockSize == 128 && formatVersion != 3),
-            "formatVersion 3 requires blockSize 256, and legacy formats require blockSize 128");
+            formatVersion == 3 || blockSize == 128, "formatVersion 1 and 2 require blockSize 128");
+        Preconditions.checkArgument(
+            !"code".equals(baseTokenizer) || formatVersion == 3,
+            "baseTokenizer 'code' requires formatVersion 3");
       }
       Map<String, Object> params = new HashMap<>();
       if (baseTokenizer != null) {
