@@ -10,7 +10,23 @@
 //! describe what you're caching and its type.
 //!
 //! To make a value type serializable (so persistent backends can store it),
-//! implement [`CacheCodecImpl`] on the type, then override [`CacheKey::codec`].
+//! implement [`CacheCodecImpl`] on the type, then override [`CacheKey::codec`]:
+//!
+//! ```ignore
+//! impl CacheCodecImpl for MyData {
+//!     fn serialize(&self, w: &mut dyn Write) -> Result<()> { /* ... */ }
+//!     fn deserialize(data: &Bytes) -> Result<Self> { /* ... */ }
+//! }
+//!
+//! impl CacheKey for MyDataKey {
+//!     type ValueType = MyData;
+//!     fn key(&self) -> Cow<'_, str> { /* ... */ }
+//!     fn type_name() -> &'static str { "MyData" }
+//!     fn codec() -> Option<CacheCodec> {
+//!         Some(CacheCodec::from_impl::<MyData>())
+//!     }
+//! }
+//! ```
 //!
 //! ## For backend implementors
 //!
@@ -55,12 +71,28 @@ use crate::{Error, Result};
 
 pub use crate::deepsize::{Context, DeepSizeOf};
 
+// ---------------------------------------------------------------------------
+// CacheKey / UnsizedCacheKey — typed key traits for cache users
+// ---------------------------------------------------------------------------
+
 /// Typed cache key for sized value types.
 ///
 /// Existing implementations can continue returning a logical string from
 /// [`key`](Self::key). Performance-sensitive implementations should also
 /// provide a stable schema and stream typed fields through
 /// [`write_key`](Self::write_key), avoiding construction of that string.
+///
+/// # Example
+///
+/// ```ignore
+/// struct MyKey { id: u64 }
+///
+/// impl CacheKey for MyKey {
+///     type ValueType = MyData;
+///     fn key(&self) -> Cow<'_, str> { self.id.to_string().into() }
+///     fn type_name() -> &'static str { "MyData" }
+/// }
+/// ```
 pub trait CacheKey {
     type ValueType: 'static;
 
@@ -142,6 +174,10 @@ pub trait UnsizedCacheKey {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
 /// Size of a cached `Arc<T>`, accounting for the Arc overhead (two atomic counters).
 fn cache_entry_size<T: DeepSizeOf + ?Sized>(value: &T) -> usize {
     value.deep_size_of() + std::mem::size_of::<std::sync::atomic::AtomicUsize>() * 2
@@ -163,6 +199,10 @@ impl CacheState {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// LanceCache — typed wrapper around dyn CacheBackend
+// ---------------------------------------------------------------------------
 
 /// Typed cache wrapper that handles key construction and type safety.
 ///
@@ -229,6 +269,8 @@ impl LanceCache {
         self.state.backend.size_bytes().await
     }
 
+    // -- Stats / clear --------------------------------------------------------
+
     pub async fn stats(&self) -> CacheStats {
         CacheStats {
             hits: self.state.hits.load(Ordering::Relaxed),
@@ -243,6 +285,8 @@ impl LanceCache {
         self.state.hits.store(0, Ordering::Relaxed);
         self.state.misses.store(0, Ordering::Relaxed);
     }
+
+    // -- CacheKey-based methods -----------------------------------------------
 
     pub async fn insert_with_key<K>(&self, cache_key: &K, metadata: Arc<K::ValueType>)
     where
@@ -273,6 +317,9 @@ impl LanceCache {
                 Some(value)
             }
             Err(_) => {
+                // Type mismatch: the backend returned a different concrete
+                // type than expected (e.g. a disk cache may store
+                // intermediate state). Treat as a miss.
                 log::warn!(
                     "cache backend returned a value with the wrong concrete type for key type {:?}",
                     K::stable_type_id()
@@ -348,6 +395,9 @@ impl LanceCache {
                 Some(value.as_ref().clone())
             }
             Err(_) => {
+                // Type mismatch: the backend returned a different concrete
+                // type than expected (e.g. a disk cache may store
+                // intermediate state). Treat as a miss.
                 log::warn!(
                     "cache backend returned a value with the wrong concrete type for unsized key type {:?}",
                     K::stable_type_id()
@@ -370,6 +420,10 @@ impl LanceCache {
         builder.finish()
     }
 }
+
+// ---------------------------------------------------------------------------
+// WeakLanceCache
+// ---------------------------------------------------------------------------
 
 /// A weak reference to a LanceCache, used by indices to avoid circular references.
 /// When the original cache is dropped, operations on this will gracefully no-op.
@@ -463,6 +517,10 @@ impl WeakLanceCache {
         })
     }
 }
+
+// ---------------------------------------------------------------------------
+// CacheStats
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
 pub struct CacheStats {
