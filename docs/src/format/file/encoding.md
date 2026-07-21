@@ -330,7 +330,7 @@ have per offset (for variable-width data).
 ### Sparse Page Layout
 
 Sparse pages require Lance 2.3. They represent flat or nested Arrow structure directly as slot-domain mappings instead
-of dense repetition and definition events. Writers emit this layout only in files declared as 2.3. The layout is
+of dense repetition and definition events. Writers emit this layout only in files declared as 2.3 or above. The layout is
 identified only by `PageLayout`; field metadata does not identify the layout of an existing page.
 
 A domain is a layer-local integer coordinate space `[0, num_slots)`, and a slot is one element in that space. The
