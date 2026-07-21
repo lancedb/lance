@@ -1073,6 +1073,7 @@ pub(crate) async fn commit_transaction(
                 if !indices.is_empty() {
                     let key = IndexMetadataKey {
                         version: target_version,
+                        store_identity: &dataset.object_store.store_prefix,
                     };
                     dataset
                         .index_cache
@@ -1690,6 +1691,7 @@ mod tests {
                     DataFile::new_legacy_from_fields("path1", vec![0, 1, 2], None),
                     DataFile::new_legacy_from_fields("unused", vec![9], None),
                 ],
+                overlays: vec![],
                 deletion_file: None,
                 row_id_meta: None,
                 physical_rows: None,
@@ -1702,6 +1704,7 @@ mod tests {
                     DataFile::new_legacy_from_fields("path2", vec![0, 1, 2], None),
                     DataFile::new_legacy_from_fields("path3", vec![2], None),
                 ],
+                overlays: vec![],
                 deletion_file: None,
                 row_id_meta: None,
                 physical_rows: None,
@@ -1739,6 +1742,7 @@ mod tests {
                     vec![0, 1, 10],
                     None,
                 )],
+                overlays: vec![],
                 deletion_file: None,
                 row_id_meta: None,
                 physical_rows: None,
@@ -1751,6 +1755,7 @@ mod tests {
                     DataFile::new_legacy_from_fields("path2", vec![0, 1, 2], None),
                     DataFile::new_legacy_from_fields("path3", vec![10], None),
                 ],
+                overlays: vec![],
                 deletion_file: None,
                 row_id_meta: None,
                 physical_rows: None,
@@ -1841,6 +1846,7 @@ mod tests {
         let fragment = Fragment {
             id: 0,
             files: vec![data_file],
+            overlays: vec![],
             deletion_file: None,
             row_id_meta: None,
             physical_rows: Some(100),

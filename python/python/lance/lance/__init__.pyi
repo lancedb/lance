@@ -160,8 +160,15 @@ class PackedBlobWriter:
     def blob_id(self) -> int: ...
     @property
     def path(self) -> str: ...
+    @property
+    def field(self) -> pa.Field: ...
     def write_blob(self, data: bytes) -> None: ...
+    def write_blobs(
+        self,
+        payloads: Union[pa.BinaryArray, pa.LargeBinaryArray, pa.ChunkedArray],
+    ) -> None: ...
     def finish(self) -> List[BlobDescriptor]: ...
+    def finish_array(self, field_name: str) -> pa.StructArray: ...
 
 class DedicatedBlobWriter:
     @property
@@ -396,6 +403,14 @@ class _Dataset:
         io_buffer_size: Optional[int] = None,
         preserve_order: Optional[bool] = None,
     ) -> List[Tuple[int, bytes]]: ...
+    def read_blob_ranges(
+        self,
+        requests: List[Tuple[int, int, int]],
+        blob_column: str,
+        selector: Literal["ids", "addresses", "indices"],
+        io_buffer_size: Optional[int] = None,
+        preserve_order: Optional[bool] = None,
+    ) -> List[Tuple[int, int, bytes]]: ...
     def take_scan(
         self,
         row_slices: Iterable[Tuple[int, int]],
@@ -568,8 +583,13 @@ class _Dataset:
         index_name: str,
         partition_id: int,
         hamming_threshold: int,
+        index_segments: Optional[List[str]] = None,
     ) -> pa.RecordBatchReader: ...
-    def get_ivf_partition_info(self, index_name: str) -> List[dict]: ...
+    def get_ivf_partition_info(
+        self,
+        index_name: str,
+        index_segments: Optional[List[str]] = None,
+    ) -> List[dict]: ...
     def hamming_clustering_for_sample(
         self,
         column: str,

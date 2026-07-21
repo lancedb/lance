@@ -5,16 +5,22 @@ use std::sync::Arc;
 
 use futures::{FutureExt, TryStreamExt};
 use lance_core::{Error, Result};
+use lance_file::reader::FileReaderOptions;
 use lance_index::{
     INDEX_FILE_NAME, IndexType,
     metrics::NoOpMetricsCollector,
     optimize::OptimizeOptions,
     progress::NoopIndexBuildProgress,
     scalar::{
-        CreatedIndex, OldIndexDataFilter, ScalarIndex, inverted::InvertedIndex,
+        CreatedIndex, OldIndexDataFilter, ScalarIndex, index_files_to_table,
+        inverted::InvertedIndex,
         lance_format::LanceIndexStore,
+        seed::{FragmentSeed, SEED_META_KEY_PREFIX},
+        table_files_to_index,
     },
 };
+use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+use lance_io::utils::CachedFileSize;
 use lance_select::{RowAddrTreeMap, RowSetOps};
 use lance_table::format::{Fragment, IndexMetadata};
 use roaring::RoaringBitmap;
@@ -26,7 +32,7 @@ use super::vector::ivf::{optimize_vector_indices, select_segment_for_single_reba
 use crate::dataset::Dataset;
 use crate::dataset::index::LanceIndexStoreExt;
 use crate::dataset::rowids::load_row_id_sequences;
-use crate::index::scalar::load_training_data;
+use crate::index::scalar::{IndexDetails, fetch_index_details, load_training_data};
 use crate::index::vector_index_details_default;
 
 #[derive(Debug, Clone)]
@@ -173,6 +179,88 @@ pub async fn build_per_segment_filters(
         filters.push(build_old_data_filter(dataset, &effective, &deleted).await?);
     }
     Ok((effective_union, filters))
+}
+
+/// Attempt to read seed buffers for `column_name` from `fragments`' data files.
+///
+/// Returns `Some(vec)` only if every fragment has a seed entry; returns `None`
+/// if any fragment is missing a seed or its data file cannot be opened.
+/// Index-type-specific validation (e.g. `rows_per_zone` checks) is left to the
+/// caller via [`FragmentSeed::metadata_value`].
+async fn try_harvest_seeds(
+    dataset: &Dataset,
+    fragments: &[Fragment],
+    column_name: &str,
+) -> Result<Option<Vec<FragmentSeed>>> {
+    if fragments.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+
+    let meta_key = format!("{}{}", SEED_META_KEY_PREFIX, column_name);
+    let mut seeds = Vec::with_capacity(fragments.len());
+
+    let scheduler = ScanScheduler::new(
+        dataset.object_store.clone(),
+        SchedulerConfig::max_bandwidth(&dataset.object_store),
+    );
+
+    for fragment in fragments {
+        let Some(data_file) = fragment.files.first() else {
+            return Ok(None);
+        };
+
+        let path = dataset
+            .base
+            .clone()
+            .join(crate::dataset::DATA_DIR)
+            .join(data_file.path.as_str());
+        let Ok(file_scheduler) = scheduler.open_file(&path, &CachedFileSize::unknown()).await
+        else {
+            return Ok(None);
+        };
+
+        let Ok(reader) = lance_file::reader::FileReader::try_open(
+            file_scheduler,
+            None,
+            Default::default(),
+            &dataset.metadata_cache.file_metadata_cache(&path),
+            FileReaderOptions::default(),
+        )
+        .await
+        else {
+            return Ok(None);
+        };
+
+        let Some(meta_value) = reader
+            .metadata()
+            .file_schema
+            .metadata
+            .get(&meta_key)
+            .cloned()
+        else {
+            return Ok(None);
+        };
+
+        // The buf_index is always the portion before the first ':'.
+        let Some(buf_index_str) = meta_value.split(':').next() else {
+            return Ok(None);
+        };
+        let Ok(buf_index) = buf_index_str.parse::<u32>() else {
+            return Ok(None);
+        };
+
+        let Ok(bytes) = reader.read_global_buffer(buf_index).await else {
+            return Ok(None);
+        };
+
+        seeds.push(FragmentSeed {
+            fragment_id: fragment.id,
+            bytes,
+            metadata_value: meta_value,
+        });
+    }
+
+    Ok(Some(seeds))
 }
 
 async fn load_unindexed_training_data(
@@ -356,38 +444,67 @@ async fn merge_scalar_indices<'a>(
         )
         .await?
     } else {
-        let new_data_stream =
-            load_unindexed_training_data(dataset.as_ref(), field_path, &update_criteria, unindexed)
-                .await?;
         let new_store = LanceIndexStore::from_dataset_for_new(&dataset, &new_uuid)?;
 
-        match index_type {
-            IndexType::BTree => {
-                let (_, old_data_filters) =
-                    build_per_segment_filters(dataset.as_ref(), &selected_old_indices).await?;
-                crate::index::scalar::btree::open_and_merge_segments(
-                    dataset.as_ref(),
-                    field_path,
-                    &selected_old_indices,
-                    new_data_stream,
-                    &new_store,
-                    &old_data_filters,
-                )
-                .await?
-            }
-            // NOTE: IndexType::Inverted never reaches here -- it is handled by the
-            // dedicated arm in merge_indices_with_unindexed_frags before this
-            // function is called.
-            _ => {
-                let old_data_filter = build_old_data_filter(
-                    dataset.as_ref(),
-                    &effective_old_frags,
-                    &deleted_old_frags,
-                )
-                .await?;
-                reference_index
-                    .update(new_data_stream, &new_store, old_data_filter)
+        // Try a seed-based update before falling back to a full column scan.
+        // Seeds are only available if every unindexed fragment had a seed buffer
+        // written during its data file write, and the plugin validates that the
+        // seeds are compatible with the current index configuration.
+        let index_details =
+            fetch_index_details(dataset.as_ref(), field_path, reference_idx).await?;
+        let details = IndexDetails(index_details.clone());
+        let plugin = details.get_plugin()?;
+        // Only open data files looking for seeds when the plugin confirms this
+        // index type and configuration can actually produce them.
+        let maybe_created = if plugin.might_use_seeds(&index_details) {
+            if let Some(seeds) = try_harvest_seeds(dataset.as_ref(), unindexed, column_name).await?
+            {
+                plugin
+                    .update_from_seeds(seeds, reference_index.clone(), &index_details, &new_store)
                     .await?
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some(created) = maybe_created {
+            created
+        } else {
+            let new_data_stream = load_unindexed_training_data(
+                dataset.as_ref(),
+                field_path,
+                &update_criteria,
+                unindexed,
+            )
+            .await?;
+
+            match index_type {
+                IndexType::BTree => {
+                    let (_, old_data_filters) =
+                        build_per_segment_filters(dataset.as_ref(), &selected_old_indices).await?;
+                    crate::index::scalar::btree::open_and_merge_segments(
+                        dataset.as_ref(),
+                        field_path,
+                        &selected_old_indices,
+                        new_data_stream,
+                        &new_store,
+                        &old_data_filters,
+                    )
+                    .await?
+                }
+                _ => {
+                    let old_data_filter = build_old_data_filter(
+                        dataset.as_ref(),
+                        &effective_old_frags,
+                        &deleted_old_frags,
+                    )
+                    .await?;
+                    reference_index
+                        .update(new_data_stream, &new_store, old_data_filter)
+                        .await?
+                }
             }
         }
     };
@@ -592,7 +709,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 CreatedIndex {
                     index_details: vector_index_details_default(),
                     index_version: lance_index::IndexType::Vector.version() as u32,
-                    files,
+                    files: table_files_to_index(files),
                 },
             ))
         } else {
@@ -655,7 +772,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     // index_version <= our max supported version, so we can safely
                     // write the current library's version for this index type.
                     index_version: lance_index::IndexType::Vector.version() as u32,
-                    files,
+                    files: table_files_to_index(files),
                 },
             ))
         }
@@ -734,7 +851,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                         new_fragment_bitmap: dataset.fragment_bitmap.as_ref().clone(),
                         new_index_version: created_index.index_version as i32,
                         new_index_details: created_index.index_details,
-                        files: created_index.files,
+                        files: index_files_to_table(created_index.files),
                     }));
                 }
 
@@ -850,7 +967,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
         new_fragment_bitmap,
         new_index_version: created_index.index_version as i32,
         new_index_details: created_index.index_details,
-        files: created_index.files,
+        files: index_files_to_table(created_index.files),
     }))
 }
 
@@ -863,8 +980,10 @@ mod tests {
     use arrow::datatypes::{Float32Type, UInt32Type};
     use arrow_array::cast::AsArray;
     use arrow_array::{
-        FixedSizeListArray, Int32Array, RecordBatch, RecordBatchIterator, StringArray, UInt32Array,
+        ArrayRef, FixedSizeListArray, Int32Array, RecordBatch, RecordBatchIterator, StringArray,
+        UInt32Array,
     };
+    use arrow_buffer::{BooleanBufferBuilder, NullBuffer};
     use arrow_schema::{DataType, Field, Schema};
     use futures::TryStreamExt;
     use lance_arrow::FixedSizeListArrayExt;
@@ -1003,6 +1122,118 @@ mod tests {
             num_rows += index.num_rows();
         }
         assert_eq!(num_rows, 2000);
+    }
+
+    #[tokio::test]
+    async fn test_optimize_append_preserves_case_sensitive_nullable_vector_column() {
+        const DIM: usize = 64;
+        const ROWS: usize = 1000;
+
+        fn make_vectors(rows: usize, dim: usize, include_null: bool) -> FixedSizeListArray {
+            if include_null {
+                let mut nulls_builder = BooleanBufferBuilder::new(rows);
+                for row_idx in 0..rows {
+                    nulls_builder.append(row_idx != 0);
+                }
+                let nulls = NullBuffer::new(nulls_builder.finish());
+                FixedSizeListArray::try_new(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    dim as i32,
+                    Arc::new(generate_random_array(rows * dim)),
+                    Some(nulls),
+                )
+                .unwrap()
+            } else {
+                FixedSizeListArray::try_new_from_values(
+                    generate_random_array(rows * dim),
+                    dim as i32,
+                )
+                .unwrap()
+            }
+        }
+
+        fn make_batch(
+            schema: Arc<Schema>,
+            start_id: u32,
+            vectors: Arc<FixedSizeListArray>,
+        ) -> RecordBatch {
+            let columns: Vec<ArrayRef> = vec![
+                Arc::new(UInt32Array::from_iter_values(
+                    start_id..start_id + ROWS as u32,
+                )) as ArrayRef,
+                vectors as ArrayRef,
+            ];
+            RecordBatch::try_new(schema, columns).unwrap()
+        }
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let vector_type = DataType::FixedSizeList(
+            Arc::new(Field::new("item", DataType::Float32, true)),
+            DIM as i32,
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt32, false),
+            Field::new("VECTOR", vector_type, true),
+        ]));
+
+        let initial_vectors = Arc::new(make_vectors(ROWS, DIM, false));
+        let initial_batch = make_batch(schema.clone(), 0, initial_vectors);
+        let batches = RecordBatchIterator::new(std::iter::once(Ok(initial_batch)), schema.clone());
+        let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+
+        let params = VectorIndexParams::with_ivf_pq_params(
+            MetricType::L2,
+            IvfBuildParams::new(2),
+            PQBuildParams {
+                num_sub_vectors: 2,
+                ..Default::default()
+            },
+        );
+        dataset
+            .create_index(&["VECTOR"], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+
+        let appended_vectors = Arc::new(make_vectors(ROWS, DIM, true));
+        let query = appended_vectors.value(5);
+        let appended_batch = make_batch(schema.clone(), ROWS as u32, appended_vectors);
+        let batches = RecordBatchIterator::new(std::iter::once(Ok(appended_batch)), schema);
+        dataset.append(batches, None).await.unwrap();
+
+        let index_name = dataset.load_indices().await.unwrap()[0].name.clone();
+        assert!(
+            !dataset
+                .unindexed_fragments(&index_name)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+
+        let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        assert!(
+            dataset
+                .unindexed_fragments(&index_name)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let mut scanner = dataset.scan();
+        scanner
+            .nearest("VECTOR", query.as_primitive::<Float32Type>(), 10)
+            .unwrap();
+        let results = scanner.try_into_batch().await.unwrap();
+        assert_eq!(
+            results.num_rows(),
+            10,
+            "expected the requested k=10 nearest-neighbor results"
+        );
     }
 
     /// Regression: a second `OptimizeOptions::append()` call on a steady-state

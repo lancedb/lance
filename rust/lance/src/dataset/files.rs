@@ -1036,6 +1036,7 @@ mod tests {
                 // No base_id -> falls back to the dataset base_uri.
                 mk_file("c.lance", None),
             ],
+            overlays: vec![],
             // Deletion files also carry a base_id when they originate from a
             // shallow clone, and must resolve against base_paths too.
             deletion_file: Some(DeletionFile {

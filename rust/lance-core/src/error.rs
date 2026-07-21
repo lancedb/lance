@@ -292,6 +292,7 @@ pub enum Error {
     Stop,
     #[snafu(display("Wrapped error: {error}, {location}"))]
     Wrapped {
+        #[snafu(source)]
         error: BoxedError,
         #[snafu(implicit)]
         location: Location,
@@ -519,9 +520,20 @@ impl Error {
         NotFoundSnafu { uri: uri.into() }.build()
     }
 
+    /// Return whether this error or one of its typed sources is a missing object.
+    pub fn is_not_found(&self) -> bool {
+        match self {
+            Self::NotFound { .. } => true,
+            Self::IO { source, .. } | Self::Wrapped { error: source, .. } => {
+                error_source_is_not_found(source.as_ref())
+            }
+            _ => false,
+        }
+    }
+
     #[track_caller]
     pub fn wrapped(error: BoxedError) -> Self {
-        WrappedSnafu { error }.build()
+        WrappedSnafu.into_error(error)
     }
 
     #[track_caller]
@@ -698,6 +710,17 @@ impl Error {
             other => Err(other),
         }
     }
+}
+
+fn error_source_is_not_found(source: &(dyn std::error::Error + 'static)) -> bool {
+    if let Some(error) = source.downcast_ref::<Error>() {
+        return error.is_not_found();
+    }
+    if let Some(error) = source.downcast_ref::<object_store::Error>() {
+        return matches!(error, object_store::Error::NotFound { .. })
+            || std::error::Error::source(error).is_some_and(error_source_is_not_found);
+    }
+    source.source().is_some_and(error_source_is_not_found)
 }
 
 pub trait LanceOptionExt<T> {
@@ -905,14 +928,46 @@ pub fn get_caller_location() -> &'static std::panic::Location<'static> {
 /// Wrap an error in a new error type that implements Clone
 ///
 /// This is useful when two threads/streams share a common fallible source
-/// The base error will always have the full error.  Any cloned results will
-/// only have Error::Cloned with the to_string of the base error.
+/// Definite not-found errors preserve typed source-chain detection and their
+/// human-readable representation. Timeout and I/O errors preserve their error
+/// categories. Other cloned results use Error::Cloned with the string
+/// representation of the base error.
 pub struct CloneableError(pub Error);
+
+struct DisplayError(Error);
+
+impl fmt::Debug for DisplayError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+impl fmt::Display for DisplayError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl std::error::Error for DisplayError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
 
 impl Clone for CloneableError {
     #[track_caller]
     fn clone(&self) -> Self {
-        Self(Error::cloned(self.0.to_string()))
+        match &self.0 {
+            Error::NotFound { uri, .. } => Self(Error::wrapped(Box::new(DisplayError(
+                Error::not_found(uri.clone()),
+            )))),
+            error if error.is_not_found() => Self(Error::wrapped(Box::new(DisplayError(
+                Error::not_found(error.to_string()),
+            )))),
+            Error::Timeout { message, .. } => Self(Error::timeout(message.clone())),
+            Error::IO { source, .. } => Self(Error::io(source.to_string())),
+            error => Self(Error::cloned(error.to_string())),
+        }
     }
 }
 
@@ -928,7 +983,55 @@ impl<T: Clone> From<Result<T>> for CloneableResult<T> {
 #[cfg(test)]
 mod test {
     use super::*;
+    use std::error::Error as _;
     use std::fmt;
+
+    #[test]
+    fn cloneable_error_preserves_not_found_contract() {
+        let original = CloneableError(Error::not_found("metadata.lance"));
+        let cloned = original.clone();
+        let cloned_again = cloned.clone();
+        assert!(matches!(original.0, Error::NotFound { .. }));
+        assert!(cloned.0.is_not_found());
+        assert!(cloned_again.0.is_not_found());
+        assert!(cloned.0.to_string().to_lowercase().contains("not found"));
+        assert!(
+            cloned_again
+                .0
+                .to_string()
+                .to_lowercase()
+                .contains("not found")
+        );
+        assert!(
+            format!("{:?}", cloned.0)
+                .to_lowercase()
+                .contains("not found")
+        );
+        assert!(cloned.0.source().is_some_and(|source| source.is::<Error>()
+            || source.source().is_some_and(|source| source.is::<Error>())));
+        let downstream_error = Error::wrapped(Box::new(Error::io_source(Box::new(
+            object_store::Error::Generic {
+                store: "N/A",
+                source: Box::new(cloned.0),
+            },
+        ))));
+        assert!(downstream_error.is_not_found());
+        assert!(
+            format!("{downstream_error:?}")
+                .to_lowercase()
+                .contains("not found")
+        );
+
+        let original = CloneableError(Error::timeout("metadata read timed out"));
+        let cloned = original.clone();
+        assert!(matches!(original.0, Error::Timeout { .. }));
+        assert!(matches!(cloned.0, Error::Timeout { .. }));
+
+        let original = CloneableError(Error::io("metadata read was denied"));
+        let cloned = original.clone();
+        assert!(matches!(original.0, Error::IO { .. }));
+        assert!(matches!(cloned.0, Error::IO { .. }));
+    }
 
     #[test]
     fn test_caller_location_capture() {

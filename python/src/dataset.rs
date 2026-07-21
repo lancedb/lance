@@ -70,6 +70,7 @@ use lance_core::datatypes::BlobHandling;
 use lance_datafusion::utils::reader_to_stream;
 use lance_encoding::decoder::DecoderConfig;
 use lance_file::reader::FileReaderOptions;
+use lance_index::scalar::inverted::InvertedListFormatVersion;
 use lance_index::scalar::inverted::query::Occur;
 use lance_index::scalar::inverted::query::{
     BooleanQuery, BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Operator, PhraseQuery,
@@ -78,7 +79,6 @@ use lance_index::{
     FtsPrewarmOptions, IndexParams, IndexType, PrewarmOptions,
     optimize::OptimizeOptions,
     progress::{IndexBuildProgress, NoopIndexBuildProgress},
-    scalar::inverted::InvertedListFormatVersion,
     scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams},
     vector::{
         ApproxMode, DEFAULT_QUERY_PARALLELISM, Query as VectorQuery,
@@ -135,11 +135,50 @@ fn read_blobs_to_python(
         .collect()
 }
 
+fn read_blob_ranges_to_python(
+    py: Python<'_>,
+    ranges: Vec<lance::dataset::ReadBlobRange>,
+) -> Vec<(usize, u64, Py<PyBytes>)> {
+    ranges
+        .into_iter()
+        .map(|range| {
+            (
+                range.request_index,
+                range.row_address,
+                PyBytes::new(py, &range.data).unbind(),
+            )
+        })
+        .collect()
+}
+
+fn blob_range_requests_from_tuples(
+    requests: Vec<(u64, u64, u64)>,
+) -> Vec<lance::dataset::BlobRangeRequest> {
+    requests
+        .into_iter()
+        .map(|(row, offset, length)| lance::dataset::BlobRangeRequest::new(row, offset, length))
+        .collect()
+}
+
 fn configure_read_blobs_builder(
     mut builder: lance::dataset::ReadBlobsBuilder,
     io_buffer_size: Option<u64>,
     preserve_order: Option<bool>,
 ) -> lance::dataset::ReadBlobsBuilder {
+    if let Some(bytes) = io_buffer_size {
+        builder = builder.with_io_buffer_size_bytes(bytes);
+    }
+    if let Some(preserve) = preserve_order {
+        builder = builder.preserve_order(preserve);
+    }
+    builder
+}
+
+fn configure_read_blob_ranges_builder(
+    mut builder: lance::dataset::ReadBlobRangesBuilder,
+    io_buffer_size: Option<u64>,
+    preserve_order: Option<bool>,
+) -> lance::dataset::ReadBlobRangesBuilder {
     if let Some(bytes) = io_buffer_size {
         builder = builder.with_io_buffer_size_bytes(bytes);
     }
@@ -547,6 +586,23 @@ fn extract_index_segments(segments: &Bound<'_, PyAny>) -> PyResult<Vec<IndexSegm
         }
     }
     Ok(extracted)
+}
+
+fn parse_index_segment_ids(index_segments: Option<Vec<String>>) -> PyResult<Option<Vec<Uuid>>> {
+    index_segments
+        .map(|segments| {
+            segments
+                .into_iter()
+                .map(|segment| {
+                    Uuid::parse_str(&segment).map_err(|err| {
+                        PyValueError::new_err(format!(
+                            "invalid index segment uuid '{segment}': {err}"
+                        ))
+                    })
+                })
+                .collect::<PyResult<Vec<_>>>()
+        })
+        .transpose()
 }
 
 impl MergeInsertBuilder {
@@ -1644,6 +1700,40 @@ impl Dataset {
         Ok(read_blobs_to_python(self_.py(), blobs))
     }
 
+    #[pyo3(signature=(
+        requests,
+        blob_column,
+        selector,
+        io_buffer_size=None,
+        preserve_order=None
+    ))]
+    fn read_blob_ranges(
+        self_: PyRef<'_, Self>,
+        requests: Vec<(u64, u64, u64)>,
+        blob_column: &str,
+        selector: &str,
+        io_buffer_size: Option<u64>,
+        preserve_order: Option<bool>,
+    ) -> PyResult<Vec<(usize, u64, Py<PyBytes>)>> {
+        let requests = blob_range_requests_from_tuples(requests);
+        let builder = self_.ds.read_blob_ranges(blob_column).infer_error()?;
+        let builder = match selector {
+            "ids" => builder.with_row_ids(requests),
+            "addresses" => builder.with_row_addresses(requests),
+            "indices" => builder.with_row_indices(requests),
+            selector => {
+                return Err(PyValueError::new_err(format!(
+                    "selector must be one of 'ids', 'addresses', or 'indices', got {selector:?}"
+                )));
+            }
+        };
+        let builder = configure_read_blob_ranges_builder(builder, io_buffer_size, preserve_order);
+        let ranges = rt()
+            .block_on(Some(self_.py()), builder.execute())?
+            .infer_error()?;
+        Ok(read_blob_ranges_to_python(self_.py(), ranges))
+    }
+
     #[pyo3(signature = (row_slices, columns = None, batch_readahead = 10))]
     fn take_scan(
         &self,
@@ -2404,19 +2494,106 @@ impl Dataset {
             "INVERTED" | "FTS" => {
                 let mut params = InvertedIndexParams::default();
                 if let Some(kwargs) = kwargs {
+                    let allowed_kwargs = [
+                        "analyzer",
+                        "with_position",
+                        "base_tokenizer",
+                        "language",
+                        "max_token_length",
+                        "lower_case",
+                        "stem",
+                        "remove_stop_words",
+                        "custom_stop_words",
+                        "ascii_folding",
+                        "min_ngram_length",
+                        "max_ngram_length",
+                        "prefix_only",
+                        "block_size",
+                        "split_identifiers",
+                        "split_on_numerics",
+                        "preserve_original",
+                        "index_operators",
+                        "memory_limit",
+                        "num_workers",
+                        "format_version",
+                        "fragment_ids",
+                        "index_uuid",
+                        "progress_callback",
+                    ];
+                    for (key, _) in kwargs.iter() {
+                        let key: String = key.extract()?;
+                        if !allowed_kwargs.contains(&key.as_str()) {
+                            return Err(PyValueError::new_err(format!(
+                                "unknown FTS index parameter '{}'",
+                                key
+                            )));
+                        }
+                    }
+
+                    let analyzer: Option<String> = kwargs
+                        .get_item("analyzer")?
+                        .map(|value| value.extract())
+                        .transpose()?;
+                    let base_tokenizer: Option<String> = kwargs
+                        .get_item("base_tokenizer")?
+                        .map(|value| value.extract())
+                        .transpose()?;
+
+                    match (analyzer.as_deref(), base_tokenizer.as_deref()) {
+                        (Some("text"), Some("code")) => {
+                            return Err(PyValueError::new_err(
+                                "base_tokenizer='code' requires analyzer='code'",
+                            ));
+                        }
+                        (Some("code"), Some(base_tokenizer)) if base_tokenizer != "code" => {
+                            return Err(PyValueError::new_err(format!(
+                                "analyzer='code' requires base_tokenizer='code', got '{}'",
+                                base_tokenizer
+                            )));
+                        }
+                        _ => {}
+                    }
+
+                    let uses_code_analyzer = match analyzer.as_deref() {
+                        Some("code") => true,
+                        Some("text") | None => base_tokenizer.as_deref() == Some("code"),
+                        Some(_) => true,
+                    };
+                    if !uses_code_analyzer {
+                        for flag in [
+                            "split_identifiers",
+                            "split_on_numerics",
+                            "preserve_original",
+                            "index_operators",
+                        ] {
+                            if let Some(value) = kwargs.get_item(flag)?
+                                && value.extract::<bool>()?
+                            {
+                                return Err(PyValueError::new_err(
+                                    "code analyzer flags require analyzer='code'",
+                                ));
+                            }
+                        }
+                    }
+
+                    if let Some(analyzer) = analyzer {
+                        params = params
+                            .analyzer(&analyzer)
+                            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+                    }
                     if let Some(with_position) = kwargs.get_item("with_position")? {
                         params = params.with_position(with_position.extract()?);
                     }
-                    if let Some(base_tokenizer) = kwargs.get_item("base_tokenizer")? {
-                        params = params.base_tokenizer(base_tokenizer.extract()?);
+                    if let Some(base_tokenizer) = base_tokenizer {
+                        params = params.base_tokenizer(base_tokenizer);
                     }
                     if let Some(language) = kwargs.get_item("language")? {
                         let language: PyBackedStr =
                             language.cast::<PyString>()?.clone().try_into()?;
-                        params = params.language(&language).map_err(|e| {
+                        params = params.language(&language).map_err(|err| {
                             PyValueError::new_err(format!(
-                                "can't set tokenizer language to {}: {:?}",
-                                language, e
+                                "can't set tokenizer language to {}: {}",
+                                language, err
                             ))
                         })?;
                     }
@@ -2432,8 +2609,8 @@ impl Dataset {
                     if let Some(remove_stop_words) = kwargs.get_item("remove_stop_words")? {
                         params = params.remove_stop_words(remove_stop_words.extract()?);
                     }
-                    if let Some(stop_words_file) = kwargs.get_item("custom_stop_words")? {
-                        params = params.custom_stop_words(stop_words_file.extract()?);
+                    if let Some(custom_stop_words) = kwargs.get_item("custom_stop_words")? {
+                        params = params.custom_stop_words(custom_stop_words.extract()?);
                     }
                     if let Some(ascii_folding) = kwargs.get_item("ascii_folding")? {
                         params = params.ascii_folding(ascii_folding.extract()?);
@@ -2451,6 +2628,18 @@ impl Dataset {
                         params = params
                             .block_size(block_size.extract()?)
                             .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                    }
+                    if let Some(split_identifiers) = kwargs.get_item("split_identifiers")? {
+                        params = params.split_identifiers(split_identifiers.extract()?);
+                    }
+                    if let Some(split_on_numerics) = kwargs.get_item("split_on_numerics")? {
+                        params = params.split_on_numerics(split_on_numerics.extract()?);
+                    }
+                    if let Some(preserve_original) = kwargs.get_item("preserve_original")? {
+                        params = params.preserve_original(preserve_original.extract()?);
+                    }
+                    if let Some(index_operators) = kwargs.get_item("index_operators")? {
+                        params = params.index_operators(index_operators.extract()?);
                     }
                     if let Some(memory_limit) = kwargs.get_item("memory_limit")? {
                         params = params.memory_limit_mb(memory_limit.extract()?);
@@ -2612,20 +2801,7 @@ impl Dataset {
         with_position: bool,
         index_segments: Option<Vec<String>>,
     ) -> PyResult<()> {
-        let index_segments = index_segments
-            .map(|segments| {
-                segments
-                    .into_iter()
-                    .map(|segment| {
-                        Uuid::parse_str(&segment).map_err(|err| {
-                            PyValueError::new_err(format!(
-                                "invalid index segment uuid '{segment}': {err}"
-                            ))
-                        })
-                    })
-                    .collect::<PyResult<Vec<_>>>()
-            })
-            .transpose()?;
+        let index_segments = parse_index_segment_ids(index_segments)?;
 
         rt().block_on(None, async {
             if with_position {
@@ -3634,9 +3810,10 @@ impl Dataset {
 
     /// Perform pairwise hamming distance clustering on a partition of an IVF_FLAT index.
     ///
-    /// This function loads a specific partition from an IVF_FLAT index on a hash column,
-    /// computes pairwise hamming distances between all hashes in the partition,
-    /// filters by threshold, and clusters the results using union-find.
+    /// This function loads a specific partition from every segment of an IVF_FLAT
+    /// index on a hash column, computes pairwise hamming distances between all
+    /// hashes in the combined partition, filters by threshold, and clusters the
+    /// results using union-find.
     ///
     /// Parameters
     /// ----------
@@ -3646,6 +3823,9 @@ impl Dataset {
     ///     The partition ID within the IVF_FLAT index
     /// hamming_threshold : int
     ///     Maximum hamming distance to consider as similar
+    /// index_segments : list of str, optional
+    ///     If specified, only these physical index segment UUIDs of the named
+    ///     logical index contribute rows. Defaults to all segments.
     ///
     /// Returns
     /// -------
@@ -3653,27 +3833,45 @@ impl Dataset {
     ///     A reader yielding batches with columns:
     ///     - 'representative': uint64 - The representative row ID for each cluster
     ///     - 'duplicates': list<uint64> - List of duplicate row IDs in each cluster
-    #[pyo3(signature = (index_name, partition_id, hamming_threshold))]
+    #[pyo3(signature = (index_name, partition_id, hamming_threshold, index_segments=None))]
     fn hamming_clustering_for_ivf_partition(
         &self,
         py: Python<'_>,
         index_name: &str,
         partition_id: usize,
         hamming_threshold: u32,
+        index_segments: Option<Vec<String>>,
     ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
-        use lance::index::vector::hamming::hamming_clustering_for_ivf_partition;
+        use lance::index::vector::hamming::{
+            hamming_clustering_for_ivf_partition, hamming_clustering_for_ivf_partition_segments,
+        };
 
+        let segment_ids = parse_index_segment_ids(index_segments)?;
         let ds = self.ds.as_ref();
         let reader = rt()
-            .block_on(
-                Some(py),
-                hamming_clustering_for_ivf_partition(
-                    ds,
-                    index_name,
-                    partition_id,
-                    hamming_threshold,
-                ),
-            )?
+            .block_on(Some(py), async {
+                match segment_ids.as_deref() {
+                    Some(segment_ids) => {
+                        hamming_clustering_for_ivf_partition_segments(
+                            ds,
+                            index_name,
+                            segment_ids,
+                            partition_id,
+                            hamming_threshold,
+                        )
+                        .await
+                    }
+                    None => {
+                        hamming_clustering_for_ivf_partition(
+                            ds,
+                            index_name,
+                            partition_id,
+                            hamming_threshold,
+                        )
+                        .await
+                    }
+                }
+            })?
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
         Ok(PyArrowType(reader))
@@ -3681,26 +3879,43 @@ impl Dataset {
 
     /// Get partition information for an IVF_FLAT index.
     ///
+    /// Partition sizes are aggregated across all segments of the logical index
+    /// unless a subset is selected via ``index_segments``.
+    ///
     /// Parameters
     /// ----------
     /// index_name : str
     ///     Name of the IVF_FLAT index
+    /// index_segments : list of str, optional
+    ///     If specified, only these physical index segment UUIDs of the named
+    ///     logical index contribute to the sizes. Defaults to all segments.
     ///
     /// Returns
     /// -------
     /// List[dict]
     ///     List of partition info dicts with 'partition_id' and 'size'
-    #[pyo3(signature = (index_name))]
+    #[pyo3(signature = (index_name, index_segments=None))]
     fn get_ivf_partition_info(
         &self,
         py: Python<'_>,
         index_name: &str,
+        index_segments: Option<Vec<String>>,
     ) -> PyResult<Vec<Py<PyDict>>> {
-        use lance::index::vector::hamming::get_ivf_partition_info;
+        use lance::index::vector::hamming::{
+            get_ivf_partition_info, get_ivf_partition_info_segments,
+        };
 
+        let segment_ids = parse_index_segment_ids(index_segments)?;
         let ds = self.ds.as_ref();
         let result = rt()
-            .block_on(Some(py), get_ivf_partition_info(ds, index_name))?
+            .block_on(Some(py), async {
+                match segment_ids.as_deref() {
+                    Some(segment_ids) => {
+                        get_ivf_partition_info_segments(ds, index_name, segment_ids).await
+                    }
+                    None => get_ivf_partition_info(ds, index_name).await,
+                }
+            })?
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
         let partitions: PyResult<Vec<_>> = result
@@ -3725,7 +3940,8 @@ impl Dataset {
     /// Parameters
     /// ----------
     /// column : str
-    ///     Name of the hash column (must be FixedSizeList<UInt8, 8>)
+    ///     Name of the hash column (must be FixedSizeList<UInt8, N> where N is
+    ///     a positive multiple of 8 bytes)
     /// sample_size : int, optional
     ///     Number of rows to sample (if None or >= total rows, uses all rows)
     /// hamming_threshold : int
@@ -3768,7 +3984,8 @@ impl Dataset {
     /// Parameters
     /// ----------
     /// column : str
-    ///     Name of the hash column (must be FixedSizeList<UInt8, 8>)
+    ///     Name of the hash column (must be FixedSizeList<UInt8, N> where N is
+    ///     a positive multiple of 8 bytes)
     /// fragment_id : int
     ///     The fragment ID to read from
     /// start_row : int

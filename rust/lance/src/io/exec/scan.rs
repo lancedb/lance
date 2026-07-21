@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::any::Any;
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -730,10 +729,6 @@ impl ExecutionPlan for LanceScanExec {
         "LanceScanExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.output_schema.clone()
     }
@@ -784,7 +779,7 @@ impl ExecutionPlan for LanceScanExec {
         )))
     }
 
-    fn partition_statistics(&self, _partition: Option<usize>) -> Result<Statistics> {
+    fn partition_statistics(&self, _partition: Option<usize>) -> Result<Arc<Statistics>> {
         // Some fragments from older datasets might have the row count stats missing.
         let (row_count, is_exact) =
             self.fragments
@@ -801,10 +796,10 @@ impl ExecutionPlan for LanceScanExec {
             false => Precision::Absent,
         };
 
-        Ok(Statistics {
+        Ok(Arc::new(Statistics {
             num_rows,
             ..Statistics::new_unknown(self.schema().as_ref())
-        })
+        }))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {

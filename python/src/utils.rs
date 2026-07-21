@@ -26,7 +26,6 @@ use lance::Result;
 use lance::datatypes::Schema;
 use lance_arrow::FixedSizeListArrayExt;
 use lance_file::previous::writer::FileWriter as PreviousFileWriter;
-use lance_index::scalar::IndexWriter;
 use lance_index::vector::hnsw::{HNSW, builder::HnswBuildParams};
 use lance_index::vector::kmeans::{
     KMeans as LanceKMeans, KMeansAlgoFloat, KMeansParams, compute_partitions,
@@ -255,7 +254,7 @@ impl Hnsw {
         rt().block_on(Some(py), async {
             let batch = self.hnsw.to_batch()?;
             let metadata = batch.schema_ref().metadata().clone();
-            writer.write_record_batch(batch).await?;
+            writer.write(&[batch]).await?;
             writer.finish_with_metadata(&metadata).await?;
             Result::Ok(())
         })?
