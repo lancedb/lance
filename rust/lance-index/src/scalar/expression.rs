@@ -796,34 +796,34 @@ impl ScalarQueryParser for LabelListQueryParser {
         }
 
         let label_list = maybe_scalar(&args[1], data_type)?;
-        if let ScalarValue::List(list_arr) = label_list {
-            let list_values = list_arr.values();
-            if list_values.is_empty() {
-                return None;
-            }
-            let mut scalars = Vec::with_capacity(list_values.len());
-            for idx in 0..list_values.len() {
-                scalars.push(ScalarValue::try_from_array(list_values.as_ref(), idx).ok()?);
-            }
-            if func.name() == "array_has_all" {
-                let query = LabelListQuery::HasAllLabels(scalars);
-                Some(IndexedExpression::index_query(
-                    column.to_string(),
-                    self.index_name.clone(),
-                    self.index_type.clone(),
-                    Arc::new(query),
-                ))
-            } else if func.name() == "array_has_any" {
-                let query = LabelListQuery::HasAnyLabel(scalars);
-                Some(IndexedExpression::index_query(
-                    column.to_string(),
-                    self.index_name.clone(),
-                    self.index_type.clone(),
-                    Arc::new(query),
-                ))
-            } else {
-                None
-            }
+        let list_values = match label_list {
+            ScalarValue::List(list_arr) => list_arr.values().clone(),
+            ScalarValue::LargeList(list_arr) => list_arr.values().clone(),
+            _ => return None,
+        };
+        if list_values.is_empty() {
+            return None;
+        }
+        let mut scalars = Vec::with_capacity(list_values.len());
+        for idx in 0..list_values.len() {
+            scalars.push(ScalarValue::try_from_array(list_values.as_ref(), idx).ok()?);
+        }
+        if func.name() == "array_has_all" {
+            let query = LabelListQuery::HasAllLabels(scalars);
+            Some(IndexedExpression::index_query(
+                column.to_string(),
+                self.index_name.clone(),
+                self.index_type.clone(),
+                Arc::new(query),
+            ))
+        } else if func.name() == "array_has_any" {
+            let query = LabelListQuery::HasAnyLabel(scalars);
+            Some(IndexedExpression::index_query(
+                column.to_string(),
+                self.index_name.clone(),
+                self.index_type.clone(),
+                Arc::new(query),
+            ))
         } else {
             None
         }
@@ -2606,6 +2606,7 @@ mod tests {
     use lance_datafusion::exec::{LanceExecutionOptions, get_session_context};
     use lance_select::result::IndexExprResultWireFormat;
     use roaring::RoaringBitmap;
+    use rstest::rstest;
 
     use crate::scalar::json::{JsonQuery, JsonQueryParser};
 
@@ -2667,6 +2668,16 @@ mod tests {
             Field::new("price", DataType::Float32, false),
             Field::new("json", DataType::LargeBinary, false),
         ]);
+        check_with_schema(index_info, expr, expected, optimize, schema);
+    }
+
+    fn check_with_schema(
+        index_info: &dyn IndexInformationProvider,
+        expr: &str,
+        expected: Option<IndexedExpression>,
+        optimize: bool,
+        schema: Schema,
+    ) {
         let df_schema: DFSchema = schema.try_into().unwrap();
 
         let ctx = get_session_context(&LanceExecutionOptions::default());
@@ -2754,6 +2765,38 @@ mod tests {
             ),
             false,
         )
+    }
+
+    #[rstest]
+    #[case::list(DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))))]
+    #[case::large_list(DataType::LargeList(Arc::new(Field::new("item", DataType::Utf8, true))))]
+    fn test_label_list_query_parser(#[case] label_type: DataType) {
+        let index_info = MockIndexInfoProvider::new(vec![(
+            "labels",
+            ColInfo::new(
+                label_type.clone(),
+                Box::new(LabelListQueryParser::new(
+                    "labels_idx".to_string(),
+                    "LabelList".to_string(),
+                )),
+            ),
+        )]);
+        let schema = Schema::new(vec![Field::new("labels", label_type, true)]);
+
+        check_with_schema(
+            &index_info,
+            "array_has_any(labels, ['distributed'])",
+            Some(IndexedExpression::index_query(
+                "labels".to_string(),
+                "labels_idx".to_string(),
+                "LabelList".to_string(),
+                Arc::new(LabelListQuery::HasAnyLabel(vec![ScalarValue::Utf8(Some(
+                    "distributed".to_string(),
+                ))])),
+            )),
+            true,
+            schema,
+        );
     }
 
     #[test]

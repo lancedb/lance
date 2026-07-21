@@ -4882,6 +4882,73 @@ def test_ngram_segment_merge_and_commit_from_python(tmp_path):
     assert ds.count_rows("text IS NULL") == 1
 
 
+@pytest.mark.parametrize(
+    "label_type",
+    [pa.list_(pa.string()), pa.large_list(pa.string())],
+    ids=["list", "large_list"],
+)
+def test_label_list_segment_index(tmp_path, label_type):
+    rows_per_fragment = 8
+    ds = lance.write_dataset(
+        pa.table(
+            {
+                "id": pa.array(range(rows_per_fragment * 4), type=pa.int32()),
+                "labels": pa.array(
+                    [
+                        ["distributed"] if row_id % 2 == 0 else ["other"]
+                        for row_id in range(rows_per_fragment * 4)
+                    ],
+                    type=label_type,
+                ),
+            }
+        ),
+        tmp_path,
+        max_rows_per_file=rows_per_fragment,
+    )
+
+    fragment_ids = [fragment.fragment_id for fragment in ds.get_fragments()]
+    assert len(fragment_ids) == 4
+
+    with pytest.raises(ValueError, match="create_index_uncommitted"):
+        ds.create_scalar_index(
+            column="labels",
+            index_type="LABEL_LIST",
+            fragment_ids=[fragment_ids[0]],
+        )
+
+    index_name = "labels_segment_idx"
+    segments = [
+        ds.create_index_uncommitted(
+            column="labels",
+            index_type="LABEL_LIST",
+            name=index_name,
+            fragment_ids=[fragment_id],
+        )
+        for fragment_id in fragment_ids
+    ]
+
+    merged_segment = ds.merge_existing_index_segments(segments)
+    ds = ds.commit_existing_index_segments(index_name, "labels", [merged_segment])
+
+    filter_expr = "array_has_any(labels, ['distributed'])"
+    without_index = ds.scanner(
+        filter=filter_expr,
+        columns=["id", "labels"],
+        use_scalar_index=False,
+    ).to_table()
+    with_index = ds.scanner(
+        filter=filter_expr,
+        columns=["id", "labels"],
+        use_scalar_index=True,
+    ).to_table()
+
+    assert with_index.equals(without_index)
+    assert (
+        "ScalarIndexQuery"
+        in ds.scanner(filter=filter_expr, use_scalar_index=True).explain_plan()
+    )
+
+
 def test_zonemap_fragment_ids_parameter_validation(tmp_path):
     ds = generate_multi_fragment_dataset(
         tmp_path, num_fragments=2, rows_per_fragment=100
