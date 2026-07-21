@@ -111,7 +111,8 @@ def test_point_lookup_with_memtables(tmp_path):
     plan = planner.plan_lookup(pa.array([2], type=pa.int64()))
     assert plan.schema.names == ["id", "name"]
     assert plan.dataset_schema.names == ["id", "name"]
-    assert "Take" in plan.explain() or "Scan" in plan.explain()
+    explained = plan.explain()
+    assert "Take" in explained or "Scan" in explained or "LanceRead" in explained
     result = plan.to_table()
     assert len(result) == 1, "Expected exactly one row for id=2"
     assert result.column("name")[0].as_py() == "gen1_2", (

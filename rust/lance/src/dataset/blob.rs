@@ -1089,7 +1089,9 @@ impl BlobSource {
     /// Drain currently queued requests and submit them as scheduler batches.
     ///
     /// Each loop iteration grabs the queued requests with a short mutex hold and
-    /// immediately releases the lock before any I/O is awaited.
+    /// dispatches them without waiting for earlier batches to finish. Awaiting a
+    /// batch here would hold later, naturally staggered callers behind its I/O.
+    /// [`FileScheduler`] owns the concurrency and backpressure for dispatched I/O.
     async fn drain_pending_reads(self: Arc<Self>, scheduler: FileScheduler) {
         loop {
             let batch = {
@@ -1100,7 +1102,10 @@ impl BlobSource {
                 }
                 std::mem::take(&mut pending_reads.requests)
             };
-            fulfill_pending_blob_reads(&scheduler, batch).await;
+            let scheduler = scheduler.clone();
+            tokio::spawn(async move {
+                fulfill_pending_blob_reads(&scheduler, batch).await;
+            });
         }
     }
 }
@@ -2871,7 +2876,10 @@ fn data_file_key_from_path(path: &str) -> &str {
 mod tests {
     use std::collections::HashMap;
     use std::ops::Range;
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
     use std::time::Duration;
 
     use arrow::{
@@ -2907,7 +2915,7 @@ mod tests {
         MultipartUpload, ObjectMeta, PutMultipartOptions, PutOptions, PutPayload, PutResult,
         path::Path,
     };
-    use tokio::sync::Notify;
+    use tokio::sync::{Notify, Semaphore};
     use url::Url;
 
     use lance_core::{
@@ -3151,8 +3159,12 @@ mod tests {
     #[derive(Debug)]
     struct RecordingRangeObjectStore {
         data: Bytes,
-        gate: Option<Arc<Notify>>,
+        gate: Option<Arc<Semaphore>>,
         requested_ranges: std::sync::Mutex<Vec<Range<u64>>>,
+        started_blob_requests: AtomicUsize,
+        active_blob_requests: AtomicUsize,
+        peak_active_blob_requests: AtomicUsize,
+        request_started: Notify,
     }
 
     impl RecordingRangeObjectStore {
@@ -3161,15 +3173,37 @@ mod tests {
                 data,
                 gate: None,
                 requested_ranges: std::sync::Mutex::new(Vec::new()),
+                started_blob_requests: AtomicUsize::new(0),
+                active_blob_requests: AtomicUsize::new(0),
+                peak_active_blob_requests: AtomicUsize::new(0),
+                request_started: Notify::new(),
             }
         }
 
-        fn with_gate(data: Bytes, gate: Arc<Notify>) -> Self {
+        fn with_gate(data: Bytes, gate: Arc<Semaphore>) -> Self {
             Self {
                 data,
                 gate: Some(gate),
                 requested_ranges: std::sync::Mutex::new(Vec::new()),
+                started_blob_requests: AtomicUsize::new(0),
+                active_blob_requests: AtomicUsize::new(0),
+                peak_active_blob_requests: AtomicUsize::new(0),
+                request_started: Notify::new(),
             }
+        }
+
+        async fn wait_for_blob_requests(&self, expected: usize) {
+            loop {
+                let request_started = self.request_started.notified();
+                if self.started_blob_requests.load(Ordering::Acquire) >= expected {
+                    return;
+                }
+                request_started.await;
+            }
+        }
+
+        fn peak_active_blob_requests(&self) -> usize {
+            self.peak_active_blob_requests.load(Ordering::Acquire)
         }
 
         fn requested_ranges(&self) -> Vec<Range<u64>> {
@@ -3235,10 +3269,21 @@ mod tests {
                 }
             };
             let is_full_object_probe = range.start == 0 && range.end == self.data.len() as u64;
-            if !is_full_object_probe && let Some(gate) = &self.gate {
-                gate.notified().await;
-            }
             self.requested_ranges.lock().unwrap().push(range.clone());
+            if !is_full_object_probe {
+                let active = self.active_blob_requests.fetch_add(1, Ordering::AcqRel) + 1;
+                self.peak_active_blob_requests
+                    .fetch_max(active, Ordering::AcqRel);
+                self.started_blob_requests.fetch_add(1, Ordering::AcqRel);
+                self.request_started.notify_waiters();
+                if let Some(gate) = &self.gate {
+                    gate.acquire()
+                        .await
+                        .expect("test gate should remain open")
+                        .forget();
+                }
+                self.active_blob_requests.fetch_sub(1, Ordering::AcqRel);
+            }
             let bytes = self.data.slice(range.start as usize..range.end as usize);
             Ok(GetResult {
                 payload: GetResultPayload::Stream(
@@ -3313,12 +3358,12 @@ mod tests {
     ) -> (
         Arc<ObjectStore>,
         Arc<RecordingRangeObjectStore>,
-        Arc<Notify>,
+        Arc<Semaphore>,
     ) {
         const TEST_RANGE_STORE_SIZE: usize = 128 * 1024;
         let mut padded = vec![0; TEST_RANGE_STORE_SIZE.max(data.len())];
         padded[..data.len()].copy_from_slice(data.as_ref());
-        let gate = Arc::new(Notify::new());
+        let gate = Arc::new(Semaphore::new(0));
         let inner = Arc::new(RecordingRangeObjectStore::with_gate(
             Bytes::from(padded),
             gate.clone(),
@@ -4815,6 +4860,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_blob_file_staggered_same_source_ranges_run_concurrently() {
+        let (store, inner, gate) = gated_range_store(
+            Bytes::from_static(b"abcdefgh"),
+            "mock://same-source/blob-range-tests",
+        );
+        let blob = Arc::new(BlobFile::new_dedicated(
+            store,
+            Path::from("blobs/test.bin"),
+            8,
+        ));
+
+        let first_blob = blob.clone();
+        let first = tokio::spawn(async move { first_blob.read_range(0..3).await });
+        inner.wait_for_blob_requests(1).await;
+
+        let second_blob = blob.clone();
+        let second = tokio::spawn(async move { second_blob.read_range(4..7).await });
+        tokio::time::timeout(Duration::from_secs(1), inner.wait_for_blob_requests(2))
+            .await
+            .expect("the second same-source range should start while the first is in flight");
+
+        assert_eq!(inner.peak_active_blob_requests(), 2);
+        gate.add_permits(2);
+        assert_eq!(first.await.unwrap().unwrap().as_ref(), b"abc");
+        assert_eq!(second.await.unwrap().unwrap().as_ref(), b"efg");
+    }
+
+    #[tokio::test]
+    async fn test_blob_file_staggered_multiple_source_ranges_run_concurrently() {
+        let (first_store, first_inner, first_gate) = gated_range_store(
+            Bytes::from_static(b"abcdefgh"),
+            "mock://first-source/blob-range-tests",
+        );
+        let (second_store, second_inner, second_gate) = gated_range_store(
+            Bytes::from_static(b"ijklmnop"),
+            "mock://second-source/blob-range-tests",
+        );
+        let first_blob = Arc::new(BlobFile::new_dedicated(
+            first_store,
+            Path::from("blobs/first.bin"),
+            8,
+        ));
+        let second_blob = Arc::new(BlobFile::new_dedicated(
+            second_store,
+            Path::from("blobs/second.bin"),
+            8,
+        ));
+
+        let first = tokio::spawn(async move { first_blob.read_range(0..3).await });
+        first_inner.wait_for_blob_requests(1).await;
+
+        let second = tokio::spawn(async move { second_blob.read_range(4..7).await });
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            second_inner.wait_for_blob_requests(1),
+        )
+        .await
+        .expect("a read from another source should start while the first is in flight");
+
+        first_gate.add_permits(1);
+        second_gate.add_permits(1);
+        assert_eq!(first.await.unwrap().unwrap().as_ref(), b"abc");
+        assert_eq!(second.await.unwrap().unwrap().as_ref(), b"mno");
+    }
+
+    #[tokio::test]
     async fn test_blob_files_share_source_and_coalesce() {
         let (store, inner) = recording_range_store(Bytes::from_static(b"abcdefghij"));
         let source = Arc::new(BlobSource::new(store, Path::from("blobs/test.bin")));
@@ -4913,7 +5024,7 @@ mod tests {
         assert_eq!(first.row_address, 11);
         assert_eq!(first.data.as_ref(), b"uvw");
 
-        slow_gate.notify_one();
+        slow_gate.add_permits(1);
         let second = tokio::time::timeout(Duration::from_secs(1), stream.next())
             .await
             .unwrap()
