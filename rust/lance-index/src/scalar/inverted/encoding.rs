@@ -128,8 +128,8 @@ pub fn compress_posting_list_with_tail_codec_and_block_size<'a>(
 }
 
 /// Byte length of the block-max-score prefix on posting blocks. 128-doc
-/// blocks store a per-block max score, patched in at build time; 256-doc
-/// (V3) blocks always carry impact skip data, which supersedes it, so they
+/// blocks store a per-block max score, patched in at build time; 256-document
+/// blocks always carry impact skip data, which supersedes it, so they
 /// store none.
 #[inline]
 pub fn posting_block_score_prefix_len(block_size: usize) -> usize {
@@ -167,7 +167,7 @@ fn encode_posting_block_payload(
             compress_sorted_block_with::<BitPacker4x>(doc_ids, &mut buffer, block)?;
             compress_block_with::<BitPacker4x>(frequencies, &mut buffer, block)?;
         }
-        // 256-doc blocks (format V3) store frequencies with patched FOR:
+        // 256-document blocks store frequencies with patched FOR:
         // outliers no longer widen the whole block, which matters because one
         // large tf per block otherwise doubles the frequency payload.
         BitPacker8x::BLOCK_LEN => {

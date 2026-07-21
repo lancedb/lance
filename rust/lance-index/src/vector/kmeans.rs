@@ -1156,7 +1156,16 @@ impl KMeans {
                 target_k
             );
         }
-        debug_assert_eq!(heap.len(), target_k);
+        if heap.len() < target_k {
+            return Err(ArrowError::InvalidArgumentError(format!(
+                "Cannot create {target_k} IVF partitions: k-means could only form {} non-empty \
+                 clusters from {n} training vectors. The dataset is likely too small or has too \
+                 many (near-)duplicate vectors for this many partitions. Reduce num_partitions to \
+                 <= {} or provide more diverse data.",
+                heap.len(),
+                heap.len()
+            )));
+        }
 
         // Construct final KMeans model with all centroids
         let mut all_clusters: Vec<Cluster<T::Native>> = heap.into_vec();
@@ -1720,6 +1729,47 @@ mod tests {
         for val in centroids {
             assert!(!val.is_nan(), "Centroid should not contain NaN values");
         }
+    }
+
+    #[tokio::test]
+    async fn test_hierarchical_kmeans_too_few_distinct_vectors_errors() {
+        // Regression test for https://github.com/lance-format/lance/issues/7867
+        //
+        // With a small number of distinct vectors repeated many times (heavy
+        // near-duplication) and dot distance, hierarchical k-means cannot form
+        // `target_k` non-empty clusters no matter how it splits: every split of a
+        // cluster of identical vectors is either ineffective (`all_same`) or
+        // immediately hits the "<= 1 point" floor. This used to trip
+        // `debug_assert_eq!(heap.len(), target_k)` (panic in debug builds) or
+        // silently return a half-empty centroid set (release builds). It should
+        // now return a clear error instead.
+        const DIM: usize = 8;
+        const NUM_DISTINCT: usize = 5;
+        const REPEATS: usize = 200;
+        const TARGET_K: usize = 300; // > 256 to trigger hierarchical clustering
+
+        let base_vectors = generate_random_array(NUM_DISTINCT * DIM);
+        let mut values = Vec::with_capacity(NUM_DISTINCT * REPEATS * DIM);
+        for _ in 0..REPEATS {
+            values.extend_from_slice(base_vectors.values());
+        }
+        let values = Float32Array::from(values);
+        let fsl = FixedSizeListArray::try_new_from_values(values, DIM as i32).unwrap();
+
+        let params = KMeansParams {
+            max_iters: 10,
+            hierarchical_k: 16,
+            distance_type: DistanceType::Dot,
+            ..Default::default()
+        };
+
+        let err = KMeans::new_with_params(&fsl, TARGET_K, &params)
+            .expect_err("training should fail rather than panic or silently under-produce");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Cannot create") && msg.contains(&TARGET_K.to_string()),
+            "unexpected error message: {msg}"
+        );
     }
 
     #[tokio::test]
