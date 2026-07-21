@@ -7,6 +7,9 @@ if [[ $# -ne 3 ]]; then
   exit 2
 fi
 
+REPO_ROOT=$(git -C "$(dirname "$0")/.." rev-parse --show-toplevel)
+cd "$REPO_ROOT"
+
 export LANCE_FTS_BENCH_COLD_TRIALS=0
 export LANCE_FTS_BENCH_WARM_RUNS=2
 export LANCE_FTS_BENCH_WARMUP_ROUNDS=0
