@@ -24,7 +24,8 @@ public class MemTableStats {
   private final long estimatedSizeBytes;
   private final long generation;
   private final Optional<Long> maxBufferedBatchPosition;
-  private final Optional<Long> maxFlushedBatchPosition;
+  private final long durableBatchCount;
+  private final long globalOffset;
   private final Optional<Long> pendingWalStartBatchPosition;
   private final Optional<Long> pendingWalEndBatchPosition;
   private final long pendingWalBatchCount;
@@ -37,7 +38,8 @@ public class MemTableStats {
       long estimatedSizeBytes,
       long generation,
       Long maxBufferedBatchPosition,
-      Long maxFlushedBatchPosition,
+      long durableBatchCount,
+      long globalOffset,
       Long pendingWalStartBatchPosition,
       Long pendingWalEndBatchPosition,
       long pendingWalBatchCount,
@@ -48,7 +50,8 @@ public class MemTableStats {
     this.estimatedSizeBytes = estimatedSizeBytes;
     this.generation = generation;
     this.maxBufferedBatchPosition = Optional.ofNullable(maxBufferedBatchPosition);
-    this.maxFlushedBatchPosition = Optional.ofNullable(maxFlushedBatchPosition);
+    this.durableBatchCount = durableBatchCount;
+    this.globalOffset = globalOffset;
     this.pendingWalStartBatchPosition = Optional.ofNullable(pendingWalStartBatchPosition);
     this.pendingWalEndBatchPosition = Optional.ofNullable(pendingWalEndBatchPosition);
     this.pendingWalBatchCount = pendingWalBatchCount;
@@ -81,9 +84,17 @@ public class MemTableStats {
     return maxBufferedBatchPosition;
   }
 
-  /** Highest WAL batch position flushed from the MemTable, if any. */
-  public Optional<Long> maxFlushedBatchPosition() {
-    return maxFlushedBatchPosition;
+  /**
+   * Writer-global count of WAL-durable batches (exclusive; 0 means none). Compare against {@code
+   * globalOffset() + batchCount()} to see what this MemTable still owes the WAL.
+   */
+  public long durableBatchCount() {
+    return durableBatchCount;
+  }
+
+  /** Writer-global coordinate of this MemTable's batch 0. */
+  public long globalOffset() {
+    return globalOffset;
   }
 
   /** First WAL batch position pending flush, if any. */
@@ -119,7 +130,8 @@ public class MemTableStats {
         .add("estimatedSizeBytes", estimatedSizeBytes)
         .add("generation", generation)
         .add("maxBufferedBatchPosition", maxBufferedBatchPosition.orElse(null))
-        .add("maxFlushedBatchPosition", maxFlushedBatchPosition.orElse(null))
+        .add("durableBatchCount", durableBatchCount)
+        .add("globalOffset", globalOffset)
         .add("pendingWalStartBatchPosition", pendingWalStartBatchPosition.orElse(null))
         .add("pendingWalEndBatchPosition", pendingWalEndBatchPosition.orElse(null))
         .add("pendingWalBatchCount", pendingWalBatchCount)

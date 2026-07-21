@@ -439,7 +439,7 @@ pub async fn apply_index_range(
 pub struct TriggerWalFlush {
     pub source: WalFlushSource,
     /// End batch position (exclusive). For `BatchStore`, flush batches after
-    /// `max_flushed_batch_position` up to this. For `WalOnly`, indicates the
+    /// the writer-global durable cursor up to this. For `WalOnly`, indicates the
     /// position the durability watermark must reach for callers waiting on
     /// this flush. Use `usize::MAX` to flush all pending batches.
     pub end_batch_position: usize,

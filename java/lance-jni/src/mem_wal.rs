@@ -1368,19 +1368,19 @@ fn write_stats_to_java<'a>(
 
 fn memtable_stats_to_java<'a>(env: &mut JNIEnv<'a>, stats: &MemTableStats) -> Result<JObject<'a>> {
     let max_buffered = box_u64_opt(env, stats.max_buffered_batch_position)?;
-    let max_flushed = box_u64_opt(env, stats.max_flushed_batch_position)?;
     let pending_start = box_u64_opt(env, stats.pending_wal_start_batch_position)?;
     let pending_end = box_u64_opt(env, stats.pending_wal_end_batch_position)?;
     Ok(env.new_object(
         "org/lance/memwal/MemTableStats",
-        "(JJJJLjava/lang/Long;Ljava/lang/Long;Ljava/lang/Long;Ljava/lang/Long;JJJ)V",
+        "(JJJJLjava/lang/Long;JJLjava/lang/Long;Ljava/lang/Long;JJJ)V",
         &[
             JValueGen::Long(stats.row_count as i64),
             JValueGen::Long(stats.batch_count as i64),
             JValueGen::Long(stats.estimated_size as i64),
             JValueGen::Long(stats.generation as i64),
             JValueGen::Object(&max_buffered),
-            JValueGen::Object(&max_flushed),
+            JValueGen::Long(stats.durable_batch_count as i64),
+            JValueGen::Long(stats.global_offset as i64),
             JValueGen::Object(&pending_start),
             JValueGen::Object(&pending_end),
             JValueGen::Long(stats.pending_wal_batch_count as i64),
