@@ -32,6 +32,7 @@ use itertools::Itertools;
 use lance_arrow::FieldExt;
 use lance_arrow::{deepcopy::deep_copy_nulls, r#struct::StructArrayExt};
 use lance_core::{Error, Result};
+use rayon::prelude::*;
 use log::trace;
 
 #[derive(Debug)]
@@ -354,43 +355,50 @@ struct RepDefStructDecodeTask {
 
 impl StructuralDecodeArrayTask for RepDefStructDecodeTask {
     fn decode(self: Box<Self>) -> Result<DecodedArray> {
-        if self.children.is_empty() {
+        let Self {
+            children,
+            child_fields,
+            is_root,
+            num_rows,
+        } = *self;
+
+        if children.is_empty() {
             return Ok(DecodedArray {
-                array: Arc::new(StructArray::new_empty_fields(self.num_rows as usize, None)),
+                array: Arc::new(StructArray::new_empty_fields(num_rows as usize, None)),
                 repdef: CompositeRepDefUnraveler::new(vec![]),
                 data_size: 0,
             });
         }
 
-        let arrays = self
-            .children
-            .into_iter()
+        let arrays: Vec<_> = children
+            .into_par_iter()
             .map(|task| task.decode())
-            .collect::<Result<Vec<_>>>()?;
-        let mut children = Vec::with_capacity(arrays.len());
-        let mut data_size = 0u64;
-        let mut arrays_iter = arrays.into_iter();
-        let first_array = arrays_iter.next().unwrap();
-        let length = first_array.array.len();
+            .collect::<Result<_>>()?;
+
+        let mut iter = arrays.into_iter();
+        let first = iter.next().unwrap();
+        let length = first.array.len();
+        let mut repdef = first.repdef;
+        let mut data_size = first.data_size;
 
         // The repdef should be identical across all children at this point
-        let mut repdef = first_array.repdef;
-        data_size += first_array.data_size;
-        children.push(first_array.array);
+        let child_arrays: Vec<_> = std::iter::once(first.array)
+            .chain(
+                iter.inspect(|a| {
+                    debug_assert_eq!(a.array.len(), length);
+                    data_size += a.data_size;
+                })
+                .map(|a| a.array),
+            )
+            .collect();
 
-        for array in arrays_iter {
-            debug_assert_eq!(length, array.array.len());
-            data_size += array.data_size;
-            children.push(array.array);
-        }
-
-        let validity = if self.is_root {
+        let validity = if is_root {
             None
         } else {
             repdef.unravel_validity(length)
         };
 
-        let array = StructArray::try_new(self.child_fields, children, validity)
+        let array = StructArray::try_new(child_fields, child_arrays, validity)
             .map_err(|e| Error::invalid_input_source(e.to_string().into()))?;
         Ok(DecodedArray {
             array: Arc::new(array),
@@ -841,6 +849,23 @@ mod tests {
             HashMap::new(),
         )
         .await;
+    }
+
+    /// Test that parallel decode produces the same results as sequential
+    /// decode would produce.
+    #[test_log::test(tokio::test)]
+    async fn test_wide_struct_parallel_decode() {
+        // Wide struct with 6 primitive columns to trigger parallel path
+        let data_type = DataType::Struct(Fields::from(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Int64, true),
+            Field::new("c", DataType::Float32, true),
+            Field::new("d", DataType::Float64, true),
+            Field::new("e", DataType::Utf8, true),
+            Field::new("f", DataType::Int16, true),
+        ]));
+        let field = Field::new("row", data_type, false);
+        check_basic_random(field).await;
     }
 
     #[test_log::test(tokio::test)]

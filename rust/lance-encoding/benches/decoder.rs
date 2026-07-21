@@ -3,7 +3,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use arrow_array::{RecordBatch, UInt32Array};
-use arrow_schema::{DataType, Field, Schema, TimeUnit};
+use arrow_schema::{DataType, Field, Fields, Schema, TimeUnit};
 use arrow_select::take::take;
 use criterion::{Criterion, criterion_group, criterion_main};
 use futures::StreamExt;
@@ -434,6 +434,67 @@ fn bench_decode_compressed(c: &mut Criterion) {
     }
 }
 
+/// Benchmark wide struct decode to measure parallel column decoding.
+///
+/// Encodes a struct with 8 columns (triggering the parallel decode path via
+/// `std::thread::scope`) and measures decode throughput in bytes/sec.
+fn bench_decode_wide_struct(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let mut group = c.benchmark_group("decode_wide_struct");
+
+    const NUM_ROWS: u64 = 1_000_000;
+
+    // 8 columns of diverse types to trigger parallel decode (threshold is 4)
+    let fields: Fields = vec![
+        Arc::new(Field::new("col_0", DataType::Int32, false)),
+        Arc::new(Field::new("col_1", DataType::Int64, false)),
+        Arc::new(Field::new("col_2", DataType::Float32, false)),
+        Arc::new(Field::new("col_3", DataType::Float64, false)),
+        Arc::new(Field::new("col_4", DataType::Int16, false)),
+        Arc::new(Field::new("col_5", DataType::Int32, false)),
+        Arc::new(Field::new("col_6", DataType::Int64, false)),
+        Arc::new(Field::new("col_7", DataType::Float32, false)),
+    ]
+    .into();
+
+    // Total bytes per row: 4+8+4+8+2+4+8+4 = 42 bytes
+    let size_bytes: u64 = 42 * NUM_ROWS;
+    group.throughput(criterion::Throughput::Bytes(size_bytes));
+
+    let data = lance_datagen::gen_batch()
+        .anon_col(lance_datagen::array::rand_type(&DataType::Struct(fields)))
+        .into_batch_rows(lance_datagen::RowCount::from(NUM_ROWS))
+        .unwrap();
+
+    let lance_schema =
+        Arc::new(lance_core::datatypes::Schema::try_from(data.schema().as_ref()).unwrap());
+    let encoding_strategy = default_encoding_strategy(LanceFileVersion::V2_2);
+    let encoded = rt
+        .block_on(encode_batch(
+            &data,
+            lance_schema,
+            encoding_strategy.as_ref(),
+            &EncodingOptions::default(),
+        ))
+        .unwrap();
+
+    group.bench_function("wide_struct_8col", |b| {
+        b.iter(|| {
+            let batch = rt
+                .block_on(lance_encoding::decoder::decode_batch(
+                    &encoded,
+                    &FilterExpression::no_filter(),
+                    Arc::<DecoderPlugins>::default(),
+                    false,
+                    LanceFileVersion::V2_2,
+                    Some(Arc::new(LanceCache::no_cache())),
+                ))
+                .unwrap();
+            assert_eq!(batch.num_rows(), NUM_ROWS as usize);
+        })
+    });
+}
+
 /// Benchmark parallel decoding with multiple concurrent batch decode tasks.
 /// This creates contention on the shared decompressor mutex when multiple
 /// batches from the same page are decoded in parallel.
@@ -570,7 +631,7 @@ criterion_group!(
         .with_profiler(lance_testing::pprof::PProfProfiler::new(100, lance_testing::pprof::Output::Flamegraph(None)));
     targets = bench_decode, bench_decode_fsl, bench_decode_str_with_dict_encoding, bench_decode_packed_struct,
                 bench_decode_str_with_fixed_size_binary_encoding, bench_decode_compressed,
-                bench_decode_compressed_parallel);
+                bench_decode_compressed_parallel, bench_decode_wide_struct);
 
 // Non-linux version does not support pprof.
 #[cfg(not(target_os = "linux"))]
@@ -578,5 +639,5 @@ criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10);
     targets = bench_decode, bench_decode_fsl, bench_decode_str_with_dict_encoding, bench_decode_packed_struct,
-                bench_decode_compressed, bench_decode_compressed_parallel);
+                bench_decode_compressed, bench_decode_compressed_parallel, bench_decode_wide_struct);
 criterion_main!(benches);
