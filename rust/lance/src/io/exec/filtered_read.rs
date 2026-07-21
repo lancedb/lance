@@ -105,16 +105,11 @@ impl EvaluatedIndex {
     /// emits them. Their fragments stay in the covered set, so non-stale rows keep the index;
     /// the blocked rows are re-evaluated against their current (overlay-merged) values on a
     /// separate targeted take path built by the scanner.
-    fn without_rows(mut self, block: &RowAddrMask) -> Self {
-        // `overlay_block` is always constructed as a block list (see `Scanner::stale_rows_block_mask`).
-        let block_list = block.block_list();
-        debug_assert!(block_list.is_some(), "overlay_block must be a block list");
-        if let Some(block_list) = block_list {
-            self.index_result.upper =
-                std::mem::take(&mut self.index_result.upper).also_block(block_list.clone());
-            self.index_result.lower =
-                std::mem::take(&mut self.index_result.lower).also_block(block_list.clone());
-        }
+    fn without_rows(mut self, block_list: &RowAddrTreeMap) -> Self {
+        self.index_result.upper =
+            std::mem::take(&mut self.index_result.upper).also_block(block_list.clone());
+        self.index_result.lower =
+            std::mem::take(&mut self.index_result.lower).also_block(block_list.clone());
         self
     }
 }
@@ -2149,8 +2144,12 @@ impl FilteredReadExec {
                         Error::internal("Index search did not yield any results".to_string())
                     })??;
                     let mut idx = EvaluatedIndex::try_from_arrow(&index_search_result)?;
-                    if let Some(overlay_block) = options.overlay_block.as_ref() {
-                        idx = idx.without_rows(overlay_block);
+                    // `overlay_block` is always constructed as a block list (see
+                    // `Scanner::stale_rows_block_mask`), so `block_list()` is always `Some`.
+                    if let Some(block_list) =
+                        options.overlay_block.as_ref().and_then(|b| b.block_list())
+                    {
+                        idx = idx.without_rows(block_list);
                     }
                     evaluated_index = Some(Arc::new(idx));
                 }

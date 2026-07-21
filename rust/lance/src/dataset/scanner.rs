@@ -87,6 +87,7 @@ use crate::dataset::overlay::{
     collect_overlay_stale_frags, collect_overlay_stale_rows_for_segment, overlaid_fragments,
 };
 use crate::dataset::row_offsets_to_row_addresses;
+use crate::dataset::rowids::translate_addr_treemap_to_row_ids;
 use crate::dataset::utils::SchemaAdapter;
 use crate::index::DatasetIndexInternalExt;
 use crate::index::scalar::inverted::{load_segment_details, load_segments};
@@ -101,9 +102,7 @@ use crate::io::exec::fts::{
     BoostQueryExec, FlatMatchFilterExec, FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec,
 };
 use crate::io::exec::knn::MultivectorScoringExec;
-use crate::io::exec::scalar_index::{
-    MaterializeIndexExec, ScalarIndexExec, translate_addr_treemap_to_row_ids,
-};
+use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
 use crate::io::exec::{
     AddRowAddrExec, FilterPlan as ExprFilterPlan, KNNVectorDistanceExec, LancePushdownScanExec,
     LanceScanExec, Planner, PreFilterSource, ScanConfig, TakeExec,
@@ -5394,9 +5393,11 @@ impl Scanner {
 
     #[instrument(level = "info", skip(self))]
     pub async fn explain_plan(&self, verbose: bool) -> Result<String> {
-        // Box the plan-building future: overlay-aware index masking deepens its
-        // async layout past rustc's default recursion limit when awaited inline
-        // here, matching the boxing `try_into_stream` and `count_rows` already use.
+        // Box the plan-building future at the call site: `create_plan`'s inlined async
+        // layout otherwise exceeds rustc's depth limit here. It has to be boxed at the
+        // call site rather than inside `create_plan` — boxing internally turns the
+        // future's `Send` check into a `Box<Future>: Send` trait obligation that
+        // overflows the solver through the cache types (E0275 in downstream crates).
         let plan = Box::pin(self.create_plan()).await?;
         let display = DisplayableExecutionPlan::new(plan.as_ref());
 

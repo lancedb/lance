@@ -654,9 +654,10 @@ impl LsmPointLookupPlanner {
                     scanner.with_row_address();
                 }
                 scanner.filter_expr(filter.clone());
-                // Box the plan-building future: overlay-aware index masking deepens
-                // create_plan's async layout past rustc's default recursion limit
-                // when this scan builder is awaited inline up the point-lookup chain.
+                // Box at the call site: `create_plan`'s inlined async layout exceeds
+                // rustc's depth limit up this point-lookup chain, and boxing inside
+                // `create_plan` instead triggers a `Box<Future>: Send` solver overflow
+                // (E0275 downstream). Same for the other arms below.
                 Box::pin(scanner.create_plan()).await?
             }
             LsmDataSource::FlushedMemTable { path, .. } => {

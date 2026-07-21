@@ -6,6 +6,7 @@ use crate::session::caches::{RowIdIndexKey, RowIdSequenceKey};
 use crate::{Error, Result};
 use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::utils::deletion::DeletionVector;
+use lance_select::{RowAddrSelection, RowAddrTreeMap};
 use lance_table::{
     format::{Fragment, RowIdMeta},
     rowids::{FragmentRowIdIndex, RowIdIndex, RowIdSequence, read_row_ids},
@@ -85,6 +86,68 @@ pub async fn get_row_id_index(
     } else {
         Ok(None)
     }
+}
+
+/// Map a set of physical row addresses to their stable row ids
+///
+/// For each fragment present in `addrs`, the live rows in physical order carry
+/// the stable ids yielded by the fragment's [`RowIdSequence`] in the same
+/// order. Zipping the two (skipping deleted physical offsets) gives the
+/// `physical offset -> stable id` mapping. Addresses that point at deleted rows
+/// have no live counterpart and are dropped, which is correct: those rows are
+/// not part of the answer.
+pub(crate) async fn translate_addr_treemap_to_row_ids(
+    dataset: &Dataset,
+    addrs: &RowAddrTreeMap,
+) -> Result<RowAddrTreeMap> {
+    let mut row_ids = RowAddrTreeMap::new();
+    for (fragment_id, selection) in addrs.iter() {
+        let file_fragment = dataset.get_fragment(*fragment_id as usize).ok_or_else(|| {
+            Error::internal(format!(
+                "fragment {fragment_id} referenced by an address-domain index result \
+                 was not found in the dataset"
+            ))
+        })?;
+        let sequence = load_row_id_sequence(dataset, file_fragment.metadata()).await?;
+
+        match selection {
+            RowAddrSelection::Full => {
+                // The whole fragment is selected: every live row's id qualifies.
+                row_ids |= RowAddrTreeMap::from(sequence.as_ref());
+            }
+            RowAddrSelection::Partial(offsets) => {
+                let Some(max_offset) = offsets.max() else {
+                    continue;
+                };
+                let (deletion_vector, num_physical_rows) = futures::try_join!(
+                    file_fragment.get_deletion_vector(),
+                    file_fragment.physical_rows()
+                )?;
+                let num_physical_rows = num_physical_rows as u32;
+                let mut ids = sequence.iter();
+                for physical_offset in 0..num_physical_rows {
+                    if physical_offset > max_offset {
+                        break;
+                    }
+                    let deleted = deletion_vector
+                        .as_ref()
+                        .is_some_and(|dv| dv.contains(physical_offset));
+                    if deleted {
+                        continue;
+                    }
+                    match ids.next() {
+                        Some(id) => {
+                            if offsets.contains(physical_offset) {
+                                row_ids.insert(id);
+                            }
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+    }
+    Ok(row_ids)
 }
 
 /// Resolve row addresses to row ids, positionally: `addr = (fragment << 32) | offset`

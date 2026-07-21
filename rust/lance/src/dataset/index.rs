@@ -73,8 +73,11 @@ impl IndexRemapper for DatasetIndexRemapper {
                         .any(|frag_idx| affected_frag_ids.contains(&(frag_idx as u64))),
                 };
             if needs_remapped {
-                // Box this deep future: overlay-aware index masking pushes its layout past
-                // rustc's default recursion limit when inlined into this state machine.
+                // Box the remap future at the call site: inlining `remap_index` into this
+                // loop's async layout otherwise exceeds rustc's depth limit. It has to be
+                // boxed here, not inside `remap_index` — boxing internally turns the
+                // future's `Send` check into a `Box<Future>: Send` trait obligation that
+                // overflows the solver through the cache types (E0275 downstream).
                 let remap_result = Box::pin(self.remap_index(index, &mapping)).await?;
                 match remap_result {
                     RemapResult::Drop => continue,
