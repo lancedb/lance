@@ -153,7 +153,7 @@ impl SlotBackoff {
             .saturating_pow(self.attempt.saturating_add(self.starting_i))
             .min(MAX_SLOTS);
         let slot_i = self.rng.random_range(0..num_slots);
-        self.attempt += 1;
+        self.attempt = self.attempt.saturating_add(1);
         // Widen before multiplying: `unit` is the first-attempt latency, which
         // can be large enough that a `u32` slot * unit product would overflow.
         Duration::from_millis(slot_i as u64 * self.unit as u64)
