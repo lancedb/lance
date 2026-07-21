@@ -1807,7 +1807,15 @@ impl InvertedPartition {
             match base_prefix_len + params.prefix_length {
                 0 => take_fst_keys(map.search(lev), &mut expanded, limit),
                 prefix_length => {
-                    let prefix = &token[..min(prefix_length as usize, token.len())];
+                    // `prefix_length` counts characters, so advance that many chars and
+                    // cut on the resulting boundary. Slicing by raw byte offset panics
+                    // when the cut lands inside a multibyte UTF-8 character; a prefix
+                    // longer than the token clamps to the whole token.
+                    let prefix_end = token
+                        .char_indices()
+                        .nth(prefix_length as usize)
+                        .map_or(token.len(), |(byte_idx, _)| byte_idx);
+                    let prefix = &token[..prefix_end];
                     let prefix = fst::automaton::Str::new(prefix).starts_with();
                     take_fst_keys(map.search(lev.intersection(prefix)), &mut expanded, limit)
                 }
@@ -10793,6 +10801,58 @@ mod tests {
             grouped_row_ids,
             vec![100, 101],
             "each original fuzzy position should match any one of its expansions"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fuzzy_prefix_length_handles_multibyte_query_token() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
+        builder.tokens.add("über".to_owned());
+        builder.posting_lists.push(PostingListBuilder::new(false));
+        builder.posting_lists[0].add(0, PositionRecorder::Count(1));
+        builder.docs.append(100, 1);
+        builder.write(store.as_ref()).await.unwrap();
+
+        write_test_metadata(&store, vec![0], InvertedIndexParams::default()).await;
+        let cache = Arc::new(LanceCache::with_capacity(4096));
+        let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
+            .await
+            .unwrap();
+
+        // `prefix_length` counts characters, but the query token was sliced by raw
+        // byte offset. "über" starts with a two-byte 'ü', so a prefix_length of 1
+        // cuts inside that character and used to panic ("byte index 1 is not a char
+        // boundary") before any candidate was matched. A prefix cut on a multibyte
+        // boundary must still resolve to a valid substring.
+        let params = Arc::new(
+            FtsSearchParams::new()
+                .with_limit(Some(10))
+                .with_fuzziness(Some(1))
+                .with_prefix_length(1),
+        );
+        let tokens = Arc::new(Tokens::new(vec!["über".to_owned()], DocType::Text));
+        let (row_ids, _) = index
+            .bm25_search(
+                tokens,
+                params,
+                Operator::Or,
+                Arc::new(NoFilter),
+                Arc::new(NoOpMetricsCollector),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            row_ids,
+            vec![100],
+            "a fuzzy prefix query whose token begins with a multibyte character should match"
         );
     }
 
