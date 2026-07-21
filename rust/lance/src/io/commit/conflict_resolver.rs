@@ -2116,7 +2116,7 @@ mod tests {
     use arrow_array::{Int32Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use lance_core::Error;
-    use lance_file::version::LanceFileVersion;
+    use lance_file::version::{LanceFileFormat, LanceFileVersion};
     use lance_io::assert_io_eq;
     use uuid::Uuid;
 
@@ -2336,7 +2336,7 @@ mod tests {
                 "path1",
                 vec![0],
                 vec![0],
-                &LanceFileVersion::Stable,
+                LanceFileFormat::from(LanceFileVersion::Stable),
                 NonZero::new(10),
             )
             .with_physical_rows(3);
@@ -2479,7 +2479,7 @@ mod tests {
                 "path1",
                 vec![0],
                 vec![0],
-                &LanceFileVersion::Stable,
+                LanceFileFormat::from(LanceFileVersion::Stable),
                 NonZero::new(10),
             )
             .with_physical_rows(3);
@@ -3484,7 +3484,7 @@ mod tests {
                 "moved.lance",
                 vec![0],
                 vec![0],
-                &LanceFileVersion::Stable,
+                LanceFileFormat::from(LanceFileVersion::Stable),
                 NonZero::new(10),
             )
             .with_physical_rows(1);

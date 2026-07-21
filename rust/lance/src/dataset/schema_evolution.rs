@@ -967,7 +967,7 @@ mod test {
     use super::*;
     use arrow_schema::Fields as ArrowFields;
     use lance_core::utils::tempfile::TempStrDir;
-    use lance_file::version::LanceFileVersion;
+    use lance_file::version::{LanceFileFormat, LanceFileVersion};
     use lance_table::format::{BasePath, DataFile};
     use rstest::rstest;
 
@@ -1295,8 +1295,7 @@ mod test {
             "checkpointed.lance",
             vec![dataset.manifest.max_field_id() + 1],
             vec![0],
-            2,
-            2,
+            LanceFileFormat::V2_2,
             NonZero::new(17),
             None,
         ));

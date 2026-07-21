@@ -47,6 +47,7 @@ use crate::{
     datatypes::{Fields, FieldsWithMeta},
     format::{MAGIC, MAJOR_VERSION, MINOR_VERSION, pb, pbfile},
     io::LanceEncodingsIo,
+    version::LanceFileFormat,
     writer::PAGE_BUFFER_ALIGNMENT,
 };
 
@@ -1008,10 +1009,9 @@ impl FileReader {
         let tail_offset = file_len - tail_bytes.len() as u64;
         let footer = Self::decode_footer(&tail_bytes)?;
 
-        let file_version = LanceFileVersion::try_from_major_minor(
-            footer.major_version as u32,
-            footer.minor_version as u32,
-        )?;
+        let file_version: LanceFileVersion =
+            LanceFileFormat::from_footer_numbers(footer.major_version, footer.minor_version)?
+                .into();
 
         let gbo_table =
             Self::decode_gbo_table(&tail_bytes, file_len, scheduler, &footer, file_version).await?;
@@ -1080,10 +1080,9 @@ impl FileReader {
         let tail_offset = file_len - tail_bytes.len() as u64;
         let footer = Self::decode_footer(&tail_bytes)?;
 
-        let file_version = LanceFileVersion::try_from_major_minor(
-            footer.major_version as u32,
-            footer.minor_version as u32,
-        )?;
+        let file_version: LanceFileVersion =
+            LanceFileFormat::from_footer_numbers(footer.major_version, footer.minor_version)?
+                .into();
 
         let gbo_table =
             Self::decode_gbo_table(&tail_bytes, file_len, scheduler, &footer, file_version).await?;
@@ -2537,10 +2536,9 @@ impl EncodedBatchReaderExt for EncodedBatch {
         let column_metadatas =
             FileReader::read_all_column_metadata(column_metadata_bytes, &footer)?;
 
-        let file_version = LanceFileVersion::try_from_major_minor(
-            footer.major_version as u32,
-            footer.minor_version as u32,
-        )?;
+        let file_version: LanceFileVersion =
+            LanceFileFormat::from_footer_numbers(footer.major_version, footer.minor_version)?
+                .into();
 
         let page_table = FileReader::meta_to_col_infos(&column_metadatas, file_version);
 
@@ -2561,10 +2559,9 @@ impl EncodedBatchReaderExt for EncodedBatch {
         Self: Sized,
     {
         let footer = FileReader::decode_footer(&bytes)?;
-        let file_version = LanceFileVersion::try_from_major_minor(
-            footer.major_version as u32,
-            footer.minor_version as u32,
-        )?;
+        let file_version: LanceFileVersion =
+            LanceFileFormat::from_footer_numbers(footer.major_version, footer.minor_version)?
+                .into();
 
         let gbo_table = FileReader::do_decode_gbo_table(
             &bytes.slice(footer.global_buff_offsets_start as usize..),
@@ -2643,6 +2640,14 @@ mod tests {
     use crate::testing::{FsFixture, WrittenFile, test_cache, write_lance_file};
     use crate::writer::{EncodedBatchWriteExt, FileWriter, FileWriterOptions};
     use lance_encoding::decoder::DecoderConfig;
+
+    fn footer_version(bytes: &[u8]) -> (u16, u16) {
+        let version_start = bytes.len() - 8;
+        (
+            u16::from_le_bytes([bytes[version_start], bytes[version_start + 1]]),
+            u16::from_le_bytes([bytes[version_start + 2], bytes[version_start + 3]]),
+        )
+    }
 
     async fn create_some_file(fs: &FsFixture, version: LanceFileVersion) -> WrittenFile {
         let location_type = DataType::Struct(Fields::from(vec![
@@ -2814,6 +2819,23 @@ mod tests {
 
         let WrittenFile { data, .. } = create_some_file(&fs, LanceFileVersion::V2_0).await;
 
+        let file_size = fs.object_store.size(&fs.tmp_path).await.unwrap() as usize;
+        let footer = fs
+            .object_store
+            .open(&fs.tmp_path)
+            .await
+            .unwrap()
+            .get_range(file_size - 8..file_size)
+            .await
+            .unwrap();
+        assert_eq!(footer_version(&footer), (0, 3));
+        assert_eq!(
+            crate::determine_file_version(&fs.object_store, &fs.tmp_path, Some(file_size))
+                .await
+                .unwrap(),
+            LanceFileVersion::V2_0
+        );
+
         for read_size in [32, 1024, 1024 * 1024] {
             let file_scheduler = fs
                 .scheduler
@@ -2882,6 +2904,7 @@ mod tests {
 
         // Test self described
         let bytes = encoded_batch.try_to_self_described_lance(version).unwrap();
+        assert_eq!(footer_version(&bytes), (2, 0));
 
         let decoded_batch = EncodedBatch::try_from_self_described_lance(bytes).unwrap();
 
@@ -2900,6 +2923,7 @@ mod tests {
 
         // Test mini
         let bytes = encoded_batch.try_to_mini_lance(version).unwrap();
+        assert_eq!(footer_version(&bytes), (2, 0));
         let decoded_batch =
             EncodedBatch::try_from_mini_lance(bytes, lance_schema.as_ref(), LanceFileVersion::V2_0)
                 .unwrap();

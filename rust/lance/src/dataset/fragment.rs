@@ -41,7 +41,7 @@ use lance_file::previous::reader::{
 use lance_file::reader::{
     CachedFileMetadata, FileMetadataIndex, FileReaderOptions, ProjectedFileReader, ReaderProjection,
 };
-use lance_file::version::LanceFileVersion;
+use lance_file::version::{LanceFileFormat, LanceFileVersion};
 use lance_file::{LanceEncodingsIo, determine_file_version};
 use lance_io::ReadBatchParams;
 use lance_io::scheduler::{FileScheduler, ScanScheduler, SchedulerConfig};
@@ -838,7 +838,7 @@ impl FileFragment {
                 filename,
                 dataset.schema().field_ids(),
                 column_indices,
-                &file_version,
+                LanceFileFormat::from(file_version),
                 None,
             );
             Ok(frag)
@@ -1126,10 +1126,7 @@ impl FileFragment {
                             }
                         }),
                 ));
-                let file_version = LanceFileVersion::try_from_major_minor(
-                    data_file.file_major_version,
-                    data_file.file_minor_version,
-                )?;
+                let file_version: LanceFileVersion = data_file.file_version()?.into();
                 let reader_projection = ReaderProjection::from_field_ids(
                     file_version,
                     schema_per_file.as_ref(),
@@ -3134,7 +3131,7 @@ mod tests {
     use lance_core::ROW_ID;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::{RowCount, array, gen_batch};
-    use lance_file::version::LanceFileVersion;
+    use lance_file::version::{LanceFileFormat, LanceFileVersion};
     use lance_file::writer::FileWriterOptions;
     use lance_io::{assert_io_eq, assert_io_lt, object_store::ObjectStore};
     use pretty_assertions::assert_eq;
@@ -3228,7 +3225,7 @@ mod tests {
         };
         use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
         use lance_core::datatypes::Schema;
-        use lance_file::version::LanceFileVersion;
+        use lance_file::version::{LanceFileFormat, LanceFileVersion};
         use lance_file::writer::{FileWriter, FileWriterOptions};
         use lance_io::utils::CachedFileSize;
         use lance_table::format::DataFile;
@@ -3307,13 +3304,13 @@ mod tests {
                 },
             )
             .unwrap();
-            let (major, minor) = writer.version().to_numbers();
+            let file_version = LanceFileFormat::from(writer.version());
             for (column_index, array) in columns.into_iter().enumerate() {
                 writer.write_column(column_index, array).await.unwrap();
             }
             let summary = writer.finish().await.unwrap();
 
-            let mut data_file = DataFile::new_unstarted(filename, major, minor);
+            let mut data_file = DataFile::new_unstarted(filename, file_version);
             data_file.fields = writer
                 .field_id_to_column_indices()
                 .iter()
@@ -5924,7 +5921,7 @@ mod tests {
             Fragment::try_infer_version(std::slice::from_ref(&frag))
                 .unwrap()
                 .unwrap(),
-            LanceFileVersion::Stable.resolve()
+            LanceFileFormat::from(LanceFileVersion::Stable)
         );
 
         let op = Operation::Append {

@@ -518,7 +518,7 @@ async fn can_use_binary_copy_impl(
     fragments: &[Fragment],
 ) -> Result<bool> {
     use lance_file::reader::FileReader as LFReader;
-    use lance_file::version::LanceFileVersion;
+    use lance_file::version::{LanceFileFormat, LanceFileVersion};
     use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 
     if matches!(options.compaction_mode(), CompactionMode::Reencode) {
@@ -578,12 +578,9 @@ async fn can_use_binary_copy_impl(
         }
 
         for data_file in &fragment.files {
-            let version_ok = LanceFileVersion::try_from_major_minor(
-                data_file.file_major_version,
-                data_file.file_minor_version,
-            )
-            .map(|v| v.resolve())
-            .is_ok_and(|v| v == storage_file_version);
+            let version_ok = data_file
+                .file_version()
+                .is_ok_and(|v| v == LanceFileFormat::from(storage_file_version));
 
             if !version_ok {
                 is_same_version = false;
@@ -8238,13 +8235,13 @@ mod tests {
             },
         )
         .unwrap();
-        let (major, minor) = writer.version().to_numbers();
+        let file_version = lance_file::version::LanceFileFormat::from(writer.version());
         for (column_index, array) in columns.into_iter().enumerate() {
             writer.write_column(column_index, array).await.unwrap();
         }
         let summary = writer.finish().await.unwrap();
 
-        let mut data_file = DataFile::new_unstarted(filename, major, minor);
+        let mut data_file = DataFile::new_unstarted(filename, file_version);
         data_file.fields = writer
             .field_id_to_column_indices()
             .iter()

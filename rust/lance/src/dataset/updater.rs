@@ -6,6 +6,7 @@ use futures::StreamExt;
 use lance_core::datatypes::{OnMissing, OnTypeMismatch};
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::{Error, Result, datatypes::Schema};
+use lance_file::version::LanceFileFormat;
 use lance_table::format::{DataFile, Fragment};
 use lance_table::utils::stream::ReadBatchFutStream;
 
@@ -232,9 +233,14 @@ impl Updater {
         // cleanup_data_fragments only needs path/base_id to remove the unfinished
         // data file and any blob sidecars. Build a minimal synthetic fragment so
         // we can reuse the shared cleanup path without fabricating full metadata.
-        fragment
-            .files
-            .push(DataFile::new(path, vec![], vec![], 0, 0, None, base_id));
+        fragment.files.push(DataFile::new(
+            path,
+            vec![],
+            vec![],
+            LanceFileFormat::V1,
+            None,
+            base_id,
+        ));
         cleanup_data_fragments(
             &self.dataset().object_store,
             &self.dataset().base,
