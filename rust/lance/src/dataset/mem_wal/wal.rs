@@ -890,13 +890,15 @@ impl WalFlusher {
         let append_result = self.wal_appender.append(snapshot.batches).await?;
         let wal_io_duration = start.elapsed();
 
-        // Append succeeded — remove the flushed batches from the front of
-        // the queue. Note: WAL-only mode does not use the global durability
-        // watermark (`durable_watermark_tx`) — `put_wal_only` waits on the
-        // per-trigger `done` cell instead — so we don't advance it here.
-        // Same for the wal-flush-completion cell, which is only consulted
-        // by MemTable-mode backpressure waiters.
+        // Append succeeded — remove the flushed batches from the front of the
+        // queue, then advance the writer-global durability cursor so durable
+        // `put_wal_only` callers waiting on their `BatchDurableWatcher` wake.
+        // The queue is strict FIFO with contiguous positions and its front
+        // always sits at the current watermark, so the newly-durable suffix
+        // ends at `durable + count`. Flushes are serialized on the single
+        // handler task, so this read-then-advance cannot race another flush.
         state.commit_flushed(snapshot.count);
+        self.advance_durable(self.durable() + snapshot.count);
 
         Ok(WalFlushResult {
             entry: Some(WalEntry {

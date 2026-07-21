@@ -1505,22 +1505,18 @@ impl ShardWriter {
             ));
         }
 
-        // A durable memtable writer needs a flush ticker to make progress. With
-        // `durable_write` on, a put becomes visible only once its WAL append
-        // lands, and memtable puts no longer self-trigger that append — the
+        // A durable writer needs a flush ticker to make progress, in either
+        // mode. With `durable_write` on, a put becomes durable only once its WAL
+        // append lands, and neither mode self-triggers that append per put — the
         // background ticker drives it. Without an interval (or with a zero one,
         // which tokio cannot schedule), a small put that never fills the
         // size-triggered buffer would block until close. Reject the config here
-        // rather than let a put hang. WAL-only mode is exempt: there a durable
-        // put triggers its own flush inline.
-        if config.enable_memtable
-            && config.durable_write
-            && config.max_wal_flush_interval.is_none_or(|d| d.is_zero())
-        {
+        // rather than let a put hang.
+        if config.durable_write && config.max_wal_flush_interval.is_none_or(|d| d.is_zero()) {
             return Err(Error::invalid_input(
                 "durable_write requires a positive max_wal_flush_interval: with no \
-                 flush ticker a durable memtable put has nothing to drive its WAL \
-                 append and would block until close",
+                 flush ticker a durable put has nothing to drive its WAL append and \
+                 would block until close",
             ));
         }
 
@@ -1804,6 +1800,7 @@ impl ShardWriter {
         let wal_handler = WalFlushHandler::new(
             wal_flusher.clone(),
             Some(state.clone()),
+            None,
             config.max_wal_flush_interval,
             stats.clone(),
         );
@@ -1876,9 +1873,25 @@ impl ShardWriter {
         stats: SharedWriteStats,
         task_executor: &Arc<TaskExecutor>,
     ) -> Result<WriterMode> {
+        // The pending queue is shared with the flush handler so a background
+        // tick can resolve to the batches still owed an append — the WAL-only
+        // analog of resolving a tick against the durability cursor in MemTable
+        // mode. A durable put waits on the durability cursor the handler's
+        // append advances, so the ticker must run (`open` rejects durable +
+        // no-interval); a non-durable writer may pass no interval and rely on
+        // the size/close triggers alone.
+        let state = Arc::new(WalOnlyState::default());
+
         // Background WAL flush handler — no MemTable state to consult, so
-        // pass `None` for the frozen-vs-active detection.
-        let wal_handler = WalFlushHandler::new(wal_flusher, None, None, stats);
+        // pass `None` for the frozen-vs-active detection; the pending queue and
+        // the flush interval drive the background append instead.
+        let wal_handler = WalFlushHandler::new(
+            wal_flusher,
+            None,
+            Some(state.clone()),
+            config.max_wal_flush_interval,
+            stats,
+        );
         task_executor.add_handler(
             "wal_flusher".to_string(),
             Box::new(wal_handler),
@@ -1893,7 +1906,7 @@ impl ShardWriter {
         let backpressure = BackpressureController::new(config.clone());
 
         Ok(WriterMode::WalOnly {
-            state: Arc::new(WalOnlyState::default()),
+            state,
             wal_flush_tx,
             trigger: StdRwLock::new(WalOnlyTriggerState::default()),
             backpressure,
@@ -2231,54 +2244,48 @@ impl ShardWriter {
         // Push batches into the pending queue and capture the assigned
         // [start, end) range. `next_batch_position` is monotonic across the
         // writer's lifetime; positions are not BatchStore indices but they
-        // are used the same way for durability tracking.
+        // are used the same way for durability tracking. Because the queue is
+        // strict FIFO with contiguous positions and its front always sits at
+        // the durability cursor, `end` is exactly the writer-global durable
+        // count this put reaches once its append lands — no globalizing offset
+        // as in MemTable mode, which restarts positions per generation.
         let batch_positions = state.push(batches);
 
-        // Time- and size-based triggers, mirroring MemTable mode but reading
-        // pending bytes from `WalOnlyState` instead of an active MemTable.
-        // Only fires for non-durable writes; durable writes go through the
-        // explicit done-cell path below so flush errors (e.g., fence) reach
-        // the caller.
-        if !self.config.durable_write {
-            let target_position = batch_positions.end;
-            let pending_bytes = state.estimated_size();
-            self.maybe_trigger_wal_flush_wal_only(
-                state,
-                wal_flush_tx,
-                trigger,
-                target_position,
-                pending_bytes,
-            );
-        }
+        // Under `durable_write` the put becomes durable only once its WAL
+        // append lands. Track it on the writer-global durability cursor *before*
+        // triggering, so a flush that completes between here and the wait is not
+        // missed: the watcher recomputes visibility from the cursor rather than
+        // latching a one-shot wake. WAL-only mode has no indexes, so the
+        // index-visibility half of the watcher is a no-op (`None`, target 0).
+        let durable_watcher = self
+            .config
+            .durable_write
+            .then(|| self.wal_flusher.track_batch(None, 0, batch_positions.end));
+
+        // Time- and size-based triggers on the write path, for durable and
+        // non-durable puts alike — mirroring MemTable mode's
+        // `maybe_trigger_wal_flush`. The background ticker drives the append
+        // too; whichever fires first wins, and a redundant trigger is a cheap
+        // no-op because the flush snapshot/commit is idempotent.
+        self.maybe_trigger_wal_flush_wal_only(
+            state,
+            wal_flush_tx,
+            trigger,
+            batch_positions.end,
+            state.estimated_size(),
+        );
 
         self.stats.record_put(start.elapsed());
 
-        // For durable writes, trigger an immediate flush and wait for the
-        // done cell. Using the done cell instead of the durability watermark
-        // watcher ensures flush errors (e.g., the WalAppender returning a
-        // fence error) propagate back to `put` instead of hanging.
-        if self.config.durable_write {
-            let done = WatchableOnceCell::new();
-            let reader = done.reader();
-            self.wal_flusher.trigger_flush(
-                WalFlushSource::WalOnly {
-                    state: state.clone(),
-                },
-                batch_positions.end,
-                Some(done),
-            )?;
-            let mut reader = reader;
-            match reader.await_value().await {
-                Some(Ok(_)) => {}
-                // Rebuild the typed error (peer fence vs. persistence-failure
-                // self-fence) so a WAL-only durable caller can tell them apart.
-                Some(Err(failure)) => return Err(failure.into_error()),
-                None => {
-                    return Err(Error::io(
-                        "WAL flush handler exited before reporting durability",
-                    ));
-                }
-            }
+        // Durable writes wait on the durability cursor, advanced by the append
+        // the ticker (or the trigger above) drives — the same watermark path
+        // MemTable mode uses. A terminal flush failure (a peer fence or an
+        // exhausted-retry persistence self-fence) poisons the writer and wakes
+        // the waiter with that typed error instead of leaving it to hang. This
+        // is why `open` rejects `durable_write` with no flush ticker: nothing
+        // else would advance the cursor a small put is parked on.
+        if let Some(mut watcher) = durable_watcher {
+            watcher.wait().await?;
         }
 
         Ok(WriteResult { batch_positions })
@@ -2876,6 +2883,10 @@ struct WalFlushHandler {
     /// via Arc::ptr_eq on the active batch_store. `None` when running in
     /// WAL-only mode (no MemTable, no frozen-vs-active distinction).
     memtable_state: Option<Arc<RwLock<WriterState>>>,
+    /// WAL-only-mode pending queue, so a background tick can resolve to the
+    /// batches still owed an append. `None` in MemTable mode. Exactly one of
+    /// `memtable_state` / `wal_only_state` is `Some`.
+    wal_only_state: Option<Arc<WalOnlyState>>,
     /// How often to append in the background. `None` disables the ticker, leaving
     /// the append size-triggered (and freeze/close-triggered) only.
     flush_interval: Option<Duration>,
@@ -2886,12 +2897,14 @@ impl WalFlushHandler {
     fn new(
         wal_flusher: Arc<WalFlusher>,
         memtable_state: Option<Arc<RwLock<WriterState>>>,
+        wal_only_state: Option<Arc<WalOnlyState>>,
         flush_interval: Option<Duration>,
         stats: SharedWriteStats,
     ) -> Self {
         Self {
             wal_flusher,
             memtable_state,
+            wal_only_state,
             flush_interval,
             stats,
         }
@@ -2993,23 +3006,43 @@ impl WalFlushHandler {
     /// Safe to walk the frozen list because a store that still owes an append
     /// cannot be swept: its L0 flush is blocked on the completion cell that only
     /// that append fires.
+    ///
+    /// In WAL-only mode there is a single FIFO pending queue and no memtable
+    /// rotation, so the ordering hazard above cannot arise: the tick resolves to
+    /// the queue whenever it holds un-appended batches.
     async fn resolve_next_pending(&self) -> Option<(WalFlushSource, usize)> {
-        let state_lock = self.memtable_state.as_ref()?;
-        let state = state_lock.read().await;
-        let durable = self.wal_flusher.durable();
+        if let Some(state_lock) = self.memtable_state.as_ref() {
+            let state = state_lock.read().await;
+            let durable = self.wal_flusher.durable();
 
-        next_pending_store(
-            state
-                .frozen_memtables
-                .iter()
-                .map(|frozen| frozen.memtable.batch_store()),
-            state.memtable.batch_store(),
-            durable,
-        )
-        .map(|store| {
-            let end = store.len();
-            (WalFlushSource::BatchStore { batch_store: store }, end)
-        })
+            return next_pending_store(
+                state
+                    .frozen_memtables
+                    .iter()
+                    .map(|frozen| frozen.memtable.batch_store()),
+                state.memtable.batch_store(),
+                durable,
+            )
+            .map(|store| {
+                let end = store.len();
+                (WalFlushSource::BatchStore { batch_store: store }, end)
+            });
+        }
+
+        let state = self.wal_only_state.as_ref()?;
+        if state.batch_count() == 0 {
+            // Everything already appended; the tick has nothing to do.
+            return None;
+        }
+        // `flush_from_wal_only` snapshots the whole queue, so the end position
+        // is informational here; carry the next position for symmetry.
+        let end = state.next_batch_position();
+        Some((
+            WalFlushSource::WalOnly {
+                state: Arc::clone(state),
+            },
+            end,
+        ))
     }
 
     /// Unified flush method for both active and frozen memtables and for
@@ -5092,8 +5125,9 @@ mod tests {
         .await
         .unwrap();
 
-        // Two durable puts → two WAL entries (durable_write triggers an
-        // explicit flush per put).
+        // Two durable puts → two WAL entries. Each `put` awaits its own append
+        // (driven by the background ticker) before returning, so the second
+        // batch is only pushed after the first is durable — they never coalesce.
         let r1 = writer
             .put(vec![create_test_batch(&schema, 0, 4)])
             .await
@@ -5122,6 +5156,51 @@ mod tests {
         // Both entries from the same writer should have the same epoch.
         assert_eq!(e0.writer_epoch, e1.writer_epoch);
         assert!(e0.writer_epoch >= 1);
+    }
+
+    /// A durable WAL-only put is driven by the background ticker, not an inline
+    /// per-put flush: `put().await` must not return until the ticker's append
+    /// advances the durability watermark it waits on. With a long interval and a
+    /// buffer the write cannot cross, the ticker is the *only* thing that can
+    /// make the put durable — so if the WAL entry is present the instant `put`
+    /// returns (before any `close()`), the watermark-wait is doing its job.
+    #[tokio::test]
+    async fn test_wal_only_durable_put_waits_for_ticker_append() {
+        use crate::dataset::mem_wal::wal::WalTailer;
+
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = create_test_schema();
+        let shard_id = Uuid::new_v4();
+
+        let mut config = wal_only_config(shard_id);
+        config.max_wal_flush_interval = Some(Duration::from_millis(100));
+        config.max_wal_buffer_size = 100 * 1024 * 1024; // never crossed
+
+        let writer = ShardWriter::open(
+            store.clone(),
+            base_path.clone(),
+            base_uri,
+            config,
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        writer
+            .put(vec![create_test_batch(&schema, 0, 4)])
+            .await
+            .unwrap();
+
+        // `put` returned, so the batch must already be durable — read the WAL
+        // directly, without closing the writer.
+        let tailer = WalTailer::new(store, base_path, shard_id);
+        assert_eq!(tailer.next_position().await.unwrap(), 2);
+        let entry = tailer.read_entry(1).await.unwrap().unwrap();
+        assert_eq!(entry.batches.len(), 1);
+        assert_eq!(entry.batches[0].num_rows(), 4);
+
+        writer.close().await.unwrap();
     }
 
     #[tokio::test]
@@ -6015,16 +6094,21 @@ mod tests {
         assert!(next_pending_store(frozen_list(), Arc::clone(&active), 3).is_none());
     }
 
-    /// A durable writer with no flush ticker cannot make progress, so `open()`
-    /// rejects it rather than letting a put block forever.
+    /// A durable writer with no flush ticker cannot make progress in either
+    /// mode — the ticker is the only thing that drives the WAL append the put
+    /// waits on — so `open()` rejects it rather than letting a put block forever.
+    #[rstest]
+    #[case::memtable(true)]
+    #[case::wal_only(false)]
     #[tokio::test]
-    async fn test_open_rejects_durable_write_without_a_ticker() {
+    async fn test_open_rejects_durable_write_without_a_ticker(#[case] enable_memtable: bool) {
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
         let schema = schema_with_pk();
         let shard_id = Uuid::new_v4();
 
         let config = ShardWriterConfig {
             durable_write: true,
+            enable_memtable,
             max_wal_flush_interval: None,
             ..memtable_config_with_pk(shard_id)
         };
@@ -6498,8 +6582,9 @@ mod tests {
     /// fence), the drained batches were dropped — the next concurrent put
     /// would then see an empty pending queue and spuriously return Ok,
     /// hiding the data loss. With the snapshot/commit fix, the failed flush
-    /// leaves the batches in the queue, and the concurrent put gets a clean
-    /// fence error too (when its own flush attempts the same WAL position).
+    /// leaves the batches in the queue for retry, and — because the flush is
+    /// terminal — it poisons the writer, waking *both* parked durability
+    /// waiters with the typed fence error instead of either one hanging.
     #[tokio::test]
     async fn test_wal_only_fenced_concurrent_puts_do_not_silently_succeed() {
         use std::sync::Arc;
@@ -6550,9 +6635,10 @@ mod tests {
         // the destructive-drain bug, the first flush would consume both
         // pending batches into a failing append; the second flush would
         // see an empty queue and return spurious success, silently losing
-        // the second put's data. With the snapshot/commit fix, the failed
-        // append leaves both batches in the queue and the second flush
-        // also fails with the fence error.
+        // the second put's data. Now both puts park on the durability
+        // watermark; the ticker's append fails with the fence, poisons the
+        // writer, and both waiters wake with the fence error — batches intact
+        // in the queue.
         let a1 = writer_a.clone();
         let a2 = writer_a.clone();
         let schema1 = schema.clone();
