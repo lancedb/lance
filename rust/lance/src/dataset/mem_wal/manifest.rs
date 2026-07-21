@@ -482,7 +482,7 @@ impl ShardManifestStore {
                         .map(|m| m.writer_epoch)
                         .unwrap_or(0);
                     if latest_epoch >= next_epoch {
-                        return Err(Error::io(format!(
+                        return Err(Error::fenced_by_peer(format!(
                             "Failed to claim shard {} (version {}): another writer claimed epoch {} (>= our target {}): {}",
                             self.shard_id, next_version, latest_epoch, next_epoch, write_err
                         )));

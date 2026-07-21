@@ -486,6 +486,19 @@ impl Error {
         }
     }
 
+    /// Return whether this error or one of its typed sources reports that a
+    /// MemWAL writer was superseded by a successor's epoch claim.
+    ///
+    /// Persistence failures also fence a writer internally, but return `false`
+    /// here because they are not peer epoch takeovers and generally require a
+    /// different recovery policy.
+    pub fn is_mem_wal_fenced(&self) -> bool {
+        if self.fence_reason() == Some(FenceReason::PeerClaimedEpoch) {
+            return true;
+        }
+        std::error::Error::source(self).is_some_and(error_source_is_mem_wal_fenced)
+    }
+
     #[track_caller]
     pub fn io_source(source: BoxedError) -> Self {
         IOSnafu.into_error(source)
@@ -721,6 +734,13 @@ fn error_source_is_not_found(source: &(dyn std::error::Error + 'static)) -> bool
             || std::error::Error::source(error).is_some_and(error_source_is_not_found);
     }
     source.source().is_some_and(error_source_is_not_found)
+}
+
+fn error_source_is_mem_wal_fenced(source: &(dyn std::error::Error + 'static)) -> bool {
+    if let Some(error) = source.downcast_ref::<Error>() {
+        return error.is_mem_wal_fenced();
+    }
+    source.source().is_some_and(error_source_is_mem_wal_fenced)
 }
 
 pub trait LanceOptionExt<T> {
@@ -964,6 +984,12 @@ impl Clone for CloneableError {
             error if error.is_not_found() => Self(Error::wrapped(Box::new(DisplayError(
                 Error::not_found(error.to_string()),
             )))),
+            Error::Fenced {
+                reason, message, ..
+            } => Self(match reason {
+                FenceReason::PeerClaimedEpoch => Error::fenced_by_peer(message.clone()),
+                FenceReason::PersistenceFailure => Error::writer_poisoned(message.clone()),
+            }),
             Error::Timeout { message, .. } => Self(Error::timeout(message.clone())),
             Error::IO { source, .. } => Self(Error::io(source.to_string())),
             error => Self(Error::cloned(error.to_string())),
@@ -985,6 +1011,21 @@ mod test {
     use super::*;
     use std::error::Error as _;
     use std::fmt;
+
+    #[test]
+    fn mem_wal_fence_predicate_is_typed_and_source_aware() {
+        let fenced = Error::fenced_by_peer(
+            "local epoch 3 < stored epoch 4 for shard 00000000-0000-0000-0000-000000000000",
+        );
+        assert!(fenced.is_mem_wal_fenced());
+        assert!(fenced.to_string().contains("Writer fenced"));
+
+        let wrapped = Error::wrapped(Box::new(fenced));
+        assert!(wrapped.is_mem_wal_fenced());
+
+        assert!(!Error::io("ordinary object-store failure").is_mem_wal_fenced());
+        assert!(!Error::writer_poisoned("WAL persistence failed").is_mem_wal_fenced());
+    }
 
     #[test]
     fn cloneable_error_preserves_not_found_contract() {
