@@ -283,4 +283,14 @@ mod tests {
             "expected at least one non-zero slot in 200 draws"
         );
     }
+
+    #[test]
+    fn test_slot_backoff_attempt_saturates() {
+        // At u32::MAX the counter must stay put rather than panic (debug) or
+        // wrap to 0 (release), which would restart the low-slot distribution.
+        let mut backoff = SlotBackoff::default();
+        backoff.attempt = u32::MAX;
+        let _ = backoff.next_backoff();
+        assert_eq!(backoff.attempt(), u32::MAX);
+    }
 }
