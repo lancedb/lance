@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use arrow_array::RecordBatch;
+use bytes::Bytes;
 use chrono::TimeDelta;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -29,7 +30,7 @@ use lance_file::writer::{self as current_writer, FileWriterOptions};
 use lance_io::object_store::{
     ObjectStore, ObjectStoreParams, ObjectStoreRegistry, parse_base_scoped_key,
 };
-use lance_table::format::{BasePath, DataFile, Fragment};
+use lance_table::format::{BasePath, DataFile, Fragment, IndexMetadata};
 use lance_table::io::commit::{CommitHandler, commit_handler_from_url};
 use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
@@ -47,6 +48,8 @@ use crate::dataset::blob::{
     blob_dedicated_threshold_from_metadata, blob_inline_threshold_from_metadata,
     blob_pack_file_threshold_from_metadata, preprocess_blob_batches,
 };
+use crate::index::DatasetIndexExt;
+use crate::index::scalar::{IndexDetails, fetch_index_details};
 use crate::session::Session;
 
 use super::DATA_DIR;
@@ -604,6 +607,7 @@ pub async fn do_write_fragments(
     params: WriteParams,
     storage_version: LanceFileVersion,
     target_bases_info: Option<Vec<TargetBaseInfo>>,
+    mut seed_writers: Vec<Box<dyn lance_index::scalar::seed::IndexSeedWriter>>,
 ) -> Result<Vec<Fragment>> {
     let adapter = SchemaAdapter::new(data.schema());
     let data = adapter.to_physical_stream(data);
@@ -669,6 +673,14 @@ pub async fn do_write_fragments(
             }
 
             writer.as_mut().unwrap().write(&batch_chunk).await?;
+            for seed_writer in seed_writers.iter_mut() {
+                let col_name = seed_writer.column_name().to_owned();
+                for batch in &batch_chunk {
+                    if let Some(col) = batch.column_by_name(&col_name) {
+                        seed_writer.observe_batch(col)?;
+                    }
+                }
+            }
             for batch in &batch_chunk {
                 num_rows_in_current_file += batch.num_rows() as u32;
             }
@@ -685,7 +697,9 @@ pub async fn do_write_fragments(
             if num_rows_in_current_file >= params.max_rows_per_file as u32
                 || writer.as_mut().unwrap().tell().await? >= params.max_bytes_per_file as u64
             {
-                let (num_rows, data_file) = writer.take().unwrap().finish().await?;
+                let mut w = writer.take().unwrap();
+                flush_seed_writers(w.as_mut(), &mut seed_writers).await?;
+                let (num_rows, data_file) = w.finish().await?;
                 info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_DATA, path = &data_file.path);
                 debug_assert_eq!(num_rows, num_rows_in_current_file);
                 bytes_completed += data_file.file_size_bytes.get().map_or(0, |s| s.get());
@@ -727,6 +741,17 @@ pub async fn do_write_fragments(
 
     // Complete the final writer
     if let Some(mut writer) = writer.take() {
+        if let Err(e) = flush_seed_writers(writer.as_mut(), &mut seed_writers).await {
+            drop(writer);
+            cleanup_data_fragments(
+                &object_store,
+                base_dir,
+                cleanup_bases.as_deref(),
+                &fragments,
+            )
+            .await;
+            return Err(e);
+        }
         match writer.finish().await {
             Ok((num_rows, data_file)) => {
                 info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_DATA, path = &data_file.path);
@@ -759,6 +784,23 @@ pub async fn do_write_fragments(
     }
 
     Ok(fragments)
+}
+
+/// Flush all seed writers into the given file writer, embedding seed buffers
+/// and schema metadata before `finish()` is called.
+async fn flush_seed_writers(
+    writer: &mut dyn GenericWriter,
+    seed_writers: &mut [Box<dyn lance_index::scalar::seed::IndexSeedWriter>],
+) -> Result<()> {
+    for seed_writer in seed_writers.iter_mut() {
+        if let Some(bytes) = seed_writer.finish()? {
+            let buf_index = writer.add_global_buffer(bytes).await?;
+            let key = seed_writer.schema_metadata_key();
+            let value = seed_writer.schema_metadata_value(buf_index);
+            writer.add_schema_metadata(key, value);
+        }
+    }
+    Ok(())
 }
 
 /// Best-effort cleanup of data files for fragments that were written but not committed.
@@ -1328,6 +1370,8 @@ pub async fn write_fragments_internal(
         )));
     }
 
+    let seed_writers = create_seed_writers(dataset, &params, storage_version).await?;
+
     let fragments = do_write_fragments(
         dataset,
         object_store,
@@ -1337,10 +1381,60 @@ pub async fn write_fragments_internal(
         params,
         storage_version,
         target_bases_info,
+        seed_writers,
     )
     .await?;
 
     Ok((fragments, schema))
+}
+
+async fn create_seed_writers(
+    dataset: Option<&Dataset>,
+    params: &WriteParams,
+    storage_version: LanceFileVersion,
+) -> Result<Vec<Box<dyn lance_index::scalar::seed::IndexSeedWriter>>> {
+    // Seeds only make sense when appending to an existing dataset with V2 files.
+    if storage_version == LanceFileVersion::Legacy {
+        return Ok(Vec::new());
+    }
+    if !matches!(params.mode, WriteMode::Append) {
+        return Ok(Vec::new());
+    }
+    let Some(dataset) = dataset else {
+        return Ok(Vec::new());
+    };
+
+    let indices: Arc<Vec<IndexMetadata>> = dataset.load_indices().await?;
+    let mut writers: Vec<Box<dyn lance_index::scalar::seed::IndexSeedWriter>> = Vec::new();
+
+    for index in indices.iter() {
+        if index.fields.len() != 1 {
+            continue;
+        }
+        let field_id = index.fields[0];
+        let Ok(field_path) = dataset.schema().field_path(field_id) else {
+            continue;
+        };
+        let Some(data_type) = dataset.schema().field(&field_path).map(|f| f.data_type()) else {
+            continue;
+        };
+
+        let Ok(index_details) = fetch_index_details(dataset, &field_path, index).await else {
+            continue;
+        };
+        let details = IndexDetails(index_details.clone());
+        let Ok(plugin) = details.get_plugin() else {
+            continue;
+        };
+        if let Some(writer) = plugin
+            .create_seed_writer(&field_path, &data_type, &index_details)
+            .await?
+        {
+            writers.push(writer);
+        }
+    }
+
+    Ok(writers)
 }
 
 fn legacy_blob_field_path(schema: &Schema) -> Option<String> {
@@ -1367,6 +1461,16 @@ pub trait GenericWriter: Send {
     async fn tell(&mut self) -> Result<u64>;
     /// Finish writing the file (flush the remaining data and write footer)
     async fn finish(&mut self) -> Result<(u32, DataFile)>;
+
+    /// Add a global buffer to the current file. Returns the 1-based buffer index.
+    /// Must be called before `finish`. No-op on legacy (V1) files (returns `Ok(1)`).
+    async fn add_global_buffer(&mut self, _buffer: Bytes) -> Result<u32> {
+        Ok(1)
+    }
+
+    /// Add a key-value pair to the file's schema metadata.
+    /// Must be called before `finish`. No-op on legacy (V1) files.
+    fn add_schema_metadata(&mut self, _key: String, _value: String) {}
 }
 
 struct V1WriterAdapter<M>
@@ -1462,6 +1566,14 @@ impl GenericWriter for V2WriterAdapter {
             self.base_id,
         );
         Ok((write_summary.num_rows as u32, data_file))
+    }
+
+    async fn add_global_buffer(&mut self, buffer: Bytes) -> Result<u32> {
+        self.writer.add_global_buffer(buffer).await
+    }
+
+    fn add_schema_metadata(&mut self, key: String, value: String) {
+        self.writer.add_schema_metadata(key, value);
     }
 }
 
@@ -3880,6 +3992,7 @@ mod tests {
             WriteParams::default(),
             LanceFileVersion::V2_1,
             None,
+            Vec::new(),
         )
         .await;
 
@@ -3940,6 +4053,7 @@ mod tests {
             },
             LanceFileVersion::V2_1,
             None,
+            Vec::new(),
         )
         .await;
 
@@ -4166,6 +4280,7 @@ mod tests {
             },
             LanceFileVersion::V2_1,
             Some(target_bases),
+            vec![],
         )
         .await;
 
@@ -4480,5 +4595,117 @@ mod tests {
             .flat_map(|f| f.metadata.files.iter().map(|file| file.base_id))
             .collect();
         assert_eq!(file_bases, vec![None, Some(1), Some(2)]);
+    }
+
+    #[tokio::test]
+    async fn test_zone_map_seeds_used_during_update() {
+        use crate::Dataset;
+        use crate::index::DatasetIndexExt;
+        use crate::index::scalar::open_scalar_index;
+        use arrow::datatypes::Int32Type;
+        use lance_datagen::{BatchCount, RowCount};
+        use lance_datagen::{array, gen_batch};
+        use lance_file::reader::FileReaderOptions;
+        use lance_index::metrics::NoOpMetricsCollector;
+        use lance_index::scalar::seed::SEED_META_KEY_PREFIX;
+        use lance_index::{IndexType, scalar::ScalarIndexParams};
+        use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+        use lance_io::utils::CachedFileSize;
+
+        let tmpdir = lance_core::utils::tempfile::TempStrDir::default();
+        let uri = tmpdir.as_str();
+
+        // Step 1: Create initial dataset
+        let reader = gen_batch()
+            .col("val", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(100), BatchCount::from(1));
+        let mut dataset = Dataset::write(reader, uri, None).await.unwrap();
+
+        // Step 2: Create a zone map index with seeds explicitly enabled (Int32 defaults to off).
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::ZoneMap)
+            .with_params(&serde_json::json!({"use_seeds": true}));
+        dataset
+            .create_index(&["val"], IndexType::ZoneMap, None, &params, false)
+            .await
+            .unwrap();
+        // Step 3: Append new data - seeds should be written automatically
+        let reader = gen_batch()
+            .col("val", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(50), BatchCount::from(1));
+        let dataset = Dataset::write(
+            reader,
+            uri,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                data_storage_version: Some(lance_file::version::LanceFileVersion::V2_1),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Step 4: Verify that the newly appended fragment has a seed embedded
+        let fragments = dataset.fragments();
+        let new_fragment = fragments.last().unwrap();
+        let data_file = new_fragment.files.first().unwrap();
+
+        let scheduler = ScanScheduler::new(
+            dataset.object_store.clone(),
+            SchedulerConfig::max_bandwidth(&dataset.object_store),
+        );
+        let path = dataset
+            .base
+            .clone()
+            .join(super::DATA_DIR)
+            .join(data_file.path.as_str());
+        let file_scheduler = scheduler
+            .open_file(&path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let reader = lance_file::reader::FileReader::try_open(
+            file_scheduler,
+            None,
+            Default::default(),
+            &dataset.metadata_cache.file_metadata_cache(&path),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let meta_key = format!("{}val", SEED_META_KEY_PREFIX);
+        let has_seed = reader
+            .metadata()
+            .file_schema
+            .metadata
+            .contains_key(&meta_key);
+        assert!(
+            has_seed,
+            "Newly appended fragment should have a zone map seed in metadata"
+        );
+
+        // Step 5: Optimize the index (should use seeds)
+        let mut dataset = Dataset::open(uri).await.unwrap();
+        dataset.optimize_indices(&Default::default()).await.unwrap();
+
+        // Step 6: Query the updated index to verify it's correct
+        let dataset = Dataset::open(uri).await.unwrap();
+        let indices = dataset.load_indices().await.unwrap();
+        assert!(
+            !indices.is_empty(),
+            "Dataset should still have an index after optimization"
+        );
+
+        // Verify the index is a ZoneMap and covers all fragments
+        let index = indices.iter().find(|i| i.name.contains("val")).unwrap();
+        let scalar_index = open_scalar_index(&dataset, "val", index, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(
+            scalar_index.index_type(),
+            IndexType::ZoneMap,
+            "Index should still be a ZoneMap after optimization"
+        );
+        let frags = scalar_index.calculate_included_frags().await.unwrap();
+        assert_eq!(frags.len(), 2, "Index should cover both fragments");
     }
 }
