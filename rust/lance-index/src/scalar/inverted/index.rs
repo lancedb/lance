@@ -1272,7 +1272,9 @@ impl InvertedIndex {
         }
         // Ensures old partitioned files without persisted stats populate their
         // fallback stats before any synchronous local scorer is constructed.
-        self.aggregate_corpus_stats().await?;
+        if self.corpus_stats.get().is_none() {
+            self.aggregate_corpus_stats().await?;
+        }
 
         let impact_shared_threshold = Arc::new(AtomicU32::new(f32::NEG_INFINITY.to_bits()));
         let local_shared_threshold = Arc::new(AtomicU32::new(f32::NEG_INFINITY.to_bits()));
@@ -1316,13 +1318,22 @@ impl InvertedIndex {
                                 <= u128::from(*FLAT_SEARCH_PERCENT_THRESHOLD)
                                     .saturating_mul(documents.len() as u128)
                         });
-                    let visibility = documents
-                        .visibility(mask.clone(), materialize_selected)
-                        .await?;
+                    let visibility =
+                        match documents.immediate_visibility(mask.clone(), materialize_selected) {
+                            Some(visibility) => visibility,
+                            None => {
+                                documents
+                                    .visibility(mask.clone(), materialize_selected)
+                                    .await?
+                            }
+                        };
                     if visibility.is_empty() {
                         return Result::Ok((partition_ordinal, PartitionCandidates::empty()));
                     }
-                    let lengths = documents.lengths().await?;
+                    let lengths = match documents.cached_lengths() {
+                        Some(lengths) => lengths,
+                        None => documents.lengths().await?,
+                    };
                     let max_position = postings
                         .iter()
                         .map(|posting| posting.term_index() as usize)
@@ -1943,6 +1954,8 @@ impl InvertedIndex {
                     .to_owned(),
             ));
         }
+        self.document_projections_resident
+            .store(true, Ordering::Release);
         info!(
             partition_count = self.partitions.len(),
             query_ready,
@@ -10863,8 +10876,8 @@ mod tests {
             .into_iter()
             .collect::<Result<Vec<_>>>()
             .unwrap();
-        assert!(index.has_resident_document_projections());
         assert!(index.document_projections_resident.load(Ordering::Acquire));
+        assert!(index.has_resident_document_projections());
         assert!(index.corpus_stats.initialized());
         assert!(index.partitions.iter().all(|partition| {
             partition.docs.query_ready()
