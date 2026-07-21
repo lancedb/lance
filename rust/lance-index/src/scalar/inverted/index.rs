@@ -1246,6 +1246,14 @@ impl InvertedIndex {
         &self,
         request: ModernSearchRequest<'_>,
     ) -> Result<(Vec<u64>, Vec<f32>)> {
+        // Old partitioned files without persisted stats populate their
+        // fallback stats before deferred candidate orchestration.  A resident
+        // search can skip this full-index synchronization: standard prewarm
+        // has already initialized it, while any independently resident
+        // partition loads its lengths before constructing a local scorer.
+        if self.corpus_stats.get().is_none() {
+            self.aggregate_corpus_stats().await?;
+        }
         let ranked = self.bm25_search_modern_candidates(request).await?;
         self.resolve_deferred_modern_candidates(ranked).await
     }
@@ -1270,12 +1278,6 @@ impl InvertedIndex {
                 self.partitions.len()
             )));
         }
-        // Ensures old partitioned files without persisted stats populate their
-        // fallback stats before any synchronous local scorer is constructed.
-        if self.corpus_stats.get().is_none() {
-            self.aggregate_corpus_stats().await?;
-        }
-
         let impact_shared_threshold = Arc::new(AtomicU32::new(f32::NEG_INFINITY.to_bits()));
         let local_shared_threshold = Arc::new(AtomicU32::new(f32::NEG_INFINITY.to_bits()));
         let parts = self
@@ -10913,6 +10915,47 @@ mod tests {
         assert_eq!(resident.0.len(), 2);
         assert!(resident.0.contains(&100));
         assert!(resident.0.contains(&200));
+    }
+
+    #[tokio::test]
+    async fn test_resident_modern_search_loads_partition_stats_without_global_stats() {
+        let (_tmpdir, index) = load_global_scoring_test_index(false).await;
+        assert!(index.corpus_stats.get().is_none());
+        assert!(
+            index
+                .partitions
+                .iter()
+                .all(|partition| partition.docs.cached_stats().is_none())
+        );
+
+        for partition in &index.partitions {
+            partition.docs.modern().unwrap().projection().await.unwrap();
+        }
+        assert!(index.has_resident_document_projections());
+
+        let scorer = MemBM25Scorer::new(56_100, 112, HashMap::from([("alpha".to_owned(), 2)]));
+        let result = index
+            .bm25_search(
+                Arc::new(Tokens::new(vec!["alpha".to_owned()], DocType::Text)),
+                Arc::new(FtsSearchParams::new().with_limit(Some(2))),
+                Operator::Or,
+                Arc::new(NoFilter),
+                Arc::new(NoOpMetricsCollector),
+                Some(&scorer),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.0.len(), 2);
+        assert!(result.0.contains(&100));
+        assert!(result.0.contains(&200));
+        assert!(index.corpus_stats.get().is_none());
+        assert!(
+            index
+                .partitions
+                .iter()
+                .all(|partition| partition.docs.cached_stats().is_some())
+        );
     }
 
     async fn search_test_impact_partition(
