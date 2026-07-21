@@ -714,7 +714,7 @@ struct Snapshot {
     /// visible_count` for any snapshot the writer has stored (each publish
     /// appends one entry and bumps `visible_count`).
     batches: BatchLog,
-    /// Number of non-zero-token documents for `i < visible_count`.
+    /// `Σ batches[i].documents.len()` for `i < visible_count`.
     cumulative_doc_count: u64,
     /// `Σ batches[i].documents[*].num_tokens` for `i < visible_count`.
     cumulative_total_tokens: u64,
@@ -1239,10 +1239,12 @@ impl FtsMemIndex {
         let mut term_builders: FxHashMap<Arc<str>, BatchTermBuilder> = FxHashMap::default();
         let mut documents: Vec<DocumentMetadata> = Vec::with_capacity(batch.num_rows());
         let mut total_tokens: u64 = 0;
+        let preserve_zero_token_documents =
+            self.params.get_document_granularity().is_list_element();
         let mut index_document = |key: DocumentKey, text: &str| -> Result<()> {
             let document_position = document_position_start + documents.len() as u64;
             let num_tokens = index_text(text, document_position, tokenizer, &mut term_builders)?;
-            if num_tokens > 0 {
+            if preserve_zero_token_documents || num_tokens > 0 {
                 documents.push(DocumentMetadata { key, num_tokens });
                 total_tokens += num_tokens as u64;
             }
@@ -1259,7 +1261,7 @@ impl FtsMemIndex {
             )?;
         }
 
-        if total_tokens == 0 {
+        if documents.is_empty() {
             return Ok(());
         }
 
@@ -1967,9 +1969,9 @@ impl FtsMemIndex {
     /// Export the in-memory FTS index to an `InnerBuilder` ready to be
     /// written to disk.
     ///
-    /// Documents are kept in insert order and retain their positions in the
-    /// forward-written flush data file; zero-token rows are omitted.
-    /// `total_rows` is used only to validate positions.
+    /// Stored documents are kept in insert order and retain their positions in
+    /// the forward-written flush data file. `total_rows` is used only to
+    /// validate positions.
     pub fn to_index_builder(
         &self,
         partition_id: u64,
@@ -4127,7 +4129,7 @@ mod tests {
         assert_eq!(index.source_column_name(), "tags");
 
         index.insert(&create_element_test_batch(), 0).unwrap();
-        assert_eq!(index.doc_count(), 4);
+        assert_eq!(index.doc_count(), 6);
 
         let mut beta = index.search("beta");
         beta.sort_by_key(|entry| (entry.row_position, entry.doc_index.clone()));
@@ -4267,7 +4269,7 @@ mod tests {
     }
 
     #[test]
-    fn test_zero_token_element_documents_are_skipped_after_flush() {
+    fn test_zero_token_element_documents_remain_addressable_after_flush() {
         let mut tags = ListBuilder::new(StringBuilder::new());
         tags.values().append_null();
         tags.values().append_value("");
@@ -4293,8 +4295,8 @@ mod tests {
         index.insert(&batch, 0).unwrap();
         index.flush();
 
-        assert!(index.is_empty());
-        assert_eq!(index.doc_count(), 0);
+        assert!(!index.is_empty());
+        assert_eq!(index.doc_count(), 3);
         assert!(index.search("missing").is_empty());
     }
 

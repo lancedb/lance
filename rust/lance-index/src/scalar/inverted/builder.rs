@@ -1398,8 +1398,10 @@ impl IndexWorker {
                     .zip(row_id_col.values().iter())
                     .enumerate()
                 {
-                    let Some(doc) = doc else {
-                        continue;
+                    let doc = match doc {
+                        Some(doc) => doc,
+                        None if self.coordinate_rank > 0 => "",
+                        None => continue,
                     };
                     let doc_index = doc_index_columns
                         .iter()
@@ -1600,7 +1602,10 @@ impl IndexWorker {
             self.builder.tokens.memory_size() as u64,
         );
 
-        if token_num == 0 {
+        // Row indexes omit zero-token documents from corpus statistics.
+        // ListElement indexes retain them so their physical coordinates remain
+        // part of the document corpus even when they cannot match a term.
+        if token_num == 0 && self.coordinate_rank == 0 {
             self.last_token_count = 0;
             self.trim_temporary_buffers();
             self.adjust_tracked_memory_size(
@@ -1657,7 +1662,7 @@ impl IndexWorker {
                     new_posting_memory_size as i64 - old_posting_memory_size as i64;
             }
             Self::apply_delta(&mut self.memory_size, posting_memory_delta);
-        } else {
+        } else if token_num > 0 {
             self.token_ids.sort_unstable();
             let mut iter = self.token_ids.iter();
             let mut current = *iter.next().unwrap();
@@ -2352,7 +2357,7 @@ mod tests {
     use crate::progress::IndexBuildProgress;
     use crate::scalar::inverted::{MemBM25Scorer, Scorer};
     use crate::scalar::{IndexFile, IndexReader, IndexWriter, ScalarIndex};
-    use arrow_array::{RecordBatch, StringArray, UInt64Array};
+    use arrow_array::{RecordBatch, StringArray, UInt32Array, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
     use async_trait::async_trait;
     use bytes::Bytes;
@@ -3662,6 +3667,55 @@ mod tests {
         let statistics = index.statistics()?;
         assert_eq!(statistics["num_tokens"], 0);
         assert_eq!(statistics["num_docs"], 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_zero_token_coordinate_documents_are_preserved_in_corpus_stats() -> Result<()> {
+        let index_dir = TempDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            index_dir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("doc", DataType::Utf8, true),
+            Field::new(doc_index_storage_column(0), DataType::UInt32, false),
+            Field::new(ROW_ID, DataType::UInt64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![
+                    None,
+                    Some(""),
+                    Some("   "),
+                    Some("the"),
+                    Some("overlength"),
+                ])),
+                Arc::new(UInt32Array::from(vec![0, 1, 2, 3, 4])),
+                Arc::new(UInt64Array::from(vec![7, 7, 7, 7, 7])),
+            ],
+        )?;
+        let stream = RecordBatchStreamAdapter::new(batch.schema(), stream::iter(vec![Ok(batch)]));
+        let params =
+            InvertedIndexParams::new("whitespace".to_string(), lance_tokenizer::Language::English)
+                .with_position(false)
+                .remove_stop_words(true)
+                .stem(false)
+                .max_token_length(Some(6))
+                .num_workers(1);
+
+        let mut builder = InvertedIndexBuilder::new(params);
+        builder
+            .update(Box::pin(stream), store.as_ref(), None)
+            .await?;
+
+        let index = InvertedIndex::load(store, None, &LanceCache::no_cache()).await?;
+        let statistics = index.statistics()?;
+        assert_eq!(statistics["num_tokens"], 0);
+        assert_eq!(statistics["num_docs"], 5);
 
         Ok(())
     }

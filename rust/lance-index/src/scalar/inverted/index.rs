@@ -7362,13 +7362,11 @@ async fn tokenize_and_count(
                             temp_query_token_counts
                                 .extend(std::iter::repeat_n(0, query_tokens.len()));
 
-                            let Some(doc) = doc else {
-                                continue;
+                            let (all_tokens, phrase_match) = match doc {
+                                Some(doc) => count_text(doc, &mut temp_query_token_counts)?,
+                                None => (0, false),
                             };
-
-                            let (all_tokens, phrase_match) =
-                                count_text(doc, &mut temp_query_token_counts)?;
-                            if all_tokens > 0 {
+                            if coordinate_rank > 0 || all_tokens > 0 {
                                 append_counts(
                                     row_index,
                                     *row_id,
@@ -12504,6 +12502,61 @@ mod tests {
             scorer.query_weight("hello"),
             expected_scorer.query_weight("hello")
         );
+    }
+
+    #[tokio::test]
+    async fn flat_bm25_preserves_zero_token_list_element_documents() {
+        let coordinate_column = doc_index_storage_column(0);
+        let schema = Arc::new(Schema::new(vec![
+            ROW_ID_FIELD.clone(),
+            Field::new(&coordinate_column, DataType::UInt32, false),
+            Field::new("text", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(UInt64Array::from(vec![7_u64; 6])) as ArrayRef,
+                Arc::new(UInt32Array::from(vec![0, 1, 2, 3, 4, 5])) as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    None,
+                    Some(""),
+                    Some("   "),
+                    Some("the"),
+                    Some("overlength"),
+                    Some("hello"),
+                ])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let params = InvertedIndexParams::new("whitespace".to_string(), Language::English)
+            .remove_stop_words(true)
+            .stem(false)
+            .max_token_length(Some(6));
+        let query_tokens = Arc::new(Tokens::new(vec!["hello".to_string()], DocType::Text));
+
+        let counted_input = tokenize_and_count(
+            stream::iter(vec![Ok(batch)]),
+            params.build().unwrap(),
+            query_tokens.clone(),
+            2,
+            None,
+            1,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(counted_input.num_rows(), 6);
+        assert_eq!(
+            counted_input[&coordinate_column]
+                .as_primitive::<UInt32Type>()
+                .values(),
+            &[0, 1, 2, 3, 4, 5]
+        );
+        let scorer = initialize_scorer(None, query_tokens.as_ref(), &counted_input);
+        assert_eq!(scorer.total_tokens, 1);
+        assert_eq!(scorer.num_docs(), 6);
+        assert_eq!(scorer.num_docs_containing_token("hello"), 1);
     }
 
     #[tokio::test]

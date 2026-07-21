@@ -654,7 +654,7 @@ async fn test_element_document_fts_flat_indexed_and_mixed() {
 
 #[tokio::test]
 async fn test_element_document_persists_empty_and_zero_token_corpora() {
-    async fn assert_empty_query(tags: ArrayRef, expected_documents: usize) {
+    async fn assert_empty_query(tags: ArrayRef, expected_documents: usize, with_position: bool) {
         let ids = Arc::new(Int32Array::from_iter_values(0..tags.len() as i32));
         let batch =
             RecordBatch::try_from_iter(vec![("id", ids as ArrayRef), ("tags", tags)]).unwrap();
@@ -671,7 +671,7 @@ async fn test_element_document_persists_empty_and_zero_token_corpora() {
             &["tags"],
             IndexType::Inverted,
             None,
-            &list_element_params(true),
+            &list_element_params(with_position),
             true,
         )
         .await
@@ -693,8 +693,15 @@ async fn test_element_document_persists_empty_and_zero_token_corpora() {
         assert_eq!(index.statistics().unwrap()["num_docs"], expected_documents);
     }
 
-    assert_empty_query(string_lists(&[None, Some(vec![])]), 0).await;
-    assert_empty_query(string_lists(&[Some(vec![None, Some(""), Some("!!!")])]), 3).await;
+    for with_position in [false, true] {
+        assert_empty_query(string_lists(&[None, Some(vec![])]), 0, with_position).await;
+        assert_empty_query(
+            string_lists(&[Some(vec![None, Some(""), Some("!!!")])]),
+            3,
+            with_position,
+        )
+        .await;
+    }
 }
 
 #[tokio::test]
