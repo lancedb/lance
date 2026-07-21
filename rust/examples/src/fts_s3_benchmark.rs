@@ -504,6 +504,7 @@ async fn main() -> AnyResult<()> {
         dataset_builder = dataset_builder.with_index_cache_size_bytes(cache_size_bytes);
     }
     let dataset = dataset_builder.load().await?;
+    let object_store = dataset.object_store(None).await?;
     let open_ms = open_started.elapsed().as_secs_f64() * 1_000.0;
     let row_count = dataset.count_rows(None).await?;
     if let Some(expected) = args.expected_rows
@@ -544,6 +545,7 @@ async fn main() -> AnyResult<()> {
 
     if let Some(index_name) = &args.prewarm_index {
         let cache_before = dataset.session().index_cache_stats().await;
+        let _ = object_store.io_stats_incremental();
         let prewarm_started = Instant::now();
         if args.prewarm_positions {
             dataset
@@ -556,6 +558,7 @@ async fn main() -> AnyResult<()> {
             dataset.prewarm_index(index_name).await?;
         }
         let prewarm_ms = prewarm_started.elapsed().as_secs_f64() * 1_000.0;
+        let prewarm_io = object_store.io_stats_incremental();
         let cache_after = dataset.session().index_cache_stats().await;
         emit(json!({
             "event": "prewarm_complete",
@@ -567,6 +570,10 @@ async fn main() -> AnyResult<()> {
             "index_cache_entries_after": cache_after.num_entries,
             "index_cache_size_bytes_before": cache_before.size_bytes,
             "index_cache_size_bytes_after": cache_after.size_bytes,
+            "read_iops": prewarm_io.read_iops,
+            "read_bytes": prewarm_io.read_bytes,
+            "write_iops": prewarm_io.write_iops,
+            "written_bytes": prewarm_io.written_bytes,
             "rss_kib": linux_memory_kib("VmRSS:"),
             "peak_rss_kib": linux_memory_kib("VmHWM:"),
         }));
@@ -595,6 +602,7 @@ async fn main() -> AnyResult<()> {
         None
     };
 
+    let _ = object_store.io_stats_incremental();
     for _ in 0..args.warmup_rounds {
         for query in &queries {
             let _ = run_query(
@@ -608,6 +616,16 @@ async fn main() -> AnyResult<()> {
             .await?;
         }
     }
+    let warmup_io = object_store.io_stats_incremental();
+    emit(json!({
+        "event": "warmup_complete",
+        "label": args.label,
+        "rounds": args.warmup_rounds,
+        "read_iops": warmup_io.read_iops,
+        "read_bytes": warmup_io.read_bytes,
+        "write_iops": warmup_io.write_iops,
+        "written_bytes": warmup_io.written_bytes,
+    }));
 
     let dataset = Arc::new(dataset);
     let jobs = (0..args.measured_rounds)
@@ -651,6 +669,7 @@ async fn main() -> AnyResult<()> {
         .try_collect::<Vec<_>>()
         .await?;
     let measured_seconds = measured_started.elapsed().as_secs_f64();
+    let measured_io = object_store.io_stats_incremental();
     measurements.sort_unstable_by_key(|measurement| (measurement.round, measurement.query_index));
 
     for measurement in &measurements {
@@ -683,6 +702,10 @@ async fn main() -> AnyResult<()> {
         "latency_p50_ms": percentile(&latencies, 50.0),
         "latency_p95_ms": percentile(&latencies, 95.0),
         "latency_p99_ms": percentile(&latencies, 99.0),
+        "read_iops": measured_io.read_iops,
+        "read_bytes": measured_io.read_bytes,
+        "write_iops": measured_io.write_iops,
+        "written_bytes": measured_io.written_bytes,
         "rss_kib": linux_memory_kib("VmRSS:"),
         "peak_rss_kib": linux_memory_kib("VmHWM:"),
     }));

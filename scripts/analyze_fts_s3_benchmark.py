@@ -73,8 +73,12 @@ def parity_result(
 def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
     queries = [record for record in records if record.get("event") == "query"]
     summaries = [record for record in records if record.get("event") == "summary"]
+    prewarms = [
+        record for record in records if record.get("event") == "prewarm_complete"
+    ]
     latencies = [float(record["latency_ms"]) for record in queries]
     throughputs = [float(record["throughput_qps"]) for record in summaries]
+    prewarm_ms = [float(record["prewarm_ms"]) for record in prewarms]
     peak_rss = [
         int(record["peak_rss_kib"])
         for record in queries + summaries
@@ -87,7 +91,43 @@ def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
         "latency_p95_ms": percentile(latencies, 95.0),
         "latency_p99_ms": percentile(latencies, 99.0),
         "throughput_qps_mean": mean(throughputs) if throughputs else None,
+        "prewarm_ms_mean": mean(prewarm_ms) if prewarm_ms else None,
+        "prewarm_read_iops": sum(
+            int(record.get("read_iops", 0)) for record in prewarms
+        ),
+        "prewarm_read_bytes": sum(
+            int(record.get("read_bytes", 0)) for record in prewarms
+        ),
+        "index_cache_size_bytes_after_max": max(
+            (int(record["index_cache_size_bytes_after"]) for record in prewarms),
+            default=None,
+        ),
+        "read_iops": sum(int(record.get("read_iops", 0)) for record in summaries),
+        "read_bytes": sum(int(record.get("read_bytes", 0)) for record in summaries),
+        "write_iops": sum(int(record.get("write_iops", 0)) for record in summaries),
+        "written_bytes": sum(
+            int(record.get("written_bytes", 0)) for record in summaries
+        ),
         "peak_rss_kib_max": max(peak_rss) if peak_rss else None,
+    }
+
+
+def summarize_rounds(
+    records: list[dict[str, Any]], first_round: bool
+) -> dict[str, Any]:
+    queries = [
+        record
+        for record in records
+        if record.get("event") == "query"
+        and ((int(record["round"]) == 0) == first_round)
+    ]
+    latencies = [float(record["latency_ms"]) for record in queries]
+    return {
+        "query_executions": len(queries),
+        "latency_mean_ms": mean(latencies) if latencies else None,
+        "latency_p50_ms": percentile(latencies, 50.0),
+        "latency_p95_ms": percentile(latencies, 95.0),
+        "latency_p99_ms": percentile(latencies, 99.0),
     }
 
 
@@ -95,6 +135,26 @@ def relative_change(baseline: float | None, candidate: float | None) -> float | 
     if baseline is None or candidate is None or baseline == 0:
         return None
     return (candidate - baseline) / baseline * 100.0
+
+
+def compare_latency_summaries(
+    baseline: dict[str, Any], candidate: dict[str, Any]
+) -> dict[str, Any]:
+    return {
+        "baseline": baseline,
+        "candidate": candidate,
+        "candidate_vs_baseline_percent": {
+            "latency_mean": relative_change(
+                baseline["latency_mean_ms"], candidate["latency_mean_ms"]
+            ),
+            "latency_p50": relative_change(
+                baseline["latency_p50_ms"], candidate["latency_p50_ms"]
+            ),
+            "latency_p95": relative_change(
+                baseline["latency_p95_ms"], candidate["latency_p95_ms"]
+            ),
+        },
+    }
 
 
 def main() -> int:
@@ -168,9 +228,19 @@ def main() -> int:
     for phase in args.phases:
         baseline = summarize(data[(phase, "baseline")])
         candidate = summarize(data[(phase, "candidate")])
+        first_round = compare_latency_summaries(
+            summarize_rounds(data[(phase, "baseline")], True),
+            summarize_rounds(data[(phase, "candidate")], True),
+        )
+        steady_rounds = compare_latency_summaries(
+            summarize_rounds(data[(phase, "baseline")], False),
+            summarize_rounds(data[(phase, "candidate")], False),
+        )
         phases[phase] = {
             "baseline": baseline,
             "candidate": candidate,
+            "first_round": first_round,
+            "steady_rounds": steady_rounds,
             "candidate_vs_baseline_percent": {
                 "latency_mean": relative_change(
                     baseline["latency_mean_ms"], candidate["latency_mean_ms"]
@@ -184,6 +254,9 @@ def main() -> int:
                 "throughput": relative_change(
                     baseline["throughput_qps_mean"],
                     candidate["throughput_qps_mean"],
+                ),
+                "prewarm_ms": relative_change(
+                    baseline["prewarm_ms_mean"], candidate["prewarm_ms_mean"]
                 ),
                 "peak_rss": relative_change(
                     baseline["peak_rss_kib_max"], candidate["peak_rss_kib_max"]
