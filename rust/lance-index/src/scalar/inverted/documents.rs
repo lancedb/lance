@@ -147,6 +147,10 @@ impl DocLengths {
         )
     }
 
+    fn scoring_ready(&self) -> bool {
+        !self.quantized_scoring || self.norms.get().is_some()
+    }
+
     #[inline]
     pub(crate) fn scoring(&self, doc_id: DocId) -> u32 {
         match self.scoring_norms() {
@@ -561,6 +565,13 @@ impl PartitionDocumentStore {
         }
     }
 
+    pub(crate) fn query_ready(&self) -> bool {
+        match self {
+            Self::Legacy(_) => true,
+            Self::Modern(docs) => docs.query_ready(),
+        }
+    }
+
     pub(crate) async fn load_build_docset(&self) -> Result<DocSet> {
         match self {
             Self::Legacy(docs) => Ok((**docs).clone()),
@@ -647,6 +658,18 @@ impl PartitionDocuments {
 
     pub(crate) fn projection_loaded(&self) -> bool {
         self.projection.initialized()
+    }
+
+    pub(crate) fn query_ready(&self) -> bool {
+        self.prewarm_complete.initialized()
+            && self
+                .lengths
+                .get()
+                .is_some_and(|lengths| lengths.scoring_ready())
+            && self
+                .projection
+                .get()
+                .is_some_and(|projection| projection.doc_ids_by_address.initialized())
     }
 
     async fn reader(&self) -> Result<Arc<dyn IndexReader>> {
@@ -863,6 +886,31 @@ impl PartitionDocuments {
         }
     }
 
+    /// Estimated Arrow payload retained while resolving these final candidates.
+    /// The estimate is used to cap cross-partition read concurrency; a single
+    /// oversized partition is still allowed to make progress.
+    pub(crate) fn estimated_address_read_bytes(&self, doc_ids: &[DocId]) -> usize {
+        if doc_ids.is_empty() || self.projection.initialized() {
+            return 0;
+        }
+        if self.remapper.is_some() {
+            return self.num_docs.saturating_mul(std::mem::size_of::<u64>());
+        }
+
+        // Avoid repeating the sort/dedup performed by `resolve_addresses`.
+        // Treating every requested DocId as distinct and disjoint can only
+        // overestimate the payload, which makes the concurrency bound safer.
+        let point_bytes = doc_ids.len().saturating_mul(std::mem::size_of::<u64>());
+        let use_bulk = doc_ids.len() > MAX_POINT_ADDRESS_RANGES
+            || point_bytes > MAX_POINT_ADDRESS_BYTES
+            || doc_ids.len() >= self.num_docs;
+        if use_bulk {
+            self.num_docs.saturating_mul(std::mem::size_of::<u64>())
+        } else {
+            point_bytes
+        }
+    }
+
     /// Materialize the build-side table for rewrite/update operations.
     pub(crate) async fn load_build_docset(&self) -> Result<DocSet> {
         DocSet::load(self.reader().await?, false, self.remapper.clone()).await
@@ -913,7 +961,12 @@ impl PartitionDocuments {
                     let _ = self.projection.set(projection);
                 }
 
-                self.lengths().await?;
+                let lengths = self.lengths().await?;
+                spawn_cpu(move || {
+                    let _ = lengths.scoring_norms();
+                    Result::Ok(())
+                })
+                .await?;
                 self.projection().await?.doc_ids_by_address().await?;
                 Result::Ok(())
             })
@@ -994,6 +1047,7 @@ fn corrupt_docs(path: &str, message: impl Into<String>) -> Error {
 mod tests {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     use arrow_array::{ArrayRef, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
@@ -1003,6 +1057,7 @@ mod tests {
     use lance_io::object_store::ObjectStore;
     use lance_select::RowAddrTreeMap;
     use roaring::RoaringTreemap;
+    use tokio::sync::Notify;
 
     use crate::scalar::lance_format::LanceIndexStore;
     use crate::scalar::{IndexFile, IndexWriter};
@@ -1031,9 +1086,32 @@ mod tests {
         }
     }
 
+    const PAUSE_ONCE: usize = 1;
+    const FAIL_ONCE: usize = 2;
+
+    #[derive(Debug, Default)]
+    struct ReadFault {
+        action: AtomicUsize,
+        started: Notify,
+    }
+
+    impl ReadFault {
+        async fn apply(&self) -> Result<()> {
+            match self.action.swap(0, Ordering::AcqRel) {
+                PAUSE_ONCE => {
+                    self.started.notify_one();
+                    std::future::pending::<Result<()>>().await
+                }
+                FAIL_ONCE => Err(Error::io("injected document read failure")),
+                _ => Ok(()),
+            }
+        }
+    }
+
     struct CountingReader {
         inner: Arc<dyn IndexReader>,
         counts: Arc<DocumentReadCounts>,
+        fault: Option<Arc<ReadFault>>,
     }
 
     #[async_trait]
@@ -1053,6 +1131,9 @@ mod tests {
         ) -> Result<RecordBatch> {
             self.counts.range_calls.fetch_add(1, Ordering::Relaxed);
             self.counts.record(range.len(), projection);
+            if let Some(fault) = &self.fault {
+                fault.apply().await?;
+            }
             self.inner.read_range(range, projection).await
         }
 
@@ -1064,6 +1145,9 @@ mod tests {
             self.counts.ranges_calls.fetch_add(1, Ordering::Relaxed);
             self.counts
                 .record(ranges.iter().map(Range::len).sum(), projection);
+            if let Some(fault) = &self.fault {
+                fault.apply().await?;
+            }
             self.inner.read_ranges(ranges, projection).await
         }
 
@@ -1089,6 +1173,7 @@ mod tests {
         inner: Arc<dyn IndexStore>,
         target: String,
         counts: Arc<DocumentReadCounts>,
+        fault: Option<Arc<ReadFault>>,
     }
 
     impl DeepSizeOf for CountingStore {
@@ -1108,6 +1193,7 @@ mod tests {
                 inner: self.inner.clone(),
                 target: self.target.clone(),
                 counts: self.counts.clone(),
+                fault: self.fault.clone(),
             })
         }
 
@@ -1130,6 +1216,7 @@ mod tests {
                 Ok(Arc::new(CountingReader {
                     inner: reader,
                     counts: self.counts.clone(),
+                    fault: self.fault.clone(),
                 }))
             } else {
                 Ok(reader)
@@ -1141,6 +1228,7 @@ mod tests {
                 inner: self.inner.with_io_priority(io_priority),
                 target: self.target.clone(),
                 counts: self.counts.clone(),
+                fault: self.fault.clone(),
             })
         }
 
@@ -1239,8 +1327,29 @@ mod tests {
                 inner,
                 target: target.to_owned(),
                 counts: counts.clone(),
+                fault: None,
             }),
             counts,
+        )
+    }
+
+    fn faulting_store(
+        inner: Arc<dyn IndexStore>,
+        target: &str,
+        action: usize,
+    ) -> (Arc<dyn IndexStore>, Arc<ReadFault>) {
+        let fault = Arc::new(ReadFault {
+            action: AtomicUsize::new(action),
+            started: Notify::new(),
+        });
+        (
+            Arc::new(CountingStore {
+                inner,
+                target: target.to_owned(),
+                counts: Arc::new(DocumentReadCounts::default()),
+                fault: Some(fault.clone()),
+            }),
+            fault,
         )
     }
 
@@ -1535,6 +1644,7 @@ mod tests {
 
         assert!(documents.lengths_loaded());
         assert!(documents.projection_loaded());
+        assert!(documents.query_ready());
         assert!(matches!(
             first_lookup.as_ref(),
             AddressDocIdLookup::Identity
@@ -1548,6 +1658,72 @@ mod tests {
         assert_eq!(counts.range_calls.load(Ordering::Relaxed), 1);
         assert_eq!(counts.length_rows.load(Ordering::Relaxed), 3);
         assert_eq!(counts.address_rows.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn prewarm_materializes_quantized_norms_before_becoming_query_ready() {
+        let (_directory, store) = test_store();
+        let path = "docs.lance";
+        write_documents(
+            store.as_ref(),
+            path,
+            UInt64Array::from(vec![10, 20, 30]),
+            UInt32Array::from(vec![2, 300, 5]),
+            Some("307"),
+        )
+        .await;
+        let reader = store.open_index_file(path).await.unwrap();
+        let documents =
+            PartitionDocuments::try_new(store, path.to_owned(), reader.as_ref(), None, true)
+                .unwrap();
+
+        assert!(!documents.query_ready());
+        documents.prewarm().await.unwrap();
+        let lengths = documents.lengths().await.unwrap();
+        assert!(lengths.scoring_ready());
+        assert_eq!(lengths.scoring_norms().unwrap().len(), 3);
+        assert!(documents.query_ready());
+    }
+
+    #[tokio::test]
+    async fn cancelled_or_failed_prewarm_can_retry_without_partial_publication() {
+        let (_directory, store) = test_store();
+        let path = "docs.lance";
+        write_documents(
+            store.as_ref(),
+            path,
+            UInt64Array::from(vec![10, 20, 30]),
+            UInt32Array::from(vec![2, 3, 5]),
+            Some("10"),
+        )
+        .await;
+
+        let (pausing, pause) = faulting_store(store.clone(), path, PAUSE_ONCE);
+        let documents = Arc::new(open_documents(pausing, path, None).await.unwrap());
+        let task = tokio::spawn({
+            let documents = documents.clone();
+            async move { documents.prewarm().await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), pause.started.notified())
+            .await
+            .expect("prewarm should reach the injected pending read");
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(!documents.lengths_loaded());
+        assert!(!documents.projection_loaded());
+        assert!(!documents.query_ready());
+        documents.prewarm().await.unwrap();
+        assert!(documents.query_ready());
+
+        let (failing, _fault) = faulting_store(store, path, FAIL_ONCE);
+        let documents = open_documents(failing, path, None).await.unwrap();
+        let error = documents.prewarm().await.unwrap_err();
+        assert!(error.to_string().contains("injected document read failure"));
+        assert!(!documents.lengths_loaded());
+        assert!(!documents.projection_loaded());
+        assert!(!documents.query_ready());
+        documents.prewarm().await.unwrap();
+        assert!(documents.query_ready());
     }
 
     #[tokio::test]
@@ -1630,6 +1806,7 @@ mod tests {
         assert_eq!(counts.rows.load(Ordering::Relaxed), 0);
 
         let point_ids = [DocId::new(5), DocId::new(6), DocId::new(10), DocId::new(5)];
+        assert_eq!(documents.estimated_address_read_bytes(&point_ids), 32);
         assert_eq!(
             documents.resolve_addresses(&point_ids).await.unwrap(),
             vec![1005, 1006, 1010, 1005]
@@ -1640,6 +1817,10 @@ mod tests {
 
         let bulk_ids = (0..=512).step_by(2).map(DocId::new).collect::<Vec<_>>();
         assert_eq!(bulk_ids.len(), MAX_POINT_ADDRESS_RANGES + 1);
+        assert_eq!(
+            documents.estimated_address_read_bytes(&bulk_ids),
+            num_docs as usize * std::mem::size_of::<u64>()
+        );
         let resolved = documents.resolve_addresses(&bulk_ids).await.unwrap();
         assert_eq!(resolved.first(), Some(&1000));
         assert_eq!(resolved.last(), Some(&1512));
