@@ -1560,32 +1560,14 @@ impl ShardWriter {
         // Derive PK metadata and run every side-effect-free validation *before*
         // claiming the epoch. `claim_epoch` durably bumps the stored epoch and,
         // for a successor, `write_fence_sentinel` fences the predecessor — so an
-        // open doomed by purely local input (a bad flush interval, an index config
-        // that disagrees with the schema) must fail here, before it can knock the
-        // healthy incumbent off the shard. Memtable-only: WAL-only mode has no
-        // indexes and no memtable ticker to validate.
+        // open doomed by purely local input (an index config that disagrees with
+        // the schema) must fail here, before it can knock the healthy incumbent off
+        // the shard. Memtable-only: WAL-only mode has no indexes to validate.
         let memtable_validation = if config.enable_memtable {
             let lance_schema = Schema::try_from(schema.as_ref())?;
             let pk_fields = lance_schema.unenforced_primary_key();
             let pk_field_ids: Vec<i32> = pk_fields.iter().map(|f| f.id).collect();
             let pk_columns: Vec<String> = pk_fields.iter().map(|f| f.name.clone()).collect();
-
-            // A durable writer with no flush ticker cannot make progress. The WAL
-            // append is timer-, size-, and freeze-driven now — the put path no
-            // longer triggers its own — so with no ticker a durable put below the
-            // size threshold waits on an append that nothing will ever make. Reject
-            // the combination rather than deadlock on it.
-            if config.durable_write
-                && config
-                    .max_wal_flush_interval
-                    .is_none_or(|interval| interval.is_zero())
-            {
-                return Err(Error::invalid_input(
-                    "durable_write requires a non-zero max_wal_flush_interval: the WAL append is \
-                     driven by that ticker, so without it a durable put would wait forever for an \
-                     append that never happens",
-                ));
-            }
 
             // Reject an index config that disagrees with the schema *before* a
             // single row is accepted. Such a config fails deterministically on
@@ -5414,9 +5396,9 @@ mod tests {
 
     /// A doomed open must fail on local validation *before* it claims the epoch,
     /// so it cannot fence the healthy writer already serving the shard. The
-    /// durable-write/flush-interval and index-config checks used to run *after*
-    /// `claim_epoch` (and, for a successor, after `write_fence_sentinel`), so a
-    /// rejected open still bumped the stored epoch and fenced the incumbent.
+    /// index-config check used to run *after* `claim_epoch` (and, for a successor,
+    /// after `write_fence_sentinel`), so a rejected open still bumped the stored
+    /// epoch and fenced the incumbent.
     #[tokio::test]
     async fn test_doomed_open_does_not_fence_incumbent() {
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
@@ -5438,26 +5420,27 @@ mod tests {
             .await
             .unwrap();
 
-        // A durable writer with no flush interval is rejected — the put path no
-        // longer triggers its own append, so it would deadlock. On the old path
-        // this rejection landed only after the epoch had already been claimed.
-        let doomed_config = ShardWriterConfig {
-            max_wal_flush_interval: None,
-            ..memtable_config_with_pk(shard_id)
-        };
+        // An index config that disagrees with the schema (FTS on the Int32 `id`
+        // column) is rejected on local validation. On the old path this rejection
+        // landed only after the epoch had already been claimed.
+        let bad_fts = MemIndexConfig::Fts(FtsIndexConfig::new(
+            "bad_fts".to_string(),
+            0,
+            "id".to_string(),
+        ));
         let err = ShardWriter::open(
             store.clone(),
             base_path.clone(),
             base_uri.clone(),
-            doomed_config,
+            memtable_config_with_pk(shard_id),
             schema.clone(),
-            vec![],
+            vec![bad_fts],
         )
         .await
         .map(|_| ())
-        .expect_err("durable_write with no flush interval must be rejected");
+        .expect_err("an FTS index on a non-Utf8 column must be rejected");
         assert!(
-            err.to_string().contains("max_wal_flush_interval"),
+            err.to_string().contains("bad_fts") && err.to_string().contains("Utf8"),
             "unexpected error: {err}"
         );
 
