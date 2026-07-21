@@ -913,4 +913,187 @@ mod tests {
             (MAX_UPLOAD_PART_SIZE, true)
         );
     }
+
+    mod flaky_store {
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use futures::stream::BoxStream;
+        use object_store::{
+            CopyOptions, GetOptions, GetResult, ListResult, ObjectMeta, PutMultipartOptions,
+            PutOptions, PutPayload, PutResult, UploadPart,
+        };
+
+        use super::*;
+
+        /// Wraps a store so that multipart uploads reproduce the client-side
+        /// part bookkeeping of the real S3/Azure `MultipartUpload`
+        /// implementations, which the in-memory store does not share: every
+        /// `put_part` call claims the next part index (including calls whose
+        /// upload later fails), only successful uploads record a part, and
+        /// `complete` requires one recorded part per claimed index, failing
+        /// with the same "Missing part" error as
+        /// `object_store::client::parts::Parts::finish`.
+        ///
+        /// The first `part_failures_left` part uploads fail with a retryable
+        /// "connection reset by peer" error.
+        #[derive(Debug)]
+        pub struct FlakyStore {
+            pub inner: Arc<dyn ObjectStore>,
+            pub part_failures_left: Arc<AtomicUsize>,
+        }
+
+        impl std::fmt::Display for FlakyStore {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "FlakyStore({})", self.inner)
+            }
+        }
+
+        #[async_trait]
+        impl ObjectStore for FlakyStore {
+            async fn put_opts(
+                &self,
+                location: &Path,
+                payload: PutPayload,
+                opts: PutOptions,
+            ) -> OSResult<PutResult> {
+                self.inner.put_opts(location, payload, opts).await
+            }
+
+            async fn put_multipart_opts(
+                &self,
+                location: &Path,
+                _opts: PutMultipartOptions,
+            ) -> OSResult<Box<dyn MultipartUpload>> {
+                Ok(Box::new(FlakyMultipartUpload {
+                    store: self.inner.clone(),
+                    location: location.clone(),
+                    part_idx: 0,
+                    recorded_parts: Arc::new(Mutex::new(Vec::new())),
+                    part_failures_left: self.part_failures_left.clone(),
+                }))
+            }
+
+            async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
+                self.inner.get_opts(location, options).await
+            }
+
+            fn delete_stream(
+                &self,
+                locations: BoxStream<'static, OSResult<Path>>,
+            ) -> BoxStream<'static, OSResult<Path>> {
+                self.inner.delete_stream(locations)
+            }
+
+            fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
+                self.inner.list(prefix)
+            }
+
+            async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
+                self.inner.list_with_delimiter(prefix).await
+            }
+
+            async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> OSResult<()> {
+                self.inner.copy_opts(from, to, opts).await
+            }
+        }
+
+        #[derive(Debug)]
+        struct FlakyMultipartUpload {
+            store: Arc<dyn ObjectStore>,
+            location: Path,
+            part_idx: usize,
+            recorded_parts: Arc<Mutex<Vec<(usize, PutPayload)>>>,
+            part_failures_left: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl MultipartUpload for FlakyMultipartUpload {
+            fn put_part(&mut self, data: PutPayload) -> UploadPart {
+                let idx = self.part_idx;
+                self.part_idx += 1;
+                let recorded_parts = self.recorded_parts.clone();
+                let part_failures_left = self.part_failures_left.clone();
+                Box::pin(async move {
+                    let should_fail = part_failures_left
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                        .is_ok();
+                    if should_fail {
+                        return Err(OSError::Generic {
+                            store: "FlakyStore",
+                            source: "connection reset by peer".to_string().into(),
+                        });
+                    }
+                    recorded_parts.lock().unwrap().push((idx, data));
+                    Ok(())
+                })
+            }
+
+            async fn complete(&mut self) -> OSResult<PutResult> {
+                let mut parts = std::mem::take(&mut *self.recorded_parts.lock().unwrap());
+                if parts.len() != self.part_idx {
+                    return Err(OSError::Generic {
+                        store: "Parts",
+                        source: "Missing part".to_string().into(),
+                    });
+                }
+                parts.sort_unstable_by_key(|(idx, _)| *idx);
+                let mut buf =
+                    Vec::with_capacity(parts.iter().map(|(_, p)| p.content_length()).sum());
+                for (_, payload) in &parts {
+                    for chunk in payload {
+                        buf.extend_from_slice(chunk);
+                    }
+                }
+                self.store.put(&self.location, buf.into()).await
+            }
+
+            async fn abort(&mut self) -> OSResult<()> {
+                Ok(())
+            }
+        }
+    }
+
+    /// A part upload that fails with a retryable error (e.g. a connection
+    /// reset from S3/Azure throttling) and is re-submitted by `ObjectWriter`
+    /// must still produce a complete, correctly ordered object.
+    ///
+    /// The `MultipartUpload` trait assigns a fresh part index to every
+    /// `put_part` call, so re-submitting a failed part through `put_part`
+    /// leaves the failed part's index permanently unfilled and `complete()`
+    /// fails with "Generic Parts error: Missing part" even though the retry
+    /// itself succeeded.
+    #[tokio::test(start_paused = true)]
+    async fn test_multipart_part_retry_after_connection_reset() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let part_failures_left = Arc::new(AtomicUsize::new(1));
+        let mut store = LanceObjectStore::memory();
+        store.inner = Arc::new(flaky_store::FlakyStore {
+            inner: store.inner.clone(),
+            part_failures_left: part_failures_left.clone(),
+        });
+
+        let path = Path::from("/flaky");
+        let mut writer = ObjectWriter::new(&store, &path).await.unwrap();
+
+        // Three parts: two full 5MB parts plus a final partial part flushed on
+        // shutdown. Position-dependent bytes catch both failure modes: an
+        // error from complete() and out-of-order reassembly of the retried
+        // part (251 is prime, so the pattern never aligns with part sizes).
+        let data: Vec<u8> = (0..INITIAL_UPLOAD_STEP * 2 + 1024)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        writer.write_all(&data).await.unwrap();
+        let res = Writer::shutdown(&mut writer).await.unwrap();
+
+        assert_eq!(
+            part_failures_left.load(Ordering::SeqCst),
+            0,
+            "the injected part failure never fired, so the retry path was not exercised"
+        );
+        assert_eq!(res.size, data.len());
+        let round_trip = store.inner.get(&path).await.unwrap().bytes().await.unwrap();
+        assert_eq!(round_trip, Bytes::from(data));
+    }
 }
