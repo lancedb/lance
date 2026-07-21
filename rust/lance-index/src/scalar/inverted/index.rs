@@ -412,55 +412,75 @@ fn rescore_partition_candidates<C>(
     partition: PartitionCandidates<C>,
     scorer: &MemBM25Scorer,
     idf_cache: &mut HashMap<String, f32>,
-) -> Vec<(C, f32)> {
+    mut push_candidate: impl FnMut(C, f32) -> Result<()>,
+) -> Result<()> {
     let PartitionCandidates {
         tokens_by_position,
         grouped_expansions,
         candidates,
     } = partition;
-    let idf_by_position = tokens_by_position
-        .iter()
-        .map(|token| {
-            *idf_cache
-                .entry(token.clone())
-                .or_insert_with(|| scorer.query_weight(token))
-        })
-        .collect::<Vec<_>>();
+    let mut idf_by_position = Vec::with_capacity(tokens_by_position.len());
+    for token in &tokens_by_position {
+        let weight = match idf_cache.get(token) {
+            Some(weight) => *weight,
+            None => {
+                let weight = scorer.query_weight(token);
+                idf_cache.insert(token.clone(), weight);
+                weight
+            }
+        };
+        idf_by_position.push(weight);
+    }
+
+    if grouped_expansions.is_empty() {
+        for DocCandidate {
+            document,
+            freqs,
+            doc_length,
+            ..
+        } in candidates
+        {
+            let mut score = 0.0;
+            for (term_index, freq) in freqs {
+                debug_assert!((term_index as usize) < idf_by_position.len());
+                score += idf_by_position[term_index as usize] * scorer.doc_weight(freq, doc_length);
+            }
+            push_candidate(document, score)?;
+        }
+        return Ok(());
+    }
+
     let grouped_positions = grouped_expansions
         .iter()
         .map(|group| group.position)
         .collect::<HashSet<_>>();
 
-    candidates
-        .into_iter()
-        .map(
-            |DocCandidate {
-                 document,
-                 posting_doc_id,
-                 freqs,
-                 doc_length,
-             }| {
-                let mut score = 0.0;
-                for (term_index, freq) in freqs {
-                    if grouped_positions.contains(&term_index) {
-                        continue;
-                    }
-                    debug_assert!((term_index as usize) < idf_by_position.len());
-                    score +=
-                        idf_by_position[term_index as usize] * scorer.doc_weight(freq, doc_length);
-                }
-                for group in &grouped_expansions {
-                    for term in group.terms.iter() {
-                        let Some(freq) = term.frequency(posting_doc_id) else {
-                            continue;
-                        };
-                        score += term.query_weight() * scorer.doc_weight(freq, doc_length);
-                    }
-                }
-                (document, score)
-            },
-        )
-        .collect()
+    for DocCandidate {
+        document,
+        posting_doc_id,
+        freqs,
+        doc_length,
+    } in candidates
+    {
+        let mut score = 0.0;
+        for (term_index, freq) in freqs {
+            if grouped_positions.contains(&term_index) {
+                continue;
+            }
+            debug_assert!((term_index as usize) < idf_by_position.len());
+            score += idf_by_position[term_index as usize] * scorer.doc_weight(freq, doc_length);
+        }
+        for group in &grouped_expansions {
+            for term in group.terms.iter() {
+                let Some(freq) = term.frequency(posting_doc_id) else {
+                    continue;
+                };
+                score += term.query_weight() * scorer.doc_weight(freq, doc_length);
+            }
+        }
+        push_candidate(document, score)?;
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -1192,9 +1212,10 @@ impl InvertedIndex {
         let mut idf_cache = HashMap::new();
         let mut parts = stream::iter(parts).buffer_unordered(get_num_compute_intensive_cpus());
         while let Some(partition) = parts.try_next().await? {
-            for (row_id, score) in rescore_partition_candidates(partition, scorer, &mut idf_cache) {
+            rescore_partition_candidates(partition, scorer, &mut idf_cache, |row_id, score| {
                 push_scored_key(&mut ranked, limit, row_id, score);
-            }
+                Ok(())
+            })?;
         }
         Ok(ranked
             .into_sorted_vec()
@@ -1383,14 +1404,15 @@ impl InvertedIndex {
         let mut idf_cache = HashMap::new();
         let mut parts = stream::iter(parts).buffer_unordered(get_num_compute_intensive_cpus());
         while let Some((partition_ordinal, partition)) = parts.try_next().await? {
-            for (doc_id, score) in rescore_partition_candidates(partition, scorer, &mut idf_cache) {
+            rescore_partition_candidates(partition, scorer, &mut idf_cache, |doc_id, score| {
                 push_scored_partition_doc(
                     &mut ranked,
                     limit,
                     PartitionDocId::try_new(partition_ordinal, doc_id)?,
                     score,
                 );
-            }
+                Ok(())
+            })?;
         }
 
         Ok(ranked.into_sorted_vec())
