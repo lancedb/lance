@@ -736,6 +736,11 @@ impl PartitionDocuments {
             .cloned()
     }
 
+    /// Return resident lengths without entering the asynchronous singleflight path.
+    pub(crate) fn cached_lengths(&self) -> Option<Arc<DocLengths>> {
+        self.lengths.get().cloned()
+    }
+
     pub(crate) async fn projection(&self) -> Result<Arc<VersionAddressProjection>> {
         self.projection
             .get_or_try_init(|| async {
@@ -752,11 +757,8 @@ impl PartitionDocuments {
         mask: Arc<RowAddrMask>,
         materialize_selected: bool,
     ) -> Result<DocVisibility> {
-        if mask.max_len() == Some(0) {
-            return Ok(DocVisibility::Selected(RoaringBitmap::new()));
-        }
-        if mask.is_select_all() && self.remapper.is_none() {
-            return Ok(DocVisibility::All);
+        if let Some(visibility) = self.immediate_visibility(mask.clone(), materialize_selected) {
+            return Ok(visibility);
         }
 
         let projection = self.projection().await?;
@@ -767,6 +769,30 @@ impl PartitionDocuments {
             projection.materialize_visibility(mask).await
         } else {
             Ok(DocVisibility::Filtered { projection, mask })
+        }
+    }
+
+    /// Resolve visibility without I/O or CPU-pool work when all required state is resident.
+    pub(crate) fn immediate_visibility(
+        &self,
+        mask: Arc<RowAddrMask>,
+        materialize_selected: bool,
+    ) -> Option<DocVisibility> {
+        if mask.max_len() == Some(0) {
+            return Some(DocVisibility::Selected(RoaringBitmap::new()));
+        }
+        if mask.is_select_all() && self.remapper.is_none() {
+            return Some(DocVisibility::All);
+        }
+
+        let projection = self.projection.get()?.clone();
+        if mask.is_select_all() {
+            return Some(DocVisibility::Selected(projection.live_doc_ids()));
+        }
+        if materialize_selected {
+            None
+        } else {
+            Some(DocVisibility::Filtered { projection, mask })
         }
     }
 
@@ -1645,6 +1671,11 @@ mod tests {
         assert!(documents.lengths_loaded());
         assert!(documents.projection_loaded());
         assert!(documents.query_ready());
+        assert_eq!(documents.cached_lengths().unwrap().total_tokens(), 10);
+        assert!(matches!(
+            documents.immediate_visibility(Arc::new(RowAddrMask::all_rows()), false),
+            Some(DocVisibility::All)
+        ));
         assert!(matches!(
             first_lookup.as_ref(),
             AddressDocIdLookup::Identity
