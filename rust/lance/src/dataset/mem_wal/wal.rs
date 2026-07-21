@@ -1983,6 +1983,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_writer_cursors_advance_and_visibility() {
+        // The durable cursor starts at zero and advances to the value passed.
+        let cursors = WriterCursors::new(true);
+        assert_eq!(cursors.durable(), 0);
+        cursors.advance_durable(5);
+        assert_eq!(cursors.durable(), 5);
+
+        // fetch_max: a lower value never walks the cursor backwards.
+        cursors.advance_durable(3);
+        assert_eq!(cursors.durable(), 5);
+
+        // durable_write = true: visibility is clamped by the writer-global durable
+        // cursor, offset by this memtable's global coordinate.
+        assert!(cursors.durable_write());
+        // global_offset 0: min(indexed = 10, durable = 5) = 5.
+        assert_eq!(cursors.visible_count(10, 0), 5);
+        // global_offset 2: min(indexed = 10, durable 5 - 2 = 3) = 3.
+        assert_eq!(cursors.visible_count(10, 2), 3);
+        // A memtable that starts past the durable cursor sees nothing.
+        assert_eq!(cursors.visible_count(10, 8), 0);
+        // Indexing, not durability, is the tighter bound here.
+        assert_eq!(cursors.visible_count(2, 0), 2);
+
+        // durable_write = false: durability is not part of visibility, so the
+        // indexed count passes through unchanged regardless of the cursor.
+        let non_durable = WriterCursors::new(false);
+        assert!(!non_durable.durable_write());
+        assert_eq!(non_durable.visible_count(7, 0), 7);
+        non_durable.advance_durable(1);
+        assert_eq!(non_durable.visible_count(7, 0), 7);
+    }
+
+    #[tokio::test]
+    async fn test_writer_cursors_advance_is_monotonic() {
+        let cursors = Arc::new(WriterCursors::new(true));
+        let mut handles = Vec::new();
+        for target in [4usize, 1, 9, 3, 7, 2] {
+            let cursors = cursors.clone();
+            handles.push(tokio::spawn(async move {
+                let before = cursors.durable();
+                cursors.advance_durable(target);
+                // An advance can only move the cursor forward, never back — even
+                // when a smaller target races a larger one.
+                assert!(cursors.durable() >= before);
+            }));
+        }
+        for handle in handles {
+            handle.await.unwrap();
+        }
+        // Whatever order the concurrent advances landed in, the cursor ends at the
+        // largest target.
+        assert_eq!(cursors.durable(), 9);
+    }
+
+    /// The happy path of the index-apply task: a valid range advances the index
+    /// cursor to its end and reports exactly the rows it covered.
+    #[tokio::test]
+    async fn test_index_apply_advances_cursor_and_counts_rows() {
+        let schema = create_test_schema();
+        let batch_store = Arc::new(BatchStore::with_capacity(10));
+        for _ in 0..3 {
+            batch_store.append(create_test_batch(&schema, 5)).unwrap();
+        }
+
+        let mut idx = IndexStore::new();
+        idx.add_btree("id_idx".to_string(), 0, "id".to_string());
+        let indexes = Arc::new(idx);
+        let cursors = Arc::new(WriterCursors::new(true));
+
+        let stats = apply_index_range(
+            &cursors,
+            TriggerIndexApply {
+                batch_store: batch_store.clone(),
+                indexes: indexes.clone(),
+                end_batch_position: batch_store.len(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Three batches of five rows each were indexed, and the cursor advanced to
+        // cover them.
+        assert_eq!(indexes.indexed_count(), 3);
+        assert_eq!(stats.rows_indexed, 15);
+
+        // Re-applying the same range is a coalesced no-op: the cursor holds and no
+        // rows are recounted.
+        let repeat = apply_index_range(
+            &cursors,
+            TriggerIndexApply {
+                batch_store: batch_store.clone(),
+                indexes: indexes.clone(),
+                end_batch_position: batch_store.len(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(indexes.indexed_count(), 3);
+        assert_eq!(repeat.rows_indexed, 0);
+    }
+
+    #[tokio::test]
     async fn test_wal_entry_read() {
         let (store, base_path, _temp_dir) = create_local_store().await;
         let shard_id = Uuid::new_v4();

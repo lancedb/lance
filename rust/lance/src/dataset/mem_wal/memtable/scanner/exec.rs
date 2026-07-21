@@ -46,7 +46,7 @@ pub(super) fn newest_pk_positions(
         if n == 0 {
             continue;
         }
-        if batch_position > visible_count {
+        if batch_position >= visible_count {
             current_row += n as u64;
             continue;
         }

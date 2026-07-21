@@ -493,13 +493,13 @@ impl MemTable {
         self.batch_store.is_full() || self.batch_store.estimated_bytes() >= max_bytes
     }
 
-    /// Get batches visible up to a specific batch position (inclusive).
+    /// Get the batches in the visible prefix.
     ///
-    /// A batch at position `i` is visible if `i <= visible_count`.
+    /// A batch at position `i` is visible if `i < visible_count`.
     ///
     /// # Arguments
     ///
-    /// * `visible_count` - The maximum batch position to include (inclusive)
+    /// * `visible_count` - Exclusive count of batch positions to include
     ///
     /// # Returns
     ///
@@ -508,7 +508,7 @@ impl MemTable {
         self.batch_store.visible_record_batches(visible_count)
     }
 
-    /// Get batch positions visible up to a specific batch position (inclusive).
+    /// Get the batch positions in the visible prefix.
     ///
     /// This is useful for filtering index results by visibility.
     pub async fn get_visible_batch_positions(&self, visible_count: usize) -> Vec<usize> {

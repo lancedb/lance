@@ -241,7 +241,7 @@ impl MemTableBruteForceVectorExec {
             if n == 0 {
                 continue;
             }
-            if batch_position > self.visible_count {
+            if batch_position >= self.visible_count {
                 current_row += n as u64;
                 continue;
             }
