@@ -1036,7 +1036,13 @@ impl Dataset {
 
     #[getter(data_storage_version)]
     fn data_storage_version(&self) -> PyResult<String> {
-        Ok(self.ds.manifest().data_storage_format.version.clone())
+        Ok(self
+            .ds
+            .manifest()
+            .data_storage_format
+            .version
+            .to_manifest_string()
+            .to_string())
     }
 
     #[getter(has_stable_row_ids)]
