@@ -47,6 +47,7 @@ pub use super::memtable::scanner::MemTableScanner;
 pub use super::util::{WatchableOnceCell, WatchableOnceCellReader};
 pub use super::wal::{WalEntry, WalEntryData, WalFlushFailure, WalFlushResult, WalFlusher};
 
+use super::memtable::MemTableFlushWatcher;
 use super::memtable::flush::TriggerMemTableFlush;
 use super::scanner::GenerationWarmer;
 use super::wal::{
@@ -608,9 +609,8 @@ impl Default for TaskExecutor {
 pub enum DurabilityResult {
     /// Write is now durable.
     Durable,
-    /// Write failed. The carrier preserves typed writer-fence information
-    /// across cloneable completion channels.
-    Failed(WalFlushFailure),
+    /// Write failed with an error message.
+    Failed(String),
 }
 
 impl DurabilityResult {
@@ -621,14 +621,7 @@ impl DurabilityResult {
 
     /// Create a failed durability result.
     pub fn err(msg: impl Into<String>) -> Self {
-        Self::Failed(WalFlushFailure {
-            fence_reason: None,
-            message: msg.into(),
-        })
-    }
-
-    fn from_error(error: &Error) -> Self {
-        Self::Failed(WalFlushFailure::from_error(error))
+        Self::Failed(msg.into())
     }
 
     /// Check if the result is durable.
@@ -640,7 +633,7 @@ impl DurabilityResult {
     pub fn into_result(self) -> Result<()> {
         match self {
             Self::Durable => Ok(()),
-            Self::Failed(failure) => Err(failure.into_error()),
+            Self::Failed(msg) => Err(Error::io(msg)),
         }
     }
 }
@@ -805,7 +798,7 @@ struct WriterState {
     /// Total size of frozen memtables (for backpressure).
     frozen_memtable_bytes: usize,
     /// Flush watchers for frozen memtables (for backpressure).
-    frozen_flush_watchers: VecDeque<(usize, DurabilityWatcher)>,
+    frozen_flush_watchers: VecDeque<(usize, DurabilityWatcher, MemTableFlushWatcher)>,
     /// Sealed memtables, kept queryable so a concurrent reader sees no hole
     /// between `freeze_memtable` and the flush task's manifest commit, and for
     /// `frozen_memtable_grace` beyond it so as-of reads stay batch-resolved.
@@ -1260,6 +1253,7 @@ impl SharedWriterState {
         // its cells and a failed send below can poison-and-return without leaving
         // partial state to unwind.
         let _memtable_flush_watcher = old_memtable.create_memtable_flush_completion();
+        let typed_memtable_flush_watcher = old_memtable.create_typed_memtable_flush_completion();
 
         // The outgoing memtable may still owe an index apply — the puts that
         // filled it triggered one, but the task need not have drained yet, and
@@ -1289,9 +1283,11 @@ impl SharedWriterState {
         let flush_watcher = old_memtable
             .get_memtable_flush_watcher()
             .expect("Flush watcher should exist after create_memtable_flush_completion");
-        state
-            .frozen_flush_watchers
-            .push_back((frozen_size, flush_watcher));
+        state.frozen_flush_watchers.push_back((
+            frozen_size,
+            flush_watcher,
+            typed_memtable_flush_watcher,
+        ));
 
         let frozen_memtable = Arc::new(old_memtable);
 
@@ -1471,7 +1467,7 @@ impl SharedWriterState {
             // First try frozen memtable watchers
             s.frozen_flush_watchers
                 .front()
-                .map(|(_, watcher)| watcher.clone())
+                .map(|(_, watcher, _)| watcher.clone())
                 // If no frozen memtables, use active memtable's watcher
                 .or_else(|| s.memtable.get_memtable_flush_watcher())
         })
@@ -2538,7 +2534,7 @@ impl ShardWriter {
     /// landed and been recorded in the manifest. Does not wait on the
     /// active memtable — call [`Self::force_seal_active`] first if you
     /// want everything-on-disk. Errors in WAL-only mode, or if any
-    /// awaited flush reports `DurabilityResult::Failed`.
+    /// awaited flush reports a typed completion failure.
     ///
     /// Useful in tests for deterministic post-flush assertions, and in
     /// production wherever a caller needs a synchronous fence after
@@ -2558,11 +2554,11 @@ impl ShardWriter {
         };
 
         loop {
-            let watchers: Vec<DurabilityWatcher> = {
+            let watchers: Vec<MemTableFlushWatcher> = {
                 let st = state_lock.read().await;
                 st.frozen_flush_watchers
                     .iter()
-                    .map(|(_, w)| w.clone())
+                    .map(|(_, _, w)| w.clone())
                     .collect()
             };
             if watchers.is_empty() {
@@ -2570,7 +2566,7 @@ impl ShardWriter {
             }
             for mut w in watchers {
                 match w.await_value().await {
-                    Some(durability) => durability.into_result()?,
+                    Some(result) => result.map_err(WalFlushFailure::into_error)?,
                     None => {
                         return Err(Error::io(
                             "MemTable flush handler exited before reporting completion",
@@ -2749,12 +2745,12 @@ impl ShardWriter {
                     }
                     st.frozen_flush_watchers
                         .iter()
-                        .map(|(_, w)| w.clone())
+                        .map(|(_, _, w)| w.clone())
                         .collect()
                 };
                 for mut watcher in watchers {
                     let stage_result = match watcher.await_value().await {
-                        Some(durability) => durability.into_result(),
+                        Some(result) => result.map_err(WalFlushFailure::into_error),
                         None => Err(Error::io(
                             "MemTable flush handler exited before reporting completion during close",
                         )),
@@ -3173,15 +3169,21 @@ impl MemTableFlushHandler {
         // backpressure state for this memtable, even on failure.
         let durability = match &flush_result {
             Ok(_) => DurabilityResult::ok(),
-            Err(e) => DurabilityResult::from_error(e),
+            Err(e) => DurabilityResult::err(e.to_string()),
         };
         memtable.signal_memtable_flush_complete(durability);
+        let typed_result = flush_result
+            .as_ref()
+            .map(|_| ())
+            .map_err(WalFlushFailure::from_error);
+        memtable.signal_typed_memtable_flush_complete(typed_result);
 
         {
             let mut state = self.state.write().await;
             // Backpressure drain: unconditional so `wait_for_flush_drain`
             // sees the watcher's error signal, not a dropped channel.
-            if let Some((_size, _watcher)) = state.frozen_flush_watchers.pop_front() {
+            if let Some((_size, _watcher, _typed_watcher)) = state.frozen_flush_watchers.pop_front()
+            {
                 state.frozen_memtable_bytes =
                     state.frozen_memtable_bytes.saturating_sub(memtable_size);
             }

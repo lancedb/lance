@@ -1734,6 +1734,28 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn test_wal_flush_failure_preserves_wrapped_fence_reason() {
+        for (error, expected) in [
+            (
+                Error::fenced_by_peer("peer claimed a newer epoch"),
+                FenceReason::PeerClaimedEpoch,
+            ),
+            (
+                Error::writer_poisoned("WAL persistence failed"),
+                FenceReason::PersistenceFailure,
+            ),
+        ] {
+            let wrapped = Error::wrapped(Box::new(error));
+            let restored = WalFlushFailure::from_error(&wrapped).into_error();
+            assert_eq!(restored.fence_reason(), Some(expected));
+            assert_eq!(
+                restored.is_mem_wal_fenced(),
+                expected == FenceReason::PeerClaimedEpoch
+            );
+        }
+    }
+
     fn build_test_flusher(
         store: Arc<ObjectStore>,
         base_path: &Path,

@@ -26,6 +26,9 @@ use super::write::{DurabilityResult, WalFlushResult};
 use crate::Dataset;
 use batch_store::BatchStore;
 
+pub(crate) type MemTableFlushResult = std::result::Result<(), WalFlushFailure>;
+pub(crate) type MemTableFlushWatcher = WatchableOnceCellReader<MemTableFlushResult>;
+
 /// Default batch store capacity when not specified.
 const DEFAULT_BATCH_CAPACITY: usize = 1024;
 
@@ -106,6 +109,10 @@ pub struct MemTable {
     /// Created when the memtable is frozen and set with a value when the flush completes.
     /// Used by backpressure to wait for oldest memtable flush completion.
     memtable_flush_completion: std::sync::Mutex<Option<WatchableOnceCell<DurabilityResult>>>,
+    /// Internal completion channel that preserves typed failure information for
+    /// `ShardWriter::wait_for_flush_drain` and `ShardWriter::close`.
+    typed_memtable_flush_completion:
+        std::sync::Mutex<Option<WatchableOnceCell<MemTableFlushResult>>>,
 }
 
 /// Cached Dataset with timestamp for eventual consistency.
@@ -226,6 +233,7 @@ impl MemTable {
         // wait on it even before the memtable is frozen. Every memtable will
         // eventually be frozen and flushed.
         let memtable_flush_cell = WatchableOnceCell::new();
+        let typed_memtable_flush_cell = WatchableOnceCell::new();
 
         Ok(Self {
             schema,
@@ -248,6 +256,7 @@ impl MemTable {
             frozen_at_wal_entry_position: None,
             wal_flush_completion: std::sync::Mutex::new(None),
             memtable_flush_completion: std::sync::Mutex::new(Some(memtable_flush_cell)),
+            typed_memtable_flush_completion: std::sync::Mutex::new(Some(typed_memtable_flush_cell)),
         })
     }
 
@@ -331,6 +340,15 @@ impl MemTable {
             .map(|cell| cell.reader())
     }
 
+    pub(crate) fn create_typed_memtable_flush_completion(&self) -> MemTableFlushWatcher {
+        self.typed_memtable_flush_completion
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("typed memtable flush completion cell should exist")
+            .reader()
+    }
+
     /// Signal that the memtable flush has finished, with the outcome.
     ///
     /// Must be called whether the flush succeeded or failed — otherwise the
@@ -339,6 +357,12 @@ impl MemTable {
     /// and returns `Err` instead of receiving the actual outcome.
     pub fn signal_memtable_flush_complete(&self, result: DurabilityResult) {
         if let Some(cell) = self.memtable_flush_completion.lock().unwrap().take() {
+            cell.write(result);
+        }
+    }
+
+    pub(crate) fn signal_typed_memtable_flush_complete(&self, result: MemTableFlushResult) {
+        if let Some(cell) = self.typed_memtable_flush_completion.lock().unwrap().take() {
             cell.write(result);
         }
     }
