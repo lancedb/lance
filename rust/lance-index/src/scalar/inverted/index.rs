@@ -8517,6 +8517,7 @@ mod tests {
         scattered_reads: std::sync::atomic::AtomicUsize,
     }
 
+    #[cfg_attr(coverage, coverage(off))]
     impl DocsRowIdReadCounter {
         fn full_column_reads(&self) -> usize {
             self.full_column_reads
@@ -8533,6 +8534,7 @@ mod tests {
         counter: Arc<DocsRowIdReadCounter>,
     }
 
+    #[cfg_attr(coverage, coverage(off))]
     #[async_trait]
     impl IndexReader for DocsRowIdCountingReader {
         async fn read_record_batch(&self, n: u64, batch_size: u64) -> Result<RecordBatch> {
@@ -8588,12 +8590,14 @@ mod tests {
         counter: Arc<DocsRowIdReadCounter>,
     }
 
+    #[cfg_attr(coverage, coverage(off))]
     impl DeepSizeOf for DocsRowIdCountingStore {
         fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
             self.inner.deep_size_of_children(context)
         }
     }
 
+    #[cfg_attr(coverage, coverage(off))]
     #[async_trait]
     impl IndexStore for DocsRowIdCountingStore {
         fn as_any(&self) -> &dyn std::any::Any {
