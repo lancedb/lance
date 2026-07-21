@@ -20,6 +20,15 @@
 //! Prefix invalidation and key inventory are intentionally not part of this
 //! interface: one-way digests cannot support either operation without
 //! retaining the logical strings that fixed-size keys are designed to remove.
+//! Existing callers should migrate removed symbols as follows:
+//! - replace `with_backend_and_prefix(backend, prefix)` with
+//!   [`LanceCache::with_backend`](super::LanceCache::with_backend) followed by
+//!   [`LanceCache::with_key_prefix`](super::LanceCache::with_key_prefix);
+//! - replace `invalidate_prefix` with [`LanceCache::clear`](super::LanceCache::clear)
+//!   when clearing the shared backend is acceptable, or rotate a versioned
+//!   namespace to leave older entries to age out;
+//! - remove uses of `prefix`, `keys`, and session key-inventory methods; opaque
+//!   keys have no readable or enumerable equivalent.
 
 use std::any::Any;
 use std::pin::Pin;

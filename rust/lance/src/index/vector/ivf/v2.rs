@@ -2071,7 +2071,7 @@ mod tests {
     use crate::dataset::{InsertBuilder, UpdateBuilder, WriteMode, WriteParams};
     use crate::index::DatasetIndexExt;
     use crate::index::DatasetIndexInternalExt;
-    use crate::index::vector::ivf::v2::IvfPq;
+    use crate::index::vector::ivf::v2::{IvfPq, IvfStateEntryBox, PartitionEntry};
     use crate::utils::test::copy_test_data_to_tmp;
     use crate::{
         Dataset,
@@ -2081,7 +2081,7 @@ mod tests {
         dataset::optimize::{CompactionOptions, compact_files},
         index::vector::IndexFileVersion,
     };
-    use lance_core::cache::LanceCache;
+    use lance_core::cache::{CacheCodecImpl, LanceCache};
     use lance_core::utils::tempfile::TempStrDir;
     use lance_core::{ROW_ID, Result};
     use lance_encoding::decoder::DecoderPlugins;
@@ -2091,10 +2091,11 @@ mod tests {
     use lance_index::optimize::OptimizeOptions;
     use lance_index::progress::IndexBuildProgress;
     use lance_index::vector::DIST_COL;
+    use lance_index::vector::flat::index::FlatIndex;
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::kmeans::{KMeansParams, train_kmeans};
-    use lance_index::vector::pq::PQBuildParams;
+    use lance_index::vector::pq::{PQBuildParams, ProductQuantizer};
     use lance_index::vector::quantizer::QuantizerMetadata;
     use lance_index::vector::sq::builder::SQBuildParams;
     use lance_index::vector::{
@@ -6370,6 +6371,9 @@ mod tests {
             .await
             .unwrap();
 
+        let q = Float32Array::from_iter_values(repeat_n(0.5, DIM));
+        let expected = ground_truth(&dataset, "vector", &q, 10, DistanceType::L2).await;
+
         // Re-open with the serializing backend
         let backend = Arc::new(SerializingCacheBackend::new());
         let session = Arc::new(crate::session::Session::with_index_cache_backend(
@@ -6386,6 +6390,11 @@ mod tests {
         // Prewarm — this should serialize entries into the backend
         dataset.prewarm_index("serde_idx").await.unwrap();
         let serialized = backend.serialized_entry_count().await;
+        let state_type_id = IvfStateEntryBox::TYPE_ID;
+        let partition_type_id =
+            <PartitionEntry<FlatIndex, ProductQuantizer> as CacheCodecImpl>::TYPE_ID;
+        let state_inserts = backend.serialized_insert_count(state_type_id).await;
+        let partition_inserts = backend.serialized_insert_count(partition_type_id).await;
         let passthrough = backend.l1_entry_count().await;
         assert!(
             serialized > 0,
@@ -6410,7 +6419,7 @@ mod tests {
             "restarting must retain the serialized IVF state and partitions"
         );
         let session = Arc::new(crate::session::Session::with_index_cache_backend(
-            backend,
+            backend.clone(),
             128 * 1024 * 1024,
             Arc::new(lance_io::object_store::ObjectStoreRegistry::default()),
         ));
@@ -6423,15 +6432,27 @@ mod tests {
         // Query — the recreated backend will deserialize entries from bytes.
         // All index entries are in serialized form, so every cache hit involves
         // a deserialization round-trip.
-        let q = Float32Array::from_iter_values(repeat_n(0.5, DIM));
         let results = dataset
             .scan()
+            .with_row_id()
             .nearest("vector", &q, 10)
             .unwrap()
             .nprobes(4)
+            .project(&["_rowid"])
+            .unwrap()
             .try_into_batch()
             .await
             .unwrap();
+        assert_eq!(
+            backend.serialized_insert_count(state_type_id).await,
+            state_inserts,
+            "the first restarted query must reuse the serialized IVF state"
+        );
+        assert_eq!(
+            backend.serialized_insert_count(partition_type_id).await,
+            partition_inserts,
+            "the first restarted query must reuse every serialized IVF partition"
+        );
         assert_eq!(results.num_rows(), 10, "should return 10 nearest neighbors");
 
         // Verify distances are sorted (ascending for L2)
@@ -6444,6 +6465,19 @@ mod tests {
         for w in distances.windows(2) {
             assert!(w[1] >= w[0], "distances should be sorted ascending");
         }
+
+        let row_ids = results[ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        let recall = row_ids.intersection(&expected).count() as f32 / expected.len() as f32;
+        assert_ge!(
+            recall,
+            0.5,
+            "serialized IVF query recall is below threshold: {recall}"
+        );
 
         dataset.object_store.as_ref().io_stats_incremental();
         dataset

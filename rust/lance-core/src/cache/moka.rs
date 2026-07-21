@@ -26,9 +26,21 @@ fn key_footprint(_key: &InternalCacheKey) -> usize {
     std::mem::size_of::<InternalCacheKey>()
 }
 
-fn entry_weight(key: &InternalCacheKey, size_bytes: usize) -> u32 {
-    key_footprint(key)
-        .saturating_add(size_bytes)
+fn physical_size(key: &InternalCacheKey, size_bytes: usize) -> usize {
+    key_footprint(key).saturating_add(size_bytes)
+}
+
+/// Number of physical bytes represented by one Moka weight unit.
+///
+/// Moka limits each entry's weight to `u32`, so capacities above 4 GiB need
+/// coarser units to account for a single large entry without undercharging it.
+fn weight_unit(capacity: usize) -> usize {
+    capacity.div_ceil(u32::MAX as usize).max(1)
+}
+
+fn entry_weight(key: &InternalCacheKey, size_bytes: usize, weight_unit: usize) -> u32 {
+    physical_size(key, size_bytes)
+        .div_ceil(weight_unit)
         .try_into()
         .unwrap_or(u32::MAX)
 }
@@ -51,10 +63,12 @@ impl std::fmt::Debug for MokaCacheBackend {
 
 impl MokaCacheBackend {
     pub fn with_capacity(capacity: usize) -> Self {
+        let weight_unit = weight_unit(capacity);
+        let capacity_weight = capacity.div_ceil(weight_unit) as u64;
         let cache = moka::future::Cache::builder()
-            .max_capacity(capacity as u64)
-            .weigher(|key: &InternalCacheKey, entry: &MokaCacheEntry| {
-                entry_weight(key, entry.size_bytes)
+            .max_capacity(capacity_weight)
+            .weigher(move |key: &InternalCacheKey, entry: &MokaCacheEntry| {
+                entry_weight(key, entry.size_bytes, weight_unit)
             })
             .build();
         Self { cache }
@@ -125,7 +139,9 @@ impl CacheBackend for MokaCacheBackend {
 
     async fn size_bytes(&self) -> usize {
         self.cache.run_pending_tasks().await;
-        self.cache.weighted_size() as usize
+        self.cache.iter().fold(0, |total, (key, entry)| {
+            total.saturating_add(physical_size(key.as_ref(), entry.size_bytes))
+        })
     }
 
     fn approx_num_entries(&self) -> usize {
@@ -136,10 +152,9 @@ impl CacheBackend for MokaCacheBackend {
         // Iterate rather than using `weighted_size()` because moka's
         // weighted_size can be stale without `run_pending_tasks()`, which
         // is async and can't be called from this synchronous context.
-        self.cache
-            .iter()
-            .map(|(key, entry)| key_footprint(key.as_ref()) + entry.size_bytes)
-            .sum()
+        self.cache.iter().fold(0, |total, (key, entry)| {
+            total.saturating_add(physical_size(key.as_ref(), entry.size_bytes))
+        })
     }
 }
 
@@ -148,9 +163,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn entry_weights_are_exact_and_saturate_at_moka_limit() {
+    fn entry_weights_are_exact_at_byte_granularity() {
         let key = InternalCacheKey::from_bytes([0; 16]);
-        assert_eq!(entry_weight(&key, 7), 23);
-        assert_eq!(entry_weight(&key, usize::MAX), u32::MAX);
+        assert_eq!(weight_unit(4096), 1);
+        assert_eq!(entry_weight(&key, 7, 1), 23);
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn entry_weights_scale_for_capacities_above_four_gibibytes() {
+        let key = InternalCacheKey::from_bytes([0; 16]);
+        let capacity = 6 * 1024 * 1024 * 1024;
+        let weight_unit = weight_unit(capacity);
+        assert_eq!(weight_unit, 2);
+
+        let size_bytes = u32::MAX as usize + 1024;
+        let expected = physical_size(&key, size_bytes).div_ceil(weight_unit);
+        let weight = entry_weight(&key, size_bytes, weight_unit);
+        assert_eq!(weight as usize, expected);
+        assert_ne!(weight, u32::MAX);
     }
 }

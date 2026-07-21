@@ -20,6 +20,7 @@ struct SerializedEntry {
 #[derive(Debug, Default)]
 struct SerializedStore {
     entries: tokio::sync::Mutex<HashMap<InternalCacheKey, SerializedEntry>>,
+    insert_counts: tokio::sync::Mutex<HashMap<&'static str, usize>>,
 }
 
 /// Test-only cache backend that forces codec-backed entries through bytes.
@@ -54,6 +55,16 @@ impl SerializingCacheBackend {
 
     pub async fn serialized_entry_count(&self) -> usize {
         self.serialized.entries.lock().await.len()
+    }
+
+    pub async fn serialized_insert_count(&self, type_id: &'static str) -> usize {
+        self.serialized
+            .insert_counts
+            .lock()
+            .await
+            .get(type_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     pub async fn l1_entry_count(&self) -> usize {
@@ -92,6 +103,9 @@ impl CacheBackend for SerializingCacheBackend {
         codec
             .serialize(&entry, &mut bytes)
             .expect("test cache entry serialization should succeed");
+        let mut insert_counts = self.serialized.insert_counts.lock().await;
+        *insert_counts.entry(codec.type_id()).or_default() += 1;
+        drop(insert_counts);
         self.serialized.entries.lock().await.insert(
             *key,
             SerializedEntry {
@@ -202,6 +216,12 @@ mod tests {
 
         let restarted = backend.restart();
         assert_eq!(restarted.serialized_entry_count().await, 1);
+        assert_eq!(
+            restarted
+                .serialized_insert_count(StoredValue::TYPE_ID)
+                .await,
+            1
+        );
         assert_eq!(restarted.l1_entry_count().await, 0);
         assert!(restarted.get(&l1_key, None).await.is_none());
 
@@ -215,5 +235,11 @@ mod tests {
             .downcast::<LookupValue>()
             .unwrap();
         assert_eq!(*decoded, LookupValue(42));
+        assert_eq!(
+            restarted
+                .serialized_insert_count(StoredValue::TYPE_ID)
+                .await,
+            1
+        );
     }
 }

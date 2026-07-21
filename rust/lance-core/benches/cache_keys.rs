@@ -238,7 +238,7 @@ fn benchmark_key_preparation(c: &mut Criterion) {
                 let mut builder =
                     KeyBuilder::new(namespace, PageKey::stable_type_id(), PageKey::schema());
                 key.write_key(&mut builder);
-                black_box(builder.finish())
+                black_box(outer_hashes.hash_one(builder.finish()))
             })
         });
     }

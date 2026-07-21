@@ -152,6 +152,12 @@ impl CacheKey for DeletionFileKey<'_> {
             DeletionFileType::Array => 0,
             DeletionFileType::Bitmap => 1,
         });
+        if let Some(base_id) = self.deletion_file.base_id {
+            builder.write_some();
+            builder.write_u32(base_id);
+        } else {
+            builder.write_none();
+        }
     }
 }
 
@@ -242,5 +248,47 @@ impl DSMetadataCache {
     /// This is used by file readers and other components that need file-level caching.
     pub(crate) fn file_metadata_cache(&self, prefix: &Path) -> LanceCache {
         self.0.with_key_prefix(prefix.as_ref())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn deletion_file_key_separates_storage_bases() {
+        let cache = LanceCache::with_capacity(4096);
+        let deletion_file = DeletionFile {
+            read_version: 3,
+            id: 4,
+            file_type: DeletionFileType::Bitmap,
+            num_deleted_rows: Some(1),
+            base_id: None,
+        };
+        cache
+            .insert_with_key(
+                &DeletionFileKey {
+                    fragment_id: 2,
+                    deletion_file: &deletion_file,
+                },
+                Arc::new(DeletionVector::NoDeletions),
+            )
+            .await;
+
+        let deletion_file_on_other_base = DeletionFile {
+            base_id: Some(7),
+            ..deletion_file
+        };
+        assert!(
+            cache
+                .get_with_key(&DeletionFileKey {
+                    fragment_id: 2,
+                    deletion_file: &deletion_file_on_other_base,
+                })
+                .await
+                .is_none()
+        );
     }
 }
