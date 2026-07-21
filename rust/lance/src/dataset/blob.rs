@@ -1909,6 +1909,14 @@ struct PlannedBlobRead {
     physical_range: Range<u64>,
 }
 
+/// A slice of one disjoint physical range submitted to the file scheduler.
+#[derive(Debug)]
+struct PlannedBlobReadSlice {
+    read_index: usize,
+    physical_range_index: usize,
+    relative_range: Range<u64>,
+}
+
 /// One physical read paired with the backing source used to batch it.
 #[derive(Debug)]
 struct SourcePlannedBlobRead {
@@ -2253,40 +2261,96 @@ fn plan_blob_read_plans(
     )?))
 }
 
-/// Execute one per-source blob read plan with a single scheduler submission.
-async fn execute_blob_read_plan(
-    task: BlobReadPlan,
-    execution: Arc<ReadBlobsExecution>,
-) -> Result<Vec<IndexedReadBlob>> {
-    let non_empty_ranges = task
-        .reads
+/// Merge overlapping physical reads before submitting them to [`FileScheduler`].
+///
+/// `FileScheduler` can safely coalesce and split disjoint ranges. Original
+/// overlapping ranges need to be mapped onto their union first so a split does
+/// not advance past the start of a later nested range while reconstructing the
+/// caller's buffers.
+fn plan_disjoint_blob_reads(
+    reads: &[PlannedBlobRead],
+) -> (Vec<Range<u64>>, Vec<PlannedBlobReadSlice>) {
+    let mut non_empty_ranges = reads
         .iter()
         .enumerate()
         .filter(|(_, read)| !read.physical_range.is_empty())
         .map(|(read_index, read)| (read_index, read.physical_range.clone()))
         .collect::<Vec<_>>();
+    non_empty_ranges.sort_by_key(|(read_index, range)| (range.start, range.end, *read_index));
+
+    let mut physical_ranges = Vec::<Range<u64>>::with_capacity(non_empty_ranges.len());
+    let mut slices = Vec::with_capacity(non_empty_ranges.len());
+    for (read_index, range) in non_empty_ranges {
+        let physical_range_index = match physical_ranges.last_mut() {
+            Some(physical_range) if range.start <= physical_range.end => {
+                physical_range.end = physical_range.end.max(range.end);
+                physical_ranges.len() - 1
+            }
+            _ => {
+                physical_ranges.push(range.clone());
+                physical_ranges.len() - 1
+            }
+        };
+        let physical_start = physical_ranges[physical_range_index].start;
+        slices.push(PlannedBlobReadSlice {
+            read_index,
+            physical_range_index,
+            relative_range: range.start - physical_start..range.end - physical_start,
+        });
+    }
+
+    (physical_ranges, slices)
+}
+
+/// Execute one per-source blob read plan with a single scheduler submission.
+async fn execute_blob_read_plan(
+    task: BlobReadPlan,
+    execution: Arc<ReadBlobsExecution>,
+) -> Result<Vec<IndexedReadBlob>> {
+    let (physical_ranges, slices) = plan_disjoint_blob_reads(&task.reads);
     let mut bytes = vec![Bytes::new(); task.reads.len()];
-    if let Some((_, first_range)) = non_empty_ranges.first() {
+    if let Some(first_range) = physical_ranges.first() {
         let scheduler = execution.scheduler_for(&task.source);
         let file_scheduler = scheduler
             .open_file(&task.source.path, &task.source.file_size)
             .await?;
         let priority = first_range.start;
-        let requested = non_empty_ranges
-            .iter()
-            .map(|(_, range)| range.clone())
-            .collect::<Vec<_>>();
-        let returned = file_scheduler.submit_request(requested, priority).await?;
-        if returned.len() != non_empty_ranges.len() {
+        let physical_range_count = physical_ranges.len();
+        let returned = file_scheduler
+            .submit_request(physical_ranges, priority)
+            .await?;
+        if returned.len() != physical_range_count {
             return Err(Error::internal(format!(
-                "Blob read scheduler returned {} ranges for {} requests from {}",
+                "Blob read scheduler returned {} ranges for {} disjoint physical ranges from {}",
                 returned.len(),
-                non_empty_ranges.len(),
+                physical_range_count,
                 task.source.path
             )));
         }
-        for ((read_index, _), data) in non_empty_ranges.into_iter().zip(returned) {
-            bytes[read_index] = data;
+        for slice in slices {
+            let start = usize::try_from(slice.relative_range.start).map_err(|_| {
+                Error::internal(format!(
+                    "Blob read slice start {} does not fit into usize for {}",
+                    slice.relative_range.start, task.source.path
+                ))
+            })?;
+            let end = usize::try_from(slice.relative_range.end).map_err(|_| {
+                Error::internal(format!(
+                    "Blob read slice end {} does not fit into usize for {}",
+                    slice.relative_range.end, task.source.path
+                ))
+            })?;
+            let data = &returned[slice.physical_range_index];
+            if end > data.len() {
+                return Err(Error::internal(format!(
+                    "Blob read slice {:?} exceeds the {} bytes returned for physical range {} from {}",
+                    slice.relative_range,
+                    data.len(),
+                    slice.physical_range_index,
+                    task.source.path
+                )));
+            }
+            bytes[slice.read_index] = data.slice(start..end);
         }
     }
 
@@ -2631,14 +2695,8 @@ impl<'a> BlobV2DescriptorColumns<'a> {
         }
     }
 
-    fn is_null_blob(&self, idx: usize) -> Result<bool> {
-        if self.descriptions.is_null(idx) || self.kinds.is_null(idx) {
-            return Ok(true);
-        }
-        let kind = BlobKind::try_from(self.kinds.value(idx))?;
-        Ok(matches!(kind, BlobKind::Inline)
-            && self.positions.value(idx) == 0
-            && self.sizes.value(idx) == 0)
+    fn is_null_blob(&self, idx: usize) -> bool {
+        self.descriptions.is_null(idx) || self.kinds.is_null(idx)
     }
 }
 
@@ -3100,7 +3158,7 @@ impl<'a> BlobV2ReadContext<'a> {
         selection_index: usize,
         row_addr: u64,
     ) -> Result<Option<BlobEntry>> {
-        if columns.is_null_blob(idx)? {
+        if columns.is_null_blob(idx) {
             return Ok(None);
         }
 
@@ -5553,9 +5611,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_blob_ranges_skips_v2_nulls() {
+    async fn test_read_blob_ranges_skips_v2_nulls_and_preserves_empty_values() {
         let test_dir = TempStrDir::default();
-        let mut blob_builder = BlobArrayBuilder::new(2);
+        let mut blob_builder = BlobArrayBuilder::new(3);
+        blob_builder.push_empty().unwrap();
         blob_builder.push_null().unwrap();
         blob_builder.push_bytes(b"abc").unwrap();
         let schema = Arc::new(Schema::new(vec![blob_field("blob", true)]));
@@ -5579,16 +5638,81 @@ mod tests {
             .unwrap()
             .with_row_indices([
                 BlobRangeRequest::new(0, 0, 0),
-                BlobRangeRequest::new(0, 0, 1),
-                BlobRangeRequest::new(1, 1, 1),
+                BlobRangeRequest::new(1, 0, 0),
+                BlobRangeRequest::new(1, 0, 1),
+                BlobRangeRequest::new(2, 1, 1),
             ])
             .execute()
             .await
             .unwrap();
 
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].request_index, 2);
-        assert_eq!(results[0].data.as_ref(), b"b");
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].request_index, 0);
+        assert!(results[0].data.is_empty());
+        assert_eq!(results[1].request_index, 3);
+        assert_eq!(results[1].data.as_ref(), b"b");
+    }
+
+    #[tokio::test]
+    async fn test_read_blob_ranges_handles_overlaps_across_scheduler_splits() {
+        let max_iop_size = *lance_io::object_store::DEFAULT_MAX_IOP_SIZE;
+        let value_size = max_iop_size + 12;
+        let nested_start = value_size / 2 - 1;
+        let nested_end = value_size;
+        let (store, inner) = recording_range_store(Bytes::from(vec![7; value_size as usize]));
+        let source = Arc::new(BlobSource::new(store, Path::from("blobs/overlapping.bin")));
+        let entries = vec![
+            BlobEntry {
+                selection_index: 0,
+                row_address: 10,
+                file: BlobFile::with_source(
+                    source.clone(),
+                    0,
+                    value_size,
+                    BlobKind::Dedicated,
+                    None,
+                ),
+            },
+            BlobEntry {
+                selection_index: 1,
+                row_address: 10,
+                file: BlobFile::with_source(source, 0, value_size, BlobKind::Dedicated, None),
+            },
+        ];
+        let requested = [
+            BlobReadRange::new(0, value_size),
+            BlobReadRange::new(nested_start, nested_end - nested_start),
+        ];
+
+        let mut plans = plan_blob_read_plans(entries, Some(&requested)).unwrap();
+        let results = execute_blob_read_plan(
+            plans.pop().unwrap(),
+            Arc::new(ReadBlobsExecution::new(None)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].selection_index, 0);
+        assert_eq!(results[0].data.len(), value_size as usize);
+        assert!(results[0].data.iter().all(|byte| *byte == 7));
+        assert_eq!(results[1].selection_index, 1);
+        assert_eq!(results[1].data.len(), (nested_end - nested_start) as usize);
+        assert!(results[1].data.iter().all(|byte| *byte == 7));
+
+        let mut physical_ranges = inner.requested_blob_ranges();
+        physical_ranges.sort_by_key(|range| range.start);
+        assert_eq!(
+            physical_ranges.len(),
+            value_size.div_ceil(max_iop_size) as usize
+        );
+        assert_eq!(physical_ranges[0].start, 0);
+        assert_eq!(physical_ranges.last().unwrap().end, value_size);
+        assert!(
+            physical_ranges
+                .windows(2)
+                .all(|ranges| ranges[0].end == ranges[1].start)
+        );
     }
 
     #[tokio::test]

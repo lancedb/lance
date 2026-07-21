@@ -278,8 +278,15 @@ def dataset_with_blobs(tmp_path):
 def dataset_with_mixed_blob_v2(tmp_path):
     external_blob = tmp_path / "external.bin"
     external_blob.write_bytes(b"external")
-    payloads = [b"in", b"packed!!", b"dedicated payload", b"external", None]
-    values = [payloads[0], payloads[1], payloads[2], external_blob.as_uri(), None]
+    payloads = [b"in", b"packed!!", b"dedicated payload", b"external", None, b""]
+    values = [
+        payloads[0],
+        payloads[1],
+        payloads[2],
+        external_blob.as_uri(),
+        None,
+        payloads[5],
+    ]
     schema = pa.schema(
         [
             lance.blob_field(
@@ -553,8 +560,8 @@ def test_read_blob_ranges_mixed_sources_preserves_request_identity(
     dataset_with_mixed_blob_v2, selection_kind
 ):
     dataset, payloads = dataset_with_mixed_blob_v2
-    selected_indices = [3, 1, 1, 0, 2, 4]
-    ranges = [(1, 3), (2, 4), (0, 2), (1, 1), (5, 0), (0, 0)]
+    selected_indices = [3, 1, 1, 0, 2, 4, 5]
+    ranges = [(1, 3), (2, 4), (0, 4), (1, 1), (5, 0), (0, 0), (0, 0)]
     addresses = _blob_row_addresses(dataset)
     if selection_kind == "ids":
         all_selectors = _blob_row_ids(dataset)
