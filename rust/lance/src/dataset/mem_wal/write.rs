@@ -1505,6 +1505,25 @@ impl ShardWriter {
             ));
         }
 
+        // A durable memtable writer needs a flush ticker to make progress. With
+        // `durable_write` on, a put becomes visible only once its WAL append
+        // lands, and memtable puts no longer self-trigger that append — the
+        // background ticker drives it. Without an interval (or with a zero one,
+        // which tokio cannot schedule), a small put that never fills the
+        // size-triggered buffer would block until close. Reject the config here
+        // rather than let a put hang. WAL-only mode is exempt: there a durable
+        // put triggers its own flush inline.
+        if config.enable_memtable
+            && config.durable_write
+            && config.max_wal_flush_interval.is_none_or(|d| d.is_zero())
+        {
+            return Err(Error::invalid_input(
+                "durable_write requires a positive max_wal_flush_interval: with no \
+                 flush ticker a durable memtable put has nothing to drive its WAL \
+                 append and would block until close",
+            ));
+        }
+
         // Callers pass the base schema; lance owns the `_tombstone` column and
         // appends it here so the memtable/generation schema = base + tombstone.
         // Idempotent, so a reopen that already extended the schema is a no-op.
