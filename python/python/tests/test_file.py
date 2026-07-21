@@ -90,6 +90,27 @@ def test_multiple_close(tmp_path):
     writer.close()
 
 
+def test_size_bytes(tmp_path):
+    path = tmp_path / "foo.lance"
+    schema = pa.schema([pa.field("a", pa.int64())])
+    writer = LanceFileWriter(str(path), schema)
+    assert writer.size_bytes is None
+    writer.write_batch(pa.table({"a": [1, 2, 3]}))
+    assert writer.close() == 3
+    assert writer.size_bytes == os.path.getsize(path)
+
+    # Closing again is a no-op and must not clear the recorded size
+    writer.close()
+    assert writer.size_bytes == os.path.getsize(path)
+
+
+def test_size_bytes_with_session(tmp_path):
+    session = LanceFileSession(tmp_path)
+    with session.open_writer("foo.lance") as writer:
+        writer.write_batch(pa.table({"a": [1, 2, 3]}))
+    assert writer.size_bytes == os.path.getsize(tmp_path / "foo.lance")
+
+
 def test_version(tmp_path):
     schema = pa.schema([pa.field("a", pa.int64())])
     cases = [

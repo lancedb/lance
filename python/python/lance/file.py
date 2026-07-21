@@ -482,6 +482,12 @@ class LanceFileWriter:
     This class is used to write Lance data files, a low level structure
     optimized for storing multi-modal tabular data.  If you are working with
     Lance datasets then you should use the LanceDataset class instead.
+
+    Attributes
+    ----------
+    size_bytes: Optional[int]
+        The final size of the file in bytes.  This is None until `close` is
+        called.
     """
 
     def __init__(
@@ -548,6 +554,7 @@ class LanceFileWriter:
                 **kwargs,
             )
         self.closed = False
+        self.size_bytes: Optional[int] = None
 
     def write_batch(self, batch: Union[pa.RecordBatch, pa.Table]) -> None:
         """
@@ -569,11 +576,17 @@ class LanceFileWriter:
         Write the file metadata and close the file
 
         Returns the number of rows written to the file
+
+        After this returns, ``size_bytes`` holds the final size of the file.  This
+        is reported by the writer itself, so it is available for object stores
+        without issuing a separate metadata request.
         """
         if self.closed:
             return
         self.closed = True
-        return self._writer.finish()
+        summary = self._writer.finish_with_summary()
+        self.size_bytes = summary.size_bytes
+        return summary.num_rows
 
     def add_schema_metadata(self, key: str, value: str) -> None:
         """
