@@ -27,20 +27,31 @@ const NAMESPACE_CONTEXT: &str = "lance-format/lance 2026-07-17 cache namespace v
 const NAMESPACE_DOMAIN: &[u8] = b"lance-cache-namespace\0";
 const ENTRY_DOMAIN: &[u8] = b"lance-cache-entry\0";
 
-const TAG_U8: u8 = 1;
-const TAG_U16: u8 = 2;
-const TAG_U32: u8 = 3;
-const TAG_U64: u8 = 4;
-const TAG_I32: u8 = 5;
-const TAG_I64: u8 = 6;
-const TAG_BOOL: u8 = 7;
-const TAG_STR: u8 = 8;
-const TAG_BYTES: u8 = 9;
-const TAG_FIXED_BYTES: u8 = 10;
-const TAG_NONE: u8 = 11;
-const TAG_SOME: u8 = 12;
-const TAG_VARIANT: u8 = 13;
-const TAG_SEQUENCE: u8 = 14;
+/// One-byte type discriminants in the stable key encoding.
+#[derive(Clone, Copy)]
+#[repr(u8)]
+enum FieldTag {
+    U8 = 1,
+    U16 = 2,
+    U32 = 3,
+    U64 = 4,
+    I32 = 5,
+    I64 = 6,
+    Bool = 7,
+    Str = 8,
+    Bytes = 9,
+    FixedBytes = 10,
+    None = 11,
+    Some = 12,
+    Variant = 13,
+    Sequence = 14,
+}
+
+impl FieldTag {
+    const fn as_u8(self) -> u8 {
+        self as u8
+    }
+}
 
 /// Versioned schema identity for fields emitted by a cache key.
 ///
@@ -171,14 +182,14 @@ impl KeyBuilder {
     /// Append a tagged, fixed-width `u8`.
     #[inline]
     pub fn write_u8(&mut self, value: u8) {
-        self.hasher.update(&[TAG_U8, value]);
+        self.hasher.update(&[FieldTag::U8.as_u8(), value]);
     }
 
     /// Append a tagged, little-endian `u16`.
     #[inline]
     pub fn write_u16(&mut self, value: u16) {
         let mut encoded = [0; 3];
-        encoded[0] = TAG_U16;
+        encoded[0] = FieldTag::U16.as_u8();
         encoded[1..].copy_from_slice(&value.to_le_bytes());
         self.hasher.update(&encoded);
     }
@@ -187,7 +198,7 @@ impl KeyBuilder {
     #[inline]
     pub fn write_u32(&mut self, value: u32) {
         let mut encoded = [0; 5];
-        encoded[0] = TAG_U32;
+        encoded[0] = FieldTag::U32.as_u8();
         encoded[1..].copy_from_slice(&value.to_le_bytes());
         self.hasher.update(&encoded);
     }
@@ -196,7 +207,7 @@ impl KeyBuilder {
     #[inline]
     pub fn write_u64(&mut self, value: u64) {
         let mut encoded = [0; 9];
-        encoded[0] = TAG_U64;
+        encoded[0] = FieldTag::U64.as_u8();
         encoded[1..].copy_from_slice(&value.to_le_bytes());
         self.hasher.update(&encoded);
     }
@@ -205,7 +216,7 @@ impl KeyBuilder {
     #[inline]
     pub fn write_i32(&mut self, value: i32) {
         let mut encoded = [0; 5];
-        encoded[0] = TAG_I32;
+        encoded[0] = FieldTag::I32.as_u8();
         encoded[1..].copy_from_slice(&value.to_le_bytes());
         self.hasher.update(&encoded);
     }
@@ -214,7 +225,7 @@ impl KeyBuilder {
     #[inline]
     pub fn write_i64(&mut self, value: i64) {
         let mut encoded = [0; 9];
-        encoded[0] = TAG_I64;
+        encoded[0] = FieldTag::I64.as_u8();
         encoded[1..].copy_from_slice(&value.to_le_bytes());
         self.hasher.update(&encoded);
     }
@@ -222,44 +233,45 @@ impl KeyBuilder {
     /// Append a tagged boolean.
     #[inline]
     pub fn write_bool(&mut self, value: bool) {
-        self.hasher.update(&[TAG_BOOL, u8::from(value)]);
+        self.hasher
+            .update(&[FieldTag::Bool.as_u8(), u8::from(value)]);
     }
 
     /// Append a tagged, length-prefixed UTF-8 string.
     #[inline]
     pub fn write_str(&mut self, value: &str) {
-        self.write_variable(TAG_STR, value.as_bytes());
+        self.write_variable(FieldTag::Str, value.as_bytes());
     }
 
     /// Append tagged, length-prefixed bytes.
     #[inline]
     pub fn write_bytes(&mut self, value: &[u8]) {
-        self.write_variable(TAG_BYTES, value);
+        self.write_variable(FieldTag::Bytes, value);
     }
 
     /// Append a tagged fixed-size byte array, including its length.
     #[inline]
     pub fn write_fixed_bytes<const N: usize>(&mut self, value: &[u8; N]) {
-        self.write_variable(TAG_FIXED_BYTES, value);
+        self.write_variable(FieldTag::FixedBytes, value);
     }
 
     /// Append the canonical marker for an absent optional value.
     #[inline]
     pub fn write_none(&mut self) {
-        self.hasher.update(&[TAG_NONE]);
+        self.hasher.update(&[FieldTag::None.as_u8()]);
     }
 
     /// Append the canonical marker for a present optional value.
     #[inline]
     pub fn write_some(&mut self) {
-        self.hasher.update(&[TAG_SOME]);
+        self.hasher.update(&[FieldTag::Some.as_u8()]);
     }
 
     /// Append a tagged enum variant ordinal.
     #[inline]
     pub fn write_variant(&mut self, variant: u32) {
         let mut encoded = [0; 5];
-        encoded[0] = TAG_VARIANT;
+        encoded[0] = FieldTag::Variant.as_u8();
         encoded[1..].copy_from_slice(&variant.to_le_bytes());
         self.hasher.update(&encoded);
     }
@@ -268,7 +280,7 @@ impl KeyBuilder {
     #[inline]
     pub fn write_sequence_len(&mut self, len: u64) {
         let mut encoded = [0; 9];
-        encoded[0] = TAG_SEQUENCE;
+        encoded[0] = FieldTag::Sequence.as_u8();
         encoded[1..].copy_from_slice(&len.to_le_bytes());
         self.hasher.update(&encoded);
     }
@@ -283,8 +295,8 @@ impl KeyBuilder {
     }
 
     #[inline]
-    fn write_variable(&mut self, tag: u8, value: &[u8]) {
-        self.hasher.update(&[tag]);
+    fn write_variable(&mut self, tag: FieldTag, value: &[u8]) {
+        self.hasher.update(&[tag.as_u8()]);
         self.hasher.update(&encoded_len(value));
         self.hasher.update(value);
     }
@@ -325,6 +337,7 @@ mod tests {
     fn key_and_namespace_have_fixed_sizes() {
         assert_eq!(std::mem::size_of::<InternalCacheKey>(), 16);
         assert_eq!(std::mem::size_of::<CacheNamespace>(), 32);
+        assert_eq!(std::mem::size_of::<FieldTag>(), 1);
     }
 
     #[test]
@@ -438,7 +451,7 @@ mod tests {
         write_framed(&mut reference, b"test.Value");
         write_framed(&mut reference, SCHEMA.id().as_bytes());
         reference.update(&SCHEMA.version().to_le_bytes());
-        reference.update(&[TAG_U32, 0x04, 0x03, 0x02, 0x01]);
+        reference.update(&[FieldTag::U32.as_u8(), 0x04, 0x03, 0x02, 0x01]);
         let mut expected = [0; 16];
         expected.copy_from_slice(&reference.finalize().as_bytes()[..16]);
 
