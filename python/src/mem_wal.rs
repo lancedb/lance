@@ -949,10 +949,8 @@ fn memtable_stats_to_pydict(py: Python<'_>, stats: &MemTableStats) -> PyResult<P
         "max_buffered_batch_position",
         stats.max_buffered_batch_position,
     )?;
-    dict.set_item(
-        "max_flushed_batch_position",
-        stats.max_flushed_batch_position,
-    )?;
+    dict.set_item("durable_batch_count", stats.durable_batch_count)?;
+    dict.set_item("global_offset", stats.global_offset)?;
     dict.set_item(
         "pending_wal_start_batch_position",
         stats.pending_wal_start_batch_position,
@@ -1039,13 +1037,18 @@ fn closed_memtable_stats(stats_before_close: MemTableStats) -> MemTableStats {
         return stats_before_close;
     }
 
+    // After a successful close every buffered batch is flushed and WAL-durable,
+    // so the synthesized empty memtable starts at the writer's global end and the
+    // durable cursor has caught up to it.
+    let global_end = stats_before_close.global_offset + stats_before_close.batch_count;
     MemTableStats {
         row_count: 0,
         batch_count: 0,
         estimated_size: 0,
         generation: stats_before_close.generation.saturating_add(1),
         max_buffered_batch_position: None,
-        max_flushed_batch_position: None,
+        durable_batch_count: global_end,
+        global_offset: global_end,
         pending_wal_start_batch_position: None,
         pending_wal_end_batch_position: None,
         pending_wal_batch_count: 0,

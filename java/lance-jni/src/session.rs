@@ -4,12 +4,13 @@
 use std::sync::Arc;
 
 use jni::JNIEnv;
-use jni::objects::JObject;
+use jni::objects::{JObject, JValue};
 use jni::sys::jlong;
 use lance::dataset::{DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
 use lance::session::Session as LanceSession;
 use lance_io::object_store::ObjectStoreRegistry;
 
+use crate::RT;
 use crate::error::{Error, Result};
 
 /// Creates a new Session and returns a handle to it.
@@ -76,6 +77,41 @@ fn size_bytes_native(env: &mut JNIEnv, obj: JObject) -> Result<jlong> {
     // Safety: We trust that the handle is valid and was created by createNative
     let session_arc = unsafe { &*(handle as *const Arc<LanceSession>) };
     Ok(session_arc.size_bytes() as jlong)
+}
+
+/// Returns statistics for the session's metadata cache as an org.lance.CacheStats object.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Session_metadataCacheStatsNative<'local>(
+    mut env: JNIEnv<'local>,
+    obj: JObject,
+) -> JObject<'local> {
+    ok_or_throw!(env, metadata_cache_stats_native(&mut env, obj))
+}
+
+fn metadata_cache_stats_native<'local>(
+    env: &mut JNIEnv<'local>,
+    obj: JObject,
+) -> Result<JObject<'local>> {
+    let handle = get_session_handle(env, &obj)?;
+    if handle == 0 {
+        return Err(Error::input_error("Session is closed".to_string()));
+    }
+
+    // Safety: We trust that the handle is valid and was created by createNative
+    let session_arc = unsafe { &*(handle as *const Arc<LanceSession>) };
+    let stats = RT.block_on(session_arc.metadata_cache_stats());
+
+    let stats_obj = env.new_object(
+        "org/lance/CacheStats",
+        "(JJJJ)V",
+        &[
+            JValue::Long(stats.hits as jlong),
+            JValue::Long(stats.misses as jlong),
+            JValue::Long(stats.num_entries as jlong),
+            JValue::Long(stats.size_bytes as jlong),
+        ],
+    )?;
+    Ok(stats_obj)
 }
 
 /// Releases the native session handle.

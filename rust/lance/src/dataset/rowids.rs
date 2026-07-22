@@ -87,6 +87,48 @@ pub async fn get_row_id_index(
     }
 }
 
+/// Resolve row addresses to row ids, positionally: `addr = (fragment << 32) | offset`
+/// looks up `offset` in the fragment's [`RowIdSequence`]. The inverse companion of
+/// [`get_row_id_index`].
+///
+/// Returns one entry per input address, in order. Addresses that no longer
+/// resolve — a missing fragment, an out-of-range offset, or a `None` input —
+/// yield `None`. On datasets without stable row ids, addresses are the row
+/// ids, so the input is returned unchanged.
+pub async fn row_addrs_to_row_ids(
+    dataset: &Dataset,
+    addrs: impl IntoIterator<Item = Option<u64>>,
+) -> Result<Vec<Option<u64>>> {
+    let addrs: Vec<Option<u64>> = addrs.into_iter().collect();
+    if !dataset.manifest.uses_stable_row_ids() {
+        return Ok(addrs);
+    }
+
+    let mut positions_by_fragment: std::collections::HashMap<u32, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (position, addr) in addrs.iter().enumerate() {
+        if let Some(addr) = addr {
+            positions_by_fragment
+                .entry((addr >> 32) as u32)
+                .or_default()
+                .push(position);
+        }
+    }
+
+    let mut ids: Vec<Option<u64>> = vec![None; addrs.len()];
+    for (fragment_id, positions) in positions_by_fragment {
+        let Some(fragment) = dataset.get_fragment(fragment_id as usize) else {
+            continue;
+        };
+        let sequence = load_row_id_sequence(dataset, fragment.metadata()).await?;
+        for position in positions {
+            let offset = addrs[position].expect("grouped from Some") as u32;
+            ids[position] = sequence.get(offset as usize);
+        }
+    }
+    Ok(ids)
+}
+
 async fn load_row_id_index(dataset: &Dataset) -> Result<lance_table::rowids::RowIdIndex> {
     let sequences = load_row_id_sequences(dataset, &dataset.manifest.fragments)
         .try_collect::<Vec<_>>()
@@ -241,6 +283,51 @@ mod test {
         assert_eq!(found_addresses, expected_addresses);
 
         assert_eq!(dataset.manifest().next_row_id, num_rows);
+    }
+
+    #[tokio::test]
+    async fn test_row_addrs_to_row_ids() {
+        let num_rows = 25u64;
+        let batch = sequence_batch(0..num_rows as i32);
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let write_params = WriteParams {
+            enable_stable_row_ids: true,
+            max_rows_per_file: 10,
+            ..Default::default()
+        };
+        let dataset = Dataset::write(reader, "memory://", Some(write_params))
+            .await
+            .unwrap();
+
+        // Sequential assignment: row n lives at (n / 10, n % 10) with id n
+        let addr = |frag: u64, offset: u64| Some((frag << 32) | offset);
+        let addrs = vec![
+            addr(2, 1),   // id 21
+            addr(0, 3),   // id 3
+            None,         // null stays null
+            addr(0, 3),   // duplicates allowed
+            addr(9, 0),   // missing fragment
+            addr(1, 100), // out-of-range offset
+        ];
+        let ids = row_addrs_to_row_ids(&dataset, addrs).await.unwrap();
+        assert_eq!(ids, vec![Some(21), Some(3), None, Some(3), None, None]);
+
+        // Without stable row ids, addresses are the ids: input passes through
+        let batch = sequence_batch(0..num_rows as i32);
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let plain = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 10,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let addrs = vec![addr(1, 2), None];
+        let ids = row_addrs_to_row_ids(&plain, addrs.clone()).await.unwrap();
+        assert_eq!(ids, addrs);
     }
 
     #[tokio::test]
@@ -465,6 +552,53 @@ mod test {
         assert_eq!(index.get(3), Some(RowAddress::new_from_parts(1, 0)));
         // there is no new row id
         assert_eq!(index.get(5), None);
+    }
+
+    /// 100 sequential rows across 4 fragments with every third row deleted.
+    async fn deleted_thirds_dataset(enable_stable_row_ids: bool) -> Dataset {
+        let batch = sequence_batch(0..100);
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let write_params = WriteParams {
+            enable_stable_row_ids,
+            max_rows_per_file: 25,
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(reader, "memory://", Some(write_params))
+            .await
+            .unwrap();
+        dataset.delete("id % 3 = 0").await.unwrap();
+        dataset
+    }
+
+    #[rstest::rstest]
+    #[case::interleaved((0..100).collect(), (0..100).filter(|id| id % 3 != 0).collect())]
+    #[case::all_deleted(vec![0, 3, 9], vec![])]
+    #[case::all_live(vec![1, 2, 50, 98], vec![1, 2, 50, 98])]
+    #[tokio::test]
+    async fn test_filter_deleted_ids_with_stable_row_ids(
+        #[case] ids: Vec<u64>,
+        #[case] expected: Vec<u64>,
+    ) {
+        // Regression test for https://github.com/lance-format/lance/issues/7701:
+        // filter_deleted_ids must return exactly the live ids, in order.
+        // Sequential inserts, so stable row id == id column value.
+        let dataset = deleted_thirds_dataset(true).await;
+        assert_eq!(dataset.filter_deleted_ids(&ids).await.unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn test_filter_deleted_ids_without_stable_row_ids() {
+        // Non-stable: ids are row addresses; only deleted rows drop out.
+        let dataset = deleted_thirds_dataset(false).await;
+
+        // Row addresses: fragment (id / 25) << 32 | offset (id % 25).
+        let addr = |id: u64| (id / 25) << 32 | (id % 25);
+        let ids = (0..100).map(addr).collect::<Vec<u64>>();
+        let expected = (0..100)
+            .filter(|id| id % 3 != 0)
+            .map(addr)
+            .collect::<Vec<u64>>();
+        assert_eq!(dataset.filter_deleted_ids(&ids).await.unwrap(), expected);
     }
 
     fn build_rowid_to_i_map(row_ids: &UInt64Array, i_array: &Int32Array) -> HashMap<u64, i32> {

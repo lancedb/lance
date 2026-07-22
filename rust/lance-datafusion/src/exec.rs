@@ -16,7 +16,7 @@ use chrono::{DateTime, Utc};
 use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
 use datafusion::{
-    catalog::streaming::StreamingTable,
+    catalog::{TableProvider, streaming::StreamingTable},
     dataframe::DataFrame,
     execution::{
         TaskContext,
@@ -26,12 +26,14 @@ use datafusion::{
         runtime_env::RuntimeEnvBuilder,
     },
     physical_plan::{
-        DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
+        DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
+        SendableRecordBatchStream,
         analyze::AnalyzeExec,
         coalesce_partitions::CoalescePartitionsExec,
         display::DisplayableExecutionPlan,
         execution_plan::{Boundedness, CardinalityEffect, EmissionType},
         metrics::MetricValue,
+        sorts::sort_preserving_merge::SortPreservingMergeExec,
         stream::RecordBatchStreamAdapter,
         streaming::PartitionStream,
     },
@@ -612,8 +614,17 @@ pub fn execute_plan(
     // Coalesce to a single partition if the optimizer left more than one.
     // EnforceDistribution may remove RepartitionExec(1) nodes when the parent
     // declares UnspecifiedDistribution, leaving multi-partition plans here.
+    //
+    // If the plan carries an output ordering (e.g. a top-k `SortExec` whose
+    // result was later repartitioned to parallelize downstream operators),
+    // a plain `CoalescePartitionsExec` would scramble that order because it
+    // merges partitions in scheduling-dependent order. Use an order-preserving
+    // merge in that case instead, mirroring what `EnforceDistribution` itself
+    // does when it needs to merge an ordered, multi-partition plan.
     let plan: Arc<dyn ExecutionPlan> = if plan.properties().partitioning.partition_count() == 1 {
         plan
+    } else if let Some(ordering) = plan.output_ordering() {
+        Arc::new(SortPreservingMergeExec::new(ordering.clone(), plan))
     } else {
         Arc::new(CoalescePartitionsExec::new(plan))
     };
@@ -868,6 +879,49 @@ impl SessionContextExt for SessionContext {
         let provider = StreamingTable::try_new(schema, vec![part_stream])?;
         self.read_table(Arc::new(provider))
     }
+}
+
+/// Scan a [`TableProvider`] into a single-partition [`SendableRecordBatchStream`].
+///
+/// Multi-partition providers are coalesced into a single partition. This adapts a
+/// re-scannable provider back into the one stream the writer pipeline consumes;
+/// re-scanning the same provider (e.g. on a write retry) yields a fresh stream.
+///
+/// # Examples
+///
+/// ```
+/// # use std::sync::Arc;
+/// # use arrow_array::{Int32Array, RecordBatch};
+/// # use arrow_schema::{DataType, Field, Schema};
+/// # use datafusion::catalog::TableProvider;
+/// # use datafusion::datasource::MemTable;
+/// # use futures::TryStreamExt;
+/// # use lance_datafusion::exec::provider_to_stream;
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+/// let batch =
+///     RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1, 2, 3]))])?;
+/// let provider: Arc<dyn TableProvider> = Arc::new(MemTable::try_new(schema, vec![vec![batch]])?);
+///
+/// // A re-scannable provider yields a fresh stream on each call.
+/// let batches: Vec<RecordBatch> = provider_to_stream(provider).await?.try_collect().await?;
+/// assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
+/// # Ok(())
+/// # }
+/// ```
+pub async fn provider_to_stream(
+    provider: Arc<dyn TableProvider>,
+) -> Result<SendableRecordBatchStream> {
+    let ctx = SessionContext::new();
+    let plan = provider.scan(&ctx.state(), None, &[], None).await?;
+    let plan: Arc<dyn ExecutionPlan> =
+        if plan.properties().output_partitioning().partition_count() > 1 {
+            Arc::new(CoalescePartitionsExec::new(plan))
+        } else {
+            plan
+        };
+    Ok(plan.execute(0, ctx.task_ctx())?)
 }
 
 #[derive(Clone, Debug)]

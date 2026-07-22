@@ -43,6 +43,7 @@ pub struct CommitBuilder<'a> {
     commit_handler: Option<Arc<dyn CommitHandler>>,
     store_params: Option<ObjectStoreParams>,
     object_store: Option<Arc<ObjectStore>>,
+    source_store: Option<Arc<ObjectStore>>,
     session: Option<Arc<Session>>,
     detached: bool,
     commit_config: CommitConfig,
@@ -64,6 +65,7 @@ impl<'a> CommitBuilder<'a> {
             commit_handler: None,
             store_params: None,
             object_store: None,
+            source_store: None,
             session: None,
             detached: false,
             commit_config: Default::default(),
@@ -100,6 +102,18 @@ impl<'a> CommitBuilder<'a> {
     /// Pass an object store to use.
     pub fn with_object_store(mut self, object_store: Arc<ObjectStore>) -> Self {
         self.object_store = Some(object_store);
+        self
+    }
+
+    /// Pass the object store of the dataset being cloned from.
+    ///
+    /// Only used by `Operation::Clone`: the source manifest is read through this store
+    /// while the new dataset is written through the destination store. This lets a clone
+    /// cross object stores/accounts (e.g. between two Azure accounts), where the source
+    /// is not reachable with the destination's credentials. Defaults to the destination
+    /// store when not set, preserving same-store behavior.
+    pub fn with_source_store(mut self, source_store: Arc<ObjectStore>) -> Self {
+        self.source_store = Some(source_store);
         self
     }
 
@@ -240,6 +254,9 @@ impl<'a> CommitBuilder<'a> {
             .session
             .or_else(|| self.dest.dataset().map(|ds| ds.session.clone()))
             .unwrap_or_default();
+
+        // Store used to read the source manifest for a clone (see with_source_store).
+        let source_store = self.source_store.clone();
 
         let (object_store, base_path, commit_handler) = match &self.dest {
             WriteDestination::Dataset(dataset) => (
@@ -404,6 +421,7 @@ impl<'a> CommitBuilder<'a> {
         } else {
             commit_new_dataset(
                 object_store.as_ref(),
+                source_store.as_deref(),
                 commit_handler.as_ref(),
                 &base_path,
                 &transaction,

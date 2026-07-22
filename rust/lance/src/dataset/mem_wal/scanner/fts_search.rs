@@ -98,7 +98,7 @@ fn active_source_can_execute_fts(source: &LsmDataSource, column: &str) -> bool {
                 .get_fts_by_column(column)
                 .is_some_and(|index| !index.is_empty())
                 && batch_store
-                    .max_visible_row(index_store.max_visible_batch_position())
+                    .max_visible_row(index_store.visible_count())
                     .is_some()
         }
         _ => false,
