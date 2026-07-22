@@ -2881,7 +2881,7 @@ mod tests {
     use crate::session::Session;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount, copy_test_data_to_tmp};
     use arrow::array::AsArray;
-    use arrow::datatypes::{Float32Type, Int32Type};
+    use arrow::datatypes::{Float32Type, Int32Type, Int64Type};
     use arrow_array::Int32Array;
     use arrow_array::{
         FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator, StringArray,
@@ -2894,7 +2894,10 @@ mod tests {
     use lance_datagen::{BatchCount, ByteCount, Dimension, RowCount, array};
     use lance_index::pbold::{BTreeIndexDetails, InvertedIndexDetails};
     use lance_index::scalar::bitmap::BITMAP_LOOKUP_NAME;
-    use lance_index::scalar::inverted::INVERTED_INDEX_VERSION_V3;
+    use lance_index::scalar::inverted::query::{FtsQuery, PhraseQuery};
+    use lance_index::scalar::inverted::{
+        INVERTED_INDEX_VERSION_V1, INVERTED_INDEX_VERSION_V2, INVERTED_INDEX_VERSION_V3,
+    };
     use lance_index::scalar::{
         BuiltinIndexType, FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams,
     };
@@ -3888,6 +3891,53 @@ mod tests {
         assert_eq!(stats["num_indexed_fragments"], 2);
         assert_eq!(stats["num_unindexed_fragments"], 0);
         assert_eq!(stats["num_indices"], 1);
+    }
+
+    #[rstest]
+    #[case::v1("v3.0.1/fts_v1", INVERTED_INDEX_VERSION_V1)]
+    #[case::v2("v4.0.1/fts_v2", INVERTED_INDEX_VERSION_V2)]
+    #[tokio::test]
+    async fn test_read_fts_format_fixture(
+        #[case] fixture_path: &str,
+        #[case] expected_version: u32,
+    ) {
+        async fn search_ids(dataset: &Dataset, query: FullTextSearchQuery) -> Vec<i64> {
+            let result = dataset
+                .scan()
+                .project(&["id"])
+                .unwrap()
+                .full_text_search(query)
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            let mut ids = result["id"].as_primitive::<Int64Type>().values().to_vec();
+            ids.sort_unstable();
+            ids
+        }
+
+        let test_dir = copy_test_data_to_tmp(fixture_path).unwrap();
+        let dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
+
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1);
+        assert_eq!(indices[0].index_version, expected_version as i32);
+
+        let match_ids = search_ids(
+            &dataset,
+            FullTextSearchQuery::new("compatibility".to_string()),
+        )
+        .await;
+        assert_eq!(match_ids, (0..300).collect::<Vec<_>>());
+
+        let phrase =
+            PhraseQuery::new("lance database".to_string()).with_column(Some("text".to_string()));
+        let phrase_ids = search_ids(
+            &dataset,
+            FullTextSearchQuery::new_query(FtsQuery::Phrase(phrase)),
+        )
+        .await;
+        assert_eq!(phrase_ids, (0..300).step_by(3).collect::<Vec<_>>());
     }
 
     #[rstest]

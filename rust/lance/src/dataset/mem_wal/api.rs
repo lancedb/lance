@@ -393,10 +393,6 @@ fn writer_config_to_defaults(config: &ShardWriterConfig) -> HashMap<String, Stri
             config.durable_write.to_string(),
         ),
         (
-            "sync_indexed_write".to_string(),
-            config.sync_indexed_write.to_string(),
-        ),
-        (
             "max_wal_buffer_size".to_string(),
             config.max_wal_buffer_size.to_string(),
         ),
@@ -431,14 +427,6 @@ fn writer_config_to_defaults(config: &ShardWriterConfig) -> HashMap<String, Stri
         (
             "backpressure_log_interval_ms".to_string(),
             config.backpressure_log_interval.as_millis().to_string(),
-        ),
-        (
-            "async_index_buffer_rows".to_string(),
-            config.async_index_buffer_rows.to_string(),
-        ),
-        (
-            "async_index_interval_ms".to_string(),
-            config.async_index_interval.as_millis().to_string(),
         ),
         (
             "enable_memtable".to_string(),

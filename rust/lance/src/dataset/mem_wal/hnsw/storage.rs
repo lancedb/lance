@@ -269,25 +269,30 @@ impl ArrowFixedSizeListVectorStore {
             )));
         };
 
+        // Exhaustion is a shard-construction bug (store sized below the memtable),
+        // not caller input — hence `internal`, not `invalid_input`.
         let start = self.committed_len.load(Ordering::Relaxed);
         let end = start.checked_add(num_rows).ok_or_else(|| {
-            Error::invalid_input(format!(
+            Error::internal(format!(
                 "vector count overflow: start={}, batch_len={}",
                 start, num_rows
             ))
         })?;
         if end > self.capacity {
-            return Err(Error::invalid_input(format!(
-                "capacity {} exhausted: inserting rows [{}..{})",
+            return Err(Error::internal(format!(
+                "HNSW vector store capacity {} exhausted: inserting rows [{}..{}); \
+                 the store is sized below the memtable's row capacity",
                 self.capacity, start, end
             )));
         }
 
         let batch_idx = self.committed_batches.load(Ordering::Relaxed);
         if batch_idx >= self.max_batches {
-            return Err(Error::invalid_input(format!(
-                "max_batches {} exhausted",
-                self.max_batches
+            return Err(Error::internal(format!(
+                "HNSW vector store max_batches {} exhausted at batch_idx {} \
+                 (inserting rows [{}..{})); the store is sized below the \
+                 memtable's batch capacity",
+                self.max_batches, batch_idx, start, end
             )));
         }
 

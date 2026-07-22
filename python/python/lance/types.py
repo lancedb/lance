@@ -52,6 +52,34 @@ def _casting_recordbatch_iter(
         yield batch
 
 
+def _is_materialized(data_obj: ReaderLike) -> bool:
+    """Whether ``data_obj`` is fully materialized in memory.
+
+    Materialized sources (tables, in-memory frames) can be wrapped in an
+    in-memory table for replay without spilling and to expose exact statistics.
+    Streaming or re-readable sources (readers, scanners, datasets, generators)
+    are not considered materialized.
+    """
+    if _check_for_pandas(data_obj) and isinstance(data_obj, pd.DataFrame):
+        return True
+    if isinstance(data_obj, (pa.Table, pa.RecordBatch)):
+        return True
+    if (
+        type(data_obj).__module__.startswith("polars")
+        and data_obj.__class__.__name__ == "DataFrame"
+    ):
+        return True
+    if isinstance(data_obj, dict):
+        return True
+    if (
+        isinstance(data_obj, list)
+        and len(data_obj) > 0
+        and isinstance(data_obj[0], dict)
+    ):
+        return True
+    return False
+
+
 def _coerce_reader(
     data_obj: ReaderLike, schema: Optional[pa.Schema] = None
 ) -> pa.RecordBatchReader:

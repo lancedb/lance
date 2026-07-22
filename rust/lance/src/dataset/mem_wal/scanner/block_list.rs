@@ -328,7 +328,7 @@ fn in_memory_membership(
     batch_store: &Arc<BatchStore>,
     index_store: &Arc<IndexStore>,
 ) -> GenMembership {
-    let max_visible_row = batch_store.max_visible_row(index_store.max_visible_batch_position());
+    let max_visible_row = batch_store.max_visible_row(index_store.visible_count());
     GenMembership::InMemory {
         index_store: index_store.clone(),
         max_visible_row,
@@ -346,9 +346,10 @@ fn bounded_in_memory_membership(
     index_store: &Arc<IndexStore>,
     batch_count: u64,
 ) -> GenMembership {
-    let max_visible_row = batch_count
-        .checked_sub(1)
-        .and_then(|last_batch| batch_store.max_visible_row(last_batch as usize));
+    // `batch_count` is already an exclusive count, and so is what
+    // `max_visible_row` takes, so it passes straight through: no
+    // count-to-inclusive-position conversion, and `0` yields `None` on its own.
+    let max_visible_row = batch_store.max_visible_row(batch_count as usize);
     GenMembership::InMemory {
         index_store: index_store.clone(),
         max_visible_row,

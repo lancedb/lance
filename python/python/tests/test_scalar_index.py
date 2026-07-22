@@ -2942,6 +2942,36 @@ def test_json_index():
     )
 
 
+def test_json_index_non_exact_floats():
+    # A JSON-path btree index is trained on the value extracted from the JSON
+    # column, not on the raw column itself, so the index build must sort by
+    # the extracted value rather than assuming the raw column's order matches
+    # it. Without that, range/equality queries silently miss rows whenever
+    # the extracted floats are not exactly representable in float64 (#7485).
+    vals = ['{"latitude": 10.5}', '{"latitude": 40.1}', '{"latitude": -3.2}']
+    tbl = pa.table({"data": pa.array(vals, pa.json_())})
+    ds = lance.write_dataset(tbl, "memory://test")
+    ds.create_scalar_index(
+        "data",
+        IndexConfig(
+            index_type="json",
+            parameters={"target_index_type": "btree", "path": "latitude"},
+        ),
+    )
+
+    for filter in [
+        "json_get_float(data, 'latitude') > 0",
+        "json_get_float(data, 'latitude') >= 10.5",
+        "json_get_float(data, 'latitude') = 40.1",
+        "json_get_float(data, 'latitude') = 10.5",
+        "json_get_float(data, 'latitude') < 100",
+    ]:
+        assert "ScalarIndexQuery" in ds.scanner(filter=filter).explain_plan()
+        assert ds.to_table(filter=filter) == ds.to_table(
+            filter=filter, use_scalar_index=False
+        ), filter
+
+
 def test_null_handling():
     tbl = pa.table(
         {

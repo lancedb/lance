@@ -54,14 +54,14 @@ pub struct FtsIndexExec {
     batch_store: Arc<BatchStore>,
     indexes: Arc<IndexStore>,
     query: FtsQuery,
-    max_visible_batch_position: usize,
+    visible_count: usize,
     projection: Option<Vec<usize>>,
     output_schema: SchemaRef,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
     /// Pre-computed batch ranges for O(log n) lookup.
     batch_ranges: Vec<BatchRange>,
-    /// Maximum visible row position based on max_visible_batch_position (None if nothing visible).
+    /// Maximum visible row position based on visible_count (None if nothing visible).
     max_visible_row: Option<u64>,
     /// Whether to include _rowid column (row position) in output.
     with_row_id: bool,
@@ -81,10 +81,7 @@ impl Debug for FtsIndexExec {
         f.debug_struct("FtsIndexExec")
             .field("column", &self.query.column)
             .field("query_type", &self.query.query_type)
-            .field(
-                "max_visible_batch_position",
-                &self.max_visible_batch_position,
-            )
+            .field("visible_count", &self.visible_count)
             .field("with_row_id", &self.with_row_id)
             .finish()
     }
@@ -98,7 +95,7 @@ impl FtsIndexExec {
     /// * `batch_store` - Lock-free batch store containing data
     /// * `indexes` - Index registry with FTS indexes
     /// * `query` - FTS query parameters
-    /// * `max_visible_batch_position` - MVCC visibility sequence number
+    /// * `visible_count` - MVCC visibility sequence number
     /// * `projection` - Optional column indices to project
     /// * `base_schema` - Schema before adding score column (and _rowid if with_row_id)
     /// * `with_row_id` - Whether to include _rowid column (row position)
@@ -106,7 +103,7 @@ impl FtsIndexExec {
         batch_store: Arc<BatchStore>,
         indexes: Arc<IndexStore>,
         query: FtsQuery,
-        max_visible_batch_position: usize,
+        visible_count: usize,
         projection: Option<Vec<usize>>,
         base_schema: SchemaRef,
         with_row_id: bool,
@@ -163,7 +160,7 @@ impl FtsIndexExec {
                 end: batch_end,
                 batch_id,
             });
-            if batch_id <= max_visible_batch_position {
+            if batch_id < visible_count {
                 max_visible_row_exclusive = batch_end as u64;
             }
             current_row = batch_end;
@@ -180,7 +177,7 @@ impl FtsIndexExec {
             batch_store,
             indexes,
             query,
-            max_visible_batch_position,
+            visible_count,
             projection,
             output_schema,
             properties,
@@ -554,7 +551,7 @@ impl FtsIndexExec {
             Some(newest_pk_positions(
                 &self.batch_store,
                 pk_columns,
-                self.max_visible_batch_position,
+                self.visible_count,
                 max_visible_row,
             )?)
         };
@@ -751,7 +748,7 @@ mod tests {
 
         let query = FtsQuery::match_query("text", "hello");
 
-        let exec = FtsIndexExec::new(batch_store, indexes, query, 0, None, schema, false).unwrap();
+        let exec = FtsIndexExec::new(batch_store, indexes, query, 1, None, schema, false).unwrap();
 
         let ctx = Arc::new(TaskContext::default());
         let stream = exec.execute(0, ctx).unwrap();
@@ -853,7 +850,7 @@ mod tests {
             batch_store.clone(),
             indexes.clone(),
             query.clone(),
-            0,
+            1,
             None,
             schema.clone(),
             false,
@@ -868,7 +865,7 @@ mod tests {
         assert_eq!(total_rows, 2); // "hello" in batch1 docs 0 and 2
 
         // Query with max_visible=1 should see both batches
-        let exec = FtsIndexExec::new(batch_store, indexes, query, 1, None, schema, false).unwrap();
+        let exec = FtsIndexExec::new(batch_store, indexes, query, 2, None, schema, false).unwrap();
 
         let ctx = Arc::new(TaskContext::default());
         let stream = exec.execute(0, ctx).unwrap();

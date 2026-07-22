@@ -274,6 +274,44 @@ def dataset_with_blobs(tmp_path):
     return ds
 
 
+@pytest.fixture
+def dataset_with_mixed_blob_v2(tmp_path):
+    external_blob = tmp_path / "external.bin"
+    external_blob.write_bytes(b"external")
+    payloads = [b"in", b"packed!!", b"dedicated payload", b"external", None, b""]
+    values = [
+        payloads[0],
+        payloads[1],
+        payloads[2],
+        external_blob.as_uri(),
+        None,
+        payloads[5],
+    ]
+    schema = pa.schema(
+        [
+            lance.blob_field(
+                "blobs",
+                inline_size_threshold=4,
+                dedicated_size_threshold=12,
+            ),
+            pa.field("idx", pa.uint64()),
+        ]
+    )
+    table = pa.table(
+        {"blobs": lance.blob_array(values), "idx": range(len(values))}, schema=schema
+    )
+    dataset = lance.write_dataset(
+        table,
+        tmp_path / "mixed_blob_v2",
+        data_storage_version="2.2",
+        allow_external_blob_outside_bases=True,
+        max_rows_per_file=2,
+        max_rows_per_group=2,
+    )
+    assert len(dataset.get_fragments()) == 3
+    return dataset, payloads
+
+
 def test_blob_files(dataset_with_blobs):
     row_ids = (
         dataset_with_blobs.to_table(columns=[], with_row_id=True)
@@ -515,6 +553,125 @@ def test_read_blobs_without_preserve_order_returns_same_rows(
     blobs = dataset_with_blobs.read_blobs("blobs", **kwargs, preserve_order=False)
 
     assert sorted(blobs) == sorted(expected)
+
+
+@pytest.mark.parametrize("selection_kind", ["ids", "addresses", "indices"])
+def test_read_blob_ranges_mixed_sources_preserves_request_identity(
+    dataset_with_mixed_blob_v2, selection_kind
+):
+    dataset, payloads = dataset_with_mixed_blob_v2
+    selected_indices = [3, 1, 1, 0, 2, 4, 5]
+    ranges = [(1, 3), (2, 4), (0, 4), (1, 1), (5, 0), (0, 0), (0, 0)]
+    addresses = _blob_row_addresses(dataset)
+    if selection_kind == "ids":
+        all_selectors = _blob_row_ids(dataset)
+    elif selection_kind == "addresses":
+        all_selectors = addresses
+    else:
+        all_selectors = list(range(len(payloads)))
+    selectors = [all_selectors[index] for index in selected_indices]
+    requests = [
+        (row, offset, length) for row, (offset, length) in zip(selectors, ranges)
+    ]
+
+    results = dataset.read_blob_ranges(
+        "blobs",
+        requests,
+        selector=selection_kind,
+        io_buffer_size=1024,
+        preserve_order=True,
+    )
+
+    expected = []
+    for request_index, (row_index, (offset, length)) in enumerate(
+        zip(selected_indices, ranges)
+    ):
+        payload = payloads[row_index]
+        if payload is not None:
+            expected.append(
+                (
+                    request_index,
+                    addresses[row_index],
+                    payload[offset : offset + length],
+                )
+            )
+    assert results == expected
+
+
+def test_read_blob_ranges_skips_blob_v1_nulls(tmp_path):
+    schema = pa.schema(
+        [
+            pa.field(
+                "blobs",
+                pa.large_binary(),
+                metadata={"lance-encoding:blob": "true"},
+            ),
+            pa.field("idx", pa.uint64()),
+        ]
+    )
+    dataset = lance.write_dataset(
+        pa.table({"blobs": [None, b"", b"abc"], "idx": range(3)}, schema=schema),
+        tmp_path / "blob_v1_nulls",
+        data_storage_version="2.0",
+    )
+    addresses = _blob_row_addresses(dataset)
+
+    results = dataset.read_blob_ranges(
+        "blobs",
+        [(0, 0, 0), (0, 0, 1), (1, 0, 0), (2, 1, 1)],
+        selector="indices",
+    )
+
+    assert results == [(2, addresses[1], b""), (3, addresses[2], b"b")]
+
+
+def test_read_blob_ranges_without_preserve_order_keeps_request_identity(
+    dataset_with_mixed_blob_v2,
+):
+    dataset, _ = dataset_with_mixed_blob_v2
+    results = dataset.read_blob_ranges(
+        "blobs",
+        [(3, 0, 1), (1, 1, 2), (0, 0, 2)],
+        selector="indices",
+        preserve_order=False,
+    )
+
+    assert sorted(results) == sorted(
+        [
+            (0, _blob_row_addresses(dataset)[3], b"e"),
+            (1, _blob_row_addresses(dataset)[1], b"ac"),
+            (2, _blob_row_addresses(dataset)[0], b"in"),
+        ]
+    )
+
+
+@pytest.mark.parametrize(
+    ("requests", "message"),
+    [
+        ([(0, 2**64 - 1, 2)], "offset \\+ length overflowed"),
+        ([(0, 0, 4)], "exceeds blob size"),
+    ],
+)
+def test_read_blob_ranges_rejects_invalid_ranges(
+    dataset_with_mixed_blob_v2, requests, message
+):
+    dataset, _ = dataset_with_mixed_blob_v2
+
+    with pytest.raises(ValueError, match=message):
+        dataset.read_blob_ranges("blobs", requests, selector="indices")
+
+
+def test_read_blob_ranges_rejects_invalid_selector(dataset_with_mixed_blob_v2):
+    dataset, _ = dataset_with_mixed_blob_v2
+
+    with pytest.raises(ValueError, match="selector must be one of"):
+        dataset.read_blob_ranges("blobs", [], selector="offsets")
+
+
+def test_read_blob_ranges_accepts_empty_batch(dataset_with_mixed_blob_v2):
+    dataset, _ = dataset_with_mixed_blob_v2
+
+    assert dataset.read_blob_ranges("blobs", [], selector="indices") == []
 
 
 def test_blob_file_seek(tmp_path, dataset_with_blobs):
