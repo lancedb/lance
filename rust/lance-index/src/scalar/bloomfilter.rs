@@ -518,6 +518,71 @@ impl ScalarIndex for BloomFilterIndex {
     }
 }
 
+/// Merge caller-selected BloomFilter segments into one self-contained segment.
+pub async fn merge_bloomfilter_indices(
+    source_indices: &[&BloomFilterIndex],
+    dest_store: &dyn IndexStore,
+    fragment_filter: &RoaringBitmap,
+) -> Result<CreatedIndex> {
+    let first = source_indices.first().ok_or_else(|| {
+        Error::invalid_input("merge_bloomfilter_indices requires at least one source index")
+    })?;
+    let params = BloomFilterIndexBuilderParams {
+        number_of_items: first.number_of_items,
+        probability: first.probability,
+    };
+
+    let mut blocks = Vec::new();
+    let mut merged_null_rows = RowAddrTreeMap::new();
+    let mut has_missing_null_bitmap = false;
+    for source in source_indices {
+        if source.number_of_items != params.number_of_items
+            || source.probability != params.probability
+        {
+            return Err(Error::invalid_input(format!(
+                "cannot merge BloomFilter segments with different parameters: \
+                 number_of_items={}, probability={} and number_of_items={}, probability={}",
+                params.number_of_items,
+                params.probability,
+                source.number_of_items,
+                source.probability
+            )));
+        }
+        blocks.extend(
+            source
+                .zones
+                .iter()
+                .filter(|block| {
+                    u32::try_from(block.bound.fragment_id)
+                        .is_ok_and(|fragment_id| fragment_filter.contains(fragment_id))
+                })
+                .cloned(),
+        );
+        match &source.null_rows {
+            Some(null_rows) => {
+                let mut filtered = null_rows.clone();
+                filtered.retain_fragments(fragment_filter.iter());
+                merged_null_rows |= &filtered;
+            }
+            None => has_missing_null_bitmap = true,
+        }
+    }
+    blocks.sort_by_key(|block| (block.bound.fragment_id, block.bound.start));
+
+    let mut builder = BloomFilterIndexBuilder::try_new(params)?;
+    builder.blocks = blocks;
+    if !has_missing_null_bitmap {
+        builder.null_rows = Some(merged_null_rows);
+    }
+    let files = builder.write_index(dest_store).await?;
+
+    Ok(CreatedIndex {
+        index_details: prost_types::Any::from_msg(&pb::BloomFilterIndexDetails::default()).unwrap(),
+        index_version: BLOOMFILTER_INDEX_VERSION,
+        files,
+    })
+}
+
 fn default_number_of_items() -> u64 {
     *DEFAULT_NUMBER_OF_ITEMS
 }
@@ -1112,15 +1177,9 @@ impl BasicTrainer for BloomFilterIndexPlugin {
         data: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
         request: Box<dyn TrainingRequest>,
-        fragment_ids: Option<Vec<u32>>,
+        _fragment_ids: Option<Vec<u32>>,
         _progress: Arc<dyn crate::progress::IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
-        if fragment_ids.is_some() {
-            return Err(Error::invalid_input_source(
-                "BloomFilter index does not support fragment training".into(),
-            ));
-        }
-
         let request = (request as Box<dyn std::any::Any>)
             .downcast::<BloomFilterIndexTrainingRequest>()
             .map_err(|_| {
@@ -1233,7 +1292,7 @@ mod tests {
 
     use crate::scalar::{
         BloomFilterQuery, IndexStore, ScalarIndex, SearchResult,
-        bloomfilter::{BloomFilterIndex, BloomFilterIndexBuilderParams},
+        bloomfilter::{BloomFilterIndex, BloomFilterIndexBuilderParams, merge_bloomfilter_indices},
         lance_format::LanceIndexStore,
     };
 
@@ -2342,6 +2401,96 @@ mod tests {
         assert!(
             !result.is_exact(),
             "IS NULL on a legacy index should not be exact"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_merge_bloomfilter_indices_preserves_exact_and_legacy_nulls() {
+        fn create_store() -> (TempObjDir, Arc<LanceIndexStore>) {
+            let tmpdir = TempObjDir::default();
+            let store = Arc::new(LanceIndexStore::new(
+                Arc::new(ObjectStore::local()),
+                tmpdir.clone(),
+                Arc::new(LanceCache::no_cache()),
+            ));
+            (tmpdir, store)
+        }
+
+        let (_first_tmpdir, first_store) = create_store();
+        let (_second_tmpdir, second_store) = create_store();
+        let (_merged_tmpdir, merged_store) = create_store();
+        let params = BloomFilterIndexBuilderParams::new(1000, 0.01);
+        for (fragment_id, store) in [(0_u64, &first_store), (1_u64, &second_store)] {
+            let row_base = fragment_id << 32;
+            let batch = record_batch!(
+                (VALUE_COLUMN_NAME, Int64, [Some(10), None, Some(30)]),
+                (ROW_ADDR, UInt64, [row_base, row_base + 1, row_base + 2])
+            )
+            .unwrap();
+            let schema = batch.schema();
+            let stream = Box::pin(RecordBatchStreamAdapter::new(
+                schema,
+                stream::once(async move { Ok(batch) }),
+            ));
+            BloomFilterIndexPlugin::train_bloomfilter_index(
+                stream,
+                store.as_ref(),
+                Some(params.clone()),
+            )
+            .await
+            .unwrap();
+        }
+
+        let first = BloomFilterIndex::load(first_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        let second = BloomFilterIndex::load(second_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        merge_bloomfilter_indices(
+            &[first.as_ref(), second.as_ref()],
+            merged_store.as_ref(),
+            &RoaringBitmap::from_iter([0, 1]),
+        )
+        .await
+        .unwrap();
+        let merged = BloomFilterIndex::load(merged_store.clone(), None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        let mut expected_nulls = RowAddrTreeMap::new();
+        expected_nulls.insert(1);
+        expected_nulls.insert((1_u64 << 32) + 1);
+        assert_eq!(
+            merged
+                .search(&BloomFilterQuery::IsNull(), &NoOpMetricsCollector)
+                .await
+                .unwrap(),
+            SearchResult::exact(expected_nulls)
+        );
+
+        let (_legacy_tmpdir, legacy_store) = create_store();
+        let (_legacy_merged_tmpdir, legacy_merged_store) = create_store();
+        write_legacy_bloomfilter(legacy_store.as_ref(), true).await;
+        let legacy = BloomFilterIndex::load(legacy_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        merge_bloomfilter_indices(
+            &[legacy.as_ref(), second.as_ref()],
+            legacy_merged_store.as_ref(),
+            &RoaringBitmap::from_iter([0, 1]),
+        )
+        .await
+        .unwrap();
+        let legacy_merged =
+            BloomFilterIndex::load(legacy_merged_store, None, &LanceCache::no_cache())
+                .await
+                .unwrap();
+        assert!(
+            !legacy_merged
+                .search(&BloomFilterQuery::IsNull(), &NoOpMetricsCollector)
+                .await
+                .unwrap()
+                .is_exact()
         );
     }
 }

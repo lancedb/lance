@@ -3299,6 +3299,7 @@ class LanceDataset(pa.dataset.Dataset):
             "INVERTED",
             "FTS",
             "ZONEMAP",
+            "BLOOMFILTER",
         }
 
     @classmethod
@@ -3310,6 +3311,7 @@ class LanceDataset(pa.dataset.Dataset):
             "BTREE",
             "BITMAP",
             "ZONEMAP",
+            "BLOOMFILTER",
         }
 
     def create_scalar_index(
@@ -4265,8 +4267,8 @@ class LanceDataset(pa.dataset.Dataset):
         Create one segment without publishing it and return its metadata.
 
         This is the public distributed-build API for vector, BTREE scalar,
-        canonical bitmap scalar, INVERTED scalar, and ZONEMAP scalar index
-        construction. Unlike
+        canonical bitmap scalar, INVERTED scalar, ZONEMAP scalar, and
+        BLOOMFILTER scalar index construction. Unlike
         :meth:`create_index`, this method does not publish the index into the
         dataset manifest. Instead, it writes one segment under
         ``_indices/<segment_uuid>/`` and returns the resulting
@@ -4282,7 +4284,7 @@ class LanceDataset(pa.dataset.Dataset):
         4. commit the final segment list with
            :meth:`commit_existing_index_segments`
 
-        BTREE, BITMAP, INVERTED, and ZONEMAP segments may
+        BTREE, BITMAP, INVERTED, ZONEMAP, and BLOOMFILTER segments may
         be merged with :meth:`merge_existing_index_segments` before commit.
         Parameters are the same as :meth:`create_index`, with one additional
         requirement:
