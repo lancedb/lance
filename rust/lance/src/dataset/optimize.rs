@@ -1172,7 +1172,13 @@ async fn build_user_view_struct(
                 }
             }
             RowClass::DataBlob => {
-                let data = blob_files[blob_file_idx].read().await?;
+                let blob_file = blob_files[blob_file_idx].as_ref().ok_or_else(|| {
+                    Error::internal(format!(
+                        "Non-null blob row {} in column '{}' resolved to null",
+                        i, column_name
+                    ))
+                })?;
+                let data = blob_file.read().await?;
                 blob_file_idx += 1;
                 data_builder.append_value(data.as_ref());
                 uri_builder.append_null();
@@ -2586,7 +2592,7 @@ mod tests {
             .unwrap();
         assert_eq!(blobs.len(), expected_payload.len());
         for (blob, expected) in blobs.iter().zip(expected_payload.iter()) {
-            let bytes = blob.read().await.unwrap();
+            let bytes = blob.as_ref().unwrap().read().await.unwrap();
             assert_eq!(bytes.as_ref(), expected.as_slice());
         }
     }
@@ -7171,11 +7177,12 @@ mod tests {
             let row_id = row_ids.value(i);
             let id = ids.value(i);
             let blobs = dataset.take_blobs(&[row_id], column).await.unwrap();
-            if blobs.is_empty() {
-                result.push((id, None));
-            } else {
-                let data = blobs[0].read().await.unwrap();
-                result.push((id, Some(data.to_vec())));
+            match blobs.into_iter().next().flatten() {
+                Some(blob) => {
+                    let data = blob.read().await.unwrap();
+                    result.push((id, Some(data.to_vec())));
+                }
+                None => result.push((id, None)),
             }
         }
         result

@@ -125,27 +125,33 @@ const DEFAULT_NPROBES: usize = 1;
 const LANCE_COMMIT_MESSAGE_KEY: &str = "__lance_commit_message";
 const INDEX_PROGRESS_QUEUE_SIZE: usize = 1024;
 
-fn read_blobs_to_python(
-    py: Python<'_>,
-    blobs: Vec<lance::dataset::ReadBlob>,
-) -> Vec<(u64, Py<PyBytes>)> {
+type PyBlobBytes = Option<Py<PyBytes>>;
+type PyReadBlob = (u64, PyBlobBytes);
+type PyReadBlobRange = (usize, u64, PyBlobBytes);
+
+fn read_blobs_to_python(py: Python<'_>, blobs: Vec<lance::dataset::ReadBlob>) -> Vec<PyReadBlob> {
     blobs
         .into_iter()
-        .map(|blob| (blob.row_address, PyBytes::new(py, &blob.data).unbind()))
+        .map(|blob| {
+            (
+                blob.row_address,
+                blob.data.map(|data| PyBytes::new(py, &data).unbind()),
+            )
+        })
         .collect()
 }
 
 fn read_blob_ranges_to_python(
     py: Python<'_>,
     ranges: Vec<lance::dataset::ReadBlobRange>,
-) -> Vec<(usize, u64, Py<PyBytes>)> {
+) -> Vec<PyReadBlobRange> {
     ranges
         .into_iter()
         .map(|range| {
             (
                 range.request_index,
                 range.row_address,
-                PyBytes::new(py, &range.data).unbind(),
+                range.data.map(|data| PyBytes::new(py, &data).unbind()),
             )
         })
         .collect()
@@ -1618,18 +1624,21 @@ impl Dataset {
         self_: PyRef<'_, Self>,
         row_ids: Vec<u64>,
         blob_column: &str,
-    ) -> PyResult<Vec<LanceBlobFile>> {
+    ) -> PyResult<Vec<Option<LanceBlobFile>>> {
         let blobs = rt()
             .block_on(Some(self_.py()), self_.ds.take_blobs(&row_ids, blob_column))?
             .infer_error()?;
-        Ok(blobs.into_iter().map(LanceBlobFile::from).collect())
+        Ok(blobs
+            .into_iter()
+            .map(|blob| blob.map(LanceBlobFile::from))
+            .collect())
     }
 
     fn take_blobs_by_addresses(
         self_: PyRef<'_, Self>,
         row_addresses: Vec<u64>,
         blob_column: &str,
-    ) -> PyResult<Vec<LanceBlobFile>> {
+    ) -> PyResult<Vec<Option<LanceBlobFile>>> {
         let blobs = rt()
             .block_on(
                 Some(self_.py()),
@@ -1638,21 +1647,27 @@ impl Dataset {
                     .take_blobs_by_addresses(&row_addresses, blob_column),
             )?
             .infer_error()?;
-        Ok(blobs.into_iter().map(LanceBlobFile::from).collect())
+        Ok(blobs
+            .into_iter()
+            .map(|blob| blob.map(LanceBlobFile::from))
+            .collect())
     }
 
     fn take_blobs_by_indices(
         self_: PyRef<'_, Self>,
         row_indices: Vec<u64>,
         blob_column: &str,
-    ) -> PyResult<Vec<LanceBlobFile>> {
+    ) -> PyResult<Vec<Option<LanceBlobFile>>> {
         let blobs = rt()
             .block_on(
                 Some(self_.py()),
                 self_.ds.take_blobs_by_indices(&row_indices, blob_column),
             )?
             .infer_error()?;
-        Ok(blobs.into_iter().map(LanceBlobFile::from).collect())
+        Ok(blobs
+            .into_iter()
+            .map(|blob| blob.map(LanceBlobFile::from))
+            .collect())
     }
 
     #[pyo3(signature=(
@@ -1667,7 +1682,7 @@ impl Dataset {
         blob_column: &str,
         io_buffer_size: Option<u64>,
         preserve_order: Option<bool>,
-    ) -> PyResult<Vec<(u64, Py<PyBytes>)>> {
+    ) -> PyResult<Vec<PyReadBlob>> {
         let builder = configure_read_blobs_builder(
             self_
                 .ds
@@ -1695,7 +1710,7 @@ impl Dataset {
         blob_column: &str,
         io_buffer_size: Option<u64>,
         preserve_order: Option<bool>,
-    ) -> PyResult<Vec<(u64, Py<PyBytes>)>> {
+    ) -> PyResult<Vec<PyReadBlob>> {
         let builder = configure_read_blobs_builder(
             self_
                 .ds
@@ -1723,7 +1738,7 @@ impl Dataset {
         blob_column: &str,
         io_buffer_size: Option<u64>,
         preserve_order: Option<bool>,
-    ) -> PyResult<Vec<(u64, Py<PyBytes>)>> {
+    ) -> PyResult<Vec<PyReadBlob>> {
         let builder = configure_read_blobs_builder(
             self_
                 .ds
@@ -1753,7 +1768,7 @@ impl Dataset {
         selector: &str,
         io_buffer_size: Option<u64>,
         preserve_order: Option<bool>,
-    ) -> PyResult<Vec<(usize, u64, Py<PyBytes>)>> {
+    ) -> PyResult<Vec<PyReadBlobRange>> {
         let requests = blob_range_requests_from_tuples(requests);
         let builder = self_.ds.read_blob_ranges(blob_column).infer_error()?;
         let builder = match selector {

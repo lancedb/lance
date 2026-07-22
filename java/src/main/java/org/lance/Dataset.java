@@ -1625,7 +1625,7 @@ public class Dataset implements Closeable {
    *
    * @param rowIds stable row ids (row addresses)
    * @param column blob column name
-   * @return list of BlobFile objects
+   * @return one element per row id; null blob values are represented by null elements
    */
   public List<BlobFile> takeBlobs(List<Long> rowIds, String column) {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
@@ -1643,7 +1643,7 @@ public class Dataset implements Closeable {
    *
    * @param rowIndices row offsets within dataset
    * @param column blob column name
-   * @return list of BlobFile objects
+   * @return one element per row index; null blob values are represented by null elements
    */
   public List<BlobFile> takeBlobsByIndices(List<Long> rowIndices, String column) {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {

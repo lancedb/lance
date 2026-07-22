@@ -223,6 +223,11 @@ row_addrs = ds.to_table(columns=[], with_row_address=True).column("_rowaddr").to
 rows = ds.read_blobs("blob", addresses=row_addrs[:2])
 ```
 
+Blob selection APIs preserve caller identity. `read_blobs()` and
+`take_blobs()` return one element per selected row, and `read_blob_ranges()`
+returns one element per request. A null blob is returned as `None`; a valid
+empty blob remains a non-null empty payload or zero-length `BlobFile`.
+
 ### Read blob columns as Arrow binary
 
 ```python

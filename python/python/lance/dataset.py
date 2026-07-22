@@ -2175,7 +2175,7 @@ class LanceDataset(pa.dataset.Dataset):
         ids: Optional[Union[List[int], pa.Array]] = None,
         addresses: Optional[Union[List[int], pa.Array]] = None,
         indices: Optional[Union[List[int], pa.Array]] = None,
-    ) -> List[BlobFile]:
+    ) -> List[Optional[BlobFile]]:
         """
         Select blobs by row IDs.
 
@@ -2202,7 +2202,9 @@ class LanceDataset(pa.dataset.Dataset):
 
         Returns
         -------
-        blob_files : List[BlobFile]
+        blob_files : List[Optional[BlobFile]]
+            One element per selected row. Null blob values return ``None``;
+            valid empty blobs return a ``BlobFile`` with size zero.
         """
         selection_kind, selection_values = _resolve_blob_selection(
             ids, addresses, indices
@@ -2218,7 +2220,10 @@ class LanceDataset(pa.dataset.Dataset):
             lance_blob_files = self._ds.take_blobs_by_indices(
                 selection_values, blob_column
             )
-        return [BlobFile(lance_blob_file) for lance_blob_file in lance_blob_files]
+        return [
+            BlobFile(lance_blob_file) if lance_blob_file is not None else None
+            for lance_blob_file in lance_blob_files
+        ]
 
     def read_blobs(
         self,
@@ -2229,7 +2234,7 @@ class LanceDataset(pa.dataset.Dataset):
         *,
         io_buffer_size: Optional[int] = None,
         preserve_order: Optional[bool] = None,
-    ) -> List[Tuple[int, bytes]]:
+    ) -> List[Tuple[int, Optional[bytes]]]:
         """
         Read blobs directly into memory using Lance's planned blob reader.
 
@@ -2257,8 +2262,9 @@ class LanceDataset(pa.dataset.Dataset):
 
         Returns
         -------
-        blobs : List[Tuple[int, bytes]]
-            A list of ``(row_address, blob_bytes)`` pairs.
+        blobs : List[Tuple[int, Optional[bytes]]]
+            One ``(row_address, blob_bytes)`` pair per selected row. Null blob
+            values return ``None``; valid empty blobs return ``b""``.
         """
         selection_kind, selection_values = _resolve_blob_selection(
             ids, addresses, indices
@@ -2284,7 +2290,7 @@ class LanceDataset(pa.dataset.Dataset):
         selector: Literal["ids", "addresses", "indices"],
         io_buffer_size: Optional[int] = None,
         preserve_order: Optional[bool] = None,
-    ) -> List[Tuple[int, int, bytes]]:
+    ) -> List[Tuple[int, int, Optional[bytes]]]:
         """
         Read row-specific blob-local byte ranges with one planned API call.
 
@@ -2295,9 +2301,11 @@ class LanceDataset(pa.dataset.Dataset):
         request coalescing, and bounded I/O scheduling all happen in Rust; this
         method does not use a Python thread pool.
 
-        Null blob requests produce no result. Empty ranges on non-null blobs
-        return empty bytes without issuing payload I/O. By default results
-        preserve the input order among non-null requests.
+        Every request produces one result. Null blob requests return ``None``.
+        Empty ranges on non-null blobs return empty bytes without issuing
+        payload I/O. Blob-local bounds are not evaluated for null values because
+        they have no logical payload length. By default results preserve the
+        input request order.
 
         Parameters
         ----------
@@ -2327,8 +2335,8 @@ class LanceDataset(pa.dataset.Dataset):
 
         Returns
         -------
-        results : List[Tuple[int, int, bytes]]
-            ``(request_index, row_address, data)`` for each non-null request.
+        results : List[Tuple[int, int, Optional[bytes]]]
+            One ``(request_index, row_address, data)`` tuple per request.
             The Python list retains all returned payload bytes in memory; peak
             result memory is therefore proportional to their total logical size.
         """

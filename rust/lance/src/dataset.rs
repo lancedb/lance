@@ -1734,11 +1734,15 @@ impl Dataset {
     }
 
     /// Take [BlobFile] by row IDs.
+    ///
+    /// The returned vector has one element per row ID. Null blob values are
+    /// represented as `None`; valid empty blobs return a `BlobFile` with size
+    /// zero.
     pub async fn take_blobs(
         self: &Arc<Self>,
         row_ids: &[u64],
         column: impl AsRef<str>,
-    ) -> Result<Vec<BlobFile>> {
+    ) -> Result<Vec<Option<BlobFile>>> {
         blob::take_blobs(self, row_ids, column.as_ref()).await
     }
 
@@ -1748,21 +1752,25 @@ impl Dataset {
     /// Use this method when you already have row addresses, for example from
     /// a scan with `with_row_address()`. For row IDs (stable identifiers), use
     /// [`Self::take_blobs`]. For row indices (offsets), use
-    /// [`Self::take_blobs_by_indices`].
+    /// [`Self::take_blobs_by_indices`]. The result has the same null and empty
+    /// blob representation as [`Self::take_blobs`].
     pub async fn take_blobs_by_addresses(
         self: &Arc<Self>,
         row_addrs: &[u64],
         column: impl AsRef<str>,
-    ) -> Result<Vec<BlobFile>> {
+    ) -> Result<Vec<Option<BlobFile>>> {
         blob::take_blobs_by_addresses(self, row_addrs, column.as_ref()).await
     }
 
     /// Take [BlobFile] by row indices (offsets in the dataset).
+    ///
+    /// The result has the same null and empty blob representation as
+    /// [`Self::take_blobs`].
     pub async fn take_blobs_by_indices(
         self: &Arc<Self>,
         row_indices: &[u64],
         column: impl AsRef<str>,
-    ) -> Result<Vec<BlobFile>> {
+    ) -> Result<Vec<Option<BlobFile>>> {
         let fragments = self.get_fragments();
         let row_addrs = row_offsets_to_row_addresses(&fragments, row_indices).await?;
         blob::take_blobs_by_addresses(self, &row_addrs, column.as_ref()).await
@@ -1773,7 +1781,9 @@ impl Dataset {
     /// This API complements [`Self::take_blobs`]. `take_blobs` returns
     /// [`BlobFile`] handles for caller-driven random access, while
     /// `read_blobs` builds a streaming read plan for sequential or batched blob
-    /// retrieval.
+    /// retrieval. Every selected row produces one result: null blob values have
+    /// `ReadBlob::data` set to `None`, while valid empty blobs contain an empty
+    /// buffer.
     ///
     /// ```rust
     /// # use std::sync::Arc;
@@ -1804,7 +1814,9 @@ impl Dataset {
     ///
     /// Each [`BlobRangeRequest`] contains both its row selector and byte range,
     /// so requests can be repeated or reordered without coordinating parallel
-    /// selector and range lists.
+    /// selector and range lists. Every request produces one result. A null blob
+    /// has `ReadBlobRange::data` set to `None`; an empty range on a non-null blob
+    /// contains an empty buffer.
     ///
     /// ```rust
     /// # use std::sync::Arc;

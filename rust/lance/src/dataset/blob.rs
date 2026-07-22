@@ -1575,8 +1575,10 @@ impl BlobFile {
 pub struct ReadBlob {
     /// Row address of the blob that was read.
     pub row_address: u64,
-    /// Blob payload bytes.
-    pub data: Bytes,
+    /// Blob payload bytes, or `None` when the selected blob value is null.
+    ///
+    /// A valid empty blob is represented as `Some(Bytes::new())`.
+    pub data: Option<Bytes>,
 }
 
 /// A byte range relative to the beginning of one logical blob value.
@@ -1634,8 +1636,11 @@ pub struct ReadBlobRange {
     pub row_address: u64,
     /// Blob-local range supplied for this request.
     pub range: BlobReadRange,
-    /// Bytes in `range`.
-    pub data: Bytes,
+    /// Bytes in `range`, or `None` when the selected blob value is null.
+    ///
+    /// An empty range on a non-null blob is represented as
+    /// `Some(Bytes::new())`.
+    pub data: Option<Bytes>,
 }
 
 /// Stream returned by [`ReadBlobsBuilder::try_into_stream`].
@@ -1728,29 +1733,41 @@ impl ReadBlobsBuilder {
 
     /// Execute the planned blob read and return a stream of blob payloads.
     ///
-    /// The stream yields one [`ReadBlob`] per selected non-null blob row.
+    /// The stream yields one [`ReadBlob`] per selected row. Null blob values
+    /// have `data` set to `None`; valid empty blobs contain an empty buffer.
     pub async fn try_into_stream(self) -> Result<ReadBlobsStream> {
         self.validate()?;
-        let entries = collect_blob_entries_for_selection(
+        let collected = collect_blob_selection_for_selection(
             &self.dataset,
             self.blob_field_id,
             &self.column,
             &self.selection,
         )
         .await?;
+        let (selection_count, null_blobs) =
+            collect_null_read_blobs(&collected.entries, collected.row_addresses)?;
         let physical_buffer_size = self.options.io_buffer_size_bytes.unwrap_or_else(|| {
             SchedulerConfig::max_bandwidth(self.dataset.object_store.as_ref()).io_buffer_size_bytes
         });
-        let batches = plan_blob_read_batches(entries, None, physical_buffer_size)?;
+        let batches = plan_blob_read_batches(collected.entries, None, physical_buffer_size)?;
         let execution = Arc::new(ReadBlobsExecution::new(self.options.io_buffer_size_bytes));
-        Ok(execute_blob_read_batches_stream(
+        let non_null_blobs = execute_blob_read_batches_stream(
             batches,
             execution,
             self.dataset.object_store.io_parallelism(),
             self.options.preserve_order,
         )
-        .map_ok(into_read_blob)
-        .boxed())
+        .map_ok(|blob| {
+            let selection_index = blob.selection_index;
+            (selection_index, into_read_blob(blob))
+        })
+        .boxed();
+        Ok(totalize_blob_selection_stream(
+            non_null_blobs,
+            null_blobs,
+            selection_count,
+            self.options.preserve_order,
+        ))
     }
 
     /// Execute the planned blob read and collect the full result in memory.
@@ -1820,37 +1837,55 @@ impl ReadBlobRangesBuilder {
         self
     }
 
-    /// Execute the planned range read and return a stream of non-null results.
+    /// Execute the planned range read and return one result per request.
     ///
-    /// Null blob requests do not produce a result. Empty ranges on non-null
-    /// blobs produce an empty buffer without issuing payload I/O. By default,
+    /// Null blob requests have `data` set to `None`. Empty ranges on non-null
+    /// blobs contain an empty buffer without issuing payload I/O. By default,
     /// results follow input order; `request_index` identifies the original
-    /// request even when ordering is disabled.
+    /// request even when ordering is disabled. Blob-local bounds are not
+    /// evaluated for null values because they have no logical payload length.
     pub async fn try_into_stream(self) -> Result<ReadBlobRangesStream> {
         self.validate()?;
-        let entries = collect_blob_entries_for_selection(
+        let collected = collect_blob_selection_for_selection(
             &self.inner.dataset,
             self.inner.blob_field_id,
             &self.inner.column,
             &self.inner.selection,
         )
         .await?;
+        let (selection_count, null_ranges) = collect_null_read_blob_ranges(
+            &collected.entries,
+            collected.row_addresses,
+            &self.ranges,
+        )?;
         let physical_buffer_size = self.inner.options.io_buffer_size_bytes.unwrap_or_else(|| {
             SchedulerConfig::max_bandwidth(self.inner.dataset.object_store.as_ref())
                 .io_buffer_size_bytes
         });
-        let batches = plan_blob_read_batches(entries, Some(&self.ranges), physical_buffer_size)?;
+        let batches =
+            plan_blob_read_batches(collected.entries, Some(&self.ranges), physical_buffer_size)?;
         let execution = Arc::new(ReadBlobsExecution::new(
             self.inner.options.io_buffer_size_bytes,
         ));
-        Ok(execute_blob_read_batches_stream(
+        let non_null_ranges = execute_blob_read_batches_stream(
             batches,
             execution,
             self.inner.dataset.object_store.io_parallelism(),
             self.inner.options.preserve_order,
         )
-        .map(|result| result.and_then(into_read_blob_range))
-        .boxed())
+        .map(|result| {
+            result.and_then(|blob| {
+                let selection_index = blob.selection_index;
+                into_read_blob_range(blob).map(|range| (selection_index, range))
+            })
+        })
+        .boxed();
+        Ok(totalize_blob_selection_stream(
+            non_null_ranges,
+            null_ranges,
+            selection_count,
+            self.inner.options.preserve_order,
+        ))
     }
 
     /// Execute the planned range read and collect all returned bytes in memory.
@@ -1903,6 +1938,13 @@ struct BlobEntry {
     selection_index: usize,
     row_address: u64,
     file: BlobFile,
+}
+
+/// Selected rows together with the subset that has a readable blob payload.
+#[derive(Debug)]
+struct CollectedBlobSelection {
+    entries: Vec<BlobEntry>,
+    row_addresses: Vec<u64>,
 }
 
 /// Physical read input derived from one [`BlobEntry`].
@@ -2111,8 +2153,124 @@ fn into_read_blob(blob: IndexedReadBlob) -> ReadBlob {
     );
     ReadBlob {
         row_address: blob.row_address,
-        data: blob.data,
+        data: Some(blob.data),
     }
+}
+
+fn collect_null_read_blobs(
+    entries: &[BlobEntry],
+    row_addresses: Vec<u64>,
+) -> Result<(usize, Vec<(usize, ReadBlob)>)> {
+    collect_null_selection_values(entries, row_addresses, |_, row_address| {
+        Ok(ReadBlob {
+            row_address,
+            data: None,
+        })
+    })
+}
+
+fn collect_null_read_blob_ranges(
+    entries: &[BlobEntry],
+    row_addresses: Vec<u64>,
+    ranges: &[BlobReadRange],
+) -> Result<(usize, Vec<(usize, ReadBlobRange)>)> {
+    collect_null_selection_values(entries, row_addresses, |request_index, row_address| {
+        let range = ranges.get(request_index).copied().ok_or_else(|| {
+            Error::internal(format!("Missing blob range for request {}", request_index))
+        })?;
+        Ok(ReadBlobRange {
+            request_index,
+            row_address,
+            range,
+            data: None,
+        })
+    })
+}
+
+fn collect_null_selection_values<T>(
+    entries: &[BlobEntry],
+    row_addresses: Vec<u64>,
+    mut make_value: impl FnMut(usize, u64) -> Result<T>,
+) -> Result<(usize, Vec<(usize, T)>)> {
+    let selection_count = row_addresses.len();
+    let mut non_null = vec![false; selection_count];
+    for entry in entries {
+        let is_non_null = non_null.get_mut(entry.selection_index).ok_or_else(|| {
+            Error::internal(format!(
+                "Blob selection index {} exceeded selected row count {}",
+                entry.selection_index, selection_count
+            ))
+        })?;
+        if *is_non_null {
+            return Err(Error::internal(format!(
+                "Blob selection index {} was collected more than once",
+                entry.selection_index
+            )));
+        }
+        *is_non_null = true;
+    }
+
+    let mut null_values = Vec::with_capacity(selection_count.saturating_sub(entries.len()));
+    for (selection_index, row_address) in row_addresses.into_iter().enumerate() {
+        if !non_null[selection_index] {
+            null_values.push((selection_index, make_value(selection_index, row_address)?));
+        }
+    }
+    Ok((selection_count, null_values))
+}
+
+fn totalize_blob_selection_stream<T: Send + 'static>(
+    non_null_values: BoxStream<'static, Result<(usize, T)>>,
+    null_values: Vec<(usize, T)>,
+    selection_count: usize,
+    preserve_order: bool,
+) -> BoxStream<'static, Result<T>> {
+    if !preserve_order {
+        let null_values = stream::iter(null_values.into_iter().map(|(_, value)| Ok(value)));
+        return stream::select(null_values, non_null_values.map_ok(|(_, value)| value)).boxed();
+    }
+
+    let mut non_null_values = non_null_values;
+    let mut next_selection_index = 0;
+    let mut ready = null_values.into_iter().collect::<BTreeMap<_, _>>();
+    stream::poll_fn(move |cx| {
+        loop {
+            if next_selection_index == selection_count {
+                return Poll::Ready(None);
+            }
+
+            if let Some(value) = ready.remove(&next_selection_index) {
+                next_selection_index += 1;
+                return Poll::Ready(Some(Ok(value)));
+            }
+
+            match non_null_values.poll_next_unpin(cx) {
+                Poll::Ready(Some(Ok((selection_index, value)))) => {
+                    if selection_index >= selection_count {
+                        return Poll::Ready(Some(Err(Error::internal(format!(
+                            "Blob selection index {} exceeded selected row count {}",
+                            selection_index, selection_count
+                        )))));
+                    }
+                    if ready.insert(selection_index, value).is_some() {
+                        return Poll::Ready(Some(Err(Error::internal(format!(
+                            "Blob selection index {} was produced more than once",
+                            selection_index
+                        )))));
+                    }
+                }
+                Poll::Ready(Some(Err(err))) => return Poll::Ready(Some(Err(err))),
+                Poll::Ready(None) => {
+                    return Poll::Ready(Some(Err(Error::internal(format!(
+                        "planned blob read stream completed before selection index {} was produced",
+                        next_selection_index
+                    )))));
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    })
+    .boxed()
 }
 
 fn into_read_blob_range(blob: IndexedReadBlob) -> Result<ReadBlobRange> {
@@ -2126,7 +2284,7 @@ fn into_read_blob_range(blob: IndexedReadBlob) -> Result<ReadBlobRange> {
         request_index: blob.selection_index,
         row_address: blob.row_address,
         range,
-        data: blob.data,
+        data: Some(blob.data),
     })
 }
 
@@ -2474,18 +2632,16 @@ pub(super) async fn take_blobs(
     dataset: &Arc<Dataset>,
     row_ids: &[u64],
     column: &str,
-) -> Result<Vec<BlobFile>> {
+) -> Result<Vec<Option<BlobFile>>> {
     let blob_field_id = validate_blob_column(dataset, column)?;
-    Ok(collect_blob_entries_for_selection(
+    let collected = collect_blob_selection_for_selection(
         dataset,
         blob_field_id,
         column,
         &ReadBlobsSelection::RowIds(row_ids.to_vec()),
     )
-    .await?
-    .into_iter()
-    .map(|entry| entry.file)
-    .collect())
+    .await?;
+    into_optional_blob_files(collected)
 }
 
 /// Take [BlobFile] by row addresses.
@@ -2499,18 +2655,38 @@ pub async fn take_blobs_by_addresses(
     dataset: &Arc<Dataset>,
     row_addrs: &[u64],
     column: &str,
-) -> Result<Vec<BlobFile>> {
+) -> Result<Vec<Option<BlobFile>>> {
     let blob_field_id = validate_blob_column(dataset, column)?;
-    Ok(collect_blob_entries_for_selection(
+    let collected = collect_blob_selection_for_selection(
         dataset,
         blob_field_id,
         column,
         &ReadBlobsSelection::RowAddresses(row_addrs.to_vec()),
     )
-    .await?
-    .into_iter()
-    .map(|entry| entry.file)
-    .collect())
+    .await?;
+    into_optional_blob_files(collected)
+}
+
+fn into_optional_blob_files(collected: CollectedBlobSelection) -> Result<Vec<Option<BlobFile>>> {
+    let selection_count = collected.row_addresses.len();
+    let mut files = std::iter::repeat_with(|| None)
+        .take(selection_count)
+        .collect::<Vec<_>>();
+    for entry in collected.entries {
+        let slot = files.get_mut(entry.selection_index).ok_or_else(|| {
+            Error::internal(format!(
+                "Blob selection index {} exceeded selected row count {}",
+                entry.selection_index, selection_count
+            ))
+        })?;
+        if slot.replace(entry.file).is_some() {
+            return Err(Error::internal(format!(
+                "Blob selection index {} was collected more than once",
+                entry.selection_index
+            )));
+        }
+    }
+    Ok(files)
 }
 
 /// Validate that `column` exists and is a blob column, returning its field id.
@@ -2556,14 +2732,13 @@ async fn take_blob_descriptions_by_row_addresses(
         .await
 }
 
-/// Resolve a caller selection into [`BlobEntry`] values that share `BlobSource`
-/// instances by physical backing object.
-async fn collect_blob_entries_for_selection(
+/// Resolve every selected row address and the non-null blob entries among them.
+async fn collect_blob_selection_for_selection(
     dataset: &Arc<Dataset>,
     blob_field_id: u32,
     column: &str,
     selection: &ReadBlobsSelection,
-) -> Result<Vec<BlobEntry>> {
+) -> Result<CollectedBlobSelection> {
     let description_and_addr = match selection {
         ReadBlobsSelection::None => {
             return Err(Error::invalid_input(
@@ -2585,18 +2760,26 @@ async fn collect_blob_entries_for_selection(
     };
 
     if description_and_addr.num_rows() == 0 {
-        return Ok(Vec::new());
+        return Ok(CollectedBlobSelection {
+            entries: Vec::new(),
+            row_addresses: Vec::new(),
+        });
     }
 
     let descriptions = leaf_descriptor_struct(&description_and_addr, column)?;
     let row_addrs = description_and_addr.column(1).as_primitive::<UInt64Type>();
+    let row_addresses = row_addrs.values().to_vec();
 
-    match blob_version_from_descriptions(descriptions)? {
+    let entries = match blob_version_from_descriptions(descriptions)? {
         BlobVersion::V1 => collect_blob_entries_v1(dataset, blob_field_id, descriptions, row_addrs),
         BlobVersion::V2 => {
             collect_blob_entries_v2(dataset, blob_field_id, descriptions, row_addrs).await
         }
-    }
+    }?;
+    Ok(CollectedBlobSelection {
+        entries,
+        row_addresses,
+    })
 }
 
 /// Walk into the descriptor `RecordBatch` at `column` and return the leaf
@@ -4061,7 +4244,7 @@ mod tests {
         for (actual_idx, (expected_batch_idx, expected_row_idx)) in
             [(5, 5), (6, 7), (8, 3)].iter().enumerate()
         {
-            let val = blobs[actual_idx].read().await.unwrap();
+            let val = blobs[actual_idx].as_ref().unwrap().read().await.unwrap();
             let expected = fixture.data[*expected_batch_idx]
                 .column(1)
                 .as_binary::<i64>()
@@ -4107,7 +4290,7 @@ mod tests {
                 .column(1)
                 .as_binary::<i64>()
                 .value(*expected_row_idx);
-            assert_eq!(blobs[actual_idx].data.as_ref(), expected);
+            assert_eq!(blobs[actual_idx].data.as_deref(), Some(expected));
         }
     }
 
@@ -4142,6 +4325,8 @@ mod tests {
         let blobs2 = fixture.dataset.take_blobs(&row_ids, "blobs").await.unwrap();
 
         for (blob1, blob2) in blobs.iter().zip(blobs2.iter()) {
+            let blob1 = blob1.as_ref().unwrap();
+            let blob2 = blob2.as_ref().unwrap();
             assert_eq!(blob1.position(), blob2.position());
             assert_eq!(blob1.size(), blob2.size());
             assert_eq!(blob1.data_path(), blob2.data_path());
@@ -4297,7 +4482,7 @@ mod tests {
 
         // Verify we can read the blob content
         for blob in &blobs {
-            let content = blob.read().await.unwrap();
+            let content = blob.as_ref().unwrap().read().await.unwrap();
             assert!(!content.is_empty(), "Blob content should not be empty");
         }
 
@@ -4310,7 +4495,7 @@ mod tests {
 
         // Verify we can read the blob content from second fragment
         for blob in &blobs {
-            let content = blob.read().await.unwrap();
+            let content = blob.as_ref().unwrap().read().await.unwrap();
             assert!(!content.is_empty(), "Blob content should not be empty");
         }
 
@@ -4498,7 +4683,10 @@ mod tests {
             .unwrap();
         assert_eq!(blob_files.len(), payloads.len());
         for (blob_file, expected) in blob_files.iter().zip(payloads) {
-            assert_eq!(blob_file.read().await.unwrap().as_ref(), expected);
+            assert_eq!(
+                blob_file.as_ref().unwrap().read().await.unwrap().as_ref(),
+                expected
+            );
         }
 
         let read_blobs = dataset
@@ -4510,7 +4698,7 @@ mod tests {
             .unwrap();
         assert_eq!(read_blobs.len(), payloads.len());
         for (read_blob, expected) in read_blobs.iter().zip(payloads) {
-            assert_eq!(read_blob.data.as_ref(), expected);
+            assert_eq!(read_blob.data.as_deref(), Some(expected));
         }
     }
 
@@ -4556,8 +4744,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(blobs.len(), 2);
-        let first = blobs[0].read().await.unwrap();
-        let second = blobs[1].read().await.unwrap();
+        let first = blobs[0].as_ref().unwrap().read().await.unwrap();
+        let second = blobs[1].as_ref().unwrap().read().await.unwrap();
         assert_eq!(first.as_ref(), b"hello");
         assert_eq!(second.as_ref(), b"world");
     }
@@ -4607,7 +4795,10 @@ mod tests {
 
         let blobs = dataset.take_blobs_by_indices(&[0], "blob").await.unwrap();
         assert_eq!(blobs.len(), 1);
-        assert_eq!(blobs[0].read().await.unwrap().as_ref(), b"prepared-inline");
+        assert_eq!(
+            blobs[0].as_ref().unwrap().read().await.unwrap().as_ref(),
+            b"prepared-inline"
+        );
     }
 
     #[tokio::test]
@@ -4707,8 +4898,9 @@ mod tests {
 
         let blobs = dataset.take_blobs_by_indices(&[0], "blob").await.unwrap();
         assert_eq!(blobs.len(), 1);
-        assert_eq!(blobs[0].read().await.unwrap().as_ref(), b"prepared-packed");
-        assert_eq!(blobs[0].kind(), BlobKind::Packed);
+        let blob = blobs[0].as_ref().unwrap();
+        assert_eq!(blob.read().await.unwrap().as_ref(), b"prepared-packed");
+        assert_eq!(blob.kind(), BlobKind::Packed);
     }
 
     #[tokio::test]
@@ -4789,8 +4981,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(blobs.len(), 2);
-        assert_eq!(blobs[0].read().await.unwrap().as_ref(), b"initial");
-        assert_eq!(blobs[1].read().await.unwrap().as_ref(), b"append");
+        assert_eq!(
+            blobs[0].as_ref().unwrap().read().await.unwrap().as_ref(),
+            b"initial"
+        );
+        assert_eq!(
+            blobs[1].as_ref().unwrap().read().await.unwrap().as_ref(),
+            b"append"
+        );
     }
 
     #[tokio::test]
@@ -4890,10 +5088,10 @@ mod tests {
             .unwrap();
         assert_eq!(blobs.len(), 1);
         assert_eq!(
-            blobs[0].read().await.unwrap().as_ref(),
+            blobs[0].as_ref().unwrap().read().await.unwrap().as_ref(),
             b"nested-replacement"
         );
-        assert_eq!(blobs[0].kind(), BlobKind::Packed);
+        assert_eq!(blobs[0].as_ref().unwrap().kind(), BlobKind::Packed);
     }
 
     #[tokio::test]
@@ -5042,9 +5240,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(blobs.len(), 2);
-        assert_eq!(blobs[0].read().await.unwrap().as_ref(), b"hello");
         assert_eq!(
-            blobs[1].read().await.unwrap().as_ref(),
+            blobs[0].as_ref().unwrap().read().await.unwrap().as_ref(),
+            b"hello"
+        );
+        assert_eq!(
+            blobs[1].as_ref().unwrap().read().await.unwrap().as_ref(),
             packed_payload.as_slice()
         );
 
@@ -5052,7 +5253,8 @@ mod tests {
             .take_blobs_by_indices(&[2], "info.blob")
             .await
             .unwrap();
-        assert!(null_blobs.is_empty());
+        assert_eq!(null_blobs.len(), 1);
+        assert!(null_blobs[0].is_none());
 
         let filtered = dataset
             .scan()
@@ -5652,12 +5854,12 @@ mod tests {
             let end = start + range.length as usize;
             assert_eq!(result.request_index, request_index);
             assert_eq!(result.range, *range);
-            assert_eq!(result.data.as_ref(), &payload[start..end]);
+            assert_eq!(result.data.as_deref(), Some(&payload[start..end]));
         }
     }
 
     #[tokio::test]
-    async fn test_read_blob_ranges_skips_v1_nulls_and_preserves_empty_values() {
+    async fn test_blob_selection_apis_preserve_v1_nulls_and_empty_values() {
         let test_dir = TempStrDir::default();
         let blob_metadata = HashMap::from([(BLOB_META_KEY.to_string(), "true".to_string())]);
         let schema = Arc::new(Schema::new(vec![
@@ -5679,6 +5881,51 @@ mod tests {
             .unwrap(),
         );
 
+        let blob_files = dataset
+            .take_blobs_by_indices(&[2, 1, 0], "blob")
+            .await
+            .unwrap();
+        assert_eq!(blob_files.len(), 3);
+        assert_eq!(
+            blob_files[0]
+                .as_ref()
+                .unwrap()
+                .read()
+                .await
+                .unwrap()
+                .as_ref(),
+            b"abc"
+        );
+        assert!(
+            blob_files[1]
+                .as_ref()
+                .unwrap()
+                .read()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(blob_files[2].is_none());
+
+        let blobs = dataset
+            .read_blobs("blob")
+            .unwrap()
+            .with_row_indices([2, 1, 0])
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(
+            blobs
+                .iter()
+                .map(|blob| (blob.row_address, blob.data.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![
+                (2, Some(b"abc".as_slice())),
+                (1, Some(b"".as_slice())),
+                (0, None),
+            ]
+        );
+
         let results = dataset
             .read_blob_ranges("blob")
             .unwrap()
@@ -5695,9 +5942,14 @@ mod tests {
         assert_eq!(
             results
                 .iter()
-                .map(|result| (result.request_index, result.data.as_ref()))
+                .map(|result| (result.request_index, result.data.as_deref()))
                 .collect::<Vec<_>>(),
-            vec![(2, b"".as_slice()), (3, b"b".as_slice())]
+            vec![
+                (0, None),
+                (1, None),
+                (2, Some(b"".as_slice())),
+                (3, Some(b"b".as_slice())),
+            ]
         );
 
         let descriptions = StructArray::try_new(
@@ -5722,7 +5974,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_blob_ranges_skips_v2_nulls_and_preserves_empty_values() {
+    async fn test_blob_selection_apis_preserve_v2_nulls_and_empty_values() {
         let test_dir = TempStrDir::default();
         let mut blob_builder = BlobArrayBuilder::new(3);
         blob_builder.push_empty().unwrap();
@@ -5744,6 +5996,51 @@ mod tests {
             .unwrap(),
         );
 
+        let blob_files = dataset
+            .take_blobs_by_indices(&[2, 1, 0], "blob")
+            .await
+            .unwrap();
+        assert_eq!(blob_files.len(), 3);
+        assert_eq!(
+            blob_files[0]
+                .as_ref()
+                .unwrap()
+                .read()
+                .await
+                .unwrap()
+                .as_ref(),
+            b"abc"
+        );
+        assert!(blob_files[1].is_none());
+        assert!(
+            blob_files[2]
+                .as_ref()
+                .unwrap()
+                .read()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let blobs = dataset
+            .read_blobs("blob")
+            .unwrap()
+            .with_row_indices([2, 1, 0])
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(
+            blobs
+                .iter()
+                .map(|blob| (blob.row_address, blob.data.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![
+                (2, Some(b"abc".as_slice())),
+                (1, None),
+                (0, Some(b"".as_slice())),
+            ]
+        );
+
         let results = dataset
             .read_blob_ranges("blob")
             .unwrap()
@@ -5757,11 +6054,15 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(results.len(), 2);
+        assert_eq!(results.len(), 4);
         assert_eq!(results[0].request_index, 0);
-        assert!(results[0].data.is_empty());
-        assert_eq!(results[1].request_index, 3);
-        assert_eq!(results[1].data.as_ref(), b"b");
+        assert_eq!(results[0].data.as_deref(), Some(b"".as_slice()));
+        assert_eq!(results[1].request_index, 1);
+        assert!(results[1].data.is_none());
+        assert_eq!(results[2].request_index, 2);
+        assert!(results[2].data.is_none());
+        assert_eq!(results[3].request_index, 3);
+        assert_eq!(results[3].data.as_deref(), Some(b"b".as_slice()));
     }
 
     #[tokio::test]
@@ -5947,8 +6248,9 @@ mod tests {
         let stats = dataset.object_store.io_stats_incremental();
 
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].data.len(), WINDOW_SIZE as usize);
-        assert!(results[0].data.iter().all(|byte| *byte == 0xA5));
+        let data = results[0].data.as_ref().unwrap();
+        assert_eq!(data.len(), WINDOW_SIZE as usize);
+        assert!(data.iter().all(|byte| *byte == 0xA5));
         let blob_payload_ranges = stats
             .requests
             .iter()
@@ -6019,7 +6321,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(first.row_address, 11);
-        assert_eq!(first.data.as_ref(), b"uvw");
+        assert_eq!(first.data.as_deref(), Some(b"uvw".as_slice()));
 
         slow_gate.add_permits(1);
         let second = tokio::time::timeout(Duration::from_secs(1), stream.next())
@@ -6028,7 +6330,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(second.row_address, 10);
-        assert_eq!(second.data.as_ref(), b"abc");
+        assert_eq!(second.data.as_deref(), Some(b"abc".as_slice()));
     }
 
     #[tokio::test]
@@ -6042,9 +6344,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(blobs.len(), 1);
-        assert_eq!(blobs[0].kind(), BlobKind::Inline);
+        let blob = blobs[0].as_ref().unwrap();
+        assert_eq!(blob.kind(), BlobKind::Inline);
         assert_eq!(
-            blobs[0].read().await.unwrap().as_ref(),
+            blob.read().await.unwrap().as_ref(),
             fixture.expected.as_slice()
         );
     }
@@ -6062,9 +6365,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(blobs.len(), 1);
-        assert_eq!(blobs[0].kind(), BlobKind::Packed);
+        let blob = blobs[0].as_ref().unwrap();
+        assert_eq!(blob.kind(), BlobKind::Packed);
         assert_eq!(
-            blobs[0].read().await.unwrap().as_ref(),
+            blob.read().await.unwrap().as_ref(),
             fixture.expected.as_slice()
         );
     }
@@ -6080,9 +6384,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(blobs.len(), 1);
-        assert_eq!(blobs[0].kind(), BlobKind::Dedicated);
+        let blob = blobs[0].as_ref().unwrap();
+        assert_eq!(blob.kind(), BlobKind::Dedicated);
         assert_eq!(
-            blobs[0].read().await.unwrap().as_ref(),
+            blob.read().await.unwrap().as_ref(),
             fixture.expected.as_slice()
         );
     }
@@ -6100,9 +6405,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(blobs.len(), 1);
-        assert_eq!(blobs[0].kind(), BlobKind::Packed);
+        let blob = blobs[0].as_ref().unwrap();
+        assert_eq!(blob.kind(), BlobKind::Packed);
         assert_eq!(
-            blobs[0].read().await.unwrap().as_ref(),
+            blob.read().await.unwrap().as_ref(),
             fixture.expected.as_slice()
         );
     }
@@ -6223,7 +6529,10 @@ mod tests {
 
         let blobs = dataset.take_blobs_by_indices(&[0], "blob").await.unwrap();
         assert_eq!(blobs.len(), 1);
-        assert_eq!(blobs[0].read().await.unwrap().as_ref(), b"outside");
+        assert_eq!(
+            blobs[0].as_ref().unwrap().read().await.unwrap().as_ref(),
+            b"outside"
+        );
     }
 
     #[tokio::test]
@@ -6286,7 +6595,10 @@ mod tests {
 
         let blobs = dataset.take_blobs_by_indices(&[0], "blob").await.unwrap();
         assert_eq!(blobs.len(), 1);
-        assert_eq!(blobs[0].read().await.unwrap().as_ref(), b"mapped");
+        assert_eq!(
+            blobs[0].as_ref().unwrap().read().await.unwrap().as_ref(),
+            b"mapped"
+        );
     }
 
     #[tokio::test]
@@ -6371,8 +6683,9 @@ mod tests {
 
         let blobs = dataset.take_blobs_by_indices(&[0], "blob").await.unwrap();
         assert_eq!(blobs.len(), 1);
-        assert_eq!(blobs[0].kind(), BlobKind::Inline);
-        assert_eq!(blobs[0].read().await.unwrap().as_ref(), b"inline");
+        let blob = blobs[0].as_ref().unwrap();
+        assert_eq!(blob.kind(), BlobKind::Inline);
+        assert_eq!(blob.read().await.unwrap().as_ref(), b"inline");
     }
 
     #[tokio::test]
@@ -6425,8 +6738,9 @@ mod tests {
 
         let blobs = dataset.take_blobs_by_indices(&[0], "blob").await.unwrap();
         assert_eq!(blobs.len(), 1);
-        assert_eq!(blobs[0].kind(), BlobKind::Packed);
-        assert_eq!(blobs[0].read().await.unwrap().as_ref(), payload.as_slice());
+        let blob = blobs[0].as_ref().unwrap();
+        assert_eq!(blob.kind(), BlobKind::Packed);
+        assert_eq!(blob.read().await.unwrap().as_ref(), payload.as_slice());
     }
 
     #[tokio::test]
@@ -6469,8 +6783,9 @@ mod tests {
 
         let blobs = dataset.take_blobs_by_indices(&[0], "blob").await.unwrap();
         assert_eq!(blobs.len(), 1);
-        assert_eq!(blobs[0].kind(), BlobKind::Packed);
-        assert_eq!(blobs[0].read().await.unwrap().as_ref(), payload.as_slice());
+        let blob = blobs[0].as_ref().unwrap();
+        assert_eq!(blob.kind(), BlobKind::Packed);
+        assert_eq!(blob.read().await.unwrap().as_ref(), payload.as_slice());
     }
 
     #[tokio::test]
@@ -6523,8 +6838,9 @@ mod tests {
 
         let blobs = dataset.take_blobs_by_indices(&[0], "blob").await.unwrap();
         assert_eq!(blobs.len(), 1);
-        assert_eq!(blobs[0].kind(), BlobKind::Dedicated);
-        assert_eq!(blobs[0].read().await.unwrap().as_ref(), payload.as_slice());
+        let blob = blobs[0].as_ref().unwrap();
+        assert_eq!(blob.kind(), BlobKind::Dedicated);
+        assert_eq!(blob.read().await.unwrap().as_ref(), payload.as_slice());
     }
 
     #[tokio::test]
