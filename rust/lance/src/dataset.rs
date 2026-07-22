@@ -2806,6 +2806,15 @@ impl Dataset {
 
     // This method filters deleted items from `addr_or_ids` using `addrs` as a reference
     async fn filter_addr_or_ids(&self, addr_or_ids: &[u64], addrs: &[u64]) -> Result<Vec<u64>> {
+        // The final zip pairs these positionally; misalignment must fail
+        // loud rather than truncate.
+        if addr_or_ids.len() != addrs.len() {
+            return Err(Error::internal(format!(
+                "filter_addr_or_ids: addr_or_ids has {} entries but addrs has {}",
+                addr_or_ids.len(),
+                addrs.len()
+            )));
+        }
         if addrs.is_empty() {
             return Ok(Vec::new());
         }
@@ -2917,17 +2926,24 @@ impl Dataset {
     }
 
     pub(crate) async fn filter_deleted_ids(&self, ids: &[u64]) -> Result<Vec<u64>> {
-        let addresses = if let Some(row_id_index) = get_row_id_index(self).await? {
-            let addresses = ids
-                .iter()
-                .filter_map(|id| row_id_index.get(*id).map(|address| address.into()))
-                .collect::<Vec<_>>();
-            Cow::Owned(addresses)
+        let (ids, addresses) = if let Some(row_id_index) = get_row_id_index(self).await? {
+            // Ids absent from the deletion-aware index are deleted; drop
+            // them from both lists to keep the zip aligned. ids.len() is an
+            // upper bound on the output size, so allocate once up front.
+            let mut live_ids = Vec::with_capacity(ids.len());
+            let mut addresses = Vec::with_capacity(ids.len());
+            for id in ids {
+                if let Some(address) = row_id_index.get(*id) {
+                    live_ids.push(*id);
+                    addresses.push(u64::from(address));
+                }
+            }
+            (Cow::Owned(live_ids), Cow::Owned(addresses))
         } else {
-            Cow::Borrowed(ids)
+            (Cow::Borrowed(ids), Cow::Borrowed(ids))
         };
 
-        self.filter_addr_or_ids(ids, &addresses).await
+        self.filter_addr_or_ids(&ids, &addresses).await
     }
 
     /// Gets the number of files that are so small they don't even have a full
