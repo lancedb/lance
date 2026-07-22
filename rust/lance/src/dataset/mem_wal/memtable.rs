@@ -356,7 +356,11 @@ impl MemTable {
     /// (e.g. `ShardWriter::wait_for_flush_drain`) sees the closed channel
     /// and returns `Err` instead of receiving the actual outcome.
     pub fn signal_memtable_flush_complete(&self, result: DurabilityResult) {
-        let cell = self.memtable_flush_completion.lock().unwrap().take();
+        let cell = self
+            .memtable_flush_completion
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
         if let Some(cell) = cell {
             cell.write(result);
         } else {
@@ -365,7 +369,11 @@ impl MemTable {
     }
 
     pub(crate) fn signal_typed_memtable_flush_complete(&self, result: MemTableFlushResult) {
-        let cell = self.typed_memtable_flush_completion.lock().unwrap().take();
+        let cell = self
+            .typed_memtable_flush_completion
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
         if let Some(cell) = cell {
             cell.write(result);
         } else {
@@ -901,6 +909,34 @@ mod tests {
             .create_typed_memtable_flush_completion()
             .expect_err("completion reader should not be created from a poisoned mutex");
         assert!(error.to_string().contains("mutex poisoned"));
+    }
+
+    #[tokio::test]
+    async fn test_flush_completion_signals_through_poisoned_mutexes() {
+        let memtable = MemTable::new(create_test_schema(), 1, vec![]).unwrap();
+        let mut durability_watcher = memtable.create_memtable_flush_completion();
+        let mut typed_watcher = memtable.create_typed_memtable_flush_completion().unwrap();
+
+        let durability_poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = memtable.memtable_flush_completion.lock().unwrap();
+            panic!("poison durability completion mutex");
+        }));
+        assert!(durability_poisoned.is_err());
+
+        let typed_poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = memtable.typed_memtable_flush_completion.lock().unwrap();
+            panic!("poison typed completion mutex");
+        }));
+        assert!(typed_poisoned.is_err());
+
+        memtable.signal_memtable_flush_complete(DurabilityResult::ok());
+        memtable.signal_typed_memtable_flush_complete(Ok(()));
+
+        assert!(matches!(
+            durability_watcher.await_value().await,
+            Some(DurabilityResult::Durable)
+        ));
+        assert!(matches!(typed_watcher.await_value().await, Some(Ok(()))));
     }
 
     #[test]
