@@ -32,8 +32,8 @@ if [[ ! -d "$head_dir/.git" && ! -f "$head_dir/.git" ]]; then
     git -C "$clone_dir" worktree add --detach "$head_dir" "$head_branch"
 fi
 
-[[ $(git -C "$base_dir" rev-parse HEAD~2) == "$base_upstream" ]]
-[[ $(git -C "$head_dir" rev-parse HEAD~2) == "$head_upstream" ]]
+[[ $(git -C "$base_dir" rev-parse HEAD~3) == "$base_upstream" ]]
+[[ $(git -C "$head_dir" rev-parse HEAD~3) == "$head_upstream" ]]
 
 build_binary() {
     local source_dir=$1
@@ -41,13 +41,12 @@ build_binary() {
     local build_log=$3
     local artifact_file
     artifact_file=$(mktemp "$run_root/artifact.XXXXXX")
-    CARGO_TARGET_DIR="$target_dir" cargo test \
-        --manifest-path "$source_dir/Cargo.toml" \
-        -p lance \
-        --profile release-with-debug \
-        --test row_stream_pr7792_bench \
-        --no-run \
-        --message-format=json \
+    (cd "$source_dir" && CARGO_TARGET_DIR="$target_dir" cargo test \
+            -p lance \
+            --profile release-with-debug \
+            --test row_stream_pr7792_bench \
+            --no-run \
+            --message-format=json) \
         2> >(tee "$build_log" >&2) \
         | tee "$artifact_file" >/dev/null
     local executable
