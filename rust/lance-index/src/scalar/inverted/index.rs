@@ -944,7 +944,7 @@ impl InvertedIndex {
                         // row_id/num_tokens download for it.
                         return Result::Ok((part, PartitionCandidates::empty()));
                     }
-                    let docs_for_wand = part.docs.docs_for_wand(mask.as_ref()).await?;
+                    let docs_for_wand = part.docs.docs_for_wand(operator, mask.as_ref()).await?;
                     let max_position = postings
                         .iter()
                         .map(|posting| posting.term_index() as usize)
@@ -2418,10 +2418,9 @@ impl InvertedPartition {
             self.inverted_list.block_size(),
         );
         builder.tokens = self.tokens.into_mutable();
-        // into_builder rewrites every doc, so materialize the full
-        // DocSet now and clone it out of the Arc.
-        let docs_arc = self.docs.ensure_loaded().await?;
-        builder.docs = (*docs_arc).clone();
+        // into_builder rewrites every doc, so it needs a fully-owned DocSet
+        // (row_ids included) it can mutate; the copy is not stashed anywhere.
+        builder.docs = self.docs.owned_docset().await?;
 
         builder
             .posting_lists
@@ -6407,11 +6406,80 @@ impl NumTokens {
     }
 }
 
+/// Per-doc `row_id` storage for a [`DocSet`]. `Shared` is a zero-copy view
+/// of the partition's `DocRowIdsKey` index-cache entry and must only be held
+/// transiently (per-query views) — a long-lived `Shared` would pin the
+/// allocation so evicting the entry could no longer free it.
+#[derive(Debug, Clone)]
+enum RowIds {
+    Owned(Vec<u64>),
+    Shared(ScalarBuffer<u64>),
+}
+
+impl Default for RowIds {
+    fn default() -> Self {
+        Self::Owned(Vec::new())
+    }
+}
+
+impl std::ops::Deref for RowIds {
+    type Target = [u64];
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Owned(values) => values,
+            Self::Shared(values) => values,
+        }
+    }
+}
+
+impl DeepSizeOf for RowIds {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+        match self {
+            Self::Owned(values) => values.deep_size_of_children(context),
+            // Weighed by the DocRowIdsKey cache entry; counting it here too
+            // would double-bill the cache for the same allocation.
+            Self::Shared(_) => 0,
+        }
+    }
+}
+
+impl RowIds {
+    fn with_capacity(capacity: usize) -> Self {
+        Self::Owned(Vec::with_capacity(capacity))
+    }
+
+    fn into_owned(self) -> Vec<u64> {
+        match self {
+            Self::Owned(values) => values,
+            Self::Shared(values) => values.to_vec(),
+        }
+    }
+
+    fn push(&mut self, value: u64) {
+        match self {
+            Self::Owned(values) => values.push(value),
+            Self::Shared(values) => {
+                let mut owned = values.to_vec();
+                owned.push(value);
+                *self = Self::Owned(owned);
+            }
+        }
+    }
+
+    fn memory_size(&self) -> usize {
+        match self {
+            Self::Owned(values) => values.capacity() * std::mem::size_of::<u64>(),
+            Self::Shared(_) => 0,
+        }
+    }
+}
+
 // DocSet is a mapping from row ids to the number of tokens in the document
 // It's used to sort the documents by the bm25 score
 #[derive(Debug, Clone, Default)]
 pub struct DocSet {
-    row_ids: Vec<u64>,
+    row_ids: RowIds,
     num_tokens: NumTokens,
     // (row_id, doc_id) pairs sorted by row_id
     inv: Vec<(u64, u32)>,
@@ -6589,13 +6657,52 @@ impl DocSet {
         total_tokens: u64,
     ) -> Self {
         Self {
-            row_ids: Vec::new(),
+            row_ids: RowIds::default(),
             num_tokens: NumTokens::Shared(num_tokens_col.values().clone()),
             inv: Vec::new(),
             total_tokens,
             scoring_quantized: false,
             norms: Arc::new(std::sync::OnceLock::new()),
         }
+    }
+
+    /// A per-query scoring view: this num-tokens-only set plus a zero-copy
+    /// `row_ids` borrow of the partition's `DocRowIdsKey` cache entry, for
+    /// the masked non-flat wand path. Dropped with the query, so the borrow
+    /// pins the entry's allocation only while the query is in flight.
+    pub(crate) fn with_shared_row_ids(&self, row_ids: ScalarBuffer<u64>) -> Self {
+        let mut docs = self.clone();
+        docs.row_ids = RowIds::Shared(row_ids);
+        docs
+    }
+
+    /// The resident scoring set for a modern partition: shared `num_tokens`
+    /// plus `inv` derived from a transient borrow of the row-ids column.
+    /// No `row_ids` — that column lives solely in the `DocRowIdsKey` cache
+    /// entry so the cache can weigh and evict it.
+    pub(crate) fn from_cached_num_tokens_with_inv(
+        row_ids_col: &UInt64Array,
+        num_tokens_col: &arrow_array::UInt32Array,
+        total_tokens: u64,
+    ) -> Self {
+        let row_ids = row_ids_col.values();
+        let mut inv: Vec<(u64, u32)> = row_ids
+            .iter()
+            .enumerate()
+            .map(|(doc_id, row_id)| (*row_id, doc_id as u32))
+            .collect();
+        if !row_ids.is_sorted() {
+            inv.sort_unstable_by_key(|entry| entry.0);
+        }
+        let mut docs = Self::from_cached_num_tokens(num_tokens_col, total_tokens);
+        docs.inv = inv;
+        docs
+    }
+
+    /// True iff `doc_ids()` can answer reverse lookups (`inv` built, or the
+    /// sorted legacy `row_ids` present). The flat-search path requires this.
+    pub(crate) fn supports_reverse_lookup(&self) -> bool {
+        !self.inv.is_empty() || self.has_row_ids()
     }
 
     /// Build a `DocSet` from already-loaded `row_id` and `num_tokens`
@@ -6626,7 +6733,7 @@ impl DocSet {
 
             let total_tokens = num_tokens.iter().map(|&x| x as u64).sum();
             return Ok(Self {
-                row_ids,
+                row_ids: RowIds::Owned(row_ids),
                 num_tokens: NumTokens::Owned(num_tokens),
                 inv: Vec::new(),
                 total_tokens,
@@ -6669,7 +6776,7 @@ impl DocSet {
 
             let total_tokens = num_tokens.iter().map(|&x| x as u64).sum();
             return Ok(Self {
-                row_ids,
+                row_ids: RowIds::Owned(row_ids),
                 num_tokens: NumTokens::Owned(num_tokens),
                 inv,
                 total_tokens,
@@ -6690,7 +6797,7 @@ impl DocSet {
         }
         let total_tokens = num_tokens.iter().map(|&x| x as u64).sum();
         Ok(Self {
-            row_ids,
+            row_ids: RowIds::Owned(row_ids),
             num_tokens: NumTokens::Owned(num_tokens),
             inv,
             total_tokens,
@@ -6704,7 +6811,7 @@ impl DocSet {
     pub fn remap(&mut self, mapping: &RowAddrRemap) -> Vec<u32> {
         let mut removed = Vec::new();
         let len = self.len();
-        let row_ids = std::mem::replace(&mut self.row_ids, Vec::with_capacity(len));
+        let row_ids = std::mem::replace(&mut self.row_ids, RowIds::with_capacity(len)).into_owned();
         let num_tokens =
             std::mem::replace(&mut self.num_tokens, NumTokens::with_capacity(len)).into_owned();
         self.invalidate_norms();
@@ -6796,7 +6903,7 @@ impl DocSet {
     }
 
     pub(crate) fn memory_size(&self) -> usize {
-        self.row_ids.capacity() * std::mem::size_of::<u64>()
+        self.row_ids.memory_size()
             + self.num_tokens.memory_size()
             + self.inv.capacity() * std::mem::size_of::<(u64, u32)>()
     }
@@ -8955,6 +9062,132 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_prewarm_fills_row_ids_cache_entry_without_a_second_copy() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let expected_row_ids = write_many_partition_index(store.as_ref()).await;
+
+        let counter = Arc::new(DocsRowIdReadCounter::default());
+        let inner_store: Arc<dyn IndexStore> = store.clone();
+        let counting_store: Arc<dyn IndexStore> = Arc::new(DocsRowIdCountingStore {
+            inner: inner_store,
+            counter: counter.clone(),
+        });
+        let cache = Arc::new(LanceCache::with_capacity(64 * 1024 * 1024));
+        let index = InvertedIndex::load(counting_store, None, cache.as_ref())
+            .await
+            .unwrap();
+
+        index
+            .prewarm_with_options(&FtsPrewarmOptions::default())
+            .await
+            .unwrap();
+        let total_partitions = (MANY_PARTITIONS + 1) as usize;
+        assert_eq!(counter.full_column_reads(), total_partitions);
+        assert_eq!(counter.scattered_reads(), 0);
+
+        // Prewarm loads every column into its cache entry; the resident
+        // DocSet keeps reverse lookups but no row_ids copy.
+        for partition_id in 0..=MANY_PARTITIONS {
+            assert!(
+                cache
+                    .with_key_prefix(format!("part-{partition_id}").as_str())
+                    .get_with_key(&DocRowIdsKey { partition_id })
+                    .await
+                    .is_some(),
+                "prewarm must fill the DocRowIds entry for partition {partition_id}"
+            );
+        }
+        for part in &index.partitions {
+            let resident = part.docs.ensure_loaded().await.unwrap();
+            assert!(!resident.has_row_ids());
+            assert!(resident.supports_reverse_lookup());
+        }
+
+        // A warm query resolves entirely from the cache entries.
+        let tokens = Arc::new(Tokens::new(vec!["pipeline".to_owned()], DocType::Text));
+        let params = Arc::new(FtsSearchParams::new().with_limit(Some(1000)));
+        let (row_ids, _) = index
+            .bm25_search(
+                tokens,
+                params,
+                Operator::Or,
+                Arc::new(NoFilter),
+                Arc::new(NoOpMetricsCollector),
+                None,
+            )
+            .await
+            .unwrap();
+        let mut got = row_ids;
+        got.sort_unstable();
+        let mut want = expected_row_ids;
+        want.sort_unstable();
+        assert_eq!(got, want);
+        assert_eq!(counter.full_column_reads(), total_partitions);
+        assert_eq!(counter.scattered_reads(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_row_ids_resolution_reloads_after_eviction() {
+        // no_cache retains nothing — the always-evicted worst case. Every
+        // query reloads the column single-flight and must stay correct;
+        // nothing may depend on a pinned copy surviving eviction.
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let expected_row_ids = write_many_partition_index(store.as_ref()).await;
+
+        let counter = Arc::new(DocsRowIdReadCounter::default());
+        let inner_store: Arc<dyn IndexStore> = store.clone();
+        let counting_store: Arc<dyn IndexStore> = Arc::new(DocsRowIdCountingStore {
+            inner: inner_store,
+            counter: counter.clone(),
+        });
+        let cache = LanceCache::no_cache();
+        let index = InvertedIndex::load(counting_store, None, &cache)
+            .await
+            .unwrap();
+
+        let tokens = Arc::new(Tokens::new(vec!["pipeline".to_owned()], DocType::Text));
+        let params = Arc::new(FtsSearchParams::new().with_limit(Some(1000)));
+        let mut want = expected_row_ids;
+        want.sort_unstable();
+        let mut reads_after_first = 0;
+        for round in 0..2 {
+            let (row_ids, _) = index
+                .bm25_search(
+                    tokens.clone(),
+                    params.clone(),
+                    Operator::Or,
+                    Arc::new(NoFilter),
+                    Arc::new(NoOpMetricsCollector),
+                    None,
+                )
+                .await
+                .unwrap();
+            let mut got = row_ids;
+            got.sort_unstable();
+            assert_eq!(got, want, "round {round} must stay correct");
+            if round == 0 {
+                reads_after_first = counter.full_column_reads();
+                assert!(reads_after_first > 0);
+            }
+        }
+        assert!(
+            counter.full_column_reads() > reads_after_first,
+            "with nothing retained, the next query reloads the column"
+        );
+        assert_eq!(counter.scattered_reads(), 0);
+    }
+
+    #[tokio::test]
     async fn test_modern_prewarm_packs_group_with_shared_posting_buffer() {
         let tmpdir = TempObjDir::default();
         let store = Arc::new(LanceIndexStore::new(
@@ -9831,14 +10064,37 @@ mod tests {
         assert_eq!(first.total_tokens_num(), 100);
 
         let all_rows = RowAddrMask::all_rows();
-        let wand_view = partition.docs.docs_for_wand(&all_rows).await.unwrap();
+        let wand_view = partition
+            .docs
+            .docs_for_wand(Operator::Or, &all_rows)
+            .await
+            .unwrap();
         assert!(Arc::ptr_eq(first, &wand_view));
 
+        // A flat-shaped mask (OR + tiny allow-list) gets the resident set:
+        // reverse lookups via `inv`, still no row_ids copy.
         let filtered = RowAddrMask::allow_nothing();
-        let full = partition.docs.docs_for_wand(&filtered).await.unwrap();
-        assert!(full.has_row_ids());
-        assert!(matches!(&full.num_tokens, NumTokens::Owned(_)));
-        assert_eq!(full.total_tokens_num(), 100);
+        let resident = partition
+            .docs
+            .docs_for_wand(Operator::Or, &filtered)
+            .await
+            .unwrap();
+        assert!(!resident.has_row_ids());
+        assert!(resident.supports_reverse_lookup());
+        assert!(matches!(&resident.num_tokens, NumTokens::Shared(_)));
+        assert_eq!(resident.total_tokens_num(), 100);
+
+        // A masked non-flat walk (AND never takes the flat path) gets a
+        // per-query view borrowing the row-ids cache entry.
+        let masked_view = partition
+            .docs
+            .docs_for_wand(Operator::And, &filtered)
+            .await
+            .unwrap();
+        assert!(masked_view.has_row_ids());
+        assert!(matches!(&masked_view.row_ids, RowIds::Shared(_)));
+        assert_eq!(masked_view.total_tokens_num(), 100);
+
         assert_eq!(
             partition.docs.resolve_row_ids(&[0, 99]).await.unwrap(),
             [0, 99]
@@ -10636,7 +10892,11 @@ mod tests {
         assert!(grouped_expansions.is_empty());
 
         let mask = NoFilter.mask();
-        let docs_for_wand = partition.docs.docs_for_wand(mask.as_ref()).await.unwrap();
+        let docs_for_wand = partition
+            .docs
+            .docs_for_wand(Operator::Or, mask.as_ref())
+            .await
+            .unwrap();
         let mut candidates = partition
             .bm25_search(
                 docs_for_wand.as_ref(),
