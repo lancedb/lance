@@ -26,3 +26,6 @@ uv run python "${REPO_ROOT}/benchmarks/issue-7860-sparse-layout/benchmark.py" \
     --repeats "${REPEATS}" \
     --seed 0 \
     --expected-sha "${EXPECTED_SHA}"
+
+RESULT_ROOT="${RESULT_ROOT}" ATTRS=50 \
+    "${REPO_ROOT}/benchmarks/issue-7860-sparse-layout/inspect-layouts.sh"

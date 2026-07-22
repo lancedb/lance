@@ -98,6 +98,8 @@ def layout_summary(path: Path) -> dict[str, object]:
                     layout = "fullzip"
                 elif "ConstantLayout" in encoding:
                     layout = "constant"
+                elif "IndirectEncoding" in encoding:
+                    layout = "indirect"
                 elif "Flat" in encoding or "List" in encoding:
                     layout = "legacy"
                 else:
@@ -220,10 +222,17 @@ def main() -> None:
         layouts[name] = layout_summary(path)
         validate_dataset(path, expected)
 
-    for name in ("v2_0_default", "v2_1_default", "v2_3_miniblock"):
-        assert layouts[name]["layout_counts"].get("sparse", 0) == 0
-    for name in ("v2_3_default", "v2_3_sparse"):
-        assert layouts[name]["layout_counts"].get("sparse", 0) == args.attrs
+    write_result(
+        args.root / "preflight.json",
+        {
+            "benchmark_git_sha": actual_sha,
+            "pylance_version": lance.__version__,
+            "rows": args.rows,
+            "columns": len(table.schema),
+            "write_seconds": write_seconds,
+            "python_metadata_layouts": layouts,
+        },
+    )
 
     measurements = {}
     for late_materialization in (None, False):
