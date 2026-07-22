@@ -124,13 +124,13 @@ pub(crate) async fn translate_addr_treemap_to_row_ids(
                     file_fragment.physical_rows()
                 )?;
                 let num_physical_rows = u32::try_from(num_physical_rows).map_err(|_| {
-                    Error::corrupt_file(format!(
+                    Error::internal(format!(
                         "fragment_id={fragment_id} has num_physical_rows={num_physical_rows}, \
                          which exceeds the maximum representable physical offset"
                     ))
                 })?;
                 if max_offset >= num_physical_rows {
-                    return Err(Error::corrupt_file(format!(
+                    return Err(Error::internal(format!(
                         "fragment_id={fragment_id} selection has max_offset={max_offset}, \
                          but num_physical_rows={num_physical_rows}"
                     )));
@@ -152,7 +152,18 @@ pub(crate) async fn translate_addr_treemap_to_row_ids(
                                 row_ids.insert(id);
                             }
                         }
-                        None => break,
+                        // The sequence yields one id per live row, so it can only
+                        // run dry before `max_offset` if it holds fewer ids than the
+                        // fragment has live rows. Breaking would silently drop the
+                        // remaining selected offsets and let stale index results
+                        // escape masking, so treat the mismatch as corruption.
+                        None => {
+                            return Err(Error::internal(format!(
+                                "fragment_id={fragment_id} row-id sequence exhausted at \
+                                 physical_offset={physical_offset} before reaching \
+                                 max_offset={max_offset} (num_physical_rows={num_physical_rows})"
+                            )));
+                        }
                     }
                 }
             }
