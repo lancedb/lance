@@ -79,12 +79,11 @@ impl Backoff {
 
 /// Upper bound on the number of retry slots.
 ///
-/// Slots double each attempt to spread contending writers apart, but past a few
-/// hundred the count already exceeds any realistic number of concurrent
-/// committers, so further doubling only inflates the wait without reducing
-/// collisions. Capping the count also bounds a single backoff to
-/// `(MAX_SLOTS - 1) * unit` instead of letting it grow without limit as
-/// `attempt` climbs.
+/// Slots double each attempt to spread contending writers apart, but a hundred
+/// or so already exceeds any realistic number of concurrent committers, so
+/// further doubling only inflates the wait without reducing collisions. Capping
+/// the count also bounds a single backoff to `(MAX_SLOTS - 1) * unit` instead of
+/// letting it grow without limit as `attempt` climbs.
 const MAX_SLOTS: u32 = 128;
 
 /// SlotBackoff is a backoff strategy that randomly chooses a time slot to retry.
@@ -95,7 +94,7 @@ const MAX_SLOTS: u32 = 128;
 /// The `unit` represents the time it takes to complete one attempt. Future attempts
 /// are divided into time slots, and a random slot is chosen for the retry. The number
 /// of slots increases exponentially with each attempt. Initially, there are 4 slots,
-/// then 8, then 16, and so on.
+/// then 8, then 16, and so on, up to a fixed cap.
 ///
 /// Example:
 /// Suppose you have 10 tasks that can't overlap, each taking 1 second. The tasks
@@ -282,8 +281,10 @@ mod tests {
     fn test_slot_backoff_attempt_saturates() {
         // At u32::MAX the counter must stay put rather than panic (debug) or
         // wrap to 0 (release), which would restart the low-slot distribution.
-        let mut backoff = SlotBackoff::default();
-        backoff.attempt = u32::MAX;
+        let mut backoff = SlotBackoff {
+            attempt: u32::MAX,
+            ..Default::default()
+        };
         let _ = backoff.next_backoff();
         assert_eq!(backoff.attempt(), u32::MAX);
     }
