@@ -6,8 +6,9 @@ RUN_ID=${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}
 REPEATS=${REPEATS:-11}
 RESULT_ROOT=${RESULT_ROOT:-${HOME}/lance-issue-7860-results/${RUN_ID}}
 
-REPO_ROOT=$(git rev-parse --show-toplevel)
-ACTUAL_SHA=$(git rev-parse HEAD)
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel)
+ACTUAL_SHA=$(git -C "${REPO_ROOT}" rev-parse HEAD)
 if [[ ${ACTUAL_SHA} != "${EXPECTED_SHA}" ]]; then
     echo "expected git SHA ${EXPECTED_SHA}, found ${ACTUAL_SHA}" >&2
     exit 1
