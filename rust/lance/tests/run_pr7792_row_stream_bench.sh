@@ -12,7 +12,8 @@ result_jsonl=$3
 run_root=$(dirname "$result_jsonl")
 base_dir="$run_root/base"
 head_dir="$run_root/head"
-target_dir="$run_root/target"
+base_target_dir="$run_root/target-base"
+head_target_dir="$run_root/target-head"
 binary_dir="$run_root/bin"
 case_dir="$run_root/cases"
 base_branch=origin/xuanwo/bench-pr7792-row-stream-base-20260723
@@ -32,13 +33,14 @@ if [[ ! -d "$head_dir/.git" && ! -f "$head_dir/.git" ]]; then
     git -C "$clone_dir" worktree add --detach "$head_dir" "$head_branch"
 fi
 
-[[ $(git -C "$base_dir" rev-parse HEAD~3) == "$base_upstream" ]]
-[[ $(git -C "$head_dir" rev-parse HEAD~3) == "$head_upstream" ]]
+[[ $(git -C "$base_dir" rev-parse HEAD~4) == "$base_upstream" ]]
+[[ $(git -C "$head_dir" rev-parse HEAD~4) == "$head_upstream" ]]
 
 build_binary() {
     local source_dir=$1
     local output_binary=$2
     local build_log=$3
+    local target_dir=$4
     local artifact_file
     artifact_file=$(mktemp "$run_root/artifact.XXXXXX")
     (cd "$source_dir" && CARGO_TARGET_DIR="$target_dir" cargo test \
@@ -58,11 +60,12 @@ build_binary() {
     chmod +x "$output_binary"
 }
 
-build_binary "$base_dir" "$binary_dir/base" "$run_root/build-base.log"
-CARGO_TARGET_DIR="$target_dir" cargo clean \
-    --manifest-path "$head_dir/Cargo.toml" \
-    -p lance
-build_binary "$head_dir" "$binary_dir/head" "$run_root/build-head.log"
+build_binary "$base_dir" "$binary_dir/base" "$run_root/build-base.log" "$base_target_dir"
+build_binary "$head_dir" "$binary_dir/head" "$run_root/build-head.log" "$head_target_dir"
+if cmp -s "$binary_dir/base" "$binary_dir/head"; then
+    echo "base and head benchmark binaries are unexpectedly identical" >&2
+    exit 1
+fi
 
 result_tmp=$(mktemp "$run_root/results.XXXXXX")
 jq -cn \
@@ -70,10 +73,12 @@ jq -cn \
     --arg head_upstream "$head_upstream" \
     --arg base_bench_commit "$(git -C "$base_dir" rev-parse HEAD)" \
     --arg head_bench_commit "$(git -C "$head_dir" rev-parse HEAD)" \
+    --arg base_binary_sha256 "$(sha256sum "$binary_dir/base" | awk '{print $1}')" \
+    --arg head_binary_sha256 "$(sha256sum "$binary_dir/head" | awk '{print $1}')" \
     --arg rustc "$(rustc --version)" \
     --arg kernel "$(uname -srmo)" \
     --arg cpu "$(lscpu | awk -F: '/Model name/{gsub(/^[[:space:]]+/, "", $2); print $2; exit}')" \
-    '{event:"benchmark_metadata", base_upstream:$base_upstream, head_upstream:$head_upstream, base_bench_commit:$base_bench_commit, head_bench_commit:$head_bench_commit, rustc:$rustc, kernel:$kernel, cpu:$cpu}' \
+    '{event:"benchmark_metadata", base_upstream:$base_upstream, head_upstream:$head_upstream, base_bench_commit:$base_bench_commit, head_bench_commit:$head_bench_commit, base_binary_sha256:$base_binary_sha256, head_binary_sha256:$head_binary_sha256, rustc:$rustc, kernel:$kernel, cpu:$cpu}' \
     >> "$result_tmp"
 
 dataset_created=0
