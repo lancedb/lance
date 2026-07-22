@@ -137,6 +137,23 @@ pub static FTS_SCHEMA: LazyLock<SchemaRef> =
 static ROW_ID_SCHEMA: LazyLock<SchemaRef> =
     LazyLock::new(|| Arc::new(Schema::new(vec![ROW_ID_FIELD.clone()])));
 
+const DEFAULT_FTS_PARTITION_SEARCH_BATCH_SIZE: usize = 1;
+
+static FTS_PARTITION_SEARCH_BATCH_SIZE: LazyLock<usize> = LazyLock::new(|| {
+    let batch_size = std::env::var("LANCE_FTS_PARTITION_SEARCH_BATCH_SIZE")
+        .map(|value| {
+            value
+                .parse()
+                .expect("failed to parse LANCE_FTS_PARTITION_SEARCH_BATCH_SIZE")
+        })
+        .unwrap_or(DEFAULT_FTS_PARTITION_SEARCH_BATCH_SIZE);
+    assert!(
+        batch_size > 0,
+        "LANCE_FTS_PARTITION_SEARCH_BATCH_SIZE must be greater than zero"
+    );
+    batch_size
+});
+
 pub fn resolve_fts_format_version(
     value: Option<&str>,
 ) -> std::result::Result<InvertedListFormatVersion, Error> {
@@ -274,16 +291,6 @@ struct PartitionCandidates {
     tokens_by_position: Vec<String>,
     grouped_expansions: Vec<GroupedExpansionTerms>,
     candidates: Vec<DocCandidate>,
-}
-
-impl PartitionCandidates {
-    fn empty() -> Self {
-        Self {
-            tokens_by_position: Vec::new(),
-            grouped_expansions: Vec::new(),
-            candidates: Vec::new(),
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -957,11 +964,12 @@ impl InvertedIndex {
         // global k-th - see `Wand::shared_threshold`).
         let impact_shared_threshold = Arc::new(AtomicU32::new(f32::NEG_INFINITY.to_bits()));
         let legacy_shared_threshold = Arc::new(AtomicU32::new(f32::NEG_INFINITY.to_bits()));
+        let batch_size = *FTS_PARTITION_SEARCH_BATCH_SIZE;
         let parts = self
             .partitions
-            .iter()
-            .map(|part| {
-                let part = part.clone();
+            .chunks(batch_size)
+            .map(|part_batch| {
+                let part_batch = part_batch.to_vec();
                 let tokens = tokens.clone();
                 let params = params.clone();
                 let mask = mask.clone();
@@ -970,162 +978,192 @@ impl InvertedIndex {
                 let impact_shared_threshold = impact_shared_threshold.clone();
                 let legacy_shared_threshold = legacy_shared_threshold.clone();
                 async move {
-                    let loaded_postings = part
-                        .load_posting_lists(
-                            tokens.as_ref(),
-                            params.as_ref(),
-                            operator,
-                            impact_scorer.as_ref(),
-                            metrics.as_ref(),
-                        )
+                    let prepared =
+                        futures::future::try_join_all(part_batch.into_iter().map(|part| {
+                            let tokens = tokens.clone();
+                            let params = params.clone();
+                            let mask = mask.clone();
+                            let metrics = metrics.clone();
+                            let impact_scorer = impact_scorer.clone();
+                            let impact_shared_threshold = impact_shared_threshold.clone();
+                            let legacy_shared_threshold = legacy_shared_threshold.clone();
+                            async move {
+                                let loaded_postings = part
+                                    .load_posting_lists(
+                                        tokens.as_ref(),
+                                        params.as_ref(),
+                                        operator,
+                                        impact_scorer.as_ref(),
+                                        metrics.as_ref(),
+                                    )
+                                    .await?;
+                                let LoadedPostings {
+                                    postings,
+                                    grouped_expansions,
+                                    impact_safe,
+                                } = loaded_postings;
+                                if postings.is_empty() {
+                                    // No hits in this partition; its DocSet stays
+                                    // unloaded, so we never pay the per-doc
+                                    // row_id/num_tokens download for it.
+                                    return Result::Ok(None);
+                                }
+                                let docs_for_wand = part.docs.docs_for_wand(mask.as_ref()).await?;
+                                let max_position = postings
+                                    .iter()
+                                    .map(|posting| posting.term_index() as usize)
+                                    .max()
+                                    .unwrap_or_default();
+                                let mut tokens_by_position = vec![String::new(); max_position + 1];
+                                for posting in &postings {
+                                    let idx = posting.term_index() as usize;
+                                    tokens_by_position[idx] = posting.token().to_owned();
+                                }
+                                let has_grouped_expansions = !grouped_expansions.is_empty();
+                                let use_impact_path = impact_safe && !has_grouped_expansions;
+                                let wand_params = if has_grouped_expansions {
+                                    let mut rescoring_params = params.as_ref().clone();
+                                    rescoring_params.limit = grouped_rescore_wand_limit(
+                                        params.limit,
+                                        &grouped_expansions,
+                                    );
+                                    Arc::new(rescoring_params)
+                                } else {
+                                    params.clone()
+                                };
+                                let partition_threshold = if has_grouped_expansions {
+                                    Arc::new(AtomicU32::new(f32::NEG_INFINITY.to_bits()))
+                                } else if use_impact_path {
+                                    impact_shared_threshold
+                                } else {
+                                    legacy_shared_threshold
+                                };
+                                let wand_scorer = use_impact_path.then(|| impact_scorer.clone());
+                                let part_for_wand = part.clone();
+                                let search = move || {
+                                    let candidates = part_for_wand.bm25_search(
+                                        docs_for_wand.as_ref(),
+                                        wand_params.as_ref(),
+                                        operator,
+                                        mask,
+                                        postings,
+                                        wand_scorer,
+                                        metrics.as_ref(),
+                                        partition_threshold,
+                                    )?;
+                                    Result::Ok((
+                                        part,
+                                        PartitionCandidates {
+                                            tokens_by_position,
+                                            grouped_expansions,
+                                            candidates,
+                                        },
+                                    ))
+                                };
+                                Result::Ok(Some(search))
+                            }
+                        }))
                         .await?;
-                    let LoadedPostings {
-                        postings,
-                        grouped_expansions,
-                        impact_safe,
-                    } = loaded_postings;
-                    if postings.is_empty() {
-                        // No hits in this partition; its DocSet stays
-                        // unloaded, so we never pay the per-doc
-                        // row_id/num_tokens download for it.
-                        return Result::Ok(PartitionCandidates::empty());
-                    }
-                    let docs_for_wand = part.docs.docs_for_wand(mask.as_ref()).await?;
-                    let max_position = postings
-                        .iter()
-                        .map(|posting| posting.term_index() as usize)
-                        .max()
-                        .unwrap_or_default();
-                    let mut tokens_by_position = vec![String::new(); max_position + 1];
-                    for posting in &postings {
-                        let idx = posting.term_index() as usize;
-                        tokens_by_position[idx] = posting.token().to_owned();
-                    }
-                    let params = params.clone();
-                    let mask = mask.clone();
-                    let metrics = metrics.clone();
-                    let part_for_wand = part.clone();
-                    let has_grouped_expansions = !grouped_expansions.is_empty();
-                    let use_impact_path = impact_safe && !has_grouped_expansions;
-                    let wand_params = if has_grouped_expansions {
-                        let mut rescoring_params = params.as_ref().clone();
-                        rescoring_params.limit =
-                            grouped_rescore_wand_limit(params.limit, &grouped_expansions);
-                        Arc::new(rescoring_params)
+                    let searches = prepared.into_iter().flatten().collect::<Vec<_>>();
+                    let mut partition_results = if searches.is_empty() {
+                        Vec::new()
                     } else {
-                        params.clone()
+                        spawn_cpu(move || {
+                            searches
+                                .into_iter()
+                                .map(|search| search())
+                                .collect::<Result<Vec<_>>>()
+                        })
+                        .await?
                     };
-                    let partition_threshold = if has_grouped_expansions {
-                        Arc::new(AtomicU32::new(f32::NEG_INFINITY.to_bits()))
-                    } else if use_impact_path {
-                        impact_shared_threshold
-                    } else {
-                        legacy_shared_threshold
-                    };
-                    let wand_scorer = use_impact_path.then(|| impact_scorer.clone());
-                    let candidates = spawn_cpu(move || {
-                        let candidates = part_for_wand.bm25_search(
-                            docs_for_wand.as_ref(),
-                            wand_params.as_ref(),
-                            operator,
-                            mask,
-                            postings,
-                            wand_scorer,
-                            metrics.as_ref(),
-                            partition_threshold,
-                        )?;
-                        std::result::Result::<_, Error>::Ok(candidates)
-                    })
-                    .await?;
-                    let mut partition_result = PartitionCandidates {
-                        tokens_by_position,
-                        grouped_expansions,
-                        candidates,
-                    };
-                    resolve_deferred_candidates(&part.docs, &mut partition_result.candidates)
-                        .await?;
-                    Result::Ok(partition_result)
+                    for (part, result) in &mut partition_results {
+                        resolve_deferred_candidates(&part.docs, &mut result.candidates).await?;
+                    }
+                    Result::Ok(partition_results)
                 }
             })
             .collect::<Vec<_>>();
-        let mut parts = stream::iter(parts).buffer_unordered(get_num_compute_intensive_cpus());
+        let mut parts =
+            stream::iter(parts).buffer_unordered(get_num_compute_intensive_cpus().max(1));
         let mut idf_cache: HashMap<String, f32> = HashMap::new();
-        while let Some(res) = parts.try_next().await? {
-            if res.candidates.is_empty() {
-                continue;
-            }
-            let PartitionCandidates {
-                tokens_by_position,
-                grouped_expansions,
-                candidates: part_candidates,
-            } = res;
-            let mut idf_by_position = Vec::with_capacity(tokens_by_position.len());
-            for token in &tokens_by_position {
-                let idf_weight = match idf_cache.get(token) {
-                    Some(weight) => *weight,
-                    None => {
-                        let weight = scorer.query_weight(token);
-                        idf_cache.insert(token.clone(), weight);
-                        weight
-                    }
-                };
-                idf_by_position.push(idf_weight);
-            }
-
-            if grouped_expansions.is_empty() {
-                for DocCandidate {
-                    addr,
-                    freqs,
-                    doc_length,
-                    ..
-                } in part_candidates
-                {
-                    let mut score = 0.0;
-                    for (term_index, freq) in freqs.into_iter() {
-                        debug_assert!((term_index as usize) < idf_by_position.len());
-                        score += idf_by_position[term_index as usize]
-                            * scorer.doc_weight(freq, doc_length);
-                    }
-                    push_scored_candidate(&mut candidates, limit, addr, score)?;
+        while let Some(batch_results) = parts.try_next().await? {
+            for (_, res) in batch_results {
+                if res.candidates.is_empty() {
+                    continue;
                 }
-            } else {
-                let grouped_positions = grouped_expansions
-                    .iter()
-                    .map(|group| group.position)
-                    .collect::<HashSet<_>>();
-                for DocCandidate {
-                    addr,
-                    posting_doc_id,
-                    freqs,
-                    doc_length,
-                } in part_candidates
-                {
-                    let mut score = 0.0;
-                    for (term_index, freq) in freqs.into_iter() {
-                        if grouped_positions.contains(&term_index) {
-                            continue;
+                let PartitionCandidates {
+                    tokens_by_position,
+                    grouped_expansions,
+                    candidates: part_candidates,
+                } = res;
+                let mut idf_by_position = Vec::with_capacity(tokens_by_position.len());
+                for token in &tokens_by_position {
+                    let idf_weight = match idf_cache.get(token) {
+                        Some(weight) => *weight,
+                        None => {
+                            let weight = scorer.query_weight(token);
+                            idf_cache.insert(token.clone(), weight);
+                            weight
                         }
-                        debug_assert!((term_index as usize) < idf_by_position.len());
-                        score += idf_by_position[term_index as usize]
-                            * scorer.doc_weight(freq, doc_length);
+                    };
+                    idf_by_position.push(idf_weight);
+                }
+
+                if grouped_expansions.is_empty() {
+                    for DocCandidate {
+                        addr,
+                        freqs,
+                        doc_length,
+                        ..
+                    } in part_candidates
+                    {
+                        let mut score = 0.0;
+                        for (term_index, freq) in freqs.into_iter() {
+                            debug_assert!((term_index as usize) < idf_by_position.len());
+                            score += idf_by_position[term_index as usize]
+                                * scorer.doc_weight(freq, doc_length);
+                        }
+                        push_scored_candidate(&mut candidates, limit, addr, score)?;
                     }
-                    for group in &grouped_expansions {
-                        for term in &group.terms {
-                            let Some(freq) = term.frequency(posting_doc_id) else {
+                } else {
+                    let grouped_positions = grouped_expansions
+                        .iter()
+                        .map(|group| group.position)
+                        .collect::<HashSet<_>>();
+                    for DocCandidate {
+                        addr,
+                        posting_doc_id,
+                        freqs,
+                        doc_length,
+                    } in part_candidates
+                    {
+                        let mut score = 0.0;
+                        for (term_index, freq) in freqs.into_iter() {
+                            if grouped_positions.contains(&term_index) {
                                 continue;
-                            };
-                            let idf_weight = match idf_cache.get(&term.token) {
-                                Some(weight) => *weight,
-                                None => {
-                                    let weight = scorer.query_weight(&term.token);
-                                    idf_cache.insert(term.token.clone(), weight);
-                                    weight
-                                }
-                            };
-                            score += idf_weight * scorer.doc_weight(freq, doc_length);
+                            }
+                            debug_assert!((term_index as usize) < idf_by_position.len());
+                            score += idf_by_position[term_index as usize]
+                                * scorer.doc_weight(freq, doc_length);
                         }
+                        for group in &grouped_expansions {
+                            for term in &group.terms {
+                                let Some(freq) = term.frequency(posting_doc_id) else {
+                                    continue;
+                                };
+                                let idf_weight = match idf_cache.get(&term.token) {
+                                    Some(weight) => *weight,
+                                    None => {
+                                        let weight = scorer.query_weight(&term.token);
+                                        idf_cache.insert(term.token.clone(), weight);
+                                        weight
+                                    }
+                                };
+                                score += idf_weight * scorer.doc_weight(freq, doc_length);
+                            }
+                        }
+                        push_scored_candidate(&mut candidates, limit, addr, score)?;
                     }
-                    push_scored_candidate(&mut candidates, limit, addr, score)?;
                 }
             }
         }
