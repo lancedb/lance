@@ -356,7 +356,7 @@ fn supports_fixed_size_list_values(data: &DataBlock) -> bool {
 }
 
 /// Whether the sparse writer can encode this value block without changing its value path.
-pub(in crate::encodings::logical::primitive) fn supports_value_block(data: &DataBlock) -> bool {
+pub fn supports_value_block(data: &DataBlock) -> bool {
     match data {
         DataBlock::FixedWidth(_) | DataBlock::VariableWidth(_) => true,
         DataBlock::Struct(data) => !data.has_variable_width_child(),
@@ -386,13 +386,13 @@ struct SerializedValuePage {
     metadata: LanceBuffer,
 }
 
-pub(in crate::encodings::logical::primitive) struct PreparedSparseValues {
+pub struct PreparedSparseValues {
     num_values: u64,
     value_compression: CompressiveEncoding,
     values: SerializedValuePage,
 }
 
-pub(in crate::encodings::logical::primitive) enum SparseValueInput {
+pub enum SparseValueInput {
     Unprepared(DataBlock),
     Prepared(PreparedSparseValues),
 }
@@ -536,7 +536,7 @@ fn serialize_value_chunks(
     })
 }
 
-pub(in crate::encodings::logical::primitive) fn prepare_values(
+pub fn prepare_values(
     field: &Field,
     compression_strategy: &dyn CompressionStrategy,
     data: DataBlock,

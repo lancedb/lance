@@ -263,7 +263,7 @@ impl NormalizedStructuralPlan {
         })
     }
 
-    fn serializer(&self) -> (SerializerContext, Option<u64>) {
+    fn to_serializer(&self) -> (SerializerContext, Option<u64>) {
         if self.dense_all_valid {
             let def_meaning = self
                 .layers
@@ -321,7 +321,7 @@ impl NormalizedStructuralPlan {
     }
 
     pub(crate) fn serialize(&self) -> SerializedRepDefs {
-        self.serializer().0.build()
+        self.to_serializer().0.build()
     }
 
     pub(crate) fn serialize_with_miniblock_repdef_budget(
@@ -330,7 +330,7 @@ impl NormalizedStructuralPlan {
         num_rows: u64,
         num_values: u64,
     ) -> Result<(SerializedRepDefs, MiniBlockRepDefBudget)> {
-        let (context, bits_per_level) = self.serializer();
+        let (context, bits_per_level) = self.to_serializer();
         context.build_with_miniblock_repdef_budget(
             bits_per_level.map(max_levels_for_bits),
             num_rows,

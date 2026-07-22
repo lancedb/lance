@@ -37,7 +37,7 @@ use lance_core::{
     error::{Error, LanceOptionExt},
     utils::bit::pad_bytes,
 };
-use log::trace;
+use log::{debug, trace};
 
 use crate::encodings::logical::primitive::miniblock::MiniBlockChunk;
 use crate::utils::bytepack::ByteUnpacker;
@@ -5790,7 +5790,7 @@ impl PrimitiveStructuralEncoder {
                     ) {
                         Ok(prepared_values) => prepared_values,
                         Err(error) => {
-                            trace!(
+                            debug!(
                                 "Keeping column {} on its dense structural path because sparse value preparation is unavailable: {}",
                                 self.column_index, error
                             );
