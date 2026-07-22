@@ -7131,6 +7131,57 @@ mod test {
         assert_eq!(expected_i, actual_i);
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_flat_knn_large_limit_preserves_global_order() {
+        // Regression test for https://github.com/lance-format/lance/issues/7865.
+        //
+        // An exact (flat, no vector index) KNN search with a limit larger than one
+        // output batch (BATCH_SIZE_FALLBACK = 8192 rows) used to be able to return
+        // results in the wrong global order: `execute_plan` coalesced the
+        // partitions the physical optimizer parallelizes above the top-k `SortExec`
+        // with a plain `CoalescePartitionsExec`, which does not preserve order.
+        // This only reproduces at real (> 1) parallelism, which is why the
+        // plan-shape tests elsewhere (pinned to `target_parallelism(1)`) never
+        // caught it.
+        let dim = 16u32;
+        let frag_count = 4u32;
+        let rows_per_fragment = 5_000u32;
+        let k = 12_000usize; // > BATCH_SIZE_FALLBACK, so results span multiple batches
+
+        let dataset = gen_batch()
+            .col("vec", array::rand_vec::<Float32Type>(Dimension::from(dim)))
+            .into_ram_dataset(
+                FragmentCount::from(frag_count),
+                FragmentRowCount::from(rows_per_fragment),
+            )
+            .await
+            .unwrap();
+
+        let query = Float32Array::from(vec![0.0_f32; dim as usize]);
+
+        // The bug is a scheduling race between parallel partitions, so run
+        // several iterations to reliably catch it if the ordering guarantee
+        // regresses.
+        for _ in 0..10 {
+            let mut scan = dataset.scan();
+            scan.nearest("vec", &query, k).unwrap();
+            scan.target_parallelism(8);
+
+            let batch = scan.try_into_batch().await.unwrap();
+            assert_eq!(batch.num_rows(), k);
+
+            let distances = batch[DIST_COL].as_primitive::<Float32Type>();
+            for pair in distances.values().windows(2) {
+                assert!(
+                    pair[0] <= pair[1],
+                    "flat KNN results must be globally sorted by distance, found {} before {}",
+                    pair[0],
+                    pair[1]
+                );
+            }
+        }
+    }
+
     #[rstest]
     #[tokio::test]
     async fn test_refine_factor(

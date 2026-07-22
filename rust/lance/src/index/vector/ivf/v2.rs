@@ -2055,7 +2055,7 @@ mod tests {
     use crate::dataset::{InsertBuilder, UpdateBuilder, WriteMode, WriteParams};
     use crate::index::DatasetIndexExt;
     use crate::index::DatasetIndexInternalExt;
-    use crate::index::vector::ivf::v2::IvfPq;
+    use crate::index::vector::ivf::v2::{IvfFlatIndex, IvfPq};
     use crate::utils::test::copy_test_data_to_tmp;
     use crate::{
         Dataset,
@@ -2863,6 +2863,17 @@ mod tests {
     }
 
     async fn load_partition_row_ids(index: &IvfPq, partition_idx: usize) -> Vec<u64> {
+        index
+            .storage
+            .load_partition(partition_idx, None)
+            .await
+            .unwrap()
+            .row_ids()
+            .copied()
+            .collect()
+    }
+
+    async fn load_flat_partition_row_ids(index: &IvfFlatIndex, partition_idx: usize) -> Vec<u64> {
         index
             .storage
             .load_partition(partition_idx, None)
@@ -6145,6 +6156,187 @@ mod tests {
             assert!(
                 search_result.num_rows() > 0,
                 "Multivector search should return results with remaining data"
+            );
+        }
+    }
+
+    async fn row_ids_matching(dataset: &Dataset, predicate: &str) -> HashSet<u64> {
+        let mut scan = dataset.scan();
+        scan.with_row_id();
+        scan.filter(predicate).unwrap();
+        let batch = scan.try_into_batch().await.unwrap();
+        batch[ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect()
+    }
+
+    struct OptimizeAfterDelete {
+        deleted_row_ids: HashSet<u64>,
+        partition_row_ids_before: Vec<Vec<u64>>,
+        index_row_ids: HashSet<u64>,
+        num_partitions_after: usize,
+        stats_json: String,
+    }
+
+    /// Shared scenario for the issue-7701 regressions: stable-row-id dataset,
+    /// IVF_FLAT index, scattered delete, optimize. Asserts the invariants both
+    /// partition adjustments must hold -- no live row lost, no id that never
+    /// existed -- and returns the state for the mode-specific assertions.
+    async fn optimize_after_delete(
+        total_rows: usize,
+        nlist: usize,
+        delete_predicate: &str,
+        keep_predicate: &str,
+    ) -> OptimizeAfterDelete {
+        const INDEX_NAME: &str = "vector_idx";
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let (batch, schema) = generate_batch::<Float32Type>(total_rows, None, 0.0..1.0, false);
+        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+        let mut dataset = Dataset::write(
+            batches,
+            test_uri,
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let params = VectorIndexParams::ivf_flat(nlist, DistanceType::L2);
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some(INDEX_NAME.to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let index_ctx = load_vector_index_context(&dataset, "vector", INDEX_NAME).await;
+        let flat = index_ctx
+            .index
+            .as_any()
+            .downcast_ref::<IvfFlatIndex>()
+            .expect("expected IvfFlat index");
+        let mut partition_row_ids_before = Vec::with_capacity(nlist);
+        for part in 0..flat.ivf.num_partitions() {
+            partition_row_ids_before.push(load_flat_partition_row_ids(flat, part).await);
+        }
+
+        let deleted_row_ids = row_ids_matching(&dataset, delete_predicate).await;
+        let live_row_ids = row_ids_matching(&dataset, keep_predicate).await;
+        dataset.delete(delete_predicate).await.unwrap();
+
+        dataset
+            .optimize_indices(&OptimizeOptions::new())
+            .await
+            .unwrap();
+
+        let final_ctx = load_vector_index_context(&dataset, "vector", INDEX_NAME).await;
+        let num_partitions_after = final_ctx.num_partitions();
+        let stats_json = final_ctx.stats_json().to_string();
+        let flat = final_ctx
+            .index
+            .as_any()
+            .downcast_ref::<IvfFlatIndex>()
+            .expect("expected IvfFlat index");
+        let mut index_row_ids = HashSet::new();
+        for part in 0..flat.ivf.num_partitions() {
+            index_row_ids.extend(load_flat_partition_row_ids(flat, part).await);
+        }
+
+        for row_id in &live_row_ids {
+            assert!(
+                index_row_ids.contains(row_id),
+                "live row id {} missing from index after optimize",
+                row_id
+            );
+        }
+        for row_id in &index_row_ids {
+            assert!(
+                live_row_ids.contains(row_id) || deleted_row_ids.contains(row_id),
+                "unexpected row id {} in index after optimize",
+                row_id
+            );
+        }
+
+        OptimizeAfterDelete {
+            deleted_row_ids,
+            partition_row_ids_before,
+            index_row_ids,
+            num_partitions_after,
+            stats_json,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_optimize_join_after_delete_with_stable_row_ids() {
+        // Regression test for https://github.com/lance-format/lance/issues/7701:
+        // every partition (400 rows / 4) is under the IVF_FLAT join threshold,
+        // so optimize joins the smallest after a scattered delete.
+        let run = optimize_after_delete(400, 4, "id % 3 = 0", "id % 3 != 0").await;
+
+        assert_eq!(
+            run.num_partitions_after, 3,
+            "optimize should have joined the smallest partition, got stats: {}",
+            run.stats_json
+        );
+
+        // Only the joined partition is rebuilt from live rows; untouched
+        // partitions keep their deleted ids (filtered at query time).
+        let missing = run
+            .deleted_row_ids
+            .difference(&run.index_row_ids)
+            .copied()
+            .collect::<HashSet<_>>();
+        assert!(
+            !missing.is_empty(),
+            "joined partition should have contained deleted row ids"
+        );
+        let matches_one_partition = run.partition_row_ids_before.iter().any(|part_ids| {
+            let part_deleted = part_ids
+                .iter()
+                .copied()
+                .filter(|id| run.deleted_row_ids.contains(id))
+                .collect::<HashSet<_>>();
+            part_deleted == missing
+        });
+        assert!(
+            matches_one_partition,
+            "row ids dropped from the index should be exactly the joined partition's deleted ids"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_optimize_split_after_delete_with_stable_row_ids() {
+        // Regression test for https://github.com/lance-format/lance/issues/7701:
+        // one partition holds more than 4x the IVF_FLAT target, so optimize
+        // splits it after a scattered delete. This path reaches
+        // filter_deleted_ids through reshuffle_partitions, unlike the join
+        // path's take_vectors.
+        let run = optimize_after_delete(20_000, 1, "id % 5 = 0", "id % 5 != 0").await;
+
+        assert!(
+            run.num_partitions_after > 1,
+            "optimize should have split the oversized partition, got stats: {}",
+            run.stats_json
+        );
+
+        // The split rebuilds the whole partition from live rows: no deleted
+        // ids remain.
+        for row_id in &run.deleted_row_ids {
+            assert!(
+                !run.index_row_ids.contains(row_id),
+                "deleted row id {} still in index after split",
+                row_id
             );
         }
     }

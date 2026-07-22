@@ -1579,8 +1579,70 @@ pub struct ReadBlob {
     pub data: Bytes,
 }
 
+/// A byte range relative to the beginning of one logical blob value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlobReadRange {
+    /// Byte offset from the beginning of the blob value.
+    pub offset: u64,
+    /// Number of bytes to read.
+    pub length: u64,
+}
+
+impl BlobReadRange {
+    /// Create a blob-local byte range from an offset and length.
+    pub const fn new(offset: u64, length: u64) -> Self {
+        Self { offset, length }
+    }
+
+    fn checked_range(self, request_index: usize) -> Result<Range<u64>> {
+        let end = self.offset.checked_add(self.length).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "Blob range request {request_index} offset + length overflowed u64: offset={}, length={}",
+                self.offset, self.length
+            ))
+        })?;
+        Ok(self.offset..end)
+    }
+}
+
+/// One row-specific blob range read request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlobRangeRequest {
+    /// Row selector interpreted by the selection method on
+    /// [`ReadBlobRangesBuilder`].
+    pub row: u64,
+    /// Blob-local byte range to read from the selected row.
+    pub range: BlobReadRange,
+}
+
+impl BlobRangeRequest {
+    /// Create a request for `length` bytes at `offset` in the selected row.
+    pub const fn new(row: u64, offset: u64, length: u64) -> Self {
+        Self {
+            row,
+            range: BlobReadRange::new(offset, length),
+        }
+    }
+}
+
+/// Bytes materialized for one request submitted through [`ReadBlobRangesBuilder`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadBlobRange {
+    /// Zero-based position of this request in the caller's request list.
+    pub request_index: usize,
+    /// Physical row address of the selected blob value.
+    pub row_address: u64,
+    /// Blob-local range supplied for this request.
+    pub range: BlobReadRange,
+    /// Bytes in `range`.
+    pub data: Bytes,
+}
+
 /// Stream returned by [`ReadBlobsBuilder::try_into_stream`].
 pub type ReadBlobsStream = BoxStream<'static, Result<ReadBlob>>;
+
+/// Stream returned by [`ReadBlobRangesBuilder::try_into_stream`].
+pub type ReadBlobRangesStream = BoxStream<'static, Result<ReadBlobRange>>;
 
 /// Row selector configured on [`ReadBlobsBuilder`].
 #[derive(Debug, Clone)]
@@ -1676,66 +1738,18 @@ impl ReadBlobsBuilder {
             &self.selection,
         )
         .await?;
-        let expected_selection_indices = entries
-            .iter()
-            .map(|entry| entry.selection_index)
-            .collect::<VecDeque<_>>();
-        let plans = plan_blob_read_plans(entries);
+        let physical_buffer_size = self.options.io_buffer_size_bytes.unwrap_or_else(|| {
+            SchedulerConfig::max_bandwidth(self.dataset.object_store.as_ref()).io_buffer_size_bytes
+        });
+        let batches = plan_blob_read_batches(entries, None, physical_buffer_size)?;
         let execution = Arc::new(ReadBlobsExecution::new(self.options.io_buffer_size_bytes));
-        if plans.is_empty() {
-            return Ok(stream::empty().boxed());
-        }
-
-        let plan_stream = stream::iter(plans.into_iter().map(move |plan| {
-            let execution = execution.clone();
-            execute_blob_read_plan(plan, execution)
-        }))
-        .buffer_unordered(self.dataset.object_store.io_parallelism().max(1));
-
-        if !self.options.preserve_order {
-            return Ok(plan_stream
-                .map_ok(|blobs| {
-                    stream::iter(blobs.into_iter().map(|blob| Ok(into_read_blob(blob))))
-                })
-                .try_flatten()
-                .boxed());
-        }
-
-        let mut plan_stream = plan_stream.boxed();
-        let mut expected_selection_indices = expected_selection_indices;
-        let mut ready = BTreeMap::<usize, ReadBlob>::new();
-
-        Ok(stream::poll_fn(move |cx| {
-            loop {
-                let Some(next_selection_index) = expected_selection_indices.front().copied() else {
-                    return Poll::Ready(None);
-                };
-
-                if let Some(blob) = ready.remove(&next_selection_index) {
-                    expected_selection_indices.pop_front();
-                    return Poll::Ready(Some(Ok(blob)));
-                }
-
-                match plan_stream.poll_next_unpin(cx) {
-                    Poll::Ready(Some(Ok(blobs))) => {
-                        for blob in blobs {
-                            ready.insert(blob.selection_index, into_read_blob(blob));
-                        }
-                    }
-                    Poll::Ready(Some(Err(err))) => {
-                        return Poll::Ready(Some(Err(err)));
-                    }
-                    Poll::Ready(None) => {
-                        let err = Error::internal(format!(
-                            "planned blob read stream completed before selection index {} was produced",
-                            next_selection_index
-                        ));
-                        return Poll::Ready(Some(Err(err)));
-                    }
-                    Poll::Pending => return Poll::Pending,
-                }
-            }
-        })
+        Ok(execute_blob_read_batches_stream(
+            batches,
+            execution,
+            self.dataset.object_store.io_parallelism(),
+            self.options.preserve_order,
+        )
+        .map_ok(into_read_blob)
         .boxed())
     }
 
@@ -1757,6 +1771,132 @@ impl ReadBlobsBuilder {
     }
 }
 
+/// Builder for planned blob-local range reads.
+///
+/// Planning retains `O(request_count)` metadata. [`Self::try_into_stream`]
+/// bounds each scheduler-visible physical batch by the configured I/O buffer
+/// size after accounting for range coalescing, except that one request larger
+/// than the buffer must be materialized by itself. The existing scheduler
+/// separately applies byte backpressure to physical I/O. [`Self::execute`]
+/// additionally retains all returned payload bytes.
+#[derive(Debug, Clone)]
+pub struct ReadBlobRangesBuilder {
+    inner: ReadBlobsBuilder,
+    ranges: Vec<BlobReadRange>,
+}
+
+impl ReadBlobRangesBuilder {
+    pub(crate) fn new(inner: ReadBlobsBuilder) -> Self {
+        Self {
+            inner,
+            ranges: Vec::new(),
+        }
+    }
+
+    /// Read requests whose row values are stable row ids.
+    pub fn with_row_ids(self, requests: impl IntoIterator<Item = BlobRangeRequest>) -> Self {
+        self.with_requests(requests, ReadBlobsSelection::RowIds)
+    }
+
+    /// Read requests whose row values are offsets in dataset order.
+    pub fn with_row_indices(self, requests: impl IntoIterator<Item = BlobRangeRequest>) -> Self {
+        self.with_requests(requests, ReadBlobsSelection::RowIndices)
+    }
+
+    /// Read requests whose row values are physical row addresses.
+    pub fn with_row_addresses(self, requests: impl IntoIterator<Item = BlobRangeRequest>) -> Self {
+        self.with_requests(requests, ReadBlobsSelection::RowAddresses)
+    }
+
+    /// Set the scheduler I/O buffer size used while materializing ranges.
+    pub fn with_io_buffer_size_bytes(mut self, bytes: u64) -> Self {
+        self.inner.options.io_buffer_size_bytes = Some(bytes);
+        self
+    }
+
+    /// Whether results must follow the caller's request order.
+    pub fn preserve_order(mut self, preserve: bool) -> Self {
+        self.inner.options.preserve_order = preserve;
+        self
+    }
+
+    /// Execute the planned range read and return a stream of non-null results.
+    ///
+    /// Null blob requests do not produce a result. Empty ranges on non-null
+    /// blobs produce an empty buffer without issuing payload I/O. By default,
+    /// results follow input order; `request_index` identifies the original
+    /// request even when ordering is disabled.
+    pub async fn try_into_stream(self) -> Result<ReadBlobRangesStream> {
+        self.validate()?;
+        let entries = collect_blob_entries_for_selection(
+            &self.inner.dataset,
+            self.inner.blob_field_id,
+            &self.inner.column,
+            &self.inner.selection,
+        )
+        .await?;
+        let physical_buffer_size = self.inner.options.io_buffer_size_bytes.unwrap_or_else(|| {
+            SchedulerConfig::max_bandwidth(self.inner.dataset.object_store.as_ref())
+                .io_buffer_size_bytes
+        });
+        let batches = plan_blob_read_batches(entries, Some(&self.ranges), physical_buffer_size)?;
+        let execution = Arc::new(ReadBlobsExecution::new(
+            self.inner.options.io_buffer_size_bytes,
+        ));
+        Ok(execute_blob_read_batches_stream(
+            batches,
+            execution,
+            self.inner.dataset.object_store.io_parallelism(),
+            self.inner.options.preserve_order,
+        )
+        .map(|result| result.and_then(into_read_blob_range))
+        .boxed())
+    }
+
+    /// Execute the planned range read and collect all returned bytes in memory.
+    pub async fn execute(self) -> Result<Vec<ReadBlobRange>> {
+        self.try_into_stream().await?.try_collect().await
+    }
+
+    fn validate(&self) -> Result<()> {
+        match self.inner.selection {
+            ReadBlobsSelection::None => {
+                return Err(Error::invalid_input(
+                    "ReadBlobRangesBuilder requires requests; call one of with_row_ids, with_row_indices, or with_row_addresses".to_string(),
+                ));
+            }
+            _ if self.inner.options.io_buffer_size_bytes == Some(0) => {
+                return Err(Error::invalid_input(
+                    "ReadBlobRangesBuilder io_buffer_size must be greater than 0".to_string(),
+                ));
+            }
+            _ => {}
+        }
+        for (request_index, range) in self.ranges.iter().enumerate() {
+            range.checked_range(request_index)?;
+        }
+        Ok(())
+    }
+
+    fn with_requests(
+        mut self,
+        requests: impl IntoIterator<Item = BlobRangeRequest>,
+        selection: fn(Vec<u64>) -> ReadBlobsSelection,
+    ) -> Self {
+        let requests = requests.into_iter();
+        let (lower_bound, _) = requests.size_hint();
+        let mut rows = Vec::with_capacity(lower_bound);
+        let mut ranges = Vec::with_capacity(lower_bound);
+        for request in requests {
+            rows.push(request.row);
+            ranges.push(request.range);
+        }
+        self.inner.selection = selection(rows);
+        self.ranges = ranges;
+        self
+    }
+}
+
 /// One logical blob selected for planned reading.
 #[derive(Debug)]
 struct BlobEntry {
@@ -1770,7 +1910,24 @@ struct BlobEntry {
 struct PlannedBlobRead {
     selection_index: usize,
     row_address: u64,
+    requested_range: Option<BlobReadRange>,
     physical_range: Range<u64>,
+}
+
+/// A slice of one disjoint physical range submitted to the file scheduler.
+#[derive(Debug)]
+struct PlannedBlobReadSlice {
+    read_index: usize,
+    physical_range_index: usize,
+    relative_range: Range<u64>,
+}
+
+/// One physical read paired with the backing source used to batch it.
+#[derive(Debug)]
+struct SourcePlannedBlobRead {
+    source_key: BlobSourceKey,
+    source: Arc<BlobSource>,
+    read: PlannedBlobRead,
 }
 
 /// One per-source read plan emitted by `read_blobs`.
@@ -1779,6 +1936,127 @@ struct BlobReadPlan {
     source_key: BlobSourceKey,
     source: Arc<BlobSource>,
     reads: Vec<PlannedBlobRead>,
+}
+
+/// A payload-bounded group of per-source plans.
+#[derive(Debug)]
+struct BlobReadBatch {
+    plans: Vec<BlobReadPlan>,
+    expected_selection_indices: VecDeque<usize>,
+}
+
+#[derive(Debug)]
+struct CoalescedRangeInsertion {
+    merged: Range<u64>,
+    replaced_starts: Vec<u64>,
+    replaced_bytes: u64,
+}
+
+impl CoalescedRangeInsertion {
+    fn additional_bytes(&self) -> Result<u64> {
+        let merged_bytes = self.merged.end - self.merged.start;
+        merged_bytes.checked_sub(self.replaced_bytes).ok_or_else(|| {
+            Error::internal(format!(
+                "Coalesced blob range {:?} was smaller than its replaced ranges totaling {} bytes",
+                self.merged, self.replaced_bytes
+            ))
+        })
+    }
+}
+
+/// Physical ranges already charged to one source in the current batch.
+#[derive(Debug, Default)]
+struct CoalescedPhysicalRanges {
+    ranges: BTreeMap<u64, u64>,
+}
+
+impl CoalescedPhysicalRanges {
+    fn plan_insertion(
+        &self,
+        range: &Range<u64>,
+        block_size: u64,
+    ) -> Result<Option<CoalescedRangeInsertion>> {
+        if range.is_empty() {
+            return Ok(None);
+        }
+
+        let scan_start = self
+            .ranges
+            .range(..=range.start)
+            .next_back()
+            .map(|(start, _)| *start)
+            .unwrap_or(range.start);
+        let mut merged = range.clone();
+        let mut replaced_starts = Vec::new();
+        let mut replaced_bytes = 0_u64;
+        for (&start, &end) in self.ranges.range(scan_start..) {
+            if end.saturating_add(block_size) < merged.start {
+                continue;
+            }
+            if start > merged.end.saturating_add(block_size) {
+                break;
+            }
+            merged.start = merged.start.min(start);
+            merged.end = merged.end.max(end);
+            replaced_starts.push(start);
+            replaced_bytes = replaced_bytes
+                .checked_add(end - start)
+                .ok_or_else(|| Error::internal("Coalesced blob range size overflow".to_string()))?;
+        }
+
+        Ok(Some(CoalescedRangeInsertion {
+            merged,
+            replaced_starts,
+            replaced_bytes,
+        }))
+    }
+
+    fn insert(&mut self, insertion: CoalescedRangeInsertion) {
+        for start in insertion.replaced_starts {
+            self.ranges.remove(&start);
+        }
+        self.ranges
+            .insert(insertion.merged.start, insertion.merged.end);
+    }
+}
+
+/// Exact scheduler-visible physical footprint of the current batch.
+#[derive(Debug, Default)]
+struct BlobReadBatchFootprint {
+    sources: HashMap<BlobSourceKey, CoalescedPhysicalRanges>,
+    physical_bytes: u64,
+}
+
+impl BlobReadBatchFootprint {
+    fn try_insert(
+        &mut self,
+        planned: &SourcePlannedBlobRead,
+        physical_buffer_size: u64,
+        allow_oversized: bool,
+    ) -> Result<bool> {
+        let remaining = physical_buffer_size.saturating_sub(self.physical_bytes);
+        let additional_bytes = {
+            let source_ranges = self.sources.entry(planned.source_key.clone()).or_default();
+            let insertion = source_ranges.plan_insertion(
+                &planned.read.physical_range,
+                planned.source.object_store.block_size() as u64,
+            )?;
+            let Some(insertion) = insertion else {
+                return Ok(true);
+            };
+            let additional_bytes = insertion.additional_bytes()?;
+            if !allow_oversized && additional_bytes > remaining {
+                return Ok(false);
+            }
+            source_ranges.insert(insertion);
+            additional_bytes
+        };
+        self.physical_bytes = self
+            .physical_bytes
+            .checked_add(additional_bytes)
+            .ok_or_else(|| Error::internal("Blob read batch size overflow".to_string()))?;
+        Ok(true)
+    }
 }
 
 /// Operation-scoped scheduler cache for one [`ReadBlobsBuilder`] execution.
@@ -1822,42 +2100,140 @@ impl ReadBlobsExecution {
 struct IndexedReadBlob {
     selection_index: usize,
     row_address: u64,
+    requested_range: Option<BlobReadRange>,
     data: Bytes,
 }
 
 fn into_read_blob(blob: IndexedReadBlob) -> ReadBlob {
+    debug_assert!(
+        blob.requested_range.is_none(),
+        "whole-blob reads must not carry a requested range"
+    );
     ReadBlob {
         row_address: blob.row_address,
         data: blob.data,
     }
 }
 
+fn into_read_blob_range(blob: IndexedReadBlob) -> Result<ReadBlobRange> {
+    let range = blob.requested_range.ok_or_else(|| {
+        Error::internal(format!(
+            "Blob range request {} completed without range metadata",
+            blob.selection_index
+        ))
+    })?;
+    Ok(ReadBlobRange {
+        request_index: blob.selection_index,
+        row_address: blob.row_address,
+        range,
+        data: blob.data,
+    })
+}
+
+/// Split selected reads into request-order batches before grouping each batch
+/// by physical source. Each batch accounts for the physical spans that the file
+/// scheduler will read after coalescing nearby ranges.
+fn plan_blob_read_batches(
+    mut entries: Vec<BlobEntry>,
+    requested_ranges: Option<&[BlobReadRange]>,
+    physical_buffer_size: u64,
+) -> Result<Vec<BlobReadBatch>> {
+    debug_assert!(physical_buffer_size > 0);
+    entries.sort_by_key(|entry| entry.selection_index);
+    let planned_reads = plan_blob_reads(entries, requested_ranges)?;
+
+    let mut batches = Vec::new();
+    let mut current_reads = Vec::new();
+    let mut footprint = BlobReadBatchFootprint::default();
+    for planned in planned_reads {
+        if !footprint.try_insert(&planned, physical_buffer_size, current_reads.is_empty())? {
+            batches.push(into_blob_read_batch(std::mem::take(&mut current_reads)));
+            footprint = BlobReadBatchFootprint::default();
+            let inserted = footprint.try_insert(&planned, physical_buffer_size, true)?;
+            debug_assert!(inserted, "an empty batch must accept one physical read");
+        }
+        current_reads.push(planned);
+    }
+    if !current_reads.is_empty() {
+        batches.push(into_blob_read_batch(current_reads));
+    }
+
+    Ok(batches)
+}
+
+fn plan_blob_reads(
+    entries: Vec<BlobEntry>,
+    requested_ranges: Option<&[BlobReadRange]>,
+) -> Result<Vec<SourcePlannedBlobRead>> {
+    let mut planned_reads = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let requested_range = requested_ranges
+            .map(|ranges| {
+                ranges.get(entry.selection_index).copied().ok_or_else(|| {
+                    Error::internal(format!(
+                        "Missing blob range for request {}",
+                        entry.selection_index
+                    ))
+                })
+            })
+            .transpose()?;
+        let logical_range = match requested_range {
+            Some(range) => range.checked_range(entry.selection_index)?,
+            None => 0..entry.file.size,
+        };
+        let physical_range = entry.file.read_phys_range(logical_range).map_err(|err| {
+            Error::invalid_input(format!(
+                "Blob range request {} for row address {} is invalid: {}",
+                entry.selection_index, entry.row_address, err
+            ))
+        })?;
+        let source_key = BlobSourceKey::new(&entry.file.source);
+        planned_reads.push(SourcePlannedBlobRead {
+            source_key,
+            source: entry.file.source.clone(),
+            read: PlannedBlobRead {
+                selection_index: entry.selection_index,
+                row_address: entry.row_address,
+                requested_range,
+                physical_range,
+            },
+        });
+    }
+
+    Ok(planned_reads)
+}
+
+fn into_blob_read_batch(planned_reads: Vec<SourcePlannedBlobRead>) -> BlobReadBatch {
+    let expected_selection_indices = planned_reads
+        .iter()
+        .map(|planned| planned.read.selection_index)
+        .collect();
+    BlobReadBatch {
+        plans: group_blob_read_plans(planned_reads),
+        expected_selection_indices,
+    }
+}
+
 /// Group selected blobs by physical source and sort each group's ranges by
 /// physical offset before handing them to the file scheduler.
-fn plan_blob_read_plans(entries: Vec<BlobEntry>) -> Vec<BlobReadPlan> {
+fn group_blob_read_plans(planned_reads: Vec<SourcePlannedBlobRead>) -> Vec<BlobReadPlan> {
     let mut plan_indices = HashMap::<BlobSourceKey, usize>::new();
     let mut plans = Vec::<BlobReadPlan>::new();
 
-    for entry in entries {
-        let source_key = BlobSourceKey::new(&entry.file.source);
-        let plan_index = if let Some(plan_index) = plan_indices.get(&source_key) {
+    for planned in planned_reads {
+        let plan_index = if let Some(plan_index) = plan_indices.get(&planned.source_key) {
             *plan_index
         } else {
             let plan_index = plans.len();
             plans.push(BlobReadPlan {
-                source_key: source_key.clone(),
-                source: entry.file.source.clone(),
+                source_key: planned.source_key.clone(),
+                source: planned.source,
                 reads: Vec::new(),
             });
-            plan_indices.insert(source_key.clone(), plan_index);
+            plan_indices.insert(planned.source_key, plan_index);
             plan_index
         };
-
-        plans[plan_index].reads.push(PlannedBlobRead {
-            selection_index: entry.selection_index,
-            row_address: entry.row_address,
-            physical_range: entry.file.position..(entry.file.position + entry.file.size),
-        });
+        plans[plan_index].reads.push(planned.read);
     }
 
     plans.sort_by(|left, right| {
@@ -1880,22 +2256,108 @@ fn plan_blob_read_plans(entries: Vec<BlobEntry>) -> Vec<BlobReadPlan> {
     plans
 }
 
+fn plan_blob_read_plans(
+    entries: Vec<BlobEntry>,
+    requested_ranges: Option<&[BlobReadRange]>,
+) -> Result<Vec<BlobReadPlan>> {
+    Ok(group_blob_read_plans(plan_blob_reads(
+        entries,
+        requested_ranges,
+    )?))
+}
+
+/// Merge overlapping physical reads before submitting them to [`FileScheduler`].
+///
+/// `FileScheduler` can safely coalesce and split disjoint ranges. Original
+/// overlapping ranges need to be mapped onto their union first so a split does
+/// not advance past the start of a later nested range while reconstructing the
+/// caller's buffers.
+fn plan_disjoint_blob_reads(
+    reads: &[PlannedBlobRead],
+) -> (Vec<Range<u64>>, Vec<PlannedBlobReadSlice>) {
+    let mut non_empty_ranges = reads
+        .iter()
+        .enumerate()
+        .filter(|(_, read)| !read.physical_range.is_empty())
+        .map(|(read_index, read)| (read_index, read.physical_range.clone()))
+        .collect::<Vec<_>>();
+    non_empty_ranges.sort_by_key(|(read_index, range)| (range.start, range.end, *read_index));
+
+    let mut physical_ranges = Vec::<Range<u64>>::with_capacity(non_empty_ranges.len());
+    let mut slices = Vec::with_capacity(non_empty_ranges.len());
+    for (read_index, range) in non_empty_ranges {
+        let physical_range_index = match physical_ranges.last_mut() {
+            Some(physical_range) if range.start <= physical_range.end => {
+                physical_range.end = physical_range.end.max(range.end);
+                physical_ranges.len() - 1
+            }
+            _ => {
+                physical_ranges.push(range.clone());
+                physical_ranges.len() - 1
+            }
+        };
+        let physical_start = physical_ranges[physical_range_index].start;
+        slices.push(PlannedBlobReadSlice {
+            read_index,
+            physical_range_index,
+            relative_range: range.start - physical_start..range.end - physical_start,
+        });
+    }
+
+    (physical_ranges, slices)
+}
+
 /// Execute one per-source blob read plan with a single scheduler submission.
 async fn execute_blob_read_plan(
     task: BlobReadPlan,
     execution: Arc<ReadBlobsExecution>,
 ) -> Result<Vec<IndexedReadBlob>> {
-    let ranges = task
-        .reads
-        .iter()
-        .map(|read| read.physical_range.clone())
-        .collect::<Vec<_>>();
-    let scheduler = execution.scheduler_for(&task.source);
-    let file_scheduler = scheduler
-        .open_file(&task.source.path, &task.source.file_size)
-        .await?;
-    let priority = ranges[0].start;
-    let bytes = file_scheduler.submit_request(ranges, priority).await?;
+    let (physical_ranges, slices) = plan_disjoint_blob_reads(&task.reads);
+    let mut bytes = vec![Bytes::new(); task.reads.len()];
+    if let Some(first_range) = physical_ranges.first() {
+        let scheduler = execution.scheduler_for(&task.source);
+        let file_scheduler = scheduler
+            .open_file(&task.source.path, &task.source.file_size)
+            .await?;
+        let priority = first_range.start;
+        let physical_range_count = physical_ranges.len();
+        let returned = file_scheduler
+            .submit_request(physical_ranges, priority)
+            .await?;
+        if returned.len() != physical_range_count {
+            return Err(Error::internal(format!(
+                "Blob read scheduler returned {} ranges for {} disjoint physical ranges from {}",
+                returned.len(),
+                physical_range_count,
+                task.source.path
+            )));
+        }
+        for slice in slices {
+            let start = usize::try_from(slice.relative_range.start).map_err(|_| {
+                Error::internal(format!(
+                    "Blob read slice start {} does not fit into usize for {}",
+                    slice.relative_range.start, task.source.path
+                ))
+            })?;
+            let end = usize::try_from(slice.relative_range.end).map_err(|_| {
+                Error::internal(format!(
+                    "Blob read slice end {} does not fit into usize for {}",
+                    slice.relative_range.end, task.source.path
+                ))
+            })?;
+            let data = &returned[slice.physical_range_index];
+            if end > data.len() {
+                return Err(Error::internal(format!(
+                    "Blob read slice {:?} exceeds the {} bytes returned for physical range {} from {}",
+                    slice.relative_range,
+                    data.len(),
+                    slice.physical_range_index,
+                    task.source.path
+                )));
+            }
+            bytes[slice.read_index] = data.slice(start..end);
+        }
+    }
 
     Ok(task
         .reads
@@ -1904,9 +2366,87 @@ async fn execute_blob_read_plan(
         .map(|(read, data)| IndexedReadBlob {
             selection_index: read.selection_index,
             row_address: read.row_address,
+            requested_range: read.requested_range,
             data,
         })
         .collect())
+}
+
+fn execute_blob_read_batches_stream(
+    batches: Vec<BlobReadBatch>,
+    execution: Arc<ReadBlobsExecution>,
+    io_parallelism: usize,
+    preserve_order: bool,
+) -> BoxStream<'static, Result<IndexedReadBlob>> {
+    let streams = batches.into_iter().map(move |batch| {
+        execute_blob_read_plans_stream(
+            batch.plans,
+            batch.expected_selection_indices,
+            execution.clone(),
+            io_parallelism,
+            preserve_order,
+        )
+    });
+    stream::iter(streams).flatten().boxed()
+}
+
+fn execute_blob_read_plans_stream(
+    plans: Vec<BlobReadPlan>,
+    expected_selection_indices: VecDeque<usize>,
+    execution: Arc<ReadBlobsExecution>,
+    io_parallelism: usize,
+    preserve_order: bool,
+) -> BoxStream<'static, Result<IndexedReadBlob>> {
+    if plans.is_empty() {
+        return stream::empty().boxed();
+    }
+
+    let plan_stream = stream::iter(plans.into_iter().map(move |plan| {
+        let execution = execution.clone();
+        execute_blob_read_plan(plan, execution)
+    }))
+    .buffer_unordered(io_parallelism.max(1));
+
+    if !preserve_order {
+        return plan_stream
+            .map_ok(|blobs| stream::iter(blobs.into_iter().map(Ok)))
+            .try_flatten()
+            .boxed();
+    }
+
+    let mut plan_stream = plan_stream.boxed();
+    let mut expected_selection_indices = expected_selection_indices;
+    let mut ready = BTreeMap::<usize, IndexedReadBlob>::new();
+    stream::poll_fn(move |cx| {
+        loop {
+            let Some(next_selection_index) = expected_selection_indices.front().copied() else {
+                return Poll::Ready(None);
+            };
+
+            if let Some(blob) = ready.remove(&next_selection_index) {
+                expected_selection_indices.pop_front();
+                return Poll::Ready(Some(Ok(blob)));
+            }
+
+            match plan_stream.poll_next_unpin(cx) {
+                Poll::Ready(Some(Ok(blobs))) => {
+                    for blob in blobs {
+                        ready.insert(blob.selection_index, blob);
+                    }
+                }
+                Poll::Ready(Some(Err(err))) => return Poll::Ready(Some(Err(err))),
+                Poll::Ready(None) => {
+                    let err = Error::internal(format!(
+                        "planned blob read stream completed before selection index {} was produced",
+                        next_selection_index
+                    ));
+                    return Poll::Ready(Some(Err(err)));
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    })
+    .boxed()
 }
 
 async fn execute_blob_entries(
@@ -1914,7 +2454,7 @@ async fn execute_blob_entries(
     io_parallelism: usize,
     io_buffer_size_bytes: Option<u64>,
 ) -> Result<Vec<IndexedReadBlob>> {
-    let plans = plan_blob_read_plans(entries);
+    let plans = plan_blob_read_plans(entries, None)?;
     if plans.is_empty() {
         return Ok(Vec::new());
     }
@@ -2160,14 +2700,8 @@ impl<'a> BlobV2DescriptorColumns<'a> {
         }
     }
 
-    fn is_null_blob(&self, idx: usize) -> Result<bool> {
-        if self.descriptions.is_null(idx) || self.kinds.is_null(idx) {
-            return Ok(true);
-        }
-        let kind = BlobKind::try_from(self.kinds.value(idx))?;
-        Ok(matches!(kind, BlobKind::Inline)
-            && self.positions.value(idx) == 0
-            && self.sizes.value(idx) == 0)
+    fn is_null_blob(&self, idx: usize) -> bool {
+        self.descriptions.is_null(idx) || self.kinds.is_null(idx)
     }
 }
 
@@ -2190,6 +2724,11 @@ fn collect_blob_entries_v1(
         .filter_map(|(selection_index, ((row_addr, position), size))| {
             let position = position?;
             let size = size?;
+            // V1 encodes valid empty blobs as (0, 0) and smuggles null
+            // repetition/definition levels through a non-zero zero-sized position.
+            if descriptions.is_null(selection_index) || (size == 0 && position != 0) {
+                return None;
+            }
             Some((selection_index, *row_addr, position, size))
         })
         .map(|(selection_index, row_addr, position, size)| {
@@ -2624,7 +3163,7 @@ impl<'a> BlobV2ReadContext<'a> {
         selection_index: usize,
         row_addr: u64,
     ) -> Result<Option<BlobEntry>> {
-        if columns.is_null_blob(idx)? {
+        if columns.is_null_blob(idx) {
             return Ok(None);
         }
 
@@ -2874,7 +3413,7 @@ fn data_file_key_from_path(path: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
     use std::ops::Range;
     use std::sync::{
         Arc,
@@ -2891,6 +3430,7 @@ mod tests {
         Array, ArrayRef, Int32Array, LargeBinaryArray, RecordBatchIterator, StringArray,
         StructArray, UInt8Array, UInt32Array, UInt64Array,
     };
+    use arrow_buffer::NullBuffer;
     use arrow_schema::{DataType, Field, Schema};
     use async_trait::async_trait;
     use bytes::Bytes;
@@ -2930,9 +3470,10 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        BlobEntry, BlobFile, BlobSource, ExternalBaseCandidate, ExternalBaseResolver,
-        ReadBlobsExecution, collect_blob_entries_v1, data_file_key_from_path, execute_blob_entries,
-        execute_blob_read_plan, plan_blob_read_plans,
+        BlobEntry, BlobFile, BlobRangeRequest, BlobReadRange, BlobSource, ExternalBaseCandidate,
+        ExternalBaseResolver, ReadBlobsExecution, collect_blob_entries_v1, data_file_key_from_path,
+        execute_blob_entries, execute_blob_read_batches_stream, execute_blob_read_plan,
+        plan_blob_read_batches, plan_blob_read_plans,
     };
     use crate::{
         Dataset,
@@ -3326,9 +3867,10 @@ mod tests {
         }
     }
 
-    fn recording_range_store_with_url(
+    fn recording_range_store_with_url_and_block_size(
         data: Bytes,
         url: &str,
+        block_size: Option<usize>,
     ) -> (Arc<ObjectStore>, Arc<RecordingRangeObjectStore>) {
         const TEST_RANGE_STORE_SIZE: usize = 128 * 1024;
         let mut padded = vec![0; TEST_RANGE_STORE_SIZE.max(data.len())];
@@ -3337,7 +3879,7 @@ mod tests {
         let store = Arc::new(ObjectStore::new(
             inner.clone() as Arc<dyn object_store::ObjectStore>,
             Url::parse(url).unwrap(),
-            None,
+            block_size,
             None,
             false,
             true,
@@ -3348,8 +3890,26 @@ mod tests {
         (store, inner)
     }
 
+    fn recording_range_store_with_url(
+        data: Bytes,
+        url: &str,
+    ) -> (Arc<ObjectStore>, Arc<RecordingRangeObjectStore>) {
+        recording_range_store_with_url_and_block_size(data, url, None)
+    }
+
     fn recording_range_store(data: Bytes) -> (Arc<ObjectStore>, Arc<RecordingRangeObjectStore>) {
         recording_range_store_with_url(data, "mock://recording/blob-range-tests")
+    }
+
+    fn recording_range_store_with_block_size(
+        data: Bytes,
+        block_size: usize,
+    ) -> (Arc<ObjectStore>, Arc<RecordingRangeObjectStore>) {
+        recording_range_store_with_url_and_block_size(
+            data,
+            "mock://recording/blob-range-tests",
+            Some(block_size),
+        )
     }
 
     fn gated_range_store(
@@ -4965,6 +5525,442 @@ mod tests {
         assert_eq!(inner.requested_blob_ranges(), vec![1..7]);
     }
 
+    #[test]
+    fn test_blob_read_batches_bound_physical_bytes() {
+        let (store, _) = recording_range_store(Bytes::from_static(b"abcdefghij"));
+        let source = Arc::new(BlobSource::new(store, Path::from("blobs/test.bin")));
+        let entries = vec![
+            BlobEntry {
+                selection_index: 1,
+                row_address: 11,
+                file: BlobFile::with_source(source.clone(), 4, 6, BlobKind::Packed, None),
+            },
+            BlobEntry {
+                selection_index: 0,
+                row_address: 10,
+                file: BlobFile::with_source(source, 1, 3, BlobKind::Packed, None),
+            },
+        ];
+        let requested = [BlobReadRange::new(0, 3), BlobReadRange::new(0, 5)];
+
+        let batches = plan_blob_read_batches(entries, Some(&requested), 4).unwrap();
+
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].expected_selection_indices, VecDeque::from([0]));
+        assert_eq!(batches[1].expected_selection_indices, VecDeque::from([1]));
+    }
+
+    #[tokio::test]
+    async fn test_blob_read_batches_bound_coalesced_physical_bytes() {
+        const BLOCK_SIZE: usize = 64 * 1024;
+        const RANGE_GAP: u64 = 32 * 1024;
+        const REQUEST_COUNT: usize = 4;
+
+        let mut data = vec![0_u8; 128 * 1024];
+        for request_index in 0..REQUEST_COUNT {
+            data[request_index * RANGE_GAP as usize] = request_index as u8 + 1;
+        }
+        let (store, inner) = recording_range_store_with_block_size(Bytes::from(data), BLOCK_SIZE);
+        let source = Arc::new(BlobSource::new(store, Path::from("blobs/dense.pack")));
+        let entries = (0..REQUEST_COUNT)
+            .map(|request_index| BlobEntry {
+                selection_index: request_index,
+                row_address: request_index as u64,
+                file: BlobFile::with_source(
+                    source.clone(),
+                    request_index as u64 * RANGE_GAP,
+                    1,
+                    BlobKind::Packed,
+                    None,
+                ),
+            })
+            .collect();
+        let requested = [BlobReadRange::new(0, 1); REQUEST_COUNT];
+
+        let batches =
+            plan_blob_read_batches(entries, Some(&requested), REQUEST_COUNT as u64).unwrap();
+        assert_eq!(batches.len(), REQUEST_COUNT);
+
+        let results = execute_blob_read_batches_stream(
+            batches,
+            Arc::new(ReadBlobsExecution::new(Some(REQUEST_COUNT as u64))),
+            REQUEST_COUNT,
+            true,
+        )
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+        assert_eq!(results.len(), REQUEST_COUNT);
+        for (request_index, result) in results.iter().enumerate() {
+            assert_eq!(result.selection_index, request_index);
+            assert_eq!(result.data.as_ref(), &[request_index as u8 + 1]);
+        }
+        assert_eq!(
+            inner.requested_blob_ranges(),
+            (0..REQUEST_COUNT)
+                .map(|request_index| {
+                    let start = request_index as u64 * RANGE_GAP;
+                    start..start + 1
+                })
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_blob_ranges_preserves_request_order_across_fragments() {
+        let fixture = BlobTestFixture::new().await;
+        let selections = [
+            (22_u64, 2_usize, 2_usize),
+            (2, 0, 2),
+            (12, 1, 2),
+            (12, 1, 2),
+        ];
+        let ranges = vec![
+            BlobReadRange::new(2, 3),
+            BlobReadRange::new(0, 2),
+            BlobReadRange::new(3, 2),
+            BlobReadRange::new(0, 3),
+        ];
+
+        let results = fixture
+            .dataset
+            .read_blob_ranges("blobs")
+            .unwrap()
+            .with_row_indices(
+                selections
+                    .iter()
+                    .zip(&ranges)
+                    .map(|((row_index, _, _), range)| {
+                        BlobRangeRequest::new(*row_index, range.offset, range.length)
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .execute()
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), selections.len());
+        for (request_index, (((_, batch_index, row_index), range), result)) in
+            selections.iter().zip(&ranges).zip(&results).enumerate()
+        {
+            let payload = fixture.data[*batch_index]
+                .column(1)
+                .as_binary::<i64>()
+                .value(*row_index);
+            let start = range.offset as usize;
+            let end = start + range.length as usize;
+            assert_eq!(result.request_index, request_index);
+            assert_eq!(result.range, *range);
+            assert_eq!(result.data.as_ref(), &payload[start..end]);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_read_blob_ranges_skips_v1_nulls_and_preserves_empty_values() {
+        let test_dir = TempStrDir::default();
+        let blob_metadata = HashMap::from([(BLOB_META_KEY.to_string(), "true".to_string())]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("blob", DataType::LargeBinary, true).with_metadata(blob_metadata),
+        ]));
+        let blobs =
+            LargeBinaryArray::from(vec![None, Some(b"".as_slice()), Some(b"abc".as_slice())]);
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(blobs)]).unwrap();
+        let dataset = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new(vec![Ok(batch)], schema),
+                &test_dir,
+                Some(WriteParams {
+                    data_storage_version: Some(LanceFileVersion::V2_0),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+
+        let results = dataset
+            .read_blob_ranges("blob")
+            .unwrap()
+            .with_row_indices([
+                BlobRangeRequest::new(0, 0, 0),
+                BlobRangeRequest::new(0, 0, 1),
+                BlobRangeRequest::new(1, 0, 0),
+                BlobRangeRequest::new(2, 1, 1),
+            ])
+            .execute()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| (result.request_index, result.data.as_ref()))
+                .collect::<Vec<_>>(),
+            vec![(2, b"".as_slice()), (3, b"b".as_slice())]
+        );
+
+        let descriptions = StructArray::try_new(
+            vec![
+                Arc::new(Field::new("position", DataType::UInt64, false)),
+                Arc::new(Field::new("size", DataType::UInt64, false)),
+            ]
+            .into(),
+            vec![
+                Arc::new(UInt64Array::from(vec![0])) as ArrayRef,
+                Arc::new(UInt64Array::from(vec![0])) as ArrayRef,
+            ],
+            Some(NullBuffer::from(vec![false])),
+        )
+        .unwrap();
+        let row_addrs = UInt64Array::from(vec![u64::MAX]);
+        assert!(
+            collect_blob_entries_v1(&dataset, u32::MAX, &descriptions, &row_addrs)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_blob_ranges_skips_v2_nulls_and_preserves_empty_values() {
+        let test_dir = TempStrDir::default();
+        let mut blob_builder = BlobArrayBuilder::new(3);
+        blob_builder.push_empty().unwrap();
+        blob_builder.push_null().unwrap();
+        blob_builder.push_bytes(b"abc").unwrap();
+        let schema = Arc::new(Schema::new(vec![blob_field("blob", true)]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![blob_builder.finish().unwrap()]).unwrap();
+        let dataset = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new(vec![Ok(batch)], schema),
+                &test_dir,
+                Some(WriteParams {
+                    data_storage_version: Some(LanceFileVersion::V2_2),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+
+        let results = dataset
+            .read_blob_ranges("blob")
+            .unwrap()
+            .with_row_indices([
+                BlobRangeRequest::new(0, 0, 0),
+                BlobRangeRequest::new(1, 0, 0),
+                BlobRangeRequest::new(1, 0, 1),
+                BlobRangeRequest::new(2, 1, 1),
+            ])
+            .execute()
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].request_index, 0);
+        assert!(results[0].data.is_empty());
+        assert_eq!(results[1].request_index, 3);
+        assert_eq!(results[1].data.as_ref(), b"b");
+    }
+
+    #[tokio::test]
+    async fn test_read_blob_ranges_handles_overlaps_across_scheduler_splits() {
+        let max_iop_size = *lance_io::object_store::DEFAULT_MAX_IOP_SIZE;
+        let value_size = max_iop_size + 12;
+        let nested_start = value_size / 2 - 1;
+        let nested_end = value_size;
+        let (store, inner) = recording_range_store(Bytes::from(vec![7; value_size as usize]));
+        let source = Arc::new(BlobSource::new(store, Path::from("blobs/overlapping.bin")));
+        let entries = vec![
+            BlobEntry {
+                selection_index: 0,
+                row_address: 10,
+                file: BlobFile::with_source(
+                    source.clone(),
+                    0,
+                    value_size,
+                    BlobKind::Dedicated,
+                    None,
+                ),
+            },
+            BlobEntry {
+                selection_index: 1,
+                row_address: 10,
+                file: BlobFile::with_source(source, 0, value_size, BlobKind::Dedicated, None),
+            },
+        ];
+        let requested = [
+            BlobReadRange::new(0, value_size),
+            BlobReadRange::new(nested_start, nested_end - nested_start),
+        ];
+
+        let mut plans = plan_blob_read_plans(entries, Some(&requested)).unwrap();
+        let results = execute_blob_read_plan(
+            plans.pop().unwrap(),
+            Arc::new(ReadBlobsExecution::new(None)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].selection_index, 0);
+        assert_eq!(results[0].data.len(), value_size as usize);
+        assert!(results[0].data.iter().all(|byte| *byte == 7));
+        assert_eq!(results[1].selection_index, 1);
+        assert_eq!(results[1].data.len(), (nested_end - nested_start) as usize);
+        assert!(results[1].data.iter().all(|byte| *byte == 7));
+
+        let mut physical_ranges = inner.requested_blob_ranges();
+        physical_ranges.sort_by_key(|range| range.start);
+        assert_eq!(
+            physical_ranges.len(),
+            value_size.div_ceil(max_iop_size) as usize
+        );
+        assert_eq!(physical_ranges[0].start, 0);
+        assert_eq!(physical_ranges.last().unwrap().end, value_size);
+        assert!(
+            physical_ranges
+                .windows(2)
+                .all(|ranges| ranges[0].end == ranges[1].start)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_blob_ranges_rejects_overflow_and_out_of_bounds() {
+        let fixture = BlobTestFixture::new().await;
+
+        let err = fixture
+            .dataset
+            .read_blob_ranges("blobs")
+            .unwrap()
+            .execute()
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }));
+        assert!(err.to_string().contains("requires requests"));
+
+        let err = fixture
+            .dataset
+            .read_blob_ranges("blobs")
+            .unwrap()
+            .with_row_indices([BlobRangeRequest::new(0, u64::MAX, 1)])
+            .execute()
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }));
+        assert!(err.to_string().contains("offset + length overflowed"));
+
+        let err = fixture
+            .dataset
+            .read_blob_ranges("blobs")
+            .unwrap()
+            .with_row_indices([BlobRangeRequest::new(0, 0, u64::MAX)])
+            .execute()
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }));
+        assert!(err.to_string().contains("exceeds blob size"));
+        assert!(err.to_string().contains("request 0"));
+    }
+
+    #[tokio::test]
+    async fn test_planned_blob_range_avoids_whole_value_read_amplification() {
+        const VALUE_SIZE: u64 = 500 * 1024 * 1024;
+        const WINDOW_SIZE: u64 = 100 * 1024;
+
+        let (store, inner) = recording_range_store(Bytes::from(vec![7; WINDOW_SIZE as usize]));
+        let source = Arc::new(BlobSource::new(store, Path::from("blobs/large.bin")));
+        source
+            .file_size
+            .set(std::num::NonZeroU64::new(VALUE_SIZE).unwrap());
+        let entries = vec![BlobEntry {
+            selection_index: 0,
+            row_address: 10,
+            file: BlobFile::with_source(source, 0, VALUE_SIZE, BlobKind::Dedicated, None),
+        }];
+        let requested = [BlobReadRange::new(0, WINDOW_SIZE)];
+        let mut plans = plan_blob_read_plans(entries, Some(&requested)).unwrap();
+        let results = execute_blob_read_plan(
+            plans.pop().unwrap(),
+            Arc::new(ReadBlobsExecution::new(None)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].data.len(), WINDOW_SIZE as usize);
+        let physical_ranges = inner.requested_blob_ranges();
+        assert_eq!(physical_ranges, vec![0..WINDOW_SIZE]);
+        assert_eq!(
+            physical_ranges
+                .iter()
+                .map(|range| range.end - range.start)
+                .sum::<u64>(),
+            WINDOW_SIZE
+        );
+        assert!(!physical_ranges.contains(&(0..VALUE_SIZE)));
+    }
+
+    #[tokio::test]
+    async fn test_read_blob_ranges_avoids_whole_value_read_amplification_end_to_end() {
+        const VALUE_SIZE: usize = 8 * 1024 * 1024;
+        const WINDOW_SIZE: u64 = 100 * 1024;
+
+        let test_dir = TempStrDir::default();
+        let mut blob_builder = BlobArrayBuilder::new(1);
+        blob_builder.push_bytes(vec![0xA5; VALUE_SIZE]).unwrap();
+        let mut blob_field = blob_field("blob", false);
+        let mut metadata = blob_field.metadata().clone();
+        metadata.insert(
+            BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY.to_string(),
+            "1".to_string(),
+        );
+        blob_field = blob_field.with_metadata(metadata);
+        let schema = Arc::new(Schema::new(vec![blob_field]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(blob_builder.finish().unwrap())],
+        )
+        .unwrap();
+        let dataset = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new(vec![Ok(batch)], schema),
+                &test_dir,
+                Some(WriteParams {
+                    data_storage_version: Some(LanceFileVersion::V2_2),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+
+        let _ = dataset.object_store.io_stats_incremental();
+        let results = dataset
+            .read_blob_ranges("blob")
+            .unwrap()
+            .with_row_indices([BlobRangeRequest::new(0, 4 * 1024 * 1024, WINDOW_SIZE)])
+            .execute()
+            .await
+            .unwrap();
+        let stats = dataset.object_store.io_stats_incremental();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].data.len(), WINDOW_SIZE as usize);
+        assert!(results[0].data.iter().all(|byte| *byte == 0xA5));
+        let blob_payload_ranges = stats
+            .requests
+            .iter()
+            .filter(|request| request.path.as_ref().ends_with(".blob"))
+            .filter_map(|request| request.range.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            blob_payload_ranges,
+            vec![4 * 1024 * 1024..4 * 1024 * 1024 + WINDOW_SIZE]
+        );
+    }
+
     #[tokio::test]
     async fn test_read_blobs_stream_emits_ready_plan_without_waiting_for_slower_ones() {
         let (slow_store, _, slow_gate) = gated_range_store(
@@ -5001,7 +5997,8 @@ mod tests {
         ];
         let execution = Arc::new(ReadBlobsExecution::new(None));
         let mut stream: super::ReadBlobsStream = futures::stream::iter(
-            plan_blob_read_plans(entries)
+            plan_blob_read_plans(entries, None)
+                .unwrap()
                 .into_iter()
                 .map(move |plan| execute_blob_read_plan(plan, execution.clone())),
         )

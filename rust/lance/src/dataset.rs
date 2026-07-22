@@ -37,6 +37,7 @@ use lance_io::object_store::{
     WrappingObjectStore,
 };
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+use lance_io::traits::{WriteExt, Writer};
 use lance_io::utils::{
     CachedFileSize, read_last_block, read_message, read_metadata_offset, read_struct,
 };
@@ -118,7 +119,10 @@ use crate::io::commit::{
 use crate::session::Session;
 use crate::utils::temporal::{SystemTime, timestamp_to_nanos, utc_now};
 use crate::{Error, Result};
-pub use blob::{BlobFile, ReadBlob, ReadBlobsBuilder, ReadBlobsStream};
+pub use blob::{
+    BlobFile, BlobRangeRequest, BlobReadRange, ReadBlob, ReadBlobRange, ReadBlobRangesBuilder,
+    ReadBlobRangesStream, ReadBlobsBuilder, ReadBlobsStream,
+};
 use hash_joiner::HashJoiner;
 pub use lance_core::ROW_ID;
 use lance_core::box_error;
@@ -1797,6 +1801,36 @@ impl Dataset {
         ))
     }
 
+    /// Create a planned reader for row-specific blob-local byte ranges.
+    ///
+    /// Each [`BlobRangeRequest`] contains both its row selector and byte range,
+    /// so requests can be repeated or reordered without coordinating parallel
+    /// selector and range lists.
+    ///
+    /// ```rust
+    /// # use std::sync::Arc;
+    /// # use lance::dataset::{BlobRangeRequest, Dataset};
+    /// # use lance::Result;
+    /// # async fn example(dataset: Arc<Dataset>) -> Result<()> {
+    /// let ranges = dataset
+    ///     .read_blob_ranges("images")?
+    ///     .with_row_indices([
+    ///         BlobRangeRequest::new(7, 0, 1024),
+    ///         BlobRangeRequest::new(7, 4096, 1024),
+    ///     ])
+    ///     .execute()
+    ///     .await?;
+    /// # let _ = ranges;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn read_blob_ranges(
+        self: &Arc<Self>,
+        column: impl AsRef<str>,
+    ) -> Result<ReadBlobRangesBuilder> {
+        Ok(ReadBlobRangesBuilder::new(self.read_blobs(column)?))
+    }
+
     /// Get a stream of batches based on iterator of ranges of row numbers.
     ///
     /// This is an experimental API. It may change at any time.
@@ -2761,6 +2795,15 @@ impl Dataset {
 
     // This method filters deleted items from `addr_or_ids` using `addrs` as a reference
     async fn filter_addr_or_ids(&self, addr_or_ids: &[u64], addrs: &[u64]) -> Result<Vec<u64>> {
+        // The final zip pairs these positionally; misalignment must fail
+        // loud rather than truncate.
+        if addr_or_ids.len() != addrs.len() {
+            return Err(Error::internal(format!(
+                "filter_addr_or_ids: addr_or_ids has {} entries but addrs has {}",
+                addr_or_ids.len(),
+                addrs.len()
+            )));
+        }
         if addrs.is_empty() {
             return Ok(Vec::new());
         }
@@ -2872,17 +2915,24 @@ impl Dataset {
     }
 
     pub(crate) async fn filter_deleted_ids(&self, ids: &[u64]) -> Result<Vec<u64>> {
-        let addresses = if let Some(row_id_index) = get_row_id_index(self).await? {
-            let addresses = ids
-                .iter()
-                .filter_map(|id| row_id_index.get(*id).map(|address| address.into()))
-                .collect::<Vec<_>>();
-            Cow::Owned(addresses)
+        let (ids, addresses) = if let Some(row_id_index) = get_row_id_index(self).await? {
+            // Ids absent from the deletion-aware index are deleted; drop
+            // them from both lists to keep the zip aligned. ids.len() is an
+            // upper bound on the output size, so allocate once up front.
+            let mut live_ids = Vec::with_capacity(ids.len());
+            let mut addresses = Vec::with_capacity(ids.len());
+            for id in ids {
+                if let Some(address) = row_id_index.get(*id) {
+                    live_ids.push(*id);
+                    addresses.push(u64::from(address));
+                }
+            }
+            (Cow::Owned(live_ids), Cow::Owned(addresses))
         } else {
-            Cow::Borrowed(ids)
+            (Cow::Borrowed(ids), Cow::Borrowed(ids))
         };
 
-        self.filter_addr_or_ids(ids, &addresses).await
+        self.filter_addr_or_ids(&ids, &addresses).await
     }
 
     /// Gets the number of files that are so small they don't even have a full
@@ -3058,14 +3108,24 @@ impl Dataset {
     }
 
     /// Deep clone the target version into a new dataset at target_path.
-    /// This performs a server-side copy of all relevant dataset files (data files,
-    /// deletion files, and any external row-id files) into the target dataset
-    /// without loading data into memory.
+    /// This copies all relevant dataset files (data files, deletion files, and
+    /// index files) into the target dataset without loading data into memory.
+    ///
+    /// The source files are read through this dataset's own object store while the
+    /// copies are written through the target object store built from `store_params`.
+    /// This makes the clone work across accounts/stores (e.g. between two abfss
+    /// accounts): when the source and target stores are the same the copy stays
+    /// server-side, otherwise the data is streamed through this process.
     ///
     /// Parameters:
     /// - `target_path`: the URI string to clone the dataset into.
     /// - `version`: the version cloned from, could be a version number, branch head, or tag.
-    /// - `store_params`: the object store params to use for the new dataset.
+    /// - `store_params`: the object store params for the target dataset (e.g. the
+    ///   credentials of the target account).
+    ///
+    /// Note: external `base_paths` referenced by the source manifest are read through
+    /// this dataset's object store; per-base distinct source credentials are not yet
+    /// supported (see <https://github.com/lance-format/lance/issues/6093>).
     pub async fn deep_clone(
         &mut self,
         target_path: &str,
@@ -3106,7 +3166,12 @@ impl Dataset {
             path
         };
 
-        // TODO: Leverage object store bulk copy for efficient deep_clone
+        // When the source and target live in the same store we can keep the copy
+        // server-side. Otherwise (e.g. cloning across accounts) we stream each file
+        // from the source store to the target store.
+        let same_store = src_ds.object_store.store_prefix == target_store.store_prefix;
+
+        // TODO: Leverage object store bulk copy for efficient same-store deep_clone.
         //
         // All cloud storage providers support batch copy APIs that would provide significant
         // performance improvements. We use single file copy before we have upstream support.
@@ -3116,10 +3181,21 @@ impl Dataset {
         let copy_futures = src_paths
             .iter()
             .map(|(relative_path, base)| {
-                let store = Arc::clone(&target_store);
+                let source_store = Arc::clone(&src_ds.object_store);
+                let target_store = Arc::clone(&target_store);
                 let src_path = build_absolute_path(relative_path, base);
                 let target_path = build_absolute_path(relative_path, &target_base);
-                async move { store.copy(&src_path, &target_path).await.map(|_| ()) }
+                async move {
+                    if same_store {
+                        target_store.copy(&src_path, &target_path).await?;
+                    } else {
+                        let reader = source_store.open(&src_path).await?;
+                        let mut writer = target_store.create(&target_path).await?;
+                        writer.copy_from_reader(reader.as_ref()).await?;
+                        writer.shutdown().await?;
+                    }
+                    Result::Ok(())
+                }
             })
             .collect::<Vec<_>>();
 
@@ -3144,6 +3220,7 @@ impl Dataset {
         let builder = CommitBuilder::new(WriteDestination::Uri(target_path))
             .with_store_params(store_params.clone().unwrap_or_default())
             .with_object_store(target_store.clone())
+            .with_source_store(src_ds.object_store.clone())
             .with_commit_handler(self.commit_handler.clone())
             .with_storage_format(self.manifest.data_storage_format.lance_file_version()?);
         let new_ds = builder.execute(txn).await?;

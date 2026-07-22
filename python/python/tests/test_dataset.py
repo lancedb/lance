@@ -2424,6 +2424,29 @@ def test_merge_insert(tmp_path: Path):
         check_merge_stats(merge_dict, (None, None, None))
 
 
+@pytest.mark.parametrize("materialized", [True, False])
+def test_merge_insert_input_kinds(tmp_path: Path, materialized: bool):
+    # A materialized pa.Table is routed through the in-memory (MemTable) path,
+    # while a RecordBatchReader is routed through the streaming path. Both must
+    # produce identical results.
+    schema = pa.schema([pa.field("id", pa.int64()), pa.field("value", pa.int64())])
+    base = pa.table({"id": range(5), "value": [0] * 5}, schema=schema)
+    new = pa.table({"id": [1, 2, 5, 6], "value": [10, 20, 50, 60]}, schema=schema)
+
+    dataset = lance.write_dataset(base, tmp_path / "dataset", mode="create")
+    source = new if materialized else new.to_reader()
+
+    dataset.merge_insert(
+        "id"
+    ).when_matched_update_all().when_not_matched_insert_all().execute(source)
+
+    result = dataset.to_table().sort_by("id").to_pydict()
+    assert result == {
+        "id": [0, 1, 2, 3, 4, 5, 6],
+        "value": [0, 10, 20, 0, 0, 50, 60],
+    }
+
+
 def test_merge_insert_subcols(tmp_path: Path):
     initial_data = pa.table(
         {

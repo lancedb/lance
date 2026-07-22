@@ -15,6 +15,7 @@ use std::{
 use crate::{
     constants::{
         STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK,
+        STRUCTURAL_ENCODING_SPARSE,
     },
     data::DictionaryDataBlock,
     encodings::logical::primitive::blob::{BlobDescriptionPageScheduler, BlobPageScheduler},
@@ -92,6 +93,7 @@ pub mod constant;
 pub mod dict;
 pub mod fullzip;
 pub mod miniblock;
+pub(crate) mod sparse;
 
 const FILL_BYTE: u8 = 0xFE;
 const DEFAULT_DICT_DIVISOR: u64 = 2;
@@ -3349,6 +3351,16 @@ impl StructuralPrimitiveFieldScheduler {
                 mini_block,
                 decompressors,
             )?),
+            Layout::SparseLayout(sparse_layout) => {
+                Box::new(sparse::SparseStructuralScheduler::try_new(
+                    &page_info.buffer_offsets_and_sizes,
+                    page_info.priority,
+                    page_info.num_rows,
+                    target_field.data_type(),
+                    sparse_layout,
+                    decompressors,
+                )?)
+            }
             Layout::FullZipLayout(full_zip) => {
                 let mut scheduler = FullZipScheduler::try_new(
                     &page_info.buffer_offsets_and_sizes,
@@ -3576,25 +3588,34 @@ impl StructuralCompositeDecodeArrayTask {
     fn restore_validity(
         array: Arc<dyn Array>,
         unraveler: &mut CompositeRepDefUnraveler,
-    ) -> Arc<dyn Array> {
-        let validity = unraveler.unravel_validity(array.len());
+    ) -> Result<Arc<dyn Array>> {
+        let validity = unraveler.unravel_validity(array.len())?;
         let Some(validity) = validity else {
-            return array;
+            return Ok(array);
         };
         if array.data_type() == &DataType::Null {
             // We unravel from a null array but we don't add the null buffer because arrow-rs doesn't like it
-            return array;
+            return Ok(array);
         }
-        assert_eq!(validity.len(), array.len());
-        // SAFETY: We've should have already asserted the buffers are all valid, we are just
-        // adding null buffers to the array here
-        make_array(unsafe {
+        if validity.len() != array.len() {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "Structural validity has {} entries for an array with {} values",
+                    validity.len(),
+                    array.len()
+                )
+                .into(),
+            ));
+        }
+        // SAFETY: The array buffers have already been validated and the null buffer length
+        // matches the array. We are only attaching the null buffer here.
+        Ok(make_array(unsafe {
             array
                 .to_data()
                 .into_builder()
                 .nulls(Some(validity))
                 .build_unchecked()
-        })
+        }))
     }
 }
 
@@ -3620,7 +3641,7 @@ impl StructuralDecodeArrayTask for StructuralCompositeDecodeArrayTask {
         let array = arrow_select::concat::concat(&array_refs)?;
         let mut repdef = CompositeRepDefUnraveler::new(unravelers);
 
-        let array = Self::restore_validity(array, &mut repdef);
+        let array = Self::restore_validity(array, &mut repdef)?;
 
         Ok(DecodedArray {
             array,
@@ -3787,18 +3808,24 @@ struct DictEncodingBudget {
     max_encoded_size: usize,
 }
 
-// A primitive page after applying the dense mini-block rep/def budget.
+enum PrimitivePageStructure {
+    Dense {
+        repdef: SerializedRepDefs,
+        single_row_miniblock_repdef_levels: Option<u64>,
+    },
+    Sparse(sparse::SparseStructuralPlan),
+}
+
+// A primitive page after structural encoding selection and optional dense splitting.
 struct PrimitivePageData {
     // Arrow leaf arrays that contain this page's visible values.
     arrays: Vec<ArrayRef>,
-    // Repetition / definition levels aligned to this page.
-    repdef: SerializedRepDefs,
+    // Structural representation aligned to this page.
+    structure: PrimitivePageStructure,
     // Top-level row number of the first row in this page.
     row_number: u64,
     // Number of top-level rows in this page.
     num_rows: u64,
-    // Present when one top-level row is too large for one mini-block rep/def page.
-    single_row_miniblock_repdef_levels: Option<u64>,
 }
 
 // Immutable encoder state shared by per-page encode tasks.
@@ -3833,6 +3860,19 @@ impl PrimitiveStructuralEncoder {
         field: Field,
         encoding_metadata: Arc<HashMap<String, String>>,
     ) -> Result<Self> {
+        let requests_sparse = encoding_metadata
+            .get(STRUCTURAL_ENCODING_META_KEY)
+            .is_some_and(|requested| requested.eq_ignore_ascii_case(STRUCTURAL_ENCODING_SPARSE));
+        if requests_sparse && options.version.resolve() < LanceFileVersion::V2_3 {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "Field '{}' requests sparse structural encoding, which requires Lance file format 2.3+; current version is {}",
+                    field.name,
+                    options.version.resolve()
+                )
+                .into(),
+            ));
+        }
         Ok(Self {
             accumulation_queue: AccumulationQueue::new(
                 options.cache_bytes_per_column,
@@ -4362,7 +4402,7 @@ impl PrimitiveStructuralEncoder {
             return Ok(None);
         }
         let mut validity = BooleanBufferBuilder::new(num_values);
-        unraveler.unravel_validity(&mut validity);
+        unraveler.unravel_validity(&mut validity)?;
         Ok(Some(validity.finish()))
     }
 
@@ -5302,19 +5342,23 @@ impl PrimitiveStructuralEncoder {
         if budget == MiniBlockRepDefBudget::WithinBudget {
             return Ok(vec![PrimitivePageData {
                 arrays,
-                repdef,
+                structure: PrimitivePageStructure::Dense {
+                    repdef,
+                    single_row_miniblock_repdef_levels: None,
+                },
                 row_number,
                 num_rows,
-                single_row_miniblock_repdef_levels: None,
             }]);
         }
         if let MiniBlockRepDefBudget::SingleRowOverBudget(num_levels) = budget {
             return Ok(vec![PrimitivePageData {
                 arrays,
-                repdef,
+                structure: PrimitivePageStructure::Dense {
+                    repdef,
+                    single_row_miniblock_repdef_levels: Some(num_levels),
+                },
                 row_number,
                 num_rows,
-                single_row_miniblock_repdef_levels: Some(num_levels),
             }]);
         }
 
@@ -5328,10 +5372,12 @@ impl PrimitiveStructuralEncoder {
             let repdef = Self::slice_repdef(&repdef, split.level_range);
             pages.push(PrimitivePageData {
                 arrays,
-                repdef,
+                structure: PrimitivePageStructure::Dense {
+                    repdef,
+                    single_row_miniblock_repdef_levels: None,
+                },
                 row_number: row_number + split.row_start,
                 num_rows: split.num_rows,
-                single_row_miniblock_repdef_levels: None,
             });
         }
         Ok(pages)
@@ -5350,12 +5396,36 @@ impl PrimitiveStructuralEncoder {
         } = ctx;
         let PrimitivePageData {
             arrays,
-            repdef,
+            structure,
             row_number,
             num_rows,
-            single_row_miniblock_repdef_levels,
         } = page;
         let num_values = arrays.iter().map(|arr| arr.len() as u64).sum();
+
+        let (repdef, single_row_miniblock_repdef_levels) = match structure {
+            PrimitivePageStructure::Dense {
+                repdef,
+                single_row_miniblock_repdef_levels,
+            } => (repdef, single_row_miniblock_repdef_levels),
+            PrimitivePageStructure::Sparse(plan) => {
+                log::debug!(
+                    "Encoding column {} with {} visible items ({} rows) using sparse layout",
+                    column_idx,
+                    num_values,
+                    num_rows
+                );
+                return sparse::writer::encode_page(
+                    column_idx,
+                    &field,
+                    compression_strategy.as_ref(),
+                    DataBlock::from_arrays(&arrays, num_values),
+                    plan,
+                    row_number,
+                    num_rows,
+                    support_large_chunk,
+                );
+            }
+        };
 
         if num_values == 0 {
             // This page contains only structural events, such as empty/null list rows.
@@ -5663,20 +5733,39 @@ impl PrimitiveStructuralEncoder {
         let num_values = arrays.iter().map(|arr| arr.len() as u64).sum();
         let is_simple_validity = repdefs.iter().all(|rd| rd.is_simple_validity());
         let has_repdef_info = repdefs.iter().any(|rd| !rd.is_empty());
-        let (repdef, miniblock_repdef_budget) =
-            RepDefBuilder::serialize_with_miniblock_repdef_budget(
-                repdefs,
-                miniblock::max_repdef_levels_per_chunk,
-                num_rows,
-                num_values,
-            )?;
-        let pages = Self::split_pages_for_miniblock_repdef_budget(
-            arrays,
-            repdef,
-            miniblock_repdef_budget,
-            row_number,
-            num_rows,
-        )?;
+        let normalized = RepDefBuilder::normalize(repdefs);
+        let requests_sparse = self
+            .encoding_metadata
+            .get(STRUCTURAL_ENCODING_META_KEY)
+            .is_some_and(|requested| requested.eq_ignore_ascii_case(STRUCTURAL_ENCODING_SPARSE));
+        let sparse_plan = requests_sparse
+            .then(|| sparse::writer::plan(&normalized, num_values))
+            .transpose()?;
+        let pages = match sparse_plan {
+            Some(plan) if !sparse::writer::uses_constant_layout(&plan, &self.field) => {
+                vec![PrimitivePageData {
+                    arrays,
+                    structure: PrimitivePageStructure::Sparse(plan),
+                    row_number,
+                    num_rows,
+                }]
+            }
+            _ => {
+                let (repdef, miniblock_repdef_budget) = normalized
+                    .serialize_with_miniblock_repdef_budget(
+                        miniblock::max_repdef_levels_per_chunk,
+                        num_rows,
+                        num_values,
+                    )?;
+                Self::split_pages_for_miniblock_repdef_budget(
+                    arrays,
+                    repdef,
+                    miniblock_repdef_budget,
+                    row_number,
+                    num_rows,
+                )?
+            }
+        };
 
         let mut tasks = Vec::with_capacity(pages.len());
         let ctx = PrimitiveEncodeContext {

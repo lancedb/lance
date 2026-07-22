@@ -409,7 +409,6 @@ public class MemWalTest {
       ShardWriterConfig config =
           new ShardWriterConfig()
               .withDurableWrite(true)
-              .withSyncIndexedWrite(true)
               .withMaxWalBufferSize(1)
               .withMaxWalFlushIntervalMs(10);
 

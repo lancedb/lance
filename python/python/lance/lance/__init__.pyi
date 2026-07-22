@@ -403,6 +403,14 @@ class _Dataset:
         io_buffer_size: Optional[int] = None,
         preserve_order: Optional[bool] = None,
     ) -> List[Tuple[int, bytes]]: ...
+    def read_blob_ranges(
+        self,
+        requests: List[Tuple[int, int, int]],
+        blob_column: str,
+        selector: Literal["ids", "addresses", "indices"],
+        io_buffer_size: Optional[int] = None,
+        preserve_order: Optional[bool] = None,
+    ) -> List[Tuple[int, int, bytes]]: ...
     def take_scan(
         self,
         row_slices: Iterable[Tuple[int, int]],
@@ -606,6 +614,13 @@ class _MergeInsertBuilder:
     def target_bases(self, bases: list[str]) -> Self: ...
     def target_all_bases(self, include_primary: bool = True) -> Self: ...
     def execute(self, new_data: pa.RecordBatchReader) -> ExecuteResult: ...
+    def execute_batches(self, new_data: pa.RecordBatchReader) -> ExecuteResult: ...
+    def execute_uncommitted(
+        self, new_data: pa.RecordBatchReader
+    ) -> tuple[Transaction, ExecuteResult]: ...
+    def execute_uncommitted_batches(
+        self, new_data: pa.RecordBatchReader
+    ) -> tuple[Transaction, ExecuteResult]: ...
 
 class _Scanner:
     @property
