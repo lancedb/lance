@@ -846,6 +846,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_manifest_version_conflict_detection() {
+        let (store, base_path, _controls) = failing_memory_store().await;
+        let shard_id = Uuid::new_v4();
+        let manifest_store = ShardManifestStore::new(store, &base_path, shard_id, 2);
+        let manifest = create_test_manifest(shard_id, 1, 1);
+
+        manifest_store.write(&manifest).await.unwrap();
+        let conflict = manifest_store.write(&manifest).await.unwrap_err();
+        assert!(is_manifest_version_conflict(&conflict));
+        assert!(conflict.to_string().contains("already exists"));
+
+        assert!(!is_manifest_version_conflict(&Error::io(
+            "ordinary manifest I/O failure"
+        )));
+    }
+
+    #[tokio::test]
     async fn test_claim_epoch_refuses_sealed_manifest() {
         // A `Sealed` manifest is the drop-table 2PC in-doubt marker:
         // `claim_epoch` must refuse it with a distinguishable error rather

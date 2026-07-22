@@ -23,7 +23,7 @@ use lance_io::object_store::{
     ObjectStore, ObjectStoreParams, ObjectStoreRegistry, WrappingObjectStore,
 };
 
-/// Knobs controlling injected WAL-entry write failures, shared with the test.
+/// Knobs controlling injected WAL and manifest write failures, shared with tests.
 #[derive(Debug, Default)]
 pub struct FailControls {
     /// Remaining WAL-entry `put_opts` calls to fail; saturates at 0. Set high to
@@ -57,10 +57,30 @@ impl FailControls {
     pub fn attempts(&self) -> usize {
         self.wal_put_attempts.load(Ordering::SeqCst)
     }
-    pub fn fail_manifest_puts(&self, n: usize) {
+    /// Fail the next `n` versioned manifest writes.
+    ///
+    /// Configure the [`FailControls`] returned by [`failing_memory_store`] before
+    /// invoking the manifest operation under test:
+    ///
+    /// ```text
+    /// let (_, _, controls) = failing_memory_store().await;
+    /// controls.fail_manifest_puts(1);
+    /// ```
+    pub(crate) fn fail_manifest_puts(&self, n: usize) {
         self.manifest_put_failures.store(n, Ordering::SeqCst);
     }
-    pub fn set_manifest_lost_ack(&self, v: bool) {
+
+    /// Commit failed manifest writes before returning the injected error.
+    ///
+    /// Use this with [`Self::fail_manifest_puts`] to simulate a lost
+    /// acknowledgement:
+    ///
+    /// ```text
+    /// let (_, _, controls) = failing_memory_store().await;
+    /// controls.set_manifest_lost_ack(true);
+    /// controls.fail_manifest_puts(1);
+    /// ```
+    pub(crate) fn set_manifest_lost_ack(&self, v: bool) {
         self.simulate_manifest_lost_ack.store(v, Ordering::SeqCst);
     }
 

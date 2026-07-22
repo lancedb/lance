@@ -1704,6 +1704,7 @@ mod tests {
     use crate::dataset::mem_wal::test_util::failing_memory_store;
     use arrow_array::{Int32Array, StringArray};
     use arrow_schema::{DataType, Field, Schema};
+    use rstest::rstest;
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -1734,26 +1735,21 @@ mod tests {
         .unwrap()
     }
 
-    #[test]
-    fn test_wal_flush_failure_preserves_wrapped_fence_reason() {
-        for (error, expected) in [
-            (
-                Error::fenced_by_peer("peer claimed a newer epoch"),
-                FenceReason::PeerClaimedEpoch,
-            ),
-            (
-                Error::writer_poisoned("WAL persistence failed"),
-                FenceReason::PersistenceFailure,
-            ),
-        ] {
-            let wrapped = Error::wrapped(Box::new(error));
-            let restored = WalFlushFailure::from_error(&wrapped).into_error();
-            assert_eq!(restored.fence_reason(), Some(expected));
-            assert_eq!(
-                restored.is_mem_wal_fenced(),
-                expected == FenceReason::PeerClaimedEpoch
-            );
-        }
+    #[rstest]
+    #[case::peer(FenceReason::PeerClaimedEpoch)]
+    #[case::persistence(FenceReason::PersistenceFailure)]
+    fn test_wal_flush_failure_preserves_wrapped_fence_reason(#[case] expected: FenceReason) {
+        let error = match expected {
+            FenceReason::PeerClaimedEpoch => Error::fenced_by_peer("peer claimed a newer epoch"),
+            FenceReason::PersistenceFailure => Error::writer_poisoned("WAL persistence failed"),
+        };
+        let wrapped = Error::wrapped(Box::new(error));
+        let restored = WalFlushFailure::from_error(&wrapped).into_error();
+        assert_eq!(restored.fence_reason(), Some(expected));
+        assert_eq!(
+            restored.is_mem_wal_fenced(),
+            expected == FenceReason::PeerClaimedEpoch
+        );
     }
 
     fn build_test_flusher(

@@ -340,13 +340,13 @@ impl MemTable {
             .map(|cell| cell.reader())
     }
 
-    pub(crate) fn create_typed_memtable_flush_completion(&self) -> MemTableFlushWatcher {
+    pub(crate) fn create_typed_memtable_flush_completion(&self) -> Result<MemTableFlushWatcher> {
         self.typed_memtable_flush_completion
             .lock()
-            .unwrap()
+            .map_err(|_| Error::internal("typed memtable flush completion mutex poisoned"))?
             .as_ref()
-            .expect("typed memtable flush completion cell should exist")
-            .reader()
+            .map(|cell| cell.reader())
+            .ok_or_else(|| Error::internal("typed memtable flush completion already signaled"))
     }
 
     /// Signal that the memtable flush has finished, with the outcome.
@@ -356,14 +356,23 @@ impl MemTable {
     /// (e.g. `ShardWriter::wait_for_flush_drain`) sees the closed channel
     /// and returns `Err` instead of receiving the actual outcome.
     pub fn signal_memtable_flush_complete(&self, result: DurabilityResult) {
-        if let Some(cell) = self.memtable_flush_completion.lock().unwrap().take() {
+        let cell = self.memtable_flush_completion.lock().unwrap().take();
+        if let Some(cell) = cell {
             cell.write(result);
+        } else {
+            debug_assert!(false, "memtable flush completion signaled more than once");
         }
     }
 
     pub(crate) fn signal_typed_memtable_flush_complete(&self, result: MemTableFlushResult) {
-        if let Some(cell) = self.typed_memtable_flush_completion.lock().unwrap().take() {
+        let cell = self.typed_memtable_flush_completion.lock().unwrap().take();
+        if let Some(cell) = cell {
             cell.write(result);
+        } else {
+            debug_assert!(
+                false,
+                "typed memtable flush completion signaled more than once"
+            );
         }
     }
 
@@ -863,6 +872,55 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_typed_memtable_flush_completion_reports_result() {
+        let memtable = MemTable::new(create_test_schema(), 1, vec![]).unwrap();
+        let mut watcher = memtable.create_typed_memtable_flush_completion().unwrap();
+
+        memtable.signal_typed_memtable_flush_complete(Ok(()));
+        assert!(matches!(watcher.await_value().await, Some(Ok(()))));
+
+        let error = memtable
+            .create_typed_memtable_flush_completion()
+            .expect_err("completion reader should not be created after signaling");
+        assert!(error.to_string().contains("already signaled"));
+    }
+
+    #[test]
+    fn test_typed_memtable_flush_completion_reports_poisoned_mutex() {
+        let memtable = MemTable::new(create_test_schema(), 1, vec![]).unwrap();
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = memtable.typed_memtable_flush_completion.lock().unwrap();
+            panic!("poison typed completion mutex");
+        }));
+        assert!(poisoned.is_err());
+
+        let error = memtable
+            .create_typed_memtable_flush_completion()
+            .expect_err("completion reader should not be created from a poisoned mutex");
+        assert!(error.to_string().contains("mutex poisoned"));
+    }
+
+    #[test]
+    fn test_duplicate_memtable_flush_completion_is_detected() {
+        let memtable = MemTable::new(create_test_schema(), 1, vec![]).unwrap();
+        memtable.signal_memtable_flush_complete(DurabilityResult::ok());
+        let duplicate = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            memtable.signal_memtable_flush_complete(DurabilityResult::ok());
+        }));
+        assert_eq!(duplicate.is_err(), cfg!(debug_assertions));
+    }
+
+    #[test]
+    fn test_duplicate_typed_memtable_flush_completion_is_detected() {
+        let memtable = MemTable::new(create_test_schema(), 1, vec![]).unwrap();
+        memtable.signal_typed_memtable_flush_complete(Ok(()));
+        let duplicate = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            memtable.signal_typed_memtable_flush_complete(Ok(()));
+        }));
+        assert_eq!(duplicate.is_err(), cfg!(debug_assertions));
     }
 
     #[tokio::test]

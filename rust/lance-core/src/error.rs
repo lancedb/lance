@@ -1033,6 +1033,7 @@ impl<T: Clone> From<Result<T>> for CloneableResult<T> {
 #[cfg(test)]
 mod test {
     use super::*;
+    use rstest::rstest;
     use std::error::Error as _;
     use std::fmt;
 
@@ -1058,22 +1059,25 @@ mod test {
         assert!(!wrapped.is_mem_wal_fenced());
     }
 
-    #[test]
-    fn cloneable_error_preserves_nested_fence_reason() {
-        for (error, expected) in [
-            (
-                Error::fenced_by_peer("peer fence"),
-                FenceReason::PeerClaimedEpoch,
-            ),
-            (
-                Error::writer_poisoned("persistence fence"),
-                FenceReason::PersistenceFailure,
-            ),
-        ] {
-            let wrapped = Error::wrapped(Box::new(error));
-            let cloned = CloneableError(wrapped).clone();
-            assert_eq!(cloned.0.fence_reason(), Some(expected));
-        }
+    #[rstest]
+    #[case::direct_peer(false, FenceReason::PeerClaimedEpoch)]
+    #[case::direct_persistence(false, FenceReason::PersistenceFailure)]
+    #[case::nested_peer(true, FenceReason::PeerClaimedEpoch)]
+    #[case::nested_persistence(true, FenceReason::PersistenceFailure)]
+    fn cloneable_error_preserves_fence_reason(#[case] nested: bool, #[case] expected: FenceReason) {
+        let error = match expected {
+            FenceReason::PeerClaimedEpoch => Error::fenced_by_peer("peer fence"),
+            FenceReason::PersistenceFailure => Error::writer_poisoned("persistence fence"),
+        };
+        let error = if nested {
+            Error::wrapped(Box::new(error))
+        } else {
+            error
+        };
+        let original = CloneableError(error);
+        let cloned = original.clone();
+        assert_eq!(original.0.fence_reason(), Some(expected));
+        assert_eq!(cloned.0.fence_reason(), Some(expected));
     }
 
     #[test]

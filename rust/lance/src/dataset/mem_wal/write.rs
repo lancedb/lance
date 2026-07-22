@@ -1253,7 +1253,7 @@ impl SharedWriterState {
         // its cells and a failed send below can poison-and-return without leaving
         // partial state to unwind.
         let _memtable_flush_watcher = old_memtable.create_memtable_flush_completion();
-        let typed_memtable_flush_watcher = old_memtable.create_typed_memtable_flush_completion();
+        let typed_memtable_flush_watcher = old_memtable.create_typed_memtable_flush_completion()?;
 
         // The outgoing memtable may still owe an index apply — the puts that
         // filled it triggered one, but the task need not have drained yet, and
