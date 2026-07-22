@@ -100,6 +100,18 @@ impl EvaluatedIndex {
             applicable_fragments,
         })
     }
+
+    /// Block `rows` (stale overlay row addresses) from the index result so the index never
+    /// emits them. Their fragments stay in the covered set, so non-stale rows keep the index;
+    /// the blocked rows are re-evaluated against their current (overlay-merged) values on a
+    /// separate targeted take path built by the scanner.
+    fn without_rows(mut self, block_list: &RowAddrTreeMap) -> Self {
+        self.index_result.upper =
+            std::mem::take(&mut self.index_result.upper).also_block(block_list.clone());
+        self.index_result.lower =
+            std::mem::take(&mut self.index_result.lower).also_block(block_list.clone());
+        self
+    }
 }
 
 /// A fragment along with ranges of row offsets to read
@@ -1505,6 +1517,12 @@ pub struct FilteredReadOptions {
     pub io_buffer_size_bytes: Option<u64>,
     /// If true, skip fragments that are not covered by the scalar index result.
     pub only_indexed_fragments: bool,
+    /// Row addresses whose index entries may be stale because an overlay committed after the
+    /// index was built touches an indexed field. They are blocked from the index result so the
+    /// index never emits them; the scanner re-evaluates just these rows against their current
+    /// (overlay-merged) values on a targeted take path. Their fragments stay in the covered set,
+    /// so non-stale rows keep the index. `None` on the common no-overlay fast path.
+    pub overlay_block: Option<RowAddrMask>,
 }
 
 impl FilteredReadOptions {
@@ -1534,10 +1552,18 @@ impl FilteredReadOptions {
             full_filter: None,
             io_buffer_size_bytes: None,
             only_indexed_fragments: false,
+            overlay_block: None,
             threading_mode: FilteredReadThreadingMode::OnePartitionMultipleThreads(
                 get_num_compute_intensive_cpus(),
             ),
         }
+    }
+
+    /// Block the given stale overlay row addresses (see the `overlay_block` field) from the
+    /// scalar index result so the index never emits them.
+    pub fn with_overlay_block(mut self, block: RowAddrMask) -> Self {
+        self.overlay_block = Some(block);
+        self
     }
 
     /// Include deleted rows in the scan
@@ -2117,9 +2143,15 @@ impl FilteredReadExec {
                     let index_search_result = index_search.next().await.ok_or_else(|| {
                         Error::internal("Index search did not yield any results".to_string())
                     })??;
-                    evaluated_index = Some(Arc::new(EvaluatedIndex::try_from_arrow(
-                        &index_search_result,
-                    )?));
+                    let mut idx = EvaluatedIndex::try_from_arrow(&index_search_result)?;
+                    // `overlay_block` is always constructed as a block list (see
+                    // `Scanner::stale_rows_block_mask`), so `block_list()` is always `Some`.
+                    if let Some(block_list) =
+                        options.overlay_block.as_ref().and_then(|b| b.block_list())
+                    {
+                        idx = idx.without_rows(block_list);
+                    }
+                    evaluated_index = Some(Arc::new(idx));
                 }
 
                 // Load fragments to compute the plan

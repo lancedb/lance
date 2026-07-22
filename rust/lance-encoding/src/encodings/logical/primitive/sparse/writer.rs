@@ -346,6 +346,30 @@ pub(in crate::encodings::logical::primitive) fn uses_constant_layout(
     }
 }
 
+fn supports_fixed_size_list_values(data: &DataBlock) -> bool {
+    match data {
+        DataBlock::FixedWidth(_) => true,
+        DataBlock::FixedSizeList(list) => supports_fixed_size_list_values(list.child.as_ref()),
+        DataBlock::Nullable(nullable) => supports_fixed_size_list_values(nullable.data.as_ref()),
+        _ => false,
+    }
+}
+
+/// Whether the sparse writer can encode this value block without changing its value path.
+pub fn supports_value_block(data: &DataBlock) -> bool {
+    match data {
+        DataBlock::FixedWidth(_) | DataBlock::VariableWidth(_) => true,
+        DataBlock::Struct(data) => !data.has_variable_width_child(),
+        DataBlock::FixedSizeList(data) => supports_fixed_size_list_values(data.child.as_ref()),
+        DataBlock::Empty()
+        | DataBlock::Constant(_)
+        | DataBlock::AllNull(_)
+        | DataBlock::Nullable(_)
+        | DataBlock::Opaque(_)
+        | DataBlock::Dictionary(_) => false,
+    }
+}
+
 struct SparseMiniBlockChunk {
     buffer_sizes: Vec<u32>,
     num_values: u32,
@@ -360,6 +384,17 @@ struct SerializedValuePage {
     num_buffers: u64,
     data: LanceBuffer,
     metadata: LanceBuffer,
+}
+
+pub struct PreparedSparseValues {
+    num_values: u64,
+    value_compression: CompressiveEncoding,
+    values: SerializedValuePage,
+}
+
+pub enum SparseValueInput {
+    Unprepared(DataBlock),
+    Prepared(PreparedSparseValues),
 }
 
 struct EncodedStructuralPlan {
@@ -498,6 +533,43 @@ fn serialize_value_chunks(
         num_buffers: usize_to_u64(num_buffers, "value buffer count")?,
         data: LanceBuffer::from(data_buffer),
         metadata: LanceBuffer::from(metadata),
+    })
+}
+
+pub fn prepare_values(
+    field: &Field,
+    compression_strategy: &dyn CompressionStrategy,
+    data: DataBlock,
+    support_large_chunk: bool,
+) -> Result<PreparedSparseValues> {
+    match &data {
+        DataBlock::AllNull(_) => {
+            return Err(Error::internal(
+                "All-null values must use ConstantLayout".to_string(),
+            ));
+        }
+        DataBlock::Dictionary(_) => {
+            return Err(Error::not_supported_source(
+                "Sparse layout does not support dictionary data blocks".into(),
+            ));
+        }
+        DataBlock::Struct(data) if data.has_variable_width_child() => {
+            return Err(Error::not_supported_source(
+                "Sparse layout does not support variable-width packed struct data blocks".into(),
+            ));
+        }
+        _ => {}
+    }
+
+    let num_values = data.num_values();
+    let compressor = compression_strategy.create_miniblock_compressor(field, &data)?;
+    let (compressed, value_compression) = compressor.compress(data)?;
+    let values =
+        serialize_value_chunks(with_explicit_value_counts(compressed)?, support_large_chunk)?;
+    Ok(PreparedSparseValues {
+        num_values,
+        value_compression,
+        values,
     })
 }
 
@@ -749,42 +821,28 @@ pub(in crate::encodings::logical::primitive) fn encode_page(
     column_idx: u32,
     field: &Field,
     compression_strategy: &dyn CompressionStrategy,
-    data: DataBlock,
+    values: SparseValueInput,
     plan: SparseStructuralPlan,
     row_number: u64,
     num_rows: u64,
     support_large_chunk: bool,
 ) -> Result<EncodedPage> {
-    if plan.num_visible_items != data.num_values() {
+    let PreparedSparseValues {
+        num_values,
+        value_compression,
+        values,
+    } = match values {
+        SparseValueInput::Unprepared(data) => {
+            prepare_values(field, compression_strategy, data, support_large_chunk)?
+        }
+        SparseValueInput::Prepared(prepared) => prepared,
+    };
+    if plan.num_visible_items != num_values {
         return Err(Error::internal(format!(
             "Sparse structural plan has {} visible items but data has {} values",
-            plan.num_visible_items,
-            data.num_values()
+            plan.num_visible_items, num_values
         )));
     }
-    match &data {
-        DataBlock::AllNull(_) => {
-            return Err(Error::internal(
-                "All-null values must use ConstantLayout".to_string(),
-            ));
-        }
-        DataBlock::Dictionary(_) => {
-            return Err(Error::not_supported_source(
-                "Sparse layout does not support dictionary data blocks".into(),
-            ));
-        }
-        DataBlock::Struct(data) if data.has_variable_width_child() => {
-            return Err(Error::not_supported_source(
-                "Sparse layout does not support variable-width packed struct data blocks".into(),
-            ));
-        }
-        _ => {}
-    }
-
-    let compressor = compression_strategy.create_miniblock_compressor(field, &data)?;
-    let (compressed, value_compression) = compressor.compress(data)?;
-    let values =
-        serialize_value_chunks(with_explicit_value_counts(compressed)?, support_large_chunk)?;
     let structural = encode_structural_plan(&plan, compression_strategy)?;
     let description = pb21::PageLayout {
         layout: Some(pb21::page_layout::Layout::SparseLayout(
@@ -817,17 +875,20 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use arrow_array::{
-        Array, ArrayRef, FixedSizeListArray, Int32Array, LargeListArray, ListArray, StructArray,
+        Array, ArrayRef, DictionaryArray, FixedSizeBinaryArray, FixedSizeListArray, Int8Array,
+        Int32Array, LargeListArray, ListArray, StringArray, StructArray,
         builder::{Int32Builder, MapBuilder, StringBuilder},
+        types::Int8Type,
     };
     use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field as ArrowField, Fields};
 
     use crate::{
         constants::{
-            STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY,
+            PACKED_STRUCT_META_KEY, STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY,
             STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_SPARSE,
         },
+        data::FixedSizeListBlock,
         encoder::{
             ColumnIndexSequence, EncodingOptions, FieldEncoder, MIN_PAGE_BUFFER_ALIGNMENT,
             OutOfLineBuffers, default_encoding_strategy,
@@ -865,6 +926,101 @@ mod tests {
             )
             .unwrap(),
         )
+    }
+
+    fn sparse_list_values(
+        num_rows: usize,
+        stride: usize,
+        values: ArrayRef,
+        item_field: Arc<ArrowField>,
+    ) -> ArrayRef {
+        let mut offsets = Vec::with_capacity(num_rows + 1);
+        let mut num_values = 0_i32;
+        offsets.push(num_values);
+        for row in 0..num_rows {
+            if (row + 1).is_multiple_of(stride) || row + 1 == num_rows {
+                num_values += 1;
+            }
+            offsets.push(num_values);
+        }
+        assert_eq!(values.len(), num_values as usize);
+        Arc::new(
+            ListArray::try_new(
+                item_field,
+                OffsetBuffer::new(ScalarBuffer::from(offsets)),
+                values,
+                None,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn sparse_i32_list(num_rows: usize, stride: usize) -> ArrayRef {
+        let num_values = num_rows.div_ceil(stride);
+        sparse_list_values(
+            num_rows,
+            stride,
+            Arc::new(Int32Array::from_iter_values(0..num_values as i32)),
+            Arc::new(ArrowField::new("item", DataType::Int32, true)),
+        )
+    }
+
+    fn unsplittable_nested_list(values: ArrayRef, item_field: Arc<ArrowField>) -> ArrayRef {
+        const NUM_INNER_LISTS: usize = 70_000;
+
+        let mut inner_offsets = vec![0_i32; NUM_INNER_LISTS + 1];
+        assert!(!values.is_empty());
+        assert!(values.len() <= NUM_INNER_LISTS);
+        for value_index in 1..=values.len() {
+            inner_offsets[NUM_INNER_LISTS - values.len() + value_index] = value_index as i32;
+        }
+        let inner = Arc::new(
+            ListArray::try_new(
+                item_field,
+                OffsetBuffer::new(ScalarBuffer::from(inner_offsets)),
+                values,
+                None,
+            )
+            .unwrap(),
+        ) as ArrayRef;
+        Arc::new(
+            ListArray::try_new(
+                Arc::new(ArrowField::new("item", inner.data_type().clone(), true)),
+                OffsetBuffer::new(ScalarBuffer::from(vec![0_i32, NUM_INNER_LISTS as i32])),
+                inner,
+                None,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn variable_packed_struct_values(num_values: usize) -> (ArrayRef, Arc<ArrowField>) {
+        let fields = Fields::from(vec![ArrowField::new("value", DataType::Utf8, false)]);
+        let values = Arc::new(StructArray::new(
+            fields.clone(),
+            vec![Arc::new(StringArray::from_iter_values(
+                (0..num_values).map(|index| format!("value-{index}")),
+            ))],
+            None,
+        )) as ArrayRef;
+        let item_field = Arc::new(
+            ArrowField::new("item", DataType::Struct(fields), true).with_metadata(HashMap::from([
+                (PACKED_STRUCT_META_KEY.to_string(), "true".to_string()),
+            ])),
+        );
+        (values, item_field)
+    }
+
+    fn dictionary_values(num_values: usize) -> (ArrayRef, Arc<ArrowField>) {
+        let keys = Int8Array::from_iter_values((0..num_values).map(|index| (index % 2) as i8));
+        let values = Arc::new(StringArray::from(vec!["value-0", "value-1"]));
+        let dictionary = Arc::new(DictionaryArray::<Int8Type>::try_new(keys, values).unwrap());
+        let item_field = Arc::new(ArrowField::new(
+            "item",
+            dictionary.data_type().clone(),
+            true,
+        ));
+        (dictionary, item_field)
     }
 
     fn large_list_i32(offsets: Vec<i64>, validity: Option<Vec<bool>>) -> ArrayRef {
@@ -1142,6 +1298,64 @@ mod tests {
             }
             _ => None,
         }
+    }
+
+    #[test]
+    fn test_sparse_value_block_eligibility() {
+        let fixed = DataBlock::from_array(Int32Array::from_iter_values(0..4));
+        assert!(supports_value_block(&fixed));
+
+        let variable = DataBlock::from_array(StringArray::from(vec!["a", "b"]));
+        assert!(supports_value_block(&variable));
+
+        let nullable = DataBlock::from_array(Int32Array::from(vec![Some(1), None]));
+        assert!(!supports_value_block(&nullable));
+
+        let all_null = DataBlock::from_array(Int32Array::from(vec![None, None]));
+        assert!(!supports_value_block(&all_null));
+
+        let (dictionary, _) = dictionary_values(4);
+        assert!(!supports_value_block(&DataBlock::from_arrays(
+            &[dictionary],
+            4
+        )));
+
+        let fixed_fields = Fields::from(vec![ArrowField::new("value", DataType::Int32, false)]);
+        let fixed_struct = StructArray::new(
+            fixed_fields,
+            vec![Arc::new(Int32Array::from_iter_values(0..4))],
+            None,
+        );
+        assert!(supports_value_block(&DataBlock::from_array(fixed_struct)));
+
+        let variable_fields = Fields::from(vec![ArrowField::new("value", DataType::Utf8, false)]);
+        let variable_struct = StructArray::new(
+            variable_fields,
+            vec![Arc::new(StringArray::from(vec!["a", "b"]))],
+            None,
+        );
+        assert!(!supports_value_block(&DataBlock::from_array(
+            variable_struct
+        )));
+
+        let fixed_size_list = FixedSizeListArray::try_new(
+            Arc::new(ArrowField::new("item", DataType::Int32, false)),
+            2,
+            Arc::new(Int32Array::from_iter_values(0..4)),
+            None,
+        )
+        .unwrap();
+        assert!(supports_value_block(&DataBlock::from_array(
+            fixed_size_list
+        )));
+
+        let unsupported_fixed_size_list = DataBlock::FixedSizeList(FixedSizeListBlock {
+            child: Box::new(DataBlock::from_array(StringArray::from(vec![
+                "a", "b", "c", "d",
+            ]))),
+            dimension: 2,
+        });
+        assert!(!supports_value_block(&unsupported_fixed_size_list));
     }
 
     fn planned_list(
@@ -1782,6 +1996,325 @@ mod tests {
             page_layout(&v2_3_sparse[0]),
             pb21::page_layout::Layout::SparseLayout(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn test_auto_sparse_for_split_required_page() {
+        const NUM_ROWS: usize = 70_000;
+        let array = sparse_i32_list(NUM_ROWS, 2_000);
+
+        let within_budget = encode_pages(
+            sparse_i32_list(4_096, 1_024),
+            LanceFileVersion::V2_3,
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(within_budget.len(), 1);
+        assert!(matches!(
+            page_layout(&within_budget[0]),
+            pb21::page_layout::Layout::MiniBlockLayout(_)
+        ));
+
+        let automatic = encode_pages(array.clone(), LanceFileVersion::V2_3, HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(automatic.len(), 1);
+        assert!(matches!(
+            page_layout(&automatic[0]),
+            pb21::page_layout::Layout::SparseLayout(_)
+        ));
+
+        let miniblock = encode_pages(
+            array.clone(),
+            LanceFileVersion::V2_3,
+            structural_metadata(STRUCTURAL_ENCODING_MINIBLOCK),
+        )
+        .await
+        .unwrap();
+        assert!(miniblock.len() > 1);
+        assert!(miniblock.iter().all(|page| matches!(
+            page_layout(page),
+            pb21::page_layout::Layout::MiniBlockLayout(_)
+        )));
+
+        let fullzip = encode_pages(
+            array.clone(),
+            LanceFileVersion::V2_3,
+            structural_metadata(STRUCTURAL_ENCODING_FULLZIP),
+        )
+        .await
+        .unwrap();
+        assert_eq!(fullzip.len(), miniblock.len());
+        assert!(fullzip.iter().all(|page| matches!(
+            page_layout(page),
+            pb21::page_layout::Layout::FullZipLayout(_)
+        )));
+
+        let sparse = encode_pages(array.clone(), LanceFileVersion::V2_3, sparse_metadata())
+            .await
+            .unwrap();
+        assert_eq!(sparse.len(), 1);
+        assert!(matches!(
+            page_layout(&sparse[0]),
+            pb21::page_layout::Layout::SparseLayout(_)
+        ));
+
+        let v2_2_default = encode_pages(array.clone(), LanceFileVersion::V2_2, HashMap::new())
+            .await
+            .unwrap();
+        let v2_2_miniblock = encode_pages(
+            array.clone(),
+            LanceFileVersion::V2_2,
+            structural_metadata(STRUCTURAL_ENCODING_MINIBLOCK),
+        )
+        .await
+        .unwrap();
+        assert_eq!(v2_2_default.len(), v2_2_miniblock.len());
+        for (default, explicit) in v2_2_default.iter().zip(v2_2_miniblock.iter()) {
+            assert_eq!(page_layout(default), page_layout(explicit));
+            assert_eq!(default.data, explicit.data);
+        }
+
+        let cases = TestCases::default()
+            .with_min_file_version(LanceFileVersion::V2_3)
+            .with_max_file_version(LanceFileVersion::V2_3)
+            .with_page_sizes(vec![1024 * 1024])
+            .with_batch_size(NUM_ROWS as u32)
+            .with_range(1_999..2_002)
+            .with_indices(vec![0, 1_999, 2_000, NUM_ROWS as u64 - 1]);
+        check_round_trip_encoding_of_data(vec![array], &cases, HashMap::new()).await;
+    }
+
+    #[tokio::test]
+    async fn test_auto_sparse_for_single_row_over_budget() {
+        let array = unsplittable_nested_list(
+            Arc::new(Int32Array::from(vec![42, 43])),
+            Arc::new(ArrowField::new("item", DataType::Int32, true)),
+        );
+
+        let automatic = encode_pages(array.clone(), LanceFileVersion::V2_3, HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(automatic.len(), 1);
+        assert!(matches!(
+            page_layout(&automatic[0]),
+            pb21::page_layout::Layout::SparseLayout(_)
+        ));
+
+        let v2_2 = encode_pages(array.clone(), LanceFileVersion::V2_2, HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(v2_2.len(), 1);
+        assert!(matches!(
+            page_layout(&v2_2[0]),
+            pb21::page_layout::Layout::FullZipLayout(_)
+        ));
+
+        let miniblock_error = encode_pages(
+            array.clone(),
+            LanceFileVersion::V2_3,
+            structural_metadata(STRUCTURAL_ENCODING_MINIBLOCK),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            miniblock_error
+                .to_string()
+                .contains("Mini-block cannot encode 70000 rep/def levels")
+        );
+
+        let fullzip = encode_pages(
+            array.clone(),
+            LanceFileVersion::V2_3,
+            structural_metadata(STRUCTURAL_ENCODING_FULLZIP),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            page_layout(&fullzip[0]),
+            pb21::page_layout::Layout::FullZipLayout(_)
+        ));
+
+        let explicit_sparse =
+            encode_pages(array.clone(), LanceFileVersion::V2_3, sparse_metadata())
+                .await
+                .unwrap();
+        assert!(matches!(
+            page_layout(&explicit_sparse[0]),
+            pb21::page_layout::Layout::SparseLayout(_)
+        ));
+
+        let cases = TestCases::default()
+            .with_min_file_version(LanceFileVersion::V2_3)
+            .with_max_file_version(LanceFileVersion::V2_3)
+            .with_range(0..1)
+            .with_indices(vec![0]);
+        check_round_trip_encoding_of_data(vec![array], &cases, HashMap::new()).await;
+    }
+
+    #[tokio::test]
+    async fn test_auto_sparse_keeps_unsupported_values_dense() {
+        const NUM_ROWS: usize = 70_000;
+        let num_values = NUM_ROWS.div_ceil(2_000);
+
+        let (dictionary, dictionary_field) = dictionary_values(num_values);
+        let dictionary_array = sparse_list_values(NUM_ROWS, 2_000, dictionary, dictionary_field);
+        let dictionary_pages = encode_pages(
+            dictionary_array.clone(),
+            LanceFileVersion::V2_3,
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+        assert!(dictionary_pages.len() > 1);
+        assert!(dictionary_pages.iter().all(|page| matches!(
+            page_layout(page),
+            pb21::page_layout::Layout::MiniBlockLayout(_)
+        )));
+
+        let (packed_values, packed_field) = variable_packed_struct_values(num_values);
+        let packed_array = sparse_list_values(NUM_ROWS, 2_000, packed_values, packed_field);
+        let packed_pages =
+            encode_pages(packed_array.clone(), LanceFileVersion::V2_3, HashMap::new())
+                .await
+                .unwrap();
+        assert!(packed_pages.len() > 1);
+        assert!(packed_pages.iter().all(|page| matches!(
+            page_layout(page),
+            pb21::page_layout::Layout::FullZipLayout(_)
+        )));
+
+        let (packed_values, packed_field) = variable_packed_struct_values(2);
+        let unsplittable_packed = unsplittable_nested_list(packed_values, packed_field);
+        let packed_fallback = encode_pages(
+            unsplittable_packed.clone(),
+            LanceFileVersion::V2_3,
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(packed_fallback.len(), 1);
+        assert!(matches!(
+            page_layout(&packed_fallback[0]),
+            pb21::page_layout::Layout::FullZipLayout(_)
+        ));
+
+        let (dictionary, dictionary_field) = dictionary_values(2);
+        let unsplittable_dictionary = unsplittable_nested_list(dictionary, dictionary_field);
+        let v2_2_error = encode_pages(
+            unsplittable_dictionary.clone(),
+            LanceFileVersion::V2_2,
+            HashMap::new(),
+        )
+        .await
+        .unwrap_err();
+        let v2_3_error = encode_pages(
+            unsplittable_dictionary,
+            LanceFileVersion::V2_3,
+            HashMap::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(v2_3_error.to_string(), v2_2_error.to_string());
+        assert!(
+            v2_3_error
+                .to_string()
+                .contains("Mini-block cannot encode 70000 rep/def levels")
+        );
+
+        let cases = TestCases::default()
+            .with_min_file_version(LanceFileVersion::V2_3)
+            .with_max_file_version(LanceFileVersion::V2_3)
+            .with_page_sizes(vec![1024 * 1024])
+            .with_batch_size(NUM_ROWS as u32)
+            .with_range(1_999..2_002)
+            .with_indices(vec![0, 2_000, NUM_ROWS as u64 - 1]);
+        check_round_trip_encoding_of_data(vec![dictionary_array], &cases, HashMap::new()).await;
+        let packed_cases = TestCases::default()
+            .with_min_file_version(LanceFileVersion::V2_3)
+            .with_max_file_version(LanceFileVersion::V2_3)
+            .with_page_sizes(vec![1024 * 1024])
+            .with_batch_size(NUM_ROWS as u32);
+        check_round_trip_encoding_of_data(vec![packed_array], &packed_cases, HashMap::new()).await;
+
+        let single_row_cases = TestCases::default()
+            .with_min_file_version(LanceFileVersion::V2_3)
+            .with_max_file_version(LanceFileVersion::V2_3)
+            .with_page_sizes(vec![1024 * 1024])
+            .with_range(0..1)
+            .with_indices(vec![0]);
+        check_round_trip_encoding_of_data(
+            vec![unsplittable_packed],
+            &single_row_cases,
+            HashMap::new(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_auto_sparse_wide_values_keep_dense_fallback() {
+        let first = vec![0xAB_u8; 5_000];
+        let second = vec![0xCD_u8; 5_000];
+        let fixed_size_binary = Arc::new(
+            FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                [Some(first.as_slice()), Some(second.as_slice())].into_iter(),
+                5_000,
+            )
+            .unwrap(),
+        ) as ArrayRef;
+
+        const FSL_DIMENSION: i32 = 2_048;
+        let fixed_size_list = Arc::new(
+            FixedSizeListArray::try_new(
+                Arc::new(ArrowField::new("item", DataType::Int32, true)),
+                FSL_DIMENSION,
+                Arc::new(Int32Array::from_iter_values(0..(FSL_DIMENSION * 2))),
+                None,
+            )
+            .unwrap(),
+        ) as ArrayRef;
+
+        for (label, values) in [
+            ("fixed-size binary", fixed_size_binary),
+            ("fixed-size list", fixed_size_list),
+        ] {
+            let item_field = Arc::new(ArrowField::new("item", values.data_type().clone(), true));
+            let array = unsplittable_nested_list(values, item_field);
+
+            let v2_2 = encode_pages(array.clone(), LanceFileVersion::V2_2, HashMap::new())
+                .await
+                .unwrap();
+            let v2_3 = encode_pages(array.clone(), LanceFileVersion::V2_3, HashMap::new())
+                .await
+                .unwrap();
+            for pages in [&v2_2, &v2_3] {
+                assert_eq!(pages.len(), 1, "unexpected {label} page count");
+                assert!(
+                    matches!(
+                        page_layout(&pages[0]),
+                        pb21::page_layout::Layout::FullZipLayout(_)
+                    ),
+                    "{label} should retain the dense full-zip fallback"
+                );
+            }
+
+            let explicit_error =
+                encode_pages(array.clone(), LanceFileVersion::V2_3, sparse_metadata())
+                    .await
+                    .unwrap_err();
+            assert!(
+                explicit_error.to_string().contains("too wide"),
+                "explicit sparse should preserve the {label} value error: {explicit_error}"
+            );
+
+            let cases = TestCases::default()
+                .with_min_file_version(LanceFileVersion::V2_2)
+                .with_max_file_version(LanceFileVersion::V2_3)
+                .with_range(0..1)
+                .with_indices(vec![0]);
+            check_round_trip_encoding_of_data(vec![array], &cases, HashMap::new()).await;
+        }
     }
 
     #[test]
