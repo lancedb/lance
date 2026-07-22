@@ -61,9 +61,8 @@ use super::tokenizer::{LEGACY_BLOCK_SIZE, validate_block_size};
 use super::{InvertedIndexBuilder, InvertedIndexParams, wand::*};
 use super::{
     builder::{
-        BLOCK_SIZE, ScoredDoc, doc_file_path,
-        inverted_list_schema_for_version_with_block_size_and_impacts, posting_file_path,
-        token_file_path,
+        BLOCK_SIZE, doc_file_path, inverted_list_schema_for_version_with_block_size_and_impacts,
+        posting_file_path, token_file_path,
     },
     iter::PlainPostingListIterator,
     query::*,
@@ -82,6 +81,7 @@ use crate::scalar::{
     OldIndexDataFilter, RowIdRemapper, ScalarIndex, ScalarIndexParams, SearchResult, TokenQuery,
     UpdateCriteria,
 };
+use crate::vector::graph::OrderedFloat;
 use crate::{FtsPrewarmOptions, Index};
 use crate::{prefilter::PreFilter, scalar::inverted::iter::take_fst_keys};
 use std::str::FromStr;
@@ -504,35 +504,6 @@ impl DeepSizeOf for InvertedIndex {
     }
 }
 
-/// Resolve any `Pending` candidates that wand emitted via the
-/// deferred-row_id path. After this returns, every entry in
-/// `candidates` carries a real row_id.
-async fn resolve_deferred_candidates(
-    docs: &LazyDocSet,
-    candidates: &mut [DocCandidate],
-) -> Result<()> {
-    let pending: Vec<u32> = candidates
-        .iter()
-        .filter_map(|c| match c.addr {
-            CandidateAddr::Pending(d) => Some(d),
-            CandidateAddr::RowId(_) => None,
-        })
-        .collect();
-    if pending.is_empty() {
-        return Ok(());
-    }
-    let mut iter = docs.resolve_row_ids(&pending).await?.into_iter();
-    for c in candidates {
-        if matches!(c.addr, CandidateAddr::Pending(_)) {
-            let r = iter.next().ok_or_else(|| {
-                Error::internal("resolve_row_ids returned fewer items than requested")
-            })?;
-            c.addr = CandidateAddr::RowId(r);
-        }
-    }
-    Ok(())
-}
-
 impl InvertedIndex {
     fn format_version(&self) -> InvertedListFormatVersion {
         self.format_version
@@ -880,30 +851,54 @@ impl InvertedIndex {
             return Ok((Vec::new(), Vec::new()));
         }
 
+        /// Global-heap entry carrying the score plus where its row_id comes
+        /// from. `Pending` candidates keep (slot, doc_id) through the top-k
+        /// so only the final survivors pay row_id resolution.
+        struct MergedCandidate {
+            score: OrderedFloat,
+            /// Index into the per-query partition list for `Pending` addresses.
+            slot: u32,
+            addr: CandidateAddr,
+        }
+
+        impl PartialEq for MergedCandidate {
+            fn eq(&self, other: &Self) -> bool {
+                self.score == other.score
+            }
+        }
+
+        impl Eq for MergedCandidate {}
+
+        impl PartialOrd for MergedCandidate {
+            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+
+        impl Ord for MergedCandidate {
+            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+                self.score.cmp(&other.score)
+            }
+        }
+
         fn push_scored_candidate(
-            candidates: &mut BinaryHeap<Reverse<ScoredDoc>>,
+            candidates: &mut BinaryHeap<Reverse<MergedCandidate>>,
             limit: usize,
+            slot: u32,
             addr: CandidateAddr,
             score: f32,
-        ) -> Result<()> {
-            // resolve_deferred_candidates ran upstream, so every candidate
-            // carries a real row_id at this point.
-            let row_id = match addr {
-                CandidateAddr::RowId(r) => r,
-                CandidateAddr::Pending(_) => {
-                    return Err(Error::internal(
-                        "bm25_search post-condition: deferred candidate left unresolved",
-                    ));
-                }
+        ) {
+            let candidate = MergedCandidate {
+                score: OrderedFloat(score),
+                slot,
+                addr,
             };
-
             if candidates.len() < limit {
-                candidates.push(Reverse(ScoredDoc::new(row_id, score)));
+                candidates.push(Reverse(candidate));
             } else if candidates.peek().unwrap().0.score.0 < score {
                 candidates.pop();
-                candidates.push(Reverse(ScoredDoc::new(row_id, score)));
+                candidates.push(Reverse(candidate));
             }
-            Ok(())
         }
 
         let mask = prefilter.mask();
@@ -947,7 +942,7 @@ impl InvertedIndex {
                         // No hits in this partition; its DocSet stays
                         // unloaded, so we never pay the per-doc
                         // row_id/num_tokens download for it.
-                        return Result::Ok(PartitionCandidates::empty());
+                        return Result::Ok((part, PartitionCandidates::empty()));
                     }
                     let docs_for_wand = part.docs.docs_for_wand(mask.as_ref()).await?;
                     let max_position = postings
@@ -985,23 +980,26 @@ impl InvertedIndex {
                         std::result::Result::<_, Error>::Ok(candidates)
                     })
                     .await?;
-                    let mut partition_result = PartitionCandidates {
+                    let partition_result = PartitionCandidates {
                         tokens_by_position,
                         grouped_expansions,
                         candidates,
                     };
-                    resolve_deferred_candidates(&part.docs, &mut partition_result.candidates)
-                        .await?;
-                    Result::Ok(partition_result)
+                    Result::Ok((part, partition_result))
                 }
             })
             .collect::<Vec<_>>();
         let mut parts = stream::iter(parts).buffer_unordered(get_num_compute_intensive_cpus());
         let mut idf_cache: HashMap<String, f32> = HashMap::new();
-        while let Some(res) = parts.try_next().await? {
+        // Partitions that produced candidates, indexed by the `slot` carried
+        // in deferred heap entries.
+        let mut resolving_parts: Vec<Arc<InvertedPartition>> = Vec::new();
+        while let Some((part, res)) = parts.try_next().await? {
             if res.candidates.is_empty() {
                 continue;
             }
+            let slot = resolving_parts.len() as u32;
+            resolving_parts.push(part);
             let PartitionCandidates {
                 tokens_by_position,
                 grouped_expansions,
@@ -1034,7 +1032,7 @@ impl InvertedIndex {
                         score += idf_by_position[term_index as usize]
                             * scorer.doc_weight(freq, doc_length);
                     }
-                    push_scored_candidate(&mut candidates, limit, addr, score)?;
+                    push_scored_candidate(&mut candidates, limit, slot, addr, score);
                 }
             } else {
                 let grouped_positions = grouped_expansions
@@ -1065,16 +1063,57 @@ impl InvertedIndex {
                             score += term.query_weight() * scorer.doc_weight(freq, doc_length);
                         }
                     }
-                    push_scored_candidate(&mut candidates, limit, addr, score)?;
+                    push_scored_candidate(&mut candidates, limit, slot, addr, score);
                 }
             }
         }
 
-        Ok(candidates
-            .into_sorted_vec()
-            .into_iter()
-            .map(|Reverse(doc)| (doc.row_id, doc.score.0))
-            .unzip())
+        // Resolve row_ids only for the candidates that survived the global
+        // top-k: group deferred survivors per partition and batch-resolve —
+        // at most `limit` lookups regardless of how many partitions
+        // contributed candidates.
+        /// One partition's surviving deferred candidates: positions in the
+        /// merged result list paired with the doc_ids to resolve.
+        type DeferredGroup = Vec<(usize, u32)>;
+        let sorted = candidates.into_sorted_vec();
+        let mut row_ids = Vec::with_capacity(sorted.len());
+        let mut scores = Vec::with_capacity(sorted.len());
+        let mut deferred: HashMap<u32, DeferredGroup> = HashMap::new();
+        for (pos, Reverse(candidate)) in sorted.into_iter().enumerate() {
+            scores.push(candidate.score.0);
+            match candidate.addr {
+                CandidateAddr::RowId(row_id) => row_ids.push(row_id),
+                CandidateAddr::Pending(doc_id) => {
+                    deferred
+                        .entry(candidate.slot)
+                        .or_default()
+                        .push((pos, doc_id));
+                    // Placeholder, overwritten by the batch resolution below.
+                    row_ids.push(0);
+                }
+            }
+        }
+        if !deferred.is_empty() {
+            let groups = deferred
+                .into_iter()
+                .map(|(slot, entries)| (resolving_parts[slot as usize].clone(), entries))
+                .collect::<Vec<_>>();
+            let resolved: Vec<(DeferredGroup, Vec<u64>)> =
+                stream::iter(groups.into_iter().map(|(part, entries)| async move {
+                    let doc_ids: Vec<u32> = entries.iter().map(|&(_, doc_id)| doc_id).collect();
+                    let resolved = part.docs.resolve_row_ids(&doc_ids).await?;
+                    Result::Ok((entries, resolved))
+                }))
+                .buffer_unordered(get_num_compute_intensive_cpus())
+                .try_collect()
+                .await?;
+            for (entries, resolved) in resolved {
+                for ((pos, _), row_id) in entries.into_iter().zip(resolved) {
+                    row_ids[pos] = row_id;
+                }
+            }
+        }
+        Ok((row_ids, scores))
     }
 
     async fn load_legacy_index(
@@ -1722,6 +1761,8 @@ impl InvertedPartition {
         let docs = Arc::new(LazyDocSet::new(
             store.clone(),
             docs_path,
+            id,
+            WeakLanceCache::from(index_cache),
             num_docs,
             false,
             frag_reuse_index,
@@ -7426,10 +7467,41 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
 
+    use crate::scalar::inverted::lazy_docset::DocRowIdsKey;
     use crate::scalar::inverted::tokenizer::document_tokenizer::TextTokenizer;
     use lance_tokenizer::{Language, SimpleTokenizer, StopWordFilter, TextAnalyzer};
 
     use super::*;
+
+    /// Test helper: resolve any `Pending` candidates a partition-level wand
+    /// walk emitted, so per-partition results can be asserted on real
+    /// row_ids. Production resolves only global top-k survivors inside
+    /// `InvertedIndex::bm25_search`.
+    async fn resolve_deferred_candidates(
+        docs: &LazyDocSet,
+        candidates: &mut [DocCandidate],
+    ) -> Result<()> {
+        let pending: Vec<u32> = candidates
+            .iter()
+            .filter_map(|c| match c.addr {
+                CandidateAddr::Pending(d) => Some(d),
+                CandidateAddr::RowId(_) => None,
+            })
+            .collect();
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let mut iter = docs.resolve_row_ids(&pending).await?.into_iter();
+        for c in candidates {
+            if matches!(c.addr, CandidateAddr::Pending(_)) {
+                let r = iter.next().ok_or_else(|| {
+                    Error::internal("resolve_row_ids returned fewer items than requested")
+                })?;
+                c.addr = CandidateAddr::RowId(r);
+            }
+        }
+        Ok(())
+    }
 
     #[derive(Debug)]
     struct MetadataAccessDeniedStore {
@@ -8668,25 +8740,15 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_bm25_search_many_partitions_resolves_exact_row_ids() {
-        // Regression test for deferred row_id resolution: with many partitions
-        // (including one whose only token does not match the query), a search
-        // must resolve every candidate's row_id exactly once and correctly.
-        // Also asserts the caching contract: each resolving partition reads the
-        // ROW_ID column exactly once (one full-column read, no scattered
-        // single-row reads), and subsequent queries perform no further reads.
-        let tmpdir = TempObjDir::default();
-        let store = Arc::new(LanceIndexStore::new(
-            ObjectStore::local().into(),
-            tmpdir.clone(),
-            Arc::new(LanceCache::no_cache()),
-        ));
+    /// Matching-partition count used by `write_many_partition_index`.
+    const MANY_PARTITIONS: u64 = 40;
 
-        const NUM_MATCHING_PARTITIONS: u64 = 40;
-        let mut expected_row_ids: Vec<u64> =
-            Vec::with_capacity((NUM_MATCHING_PARTITIONS * 3) as usize);
-        for pid in 0..NUM_MATCHING_PARTITIONS {
+    /// Writes `MANY_PARTITIONS` partitions whose only token is "pipeline"
+    /// (1-3 docs each), one extra partition whose only token does not match,
+    /// and the metadata file. Returns every matching doc's row_id.
+    async fn write_many_partition_index(store: &LanceIndexStore) -> Vec<u64> {
+        let mut expected_row_ids: Vec<u64> = Vec::with_capacity((MANY_PARTITIONS * 3) as usize);
+        for pid in 0..MANY_PARTITIONS {
             let mut builder = InnerBuilder::new(pid, false, TokenSetFormat::default());
             builder.tokens.add("pipeline".to_owned());
             builder.posting_lists.push(PostingListBuilder::new(false));
@@ -8697,20 +8759,20 @@ mod tests {
                 builder.docs.append(row_id, 1);
                 expected_row_ids.push(row_id);
             }
-            builder.write(store.as_ref()).await.unwrap();
+            builder.write(store).await.unwrap();
         }
         // A partition whose only token does NOT match the query.
         let mut empty_builder =
-            InnerBuilder::new(NUM_MATCHING_PARTITIONS, false, TokenSetFormat::default());
+            InnerBuilder::new(MANY_PARTITIONS, false, TokenSetFormat::default());
         empty_builder.tokens.add("unrelated".to_owned());
         empty_builder
             .posting_lists
             .push(PostingListBuilder::new(false));
         empty_builder.posting_lists[0].add(0, PositionRecorder::Count(1));
         empty_builder.docs.append(999_999, 1);
-        empty_builder.write(store.as_ref()).await.unwrap();
+        empty_builder.write(store).await.unwrap();
 
-        let all_partitions: Vec<u64> = (0..=NUM_MATCHING_PARTITIONS).collect();
+        let all_partitions: Vec<u64> = (0..=MANY_PARTITIONS).collect();
         let metadata = std::collections::HashMap::from_iter(vec![
             (
                 "partitions".to_owned(),
@@ -8730,6 +8792,24 @@ mod tests {
             .await
             .unwrap();
         writer.finish_with_metadata(metadata).await.unwrap();
+        expected_row_ids
+    }
+
+    #[tokio::test]
+    async fn test_bm25_search_many_partitions_resolves_exact_row_ids() {
+        // Regression test for deferred row_id resolution: with many partitions
+        // (including one whose only token does not match the query), a search
+        // must resolve every candidate's row_id exactly once and correctly.
+        // Also asserts the caching contract: each resolving partition reads the
+        // ROW_ID column exactly once (one full-column read, no scattered
+        // single-row reads), and subsequent queries perform no further reads.
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let expected_row_ids = write_many_partition_index(store.as_ref()).await;
 
         // Load through a store that counts docs-file ROW_ID reads.
         let counter = Arc::new(DocsRowIdReadCounter::default());
@@ -8775,7 +8855,7 @@ mod tests {
         // partition must not read its ROW_ID column at all.
         assert_eq!(
             counter.full_column_reads(),
-            NUM_MATCHING_PARTITIONS as usize,
+            MANY_PARTITIONS as usize,
             "each resolving partition reads the ROW_ID column exactly once"
         );
         assert_eq!(
@@ -8796,10 +8876,82 @@ mod tests {
         assert!(row_ids_k.iter().all(|id| expected_row_ids.contains(id)));
         assert_eq!(
             counter.full_column_reads(),
-            NUM_MATCHING_PARTITIONS as usize,
+            MANY_PARTITIONS as usize,
             "subsequent queries must not re-read the ROW_ID column"
         );
         assert_eq!(counter.scattered_reads(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_bm25_search_resolves_only_topk_survivors_and_accounts_cache() {
+        // Late resolution: row_ids are resolved only for candidates that
+        // survive the global top-k, so with k much smaller than the partition
+        // count, only the partitions holding survivors load their ROW_ID
+        // column. Each loaded column must be visible to the index cache as
+        // its own weighed entry.
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let expected_row_ids = write_many_partition_index(store.as_ref()).await;
+
+        let counter = Arc::new(DocsRowIdReadCounter::default());
+        let inner_store: Arc<dyn IndexStore> = store.clone();
+        let counting_store: Arc<dyn IndexStore> = Arc::new(DocsRowIdCountingStore {
+            inner: inner_store,
+            counter: counter.clone(),
+        });
+        let cache = Arc::new(LanceCache::with_capacity(64 * 1024 * 1024));
+        let index = InvertedIndex::load(counting_store, None, cache.as_ref())
+            .await
+            .unwrap();
+
+        // k=3 with 40 matching partitions: survivors span at most 3
+        // partitions, so at most 3 ROW_ID columns are read even though every
+        // matching partition produced candidates.
+        let tokens = Arc::new(Tokens::new(vec!["pipeline".to_owned()], DocType::Text));
+        let params = Arc::new(FtsSearchParams::new().with_limit(Some(3)));
+        let (row_ids, scores) = index
+            .bm25_search(
+                tokens,
+                params,
+                Operator::Or,
+                Arc::new(NoFilter),
+                Arc::new(NoOpMetricsCollector),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(row_ids.len(), 3);
+        assert_eq!(scores.len(), 3);
+        assert!(row_ids.iter().all(|id| expected_row_ids.contains(id)));
+        let reads = counter.full_column_reads();
+        assert!(
+            (1..=3).contains(&reads),
+            "only partitions with surviving candidates load their ROW_ID column, got {reads}"
+        );
+        assert_eq!(counter.scattered_reads(), 0);
+
+        // Accounting: every loaded column is present in the index cache as a
+        // DocRowIds entry (weighed at insert, evictable under pressure).
+        // Partition caches are scoped with a `part-{id}` prefix on load.
+        let mut cached_entries = 0;
+        for partition_id in 0..=MANY_PARTITIONS {
+            if cache
+                .with_key_prefix(format!("part-{partition_id}").as_str())
+                .get_with_key(&DocRowIdsKey { partition_id })
+                .await
+                .is_some()
+            {
+                cached_entries += 1;
+            }
+        }
+        assert_eq!(
+            cached_entries, reads,
+            "each loaded ROW_ID column is its own index-cache entry"
+        );
     }
 
     #[tokio::test]

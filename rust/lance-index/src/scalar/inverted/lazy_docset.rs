@@ -15,6 +15,7 @@
 //! only partitions that actually contribute hits pay
 //! `ensure_num_tokens_loaded`/`ensure_loaded`.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use arrow::array::AsArray;
@@ -22,6 +23,7 @@ use arrow::datatypes::{UInt32Type, UInt64Type};
 use arrow_array::{Array, UInt32Array, UInt64Array};
 use lance_core::ROW_ID;
 use lance_core::Result;
+use lance_core::cache::{CacheKey, WeakLanceCache};
 use lance_core::deepsize::DeepSizeOf;
 use tokio::sync::OnceCell;
 
@@ -60,19 +62,58 @@ struct NumTokensSnapshot {
     docs: Arc<DocSet>,
 }
 
+/// A partition's full `doc_id -> row_id` column, stored as its own
+/// index-cache entry so the cache weighs it at insert time and can
+/// evict it independently of the partition object. Keeping it out of
+/// the partition's lazily-populated fields keeps the memory visible
+/// to capacity accounting.
+#[derive(Debug)]
+pub struct CachedDocRowIds {
+    pub row_ids: Arc<UInt64Array>,
+}
+
+impl DeepSizeOf for CachedDocRowIds {
+    fn deep_size_of_children(&self, _ctx: &mut lance_core::deepsize::Context) -> usize {
+        self.row_ids.len() * std::mem::size_of::<u64>()
+    }
+}
+
+/// Cache key for [`CachedDocRowIds`], scoped per partition.
+#[derive(Debug, Clone)]
+pub struct DocRowIdsKey {
+    pub partition_id: u64,
+}
+
+impl CacheKey for DocRowIdsKey {
+    type ValueType = CachedDocRowIds;
+
+    fn key(&self) -> Cow<'_, str> {
+        format!("doc-row-ids-{}", self.partition_id).into()
+    }
+
+    fn type_name() -> &'static str {
+        "DocRowIds"
+    }
+}
+
 /// Store-backed DocSet view that loads on demand and caches.
 ///
 /// Holds the [`IndexStore`] and docs-file path rather than an open
 /// [`IndexReader`], so a cached partition does not pin a docs-file
 /// handle for its whole lifetime. The reader is re-opened on demand
 /// inside each column accessor and dropped when that read completes;
-/// because the resulting buffers are cached in the `OnceCell`s below,
-/// a contributing partition re-opens only on a cold miss, and a
-/// partition that never scores never opens the docs file at all after
-/// construction.
+/// because the resulting buffers are cached (num_tokens and the full
+/// DocSet in the `OnceCell`s below, the row_id column as its own
+/// index-cache entry), a contributing partition re-opens only on a
+/// cold miss, and a partition that never scores never opens the docs
+/// file at all after construction.
 pub struct DeferredDocSet {
     store: Arc<dyn IndexStore>,
     docs_path: String,
+    /// Scopes this partition's [`DocRowIdsKey`] in the index cache.
+    partition_id: u64,
+    /// The index cache holding the row_id column entry.
+    index_cache: WeakLanceCache,
     is_legacy: bool,
     frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     /// 256-document-block partitions score with quantized document lengths; the
@@ -83,8 +124,6 @@ pub struct DeferredDocSet {
     /// `NUM_TOKEN_COL` and its zero-copy scoring view carrying the cached sum,
     /// published together on first read.
     num_tokens: OnceCell<NumTokensSnapshot>,
-    /// `ROW_ID` arrow buffer cached on first read.
-    row_ids_col: OnceCell<Arc<UInt64Array>>,
     /// Full DocSet, materialized on first `ensure_loaded`.
     full: OnceCell<Arc<DocSet>>,
 }
@@ -128,13 +167,8 @@ impl DeepSizeOf for LazyDocSet {
                                 + arr.deep_size_of_children(ctx)
                         })
                         .unwrap_or(0)
-                    + d.row_ids_col
-                        .get()
-                        .map(|arr| {
-                            let arr: &dyn Array = arr.as_ref();
-                            arr.deep_size_of_children(ctx)
-                        })
-                        .unwrap_or(0)
+                // The row_id column is not a field here: it lives in the
+                // index cache as its own weighed entry (`DocRowIdsKey`).
             }
         }
     }
@@ -145,6 +179,8 @@ impl LazyDocSet {
     pub fn new(
         store: Arc<dyn IndexStore>,
         docs_path: String,
+        partition_id: u64,
+        index_cache: WeakLanceCache,
         num_rows: usize,
         is_legacy: bool,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
@@ -153,12 +189,13 @@ impl LazyDocSet {
         Self::Deferred(Box::new(DeferredDocSet {
             store,
             docs_path,
+            partition_id,
+            index_cache,
             is_legacy,
             frag_reuse_index,
             quantized_scoring,
             num_rows,
             num_tokens: OnceCell::new(),
-            row_ids_col: OnceCell::new(),
             full: OnceCell::new(),
         }))
     }
@@ -302,15 +339,30 @@ impl DeferredDocSet {
             .await
     }
 
+    /// The full `ROW_ID` column, loaded through the index cache as its own
+    /// weighed entry ([`DocRowIdsKey`]) rather than a field on this struct,
+    /// so the memory is accounted for at insert time and evictable under
+    /// pressure. Concurrent loads are deduped by the cache backend.
     async fn row_ids_column(&self) -> Result<Arc<UInt64Array>> {
-        self.row_ids_col
-            .get_or_try_init(|| async {
-                let reader = self.reader().await?;
-                let batch = reader.read_range(0..self.num_rows, Some(&[ROW_ID])).await?;
-                Result::Ok(Arc::new(batch[ROW_ID].as_primitive::<UInt64Type>().clone()))
-            })
-            .await
-            .cloned()
+        let store = self.store.clone();
+        let docs_path = self.docs_path.clone();
+        let num_rows = self.num_rows;
+        let cached = self
+            .index_cache
+            .get_or_insert_with_key(
+                DocRowIdsKey {
+                    partition_id: self.partition_id,
+                },
+                || async move {
+                    let reader = store.open_index_file(&docs_path).await?;
+                    let batch = reader.read_range(0..num_rows, Some(&[ROW_ID])).await?;
+                    Result::Ok(CachedDocRowIds {
+                        row_ids: Arc::new(batch[ROW_ID].as_primitive::<UInt64Type>().clone()),
+                    })
+                },
+            )
+            .await?;
+        Ok(cached.row_ids.clone())
     }
 
     async fn ensure_loaded(&self) -> Result<Arc<DocSet>> {
@@ -356,9 +408,6 @@ impl DeferredDocSet {
         {
             return Ok(doc_ids.iter().map(|&d| full.row_id(d)).collect());
         }
-        if let Some(arr) = self.row_ids_col.get() {
-            return Ok(doc_ids.iter().map(|&d| arr.value(d as usize)).collect());
-        }
         let arr = self.row_ids_column().await?;
         Ok(doc_ids.iter().map(|&d| arr.value(d as usize)).collect())
     }
@@ -375,12 +424,22 @@ mod tests {
     #[tokio::test]
     async fn test_full_docset_is_a_complete_cached_snapshot() {
         let temp_dir = TempObjDir::default();
+        let cache = Arc::new(LanceCache::no_cache());
         let store = Arc::new(LanceIndexStore::new(
             ObjectStore::local().into(),
             temp_dir.clone(),
-            Arc::new(LanceCache::no_cache()),
+            cache.clone(),
         ));
-        let docs = LazyDocSet::new(store, "unused".to_owned(), 3, false, None, false);
+        let docs = LazyDocSet::new(
+            store,
+            "unused".to_owned(),
+            0,
+            WeakLanceCache::from(&cache),
+            3,
+            false,
+            None,
+            false,
+        );
         assert_eq!(docs.total_tokens_cached(), None);
 
         let row_ids = UInt64Array::from(vec![10, 20, 30]);
