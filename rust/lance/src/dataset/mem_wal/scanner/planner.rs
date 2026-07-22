@@ -1091,7 +1091,7 @@ mod integration_tests {
         let (base_dataset, _, _, pk_columns, _temp_path) = setup_multi_level_lsm().await;
 
         // Create scanner with only base table (no shard snapshots or active memtable)
-        let scanner = LsmScanner::new(base_dataset, vec![], pk_columns);
+        let scanner = LsmScanner::new(base_dataset.clone(), vec![], pk_columns.clone());
 
         let plan = scanner.create_plan().await.unwrap();
 
@@ -1101,6 +1101,22 @@ mod integration_tests {
             plan,
             "ProjectionExec:...
   LanceRead:...base/data...refine_filter=--",
+        )
+        .await
+        .unwrap();
+
+        // A base-only source has no cross-generation block filter, so its
+        // finite limit remains safe to push into the physical Lance read.
+        let scanner = LsmScanner::new(base_dataset, vec![], pk_columns)
+            .limit(Some(3), None)
+            .unwrap();
+        let plan = scanner.create_plan().await.unwrap();
+        assert_plan_node_equals(
+            plan,
+            "GlobalLimitExec: skip=0, fetch=3
+  ProjectionExec:...
+    LocalLimitExec: fetch=3
+      LanceRead:...base/data...range_before=Some(0..3)...refine_filter=--",
         )
         .await
         .unwrap();
