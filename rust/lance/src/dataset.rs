@@ -83,7 +83,7 @@ pub mod optimize;
 pub(crate) mod overlay;
 pub mod progress;
 pub mod refs;
-pub(crate) mod rowids;
+pub mod rowids;
 pub mod scanner;
 mod schema_evolution;
 pub mod sql;
@@ -118,7 +118,10 @@ use crate::io::commit::{
 use crate::session::Session;
 use crate::utils::temporal::{SystemTime, timestamp_to_nanos, utc_now};
 use crate::{Error, Result};
-pub use blob::{BlobFile, ReadBlob, ReadBlobsBuilder, ReadBlobsStream};
+pub use blob::{
+    BlobFile, BlobRangeRequest, BlobReadRange, ReadBlob, ReadBlobRange, ReadBlobRangesBuilder,
+    ReadBlobRangesStream, ReadBlobsBuilder, ReadBlobsStream,
+};
 use hash_joiner::HashJoiner;
 pub use lance_core::ROW_ID;
 use lance_core::box_error;
@@ -741,6 +744,7 @@ impl Dataset {
             let ds_index_cache = session.index_cache.for_dataset(uri);
             let metadata_key = crate::session::index_caches::IndexMetadataKey {
                 version: manifest_location.version,
+                store_identity: &object_store.store_prefix,
             };
             ds_index_cache
                 .insert_with_key(&metadata_key, Arc::new(indices))
@@ -1794,6 +1798,36 @@ impl Dataset {
             column.to_string(),
             blob_field_id,
         ))
+    }
+
+    /// Create a planned reader for row-specific blob-local byte ranges.
+    ///
+    /// Each [`BlobRangeRequest`] contains both its row selector and byte range,
+    /// so requests can be repeated or reordered without coordinating parallel
+    /// selector and range lists.
+    ///
+    /// ```rust
+    /// # use std::sync::Arc;
+    /// # use lance::dataset::{BlobRangeRequest, Dataset};
+    /// # use lance::Result;
+    /// # async fn example(dataset: Arc<Dataset>) -> Result<()> {
+    /// let ranges = dataset
+    ///     .read_blob_ranges("images")?
+    ///     .with_row_indices([
+    ///         BlobRangeRequest::new(7, 0, 1024),
+    ///         BlobRangeRequest::new(7, 4096, 1024),
+    ///     ])
+    ///     .execute()
+    ///     .await?;
+    /// # let _ = ranges;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn read_blob_ranges(
+        self: &Arc<Self>,
+        column: impl AsRef<str>,
+    ) -> Result<ReadBlobRangesBuilder> {
+        Ok(ReadBlobRangesBuilder::new(self.read_blobs(column)?))
     }
 
     /// Get a stream of batches based on iterator of ranges of row numbers.

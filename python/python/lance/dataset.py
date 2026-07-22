@@ -71,7 +71,7 @@ from .lance import (
 from .lance import __version__ as __version__
 from .lance import _Session as Session
 from .query import FullTextQuery
-from .types import _coerce_reader
+from .types import _coerce_reader, _is_materialized
 from .udf import BatchUDF, normalize_transform
 from .udf import BatchUDFCheckpoint as BatchUDFCheckpoint
 from .udf import batch_udf as batch_udf
@@ -397,6 +397,12 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         """
         reader = _coerce_reader(data_obj, schema)
 
+        # Materialized sources are wrapped in an in-memory table so retries never
+        # spill and the source's statistics can drive the join; everything else is
+        # treated as a one-shot stream.
+        if _is_materialized(data_obj):
+            return super(MergeInsertBuilder, self).execute_batches(reader)
+
         return super(MergeInsertBuilder, self).execute(reader)
 
     def execute_uncommitted(
@@ -420,6 +426,9 @@ class MergeInsertBuilder(_MergeInsertBuilder):
             source is some kind of generator.
         """
         reader = _coerce_reader(data_obj, schema)
+
+        if _is_materialized(data_obj):
+            return super(MergeInsertBuilder, self).execute_uncommitted_batches(reader)
 
         return super(MergeInsertBuilder, self).execute_uncommitted(reader)
 
@@ -2267,6 +2276,70 @@ class LanceDataset(pa.dataset.Dataset):
             )
         return self._ds.read_blobs_by_indices(selection_values, blob_column, **kwargs)
 
+    def read_blob_ranges(
+        self,
+        blob_column: str,
+        requests: Sequence[Tuple[int, int, int]],
+        *,
+        selector: Literal["ids", "addresses", "indices"],
+        io_buffer_size: Optional[int] = None,
+        preserve_order: Optional[bool] = None,
+    ) -> List[Tuple[int, int, bytes]]:
+        """
+        Read row-specific blob-local byte ranges with one planned API call.
+
+        Each request is a ``(row, offset, length)`` tuple. ``selector`` defines
+        whether every ``row`` value is interpreted as a stable row ID, physical
+        row address, or dataset index. Repeat a row value to read multiple ranges
+        from the same blob. Planning, range validation, physical-source grouping,
+        request coalescing, and bounded I/O scheduling all happen in Rust; this
+        method does not use a Python thread pool.
+
+        Null blob requests produce no result. Empty ranges on non-null blobs
+        return empty bytes without issuing payload I/O. By default results
+        preserve the input order among non-null requests.
+
+        Parameters
+        ----------
+        blob_column : str
+            The name of the blob column to read.
+        requests : Sequence[Tuple[int, int, int]]
+            Complete ``(row, offset, length)`` requests.
+        selector : {"ids", "addresses", "indices"}
+            Interpretation of every request's ``row`` value.
+        io_buffer_size : int, optional
+            Override the scheduler I/O buffer size used while materializing ranges.
+        preserve_order : bool, optional
+            If True, returned results follow request order. If False,
+            ``request_index`` still identifies every result.
+
+        Examples
+        --------
+        Read two disjoint ranges from the same row index:
+
+        .. code-block:: python
+
+            dataset.read_blob_ranges(
+                "images",
+                requests=[(7, 0, 1024), (7, 4096, 1024)],
+                selector="indices",
+            )
+
+        Returns
+        -------
+        results : List[Tuple[int, int, bytes]]
+            ``(request_index, row_address, data)`` for each non-null request.
+            The Python list retains all returned payload bytes in memory; peak
+            result memory is therefore proportional to their total logical size.
+        """
+        return self._ds.read_blob_ranges(
+            list(requests),
+            blob_column,
+            selector,
+            io_buffer_size=io_buffer_size,
+            preserve_order=preserve_order,
+        )
+
     def head(self, num_rows, **kwargs):
         """
         Load the first N rows of the dataset.
@@ -3370,10 +3443,10 @@ class LanceDataset(pa.dataset.Dataset):
         format_version: int or str, optional
             This is for the ``INVERTED`` / ``FTS`` index. Explicit on-disk FTS
             format version to write when creating a new index. Accepts ``1``,
-            ``2``, ``3``, ``"v1"``, ``"v2"``, or ``"v3"``. If unset, Lance
-            writes v2 for ``block_size=128`` and v3 for ``block_size=256``.
-            ``format_version=3`` is experimental and is only valid with
-            ``block_size=256``.
+            ``2``, ``3``, ``"v1"``, ``"v2"``, or ``"v3"``.
+            If unset, Lance uses ``LANCE_FTS_FORMAT_VERSION`` when present and
+            otherwise writes v2 for text analysis with ``block_size=128`` and
+            v3 for code analysis or ``block_size=256``.
 
         with_position: bool, default False
             This is for the ``INVERTED`` index. If True, the index will store the
@@ -5086,7 +5159,6 @@ class LanceDataset(pa.dataset.Dataset):
         identity_column: Optional[str] = None,
         unsharded: bool = False,
         durable_write: Optional[bool] = None,
-        sync_indexed_write: Optional[bool] = None,
         max_wal_buffer_size: Optional[int] = None,
         max_wal_flush_interval_ms: Optional[int] = None,
         max_memtable_size: Optional[int] = None,
@@ -5094,8 +5166,6 @@ class LanceDataset(pa.dataset.Dataset):
         max_memtable_batches: Optional[int] = None,
         max_unflushed_memtable_bytes: Optional[int] = None,
         manifest_scan_batch_size: Optional[int] = None,
-        async_index_buffer_rows: Optional[int] = None,
-        async_index_interval_ms: Optional[int] = None,
         backpressure_log_interval_ms: Optional[int] = None,
         stats_log_interval_ms: Optional[int] = None,
         hnsw_params: Optional[Dict[str, Dict[str, int]]] = None,
@@ -5156,7 +5226,6 @@ class LanceDataset(pa.dataset.Dataset):
             identity_column=identity_column,
             unsharded=unsharded,
             durable_write=durable_write,
-            sync_indexed_write=sync_indexed_write,
             max_wal_buffer_size=max_wal_buffer_size,
             max_wal_flush_interval_ms=max_wal_flush_interval_ms,
             max_memtable_size=max_memtable_size,
@@ -5164,8 +5233,6 @@ class LanceDataset(pa.dataset.Dataset):
             max_memtable_batches=max_memtable_batches,
             max_unflushed_memtable_bytes=max_unflushed_memtable_bytes,
             manifest_scan_batch_size=manifest_scan_batch_size,
-            async_index_buffer_rows=async_index_buffer_rows,
-            async_index_interval_ms=async_index_interval_ms,
             backpressure_log_interval_ms=backpressure_log_interval_ms,
             stats_log_interval_ms=stats_log_interval_ms,
             hnsw_params=hnsw_params,
@@ -5188,7 +5255,6 @@ class LanceDataset(pa.dataset.Dataset):
         shard_id: str,
         *,
         durable_write: Optional[bool] = None,
-        sync_indexed_write: Optional[bool] = None,
         max_wal_buffer_size: Optional[int] = None,
         max_wal_flush_interval_ms: Optional[int] = None,
         max_memtable_size: Optional[int] = None,
@@ -5196,8 +5262,6 @@ class LanceDataset(pa.dataset.Dataset):
         max_memtable_batches: Optional[int] = None,
         max_unflushed_memtable_bytes: Optional[int] = None,
         manifest_scan_batch_size: Optional[int] = None,
-        async_index_buffer_rows: Optional[int] = None,
-        async_index_interval_ms: Optional[int] = None,
         backpressure_log_interval_ms: Optional[int] = None,
         stats_log_interval_ms: Optional[int] = None,
         hnsw_params: Optional[Dict[str, Dict[str, int]]] = None,
@@ -5215,8 +5279,6 @@ class LanceDataset(pa.dataset.Dataset):
             ``str(uuid.uuid4())``).
         durable_write : bool, optional
             Whether to fsync WAL writes (default: ``True``).
-        sync_indexed_write : bool, optional
-            Whether index updates are synchronous (default: ``True``).
         max_wal_buffer_size : int, optional
             Maximum WAL buffer size in bytes (default: 10 MB).
         max_wal_flush_interval_ms : int, optional
@@ -5231,10 +5293,6 @@ class LanceDataset(pa.dataset.Dataset):
             Maximum unflushed bytes before backpressure (default: 1 GB).
         manifest_scan_batch_size : int, optional
             Batch size for manifest scans (default: 2).
-        async_index_buffer_rows : int, optional
-            Buffer rows for async index updates (default: 10 000).
-        async_index_interval_ms : int, optional
-            Interval for async index updates in milliseconds (default: 1000).
         backpressure_log_interval_ms : int, optional
             Interval for backpressure log messages in milliseconds
             (default: 30 000).
@@ -5282,7 +5340,6 @@ class LanceDataset(pa.dataset.Dataset):
             name: val
             for name, val in [
                 ("durable_write", durable_write),
-                ("sync_indexed_write", sync_indexed_write),
                 ("max_wal_buffer_size", max_wal_buffer_size),
                 ("max_wal_flush_interval_ms", max_wal_flush_interval_ms),
                 ("max_memtable_size", max_memtable_size),
@@ -5290,8 +5347,6 @@ class LanceDataset(pa.dataset.Dataset):
                 ("max_memtable_batches", max_memtable_batches),
                 ("max_unflushed_memtable_bytes", max_unflushed_memtable_bytes),
                 ("manifest_scan_batch_size", manifest_scan_batch_size),
-                ("async_index_buffer_rows", async_index_buffer_rows),
-                ("async_index_interval_ms", async_index_interval_ms),
                 ("backpressure_log_interval_ms", backpressure_log_interval_ms),
                 ("stats_log_interval_ms", stats_log_interval_ms),
                 ("hnsw_params", hnsw_params),

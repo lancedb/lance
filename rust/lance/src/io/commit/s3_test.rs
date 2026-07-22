@@ -317,9 +317,10 @@ async fn test_ddb_open_iops() {
         .await
         .unwrap();
     let io_stats = dataset.object_store.as_ref().io_stats_incremental();
-    // Open dataset can be read with 1 IOP, just to read the manifest.
-    // Looking up latest manifest is handled in dynamodb.
-    assert_io_eq!(io_stats, read_iops, 1);
+    // Open dataset can be read with 2 IOPs: HEAD verifies that the
+    // finalized path returned by DynamoDB still exists, then the manifest
+    // itself is read. Looking up the latest manifest is handled in DynamoDB.
+    assert_io_eq!(io_stats, read_iops, 2);
     assert_io_eq!(io_stats, write_iops, 0);
 
     // Append
@@ -341,10 +342,8 @@ async fn test_ddb_open_iops() {
     // Checkout original version
     dataset.checkout_version(1).await.unwrap();
     let io_stats = dataset.object_store.as_ref().io_stats_incremental();
-    // Checkout: 0 read IOPS. Version 1's manifest was already loaded and cached
-    // on this Session when the dataset was opened above, so the checkout serves
-    // the manifest body from the metadata cache. Version resolution is handled
-    // in DynamoDB and issues no S3 read.
-    assert_io_eq!(io_stats, read_iops, 0);
+    // Checkout: 1 read IOP. Version resolution HEAD-checks the finalized path,
+    // while the manifest body is served from the Session metadata cache.
+    assert_io_eq!(io_stats, read_iops, 1);
     assert_io_eq!(io_stats, write_iops, 0);
 }

@@ -94,16 +94,22 @@ impl CacheKey for FragReuseIndexKey<'_> {
     }
 }
 
-#[derive(Debug)]
-pub struct IndexMetadataKey {
+#[derive(Clone, Copy, Debug)]
+pub struct IndexMetadataKey<'a> {
     pub version: u64,
+    pub store_identity: &'a str,
 }
 
-impl CacheKey for IndexMetadataKey {
+impl CacheKey for IndexMetadataKey<'_> {
     type ValueType = Vec<IndexMetadata>;
 
     fn key(&self) -> Cow<'_, str> {
-        Cow::Owned(self.version.to_string())
+        Cow::Owned(format!(
+            "{}:{}/{}",
+            self.store_identity.len(),
+            self.store_identity,
+            self.version
+        ))
     }
 
     fn type_name() -> &'static str {
@@ -143,5 +149,24 @@ impl CacheKey for ScalarIndexDetailsKey<'_> {
 
     fn type_name() -> &'static str {
         "ScalarIndexDetails"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn index_metadata_key_isolates_object_store_identity() {
+        let first = IndexMetadataKey {
+            version: 7,
+            store_identity: "s3$first-options",
+        };
+        let second = IndexMetadataKey {
+            version: 7,
+            store_identity: "s3$second-options",
+        };
+
+        assert_ne!(first.key(), second.key());
     }
 }

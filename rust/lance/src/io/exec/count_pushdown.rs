@@ -147,6 +147,11 @@ fn try_rewrite(agg: &AggregateExec) -> DFResult<Option<Arc<dyn ExecutionPlan>>> 
     };
 
     let options = filtered_read.options();
+    // We don't currently support count pushdown when the row selector
+    // is a row stream.
+    if filtered_read.row_stream_input().is_some() {
+        return Ok(None);
+    }
     // A refine filter is a residual the index couldn't fully evaluate — it
     // needs column data to apply, which we can't.
     if options.refine_filter.is_some() {

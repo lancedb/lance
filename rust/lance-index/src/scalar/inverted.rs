@@ -268,7 +268,7 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
     }
 
     fn version(&self) -> u32 {
-        max_supported_fts_format_version().index_version()
+        INVERTED_INDEX_VERSION_V3
     }
 
     fn new_query_parser(
@@ -320,12 +320,9 @@ mod tests {
     use crate::scalar::{BuiltinIndexType, ScalarIndexParams};
 
     #[test]
-    fn test_plugin_version_tracks_max_supported_format() {
+    fn test_plugin_version_tracks_v3_capability_gate() {
         let plugin = InvertedIndexPlugin;
-        assert_eq!(
-            plugin.version(),
-            max_supported_fts_format_version().index_version()
-        );
+        assert_eq!(plugin.version(), INVERTED_INDEX_VERSION_V3);
     }
 
     #[test]

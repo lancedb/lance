@@ -75,7 +75,7 @@ pub struct DeferredDocSet {
     docs_path: String,
     is_legacy: bool,
     frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
-    /// V3 (256-doc block) partitions score with quantized doc lengths; the
+    /// 256-document-block partitions score with quantized document lengths; the
     /// flag is applied to every `DocSet` this deferred set materializes.
     quantized_scoring: bool,
     /// Doc count cached at construction so `len()` stays sync + IO-free.

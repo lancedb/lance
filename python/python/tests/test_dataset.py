@@ -2424,6 +2424,29 @@ def test_merge_insert(tmp_path: Path):
         check_merge_stats(merge_dict, (None, None, None))
 
 
+@pytest.mark.parametrize("materialized", [True, False])
+def test_merge_insert_input_kinds(tmp_path: Path, materialized: bool):
+    # A materialized pa.Table is routed through the in-memory (MemTable) path,
+    # while a RecordBatchReader is routed through the streaming path. Both must
+    # produce identical results.
+    schema = pa.schema([pa.field("id", pa.int64()), pa.field("value", pa.int64())])
+    base = pa.table({"id": range(5), "value": [0] * 5}, schema=schema)
+    new = pa.table({"id": [1, 2, 5, 6], "value": [10, 20, 50, 60]}, schema=schema)
+
+    dataset = lance.write_dataset(base, tmp_path / "dataset", mode="create")
+    source = new if materialized else new.to_reader()
+
+    dataset.merge_insert(
+        "id"
+    ).when_matched_update_all().when_not_matched_insert_all().execute(source)
+
+    result = dataset.to_table().sort_by("id").to_pydict()
+    assert result == {
+        "id": [0, 1, 2, 3, 4, 5, 6],
+        "value": [0, 10, 20, 0, 0, 50, 60],
+    }
+
+
 def test_merge_insert_subcols(tmp_path: Path):
     initial_data = pa.table(
         {
@@ -4687,16 +4710,20 @@ def test_late_materialization_param(tmp_path: Path):
     )
     filt = "filter % 2 == 0"
 
-    assert "(values)" in dataset.scanner(
-        filter=filt, late_materialization=None
-    ).explain_plan(True)
+    # A late-materialized column is fetched by a row-stream read
+    # (`projection=[values], source=stream`); an eager column appears in the
+    # scan projection
+    late = "projection=[values], source=stream"
+    assert late in dataset.scanner(filter=filt, late_materialization=None).explain_plan(
+        True
+    )
     assert ", values" in dataset.scanner(
         filter=filt, late_materialization=False
     ).explain_plan(True)
-    assert "(values)" in dataset.scanner(
-        filter=filt, late_materialization=True
-    ).explain_plan(True)
-    assert "(values)" in dataset.scanner(
+    assert late in dataset.scanner(filter=filt, late_materialization=True).explain_plan(
+        True
+    )
+    assert late in dataset.scanner(
         filter=filt, late_materialization=["values"]
     ).explain_plan(True)
     assert ", values" in dataset.scanner(
