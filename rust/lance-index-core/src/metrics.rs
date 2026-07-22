@@ -63,6 +63,21 @@ pub trait MetricsCollector: Send + Sync {
 
     fn record_freqs_collected(&self, _num_collections: usize) {}
 
+    /// Record the wall time spent loading postings for one FTS partition.
+    fn record_fts_postings_load_timing(&self, _elapsed_us: usize) {}
+
+    /// Record the wall time spent making document metadata ready for WAND.
+    fn record_fts_docs_ready_timing(&self, _elapsed_us: usize) {}
+
+    /// Record the three boundaries around one FTS CPU-pool dispatch.
+    ///
+    /// `queue_us` is submit-to-closure-start, `run_us` is closure execution,
+    /// and `wake_us` is closure-finish-to-async-continuation-resume.
+    fn record_fts_spawn_timing(&self, _queue_us: usize, _run_us: usize, _wake_us: usize) {}
+
+    /// Record deferred row-id resolution after one partition's CPU work.
+    fn record_fts_row_id_resolve_timing(&self, _elapsed_us: usize) {}
+
     /// Returns an optional sink for recording exact I/O statistics (bytes read,
     /// IOPS, and requests) performed on behalf of this collector.
     ///

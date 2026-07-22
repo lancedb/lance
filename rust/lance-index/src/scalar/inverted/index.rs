@@ -970,6 +970,7 @@ impl InvertedIndex {
                 let impact_shared_threshold = impact_shared_threshold.clone();
                 let legacy_shared_threshold = legacy_shared_threshold.clone();
                 async move {
+                    let postings_load_start = std::time::Instant::now();
                     let loaded_postings = part
                         .load_posting_lists(
                             tokens.as_ref(),
@@ -979,6 +980,12 @@ impl InvertedIndex {
                             metrics.as_ref(),
                         )
                         .await?;
+                    metrics.record_fts_postings_load_timing(
+                        postings_load_start
+                            .elapsed()
+                            .as_micros()
+                            .min(usize::MAX as u128) as usize,
+                    );
                     let LoadedPostings {
                         postings,
                         grouped_expansions,
@@ -990,7 +997,14 @@ impl InvertedIndex {
                         // row_id/num_tokens download for it.
                         return Result::Ok(PartitionCandidates::empty());
                     }
+                    let docs_ready_start = std::time::Instant::now();
                     let docs_for_wand = part.docs.docs_for_wand(mask.as_ref()).await?;
+                    metrics.record_fts_docs_ready_timing(
+                        docs_ready_start
+                            .elapsed()
+                            .as_micros()
+                            .min(usize::MAX as u128) as usize,
+                    );
                     let max_position = postings
                         .iter()
                         .map(|posting| posting.term_index() as usize)
@@ -1023,7 +1037,10 @@ impl InvertedIndex {
                         legacy_shared_threshold
                     };
                     let wand_scorer = use_impact_path.then(|| impact_scorer.clone());
-                    let candidates = spawn_cpu(move || {
+                    let timing_metrics = metrics.clone();
+                    let submitted_at = std::time::Instant::now();
+                    let (candidates, started_at, finished_at) = spawn_cpu(move || {
+                        let started_at = std::time::Instant::now();
                         let candidates = part_for_wand.bm25_search(
                             docs_for_wand.as_ref(),
                             wand_params.as_ref(),
@@ -1034,16 +1051,39 @@ impl InvertedIndex {
                             metrics.as_ref(),
                             partition_threshold,
                         )?;
-                        std::result::Result::<_, Error>::Ok(candidates)
+                        let finished_at = std::time::Instant::now();
+                        std::result::Result::<_, Error>::Ok((candidates, started_at, finished_at))
                     })
                     .await?;
+                    let resumed_at = std::time::Instant::now();
+                    timing_metrics.record_fts_spawn_timing(
+                        started_at
+                            .saturating_duration_since(submitted_at)
+                            .as_micros()
+                            .min(usize::MAX as u128) as usize,
+                        finished_at
+                            .saturating_duration_since(started_at)
+                            .as_micros()
+                            .min(usize::MAX as u128) as usize,
+                        resumed_at
+                            .saturating_duration_since(finished_at)
+                            .as_micros()
+                            .min(usize::MAX as u128) as usize,
+                    );
                     let mut partition_result = PartitionCandidates {
                         tokens_by_position,
                         grouped_expansions,
                         candidates,
                     };
+                    let row_id_resolve_start = std::time::Instant::now();
                     resolve_deferred_candidates(&part.docs, &mut partition_result.candidates)
                         .await?;
+                    timing_metrics.record_fts_row_id_resolve_timing(
+                        row_id_resolve_start
+                            .elapsed()
+                            .as_micros()
+                            .min(usize::MAX as u128) as usize,
+                    );
                     Result::Ok(partition_result)
                 }
             })

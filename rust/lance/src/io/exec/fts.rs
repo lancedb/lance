@@ -169,6 +169,24 @@ pub struct FtsIndexMetrics {
     /// Wall time (ms) of the exec-local `build_global_bm25_scorer`
     /// fallback; zero when a preset base scorer was injected.
     scorer_build_ms: Gauge,
+    index_setup_us: Gauge,
+    prefilter_wait_us: Gauge,
+    search_segments_us: Gauge,
+    result_build_us: Gauge,
+    match_total_us: Gauge,
+    postings_load_us: Count,
+    postings_load_max_us: Gauge,
+    docs_ready_us: Count,
+    docs_ready_max_us: Gauge,
+    cpu_spawn_tasks: Count,
+    cpu_spawn_queue_us: Count,
+    cpu_spawn_queue_max_us: Gauge,
+    cpu_spawn_run_us: Count,
+    cpu_spawn_run_max_us: Gauge,
+    cpu_spawn_wake_us: Count,
+    cpu_spawn_wake_max_us: Gauge,
+    row_id_resolve_us: Count,
+    row_id_resolve_max_us: Gauge,
     baseline_metrics: BaselineMetrics,
 }
 
@@ -183,6 +201,24 @@ impl FtsIndexMetrics {
             and_full_scores: metrics.new_count(AND_FULL_SCORES_METRIC, partition),
             freqs_collected: metrics.new_count(FREQS_COLLECTED_METRIC, partition),
             scorer_build_ms: metrics.new_gauge("scorer_build_ms", partition),
+            index_setup_us: metrics.new_gauge("index_setup_us", partition),
+            prefilter_wait_us: metrics.new_gauge("prefilter_wait_us", partition),
+            search_segments_us: metrics.new_gauge("search_segments_us", partition),
+            result_build_us: metrics.new_gauge("result_build_us", partition),
+            match_total_us: metrics.new_gauge("match_total_us", partition),
+            postings_load_us: metrics.new_count("postings_load_us", partition),
+            postings_load_max_us: metrics.new_gauge("postings_load_max_us", partition),
+            docs_ready_us: metrics.new_count("docs_ready_us", partition),
+            docs_ready_max_us: metrics.new_gauge("docs_ready_max_us", partition),
+            cpu_spawn_tasks: metrics.new_count("cpu_spawn_tasks", partition),
+            cpu_spawn_queue_us: metrics.new_count("cpu_spawn_queue_us", partition),
+            cpu_spawn_queue_max_us: metrics.new_gauge("cpu_spawn_queue_max_us", partition),
+            cpu_spawn_run_us: metrics.new_count("cpu_spawn_run_us", partition),
+            cpu_spawn_run_max_us: metrics.new_gauge("cpu_spawn_run_max_us", partition),
+            cpu_spawn_wake_us: metrics.new_count("cpu_spawn_wake_us", partition),
+            cpu_spawn_wake_max_us: metrics.new_gauge("cpu_spawn_wake_max_us", partition),
+            row_id_resolve_us: metrics.new_count("row_id_resolve_us", partition),
+            row_id_resolve_max_us: metrics.new_gauge("row_id_resolve_max_us", partition),
             baseline_metrics: BaselineMetrics::new(metrics, partition),
         }
     }
@@ -193,6 +229,10 @@ impl FtsIndexMetrics {
 
     pub fn record_scorer_build(&self, elapsed: std::time::Duration) {
         self.scorer_build_ms.set(elapsed.as_millis() as usize);
+    }
+
+    fn elapsed_us(elapsed: std::time::Duration) -> usize {
+        elapsed.as_micros().min(usize::MAX as u128) as usize
     }
 }
 
@@ -223,6 +263,31 @@ impl MetricsCollector for FtsIndexMetrics {
 
     fn record_freqs_collected(&self, num_collections: usize) {
         self.freqs_collected.add(num_collections);
+    }
+
+    fn record_fts_postings_load_timing(&self, elapsed_us: usize) {
+        self.postings_load_us.add(elapsed_us);
+        self.postings_load_max_us.set_max(elapsed_us);
+    }
+
+    fn record_fts_docs_ready_timing(&self, elapsed_us: usize) {
+        self.docs_ready_us.add(elapsed_us);
+        self.docs_ready_max_us.set_max(elapsed_us);
+    }
+
+    fn record_fts_spawn_timing(&self, queue_us: usize, run_us: usize, wake_us: usize) {
+        self.cpu_spawn_tasks.add(1);
+        self.cpu_spawn_queue_us.add(queue_us);
+        self.cpu_spawn_queue_max_us.set_max(queue_us);
+        self.cpu_spawn_run_us.add(run_us);
+        self.cpu_spawn_run_max_us.set_max(run_us);
+        self.cpu_spawn_wake_us.add(wake_us);
+        self.cpu_spawn_wake_max_us.set_max(wake_us);
+    }
+
+    fn record_fts_row_id_resolve_timing(&self, elapsed_us: usize) {
+        self.row_id_resolve_us.add(elapsed_us);
+        self.row_id_resolve_max_us.set_max(elapsed_us);
     }
 }
 
@@ -477,6 +542,8 @@ impl ExecutionPlan for MatchQueryExec {
         )))?;
         let stream = stream::once(async move {
             let _timer = metrics.baseline_metrics.elapsed_compute().timer();
+            let match_start = std::time::Instant::now();
+            let index_setup_start = std::time::Instant::now();
             let segments = match preset_segments {
                 Some(segments) => segments,
                 None => load_segments(&ds, &column)
@@ -489,6 +556,9 @@ impl ExecutionPlan for MatchQueryExec {
             let _details = load_segment_details(&ds, &column, &segments).await?;
             let indices =
                 open_fts_segments(&ds, &column, &segments, &metrics.index_metrics).await?;
+            metrics
+                .index_setup_us
+                .set(FtsIndexMetrics::elapsed_us(index_setup_start.elapsed()));
 
             let mut pre_filter =
                 build_prefilter(context.clone(), partition, &prefilter_source, ds, &segments)?;
@@ -541,9 +611,14 @@ impl ExecutionPlan for MatchQueryExec {
                 }
             };
 
+            let prefilter_wait_start = std::time::Instant::now();
             pre_filter.wait_for_ready().await?;
+            metrics
+                .prefilter_wait_us
+                .set(FtsIndexMetrics::elapsed_us(prefilter_wait_start.elapsed()));
             let tokens = Arc::new(tokens);
             let params = Arc::new(params);
+            let search_start = std::time::Instant::now();
             let (doc_ids, mut scores) = search_segments(
                 &indices,
                 tokens,
@@ -554,6 +629,11 @@ impl ExecutionPlan for MatchQueryExec {
                 base_scorer,
             )
             .await?;
+            metrics
+                .search_segments_us
+                .set(FtsIndexMetrics::elapsed_us(search_start.elapsed()));
+
+            let result_build_start = std::time::Instant::now();
             scores.iter_mut().for_each(|s| {
                 *s *= query.boost;
             });
@@ -566,6 +646,12 @@ impl ExecutionPlan for MatchQueryExec {
                     Arc::new(Float32Array::from(scores)),
                 ],
             )?;
+            metrics
+                .result_build_us
+                .set(FtsIndexMetrics::elapsed_us(result_build_start.elapsed()));
+            metrics
+                .match_total_us
+                .set(FtsIndexMetrics::elapsed_us(match_start.elapsed()));
             Ok::<_, DataFusionError>(batch)
         });
 
