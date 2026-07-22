@@ -1676,6 +1676,20 @@ mod tests {
         lance_core::Result<()>
     );
 
+    #[test]
+    fn ensure_sq_metadata_compatible_checks_bounds_and_num_bits() {
+        let meta = |num_bits, bounds| ScalarQuantizationMetadata {
+            dim: 8,
+            num_bits,
+            bounds,
+        };
+        // Identical metadata is compatible.
+        assert!(ensure_sq_metadata_compatible(&meta(8, 0.0..1.0), &meta(8, 0.0..1.0)).is_ok());
+        // Different bounds OR different num_bits (same bounds) are both rejected.
+        assert!(ensure_sq_metadata_compatible(&meta(8, 0.0..1.0), &meta(8, 0.0..2.0)).is_err());
+        assert!(ensure_sq_metadata_compatible(&meta(8, 0.0..1.0), &meta(4, 0.0..1.0)).is_err());
+    }
+
     async fn write_flat_partial_aux(
         store: &ObjectStore,
         aux_path: &Path,

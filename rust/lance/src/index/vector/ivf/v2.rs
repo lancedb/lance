@@ -4008,6 +4008,7 @@ mod tests {
             let sq_meta =
                 get_sq_metadata(ds, scheduler.clone(), &indices[0].uuid.to_string()).await;
             assert_eq!(sq_meta.bounds, injected_bounds);
+            assert_eq!(sq_meta.num_bits, 8);
         }
 
         // Query both datasets with the same query set.
@@ -4069,10 +4070,11 @@ mod tests {
             }
         }
         if index_kind != "IVF_SQ" {
-            // Aggregate recall floor (the file's K/3 idiom for single-vs-split
-            // SQ); a mismatched scale would drop overlap toward random.
+            // Aggregate recall >= 0.5 vs the baseline (fixture measures ~0.75
+            // with tight variance, so this is a stable floor); a mismatched
+            // scale would drop overlap toward random.
             assert!(
-                hnsw_overlap * 3 >= hnsw_total,
+                hnsw_overlap * 2 >= hnsw_total,
                 "merged IVF_HNSW_SQ aggregate overlap too low: {hnsw_overlap}/{hnsw_total}",
             );
         }
