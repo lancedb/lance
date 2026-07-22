@@ -1627,22 +1627,56 @@ impl ScalarIndexExpr {
     /// Range queries for the same parsed scalar index are intersected and retain
     /// `needs_recheck` if any input range requires it. An exact `IS NOT NULL`
     /// query is removed when another exact same-index query is null-intolerant.
-    /// OR branches are optimized independently, while NOT subtrees remain opaque.
+    /// OR branches are optimized independently. Range queries are still merged
+    /// under NOT, but `IS NOT NULL` elimination is disabled there to preserve
+    /// SQL NULL semantics.
+    ///
+    /// Compatible [`SargableQuery::Range`] values carried by
+    /// [`ScalarIndexSearch`] are merged into one query.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use std::{ops::Bound, sync::Arc};
+    /// # use lance_index::scalar::{SargableQuery, expression::{ScalarIndexExpr, ScalarIndexSearch}};
+    /// # let range = |lower, upper| ScalarIndexExpr::Query(ScalarIndexSearch {
+    /// #     column: "x".into(),
+    /// #     index_name: "x_idx".into(),
+    /// #     index_type: "BTree".into(),
+    /// #     query: Arc::new(SargableQuery::Range(lower, upper)),
+    /// #     needs_recheck: false,
+    /// #     fragment_bitmap: None,
+    /// # });
+    /// let optimized = ScalarIndexExpr::And(
+    ///     Box::new(range(Bound::Included(10_i64.into()), Bound::Unbounded)),
+    ///     Box::new(range(Bound::Unbounded, Bound::Included(20_i64.into()))),
+    /// )
+    /// .optimize();
+    ///
+    /// assert!(matches!(optimized, ScalarIndexExpr::Query(_)));
+    /// ```
     pub fn optimize(self) -> Self {
+        self.optimize_with_context(true)
+    }
+
+    fn optimize_with_context(self, is_not_null_elidable: bool) -> Self {
         match self {
-            Self::And(_, _) => self.optimize_and_tree(),
-            Self::Or(lhs, rhs) => Self::Or(Box::new(lhs.optimize()), Box::new(rhs.optimize())),
-            Self::Not(inner) => Self::Not(inner),
+            Self::And(_, _) => self.optimize_and_tree(is_not_null_elidable),
+            Self::Or(lhs, rhs) => Self::Or(
+                Box::new(lhs.optimize_with_context(is_not_null_elidable)),
+                Box::new(rhs.optimize_with_context(is_not_null_elidable)),
+            ),
+            Self::Not(inner) => Self::Not(Box::new(inner.optimize_with_context(false))),
             other => other,
         }
     }
 
     /// Flatten one contiguous AND region, apply local optimizer rules, and
     /// rebuild a balanced AND tree.
-    fn optimize_and_tree(self) -> Self {
+    fn optimize_and_tree(self, is_not_null_elidable: bool) -> Self {
         let mut leaves = Vec::new();
-        self.collect_and_leaves(&mut leaves);
-        let leaves = Self::optimize_and_leaves(leaves);
+        self.collect_and_leaves(&mut leaves, is_not_null_elidable);
+        let leaves = Self::optimize_and_leaves(leaves, is_not_null_elidable);
 
         Self::rebuild_and_tree(leaves).expect("AND tree optimization should keep at least one leaf")
     }
@@ -1650,19 +1684,23 @@ impl ScalarIndexExpr {
     /// Apply optimizer rules within one AND region only. OR branches have already
     /// been kept as opaque leaves, so range and null-intolerance rewrites cannot
     /// cross boolean boundaries.
-    fn optimize_and_leaves(leaves: Vec<Self>) -> Vec<Self> {
-        let is_not_null_keys = leaves
-            .iter()
-            .filter_map(Self::is_not_null_query_key)
-            .collect::<HashSet<_>>();
-        let null_intolerant_keys = if is_not_null_keys.is_empty() {
+    fn optimize_and_leaves(leaves: Vec<Self>, is_not_null_elidable: bool) -> Vec<Self> {
+        let null_intolerant_keys = if !is_not_null_elidable {
             HashSet::new()
         } else {
-            leaves
+            let is_not_null_keys = leaves
                 .iter()
-                .filter_map(Self::null_intolerant_query_key)
-                .filter(|key| is_not_null_keys.contains(key))
-                .collect()
+                .filter_map(Self::is_not_null_query_key)
+                .collect::<HashSet<_>>();
+            if is_not_null_keys.is_empty() {
+                HashSet::new()
+            } else {
+                leaves
+                    .iter()
+                    .filter_map(Self::null_intolerant_query_key)
+                    .filter(|key| is_not_null_keys.contains(key))
+                    .collect()
+            }
         };
 
         let mut optimized = Vec::with_capacity(leaves.len());
@@ -1695,19 +1733,24 @@ impl ScalarIndexExpr {
         optimized
     }
 
-    /// Recursively collect all leaf nodes from an AND tree.
-    ///
-    /// OR branches are optimized independently and then retained as leaves.
-    /// NOT branches are intentionally opaque to avoid changing null semantics
-    /// under negation.
-    fn collect_and_leaves(self, leaves: &mut Vec<Self>) {
+    /// Recursively collect all leaf nodes from an AND tree. OR branches are
+    /// optimized independently with the current null-elision context. NOT
+    /// branches remain leaves while their children are optimized with null
+    /// elimination disabled.
+    fn collect_and_leaves(self, leaves: &mut Vec<Self>, is_not_null_elidable: bool) {
         match self {
             Self::And(lhs, rhs) => {
-                lhs.collect_and_leaves(leaves);
-                rhs.collect_and_leaves(leaves);
+                lhs.collect_and_leaves(leaves, is_not_null_elidable);
+                rhs.collect_and_leaves(leaves, is_not_null_elidable);
             }
             Self::Or(lhs, rhs) => {
-                leaves.push(Self::Or(Box::new(lhs.optimize()), Box::new(rhs.optimize())));
+                leaves.push(Self::Or(
+                    Box::new(lhs.optimize_with_context(is_not_null_elidable)),
+                    Box::new(rhs.optimize_with_context(is_not_null_elidable)),
+                ));
+            }
+            Self::Not(inner) => {
+                leaves.push(Self::Not(Box::new(inner.optimize_with_context(false))))
             }
             other => leaves.push(other),
         }
@@ -4071,7 +4114,7 @@ mod tests {
         // and the other queries as separate leaves
         // Let's verify by collecting leaves
         let mut leaves = Vec::new();
-        optimized.collect_and_leaves(&mut leaves);
+        optimized.collect_and_leaves(&mut leaves, true);
 
         // Should have 3 leaves: fqdn, merged_time, channel
         assert_eq!(
@@ -4143,7 +4186,7 @@ mod tests {
 
         // Should remain as two separate leaves (not merged)
         let mut leaves = Vec::new();
-        optimized.collect_and_leaves(&mut leaves);
+        optimized.collect_and_leaves(&mut leaves, true);
         assert_eq!(leaves.len(), 2);
     }
 
@@ -4180,7 +4223,7 @@ mod tests {
         let optimized = expr.optimize();
 
         let mut leaves = Vec::new();
-        optimized.collect_and_leaves(&mut leaves);
+        optimized.collect_and_leaves(&mut leaves, true);
         assert_eq!(leaves.len(), 2, "Equals + Range should not merge");
     }
 
@@ -4220,7 +4263,7 @@ mod tests {
         let optimized = expr.optimize();
 
         let mut leaves = Vec::new();
-        optimized.collect_and_leaves(&mut leaves);
+        optimized.collect_and_leaves(&mut leaves, true);
         assert_eq!(leaves.len(), 1);
 
         if let ScalarIndexExpr::Query(s) = &leaves[0] {
@@ -4299,7 +4342,7 @@ mod tests {
         let optimized = expr.optimize();
 
         let mut leaves = Vec::new();
-        optimized.collect_and_leaves(&mut leaves);
+        optimized.collect_and_leaves(&mut leaves, true);
         // Should have 2 leaves: OR node (preserved) + merged range
         assert_eq!(leaves.len(), 2);
 
@@ -4491,7 +4534,7 @@ mod tests {
 
     fn collect_test_and_leaves(expr: ScalarIndexExpr) -> Vec<ScalarIndexExpr> {
         let mut leaves = Vec::new();
-        expr.collect_and_leaves(&mut leaves);
+        expr.collect_and_leaves(&mut leaves, true);
         leaves
     }
 
@@ -4859,7 +4902,7 @@ mod tests {
     }
 
     #[test]
-    fn test_optimize_does_not_rewrite_inside_not() {
+    fn test_optimize_merges_ranges_inside_not() {
         let lower = test_scalar_range(
             "x",
             "idx_x",
@@ -4872,16 +4915,95 @@ mod tests {
             Bound::Unbounded,
             Bound::Included(ScalarValue::Int64(Some(20))),
         );
+        let sibling = test_scalar_query(
+            "y",
+            "idx_y",
+            SargableQuery::Equals(ScalarValue::Int64(Some(1))),
+        );
 
-        let optimized =
-            ScalarIndexExpr::Not(Box::new(test_and_terms(vec![lower, upper]))).optimize();
+        let nested_not = ScalarIndexExpr::Not(Box::new(test_and_terms(vec![lower, upper])));
+        let optimized = ScalarIndexExpr::And(Box::new(nested_not), Box::new(sibling)).optimize();
 
-        let ScalarIndexExpr::Not(inner) = optimized else {
+        let ScalarIndexExpr::And(nested_not, _) = optimized else {
+            panic!("expected outer AND expression");
+        };
+        let ScalarIndexExpr::Not(inner) = *nested_not else {
             panic!("expected NOT expression");
         };
         let leaves = collect_test_and_leaves(*inner);
 
+        assert_eq!(leaves.len(), 1);
+        assert!(matches!(
+            &leaves[0],
+            ScalarIndexExpr::Query(search)
+                if matches!(
+                    search.sargable_query(),
+                    Some(SargableQuery::Range(
+                        Bound::Included(ScalarValue::Int64(Some(10))),
+                        Bound::Included(ScalarValue::Int64(Some(20))),
+                    ))
+                )
+        ));
+    }
+
+    #[test]
+    fn test_optimize_does_not_remove_is_not_null_inside_not() {
+        let is_not_null = ScalarIndexExpr::Not(Box::new(test_scalar_query(
+            "x",
+            "idx_x",
+            SargableQuery::IsNull(),
+        )));
+        let range = test_scalar_range(
+            "x",
+            "idx_x",
+            Bound::Included(ScalarValue::Int64(Some(10))),
+            Bound::Unbounded,
+        );
+        let guarded_range = test_and_terms(vec![is_not_null, range]);
+        let alternative = test_scalar_query(
+            "y",
+            "idx_y",
+            SargableQuery::Equals(ScalarValue::Int64(Some(1))),
+        );
+        let or = ScalarIndexExpr::Or(Box::new(guarded_range), Box::new(alternative));
+        let sibling = test_scalar_query(
+            "z",
+            "idx_z",
+            SargableQuery::Equals(ScalarValue::Int64(Some(2))),
+        );
+        let outer_sibling = test_scalar_query(
+            "w",
+            "idx_w",
+            SargableQuery::Equals(ScalarValue::Int64(Some(3))),
+        );
+
+        let nested_not = ScalarIndexExpr::Not(Box::new(test_and_terms(vec![or, sibling])));
+        let optimized =
+            ScalarIndexExpr::And(Box::new(nested_not), Box::new(outer_sibling)).optimize();
+
+        let ScalarIndexExpr::And(nested_not, _) = optimized else {
+            panic!("expected outer AND expression");
+        };
+        let ScalarIndexExpr::Not(inner) = *nested_not else {
+            panic!("expected NOT expression");
+        };
+        let ScalarIndexExpr::And(or, _) = *inner else {
+            panic!("expected AND expression");
+        };
+        let ScalarIndexExpr::Or(lhs, _) = *or else {
+            panic!("expected OR expression");
+        };
+        let leaves = collect_test_and_leaves(*lhs);
+
         assert_eq!(leaves.len(), 2);
+        assert!(leaves.iter().any(|leaf| {
+            matches!(
+                leaf,
+                ScalarIndexExpr::Not(inner)
+                    if matches!(inner.as_ref(), ScalarIndexExpr::Query(search)
+                        if matches!(search.sargable_query(), Some(SargableQuery::IsNull())))
+            )
+        }));
     }
 
     #[test]
@@ -4975,7 +5097,7 @@ mod tests {
 
             let optimized = expr.optimize();
             let mut leaves = Vec::new();
-            optimized.collect_and_leaves(&mut leaves);
+            optimized.collect_and_leaves(&mut leaves, true);
             assert_eq!(leaves.len(), 1, "All 4 ranges should merge into 1");
 
             if let ScalarIndexExpr::Query(s) = &leaves[0] {
@@ -5012,7 +5134,7 @@ mod tests {
             let optimized = expr.optimize();
 
             let mut leaves = Vec::new();
-            optimized.collect_and_leaves(&mut leaves);
+            optimized.collect_and_leaves(&mut leaves, true);
             assert_eq!(
                 leaves.len(),
                 2,
@@ -5060,7 +5182,7 @@ mod tests {
             if let ScalarIndexExpr::Or(lhs, rhs) = &optimized {
                 // Each branch should be a single merged range
                 let mut left_leaves = Vec::new();
-                lhs.clone().collect_and_leaves(&mut left_leaves);
+                lhs.clone().collect_and_leaves(&mut left_leaves, true);
                 assert_eq!(
                     left_leaves.len(),
                     1,
@@ -5078,7 +5200,7 @@ mod tests {
                 }
 
                 let mut right_leaves = Vec::new();
-                rhs.clone().collect_and_leaves(&mut right_leaves);
+                rhs.clone().collect_and_leaves(&mut right_leaves, true);
                 assert_eq!(
                     right_leaves.len(),
                     1,
@@ -5136,7 +5258,7 @@ mod tests {
 
             let optimized = expr.optimize();
             let mut leaves = Vec::new();
-            optimized.collect_and_leaves(&mut leaves);
+            optimized.collect_and_leaves(&mut leaves, true);
             assert_eq!(
                 leaves.len(),
                 2,
@@ -5209,7 +5331,7 @@ mod tests {
 
             let optimized = expr.optimize();
             let mut leaves = Vec::new();
-            optimized.collect_and_leaves(&mut leaves);
+            optimized.collect_and_leaves(&mut leaves, true);
             assert_eq!(leaves.len(), 3, "fqdn + merged_time + channel = 3 leaves");
 
             let time_leaf = leaves
@@ -5248,7 +5370,7 @@ mod tests {
 
             let optimized = expr.optimize();
             let mut leaves = Vec::new();
-            optimized.collect_and_leaves(&mut leaves);
+            optimized.collect_and_leaves(&mut leaves, true);
             assert_eq!(leaves.len(), 1);
             if let ScalarIndexExpr::Query(s) = &leaves[0] {
                 let range = s.query.as_any().downcast_ref::<SargableQuery>().unwrap();
@@ -5282,7 +5404,7 @@ mod tests {
 
             let optimized = expr.optimize();
             let mut leaves = Vec::new();
-            optimized.collect_and_leaves(&mut leaves);
+            optimized.collect_and_leaves(&mut leaves, true);
             assert_eq!(leaves.len(), 1);
             if let ScalarIndexExpr::Query(s) = &leaves[0] {
                 let range = s.query.as_any().downcast_ref::<SargableQuery>().unwrap();
@@ -5317,7 +5439,7 @@ mod tests {
 
             let optimized = expr.optimize();
             let mut leaves = Vec::new();
-            optimized.collect_and_leaves(&mut leaves);
+            optimized.collect_and_leaves(&mut leaves, true);
             assert_eq!(leaves.len(), 1);
             if let ScalarIndexExpr::Query(s) = &leaves[0] {
                 let range = s.query.as_any().downcast_ref::<SargableQuery>().unwrap();
