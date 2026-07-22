@@ -3980,19 +3980,15 @@ mod tests {
             .unwrap();
 
         // Sharded: one uncommitted segment per fragment, then merge + commit.
-        let fragments = ds_split.get_fragments();
-        assert!(fragments.len() >= 2);
-        let mut segments = Vec::new();
-        for fragment in &fragments {
-            let segment = ds_split
-                .create_index_builder(&["vector"], IndexType::Vector, &params)
-                .name(INDEX_NAME.to_string())
-                .fragments(vec![fragment.id() as u32])
-                .execute_uncommitted()
-                .await
-                .unwrap();
-            segments.push(segment);
-        }
+        let fragment_groups: Vec<Vec<u32>> = ds_split
+            .get_fragments()
+            .iter()
+            .map(|f| vec![f.id() as u32])
+            .collect();
+        assert!(fragment_groups.len() >= 2);
+        let segments =
+            build_segments_for_fragment_groups(&mut ds_split, fragment_groups, &params, INDEX_NAME)
+                .await;
         let merged = ds_split
             .merge_existing_index_segments(segments)
             .await
@@ -4061,8 +4057,19 @@ mod tests {
                     "single vs merged IVF_SQ returned different Top-K row ids",
                 );
             } else {
-                // HNSW graph construction is approximate; just require results.
+                // HNSW graph construction is approximate, so Top-K need not be
+                // identical -- but a merged index on the SAME injected bounds
+                // must still overlap the baseline's neighbours; a mismatched
+                // scale (the bug) would drop overlap toward random. Uses the
+                // same K/3 overlap floor as the other single-vs-split SQ test
+                // in this file, which is chosen to be non-flaky.
                 assert_eq!(ids_split.len(), K);
+                let baseline: std::collections::HashSet<u64> = ids_single.iter().copied().collect();
+                let overlap = ids_split.iter().filter(|id| baseline.contains(id)).count();
+                assert!(
+                    overlap >= K / 3,
+                    "merged IVF_HNSW_SQ vs baseline top-k overlap too low: {overlap}/{K}",
+                );
             }
         }
     }
@@ -4115,7 +4122,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("SQ bounds mismatch across shards"),
+                .contains("SQ metadata mismatch across shards"),
             "{error}"
         );
     }

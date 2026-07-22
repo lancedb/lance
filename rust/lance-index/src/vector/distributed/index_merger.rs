@@ -178,17 +178,22 @@ fn ensure_fixed_size_list_compatible(
     Ok(())
 }
 
-/// SQ shards must share bit-identical bounds. Unlike PQ codebooks / IVF
-/// centroids (compared with a tolerance above, since training can drift), SQ
-/// bounds are injected verbatim into every shard's build, so any difference is
-/// not benign drift -- it means a shard self-trained its own scale and its
-/// codes are incomparable with the others. Exact inequality is the check.
-fn ensure_sq_bounds_match(
+/// SQ shards must share every metadata field that governs how a code is
+/// interpreted: `num_bits` (the scale denominator) and `bounds` (the range).
+/// Unlike PQ codebooks / IVF centroids (compared with a tolerance above, since
+/// training can drift), these are injected verbatim into every shard's build,
+/// so any difference is not benign drift -- it means a shard used a different
+/// scale and its codes are incomparable. Exact inequality is the check
+/// (`num_bits` matters especially once SQ4 lands).
+fn ensure_sq_metadata_compatible(
     reference: &ScalarQuantizationMetadata,
     candidate: &ScalarQuantizationMetadata,
 ) -> Result<()> {
-    if reference.bounds != candidate.bounds {
-        return Err(Error::index("SQ bounds mismatch across shards".to_string()));
+    if reference.num_bits != candidate.num_bits || reference.bounds != candidate.bounds {
+        return Err(Error::index(format!(
+            "SQ metadata mismatch across shards: num_bits {} vs {}, bounds {:?} vs {:?}",
+            reference.num_bits, candidate.num_bits, reference.bounds, candidate.bounds
+        )));
     }
     Ok(())
 }
@@ -1023,7 +1028,7 @@ pub async fn merge_partial_vector_auxiliary_files(
                 }
 
                 if let Some(prev) = &sq_meta {
-                    ensure_sq_bounds_match(prev, &sq_meta_parsed)?;
+                    ensure_sq_metadata_compatible(prev, &sq_meta_parsed)?;
                 } else {
                     sq_meta = Some(sq_meta_parsed.clone());
                 }
@@ -1443,7 +1448,7 @@ pub async fn merge_partial_vector_auxiliary_files(
                     return Err(Error::index("Dimension mismatch across shards".to_string()));
                 }
                 if let Some(prev) = &sq_meta {
-                    ensure_sq_bounds_match(prev, &sq_meta_parsed)?;
+                    ensure_sq_metadata_compatible(prev, &sq_meta_parsed)?;
                 } else {
                     sq_meta = Some(sq_meta_parsed.clone());
                 }

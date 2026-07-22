@@ -146,6 +146,26 @@ impl Quantization for ScalarQuantizer {
         // training on the local sample, so codes are comparable across
         // independently built shards.
         if let Some(bounds) = params.bounds.clone() {
+            // The fast path skips the training scan below, so validate here
+            // what that scan validates implicitly: a supported float element
+            // type, and finite bounds (NaN/inf would collapse every code and
+            // serialize to unusable metadata). `start == end` stays valid -- a
+            // globally constant column legitimately has min == max.
+            if !matches!(
+                fsl.value_type(),
+                DataType::Float16 | DataType::Float32 | DataType::Float64
+            ) {
+                return Err(Error::invalid_input(format!(
+                    "SQ builder: unsupported data type: {}",
+                    fsl.value_type()
+                )));
+            }
+            if !bounds.start.is_finite() || !bounds.end.is_finite() {
+                return Err(Error::invalid_input(format!(
+                    "SQ builder: injected bounds must be finite, got {}..{}",
+                    bounds.start, bounds.end
+                )));
+            }
             return Ok(Self::with_bounds(
                 params.num_bits,
                 fsl.value_length() as usize,
@@ -360,43 +380,75 @@ mod tests {
         });
     }
 
+    /// A `FixedSizeList<Float32>` built from per-element values, for the SQ
+    /// build tests.
+    fn f32_fsl(values: impl IntoIterator<Item = f32>, dim: i32) -> FixedSizeListArray {
+        FixedSizeListArray::try_new_from_values(Float32Array::from_iter_values(values), dim)
+            .unwrap()
+    }
+
     #[test]
     fn test_build_with_injected_bounds() {
         let dim = 16;
-        let injected = Range::<f64> {
-            start: -3.0,
-            end: 42.0,
-        };
+        let injected = -3.0..42.0;
         let params = SQBuildParams::with_bounds(8, injected.clone());
 
-        // Two samples with very different value ranges.
-        let sample_a = FixedSizeListArray::try_new_from_values(
-            Float32Array::from_iter_values((0..dim).map(|v| v as f32)),
-            dim,
+        // Two samples with very different value ranges; both must adopt the
+        // injected bounds, not their own.
+        let sq_a = ScalarQuantizer::build(
+            &f32_fsl((0..dim).map(|v| v as f32), dim),
+            DistanceType::L2,
+            &params,
         )
         .unwrap();
-        let sample_b = FixedSizeListArray::try_new_from_values(
-            Float32Array::from_iter_values((0..dim).map(|v| (v as f32) * 100.0 - 500.0)),
-            dim,
+        let sq_b = ScalarQuantizer::build(
+            &f32_fsl((0..dim).map(|v| (v as f32) * 100.0 - 500.0), dim),
+            DistanceType::L2,
+            &params,
         )
         .unwrap();
-
-        let sq_a = ScalarQuantizer::build(&sample_a, DistanceType::L2, &params).unwrap();
-        let sq_b = ScalarQuantizer::build(&sample_b, DistanceType::L2, &params).unwrap();
-
-        // Bounds come from the params, not from either sample.
         assert_eq!(sq_a.bounds(), injected);
         assert_eq!(sq_b.bounds(), injected);
 
-        // Both quantizers produce identical codes for the same input.
-        let query = FixedSizeListArray::try_new_from_values(
-            Float32Array::from_iter_values((0..dim).map(|v| v as f32 * 2.0)),
-            dim,
+        // Identical bounds ⟹ identical codes for the same input.
+        let query = f32_fsl((0..dim).map(|v| v as f32 * 2.0), dim);
+        assert_eq!(
+            sq_a.quantize(&query).unwrap().as_ref(),
+            sq_b.quantize(&query).unwrap().as_ref(),
+        );
+    }
+
+    #[test]
+    fn test_build_rejects_non_finite_injected_bounds() {
+        let sample = f32_fsl((0..8).map(|v| v as f32), 8);
+        for bad in [
+            f64::NAN..1.0,
+            0.0..f64::NAN,
+            f64::NEG_INFINITY..1.0,
+            0.0..f64::INFINITY,
+        ] {
+            let params = SQBuildParams::with_bounds(8, bad);
+            assert!(
+                ScalarQuantizer::build(&sample, DistanceType::L2, &params).is_err(),
+                "non-finite injected bounds must be rejected",
+            );
+        }
+        // Equal endpoints are valid (a globally constant column has min == max).
+        let params = SQBuildParams::with_bounds(8, 3.0..3.0);
+        assert!(ScalarQuantizer::build(&sample, DistanceType::L2, &params).is_ok());
+    }
+
+    #[test]
+    fn test_build_with_injected_bounds_rejects_unsupported_type() {
+        // Int32 element type: the injected-bounds fast path must still reject
+        // it, not defer the failure to quantization time.
+        let fsl = FixedSizeListArray::try_new_from_values(
+            arrow_array::Int32Array::from_iter_values(0..4),
+            4,
         )
         .unwrap();
-        let code_a = sq_a.quantize(&query).unwrap();
-        let code_b = sq_b.quantize(&query).unwrap();
-        assert_eq!(code_a.as_ref(), code_b.as_ref());
+        let params = SQBuildParams::with_bounds(8, 0.0..10.0);
+        assert!(ScalarQuantizer::build(&fsl, DistanceType::L2, &params).is_err());
     }
 
     #[test]
@@ -405,19 +457,21 @@ mod tests {
         let params = SQBuildParams::default();
         assert!(params.bounds.is_none());
 
-        let sample = FixedSizeListArray::try_new_from_values(
-            Float32Array::from_iter_values((0..dim).map(|v| v as f32)),
-            dim,
+        let sq = ScalarQuantizer::build(
+            &f32_fsl((0..dim).map(|v| v as f32), dim),
+            DistanceType::L2,
+            &params,
         )
         .unwrap();
-        let sq = ScalarQuantizer::build(&sample, DistanceType::L2, &params).unwrap();
         assert_eq!(sq.bounds(), 0.0..(dim - 1) as f64);
     }
 
     #[test]
     fn test_sq_build_params_with_bounds() {
-        let params = SQBuildParams::with_bounds(4, 1.0..2.0);
-        assert_eq!(params.num_bits, 4);
+        // 8 bits: SQ currently only encodes u8 (SQ4 is a TODO), so don't
+        // present 4 as a supported width in the test.
+        let params = SQBuildParams::with_bounds(8, 1.0..2.0);
+        assert_eq!(params.num_bits, 8);
         assert_eq!(params.bounds, Some(1.0..2.0));
         assert_eq!(params.sample_rate, SQBuildParams::default().sample_rate);
     }
