@@ -32,8 +32,8 @@ if [[ ! -d "$head_dir/.git" && ! -f "$head_dir/.git" ]]; then
     git -C "$clone_dir" worktree add --detach "$head_dir" "$head_branch"
 fi
 
-[[ $(git -C "$base_dir" rev-parse HEAD^) == "$base_upstream" ]]
-[[ $(git -C "$head_dir" rev-parse HEAD^) == "$head_upstream" ]]
+[[ $(git -C "$base_dir" rev-parse HEAD~2) == "$base_upstream" ]]
+[[ $(git -C "$head_dir" rev-parse HEAD~2) == "$head_upstream" ]]
 
 build_binary() {
     local source_dir=$1
@@ -60,6 +60,9 @@ build_binary() {
 }
 
 build_binary "$base_dir" "$binary_dir/base" "$run_root/build-base.log"
+CARGO_TARGET_DIR="$target_dir" cargo clean \
+    --manifest-path "$head_dir/Cargo.toml" \
+    -p lance
 build_binary "$head_dir" "$binary_dir/head" "$run_root/build-head.log"
 
 result_tmp=$(mktemp "$run_root/results.XXXXXX")
