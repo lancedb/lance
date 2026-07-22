@@ -1194,7 +1194,7 @@ async fn build_user_view_struct(
     )?)
 }
 
-async fn transform_blob_v2_batch(
+pub(crate) async fn transform_blob_v2_batch(
     dataset: &Arc<Dataset>,
     schema: &lance_core::datatypes::Schema,
     batch: RecordBatch,
