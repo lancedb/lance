@@ -800,7 +800,7 @@ mod tests {
             Arc::new(registry),
             FtsQuery::match_query("tags", "beta")
                 .with_document_granularity(DocumentGranularity::ListElement),
-            0,
+            1,
             None,
             schema,
             false,
