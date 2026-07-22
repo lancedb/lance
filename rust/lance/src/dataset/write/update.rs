@@ -360,7 +360,7 @@ impl UpdateJob {
         let write_schema: Arc<ArrowSchema> = Arc::new(self.dataset.schema().into());
         let stream: SendableRecordBatchStream = if has_blob_v2 {
             let dataset = self.dataset.clone();
-            let lance_schema = self.dataset.schema().clone();
+            let lance_schema = Arc::new(self.dataset.schema().clone());
             let transformed = stream.then(move |batch_result| {
                 let dataset = dataset.clone();
                 let lance_schema = lance_schema.clone();
@@ -1877,8 +1877,10 @@ mod tests {
                 let path =
                     std::path::Path::new(external_dir.as_str()).join(format!("blob_{i}.bin"));
                 std::fs::write(&path, payload).unwrap();
+                let path_str = path.display().to_string();
+                let path_prefix = if path_str.starts_with('/') { "" } else { "/" };
                 blob_builder
-                    .push_uri(format!("file://{}", path.display()))
+                    .push_uri(format!("file://{path_prefix}{path_str}"))
                     .unwrap();
             } else {
                 blob_builder.push_bytes(payload).unwrap();
