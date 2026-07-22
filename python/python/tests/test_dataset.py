@@ -700,6 +700,51 @@ def test_take(tmp_path: Path):
     assert table2 == table1
 
 
+@pytest.mark.parametrize("data_storage_version", ["legacy", "stable"])
+def test_slice(tmp_path: Path, data_storage_version: str):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+    lance.write_dataset(
+        table, base_dir, data_storage_version=data_storage_version, max_rows_per_file=10
+    )
+    dataset = lance.dataset(base_dir)
+
+    # Equivalent to take(range(start, end))
+    assert dataset.slice(10, 20) == dataset.take(list(range(10, 20)))
+
+    # Basic range within a single fragment
+    assert dataset.slice(5, 8) == table.slice(5, 3)
+
+    # Range spanning multiple fragments
+    assert dataset.slice(5, 25) == table.slice(5, 20)
+
+    # Skipping entire fragments
+    assert dataset.slice(50, 75) == table.slice(50, 25)
+
+    # Full dataset
+    assert dataset.slice(0, 100) == table.slice(0, 100)
+
+    # Empty range (start == end)
+    assert dataset.slice(10, 10) == table.slice(10, 0)
+
+    # Range extending past the end of the dataset
+    assert dataset.slice(90, 1000) == table.slice(90, 10)
+
+    # Range entirely past the end of the dataset
+    assert dataset.slice(100, 110) == table.slice(100, 0)
+
+    # With column projection
+    assert dataset.slice(10, 20, columns=["a"]) == table.select(["a"]).slice(10, 10)
+
+    # Invalid start
+    with pytest.raises(ValueError, match="start must be non-negative"):
+        dataset.slice(-1, 10)
+
+    # end < start
+    with pytest.raises(ValueError, match="must be >= start"):
+        dataset.slice(10, 5)
+
+
 def test_take_rowid_rowaddr(tmp_path: Path):
     sample_size = 10
     table1 = pa.table({"a": range(1000), "b": range(1000)})

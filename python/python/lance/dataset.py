@@ -2367,6 +2367,52 @@ class LanceDataset(pa.dataset.Dataset):
         kwargs["limit"] = num_rows
         return self.scanner(**kwargs).to_table()
 
+    def slice(
+        self,
+        start: int,
+        end: int,
+        columns: Optional[Union[List[str], Dict[str, str]]] = None,
+    ) -> pa.Table:
+        """Select a contiguous range of rows by position.
+
+        Equivalent to ``dataset.take(list(range(start, end)))``, but pushed
+        down as an offset/limit scan instead of a materialized index list.
+
+        Parameters
+        ----------
+        start : int
+            The index of the first row to include (inclusive). Must be
+            non-negative.
+        end : int
+            The index to stop before (exclusive). Must be greater than or
+            equal to ``start``.
+        columns: list of str, or dict of str to str default None
+            List of column names to be fetched.
+            Or a dictionary of column names to SQL expressions.
+            All columns are fetched if None or unspecified.
+
+        Returns
+        -------
+        table : pyarrow.Table
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> tbl = pa.table({"id": range(100)})
+        >>> dataset = lance.write_dataset(tbl, "memory://slice_dataset")
+        >>> dataset.slice(10, 20)
+        pyarrow.Table
+        id: int64
+        ----
+        id: [[10,11,12,13,14,15,16,17,18,19]]
+        """
+        if start < 0:
+            raise ValueError(f"start must be non-negative, got {start}")
+        if end < start:
+            raise ValueError(f"end ({end}) must be >= start ({start})")
+        return self.scanner(offset=start, limit=end - start, columns=columns).to_table()
+
     def count_rows(
         self, filter: Optional[Union[str, pa.compute.Expression]] = None, **kwargs
     ) -> int:
