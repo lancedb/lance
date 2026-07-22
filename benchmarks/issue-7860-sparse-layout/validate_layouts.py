@@ -51,10 +51,18 @@ def main() -> None:
             "layout_counts": dict(counts),
         }
 
-    for name in ("v2_0_default", "v2_1_default", "v2_3_miniblock"):
+    for name in (
+        "v2_0_default",
+        "v2_1_default",
+        "v2_3_default",
+        "v2_3_miniblock",
+    ):
         assert summary[name]["layout_counts"].get("sparse", 0) == 0
-    for name in ("v2_3_default", "v2_3_sparse"):
-        assert summary[name]["layout_counts"].get("sparse", 0) == args.attrs
+    assert summary["v2_3_sparse"]["layout_counts"].get("sparse", 0) == args.attrs
+    assert (
+        summary["v2_3_default"]["layout_counts"]
+        == summary["v2_3_miniblock"]["layout_counts"]
+    )
 
     print(write_result(args.root / "layout-summary.json", summary), end="")
 
