@@ -142,15 +142,12 @@ impl Quantization for ScalarQuantizer {
             data.data_type()
         )))?;
 
-        // Pre-trained (e.g. globally-trained) bounds take precedence over
-        // training on the local sample, so codes are comparable across
-        // independently built shards.
+        // Injected bounds take precedence over local training, so codes stay
+        // comparable across independently built shards.
         if let Some(bounds) = params.bounds.clone() {
-            // The fast path skips the training scan below, so validate here
-            // what that scan validates implicitly: a supported float element
-            // type, and finite bounds (NaN/inf would collapse every code and
-            // serialize to unusable metadata). `start == end` stays valid -- a
-            // globally constant column legitimately has min == max.
+            // Validate what the skipped training scan validates implicitly:
+            // supported float type, and finite non-decreasing bounds (NaN/inf
+            // collapse codes; start == end is valid for a constant column).
             if !matches!(
                 fsl.value_type(),
                 DataType::Float16 | DataType::Float32 | DataType::Float64
@@ -160,9 +157,9 @@ impl Quantization for ScalarQuantizer {
                     fsl.value_type()
                 )));
             }
-            if !bounds.start.is_finite() || !bounds.end.is_finite() {
+            if !bounds.start.is_finite() || !bounds.end.is_finite() || bounds.start > bounds.end {
                 return Err(Error::invalid_input(format!(
-                    "SQ builder: injected bounds must be finite, got {}..{}",
+                    "SQ builder: injected bounds must be finite and non-decreasing, got {}..{}",
                     bounds.start, bounds.end
                 )));
             }
@@ -419,19 +416,22 @@ mod tests {
     }
 
     #[test]
-    fn test_build_rejects_non_finite_injected_bounds() {
+    fn test_build_rejects_invalid_injected_bounds() {
         let sample = f32_fsl((0..8).map(|v| v as f32), 8);
         for bad in [
             f64::NAN..1.0,
             0.0..f64::NAN,
             f64::NEG_INFINITY..1.0,
             0.0..f64::INFINITY,
+            2.0..1.0, // reversed
         ] {
-            let params = SQBuildParams::with_bounds(8, bad);
+            let params = SQBuildParams::with_bounds(8, bad.clone());
+            let err = ScalarQuantizer::build(&sample, DistanceType::L2, &params).unwrap_err();
             assert!(
-                ScalarQuantizer::build(&sample, DistanceType::L2, &params).is_err(),
-                "non-finite injected bounds must be rejected",
+                matches!(err, Error::InvalidInput { .. }),
+                "invalid injected bounds {bad:?} must be InvalidInput, got {err:?}",
             );
+            assert!(err.to_string().contains("bounds must be finite"), "{err}");
         }
         // Equal endpoints are valid (a globally constant column has min == max).
         let params = SQBuildParams::with_bounds(8, 3.0..3.0);
@@ -448,7 +448,9 @@ mod tests {
         )
         .unwrap();
         let params = SQBuildParams::with_bounds(8, 0.0..10.0);
-        assert!(ScalarQuantizer::build(&fsl, DistanceType::L2, &params).is_err());
+        let err = ScalarQuantizer::build(&fsl, DistanceType::L2, &params).unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err:?}");
+        assert!(err.to_string().contains("unsupported data type"), "{err}");
     }
 
     #[test]

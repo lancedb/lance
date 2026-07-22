@@ -11,11 +11,16 @@ pub struct SQBuildParams {
     /// Sample rate for training.
     pub sample_rate: usize,
 
-    /// User-provided, globally-trained quantization bounds.
+    /// User-provided, globally-trained quantization bounds. When set, per-build
+    /// training is skipped and these exact bounds are used, so codes are
+    /// comparable across independently built shards (mirrors
+    /// `PQBuildParams::codebook`).
     ///
-    /// When set, per-build training is skipped and these exact bounds are used,
-    /// so codes are comparable across independently built shards of a
-    /// distributed index build. Mirrors `PQBuildParams::codebook`.
+    /// Must be the global min/max in the quantizer's **post-transform** space:
+    /// cosine indexes L2-normalize first, so cosine bounds cover the normalized
+    /// components (`-1.0..=1.0`), not the raw values; L2/dot use the raw
+    /// min/max. Bounds that don't cover that space clip every code to 0 and
+    /// silently collapse the index.
     pub bounds: Option<std::ops::Range<f64>>,
 }
 
@@ -39,6 +44,18 @@ impl Default for SQBuildParams {
 
 impl SQBuildParams {
     /// Create build params carrying pre-trained bounds, skipping training.
+    ///
+    /// Use this so independently built shards of a distributed index quantize
+    /// on the same scale and their segments stay mergeable (see [`bounds`]).
+    ///
+    /// ```
+    /// use lance_index::vector::sq::builder::SQBuildParams;
+    /// // Every shard builds against the globally-trained min/max:
+    /// let params = SQBuildParams::with_bounds(8, 0.0..1.0);
+    /// assert_eq!(params.bounds, Some(0.0..1.0));
+    /// ```
+    ///
+    /// [`bounds`]: SQBuildParams::bounds
     pub fn with_bounds(num_bits: u16, bounds: std::ops::Range<f64>) -> Self {
         Self {
             num_bits,

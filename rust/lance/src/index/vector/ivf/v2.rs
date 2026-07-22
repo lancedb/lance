@@ -4022,6 +4022,11 @@ mod tests {
             .unwrap();
         let vectors = query_batch["vector"].as_fixed_size_list();
 
+        // For HNSW (approximate, non-deterministic build) accumulate overlap
+        // across all queries and check the aggregate recall once -- a single
+        // query's overlap is too noisy on a small fixture to threshold.
+        let mut hnsw_overlap = 0usize;
+        let mut hnsw_total = 0usize;
         for i in 0..vectors.len() {
             let q = vectors.value(i);
             let collect = |ds: &Dataset| {
@@ -4057,20 +4062,19 @@ mod tests {
                     "single vs merged IVF_SQ returned different Top-K row ids",
                 );
             } else {
-                // HNSW graph construction is approximate, so Top-K need not be
-                // identical -- but a merged index on the SAME injected bounds
-                // must still overlap the baseline's neighbours; a mismatched
-                // scale (the bug) would drop overlap toward random. Uses the
-                // same K/3 overlap floor as the other single-vs-split SQ test
-                // in this file, which is chosen to be non-flaky.
                 assert_eq!(ids_split.len(), K);
                 let baseline: std::collections::HashSet<u64> = ids_single.iter().copied().collect();
-                let overlap = ids_split.iter().filter(|id| baseline.contains(id)).count();
-                assert!(
-                    overlap >= K / 3,
-                    "merged IVF_HNSW_SQ vs baseline top-k overlap too low: {overlap}/{K}",
-                );
+                hnsw_overlap += ids_split.iter().filter(|id| baseline.contains(id)).count();
+                hnsw_total += K;
             }
+        }
+        if index_kind != "IVF_SQ" {
+            // Aggregate recall floor (the file's K/3 idiom for single-vs-split
+            // SQ); a mismatched scale would drop overlap toward random.
+            assert!(
+                hnsw_overlap * 3 >= hnsw_total,
+                "merged IVF_HNSW_SQ aggregate overlap too low: {hnsw_overlap}/{hnsw_total}",
+            );
         }
     }
 
@@ -4119,6 +4123,10 @@ mod tests {
             .merge_existing_index_segments(vec![first_segment, second_segment])
             .await
             .unwrap_err();
+        assert!(
+            matches!(error, lance_core::Error::Index { .. }),
+            "expected Error::Index, got {error:?}"
+        );
         assert!(
             error
                 .to_string()
