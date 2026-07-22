@@ -123,7 +123,18 @@ pub(crate) async fn translate_addr_treemap_to_row_ids(
                     file_fragment.get_deletion_vector(),
                     file_fragment.physical_rows()
                 )?;
-                let num_physical_rows = num_physical_rows as u32;
+                let num_physical_rows = u32::try_from(num_physical_rows).map_err(|_| {
+                    Error::corrupt_file(format!(
+                        "fragment_id={fragment_id} has num_physical_rows={num_physical_rows}, \
+                         which exceeds the maximum representable physical offset"
+                    ))
+                })?;
+                if max_offset >= num_physical_rows {
+                    return Err(Error::corrupt_file(format!(
+                        "fragment_id={fragment_id} selection has max_offset={max_offset}, \
+                         but num_physical_rows={num_physical_rows}"
+                    )));
+                }
                 let mut ids = sequence.iter();
                 for physical_offset in 0..num_physical_rows {
                     if physical_offset > max_offset {
