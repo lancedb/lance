@@ -4,6 +4,8 @@
 //! End-to-end MemWAL tests through the public [`ShardWriter`] surface, as
 //! opposed to the lib-level unit tests that can reach internals directly.
 
+use std::time::Duration;
+
 use arrow_array::record_batch;
 use lance::dataset::mem_wal::{ShardWriter, ShardWriterConfig};
 use lance_core::FenceReason;
@@ -32,7 +34,7 @@ async fn durable_put_does_not_alias_across_memtable_generations() {
         shard_id,
         durable_write: true,
         max_wal_buffer_size: 64 * 1024 * 1024,
-        max_wal_flush_interval: None,
+        max_wal_flush_interval: Some(Duration::from_millis(10)),
         max_memtable_size: 64 * 1024 * 1024,
         manifest_scan_batch_size: 2,
         ..Default::default()
