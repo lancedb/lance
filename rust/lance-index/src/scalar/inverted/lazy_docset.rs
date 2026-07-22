@@ -15,13 +15,11 @@
 //! only partitions that actually contribute hits pay
 //! `ensure_num_tokens_loaded`/`ensure_loaded`.
 //!
-//! For modern partitions the `doc_id -> row_id` column has exactly ONE
+//! For modern partitions the `doc_id -> row_id` column has exactly one
 //! home: the [`DocRowIdsKey`] index-cache entry. No `DocSet` keeps a
 //! long-lived copy or reference, so evicting the entry really frees the
-//! memory and the next borrower reloads it single-flight (index files are
-//! immutable, so a reload is always equivalent). Legacy and frag-reuse
-//! partitions rewrite the mapping at load (sort / tombstone) and keep a
-//! private owned copy instead, leaving the raw-column entry unpopulated.
+//! memory; borrowers reload it single-flight. Legacy and frag-reuse
+//! partitions rewrite the mapping at load and keep a private owned copy.
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -134,9 +132,8 @@ pub struct DeferredDocSet {
     /// `NUM_TOKEN_COL` and its zero-copy scoring view carrying the cached sum,
     /// published together on first read.
     num_tokens: OnceCell<NumTokensSnapshot>,
-    /// Resident scoring set from first `ensure_loaded`: modern partitions
-    /// get num_tokens + `inv` without row_ids (the column stays in the
-    /// cache entry); legacy / frag reuse get their full rewritten DocSet.
+    /// Modern partitions: num_tokens + `inv`, no row_ids (the column stays
+    /// in the cache entry). Legacy / frag reuse: the full rewritten DocSet.
     resident: OnceCell<Arc<DocSet>>,
 }
 
@@ -270,13 +267,10 @@ impl LazyDocSet {
         }
     }
 
-    /// Make this partition's scoring state fully resident: num_tokens, the
-    /// reverse-lookup `inv`, and the row-ids column loaded into its
-    /// [`DocRowIdsKey`] cache entry. The returned DocSet carries NO row_ids
-    /// for modern partitions, so nothing pins the entry and the cache stays
-    /// free to evict it. This is what prewarm calls: afterwards queries do
-    /// no IO as long as the cache retains the prewarmed entries (the same
-    /// contract posting lists have).
+    /// Make the scoring state resident: num_tokens, `inv`, and the row-ids
+    /// column loaded into its [`DocRowIdsKey`] cache entry. The returned
+    /// DocSet carries no row_ids for modern partitions, so nothing pins the
+    /// entry. Prewarm calls this.
     pub async fn ensure_loaded(&self) -> Result<Arc<DocSet>> {
         match self {
             Self::Loaded(l) => Ok(l.docs.clone()),
@@ -315,13 +309,10 @@ impl LazyDocSet {
         }
     }
 
-    /// Pick the DocSet shape for a wand walk of `operator` under `mask`:
-    /// trivial mask → num_tokens-only (survivors resolve post-merge);
-    /// legacy / frag reuse → the owned rewritten DocSet; flat-shaped mask
-    /// (same [`should_flat_search`] predicate wand uses, so the two cannot
-    /// disagree) → the resident set with `inv`; any other mask → a
-    /// per-query view borrowing the row-ids cache entry, dropped when the
-    /// query finishes.
+    /// Pick the DocSet shape for a wand walk: trivial mask → num_tokens
+    /// only; legacy / frag reuse → owned rewritten DocSet; flat-shaped mask
+    /// (same [`should_flat_search`] predicate wand uses) → resident set with
+    /// `inv`; any other mask → per-query view borrowing the cache entry.
     pub async fn docs_for_wand(
         &self,
         operator: Operator,
@@ -430,9 +421,7 @@ impl DeferredDocSet {
             .resident
             .get_or_try_init(|| async {
                 let mut docs = if self.is_legacy || self.frag_reuse_index.is_some() {
-                    // Both rewrite the mapping (sort / tombstone), so keep a
-                    // private owned copy; caching the raw column next to it
-                    // would just double-store.
+                    // Both rewrite the mapping, so keep a private owned copy.
                     DocSet::load(
                         self.reader().await?,
                         self.is_legacy,
@@ -440,8 +429,6 @@ impl DeferredDocSet {
                     )
                     .await?
                 } else {
-                    // Borrow the cache entry once to derive `inv`; the
-                    // column itself stays only in the entry.
                     let (snapshot, row_ids) =
                         futures::try_join!(self.num_tokens_snapshot(), self.row_ids_column())?;
                     DocSet::from_cached_num_tokens_with_inv(
@@ -466,9 +453,8 @@ impl DeferredDocSet {
     }
 
     async fn resolve_row_ids(&self, doc_ids: &[u32]) -> Result<Vec<u64>> {
-        // Only legacy / frag-reuse residents carry (rewritten) row_ids.
-        // Modern partitions always read through the cache entry, which also
-        // keeps a hot prewarmed column recently-used in the LRU.
+        // Only legacy / frag-reuse residents carry (rewritten) row_ids;
+        // modern partitions read the cache entry, keeping it LRU-hot.
         if let Some(resident) = self.resident.get()
             && resident.has_row_ids()
         {

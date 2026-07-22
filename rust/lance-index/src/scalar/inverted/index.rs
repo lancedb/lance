@@ -2418,8 +2418,6 @@ impl InvertedPartition {
             self.inverted_list.block_size(),
         );
         builder.tokens = self.tokens.into_mutable();
-        // into_builder rewrites every doc, so it needs a fully-owned DocSet
-        // (row_ids included) it can mutate; the copy is not stashed anywhere.
         builder.docs = self.docs.owned_docset().await?;
 
         builder
@@ -6406,10 +6404,9 @@ impl NumTokens {
     }
 }
 
-/// Per-doc `row_id` storage for a [`DocSet`]. `Shared` is a zero-copy view
-/// of the partition's `DocRowIdsKey` index-cache entry and must only be held
-/// transiently (per-query views) — a long-lived `Shared` would pin the
-/// allocation so evicting the entry could no longer free it.
+/// `Shared` is a zero-copy view of the partition's `DocRowIdsKey` cache
+/// entry; hold it only transiently, or evicting the entry can no longer
+/// free the memory.
 #[derive(Debug, Clone)]
 enum RowIds {
     Owned(Vec<u64>),
@@ -6437,8 +6434,7 @@ impl DeepSizeOf for RowIds {
     fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         match self {
             Self::Owned(values) => values.deep_size_of_children(context),
-            // Weighed by the DocRowIdsKey cache entry; counting it here too
-            // would double-bill the cache for the same allocation.
+            // Weighed by the DocRowIdsKey cache entry.
             Self::Shared(_) => 0,
         }
     }
@@ -6666,20 +6662,16 @@ impl DocSet {
         }
     }
 
-    /// A per-query scoring view: this num-tokens-only set plus a zero-copy
-    /// `row_ids` borrow of the partition's `DocRowIdsKey` cache entry, for
-    /// the masked non-flat wand path. Dropped with the query, so the borrow
-    /// pins the entry's allocation only while the query is in flight.
+    /// Per-query view for the masked wand path: this num-tokens-only set
+    /// plus a transient borrow of the row-ids cache entry.
     pub(crate) fn with_shared_row_ids(&self, row_ids: ScalarBuffer<u64>) -> Self {
         let mut docs = self.clone();
         docs.row_ids = RowIds::Shared(row_ids);
         docs
     }
 
-    /// The resident scoring set for a modern partition: shared `num_tokens`
-    /// plus `inv` derived from a transient borrow of the row-ids column.
-    /// No `row_ids` — that column lives solely in the `DocRowIdsKey` cache
-    /// entry so the cache can weigh and evict it.
+    /// Resident scoring set for a modern partition: shared `num_tokens` plus
+    /// `inv`; no row_ids — the column lives only in the cache entry.
     pub(crate) fn from_cached_num_tokens_with_inv(
         row_ids_col: &UInt64Array,
         num_tokens_col: &arrow_array::UInt32Array,
@@ -6699,8 +6691,8 @@ impl DocSet {
         docs
     }
 
-    /// True iff `doc_ids()` can answer reverse lookups (`inv` built, or the
-    /// sorted legacy `row_ids` present). The flat-search path requires this.
+    /// True iff `doc_ids()` can answer reverse lookups; flat_search requires
+    /// this.
     pub(crate) fn supports_reverse_lookup(&self) -> bool {
         !self.inv.is_empty() || self.has_row_ids()
     }
@@ -9090,8 +9082,6 @@ mod tests {
         assert_eq!(counter.full_column_reads(), total_partitions);
         assert_eq!(counter.scattered_reads(), 0);
 
-        // Prewarm loads every column into its cache entry; the resident
-        // DocSet keeps reverse lookups but no row_ids copy.
         for partition_id in 0..=MANY_PARTITIONS {
             assert!(
                 cache
@@ -9108,7 +9098,6 @@ mod tests {
             assert!(resident.supports_reverse_lookup());
         }
 
-        // A warm query resolves entirely from the cache entries.
         let tokens = Arc::new(Tokens::new(vec!["pipeline".to_owned()], DocType::Text));
         let params = Arc::new(FtsSearchParams::new().with_limit(Some(1000)));
         let (row_ids, _) = index
@@ -9133,9 +9122,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_row_ids_resolution_reloads_after_eviction() {
-        // no_cache retains nothing — the always-evicted worst case. Every
-        // query reloads the column single-flight and must stay correct;
-        // nothing may depend on a pinned copy surviving eviction.
+        // no_cache retains nothing — the always-evicted worst case: every
+        // query must reload the column and stay correct.
         let tmpdir = TempObjDir::default();
         let store = Arc::new(LanceIndexStore::new(
             ObjectStore::local().into(),
@@ -10071,8 +10059,7 @@ mod tests {
             .unwrap();
         assert!(Arc::ptr_eq(first, &wand_view));
 
-        // A flat-shaped mask (OR + tiny allow-list) gets the resident set:
-        // reverse lookups via `inv`, still no row_ids copy.
+        // Flat-shaped mask (OR + tiny allow-list) → resident set with `inv`.
         let filtered = RowAddrMask::allow_nothing();
         let resident = partition
             .docs
@@ -10084,8 +10071,7 @@ mod tests {
         assert!(matches!(&resident.num_tokens, NumTokens::Shared(_)));
         assert_eq!(resident.total_tokens_num(), 100);
 
-        // A masked non-flat walk (AND never takes the flat path) gets a
-        // per-query view borrowing the row-ids cache entry.
+        // Masked non-flat walk (AND is never flat) → per-query view.
         let masked_view = partition
             .docs
             .docs_for_wand(Operator::And, &filtered)

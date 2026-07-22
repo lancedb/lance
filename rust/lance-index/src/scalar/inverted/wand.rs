@@ -203,11 +203,9 @@ pub static FLAT_SEARCH_PERCENT_THRESHOLD: LazyLock<u64> = LazyLock::new(|| {
         .unwrap_or(10)
 });
 
-/// Whether [`Wand::search`] will take the flat-search path.
-/// `LazyDocSet::docs_for_wand` uses the same predicate to pick the DocSet
-/// shape beforehand; the two MUST agree — a masked query scored without
-/// row_ids silently skips the `mask.selected` filter — so this is the
-/// single shared definition.
+/// Single shared definition of the flat-search predicate: [`Wand::search`]
+/// and `LazyDocSet::docs_for_wand` MUST agree — a masked query scored
+/// without row_ids silently skips the `mask.selected` filter.
 pub(super) fn should_flat_search(operator: Operator, mask: &RowAddrMask, num_docs: u64) -> bool {
     operator == Operator::Or
         && mask.iter_addrs().is_some()
