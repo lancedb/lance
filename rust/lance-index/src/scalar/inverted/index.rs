@@ -997,7 +997,9 @@ impl InvertedIndex {
                             )))
                         }
                     });
-                    let loaded: Vec<_> = futures::future::try_join_all(loads)
+                    let loaded: Vec<_> = stream::iter(loads)
+                        .buffer_unordered(self.store.io_parallelism())
+                        .try_collect::<Vec<_>>()
                         .await?
                         .into_iter()
                         .flatten()
