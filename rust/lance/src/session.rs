@@ -476,7 +476,7 @@ fn checked_cache_summary_add(
     context: impl AsRef<str>,
 ) -> Result<usize> {
     current.checked_add(increment).ok_or_else(|| {
-        Error::invalid_input(format!(
+        Error::internal(format!(
             "Cache summary overflow while adding {increment} to {} (current value: {current})",
             context.as_ref()
         ))
@@ -780,6 +780,22 @@ mod tests {
         #[case] expected_component: &str,
     ) {
         assert_eq!(cache_key_component(key, type_name), expected_component);
+    }
+
+    #[test]
+    fn test_cache_summary_overflow_is_internal_error() {
+        let err = checked_cache_summary_add(usize::MAX, 1, "total size bytes").unwrap_err();
+
+        assert!(
+            matches!(
+                &err,
+                Error::Internal { message, .. }
+                    if message.contains("Cache summary overflow")
+                        && message.contains("total size bytes")
+                        && message.contains(&usize::MAX.to_string())
+            ),
+            "expected internal overflow error, got {err:?}"
+        );
     }
 
     #[tokio::test]
