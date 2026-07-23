@@ -43,6 +43,7 @@ pub struct CommitBuilder<'a> {
     commit_handler: Option<Arc<dyn CommitHandler>>,
     store_params: Option<ObjectStoreParams>,
     object_store: Option<Arc<ObjectStore>>,
+    source_store: Option<Arc<ObjectStore>>,
     session: Option<Arc<Session>>,
     detached: bool,
     commit_config: CommitConfig,
@@ -64,6 +65,7 @@ impl<'a> CommitBuilder<'a> {
             commit_handler: None,
             store_params: None,
             object_store: None,
+            source_store: None,
             session: None,
             detached: false,
             commit_config: Default::default(),
@@ -100,6 +102,18 @@ impl<'a> CommitBuilder<'a> {
     /// Pass an object store to use.
     pub fn with_object_store(mut self, object_store: Arc<ObjectStore>) -> Self {
         self.object_store = Some(object_store);
+        self
+    }
+
+    /// Pass the object store of the dataset being cloned from.
+    ///
+    /// Only used by `Operation::Clone`: the source manifest is read through this store
+    /// while the new dataset is written through the destination store. This lets a clone
+    /// cross object stores/accounts (e.g. between two Azure accounts), where the source
+    /// is not reachable with the destination's credentials. Defaults to the destination
+    /// store when not set, preserving same-store behavior.
+    pub fn with_source_store(mut self, source_store: Arc<ObjectStore>) -> Self {
+        self.source_store = Some(source_store);
         self
     }
 
@@ -241,6 +255,9 @@ impl<'a> CommitBuilder<'a> {
             .or_else(|| self.dest.dataset().map(|ds| ds.session.clone()))
             .unwrap_or_default();
 
+        // Store used to read the source manifest for a clone (see with_source_store).
+        let source_store = self.source_store.clone();
+
         let (object_store, base_path, commit_handler) = match &self.dest {
             WriteDestination::Dataset(dataset) => (
                 dataset.object_store.clone(),
@@ -345,7 +362,6 @@ impl<'a> CommitBuilder<'a> {
         } else {
             self.use_stable_row_ids.unwrap_or(false)
         };
-
         // Validate storage format matches existing dataset
         if let Some(ds) = dest.dataset()
             && let Some(storage_format) = self.storage_format
@@ -405,6 +421,7 @@ impl<'a> CommitBuilder<'a> {
         } else {
             commit_new_dataset(
                 object_store.as_ref(),
+                source_store.as_deref(),
                 commit_handler.as_ref(),
                 &base_path,
                 &transaction,
@@ -503,7 +520,6 @@ impl<'a> CommitBuilder<'a> {
             },
             read_version,
             tag: None,
-            //TODO: handle batch transaction merges in the future
             transaction_properties: None,
         };
         let dataset = self.execute(merged.clone()).await?;
@@ -551,6 +567,7 @@ mod tests {
                 file_size_bytes: CachedFileSize::new(100),
                 base_id: None,
             }],
+            overlays: vec![],
             deletion_file: None,
             row_id_meta: None,
             physical_rows: Some(10),
@@ -630,10 +647,12 @@ mod tests {
             .unwrap();
         assert_eq!(new_ds.manifest().version, 7);
         // Session should still be re-used
-        // However, the dataset needs to be loaded and the read version checked out,
-        // so an additional 4 IOPs are needed.
+        // However, the dataset needs to be loaded and the read version checked out.
+        // The read version's manifest body is served from the session cache (it
+        // was cached when v1 was first created), so the checkout only pays the
+        // version-resolution head, not a manifest read.
         let io_stats = dataset.object_store.as_ref().io_stats_incremental();
-        assert_io_eq!(io_stats, read_iops, 5, "load dataset + check version");
+        assert_io_eq!(io_stats, read_iops, 3, "load dataset + check version");
         assert_io_eq!(io_stats, write_iops, 2, "write txn + manifest");
 
         // Commit transaction with URI and new session. Re-use the store

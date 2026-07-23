@@ -315,6 +315,28 @@ message Transaction {
     repeated DataReplacementGroup replacements = 1;
   }
 
+  // Overlay files to append to a single fragment, in order (the last entry is
+  // newest). The overlays are appended to the fragment's existing `overlays`
+  // list; they do not replace it, so overlays written by concurrent commits are
+  // preserved.
+  message DataOverlayGroup {
+    uint64 fragment_id = 1;
+    // Each DataOverlayFile.committed_version is left 0 by the writer and stamped
+    // to the new dataset version at commit time (re-stamped on retry), in the
+    // same way as the created-at / last-updated-at version sequences. The fields
+    // touched are read from each overlay's `data_file.fields`.
+    repeated DataOverlayFile overlays = 2;
+  }
+
+  // Attach overlay files to fragments, supplying new values for a subset of
+  // (row offset, field) cells without rewriting the fragments' base data files.
+  // See the DataOverlayFile message in table.proto for resolution, coverage, and
+  // versioning rules, and the Data Overlay Files and Transactions specifications
+  // for the (intentionally permissive) conflict semantics.
+  message DataOverlay {
+    repeated DataOverlayGroup groups = 1;
+  }
+
   // Update the merged generations in MemWAL index.
   // This operation is used during merge-insert to atomically record which
   // generations have been merged to the base table.
@@ -346,6 +368,7 @@ message Transaction {
     UpdateMemWalState update_mem_wal_state = 112;
     Clone clone = 113;
     UpdateBases update_bases = 114;
+    DataOverlay data_overlay = 115;
   }
 
   // Fields 200/202 (`blob_append` / `blob_overwrite`) previously represented blob dataset ops.

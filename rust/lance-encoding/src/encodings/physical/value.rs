@@ -27,7 +27,7 @@ pub struct ValueEncoder {}
 
 impl ValueEncoder {
     /// Use the largest chunk we can smaller than 4KiB
-    fn find_log_vals_per_chunk(bytes_per_word: u64, values_per_word: u64) -> (u64, u64) {
+    fn find_log_vals_per_chunk(bytes_per_word: u64, values_per_word: u64) -> Result<(u64, u64)> {
         let mut size_bytes = 2 * bytes_per_word;
         let (mut log_num_vals, mut num_vals) = match values_per_word {
             1 => (1, 2),
@@ -35,8 +35,14 @@ impl ValueEncoder {
             _ => unreachable!(),
         };
 
-        // If the type is so wide that we can't even fit 2 values we shouldn't be here
-        assert!(size_bytes < MAX_MINIBLOCK_BYTES);
+        if size_bytes >= MAX_MINIBLOCK_BYTES {
+            let num_values = 2 * values_per_word;
+            return Err(Error::invalid_input(format!(
+                "Value is too wide for miniblock encoding: {} values require {} bytes but a \
+                 miniblock chunk is limited to {} bytes.",
+                num_values, size_bytes, MAX_MINIBLOCK_BYTES
+            )));
+        }
 
         while 2 * size_bytes < MAX_MINIBLOCK_BYTES && 2 * num_vals <= *MAX_MINIBLOCK_VALUES {
             log_num_vals += 1;
@@ -44,10 +50,10 @@ impl ValueEncoder {
             num_vals *= 2;
         }
 
-        (log_num_vals, num_vals)
+        Ok((log_num_vals, num_vals))
     }
 
-    fn chunk_data(data: FixedWidthDataBlock) -> MiniBlockCompressed {
+    fn chunk_data(data: FixedWidthDataBlock) -> Result<MiniBlockCompressed> {
         // Usually there are X bytes per value.  However, when working with boolean
         // or FSL<boolean> we might have some number of bits per value that isn't
         // divisible by 8.  In this case, to avoid chunking in the middle of a byte
@@ -60,7 +66,7 @@ impl ValueEncoder {
 
         // Aim for 4KiB chunks
         let (log_vals_per_chunk, vals_per_chunk) =
-            Self::find_log_vals_per_chunk(bytes_per_word, values_per_word);
+            Self::find_log_vals_per_chunk(bytes_per_word, values_per_word)?;
         let num_chunks = bit_util::ceil(data.num_values as usize, vals_per_chunk as usize);
         debug_assert_eq!(vals_per_chunk % values_per_word, 0);
         let bytes_per_chunk = bytes_per_word * (vals_per_chunk / values_per_word);
@@ -99,11 +105,11 @@ impl ValueEncoder {
 
         debug_assert_eq!(chunks.len(), num_chunks);
 
-        MiniBlockCompressed {
+        Ok(MiniBlockCompressed {
             chunks,
             data: vec![data_buffer],
             num_values: data.num_values,
-        }
+        })
     }
 }
 
@@ -177,7 +183,7 @@ impl ValueEncoder {
         data: FixedWidthDataBlock,
         layers: Vec<MiniblockFslLayer>,
         num_rows: u64,
-    ) -> (MiniBlockCompressed, CompressiveEncoding) {
+    ) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
         // Count size to calculate rows per chunk
         let mut ceil_bytes_validity = 0;
         let mut cum_dim = 1;
@@ -198,7 +204,7 @@ impl ValueEncoder {
         };
         let est_bytes_per_word = (ceil_bytes_validity * vals_per_word) + cum_bytes_per_word;
         let (log_rows_per_chunk, rows_per_chunk) =
-            Self::find_log_vals_per_chunk(est_bytes_per_word, vals_per_word);
+            Self::find_log_vals_per_chunk(est_bytes_per_word, vals_per_word)?;
 
         let num_chunks = num_rows.div_ceil(rows_per_chunk) as usize;
 
@@ -258,17 +264,17 @@ impl ValueEncoder {
             .chain(std::iter::once(data.data))
             .collect::<Vec<_>>();
 
-        (
+        Ok((
             MiniBlockCompressed {
                 chunks,
                 data: buffers,
                 num_values: num_rows,
             },
             encoding,
-        )
+        ))
     }
 
-    fn miniblock_fsl(data: DataBlock) -> (MiniBlockCompressed, CompressiveEncoding) {
+    fn miniblock_fsl(data: DataBlock) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
         let num_rows = data.num_values();
         let fsl = data.as_fixed_size_list().unwrap();
         let mut layers = Vec::new();
@@ -469,9 +475,9 @@ impl MiniBlockCompressor for ValueEncoder {
         match chunk {
             DataBlock::FixedWidth(fixed_width) => {
                 let encoding = ProtobufUtils21::flat(fixed_width.bits_per_value, None);
-                Ok((Self::chunk_data(fixed_width), encoding))
+                Ok((Self::chunk_data(fixed_width)?, encoding))
             }
-            DataBlock::FixedSizeList(_) => Ok(Self::miniblock_fsl(chunk)),
+            DataBlock::FixedSizeList(_) => Self::miniblock_fsl(chunk),
             _ => Err(Error::invalid_input_source(
                 format!(
                     "Cannot compress a data block of type {} with ValueEncoder",
@@ -987,6 +993,59 @@ mod tests {
         );
 
         assert_eq!(decompressed.as_ref(), &sample_list);
+    }
+
+    fn wide_fixed_size_binary() -> ArrayRef {
+        let wide_value = vec![0xABu8; 5000];
+        Arc::new(
+            arrow_array::FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                std::iter::repeat_n(Some(wide_value.as_slice()), 4),
+                5000,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn wide_fixed_size_list_bool() -> ArrayRef {
+        // A wide FSL<Boolean> is sub-byte, so it chunks eight values per word and the
+        // smallest unit is 16 values rather than 2.
+        let dimension = 4095;
+        let values = arrow_array::BooleanArray::from(vec![false; dimension * 2]);
+        let field = Arc::new(Field::new("item", DataType::Boolean, true));
+        Arc::new(FixedSizeListArray::new(
+            field,
+            dimension as i32,
+            Arc::new(values),
+            None,
+        ))
+    }
+
+    #[rstest::rstest]
+    #[case::fixed_size_binary(wide_fixed_size_binary(), 2)]
+    #[case::fixed_size_list_bool(wide_fixed_size_list_bool(), 16)]
+    fn test_wide_value_miniblock_returns_error(
+        #[case] array: ArrayRef,
+        #[case] expected_min_values: u64,
+    ) {
+        let starting_data = DataBlock::from_array(array);
+
+        let encoder = ValueEncoder::default();
+        let result = MiniBlockCompressor::compress(&encoder, starting_data);
+
+        let err = result.expect_err("wide values should not be encodable as miniblock");
+        assert!(
+            matches!(err, lance_core::Error::InvalidInput { .. }),
+            "expected InvalidInput, got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("too wide for miniblock encoding"),
+            "unexpected error message: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("{expected_min_values} values require")),
+            "unexpected error message: {msg}"
+        );
     }
 
     #[test]

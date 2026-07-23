@@ -70,6 +70,7 @@ use lance_core::datatypes::BlobHandling;
 use lance_datafusion::utils::reader_to_stream;
 use lance_encoding::decoder::DecoderConfig;
 use lance_file::reader::FileReaderOptions;
+use lance_index::scalar::inverted::InvertedListFormatVersion;
 use lance_index::scalar::inverted::query::Occur;
 use lance_index::scalar::inverted::query::{
     BooleanQuery, BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Operator, PhraseQuery,
@@ -134,11 +135,50 @@ fn read_blobs_to_python(
         .collect()
 }
 
+fn read_blob_ranges_to_python(
+    py: Python<'_>,
+    ranges: Vec<lance::dataset::ReadBlobRange>,
+) -> Vec<(usize, u64, Py<PyBytes>)> {
+    ranges
+        .into_iter()
+        .map(|range| {
+            (
+                range.request_index,
+                range.row_address,
+                PyBytes::new(py, &range.data).unbind(),
+            )
+        })
+        .collect()
+}
+
+fn blob_range_requests_from_tuples(
+    requests: Vec<(u64, u64, u64)>,
+) -> Vec<lance::dataset::BlobRangeRequest> {
+    requests
+        .into_iter()
+        .map(|(row, offset, length)| lance::dataset::BlobRangeRequest::new(row, offset, length))
+        .collect()
+}
+
 fn configure_read_blobs_builder(
     mut builder: lance::dataset::ReadBlobsBuilder,
     io_buffer_size: Option<u64>,
     preserve_order: Option<bool>,
 ) -> lance::dataset::ReadBlobsBuilder {
+    if let Some(bytes) = io_buffer_size {
+        builder = builder.with_io_buffer_size_bytes(bytes);
+    }
+    if let Some(preserve) = preserve_order {
+        builder = builder.preserve_order(preserve);
+    }
+    builder
+}
+
+fn configure_read_blob_ranges_builder(
+    mut builder: lance::dataset::ReadBlobRangesBuilder,
+    io_buffer_size: Option<u64>,
+    preserve_order: Option<bool>,
+) -> lance::dataset::ReadBlobRangesBuilder {
     if let Some(bytes) = io_buffer_size {
         builder = builder.with_io_buffer_size_bytes(bytes);
     }
@@ -163,7 +203,6 @@ fn stats_log_interval_from_millis(ms: u64) -> Option<std::time::Duration> {
 #[allow(clippy::too_many_arguments)]
 fn writer_config_from_kwargs(
     durable_write: Option<bool>,
-    sync_indexed_write: Option<bool>,
     max_wal_buffer_size: Option<usize>,
     max_wal_flush_interval_ms: Option<u64>,
     max_memtable_size: Option<usize>,
@@ -171,8 +210,6 @@ fn writer_config_from_kwargs(
     max_memtable_batches: Option<usize>,
     max_unflushed_memtable_bytes: Option<usize>,
     manifest_scan_batch_size: Option<usize>,
-    async_index_buffer_rows: Option<usize>,
-    async_index_interval_ms: Option<u64>,
     backpressure_log_interval_ms: Option<u64>,
     stats_log_interval_ms: Option<u64>,
     hnsw_params: Option<HashMap<String, HashMap<String, u32>>>,
@@ -183,10 +220,6 @@ fn writer_config_from_kwargs(
     let mut any = false;
     if let Some(v) = durable_write {
         config = config.with_durable_write(v);
-        any = true;
-    }
-    if let Some(v) = sync_indexed_write {
-        config = config.with_sync_indexed_write(v);
         any = true;
     }
     if let Some(v) = max_wal_buffer_size {
@@ -215,14 +248,6 @@ fn writer_config_from_kwargs(
     }
     if let Some(v) = manifest_scan_batch_size {
         config = config.with_manifest_scan_batch_size(v);
-        any = true;
-    }
-    if let Some(v) = async_index_buffer_rows {
-        config = config.with_async_index_buffer_rows(v);
-        any = true;
-    }
-    if let Some(v) = async_index_interval_ms {
-        config = config.with_async_index_interval(Duration::from_millis(v));
         any = true;
     }
     if let Some(v) = backpressure_log_interval_ms {
@@ -395,6 +420,23 @@ impl MergeInsertBuilder {
         Ok(slf)
     }
 
+    pub fn target_bases(
+        mut slf: PyRefMut<'_, Self>,
+        bases: Vec<String>,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        slf.builder.target_base_names_or_paths(bases);
+        Ok(slf)
+    }
+
+    #[pyo3(signature = (include_primary = true))]
+    pub fn target_all_bases(
+        mut slf: PyRefMut<'_, Self>,
+        include_primary: bool,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        slf.builder.target_all_bases(include_primary);
+        Ok(slf)
+    }
+
     pub fn execute(&mut self, new_data: &Bound<PyAny>) -> PyResult<Py<PyAny>> {
         let py = new_data.py();
         let new_data = convert_reader(new_data)?;
@@ -431,6 +473,60 @@ impl MergeInsertBuilder {
             transaction, stats, ..
         } = rt()
             .spawn(Some(py), job.execute_uncommitted(new_data))?
+            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
+
+        let stats = Self::build_stats(&stats, py)?;
+
+        Ok((PyLance(transaction), stats))
+    }
+
+    /// Execute the merge insert from fully-materialized data.
+    ///
+    /// The data is read into memory and wrapped in an in-memory table, so retries
+    /// never spill to disk and the source's statistics drive the join. Callers
+    /// should only route in-memory inputs (e.g. a `pa.Table`) here.
+    pub fn execute_batches(&mut self, new_data: &Bound<PyAny>) -> PyResult<Py<PyAny>> {
+        let py = new_data.py();
+        let reader = convert_reader(new_data)?;
+        let batches = reader
+            .collect::<std::result::Result<Vec<RecordBatch>, _>>()
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        let job = self
+            .builder
+            .try_build()
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        let (new_dataset, stats) = rt()
+            .spawn(Some(py), job.execute_batches(batches))?
+            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
+
+        let dataset = self.dataset.bind(py);
+        dataset.borrow_mut().ds = new_dataset;
+
+        Ok(Self::build_stats(&stats, py)?.into())
+    }
+
+    /// [`Self::execute_batches`] without committing; returns the transaction.
+    pub fn execute_uncommitted_batches<'a>(
+        &mut self,
+        new_data: &Bound<'a, PyAny>,
+    ) -> PyResult<(PyLance<Transaction>, Bound<'a, PyDict>)> {
+        let py = new_data.py();
+        let reader = convert_reader(new_data)?;
+        let batches = reader
+            .collect::<std::result::Result<Vec<RecordBatch>, _>>()
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        let job = self
+            .builder
+            .try_build()
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        let UncommittedMergeInsert {
+            transaction, stats, ..
+        } = rt()
+            .spawn(Some(py), job.execute_uncommitted_batches(batches))?
             .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
 
         let stats = Self::build_stats(&stats, py)?;
@@ -529,6 +625,23 @@ fn extract_index_segments(segments: &Bound<'_, PyAny>) -> PyResult<Vec<IndexSegm
         }
     }
     Ok(extracted)
+}
+
+fn parse_index_segment_ids(index_segments: Option<Vec<String>>) -> PyResult<Option<Vec<Uuid>>> {
+    index_segments
+        .map(|segments| {
+            segments
+                .into_iter()
+                .map(|segment| {
+                    Uuid::parse_str(&segment).map_err(|err| {
+                        PyValueError::new_err(format!(
+                            "invalid index segment uuid '{segment}': {err}"
+                        ))
+                    })
+                })
+                .collect::<PyResult<Vec<_>>>()
+        })
+        .transpose()
 }
 
 impl MergeInsertBuilder {
@@ -1626,6 +1739,40 @@ impl Dataset {
         Ok(read_blobs_to_python(self_.py(), blobs))
     }
 
+    #[pyo3(signature=(
+        requests,
+        blob_column,
+        selector,
+        io_buffer_size=None,
+        preserve_order=None
+    ))]
+    fn read_blob_ranges(
+        self_: PyRef<'_, Self>,
+        requests: Vec<(u64, u64, u64)>,
+        blob_column: &str,
+        selector: &str,
+        io_buffer_size: Option<u64>,
+        preserve_order: Option<bool>,
+    ) -> PyResult<Vec<(usize, u64, Py<PyBytes>)>> {
+        let requests = blob_range_requests_from_tuples(requests);
+        let builder = self_.ds.read_blob_ranges(blob_column).infer_error()?;
+        let builder = match selector {
+            "ids" => builder.with_row_ids(requests),
+            "addresses" => builder.with_row_addresses(requests),
+            "indices" => builder.with_row_indices(requests),
+            selector => {
+                return Err(PyValueError::new_err(format!(
+                    "selector must be one of 'ids', 'addresses', or 'indices', got {selector:?}"
+                )));
+            }
+        };
+        let builder = configure_read_blob_ranges_builder(builder, io_buffer_size, preserve_order);
+        let ranges = rt()
+            .block_on(Some(self_.py()), builder.execute())?
+            .infer_error()?;
+        Ok(read_blob_ranges_to_python(self_.py(), ranges))
+    }
+
     #[pyo3(signature = (row_slices, columns = None, batch_readahead = 10))]
     fn take_scan(
         &self,
@@ -2386,19 +2533,106 @@ impl Dataset {
             "INVERTED" | "FTS" => {
                 let mut params = InvertedIndexParams::default();
                 if let Some(kwargs) = kwargs {
+                    let allowed_kwargs = [
+                        "analyzer",
+                        "with_position",
+                        "base_tokenizer",
+                        "language",
+                        "max_token_length",
+                        "lower_case",
+                        "stem",
+                        "remove_stop_words",
+                        "custom_stop_words",
+                        "ascii_folding",
+                        "min_ngram_length",
+                        "max_ngram_length",
+                        "prefix_only",
+                        "block_size",
+                        "split_identifiers",
+                        "split_on_numerics",
+                        "preserve_original",
+                        "index_operators",
+                        "memory_limit",
+                        "num_workers",
+                        "format_version",
+                        "fragment_ids",
+                        "index_uuid",
+                        "progress_callback",
+                    ];
+                    for (key, _) in kwargs.iter() {
+                        let key: String = key.extract()?;
+                        if !allowed_kwargs.contains(&key.as_str()) {
+                            return Err(PyValueError::new_err(format!(
+                                "unknown FTS index parameter '{}'",
+                                key
+                            )));
+                        }
+                    }
+
+                    let analyzer: Option<String> = kwargs
+                        .get_item("analyzer")?
+                        .map(|value| value.extract())
+                        .transpose()?;
+                    let base_tokenizer: Option<String> = kwargs
+                        .get_item("base_tokenizer")?
+                        .map(|value| value.extract())
+                        .transpose()?;
+
+                    match (analyzer.as_deref(), base_tokenizer.as_deref()) {
+                        (Some("text"), Some("code")) => {
+                            return Err(PyValueError::new_err(
+                                "base_tokenizer='code' requires analyzer='code'",
+                            ));
+                        }
+                        (Some("code"), Some(base_tokenizer)) if base_tokenizer != "code" => {
+                            return Err(PyValueError::new_err(format!(
+                                "analyzer='code' requires base_tokenizer='code', got '{}'",
+                                base_tokenizer
+                            )));
+                        }
+                        _ => {}
+                    }
+
+                    let uses_code_analyzer = match analyzer.as_deref() {
+                        Some("code") => true,
+                        Some("text") | None => base_tokenizer.as_deref() == Some("code"),
+                        Some(_) => true,
+                    };
+                    if !uses_code_analyzer {
+                        for flag in [
+                            "split_identifiers",
+                            "split_on_numerics",
+                            "preserve_original",
+                            "index_operators",
+                        ] {
+                            if let Some(value) = kwargs.get_item(flag)?
+                                && value.extract::<bool>()?
+                            {
+                                return Err(PyValueError::new_err(
+                                    "code analyzer flags require analyzer='code'",
+                                ));
+                            }
+                        }
+                    }
+
+                    if let Some(analyzer) = analyzer {
+                        params = params
+                            .analyzer(&analyzer)
+                            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+                    }
                     if let Some(with_position) = kwargs.get_item("with_position")? {
                         params = params.with_position(with_position.extract()?);
                     }
-                    if let Some(base_tokenizer) = kwargs.get_item("base_tokenizer")? {
-                        params = params.base_tokenizer(base_tokenizer.extract()?);
+                    if let Some(base_tokenizer) = base_tokenizer {
+                        params = params.base_tokenizer(base_tokenizer);
                     }
                     if let Some(language) = kwargs.get_item("language")? {
                         let language: PyBackedStr =
                             language.cast::<PyString>()?.clone().try_into()?;
-                        params = params.language(&language).map_err(|e| {
+                        params = params.language(&language).map_err(|err| {
                             PyValueError::new_err(format!(
-                                "can't set tokenizer language to {}: {:?}",
-                                language, e
+                                "can't set tokenizer language to {}: {}",
+                                language, err
                             ))
                         })?;
                     }
@@ -2414,8 +2648,8 @@ impl Dataset {
                     if let Some(remove_stop_words) = kwargs.get_item("remove_stop_words")? {
                         params = params.remove_stop_words(remove_stop_words.extract()?);
                     }
-                    if let Some(stop_words_file) = kwargs.get_item("custom_stop_words")? {
-                        params = params.custom_stop_words(stop_words_file.extract()?);
+                    if let Some(custom_stop_words) = kwargs.get_item("custom_stop_words")? {
+                        params = params.custom_stop_words(custom_stop_words.extract()?);
                     }
                     if let Some(ascii_folding) = kwargs.get_item("ascii_folding")? {
                         params = params.ascii_folding(ascii_folding.extract()?);
@@ -2429,11 +2663,45 @@ impl Dataset {
                     if let Some(prefix_only) = kwargs.get_item("prefix_only")? {
                         params = params.ngram_prefix_only(prefix_only.extract()?);
                     }
+                    if let Some(block_size) = kwargs.get_item("block_size")? {
+                        params = params
+                            .block_size(block_size.extract()?)
+                            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                    }
+                    if let Some(split_identifiers) = kwargs.get_item("split_identifiers")? {
+                        params = params.split_identifiers(split_identifiers.extract()?);
+                    }
+                    if let Some(split_on_numerics) = kwargs.get_item("split_on_numerics")? {
+                        params = params.split_on_numerics(split_on_numerics.extract()?);
+                    }
+                    if let Some(preserve_original) = kwargs.get_item("preserve_original")? {
+                        params = params.preserve_original(preserve_original.extract()?);
+                    }
+                    if let Some(index_operators) = kwargs.get_item("index_operators")? {
+                        params = params.index_operators(index_operators.extract()?);
+                    }
                     if let Some(memory_limit) = kwargs.get_item("memory_limit")? {
                         params = params.memory_limit_mb(memory_limit.extract()?);
                     }
                     if let Some(num_workers) = kwargs.get_item("num_workers")? {
                         params = params.num_workers(num_workers.extract()?);
+                    }
+                    if let Some(format_version) = kwargs.get_item("format_version")?
+                        && !format_version.is_none()
+                    {
+                        let value = if let Ok(value) = format_version.cast::<PyString>() {
+                            value.to_string_lossy().to_string()
+                        } else if let Ok(value) = format_version.extract::<u32>() {
+                            value.to_string()
+                        } else {
+                            return Err(PyValueError::new_err(
+                                "format_version must be 1, 2, 3, 'v1', 'v2', or 'v3'",
+                            ));
+                        };
+                        let format_version = value
+                            .parse::<InvertedListFormatVersion>()
+                            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+                        params = params.format_version(format_version);
                     }
                 }
                 Box::new(params)
@@ -2565,18 +2833,31 @@ impl Dataset {
         Ok(())
     }
 
-    #[pyo3(signature = (name, *, with_position = false))]
-    fn prewarm_index(&self, name: &str, with_position: bool) -> PyResult<()> {
+    #[pyo3(signature = (name, *, with_position = false, index_segments = None))]
+    fn prewarm_index(
+        &self,
+        name: &str,
+        with_position: bool,
+        index_segments: Option<Vec<String>>,
+    ) -> PyResult<()> {
+        let index_segments = parse_index_segment_ids(index_segments)?;
+
         rt().block_on(None, async {
             if with_position {
-                self.ds
-                    .prewarm_index_with_options(
-                        name,
-                        &PrewarmOptions::Fts(FtsPrewarmOptions::new().with_position(true)),
-                    )
-                    .await
+                let options = PrewarmOptions::Fts(FtsPrewarmOptions::new().with_position(true));
+                if let Some(index_segments) = index_segments.as_deref() {
+                    self.ds
+                        .prewarm_index_segments_with_options(name, index_segments, &options)
+                        .await
+                } else {
+                    self.ds.prewarm_index_with_options(name, &options).await
+                }
             } else {
-                self.ds.prewarm_index(name).await
+                if let Some(index_segments) = index_segments.as_deref() {
+                    self.ds.prewarm_index_segments(name, index_segments).await
+                } else {
+                    self.ds.prewarm_index(name).await
+                }
             }
         })?
         .infer_error()
@@ -3344,7 +3625,6 @@ impl Dataset {
         identity_column=None,
         unsharded=false,
         durable_write=None,
-        sync_indexed_write=None,
         max_wal_buffer_size=None,
         max_wal_flush_interval_ms=None,
         max_memtable_size=None,
@@ -3352,8 +3632,6 @@ impl Dataset {
         max_memtable_batches=None,
         max_unflushed_memtable_bytes=None,
         manifest_scan_batch_size=None,
-        async_index_buffer_rows=None,
-        async_index_interval_ms=None,
         backpressure_log_interval_ms=None,
         stats_log_interval_ms=None,
         hnsw_params=None,
@@ -3367,7 +3645,6 @@ impl Dataset {
         identity_column: Option<String>,
         unsharded: bool,
         durable_write: Option<bool>,
-        sync_indexed_write: Option<bool>,
         max_wal_buffer_size: Option<usize>,
         max_wal_flush_interval_ms: Option<u64>,
         max_memtable_size: Option<usize>,
@@ -3375,8 +3652,6 @@ impl Dataset {
         max_memtable_batches: Option<usize>,
         max_unflushed_memtable_bytes: Option<usize>,
         manifest_scan_batch_size: Option<usize>,
-        async_index_buffer_rows: Option<usize>,
-        async_index_interval_ms: Option<u64>,
         backpressure_log_interval_ms: Option<u64>,
         stats_log_interval_ms: Option<u64>,
         hnsw_params: Option<HashMap<String, HashMap<String, u32>>>,
@@ -3404,7 +3679,6 @@ impl Dataset {
 
         let writer_config = writer_config_from_kwargs(
             durable_write,
-            sync_indexed_write,
             max_wal_buffer_size,
             max_wal_flush_interval_ms,
             max_memtable_size,
@@ -3412,8 +3686,6 @@ impl Dataset {
             max_memtable_batches,
             max_unflushed_memtable_bytes,
             manifest_scan_batch_size,
-            async_index_buffer_rows,
-            async_index_interval_ms,
             backpressure_log_interval_ms,
             stats_log_interval_ms,
             hnsw_params,
@@ -3495,7 +3767,6 @@ impl Dataset {
         shard_id,
         *,
         durable_write=None,
-        sync_indexed_write=None,
         max_wal_buffer_size=None,
         max_wal_flush_interval_ms=None,
         max_memtable_size=None,
@@ -3503,8 +3774,6 @@ impl Dataset {
         max_memtable_batches=None,
         max_unflushed_memtable_bytes=None,
         manifest_scan_batch_size=None,
-        async_index_buffer_rows=None,
-        async_index_interval_ms=None,
         backpressure_log_interval_ms=None,
         stats_log_interval_ms=None,
         hnsw_params=None,
@@ -3514,7 +3783,6 @@ impl Dataset {
         py: Python<'_>,
         shard_id: String,
         durable_write: Option<bool>,
-        sync_indexed_write: Option<bool>,
         max_wal_buffer_size: Option<usize>,
         max_wal_flush_interval_ms: Option<u64>,
         max_memtable_size: Option<usize>,
@@ -3522,8 +3790,6 @@ impl Dataset {
         max_memtable_batches: Option<usize>,
         max_unflushed_memtable_bytes: Option<usize>,
         manifest_scan_batch_size: Option<usize>,
-        async_index_buffer_rows: Option<usize>,
-        async_index_interval_ms: Option<u64>,
         backpressure_log_interval_ms: Option<u64>,
         stats_log_interval_ms: Option<u64>,
         hnsw_params: Option<HashMap<String, HashMap<String, u32>>>,
@@ -3535,7 +3801,6 @@ impl Dataset {
 
         let config = writer_config_from_kwargs(
             durable_write,
-            sync_indexed_write,
             max_wal_buffer_size,
             max_wal_flush_interval_ms,
             max_memtable_size,
@@ -3543,8 +3808,6 @@ impl Dataset {
             max_memtable_batches,
             max_unflushed_memtable_bytes,
             manifest_scan_batch_size,
-            async_index_buffer_rows,
-            async_index_interval_ms,
             backpressure_log_interval_ms,
             stats_log_interval_ms,
             hnsw_params,
@@ -3568,9 +3831,10 @@ impl Dataset {
 
     /// Perform pairwise hamming distance clustering on a partition of an IVF_FLAT index.
     ///
-    /// This function loads a specific partition from an IVF_FLAT index on a hash column,
-    /// computes pairwise hamming distances between all hashes in the partition,
-    /// filters by threshold, and clusters the results using union-find.
+    /// This function loads a specific partition from every segment of an IVF_FLAT
+    /// index on a hash column, computes pairwise hamming distances between all
+    /// hashes in the combined partition, filters by threshold, and clusters the
+    /// results using union-find.
     ///
     /// Parameters
     /// ----------
@@ -3580,6 +3844,9 @@ impl Dataset {
     ///     The partition ID within the IVF_FLAT index
     /// hamming_threshold : int
     ///     Maximum hamming distance to consider as similar
+    /// index_segments : list of str, optional
+    ///     If specified, only these physical index segment UUIDs of the named
+    ///     logical index contribute rows. Defaults to all segments.
     ///
     /// Returns
     /// -------
@@ -3587,27 +3854,45 @@ impl Dataset {
     ///     A reader yielding batches with columns:
     ///     - 'representative': uint64 - The representative row ID for each cluster
     ///     - 'duplicates': list<uint64> - List of duplicate row IDs in each cluster
-    #[pyo3(signature = (index_name, partition_id, hamming_threshold))]
+    #[pyo3(signature = (index_name, partition_id, hamming_threshold, index_segments=None))]
     fn hamming_clustering_for_ivf_partition(
         &self,
         py: Python<'_>,
         index_name: &str,
         partition_id: usize,
         hamming_threshold: u32,
+        index_segments: Option<Vec<String>>,
     ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
-        use lance::index::vector::hamming::hamming_clustering_for_ivf_partition;
+        use lance::index::vector::hamming::{
+            hamming_clustering_for_ivf_partition, hamming_clustering_for_ivf_partition_segments,
+        };
 
+        let segment_ids = parse_index_segment_ids(index_segments)?;
         let ds = self.ds.as_ref();
         let reader = rt()
-            .block_on(
-                Some(py),
-                hamming_clustering_for_ivf_partition(
-                    ds,
-                    index_name,
-                    partition_id,
-                    hamming_threshold,
-                ),
-            )?
+            .block_on(Some(py), async {
+                match segment_ids.as_deref() {
+                    Some(segment_ids) => {
+                        hamming_clustering_for_ivf_partition_segments(
+                            ds,
+                            index_name,
+                            segment_ids,
+                            partition_id,
+                            hamming_threshold,
+                        )
+                        .await
+                    }
+                    None => {
+                        hamming_clustering_for_ivf_partition(
+                            ds,
+                            index_name,
+                            partition_id,
+                            hamming_threshold,
+                        )
+                        .await
+                    }
+                }
+            })?
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
         Ok(PyArrowType(reader))
@@ -3615,26 +3900,43 @@ impl Dataset {
 
     /// Get partition information for an IVF_FLAT index.
     ///
+    /// Partition sizes are aggregated across all segments of the logical index
+    /// unless a subset is selected via ``index_segments``.
+    ///
     /// Parameters
     /// ----------
     /// index_name : str
     ///     Name of the IVF_FLAT index
+    /// index_segments : list of str, optional
+    ///     If specified, only these physical index segment UUIDs of the named
+    ///     logical index contribute to the sizes. Defaults to all segments.
     ///
     /// Returns
     /// -------
     /// List[dict]
     ///     List of partition info dicts with 'partition_id' and 'size'
-    #[pyo3(signature = (index_name))]
+    #[pyo3(signature = (index_name, index_segments=None))]
     fn get_ivf_partition_info(
         &self,
         py: Python<'_>,
         index_name: &str,
+        index_segments: Option<Vec<String>>,
     ) -> PyResult<Vec<Py<PyDict>>> {
-        use lance::index::vector::hamming::get_ivf_partition_info;
+        use lance::index::vector::hamming::{
+            get_ivf_partition_info, get_ivf_partition_info_segments,
+        };
 
+        let segment_ids = parse_index_segment_ids(index_segments)?;
         let ds = self.ds.as_ref();
         let result = rt()
-            .block_on(Some(py), get_ivf_partition_info(ds, index_name))?
+            .block_on(Some(py), async {
+                match segment_ids.as_deref() {
+                    Some(segment_ids) => {
+                        get_ivf_partition_info_segments(ds, index_name, segment_ids).await
+                    }
+                    None => get_ivf_partition_info(ds, index_name).await,
+                }
+            })?
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
         let partitions: PyResult<Vec<_>> = result
@@ -3659,7 +3961,8 @@ impl Dataset {
     /// Parameters
     /// ----------
     /// column : str
-    ///     Name of the hash column (must be FixedSizeList<UInt8, 8>)
+    ///     Name of the hash column (must be FixedSizeList<UInt8, N> where N is
+    ///     a positive multiple of 8 bytes)
     /// sample_size : int, optional
     ///     Number of rows to sample (if None or >= total rows, uses all rows)
     /// hamming_threshold : int
@@ -3702,7 +4005,8 @@ impl Dataset {
     /// Parameters
     /// ----------
     /// column : str
-    ///     Name of the hash column (must be FixedSizeList<UInt8, 8>)
+    ///     Name of the hash column (must be FixedSizeList<UInt8, N> where N is
+    ///     a positive multiple of 8 bytes)
     /// fragment_id : int
     ///     The fragment ID to read from
     /// start_row : int
@@ -4501,6 +4805,11 @@ pub fn get_write_params(
             && !target_bases_list.is_empty()
         {
             p = p.with_target_base_names_or_paths(target_bases_list);
+        }
+
+        // Handle target_all_bases parameter (bool: include primary storage)
+        if let Some(target_all_bases) = get_dict_opt::<bool>(options, "target_all_bases")? {
+            p = p.with_target_all_bases(target_all_bases);
         }
 
         // Handle base_store_params: per-base storage options keyed by base path URI

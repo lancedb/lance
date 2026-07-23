@@ -6,6 +6,7 @@
 use std::{
     collections::HashMap,
     fmt::{self, Formatter},
+    num::NonZero,
     sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
@@ -14,9 +15,8 @@ use chrono::{DateTime, Utc};
 
 use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
-use datafusion::physical_plan::metrics::MetricType;
 use datafusion::{
-    catalog::streaming::StreamingTable,
+    catalog::{TableProvider, streaming::StreamingTable},
     dataframe::DataFrame,
     execution::{
         TaskContext,
@@ -26,16 +26,19 @@ use datafusion::{
         runtime_env::RuntimeEnvBuilder,
     },
     physical_plan::{
-        DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
+        DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
+        SendableRecordBatchStream,
         analyze::AnalyzeExec,
         coalesce_partitions::CoalescePartitionsExec,
         display::DisplayableExecutionPlan,
         execution_plan::{Boundedness, CardinalityEffect, EmissionType},
         metrics::MetricValue,
+        sorts::sort_preserving_merge::SortPreservingMergeExec,
         stream::RecordBatchStreamAdapter,
         streaming::PartitionStream,
     },
 };
+use datafusion::{execution::memory_pool::TrackConsumersPool, physical_plan::metrics::MetricType};
 use datafusion_common::{DataFusionError, Statistics};
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
 
@@ -152,10 +155,6 @@ impl ExecutionPlan for OneShotExec {
         "OneShotExec"
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn schema(&self) -> arrow_schema::SchemaRef {
         self.schema.clone()
     }
@@ -243,10 +242,6 @@ impl ExecutionPlan for TracedExec {
         "TracedExec"
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
@@ -310,7 +305,7 @@ impl std::fmt::Debug for LanceExecutionOptions {
     }
 }
 
-const DEFAULT_LANCE_MEM_POOL_SIZE_PER_PARTITION: u64 = 100 * 1024 * 1024;
+const DEFAULT_LANCE_MEM_POOL_SIZE_PER_PARTITION: u64 = 150 * 1024 * 1024;
 const DEFAULT_LANCE_MAX_TEMP_DIRECTORY_SIZE: u64 = 100 * 1024 * 1024 * 1024; // 100GB
 
 impl LanceExecutionOptions {
@@ -366,12 +361,21 @@ pub fn new_session_context(options: &LanceExecutionOptions) -> SessionContext {
         session_config = session_config.with_target_partitions(target_partition);
     }
     if options.use_spilling() {
+        // The default 10MB sort spill reservation seems to be too small for many common cases.
+        //
+        // There currently is no reasonable guidance provided by DataFusion for setting this value.
+        // We bump this to 40MB but try a smaller value if the mem pool is small.
+        let sort_spill_reservation_bytes =
+            (options.mem_pool_size() / 3).min(40 * 1024 * 1024) as usize;
+        session_config =
+            session_config.with_sort_spill_reservation_bytes(sort_spill_reservation_bytes);
         let disk_manager_builder = DiskManagerBuilder::default()
             .with_max_temp_directory_size(options.max_temp_directory_size());
         runtime_env_builder = runtime_env_builder
             .with_disk_manager_builder(disk_manager_builder)
-            .with_memory_pool(Arc::new(FairSpillPool::new(
-                options.mem_pool_size() as usize
+            .with_memory_pool(Arc::new(TrackConsumersPool::new(
+                FairSpillPool::new(options.mem_pool_size() as usize),
+                NonZero::try_from(16).unwrap(),
             )));
     }
     let runtime_env = runtime_env_builder.build_arc().unwrap();
@@ -610,8 +614,17 @@ pub fn execute_plan(
     // Coalesce to a single partition if the optimizer left more than one.
     // EnforceDistribution may remove RepartitionExec(1) nodes when the parent
     // declares UnspecifiedDistribution, leaving multi-partition plans here.
+    //
+    // If the plan carries an output ordering (e.g. a top-k `SortExec` whose
+    // result was later repartitioned to parallelize downstream operators),
+    // a plain `CoalescePartitionsExec` would scramble that order because it
+    // merges partitions in scheduling-dependent order. Use an order-preserving
+    // merge in that case instead, mirroring what `EnforceDistribution` itself
+    // does when it needs to merge an ordered, multi-partition plan.
     let plan: Arc<dyn ExecutionPlan> = if plan.properties().partitioning.partition_count() == 1 {
         plan
+    } else if let Some(ordering) = plan.output_ordering() {
+        Arc::new(SortPreservingMergeExec::new(ordering.clone(), plan))
     } else {
         Arc::new(CoalescePartitionsExec::new(plan))
     };
@@ -640,7 +653,8 @@ pub async fn analyze_plan(
     let analyze = Arc::new(AnalyzeExec::new(
         true,
         true,
-        vec![MetricType::SUMMARY],
+        vec![MetricType::Summary],
+        None,
         plan,
         schema,
     ));
@@ -867,6 +881,49 @@ impl SessionContextExt for SessionContext {
     }
 }
 
+/// Scan a [`TableProvider`] into a single-partition [`SendableRecordBatchStream`].
+///
+/// Multi-partition providers are coalesced into a single partition. This adapts a
+/// re-scannable provider back into the one stream the writer pipeline consumes;
+/// re-scanning the same provider (e.g. on a write retry) yields a fresh stream.
+///
+/// # Examples
+///
+/// ```
+/// # use std::sync::Arc;
+/// # use arrow_array::{Int32Array, RecordBatch};
+/// # use arrow_schema::{DataType, Field, Schema};
+/// # use datafusion::catalog::TableProvider;
+/// # use datafusion::datasource::MemTable;
+/// # use futures::TryStreamExt;
+/// # use lance_datafusion::exec::provider_to_stream;
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+/// let batch =
+///     RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1, 2, 3]))])?;
+/// let provider: Arc<dyn TableProvider> = Arc::new(MemTable::try_new(schema, vec![vec![batch]])?);
+///
+/// // A re-scannable provider yields a fresh stream on each call.
+/// let batches: Vec<RecordBatch> = provider_to_stream(provider).await?.try_collect().await?;
+/// assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
+/// # Ok(())
+/// # }
+/// ```
+pub async fn provider_to_stream(
+    provider: Arc<dyn TableProvider>,
+) -> Result<SendableRecordBatchStream> {
+    let ctx = SessionContext::new();
+    let plan = provider.scan(&ctx.state(), None, &[], None).await?;
+    let plan: Arc<dyn ExecutionPlan> =
+        if plan.properties().output_partitioning().partition_count() > 1 {
+            Arc::new(CoalescePartitionsExec::new(plan))
+        } else {
+            plan
+        };
+    Ok(plan.execute(0, ctx.task_ctx())?)
+}
+
 #[derive(Clone, Debug)]
 pub struct StrictBatchSizeExec {
     input: Arc<dyn ExecutionPlan>,
@@ -892,10 +949,6 @@ impl DisplayAs for StrictBatchSizeExec {
 impl ExecutionPlan for StrictBatchSizeExec {
     fn name(&self) -> &str {
         "StrictBatchSizeExec"
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
@@ -938,7 +991,7 @@ impl ExecutionPlan for StrictBatchSizeExec {
     fn partition_statistics(
         &self,
         partition: Option<usize>,
-    ) -> datafusion_common::Result<Statistics> {
+    ) -> datafusion_common::Result<std::sync::Arc<Statistics>> {
         self.input.partition_statistics(partition)
     }
 
@@ -998,10 +1051,6 @@ impl DisplayAs for HardCapBatchSizeExec {
 impl ExecutionPlan for HardCapBatchSizeExec {
     fn name(&self) -> &str {
         "HardCapBatchSizeExec"
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
@@ -1065,7 +1114,7 @@ impl ExecutionPlan for HardCapBatchSizeExec {
     fn partition_statistics(
         &self,
         partition: Option<usize>,
-    ) -> datafusion_common::Result<Statistics> {
+    ) -> datafusion_common::Result<std::sync::Arc<Statistics>> {
         self.input.partition_statistics(partition)
     }
 

@@ -21,7 +21,8 @@ use uuid::Uuid;
 
 use crate::Result;
 use crate::dataset::builder::DatasetBuilder;
-use crate::dataset::write::{do_write_fragments, validate_and_resolve_target_bases};
+use crate::dataset::utils::SchemaAdapter;
+use crate::dataset::write::{do_write_fragments, validate_and_resolve_target_bases_with_primary};
 use crate::dataset::{DATA_DIR, Dataset, ReadParams, WriteMode, WriteParams};
 
 /// Generates a filename optimized for S3 throughput using a UUID-based approach.
@@ -106,6 +107,12 @@ impl<'a> FragmentCreateBuilder<'a> {
         id: Option<u64>,
     ) -> Result<Fragment> {
         let (stream, schema) = self.get_stream_and_schema(Box::new(source)).await?;
+        // Convert Arrow JSON columns (`arrow.json`, stored as Utf8) into Lance JSON
+        // (`lance.json`, stored as JSONB-encoded LargeBinary) before writing. The
+        // multi-fragment and dataset write paths perform this through `do_write_fragments`;
+        // the single-fragment create path must do the same or the raw UTF-8 string bytes
+        // would be written into a column whose schema declares JSONB, corrupting reads.
+        let stream = SchemaAdapter::new(stream.schema()).to_physical_stream(stream);
         self.write_impl(stream, schema, id).await
     }
 
@@ -206,6 +213,7 @@ impl<'a> FragmentCreateBuilder<'a> {
         let version = params.data_storage_version.unwrap_or_default();
         let needs_existing_dataset = params.target_base_names_or_paths.is_some()
             || params.target_bases.is_some()
+            || params.target_all_bases.is_some()
             || params.initial_bases.is_some();
         let existing_dataset = if needs_existing_dataset {
             self.existing_dataset(&params).await?
@@ -215,17 +223,24 @@ impl<'a> FragmentCreateBuilder<'a> {
         let existing_base_paths = existing_dataset
             .as_ref()
             .map(|dataset| &dataset.manifest.base_paths);
-        let target_bases_info = if needs_existing_dataset {
-            validate_and_resolve_target_bases(&mut params, existing_base_paths).await?
-        } else {
-            None
-        };
         let (object_store, base_path) = ObjectStore::from_uri_and_params(
             params.store_registry(),
             self.dataset_uri,
             &params.store_params.clone().unwrap_or_default(),
         )
         .await?;
+        let target_bases_info = if needs_existing_dataset {
+            validate_and_resolve_target_bases_with_primary(
+                &mut params,
+                existing_base_paths,
+                &object_store,
+                &base_path,
+                self.dataset_uri,
+            )
+            .await?
+        } else {
+            None
+        };
         do_write_fragments(
             existing_dataset.as_ref(),
             object_store,
@@ -235,6 +250,7 @@ impl<'a> FragmentCreateBuilder<'a> {
             params,
             version,
             target_bases_info,
+            Vec::new(),
         )
         .await
     }
@@ -287,7 +303,7 @@ impl<'a> FragmentCreateBuilder<'a> {
             return Err(Error::invalid_input("Input data was empty."));
         }
 
-        fragment.physical_rows = Some(writer.finish().await?);
+        fragment.physical_rows = Some(writer.finish().await?.num_rows as usize);
 
         progress.complete(&fragment).await?;
 
@@ -407,7 +423,7 @@ mod tests {
             matches!(result.as_ref().unwrap_err(), Error::InvalidInput { source, .. }
             if source.to_string().contains("Cannot write with an empty schema.")),
             "{:?}",
-            &result
+            result
         );
 
         // Writing empty reader produces an error
@@ -421,7 +437,7 @@ mod tests {
             matches!(result.as_ref().unwrap_err(), Error::InvalidInput { source, .. }
             if source.to_string().contains("Input data was empty.")),
             "{:?}",
-            &result
+            result
         );
 
         // Writing with incorrect schema produces an error.
@@ -439,7 +455,7 @@ mod tests {
             matches!(result.as_ref().unwrap_err(), Error::SchemaMismatch { difference, .. }
             if difference.contains("fields did not match")),
             "{:?}",
-            &result
+            result
         );
     }
 
@@ -498,7 +514,7 @@ mod tests {
             matches!(result.as_ref().unwrap_err(), Error::InvalidInput { source, .. }
             if source.to_string().contains("Cannot write with an empty schema.")),
             "{:?}",
-            &result
+            result
         );
 
         // Writing empty reader produces an error
@@ -525,7 +541,7 @@ mod tests {
             matches!(result.as_ref().unwrap_err(), Error::SchemaMismatch { difference, .. }
             if difference.contains("fields did not match")),
             "{:?}",
-            &result
+            result
         );
     }
 
@@ -604,6 +620,51 @@ mod tests {
 
         assert_eq!(fragments.len(), 1);
         assert_eq!(fragments[0].files[0].base_id, Some(2));
+    }
+
+    #[tokio::test]
+    async fn test_write_fragments_with_target_all_bases() {
+        let primary = TempStrDir::default();
+        let base1 = TempStrDir::default();
+        let base2 = TempStrDir::default();
+        let create_params = WriteParams::default().with_initial_bases(vec![
+            BasePath::new(0, base1.to_string(), Some("base1".to_string()), false),
+            BasePath::new(0, base2.to_string(), Some("base2".to_string()), false),
+        ]);
+
+        let dataset = InsertBuilder::new(primary.as_str())
+            .with_params(&create_params)
+            .execute_stream(test_data())
+            .await
+            .unwrap();
+
+        // Without primary, the first slot is the lowest registered base id.
+        let append_params = WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        }
+        .with_target_all_bases(false);
+        let fragments = FragmentCreateBuilder::new(dataset.uri.as_str())
+            .write_params(&append_params)
+            .write_fragments(test_data())
+            .await
+            .unwrap();
+        assert_eq!(fragments.len(), 1);
+        assert_eq!(fragments[0].files[0].base_id, Some(1));
+
+        // With primary included, the first slot is primary storage.
+        let append_params = WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        }
+        .with_target_all_bases(true);
+        let fragments = FragmentCreateBuilder::new(dataset.uri.as_str())
+            .write_params(&append_params)
+            .write_fragments(test_data())
+            .await
+            .unwrap();
+        assert_eq!(fragments.len(), 1);
+        assert_eq!(fragments[0].files[0].base_id, None);
     }
 
     #[rstest]

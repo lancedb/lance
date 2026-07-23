@@ -19,6 +19,7 @@ use futures::TryStreamExt;
 use lance::dataset::Dataset as LanceDataset;
 use lance::dataset::mem_wal::scanner::{
     FlushedGeneration, LsmDataSourceCollector, LsmPointLookupPlanner, LsmVectorSearchPlanner,
+    parse_filter_expr as parse_lsm_filter_expr,
 };
 use lance::dataset::mem_wal::write::{MemTableStats, WriteStatsSnapshot};
 use lance::dataset::mem_wal::{LsmScanner, ShardSnapshot, ShardWriter, evaluate_sharding_spec};
@@ -237,6 +238,14 @@ struct ClosedShardWriterState {
     memtable_stats: MemTableStats,
 }
 
+fn collect_record_batches(data: &Bound<'_, PyAny>) -> PyResult<Vec<RecordBatch>> {
+    let reader = ArrowArrayStreamReader::from_pyarrow_bound(data)
+        .map_err(|e| PyValueError::new_err(format!("Cannot read data as Arrow: {}", e)))?;
+    reader
+        .collect::<Result<_, _>>()
+        .map_err(|e| PyIOError::new_err(format!("Failed to read batches: {}", e)))
+}
+
 #[pymethods]
 impl PyShardWriter {
     /// Write data batches to the MemWAL.
@@ -244,11 +253,7 @@ impl PyShardWriter {
     /// Accepts any PyArrow-compatible data source (RecordBatch, Table,
     /// or an Arrow stream reader).
     pub fn put(&self, py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<()> {
-        let reader = ArrowArrayStreamReader::from_pyarrow_bound(data)
-            .map_err(|e| PyValueError::new_err(format!("Cannot read data as Arrow: {}", e)))?;
-        let batches: Vec<RecordBatch> = reader
-            .collect::<Result<_, _>>()
-            .map_err(|e| PyIOError::new_err(format!("Failed to read batches: {}", e)))?;
+        let batches = collect_record_batches(data)?;
 
         if batches.is_empty() {
             return Ok(());
@@ -259,6 +264,31 @@ impl PyShardWriter {
             let guard = inner.lock().await;
             match guard.as_ref() {
                 Some(writer) => writer.put(batches).await.map(|_| ()),
+                None => Err(lance_core::Error::invalid_input(
+                    "ShardWriter is already closed",
+                )),
+            }
+        })?
+        .map_err(|e: lance::Error| PyIOError::new_err(e.to_string()))
+    }
+
+    /// Delete rows from the MemWAL by primary key.
+    ///
+    /// Accepts any PyArrow-compatible data source carrying the shard's primary
+    /// key column(s). Rust core validates that primary keys exist and builds the
+    /// tombstone rows.
+    pub fn delete(&self, py: Python<'_>, keys: &Bound<'_, PyAny>) -> PyResult<()> {
+        let batches = collect_record_batches(keys)?;
+
+        if batches.is_empty() {
+            return Ok(());
+        }
+
+        let inner = self.inner.clone();
+        rt().block_on(Some(py), async move {
+            let guard = inner.lock().await;
+            match guard.as_ref() {
+                Some(writer) => writer.delete(batches).await.map(|_| ()),
                 None => Err(lance_core::Error::invalid_input(
                     "ShardWriter is already closed",
                 )),
@@ -545,7 +575,11 @@ impl PyLsmScanner {
             .take()
             .ok_or_else(|| PyRuntimeError::new_err("Scanner has already been consumed"))?;
         let cols: Vec<&str> = columns.iter().map(|s| s.as_str()).collect();
-        slf.inner = Some(scanner.project(&cols));
+        slf.inner = Some(
+            scanner
+                .project(&cols)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?,
+        );
         Ok(slf)
     }
 
@@ -563,18 +597,22 @@ impl PyLsmScanner {
         Ok(slf)
     }
 
-    /// Limit the number of rows returned.
-    #[pyo3(signature = (n, offset=None))]
+    /// Limit the number of rows returned, optionally with an offset.
+    #[pyo3(signature = (n=None, offset=None))]
     pub fn limit(
         mut slf: PyRefMut<'_, Self>,
-        n: usize,
+        n: Option<usize>,
         offset: Option<usize>,
     ) -> PyResult<PyRefMut<'_, Self>> {
         let scanner = slf
             .inner
             .take()
             .ok_or_else(|| PyRuntimeError::new_err("Scanner has already been consumed"))?;
-        slf.inner = Some(scanner.limit(n, offset));
+        slf.inner = Some(
+            scanner
+                .limit(n.map(|n| n as i64), offset.map(|o| o as i64))
+                .map_err(|e| PyValueError::new_err(e.to_string()))?,
+        );
         Ok(slf)
     }
 
@@ -729,13 +767,14 @@ pub struct PyLsmVectorSearchPlanner {
 #[pymethods]
 impl PyLsmVectorSearchPlanner {
     #[new]
-    #[pyo3(signature = (dataset, shard_snapshots, vector_column, pk_columns=None, distance_type=None))]
+    #[pyo3(signature = (dataset, shard_snapshots, vector_column, pk_columns=None, distance_type=None, filter=None))]
     pub fn new(
         dataset: &Bound<'_, PyDataset>,
         shard_snapshots: Vec<Bound<'_, PyShardSnapshot>>,
         vector_column: String,
         pk_columns: Option<Vec<String>>,
         distance_type: Option<String>,
+        filter: Option<String>,
     ) -> PyResult<Self> {
         let ds = dataset.borrow().ds.clone();
         let snapshots: Vec<ShardSnapshot> = shard_snapshots
@@ -751,9 +790,16 @@ impl PyLsmVectorSearchPlanner {
         let dist_type = parse_distance_type(distance_type.as_deref().unwrap_or("l2"))?;
 
         let vector_dim = get_vector_dim(&ds, &vector_column)?;
+        let filter = filter
+            .as_deref()
+            .map(|filter| {
+                parse_lsm_filter_expr(base_schema.as_ref(), filter)
+                    .map_err(|e| PyValueError::new_err(e.to_string()))
+            })
+            .transpose()?;
 
         let collector = LsmDataSourceCollector::new(ds.clone(), snapshots);
-        let planner = LsmVectorSearchPlanner::new(
+        let mut planner = LsmVectorSearchPlanner::new(
             collector,
             pk_cols,
             base_schema.clone(),
@@ -761,6 +807,9 @@ impl PyLsmVectorSearchPlanner {
             dist_type,
         )
         .with_dataset(ds);
+        if let Some(filter) = filter {
+            planner = planner.with_filter(Some(filter));
+        }
 
         Ok(Self {
             planner,
@@ -900,10 +949,8 @@ fn memtable_stats_to_pydict(py: Python<'_>, stats: &MemTableStats) -> PyResult<P
         "max_buffered_batch_position",
         stats.max_buffered_batch_position,
     )?;
-    dict.set_item(
-        "max_flushed_batch_position",
-        stats.max_flushed_batch_position,
-    )?;
+    dict.set_item("durable_batch_count", stats.durable_batch_count)?;
+    dict.set_item("global_offset", stats.global_offset)?;
     dict.set_item(
         "pending_wal_start_batch_position",
         stats.pending_wal_start_batch_position,
@@ -990,13 +1037,18 @@ fn closed_memtable_stats(stats_before_close: MemTableStats) -> MemTableStats {
         return stats_before_close;
     }
 
+    // After a successful close every buffered batch is flushed and WAL-durable,
+    // so the synthesized empty memtable starts at the writer's global end and the
+    // durable cursor has caught up to it.
+    let global_end = stats_before_close.global_offset + stats_before_close.batch_count;
     MemTableStats {
         row_count: 0,
         batch_count: 0,
         estimated_size: 0,
         generation: stats_before_close.generation.saturating_add(1),
         max_buffered_batch_position: None,
-        max_flushed_batch_position: None,
+        durable_batch_count: global_end,
+        global_offset: global_end,
         pending_wal_start_batch_position: None,
         pending_wal_end_batch_position: None,
         pending_wal_batch_count: 0,

@@ -595,8 +595,10 @@ impl CacheStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Error;
     use std::collections::{BTreeSet, HashMap};
     use std::marker::PhantomData;
+    use std::sync::atomic::AtomicUsize;
 
     struct TestKey<T: 'static> {
         key: String,
@@ -686,6 +688,39 @@ mod tests {
                 .await;
         }
         assert!(cache.size_bytes().await <= capacity);
+    }
+
+    #[tokio::test]
+    async fn test_cache_weighs_key_footprint() {
+        // Weighted size charges the key's unique bytes, not just the value.
+        let cache = LanceCache::with_capacity(usize::MAX);
+        let key = "k".repeat(10_000);
+        let value = Arc::new(vec![1_i32]);
+        let expected =
+            std::mem::size_of::<InternalCacheKey>() + key.len() + cache_entry_size(&*value);
+        cache
+            .insert_with_key(&TestKey::<Vec<i32>>::new(&key), value)
+            .await;
+        assert_eq!(cache.size_bytes().await, expected);
+    }
+
+    #[tokio::test]
+    async fn test_cache_shared_prefix_not_charged_per_entry() {
+        // The shared prefix contributes nothing per entry (it isn't freed on a
+        // single eviction); only struct + unique key + value are charged.
+        let cache = LanceCache::with_capacity(usize::MAX).with_key_prefix(&"p".repeat(10_000));
+        for i in 0..100 {
+            cache
+                .insert_with_key(
+                    &TestKey::<Vec<i32>>::new(&i.to_string()),
+                    Arc::new(vec![1_i32]),
+                )
+                .await;
+        }
+        let value_cost = cache_entry_size(&vec![1_i32]);
+        let key_bytes: usize = (0..100).map(|i| i.to_string().len()).sum();
+        let expected = 100 * (std::mem::size_of::<InternalCacheKey>() + value_cost) + key_bytes;
+        assert_eq!(cache.size_bytes().await, expected);
     }
 
     #[tokio::test]
@@ -884,6 +919,37 @@ mod tests {
             .unwrap();
         assert_eq!(*v, vec![1, 2, 3]);
         assert_eq!(cache.stats().await.hits, 1);
+    }
+
+    #[tokio::test]
+    async fn test_cache_coalesces_concurrent_loader_errors() {
+        let cache = LanceCache::with_capacity(1000);
+        let barrier = Arc::new(tokio::sync::Barrier::new(5));
+        let loader_calls = Arc::new(AtomicUsize::new(0));
+
+        let results = futures::future::join_all((0..5).map(|_| {
+            let cache = cache.clone();
+            let barrier = barrier.clone();
+            let loader_calls = loader_calls.clone();
+            async move {
+                barrier.wait().await;
+                cache
+                    .get_or_insert_with_key(TestKey::<Vec<i32>>::new("error"), || async move {
+                        loader_calls.fetch_add(1, Ordering::Relaxed);
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        Err(Error::timeout("metadata read timed out"))
+                    })
+                    .await
+            }
+        }))
+        .await;
+
+        assert_eq!(loader_calls.load(Ordering::Relaxed), 1);
+        assert!(
+            results
+                .iter()
+                .all(|result| matches!(result, Err(Error::Timeout { .. })))
+        );
     }
 
     #[tokio::test]

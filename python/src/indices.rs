@@ -232,6 +232,7 @@ async fn do_train_pq_model(
     distance_type: &str,
     sample_rate: u32,
     max_iters: u32,
+    num_bits: u32,
     ivf_model: IvfModel,
     fragment_ids: Option<Vec<u32>>,
 ) -> PyResult<ArrayData> {
@@ -239,7 +240,7 @@ async fn do_train_pq_model(
     let distance_type = DistanceType::try_from(distance_type).unwrap();
     let params = PQBuildParams {
         num_sub_vectors: num_subvectors as usize,
-        num_bits: 8,
+        num_bits: num_bits as usize,
         max_iters: max_iters as usize,
         sample_rate: sample_rate as usize,
         ..Default::default()
@@ -260,7 +261,7 @@ async fn do_train_pq_model(
 
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
-#[pyo3(signature=(dataset, column, dimension, num_subvectors, distance_type, sample_rate, max_iters, ivf_centroids, fragment_ids=None))]
+#[pyo3(signature=(dataset, column, dimension, num_subvectors, distance_type, sample_rate, max_iters, ivf_centroids, fragment_ids=None, num_bits=8))]
 fn train_pq_model<'py>(
     py: Python<'py>,
     dataset: &Dataset,
@@ -272,6 +273,7 @@ fn train_pq_model<'py>(
     max_iters: u32,
     ivf_centroids: PyArrowType<ArrayData>,
     fragment_ids: Option<Vec<u32>>,
+    num_bits: u32,
 ) -> PyResult<Bound<'py, PyAny>> {
     let ivf_centroids = ivf_centroids.0;
     let ivf_centroids = FixedSizeListArray::from(ivf_centroids);
@@ -291,6 +293,7 @@ fn train_pq_model<'py>(
             distance_type,
             sample_rate,
             max_iters,
+            num_bits,
             ivf_model,
             fragment_ids,
         ),
@@ -398,7 +401,7 @@ async fn do_transform_vectors(
 
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
-#[pyo3(signature=(dataset, column, dimension, num_subvectors, distance_type, ivf_centroids, pq_codebook, dst_uri, fragments, partitions_ds_uri=None))]
+#[pyo3(signature=(dataset, column, dimension, num_subvectors, distance_type, ivf_centroids, pq_codebook, dst_uri, fragments, partitions_ds_uri=None, num_bits=8))]
 pub fn transform_vectors(
     py: Python<'_>,
     dataset: &Dataset,
@@ -411,6 +414,7 @@ pub fn transform_vectors(
     dst_uri: &str,
     fragments: Vec<FileFragment>,
     partitions_ds_uri: Option<&str>,
+    num_bits: u32,
 ) -> PyResult<()> {
     let ivf_centroids = ivf_centroids.0;
     let ivf_centroids = FixedSizeListArray::from(ivf_centroids);
@@ -419,7 +423,7 @@ pub fn transform_vectors(
     let distance_type = DistanceType::try_from(distance_type).unwrap();
     let pq = ProductQuantizer::new(
         num_subvectors as usize,
-        /*num_bits=*/ 8,
+        num_bits,
         dimension,
         codebook,
         distance_type,
@@ -561,7 +565,7 @@ async fn do_load_shuffled_vectors(
 }
 
 #[pyfunction]
-#[pyo3(signature=(filenames, dir_path, dataset, column, ivf_centroids, pq_codebook, pq_dimension, num_subvectors, distance_type, index_name=None))]
+#[pyo3(signature=(filenames, dir_path, dataset, column, ivf_centroids, pq_codebook, pq_dimension, num_subvectors, distance_type, index_name=None, num_bits=8))]
 #[allow(clippy::too_many_arguments)]
 pub fn load_shuffled_vectors(
     filenames: Vec<String>,
@@ -574,6 +578,7 @@ pub fn load_shuffled_vectors(
     num_subvectors: u32,
     distance_type: &str,
     index_name: Option<&str>,
+    num_bits: u32,
 ) -> PyResult<()> {
     let mut default_idx_name = column.to_string();
     default_idx_name.push_str("_idx");
@@ -595,7 +600,7 @@ pub fn load_shuffled_vectors(
     let distance_type = DistanceType::try_from(distance_type).unwrap();
     let pq_model = ProductQuantizer::new(
         num_subvectors as usize,
-        /*num_bits=*/ 8,
+        num_bits,
         pq_dimension,
         codebook,
         distance_type,

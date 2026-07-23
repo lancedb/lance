@@ -27,7 +27,6 @@
 //! Already-blocked rows are dropped from the key set before probing older
 //! generations, preserving the per-row short-circuit.
 
-use std::any::Any;
 use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -107,10 +106,6 @@ impl DisplayAs for PkBlockFilterExec {
 impl ExecutionPlan for PkBlockFilterExec {
     fn name(&self) -> &str {
         "PkBlockFilterExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn schema(&self) -> SchemaRef {
@@ -322,7 +317,7 @@ mod tests {
             let (bp, off, _) = store.append(b.clone()).unwrap();
             index.insert_with_batch_position(&b, off, Some(bp)).unwrap();
         }
-        let max_visible_row = store.max_visible_row(index.max_visible_batch_position());
+        let max_visible_row = store.max_visible_row(index.visible_count());
         GenMembership::InMemory {
             index_store: Arc::new(index),
             max_visible_row,

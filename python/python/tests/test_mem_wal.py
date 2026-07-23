@@ -11,6 +11,7 @@ import pytest
 from lance.mem_wal import (
     LsmPointLookupPlanner,
     LsmScanner,
+    LsmVectorSearchPlanner,
     ShardingField,
     ShardingSpec,
     ShardSnapshot,
@@ -110,7 +111,8 @@ def test_point_lookup_with_memtables(tmp_path):
     plan = planner.plan_lookup(pa.array([2], type=pa.int64()))
     assert plan.schema.names == ["id", "name"]
     assert plan.dataset_schema.names == ["id", "name"]
-    assert "Take" in plan.explain() or "Scan" in plan.explain()
+    explained = plan.explain()
+    assert "Take" in explained or "Scan" in explained or "LanceRead" in explained
     result = plan.to_table()
     assert len(result) == 1, "Expected exactly one row for id=2"
     assert result.column("name")[0].as_py() == "gen1_2", (
@@ -163,6 +165,11 @@ def test_lsm_scanner_with_memtables(tmp_path):
     assert name_by_id[2] == "gen1_2", "Flushed gen must overwrite base for id=2"
     assert name_by_id[3] == "base_3"
 
+    offset_table = (
+        LsmScanner.from_snapshots(base_ds, [snap]).limit(None, offset=1).to_table()
+    )
+    assert len(offset_table) == 2, "Offset-only LSM scan should not require a limit"
+
 
 def test_shard_writer_lsm_scanner_includes_own_flushed_generations(tmp_path):
     ds_path = str(tmp_path / "base")
@@ -188,6 +195,33 @@ def test_shard_writer_lsm_scanner_includes_own_flushed_generations(tmp_path):
             if time.time() >= deadline:
                 assert False, "writer.lsm_scanner() did not include flushed writer rows"
             time.sleep(0.05)
+
+
+def test_shard_writer_delete_binding_masks_base_row(tmp_path):
+    ds_path = str(tmp_path / "base")
+    shard_id = str(uuid.uuid4())
+    ds = lance.write_dataset(
+        _lookup_table([1, 2, 3], "base"), ds_path, schema=_LOOKUP_SCHEMA
+    )
+    ds.initialize_mem_wal()
+
+    delete_keys = pa.table({"id": pa.array([2], type=pa.int64())})
+
+    with ds.mem_wal_writer(
+        shard_id,
+        durable_write=True,
+        max_wal_buffer_size=1,
+        max_wal_flush_interval_ms=10,
+    ) as writer:
+        writer.put(_lookup_table([4], "writer"))
+        writer.delete(delete_keys)
+        table = writer.lsm_scanner().to_table()
+
+    rows = {row["id"]: row["name"] for row in table.to_pylist()}
+    assert rows[1] == "base_1"
+    assert 2 not in rows, "deleted base row should be masked by the tombstone"
+    assert rows[3] == "base_3"
+    assert rows[4] == "writer_4"
 
 
 _VDIM = 4  # matches Rust test fixture dimension
@@ -219,6 +253,40 @@ def _vector_search_table(ids):
         {"id": pa.array(ids, pa.int32()), "vector": vectors},
         schema=_vector_search_schema(),
     )
+
+
+def test_lsm_vector_search_filter_binding(tmp_path):
+    ds_path = str(tmp_path / "vec")
+    ds = lance.write_dataset(
+        _vector_search_table(range(400)), ds_path, schema=_vector_search_schema()
+    )
+    ds.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        name="vector_idx",
+        num_partitions=2,
+        num_sub_vectors=2,
+    )
+    ds.initialize_mem_wal(maintained_indexes=["vector_idx"])
+
+    planner = LsmVectorSearchPlanner(ds, [], "vector", filter="id >= 200")
+    query_id = 250
+    query = pa.array([25.0, 25.1, 25.2, 25.3], type=pa.float32())
+    table = planner.plan_search(query, k=20, nprobes=2, columns=["id"]).to_table()
+
+    ids = table.column("id").to_pylist()
+    assert ids, "filtered vector search should return at least one row"
+    assert min(ids) >= 200
+    assert query_id in ids, f"filtered vector search recall missed id={query_id}: {ids}"
+
+    with pytest.raises(ValueError, match="k must be positive"):
+        planner.plan_search(query, k=0, nprobes=2, columns=["id"])
+    with pytest.raises(ValueError, match="nprobes must be positive"):
+        planner.plan_search(query, k=20, nprobes=0, columns=["id"])
+    with pytest.raises(ValueError, match="overfetch_factor must be finite"):
+        planner.plan_search(
+            query, k=20, nprobes=2, columns=["id"], overfetch_factor=math.inf
+        )
 
 
 VECTOR_DIM = 32
@@ -287,7 +355,6 @@ def test_shard_writer_e2e_correctness(tmp_path):
     writer = ds.mem_wal_writer(
         shard_id,
         durable_write=True,
-        sync_indexed_write=True,
         max_wal_buffer_size=10 * 1024,  # 10 KB
         max_wal_flush_interval_ms=50,
         max_memtable_size=80,  # flush after ~80 rows
@@ -337,9 +404,7 @@ def test_shard_writer_e2e_correctness(tmp_path):
     # === New writer: write and read back via active MemTable scanner ===
     ds2 = lance.dataset(ds_path)
     shard_id2 = str(uuid.uuid4())
-    with ds2.mem_wal_writer(
-        shard_id2, durable_write=False, sync_indexed_write=True
-    ) as writer2:
+    with ds2.mem_wal_writer(shard_id2, durable_write=False) as writer2:
         verify_batch = _e2e_batch(schema, start_id=10000, num_rows=10)
         writer2.put(pa.Table.from_batches([verify_batch]))
         result = writer2.lsm_scanner().to_table()
@@ -454,7 +519,6 @@ def test_initialize_mem_wal_writer_config_defaults(tmp_path):
     # Duration knobs are recorded in milliseconds with a `_ms` suffix.
     assert defaults["max_wal_flush_interval_ms"] == "250"
     # Every ShardWriterConfig tunable is recorded once any default is set.
-    assert "sync_indexed_write" in defaults
     assert "enable_memtable" in defaults
 
 

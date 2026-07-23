@@ -760,10 +760,6 @@ impl Schema {
         Ok(schema)
     }
 
-    pub fn all_fields_nullable(&self) -> bool {
-        SchemaFieldIterPreOrder::new(self).all(|f| f.nullable)
-    }
-
     /// Returns the properly formatted path from root to the field.
     /// Field names containing dots are quoted (e.g., struct.`field.with.dot`)
     pub fn field_path(&self, field_id: i32) -> Result<String> {
@@ -1075,6 +1071,17 @@ pub enum BlobHandling {
 }
 
 impl BlobHandling {
+    fn should_load_binary(&self, field: &Field) -> bool {
+        if !field.is_blob() {
+            return false;
+        }
+        match self {
+            Self::AllBinary => true,
+            Self::SomeBlobsBinary(set) | Self::SomeBinary(set) => set.contains(&(field.id as u32)),
+            Self::BlobsDescriptions | Self::AllDescriptions => false,
+        }
+    }
+
     fn should_unload(&self, field: &Field) -> bool {
         // Blob v2 columns are Structs, so we need to treat any blob-marked field as unloadable
         // even if the physical data type is not binary-like.
@@ -1090,10 +1097,34 @@ impl BlobHandling {
         }
     }
 
+    /// Whether `field` will be projected as a lightweight blob *description*
+    /// (offset + size) rather than its full binary value under this handling.
+    ///
+    /// A description is tiny and cheap to read eagerly; the full binary value is
+    /// not. Materialization heuristics use this to decide early vs late loading.
+    pub fn returns_description(&self, field: &Field) -> bool {
+        self.should_unload(field)
+    }
+
+    /// Apply this blob handling policy to a projected field tree.
+    ///
+    /// Blob descriptor modes convert blob leaves to descriptor views. Binary
+    /// modes convert selected blob leaves to `LargeBinary`. Non-blob nested
+    /// fields are preserved while their children are handled recursively.
     pub fn unload_if_needed(&self, mut field: Field) -> Field {
+        if self.should_load_binary(&field) {
+            field.binary_blob_mut();
+            return field;
+        }
         if self.should_unload(&field) {
             field.unloaded_mut();
+            return field;
         }
+        field.children = field
+            .children
+            .into_iter()
+            .map(|child| self.unload_if_needed(child))
+            .collect();
         field
     }
 }
@@ -2472,86 +2503,6 @@ mod tests {
         assert!(out_of_order.compare_with_options(&expected, &options));
         let res = out_of_order.explain_difference(&expected, &options);
         assert!(res.is_none(), "Expected None, got {:?}", res);
-    }
-
-    #[test]
-    pub fn test_all_fields_nullable() {
-        let test_cases = vec![
-            (
-                vec![], // empty schema
-                true,
-            ),
-            (
-                vec![
-                    Field::new_arrow("a", DataType::Int32, true).unwrap(),
-                    Field::new_arrow("b", DataType::Utf8, true).unwrap(),
-                ], // basic case
-                true,
-            ),
-            (
-                vec![
-                    Field::new_arrow("a", DataType::Int32, false).unwrap(),
-                    Field::new_arrow("b", DataType::Utf8, true).unwrap(),
-                ],
-                false,
-            ),
-            (
-                // check nested schema, parent is nullable
-                vec![
-                    Field::new_arrow(
-                        "struct",
-                        DataType::Struct(ArrowFields::from(vec![ArrowField::new(
-                            "a",
-                            DataType::Int32,
-                            false,
-                        )])),
-                        true,
-                    )
-                    .unwrap(),
-                ],
-                false,
-            ),
-            (
-                // check nested schema, child is nullable
-                vec![
-                    Field::new_arrow(
-                        "struct",
-                        DataType::Struct(ArrowFields::from(vec![ArrowField::new(
-                            "a",
-                            DataType::Int32,
-                            true,
-                        )])),
-                        false,
-                    )
-                    .unwrap(),
-                ],
-                false,
-            ),
-            (
-                // check nested schema, all is nullable
-                vec![
-                    Field::new_arrow(
-                        "struct",
-                        DataType::Struct(ArrowFields::from(vec![ArrowField::new(
-                            "a",
-                            DataType::Int32,
-                            true,
-                        )])),
-                        true,
-                    )
-                    .unwrap(),
-                ],
-                true,
-            ),
-        ];
-
-        for (fields, expected) in test_cases {
-            let schema = Schema {
-                fields,
-                metadata: Default::default(),
-            };
-            assert_eq!(schema.all_fields_nullable(), expected);
-        }
     }
 
     #[test]

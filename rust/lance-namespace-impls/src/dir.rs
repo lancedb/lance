@@ -21,8 +21,8 @@ use lance::dataset::scanner::Scanner;
 use lance::dataset::statistics::DatasetStatisticsExt;
 use lance::dataset::transaction::{Operation, Transaction};
 use lance::dataset::{
-    Dataset, MergeInsertBuilder, WhenMatched, WhenNotMatched, WhenNotMatchedBySource, WriteMode,
-    WriteParams,
+    Dataset, MergeInsertBuilder, UpdateBuilder, WhenMatched, WhenNotMatched,
+    WhenNotMatchedBySource, WriteMode, WriteParams,
 };
 use lance::index::{DatasetIndexExt, IndexParams, vector::VectorIndexParams};
 use lance::session::Session;
@@ -34,6 +34,7 @@ use lance_index::vector::{
     sq::builder::SQBuildParams,
 };
 use lance_index::{IndexType, is_system_index};
+use lance_io::object_store::throttle::is_throttle_error;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
 use lance_linalg::distance::MetricType;
 use lance_table::io::commit::{ManifestNamingScheme, VERSIONS_DIR};
@@ -43,25 +44,28 @@ use object_store::{Error as ObjectStoreError, ObjectStore as OSObjectStore, PutM
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::{Arc, Mutex};
+use tokio::sync::OnceCell;
 
 use crate::context::DynamicContextProvider;
 use lance_namespace::models::{
     AlterTableAddColumnsRequest, AlterTableAddColumnsResponse, AlterTableAlterColumnsRequest,
     AlterTableAlterColumnsResponse, AlterTableDropColumnsRequest, AlterTableDropColumnsResponse,
-    AnalyzeTableQueryPlanRequest, BatchDeleteTableVersionsRequest,
-    BatchDeleteTableVersionsResponse, BranchContents as ModelBranchContents, CountTableRowsRequest,
-    CreateNamespaceRequest, CreateNamespaceResponse, CreateTableBranchRequest,
-    CreateTableBranchResponse, CreateTableIndexRequest, CreateTableIndexResponse,
-    CreateTableRequest, CreateTableResponse, CreateTableScalarIndexResponse, CreateTableTagRequest,
-    CreateTableTagResponse, CreateTableVersionRequest, CreateTableVersionResponse,
-    DeclareTableRequest, DeclareTableResponse, DeleteTableBranchRequest, DeleteTableBranchResponse,
-    DeleteTableTagRequest, DeleteTableTagResponse, DescribeNamespaceRequest,
-    DescribeNamespaceResponse, DescribeTableIndexStatsRequest, DescribeTableIndexStatsResponse,
-    DescribeTableRequest, DescribeTableResponse, DescribeTableVersionRequest,
-    DescribeTableVersionResponse, DescribeTransactionRequest, DescribeTransactionResponse,
-    DropNamespaceRequest, DropNamespaceResponse, DropTableIndexRequest, DropTableIndexResponse,
-    DropTableRequest, DropTableResponse, ExplainTableQueryPlanRequest, FragmentStats,
-    FragmentSummary, GetTableStatsRequest, GetTableStatsResponse, GetTableTagVersionRequest,
+    AlterTransactionRequest, AlterTransactionResponse, AnalyzeTableQueryPlanRequest,
+    BatchDeleteTableVersionsRequest, BatchDeleteTableVersionsResponse,
+    BranchContents as ModelBranchContents, CountTableRowsRequest, CreateNamespaceRequest,
+    CreateNamespaceResponse, CreateTableBranchRequest, CreateTableBranchResponse,
+    CreateTableIndexRequest, CreateTableIndexResponse, CreateTableRequest, CreateTableResponse,
+    CreateTableScalarIndexResponse, CreateTableTagRequest, CreateTableTagResponse,
+    CreateTableVersionRequest, CreateTableVersionResponse, DeclareTableRequest,
+    DeclareTableResponse, DeleteFromTableRequest, DeleteFromTableResponse,
+    DeleteTableBranchRequest, DeleteTableBranchResponse, DeleteTableTagRequest,
+    DeleteTableTagResponse, DescribeNamespaceRequest, DescribeNamespaceResponse,
+    DescribeTableIndexStatsRequest, DescribeTableIndexStatsResponse, DescribeTableRequest,
+    DescribeTableResponse, DescribeTableVersionRequest, DescribeTableVersionResponse,
+    DescribeTransactionRequest, DescribeTransactionResponse, DropNamespaceRequest,
+    DropNamespaceResponse, DropTableIndexRequest, DropTableIndexResponse, DropTableRequest,
+    DropTableResponse, ExplainTableQueryPlanRequest, FragmentStats, FragmentSummary,
+    GetTableStatsRequest, GetTableStatsResponse, GetTableTagVersionRequest,
     GetTableTagVersionResponse, Identity, IndexContent, InsertIntoTableRequest,
     InsertIntoTableResponse, ListNamespacesRequest, ListNamespacesResponse,
     ListTableBranchesRequest, ListTableBranchesResponse, ListTableIndicesRequest,
@@ -70,11 +74,14 @@ use lance_namespace::models::{
     MergeInsertIntoTableRequest, MergeInsertIntoTableResponse, NamespaceExistsRequest,
     QueryTableRequest, QueryTableRequestColumns, QueryTableRequestVector, RestoreTableRequest,
     RestoreTableResponse, TableExistsRequest, TableVersion, TagContents as ModelTagContents,
-    UpdateTableSchemaMetadataRequest, UpdateTableSchemaMetadataResponse, UpdateTableTagRequest,
-    UpdateTableTagResponse,
+    UpdateTableRequest, UpdateTableResponse, UpdateTableSchemaMetadataRequest,
+    UpdateTableSchemaMetadataResponse, UpdateTableTagRequest, UpdateTableTagResponse,
 };
 
 use lance_core::{Error, Result, box_error};
+use lance_index::scalar::inverted::query::{
+    BooleanQuery, BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Occur, Operator, PhraseQuery,
+};
 use lance_namespace::LanceNamespace;
 use lance_namespace::error::NamespaceError;
 use lance_namespace::schema::arrow_schema_to_json;
@@ -736,7 +743,7 @@ impl DirectoryNamespaceBuilder {
             Self::initialize_object_store(&self.root, &self.storage_options, &self.session).await?;
 
         let manifest_ns = if self.manifest_enabled {
-            match manifest::ManifestNamespace::from_directory(
+            match manifest::ManifestNamespace::open_from_directory(
                 self.root.clone(),
                 self.storage_options.clone(),
                 self.session.clone(),
@@ -755,18 +762,19 @@ impl DirectoryNamespaceBuilder {
                     // degrading to a directory-listing view that ignores it.
                     return Err(e);
                 }
-                Err(e) => {
-                    // Failed to initialize manifest namespace, fall back to directory listing only
-                    log::warn!(
-                        "Failed to initialize manifest namespace, falling back to directory listing only: {}",
-                        e
-                    );
+                Err(e) if manifest::ManifestNamespace::is_not_found_load_error(&e) => {
+                    log::debug!("Manifest namespace does not exist yet: {}", e);
                     None
                 }
+                Err(e) => return Err(e),
             }
         } else {
             None
         };
+        let manifest_cell = OnceCell::new();
+        if let Some(manifest_ns) = manifest_ns {
+            let _ = manifest_cell.set(manifest_ns);
+        }
 
         // Create credential vendor once during initialization if enabled
         let credential_vendor = if has_credential_vendor_config(&self.credential_vendor_properties)
@@ -790,8 +798,12 @@ impl DirectoryNamespaceBuilder {
             session: self.session,
             object_store,
             base_path,
-            manifest_ns,
+            manifest_ns: manifest_cell,
+            write_manifest_ns: OnceCell::new(),
+            manifest_enabled: self.manifest_enabled,
             dir_listing_enabled: self.dir_listing_enabled,
+            inline_optimization_enabled: self.inline_optimization_enabled,
+            commit_retries: self.commit_retries,
             dir_listing_to_manifest_migration_enabled: self
                 .dir_listing_to_manifest_migration_enabled,
             table_version_tracking_enabled: self.table_version_tracking_enabled,
@@ -868,8 +880,12 @@ pub struct DirectoryNamespace {
     session: Option<Arc<Session>>,
     object_store: Arc<ObjectStore>,
     base_path: Path,
-    manifest_ns: Option<Arc<manifest::ManifestNamespace>>,
+    manifest_ns: OnceCell<Arc<manifest::ManifestNamespace>>,
+    write_manifest_ns: OnceCell<Arc<manifest::ManifestNamespace>>,
+    manifest_enabled: bool,
     dir_listing_enabled: bool,
+    inline_optimization_enabled: bool,
+    commit_retries: Option<u32>,
     /// When true, root-level table operations check the manifest first before
     /// falling back to directory listing. When false, root-level tables skip
     /// the manifest check and use directory listing directly.
@@ -912,7 +928,121 @@ struct TableDeleteEntry {
     ranges: Vec<(i64, i64)>,
 }
 
+/// Persistent record of `alter_transaction` outcomes for a single transaction.
+///
+/// Lance's transaction file is immutable once written, so we record any
+/// modifications (status transitions, extra properties, tombstoned properties)
+/// in a namespace-owned sidecar file. The sidecar is then merged into the
+/// response of subsequent `describe_transaction` / `alter_transaction` calls.
+///
+/// Serialization is implemented manually via `serde_json::Value` to avoid
+/// pulling in `serde`'s `derive` feature for this crate.
+#[derive(Debug, Clone, Default)]
+struct TransactionAlteration {
+    /// The most recently applied status, if any.
+    status: Option<String>,
+    /// User-defined properties layered on top of the immutable transaction
+    /// properties. Values here take precedence over the transaction's own
+    /// properties when both are present.
+    properties: HashMap<String, String>,
+    /// Names of transaction properties that have been tombstoned via
+    /// `unset_property_action`. A tombstoned key is hidden from the response
+    /// even when the immutable transaction still carries it.
+    removed_properties: std::collections::HashSet<String>,
+}
+
+impl TransactionAlteration {
+    /// JSON field names used for the sidecar on-disk representation.
+    const F_STATUS: &'static str = "status";
+    const F_PROPERTIES: &'static str = "properties";
+    const F_REMOVED_PROPERTIES: &'static str = "removed_properties";
+
+    /// Serialize this alteration to a JSON byte vector.
+    ///
+    /// Uses the same pattern as `dir/manifest.rs`: rely on the built-in
+    /// `Serialize` impls for `Option<String>`, `HashMap<String, String>` and
+    /// `HashSet<String>` provided by the `serde` crate (transitively pulled in
+    /// by `serde_json`), so no `serde` derive nor extra dependency is needed.
+    fn to_json_bytes(&self) -> serde_json::Result<Vec<u8>> {
+        serde_json::to_vec(&serde_json::json!({
+            Self::F_STATUS: self.status,
+            Self::F_PROPERTIES: self.properties,
+            Self::F_REMOVED_PROPERTIES: self.removed_properties,
+        }))
+    }
+
+    /// Deserialize an alteration from JSON bytes, mirroring the
+    /// `serde_json::from_slice::<HashMap<String, String>>(...)` idiom already
+    /// used in `dir/manifest.rs`. Missing / null fields fall back to defaults
+    /// so that the sidecar format stays forward-compatible.
+    fn from_json_slice(bytes: &[u8]) -> serde_json::Result<Self> {
+        let mut obj: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(bytes)?;
+        Ok(Self {
+            status: serde_json::from_value(
+                obj.remove(Self::F_STATUS)
+                    .unwrap_or(serde_json::Value::Null),
+            )?,
+            properties: serde_json::from_value(
+                obj.remove(Self::F_PROPERTIES)
+                    .unwrap_or(serde_json::Value::Null),
+            )
+            .unwrap_or_default(),
+            removed_properties: serde_json::from_value(
+                obj.remove(Self::F_REMOVED_PROPERTIES)
+                    .unwrap_or(serde_json::Value::Null),
+            )
+            .unwrap_or_default(),
+        })
+    }
+}
+
 impl DirectoryNamespace {
+    fn manifest_ns_for_read(&self) -> Option<&Arc<manifest::ManifestNamespace>> {
+        self.write_manifest_ns
+            .get()
+            .or_else(|| self.manifest_ns.get())
+    }
+
+    async fn manifest_ns_for_write(&self) -> Result<Option<Arc<manifest::ManifestNamespace>>> {
+        if !self.manifest_enabled {
+            return Ok(None);
+        }
+
+        let manifest_ns = self
+            .write_manifest_ns
+            .get_or_try_init(|| async {
+                manifest::ManifestNamespace::from_directory(
+                    self.root.clone(),
+                    self.storage_options.clone(),
+                    self.session.clone(),
+                    self.object_store.clone(),
+                    self.base_path.clone(),
+                    self.dir_listing_enabled,
+                    self.inline_optimization_enabled,
+                    self.commit_retries,
+                )
+                .await
+                .map(Arc::new)
+            })
+            .await?;
+        Ok(Some(manifest_ns.clone()))
+    }
+
+    fn child_namespace_requires_manifest_error(&self) -> Error {
+        if self.manifest_enabled {
+            NamespaceError::NamespaceNotFound {
+                message: "Child namespace reads require an existing __manifest dataset".to_string(),
+            }
+            .into()
+        } else {
+            NamespaceError::Unsupported {
+                message: "Child namespaces are only supported when manifest mode is enabled"
+                    .to_string(),
+            }
+            .into()
+        }
+    }
+
     /// Apply pagination to a list of table names
     ///
     /// Sorts the list alphabetically and applies pagination using page_token (start_after) and limit.
@@ -986,7 +1116,7 @@ impl DirectoryNamespace {
             let table_name = &path[..path.len() - 6];
 
             // Use atomic check to skip deregistered tables.
-            let status = self.check_table_status(table_name).await;
+            let status = self.check_table_status(table_name).await?;
             if status.is_deregistered {
                 continue;
             }
@@ -1135,6 +1265,85 @@ impl DirectoryNamespace {
         }
     }
 
+    /// Map a Lance error from a table mutation (update / delete / merge-insert) into the most
+    /// specific `NamespaceError` we can determine from the underlying variant.
+    ///
+    /// Collapsing every failure into `InvalidInput`/`Internal` hides the real cause from callers;
+    /// mapping per variant lets them branch on a meaningful error code (e.g. retry on
+    /// `ConcurrentModification`, surface `TableNotFound` to the user).
+    ///
+    /// Commit-conflict variants are mapped consistently with `convert_lance_commit_error` in
+    /// `manifest.rs`: `CommitConflict` (retries exhausted, safe to retry) -> `Throttling`, while
+    /// semantic conflicts (`TooMuchWriteContention` / `RetryableCommitConflict` /
+    /// `IncompatibleTransaction` / `VersionConflict`) -> `ConcurrentModification`.
+    fn map_mutation_error(
+        err: lance_core::Error,
+        operation: &str,
+        table_uri: &str,
+    ) -> lance_core::Error {
+        let detail = err.to_string();
+        let ns_err = match &err {
+            lance_core::Error::InvalidInput { .. }
+            | lance_core::Error::Unprocessable { .. }
+            | lance_core::Error::InvalidRef { .. } => NamespaceError::InvalidInput {
+                message: format!(
+                    "Invalid input for {} on table at '{}': {}",
+                    operation, table_uri, detail
+                ),
+            },
+            lance_core::Error::NotFound { .. } | lance_core::Error::DatasetNotFound { .. } => {
+                NamespaceError::TableNotFound {
+                    message: format!(
+                        "Table at '{}' not found while running {}: {}",
+                        table_uri, operation, detail
+                    ),
+                }
+            }
+            lance_core::Error::SchemaMismatch { .. } | lance_core::Error::Schema { .. } => {
+                NamespaceError::TableSchemaValidationError {
+                    message: format!(
+                        "Schema validation failed for {} on table at '{}': {}",
+                        operation, table_uri, detail
+                    ),
+                }
+            }
+            // `CommitConflict` means the version-collision retries were exhausted; the operation
+            // is safe to retry as-is, so surface it as `Throttling` (kept aligned with
+            // `convert_lance_commit_error` in manifest.rs).
+            lance_core::Error::CommitConflict { .. } => NamespaceError::Throttling {
+                message: format!(
+                    "Too many concurrent writes for {} on table at '{}', please retry later: {}",
+                    operation, table_uri, detail
+                ),
+            },
+            // Semantic conflicts: a concurrent change is incompatible with this one and retrying
+            // as-is would not help, so surface them as `ConcurrentModification` (kept aligned with
+            // `convert_lance_commit_error` in manifest.rs).
+            lance_core::Error::TooMuchWriteContention { .. }
+            | lance_core::Error::RetryableCommitConflict { .. }
+            | lance_core::Error::IncompatibleTransaction { .. }
+            | lance_core::Error::VersionConflict { .. } => NamespaceError::ConcurrentModification {
+                message: format!(
+                    "Concurrent modification detected for {} on table at '{}': {}",
+                    operation, table_uri, detail
+                ),
+            },
+            lance_core::Error::NotSupported { .. } => NamespaceError::Unsupported {
+                message: format!(
+                    "{} is not supported on table at '{}': {}",
+                    operation, table_uri, detail
+                ),
+            },
+            _ => NamespaceError::Internal {
+                message: format!(
+                    "Failed to run {} on table at '{}': {}",
+                    operation, table_uri, detail
+                ),
+            },
+        };
+        ns_err.into()
+    }
+
     async fn table_has_actual_manifests(&self, table_name: &str) -> Result<bool> {
         manifest::ManifestNamespace::path_has_actual_manifests(
             &self.object_store,
@@ -1258,17 +1467,19 @@ impl DirectoryNamespace {
             .load()
             .await
             .map_err(|e| {
-                lance_core::Error::from(NamespaceError::TableNotFound {
-                    message: format!(
-                        "branch '{}' not found for table at '{}': {}",
-                        branch, table_uri, e
-                    ),
-                })
+                let message = format!(
+                    "branch '{}' not found for table at '{}': {}",
+                    branch, table_uri, e
+                );
+                Self::map_open_error(e, NamespaceError::TableNotFound { message })
             })?;
-        dataset.branches().get(branch).await.map_err(|_| {
-            lance_core::Error::from(NamespaceError::TableNotFound {
-                message: format!("branch '{}' not found for table at '{}'", branch, table_uri),
-            })
+        dataset.branches().get(branch).await.map_err(|e| {
+            Self::map_open_error(
+                e,
+                NamespaceError::TableNotFound {
+                    message: format!("branch '{}' not found for table at '{}'", branch, table_uri),
+                },
+            )
         })?;
         Ok(dataset)
     }
@@ -1297,9 +1508,8 @@ impl DirectoryNamespace {
             .load()
             .await
             .map_err(|e| {
-                lance_core::Error::from(NamespaceError::TableNotFound {
-                    message: format!("table at '{}' not found: {}", table_uri, e),
-                })
+                let message = format!("table at '{}' not found: {}", table_uri, e);
+                Self::map_open_error(e, NamespaceError::TableNotFound { message })
             })?;
         let branch_location = main.branch_location().find_branch(Some(branch))?;
         match main.branches().get(branch).await {
@@ -1464,9 +1674,9 @@ impl DirectoryNamespace {
 
         if needs_sort {
             if descending {
-                table_versions.sort_by(|a, b| b.version.cmp(&a.version));
+                table_versions.sort_by_key(|v| std::cmp::Reverse(v.version));
             } else {
-                table_versions.sort_by(|a, b| a.version.cmp(&b.version));
+                table_versions.sort_by_key(|v| v.version);
             }
         }
 
@@ -1485,10 +1695,11 @@ impl DirectoryNamespace {
         request: DescribeTableRequest,
     ) -> Result<DescribeTableResponse> {
         let is_root_level = request.id.as_ref().is_some_and(|id| id.len() == 1);
+        let is_child_table = request.id.as_ref().is_some_and(|id| id.len() > 1);
         let skip_manifest_for_root = self.dir_listing_enabled
             && is_root_level
             && !self.dir_listing_to_manifest_migration_enabled;
-        if let Some(ref manifest_ns) = self.manifest_ns
+        if let Some(manifest_ns) = self.manifest_ns_for_read()
             && !skip_manifest_for_root
         {
             match manifest_ns.describe_table(request.clone()).await {
@@ -1512,19 +1723,31 @@ impl DirectoryNamespace {
                     // rather than degrading to a directory-listing view.
                     return Err(e);
                 }
-                Err(_) if self.dir_listing_enabled && is_root_level => {
-                    // Fall through to directory check only for single-level IDs
+                Err(e) if self.dir_listing_enabled && is_root_level => {
+                    // Only a genuinely-absent table (e.g. an unmigrated on-disk
+                    // table) may fall through to the directory check; any other
+                    // manifest error must propagate rather than be read as missing.
+                    if !Self::is_manifest_table_absent_error(&e) {
+                        return Err(Self::classify_storage_error(e));
+                    }
                 }
                 Err(e) => return Err(e),
             }
         }
+        if is_child_table {
+            return Err(self.child_namespace_requires_manifest_error());
+        }
 
         let table_name = Self::table_name_from_id(&request.id)?;
         let table_id = Self::format_table_id_from_request(&request.id);
+        if !self.dir_listing_enabled {
+            return Err(NamespaceError::TableNotFound { message: table_id }.into());
+        }
+
         let table_uri = self.table_full_uri(&table_name);
 
         // Atomically check table existence and deregistration status
-        let status = self.check_table_status(&table_name).await;
+        let status = self.check_table_status(&table_name).await?;
 
         if !status.exists {
             return Err(NamespaceError::TableNotFound {
@@ -1625,12 +1848,14 @@ impl DirectoryNamespace {
                         .checkout_version(requested_version as u64)
                         .await
                         .map_err(|e| {
-                            lance_core::Error::from(NamespaceError::TableVersionNotFound {
-                                message: format!(
-                                    "Version {} not found for table '{}': {}",
-                                    requested_version, table_name, e
-                                ),
-                            })
+                            let message = format!(
+                                "Version {} not found for table '{}': {}",
+                                requested_version, table_name, e
+                            );
+                            Self::map_open_error(
+                                e,
+                                NamespaceError::TableVersionNotFound { message },
+                            )
                         })?;
                 }
 
@@ -1744,22 +1969,20 @@ impl DirectoryNamespace {
         let builder = self.configured_builder(table_uri);
 
         let dataset = builder.load().await.map_err(|e| {
-            lance_core::Error::from(NamespaceError::TableNotFound {
-                message: format!(
-                    "Failed to open table at '{}' for {}: {}",
-                    table_uri, operation, e
-                ),
-            })
+            let message = format!(
+                "Failed to open table at '{}' for {}: {}",
+                table_uri, operation, e
+            );
+            Self::map_open_error(e, NamespaceError::TableNotFound { message })
         })?;
 
         if let Some(version) = version {
             return dataset.checkout_version(version as u64).await.map_err(|e| {
-                lance_core::Error::from(NamespaceError::TableVersionNotFound {
-                    message: format!(
-                        "Failed to checkout version {} for table at '{}' during {}: {}",
-                        version, table_uri, operation, e
-                    ),
-                })
+                let message = format!(
+                    "Failed to checkout version {} for table at '{}' during {}: {}",
+                    version, table_uri, operation, e
+                );
+                Self::map_open_error(e, NamespaceError::TableVersionNotFound { message })
             });
         }
 
@@ -1984,12 +2207,29 @@ impl DirectoryNamespace {
     fn transaction_response(
         version: u64,
         transaction: &Transaction,
+        alteration: Option<TransactionAlteration>,
     ) -> DescribeTransactionResponse {
         let mut properties = transaction
             .transaction_properties
             .as_ref()
             .map(|properties| (**properties).clone())
             .unwrap_or_default();
+
+        // Apply persisted alterations on top of the immutable transaction
+        // properties so callers see the current effective state.
+        let mut effective_status = "SUCCEEDED".to_string();
+        if let Some(alteration) = alteration {
+            for key in &alteration.removed_properties {
+                properties.remove(key);
+            }
+            for (key, value) in alteration.properties {
+                properties.insert(key, value);
+            }
+            if let Some(status) = alteration.status {
+                effective_status = status;
+            }
+        }
+
         properties.insert("uuid".to_string(), transaction.uuid.clone());
         properties.insert("version".to_string(), version.to_string());
         properties.insert(
@@ -2005,7 +2245,7 @@ impl DirectoryNamespace {
         }
 
         DescribeTransactionResponse {
-            status: "SUCCEEDED".to_string(),
+            status: effective_status,
             properties: Some(properties),
         }
     }
@@ -2094,8 +2334,86 @@ impl DirectoryNamespace {
         .into())
     }
 
+    /// Relative directory (under a table's Lance root) used to persist
+    /// alter_transaction outcomes. The Lance transaction file itself is
+    /// immutable, so we keep alterations in a namespace-owned sidecar.
+    const TRANSACTION_ALTERATIONS_DIR: &'static str = "_alter_transactions";
+
+    fn transaction_alteration_path(&self, table_uri: &str, txn_uuid: &str) -> Result<Path> {
+        let table_path = self.object_store_path_from_uri(table_uri)?;
+        Ok(table_path
+            .join(Self::TRANSACTION_ALTERATIONS_DIR)
+            .join(format!("{}.json", txn_uuid).as_str()))
+    }
+
+    async fn load_transaction_alteration(
+        &self,
+        table_uri: &str,
+        txn_uuid: &str,
+    ) -> Result<Option<TransactionAlteration>> {
+        let path = self.transaction_alteration_path(table_uri, txn_uuid)?;
+        match self.object_store.inner.get(&path).await {
+            Ok(get_result) => {
+                let bytes = get_result.bytes().await.map_err(|e| {
+                    lance_core::Error::from(NamespaceError::Internal {
+                        message: format!(
+                            "Failed to read alter_transaction sidecar for '{}': {}",
+                            txn_uuid, e
+                        ),
+                    })
+                })?;
+                let alteration = TransactionAlteration::from_json_slice(&bytes).map_err(|e| {
+                    lance_core::Error::from(NamespaceError::Internal {
+                        message: format!(
+                            "Failed to parse alter_transaction sidecar for '{}': {}",
+                            txn_uuid, e
+                        ),
+                    })
+                })?;
+                Ok(Some(alteration))
+            }
+            Err(ObjectStoreError::NotFound { .. }) => Ok(None),
+            Err(e) => Err(lance_core::Error::from(NamespaceError::Internal {
+                message: format!(
+                    "Failed to load alter_transaction sidecar for '{}': {}",
+                    txn_uuid, e
+                ),
+            })),
+        }
+    }
+
+    async fn save_transaction_alteration(
+        &self,
+        table_uri: &str,
+        txn_uuid: &str,
+        alteration: &TransactionAlteration,
+    ) -> Result<()> {
+        let path = self.transaction_alteration_path(table_uri, txn_uuid)?;
+        let bytes = alteration.to_json_bytes().map_err(|e| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!(
+                    "Failed to serialize alter_transaction sidecar for '{}': {}",
+                    txn_uuid, e
+                ),
+            })
+        })?;
+        self.object_store
+            .inner
+            .put(&path, bytes.into())
+            .await
+            .map_err(|e| {
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!(
+                        "Failed to persist alter_transaction sidecar for '{}': {}",
+                        txn_uuid, e
+                    ),
+                })
+            })?;
+        Ok(())
+    }
+
     fn table_full_uri(&self, table_name: &str) -> String {
-        format!("{}/{}.lance", &self.root, table_name)
+        format!("{}/{}.lance", self.root, table_name)
     }
 
     /// Get the object store path for a table (relative to base_path)
@@ -2126,25 +2444,105 @@ impl DirectoryNamespace {
     /// This performs a single directory listing to get a consistent snapshot of the
     /// table's state, avoiding race conditions between checking existence and
     /// checking deregistration status.
-    pub(crate) async fn check_table_status(&self, table_name: &str) -> TableStatus {
+    pub(crate) async fn check_table_status(&self, table_name: &str) -> Result<TableStatus> {
         let table_path = self.table_path(table_name);
         match self.object_store.read_dir(table_path).await {
             Ok(entries) => {
                 let exists = !entries.is_empty();
                 let is_deregistered = entries.iter().any(|e| e.ends_with(".lance-deregistered"));
                 let has_reserved_file = entries.iter().any(|e| e.ends_with(".lance-reserved"));
-                TableStatus {
+                Ok(TableStatus {
                     exists,
                     is_deregistered,
                     has_reserved_file,
-                }
+                })
             }
-            Err(_) => TableStatus {
+            // Local filesystems error on a missing directory where object stores
+            // return an empty listing; both mean the table does not exist.
+            Err(e) if manifest::ManifestNamespace::is_not_found_load_error(&e) => Ok(TableStatus {
                 exists: false,
                 is_deregistered: false,
                 has_reserved_file: false,
-            },
+            }),
+            // Any other failure must propagate: collapsing it to "does not exist"
+            // lets a transient error overwrite a live table via create/exist-ok
+            // callers and destroys the retry evidence classifiers depend on.
+            Err(e) => Err(Self::classify_storage_error(e)),
         }
+    }
+
+    /// Classify a storage error into a typed [`NamespaceError`]. The full source
+    /// text is embedded in the message because the pyo3 layer flattens namespace
+    /// errors to message-only (no `__cause__`), so that is the only place the
+    /// 429/503 evidence survives to Python.
+    fn classify_storage_error(err: Error) -> Error {
+        if matches!(&err, Error::Namespace { .. }) {
+            return err;
+        }
+        let detail = err.to_string();
+        if let Error::IO { source, .. } = &err
+            && let Some(os_err) = source.downcast_ref::<ObjectStoreError>()
+        {
+            if is_throttle_error(os_err) {
+                return NamespaceError::Throttling {
+                    message: format!(
+                        "Storage request was throttled while resolving table: {detail}"
+                    ),
+                }
+                .into();
+            }
+            if Self::is_service_unavailable_error(os_err) {
+                return NamespaceError::ServiceUnavailable {
+                    message: format!("Storage service unavailable while resolving table: {detail}"),
+                }
+                .into();
+            }
+        }
+        NamespaceError::Internal {
+            message: format!("Storage error while resolving table: {detail}"),
+        }
+        .into()
+    }
+
+    /// Detect a clearly-transient 5xx not already caught by [`is_throttle_error`].
+    /// `object_store` does not expose HTTP status codes, so match the (deliberately
+    /// narrow) canonical status phrases in the message.
+    fn is_service_unavailable_error(err: &ObjectStoreError) -> bool {
+        if let ObjectStoreError::Generic { source, .. } = err {
+            let message = source.to_string().to_ascii_lowercase();
+            message.contains("503 service unavailable")
+                || message.contains("502 bad gateway")
+                || message.contains("504 gateway timeout")
+        } else {
+            false
+        }
+    }
+
+    /// Whether a manifest error means the table is genuinely absent (rather than a
+    /// storage failure while consulting the manifest). Only such errors may fall
+    /// through to the directory listing; anything else must propagate.
+    fn is_manifest_table_absent_error(err: &Error) -> bool {
+        if manifest::ManifestNamespace::is_not_found_load_error(err) {
+            return true;
+        }
+        if let Error::Namespace { source, .. } = err
+            && let Some(ns_err) = source.downcast_ref::<NamespaceError>()
+        {
+            return matches!(ns_err, NamespaceError::TableNotFound { .. });
+        }
+        false
+    }
+
+    /// Map a dataset/version/branch open error: a transient IO error propagates
+    /// typed via [`classify_storage_error`], while a genuine not-found (missing
+    /// dataset, version, or ref) keeps the caller's `not_found` variant.
+    fn map_open_error(err: Error, not_found: NamespaceError) -> Error {
+        if matches!(&err, Error::IO { .. })
+            && !manifest::ManifestNamespace::is_not_found_load_error(&err)
+        {
+            return Self::classify_storage_error(err);
+        }
+        not_found.into()
     }
 
     async fn put_marker_file_atomic(
@@ -2281,7 +2679,7 @@ impl DirectoryNamespace {
     /// - Manifest registration fails
     pub async fn migrate(&self) -> Result<usize> {
         // We only care about tables in the root namespace
-        let Some(ref manifest_ns) = self.manifest_ns else {
+        let Some(manifest_ns) = self.manifest_ns_for_write().await? else {
             return Ok(0); // No manifest, nothing to migrate
         };
 
@@ -2553,10 +2951,13 @@ impl LanceNamespace for DirectoryNamespace {
         request: ListNamespacesRequest,
     ) -> Result<ListNamespacesResponse> {
         self.record_op("list_namespaces");
-        if let Some(ref manifest_ns) = self.manifest_ns {
+        if let Some(manifest_ns) = self.manifest_ns_for_read() {
             return manifest_ns.list_namespaces(request).await;
         }
 
+        if request.id.as_ref().is_some_and(|id| !id.is_empty()) {
+            return Err(self.child_namespace_requires_manifest_error());
+        }
         Self::validate_root_namespace_id(&request.id)?;
         Ok(ListNamespacesResponse::new(vec![]))
     }
@@ -2566,10 +2967,13 @@ impl LanceNamespace for DirectoryNamespace {
         request: DescribeNamespaceRequest,
     ) -> Result<DescribeNamespaceResponse> {
         self.record_op("describe_namespace");
-        if let Some(ref manifest_ns) = self.manifest_ns {
+        if let Some(manifest_ns) = self.manifest_ns_for_read() {
             return manifest_ns.describe_namespace(request).await;
         }
 
+        if request.id.as_ref().is_some_and(|id| !id.is_empty()) {
+            return Err(self.child_namespace_requires_manifest_error());
+        }
         Self::validate_root_namespace_id(&request.id)?;
         #[allow(clippy::needless_update)]
         Ok(DescribeNamespaceResponse {
@@ -2583,7 +2987,7 @@ impl LanceNamespace for DirectoryNamespace {
         request: CreateNamespaceRequest,
     ) -> Result<CreateNamespaceResponse> {
         self.record_op("create_namespace");
-        if let Some(ref manifest_ns) = self.manifest_ns {
+        if let Some(manifest_ns) = self.manifest_ns_for_write().await? {
             return manifest_ns.create_namespace(request).await;
         }
 
@@ -2603,7 +3007,7 @@ impl LanceNamespace for DirectoryNamespace {
 
     async fn drop_namespace(&self, request: DropNamespaceRequest) -> Result<DropNamespaceResponse> {
         self.record_op("drop_namespace");
-        if let Some(ref manifest_ns) = self.manifest_ns {
+        if let Some(manifest_ns) = self.manifest_ns_for_write().await? {
             return manifest_ns.drop_namespace(request).await;
         }
 
@@ -2623,7 +3027,7 @@ impl LanceNamespace for DirectoryNamespace {
 
     async fn namespace_exists(&self, request: NamespaceExistsRequest) -> Result<()> {
         self.record_op("namespace_exists");
-        if let Some(ref manifest_ns) = self.manifest_ns {
+        if let Some(manifest_ns) = self.manifest_ns_for_read() {
             return manifest_ns.namespace_exists(request).await;
         }
 
@@ -2631,11 +3035,7 @@ impl LanceNamespace for DirectoryNamespace {
             return Ok(());
         }
 
-        Err(NamespaceError::NamespaceNotFound {
-            message: "Child namespaces are only supported when manifest mode is enabled"
-                .to_string(),
-        }
-        .into())
+        Err(self.child_namespace_requires_manifest_error())
     }
 
     async fn list_tables(&self, request: ListTablesRequest) -> Result<ListTablesResponse> {
@@ -2649,31 +3049,30 @@ impl LanceNamespace for DirectoryNamespace {
 
         // For child namespaces, always delegate to manifest (if enabled)
         if !namespace_id.is_empty() {
-            if let Some(ref manifest_ns) = self.manifest_ns {
+            if let Some(manifest_ns) = self.manifest_ns_for_read() {
                 return manifest_ns.list_tables(request).await;
             }
-            return Err(NamespaceError::Unsupported {
-                message: "Child namespaces are only supported when manifest mode is enabled"
-                    .to_string(),
-            }
-            .into());
+            return Err(self.child_namespace_requires_manifest_error());
         }
 
         // When only manifest is enabled (no directory listing), delegate directly to manifest
-        if let Some(ref manifest_ns) = self.manifest_ns
+        if let Some(manifest_ns) = self.manifest_ns_for_read()
             && !self.dir_listing_enabled
         {
             return manifest_ns.list_tables(request).await;
         }
+        if !self.dir_listing_enabled {
+            return Ok(ListTablesResponse::new(vec![]));
+        }
 
         // When both manifest and directory listing are enabled with migration mode,
         // we need to merge and deduplicate
-        let mut tables = if self.manifest_ns.is_some()
+        let mut tables = if self.manifest_ns_for_read().is_some()
             && self.dir_listing_enabled
             && self.dir_listing_to_manifest_migration_enabled
         {
             // Get all manifest table locations (for deduplication)
-            let manifest_locations = if let Some(ref manifest_ns) = self.manifest_ns {
+            let manifest_locations = if let Some(manifest_ns) = self.manifest_ns_for_read() {
                 manifest_ns.list_manifest_table_locations().await?
             } else {
                 std::collections::HashSet::new()
@@ -2683,7 +3082,7 @@ impl LanceNamespace for DirectoryNamespace {
             let mut manifest_request = request.clone();
             manifest_request.limit = None;
             manifest_request.page_token = None;
-            let manifest_tables = if let Some(ref manifest_ns) = self.manifest_ns {
+            let manifest_tables = if let Some(manifest_ns) = self.manifest_ns_for_read() {
                 let manifest_response = manifest_ns.list_tables(manifest_request).await?;
                 manifest_response.tables
             } else {
@@ -2731,10 +3130,11 @@ impl LanceNamespace for DirectoryNamespace {
     async fn table_exists(&self, request: TableExistsRequest) -> Result<()> {
         self.record_op("table_exists");
         let is_root_level = request.id.as_ref().is_some_and(|id| id.len() == 1);
+        let is_child_table = request.id.as_ref().is_some_and(|id| id.len() > 1);
         let skip_manifest_for_root = self.dir_listing_enabled
             && is_root_level
             && !self.dir_listing_to_manifest_migration_enabled;
-        if let Some(ref manifest_ns) = self.manifest_ns
+        if let Some(manifest_ns) = self.manifest_ns_for_read()
             && !skip_manifest_for_root
         {
             match manifest_ns.table_exists(request.clone()).await {
@@ -2744,18 +3144,29 @@ impl LanceNamespace for DirectoryNamespace {
                     // rather than degrading to a directory-listing view.
                     return Err(e);
                 }
-                Err(_) if self.dir_listing_enabled && is_root_level => {
-                    // Fall through to directory check only for single-level IDs
+                Err(e) if self.dir_listing_enabled && is_root_level => {
+                    // Only a genuinely-absent table (e.g. an unmigrated on-disk
+                    // table) may fall through to the directory check; any other
+                    // manifest error must propagate rather than be read as missing.
+                    if !Self::is_manifest_table_absent_error(&e) {
+                        return Err(Self::classify_storage_error(e));
+                    }
                 }
                 Err(e) => return Err(e),
             }
         }
+        if is_child_table {
+            return Err(self.child_namespace_requires_manifest_error());
+        }
 
         let table_name = Self::table_name_from_id(&request.id)?;
         let table_id = Self::format_table_id_from_request(&request.id);
+        if !self.dir_listing_enabled {
+            return Err(NamespaceError::TableNotFound { message: table_id }.into());
+        }
 
         // Atomically check table existence and deregistration status
-        let status = self.check_table_status(&table_name).await;
+        let status = self.check_table_status(&table_name).await?;
 
         if !status.exists {
             return Err(NamespaceError::TableNotFound {
@@ -2776,7 +3187,7 @@ impl LanceNamespace for DirectoryNamespace {
 
     async fn drop_table(&self, request: DropTableRequest) -> Result<DropTableResponse> {
         self.record_op("drop_table");
-        if let Some(ref manifest_ns) = self.manifest_ns {
+        if let Some(manifest_ns) = self.manifest_ns_for_write().await? {
             return manifest_ns.drop_table(request).await;
         }
 
@@ -2806,7 +3217,7 @@ impl LanceNamespace for DirectoryNamespace {
         request_data: Bytes,
     ) -> Result<CreateTableResponse> {
         self.record_op("create_table");
-        if let Some(ref manifest_ns) = self.manifest_ns {
+        if let Some(manifest_ns) = self.manifest_ns_for_write().await? {
             return manifest_ns.create_table(request, request_data).await;
         }
 
@@ -2814,7 +3225,7 @@ impl LanceNamespace for DirectoryNamespace {
 
         let table_name = Self::table_name_from_id(&request.id)?;
         let table_uri = self.table_full_uri(&table_name);
-        let status = self.check_table_status(&table_name).await;
+        let status = self.check_table_status(&table_name).await?;
         let (reader, _num_rows) =
             Self::ipc_reader_from_request_data(&request_data, "create_table")?;
 
@@ -2853,7 +3264,7 @@ impl LanceNamespace for DirectoryNamespace {
 
     async fn declare_table(&self, request: DeclareTableRequest) -> Result<DeclareTableResponse> {
         self.record_op("declare_table");
-        if let Some(ref manifest_ns) = self.manifest_ns {
+        if let Some(manifest_ns) = self.manifest_ns_for_write().await? {
             let mut response = manifest_ns.declare_table(request.clone()).await?;
             if let Some(ref location) = response.location {
                 // For backwards compatibility, only skip vending credentials when explicitly set to false
@@ -2892,7 +3303,7 @@ impl LanceNamespace for DirectoryNamespace {
         // Check if table already has data (created via create_table).
         // The atomic put only prevents races between concurrent declare_table calls,
         // not between declare_table and existing data.
-        let status = self.check_table_status(&table_name).await;
+        let status = self.check_table_status(&table_name).await?;
         if status.exists && !status.has_reserved_file {
             // Table has data but no reserved file - it was created with data
             return Err(NamespaceError::TableAlreadyExists {
@@ -2944,7 +3355,7 @@ impl LanceNamespace for DirectoryNamespace {
     ) -> Result<lance_namespace::models::RegisterTableResponse> {
         self.record_op("register_table");
         // If manifest is enabled, delegate to manifest namespace
-        if let Some(ref manifest_ns) = self.manifest_ns {
+        if let Some(manifest_ns) = self.manifest_ns_for_write().await? {
             return LanceNamespace::register_table(manifest_ns.as_ref(), request).await;
         }
 
@@ -2961,7 +3372,7 @@ impl LanceNamespace for DirectoryNamespace {
     ) -> Result<lance_namespace::models::DeregisterTableResponse> {
         self.record_op("deregister_table");
         // If manifest is enabled, delegate to manifest namespace
-        if let Some(ref manifest_ns) = self.manifest_ns {
+        if let Some(manifest_ns) = self.manifest_ns_for_write().await? {
             return LanceNamespace::deregister_table(manifest_ns.as_ref(), request).await;
         }
 
@@ -2971,7 +3382,7 @@ impl LanceNamespace for DirectoryNamespace {
 
         // Check table existence and deregistration status.
         // This provides better error messages for common cases.
-        let status = self.check_table_status(&table_name).await;
+        let status = self.check_table_status(&table_name).await?;
 
         if !status.exists {
             return Err(NamespaceError::TableNotFound {
@@ -3019,7 +3430,7 @@ impl LanceNamespace for DirectoryNamespace {
         &self,
         request: AlterTableAddColumnsRequest,
     ) -> Result<AlterTableAddColumnsResponse> {
-        if let Some(ref manifest_ns) = self.manifest_ns {
+        if let Some(manifest_ns) = self.manifest_ns_for_write().await? {
             return manifest_ns.alter_table_add_columns(request).await;
         }
 
@@ -3028,7 +3439,7 @@ impl LanceNamespace for DirectoryNamespace {
         let table_uri = self.table_full_uri(&table_name);
 
         // Check table existence and deregistration status before opening the dataset
-        let status = self.check_table_status(&table_name).await;
+        let status = self.check_table_status(&table_name).await?;
         if !status.exists {
             return Err(NamespaceError::TableNotFound {
                 message: table_name,
@@ -3077,7 +3488,7 @@ impl LanceNamespace for DirectoryNamespace {
         &self,
         request: AlterTableAlterColumnsRequest,
     ) -> Result<AlterTableAlterColumnsResponse> {
-        if let Some(ref manifest_ns) = self.manifest_ns {
+        if let Some(manifest_ns) = self.manifest_ns_for_write().await? {
             return manifest_ns.alter_table_alter_columns(request).await;
         }
 
@@ -3085,7 +3496,7 @@ impl LanceNamespace for DirectoryNamespace {
         let table_uri = self.table_full_uri(&table_name);
 
         // Check table existence and deregistration status before opening the dataset
-        let status = self.check_table_status(&table_name).await;
+        let status = self.check_table_status(&table_name).await?;
         if !status.exists {
             return Err(NamespaceError::TableNotFound {
                 message: table_name,
@@ -3127,7 +3538,7 @@ impl LanceNamespace for DirectoryNamespace {
         &self,
         request: AlterTableDropColumnsRequest,
     ) -> Result<AlterTableDropColumnsResponse> {
-        if let Some(ref manifest_ns) = self.manifest_ns {
+        if let Some(manifest_ns) = self.manifest_ns_for_write().await? {
             return manifest_ns.alter_table_drop_columns(request).await;
         }
 
@@ -3135,7 +3546,7 @@ impl LanceNamespace for DirectoryNamespace {
         let table_uri = self.table_full_uri(&table_name);
 
         // Check table existence and deregistration status before opening the dataset
-        let status = self.check_table_status(&table_name).await;
+        let status = self.check_table_status(&table_name).await?;
         if !status.exists {
             return Err(NamespaceError::TableNotFound {
                 message: table_name,
@@ -3681,7 +4092,212 @@ impl LanceNamespace for DirectoryNamespace {
             .await?;
         let (version, transaction) = self.find_transaction(&dataset, &id).await?;
 
-        Ok(Self::transaction_response(version, &transaction))
+        // Merge any persisted alter_transaction changes stored in the sidecar
+        // so that describe_transaction reflects the latest altered state.
+        let sidecar = self
+            .load_transaction_alteration(&table_uri, &transaction.uuid)
+            .await?;
+
+        Ok(Self::transaction_response(version, &transaction, sidecar))
+    }
+
+    async fn alter_transaction(
+        &self,
+        request: AlterTransactionRequest,
+    ) -> Result<AlterTransactionResponse> {
+        self.record_op("alter_transaction");
+
+        // Parse the request ID: must include table id and transaction identifier
+        let mut request_id = request.id.ok_or_else(|| {
+            lance_core::Error::from(NamespaceError::InvalidInput {
+                message: "Transaction id must include table id and transaction identifier"
+                    .to_string(),
+            })
+        })?;
+        if request_id.len() < 2 {
+            return Err(NamespaceError::InvalidInput {
+                message: format!(
+                    "Transaction request id must include table id and transaction identifier, got {:?}",
+                    request_id
+                ),
+            }
+            .into());
+        }
+
+        let txn_id = request_id.pop().expect("request_id len checked above");
+        let table_id = Some(request_id);
+        let table_uri = self.resolve_table_location(&table_id).await?;
+        let dataset = self
+            .load_dataset(&table_uri, None, "alter_transaction")
+            .await?;
+        let (version, transaction) = self.find_transaction(&dataset, &txn_id).await?;
+
+        // Reserved keys are derived from the immutable Transaction metadata and
+        // must not be modified via alter_transaction. They are only surfaced in
+        // the response for the caller's convenience.
+        const RESERVED_KEYS: &[&str] = &["uuid", "version", "read_version", "operation", "tag"];
+        let is_reserved = |key: &str| RESERVED_KEYS.contains(&key);
+
+        // Load the existing sidecar (if any) so alterations accumulate across
+        // successive alter_transaction calls.
+        let mut sidecar = self
+            .load_transaction_alteration(&table_uri, &transaction.uuid)
+            .await?
+            .unwrap_or_default();
+
+        for action in &request.actions {
+            if let Some(ref set_status) = action.set_status_action
+                && let Some(ref status) = set_status.status
+            {
+                // Validate the status value (case-insensitive)
+                let normalized = status.to_lowercase().replace('_', "");
+                match normalized.as_str() {
+                    "queued" | "running" | "succeeded" | "failed" | "canceled" => {
+                        sidecar.status = Some(status.clone());
+                    }
+                    _ => {
+                        return Err(NamespaceError::InvalidInput {
+                            message: format!(
+                                "Invalid transaction status '{}'. Valid values are: Queued, Running, Succeeded, Failed, Canceled",
+                                status
+                            ),
+                        }
+                        .into());
+                    }
+                }
+            }
+
+            if let Some(ref set_property) = action.set_property_action
+                && let (Some(key), Some(value)) = (&set_property.key, &set_property.value)
+            {
+                if is_reserved(key) {
+                    return Err(NamespaceError::InvalidInput {
+                        message: format!("Property '{}' is reserved and cannot be modified", key),
+                    }
+                    .into());
+                }
+                let mode = set_property
+                    .mode
+                    .as_deref()
+                    .unwrap_or("Overwrite")
+                    .to_lowercase();
+                match mode.as_str() {
+                    "overwrite" => {
+                        sidecar.properties.insert(key.clone(), value.clone());
+                    }
+                    "fail" => {
+                        // Consider both the immutable transaction properties
+                        // and any values previously written to the sidecar.
+                        let exists = sidecar.properties.contains_key(key)
+                            || transaction
+                                .transaction_properties
+                                .as_ref()
+                                .is_some_and(|props| props.contains_key(key));
+                        if exists {
+                            return Err(NamespaceError::ConcurrentModification {
+                                message: format!(
+                                    "Property '{}' already exists and mode is 'Fail'",
+                                    key
+                                ),
+                            }
+                            .into());
+                        }
+                        sidecar.properties.insert(key.clone(), value.clone());
+                    }
+                    "skip" => {
+                        let exists = sidecar.properties.contains_key(key)
+                            || transaction
+                                .transaction_properties
+                                .as_ref()
+                                .is_some_and(|props| props.contains_key(key));
+                        if !exists {
+                            sidecar.properties.insert(key.clone(), value.clone());
+                        }
+                    }
+                    _ => {
+                        return Err(NamespaceError::InvalidInput {
+                            message: format!(
+                                "Invalid set_property mode '{}'. Valid values are: Overwrite, Fail, Skip",
+                                mode
+                            ),
+                        }
+                        .into());
+                    }
+                }
+            }
+
+            if let Some(ref unset_property) = action.unset_property_action
+                && let Some(ref key) = unset_property.key
+            {
+                if is_reserved(key) {
+                    return Err(NamespaceError::InvalidInput {
+                        message: format!("Property '{}' is reserved and cannot be modified", key),
+                    }
+                    .into());
+                }
+                let mode = unset_property
+                    .mode
+                    .as_deref()
+                    .unwrap_or("Skip")
+                    .to_lowercase();
+                let exists_in_transaction = transaction
+                    .transaction_properties
+                    .as_ref()
+                    .is_some_and(|props| props.contains_key(key));
+                match mode.as_str() {
+                    "skip" => {
+                        sidecar.properties.remove(key);
+                        if exists_in_transaction {
+                            // Track a tombstone so describe_transaction can
+                            // hide the immutable property from the response.
+                            sidecar.removed_properties.insert(key.clone());
+                        }
+                    }
+                    "fail" => {
+                        if !sidecar.properties.contains_key(key) && !exists_in_transaction {
+                            return Err(NamespaceError::InvalidInput {
+                                message: format!(
+                                    "Property '{}' does not exist and mode is 'Fail'",
+                                    key
+                                ),
+                            }
+                            .into());
+                        }
+                        sidecar.properties.remove(key);
+                        if exists_in_transaction {
+                            sidecar.removed_properties.insert(key.clone());
+                        }
+                    }
+                    _ => {
+                        return Err(NamespaceError::InvalidInput {
+                            message: format!(
+                                "Invalid unset_property mode '{}'. Valid values are: Skip, Fail",
+                                mode
+                            ),
+                        }
+                        .into());
+                    }
+                }
+            }
+        }
+
+        // Persist the accumulated alterations so subsequent calls observe
+        // them. The transaction file itself is immutable in Lance, so we
+        // record alter_transaction outcomes in a namespace-owned sidecar.
+        self.save_transaction_alteration(&table_uri, &transaction.uuid, &sidecar)
+            .await?;
+
+        // Assemble the response by merging the immutable transaction metadata
+        // with the persisted alterations.
+        let final_status = sidecar
+            .status
+            .clone()
+            .unwrap_or_else(|| "SUCCEEDED".to_string());
+        let response = Self::transaction_response(version, &transaction, Some(sidecar));
+        Ok(AlterTransactionResponse {
+            status: final_status,
+            properties: response.properties,
+        })
     }
 
     async fn create_table_scalar_index(
@@ -4194,12 +4810,7 @@ impl LanceNamespace for DirectoryNamespace {
             })?
             .execute_reader(reader)
             .await
-            .map_err(|e| NamespaceError::Internal {
-                message: format!(
-                    "Failed to merge_insert_into_table at '{}': {}",
-                    table_uri, e
-                ),
-            })?;
+            .map_err(|e| Self::map_mutation_error(e, "merge_insert_into_table", &table_uri))?;
 
         Ok(MergeInsertIntoTableResponse {
             transaction_id: None,
@@ -4207,6 +4818,119 @@ impl LanceNamespace for DirectoryNamespace {
             num_inserted_rows: Some(stats.num_inserted_rows as i64),
             num_deleted_rows: Some(stats.num_deleted_rows as i64),
             version: Some(dataset.version().version as i64),
+        })
+    }
+
+    async fn update_table(&self, request: UpdateTableRequest) -> Result<UpdateTableResponse> {
+        self.record_op("update_table");
+
+        if request.updates.is_empty() {
+            return Err(NamespaceError::InvalidInput {
+                message: "update_table requires at least one [column, expression] pair".to_string(),
+            }
+            .into());
+        }
+
+        // Validate every update pair shape and detect duplicate columns up front so we
+        // surface a clean error instead of failing deep inside the planner.
+        let mut seen_columns: HashMap<String, ()> = HashMap::with_capacity(request.updates.len());
+        for (idx, pair) in request.updates.iter().enumerate() {
+            if pair.len() != 2 {
+                return Err(NamespaceError::InvalidInput {
+                    message: format!(
+                        "update_table updates[{}] must be a [column, expression] pair, got {} elements",
+                        idx,
+                        pair.len()
+                    ),
+                }
+                .into());
+            }
+            let column = &pair[0];
+            if column.trim().is_empty() {
+                return Err(NamespaceError::InvalidInput {
+                    message: format!("update_table updates[{}] has an empty column name", idx),
+                }
+                .into());
+            }
+            if seen_columns.insert(column.clone(), ()).is_some() {
+                return Err(NamespaceError::InvalidInput {
+                    message: format!(
+                        "update_table cannot update column '{}' more than once",
+                        column
+                    ),
+                }
+                .into());
+            }
+        }
+
+        let table_uri = self.resolve_table_location(&request.id).await?;
+        let dataset = Arc::new(self.load_dataset(&table_uri, None, "update_table").await?);
+
+        let mut builder = UpdateBuilder::new(dataset);
+        for pair in &request.updates {
+            // Indexing by 0/1 is safe due to the length check above.
+            builder = builder.set(&pair[0], &pair[1]).map_err(|e| {
+                lance_core::Error::from(NamespaceError::InvalidInput {
+                    message: format!("Invalid update expression for column '{}': {}", pair[0], e),
+                })
+            })?;
+        }
+        if let Some(predicate) = request.predicate.as_deref()
+            && !predicate.trim().is_empty()
+        {
+            builder = builder.update_where(predicate).map_err(|e| {
+                lance_core::Error::from(NamespaceError::InvalidInput {
+                    message: format!("Invalid update_table predicate '{}': {}", predicate, e),
+                })
+            })?;
+        }
+
+        let job = builder.build().map_err(|e| {
+            lance_core::Error::from(NamespaceError::InvalidInput {
+                message: format!("Failed to build update_table job: {}", e),
+            })
+        })?;
+
+        let result = job
+            .execute()
+            .await
+            .map_err(|e| Self::map_mutation_error(e, "update_table", &table_uri))?;
+
+        let version = result.new_dataset.version().version as i64;
+        Ok(UpdateTableResponse {
+            transaction_id: None,
+            updated_rows: result.rows_updated as i64,
+            version,
+            properties: None,
+        })
+    }
+
+    async fn delete_from_table(
+        &self,
+        request: DeleteFromTableRequest,
+    ) -> Result<DeleteFromTableResponse> {
+        self.record_op("delete_from_table");
+
+        if request.predicate.trim().is_empty() {
+            return Err(NamespaceError::InvalidInput {
+                message: "delete_from_table requires a non-empty predicate".to_string(),
+            }
+            .into());
+        }
+
+        let table_uri = self.resolve_table_location(&request.id).await?;
+        let mut dataset = self
+            .load_dataset(&table_uri, None, "delete_from_table")
+            .await?;
+
+        let result = dataset
+            .delete(&request.predicate)
+            .await
+            .map_err(|e| Self::map_mutation_error(e, "delete_from_table", &table_uri))?;
+
+        Ok(DeleteFromTableResponse {
+            transaction_id: None,
+            version: Some(result.new_dataset.version().version as i64),
         })
     }
 
@@ -4344,9 +5068,16 @@ impl LanceNamespace for DirectoryNamespace {
                     .map_err(|e| NamespaceError::InvalidInput {
                         message: format!("Invalid full text search: {:?}", e),
                     })?;
+            } else if let Some(ref structured_query) = fts_query.structured_query {
+                // Structured FTS: map the namespace query model into the engine FtsQuery.
+                let engine_query = build_engine_fts_query(&structured_query.query)?;
+                let fts = FullTextSearchQuery::new_query(engine_query);
+                scanner
+                    .full_text_search(fts)
+                    .map_err(|e| NamespaceError::InvalidInput {
+                        message: format!("Invalid full text search: {:?}", e),
+                    })?;
             }
-            // Note: structured_query would require more complex parsing
-            // For now, we only support string_query
         }
 
         // Apply column projection if specified
@@ -4762,10 +5493,227 @@ impl LanceNamespace for DirectoryNamespace {
     }
 }
 
+/// Maps a namespace structured `FtsQuery` model into the engine `FtsQuery`. Mirrors the mapping the
+/// JNI scanner performs, so the local `queryTable` path honors `structured_query` the same way a
+/// `fragment.newScan(fullTextQuery)` does.
+fn build_engine_fts_query(
+    query: &lance_namespace::models::FtsQuery,
+) -> std::result::Result<FtsQuery, NamespaceError> {
+    if let Some(ref m) = query.r#match {
+        Ok(FtsQuery::Match(build_engine_match_query(m)?))
+    } else if let Some(ref p) = query.phrase {
+        let mut phrase = PhraseQuery::new(p.terms.clone());
+        if let Some(ref column) = p.column {
+            phrase = phrase.with_column(Some(column.clone()));
+        }
+        if let Some(slop) = p.slop {
+            phrase = phrase.with_slop(slop as u32);
+        }
+        Ok(FtsQuery::Phrase(phrase))
+    } else if let Some(ref mm) = query.multi_match {
+        let match_queries = mm
+            .match_queries
+            .iter()
+            .map(build_engine_match_query)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(FtsQuery::MultiMatch(MultiMatchQuery { match_queries }))
+    } else if let Some(ref b) = query.boolean {
+        let mut clauses: Vec<(Occur, FtsQuery)> = Vec::new();
+        for clause in &b.must {
+            clauses.push((Occur::Must, build_engine_fts_query(clause)?));
+        }
+        for clause in &b.should {
+            clauses.push((Occur::Should, build_engine_fts_query(clause)?));
+        }
+        for clause in &b.must_not {
+            clauses.push((Occur::MustNot, build_engine_fts_query(clause)?));
+        }
+        Ok(FtsQuery::Boolean(BooleanQuery::new(clauses)))
+    } else if let Some(ref boost) = query.boost {
+        let positive = build_engine_fts_query(&boost.positive)?;
+        let negative = build_engine_fts_query(&boost.negative)?;
+        Ok(FtsQuery::Boost(BoostQuery::new(
+            positive,
+            negative,
+            boost.negative_boost,
+        )))
+    } else {
+        Err(NamespaceError::InvalidInput {
+            message: "structured_query.query must set exactly one of match, phrase, multi_match, \
+                      boolean, or boost"
+                .to_string(),
+        })
+    }
+}
+
+fn build_engine_match_query(
+    m: &lance_namespace::models::MatchQuery,
+) -> std::result::Result<MatchQuery, NamespaceError> {
+    let mut match_query = MatchQuery::new(m.terms.clone());
+    if let Some(ref column) = m.column {
+        match_query = match_query.with_column(Some(column.clone()));
+    }
+    if let Some(boost) = m.boost {
+        match_query = match_query.with_boost(boost);
+    }
+    if let Some(fuzziness) = m.fuzziness {
+        match_query = match_query.with_fuzziness(Some(fuzziness as u32));
+    }
+    if let Some(max_expansions) = m.max_expansions {
+        match_query = match_query.with_max_expansions(max_expansions as usize);
+    }
+    if let Some(ref operator) = m.operator {
+        let op =
+            Operator::try_from(operator.as_str()).map_err(|e| NamespaceError::InvalidInput {
+                message: format!("Invalid FTS operator: {:?}", e),
+            })?;
+        match_query = match_query.with_operator(op);
+    }
+    if let Some(prefix_length) = m.prefix_length {
+        match_query = match_query.with_prefix_length(prefix_length as u32);
+    }
+    Ok(match_query)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use arrow_ipc::reader::{FileReader, StreamReader};
+
+    #[test]
+    fn test_build_engine_fts_query_match() {
+        let mut ns_match = lance_namespace::models::MatchQuery::new("hello world".to_string());
+        ns_match.column = Some("body".to_string());
+        ns_match.operator = Some("AND".to_string());
+        ns_match.fuzziness = Some(1);
+        ns_match.max_expansions = Some(30);
+        ns_match.boost = Some(2.0);
+        ns_match.prefix_length = Some(2);
+
+        let mut ns_query = lance_namespace::models::FtsQuery::new();
+        ns_query.r#match = Some(Box::new(ns_match));
+
+        match build_engine_fts_query(&ns_query).unwrap() {
+            FtsQuery::Match(m) => {
+                assert_eq!(m.terms, "hello world");
+                assert_eq!(m.column, Some("body".to_string()));
+                assert_eq!(m.operator, Operator::And);
+                assert_eq!(m.fuzziness, Some(1));
+                assert_eq!(m.max_expansions, 30);
+                assert_eq!(m.boost, 2.0);
+                assert_eq!(m.prefix_length, 2);
+            }
+            other => panic!("expected Match, got {:?}", other),
+        }
+    }
+
+    /// Wraps a namespace `MatchQuery` (with a column) as an `FtsQuery` for use as a clause in
+    /// compound queries (boolean / boost).
+    fn ns_match_query(terms: &str, column: &str) -> lance_namespace::models::FtsQuery {
+        let mut m = lance_namespace::models::MatchQuery::new(terms.to_string());
+        m.column = Some(column.to_string());
+        let mut q = lance_namespace::models::FtsQuery::new();
+        q.r#match = Some(Box::new(m));
+        q
+    }
+
+    #[test]
+    fn test_build_engine_fts_query_phrase() {
+        let mut ns_phrase = lance_namespace::models::PhraseQuery::new("hello world".to_string());
+        ns_phrase.column = Some("body".to_string());
+        ns_phrase.slop = Some(2);
+
+        let mut ns_query = lance_namespace::models::FtsQuery::new();
+        ns_query.phrase = Some(Box::new(ns_phrase));
+
+        match build_engine_fts_query(&ns_query).unwrap() {
+            FtsQuery::Phrase(p) => {
+                assert_eq!(p.terms, "hello world");
+                assert_eq!(p.column, Some("body".to_string()));
+                assert_eq!(p.slop, 2);
+            }
+            other => panic!("expected Phrase, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_build_engine_fts_query_multi_match() {
+        let mut m1 = lance_namespace::models::MatchQuery::new("hello".to_string());
+        m1.column = Some("title".to_string());
+        let mut m2 = lance_namespace::models::MatchQuery::new("hello".to_string());
+        m2.column = Some("body".to_string());
+        m2.boost = Some(2.0);
+
+        let ns_multi = lance_namespace::models::MultiMatchQuery::new(vec![m1, m2]);
+        let mut ns_query = lance_namespace::models::FtsQuery::new();
+        ns_query.multi_match = Some(Box::new(ns_multi));
+
+        match build_engine_fts_query(&ns_query).unwrap() {
+            FtsQuery::MultiMatch(mm) => {
+                assert_eq!(mm.match_queries.len(), 2);
+                assert_eq!(mm.match_queries[0].terms, "hello");
+                assert_eq!(mm.match_queries[0].column, Some("title".to_string()));
+                assert_eq!(mm.match_queries[1].column, Some("body".to_string()));
+                assert_eq!(mm.match_queries[1].boost, 2.0);
+            }
+            other => panic!("expected MultiMatch, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_build_engine_fts_query_boolean() {
+        // BooleanQuery::new(must, must_not, should)
+        let ns_boolean = lance_namespace::models::BooleanQuery::new(
+            vec![ns_match_query("must-term", "body")],
+            vec![ns_match_query("must-not-term", "body")],
+            vec![ns_match_query("should-term", "body")],
+        );
+        let mut ns_query = lance_namespace::models::FtsQuery::new();
+        ns_query.boolean = Some(Box::new(ns_boolean));
+
+        match build_engine_fts_query(&ns_query).unwrap() {
+            FtsQuery::Boolean(b) => {
+                assert!(matches!(&b.must[..], [FtsQuery::Match(m)] if m.terms == "must-term"));
+                assert!(
+                    matches!(&b.must_not[..], [FtsQuery::Match(m)] if m.terms == "must-not-term")
+                );
+                assert!(matches!(&b.should[..], [FtsQuery::Match(m)] if m.terms == "should-term"));
+            }
+            other => panic!("expected Boolean, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_build_engine_fts_query_boost() {
+        let mut ns_boost = lance_namespace::models::BoostQuery::new(
+            ns_match_query("positive-term", "body"),
+            ns_match_query("negative-term", "body"),
+        );
+        ns_boost.negative_boost = Some(0.25);
+
+        let mut ns_query = lance_namespace::models::FtsQuery::new();
+        ns_query.boost = Some(Box::new(ns_boost));
+
+        match build_engine_fts_query(&ns_query).unwrap() {
+            FtsQuery::Boost(b) => {
+                assert!(
+                    matches!(b.positive.as_ref(), FtsQuery::Match(m) if m.terms == "positive-term")
+                );
+                assert!(
+                    matches!(b.negative.as_ref(), FtsQuery::Match(m) if m.terms == "negative-term")
+                );
+                assert_eq!(b.negative_boost, 0.25);
+            }
+            other => panic!("expected Boost, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_build_engine_fts_query_requires_a_variant() {
+        // An FtsQuery with no variant set is rejected rather than silently ignored.
+        let empty = lance_namespace::models::FtsQuery::new();
+        assert!(build_engine_fts_query(&empty).is_err());
+    }
     use lance::dataset::Dataset;
     use lance::index::DatasetIndexExt;
     use lance_core::utils::tempfile::{TempStdDir, TempStrDir};
@@ -4793,6 +5741,52 @@ mod tests {
                 expected_fragment,
                 plan
             );
+        }
+    }
+
+    fn mutation_error_code(err: lance_core::Error) -> ErrorCode {
+        match err {
+            lance_core::Error::Namespace { source, .. } => source
+                .downcast_ref::<NamespaceError>()
+                .expect("mutation error should wrap a NamespaceError")
+                .code(),
+            other => panic!("expected Namespace error, got: {other:?}"),
+        }
+    }
+
+    /// `map_mutation_error` must classify commit-conflict variants the same way as
+    /// `convert_lance_commit_error` in `manifest.rs`: `CommitConflict` is a retries-exhausted
+    /// version collision that is safe to retry (`Throttling`), while the semantic-conflict variants
+    /// map to `ConcurrentModification`.
+    #[test]
+    fn test_map_mutation_error_commit_conflict_alignment() {
+        let boxed = || -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            Box::<dyn std::error::Error + Send + Sync>::from("inner conflict")
+        };
+
+        let throttling_cases = vec![lance_core::Error::commit_conflict_source(1, boxed())];
+        for err in throttling_cases {
+            let code = mutation_error_code(DirectoryNamespace::map_mutation_error(
+                err,
+                "update",
+                "memory://t",
+            ));
+            assert_eq!(code, ErrorCode::Throttling);
+        }
+
+        let concurrent_cases = vec![
+            lance_core::Error::too_much_write_contention("contention"),
+            lance_core::Error::retryable_commit_conflict_source(1, boxed()),
+            lance_core::Error::incompatible_transaction_source(boxed()),
+            lance_core::Error::version_conflict("conflict", 0, 3),
+        ];
+        for err in concurrent_cases {
+            let code = mutation_error_code(DirectoryNamespace::map_mutation_error(
+                err,
+                "update",
+                "memory://t",
+            ));
+            assert_eq!(code, ErrorCode::ConcurrentModification);
         }
     }
 
@@ -4860,6 +5854,514 @@ mod tests {
             Arc::new(CountingFileStoreProvider { listing_count }),
         );
         Arc::new(Session::new(0, 0, registry))
+    }
+
+    // Fault-injection store: returns a runtime-toggleable result from
+    // `list_with_delimiter` (the call `check_table_status` makes) and delegates
+    // everything else, so a table can be created before failures are injected.
+    use futures::stream::BoxStream;
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+        PutMultipartOptions, PutPayload, PutResult, Result as OSResult,
+    };
+    use std::ops::Range;
+
+    #[derive(Debug, Clone, Copy)]
+    enum ListBehavior {
+        Throttle,
+        ServiceUnavailable,
+        Internal,
+        NotFound,
+        EmptyListing,
+    }
+
+    #[derive(Debug)]
+    struct FailingListStore {
+        target: Arc<dyn OSObjectStore>,
+        behavior: Arc<Mutex<Option<ListBehavior>>>,
+    }
+
+    impl std::fmt::Display for FailingListStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "FailingListStore({})", self.target)
+        }
+    }
+
+    #[async_trait]
+    impl OSObjectStore for FailingListStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            bytes: PutPayload,
+            opts: PutOptions,
+        ) -> OSResult<PutResult> {
+            self.target.put_opts(location, bytes, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> OSResult<Box<dyn MultipartUpload>> {
+            self.target.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
+            self.target.get_opts(location, options).await
+        }
+
+        async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> OSResult<Vec<Bytes>> {
+            self.target.get_ranges(location, ranges).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, OSResult<Path>>,
+        ) -> BoxStream<'static, OSResult<Path>> {
+            self.target.delete_stream(locations)
+        }
+
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
+            self.target.list(prefix)
+        }
+
+        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
+            let behavior = *self.behavior.lock().unwrap();
+            match behavior {
+                None => self.target.list_with_delimiter(prefix).await,
+                Some(ListBehavior::EmptyListing) => Ok(ListResult {
+                    common_prefixes: Vec::new(),
+                    objects: Vec::new(),
+                }),
+                // Mirrors the object_store retry-exhaustion message shape for an
+                // Azure ServerBusy response, which is what the incident produced.
+                Some(ListBehavior::Throttle) => Err(ObjectStoreError::Generic {
+                    store: "test",
+                    source: "Error performing list request: response error, after 3 retries, \
+                             max_retries: 3, retry_timeout: 180s - HTTP status server error \
+                             (503 Service Unavailable): ServerBusy: The server is busy"
+                        .into(),
+                }),
+                Some(ListBehavior::ServiceUnavailable) => Err(ObjectStoreError::Generic {
+                    store: "test",
+                    source: "Error performing list request: 503 Service Unavailable".into(),
+                }),
+                Some(ListBehavior::Internal) => Err(ObjectStoreError::Generic {
+                    store: "test",
+                    source: "Error performing list request: catastrophic unclassified failure"
+                        .into(),
+                }),
+                Some(ListBehavior::NotFound) => Err(ObjectStoreError::NotFound {
+                    path: "test_table.lance".to_string(),
+                    source: "entity not found".into(),
+                }),
+            }
+        }
+
+        async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> OSResult<()> {
+            self.target.copy_opts(from, to, opts).await
+        }
+    }
+
+    #[derive(Debug)]
+    struct FailingListStoreProvider {
+        behavior: Arc<Mutex<Option<ListBehavior>>>,
+    }
+
+    #[async_trait]
+    impl lance_io::object_store::ObjectStoreProvider for FailingListStoreProvider {
+        async fn new_store(
+            &self,
+            base_path: Url,
+            params: &ObjectStoreParams,
+        ) -> Result<ObjectStore> {
+            let mut store = FileStoreProvider.new_store(base_path, params).await?;
+            store.inner = Arc::new(FailingListStore {
+                target: store.inner.clone(),
+                behavior: self.behavior.clone(),
+            });
+            Ok(store)
+        }
+
+        fn extract_path(&self, url: &Url) -> Result<Path> {
+            FileStoreProvider.extract_path(url)
+        }
+
+        fn calculate_object_store_prefix(
+            &self,
+            url: &Url,
+            storage_options: Option<&HashMap<String, String>>,
+        ) -> Result<String> {
+            FileStoreProvider.calculate_object_store_prefix(url, storage_options)
+        }
+    }
+
+    fn build_failing_list_session(behavior: Arc<Mutex<Option<ListBehavior>>>) -> Arc<Session> {
+        let registry = Arc::new(ObjectStoreRegistry::default());
+        registry.insert(
+            "file-object-store",
+            Arc::new(FailingListStoreProvider { behavior }),
+        );
+        Arc::new(Session::new(0, 0, registry))
+    }
+
+    /// Build a dir-listing namespace whose object store's listing calls follow a
+    /// shared, runtime-toggleable behavior. Returns the namespace, the temp dir
+    /// (kept alive for the store), and the behavior toggle.
+    async fn failing_list_namespace() -> (
+        DirectoryNamespace,
+        TempStdDir,
+        Arc<Mutex<Option<ListBehavior>>>,
+    ) {
+        let temp_dir = TempStdDir::default();
+        let root_uri = file_object_store_uri(temp_dir.to_str().unwrap());
+        let behavior = Arc::new(Mutex::new(None));
+        let session = build_failing_list_session(behavior.clone());
+        let namespace = DirectoryNamespaceBuilder::new(root_uri)
+            .session(session)
+            .manifest_enabled(false)
+            .dir_listing_enabled(true)
+            .build()
+            .await
+            .unwrap();
+        (namespace, temp_dir, behavior)
+    }
+
+    async fn create_named_dir_table(namespace: &DirectoryNamespace, name: &str) {
+        let schema = create_test_schema();
+        let ipc_data = create_test_ipc_data(&schema);
+        let mut create_req = CreateTableRequest::new();
+        create_req.id = Some(vec![name.to_string()]);
+        namespace
+            .create_table(create_req, Bytes::from(ipc_data))
+            .await
+            .unwrap();
+    }
+
+    /// Regression test for the throttling-induced TableNotFound bug: a storage
+    /// error while resolving a table must surface as a typed storage error
+    /// (Throttling / ServiceUnavailable / Internal) carrying the underlying
+    /// evidence in its message — never as TableNotFound.
+    #[tokio::test]
+    async fn test_table_resolution_propagates_storage_errors_not_table_not_found() {
+        for (behavior, expected_code, evidence) in [
+            (ListBehavior::Throttle, ErrorCode::Throttling, "serverbusy"),
+            (
+                ListBehavior::ServiceUnavailable,
+                ErrorCode::ServiceUnavailable,
+                "503 service unavailable",
+            ),
+            (ListBehavior::Internal, ErrorCode::Internal, "catastrophic"),
+        ] {
+            let (namespace, _temp_dir, toggle) = failing_list_namespace().await;
+            create_named_dir_table(&namespace, "checkpoint").await;
+            *toggle.lock().unwrap() = Some(behavior);
+
+            let mut describe_req = DescribeTableRequest::new();
+            describe_req.id = Some(vec!["checkpoint".to_string()]);
+            let err = namespace.describe_table(describe_req).await.unwrap_err();
+            let msg = err.to_string();
+            assert_eq!(
+                mutation_error_code(err),
+                expected_code,
+                "describe_table under {behavior:?}; msg: {msg}"
+            );
+            assert!(
+                msg.to_ascii_lowercase().contains(evidence),
+                "describe_table message must carry storage evidence '{evidence}', got: {msg}"
+            );
+
+            let mut exists_req = TableExistsRequest::new();
+            exists_req.id = Some(vec!["checkpoint".to_string()]);
+            let err = namespace.table_exists(exists_req).await.unwrap_err();
+            let msg = err.to_string();
+            assert_eq!(
+                mutation_error_code(err),
+                expected_code,
+                "table_exists under {behavior:?}; msg: {msg}"
+            );
+            assert!(
+                msg.to_ascii_lowercase().contains(evidence),
+                "table_exists message must carry storage evidence '{evidence}', got: {msg}"
+            );
+        }
+    }
+
+    /// A genuine not-found error and an empty listing must both still resolve to
+    /// TableNotFound (the local-FS and object-store representations of "missing").
+    #[tokio::test]
+    async fn test_table_resolution_missing_table_yields_table_not_found() {
+        for behavior in [ListBehavior::NotFound, ListBehavior::EmptyListing] {
+            let (namespace, _temp_dir, toggle) = failing_list_namespace().await;
+            *toggle.lock().unwrap() = Some(behavior);
+
+            let mut describe_req = DescribeTableRequest::new();
+            describe_req.id = Some(vec!["missing".to_string()]);
+            let err = namespace.describe_table(describe_req).await.unwrap_err();
+            assert_eq!(
+                mutation_error_code(err),
+                ErrorCode::TableNotFound,
+                "describe_table under {behavior:?} should be TableNotFound"
+            );
+
+            let mut exists_req = TableExistsRequest::new();
+            exists_req.id = Some(vec!["missing".to_string()]);
+            let err = namespace.table_exists(exists_req).await.unwrap_err();
+            assert_eq!(
+                mutation_error_code(err),
+                ErrorCode::TableNotFound,
+                "table_exists under {behavior:?} should be TableNotFound"
+            );
+        }
+    }
+
+    /// Hybrid (manifest + directory) resolution must exercise the
+    /// manifest→directory fall-through for a table that exists on disk but is not
+    /// registered in the manifest: the fall-through must succeed normally, and
+    /// must not degrade a storage error into TableNotFound.
+    ///
+    /// A `__manifest` table must actually exist for the manifest branch to run;
+    /// otherwise `manifest_ns_for_read()` is None and the manifest branch (and its
+    /// fall-through arm) is skipped entirely. We therefore create a *separate*
+    /// table through a manifest-enabled namespace first so `__manifest` exists.
+    #[tokio::test]
+    async fn test_hybrid_resolution_falls_through_and_does_not_mask_throttle() {
+        let temp_dir = TempStdDir::default();
+        let root_uri = file_object_store_uri(temp_dir.to_str().unwrap());
+        let behavior = Arc::new(Mutex::new(None));
+        let session = build_failing_list_session(behavior.clone());
+
+        // Seed table via a manifest-enabled namespace so `__manifest` exists.
+        let manifest_ns = DirectoryNamespaceBuilder::new(root_uri.clone())
+            .session(session.clone())
+            .manifest_enabled(true)
+            .dir_listing_enabled(true)
+            .build()
+            .await
+            .unwrap();
+        create_named_dir_table(&manifest_ns, "seed").await;
+
+        // The table under test: on disk but never registered in the manifest.
+        let dir_ns = DirectoryNamespaceBuilder::new(root_uri.clone())
+            .session(session.clone())
+            .manifest_enabled(false)
+            .dir_listing_enabled(true)
+            .build()
+            .await
+            .unwrap();
+        create_named_dir_table(&dir_ns, "checkpoint").await;
+
+        // Migration enabled so root-level reads consult the manifest and fall
+        // through to the directory check on a manifest miss.
+        let hybrid_ns = DirectoryNamespaceBuilder::new(root_uri)
+            .session(session)
+            .manifest_enabled(true)
+            .dir_listing_enabled(true)
+            .dir_listing_to_manifest_migration_enabled(true)
+            .build()
+            .await
+            .unwrap();
+
+        // (a) Healthy fall-through: the manifest reports "checkpoint" absent and it
+        // resolves via the directory listing (guards the migration lookup).
+        let mut describe_req = DescribeTableRequest::new();
+        describe_req.id = Some(vec!["checkpoint".to_string()]);
+        hybrid_ns
+            .describe_table(describe_req)
+            .await
+            .expect("unregistered on-disk table should resolve via the manifest fall-through");
+
+        // (b) The throttle here surfaces from the directory check after the manifest
+        // reports absent; the fall-through arm's own storage-error guard is covered
+        // by the classify_storage_error / is_manifest_table_absent_error unit tests.
+        *behavior.lock().unwrap() = Some(ListBehavior::Throttle);
+        let mut describe_req = DescribeTableRequest::new();
+        describe_req.id = Some(vec!["checkpoint".to_string()]);
+        let err = hybrid_ns.describe_table(describe_req).await.unwrap_err();
+        let code = mutation_error_code(err);
+        assert_ne!(
+            code,
+            ErrorCode::TableNotFound,
+            "hybrid resolution masked a throttle as TableNotFound"
+        );
+        assert!(
+            matches!(
+                code,
+                ErrorCode::Throttling | ErrorCode::ServiceUnavailable | ErrorCode::Internal
+            ),
+            "hybrid resolution should surface a storage error, got {code:?}"
+        );
+    }
+
+    #[test]
+    fn test_classify_storage_error_maps_variants_and_preserves_evidence() {
+        let throttle: Error = ObjectStoreError::Generic {
+            store: "test",
+            source: "list request failed, after 3 retries, max_retries: 3 - 503 ServerBusy".into(),
+        }
+        .into();
+        assert!(matches!(throttle, Error::IO { .. }));
+        let classified = DirectoryNamespace::classify_storage_error(throttle);
+        let msg = classified.to_string();
+        assert_eq!(mutation_error_code(classified), ErrorCode::Throttling);
+        assert!(
+            msg.to_ascii_lowercase().contains("serverbusy"),
+            "throttle evidence lost: {msg}"
+        );
+
+        let service: Error = ObjectStoreError::Generic {
+            store: "test",
+            source: "504 Gateway Timeout".into(),
+        }
+        .into();
+        assert_eq!(
+            mutation_error_code(DirectoryNamespace::classify_storage_error(service)),
+            ErrorCode::ServiceUnavailable
+        );
+
+        let internal: Error = ObjectStoreError::Generic {
+            store: "test",
+            source: "disk caught fire".into(),
+        }
+        .into();
+        assert_eq!(
+            mutation_error_code(DirectoryNamespace::classify_storage_error(internal)),
+            ErrorCode::Internal
+        );
+
+        // A pre-existing namespace error keeps its own code rather than being reclassified.
+        let preexisting: Error = NamespaceError::TableAlreadyExists {
+            message: "t".to_string(),
+        }
+        .into();
+        assert_eq!(
+            mutation_error_code(DirectoryNamespace::classify_storage_error(preexisting)),
+            ErrorCode::TableAlreadyExists
+        );
+    }
+
+    #[test]
+    fn test_is_manifest_table_absent_error() {
+        let table_not_found: Error = NamespaceError::TableNotFound {
+            message: "t".to_string(),
+        }
+        .into();
+        assert!(DirectoryNamespace::is_manifest_table_absent_error(
+            &table_not_found
+        ));
+        let raw_not_found: Error = ObjectStoreError::NotFound {
+            path: "t".to_string(),
+            source: "x".into(),
+        }
+        .into();
+        assert!(DirectoryNamespace::is_manifest_table_absent_error(
+            &raw_not_found
+        ));
+
+        let throttle: Error = ObjectStoreError::Generic {
+            store: "test",
+            source: "after 3 retries, max_retries: 3 ServerBusy".into(),
+        }
+        .into();
+        assert!(!DirectoryNamespace::is_manifest_table_absent_error(
+            &throttle
+        ));
+        let internal: Error = NamespaceError::Internal {
+            message: "boom".to_string(),
+        }
+        .into();
+        assert!(!DirectoryNamespace::is_manifest_table_absent_error(
+            &internal
+        ));
+    }
+
+    #[test]
+    fn test_map_open_error() {
+        let not_found = || NamespaceError::TableNotFound {
+            message: "table at 'x' not found: ...".to_string(),
+        };
+
+        let throttle: Error = ObjectStoreError::Generic {
+            store: "test",
+            source: "after 3 retries, max_retries: 3 - 503 ServerBusy".into(),
+        }
+        .into();
+        assert_eq!(
+            mutation_error_code(DirectoryNamespace::map_open_error(throttle, not_found())),
+            ErrorCode::Throttling
+        );
+
+        let generic_io: Error = ObjectStoreError::Generic {
+            store: "test",
+            source: "connection reset".into(),
+        }
+        .into();
+        assert_eq!(
+            mutation_error_code(DirectoryNamespace::map_open_error(generic_io, not_found())),
+            ErrorCode::Internal
+        );
+
+        let io_not_found: Error = ObjectStoreError::NotFound {
+            path: "x".to_string(),
+            source: "missing".into(),
+        }
+        .into();
+        assert_eq!(
+            mutation_error_code(DirectoryNamespace::map_open_error(
+                io_not_found,
+                not_found()
+            )),
+            ErrorCode::TableNotFound
+        );
+
+        let dataset_not_found = Error::dataset_not_found("x".to_string(), "missing".into());
+        assert_eq!(
+            mutation_error_code(DirectoryNamespace::map_open_error(
+                dataset_not_found,
+                not_found()
+            )),
+            ErrorCode::TableNotFound
+        );
+
+        // RefNotFound is not an IO error, so it is not reclassified as a storage error.
+        let ref_not_found = Error::RefNotFound {
+            message: "branch 'b' does not exist".to_string(),
+        };
+        assert_eq!(
+            mutation_error_code(DirectoryNamespace::map_open_error(
+                ref_not_found,
+                not_found()
+            )),
+            ErrorCode::TableNotFound
+        );
+
+        // The caller's not-found variant is honored, but a throttle still propagates.
+        let version_miss = Error::RefNotFound {
+            message: "version 5 does not exist".to_string(),
+        };
+        assert_eq!(
+            mutation_error_code(DirectoryNamespace::map_open_error(
+                version_miss,
+                NamespaceError::TableVersionNotFound {
+                    message: "version 5 not found".to_string(),
+                },
+            )),
+            ErrorCode::TableVersionNotFound
+        );
+        let version_throttle: Error = ObjectStoreError::Generic {
+            store: "test",
+            source: "after 3 retries, max_retries: 3 - 503 ServerBusy".into(),
+        }
+        .into();
+        assert_eq!(
+            mutation_error_code(DirectoryNamespace::map_open_error(
+                version_throttle,
+                NamespaceError::TableVersionNotFound {
+                    message: "version 5 not found".to_string(),
+                },
+            )),
+            ErrorCode::Throttling
+        );
     }
 
     /// Helper to create test IPC data from a schema
@@ -4969,6 +6471,43 @@ mod tests {
         )
         .unwrap();
         create_ipc_data_from_batches(schema, vec![batch])
+    }
+
+    async fn create_legacy_manifest_without_primary_key_metadata(root: &str) {
+        use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+        use arrow::record_batch::{RecordBatch, RecordBatchIterator};
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("object_id", DataType::Utf8, false),
+            Field::new("object_type", DataType::Utf8, false),
+            Field::new("location", DataType::Utf8, true),
+            Field::new("metadata", DataType::Utf8, true),
+            Field::new(
+                "base_objects",
+                DataType::List(Arc::new(Field::new("object_id", DataType::Utf8, true))),
+                true,
+            ),
+        ]));
+        let batch = RecordBatch::new_empty(schema.clone());
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        Dataset::write(Box::new(reader), &format!("{}/__manifest", root), None)
+            .await
+            .unwrap();
+    }
+
+    async fn manifest_has_primary_key_metadata(root: &str) -> bool {
+        let dataset = Dataset::open(&format!("{}/__manifest", root))
+            .await
+            .unwrap();
+        dataset
+            .schema()
+            .field("object_id")
+            .map(|field| {
+                field
+                    .metadata
+                    .contains_key(lance_core::datatypes::LANCE_UNENFORCED_PRIMARY_KEY_POSITION)
+            })
+            .unwrap_or(false)
     }
 
     fn create_vector_table_ipc_data() -> Vec<u8> {
@@ -9329,7 +10868,7 @@ mod tests {
             .unwrap();
 
         // Table status should show exists=true, is_deregistered=false
-        let status = namespace.check_table_status("test_table").await;
+        let status = namespace.check_table_status("test_table").await.unwrap();
         assert!(status.exists);
         assert!(!status.is_deregistered);
         assert!(!status.has_reserved_file);
@@ -11218,6 +12757,204 @@ mod tests {
             assert!(total_rows > 0);
             assert!(total_rows < 3);
         }
+
+        // ---------------------- update_table / delete_from_table ----------------------
+
+        #[tokio::test]
+        async fn test_update_full_table() {
+            let (namespace, _temp_dir, table_id) = create_ns_with_table().await;
+
+            // Capture base version so we can assert the update bumped it.
+            let base_version = open_dataset(&namespace, &table_id[0])
+                .await
+                .version()
+                .version;
+
+            let request = UpdateTableRequest {
+                id: Some(table_id.clone()),
+                updates: vec![vec!["name".to_string(), "'updated'".to_string()]],
+                predicate: None,
+                ..Default::default()
+            };
+
+            let response = namespace.update_table(request).await.unwrap();
+            assert_eq!(response.updated_rows, 3);
+            assert!(response.version as u64 > base_version);
+
+            // Validate that all rows now carry the new value.
+            let count_req = CountTableRowsRequest {
+                id: Some(table_id),
+                version: None,
+                predicate: Some("name = 'updated'".to_string()),
+                ..Default::default()
+            };
+            assert_eq!(namespace.count_table_rows(count_req).await.unwrap(), 3);
+        }
+
+        #[tokio::test]
+        async fn test_update_with_predicate() {
+            let (namespace, _temp_dir, table_id) = create_ns_with_table().await;
+
+            let request = UpdateTableRequest {
+                id: Some(table_id.clone()),
+                updates: vec![vec!["name".to_string(), "'matched'".to_string()]],
+                predicate: Some("id > 1".to_string()),
+                ..Default::default()
+            };
+
+            let response = namespace.update_table(request).await.unwrap();
+            assert_eq!(response.updated_rows, 2);
+
+            // Rows that did not match the predicate must remain unchanged.
+            let untouched = CountTableRowsRequest {
+                id: Some(table_id.clone()),
+                version: None,
+                predicate: Some("name = 'Alice'".to_string()),
+                ..Default::default()
+            };
+            assert_eq!(namespace.count_table_rows(untouched).await.unwrap(), 1);
+
+            let touched = CountTableRowsRequest {
+                id: Some(table_id),
+                version: None,
+                predicate: Some("name = 'matched'".to_string()),
+                ..Default::default()
+            };
+            assert_eq!(namespace.count_table_rows(touched).await.unwrap(), 2);
+        }
+
+        #[tokio::test]
+        async fn test_update_invalid_expression_returns_invalid_input() {
+            let (namespace, _temp_dir, table_id) = create_ns_with_table().await;
+
+            let request = UpdateTableRequest {
+                id: Some(table_id),
+                // Reference an unknown column on the right-hand side.
+                updates: vec![vec!["name".to_string(), "no_such_column + 1".to_string()]],
+                predicate: None,
+                ..Default::default()
+            };
+
+            let err = namespace.update_table(request).await.unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("Invalid input"),
+                "expected Invalid input error, got: {}",
+                msg
+            );
+        }
+
+        #[tokio::test]
+        async fn test_update_rejects_duplicate_columns() {
+            let (namespace, _temp_dir, table_id) = create_ns_with_table().await;
+
+            let request = UpdateTableRequest {
+                id: Some(table_id),
+                updates: vec![
+                    vec!["name".to_string(), "'a'".to_string()],
+                    vec!["name".to_string(), "'b'".to_string()],
+                ],
+                predicate: None,
+                ..Default::default()
+            };
+
+            let err = namespace.update_table(request).await.unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("Invalid input") && msg.contains("more than once"),
+                "expected duplicate column InvalidInput error, got: {}",
+                msg
+            );
+        }
+
+        #[tokio::test]
+        async fn test_delete_with_predicate() {
+            let (namespace, _temp_dir, table_id) = create_ns_with_table().await;
+
+            let request = DeleteFromTableRequest {
+                id: Some(table_id.clone()),
+                predicate: "id > 1".to_string(),
+                ..Default::default()
+            };
+
+            let response = namespace.delete_from_table(request).await.unwrap();
+            assert!(response.version.is_some());
+
+            let count_req = CountTableRowsRequest {
+                id: Some(table_id),
+                version: None,
+                predicate: None,
+                ..Default::default()
+            };
+            // Original rows = 3; after deleting `id > 1` only row id=1 remains.
+            assert_eq!(namespace.count_table_rows(count_req).await.unwrap(), 1);
+        }
+
+        #[tokio::test]
+        async fn test_delete_empty_predicate_returns_invalid_input() {
+            let (namespace, _temp_dir, table_id) = create_ns_with_table().await;
+
+            let request = DeleteFromTableRequest {
+                id: Some(table_id),
+                predicate: "   ".to_string(),
+                ..Default::default()
+            };
+
+            let err = namespace.delete_from_table(request).await.unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("Invalid input") && msg.contains("non-empty predicate"),
+                "expected non-empty predicate InvalidInput error, got: {}",
+                msg
+            );
+        }
+
+        #[tokio::test]
+        async fn test_delete_table_not_found() {
+            let (namespace, _temp_dir) = create_test_namespace().await;
+
+            let request = DeleteFromTableRequest {
+                id: Some(vec!["does_not_exist".to_string()]),
+                predicate: "id = 1".to_string(),
+                ..Default::default()
+            };
+
+            let err = namespace.delete_from_table(request).await.unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("Table not found"),
+                "expected TableNotFound for missing table, got: {}",
+                msg
+            );
+        }
+
+        #[tokio::test]
+        async fn test_delete_invalid_predicate_returns_invalid_input() {
+            let (namespace, _temp_dir, table_id) = create_ns_with_table().await;
+
+            // A predicate referencing a column that does not exist reaches `Dataset::delete`
+            // and surfaces as `Error::InvalidInput`, which must map to `InvalidInput` rather
+            // than a generic `Internal`.
+            let request = DeleteFromTableRequest {
+                id: Some(table_id),
+                predicate: "no_such_column = 1".to_string(),
+                ..Default::default()
+            };
+
+            let err = namespace.delete_from_table(request).await.unwrap_err();
+            let lance_core::Error::Namespace { source, .. } = &err else {
+                panic!("expected a Namespace error, got: {}", err);
+            };
+            let ns_err = source
+                .downcast_ref::<NamespaceError>()
+                .expect("expected a NamespaceError source");
+            assert_eq!(
+                ns_err.code(),
+                lance_namespace::ErrorCode::InvalidInput,
+                "expected InvalidInput for an invalid delete predicate, got: {}",
+                err
+            );
+        }
     }
 
     #[tokio::test]
@@ -11455,7 +13192,7 @@ mod tests {
             &plan_str,
             &[
                 "ProjectionExec: expr=[id@0 as id, name@2 as name",
-                "Take: columns=\"id, _rowid, (name)\"",
+                "projection=[name], source=stream(_rowid)",
                 "LanceRead: uri=",
                 "projection=[id]",
                 "row_id=true, row_addr=false",
@@ -11552,9 +13289,7 @@ mod tests {
                 "AnalyzeExec verbose=true",
                 "ProjectionExec: elapsed=",
                 "expr=[id@0 as id, name@2 as name",
-                "Take: elapsed=",
-                "columns=\"id, _rowid, (name)\"",
-                "CoalesceBatchesExec: elapsed=",
+                "projection=[name], source=stream(_rowid)",
                 "LanceRead: elapsed=",
                 "projection=[id]",
                 "row_id=true, row_addr=false",
@@ -11632,6 +13367,109 @@ mod tests {
              without migration mode, but got {}",
             count
         );
+    }
+
+    #[tokio::test]
+    async fn test_build_and_root_reads_do_not_create_manifest() {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let manifest_path = std::path::Path::new(temp_path).join("__manifest");
+
+        let dir_only_ns = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(false)
+            .dir_listing_enabled(true)
+            .build()
+            .await
+            .unwrap();
+        create_scalar_table(&dir_only_ns, "catalog").await;
+        assert!(!manifest_path.exists());
+
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(true)
+            .dir_listing_enabled(true)
+            .build()
+            .await
+            .unwrap();
+        assert!(!manifest_path.exists());
+
+        let mut exists_req = TableExistsRequest::new();
+        exists_req.id = Some(vec!["catalog".to_string()]);
+        namespace.table_exists(exists_req).await.unwrap();
+        assert!(!manifest_path.exists());
+
+        let mut describe_req = DescribeTableRequest::new();
+        describe_req.id = Some(vec!["catalog".to_string()]);
+        namespace.describe_table(describe_req).await.unwrap();
+        assert!(!manifest_path.exists());
+
+        let list_response = namespace
+            .list_tables(ListTablesRequest {
+                id: Some(vec![]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(list_response.tables, vec!["catalog".to_string()]);
+        assert!(!manifest_path.exists());
+
+        let mut list_namespaces_req = ListNamespacesRequest::new();
+        list_namespaces_req.id = Some(vec!["workspace".to_string()]);
+        let err = namespace
+            .list_namespaces(list_namespaces_req)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("__manifest"));
+        assert!(!manifest_path.exists());
+
+        let err = namespace
+            .list_tables(ListTablesRequest {
+                id: Some(vec!["workspace".to_string()]),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("__manifest"));
+        assert!(!manifest_path.exists());
+
+        let mut child_describe_req = DescribeTableRequest::new();
+        child_describe_req.id = Some(vec!["workspace".to_string(), "catalog".to_string()]);
+        let err = namespace
+            .describe_table(child_describe_req)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("__manifest"));
+        assert!(!manifest_path.exists());
+
+        let mut child_exists_req = TableExistsRequest::new();
+        child_exists_req.id = Some(vec!["workspace".to_string(), "catalog".to_string()]);
+        let err = namespace.table_exists(child_exists_req).await.unwrap_err();
+        assert!(err.to_string().contains("__manifest"));
+        assert!(!manifest_path.exists());
+
+        let mut create_ns_req = CreateNamespaceRequest::new();
+        create_ns_req.id = Some(vec!["workspace".to_string()]);
+        namespace.create_namespace(create_ns_req).await.unwrap();
+        assert!(manifest_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_migrate_updates_read_opened_legacy_manifest() {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        create_legacy_manifest_without_primary_key_metadata(temp_path).await;
+        assert!(!manifest_has_primary_key_metadata(temp_path).await);
+
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(true)
+            .dir_listing_enabled(true)
+            .build()
+            .await
+            .unwrap();
+        assert!(!manifest_has_primary_key_metadata(temp_path).await);
+
+        let migrated = namespace.migrate().await.unwrap();
+        assert_eq!(migrated, 0);
+        assert!(manifest_has_primary_key_metadata(temp_path).await);
     }
 
     #[tokio::test]
@@ -12535,5 +14373,342 @@ mod tests {
             .await
             .expect("reopen branch failed");
         assert_eq!(scan_id_column(&reopened).await, vec![1, 2]);
+    }
+
+    #[tokio::test]
+    async fn test_alter_transaction_set_status() {
+        use lance_namespace::models::{
+            AlterTransactionAction, AlterTransactionRequest, AlterTransactionSetStatus,
+            DescribeTransactionRequest,
+        };
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+        create_scalar_table(&namespace, "users").await;
+        let txn_id = create_scalar_index(&namespace, "users", "users_id_idx")
+            .await
+            .expect("create_scalar_index should return a transaction id");
+
+        // First verify the transaction exists
+        let describe_resp = namespace
+            .describe_transaction(DescribeTransactionRequest {
+                id: Some(vec!["users".to_string(), txn_id.clone()]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(describe_resp.status, "SUCCEEDED");
+
+        // Alter the transaction status
+        let response = namespace
+            .alter_transaction(AlterTransactionRequest {
+                id: Some(vec!["users".to_string(), txn_id.clone()]),
+                actions: vec![AlterTransactionAction {
+                    set_status_action: Some(Box::new(AlterTransactionSetStatus {
+                        status: Some("Canceled".to_string()),
+                    })),
+                    set_property_action: None,
+                    unset_property_action: None,
+                }],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(response.status, "Canceled");
+        assert!(response.properties.is_some());
+        let props = response.properties.unwrap();
+        assert_eq!(props.get("uuid"), Some(&txn_id));
+        assert_eq!(props.get("operation"), Some(&"CreateIndex".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_alter_transaction_set_property() {
+        use lance_namespace::models::{
+            AlterTransactionAction, AlterTransactionRequest, AlterTransactionSetProperty,
+        };
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+        create_scalar_table(&namespace, "users").await;
+        let txn_id = create_scalar_index(&namespace, "users", "users_id_idx")
+            .await
+            .expect("create_scalar_index should return a transaction id");
+
+        let response = namespace
+            .alter_transaction(AlterTransactionRequest {
+                id: Some(vec!["users".to_string(), txn_id.clone()]),
+                actions: vec![AlterTransactionAction {
+                    set_status_action: None,
+                    set_property_action: Some(Box::new(AlterTransactionSetProperty {
+                        key: Some("custom_key".to_string()),
+                        value: Some("custom_value".to_string()),
+                        mode: None,
+                    })),
+                    unset_property_action: None,
+                }],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(response.status, "SUCCEEDED");
+        let props = response.properties.unwrap();
+        assert_eq!(props.get("custom_key"), Some(&"custom_value".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_alter_transaction_set_property_fail_mode() {
+        use lance_namespace::models::{
+            AlterTransactionAction, AlterTransactionRequest, AlterTransactionSetProperty,
+        };
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+        create_scalar_table(&namespace, "users").await;
+        let txn_id = create_scalar_index(&namespace, "users", "users_id_idx")
+            .await
+            .expect("create_scalar_index should return a transaction id");
+
+        // First, set a non-reserved property so it exists in the sidecar.
+        namespace
+            .alter_transaction(AlterTransactionRequest {
+                id: Some(vec!["users".to_string(), txn_id.clone()]),
+                actions: vec![AlterTransactionAction {
+                    set_status_action: None,
+                    set_property_action: Some(Box::new(AlterTransactionSetProperty {
+                        key: Some("custom_key".to_string()),
+                        value: Some("initial_value".to_string()),
+                        mode: None,
+                    })),
+                    unset_property_action: None,
+                }],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // Now try to set the same property again with Fail mode, which must
+        // exercise the mode='Fail' branch (not the reserved-key guard).
+        let result = namespace
+            .alter_transaction(AlterTransactionRequest {
+                id: Some(vec!["users".to_string(), txn_id.clone()]),
+                actions: vec![AlterTransactionAction {
+                    set_status_action: None,
+                    set_property_action: Some(Box::new(AlterTransactionSetProperty {
+                        key: Some("custom_key".to_string()),
+                        value: Some("new_value".to_string()),
+                        mode: Some("Fail".to_string()),
+                    })),
+                    unset_property_action: None,
+                }],
+                ..Default::default()
+            })
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_alter_transaction_unset_property() {
+        use lance_namespace::models::{
+            AlterTransactionAction, AlterTransactionRequest, AlterTransactionSetProperty,
+            AlterTransactionUnsetProperty,
+        };
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+        create_scalar_table(&namespace, "users").await;
+        let txn_id = create_scalar_index(&namespace, "users", "users_id_idx")
+            .await
+            .expect("create_scalar_index should return a transaction id");
+
+        // First set a custom property, then unset it
+        let response = namespace
+            .alter_transaction(AlterTransactionRequest {
+                id: Some(vec!["users".to_string(), txn_id.clone()]),
+                actions: vec![
+                    AlterTransactionAction {
+                        set_status_action: None,
+                        set_property_action: Some(Box::new(AlterTransactionSetProperty {
+                            key: Some("temp_key".to_string()),
+                            value: Some("temp_value".to_string()),
+                            mode: None,
+                        })),
+                        unset_property_action: None,
+                    },
+                    AlterTransactionAction {
+                        set_status_action: None,
+                        set_property_action: None,
+                        unset_property_action: Some(Box::new(AlterTransactionUnsetProperty {
+                            key: Some("temp_key".to_string()),
+                            mode: None,
+                        })),
+                    },
+                ],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(response.status, "SUCCEEDED");
+        let props = response.properties.unwrap();
+        assert!(!props.contains_key("temp_key"));
+    }
+
+    #[tokio::test]
+    async fn test_alter_transaction_invalid_status() {
+        use lance_namespace::models::{
+            AlterTransactionAction, AlterTransactionRequest, AlterTransactionSetStatus,
+        };
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+        create_scalar_table(&namespace, "users").await;
+        let txn_id = create_scalar_index(&namespace, "users", "users_id_idx")
+            .await
+            .expect("create_scalar_index should return a transaction id");
+
+        let result = namespace
+            .alter_transaction(AlterTransactionRequest {
+                id: Some(vec!["users".to_string(), txn_id.clone()]),
+                actions: vec![AlterTransactionAction {
+                    set_status_action: Some(Box::new(AlterTransactionSetStatus {
+                        status: Some("InvalidStatus".to_string()),
+                    })),
+                    set_property_action: None,
+                    unset_property_action: None,
+                }],
+                ..Default::default()
+            })
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_alter_transaction_not_found() {
+        use lance_namespace::models::{
+            AlterTransactionAction, AlterTransactionRequest, AlterTransactionSetStatus,
+        };
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+        create_scalar_table(&namespace, "users").await;
+
+        // Try to alter a non-existent transaction
+        let result = namespace
+            .alter_transaction(AlterTransactionRequest {
+                id: Some(vec!["users".to_string(), "non_existent_txn".to_string()]),
+                actions: vec![AlterTransactionAction {
+                    set_status_action: Some(Box::new(AlterTransactionSetStatus {
+                        status: Some("Canceled".to_string()),
+                    })),
+                    set_property_action: None,
+                    unset_property_action: None,
+                }],
+                ..Default::default()
+            })
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_alter_transaction_missing_id() {
+        use lance_namespace::models::{
+            AlterTransactionAction, AlterTransactionRequest, AlterTransactionSetStatus,
+        };
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+
+        // Try with missing id
+        let result = namespace
+            .alter_transaction(AlterTransactionRequest {
+                id: None,
+                actions: vec![AlterTransactionAction {
+                    set_status_action: Some(Box::new(AlterTransactionSetStatus {
+                        status: Some("Canceled".to_string()),
+                    })),
+                    set_property_action: None,
+                    unset_property_action: None,
+                }],
+                ..Default::default()
+            })
+            .await;
+        assert!(result.is_err());
+
+        // Try with insufficient id parts
+        let result = namespace
+            .alter_transaction(AlterTransactionRequest {
+                id: Some(vec!["users".to_string()]),
+                actions: vec![AlterTransactionAction {
+                    set_status_action: Some(Box::new(AlterTransactionSetStatus {
+                        status: Some("Canceled".to_string()),
+                    })),
+                    set_property_action: None,
+                    unset_property_action: None,
+                }],
+                ..Default::default()
+            })
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_alter_transaction_persists_changes() {
+        use lance_namespace::models::{
+            AlterTransactionAction, AlterTransactionRequest, AlterTransactionSetProperty,
+            AlterTransactionSetStatus, DescribeTransactionRequest,
+        };
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+        create_scalar_table(&namespace, "users").await;
+        let transaction_id = create_scalar_index(&namespace, "users", "users_id_idx").await;
+
+        let txn_id = transaction_id.expect("scalar index should produce a transaction id");
+
+        // Alter status and set a custom property.
+        namespace
+            .alter_transaction(AlterTransactionRequest {
+                id: Some(vec!["users".to_string(), txn_id.clone()]),
+                actions: vec![
+                    AlterTransactionAction {
+                        set_status_action: Some(Box::new(AlterTransactionSetStatus {
+                            status: Some("Canceled".to_string()),
+                        })),
+                        set_property_action: None,
+                        unset_property_action: None,
+                    },
+                    AlterTransactionAction {
+                        set_status_action: None,
+                        set_property_action: Some(Box::new(AlterTransactionSetProperty {
+                            key: Some("owner".to_string()),
+                            value: Some("alice".to_string()),
+                            mode: None,
+                        })),
+                        unset_property_action: None,
+                    },
+                ],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // The changes must survive across a fresh describe_transaction call,
+        // proving the alteration was persisted to the transaction file.
+        let describe_resp = namespace
+            .describe_transaction(DescribeTransactionRequest {
+                id: Some(vec!["users".to_string(), txn_id.clone()]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let props = describe_resp.properties.expect("properties should be set");
+        assert_eq!(props.get("owner"), Some(&"alice".to_string()));
+        // The internal `_status` marker should not leak into the response but
+        // must be present on disk so subsequent alter_transaction calls can
+        // observe the previously set status.
+        assert!(!props.contains_key("_status"));
+
+        let follow_up = namespace
+            .alter_transaction(AlterTransactionRequest {
+                id: Some(vec!["users".to_string(), txn_id.clone()]),
+                actions: vec![],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(follow_up.status, "Canceled");
+        let follow_up_props = follow_up.properties.unwrap();
+        assert_eq!(follow_up_props.get("owner"), Some(&"alice".to_string()));
     }
 }

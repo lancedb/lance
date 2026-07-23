@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::HashMap;
-use std::{any::Any, sync::Arc};
+use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Int64Type, UInt64Type};
@@ -25,7 +25,8 @@ use datafusion::{
 };
 use datafusion_functions::core::expr_ext::FieldAccessor;
 use datafusion_physical_expr::EquivalenceProperties;
-use futures::{FutureExt, Stream, StreamExt, TryStreamExt};
+use futures::stream::BoxStream;
+use futures::{FutureExt, StreamExt, TryStreamExt};
 use lance_arrow::{RecordBatchExt, SchemaExt};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID_FIELD};
@@ -158,10 +159,6 @@ impl ExecutionPlan for LancePushdownScanExec {
         "LancePushdownScanExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.output_schema.clone()
     }
@@ -218,7 +215,7 @@ impl ExecutionPlan for LancePushdownScanExec {
             )
             .await?;
 
-            frag_scanner.scan().await
+            frag_scanner.scan()
         });
 
         let batch_stream = batch_stream
@@ -325,7 +322,7 @@ impl FragmentScanner {
         })
     }
 
-    pub async fn scan(self) -> Result<impl Stream<Item = Result<RecordBatch>> + 'static + Send> {
+    pub fn scan(self) -> Result<BoxStream<'static, Result<RecordBatch>>> {
         let batch_readahead = self.config.batch_readahead;
         let simplified_predicates = self.simplified_predicates()?;
         let ordered_output = self.config.ordered_output;
@@ -671,7 +668,7 @@ impl FragmentScanner {
                 .collect();
             let schema =
                 Arc::new(ArrowSchema::from(self.predicate_projection.as_ref()).try_into()?);
-            let context = SimplifyContext::default().with_schema(schema);
+            let context = SimplifyContext::builder().with_schema(schema).build();
             let mut simplifier = ExprSimplifier::new(context);
 
             let mut predicates = Vec::with_capacity(num_batches);

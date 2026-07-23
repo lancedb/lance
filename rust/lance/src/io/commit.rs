@@ -140,6 +140,7 @@ pub(crate) async fn write_transaction_file(
 #[allow(clippy::too_many_arguments)]
 async fn do_commit_new_dataset(
     object_store: &ObjectStore,
+    source_store: Option<&ObjectStore>,
     commit_handler: &dyn CommitHandler,
     base_path: &Path,
     transaction: &Transaction,
@@ -163,15 +164,19 @@ async fn do_commit_new_dataset(
         ..
     } = &transaction.operation
     {
+        // The source manifest must be read through the source store, which may differ
+        // from the destination store when cloning across object stores/accounts. Falls
+        // back to the destination store for same-store clones.
+        let source_store = source_store.unwrap_or(object_store);
         let source_base_path =
             ObjectStore::extract_path_from_uri(store_registry, ref_path.as_str())?;
         let source_manifest_location = commit_handler
-            .resolve_version_location(&source_base_path, *ref_version, &object_store.inner)
+            .resolve_version_location(&source_base_path, *ref_version, &source_store.inner)
             .await?;
         let source_manifest = Dataset::load_manifest(
-            object_store,
+            source_store,
             &source_manifest_location,
-            base_path.to_string().as_str(),
+            ref_path.as_str(),
             &Session::default(),
         )
         .await?;
@@ -192,7 +197,7 @@ async fn do_commit_new_dataset(
             );
 
             let updated_indices = if let Some(index_section_pos) = source_manifest.index_section {
-                let reader = object_store.open(&source_manifest_location.path).await?;
+                let reader = source_store.open(&source_manifest_location.path).await?;
                 let section: pb::IndexSection =
                     lance_io::utils::read_message(reader.as_ref(), index_section_pos).await?;
                 section
@@ -229,7 +234,7 @@ async fn do_commit_new_dataset(
             // Indices: keep metadata but normalize base to local
             let mut updated_indices = Vec::new();
             if let Some(index_section_pos) = source_manifest.index_section {
-                let reader = object_store.open(&source_manifest_location.path).await?;
+                let reader = source_store.open(&source_manifest_location.path).await?;
                 let section: pb::IndexSection =
                     lance_io::utils::read_message(reader.as_ref(), index_section_pos).await?;
                 updated_indices = section
@@ -300,6 +305,7 @@ async fn do_commit_new_dataset(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn commit_new_dataset(
     object_store: &ObjectStore,
+    source_store: Option<&ObjectStore>,
     commit_handler: &dyn CommitHandler,
     base_path: &Path,
     transaction: &Transaction,
@@ -310,6 +316,7 @@ pub(crate) async fn commit_new_dataset(
 ) -> Result<(Manifest, ManifestLocation)> {
     do_commit_new_dataset(
         object_store,
+        source_store,
         commit_handler,
         base_path,
         transaction,
@@ -489,13 +496,12 @@ fn fix_schema(manifest: &mut Manifest) -> Result<()> {
     }
 
     // Now, we need to remap the field ids to be unique.
-    let mut field_id_seed = manifest.max_field_id() + 1;
     let mut old_field_id_mapping: HashMap<i32, i32> = HashMap::new();
     let mut fields_with_duplicate_ids = fields_with_duplicate_ids.into_iter().collect::<Vec<_>>();
     fields_with_duplicate_ids.sort_unstable();
-    for field_id in fields_with_duplicate_ids {
+    for (field_id_seed, field_id) in (manifest.max_field_id() + 1..).zip(fields_with_duplicate_ids)
+    {
         old_field_id_mapping.insert(field_id, field_id_seed);
-        field_id_seed += 1;
     }
 
     let mut fragments = manifest.fragments.as_ref().clone();
@@ -592,17 +598,21 @@ pub(crate) async fn migrate_fragments(
 
             let mut data_files = fragment.files.clone();
 
-            // For each of the data files in the fragment, we need to get the file size
-            let object_store = dataset.object_store.as_ref();
+            // For each of the data files in the fragment, we need to get the file size.
+            // Resolve each file against its own storage base: multi-base datasets
+            // keep data files outside the dataset root (DataFile.base_id).
             let get_sizes = data_files
                 .iter()
                 .map(|file| {
                     if let Some(size) = file.file_size_bytes.get() {
                         Either::Left(futures::future::ready(Ok(size)))
                     } else {
-                        Either::Right(async {
+                        let dataset = dataset.clone();
+                        Either::Right(async move {
+                            let object_store = dataset.object_store_for_data_file(file).await?;
+                            let data_dir = dataset.data_file_dir_for_base(file.base_id)?;
                             object_store
-                                .size(&dataset.base.clone().join("data").join(file.path.clone()))
+                                .size(&data_dir.join(file.path.clone()))
                                 .map_ok(|size| {
                                     NonZero::new(size).ok_or_else(|| {
                                         Error::internal(format!("File {} has size 0", file.path))
@@ -1070,6 +1080,7 @@ pub(crate) async fn commit_transaction(
                 if !indices.is_empty() {
                     let key = IndexMetadataKey {
                         version: target_version,
+                        store_identity: &dataset.object_store.store_prefix,
                     };
                     dataset
                         .index_cache
@@ -1687,6 +1698,7 @@ mod tests {
                     DataFile::new_legacy_from_fields("path1", vec![0, 1, 2], None),
                     DataFile::new_legacy_from_fields("unused", vec![9], None),
                 ],
+                overlays: vec![],
                 deletion_file: None,
                 row_id_meta: None,
                 physical_rows: None,
@@ -1699,6 +1711,7 @@ mod tests {
                     DataFile::new_legacy_from_fields("path2", vec![0, 1, 2], None),
                     DataFile::new_legacy_from_fields("path3", vec![2], None),
                 ],
+                overlays: vec![],
                 deletion_file: None,
                 row_id_meta: None,
                 physical_rows: None,
@@ -1736,6 +1749,7 @@ mod tests {
                     vec![0, 1, 10],
                     None,
                 )],
+                overlays: vec![],
                 deletion_file: None,
                 row_id_meta: None,
                 physical_rows: None,
@@ -1748,6 +1762,7 @@ mod tests {
                     DataFile::new_legacy_from_fields("path2", vec![0, 1, 2], None),
                     DataFile::new_legacy_from_fields("path3", vec![10], None),
                 ],
+                overlays: vec![],
                 deletion_file: None,
                 row_id_meta: None,
                 physical_rows: None,
@@ -1838,6 +1853,7 @@ mod tests {
         let fragment = Fragment {
             id: 0,
             files: vec![data_file],
+            overlays: vec![],
             deletion_file: None,
             row_id_meta: None,
             physical_rows: Some(100),

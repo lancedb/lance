@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use futures::Future;
 
 use crate::Result;
+use crate::error::CloneableError;
 
 use super::CacheCodec;
 use super::backend::{CacheBackend, CacheEntry, CacheKeyIterator, InternalCacheKey};
@@ -18,6 +19,12 @@ use super::backend::{CacheBackend, CacheEntry, CacheKeyIterator, InternalCacheKe
 struct MokaCacheEntry {
     entry: CacheEntry,
     size_bytes: usize,
+}
+
+/// Per-entry key cost for eviction: the struct plus the unique `key` bytes.
+/// Excludes the shared `prefix` `Arc<str>`, which isn't freed per eviction.
+fn key_footprint(key: &InternalCacheKey) -> usize {
+    std::mem::size_of::<InternalCacheKey>() + key.key().len()
 }
 
 /// Default [`CacheBackend`] backed by a [moka](https://crates.io/crates/moka) cache.
@@ -40,7 +47,12 @@ impl MokaCacheBackend {
     pub fn with_capacity(capacity: usize) -> Self {
         let cache = moka::future::Cache::builder()
             .max_capacity(capacity as u64)
-            .weigher(|_, v: &MokaCacheEntry| v.size_bytes.try_into().unwrap_or(u32::MAX))
+            .weigher(|key: &InternalCacheKey, entry: &MokaCacheEntry| {
+                key_footprint(key)
+                    .saturating_add(entry.size_bytes)
+                    .try_into()
+                    .unwrap_or(u32::MAX)
+            })
             .support_invalidation_closures()
             .build();
         Self { cache }
@@ -77,37 +89,25 @@ impl CacheBackend for MokaCacheBackend {
         loader: Pin<Box<dyn Future<Output = Result<(CacheEntry, usize)>> + Send + 'a>>,
         _codec: Option<CacheCodec>,
     ) -> Result<(CacheEntry, bool)> {
-        // Use moka's built-in dedup: optionally_get_with runs the init future
-        // at most once per key, even under concurrent access.
-        let (error_tx, error_rx) = tokio::sync::oneshot::channel();
-
         // Track whether the loader actually ran (= cache miss).
         let was_miss = Arc::new(AtomicBool::new(false));
         let was_miss_clone = was_miss.clone();
 
         let init = async move {
             was_miss_clone.store(true, Ordering::Relaxed);
-            match loader.await {
-                Ok((entry, size_bytes)) => Some(MokaCacheEntry { entry, size_bytes }),
-                Err(e) => {
-                    let _ = error_tx.send(e);
-                    None
-                }
-            }
+            loader
+                .await
+                .map(|(entry, size_bytes)| MokaCacheEntry { entry, size_bytes })
+                .map_err(CloneableError)
         };
 
         let owned_key = key.clone();
-        match self.cache.optionally_get_with(owned_key, init).await {
-            Some(record) => {
+        match self.cache.try_get_with(owned_key, init).await {
+            Ok(record) => {
                 let was_cached = !was_miss.load(Ordering::Relaxed);
                 Ok((record.entry, was_cached))
             }
-            None => match error_rx.await {
-                Ok(err) => Err(err),
-                Err(_) => Err(crate::Error::internal(
-                    "Failed to retrieve error from cache loader",
-                )),
-            },
+            Err(error) => Err(Arc::unwrap_or_clone(error).0),
         }
     }
 
@@ -148,6 +148,9 @@ impl CacheBackend for MokaCacheBackend {
         // Iterate rather than using `weighted_size()` because moka's
         // weighted_size can be stale without `run_pending_tasks()`, which
         // is async and can't be called from this synchronous context.
-        self.cache.iter().map(|(_, v)| v.size_bytes).sum()
+        self.cache
+            .iter()
+            .map(|(key, entry)| key_footprint(key.as_ref()) + entry.size_bytes)
+            .sum()
     }
 }

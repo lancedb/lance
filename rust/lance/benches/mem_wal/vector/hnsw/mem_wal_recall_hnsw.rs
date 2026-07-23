@@ -385,9 +385,10 @@ async fn run_checkpoint(
     }
     let writer_config = ShardWriterConfig {
         shard_id,
+        max_wal_persist_retries: 3,
+        wal_persist_retry_base_delay: std::time::Duration::from_millis(50),
         shard_spec_id: 0,
         durable_write: false,
-        sync_indexed_write: true,
         max_memtable_size: cp.saturating_mul(row_size_estimate).saturating_mul(4),
         max_memtable_rows: cp.saturating_mul(2),
         max_memtable_batches: total_batches_max.saturating_mul(2).max(8_000),
@@ -414,11 +415,11 @@ async fn run_checkpoint(
         writer.put(vec![batch]).await?;
     }
 
-    let target_batch_pos = total_batches.saturating_sub(1);
+    let target_indexed_count = total_batches;
     let mut spins = 0u64;
     loop {
         let active = writer.active_memtable_ref().await?;
-        if active.index_store.max_visible_batch_position() >= target_batch_pos {
+        if active.index_store.indexed_count() >= target_indexed_count {
             break;
         }
         drop(active);
@@ -665,7 +666,7 @@ async fn run_checkpoint(
             active.schema.clone(),
         );
         let q_arr: ArrayRef = Arc::new(q_fsl);
-        scanner.nearest(VECTOR_COL, q_arr, k);
+        scanner.nearest(VECTOR_COL, q_arr.as_ref(), k)?;
         let h_t = Instant::now();
         let stream = scanner.try_into_stream().await?;
         let batches: Vec<RecordBatch> = stream.try_collect().await?;

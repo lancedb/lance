@@ -30,6 +30,12 @@ Rust workspace with Python and Java bindings:
 
 Key technical traits: async-first (tokio), Arrow-native, versioned writes with manifest tracking, custom ML-optimized encodings, unified object store interface (local/S3/Azure/GCS).
 
+## File Format Stability and Compatibility
+
+- Treat every file format marked stable as a durable compatibility contract. All changes to a stable format must preserve both backward and forward compatibility.
+- Treat every file format marked unstable as disposable. It may change freely; do not add compatibility code, migrations, fallbacks, or tests for files written by earlier unstable revisions.
+- Evaluate compatibility against the latest released stable version while continuing to honor all stable format contracts. Changes that exist only on the current branch or `main` are not compatibility constraints; do not compromise a cleaner or more complete design to preserve those intermediate states.
+
 ## Development Commands
 
 ### Rust
@@ -100,6 +106,7 @@ AWS_DEFAULT_REGION=us-east-1 pytest --run-integration python/tests/test_s3_ddb.p
 
 - Prefer implementing functionality with the standard library or existing workspace dependencies before adding new external crates.
 - Keep `Cargo.lock` changes intentional; revert unrelated dependency bumps. Pin broken deps with a comment linking the upstream issue.
+- The repo has three lockfiles: the root `Cargo.lock`, `python/Cargo.lock`, and `java/lance-jni/Cargo.lock` (the latter two are excluded from the workspace). A `workspace.dependencies` change must be reflected in all three — refresh the excluded ones with `cargo check --manifest-path python/Cargo.toml` and `cargo check --manifest-path java/lance-jni/Cargo.toml`, then commit the updated lockfiles. The `cargo-lock-sync` pre-commit hook catches a miss offline.
 - Gate optional/domain-specific deps behind Cargo feature flags. Prefer separate crates for domain functionality (geo, NLP).
 
 ## Testing Standards
@@ -132,6 +139,11 @@ AWS_DEFAULT_REGION=us-east-1 pytest --run-integration python/tests/test_s3_ddb.p
 - Keep doc examples in sync with actual API signatures — update when refactoring.
 - Indent content under MkDocs admonition directives (`!!! note`, etc.) with 4 spaces.
 - Proofread comments and docs for typos before committing.
+
+## Filing Issues
+
+- When opening an issue with `gh issue create` or the API, classify it and pass the matching label: `--label bug`, `--label feature`, or `--label performance`. These paths bypass the `.github/ISSUE_TEMPLATE` forms, so the label is not applied automatically.
+- Prefix the title to match, e.g. `bug: ...`, `feature: ...`, or `perf: ...`. A content-based labeler (`.github/workflows/issue-labeler.yml`) uses this as a fallback signal, but an explicit `--label` is the reliable path.
 
 ## Pull Requests
 

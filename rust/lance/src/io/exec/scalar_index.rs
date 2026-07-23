@@ -6,7 +6,7 @@ use std::sync::{Arc, LazyLock};
 use super::utils::{IndexMetrics, InstrumentedRecordBatchStreamAdapter};
 use crate::{
     Dataset,
-    dataset::rowids::load_row_id_sequences,
+    dataset::rowids::{load_row_id_sequences, translate_addr_treemap_to_row_ids},
     index::{
         prefilter::DatasetPreFilter,
         scalar_logical::{open_named_scalar_index, scalar_index_fragment_bitmap},
@@ -42,7 +42,8 @@ use lance_index::{
     },
 };
 use lance_select::{
-    IndexExprResult, RowAddrMask, RowAddrTreeMap, RowSetOps, result::IndexExprResultWireFormat,
+    IndexExprResult, NullableIndexExprResult, NullableRowAddrMask, NullableRowAddrSet, RowAddrMask,
+    RowAddrTreeMap, RowSetOps, result::IndexExprResultWireFormat,
 };
 use lance_table::format::Fragment;
 use roaring::RoaringBitmap;
@@ -58,6 +59,50 @@ impl ScalarIndexLoader for Dataset {
     ) -> Result<Arc<dyn ScalarIndex>> {
         open_named_scalar_index(self, column, index_name, metrics).await
     }
+
+    async fn row_addr_result_to_row_ids(
+        &self,
+        result: NullableIndexExprResult,
+    ) -> Result<NullableIndexExprResult> {
+        // Addresses and row ids only diverge under stable row ids; otherwise the
+        // address is the row id and there is nothing to translate.
+        if !self.manifest.uses_stable_row_ids() {
+            return Ok(result);
+        }
+
+        let NullableIndexExprResult { lower, upper, .. } = result;
+        let lower = translate_addr_mask_to_row_ids(self, lower).await?;
+        let upper = translate_addr_mask_to_row_ids(self, upper).await?;
+        Ok(NullableIndexExprResult::new(lower, upper))
+    }
+}
+
+/// Translate an address-domain [`NullableRowAddrMask`] into the row-id domain
+///
+/// Address-domain index results are always positive allow-lists (`AtMost`), so
+/// a block-list here would mean a boolean op was applied before translation,
+/// which is unsupported.
+async fn translate_addr_mask_to_row_ids(
+    dataset: &Dataset,
+    mask: NullableRowAddrMask,
+) -> Result<NullableRowAddrMask> {
+    match mask {
+        NullableRowAddrMask::AllowList(set) => Ok(NullableRowAddrMask::AllowList(
+            translate_addr_set_to_row_ids(dataset, set).await?,
+        )),
+        NullableRowAddrMask::BlockList(_) => Err(Error::internal(
+            "cannot translate a block-list address mask to the row-id domain",
+        )),
+    }
+}
+
+async fn translate_addr_set_to_row_ids(
+    dataset: &Dataset,
+    set: NullableRowAddrSet,
+) -> Result<NullableRowAddrSet> {
+    let selected = translate_addr_treemap_to_row_ids(dataset, set.selected_rows()).await?;
+    let nulls = translate_addr_treemap_to_row_ids(dataset, set.null_rows()).await?;
+    Ok(NullableRowAddrSet::new(selected, nulls))
 }
 
 /// An execution node that performs a scalar index search
@@ -103,7 +148,7 @@ impl ScalarIndexExec {
         ));
         Self {
             dataset,
-            expr,
+            expr: expr.optimize(),
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
             result_format,
@@ -182,10 +227,6 @@ impl ExecutionPlan for ScalarIndexExec {
         "ScalarIndexExec"
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.result_format.schema().clone()
     }
@@ -233,11 +274,11 @@ impl ExecutionPlan for ScalarIndexExec {
     fn partition_statistics(
         &self,
         _partition: Option<usize>,
-    ) -> datafusion::error::Result<datafusion::physical_plan::Statistics> {
-        Ok(datafusion::physical_plan::Statistics {
+    ) -> datafusion::error::Result<Arc<datafusion::physical_plan::Statistics>> {
+        Ok(Arc::new(datafusion::physical_plan::Statistics {
             num_rows: datafusion::common::stats::Precision::Exact(2),
             ..datafusion::physical_plan::Statistics::new_unknown(self.result_format.schema())
-        })
+        }))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -489,10 +530,6 @@ impl ExecutionPlan for MapIndexExec {
         "MapIndexExec"
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         INDEX_LOOKUP_SCHEMA.clone()
     }
@@ -561,6 +598,10 @@ pub struct MaterializeIndexExec {
     dataset: Arc<Dataset>,
     expr: ScalarIndexExpr,
     fragments: Arc<Vec<Fragment>>,
+    /// Row addresses blocked from the index result due to data overlay files committed after the
+    /// index was built. ANDead into the candidate mask before row ID materialisation so that stale
+    /// index entries never reach downstream operators.
+    overlay_block: Option<RowAddrMask>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -633,9 +674,16 @@ impl MaterializeIndexExec {
             dataset,
             expr,
             fragments,
+            overlay_block: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
+    }
+
+    /// Block specific row addresses (see the `overlay_block` field) from the index result.
+    pub fn with_overlay_block(mut self, block: RowAddrMask) -> Self {
+        self.overlay_block = Some(block);
+        self
     }
 
     #[instrument(name = "materialize_scalar_index", skip_all, level = "debug")]
@@ -643,6 +691,7 @@ impl MaterializeIndexExec {
         expr: ScalarIndexExpr,
         dataset: Arc<Dataset>,
         fragments: Arc<Vec<Fragment>>,
+        overlay_block: Option<RowAddrMask>,
         metrics: Arc<IndexMetrics>,
     ) -> Result<RecordBatch> {
         let expr_result = expr.evaluate(dataset.as_ref(), metrics.as_ref());
@@ -670,12 +719,15 @@ impl MaterializeIndexExec {
             }
             Ok(result.upper)
         };
-        let mask = if let Some(prefilter) = prefilter {
+        let mut mask = if let Some(prefilter) = prefilter {
             let (expr_result, prefilter) = futures::try_join!(expr_result, prefilter)?;
             take_upper(expr_result)? & (*prefilter).clone()
         } else {
             take_upper(expr_result.await?)?
         };
+        if let Some(block) = overlay_block {
+            mask = mask & block;
+        }
         let ids = row_ids_for_mask(mask, &dataset, &fragments).await?;
         let ids = UInt64Array::from(ids);
         Ok(RecordBatch::try_new(
@@ -776,10 +828,6 @@ impl ExecutionPlan for MaterializeIndexExec {
         "MaterializeIndexExec"
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         MATERIALIZE_INDEX_SCHEMA.clone()
     }
@@ -811,6 +859,7 @@ impl ExecutionPlan for MaterializeIndexExec {
             self.expr.clone(),
             self.dataset.clone(),
             self.fragments.clone(),
+            self.overlay_block.clone(),
             metrics,
         );
         let stream = futures::stream::iter(vec![batch_fut])
@@ -849,13 +898,15 @@ mod tests {
 
     use crate::index::DatasetIndexExt;
     use arrow::datatypes::UInt64Type;
+    use arrow::record_batch::RecordBatchIterator;
+    use arrow_array::{ArrayRef, Int32Array, RecordBatch};
     use arrow_schema::Schema;
     use datafusion::{
         execution::TaskContext, physical_plan::ExecutionPlan, prelude::SessionConfig,
         scalar::ScalarValue,
     };
     use futures::TryStreamExt;
-    use lance_core::utils::tempfile::TempStrDir;
+    use lance_core::utils::{address::RowAddress, tempfile::TempStrDir};
     use lance_datagen::gen_batch;
     use lance_index::{
         IndexType,
@@ -864,10 +915,11 @@ mod tests {
             expression::{ScalarIndexExpr, ScalarIndexSearch},
         },
     };
-    use lance_select::result::IndexExprResultWireFormat;
+    use lance_select::{RowAddrTreeMap, result::IndexExprResultWireFormat};
 
     use crate::{
         Dataset,
+        dataset::WriteParams,
         io::exec::scalar_index::MaterializeIndexExec,
         utils::test::{DatagenExt, FragmentCount, FragmentRowCount, NoContextTestFixture},
     };
@@ -928,7 +980,6 @@ mod tests {
             needs_recheck: false,
             fragment_bitmap: None,
         });
-
         let fragments = dataset.fragments().clone();
 
         let plan = MaterializeIndexExec::new(dataset, query, fragments);
@@ -947,6 +998,51 @@ mod tests {
 
         assert_eq!(batches.len(), 10);
         assert_eq!(batches[0].num_rows(), 5);
+    }
+
+    #[tokio::test]
+    async fn test_translate_addr_treemap_to_stable_row_ids() {
+        let test_dir = TempStrDir::default();
+        let batch = RecordBatch::try_from_iter(vec![(
+            "id",
+            Arc::new(Int32Array::from((0..10).collect::<Vec<_>>())) as ArrayRef,
+        )])
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let write_params = WriteParams {
+            enable_stable_row_ids: true,
+            max_rows_per_file: 5,
+            ..Default::default()
+        };
+        let dataset = Dataset::write(reader, test_dir.as_str(), Some(write_params))
+            .await
+            .unwrap();
+        let fragment_id = dataset.get_fragments()[1].id() as u32;
+
+        let mut full_fragment = RowAddrTreeMap::new();
+        full_fragment.insert_fragment(fragment_id);
+        let translated = super::translate_addr_treemap_to_row_ids(&dataset, &full_fragment)
+            .await
+            .unwrap();
+        let row_ids = translated
+            .get_fragment_bitmap(0)
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>();
+        assert_eq!(row_ids, vec![5, 6, 7, 8, 9]);
+
+        let mut partial_fragment = RowAddrTreeMap::new();
+        partial_fragment.insert(RowAddress::new_from_parts(fragment_id, 1).into());
+        partial_fragment.insert(RowAddress::new_from_parts(fragment_id, 3).into());
+        let translated = super::translate_addr_treemap_to_row_ids(&dataset, &partial_fragment)
+            .await
+            .unwrap();
+        let row_ids = translated
+            .get_fragment_bitmap(0)
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>();
+        assert_eq!(row_ids, vec![6, 8]);
     }
 
     /// `ScalarIndexExec::schema()` (and the stream it emits) must advertise
