@@ -370,6 +370,19 @@ impl TryFrom<pb::Transaction> for Transaction {
                     .map(DataOverlayGroup::try_from)
                     .collect::<Result<Vec<_>>>()?,
             },
+            Some(pb::transaction::Operation::UserOperation(_)) => {
+                // Action-based transactions (Transaction V2) are a draft wire
+                // format (OSS-1530). This version of Lance recognizes the message
+                // but has no support for it: reject on load, fail-closed. Because
+                // load_and_sort_new_transactions collects transactions with
+                // try_collect, a concurrent V2 commit in the conflict window
+                // aborts the whole commit rather than being silently skipped.
+                // Do NOT make this parsing lenient.
+                return Err(Error::not_supported(
+                    "action-based transactions (Transaction V2) are not supported \
+                     by this version of Lance; please upgrade",
+                ));
+            }
             None => {
                 return Err(Error::internal(
                     "Transaction message did not contain an operation".to_string(),
@@ -812,5 +825,44 @@ mod tests {
             }
             other => panic!("expected DataOverlay, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_user_operation_rejected_on_load() {
+        // Action-based transactions (Transaction V2) are a draft wire format that
+        // this version of Lance does not support. Loading one must fail closed
+        // (never be silently skipped or leniently parsed), so that a concurrent
+        // V2 commit in the conflict window aborts an in-flight commit.
+        let message = pb::Transaction {
+            read_version: 1,
+            uuid: Uuid::new_v4().to_string(),
+            operation: Some(pb::transaction::Operation::UserOperation(
+                pb::transaction::UserOperation {
+                    description: "INSERT INTO t VALUES (1)".to_string(),
+                    uuid: Uuid::new_v4().to_string(),
+                    read_version: 1,
+                    actions: vec![pb::transaction::UserAction {
+                        description: "append batch".to_string(),
+                        actions: vec![pb::transaction::Action {
+                            action: Some(pb::transaction::action::Action::AddFragment(
+                                pb::transaction::AddFragment {
+                                    local: 0,
+                                    physical_rows: 1,
+                                    data_change: Some(true),
+                                    ..Default::default()
+                                },
+                            )),
+                        }],
+                    }],
+                },
+            )),
+            ..Default::default()
+        };
+
+        let err = Transaction::try_from(message).unwrap_err();
+        assert!(
+            matches!(err, Error::NotSupported { .. }),
+            "expected NotSupported, got: {err:?}"
+        );
     }
 }
