@@ -53,11 +53,6 @@ pub struct LsmScanPlanner {
     flushed_cache: Option<Arc<dyn DatasetCache>>,
     /// Optional warmer fired on first open of a flushed generation.
     warmer: Option<Arc<dyn GenerationWarmer>>,
-    /// Configured search over-fetch factor. Plain scans validate it for
-    /// consistent [`LsmScanner`](super::LsmScanner) builder semantics but do
-    /// not use it: block-filtered scans refill exactly instead of relying on a
-    /// finite heuristic.
-    overfetch_factor: f64,
 }
 
 impl LsmScanPlanner {
@@ -75,7 +70,6 @@ impl LsmScanPlanner {
             store_params: None,
             flushed_cache: None,
             warmer: None,
-            overfetch_factor: 1.0,
         }
     }
 
@@ -101,14 +95,6 @@ impl LsmScanPlanner {
     /// Inject the warmer fired on first open of a flushed generation.
     pub fn with_warmer(mut self, warmer: Arc<dyn GenerationWarmer>) -> Self {
         self.warmer = Some(warmer);
-        self
-    }
-
-    /// Set the search over-fetch factor to validate when planning a scan.
-    /// Values below `1.0` are rejected by [`Self::plan_scan`], consistently
-    /// with the vector and full-text planners.
-    pub fn with_overfetch_factor(mut self, factor: f64) -> Self {
-        self.overfetch_factor = factor;
         self
     }
 
@@ -155,7 +141,6 @@ impl LsmScanPlanner {
 
         // 1. Collect all data sources
         let sources = self.collector.collect()?;
-        super::validate_overfetch_factor(self.overfetch_factor)?;
 
         if sources.is_empty() {
             // Return empty plan
