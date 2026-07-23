@@ -1772,8 +1772,9 @@ impl Scanner {
 
     /// Configure the speed / accuracy tradeoff for approximate vector search.
     ///
-    /// This setting is currently only used by RQ-quantized indexes, such as
-    /// IVF_RQ. Other index types ignore this setting.
+    /// This setting is currently used by RQ-quantized indexes (such as
+    /// IVF_RQ) and by prefiltered search on HNSW indexes, where `Fast`
+    /// enables the ACORN traversal. Other index types ignore this setting.
     pub fn approx_mode(&mut self, approx_mode: ApproxMode) -> &mut Self {
         if let Some(q) = self.nearest.as_mut() {
             q.approx_mode = approx_mode;
@@ -8170,8 +8171,20 @@ mod test {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
         #[values(false, true)] stable_row_ids: bool,
+        #[values(ApproxMode::Normal, ApproxMode::Fast)] approx_mode: ApproxMode,
         #[values(
             VectorIndexParams::ivf_pq(2, 8, 2, MetricType::L2, 2),
+            VectorIndexParams::ivf_hnsw(
+                MetricType::L2,
+                IvfBuildParams::new(2),
+                HnswBuildParams::default()
+            ),
+            VectorIndexParams::with_ivf_hnsw_pq_params(
+                MetricType::L2,
+                IvfBuildParams::new(2),
+                HnswBuildParams::default(),
+                PQBuildParams::new(2, 8)
+            ),
             VectorIndexParams::with_ivf_hnsw_sq_params(
                 MetricType::L2,
                 IvfBuildParams::new(2),
@@ -8226,6 +8239,7 @@ mod test {
         scan.nearest("vector", query_key.as_ref(), 1).unwrap();
         scan.minimum_nprobes(100);
         scan.ef(100);
+        scan.approx_mode(approx_mode);
         scan.with_row_id();
 
         let batches = scan

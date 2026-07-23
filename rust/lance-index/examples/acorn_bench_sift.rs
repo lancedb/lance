@@ -7,6 +7,7 @@
 //! ground truth.
 //!
 //! Run: SIFT_DIR=/path/to/sift cargo run --release -p lance-index --example acorn_bench_sift
+//! Works with any texmex-format dataset, e.g. SIFT_DIR=/path/to/gist for GIST1M.
 
 #![allow(clippy::print_stdout)]
 
@@ -113,11 +114,16 @@ impl CaseResult {
 }
 
 fn main() {
-    let sift_dir = std::env::var("SIFT_DIR").expect("set SIFT_DIR to the extracted sift/ dir");
-    println!("loading SIFT1M from {sift_dir}...");
-    let (base, dim, total) = read_fvecs(&format!("{sift_dir}/sift_base.fvecs"));
-    let (queries, query_dim, num_queries) = read_fvecs(&format!("{sift_dir}/sift_query.fvecs"));
-    let official_gt = read_ivecs(&format!("{sift_dir}/sift_groundtruth.ivecs"));
+    let sift_dir = std::env::var("SIFT_DIR").expect("set SIFT_DIR to the extracted dataset dir");
+    let prefix = std::path::Path::new(&sift_dir)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("SIFT_DIR must end in the dataset name, e.g. sift or gist")
+        .to_string();
+    println!("loading {prefix} from {sift_dir}...");
+    let (base, dim, total) = read_fvecs(&format!("{sift_dir}/{prefix}_base.fvecs"));
+    let (queries, query_dim, num_queries) = read_fvecs(&format!("{sift_dir}/{prefix}_query.fvecs"));
+    let official_gt = read_ivecs(&format!("{sift_dir}/{prefix}_groundtruth.ivecs"));
     assert_eq!(dim, query_dim);
     println!("base {total} x {dim}, {num_queries} queries");
 
@@ -139,6 +145,7 @@ fn main() {
         lower_bound: None,
         upper_bound: None,
         dist_q_c: 0.0,
+        use_acorn: false,
     };
     let params_hi = HnswQueryParams {
         ef: EF_HI,
@@ -264,7 +271,7 @@ fn main() {
                     }
                     let t = Instant::now();
                     let nodes = hnsw
-                        .search_acorn(query.clone(), K, &params, bitset, storage.as_ref())
+                        .search_acorn(query.clone(), K, &params, &bitset, storage.as_ref())
                         .unwrap();
                     acorn.latency_us.push(t.elapsed().as_secs_f64() * 1e6);
                     let got: Vec<u32> = nodes.iter().map(|n| n.id).collect();
@@ -279,7 +286,7 @@ fn main() {
                     }
                     let t = Instant::now();
                     let nodes = hnsw
-                        .search_acorn(query.clone(), K, &params_hi, bitset, storage.as_ref())
+                        .search_acorn(query.clone(), K, &params_hi, &bitset, storage.as_ref())
                         .unwrap();
                     acorn_hi.latency_us.push(t.elapsed().as_secs_f64() * 1e6);
                     let got: Vec<u32> = nodes.iter().map(|n| n.id).collect();

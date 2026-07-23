@@ -95,6 +95,7 @@ fn main() {
         lower_bound: None,
         upper_bound: None,
         dist_q_c: 0.0,
+        use_acorn: false,
     };
     let params_hi = HnswQueryParams {
         ef: EF_HI,
@@ -217,7 +218,7 @@ fn main() {
                     }
                     let t = Instant::now();
                     let nodes = hnsw
-                        .search_acorn(query.clone(), K, &params, bitset, storage.as_ref())
+                        .search_acorn(query.clone(), K, &params, &bitset, storage.as_ref())
                         .unwrap();
                     acorn.latency_us.push(t.elapsed().as_secs_f64() * 1e6);
                     let got: Vec<u32> = nodes.iter().map(|n| n.id).collect();
