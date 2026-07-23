@@ -39,6 +39,16 @@ def _take_indices(num_rows: int) -> list:
     return sorted(rng.sample(range(num_rows), TAKE_ROWS))
 
 
+def _covered_value(ds: lance.LanceDataset):
+    """``val`` at offset 0, which every coverage pattern includes.
+
+    Used to guard the fixture: after committing overlays a covered cell must
+    read back a new value, otherwise a read-invisible overlay would let the
+    benchmark silently time plain base reads.
+    """
+    return ds.take([0], columns=["val"]).column("val").to_pylist()[0]
+
+
 def _measure_cold_io(ds: lance.LanceDataset, base: str, work):
     """Drop the page cache, run ``work`` once, return its read IO stats."""
     wipe_os_cache(base)
@@ -88,7 +98,9 @@ def test_overlay_read_scaling(
     base = str(tmp_path / "ds")
     ds = make_base_dataset(base, NUM_ROWS, ROWS_PER_FILE, "int32", version)
     if num_overlays:
-        ds = commit_overlay_layers(ds, base, num_overlays, fraction, pattern, "int32")
+        base_val = _covered_value(ds)
+        ds = commit_overlay_layers(ds, num_overlays, fraction, pattern, "int32")
+        assert _covered_value(ds) != base_val, "overlay not visible on read"
     _run_read(benchmark, record_property, base, ds, workload, NUM_ROWS)
 
 
@@ -98,7 +110,9 @@ def test_overlay_read_dtype(benchmark, tmp_path, record_property, workload, dtyp
     num_rows = NUM_ROWS_EMBEDDING if dtype == "embedding" else NUM_ROWS
     base = str(tmp_path / "ds")
     ds = make_base_dataset(base, num_rows, num_rows, dtype, "2.1")
-    ds = commit_overlay_layers(ds, base, 4, 0.01, "stride", dtype)
+    base_val = _covered_value(ds)
+    ds = commit_overlay_layers(ds, 4, 0.01, "stride", dtype)
+    assert _covered_value(ds) != base_val, "overlay not visible on read"
     _run_read(benchmark, record_property, base, ds, workload, num_rows)
 
 
@@ -132,13 +146,14 @@ def test_overlay_read_wide(
         embedding_dim=WIDE_EMBEDDING_DIM,
     )
     if num_overlays:
+        base_val = _covered_value(ds)
         ds = commit_overlay_layers(
             ds,
-            base,
             num_overlays,
             fraction,
             pattern,
             "embedding",
             embedding_dim=WIDE_EMBEDDING_DIM,
         )
+        assert _covered_value(ds) != base_val, "overlay not visible on read"
     _run_read(benchmark, record_property, base, ds, workload, NUM_ROWS_WIDE)

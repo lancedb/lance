@@ -29,7 +29,7 @@ from lance.file import LanceFileWriter  # noqa: E402
 EMBEDDING_DIM = 128
 
 
-def value_type(dtype: str, embedding_dim: int = EMBEDDING_DIM) -> pa.DataType:
+def _value_type(dtype: str, embedding_dim: int = EMBEDDING_DIM) -> pa.DataType:
     if dtype == "int32":
         return pa.int32()
     if dtype == "embedding":
@@ -70,7 +70,7 @@ def make_base_dataset(
     rewriting whole rows (update / merge_insert) can be compared against
     overlaying just ``val``.
     """
-    vtype = value_type(dtype, embedding_dim)
+    vtype = _value_type(dtype, embedding_dim)
     fields = {"id": pa.int64(), "val": vtype}
     if payload_dim:
         fields["payload"] = pa.list_(pa.float32(), payload_dim)
@@ -125,7 +125,6 @@ def _val_field_id(ds: lance.LanceDataset) -> int:
 
 def commit_overlay_layers(
     ds: lance.LanceDataset,
-    base_path: str,
     num_layers: int,
     fraction: float,
     pattern: str,
@@ -215,11 +214,6 @@ def file_sizes(path: str) -> dict:
     return out
 
 
-def dir_size(path: str) -> int:
-    """Total bytes of all files under ``path`` (persisted storage cost)."""
-    return sum(file_sizes(path).values())
-
-
 def written_breakdown(before: dict, after: dict) -> Tuple[int, int]:
     """Split newly written/grown bytes (``after`` vs ``before`` snapshots) into
     (data_bytes, metadata_bytes). Data is everything under ``data/``; metadata is
@@ -238,5 +232,7 @@ def written_breakdown(before: dict, after: dict) -> Tuple[int, int]:
 
 def manifest_size(ds: lance.LanceDataset) -> int:
     """Size in bytes of the manifest for the dataset's current version."""
+    # Manifests are named `{u64::MAX - version}.manifest` so that a plain
+    # lexicographic directory listing yields newest-version-first.
     name = f"{(1 << 64) - 1 - ds.version}.manifest"
     return os.path.getsize(os.path.join(_local_path(ds), "_versions", name))

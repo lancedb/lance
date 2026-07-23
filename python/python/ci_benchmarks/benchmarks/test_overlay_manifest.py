@@ -35,10 +35,14 @@ def test_overlay_manifest_size(
     base_bytes = manifest_size(ds)
 
     if num_overlays:
-        ds = commit_overlay_layers(ds, base, num_overlays, fraction, pattern, "int32")
+        ds = commit_overlay_layers(ds, num_overlays, fraction, pattern, "int32")
 
     total = manifest_size(ds)
     growth = total - base_bytes
+    # Guard the fixture: committed overlays must enlarge the manifest, else the
+    # benchmark would report growth=0 for overlays that were never recorded.
+    if num_overlays:
+        assert growth > 0, "overlays did not grow the manifest"
     per_overlay = growth / num_overlays if num_overlays else 0
 
     record_property("manifest_bytes", total)

@@ -110,7 +110,7 @@ def test_overlay_write_cost(tmp_path, record_property, approach, width):
                 _new_rows(ids, payload_dim)
             )
         elif approach == "overlay":
-            ds = commit_overlay_layers(ds, base, 1, UPDATE_FRACTION, "stride", "int32")
+            ds = commit_overlay_layers(ds, 1, UPDATE_FRACTION, "stride", "int32")
         elif approach == "full_rewrite":
             table = ds.to_table()
             val = table.column("val").to_numpy(zero_copy_only=False).copy()
