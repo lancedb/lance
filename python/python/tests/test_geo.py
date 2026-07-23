@@ -153,3 +153,57 @@ def test_rtree_index(tmp_path: Path):
     table_with_index = query(ds, has_index=True)
 
     assert table_with_index == table_without_index
+
+
+def test_rtree_segment_merge_and_commit(tmp_path: Path):
+    num_points = 120
+    points_2d = points(
+        [
+            np.arange(num_points, dtype=np.float64),
+            np.arange(num_points, dtype=np.float64),
+        ]
+    )
+    schema = pa.schema(
+        [
+            pa.field("id", pa.int64()),
+            pa.field(point("xy")).with_name("point"),
+        ]
+    )
+    table = pa.Table.from_arrays(
+        [np.arange(num_points, dtype=np.int64), points_2d], schema=schema
+    )
+    ds = lance.write_dataset(
+        table,
+        str(tmp_path / "segmented_rtree.lance"),
+        max_rows_per_file=40,
+    )
+    fragments = ds.get_fragments()
+    segments = [
+        ds.create_index_uncommitted(
+            column="point",
+            index_type="RTREE",
+            name="point_rtree",
+            fragment_ids=[fragment.fragment_id],
+        )
+        for fragment in fragments
+    ]
+
+    merged = ds.merge_existing_index_segments(segments)
+    assert set(merged.fragment_ids) == {fragment.fragment_id for fragment in fragments}
+    ds = ds.commit_existing_index_segments("point_rtree", "point", [merged])
+
+    sql = """
+          SELECT id, point
+          FROM dataset
+          WHERE St_Intersects(point, ST_GeomFromText('LINESTRING (10 10, 20 20)'))
+          """
+    indexed = pa.Table.from_batches(ds.sql(sql).build().to_batch_records())
+    assert indexed["id"].to_pylist() == list(range(10, 21))
+    explain = (
+        pa.Table.from_batches(
+            ds.sql("EXPLAIN ANALYZE " + sql).build().to_batch_records()
+        )
+        .to_pandas()
+        .to_string()
+    )
+    assert "ScalarIndexQuery" in explain

@@ -531,6 +531,14 @@ fn segment_has_label_list_details(segment: &IndexMetadata) -> bool {
         .is_some_and(|details| details.type_url.ends_with("LabelListIndexDetails"))
 }
 
+#[cfg(feature = "geo")]
+fn segment_has_rtree_details(segment: &IndexMetadata) -> bool {
+    segment
+        .index_details
+        .as_ref()
+        .is_some_and(|details| details.type_url.ends_with("RTreeIndexDetails"))
+}
+
 // Cache keys for different index types
 #[derive(Debug, Clone)]
 pub(crate) struct LegacyVectorIndexCacheKey<'a> {
@@ -1412,6 +1420,10 @@ impl DatasetIndexExt for Dataset {
         let all_fmindex = source_segments.iter().all(segment_has_fmindex_details);
         let all_zonemap = source_segments.iter().all(segment_has_zonemap_details);
         let all_label_list = source_segments.iter().all(segment_has_label_list_details);
+        #[cfg(feature = "geo")]
+        let all_rtree = source_segments.iter().all(segment_has_rtree_details);
+        #[cfg(not(feature = "geo"))]
+        let all_rtree = false;
         if !all_vector
             && !all_inverted
             && !all_bitmap
@@ -1420,6 +1432,7 @@ impl DatasetIndexExt for Dataset {
             && !all_fmindex
             && !all_zonemap
             && !all_label_list
+            && !all_rtree
         {
             return Err(Error::invalid_input(
                 "merge_existing_index_segments requires all segments to have the same supported index type"
@@ -1446,6 +1459,13 @@ impl DatasetIndexExt for Dataset {
             crate::index::scalar::label_list::merge_segments(self, source_segments).await?
         } else if all_zonemap {
             crate::index::scalar::zonemap::merge_segments(self, source_segments).await?
+        } else if all_rtree {
+            #[cfg(feature = "geo")]
+            {
+                crate::index::scalar::rtree::merge_segments(self, source_segments).await?
+            }
+            #[cfg(not(feature = "geo"))]
+            unreachable!("RTree segments require the geo feature")
         } else {
             crate::index::scalar::btree::merge_segments(self, source_segments).await?
         };

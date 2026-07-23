@@ -10,7 +10,8 @@ use crate::scalar::registry::{
 use crate::scalar::rtree::sort::Sorter;
 use crate::scalar::{
     AnyQuery, BuiltinIndexType, CreatedIndex, GeoQuery, IndexFile, IndexReader, IndexStore,
-    IndexWriter, RowIdRemapper, ScalarIndex, ScalarIndexParams, SearchResult, UpdateCriteria,
+    IndexWriter, OldIndexDataFilter, RowIdRemapper, ScalarIndex, ScalarIndexParams, SearchResult,
+    UpdateCriteria,
 };
 use crate::{Index, IndexType, pb};
 use arrow_array::UInt32Array;
@@ -426,6 +427,136 @@ impl RTreeIndex {
             merged,
         )))
     }
+}
+
+fn filter_keeps_nothing(filter: &Option<OldIndexDataFilter>) -> bool {
+    match filter {
+        Some(OldIndexDataFilter::Fragments { to_keep, .. }) => to_keep.is_empty(),
+        Some(OldIndexDataFilter::RowIds(valid)) => valid.is_empty(),
+        None => false,
+    }
+}
+
+fn filter_rtree_data(
+    data: SendableRecordBatchStream,
+    filter: OldIndexDataFilter,
+) -> SendableRecordBatchStream {
+    let schema = data.schema();
+    let filtered = data.map(move |batch_result| {
+        let batch = batch_result?;
+        let row_ids = batch
+            .column_by_name(ROW_ID)
+            .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
+            .ok_or_else(|| Error::internal("expected UInt64Array for RTree row ids"))?;
+        let mask = filter.filter_row_ids(row_ids);
+        Ok(arrow_select::filter::filter_record_batch(&batch, &mask)?)
+    });
+    Box::pin(RecordBatchStreamAdapter::new(schema, filtered))
+}
+
+fn remap_rtree_data(
+    data: SendableRecordBatchStream,
+    remapper: Arc<dyn RowIdRemapper>,
+) -> SendableRecordBatchStream {
+    let schema = data.schema();
+    let remapped = data.map(move |batch_result| {
+        let batch = batch_result?;
+        Ok(remapper.remap_row_ids_record_batch(batch, 1)?)
+    });
+    Box::pin(RecordBatchStreamAdapter::new(schema, remapped))
+}
+
+/// Merge caller-selected RTree segments into one self-contained segment.
+pub async fn merge_rtree_indices(
+    source_indices: &[Arc<RTreeIndex>],
+    dest_store: &dyn IndexStore,
+    old_data_filters: &[Option<OldIndexDataFilter>],
+) -> Result<CreatedIndex> {
+    if source_indices.is_empty() {
+        return Err(Error::invalid_input(
+            "merge_rtree_indices requires at least one source index",
+        ));
+    }
+    if source_indices.len() != old_data_filters.len() {
+        return Err(Error::invalid_input(format!(
+            "merge_rtree_indices received {} source indices but {} filters",
+            source_indices.len(),
+            old_data_filters.len()
+        )));
+    }
+
+    let first_contributing = source_indices
+        .iter()
+        .zip(old_data_filters)
+        .find(|(source, filter)| source.metadata.num_items > 0 && !filter_keeps_nothing(filter))
+        .or_else(|| {
+            source_indices
+                .iter()
+                .zip(old_data_filters)
+                .find(|(_, filter)| !filter_keeps_nothing(filter))
+        })
+        .map(|(source, _)| source)
+        .unwrap_or(&source_indices[0]);
+    let page_size = first_contributing.metadata.page_size;
+    let mut data_streams = Vec::with_capacity(source_indices.len());
+    let mut null_map = RowAddrTreeMap::new();
+    let mut total_bbox = BoundingBox::new();
+
+    for (source, filter) in source_indices.iter().zip(old_data_filters) {
+        if filter_keeps_nothing(filter) {
+            continue;
+        }
+        if source.metadata.num_items > 0 && source.metadata.page_size != page_size {
+            return Err(Error::invalid_input(format!(
+                "cannot merge RTree segments with different page sizes: {} and {}",
+                page_size, source.metadata.page_size
+            )));
+        }
+        if source.metadata.num_items > 0 {
+            total_bbox.add_rect(&source.metadata.bbox);
+        }
+
+        let mut source_nulls = source.search_null(&NoOpMetricsCollector).await?;
+        if let Some(remapper) = &source.frag_reuse_index {
+            source_nulls = remapper.remap_row_addrs_tree_map(&source_nulls);
+        }
+        if let Some(filter) = filter {
+            filter.retain_old_rows(&mut source_nulls);
+        }
+        null_map |= &source_nulls;
+
+        let mut data = source.as_ref().clone().into_data_stream().await?;
+        if let Some(remapper) = source.frag_reuse_index.clone() {
+            data = remap_rtree_data(data, remapper);
+        }
+        data_streams.push(match filter {
+            Some(filter) => filter_rtree_data(data, filter.clone()),
+            None => data,
+        });
+    }
+
+    let combined = Box::pin(RecordBatchStreamAdapter::new(
+        BBOX_ROWID_SCHEMA.clone(),
+        stream::select_all(data_streams),
+    ));
+    let tmpdir = Arc::new(TempDir::default());
+    let spill_store = Arc::new(LanceIndexStore::new(
+        Arc::new(ObjectStore::local()),
+        tmpdir.obj_path(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    let (bbox_data, mut stats) =
+        RTreeIndexPlugin::process_and_analyze_bbox_stream(combined, page_size, spill_store).await?;
+    stats.null_map = null_map;
+    stats.total_bbox = total_bbox;
+    let files =
+        RTreeIndexPlugin::train_rtree_index(bbox_data, stats, page_size, dest_store).await?;
+
+    Ok(CreatedIndex {
+        index_details: prost_types::Any::from_msg(&pb::RTreeIndexDetails::default())?,
+        index_version: RTREE_INDEX_VERSION,
+        files,
+    })
 }
 
 impl DeepSizeOf for RTreeIndex {
@@ -923,15 +1054,9 @@ impl BasicTrainer for RTreeIndexPlugin {
         data: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
         request: Box<dyn TrainingRequest>,
-        fragment_ids: Option<Vec<u32>>,
+        _fragment_ids: Option<Vec<u32>>,
         _progress: Arc<dyn crate::progress::IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
-        if fragment_ids.is_some() {
-            return Err(Error::invalid_input_source(
-                "RTree index does not support fragment training".into(),
-            ));
-        }
-
         Self::validate_schema(&data.schema())?;
 
         let request = request
@@ -1012,6 +1137,7 @@ struct EncodedBatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::frag_reuse::{FragReuseIndex, FragReuseIndexDetails, FragReuseIndexHandle};
     use crate::metrics::NoOpMetricsCollector;
     use crate::scalar::registry::VALUE_COLUMN_NAME;
     use arrow_array::ArrayRef;
@@ -1176,6 +1302,99 @@ mod tests {
         expected_nulls.sort();
 
         assert_eq!(actual_nulls, expected_nulls);
+    }
+
+    #[tokio::test]
+    async fn test_merge_rtree_indices_filters_rows_and_nulls() {
+        let point_type = PointType::new(Dimension::XY, Default::default());
+        let mut first_builder = PointBuilder::new(point_type.clone());
+        first_builder.push_point(Some(&geo_types::point!(x: 10.0, y: 10.0)));
+        first_builder.push_null();
+        let first = first_builder.finish();
+
+        let mut second_builder = PointBuilder::new(point_type);
+        second_builder.push_point(Some(&geo_types::point!(x: 100.0, y: 100.0)));
+        second_builder.push_null();
+        let second = second_builder.finish();
+        let empty = PointBuilder::new(PointType::new(Dimension::XY, Default::default())).finish();
+
+        let (empty_index, _empty_store, _empty_tmpdir) = train_index(&empty, Some(8)).await;
+        let (first_index, _first_store, _first_tmpdir) = train_index(&first, Some(4)).await;
+        let (second_index, _second_store, _second_tmpdir) = train_index(&second, Some(4)).await;
+        let mut near_origin = BoundingBox::new();
+        near_origin.add_rect(&Rect::new(
+            coord! { x: 9.0, y: 9.0 },
+            coord! { x: 11.0, y: 11.0 },
+        ));
+        let mut expected_geometry = RowAddrTreeMap::new();
+        expected_geometry.insert(0);
+        assert_eq!(
+            first_index
+                .search_bbox(near_origin, &NoOpMetricsCollector)
+                .await
+                .unwrap(),
+            expected_geometry
+        );
+        let merged_tmpdir = TempObjDir::default();
+        let merged_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            merged_tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let remapped_geometry = RowAddress::new_from_parts(2, 0).into();
+        let remapped_null = RowAddress::new_from_parts(2, 1).into();
+        expected_geometry = RowAddrTreeMap::new();
+        expected_geometry.insert(remapped_geometry);
+        let remapper = FragReuseIndexHandle(Arc::new(FragReuseIndex::new(
+            uuid::Uuid::new_v4(),
+            vec![HashMap::from([
+                (0, Some(remapped_geometry)),
+                (1, Some(remapped_null)),
+            ])],
+            FragReuseIndexDetails { versions: vec![] },
+        )));
+        let mut first_index = first_index.as_ref().clone();
+        first_index.frag_reuse_index = Some(Arc::new(remapper));
+
+        let mut keep_first_rows = RowAddrTreeMap::new();
+        keep_first_rows.insert(remapped_geometry);
+        keep_first_rows.insert(remapped_null);
+        merge_rtree_indices(
+            &[empty_index, Arc::new(first_index), second_index],
+            merged_store.as_ref(),
+            &[
+                None,
+                Some(OldIndexDataFilter::RowIds(keep_first_rows)),
+                Some(OldIndexDataFilter::RowIds(RowAddrTreeMap::new())),
+            ],
+        )
+        .await
+        .unwrap();
+
+        let merged = RTreeIndex::load(merged_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        assert_eq!(merged.metadata.num_items, 1);
+        assert!(
+            merged.metadata.bbox.rect_intersects(&near_origin),
+            "merged bounds {:?} do not intersect {:?}",
+            merged.metadata.bbox,
+            near_origin
+        );
+        assert_eq!(
+            merged
+                .search_bbox(near_origin, &NoOpMetricsCollector)
+                .await
+                .unwrap(),
+            expected_geometry
+        );
+        let mut expected_null = RowAddrTreeMap::new();
+        expected_null.insert(remapped_null);
+        assert_eq!(
+            merged.search_null(&NoOpMetricsCollector).await.unwrap(),
+            expected_null
+        );
     }
 
     #[tokio::test]
