@@ -18,7 +18,7 @@ use datafusion::prelude::SessionContext;
 use futures::TryStreamExt;
 use lance::dataset::Dataset as LanceDataset;
 use lance::dataset::mem_wal::scanner::{
-    FlushedGeneration, LsmDataSourceCollector, LsmPointLookupPlanner, LsmVectorSearchPlanner,
+    LsmDataSourceCollector, LsmPointLookupPlanner, LsmVectorSearchPlanner, SsTable,
     parse_filter_expr as parse_lsm_filter_expr,
 };
 use lance::dataset::mem_wal::write::{MemTableStats, WriteStatsSnapshot};
@@ -52,10 +52,10 @@ pub fn py_evaluate_sharding_spec<'py>(
     result.to_pyarrow(py)
 }
 
-/// Write a primary-key dedup sidecar (`_pk_index/`) for a flushed-generation
+/// Write a primary-key dedup sidecar (`_pk_index/`) for an SSTable
 /// dataset already written at `gen_path`, mirroring what production flush emits.
 ///
-/// Test-support only: lets Python tests stage a *faithful* flushed generation
+/// Test-support only: lets Python tests stage a *faithful* SSTable
 /// (dataset + sidecar). Production always writes the sidecar during flush, so a
 /// dataset-without-sidecar is not a state the system otherwise produces.
 #[pyfunction(name = "_write_pk_sidecar", signature = (gen_path, data, pk_columns))]
@@ -161,7 +161,7 @@ impl PyMergedGeneration {
 
 /// Snapshot of a MemWAL shard's state at a point in time.
 ///
-/// Used to specify which flushed generations to include when creating an
+/// Used to specify which SSTables to include when creating an
 /// `_LsmScanner`. Supports a builder pattern for adding generations.
 #[pyclass(name = "_ShardSnapshot", module = "_lib", skip_from_py_object)]
 #[derive(Clone)]
@@ -195,13 +195,13 @@ impl PyShardSnapshot {
         slf
     }
 
-    /// Add a flushed generation by its generation number and storage path.
-    pub fn with_flushed_generation(
+    /// Add an SSTable by its generation number and storage path.
+    pub fn with_sstable(
         mut slf: PyRefMut<'_, Self>,
         generation: u64,
         path: String,
     ) -> PyRefMut<'_, Self> {
-        slf.inner = slf.inner.clone().with_flushed_generation(generation, path);
+        slf.inner = slf.inner.clone().with_sstable(generation, path);
         slf
     }
 
@@ -212,10 +212,10 @@ impl PyShardSnapshot {
 
     pub fn __repr__(&self) -> String {
         format!(
-            "_ShardSnapshot(shard_id='{}', current_gen={}, flushed_gens={})",
+            "_ShardSnapshot(shard_id='{}', current_gen={}, sstables={})",
             self.inner.shard_id,
             self.inner.current_generation,
-            self.inner.flushed_generations.len()
+            self.inner.sstables.len()
         )
     }
 }
@@ -384,7 +384,7 @@ impl PyShardWriter {
 
     /// Create an LSM scanner that includes the active MemTable for strong consistency.
     ///
-    /// The scanner covers: base table + given flushed generations + current active MemTable.
+    /// The scanner covers: base table + given SSTables + current active MemTable.
     #[pyo3(signature = (shard_snapshots=vec![]))]
     pub fn lsm_scanner(
         &self,
@@ -537,7 +537,7 @@ impl PyExecutionPlan {
     }
 }
 
-/// LSM-aware scanner covering base table, flushed MemTables, and active MemTable.
+/// LSM-aware scanner covering base table, SSTables, and active MemTable.
 ///
 /// Provides deduplication by primary key, always returning the newest version
 /// of each row across all LSM levels.
@@ -1021,12 +1021,12 @@ fn shard_snapshot_from_manifest(manifest: lance_index::mem_wal::ShardManifest) -
         shard_id: manifest.shard_id,
         spec_id: manifest.shard_spec_id,
         current_generation: manifest.current_generation,
-        flushed_generations: manifest
-            .flushed_generations
+        sstables: manifest
+            .sstables
             .into_iter()
-            .map(|generation| FlushedGeneration {
-                generation: generation.generation,
-                path: generation.path,
+            .map(|sstable| SsTable {
+                generation: sstable.generation,
+                path: sstable.path,
             })
             .collect(),
     }

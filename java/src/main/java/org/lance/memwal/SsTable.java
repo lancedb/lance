@@ -15,22 +15,22 @@ package org.lance.memwal;
 
 import com.google.common.base.MoreObjects;
 
-/** A flushed MemWAL generation and the storage path of its Lance files. */
-public class FlushedGeneration {
+/** An SSTable and the storage path of its Lance files. */
+public class SsTable {
   private final long generation;
   private final String path;
 
-  public FlushedGeneration(long generation, String path) {
+  public SsTable(long generation, String path) {
     this.generation = generation;
     this.path = path;
   }
 
-  /** The generation number of this flushed MemTable. */
+  /** The generation number of this SSTable. */
   public long generation() {
     return generation;
   }
 
-  /** The storage path of the flushed Lance files. */
+  /** The storage path of the SSTable Lance files. */
   public String path() {
     return path;
   }

@@ -15,27 +15,27 @@ pub const MEM_WAL_INDEX_NAME: &str = "__lance_mem_wal";
 /// Type alias for shard identifier (UUID v4).
 pub type ShardId = Uuid;
 
-/// A flushed MemTable generation and its storage location.
+/// An SSTable: a flushed MemTable generation, stored as a Lance dataset.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
-pub struct FlushedGeneration {
+pub struct SsTable {
     pub generation: u64,
     pub path: String,
 }
 
-impl From<&FlushedGeneration> for pb::FlushedGeneration {
-    fn from(fg: &FlushedGeneration) -> Self {
+impl From<&SsTable> for pb::SsTable {
+    fn from(sstable: &SsTable) -> Self {
         Self {
-            generation: fg.generation,
-            path: fg.path.clone(),
+            generation: sstable.generation,
+            path: sstable.path.clone(),
         }
     }
 }
 
-impl From<pb::FlushedGeneration> for FlushedGeneration {
-    fn from(fg: pb::FlushedGeneration) -> Self {
+impl From<pb::SsTable> for SsTable {
+    fn from(sstable: pb::SsTable) -> Self {
         Self {
-            generation: fg.generation,
-            path: fg.path,
+            generation: sstable.generation,
+            path: sstable.path,
         }
     }
 }
@@ -88,7 +88,7 @@ impl TryFrom<pb::MergedGeneration> for MergedGeneration {
 }
 
 /// Tracks which merged generation a base table index has been rebuilt to cover.
-/// Used to determine whether to read from flushed MemTable indexes or base table.
+/// Used to determine whether to read from SSTable indexes or base table.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
 pub struct IndexCatchupProgress {
     pub index_name: String,
@@ -198,7 +198,7 @@ pub struct ShardManifest {
     /// 1-based.
     pub wal_entry_position_last_seen: u64,
     pub current_generation: u64,
-    pub flushed_generations: Vec<FlushedGeneration>,
+    pub sstables: Vec<SsTable>,
     /// Lifecycle status (drop-table 2PC). Defaults to `Active`; preserved
     /// across claims via `..base` so only fresh constructions set it.
     pub status: ShardStatus,
@@ -207,7 +207,7 @@ pub struct ShardManifest {
 impl DeepSizeOf for ShardManifest {
     fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.shard_field_values.deep_size_of_children(context)
-            + self.flushed_generations.deep_size_of_children(context)
+            + self.sstables.deep_size_of_children(context)
     }
 }
 
@@ -229,7 +229,7 @@ impl From<&ShardManifest> for pb::ShardManifest {
             replay_after_wal_entry_position: rm.replay_after_wal_entry_position,
             wal_entry_position_last_seen: rm.wal_entry_position_last_seen,
             current_generation: rm.current_generation,
-            flushed_generations: rm.flushed_generations.iter().map(|fg| fg.into()).collect(),
+            sstables: rm.sstables.iter().map(|sstable| sstable.into()).collect(),
             status: rm.status.to_i32(),
         }
     }
@@ -258,11 +258,7 @@ impl TryFrom<pb::ShardManifest> for ShardManifest {
             replay_after_wal_entry_position: rm.replay_after_wal_entry_position,
             wal_entry_position_last_seen: rm.wal_entry_position_last_seen,
             current_generation: rm.current_generation,
-            flushed_generations: rm
-                .flushed_generations
-                .into_iter()
-                .map(FlushedGeneration::from)
-                .collect(),
+            sstables: rm.sstables.into_iter().map(SsTable::from).collect(),
             status: ShardStatus::from_i32(rm.status),
         })
     }

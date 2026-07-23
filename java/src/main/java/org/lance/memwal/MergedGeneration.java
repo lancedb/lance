@@ -17,7 +17,7 @@ import com.google.common.base.MoreObjects;
 import com.google.common.base.Preconditions;
 
 /**
- * Identifies a flushed MemWAL generation that has been merged into the base table.
+ * Identifies an SSTable that has been merged into the base table.
  *
  * <p>Pass a list of these to {@link org.lance.merge.MergeInsertParams#markGenerationsAsMerged} so
  * Lance knows which generations are now part of the base table.
@@ -28,7 +28,7 @@ public class MergedGeneration {
 
   /**
    * @param shardId UUID string for the write shard
-   * @param generation generation number from {@link ShardSnapshot#flushedGenerations()}
+   * @param generation generation number from {@link ShardSnapshot#sstables()}
    */
   public MergedGeneration(String shardId, long generation) {
     Preconditions.checkNotNull(shardId, "shardId must not be null");

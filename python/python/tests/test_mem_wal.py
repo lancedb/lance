@@ -56,15 +56,15 @@ def _append_only_table(ids, prefix: str) -> pa.Table:
     )
 
 
-def _write_flushed_gen(base_path: str, shard_id: str, gen_folder: str, data: pa.Table):
-    """Write a flushed-generation Lance dataset at the expected sub-path.
+def _write_sstable(base_path: str, shard_id: str, gen_folder: str, data: pa.Table):
+    """Write an SSTable Lance dataset at the expected sub-path.
 
-    The collector resolves flushed generation paths as:
+    The collector resolves SSTable paths as:
         {base_dataset_path}/_mem_wal/{shard_id}/{gen_folder}
 
     Production flush also writes a primary-key dedup sidecar (`_pk_index/`) that
     the LSM scanner opens to dedup across generations; stage it here too so the
-    flushed generation faithfully matches what flush produces.
+    SSTable faithfully matches what flush produces.
     """
     from lance.lance import _write_pk_sidecar
 
@@ -75,15 +75,15 @@ def _write_flushed_gen(base_path: str, shard_id: str, gen_folder: str, data: pa.
 
 def test_point_lookup_with_memtables(tmp_path):
     """
-    Lookup against a base table that has one flushed generation containing an
-    update.  The flushed version must win over the base table version.
+    Lookup against a base table that has one SSTable containing an
+    update.  The SSTable version must win over the base table version.
 
     Setup
     -----
     base   : ids [1, 2, 3]  names ["base_1",  "base_2",  "base_3"]
     gen_1  : ids [2]        names ["gen1_2"]          ← update to id=2
 
-    ShardSnapshot: flushed_generation(gen=1, path="gen_1"), current_generation=2
+    ShardSnapshot: sstable(gen=1, path="gen_1"), current_generation=2
     """
     ds_path = str(tmp_path / "base")
     shard_id = str(uuid.uuid4())
@@ -94,20 +94,16 @@ def test_point_lookup_with_memtables(tmp_path):
     )
     base_ds.initialize_mem_wal()
 
-    # --- Flushed generation: overwrites id=2 ---
-    _write_flushed_gen(ds_path, shard_id, "gen_1", _lookup_table([2], "gen1"))
+    # --- SSTable: overwrites id=2 ---
+    _write_sstable(ds_path, shard_id, "gen_1", _lookup_table([2], "gen1"))
 
-    # --- ShardSnapshot describing the flushed state ---
-    snap = (
-        ShardSnapshot(shard_id)
-        .with_flushed_generation(1, "gen_1")
-        .with_current_generation(2)
-    )
+    # --- ShardSnapshot describing the SSTable state ---
+    snap = ShardSnapshot(shard_id).with_sstable(1, "gen_1").with_current_generation(2)
 
     planner = LsmPointLookupPlanner(base_ds, [snap])
     assert not hasattr(planner, "lookup")
 
-    # id=2 must return the flushed version
+    # id=2 must return the SSTable version
     plan = planner.plan_lookup(pa.array([2], type=pa.int64()))
     assert plan.schema.names == ["id", "name"]
     assert plan.dataset_schema.names == ["id", "name"]
@@ -116,7 +112,7 @@ def test_point_lookup_with_memtables(tmp_path):
     result = plan.to_table()
     assert len(result) == 1, "Expected exactly one row for id=2"
     assert result.column("name")[0].as_py() == "gen1_2", (
-        "Flushed generation must win over base table"
+        "SSTable must win over base table"
     )
 
     # id=1 is only in the base table
@@ -147,13 +143,9 @@ def test_lsm_scanner_with_memtables(tmp_path):
     )
     base_ds.initialize_mem_wal()
 
-    _write_flushed_gen(ds_path, shard_id, "gen_1", _lookup_table([2], "gen1"))
+    _write_sstable(ds_path, shard_id, "gen_1", _lookup_table([2], "gen1"))
 
-    snap = (
-        ShardSnapshot(shard_id)
-        .with_flushed_generation(1, "gen_1")
-        .with_current_generation(2)
-    )
+    snap = ShardSnapshot(shard_id).with_sstable(1, "gen_1").with_current_generation(2)
 
     scanner = LsmScanner.from_snapshots(base_ds, [snap])
     table = scanner.to_table()
@@ -162,7 +154,7 @@ def test_lsm_scanner_with_memtables(tmp_path):
     name_by_id = {row["id"]: row["name"] for row in table.to_pylist()}
 
     assert name_by_id[1] == "base_1"
-    assert name_by_id[2] == "gen1_2", "Flushed gen must overwrite base for id=2"
+    assert name_by_id[2] == "gen1_2", "SSTable gen must overwrite base for id=2"
     assert name_by_id[3] == "base_3"
 
     offset_table = (
@@ -171,7 +163,7 @@ def test_lsm_scanner_with_memtables(tmp_path):
     assert len(offset_table) == 2, "Offset-only LSM scan should not require a limit"
 
 
-def test_shard_writer_lsm_scanner_includes_own_flushed_generations(tmp_path):
+def test_shard_writer_lsm_scanner_includes_own_sstables(tmp_path):
     ds_path = str(tmp_path / "base")
     shard_id = str(uuid.uuid4())
     ds = lance.write_dataset(_lookup_table([0], "base"), ds_path, schema=_LOOKUP_SCHEMA)
@@ -193,7 +185,7 @@ def test_shard_writer_lsm_scanner_includes_own_flushed_generations(tmp_path):
             if name_by_id.get(1) == "writer_1" and name_by_id.get(2) == "writer_2":
                 break
             if time.time() >= deadline:
-                assert False, "writer.lsm_scanner() did not include flushed writer rows"
+                assert False, "writer.lsm_scanner() did not include SSTable writer rows"
             time.sleep(0.05)
 
 
@@ -333,7 +325,7 @@ def test_shard_writer_e2e_correctness(tmp_path):
     End-to-end correctness test for ShardWriter covering:
     - Multi-round writes that trigger WAL and MemTable flushes
     - File-system layout verification (_mem_wal/<shard_id>/wal/ and manifest/)
-    - Flushed generation data readable via LsmScanner
+    - SSTable data readable via LsmScanner
     - New writer created after close can write and scan correctly
 
     Mirrors Rust test: shard_writer_tests::test_shard_writer_e2e_correctness

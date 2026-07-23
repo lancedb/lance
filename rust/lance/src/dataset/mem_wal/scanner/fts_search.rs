@@ -4,7 +4,7 @@
 //! Full-text search planner for LSM scanner (local scoring).
 //!
 //! Builds an execution plan that scores an FTS query across the base
-//! table, flushed memtable generations, and the active/frozen-undrained
+//! table, SSTable generations, and the active/frozen-undrained
 //! in-memory memtables, returning rows ordered by BM25 `_score` DESC.
 //!
 //! # Scoring
@@ -22,17 +22,17 @@
 //! benchmark in this PR shows it carries a real latency penalty, so the
 //! local path lands first and the global option is optimized separately.
 //!
-//! Staleness: within a flushed generation, the deletion vector written
+//! Staleness: within an SSTable, the deletion vector written
 //! at flush time (see #6929) already masks rows superseded by a newer
 //! generation, so per-source results are clean within each tier. The
-//! same primary key can still appear across tiers (active vs flushed)
+//! same primary key can still appear across tiers (active vs SSTable)
 //! when an updated row sits in the active memtable while the older
-//! copy lives in a flushed generation; cross-tier deduplication is
+//! copy lives in an SSTable; cross-tier deduplication is
 //! left to the caller in local mode.
 //!
 //! Everything here is contained in the `mem_wal` module — it reuses the
 //! existing per-source FTS read paths (`scanner.full_text_search` for
-//! base/flushed Lance datasets, `MemTableScanner` for the active
+//! base/SSTable Lance datasets, `MemTableScanner` for the active
 //! memtable) and requires no changes to `lance-index`.
 
 use std::sync::Arc;
@@ -54,8 +54,8 @@ use super::block_list::compute_source_block_lists;
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
 use super::exec::PkBlockFilterExec;
-use super::flushed_cache::{DatasetCache, GenerationWarmer, open_flushed_dataset};
 use super::projection::{project_to_canonical, validate_projection_names};
+use super::sstable_cache::{DatasetCache, SsTableWarmer, open_sstable};
 use crate::dataset::mem_wal::memtable::scanner::MemTableScanner;
 use crate::session::Session;
 use lance_io::object_store::ObjectStoreParams;
@@ -110,18 +110,18 @@ pub struct LsmFtsSearchPlanner {
     collector: LsmDataSourceCollector,
     pk_columns: Vec<String>,
     base_schema: SchemaRef,
-    /// Session threaded into flushed-generation opens (shared caches).
+    /// Session threaded into SSTable opens (shared caches).
     session: Option<Arc<Session>>,
-    /// Store params for opening flushed generations, reusing the base dataset's store.
+    /// Store params for opening SSTables, reusing the base dataset's store.
     store_params: Option<ObjectStoreParams>,
-    /// Cache of opened flushed-generation datasets.
-    flushed_cache: Option<Arc<dyn DatasetCache>>,
-    /// Optional warmer fired on first open of a flushed generation.
-    warmer: Option<Arc<dyn GenerationWarmer>>,
+    /// Cache of opened SSTable datasets.
+    sstable_cache: Option<Arc<dyn DatasetCache>>,
+    /// Optional warmer fired on first open of an SSTable.
+    warmer: Option<Arc<dyn SsTableWarmer>>,
     /// Over-fetch multiple for blocked sources.
     overfetch_factor: f64,
     /// Optional prefilter predicate applied to every source arm so FTS hits
-    /// failing the predicate are dropped. Base/flushed arms use the dataset
+    /// failing the predicate are dropped. Base/SSTable arms use the dataset
     /// scanner's native filter; memtable arms filter the materialized hits.
     filter: Option<Expr>,
 }
@@ -139,7 +139,7 @@ impl LsmFtsSearchPlanner {
             base_schema,
             session: None,
             store_params: None,
-            flushed_cache: None,
+            sstable_cache: None,
             warmer: None,
             overfetch_factor: DEFAULT_OVERFETCH_FACTOR,
             filter: None,
@@ -148,7 +148,7 @@ impl LsmFtsSearchPlanner {
 
     /// Attach an optional prefilter predicate. Every source arm restricts its
     /// FTS hits to rows matching the predicate, matching a normal filtered
-    /// full-text scan over base ∪ flushed ∪ in-memory data.
+    /// full-text scan over base ∪ SSTables ∪ in-memory data.
     pub fn with_filter(mut self, filter: Option<Expr>) -> Self {
         self.filter = filter;
         self
@@ -162,27 +162,27 @@ impl LsmFtsSearchPlanner {
         self
     }
 
-    /// Set the session used to open flushed generations.
+    /// Set the session used to open SSTables.
     pub fn with_session(mut self, session: Arc<Session>) -> Self {
         self.session = Some(session);
         self
     }
 
-    /// Set the store params used to open flushed generations.
+    /// Set the store params used to open SSTables.
     pub fn with_store_params(mut self, store_params: ObjectStoreParams) -> Self {
         self.store_params = Some(store_params);
         self
     }
 
-    /// Inject a cache of opened flushed-generation datasets, making repeated
+    /// Inject a cache of opened SSTable datasets, making repeated
     /// searches against the same generation a pure `Arc::clone`.
-    pub fn with_flushed_cache(mut self, cache: Arc<dyn DatasetCache>) -> Self {
-        self.flushed_cache = Some(cache);
+    pub fn with_sstable_cache(mut self, cache: Arc<dyn DatasetCache>) -> Self {
+        self.sstable_cache = Some(cache);
         self
     }
 
-    /// Inject the warmer fired on first open of a flushed generation.
-    pub fn with_warmer(mut self, warmer: Arc<dyn GenerationWarmer>) -> Self {
+    /// Inject the warmer fired on first open of an SSTable.
+    pub fn with_warmer(mut self, warmer: Arc<dyn SsTableWarmer>) -> Self {
         self.warmer = Some(warmer);
         self
     }
@@ -193,7 +193,7 @@ impl LsmFtsSearchPlanner {
     ///
     /// * `column` — text column to search.
     /// * `query` — the FTS query (match / phrase / boolean / fuzzy for
-    ///   base/flushed Lance sources; the active memtable currently
+    ///   base/SSTable Lance sources; the active memtable currently
     ///   supports `MatchQuery`).
     /// * `limit` — optional global top-k to return.
     /// * `projection` — user columns to project. PK columns are
@@ -238,7 +238,7 @@ impl LsmFtsSearchPlanner {
             &sources,
             self.session.as_ref(),
             self.store_params.as_ref(),
-            self.flushed_cache.as_ref(),
+            self.sstable_cache.as_ref(),
         ))
         .await?;
 
@@ -380,12 +380,12 @@ impl LsmFtsSearchPlanner {
                 scanner.full_text_search(bound_query)?;
                 scanner.create_plan().await
             }
-            LsmDataSource::FlushedMemTable { path, .. } => {
-                let dataset = open_flushed_dataset(
+            LsmDataSource::SsTable { path, .. } => {
+                let dataset = open_sstable(
                     path,
                     self.session.as_ref(),
                     self.store_params.as_ref(),
-                    self.flushed_cache.as_ref(),
+                    self.sstable_cache.as_ref(),
                     self.warmer.as_ref(),
                 )
                 .await?;
@@ -622,7 +622,7 @@ mod tests {
     #[tokio::test]
     async fn local_mode_unions_base_and_active_with_consistent_score_schema() {
         // Regression for the `_score` nullability mismatch between
-        // FtsIndexExec (active arm) and FTS_SCHEMA (base/flushed). The
+        // FtsIndexExec (active arm) and FTS_SCHEMA (base/SSTable). The
         // active-only test below would not catch this — UnionExec rejects
         // schema-inequality, so we need at least one base + one active
         // source to exercise that code path.
@@ -829,12 +829,12 @@ mod tests {
         );
     }
 
-    /// The flushed arm must apply the filter as a true FTS prefilter, and that
+    /// The SSTable arm must apply the filter as a true FTS prefilter, and that
     /// prefiltered candidate set must compose with cross-generation block-list
     /// filtering plus over-fetch. Gen 1's best predicate-matching hit (id=3) is
     /// superseded by gen 2; with over-fetch, gen 1 should still contribute id=4.
     #[tokio::test]
-    async fn prefilter_on_flushed_composes_with_block_list() {
+    async fn prefilter_on_sstable_composes_with_block_list() {
         use crate::dataset::mem_wal::scanner::data_source::ShardSnapshot;
         use crate::index::DatasetIndexExt;
         use datafusion::prelude::{col, lit};
@@ -848,7 +848,7 @@ mod tests {
 
         // Gen 1: id=1 matches strongly but fails the predicate. id=3 matches
         // strongly but is stale (blocked by gen 2). id=4 is the next live
-        // predicate match that only survives if the flushed arm prefilters and
+        // predicate match that only survives if the SSTable arm prefilters and
         // over-fetches before the block-list drops id=3.
         let gen1_uri = format!("{}/_mem_wal/{}/gen_1", base_uri, shard_id);
         let mut gen1 = write_dataset(
@@ -886,8 +886,8 @@ mod tests {
 
         let snapshot = ShardSnapshot::new(shard_id)
             .with_current_generation(3)
-            .with_flushed_generation(1, "gen_1".to_string())
-            .with_flushed_generation(2, "gen_2".to_string());
+            .with_sstable(1, "gen_1".to_string())
+            .with_sstable(2, "gen_2".to_string());
         let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![snapshot]);
 
         let planner = LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], schema)
@@ -901,7 +901,7 @@ mod tests {
                 None,
             )
             .await
-            .expect("planner should produce a filtered flushed plan");
+            .expect("planner should produce a filtered SSTable plan");
 
         let ctx = datafusion::prelude::SessionContext::new();
         let stream = plan.execute(0, ctx.task_ctx()).unwrap();
@@ -922,7 +922,7 @@ mod tests {
         assert_eq!(
             ids,
             vec![4],
-            "flushed FTS prefilter should return live id=4 after stale id=3 is blocked; got {ids:?}"
+            "SSTable FTS prefilter should return live id=4 after stale id=3 is blocked; got {ids:?}"
         );
     }
 

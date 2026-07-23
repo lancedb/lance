@@ -48,7 +48,7 @@ pub use super::util::{WatchableOnceCell, WatchableOnceCellReader};
 pub use super::wal::{WalEntry, WalEntryData, WalFlushFailure, WalFlushResult, WalFlusher};
 
 use super::memtable::flush::TriggerMemTableFlush;
-use super::scanner::GenerationWarmer;
+use super::scanner::SsTableWarmer;
 use super::wal::{
     BatchDurableWatcher, TriggerIndexApply, TriggerWalFlush, WalAppender, WalFlushSource,
     WalOnlyState, WalRetryConfig, WalTailer, WriterCursors, apply_index_range, empty_flush_result,
@@ -165,14 +165,14 @@ pub struct ShardWriterConfig {
     pub stats_log_interval: Option<Duration>,
 
     /// How long a frozen memtable lingers in memory after its flush commits,
-    /// before it is evicted and served only from the on-disk flushed dataset.
+    /// before it is evicted and served only from the on-disk SSTable dataset.
     ///
     /// `Duration::ZERO` (the default) disables retention: evict on commit, no
     /// sweep ticker. Correct for single-shot queries, which can't observe a
     /// generation evicted mid-read.
     ///
     /// A non-zero value is required only for queries split across reads (e.g.
-    /// fresh tier and base table read separately, then deduped): the flushed
+    /// fresh tier and base table read separately, then deduped): the SSTable
     /// dataset loses the per-batch boundaries that bound as-of membership
     /// (see [`crate::dataset::mem_wal::scanner::FreshTierWatermark`]), so a
     /// generation evicted between a query's reads can serve a stale row. Set it
@@ -210,7 +210,7 @@ pub struct ShardWriterConfig {
     /// These control the in-memory HNSW graph this writer builds for its
     /// MemTable (and, on flush, the on-disk graph serialized from it). They are
     /// a property of the writer that builds the MemTable, not of the index
-    /// definition: each flushed generation is independent, so different writers
+    /// definition: each SSTable is independent, so different writers
     /// may use different parameters. An index without an entry uses the default
     /// build parameters. `num_edges` is the HNSW graph degree (level 0 retains
     /// `2 * num_edges`), equivalent to FAISS's `M`.
@@ -221,7 +221,7 @@ pub struct ShardWriterConfig {
     /// Optional warmer fired pre-commit for each new generation (zero cold reads
     /// on first query). Wired to the flusher; supplied by the consumer (e.g. the
     /// WAL pod). Default: `None`.
-    pub warmer: Option<Arc<dyn GenerationWarmer>>,
+    pub warmer: Option<Arc<dyn SsTableWarmer>>,
 
     /// Store params the base dataset was opened with, reused for the flusher's
     /// opens + writes (base + generations). Injected by `mem_wal_writer`; set
@@ -351,7 +351,7 @@ impl ShardWriterConfig {
         self
     }
 
-    /// Set how long a flushed memtable lingers in memory before eviction. MUST
+    /// Set how long an SSTable lingers in memory before eviction. MUST
     /// exceed the maximum query elapsed time — see `frozen_memtable_grace`.
     pub fn with_frozen_memtable_grace(mut self, grace: Duration) -> Self {
         self.frozen_memtable_grace = grace;
@@ -818,7 +818,7 @@ fn now_millis() -> u64 {
     start_time().elapsed().as_millis() as u64
 }
 
-/// Replay WAL entries written after the last successfully-flushed generation
+/// Replay WAL entries written after the last successfully-flushed SSTable
 /// into the freshly-built MemTable. Updates any in-memory indexes attached to
 /// the MemTable so replayed rows are immediately searchable.
 ///
@@ -857,7 +857,7 @@ struct ReplayResult {
 /// `make_memtable(generation, global_offset)` builds a fresh, cursor-bound
 /// memtable. Rotation happens at WAL-entry boundaries, never mid-entry, so each
 /// sealed memtable covers a clean range of complete entries and stamps the last
-/// one as its flushed generation's `replay_after_wal_entry_position`.
+/// one as its SSTable's `replay_after_wal_entry_position`.
 #[allow(clippy::too_many_arguments)]
 async fn replay_memtable_from_wal(
     object_store: Arc<ObjectStore>,
@@ -877,7 +877,7 @@ async fn replay_memtable_from_wal(
     // starts at position 1. After flushing position N the cursor holds N
     // and replay starts at N+1. The arithmetic collapses to a single
     // saturating_add(1) in both cases — we deliberately do not consult
-    // `flushed_generations` here, since an external compactor may
+    // `sstables` here, since an external compactor may
     // legitimately drain that vector back to empty after merging its
     // contents into the base table.
     let start_position = manifest.replay_after_wal_entry_position.saturating_add(1);
@@ -1742,7 +1742,7 @@ impl ShardWriter {
         );
 
         // Replay any WAL entries written after the last successfully-flushed
-        // generation, flushing sealed memtables to Lance generations as the batch
+        // SSTable, flushing sealed memtables to Lance SSTables as the batch
         // store fills. Each entry's writer_epoch is checked against ours; an entry
         // with a strictly greater epoch means a successor claimed the shard
         // between our `claim_epoch` and replay, so we abort with a fence error.
@@ -1794,8 +1794,8 @@ impl ShardWriter {
         // it is durably reflected in this writer's memtable. We can't
         // seed from `manifest.wal_entry_position_last_seen` — that field
         // is bumped on every successful tailer read by other readers, so
-        // it may sit above what's actually covered by any flushed
-        // generation. Subtracting 1 from a fresh shard's `next_wal_position`
+        // it may sit above what's actually covered by any
+        // SSTable. Subtracting 1 from a fresh shard's `next_wal_position`
         // of `FIRST_WAL_ENTRY_POSITION` (= 1) yields 0, which correctly
         // means "no entry covered yet."
         let initial_covered_wal_entry_position = next_wal_position.saturating_sub(1);
@@ -1830,7 +1830,7 @@ impl ShardWriter {
         )?;
 
         // Background MemTable flush handler — frozen memtable to Lance file.
-        // It rebuilds the same secondary indexes on each flushed generation.
+        // It rebuilds the same secondary indexes on each SSTable.
         let memtable_handler = MemTableFlushHandler::new(
             state.clone(),
             flusher,
@@ -3134,9 +3134,9 @@ struct MemTableFlushHandler {
     /// covers the whole frozen memtable before it writes a generation.
     wal_flusher: Arc<WalFlusher>,
     epoch: u64,
-    /// Secondary index configs to rebuild on each flushed generation. When
+    /// Secondary index configs to rebuild on each SSTable. When
     /// non-empty the handler flushes via [`MemTableFlusher::flush_with_indexes`]
-    /// so queries over flushed generations use index lookups instead of full
+    /// so queries over SSTables use index lookups instead of full
     /// scans — and so vector search's index-only `fast_search` can see the data
     /// at all.
     index_configs: Vec<MemIndexConfig>,
@@ -3267,7 +3267,7 @@ impl MemTableFlushHandler {
             let covered_wal_entry_position = wal_flushed_position
                 .or_else(|| memtable.frozen_at_wal_entry_position())
                 .unwrap_or(0);
-            // Rebuild secondary indexes on the flushed generation so later
+            // Rebuild secondary indexes on the SSTable so later
             // queries hit an index instead of scanning. Skip the extra
             // dataset open when there are no indexes to build. The indexed
             // path's future is boxed to keep this async block's nesting
@@ -3318,15 +3318,15 @@ impl MemTableFlushHandler {
             // the read union until a later flush or WAL replay, else a transient
             // error reopens the hole.
             if flush_result.is_ok() {
-                let flushed_generation = memtable.generation();
+                let sstable = memtable.generation();
                 if self.grace.is_zero() {
                     state
                         .frozen_memtables
-                        .retain(|frozen| frozen.memtable.generation() != flushed_generation);
+                        .retain(|frozen| frozen.memtable.generation() != sstable);
                 } else {
                     let now = now_millis();
                     for frozen in state.frozen_memtables.iter_mut() {
-                        if frozen.memtable.generation() == flushed_generation {
+                        if frozen.memtable.generation() == sstable {
                             frozen.flushed_at_ms = Some(now);
                         }
                     }
@@ -3341,7 +3341,7 @@ impl MemTableFlushHandler {
 
         info!(
             "Flushed frozen memtable generation {} ({} rows in {:?})",
-            result.generation.generation,
+            result.sstable.generation,
             result.rows_flushed,
             start.elapsed()
         );
@@ -3962,7 +3962,7 @@ mod tests {
     /// with an optional filter. Mirrors how a query reads a WAL table after a
     /// flush — the path the wallop fuzz exercised when it caught a deleted row
     /// resurfacing.
-    async fn read_flushed_ids_via_lsm(
+    async fn read_sstable_ids_via_lsm(
         writer: &ShardWriter,
         schema: Arc<ArrowSchema>,
         base_uri: &str,
@@ -3975,8 +3975,8 @@ mod tests {
         let manifest = writer.manifest().await.unwrap().unwrap();
         let mut snapshot =
             ShardSnapshot::new(shard_id).with_current_generation(manifest.current_generation);
-        for fg in &manifest.flushed_generations {
-            snapshot = snapshot.with_flushed_generation(fg.generation, fg.path.clone());
+        for sstable in &manifest.sstables {
+            snapshot = snapshot.with_sstable(sstable.generation, sstable.path.clone());
         }
         let mut scanner = LsmScanner::without_base_table(
             schema,
@@ -4018,7 +4018,7 @@ mod tests {
     }
 
     /// Delete a key, then flush: the tombstone and the live row land in the
-    /// *same* flushed generation, so flush-time dedup must keep the tombstone
+    /// *same* SSTable, so flush-time dedup must keep the tombstone
     /// (newest) and the read must fold it away. Regression for the wallop
     /// phantom (deleted row resurfacing in a filtered read after flush).
     #[tokio::test]
@@ -4047,14 +4047,14 @@ mod tests {
         writer.wait_for_flush_drain().await.unwrap();
 
         assert_eq!(
-            read_flushed_ids_via_lsm(&writer, schema.clone(), &base_uri, shard_id, None).await,
+            read_sstable_ids_via_lsm(&writer, schema.clone(), &base_uri, shard_id, None).await,
             vec![0, 1, 3, 4],
-            "id=2 deleted before flush; tombstone must not surface in a flushed-gen scan"
+            "id=2 deleted before flush; tombstone must not surface in an SSTable scan"
         );
         // The filtered read path (folds NOT _tombstone into the predicate) must
         // also drop it — this is the exact wallop failure shape (`id < 3`).
         assert_eq!(
-            read_flushed_ids_via_lsm(&writer, schema.clone(), &base_uri, shard_id, Some("id < 3"))
+            read_sstable_ids_via_lsm(&writer, schema.clone(), &base_uri, shard_id, Some("id < 3"))
                 .await,
             vec![0, 1],
             "filtered read after flush must not resurface deleted id=2"
@@ -4068,7 +4068,7 @@ mod tests {
     /// mask the older row by PK. This is the wallop scenario (seed flushed,
     /// then delete, then flush).
     #[tokio::test]
-    async fn test_shard_writer_delete_across_flushed_generations() {
+    async fn test_shard_writer_delete_across_sstables() {
         let (store, base_path, base_uri, _temp) = create_local_store().await;
         let schema = create_pk_test_schema();
         let shard_id = Uuid::new_v4();
@@ -4097,12 +4097,12 @@ mod tests {
         writer.wait_for_flush_drain().await.unwrap();
 
         assert_eq!(
-            read_flushed_ids_via_lsm(&writer, schema.clone(), &base_uri, shard_id, None).await,
+            read_sstable_ids_via_lsm(&writer, schema.clone(), &base_uri, shard_id, None).await,
             vec![1, 2, 3, 4],
             "id=0 tombstoned in a newer gen must mask the older gen's live row"
         );
         assert_eq!(
-            read_flushed_ids_via_lsm(&writer, schema.clone(), &base_uri, shard_id, Some("id < 1"))
+            read_sstable_ids_via_lsm(&writer, schema.clone(), &base_uri, shard_id, Some("id < 1"))
                 .await,
             Vec::<i32>::new(),
             "filtered read 'id < 1' must not resurface cross-gen deleted id=0"
@@ -4111,13 +4111,13 @@ mod tests {
         writer.close().await.unwrap();
     }
 
-    /// Same as the cross-generation case, but the flushed generations carry a
+    /// Same as the cross-generation case, but the SSTables carry a
     /// BTree index on `id` (as every wallop table does). A filtered read
     /// `id < 1` resolves through the scalar index; the `NOT _tombstone` residual
     /// must still be applied or the deleted row leaks. This is the exact wallop
     /// failure (BTree id + `FilteredRead 'id < 1'` resurfacing deleted id=0).
     #[tokio::test]
-    async fn test_shard_writer_delete_across_flushed_generations_indexed() {
+    async fn test_shard_writer_delete_across_sstables_indexed() {
         let (store, base_path, base_uri, _temp) = create_local_store().await;
         let schema = create_pk_test_schema();
         let shard_id = Uuid::new_v4();
@@ -4149,12 +4149,12 @@ mod tests {
         writer.wait_for_flush_drain().await.unwrap();
 
         assert_eq!(
-            read_flushed_ids_via_lsm(&writer, schema.clone(), &base_uri, shard_id, None).await,
+            read_sstable_ids_via_lsm(&writer, schema.clone(), &base_uri, shard_id, None).await,
             vec![1, 2, 3, 4],
             "indexed cross-gen: full scan must mask deleted id=0"
         );
         assert_eq!(
-            read_flushed_ids_via_lsm(&writer, schema.clone(), &base_uri, shard_id, Some("id < 1"))
+            read_sstable_ids_via_lsm(&writer, schema.clone(), &base_uri, shard_id, Some("id < 1"))
                 .await,
             Vec::<i32>::new(),
             "indexed filtered read 'id < 1' must not resurface deleted id=0 (wallop repro)"
@@ -4528,12 +4528,12 @@ mod tests {
     }
 
     /// End-to-end check that the background flush handler rebuilds secondary
-    /// indexes on every flushed generation. Before this, the handler flushed
-    /// via plain `flush`, leaving flushed generations unindexed — point
+    /// indexes on every SSTable. Before this, the handler flushed
+    /// via plain `flush`, leaving SSTables unindexed — point
     /// lookups had to full-scan and vector search's index-only `fast_search`
     /// couldn't see the data at all.
     #[tokio::test]
-    async fn test_flushed_generation_is_indexed() {
+    async fn test_sstable_is_indexed() {
         use crate::index::DatasetIndexExt;
 
         let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
@@ -4577,22 +4577,18 @@ mod tests {
         writer.force_seal_active().await.unwrap();
         writer.wait_for_flush_drain().await.unwrap();
 
-        // Resolve the flushed generation recorded in the manifest.
+        // Resolve the SSTable recorded in the manifest.
         let manifest = writer.manifest().await.unwrap().unwrap();
-        assert_eq!(
-            manifest.flushed_generations.len(),
-            1,
-            "expected exactly one flushed generation"
-        );
+        assert_eq!(manifest.sstables.len(), 1, "expected exactly one SSTable");
         let gen_uri = format!(
             "{}/_mem_wal/{}/{}",
-            base_uri, shard_id, manifest.flushed_generations[0].path
+            base_uri, shard_id, manifest.sstables[0].path
         );
 
-        // The flushed generation must carry the BTree index built during flush.
+        // The SSTable must carry the BTree index built during flush.
         let dataset = crate::Dataset::open(&gen_uri).await.unwrap();
         let indices = dataset.load_indices().await.unwrap();
-        assert_eq!(indices.len(), 1, "flushed generation should have one index");
+        assert_eq!(indices.len(), 1, "SSTable should have one index");
         assert_eq!(indices[0].name, "id_idx");
 
         // A PK filter over it must resolve through the index, not a full scan.
@@ -5830,13 +5826,13 @@ mod tests {
             // than writer B's memtable can.
         }
 
-        // Total rows across the active memtable plus every flushed generation.
+        // Total rows across the active memtable plus every SSTable.
         // Distinct ids, so no cross-generation dedup — a plain sum is exact.
         async fn total_rows(writer: &ShardWriter, base_uri: &str, shard_id: Uuid) -> usize {
             let mut rows = writer.memtable_stats().await.unwrap().row_count;
             let manifest = writer.manifest().await.unwrap().unwrap();
-            for fg in &manifest.flushed_generations {
-                let gen_uri = format!("{}/_mem_wal/{}/{}", base_uri, shard_id, fg.path);
+            for sstable in &manifest.sstables {
+                let gen_uri = format!("{}/_mem_wal/{}/{}", base_uri, shard_id, sstable.path);
                 let dataset = crate::Dataset::open(&gen_uri).await.unwrap();
                 rows += dataset.count_rows(None).await.unwrap();
             }
@@ -5859,11 +5855,11 @@ mod tests {
         // generation rather than holding it in memory or leaving it in the WAL.
         let manifest = writer_b.manifest().await.unwrap().unwrap();
         assert!(
-            !manifest.flushed_generations.is_empty(),
+            !manifest.sstables.is_empty(),
             "replay must have sealed and flushed at least one full memtable"
         );
 
-        // Every row survived, split between the flushed generations and the
+        // Every row survived, split between the SSTables and the
         // active (partial) memtable.
         assert_eq!(
             total_rows(&writer_b, &base_uri, shard_id).await as i32,
@@ -6396,13 +6392,13 @@ mod tests {
 
     /// Regression for the OSS-WAL compactor-drain bug: after a flush
     /// records its generation in the manifest and an external compactor
-    /// later drains `flushed_generations` back to empty (the legitimate
+    /// later drains `sstables` back to empty (the legitimate
     /// outcome of merging the generation into the base table), reopening
     /// the writer must not re-replay the already-flushed WAL entry into
     /// the active memtable.
     ///
     /// Under the pre-fix logic, replay disambiguated "fresh shard" from
-    /// "flushed-then-compacted" with `flushed_generations.is_empty()`,
+    /// "flushed-then-compacted" with `sstables.is_empty()`,
     /// which collapsed both cases into start-at-0. With 1-based WAL
     /// positions and a default cursor of 0 meaning "no flush stamped",
     /// the flush-then-drain sequence leaves `replay_after_wal_entry_position`
@@ -6416,7 +6412,7 @@ mod tests {
         let shard_id = Uuid::new_v4();
 
         // Writer A: write 5 rows, close (forces a flush of the active
-        // memtable). The manifest now records a flushed generation and
+        // memtable). The manifest now records an SSTable and
         // pins `replay_after_wal_entry_position` to the covered WAL entry.
         {
             let writer_a = ShardWriter::open(
@@ -6436,14 +6432,14 @@ mod tests {
             writer_a.close().await.unwrap();
         }
 
-        // Simulate an external compactor merging the flushed generation
-        // into the base table: drain `flushed_generations` to empty via a
+        // Simulate an external compactor merging the SSTable
+        // into the base table: drain `sstables` to empty via a
         // direct manifest commit. The cursor stays where the flush put it.
         let manifest_store = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2);
         let pre = manifest_store.read_latest().await.unwrap().unwrap();
         assert!(
-            !pre.flushed_generations.is_empty(),
-            "writer A's close() should have stamped a flushed generation"
+            !pre.sstables.is_empty(),
+            "writer A's close() should have stamped an SSTable"
         );
         let cursor_at_flush = pre.replay_after_wal_entry_position;
         assert!(
@@ -6457,22 +6453,22 @@ mod tests {
         manifest_store
             .commit_update(compactor_epoch, |current| ShardManifest {
                 version: current.version + 1,
-                flushed_generations: vec![],
+                sstables: vec![],
                 ..current.clone()
             })
             .await
             .unwrap();
         let post = manifest_store.read_latest().await.unwrap().unwrap();
         assert!(
-            post.flushed_generations.is_empty(),
-            "compactor drain should have left flushed_generations empty"
+            post.sstables.is_empty(),
+            "compactor drain should have left sstables empty"
         );
         assert_eq!(
             post.replay_after_wal_entry_position, cursor_at_flush,
             "compactor must not touch the replay cursor"
         );
 
-        // Writer B reopens. Pre-fix: replay saw flushed_generations empty,
+        // Writer B reopens. Pre-fix: replay saw sstables empty,
         // restarted at WAL position 0, and re-inserted writer A's rows.
         // Post-fix: replay starts at cursor + 1, finds no entry, and the
         // memtable stays empty.
@@ -6897,7 +6893,7 @@ mod tests {
             .manifest()
             .await
             .unwrap()
-            .map(|m| m.flushed_generations.len())
+            .map(|m| m.sstables.len())
             .unwrap_or(0);
 
         writer
@@ -6916,7 +6912,7 @@ mod tests {
             .await
             .unwrap()
             .expect("manifest should exist after flush");
-        assert_eq!(manifest.flushed_generations.len(), flushed_before + 1);
+        assert_eq!(manifest.sstables.len(), flushed_before + 1);
 
         writer.close().await.unwrap();
     }
@@ -6954,7 +6950,7 @@ mod tests {
             .manifest()
             .await
             .unwrap()
-            .map(|m| m.flushed_generations.len())
+            .map(|m| m.sstables.len())
             .unwrap_or(0);
 
         writer.abort().await.unwrap();
@@ -6965,7 +6961,7 @@ mod tests {
             .manifest()
             .await
             .unwrap()
-            .map(|m| m.flushed_generations.len())
+            .map(|m| m.sstables.len())
             .unwrap_or(0);
         assert_eq!(
             flushed_after, flushed_before,
@@ -7013,10 +7009,10 @@ mod tests {
         let manifest = writer.manifest().await.unwrap().expect("manifest exists");
         assert!(
             manifest
-                .flushed_generations
+                .sstables
                 .iter()
                 .any(|g| g.generation == initial_gen),
-            "flushed generation must be recorded in the manifest"
+            "SSTable must be recorded in the manifest"
         );
 
         // Still queryable in memory immediately after commit (within grace).
@@ -7024,7 +7020,7 @@ mod tests {
         assert_eq!(refs.active.generation, initial_gen + 1);
         assert!(
             refs.frozen.iter().any(|f| f.generation == initial_gen),
-            "flushed generation must stay queryable during the grace window"
+            "SSTable must stay queryable during the grace window"
         );
 
         // After the grace elapses (plus a sweep tick) the handle is evicted.
@@ -7071,10 +7067,10 @@ mod tests {
         let manifest = writer.manifest().await.unwrap().expect("manifest exists");
         assert!(
             manifest
-                .flushed_generations
+                .sstables
                 .iter()
                 .any(|g| g.generation == initial_gen),
-            "flushed generation must be recorded in the manifest"
+            "SSTable must be recorded in the manifest"
         );
 
         // ...and the in-memory handle is already gone, no sweep tick needed.
@@ -7524,7 +7520,7 @@ mod shard_writer_tests {
         // The tombstone-only generation still flushed (data without an HNSW index).
         let manifest = writer.manifest().await.unwrap().expect("manifest exists");
         assert_eq!(
-            manifest.flushed_generations.len(),
+            manifest.sstables.len(),
             1,
             "the all-tombstone generation must still flush"
         );
@@ -7591,22 +7587,22 @@ mod shard_writer_tests {
             .await
             .expect("Failed to read manifest")
             .expect("Manifest should exist");
-        assert_eq!(manifest.flushed_generations.len(), 1);
+        assert_eq!(manifest.sstables.len(), 1);
 
-        let flushed = &manifest.flushed_generations[0];
-        let gen_uri = format!("{}/_mem_wal/{}/{}", uri, shard_id, flushed.path);
-        let flushed_dataset = Dataset::open(&gen_uri)
+        let sstable = &manifest.sstables[0];
+        let gen_uri = format!("{}/_mem_wal/{}/{}", uri, shard_id, sstable.path);
+        let sstable = Dataset::open(&gen_uri)
             .await
-            .expect("Failed to open flushed generation");
-        let flushed_indices = flushed_dataset.load_indices().await.unwrap();
-        assert_eq!(flushed_indices.len(), 1);
-        assert_eq!(flushed_indices[0].name, "text_fts");
+            .expect("Failed to open SSTable");
+        let sstable_indices = sstable.load_indices().await.unwrap();
+        assert_eq!(sstable_indices.len(), 1);
+        assert_eq!(sstable_indices[0].name, "text_fts");
         assert_eq!(
-            flushed_indices[0].index_version, 1,
+            sstable_indices[0].index_version, 1,
             "maintained v1 FTS index must flush as v1"
         );
 
-        let results = flushed_dataset
+        let results = sstable
             .scan()
             .full_text_search(FullTextSearchQuery::new("Sample".to_owned()))
             .unwrap()
@@ -8130,7 +8126,7 @@ mod shard_writer_tests {
     /// 2. File system layout is correct (WAL files, manifest, generation directories)
     /// 3. WAL entries contain expected data
     /// 4. Data can be read after each flush cycle
-    /// 5. Manifest tracks flushed generations correctly
+    /// 5. Manifest tracks SSTables correctly
     ///
     /// Run with: cargo test -p lance shard_writer_tests::test_shard_writer_e2e_correctness -- --nocapture
     #[tokio::test]
@@ -8258,24 +8254,24 @@ mod shard_writer_tests {
             .expect("Failed to read manifest")
             .expect("Manifest should exist");
 
-        // Verify flushed generations exist on disk
+        // Verify SSTables exist on disk
         assert!(
-            !manifest.flushed_generations.is_empty(),
-            "Should have at least one flushed generation"
+            !manifest.sstables.is_empty(),
+            "Should have at least one SSTable"
         );
-        for flushed_gen in &manifest.flushed_generations {
+        for sstable in &manifest.sstables {
             // The path stored in manifest is relative to the shard directory
             // Construct full path: temp_dir/_mem_wal/shard_id/generation_folder
             let gen_path = temp_dir
                 .path()
                 .join("_mem_wal")
                 .join(shard_id.to_string())
-                .join(&flushed_gen.path);
+                .join(&sstable.path);
 
             // The generation directory should exist
             assert!(
                 gen_path.exists(),
-                "Flushed generation directory should exist at {:?}",
+                "SSTable directory should exist at {:?}",
                 gen_path
             );
 
@@ -8396,11 +8392,11 @@ mod shard_writer_tests {
             .expect("flush must not be redirected at the base table");
 
         let manifest = writer.manifest().await.unwrap().expect("manifest exists");
-        assert_eq!(manifest.flushed_generations.len(), 1);
-        let flushed = manifest.flushed_generations[0].clone();
+        assert_eq!(manifest.sstables.len(), 1);
+        let sstable = manifest.sstables[0].clone();
 
         // The generation landed under `_mem_wal/`, and the base table is untouched.
-        let gen_uri = format!("{}/_mem_wal/{}/{}", uri, shard_id, flushed.path);
+        let gen_uri = format!("{}/_mem_wal/{}/{}", uri, shard_id, sstable.path);
         let generation = Dataset::open(&gen_uri)
             .await
             .expect("generation must exist at its own path");
@@ -8416,7 +8412,7 @@ mod shard_writer_tests {
         // Opening the base instead would dedup back down to 16 rows.
         let snapshot = ShardSnapshot::new(shard_id)
             .with_current_generation(manifest.current_generation)
-            .with_flushed_generation(flushed.generation, flushed.path.clone());
+            .with_sstable(sstable.generation, sstable.path.clone());
         let scanner = LsmScanner::new(Arc::new(dataset), vec![snapshot], vec!["id".to_string()]);
         let rows: usize = scanner
             .try_into_stream()
@@ -8489,8 +8485,8 @@ mod shard_writer_tests {
         writer.wait_for_flush_drain().await.expect("flush failed");
 
         let manifest = writer.manifest().await.unwrap().expect("manifest exists");
-        assert_eq!(manifest.flushed_generations.len(), 1);
-        let flushed = manifest.flushed_generations[0].clone();
+        assert_eq!(manifest.sstables.len(), 1);
+        let sstable = manifest.sstables[0].clone();
 
         // The generation's own Lance manifest is the signal to key on. Keying on
         // the generation folder alone would pass vacuously: sidecars like
@@ -8501,7 +8497,7 @@ mod shard_writer_tests {
         // `{gen}/data/` never reaches a wrapper under `file://`. The manifest
         // goes through `put_opts`, and only the flusher's `Dataset::write` /
         // `open_generation` writes it — both of which must carry the params.
-        let gen_manifest = format!("{}/_versions", flushed.path);
+        let gen_manifest = format!("{}/_versions", sstable.path);
 
         assert!(
             controls.wrote_under(&gen_manifest),
@@ -8512,7 +8508,7 @@ mod shard_writer_tests {
         // And the read path must resolve the generation through them too.
         let snapshot = ShardSnapshot::new(shard_id)
             .with_current_generation(manifest.current_generation)
-            .with_flushed_generation(flushed.generation, flushed.path.clone());
+            .with_sstable(sstable.generation, sstable.path.clone());
         let scanner = LsmScanner::new(Arc::new(dataset), vec![snapshot], vec!["id".to_string()]);
         let rows: usize = scanner
             .try_into_stream()
@@ -8532,7 +8528,7 @@ mod shard_writer_tests {
         // fragments are read through it (reads have no local bypass), as is the
         // generation's standalone PK index.
         assert!(
-            controls.read_under(&format!("{}/data/", flushed.path)),
+            controls.read_under(&format!("{}/data/", sstable.path)),
             "the scan must read the generation through the base's store params"
         );
 
@@ -8581,10 +8577,10 @@ mod shard_writer_tests {
         writer.wait_for_flush_drain().await.expect("flush failed");
 
         let manifest = writer.manifest().await.unwrap().expect("manifest exists");
-        let flushed = manifest.flushed_generations[0].clone();
+        let sstable = manifest.sstables[0].clone();
         let snapshot = ShardSnapshot::new(shard_id)
             .with_current_generation(manifest.current_generation)
-            .with_flushed_generation(flushed.generation, flushed.path.clone());
+            .with_sstable(sstable.generation, sstable.path.clone());
 
         // What `DatasetBuilder::with_object_store` leaves on an opened dataset:
         // a store pinned at the base's own path.
