@@ -30,31 +30,37 @@ pub(in crate::index) async fn merge_segments(
     })?;
     let field_path = dataset.schema().field_path(field_id)?;
 
-    let mut scalar_indices = Vec::with_capacity(segments.len());
-    let mut fragment_filters = Vec::with_capacity(segments.len());
     let mut fragment_bitmap = RoaringBitmap::new();
     let dataset_fragments = dataset.fragment_bitmap.as_ref();
-    for segment in &segments {
-        let effective = segment
-            .effective_fragment_bitmap(dataset_fragments)
-            .ok_or_else(|| {
-                Error::invalid_input(format!(
-                    "CreateIndex: segment {} is missing fragment coverage",
-                    segment.uuid
-                ))
-            })?;
-        if effective.is_empty() {
+    let fragment_filters = segments
+        .iter()
+        .map(|segment| {
+            segment
+                .effective_fragment_bitmap(dataset_fragments)
+                .ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "CreateIndex: segment {} is missing fragment coverage",
+                        segment.uuid
+                    ))
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for effective in &fragment_filters {
+        fragment_bitmap |= effective;
+    }
+
+    let mut scalar_indices = Vec::with_capacity(segments.len());
+    for (position, (segment, effective)) in segments.iter().zip(&fragment_filters).enumerate() {
+        if effective.is_empty() && !(fragment_bitmap.is_empty() && position == 0) {
             continue;
         }
-        fragment_bitmap |= &effective;
-        fragment_filters.push(effective);
         let scalar_index =
             super::open_scalar_index(dataset, &field_path, segment, &NoOpMetricsCollector).await?;
-        scalar_indices.push((segment.uuid, scalar_index));
+        scalar_indices.push((segment.uuid, scalar_index, effective));
     }
 
     let mut source_indices = Vec::with_capacity(scalar_indices.len());
-    for (segment_uuid, scalar_index) in &scalar_indices {
+    for (segment_uuid, scalar_index, fragment_filter) in &scalar_indices {
         let bloomfilter_index = scalar_index
             .as_any()
             .downcast_ref::<BloomFilterIndex>()
@@ -65,18 +71,13 @@ pub(in crate::index) async fn merge_segments(
                     scalar_index.index_type()
                 ))
             })?;
-        source_indices.push(bloomfilter_index);
+        source_indices.push((bloomfilter_index, *fragment_filter));
     }
-    let filtered_sources = source_indices
-        .iter()
-        .zip(&fragment_filters)
-        .map(|(index, fragments)| (*index, fragments))
-        .collect::<Vec<_>>();
 
     let new_uuid = Uuid::new_v4();
     let new_store = LanceIndexStore::from_dataset_for_new(dataset, &new_uuid)?;
     let created_index =
-        lance_index::scalar::bloomfilter::merge_bloomfilter_indices(&filtered_sources, &new_store)
+        lance_index::scalar::bloomfilter::merge_bloomfilter_indices(&source_indices, &new_store)
             .await?;
 
     Ok(IndexMetadata {

@@ -526,10 +526,9 @@ pub async fn merge_bloomfilter_indices(
     let first = source_indices
         .iter()
         .find(|(_, fragment_filter)| !fragment_filter.is_empty())
+        .or_else(|| source_indices.first())
         .ok_or_else(|| {
-            Error::invalid_input(
-                "merge_bloomfilter_indices requires at least one source with fragment coverage",
-            )
+            Error::invalid_input("merge_bloomfilter_indices requires at least one source index")
         })?;
     let params = BloomFilterIndexBuilderParams {
         number_of_items: first.0.number_of_items,
@@ -2527,6 +2526,24 @@ mod tests {
                 .await
                 .unwrap(),
             SearchResult::exact(expected_nulls)
+        );
+
+        let (_empty_tmpdir, empty_store) = create_store();
+        merge_bloomfilter_indices(
+            &[(&ignored_legacy, &RoaringBitmap::new())],
+            empty_store.as_ref(),
+        )
+        .await
+        .unwrap();
+        let empty = BloomFilterIndex::load(empty_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        assert_eq!(
+            empty
+                .search(&BloomFilterQuery::IsNull(), &NoOpMetricsCollector)
+                .await
+                .unwrap(),
+            SearchResult::exact(RowAddrTreeMap::new())
         );
     }
 }
