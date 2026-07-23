@@ -16,7 +16,7 @@
 use std::sync::Arc;
 
 use lance_core::{Error, Result};
-use lance_index::mem_wal::{CompactedSstable, MEM_WAL_INDEX_NAME, MemWalIndex, MemWalIndexDetails};
+use lance_index::mem_wal::{CompactedSsTable, MEM_WAL_INDEX_NAME, MemWalIndex, MemWalIndexDetails};
 use lance_table::format::{IndexMetadata, pb};
 use uuid::Uuid;
 
@@ -52,7 +52,7 @@ pub(crate) fn open_mem_wal_index(index: IndexMetadata) -> Result<Arc<MemWalIndex
 pub(crate) fn update_mem_wal_index_compacted_sstables(
     indices: &mut Vec<IndexMetadata>,
     dataset_version: u64,
-    new_compacted_sstables: Vec<CompactedSstable>,
+    new_compacted_sstables: Vec<CompactedSsTable>,
 ) -> Result<()> {
     if new_compacted_sstables.is_empty() {
         return Ok(());
@@ -164,7 +164,7 @@ mod tests {
         let txn1 = Transaction::new(
             dataset.manifest.version,
             Operation::UpdateMemWalState {
-                compacted_sstables: vec![CompactedSstable::new(shard, 10)],
+                compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
             },
             None,
         );
@@ -178,7 +178,7 @@ mod tests {
         let txn2 = Transaction::new(
             dataset.manifest.version - 1, // Based on old version
             Operation::UpdateMemWalState {
-                compacted_sstables: vec![CompactedSstable::new(shard, 5)],
+                compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
             },
             None,
         );
@@ -201,7 +201,7 @@ mod tests {
         let txn1 = Transaction::new(
             dataset.manifest.version,
             Operation::UpdateMemWalState {
-                compacted_sstables: vec![CompactedSstable::new(shard, 10)],
+                compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
             },
             None,
         );
@@ -214,7 +214,7 @@ mod tests {
         let txn2 = Transaction::new(
             dataset.manifest.version - 1, // Based on old version
             Operation::UpdateMemWalState {
-                compacted_sstables: vec![CompactedSstable::new(shard, 10)],
+                compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
             },
             None,
         );
@@ -238,7 +238,7 @@ mod tests {
         let txn1 = Transaction::new(
             dataset.manifest.version,
             Operation::UpdateMemWalState {
-                compacted_sstables: vec![CompactedSstable::new(shard, 5)],
+                compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
             },
             None,
         );
@@ -252,7 +252,7 @@ mod tests {
         let txn2 = Transaction::new(
             dataset.manifest.version - 1, // Based on old version
             Operation::UpdateMemWalState {
-                compacted_sstables: vec![CompactedSstable::new(shard, 10)],
+                compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
             },
             None,
         );
@@ -276,7 +276,7 @@ mod tests {
         let txn1 = Transaction::new(
             dataset.manifest.version,
             Operation::UpdateMemWalState {
-                compacted_sstables: vec![CompactedSstable::new(shard1, 10)],
+                compacted_sstables: vec![CompactedSsTable::new(shard1, 10)],
             },
             None,
         );
@@ -290,7 +290,7 @@ mod tests {
         let txn2 = Transaction::new(
             dataset.manifest.version - 1, // Based on old version
             Operation::UpdateMemWalState {
-                compacted_sstables: vec![CompactedSstable::new(shard2, 5)],
+                compacted_sstables: vec![CompactedSsTable::new(shard2, 5)],
             },
             None,
         );
@@ -327,7 +327,7 @@ mod tests {
         let txn1 = Transaction::new(
             dataset.manifest.version,
             Operation::UpdateMemWalState {
-                compacted_sstables: vec![CompactedSstable::new(shard, 10)],
+                compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
             },
             None,
         );
@@ -385,7 +385,7 @@ mod tests {
 
         // First commit CreateIndex of MemWalIndex with compacted_sstables
         let details = MemWalIndexDetails {
-            compacted_sstables: vec![CompactedSstable::new(shard, 10)],
+            compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
             ..Default::default()
         };
         let mem_wal_index = new_mem_wal_index_meta(dataset.manifest.version, details).unwrap();
@@ -407,7 +407,7 @@ mod tests {
         let txn2 = Transaction::new(
             dataset.manifest.version - 1, // Based on old version
             Operation::UpdateMemWalState {
-                compacted_sstables: vec![CompactedSstable::new(shard, 5)],
+                compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
             },
             None,
         );
@@ -430,7 +430,7 @@ mod tests {
         update_mem_wal_index_compacted_sstables(
             &mut indices,
             1,
-            vec![CompactedSstable::new(shard1, 5)],
+            vec![CompactedSsTable::new(shard1, 5)],
         )
         .unwrap();
 
@@ -444,7 +444,7 @@ mod tests {
         update_mem_wal_index_compacted_sstables(
             &mut indices,
             2,
-            vec![CompactedSstable::new(shard1, 10)],
+            vec![CompactedSsTable::new(shard1, 10)],
         )
         .unwrap();
 
@@ -457,7 +457,7 @@ mod tests {
         update_mem_wal_index_compacted_sstables(
             &mut indices,
             3,
-            vec![CompactedSstable::new(shard2, 3)],
+            vec![CompactedSsTable::new(shard2, 3)],
         )
         .unwrap();
 
@@ -469,7 +469,7 @@ mod tests {
         update_mem_wal_index_compacted_sstables(
             &mut indices,
             4,
-            vec![CompactedSstable::new(shard1, 8)], // lower than 10
+            vec![CompactedSsTable::new(shard1, 8)], // lower than 10
         )
         .unwrap();
 
@@ -521,7 +521,7 @@ mod tests {
         let txn = Transaction::new(
             dataset.manifest.version,
             Operation::UpdateMemWalState {
-                compacted_sstables: vec![CompactedSstable::new(shard, 1)],
+                compacted_sstables: vec![CompactedSsTable::new(shard, 1)],
             },
             None,
         );

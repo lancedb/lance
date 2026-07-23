@@ -42,18 +42,18 @@ impl From<pb::SsTable> for SsTable {
 
 /// A pointer to the latest SSTable compacted for a shard.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Hash, Serialize, Deserialize)]
-pub struct CompactedSstable {
+pub struct CompactedSsTable {
     pub shard_id: Uuid,
     pub generation: u64,
 }
 
-impl DeepSizeOf for CompactedSstable {
+impl DeepSizeOf for CompactedSsTable {
     fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
         0 // UUID is 16 bytes fixed size, no heap allocations
     }
 }
 
-impl CompactedSstable {
+impl CompactedSsTable {
     pub fn new(shard_id: Uuid, generation: u64) -> Self {
         Self {
             shard_id,
@@ -62,8 +62,8 @@ impl CompactedSstable {
     }
 }
 
-impl From<&CompactedSstable> for pb::CompactedSstable {
-    fn from(sstable: &CompactedSstable) -> Self {
+impl From<&CompactedSsTable> for pb::CompactedSsTable {
+    fn from(sstable: &CompactedSsTable) -> Self {
         Self {
             shard_id: Some((&sstable.shard_id).into()),
             generation: sstable.generation,
@@ -71,15 +71,15 @@ impl From<&CompactedSstable> for pb::CompactedSstable {
     }
 }
 
-impl TryFrom<pb::CompactedSstable> for CompactedSstable {
+impl TryFrom<pb::CompactedSsTable> for CompactedSsTable {
     type Error = Error;
 
-    fn try_from(sstable: pb::CompactedSstable) -> lance_core::Result<Self> {
+    fn try_from(sstable: pb::CompactedSsTable) -> lance_core::Result<Self> {
         let shard_id = sstable
             .shard_id
             .as_ref()
             .map(Uuid::try_from)
-            .ok_or_else(|| Error::invalid_input("Missing shard_id in CompactedSstable"))??;
+            .ok_or_else(|| Error::invalid_input("Missing shard_id in CompactedSsTable"))??;
         Ok(Self {
             shard_id,
             generation: sstable.generation,
@@ -92,11 +92,11 @@ impl TryFrom<pb::CompactedSstable> for CompactedSstable {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
 pub struct IndexCatchupProgress {
     pub index_name: String,
-    pub caught_up_generations: Vec<CompactedSstable>,
+    pub caught_up_generations: Vec<CompactedSsTable>,
 }
 
 impl IndexCatchupProgress {
-    pub fn new(index_name: String, caught_up_generations: Vec<CompactedSstable>) -> Self {
+    pub fn new(index_name: String, caught_up_generations: Vec<CompactedSsTable>) -> Self {
         Self {
             index_name,
             caught_up_generations,
@@ -135,7 +135,7 @@ impl TryFrom<pb::IndexCatchupProgress> for IndexCatchupProgress {
             caught_up_generations: icp
                 .caught_up_generations
                 .into_iter()
-                .map(CompactedSstable::try_from)
+                .map(CompactedSsTable::try_from)
                 .collect::<lance_core::Result<_>>()?,
         })
     }
@@ -334,7 +334,7 @@ pub struct MemWalIndexDetails {
     pub inline_snapshots: Option<Vec<u8>>,
     pub sharding_specs: Vec<ShardingSpec>,
     pub maintained_indexes: Vec<String>,
-    pub compacted_sstables: Vec<CompactedSstable>,
+    pub compacted_sstables: Vec<CompactedSsTable>,
     pub index_catchup: Vec<IndexCatchupProgress>,
     /// Default `ShardWriter` configuration values for this MemWAL index.
     ///
@@ -381,7 +381,7 @@ impl TryFrom<pb::MemWalIndexDetails> for MemWalIndexDetails {
             compacted_sstables: details
                 .compacted_sstables
                 .into_iter()
-                .map(CompactedSstable::try_from)
+                .map(CompactedSsTable::try_from)
                 .collect::<lance_core::Result<_>>()?,
             index_catchup: details
                 .index_catchup

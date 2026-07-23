@@ -244,7 +244,7 @@ message Transaction {
     // The ids of the fields that have been modified.
     repeated uint32 fields_modified = 4;
     /// SSTables to mark as compacted after this transaction.
-    repeated CompactedSstable compacted_sstables = 5;
+    repeated CompactedSsTable compacted_sstables = 5;
     /// The fields that used to judge whether to preserve the new frag's id into
     /// the frag bitmap of the specified indices.
     repeated uint32 fields_for_preserving_frag_bitmap = 6;
@@ -342,7 +342,7 @@ message Transaction {
   // SSTables have been compacted into the base table.
   message UpdateMemWalState {
     // SSTables being marked as compacted.
-    repeated CompactedSstable compacted_sstables = 1;
+    repeated CompactedSsTable compacted_sstables = 1;
   }
 
   // An operation that updates base paths in the dataset.

@@ -126,7 +126,7 @@ use lance_datafusion::{
 };
 use lance_file::version::LanceFileVersion;
 use lance_index::IndexCriteria;
-use lance_index::mem_wal::CompactedSstable;
+use lance_index::mem_wal::CompactedSsTable;
 use lance_select::RowAddrTreeMap;
 use lance_table::format::{Fragment, IndexMetadata, RowIdMeta};
 use log::info;
@@ -353,7 +353,7 @@ struct MergeInsertParams {
     spill_for_retry: bool,
     retry_timeout: Duration,
     // MemWAL SSTables to mark as compacted when this commit succeeds.
-    compacted_sstables: Vec<CompactedSstable>,
+    compacted_sstables: Vec<CompactedSsTable>,
     // If true, skip auto cleanup during commits. This should be set to true
     // for high frequency writes to improve performance. This is also useful
     // if the writer does not have delete permissions and the clean up would
@@ -606,7 +606,7 @@ impl MergeInsertBuilder {
     ///
     /// This updates `compacted_sstables` in the MemWAL index atomically with
     /// the data commit.
-    pub fn mark_sstables_as_compacted(&mut self, sstables: Vec<CompactedSstable>) -> &mut Self {
+    pub fn mark_sstables_as_compacted(&mut self, sstables: Vec<CompactedSsTable>) -> &mut Self {
         self.params.compacted_sstables.extend(sstables);
         self
     }

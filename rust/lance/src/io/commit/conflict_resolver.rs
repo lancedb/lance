@@ -12,7 +12,7 @@ use crate::{
 use futures::{StreamExt, TryStreamExt};
 use lance_core::{Error, Result, utils::deletion::DeletionVector};
 use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
-use lance_index::mem_wal::{CompactedSstable, MEM_WAL_INDEX_NAME};
+use lance_index::mem_wal::{CompactedSsTable, MEM_WAL_INDEX_NAME};
 use lance_select::{RowAddrTreeMap, RowSetOps};
 use lance_table::format::IndexMetadata;
 use lance_table::format::overlay::OverlayCoverage;
@@ -36,7 +36,7 @@ pub struct TransactionRebase<'a> {
     conflicting_frag_reuse_indices: Vec<IndexMetadata>,
     /// Compacted SSTables from conflicting UpdateMemWalState transactions.
     /// Used when rebasing CreateIndex of MemWalIndex.
-    conflicting_mem_wal_compacted_sstables: Vec<CompactedSstable>,
+    conflicting_mem_wal_compacted_sstables: Vec<CompactedSsTable>,
 }
 
 impl<'a> TransactionRebase<'a> {
@@ -1552,8 +1552,8 @@ impl<'a> TransactionRebase<'a> {
 
     fn check_compacted_sstables_conflict(
         &self,
-        committed: &[CompactedSstable],
-        to_commit: &[CompactedSstable],
+        committed: &[CompactedSsTable],
+        to_commit: &[CompactedSsTable],
         other_transaction: &Transaction,
         other_version: u64,
     ) -> Result<()> {
@@ -4318,7 +4318,7 @@ mod tests {
         let committed_txn = Transaction::new(
             0,
             Operation::UpdateMemWalState {
-                compacted_sstables: vec![CompactedSstable::new(shard, 10)],
+                compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
             },
             None,
         );
@@ -4326,7 +4326,7 @@ mod tests {
         let to_commit_txn = Transaction::new(
             0,
             Operation::UpdateMemWalState {
-                compacted_sstables: vec![CompactedSstable::new(shard, 5)],
+                compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
             },
             None,
         );
@@ -4356,7 +4356,7 @@ mod tests {
         let committed_txn = Transaction::new(
             0,
             Operation::UpdateMemWalState {
-                compacted_sstables: vec![CompactedSstable::new(shard, 10)],
+                compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
             },
             None,
         );
@@ -4364,7 +4364,7 @@ mod tests {
         let to_commit_txn = Transaction::new(
             0,
             Operation::UpdateMemWalState {
-                compacted_sstables: vec![CompactedSstable::new(shard, 10)],
+                compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
             },
             None,
         );
@@ -4395,7 +4395,7 @@ mod tests {
         let committed_txn = Transaction::new(
             0,
             Operation::UpdateMemWalState {
-                compacted_sstables: vec![CompactedSstable::new(shard, 5)],
+                compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
             },
             None,
         );
@@ -4403,7 +4403,7 @@ mod tests {
         let to_commit_txn = Transaction::new(
             0,
             Operation::UpdateMemWalState {
-                compacted_sstables: vec![CompactedSstable::new(shard, 10)],
+                compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
             },
             None,
         );
@@ -4434,7 +4434,7 @@ mod tests {
         let committed_txn = Transaction::new(
             0,
             Operation::UpdateMemWalState {
-                compacted_sstables: vec![CompactedSstable::new(shard1, 10)],
+                compacted_sstables: vec![CompactedSsTable::new(shard1, 10)],
             },
             None,
         );
@@ -4442,7 +4442,7 @@ mod tests {
         let to_commit_txn = Transaction::new(
             0,
             Operation::UpdateMemWalState {
-                compacted_sstables: vec![CompactedSstable::new(shard2, 5)],
+                compacted_sstables: vec![CompactedSsTable::new(shard2, 5)],
             },
             None,
         );
@@ -4473,7 +4473,7 @@ mod tests {
 
         // Create a MemWalIndex with compacted_sstables
         let details = MemWalIndexDetails {
-            compacted_sstables: vec![CompactedSstable::new(shard, 10)],
+            compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
             ..Default::default()
         };
         let mem_wal_index = new_mem_wal_index_meta(1, details).unwrap();
@@ -4492,7 +4492,7 @@ mod tests {
         let to_commit_txn = Transaction::new(
             0,
             Operation::UpdateMemWalState {
-                compacted_sstables: vec![CompactedSstable::new(shard, 5)],
+                compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
             },
             None,
         );
@@ -4517,7 +4517,7 @@ mod tests {
         let to_commit_txn_higher = Transaction::new(
             0,
             Operation::UpdateMemWalState {
-                compacted_sstables: vec![CompactedSstable::new(shard, 15)],
+                compacted_sstables: vec![CompactedSsTable::new(shard, 15)],
             },
             None,
         );
@@ -4563,7 +4563,7 @@ mod tests {
         let committed_txn = Transaction::new(
             0,
             Operation::UpdateMemWalState {
-                compacted_sstables: vec![CompactedSstable::new(shard, 10)],
+                compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
             },
             None,
         );

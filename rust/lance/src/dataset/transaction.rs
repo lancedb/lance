@@ -24,7 +24,7 @@ use lance_core::datatypes::{
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result, datatypes::Schema};
 use lance_file::{datatypes::Fields, version::LanceFileVersion};
-use lance_index::mem_wal::CompactedSstable;
+use lance_index::mem_wal::CompactedSsTable;
 use lance_index::{frag_reuse::FRAG_REUSE_INDEX_NAME, is_system_index};
 use lance_io::object_store::ObjectStore;
 use lance_table::feature_flags::{FLAG_STABLE_ROW_IDS, apply_feature_flags};
@@ -425,7 +425,7 @@ pub enum Operation {
         /// The fields that have been modified
         fields_modified: Vec<u32>,
         /// MemWAL SSTables to mark as compacted after this transaction.
-        compacted_sstables: Vec<CompactedSstable>,
+        compacted_sstables: Vec<CompactedSsTable>,
         /// The fields that used to judge whether to preserve the new frag's id into
         /// the frag bitmap of the specified indices.
         fields_for_preserving_frag_bitmap: Vec<u32>,
@@ -454,7 +454,7 @@ pub enum Operation {
     /// This is used during merge-insert to atomically record which
     /// SSTables have been compacted into the base table.
     UpdateMemWalState {
-        compacted_sstables: Vec<CompactedSstable>,
+        compacted_sstables: Vec<CompactedSsTable>,
     },
 
     /// Clone a dataset.
@@ -3399,7 +3399,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                 fields_modified,
                 compacted_sstables: compacted_sstables
                     .into_iter()
-                    .map(|m| CompactedSstable::try_from(m).unwrap())
+                    .map(|m| CompactedSsTable::try_from(m).unwrap())
                     .collect(),
                 fields_for_preserving_frag_bitmap,
                 update_mode: match update_mode {
@@ -3521,7 +3521,7 @@ impl TryFrom<pb::Transaction> for Transaction {
             )) => Operation::UpdateMemWalState {
                 compacted_sstables: compacted_sstables
                     .into_iter()
-                    .map(|m| CompactedSstable::try_from(m).unwrap())
+                    .map(|m| CompactedSsTable::try_from(m).unwrap())
                     .collect(),
             },
             Some(pb::transaction::Operation::UpdateBases(pb::transaction::UpdateBases {
@@ -3743,7 +3743,7 @@ impl From<&Transaction> for pb::Transaction {
                 fields_modified: fields_modified.clone(),
                 compacted_sstables: compacted_sstables
                     .iter()
-                    .map(pb::CompactedSstable::from)
+                    .map(pb::CompactedSsTable::from)
                     .collect(),
                 fields_for_preserving_frag_bitmap: fields_for_preserving_frag_bitmap.clone(),
                 update_mode: update_mode
@@ -3819,7 +3819,7 @@ impl From<&Transaction> for pb::Transaction {
                 pb::transaction::Operation::UpdateMemWalState(pb::transaction::UpdateMemWalState {
                     compacted_sstables: compacted_sstables
                         .iter()
-                        .map(pb::CompactedSstable::from)
+                        .map(pb::CompactedSsTable::from)
                         .collect::<Vec<_>>(),
                 })
             }

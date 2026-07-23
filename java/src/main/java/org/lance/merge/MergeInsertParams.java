@@ -13,7 +13,7 @@
  */
 package org.lance.merge;
 
-import org.lance.memwal.CompactedSstable;
+import org.lance.memwal.CompactedSsTable;
 
 import com.google.common.base.MoreObjects;
 import com.google.common.base.Preconditions;
@@ -39,7 +39,7 @@ public class MergeInsertParams {
   private long retryTimeoutMs = 30 * 1000;
   private boolean skipAutoCleanup = false;
   private boolean useIndex = true;
-  private List<CompactedSstable> compactedSstables = Collections.emptyList();
+  private List<CompactedSsTable> compactedSstables = Collections.emptyList();
 
   public MergeInsertParams(List<String> on) {
     this.on = on;
@@ -253,7 +253,7 @@ public class MergeInsertParams {
    * @param sstables the SSTables being compacted
    * @return This MergeInsertParams instance
    */
-  public MergeInsertParams markSstablesAsCompacted(List<CompactedSstable> sstables) {
+  public MergeInsertParams markSstablesAsCompacted(List<CompactedSsTable> sstables) {
     Preconditions.checkNotNull(sstables, "sstables must not be null");
     this.compactedSstables = sstables;
     return this;
@@ -263,7 +263,7 @@ public class MergeInsertParams {
     return on;
   }
 
-  public List<CompactedSstable> getCompactedSstables() {
+  public List<CompactedSsTable> getCompactedSstables() {
     return compactedSstables;
   }
 

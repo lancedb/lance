@@ -9,7 +9,7 @@ import lance
 import pyarrow as pa
 import pytest
 from lance.mem_wal import (
-    CompactedSstable,
+    CompactedSsTable,
     LsmPointLookupPlanner,
     LsmScanner,
     LsmVectorSearchPlanner,
@@ -86,7 +86,7 @@ def test_mark_sstables_as_compacted(tmp_path):
         dataset.merge_insert("id")
         .when_matched_update_all()
         .when_not_matched_insert_all()
-        .mark_sstables_as_compacted([CompactedSstable(shard_id, 1)])
+        .mark_sstables_as_compacted([CompactedSsTable(shard_id, 1)])
         .execute(_lookup_table([2, 4], "compacted"))
     )
 

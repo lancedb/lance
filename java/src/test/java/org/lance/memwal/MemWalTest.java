@@ -533,7 +533,7 @@ public class MemWalTest {
                 .withMatchedUpdateAll()
                 .withNotMatched(MergeInsertParams.WhenNotMatched.InsertAll)
                 .markSstablesAsCompacted(
-                    Collections.singletonList(new CompactedSstable(shardId, 1)));
+                    Collections.singletonList(new CompactedSsTable(shardId, 1)));
 
         try (VectorSchemaRoot root = lookupRoot(allocator, new long[] {2, 4}, "merged");
             ArrowReader reader = toReader(allocator, root);

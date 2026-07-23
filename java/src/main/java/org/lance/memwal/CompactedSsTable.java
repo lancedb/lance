@@ -22,7 +22,7 @@ import com.google.common.base.Preconditions;
  * <p>Pass a list of these to {@link org.lance.merge.MergeInsertParams#markSstablesAsCompacted} so
  * Lance can record compaction progress.
  */
-public class CompactedSstable {
+public class CompactedSsTable {
   private final String shardId;
   private final long generation;
 
@@ -30,7 +30,7 @@ public class CompactedSstable {
    * @param shardId UUID string for the write shard
    * @param generation generation number from {@link ShardSnapshot#sstables()}
    */
-  public CompactedSstable(String shardId, long generation) {
+  public CompactedSsTable(String shardId, long generation) {
     Preconditions.checkNotNull(shardId, "shardId must not be null");
     this.shardId = shardId;
     this.generation = generation;

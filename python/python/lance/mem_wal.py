@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Dict, Iterable, List, Mapping, Optional, Union
 import pyarrow as pa
 
 from .lance import (
-    _CompactedSstable,
+    _CompactedSsTable,
     _evaluate_sharding_spec,
     _ExecutionPlan,
     _LsmPointLookupPlanner,
@@ -40,7 +40,7 @@ __all__ = [
     "ShardingField",
     "ShardingSpec",
     "evaluate_sharding_spec",
-    "CompactedSstable",
+    "CompactedSsTable",
     "ShardSnapshot",
     "ShardWriter",
     "LsmScanner",
@@ -124,7 +124,7 @@ def _sharding_spec_to_dict(spec: Union[ShardingSpec, Mapping[str, object]]) -> d
 
 
 @dataclass
-class CompactedSstable:
+class CompactedSsTable:
     """Points to an SSTable compacted into the base table.
 
     Pass a list of these to mark_sstables_as_compacted
@@ -628,7 +628,7 @@ def _unwrap_shard_id(shard_id: str) -> str:
 
 
 def _to_raw_compacted_sstables(
-    sstables: Iterable[CompactedSstable],
+    sstables: Iterable[CompactedSsTable],
 ) -> list:
-    """Convert Python CompactedSstable list to PyO3 _CompactedSstable list."""
-    return [_CompactedSstable(s.shard_id, s.generation) for s in sstables]
+    """Convert Python CompactedSsTable list to PyO3 _CompactedSsTable list."""
+    return [_CompactedSsTable(s.shard_id, s.generation) for s in sstables]

@@ -676,7 +676,7 @@ message SsTable {
 }
 
 // A pointer to the latest SSTable compacted for a shard.
-message CompactedSstable {
+message CompactedSsTable {
   // Shard identifier (UUID v4).
   UUID shard_id = 1;
 
@@ -693,7 +693,7 @@ message IndexCatchupProgress {
   // Per-shard progress: the generation up to which this index covers.
   // If a shard is not present, the index is assumed to be fully caught up
   // (i.e., caught_up_generation >= compacted_generation for that shard).
-  repeated CompactedSstable caught_up_generations = 2;
+  repeated CompactedSsTable caught_up_generations = 2;
 }
 
 // Index details for MemWAL Index, stored in IndexMetadata.index_details.
@@ -748,7 +748,7 @@ message MemWalIndexDetails {
   // Note: This is separate from shard snapshots because:
   // 1. compacted_sstables is updated by compactors (atomic with data commit)
   // 2. shard snapshots are updated by background index builder
-  repeated CompactedSstable compacted_sstables = 9;
+  repeated CompactedSsTable compacted_sstables = 9;
 
   // Per-index catchup progress tracking.
   // When data is compacted into the base table, base table indexes are rebuilt

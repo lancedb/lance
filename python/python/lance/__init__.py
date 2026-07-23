@@ -50,7 +50,7 @@ from .lance import (
     simd_info,
 )
 from .mem_wal import (
-    CompactedSstable,
+    CompactedSsTable,
     ExecutionPlan,
     LsmPointLookupPlanner,
     LsmScanner,
@@ -124,7 +124,7 @@ __all__ = [
     "LsmPointLookupPlanner",
     "LsmScanner",
     "LsmVectorSearchPlanner",
-    "CompactedSstable",
+    "CompactedSsTable",
     "ShardSnapshot",
     "ShardWriter",
     "ShardingField",

@@ -749,7 +749,7 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         return super(MergeInsertBuilder, self).analyze_plan(reader)
 
     def mark_sstables_as_compacted(
-        self, sstables: "List[mem_wal.CompactedSstable]"
+        self, sstables: "List[mem_wal.CompactedSsTable]"
     ) -> "MergeInsertBuilder":
         """Mark MemWAL SSTables as compacted into the base table.
 
@@ -757,7 +757,7 @@ class MergeInsertBuilder(_MergeInsertBuilder):
 
         Parameters
         ----------
-        sstables : list of CompactedSstable
+        sstables : list of CompactedSsTable
             SSTables to mark as compacted.
         """
         from .mem_wal import _to_raw_compacted_sstables

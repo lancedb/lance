@@ -577,11 +577,11 @@ impl MergeInsertBuilder {
     /// This updates MemWAL compaction progress to prevent duplicate compactions.
     pub fn mark_sstables_as_compacted<'a>(
         mut slf: PyRefMut<'a, Self>,
-        sstables: Vec<Bound<'a, crate::mem_wal::PyCompactedSstable>>,
+        sstables: Vec<Bound<'a, crate::mem_wal::PyCompactedSsTable>>,
     ) -> PyResult<PyRefMut<'a, Self>> {
-        use lance_index::mem_wal::CompactedSstable;
+        use lance_index::mem_wal::CompactedSsTable;
 
-        let compacted_sstables: Vec<CompactedSstable> = sstables
+        let compacted_sstables: Vec<CompactedSsTable> = sstables
             .iter()
             .map(|sstable| sstable.borrow().to_lance())
             .collect::<PyResult<_>>()?;

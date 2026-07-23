@@ -15,7 +15,7 @@ use lance::dataset::{
     MergeInsertBuilder, MergeStats, WhenMatched, WhenNotMatched, WhenNotMatchedBySource,
 };
 use lance_core::datatypes::Schema;
-use lance_index::mem_wal::CompactedSstable;
+use lance_index::mem_wal::CompactedSsTable;
 use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
@@ -244,7 +244,7 @@ fn extract_use_index<'local>(env: &mut JNIEnv<'local>, jparam: &JObject) -> Resu
 fn extract_compacted_sstables<'local>(
     env: &mut JNIEnv<'local>,
     jparam: &JObject,
-) -> Result<Vec<CompactedSstable>> {
+) -> Result<Vec<CompactedSsTable>> {
     let list = env
         .call_method(jparam, "getCompactedSstables", "()Ljava/util/List;", &[])?
         .l()?;
@@ -257,7 +257,7 @@ fn extract_compacted_sstables<'local>(
         let generation = env.call_method(&obj, "getGeneration", "()J", &[])?.j()? as u64;
         let uuid = Uuid::parse_str(&shard_id)
             .map_err(|e| Error::input_error(format!("Invalid shard_id UUID: {}", e)))?;
-        Ok(CompactedSstable::new(uuid, generation))
+        Ok(CompactedSsTable::new(uuid, generation))
     })
 }
 
