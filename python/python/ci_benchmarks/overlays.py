@@ -22,6 +22,7 @@ from urllib.parse import urlparse  # noqa: E402
 import lance  # noqa: E402
 import numpy as np  # noqa: E402
 import pyarrow as pa  # noqa: E402
+from lance._datagen import rand_batches  # noqa: E402
 from lance.file import LanceFileWriter  # noqa: E402
 
 # Default width for the ``embedding`` dtype. Individual benchmarks override it
@@ -59,32 +60,26 @@ def make_base_dataset(
     version: str,
     embedding_dim: int = EMBEDDING_DIM,
 ) -> lance.LanceDataset:
-    """Create a base dataset with an ``id`` key and a ``val`` payload column.
+    """Create a base dataset with an ``id`` column and a ``val`` column.
 
     ``val`` is the column overlays target. ``rows_per_file`` controls the number
-    of fragments (``num_rows // rows_per_file``). ``embedding_dim`` sets the width
-    of the ``val`` column when ``dtype`` is ``embedding`` (e.g. 3072 for a wide
-    embedding).
+    of fragments (``num_rows // rows_per_file``), which must divide ``num_rows``.
+    ``embedding_dim`` sets the width of the ``val`` column when ``dtype`` is
+    ``embedding`` (e.g. 3072 for a wide embedding).
     """
-    vtype = _value_type(dtype, embedding_dim)
-    fields = {"id": pa.int64(), "val": vtype}
-    schema = pa.schema(fields)
-    rng = np.random.default_rng(0)
-
-    def batches():
-        written = 0
-        while written < num_rows:
-            n = min(rows_per_file, num_rows - written)
-            ids = pa.array(range(written, written + n), pa.int64())
-            cols = [ids, _gen_values(dtype, n, rng, embedding_dim)]
-            yield pa.record_batch(cols, schema=schema)
-            written += n
-
-    reader = pa.RecordBatchReader.from_batches(schema, batches())
+    if num_rows % rows_per_file:
+        raise ValueError(
+            f"num_rows ({num_rows}) must be a multiple of rows_per_file "
+            f"({rows_per_file})"
+        )
+    schema = pa.schema({"id": pa.int64(), "val": _value_type(dtype, embedding_dim)})
+    # One fragment per batch; lance-datagen fills both columns with random data.
+    reader = rand_batches(
+        schema, num_batches=num_rows // rows_per_file, rows_per_batch=rows_per_file
+    )
     return lance.write_dataset(
         reader,
         base_path,
-        schema=schema,
         max_rows_per_file=rows_per_file,
         data_storage_version=version,
     )
