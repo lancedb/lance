@@ -238,6 +238,12 @@ impl DatasetPreFilter {
         self
     }
 
+    /// Like [`Self::with_overlay_block`] but mutates in place, for callers holding the prefilter
+    /// behind an `Arc` before `wait_for_ready` (e.g. `PhraseQueryExec`).
+    pub fn set_overlay_block(&mut self, block: RowAddrMask) {
+        self.overlay_block = Some(block);
+    }
+
     /// Creates a task to load a mask that filters out deleted rows and,
     /// when `restrict_to_fragments` is true, also restricts results to only
     /// the given `fragments`.

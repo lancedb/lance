@@ -31,6 +31,7 @@ use lance_core::{
     utils::{tokio::get_num_compute_intensive_cpus, tracing::StreamTracingExt},
 };
 use lance_datafusion::utils::{ExecutionPlanMetricsSetExt, MetricsExt, PARTITIONS_SEARCHED_METRIC};
+use lance_select::RowAddrMask;
 use lance_table::format::IndexMetadata;
 
 use super::PreFilterSource;
@@ -1155,6 +1156,12 @@ pub struct PhraseQueryExec {
     /// Optional pre-resolved segment list. See
     /// [`MatchQueryExec::new_with_segments`].
     preset_segments: Option<Vec<IndexMetadata>>,
+    /// Row addresses whose inverted-index entries are stale because a data overlay committed after
+    /// the index touched the indexed column. Blocked from the phrase result so the pre-overlay
+    /// positions never match; unlike match queries there is no flat phrase path to re-score them,
+    /// so a new phrase match on the current value only surfaces after compaction folds the overlay
+    /// into the base.
+    overlay_block: Option<RowAddrMask>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -1204,6 +1211,7 @@ impl PhraseQueryExec {
             prefilter_source,
             base_scorer: None,
             preset_segments: None,
+            overlay_block: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -1232,6 +1240,7 @@ impl PhraseQueryExec {
             prefilter_source,
             base_scorer: None,
             preset_segments: Some(segments),
+            overlay_block: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -1240,6 +1249,12 @@ impl PhraseQueryExec {
     /// Override the local BM25 scorer; see [`MatchQueryExec::with_base_scorer`].
     pub fn with_base_scorer(mut self, scorer: Arc<MemBM25Scorer>) -> Self {
         self.base_scorer = Some(scorer);
+        self
+    }
+
+    /// Block the given stale row addresses from the phrase result (see the `overlay_block` field).
+    pub fn with_overlay_block(mut self, overlay_block: RowAddrMask) -> Self {
+        self.overlay_block = Some(overlay_block);
         self
     }
 
@@ -1301,6 +1316,7 @@ impl ExecutionPlan for PhraseQueryExec {
                 prefilter_source: PreFilterSource::None,
                 base_scorer: self.base_scorer.clone(),
                 preset_segments: self.preset_segments.clone(),
+                overlay_block: self.overlay_block.clone(),
                 properties: self.properties.clone(),
                 metrics: ExecutionPlanMetricsSet::new(),
             },
@@ -1326,6 +1342,7 @@ impl ExecutionPlan for PhraseQueryExec {
                     prefilter_source,
                     base_scorer: self.base_scorer.clone(),
                     preset_segments: self.preset_segments.clone(),
+                    overlay_block: self.overlay_block.clone(),
                     properties: self.properties.clone(),
                     metrics: ExecutionPlanMetricsSet::new(),
                 }
@@ -1351,6 +1368,7 @@ impl ExecutionPlan for PhraseQueryExec {
         let prefilter_source = self.prefilter_source.clone();
         let preset_base_scorer = self.base_scorer.clone();
         let preset_segments = self.preset_segments.clone();
+        let overlay_block = self.overlay_block.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
         let stream = stream::once(async move {
             let _timer = metrics.baseline_metrics.elapsed_compute().timer();
@@ -1384,6 +1402,11 @@ impl ExecutionPlan for PhraseQueryExec {
                 Arc::get_mut(&mut pre_filter)
                     .expect("prefilter just created")
                     .set_deleted_fragments(deleted_fragments);
+            }
+            if let Some(overlay_block) = overlay_block {
+                Arc::get_mut(&mut pre_filter)
+                    .expect("prefilter just created")
+                    .set_overlay_block(overlay_block);
             }
             metrics
                 .record_parts_searched(indices.iter().map(|index| index.partition_count()).sum());

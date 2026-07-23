@@ -3575,40 +3575,38 @@ impl Scanner {
                 .to_string()));
         }
 
-        // Mask data overlay files: a fragment with an overlay committed after this FTS index can
-        // no longer be trusted to its inverted-index positions, so a stale phrase could still
-        // match. Exclude any segment covering such a fragment. Unlike match queries, phrase
-        // queries have no flat re-evaluation path, so — exactly as for unindexed fragments, which
-        // phrase queries already do not search — overlaid fragments are simply dropped from the
-        // phrase result; new phrase matches there surface once compaction folds the overlay into
-        // the base. This removes stale hits without introducing wrong ones.
+        // Mask data overlay files: a row with an overlay committed after this FTS index touched the
+        // indexed column can no longer be trusted to its inverted-index positions, so its stale
+        // phrase positions could still match. Block just those rows from the phrase result, leaving
+        // every other (fresh) row in their segments searchable. Blocking whole segments instead
+        // would also drop unrelated matches co-located in the same segment. Phrase queries have no
+        // flat re-evaluation path (unlike match queries — see `plan_match_query`), so a new phrase
+        // match on a blocked row's current value only surfaces once compaction folds the overlay
+        // into the base. This removes stale hits without introducing wrong ones.
         let target_fragments = self
             .fragments
             .clone()
             .unwrap_or_else(|| self.dataset.fragments().to_vec());
-        let (_flat_frag_ids, fresh_segments) = self
-            .fts_stale_frags_and_fresh_segments(&column, &target_fragments)
-            .await?;
+        let overlaid_frags = overlaid_fragments(&target_fragments);
+        let mut stale_rows: HashMap<u32, RoaringBitmap> = HashMap::new();
+        if !overlaid_frags.is_empty() {
+            for segment in &segments {
+                collect_overlay_stale_rows_for_segment(segment, &overlaid_frags, &mut stale_rows)?;
+            }
+        }
+        let overlay_block = self.stale_rows_block_mask(&stale_rows).await?;
 
-        let exec: Arc<dyn ExecutionPlan> = match fresh_segments {
-            // Every segment covers a stale fragment: with no flat phrase path there is nothing
-            // trustworthy left to search, so the phrase query returns no rows.
-            Some(segs) if segs.is_empty() => Arc::new(EmptyExec::new(FTS_SCHEMA.clone())),
-            Some(segs) => Arc::new(PhraseQueryExec::new_with_segments(
-                self.dataset.clone(),
-                query.clone(),
-                params.clone(),
-                prefilter_source.clone(),
-                segs,
-            )),
-            None => Arc::new(PhraseQueryExec::new(
-                self.dataset.clone(),
-                query.clone(),
-                params.clone(),
-                prefilter_source.clone(),
-            )),
-        };
-        Ok(exec)
+        let mut exec = PhraseQueryExec::new_with_segments(
+            self.dataset.clone(),
+            query.clone(),
+            params.clone(),
+            prefilter_source.clone(),
+            segments,
+        );
+        if let Some(block) = overlay_block {
+            exec = exec.with_overlay_block(block);
+        }
+        Ok(Arc::new(exec))
     }
 
     async fn plan_match_query(

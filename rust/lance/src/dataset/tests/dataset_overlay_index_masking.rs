@@ -815,6 +815,80 @@ async fn test_fts_overlay_unrelated_field_not_excluded() {
     assert_eq!(fts_ids_matching(&dataset, "banana").await, vec![3, 999]);
 }
 
+/// Two-fragment text dataset where several rows share a phrase, plus one non-matching row that
+/// will be overlaid. `text` is field 1. Fragment 0 (ids 0..6) holds three "red car" phrases and
+/// the overlay target (id=2); fragment 1 (ids 6..12) holds a fourth "red car" phrase.
+async fn create_phrase_sibling_dataset() -> Dataset {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, true),
+        ArrowField::new("text", DataType::Utf8, true),
+    ]));
+    let texts: Vec<&str> = vec![
+        "red car fast",       // 0 — matches "red car"
+        "blue sky wide",      // 1
+        "old truck slow",     // 2 — overlay target (does NOT match the phrase)
+        "red car shiny",      // 3 — matches "red car"
+        "green boat calm",    // 4
+        "red car brand",      // 5 — matches "red car"
+        "red car extra",      // 6 — fragment 1, matches "red car"
+        "pear tart sweet",    // 7
+        "lemon curd tang",    // 8
+        "peach cobbler warm", // 9
+        "plum pudding rich",  // 10
+        "fig newton crisp",   // 11
+    ];
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(0..12)),
+            Arc::new(StringArray::from(texts)),
+        ],
+    )
+    .unwrap();
+    let write_params = WriteParams {
+        max_rows_per_file: 6,
+        ..Default::default()
+    };
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+    Dataset::write(reader, "memory://", Some(write_params))
+        .await
+        .unwrap()
+}
+
+/// A phrase query must keep matches from rows that are merely co-located (same fragment/segment)
+/// with an overlaid row. Overlaying one row's `text` must drop only that row's stale phrase hit,
+/// not every phrase hit in its segment. Regression for the FTS phrase path excluding whole
+/// overlay-stale segments without re-evaluating the sibling rows they cover.
+#[tokio::test]
+async fn test_fts_phrase_overlay_keeps_sibling_matches() {
+    let mut dataset = create_phrase_sibling_dataset().await;
+    build_text_fts_index_with_positions(&mut dataset).await;
+
+    // Before any overlay the phrase "red car" matches ids 0, 3, 5 (fragment 0) and 6 (fragment 1).
+    assert_eq!(
+        fts_phrase_ids_matching(&dataset, "red car").await,
+        vec![0, 3, 5, 6]
+    );
+
+    // Overlay id=2's text (field 1). Its old value "old truck slow" never matched the phrase, so
+    // the correct result is unchanged. The overlay must not evict its siblings 0, 3 and 5.
+    let dataset = commit_overlay(
+        dataset,
+        "phrase_sibling_overlay",
+        0,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([2])),
+        vec![Arc::new(StringArray::from(vec![Some("zzoverlay")]))],
+    )
+    .await;
+
+    assert_eq!(
+        fts_phrase_ids_matching(&dataset, "red car").await,
+        vec![0, 3, 5, 6],
+        "overlaying a non-matching row dropped its co-located phrase matches"
+    );
+}
+
 /// Benchmark: measure query latency for BTree, FTS, and vector ANN with 0/4/16 overlay layers.
 ///
 /// Run with: cargo test -p lance --lib --release -- overlay_index_masking::bench --ignored --nocapture
