@@ -1738,6 +1738,21 @@ impl Dataset {
     /// The returned vector has one element per row ID. Null blob values are
     /// represented as `None`; valid empty blobs return a `BlobFile` with size
     /// zero.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use lance::dataset::Dataset;
+    /// # use lance::Result;
+    /// # async fn example(dataset: Arc<Dataset>) -> Result<()> {
+    /// let blobs = dataset.take_blobs(&[42], "images").await?;
+    /// match &blobs[0] {
+    ///     None => { /* The selected blob is null. */ }
+    ///     Some(blob) if blob.size() == 0 => { /* The selected blob is valid but empty. */ }
+    ///     Some(blob) => { let _size = blob.size(); }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn take_blobs(
         self: &Arc<Self>,
         row_ids: &[u64],
@@ -1754,6 +1769,23 @@ impl Dataset {
     /// [`Self::take_blobs`]. For row indices (offsets), use
     /// [`Self::take_blobs_by_indices`]. The result has the same null and empty
     /// blob representation as [`Self::take_blobs`].
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use lance::dataset::Dataset;
+    /// # use lance::Result;
+    /// # async fn example(dataset: Arc<Dataset>, row_address: u64) -> Result<()> {
+    /// let blobs = dataset
+    ///     .take_blobs_by_addresses(&[row_address], "images")
+    ///     .await?;
+    /// match &blobs[0] {
+    ///     None => { /* The selected blob is null. */ }
+    ///     Some(blob) if blob.size() == 0 => { /* The selected blob is valid but empty. */ }
+    ///     Some(blob) => { let _size = blob.size(); }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn take_blobs_by_addresses(
         self: &Arc<Self>,
         row_addrs: &[u64],
@@ -1766,6 +1798,21 @@ impl Dataset {
     ///
     /// The result has the same null and empty blob representation as
     /// [`Self::take_blobs`].
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use lance::dataset::Dataset;
+    /// # use lance::Result;
+    /// # async fn example(dataset: Arc<Dataset>) -> Result<()> {
+    /// let blobs = dataset.take_blobs_by_indices(&[0], "images").await?;
+    /// match &blobs[0] {
+    ///     None => { /* The selected blob is null. */ }
+    ///     Some(blob) if blob.size() == 0 => { /* The selected blob is valid but empty. */ }
+    ///     Some(blob) => { let _size = blob.size(); }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn take_blobs_by_indices(
         self: &Arc<Self>,
         row_indices: &[u64],

@@ -174,8 +174,8 @@ Choose the read API based on the payload shape you want:
 
 | API | Returns | Use When |
 |---|---|---|
-| `read_blobs` | `List[Tuple[int, bytes]]` | You need complete blob payloads in memory, such as training loaders or batch preprocessing. |
-| `take_blobs` | `List[BlobFile]` | You need file-like objects for streaming, seeking, or partial reads. |
+| `read_blobs` | `List[Tuple[int, Optional[bytes]]]` | You need complete blob payloads in memory, such as training loaders or batch preprocessing. |
+| `take_blobs` | `List[Optional[BlobFile]]` | You need file-like objects for streaming, seeking, or partial reads. |
 | `scanner(..., blob_handling="all_binary")` | Arrow binary columns | You want blob columns in a scan result or `pyarrow.Table`. |
 
 Do not wrap `take_blobs` in your own thread pool just to call `read()` or
@@ -246,8 +246,10 @@ import lance
 ds = lance.dataset("./blobs_v22.lance")
 blobs = ds.take_blobs("blob", indices=[0, 1])
 
-with blobs[0] as f:
-    header = f.read(1024)
+blob = blobs[0]
+if blob is not None:
+    with blob as f:
+        header = f.read(1024)
 ```
 
 ### Example: decode video frames lazily
@@ -258,6 +260,8 @@ import lance
 
 ds = lance.dataset("./videos_v22.lance")
 blob = ds.take_blobs("video", indices=[0])[0]
+if blob is None:
+    raise ValueError("video blob is null")
 
 start_ms, end_ms = 500, 1000
 
