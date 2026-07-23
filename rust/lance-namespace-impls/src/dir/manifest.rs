@@ -60,7 +60,7 @@ use lance_table::format::{Fragment, IndexMetadata, Manifest};
 use lance_table::io::commit::{
     CommitError, CommitHandler, commit_handler_from_url, write_manifest_file_to_path,
 };
-use object_store::{Error as ObjectStoreError, path::Path};
+use object_store::{Error as ObjectStoreError, ObjectStoreExt, path::Path};
 use roaring::RoaringBitmap;
 use std::io::Cursor;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -3490,30 +3490,89 @@ impl LanceNamespace for ManifestNamespace {
             }
         }
 
-        // Create the .lance-reserved file to mark the table as existing
+        // Create the .lance-reserved file to mark the table as existing.
+        // Avoid `object_store.create(.lance-reserved)` / PutMode::Create on the
+        // final dotfile: some object stores implement Create via temp+rename
+        // using the final basename, which yields `..lance-reserved` temps that
+        // the underlying store rejects. Stage under a non-dot sibling, then
+        // rename_if_not_exists.
         let reserved_file_path = table_path.clone().join(".lance-reserved");
+        let staging_name = format!("lance-marker.staging.{}", Uuid::new_v4().simple());
+        let staging_path = table_path.clone().join(staging_name.as_str());
 
+        // Some object stores write via temp+rename and may not flush empty
+        // objects through to the underlying filesystem, so the conditional
+        // rename can fail with NotFound. Use a tiny non-empty payload.
         self.object_store
-            .create(&reserved_file_path)
+            .inner
+            .put(&staging_path, Bytes::from_static(b"reserved").into())
             .await
             .map_err(|e| {
                 lance_core::Error::from(NamespaceError::Internal {
                     message: format!(
-                        "Failed to create .lance-reserved file for table {}: {}",
-                        table_name, e
-                    ),
-                })
-            })?
-            .shutdown()
-            .await
-            .map_err(|e| {
-                lance_core::Error::from(NamespaceError::Internal {
-                    message: format!(
-                        "Failed to finalize .lance-reserved file for table {}: {}",
+                        "Failed to stage .lance-reserved file for table {}: {}",
                         table_name, e
                     ),
                 })
             })?;
+
+        // Prefer rename_if_not_exists (conditional no-replace rename). Fall
+        // back to Create put only when the store lacks conditional rename.
+        let publish = match self
+            .object_store
+            .inner
+            .rename_if_not_exists(&staging_path, &reserved_file_path)
+            .await
+        {
+            Ok(()) => {
+                // Staging path was consumed by the rename.
+                Ok(())
+            }
+            Err(ObjectStoreError::NotImplemented { .. })
+            | Err(ObjectStoreError::NotSupported { .. }) => {
+                use object_store::{PutMode, PutOptions};
+                let result = self
+                    .object_store
+                    .inner
+                    .put_opts(
+                        &reserved_file_path,
+                        Bytes::from_static(b"reserved").into(),
+                        PutOptions {
+                            mode: PutMode::Create,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .map(|_| ());
+                if let Err(e) = self.object_store.inner.delete(&staging_path).await {
+                    log::warn!(
+                        "Failed to delete staging marker at '{}': {:?}",
+                        staging_path,
+                        e
+                    );
+                }
+                result
+            }
+            Err(e) => {
+                if let Err(del_err) = self.object_store.inner.delete(&staging_path).await {
+                    log::warn!(
+                        "Failed to delete staging marker at '{}': {:?}",
+                        staging_path,
+                        del_err
+                    );
+                }
+                Err(e)
+            }
+        };
+
+        publish.map_err(|e| {
+            lance_core::Error::from(NamespaceError::Internal {
+                message: format!(
+                    "Failed to create .lance-reserved file for table {}: {}",
+                    table_name, e
+                ),
+            })
+        })?;
 
         let metadata = Self::serialize_metadata(request.properties.as_ref(), "table", &object_id)?;
 

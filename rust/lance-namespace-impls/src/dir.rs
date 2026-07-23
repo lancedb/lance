@@ -40,7 +40,9 @@ use lance_linalg::distance::MetricType;
 use lance_table::io::commit::{ManifestNamingScheme, VERSIONS_DIR};
 use object_store::ObjectStoreExt;
 use object_store::path::Path;
-use object_store::{Error as ObjectStoreError, ObjectStore as OSObjectStore, PutMode, PutOptions};
+use object_store::{
+    Error as ObjectStoreError, ObjectMeta, ObjectStore as OSObjectStore, PutMode, PutOptions,
+};
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::{Arc, Mutex};
@@ -921,6 +923,17 @@ impl std::fmt::Display for DirectoryNamespace {
     }
 }
 
+/// Inputs for resolving an already-published `create_table_version` target.
+struct ExistingTableVersionResolve<'a> {
+    staging_path: &'a Path,
+    final_path: &'a Path,
+    version: u64,
+    table_uri: &'a str,
+    request_e_tag: Option<&'a str>,
+    final_meta: &'a ObjectMeta,
+    request_manifest_size: Option<i64>,
+}
+
 /// Describes the version ranges to delete for a single table.
 /// Used by `batch_delete_table_versions` and `delete_physical_version_files`.
 struct TableDeleteEntry {
@@ -1602,6 +1615,212 @@ impl DirectoryNamespace {
     /// version listing and deletion stay consistent with the on-disk format.
     fn manifest_version_from_filename(filename: &str) -> Option<u64> {
         ManifestNamingScheme::detect_scheme(filename)?.parse_version(filename)
+    }
+
+    /// Build a successful `CreateTableVersionResponse` from an existing final manifest.
+    fn create_table_version_response(
+        version: u64,
+        final_path: &Path,
+        final_meta: &ObjectMeta,
+    ) -> CreateTableVersionResponse {
+        CreateTableVersionResponse {
+            transaction_id: None,
+            version: Some(Box::new(TableVersion {
+                version: version as i64,
+                manifest_path: final_path.to_string(),
+                manifest_size: Some(final_meta.size as i64),
+                e_tag: final_meta.e_tag.clone(),
+                timestamp_millis: None,
+                metadata: None,
+            })),
+        }
+    }
+
+    /// Whether the staging blob matches the already-published version blob.
+    ///
+    /// Used for idempotent retries of `create_table_version`: after a successful
+    /// Create materialize the final object's e_tag may differ from the staging
+    /// e_tag, so content equality is the durable identity check.
+    async fn staging_matches_final_manifest(
+        &self,
+        staging_path: &Path,
+        final_path: &Path,
+        request_e_tag: Option<&str>,
+        final_meta: &ObjectMeta,
+        request_manifest_size: Option<i64>,
+    ) -> Result<bool> {
+        if let (Some(req_tag), Some(exist_tag)) = (request_e_tag, final_meta.e_tag.as_deref())
+            && req_tag == exist_tag
+        {
+            return Ok(true);
+        }
+        if let Some(size) = request_manifest_size
+            && size != final_meta.size as i64
+        {
+            return Ok(false);
+        }
+
+        let staging_bytes = match self.object_store.inner.get(staging_path).await {
+            Ok(r) => r.bytes().await.map_err(|e| {
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!(
+                        "Failed to read staging manifest at '{}': {}",
+                        staging_path, e
+                    ),
+                })
+            })?,
+            Err(ObjectStoreError::NotFound { .. }) => return Ok(false),
+            Err(e) => {
+                return Err(lance_core::Error::from(NamespaceError::Internal {
+                    message: format!(
+                        "Failed to read staging manifest at '{}': {}",
+                        staging_path, e
+                    ),
+                }));
+            }
+        };
+
+        let final_bytes = self
+            .object_store
+            .inner
+            .get(final_path)
+            .await
+            .map_err(|e| {
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!(
+                        "Failed to read existing version manifest at '{}': {}",
+                        final_path, e
+                    ),
+                })
+            })?
+            .bytes()
+            .await
+            .map_err(|e| {
+                lance_core::Error::from(NamespaceError::Internal {
+                    message: format!(
+                        "Failed to read existing version manifest bytes at '{}': {}",
+                        final_path, e
+                    ),
+                })
+            })?;
+
+        Ok(staging_bytes.as_ref() == final_bytes.as_ref())
+    }
+
+    /// Idempotent success or conflict when the target version path already exists.
+    async fn resolve_existing_table_version(
+        &self,
+        args: ExistingTableVersionResolve<'_>,
+    ) -> Result<CreateTableVersionResponse> {
+        if self
+            .staging_matches_final_manifest(
+                args.staging_path,
+                args.final_path,
+                args.request_e_tag,
+                args.final_meta,
+                args.request_manifest_size,
+            )
+            .await?
+        {
+            // Best-effort cleanup of a retry's staging blob.
+            if let Err(e) = self.object_store.inner.delete(args.staging_path).await {
+                log::warn!(
+                    "Failed to delete staging manifest at '{}': {:?}",
+                    args.staging_path,
+                    e
+                );
+            }
+            return Ok(Self::create_table_version_response(
+                args.version,
+                args.final_path,
+                args.final_meta,
+            ));
+        }
+
+        Err(lance_core::Error::from(
+            NamespaceError::ConcurrentModification {
+                message: format!(
+                    "Version {} already exists for table at '{}' with different content",
+                    args.version, args.table_uri
+                ),
+            },
+        ))
+    }
+
+    /// Enforce version CAS: requested version must be `latest + 1` (or `1` if empty).
+    async fn enforce_create_table_version_cas(
+        &self,
+        table_path: &Path,
+        version: u64,
+        table_uri: &str,
+    ) -> Result<()> {
+        let latest = self.list_versions_under(table_path, true, Some(1)).await?;
+        let expected = match latest.first() {
+            Some(v) => (v.version as u64).saturating_add(1),
+            None => 1,
+        };
+        if version != expected {
+            let latest_display = latest
+                .first()
+                .map(|v| v.version.to_string())
+                .unwrap_or_else(|| "none".to_string());
+            return Err(lance_core::Error::from(
+                NamespaceError::ConcurrentModification {
+                    message: format!(
+                        "Version CAS failed for table at '{}': requested {}, expected {} (latest {})",
+                        table_uri, version, expected, latest_display
+                    ),
+                },
+            ));
+        }
+        Ok(())
+    }
+
+    /// Materialize staging → final with Create semantics only (never overwrite).
+    async fn materialize_version_manifest_create(
+        &self,
+        staging_path: &Path,
+        final_path: &Path,
+        staging_manifest_path: &str,
+    ) -> std::result::Result<(), ObjectStoreError> {
+        match self
+            .object_store
+            .inner
+            .copy_if_not_exists(staging_path, final_path)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(ObjectStoreError::NotImplemented { .. })
+            | Err(ObjectStoreError::NotSupported { .. }) => {
+                let manifest_data = self
+                    .object_store
+                    .inner
+                    .get(staging_path)
+                    .await?
+                    .bytes()
+                    .await
+                    .map_err(|e| ObjectStoreError::Generic {
+                        store: "DirectoryNamespace",
+                        source: Box::new(std::io::Error::other(format!(
+                            "Failed to read staging manifest bytes at '{}': {}",
+                            staging_manifest_path, e
+                        ))),
+                    })?;
+                self.object_store
+                    .inner
+                    .put_opts(
+                        final_path,
+                        manifest_data.into(),
+                        PutOptions {
+                            mode: PutMode::Create,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .map(|_| ())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     async fn list_table_versions_from_storage(
@@ -2550,18 +2769,73 @@ impl DirectoryNamespace {
         path: &Path,
         file_description: &str,
     ) -> std::result::Result<(), String> {
-        let put_opts = PutOptions {
-            mode: PutMode::Create,
-            ..Default::default()
+        // Some object stores implement `PutMode::Create` using a temp+rename
+        // that reuses the final basename. Dotfile targets such as
+        // `.lance-reserved` therefore produce temp names containing `..`,
+        // which these stores reject. Stage under a non-dot sibling, then claim
+        // the final path with rename_if_not_exists (conditional no-replace
+        // rename) so Create semantics are preserved without changing the store.
+        let staging_name = format!("lance-marker.staging.{}", uuid::Uuid::new_v4().simple());
+        let path_str = path.as_ref();
+        let staging_path = match path_str.rfind('/') {
+            Some(idx) => Path::from(format!("{}/{}", &path_str[..idx], staging_name)),
+            None => Path::from(staging_name.as_str()),
         };
 
-        match self
+        // Some object stores write via temp+rename and may not flush empty
+        // objects through to the underlying filesystem, so the conditional
+        // rename can fail with NotFound. Use a tiny non-empty payload.
+        self.object_store
+            .inner
+            .put(&staging_path, bytes::Bytes::from_static(b"reserved").into())
+            .await
+            .map_err(|e| format!("Failed to stage {}: {:?}", file_description, e))?;
+
+        let publish_result = match self
             .object_store
             .inner
-            .put_opts(path, bytes::Bytes::new().into(), put_opts)
+            .rename_if_not_exists(&staging_path, path)
             .await
         {
-            Ok(_) => Ok(()),
+            Ok(()) => Ok(()),
+            Err(ObjectStoreError::NotImplemented { .. })
+            | Err(ObjectStoreError::NotSupported { .. }) => {
+                let result = self
+                    .object_store
+                    .inner
+                    .put_opts(
+                        path,
+                        bytes::Bytes::from_static(b"reserved").into(),
+                        PutOptions {
+                            mode: PutMode::Create,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .map(|_| ());
+                if let Err(e) = self.object_store.inner.delete(&staging_path).await {
+                    log::warn!(
+                        "Failed to delete staging marker at '{}': {:?}",
+                        staging_path,
+                        e
+                    );
+                }
+                result
+            }
+            Err(e) => {
+                if let Err(del_err) = self.object_store.inner.delete(&staging_path).await {
+                    log::warn!(
+                        "Failed to delete staging marker at '{}': {:?}",
+                        staging_path,
+                        del_err
+                    );
+                }
+                Err(e)
+            }
+        };
+
+        match publish_result {
+            Ok(()) => Ok(()),
             Err(ObjectStoreError::AlreadyExists { .. })
             | Err(ObjectStoreError::Precondition { .. }) => {
                 Err(format!("{} already exists", file_description))
@@ -3641,66 +3915,73 @@ impl LanceNamespace for DirectoryNamespace {
             })
         })?;
 
-        let copy_result = match self
-            .object_store
-            .inner
-            .copy_if_not_exists(&staging_path, &final_path)
-            .await
-        {
-            Ok(()) => Ok(()),
-            Err(ObjectStoreError::NotImplemented { .. })
-            | Err(ObjectStoreError::NotSupported { .. }) => {
-                let manifest_data = self
-                    .object_store
-                    .inner
-                    .get(&staging_path)
-                    .await
-                    .map_err(|e| {
-                        lance_core::Error::from(NamespaceError::Internal {
-                            message: format!(
-                                "Failed to read staging manifest at '{}': {}",
-                                staging_manifest_path, e
-                            ),
-                        })
-                    })?
-                    .bytes()
-                    .await
-                    .map_err(|e| {
-                        lance_core::Error::from(NamespaceError::Internal {
-                            message: format!(
-                                "Failed to read staging manifest bytes at '{}': {}",
-                                staging_manifest_path, e
-                            ),
-                        })
-                    })?;
-                self.object_store
-                    .inner
-                    .put_opts(
-                        &final_path,
-                        manifest_data.into(),
-                        PutOptions {
-                            mode: PutMode::Create,
-                            ..Default::default()
-                        },
-                    )
-                    .await
-                    .map(|_| ())
+        // Idempotent retry: version path already published with the same content.
+        match self.object_store.inner.head(&final_path).await {
+            Ok(existing_meta) => {
+                return self
+                    .resolve_existing_table_version(ExistingTableVersionResolve {
+                        staging_path: &staging_path,
+                        final_path: &final_path,
+                        version,
+                        table_uri: &table_uri,
+                        request_e_tag: request.e_tag.as_deref(),
+                        final_meta: &existing_meta,
+                        request_manifest_size: request.manifest_size,
+                    })
+                    .await;
             }
-            Err(e) => Err(e),
-        };
+            Err(ObjectStoreError::NotFound { .. }) => {}
+            Err(e) => {
+                return Err(lance_core::Error::from(NamespaceError::Internal {
+                    message: format!(
+                        "Failed to stat version {} for table at '{}': {}",
+                        version, table_uri, e
+                    ),
+                }));
+            }
+        }
+
+        // Strict CAS: only allow appending latest+1 (or version 1 on an empty chain).
+        self.enforce_create_table_version_cas(&table_path, version, &table_uri)
+            .await?;
+
+        // Materialize with Create / copy_if_not_exists only — never overwrite.
+        let copy_result = self
+            .materialize_version_manifest_create(&staging_path, &final_path, staging_manifest_path)
+            .await;
 
         match copy_result {
             Ok(()) => {}
             Err(ObjectStoreError::AlreadyExists { .. })
             | Err(ObjectStoreError::Precondition { .. }) => {
-                return Err(lance_core::Error::from(
-                    NamespaceError::ConcurrentModification {
+                // Lost a Create race: succeed only if the winner published identical bytes.
+                let existing_meta = self.object_store.inner.head(&final_path).await.map_err(|e| {
+                    lance_core::Error::from(NamespaceError::Internal {
                         message: format!(
-                            "Version {} already exists for table at '{}'",
-                            version, table_uri
+                            "Version {} conflict for table at '{}' but failed to stat winner: {}",
+                            version, table_uri, e
                         ),
-                    },
-                ));
+                    })
+                })?;
+                return self
+                    .resolve_existing_table_version(ExistingTableVersionResolve {
+                        staging_path: &staging_path,
+                        final_path: &final_path,
+                        version,
+                        table_uri: &table_uri,
+                        request_e_tag: request.e_tag.as_deref(),
+                        final_meta: &existing_meta,
+                        request_manifest_size: request.manifest_size,
+                    })
+                    .await;
+            }
+            Err(ObjectStoreError::NotFound { .. }) => {
+                return Err(lance_core::Error::from(NamespaceError::InvalidInput {
+                    message: format!(
+                        "Staging manifest not found at '{}' for version {} of table at '{}'",
+                        staging_manifest_path, version, table_uri
+                    ),
+                }));
             }
             Err(e) => {
                 return Err(lance_core::Error::from(NamespaceError::Internal {
@@ -3725,7 +4006,6 @@ impl LanceNamespace for DirectoryNamespace {
                     ),
                 })
             })?;
-        let manifest_size = final_meta.size as i64;
 
         // Delete the staging manifest after successful copy
         if let Err(e) = self.object_store.inner.delete(&staging_path).await {
@@ -3736,17 +4016,11 @@ impl LanceNamespace for DirectoryNamespace {
             );
         }
 
-        Ok(CreateTableVersionResponse {
-            transaction_id: None,
-            version: Some(Box::new(TableVersion {
-                version: version as i64,
-                manifest_path: final_path.to_string(),
-                manifest_size: Some(manifest_size),
-                e_tag: final_meta.e_tag,
-                timestamp_millis: None,
-                metadata: None,
-            })),
-        })
+        Ok(Self::create_table_version_response(
+            version,
+            &final_path,
+            &final_meta,
+        ))
     }
 
     async fn describe_table_version(
@@ -11388,9 +11662,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_create_table_version_idempotent() {
+        // A network retry of create_table_version with the same staging content
+        // must succeed (not ConcurrentModification) once the version is published.
+        use futures::TryStreamExt;
+        use lance::dataset::builder::DatasetBuilder;
+        use lance_namespace::models::CreateTableVersionRequest;
+
+        let temp_dir = TempStrDir::default();
+        let temp_path: &str = &temp_dir;
+
+        let namespace: Arc<dyn LanceNamespace> = Arc::new(
+            DirectoryNamespaceBuilder::new(temp_path)
+                .table_version_tracking_enabled(true)
+                .build()
+                .await
+                .unwrap(),
+        );
+
+        let schema = create_test_schema();
+        let ipc_data = create_test_ipc_data(&schema);
+        let mut create_req = CreateTableRequest::new();
+        create_req.id = Some(vec!["test_table".to_string()]);
+        namespace
+            .create_table(create_req, bytes::Bytes::from(ipc_data))
+            .await
+            .unwrap();
+
+        let table_id = vec!["test_table".to_string()];
+        let dataset = DatasetBuilder::from_namespace(namespace.clone(), table_id.clone())
+            .await
+            .unwrap()
+            .load()
+            .await
+            .unwrap();
+
+        let versions_path = dataset.versions_dir();
+        let manifest_metas: Vec<_> = dataset
+            .object_store(None)
+            .await
+            .unwrap()
+            .inner
+            .list(Some(&versions_path))
+            .try_collect()
+            .await
+            .unwrap();
+
+        let manifest_meta = manifest_metas
+            .iter()
+            .find(|m| {
+                m.location
+                    .filename()
+                    .map(|f| f.ends_with(".manifest"))
+                    .unwrap_or(false)
+            })
+            .expect("No manifest file found");
+
+        let manifest_data = dataset
+            .object_store(None)
+            .await
+            .unwrap()
+            .inner
+            .get(&manifest_meta.location)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+
+        let staging_path = dataset.versions_dir().join("staging_manifest");
+        dataset
+            .object_store(None)
+            .await
+            .unwrap()
+            .inner
+            .put(&staging_path, manifest_data.clone().into())
+            .await
+            .unwrap();
+
+        let mut create_version_req = CreateTableVersionRequest::new(2, staging_path.to_string());
+        create_version_req.id = Some(table_id.clone());
+        create_version_req.naming_scheme = Some("V2".to_string());
+        let first = namespace
+            .create_table_version(create_version_req)
+            .await
+            .expect("first create_table_version should succeed");
+
+        // Re-stage identical bytes (simulates Lance commit retry rewriting staging).
+        let retry_staging = dataset.versions_dir().join("staging_manifest_retry");
+        dataset
+            .object_store(None)
+            .await
+            .unwrap()
+            .inner
+            .put(&retry_staging, manifest_data.into())
+            .await
+            .unwrap();
+
+        let mut retry_req = CreateTableVersionRequest::new(2, retry_staging.to_string());
+        retry_req.id = Some(table_id.clone());
+        retry_req.naming_scheme = Some("V2".to_string());
+        let second = namespace
+            .create_table_version(retry_req)
+            .await
+            .expect("idempotent retry must succeed");
+
+        assert_eq!(
+            first.version.as_ref().map(|v| v.version),
+            second.version.as_ref().map(|v| v.version)
+        );
+        assert_eq!(
+            first.version.as_ref().map(|v| &v.manifest_path),
+            second.version.as_ref().map(|v| &v.manifest_path)
+        );
+    }
+
+    #[tokio::test]
     async fn test_create_table_version_conflict() {
-        // create_table_version should fail if the version already exists.
-        // Each version always writes to a new file location.
+        // Same version with different content must fail ConcurrentModification.
         use futures::TryStreamExt;
         use lance::dataset::builder::DatasetBuilder;
         use lance_namespace::models::CreateTableVersionRequest;
@@ -11492,15 +11881,34 @@ mod tests {
         )
         .unwrap();
 
-        // Create version 2 again (should fail - conflict)
-        let mut create_version_req = CreateTableVersionRequest::new(2, staging_path.to_string());
+        // Different content for the same version number must conflict.
+        let conflict_staging = dataset.versions_dir().join("staging_manifest_conflict");
+        dataset
+            .object_store(None)
+            .await
+            .unwrap()
+            .inner
+            .put(
+                &conflict_staging,
+                bytes::Bytes::from_static(b"not-a-real-manifest").into(),
+            )
+            .await
+            .unwrap();
+
+        let mut create_version_req =
+            CreateTableVersionRequest::new(2, conflict_staging.to_string());
         create_version_req.id = Some(table_id.clone());
         create_version_req.naming_scheme = Some("V2".to_string());
 
         let result = namespace.create_table_version(create_version_req).await;
         assert!(
             result.is_err(),
-            "create_table_version should fail for existing version"
+            "create_table_version should fail for existing version with different content"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("already exists") || err.contains("ConcurrentModification"),
+            "expected ConcurrentModification, got: {err}"
         );
 
         // Verify version 2 still exists using the dataset's object_store
@@ -11515,6 +11923,97 @@ mod tests {
             head_result.is_ok(),
             "Version 2 manifest should still exist at {}",
             version_2_path
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_table_version_cas_rejects_gap() {
+        // Strict CAS: version must be latest+1; skipping ahead is ConcurrentModification.
+        use futures::TryStreamExt;
+        use lance::dataset::builder::DatasetBuilder;
+        use lance_namespace::models::CreateTableVersionRequest;
+
+        let temp_dir = TempStrDir::default();
+        let temp_path: &str = &temp_dir;
+
+        let namespace: Arc<dyn LanceNamespace> = Arc::new(
+            DirectoryNamespaceBuilder::new(temp_path)
+                .table_version_tracking_enabled(true)
+                .build()
+                .await
+                .unwrap(),
+        );
+
+        let schema = create_test_schema();
+        let ipc_data = create_test_ipc_data(&schema);
+        let mut create_req = CreateTableRequest::new();
+        create_req.id = Some(vec!["test_table".to_string()]);
+        namespace
+            .create_table(create_req, bytes::Bytes::from(ipc_data))
+            .await
+            .unwrap();
+
+        let table_id = vec!["test_table".to_string()];
+        let dataset = DatasetBuilder::from_namespace(namespace.clone(), table_id.clone())
+            .await
+            .unwrap()
+            .load()
+            .await
+            .unwrap();
+
+        let versions_path = dataset.versions_dir();
+        let manifest_metas: Vec<_> = dataset
+            .object_store(None)
+            .await
+            .unwrap()
+            .inner
+            .list(Some(&versions_path))
+            .try_collect()
+            .await
+            .unwrap();
+        let manifest_meta = manifest_metas
+            .iter()
+            .find(|m| {
+                m.location
+                    .filename()
+                    .map(|f| f.ends_with(".manifest"))
+                    .unwrap_or(false)
+            })
+            .expect("No manifest file found");
+        let manifest_data = dataset
+            .object_store(None)
+            .await
+            .unwrap()
+            .inner
+            .get(&manifest_meta.location)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+
+        let staging_path = dataset.versions_dir().join("staging_gap");
+        dataset
+            .object_store(None)
+            .await
+            .unwrap()
+            .inner
+            .put(&staging_path, manifest_data.into())
+            .await
+            .unwrap();
+
+        // After create_table, latest is 1; requesting 5 must fail CAS.
+        let mut req = CreateTableVersionRequest::new(5, staging_path.to_string());
+        req.id = Some(table_id);
+        req.naming_scheme = Some("V2".to_string());
+        let err = namespace
+            .create_table_version(req)
+            .await
+            .expect_err("gap create must fail CAS");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("CAS") || msg.contains("ConcurrentModification"),
+            "expected CAS ConcurrentModification, got: {msg}"
         );
     }
 
