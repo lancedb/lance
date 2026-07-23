@@ -25,7 +25,7 @@ use lance_core::{Error, Result};
 use object_store::path::Path;
 use tokio::io::AsyncSeekExt;
 use tokio::sync::OnceCell;
-use tracing::instrument;
+use tracing::{instrument, warn};
 
 use crate::object_reader::stream_local_range;
 use crate::object_store::DEFAULT_LOCAL_IO_PARALLELISM;
@@ -170,6 +170,31 @@ pub(crate) fn remove_empty_dirs(
         Err(error)
     } else {
         Ok(())
+    }
+}
+
+/// Remove `path`'s ancestor directories that are now empty, stopping at the first one
+/// that is not. Best effort.
+///
+/// `LocalFileSystem::with_automatic_cleanup` cannot do this: it derives its stop boundary
+/// from a rootless `file:///` URL, which `Url::to_file_path` rejects on Windows.
+pub fn prune_empty_parent_dirs(path: &Path) {
+    let local_path = to_local_path(path);
+    let mut parent = std::path::Path::new(&local_path).parent();
+    while let Some(dir) = parent {
+        if dir.as_os_str().is_empty() {
+            break;
+        }
+        if let Err(err) = std::fs::remove_dir(dir) {
+            if !matches!(
+                err.kind(),
+                ErrorKind::DirectoryNotEmpty | ErrorKind::NotFound
+            ) {
+                warn!("failed to prune empty directory {}: {}", dir.display(), err);
+            }
+            break;
+        }
+        parent = dir.parent();
     }
 }
 

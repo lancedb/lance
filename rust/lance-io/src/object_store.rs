@@ -593,6 +593,11 @@ impl ObjectStore {
         self.scheme == "file" || self.scheme == "file+uring"
     }
 
+    /// Wider than [`Self::is_local`]: `file-object-store` also stores real directories.
+    fn backed_by_local_fs(&self) -> bool {
+        self.is_local() || self.scheme == "file-object-store"
+    }
+
     pub fn is_cloud(&self) -> bool {
         if self.is_local() || self.scheme == "memory" || self.scheme == "shared-memory" {
             return false;
@@ -825,6 +830,9 @@ impl ObjectStore {
 
     pub async fn delete(&self, path: &Path) -> Result<()> {
         self.inner.delete(path).await?;
+        if self.backed_by_local_fs() {
+            super::local::prune_empty_parent_dirs(path);
+        }
         Ok(())
     }
 
@@ -1005,11 +1013,15 @@ impl ObjectStore {
         locations: BoxStream<'a, Result<Path>>,
     ) -> BoxStream<'a, Result<Path>> {
         let store = Arc::clone(&self.inner);
+        let prune_empty_dirs = self.backed_by_local_fs();
         locations
             .and_then(move |location| {
                 let store = Arc::clone(&store);
                 async move {
                     store.delete(&location).await?;
+                    if prune_empty_dirs {
+                        super::local::prune_empty_parent_dirs(&location);
+                    }
                     Ok(location)
                 }
             })
@@ -1512,15 +1524,7 @@ mod tests {
             "delete",
         )
         .unwrap();
-        let file_url = Url::from_directory_path(&path).unwrap();
-        let url = if scheme.is_empty() {
-            file_url
-        } else {
-            let mut url = Url::parse(&format!("{scheme}:///")).unwrap();
-            // Use the file:// URL's normalized path so this works on Windows too.
-            url.set_path(file_url.path());
-            url
-        };
+        let url = dir_url(&path, scheme);
         let (store, base) = ObjectStore::from_uri(url.as_ref()).await.unwrap();
         store
             .remove_dir_all(base.clone().join("foo"))
@@ -1552,9 +1556,7 @@ mod tests {
         .unwrap();
         create_dir_all(path.join("file_bearing").join("empty_child")).unwrap();
 
-        let file_url = Url::from_directory_path(&path).unwrap();
-        let mut url = Url::parse(&format!("{scheme}:///")).unwrap();
-        url.set_path(file_url.path());
+        let url = dir_url(&path, scheme);
         let (store, base) = ObjectStore::from_uri(url.as_ref()).await.unwrap();
 
         #[cfg(unix)]
@@ -1606,6 +1608,86 @@ mod tests {
 
         assert!(path.join("fresh").exists());
         assert!(!path.join("verified").exists());
+    }
+
+    fn dir_url(path: impl AsRef<std::path::Path>, scheme: &str) -> Url {
+        let file_url = Url::from_directory_path(path).unwrap();
+        if scheme.is_empty() {
+            return file_url;
+        }
+        let mut url = Url::parse(&format!("{scheme}:///")).unwrap();
+        // Use the file:// URL's normalized path so this works on Windows too.
+        url.set_path(file_url.path());
+        url
+    }
+
+    #[tokio::test]
+    async fn test_delete_prunes_empty_dirs_local_store() {
+        test_delete_prunes_empty_dirs("").await;
+    }
+
+    #[tokio::test]
+    async fn test_delete_prunes_empty_dirs_file_object_store() {
+        test_delete_prunes_empty_dirs("file-object-store").await;
+    }
+
+    async fn test_delete_prunes_empty_dirs(scheme: &str) {
+        let (path, store, file) = prune_fixture(scheme).await;
+        store.delete(&file).await.unwrap();
+        assert_pruned(&path);
+    }
+
+    #[tokio::test]
+    async fn test_remove_stream_prunes_empty_dirs_local_store() {
+        test_remove_stream_prunes_empty_dirs("").await;
+    }
+
+    #[tokio::test]
+    async fn test_remove_stream_prunes_empty_dirs_file_object_store() {
+        test_remove_stream_prunes_empty_dirs("file-object-store").await;
+    }
+
+    async fn test_remove_stream_prunes_empty_dirs(scheme: &str) {
+        let (path, store, file) = prune_fixture(scheme).await;
+        store
+            .remove_stream(futures::stream::once(async { Ok(file) }).boxed())
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_pruned(&path);
+    }
+
+    /// A `foo/bar/nested/test_file` to delete, next to a `foo/zoo/keep_file` that must
+    /// stop the upward walk at `foo/`.
+    async fn prune_fixture(scheme: &str) -> (TempStdDir, Arc<ObjectStore>, Path) {
+        let path = TempStdDir::default();
+        let nested = path.join("foo").join("bar").join("nested");
+        create_dir_all(&nested).unwrap();
+        create_dir_all(path.join("foo").join("zoo")).unwrap();
+        write_to_file(nested.join("test_file").to_str().unwrap(), "delete").unwrap();
+        write_to_file(
+            path.join("foo")
+                .join("zoo")
+                .join("keep_file")
+                .to_str()
+                .unwrap(),
+            "keep",
+        )
+        .unwrap();
+
+        let url = dir_url(&path, scheme);
+        let (store, base) = ObjectStore::from_uri(url.as_ref()).await.unwrap();
+        let file = base
+            .join("foo")
+            .join("bar")
+            .join("nested")
+            .join("test_file");
+        (path, store, file)
+    }
+
+    fn assert_pruned(path: &TempStdDir) {
+        assert!(!path.join("foo").join("bar").exists());
+        assert!(path.join("foo").join("zoo").join("keep_file").exists());
     }
 
     #[derive(Debug)]

@@ -3120,6 +3120,8 @@ mod tests {
                 .await
                 .unwrap()
         );
+        assert!(fixture.local_index_dir(seg_b).exists());
+        assert!(fixture.local_index_dir(seg_c).exists());
     }
 
     #[tokio::test]
