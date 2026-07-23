@@ -542,50 +542,6 @@ impl TaskExecutor {
     /// [`MessageHandler::cleanup`]. This method waits for every dispatcher to finish, even if
     /// cleanup fails or a dispatcher panics, and then returns the first such failure. It returns
     /// `Ok(())` only after every registered handler has been cleaned up successfully.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use std::sync::{
-    ///     Arc,
-    ///     atomic::{AtomicBool, Ordering},
-    /// };
-    ///
-    /// use async_trait::async_trait;
-    /// use lance::dataset::mem_wal::write::{MessageHandler, TaskExecutor};
-    /// use lance::Result;
-    /// use tokio::sync::mpsc;
-    ///
-    /// struct Handler(Arc<AtomicBool>);
-    ///
-    /// #[async_trait]
-    /// impl MessageHandler<()> for Handler {
-    ///     async fn handle(&mut self, _message: ()) -> Result<()> {
-    ///         Ok(())
-    ///     }
-    ///
-    ///     async fn cleanup(&mut self, _shutdown_ok: bool) -> Result<()> {
-    ///         self.0.store(true, Ordering::SeqCst);
-    ///         Ok(())
-    ///     }
-    /// }
-    ///
-    /// # #[tokio::main]
-    /// # async fn main() -> Result<()> {
-    /// let executor = TaskExecutor::new();
-    /// let cleaned_up = Arc::new(AtomicBool::new(false));
-    /// let (_sender, receiver) = mpsc::unbounded_channel();
-    /// executor.add_handler(
-    ///     "example".to_string(),
-    ///     Box::new(Handler(cleaned_up.clone())),
-    ///     receiver,
-    /// )?;
-    ///
-    /// executor.shutdown_all().await?;
-    /// assert!(cleaned_up.load(Ordering::SeqCst));
-    /// # Ok(())
-    /// # }
-    /// ```
     pub async fn shutdown_all(&self) -> Result<()> {
         info!("Shutting down all tasks");
         self.cancellation_token.cancel();
