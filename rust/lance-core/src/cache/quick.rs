@@ -15,6 +15,7 @@ use futures::Future;
 
 use super::CacheCodec;
 use super::backend::{CacheBackend, CacheEntry, InternalCacheKey};
+use super::moka::key_footprint;
 use crate::Result;
 
 #[derive(Clone)]
@@ -27,8 +28,9 @@ struct QuickEntry {
 struct EntryWeighter;
 
 impl quick_cache::Weighter<InternalCacheKey, QuickEntry> for EntryWeighter {
-    fn weight(&self, _key: &InternalCacheKey, value: &QuickEntry) -> u64 {
-        value.size_bytes.max(1) as u64
+    fn weight(&self, key: &InternalCacheKey, value: &QuickEntry) -> u64 {
+        // Same accounting as the moka backend: key footprint + entry bytes.
+        (key_footprint(key) + value.size_bytes).max(1) as u64
     }
 }
 
@@ -58,14 +60,12 @@ impl QuickCacheBackend {
         // UP to one, which would silently halve the per-shard share.
         let shards = (capacity / TARGET_SHARD_SHARE)
             .next_power_of_two()
-            .min(1024)
-            .max(1);
+            .clamp(1, 1024);
         let shards = if shards * TARGET_SHARD_SHARE > capacity.max(TARGET_SHARD_SHARE) {
-            shards / 2
+            (shards / 2).max(1)
         } else {
             shards
-        }
-        .max(1);
+        };
         // Generous item estimate: pre-sizes the hash tables and keeps
         // quick_cache's own "at least 32 items per shard" heuristic from
         // shrinking the shard count below the explicit choice.
