@@ -11,7 +11,9 @@ use futures::TryStreamExt;
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::Int32Type;
-use arrow_array::{ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, StringArray};
+use arrow_array::{
+    ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, StringArray, record_batch,
+};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance_index::IndexType;
 use lance_index::scalar::FullTextSearchQuery;
@@ -819,32 +821,29 @@ async fn test_fts_overlay_unrelated_field_not_excluded() {
 /// will be overlaid. `text` is field 1. Fragment 0 (ids 0..6) holds three "red car" phrases and
 /// the overlay target (id=2); fragment 1 (ids 6..12) holds a fourth "red car" phrase.
 async fn create_phrase_sibling_dataset() -> Dataset {
-    let schema = Arc::new(ArrowSchema::new(vec![
-        ArrowField::new("id", DataType::Int32, true),
-        ArrowField::new("text", DataType::Utf8, true),
-    ]));
-    let texts: Vec<&str> = vec![
-        "red car fast",       // 0 — matches "red car"
-        "blue sky wide",      // 1
-        "old truck slow",     // 2 — overlay target (does NOT match the phrase)
-        "red car shiny",      // 3 — matches "red car"
-        "green boat calm",    // 4
-        "red car brand",      // 5 — matches "red car"
-        "red car extra",      // 6 — fragment 1, matches "red car"
-        "pear tart sweet",    // 7
-        "lemon curd tang",    // 8
-        "peach cobbler warm", // 9
-        "plum pudding rich",  // 10
-        "fig newton crisp",   // 11
-    ];
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(Int32Array::from_iter_values(0..12)),
-            Arc::new(StringArray::from(texts)),
-        ],
+    let batch = record_batch!(
+        ("id", Int32, (0..12).collect::<Vec<_>>()),
+        (
+            "text",
+            Utf8,
+            vec![
+                "red car fast",       // 0 — matches "red car"
+                "blue sky wide",      // 1
+                "old truck slow",     // 2 — overlay target (does NOT match the phrase)
+                "red car shiny",      // 3 — matches "red car"
+                "green boat calm",    // 4
+                "red car brand",      // 5 — matches "red car"
+                "red car extra",      // 6 — fragment 1, matches "red car"
+                "pear tart sweet",    // 7
+                "lemon curd tang",    // 8
+                "peach cobbler warm", // 9
+                "plum pudding rich",  // 10
+                "fig newton crisp",   // 11
+            ]
+        )
     )
     .unwrap();
+    let schema = batch.schema();
     let write_params = WriteParams {
         max_rows_per_file: 6,
         ..Default::default()
