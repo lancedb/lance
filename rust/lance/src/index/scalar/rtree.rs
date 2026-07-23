@@ -28,6 +28,11 @@ pub(in crate::index) async fn merge_segments(
         ))
     })?;
     let field_path = dataset.schema().field_path(field_id)?;
+    let dataset_version = segments
+        .iter()
+        .map(|segment| segment.dataset_version)
+        .min()
+        .unwrap_or(dataset.manifest.version);
     let segment_refs = segments.iter().collect::<Vec<_>>();
     let (fragment_bitmap, old_data_filters) =
         crate::index::append::build_per_segment_filters(dataset, &segment_refs).await?;
@@ -61,7 +66,7 @@ pub(in crate::index) async fn merge_segments(
     Ok(IndexMetadata {
         uuid: new_uuid,
         fields: vec![field_id],
-        dataset_version: dataset.manifest.version,
+        dataset_version,
         fragment_bitmap: Some(fragment_bitmap),
         index_details: Some(Arc::new(created_index.index_details)),
         index_version: created_index.index_version as i32,
