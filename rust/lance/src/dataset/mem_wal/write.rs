@@ -536,20 +536,39 @@ impl TaskExecutor {
         Ok(())
     }
 
+    /// Cancel and join every handler registered by [`Self::add_handler`].
+    ///
+    /// Cancellation causes each handler's dispatcher to stop accepting messages and call
+    /// [`MessageHandler::cleanup`]. This method waits for every dispatcher to finish, even if
+    /// cleanup fails or a dispatcher panics, and then returns the first such failure. It returns
+    /// `Ok(())` only after every registered handler has been cleaned up successfully.
     pub async fn shutdown_all(&self) -> Result<()> {
         info!("Shutting down all tasks");
         self.cancellation_token.cancel();
 
         let tasks = std::mem::take(&mut *self.tasks.write().unwrap());
+        let mut first_error = None;
         for (name, handle) in tasks {
             match handle.await {
                 Ok(Ok(())) => debug!("Task '{}' completed successfully", name),
-                Ok(Err(e)) => warn!("Task '{}' completed with error: {}", name, e),
-                Err(e) => error!("Task '{}' panicked: {}", name, e),
+                Ok(Err(e)) => {
+                    warn!("Task '{}' completed with error: {}", name, e);
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
+                }
+                Err(e) => {
+                    error!("Task '{}' panicked: {}", name, e);
+                    if first_error.is_none() {
+                        first_error = Some(Error::internal(format!(
+                            "Task '{name}' panicked during shutdown: {e}"
+                        )));
+                    }
+                }
             }
         }
 
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 }
 
@@ -4703,7 +4722,113 @@ mod tests {
             call_count.load(Ordering::SeqCst)
         );
 
-        executor.shutdown_all().await.ok();
+        executor
+            .shutdown_all()
+            .await
+            .expect("dispatcher should shut down successfully");
+    }
+
+    #[tokio::test]
+    async fn test_task_executor_shutdown_propagates_cleanup_error_and_joins_all_tasks() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CleanupHandler {
+            cleanup_count: Arc<AtomicUsize>,
+            error_message: Option<&'static str>,
+        }
+
+        #[async_trait]
+        impl MessageHandler<u32> for CleanupHandler {
+            async fn handle(&mut self, _message: u32) -> Result<()> {
+                Ok(())
+            }
+
+            async fn cleanup(&mut self, _shutdown_ok: bool) -> Result<()> {
+                self.cleanup_count.fetch_add(1, Ordering::SeqCst);
+                match self.error_message {
+                    Some(message) => Err(Error::io(message)),
+                    None => Ok(()),
+                }
+            }
+        }
+
+        let executor = TaskExecutor::new();
+        let cleanup_count = Arc::new(AtomicUsize::new(0));
+        let (_failing_tx, failing_rx) = mpsc::unbounded_channel::<u32>();
+        executor
+            .add_handler(
+                "failing-cleanup".to_string(),
+                Box::new(CleanupHandler {
+                    cleanup_count: cleanup_count.clone(),
+                    error_message: Some("intentional cleanup failure"),
+                }),
+                failing_rx,
+            )
+            .unwrap();
+        let (_successful_tx, successful_rx) = mpsc::unbounded_channel::<u32>();
+        executor
+            .add_handler(
+                "successful-cleanup".to_string(),
+                Box::new(CleanupHandler {
+                    cleanup_count: cleanup_count.clone(),
+                    error_message: None,
+                }),
+                successful_rx,
+            )
+            .unwrap();
+
+        let error = executor
+            .shutdown_all()
+            .await
+            .expect_err("shutdown must propagate the handler cleanup failure");
+        assert!(matches!(&error, Error::IO { .. }));
+        assert!(
+            error.to_string().contains("intentional cleanup failure"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            cleanup_count.load(Ordering::SeqCst),
+            2,
+            "shutdown must join and clean up every task after the first failure"
+        );
+        assert!(executor.tasks.read().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_task_executor_shutdown_propagates_task_panic() {
+        struct PanickingCleanupHandler;
+
+        #[async_trait]
+        impl MessageHandler<u32> for PanickingCleanupHandler {
+            async fn handle(&mut self, _message: u32) -> Result<()> {
+                Ok(())
+            }
+
+            async fn cleanup(&mut self, _shutdown_ok: bool) -> Result<()> {
+                panic!("intentional cleanup panic");
+            }
+        }
+
+        let executor = TaskExecutor::new();
+        let (_tx, rx) = mpsc::unbounded_channel::<u32>();
+        executor
+            .add_handler(
+                "panicking-cleanup".to_string(),
+                Box::new(PanickingCleanupHandler),
+                rx,
+            )
+            .unwrap();
+
+        let error = executor
+            .shutdown_all()
+            .await
+            .expect_err("shutdown must propagate the task panic");
+        assert!(matches!(&error, Error::Internal { .. }));
+        assert!(
+            error.to_string().contains("panicking-cleanup")
+                && error.to_string().contains("panicked during shutdown"),
+            "unexpected error: {error}"
+        );
     }
 
     /// Same as the local-fs test but against memory:// — closer to S3
