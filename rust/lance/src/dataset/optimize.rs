@@ -88,7 +88,7 @@ use std::ops::{AddAssign, Range};
 use std::sync::Arc;
 
 use super::fragment::FileFragment;
-use super::index::DatasetIndexRemapperOptions;
+use super::index::{DatasetIndexRemapperOptions, load_indices_for_remapping};
 use super::rowids::load_row_id_sequences;
 use super::transaction::{
     Operation, RewriteGroup, RewrittenIndex, Transaction, TransactionBuilder,
@@ -1608,8 +1608,13 @@ async fn rewrite_files(
         .iter()
         .map(|f| f.physical_rows.unwrap() as u64)
         .sum::<u64>();
-    // If we aren't using stable row ids, then we need to remap indices.
-    let needs_remapping = !dataset.manifest.uses_stable_row_ids();
+    // Capturing row addresses is only useful if something will consume them:
+    // an index to remap now, or a deferred remap through the FRI.
+    let capture_row_addrs = !dataset.manifest.uses_stable_row_ids()
+        && (options.defer_index_remap
+            || load_indices_for_remapping(dataset.as_ref())
+                .await?
+                .is_some());
     let mut new_fragments: Vec<Fragment>;
     let task_id = uuid::Uuid::new_v4();
     log::info!(
@@ -1635,7 +1640,7 @@ async fn rewrite_files(
             options.batch_size,
             options.io_buffer_size,
             true,
-            needs_remapping,
+            capture_row_addrs,
         )
         .await?;
         row_ids_rx = rx_initial;
@@ -1739,7 +1744,7 @@ async fn rewrite_files(
             ));
         }
 
-        if needs_remapping {
+        if capture_row_addrs {
             let (tx, rx) = std::sync::mpsc::channel();
             let mut addrs = RoaringTreemap::new();
             for frag in &fragments {
@@ -2009,8 +2014,17 @@ pub async fn commit_compaction(
         return Ok(CompactionMetrics::default());
     }
 
-    // If we aren't using stable row ids, then we need to remap indices.
-    let needs_remapping = !dataset.manifest.uses_stable_row_ids() && !options.defer_index_remap;
+    let has_address_style = completed_tasks.iter().any(|t| t.row_addrs.is_some());
+    // Address-style results require immediate index remapping unless it is deferred.
+    let needs_remapping =
+        !dataset.manifest.uses_stable_row_ids() && !options.defer_index_remap && has_address_style;
+
+    // Confirm there is a remapper before materializing the potentially very large row address map.
+    let index_remapper = if needs_remapping {
+        remap_options.create_remapper(dataset).await?
+    } else {
+        None
+    };
 
     // Determine the earliest version at which compaction tasks were planned/executed.
     //
@@ -2034,7 +2048,6 @@ pub async fn commit_compaction(
     let mut completed_tasks = completed_tasks;
 
     // Single reserve_fragment_ids for all address-style tasks
-    let has_address_style = completed_tasks.iter().any(|t| t.row_addrs.is_some());
     if has_address_style {
         let frags: Vec<&mut Fragment> = completed_tasks
             .iter_mut()
@@ -2084,7 +2097,7 @@ pub async fn commit_compaction(
             new_fragments: task.new_fragments.clone(),
         };
 
-        if needs_remapping {
+        if index_remapper.is_some() {
             if let Some(row_addrs_bytes) = task.row_addrs {
                 let row_addrs =
                     RoaringTreemap::deserialize_from(&mut Cursor::new(&row_addrs_bytes))?;
@@ -2151,8 +2164,7 @@ pub async fn commit_compaction(
         rewrite_groups.push(rewrite_group);
     }
 
-    let rewritten_indices = if needs_remapping {
-        let index_remapper = remap_options.create_remapper(dataset)?;
+    let rewritten_indices = if let Some(index_remapper) = index_remapper {
         let affected_ids = rewrite_groups
             .iter()
             .flat_map(|group| group.old_fragments.iter().map(|frag| frag.id))
@@ -2448,9 +2460,10 @@ mod tests {
         }
     }
 
+    #[async_trait]
     impl IndexRemapperOptions for MockIndexRemapper {
-        fn create_remapper(&self, _: &Dataset) -> Result<Box<dyn IndexRemapper>> {
-            Ok(Box::new(self.clone()))
+        async fn create_remapper(&self, _: &Dataset) -> Result<Option<Box<dyn IndexRemapper>>> {
+            Ok(Some(Box::new(self.clone())))
         }
     }
 
@@ -2979,9 +2992,70 @@ mod tests {
         }
     }
 
+    #[async_trait]
     impl IndexRemapperOptions for IgnoreRemap {
-        fn create_remapper(&self, _: &Dataset) -> Result<Box<dyn IndexRemapper>> {
-            Ok(Box::new(Self {}))
+        async fn create_remapper(&self, _: &Dataset) -> Result<Option<Box<dyn IndexRemapper>>> {
+            Ok(None)
+        }
+    }
+
+    #[rstest]
+    #[case::without_index(false)]
+    #[case::with_index(true)]
+    #[tokio::test]
+    async fn test_row_addrs_only_used_with_remappable_index(#[case] has_index: bool) {
+        let data = sample_data();
+        let reader = RecordBatchIterator::new(vec![Ok(data.slice(0, 9_000))], data.schema());
+        let mut dataset = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 3_000,
+                data_storage_version: Some(LanceFileVersion::Legacy),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        if has_index {
+            create_scalar_index(&mut dataset, "a", false).await;
+        }
+
+        let options = CompactionOptions {
+            target_rows_per_fragment: 9_000,
+            ..Default::default()
+        };
+        let plan = plan_compaction(&dataset, &options).await.unwrap();
+        assert_eq!(plan.tasks().len(), 1);
+
+        let mut result = rewrite_files(Cow::Borrowed(&dataset), plan.tasks()[0].clone(), &options)
+            .await
+            .unwrap();
+        assert_eq!(result.row_addrs.is_some(), has_index);
+
+        if has_index {
+            let row_addrs_bytes = result
+                .row_addrs
+                .as_ref()
+                .expect("indexed compaction should capture row addresses");
+            let row_addrs =
+                RoaringTreemap::deserialize_from(&mut Cursor::new(row_addrs_bytes)).unwrap();
+            assert_eq!(row_addrs.len(), 9_000);
+        } else {
+            // Simulate a stale worker result that captured row addresses before the
+            // dataset no longer needed a remapper. Invalid bytes ensure the commit
+            // does not attempt to deserialize or materialize the unused map.
+            result.row_addrs = Some(b"not a roaring treemap".to_vec());
+            commit_compaction(
+                &mut dataset,
+                vec![result],
+                Arc::new(DatasetIndexRemapperOptions::default()),
+                &options,
+            )
+            .await
+            .unwrap();
+            assert_eq!(dataset.get_fragments().len(), 1);
         }
     }
 
@@ -3322,17 +3396,10 @@ mod tests {
         dataset.delete("i < 500").await.unwrap();
         dataset2.delete("i < 500").await.unwrap();
 
-        // Create a scalar index to check this is not touched
-        dataset
-            .create_index(
-                &["i"],
-                IndexType::Scalar,
-                Some("scalar".into()),
-                &ScalarIndexParams::default(),
-                false,
-            )
-            .await
-            .unwrap();
+        // Create the same scalar index on both datasets so deferred and immediate
+        // remapping are compared under the same conditions.
+        create_scalar_index(&mut dataset, "i", false).await;
+        create_scalar_index(&mut dataset2, "i", false).await;
 
         // Verify the initial state - no fragment reuse index should exist
         let initial_indices = dataset.load_indices().await.unwrap();

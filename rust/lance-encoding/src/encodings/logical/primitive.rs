@@ -37,7 +37,7 @@ use lance_core::{
     error::{Error, LanceOptionExt},
     utils::bit::pad_bytes,
 };
-use log::trace;
+use log::{debug, trace};
 
 use crate::encodings::logical::primitive::miniblock::MiniBlockChunk;
 use crate::utils::bytepack::ByteUnpacker;
@@ -92,6 +92,7 @@ pub mod blob;
 pub mod constant;
 pub mod dict;
 pub mod fullzip;
+mod layout;
 pub mod miniblock;
 pub(crate) mod sparse;
 
@@ -3813,7 +3814,10 @@ enum PrimitivePageStructure {
         repdef: SerializedRepDefs,
         single_row_miniblock_repdef_levels: Option<u64>,
     },
-    Sparse(sparse::SparseStructuralPlan),
+    Sparse {
+        plan: sparse::SparseStructuralPlan,
+        prepared_values: Option<sparse::writer::PreparedSparseValues>,
+    },
 }
 
 // A primitive page after structural encoding selection and optional dense splitting.
@@ -5407,7 +5411,10 @@ impl PrimitiveStructuralEncoder {
                 repdef,
                 single_row_miniblock_repdef_levels,
             } => (repdef, single_row_miniblock_repdef_levels),
-            PrimitivePageStructure::Sparse(plan) => {
+            PrimitivePageStructure::Sparse {
+                plan,
+                prepared_values,
+            } => {
                 log::debug!(
                     "Encoding column {} with {} visible items ({} rows) using sparse layout",
                     column_idx,
@@ -5418,7 +5425,14 @@ impl PrimitiveStructuralEncoder {
                     column_idx,
                     &field,
                     compression_strategy.as_ref(),
-                    DataBlock::from_arrays(&arrays, num_values),
+                    prepared_values.map_or_else(
+                        || {
+                            sparse::writer::SparseValueInput::Unprepared(DataBlock::from_arrays(
+                                &arrays, num_values,
+                            ))
+                        },
+                        sparse::writer::SparseValueInput::Prepared,
+                    ),
                     plan,
                     row_number,
                     num_rows,
@@ -5734,36 +5748,79 @@ impl PrimitiveStructuralEncoder {
         let is_simple_validity = repdefs.iter().all(|rd| rd.is_simple_validity());
         let has_repdef_info = repdefs.iter().any(|rd| !rd.is_empty());
         let normalized = RepDefBuilder::normalize(repdefs);
-        let requests_sparse = self
-            .encoding_metadata
-            .get(STRUCTURAL_ENCODING_META_KEY)
+        let requested_encoding = self.encoding_metadata.get(STRUCTURAL_ENCODING_META_KEY);
+        let requests_sparse = requested_encoding
             .is_some_and(|requested| requested.eq_ignore_ascii_case(STRUCTURAL_ENCODING_SPARSE));
         let sparse_plan = requests_sparse
             .then(|| sparse::writer::plan(&normalized, num_values))
             .transpose()?;
-        let pages = match sparse_plan {
-            Some(plan) if !sparse::writer::uses_constant_layout(&plan, &self.field) => {
-                vec![PrimitivePageData {
+        let pages = if let Some(plan) = sparse_plan
+            && !sparse::writer::uses_constant_layout(&plan, &self.field)
+        {
+            vec![PrimitivePageData {
+                arrays,
+                structure: PrimitivePageStructure::Sparse {
+                    plan,
+                    prepared_values: None,
+                },
+                row_number,
+                num_rows,
+            }]
+        } else {
+            let (repdef, miniblock_repdef_budget) = normalized
+                .serialize_with_miniblock_repdef_budget(
+                    miniblock::max_repdef_levels_per_chunk,
+                    num_rows,
+                    num_values,
+                )?;
+            let automatic_sparse = layout::select_automatic_sparse(
+                self.version.resolve(),
+                requested_encoding.map(String::as_str),
+                &miniblock_repdef_budget,
+                || {
+                    let data = DataBlock::from_arrays(&arrays, num_values);
+                    if !sparse::writer::supports_value_block(&data) {
+                        return Ok(None);
+                    }
+                    let prepared_values = match sparse::writer::prepare_values(
+                        &self.field,
+                        self.compression_strategy.as_ref(),
+                        data,
+                        self.support_large_chunk,
+                    ) {
+                        Ok(prepared_values) => prepared_values,
+                        Err(error) => {
+                            debug!(
+                                "Keeping column {} on its dense structural path because sparse value preparation is unavailable: {}",
+                                self.column_index, error
+                            );
+                            return Ok(None);
+                        }
+                    };
+                    let plan = sparse::writer::plan(&normalized, num_values)?;
+                    if sparse::writer::uses_constant_layout(&plan, &self.field) {
+                        return Ok(None);
+                    }
+                    Ok(Some((plan, prepared_values)))
+                },
+            )?;
+            match automatic_sparse {
+                Some((plan, prepared_values)) => vec![PrimitivePageData {
                     arrays,
-                    structure: PrimitivePageStructure::Sparse(plan),
+                    structure: PrimitivePageStructure::Sparse {
+                        plan,
+                        prepared_values: Some(prepared_values),
+                    },
                     row_number,
                     num_rows,
-                }]
-            }
-            _ => {
-                let (repdef, miniblock_repdef_budget) = normalized
-                    .serialize_with_miniblock_repdef_budget(
-                        miniblock::max_repdef_levels_per_chunk,
-                        num_rows,
-                        num_values,
-                    )?;
-                Self::split_pages_for_miniblock_repdef_budget(
+                }],
+                None => Self::split_pages_for_miniblock_repdef_budget(
                     arrays,
                     repdef,
                     miniblock_repdef_budget,
                     row_number,
                     num_rows,
-                )?
+                )?,
             }
         };
 

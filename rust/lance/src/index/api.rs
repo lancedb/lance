@@ -27,6 +27,8 @@ pub struct IndexSegment {
     index_details: Arc<prost_types::Any>,
     /// The on-disk index version for this segment.
     index_version: i32,
+    /// Dataset version at which this segment's physical contents were built.
+    dataset_version: Option<u64>,
 }
 
 impl IndexSegment {
@@ -46,6 +48,7 @@ impl IndexSegment {
             fragment_bitmap: fragment_bitmap.into_iter().collect(),
             index_details,
             index_version,
+            dataset_version: None,
         }
     }
 
@@ -67,6 +70,11 @@ impl IndexSegment {
     /// Return the on-disk index version for this segment.
     pub fn index_version(&self) -> i32 {
         self.index_version
+    }
+
+    /// Return the source dataset version when this segment came from index metadata.
+    pub fn dataset_version(&self) -> Option<u64> {
+        self.dataset_version
     }
 
     /// Consume the segment and return its component parts.
@@ -107,12 +115,14 @@ impl IntoIndexSegment for IndexMetadata {
             ))
         })?;
 
-        Ok(IndexSegment::new(
+        let mut segment = IndexSegment::new(
             self.uuid,
             fragment_bitmap.iter(),
             index_details,
             self.index_version,
-        ))
+        );
+        segment.dataset_version = Some(self.dataset_version);
+        Ok(segment)
     }
 }
 
