@@ -8,7 +8,7 @@ merged over the base. This measures how take and full-scan cost scale with:
 - the number of overlay layers stacked on a fragment (compaction payoff),
 - coverage fraction (how many cells are overlaid),
 - fragmentation (contiguous run vs. strided -> pages touched), and
-- data type (int32 vs. a fixed-size-list embedding).
+- value width (a 4-byte int32 vs. a wide fixed-size-list embedding).
 
 Wall time is measured warm via pytest-benchmark; read IO (bytes + IOPS) is
 measured once cold, after dropping the page cache, via ``io_stats_incremental``.
@@ -22,7 +22,6 @@ from ci_benchmarks.overlays import commit_overlay_layers, make_base_dataset
 from ci_benchmarks.utils import wipe_os_cache
 
 NUM_ROWS = 1_000_000
-NUM_ROWS_EMBEDDING = 100_000
 ROWS_PER_FILE = NUM_ROWS  # single fragment: isolates overlay-layer scaling
 TAKE_ROWS = 100
 
@@ -72,7 +71,6 @@ def _run_read(benchmark, record_property, base, ds, workload, num_rows):
     read_bytes, read_iops = _measure_cold_io(ds, base, work)
     record_property("cold_read_bytes", read_bytes)
     record_property("cold_read_iops", read_iops)
-    print(f"\ncold read: {read_bytes}B over {read_iops} iops")
 
     benchmark(work)
 
@@ -102,18 +100,6 @@ def test_overlay_read_scaling(
         ds = commit_overlay_layers(ds, num_overlays, fraction, pattern, "int32")
         assert _covered_value(ds) != base_val, "overlay not visible on read"
     _run_read(benchmark, record_property, base, ds, workload, NUM_ROWS)
-
-
-@pytest.mark.parametrize("workload", ["take", "scan"])
-@pytest.mark.parametrize("dtype", ["int32", "embedding"])
-def test_overlay_read_dtype(benchmark, tmp_path, record_property, workload, dtype):
-    num_rows = NUM_ROWS_EMBEDDING if dtype == "embedding" else NUM_ROWS
-    base = str(tmp_path / "ds")
-    ds = make_base_dataset(base, num_rows, num_rows, dtype, "2.1")
-    base_val = _covered_value(ds)
-    ds = commit_overlay_layers(ds, 4, 0.01, "stride", dtype)
-    assert _covered_value(ds) != base_val, "overlay not visible on read"
-    _run_read(benchmark, record_property, base, ds, workload, num_rows)
 
 
 # Mirror test_overlay_read_scaling but on a wide 3072-d embedding column, so the

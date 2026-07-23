@@ -92,28 +92,6 @@ To save results as JSON (Bencher Metric Format):
 pytest ... --benchmark-stats-json stats.json
 ```
 
-## Data overlay benchmarks
-
-`benchmarks/test_overlay_*.py` measure the cost of data overlay files (sidecar
-files that supply replacement values for a subset of cells, merged on read).
-Unlike the other suites they generate their own base datasets and overlays (via
-`ci_benchmarks/overlays.py`) into a temporary directory, so no pre-generation step
-is needed:
-
-- `test_overlay_manifest.py` — manifest growth vs. number of overlays and coverage.
-- `test_overlay_write.py` — bytes written updating 1% of a column via an overlay vs.
-  `update` / `merge_insert` / full rewrite.
-- `test_overlay_read.py` — take and scan time + cold read IO as overlay layers,
-  coverage fraction, fragmentation, and value width (narrow `int32` vs. a wide
-  3072-d embedding) vary.
-
-```bash
-pytest python/ci_benchmarks/benchmarks/test_overlay_read.py -s
-```
-
-Size/byte metrics are attached with `record_property` (visible in `--junitxml` output)
-and printed with `-s`; read/scan timings use pytest-benchmark (`--benchmark-json`).
-
 ## Investigating memory use for a particular benchmark
 
 To investigate memory use for a particular benchmark, you can use the `bytehound` library.

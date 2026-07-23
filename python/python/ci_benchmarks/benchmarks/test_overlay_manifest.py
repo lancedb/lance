@@ -48,8 +48,3 @@ def test_overlay_manifest_size(
     record_property("manifest_bytes", total)
     record_property("manifest_growth_bytes", growth)
     record_property("bytes_per_overlay", per_overlay)
-    print(
-        f"\noverlays={num_overlays:>3} {fraction:>5.0%} {pattern:<10} "
-        f"manifest={total:>8}B  growth={growth:>8}B  "
-        f"per_overlay={per_overlay:>8.0f}B"
-    )
