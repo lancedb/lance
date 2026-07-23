@@ -49,23 +49,27 @@ impl std::fmt::Debug for QuickCacheBackend {
 /// Minimum weight budget per internal shard. quick_cache splits its weight
 /// capacity evenly across shards with no cross-shard borrowing, and an entry
 /// heavier than ~its shard's budget is silently refused admission — so the
-/// share must stay well above the largest cache entry. Large caches keep
-/// many shards for read concurrency; small caches trade shards for
-/// admissible entry size.
-const TARGET_SHARD_SHARE: usize = 4 << 30;
+/// share must stay well above the largest cache entry.
+const MIN_SHARD_SHARE: usize = 4 << 30;
 
 impl QuickCacheBackend {
     pub fn with_capacity(capacity: usize) -> Self {
-        // Round down to a power of two: quick_cache rounds the shard count
-        // UP to one, which would silently halve the per-shard share.
-        let shards = (capacity / TARGET_SHARD_SHARE)
-            .next_power_of_two()
-            .clamp(1, 1024);
-        let shards = if shards * TARGET_SHARD_SHARE > capacity.max(TARGET_SHARD_SHARE) {
-            (shards / 2).max(1)
-        } else {
+        // shards = min(cpus / 2, capacity / 4GiB), rounded DOWN to a power of
+        // two (quick_cache rounds requests UP, which would halve the share).
+        // The cpu term bounds lock contention — more shards than concurrent
+        // threads buys nothing — and the capacity term keeps every shard's
+        // share >= 4GiB so the largest cache entries stay admissible.
+        let by_cpu = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(2)
+            / 2;
+        let shards = (capacity / MIN_SHARD_SHARE).min(by_cpu).max(1);
+        let shards = if shards.is_power_of_two() {
             shards
+        } else {
+            shards.next_power_of_two() / 2
         };
+        let shards = shards.clamp(1, 1024);
         // Generous item estimate: pre-sizes the hash tables and keeps
         // quick_cache's own "at least 32 items per shard" heuristic from
         // shrinking the shard count below the explicit choice.
