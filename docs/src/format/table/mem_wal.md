@@ -14,7 +14,7 @@ Append-only MemWAL tables may omit a primary key.
 
 MemWAL adds a set of shards on top of the base table.
 Writers append to shards.
-Each shard keeps recent data in an in-memory MemTable, persists writes to a per-shard WAL, flushes MemTables as small Lance datasets, and later merges those SSTables into the base table.
+Each shard keeps recent data in an in-memory MemTable, persists writes to a per-shard WAL, flushes MemTables as small Lance datasets, and later compacts those SSTables into the base table.
 
 The base table manifest contains one MemWAL system index entry named `__lance_mem_wal`.
 This index stores MemWAL configuration and global progress metadata inline in `IndexMetadata.index_details`.
@@ -27,7 +27,7 @@ Each shard has exactly one active writer epoch at a time.
 Writers claim a shard, append WAL entries, update the in-memory MemTable, and publish SSTable generations by updating the shard manifest.
 
 For primary-key tables, all rows for the same primary key must map to the same shard.
-If one primary key can appear in multiple shards, asynchronous merge order between shards can make an older row overwrite a newer row.
+If one primary key can appear in multiple shards, asynchronous compaction order between shards can make an older row overwrite a newer row.
 Append-only tables without a primary key do not rely on last-write-wins conflict resolution and may use any deterministic shard assignment suitable for the workload.
 
 ### MemWAL Index
@@ -40,8 +40,8 @@ All MemWAL index data is stored in the `MemWalIndexDetails` protobuf message in 
 The index stores:
 
 - **Configuration**: `sharding_specs`, `maintained_indexes`, and `writer_config_defaults`.
-- **Merge progress**: `merged_generations`, the last generation merged into the base table for each shard.
-- **Index catchup progress**: `index_catchup`, the merged generation covered by each base-table index.
+- **Compaction progress**: `compacted_sstables`, the last SSTable compacted into the base table for each shard.
+- **Index catchup progress**: `index_catchup`, the compacted SSTable generation covered by each base-table index.
 - **Shard snapshots**: optional point-in-time snapshot fields for read optimization.
 
 Shard snapshots are not authoritative.
@@ -49,11 +49,11 @@ Readers that need the latest shard set list `_mem_wal/` and read each shard's la
 
 ## Shard Architecture
 
-![Shard Architecture](../../images/mem_wal_regional.png)
+![Shard Architecture](../../images/mem_wal_shard.png)
 
 Within a shard, writes first enter an in-memory **MemTable** and are durably appended to the shard **write-ahead log (WAL)**.
 The MemTable is periodically **flushed** to storage as a Lance dataset.
-SSTables are asynchronously **merged** into the base table.
+SSTables are asynchronously **compacted** into the base table.
 
 ### MemTable
 
@@ -68,16 +68,18 @@ Conceptually, a MemTable is an append log of Arrow record batches.
 Later appends have larger in-memory row positions.
 For primary-key tables, in-memory reads use the largest visible row position as the newest row for a key.
 
-### MemTable Generation
+### SSTable Generation
 
-Each MemTable has a monotonically increasing generation number starting from 1.
-When generation `N` is flushed and discarded, the next MemTable uses generation `N + 1`.
+Within each shard, SSTables have monotonically increasing generation numbers starting from 1.
+When a MemTable is flushed, the resulting SSTable is assigned the shard manifest's `current_generation`, and `current_generation` advances to the next SSTable generation.
+A MemTable does not have a generation.
 
-Generation numbers order data freshness within one shard:
+SSTable generation numbers order persisted data freshness within one shard:
 
-- Base table data has generation 0.
-- Higher MemWAL generations are newer.
-- Within the active in-memory generation, higher row positions are newer.
+- Base table data is modeled as generation 0.
+- Higher SSTable generations are newer.
+- The active MemTable is newer than every published SSTable.
+- Within the active MemTable, higher row positions are newer.
 - Within an SSTable, flush-time deletion vectors hide older duplicate primary-key rows, so readers see at most the newest row for each primary key.
 
 ## WAL
@@ -125,7 +127,7 @@ For example, position 5 is encoded as:
 
 ## SSTable
 
-An SSTable is a persisted MemTable generation — the immutable result of flushing a MemTable.
+An SSTable is the immutable result of flushing a MemTable.
 It is stored as a Lance dataset under its shard directory.
 
 !!! note
@@ -133,7 +135,7 @@ It is stored as a Lance dataset under its shard directory.
 
 ### SSTable Storage Layout
 
-Generation `i` is flushed to:
+An SSTable with generation `i` is written to:
 
 ```text
 _mem_wal/{shard_id}/{random8}_gen_{i}/
@@ -143,7 +145,7 @@ _mem_wal/{shard_id}/{random8}_gen_{i}/
 If a flush attempt fails, a retry writes a different directory instead of reusing a partially written one.
 The shard manifest records the successful directory name in the SSTable's `path`.
 
-The generation directory is a standard Lance dataset written with the base table's data storage version.
+The SSTable directory is a standard Lance dataset written with the base table's data storage version.
 Each SSTable is written as one fragment.
 Additional MemWAL sidecars may be present:
 
@@ -151,7 +153,7 @@ Additional MemWAL sidecars may be present:
 {random8}_gen_{i}/
 ├── _versions/
 │   └── {version}.manifest
-├── _deletions/                         # Present when within-generation dedup deletes rows
+├── _deletions/                         # Present when within-SSTable dedup deletes rows
 ├── _indices/                           # Present when maintained user indexes are built
 │   └── {index_uuid}/
 ├── _pk_index/                          # Primary-key sidecar BTree, not a manifest index
@@ -168,7 +170,7 @@ For a duplicate primary key within one SSTable, the newest row has the largest p
 
 Primary-key SSTables use a deletion vector to expose last-write-wins semantics.
 During flush, the writer scans rows in forward order, keeps the last occurrence of each primary key, and marks all earlier duplicate offsets deleted.
-The deletion vector is attached to fragment 0 in the generation manifest.
+The deletion vector is attached to fragment 0 in the SSTable's Lance manifest.
 
 Append-only SSTables without a primary key do not perform primary-key deduplication and retain every row.
 
@@ -184,12 +186,12 @@ Read planning then filters `_tombstone = false`, so the key is absent from query
 Primary-key MemTables maintain an implicit BTree for primary-key deduplication, independent of `maintained_indexes`.
 When a primary-key MemTable is flushed, the SSTable writes two primary-key sidecars:
 
-- `bloom_filter.bin` stores the generation's primary-key bloom filter and lets point lookups skip generations that cannot contain the queried key.
+- `bloom_filter.bin` stores the SSTable's primary-key bloom filter and lets point lookups skip SSTables that cannot contain the queried key.
 - `_pk_index/` stores a standalone BTree over primary-key values to forward row ids.
 
-The `_pk_index/` sidecar is not a maintained user index, is not registered in the generation manifest, and has no manifest UUID.
-Its identity is its immutable generation path.
-Readers open it directly from `{generation_path}/_pk_index`.
+The `_pk_index/` sidecar is not a maintained user index, is not registered in the SSTable's Lance manifest, and has no manifest UUID.
+Its identity is its immutable SSTable path.
+Readers open it directly from `{sstable_path}/_pk_index`.
 
 The `_pk_index/` directory is a Lance scalar BTree index store:
 
@@ -242,17 +244,17 @@ It is not used to choose the newest row inside the same SSTable; the deletion ve
 ### Maintained User Indexes
 
 When the MemWAL index lists `maintained_indexes`, flush may build matching indexes inside the SSTable.
-These index files live in the generation's `_indices/{index_uuid}/` directory and are recorded in the generation manifest.
+These index files live in the SSTable's `_indices/{index_uuid}/` directory and are recorded in the SSTable's Lance manifest.
 The implicit primary-key BTree sidecar is not included in `maintained_indexes` and does not live under `_indices/`.
 
 These indexes use the same row-position space as the forward-written data files.
-If the generation has a primary key, the generation deletion vector masks stale duplicate rows for indexed reads as well.
+If the SSTable has a primary key, its deletion vector masks stale duplicate rows for indexed reads as well.
 
-### Merging SSTables
+### SSTable Compaction
 
-SSTables are merged into the base table in ascending generation order within each shard.
-Lower generation numbers are older and must merge before higher generation numbers.
-The base table merge uses merge-insert semantics so newer rows overwrite older rows for the same primary key.
+SSTables are compacted into the base table in ascending generation order within each shard.
+Lower generation numbers are older and must be compacted before higher generation numbers.
+SSTable compaction uses merge-insert semantics so newer rows overwrite older rows for the same primary key.
 
 ## Shard Manifest
 
@@ -266,7 +268,7 @@ The manifest contains:
 - **Identity**: `shard_id`, `shard_spec_id`, and `shard_field_entries`.
 - **Fencing state**: `writer_epoch`.
 - **WAL pointers**: `replay_after_wal_entry_position` and `wal_entry_position_last_seen`.
-- **Generation state**: `current_generation` and `sstables`.
+- **SSTable generation state**: `current_generation` and `sstables`.
 - **Lifecycle state**: `status`, either `ACTIVE` or `SEALED`.
 
 `shard_field_entries` stores computed shard field values as raw Arrow scalar bytes keyed by `ShardingField.field_id`.
@@ -279,6 +281,9 @@ The default value 0 means no WAL entry has been covered and recovery starts at p
 `wal_entry_position_last_seen` is a best-effort hint for the most recent WAL position observed at manifest update time.
 It is not authoritative because it is not updated on every WAL write.
 Recovery must still probe or list WAL files to find the actual tail.
+
+`current_generation` is the generation number to assign to the next SSTable created by flushing the MemTable.
+Each entry in `sstables` records a published SSTable's `generation` and `path`.
 
 `status = SEALED` marks a reversible in-flight drop-table operation.
 Sealed shards refuse new writer claims.
@@ -332,8 +337,8 @@ Important fields:
 - `sharding_specs`: sharding configuration used by writers and shard pruning.
 - `maintained_indexes`: names of base-table indexes to maintain in MemTables and SSTables.
 - `writer_config_defaults`: string map of default writer configuration values persisted for all writers.
-- `merged_generations`: per-shard merge progress, updated atomically with base-table merge commits.
-- `index_catchup`: per-index coverage progress after data has merged to the base table.
+- `compacted_sstables`: per-shard compaction progress, updated atomically with base-table compaction commits.
+- `index_catchup`: per-index coverage progress after data has been compacted into the base table.
 - `snapshot_ts_millis`, `num_shards`, and `inline_snapshots`: optional shard snapshot fields for read optimization.
 
 If a shard is absent from `index_catchup` for an index, that index is assumed to be fully caught up for the shard.
@@ -424,7 +429,7 @@ The MemWAL storage layout is:
 ```
 
 Some SSTable subdirectories are conditional.
-For example, `_deletions/` is present only when the generation manifest references a deletion vector, `_indices/` is present only when maintained user indexes are built, and `_pk_index/` plus `bloom_filter.bin` are meaningful for primary-key tables.
+For example, `_deletions/` is present only when the SSTable's Lance manifest references a deletion vector, `_indices/` is present only when maintained user indexes are built, and `_pk_index/` plus `bloom_filter.bin` are meaningful for primary-key tables.
 
 ## Implementation Expectation
 
@@ -437,7 +442,7 @@ An implementation is compatible when it:
 2. Preserves WAL position, writer fencing, and manifest versioning invariants.
 3. Exposes last-write-wins semantics for primary-key tables.
 4. Preserves append-only semantics for tables without primary keys.
-5. Maintains generation ordering when merging SSTables into the base table.
+5. Maintains generation ordering when compacting SSTables into the base table.
 
 ## Writer Expectations
 
@@ -446,8 +451,8 @@ A writer operates on one shard and is responsible for:
 1. Claiming the shard with epoch-based fencing.
 2. Appending WAL entries in sequential 1-based positions.
 3. Maintaining in-memory MemTable state.
-4. Flushing MemTable generations to Lance datasets.
-5. Updating the shard manifest after a generation is durably flushed.
+4. Flushing MemTables to SSTable Lance datasets.
+5. Updating the shard manifest after an SSTable is durably written.
 
 ### Writer Fencing
 
@@ -472,25 +477,25 @@ Fence sentinel entries make this collision path explicit without storing data ba
 
 ## Background Job Expectations
 
-Background jobs merge SSTables into the base table and remove obsolete shard data.
+Background jobs compact SSTables into the base table and remove obsolete shard data.
 
-### MemTable Merger
+### SSTable Compactor
 
-SSTables must merge into the base table in ascending generation order within each shard.
-The merge uses Lance merge-insert semantics and updates `merged_generations[shard_id]` atomically with the base-table commit.
+SSTables must be compacted into the base table in ascending generation order within each shard.
+The compaction uses Lance merge-insert semantics and updates `compacted_sstables[shard_id]` atomically with the base-table commit.
 
-On commit conflict, a merger reloads the conflicting base-table version:
+On commit conflict, a compactor reloads the conflicting base-table version:
 
-- If the committed `merged_generations[shard_id]` is already greater than or equal to the generation being merged, the merger skips that generation.
-- Otherwise, the merger retries from the latest base-table version.
+- If the committed `compacted_sstables[shard_id]` is already greater than or equal to the generation being compacted, the compactor skips that generation.
+- Otherwise, the compactor retries from the latest base-table version.
 
 ### Garbage Collector
 
 The garbage collector may remove obsolete SSTables after:
 
-1. The generation has been merged to the base table.
-2. Every maintained index has caught up to cover the merged generation, or the generation is no longer needed for indexed reads.
-3. No retained base-table version needs the generation for time travel or consistency.
+1. The SSTable has been compacted into the base table.
+2. Every maintained index has caught up to cover the SSTable's generation, or the SSTable is no longer needed for indexed reads.
+3. No retained base-table version needs the SSTable for time travel or consistency.
 
 !!! warning
     Deleting WAL files can weaken writer fencing.
@@ -508,14 +513,16 @@ The newest row wins.
 
 Freshness ordering within one shard is:
 
-1. Higher generation wins.
-2. Within the active in-memory generation, higher row position wins.
-3. Within an SSTable, the generation's deletion vector has already hidden older duplicate primary-key rows.
+1. The active MemTable wins over every SSTable and the base table.
+2. Among SSTables, higher generation wins.
+3. Any uncompacted SSTable wins over the base table.
+4. Within the active MemTable, higher row position wins.
+5. Within an SSTable, its deletion vector has already hidden older duplicate primary-key rows.
 
-The base table has generation 0.
-MemWAL generations are positive.
+For freshness comparisons, the base table uses the sentinel generation 0.
+SSTable generations are positive.
 This ordering applies only to sources selected for the same read plan.
-Readers must not include an SSTable that is already covered by the base table according to `merged_generations[shard_id]`, because otherwise the positive MemWAL generation would incorrectly outrank base-table rows during deduplication.
+Readers must not include an SSTable that is already covered by the base table according to `compacted_sstables[shard_id]`, because otherwise the positive SSTable generation would incorrectly outrank base-table rows during deduplication.
 Rows from different shards do not need primary-key deduplication if the sharding spec guarantees that each primary key maps to exactly one shard.
 
 Append-only tables without a primary key do not perform primary-key deduplication.
@@ -540,11 +547,11 @@ Otherwise, reads are eventually consistent because unflushed data or newly-creat
 
 Reading a stale MemWAL index snapshot does not corrupt last-write-wins ordering, but it can reduce freshness:
 
-- If a merged SSTable is still listed, readers must skip it when `generation <= merged_generations[shard_id]`.
-  For primary-key tables, including it would let an older SSTable row outrank newer base-table contents because MemWAL generations are positive and the base table is modeled as generation 0.
-  For append-only tables, including it would return the same append twice.
-- If a garbage-collected SSTable is still listed, readers may skip it after failing to open it because its data must already be in the base table or be filtered out by `merged_generations`.
-- If a newly SSTable is not listed, the read is consistent with the older snapshot but may miss fresher data.
+- If a compacted SSTable is still listed, readers must skip it when `generation <= compacted_sstables[shard_id]`.
+    For primary-key tables, including it would let an older SSTable row outrank newer base-table contents because SSTable generations are positive and the base table is modeled as generation 0.
+    For append-only tables, including it would return the same append twice.
+- If a garbage-collected SSTable is still listed, readers may skip it after failing to open it because its data must already be in the base table or be filtered out by `compacted_sstables`.
+- If a new SSTable is not listed, the read is consistent with the older snapshot but may miss fresher data.
 
 Readers that require latest shard membership should list `_mem_wal/` and read shard manifests instead of relying only on snapshots.
 
@@ -556,7 +563,8 @@ A query planner collects sources from:
 2. SSTables that are not yet safely replaceable by base-table indexed reads.
 3. Active in-memory MemTables, when available and required by the requested consistency level.
 
-Each source is tagged with its shard and generation.
+Each source is tagged with its shard and freshness tier.
+SSTable sources are also tagged with their generation.
 For primary-key reads, the planner applies LSM deduplication across selected sources.
 For append-only reads, the planner concatenates selected sources without primary-key deduplication.
 
@@ -574,11 +582,11 @@ For example, with `bucket(user_id, 10)` and predicate `user_id = 123`:
 
 ### Indexed Read Plan
 
-When data is merged from an SSTable into the base table, base-table indexes may lag behind the data commit.
-`index_catchup` records which merged generation each base-table index covers.
+When data is compacted from an SSTable into the base table, base-table indexes may lag behind the data commit.
+`index_catchup` records which compacted generation each base-table index covers.
 
-If an indexed query needs index `I` and `I` has only caught up to generation `G` while `merged_generations[shard_id]` is higher, the planner should read the gap from SSTable indexes instead of scanning unindexed base-table rows.
-Once index `I` catches up, the planner can use the base-table index for those merged rows.
+If an indexed query needs index `I` and `I` has only caught up to generation `G` while `compacted_sstables[shard_id]` is higher, the planner should read the gap from SSTable indexes instead of scanning unindexed base-table rows.
+Once index `I` catches up, the planner can use the base-table index for those compacted rows.
 
 ## Appendices
 
@@ -606,13 +614,13 @@ Writer A is fenced and must abort.
 Recovery starts from `replay_after_wal_entry_position + 1`, which is entry 11.
 Entries 13, 14, 15, 16, and 17 are valid replay inputs because they were written by epochs that were valid at write time and are not greater than the current shard epoch.
 
-### Appendix 2: Concurrent Merger Example
+### Appendix 2: Concurrent Compactor Example
 
 Initial state:
 
 ```text
 MemWAL index:
-  merged_generations: {shard: 5}
+  compacted_sstables: {shard: 5}
 
 Shard manifest:
   current_generation: 8
@@ -621,11 +629,11 @@ Shard manifest:
     - generation: 7, path: "def67890_gen_7"
 ```
 
-Two mergers both try to merge generation 6.
-Merger A commits first and updates `merged_generations[shard]` to 6 in the same base-table commit as the data.
-Merger B then hits a commit conflict, reloads the latest MemWAL index, sees `merged_generations[shard] >= 6`, skips generation 6, and continues with generation 7.
+Two compactors both try to compact the SSTable at generation 6.
+Compactor A commits first and updates `compacted_sstables[shard]` to 6 in the same base-table commit as the data.
+Compactor B then hits a commit conflict, reloads the latest MemWAL index, sees `compacted_sstables[shard] >= 6`, skips generation 6, and continues with generation 7.
 
-The MemWAL index is the authoritative merge-progress record because it is committed atomically with the base-table data changes.
+The MemWAL index is the authoritative compaction-progress record because it is committed atomically with the base-table data changes.
 
 ### Appendix 3: Bucket Hashing
 

@@ -5,8 +5,8 @@
 //!
 //! This module provides scanners that read from multiple data sources
 //! in an LSM tree architecture:
-//! - Base table (merged data)
-//! - SSTables (persisted but not yet merged)
+//! - Base table (compacted data)
+//! - SSTables (persisted but not yet compacted)
 //! - Active MemTable (in-memory buffer)
 //!
 //! The scanner handles deduplication by primary key, keeping the newest
