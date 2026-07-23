@@ -53,19 +53,6 @@ pub struct LsmScanPlanner {
     flushed_cache: Option<Arc<dyn DatasetCache>>,
     /// Optional warmer fired on first open of a flushed generation.
     warmer: Option<Arc<dyn GenerationWarmer>>,
-    /// Over-fetch multiple for the per-source limit pushdown: block-listed
-    /// sources scan `(offset + limit) * factor` rows so cross-gen dedup drops
-    /// still leave enough live rows. Clamped to `>= 1.0`.
-    ///
-    /// This headroom must also absorb deletes: a tombstone shadows the older
-    /// real row without emitting a replacement (shadow-without-replace), so it
-    /// is pure subtraction from a block-listed source. If delete density inside
-    /// a source's fetch window exceeds `factor - 1`, that source can deliver
-    /// `< k` live rows (a recall shortfall, not wrong content — see the
-    /// under-fetch `warn!` in `PkBlockFilterExec`). Steady-state this is
-    /// self-limiting because L0→base compaction drains tombstones from the
-    /// fresh tier; the exposure is a delete-heavy burst between compactions.
-    overfetch_factor: f64,
 }
 
 impl LsmScanPlanner {
@@ -83,7 +70,6 @@ impl LsmScanPlanner {
             store_params: None,
             flushed_cache: None,
             warmer: None,
-            overfetch_factor: 1.0,
         }
     }
 
@@ -109,14 +95,6 @@ impl LsmScanPlanner {
     /// Inject the warmer fired on first open of a flushed generation.
     pub fn with_warmer(mut self, warmer: Arc<dyn GenerationWarmer>) -> Self {
         self.warmer = Some(warmer);
-        self
-    }
-
-    /// Set the over-fetch multiple for the per-source limit pushdown
-    /// (see the field docs). Values below `1.0` are rejected by
-    /// [`Self::plan_scan`].
-    pub fn with_overfetch_factor(mut self, factor: f64) -> Self {
-        self.overfetch_factor = factor;
         self
     }
 
@@ -163,7 +141,6 @@ impl LsmScanPlanner {
 
         // 1. Collect all data sources
         let sources = self.collector.collect()?;
-        let overfetch = super::validate_overfetch_factor(self.overfetch_factor)?;
 
         if sources.is_empty() {
             // Return empty plan
@@ -187,14 +164,13 @@ impl LsmScanPlanner {
         let sources: Vec<_> = sources.into_iter().rev().collect();
 
         // Per-source limit pushdown: an unordered LIMIT needs only
-        // `offset + limit` live rows from EACH source to fill the global
-        // limit after dedup (any-N semantics), so cap every on-disk source
-        // instead of scanning whole generations and trimming above the
-        // union. Block-listed sources over-fetch by `overfetch_factor` so
-        // cross-gen dedup drops still leave `n_needed` live rows; the
-        // PkBlockFilter warns when that was not enough. The active memtable
-        // is in-memory and within-gen append duplicates are resolved by its
-        // own dedup, so it is never capped here.
+        // `offset + limit` live rows from each source to fill the global limit
+        // (any-N semantics). However, a source with a cross-generation block
+        // list can lose any number of rows after its scan, so a finite fetch
+        // before that filter is not safe. Leave those scans unbounded and let
+        // the LocalLimitExec below pull until it sees `n_needed` live rows or
+        // reaches EOF. Sources without a block filter can still push the limit
+        // down safely. The active memtable is in-memory and is never capped.
         let n_needed = limit.map(|l| l.saturating_add(offset.unwrap_or(0)));
 
         let mut source_plans = Vec::new();
@@ -204,12 +180,9 @@ impl LsmScanPlanner {
             let blocked = block_lists
                 .get(&(source.shard_id(), source.generation()))
                 .cloned();
-            let fetch = match (n_needed, is_active) {
-                (Some(n), false) => Some(if blocked.is_some() && !self.pk_columns.is_empty() {
-                    ((n as f64) * overfetch).ceil() as usize
-                } else {
-                    n
-                }),
+            let has_block_filter = blocked.is_some() && !self.pk_columns.is_empty();
+            let fetch = match (n_needed, is_active, has_block_filter) {
+                (Some(n), false, false) => Some(n),
                 _ => None,
             };
             let scan = self
@@ -217,14 +190,14 @@ impl LsmScanPlanner {
                 .await?;
 
             // Drop cross-generation stale rows (PKs superseded by a newer gen).
-            // With a limit, `k = n_needed` arms the under-fetch warning; with
-            // no limit `k = 0` keeps it silent.
+            // Plain scans refill exactly, so keep the approximate-search
+            // under-fetch warning disabled with k = 0.
             let scan = match blocked {
                 Some(set) if !self.pk_columns.is_empty() => Arc::new(PkBlockFilterExec::new(
                     scan,
                     self.pk_columns.clone(),
                     set,
-                    n_needed.unwrap_or(0),
+                    0,
                 ))
                     as Arc<dyn ExecutionPlan>,
                 _ => scan,
@@ -1008,6 +981,68 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    async fn test_lsm_scan_limit_offset_refills_after_update_shadow_across_fragments() {
+        let schema = create_pk_schema();
+        let temp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp.path().to_str().unwrap());
+        let base_batch = create_test_batch(&schema, &[1, 2, 3, 4], "base");
+        let reader = RecordBatchIterator::new([Ok(base_batch)], schema.clone());
+        let base = Arc::new(
+            Dataset::write(
+                reader,
+                &base_uri,
+                Some(WriteParams {
+                    max_rows_per_file: 2,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(
+            base.get_fragments().len(),
+            2,
+            "the stale prefix and live rows must occupy separate fragments"
+        );
+
+        // The newest values for ids 1 and 2 no longer match the predicate, so
+        // their matching base values are shadowed.  The second base fragment
+        // still contains the live matches that must fill offset + limit.
+        let (batch_store, index_store) =
+            pk_indexed(&[create_test_batch(&schema, &[1, 2], "active")]);
+        let scanner = LsmScanner::new(base, vec![], vec!["id".to_string()])
+            .with_in_memory_memtables(
+                Uuid::new_v4(),
+                InMemoryMemTables {
+                    active: InMemoryMemTableRef {
+                        batch_store,
+                        index_store,
+                        schema,
+                        generation: 1,
+                    },
+                    frozen: vec![],
+                },
+            )
+            .filter("name LIKE 'base%'")
+            .unwrap()
+            .limit(Some(1), Some(1))
+            .unwrap();
+
+        let batch = scanner.try_into_batch().await.unwrap();
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(
+            ids.iter().collect::<Vec<_>>(),
+            vec![Some(4)],
+            "offset=1, limit=1 must skip id=3 after shadow filtering"
+        );
+    }
+
+    #[tokio::test]
     async fn test_lsm_scan_with_offset_without_limit() {
         let (base_dataset, shard_snapshots, active_memtable, pk_columns, _temp_path) =
             setup_multi_level_lsm().await;
@@ -1041,7 +1076,7 @@ mod integration_tests {
         let (base_dataset, _, _, pk_columns, _temp_path) = setup_multi_level_lsm().await;
 
         // Create scanner with only base table (no shard snapshots or active memtable)
-        let scanner = LsmScanner::new(base_dataset, vec![], pk_columns);
+        let scanner = LsmScanner::new(base_dataset.clone(), vec![], pk_columns.clone());
 
         let plan = scanner.create_plan().await.unwrap();
 
@@ -1051,6 +1086,22 @@ mod integration_tests {
             plan,
             "ProjectionExec:...
   LanceRead:...base/data...refine_filter=--",
+        )
+        .await
+        .unwrap();
+
+        // A base-only source has no cross-generation block filter, so its
+        // finite limit remains safe to push into the physical Lance read.
+        let scanner = LsmScanner::new(base_dataset, vec![], pk_columns)
+            .limit(Some(3), None)
+            .unwrap();
+        let plan = scanner.create_plan().await.unwrap();
+        assert_plan_node_equals(
+            plan,
+            "GlobalLimitExec: skip=0, fetch=3
+  ProjectionExec:...
+    LocalLimitExec: fetch=3
+      LanceRead:...base/data...range_before=Some(0..3)...refine_filter=--",
         )
         .await
         .unwrap();
@@ -2089,6 +2140,46 @@ mod integration_tests {
             collect_sorted_ids(&batches),
             vec![1, 3, 4],
             "id=2 deleted; tombstone row not surfaced"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_lsm_scan_limit_refills_after_active_tombstone_shadows_base() {
+        let base_schema = create_pk_schema();
+        let mem_schema = ts_pk_schema();
+        let temp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp.path().to_str().unwrap());
+        let base = Arc::new(
+            create_dataset(
+                &base_uri,
+                vec![create_test_batch(&base_schema, &[1, 2, 3], "base")],
+            )
+            .await,
+        );
+
+        let active_batch = ts_batch(&mem_schema, &[(1, None, true)]);
+        let (batch_store, index_store) = pk_indexed(&[active_batch]);
+        let scanner = LsmScanner::new(base, vec![], vec!["id".to_string()])
+            .with_in_memory_memtables(
+                Uuid::new_v4(),
+                InMemoryMemTables {
+                    active: InMemoryMemTableRef {
+                        batch_store,
+                        index_store,
+                        schema: mem_schema,
+                        generation: 1,
+                    },
+                    frozen: vec![],
+                },
+            )
+            .limit(Some(2), None)
+            .unwrap();
+
+        let batch = scanner.try_into_batch().await.unwrap();
+        assert_eq!(
+            collect_sorted_ids(&[batch]),
+            vec![2, 3],
+            "the base scan must continue past the shadowed row to fill the limit"
         );
     }
 
