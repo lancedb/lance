@@ -2301,11 +2301,13 @@ class LanceDataset(pa.dataset.Dataset):
         request coalescing, and bounded I/O scheduling all happen in Rust; this
         method does not use a Python thread pool.
 
-        Every request produces one result. Null blob requests return ``None``.
-        Empty ranges on non-null blobs return empty bytes without issuing
-        payload I/O. Blob-local bounds are not evaluated for null values because
-        they have no logical payload length. By default results preserve the
-        input request order.
+        Every request produces one result. Requests on null blobs return ``None``,
+        including when the requested range is empty. Empty ranges on non-null
+        blobs return empty bytes without issuing payload I/O. For every request,
+        offset plus length must fit in an unsigned 64-bit integer. Ranges on
+        non-null blobs must not extend beyond the logical blob size. Blob-local
+        bounds are not evaluated for null values because they have no logical
+        payload length. By default results preserve the input request order.
 
         Parameters
         ----------

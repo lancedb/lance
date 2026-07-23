@@ -1621,10 +1621,14 @@ public class Dataset implements Closeable {
   private native List<BlobFile> nativeTakeBlobsByIndices(List<Long> rowIndices, String column);
 
   /**
-   * Open {@link BlobFile} handles for given row ids on a blob column. Names and semantics align
+   * Open {@link BlobFile} handles for given row IDs on a blob column. Names and semantics align
    * with Rust/Python.
    *
+   * <p>Pass logical row IDs read from {@code _rowid}, not physical row addresses from {@code
+   * _rowaddr}.
+   *
    * <pre>{@code
+   * long rowId = 42L; // Example value from the _rowid column.
    * List<BlobFile> blobs = dataset.takeBlobs(List.of(rowId), "images");
    * for (BlobFile blob : blobs) {
    *   if (blob != null) {
@@ -1635,9 +1639,9 @@ public class Dataset implements Closeable {
    * }
    * }</pre>
    *
-   * @param rowIds stable row ids (row addresses)
+   * @param rowIds logical row IDs from the {@code _rowid} column
    * @param column blob column name
-   * @return one {@link BlobFile} per row id; null blob values are represented by null elements
+   * @return one {@link BlobFile} per row ID; null blob values are represented by null elements
    */
   public List<BlobFile> takeBlobs(List<Long> rowIds, String column) {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
