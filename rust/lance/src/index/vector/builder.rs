@@ -555,7 +555,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             ));
         };
         let sample_size_hint = match &self.quantizer_params {
-            Some(params) => params.sample_size(),
+            Some(params) => params.try_sample_size()?,
             None => 256 * 256, // here it must be retrain, let's just set sample size to the default value
         };
 
