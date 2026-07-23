@@ -569,7 +569,16 @@ where
         };
         self.leftover_count = ((self.leftover_count as u64 + length.0) % self.repeat as u64) as u32;
         self.leftover = values.last().copied().unwrap_or(T::default());
-        Ok(Arc::new(ArrayType::from(values)))
+        let array = ArrayType::from(values);
+        if array.data_type() == &self.data_type {
+            return Ok(Arc::new(array));
+        }
+        let data = array
+            .into_data()
+            .into_builder()
+            .data_type(self.data_type.clone())
+            .build()?;
+        Ok(make_array(data))
     }
 
     fn data_type(&self) -> &DataType {
@@ -3241,6 +3250,19 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn test_timestamp_timezone_is_preserved() {
+        let data_type = DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into()));
+        let mut generator = array::rand_type(&data_type);
+        let generated = generator.generate_default(RowCount::from(2)).unwrap();
+        assert_eq!(generated.data_type(), &data_type);
+
+        let fields = Fields::from(vec![Field::new("timestamp", data_type, true)]);
+        let mut generator = array::rand_struct(fields.clone());
+        let generated = generator.generate_default(RowCount::from(2)).unwrap();
+        assert_eq!(generated.data_type(), &DataType::Struct(fields));
+    }
 
     #[test]
     fn test_step() {
