@@ -35,6 +35,14 @@ cc = "1.0.83"
 # This requires GCC 12 / Clang 6 or later. (To get AVX-512 support,
 # you need Clang 11 or later.)
 fp16kernels = []
+# Enable the AMX-FP16 tile kernel backing batched fp16 dot products
+# (Granite Rapids and newer). Off by default, and deliberately separate from
+# fp16kernels: it needs a C compiler accepting -mamx-fp16 (Clang >= 16 or
+# GCC >= 13; override the probe with LANCE_AMX_FP16_CC), and it links a C FFI
+# kernel that must request XTILEDATA from the kernel before executing any tile
+# instruction. With this feature off, no AMX source is compiled or linked and
+# HNSW keeps its original per-neighbor traversal.
+amx = ["fp16kernels"]
 
 [[bench]]
 name = "l2"

@@ -17,9 +17,11 @@ use arrow_array::{
     types::{Float32Type, UInt64Type},
 };
 use arrow_schema::{DataType, SchemaRef};
+use half::f16;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, ROW_ID, Result};
 use lance_file::versions::v1::reader::FileReader as V1FileReader;
+use lance_linalg::distance::dot_f16::{amx_fp16_available, dot_f16_batch_16};
 use lance_linalg::distance::hamming::hamming;
 use lance_linalg::distance::{Cosine, DistanceType, Dot, L2};
 
@@ -353,6 +355,10 @@ pub struct FlatDistanceCal<'a, T: ArrowPrimitiveType> {
     vectors: &'a [T::Native],
     query: Cow<'a, [T::Native]>,
     dimension: usize,
+    /// Metric this calculator computes. Retained (beyond `distance_fn`) so the
+    /// fp16 `distance_batch_16` override can recognize the `Dot` case that maps
+    /// onto the batched AMX-FP16 tile kernel.
+    distance_type: DistanceType,
     #[allow(clippy::type_complexity)]
     distance_fn: fn(&[T::Native], &[T::Native]) -> f32,
 }
@@ -370,6 +376,7 @@ where
             vectors: flat_array.values(),
             query: Cow::Owned(query.as_primitive::<T>().values().to_vec()),
             dimension,
+            distance_type,
             distance_fn: distance_type.func(),
         }
     }
@@ -383,6 +390,7 @@ where
             vectors,
             query: Cow::Borrowed(&vectors[dimension * id..dimension * (id + 1)]),
             dimension,
+            distance_type,
             distance_fn: distance_type.func(),
         }
     }
@@ -402,6 +410,7 @@ impl<'a> FlatDistanceCal<'a, UInt8Type> {
             vectors: flat_array.values(),
             query: Cow::Owned(query.as_primitive::<UInt8Type>().values().to_vec()),
             dimension,
+            distance_type: _distance_type,
             distance_fn: hamming,
         }
     }
@@ -419,6 +428,7 @@ impl<'a> FlatDistanceCal<'a, UInt8Type> {
             vectors,
             query: Cow::Borrowed(&vectors[dimension * id..dimension * (id + 1)]),
             dimension,
+            distance_type: _distance_type,
             distance_fn: hamming,
         }
     }
@@ -428,6 +438,39 @@ impl<T: ArrowPrimitiveType> FlatDistanceCal<'_, T> {
     #[inline]
     fn get_vector(&self, id: u32) -> &[T::Native] {
         &self.vectors[self.dimension * id as usize..self.dimension * (id + 1) as usize]
+    }
+}
+
+impl FlatDistanceCal<'_, Float16Type> {
+    /// Whether [`Self::dot_distance_batch_16_amx`] would actually reach the
+    /// AMX-FP16 tile kernel: the metric must be `Dot`, the dimension must cover
+    /// at least one full 32-wide tile pass (below that `dot_f16_batch_16` falls
+    /// back regardless), and AMX-FP16 must be usable in this process.
+    ///
+    /// Single source of truth shared by the `distance_batch_16` override and
+    /// `has_batch_16_kernel`, so the two cannot drift apart and leave HNSW
+    /// buffering neighbors for a fused kernel it would never reach.
+    #[inline]
+    fn has_amx_dot_kernel(&self) -> bool {
+        self.distance_type == DistanceType::Dot && self.dimension >= 32 && amx_fp16_available()
+    }
+
+    /// The 16 `Dot` distances of the query against `ids`, fused into a single
+    /// AMX-FP16 tile pass when the hardware/kernel is available (otherwise 16
+    /// scalar `f16::dot`s — bit-identical to the per-id `distance()` path).
+    ///
+    /// [`dot_f16_batch_16`] returns raw dot products `Σ q·c`; `Dot` distance is
+    /// `1.0 - Σ q·c` (see `lance_linalg`'s `dot_distance`), applied here so the
+    /// result matches [`DistCalculator::distance`] to within fp16 precision.
+    /// Only valid for `DistanceType::Dot`; the enum caller guarantees that.
+    #[inline]
+    fn dot_distance_batch_16_amx(&self, ids: &[u32; 16], dists: &mut [f32; 16]) {
+        let query: &[f16] = self.query.as_ref();
+        let candidates: [&[f16]; 16] = std::array::from_fn(|i| self.get_vector(ids[i]));
+        let dots = dot_f16_batch_16(query, &candidates);
+        for (dist, dot) in dists.iter_mut().zip(dots.iter()) {
+            *dist = 1.0 - *dot;
+        }
     }
 }
 
@@ -521,6 +564,32 @@ impl DistCalculator for FlatFloatDistanceCalc<'_> {
         }
     }
 
+    /// fp16 `Dot` with AMX-FP16 available is the only configuration here backed
+    /// by a fused kernel, so it is the only one that reports `true` — and hence
+    /// the only one for which HNSW buffers neighbors 16 at a time at all.
+    fn has_batch_16_kernel(&self) -> bool {
+        matches!(self, Self::Float16(calc) if calc.has_amx_dot_kernel())
+    }
+
+    /// Fuse the 16 neighbor distances (issued in batches of 16 by HNSW's
+    /// `beam_search_loop!`) into one AMX-FP16 tile pass for the fp16 `Dot` case
+    /// — the only path with a batched kernel. Every other case (fp16 L2/Cosine,
+    /// f32, f64) keeps the trait default of 16 individual `distance()` calls, so
+    /// results there are byte-identical to before. The guard matches
+    /// `has_batch_16_kernel` exactly; it stays here because this is a public
+    /// trait method that external callers may invoke without consulting it.
+    fn distance_batch_16(&self, ids: &[u32; 16], dists: &mut [f32; 16]) {
+        if let Self::Float16(calc) = self
+            && calc.has_amx_dot_kernel()
+        {
+            calc.dot_distance_batch_16_amx(ids, dists);
+            return;
+        }
+        for (dist, &id) in dists.iter_mut().zip(ids.iter()) {
+            *dist = self.distance(id);
+        }
+    }
+
     fn prefetch(&self, id: u32) {
         match self {
             Self::Float16(calc) => calc.prefetch(id),
@@ -582,5 +651,95 @@ mod tests {
         assert_eq!(distances.len(), 2);
         assert_eq!(distances[0], 0.0);
         assert!((distances[1] - 25.0).abs() < 1e-6);
+    }
+
+    // --- fp16 Dot batched (AMX-FP16) distance_batch_16 override ---
+
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
+
+    /// Random `n x dim` fp16 storage with the given metric, plus a random fp16
+    /// query array. Values in [-1, 1).
+    fn make_random_f16(
+        n: usize,
+        dim: usize,
+        dt: DistanceType,
+        seed: u64,
+    ) -> (FlatFloatStorage, ArrayRef) {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let values = Float16Array::from_iter_values(
+            (0..n * dim).map(|_| f16::from_f32(rng.random_range(-1.0f32..1.0))),
+        );
+        let vectors = FixedSizeListArray::try_new_from_values(values, dim as i32).unwrap();
+        let storage = FlatFloatStorage::new(vectors, dt);
+        let query: ArrayRef = Arc::new(Float16Array::from_iter_values(
+            (0..dim).map(|_| f16::from_f32(rng.random_range(-1.0f32..1.0))),
+        ));
+        (storage, query)
+    }
+
+    /// The fp16 `Dot` `distance_batch_16` override (AMX-FP16 when active) must
+    /// agree with 16 individual `distance()` calls. This is floating point, so
+    /// the bar is a relative tolerance, not bit-exactness: the tile kernel sums
+    /// f32-widened products in a different order than the per-id `f16::dot`.
+    /// 5e-3 relative is ~an order below fp16's own representational error; the
+    /// observed gap is ~1e-4. Dims include non-multiples of 32 (tail path).
+    #[test]
+    fn test_distance_batch_16_f16_dot_matches_single() {
+        for dim in [32usize, 47, 64, 100, 128, 200, 768, 1536] {
+            let (storage, query) = make_random_f16(64, dim, DistanceType::Dot, 0xF16 + dim as u64);
+            let calc = storage.dist_calculator(query, 0.0);
+            let ids: [u32; 16] = std::array::from_fn(|i| i as u32 + 7);
+
+            let mut batch = [0f32; 16];
+            calc.distance_batch_16(&ids, &mut batch);
+
+            for (i, &id) in ids.iter().enumerate() {
+                let single = calc.distance(id);
+                let rel = (batch[i] - single).abs() / (single.abs() + 1e-6);
+                assert!(
+                    rel <= 5e-3 || (batch[i] - single).abs() <= 1e-3,
+                    "dim={dim} id={id}: batch {} vs single {} (rel {rel})",
+                    batch[i],
+                    single
+                );
+            }
+        }
+    }
+
+    /// On an AMX-FP16 host (env not force-disabling), prove the accelerated tile
+    /// path is actually the one the fp16 Dot override selected, not a silent
+    /// fallback. `amx_fp16_available()` is a runtime probe (the compile-time
+    /// `kernel_support` cfg is only set for the `lance-linalg` crate, so it can't
+    /// be used to gate here). Reaching the end without SIGILL also proves the
+    /// tile instructions executed safely.
+    #[test]
+    fn test_distance_batch_16_f16_amx_active() {
+        if !lance_linalg::distance::dot_f16::amx_fp16_available() {
+            return; // This CI host may not expose AMX-FP16.
+        }
+        let (storage, query) = make_random_f16(64, 128, DistanceType::Dot, 42);
+        let calc = storage.dist_calculator(query, 0.0);
+        let ids: [u32; 16] = std::array::from_fn(|i| i as u32);
+        let mut batch = [0f32; 16];
+        calc.distance_batch_16(&ids, &mut batch);
+        for (i, &id) in ids.iter().enumerate() {
+            let single = calc.distance(id);
+            assert!((batch[i] - single).abs() <= 1e-2, "id={id}");
+        }
+    }
+
+    /// Non-Dot metrics keep the default per-id path, so the batch must be
+    /// bit-for-bit identical to individual `distance()` calls (no AMX involved).
+    #[test]
+    fn test_distance_batch_16_f16_l2_falls_through() {
+        let (storage, query) = make_random_f16(64, 100, DistanceType::L2, 5);
+        let calc = storage.dist_calculator(query, 0.0);
+        let ids: [u32; 16] = std::array::from_fn(|i| i as u32 + 3);
+        let mut batch = [0f32; 16];
+        calc.distance_batch_16(&ids, &mut batch);
+        for (i, &id) in ids.iter().enumerate() {
+            assert_eq!(batch[i].to_bits(), calc.distance(id).to_bits(), "id={id}");
+        }
     }
 }

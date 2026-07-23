@@ -66,6 +66,36 @@ pub trait DistCalculator {
         *dists = self.distance_all(k_hint);
     }
 
+    /// Whether [`Self::distance_batch_16`] on this calculator is backed by a real
+    /// fused kernel rather than the 16-individual-[`Self::distance`] default.
+    ///
+    /// HNSW's `beam_search_loop!` reads this once per search to decide whether to
+    /// buffer neighbors 16 at a time at all. Backends answering `false` — the
+    /// default, i.e. every backend without a batched kernel — keep the original
+    /// evaluate-each-neighbor-immediately traversal, so they pay nothing for a
+    /// batching path they could not benefit from.
+    ///
+    /// Implementations must answer `true` only when the fused path would actually
+    /// be taken (correct metric and dimension, hardware usable at runtime);
+    /// answering `true` while [`Self::distance_batch_16`] falls back internally
+    /// would make the buffering pure overhead.
+    fn has_batch_16_kernel(&self) -> bool {
+        false
+    }
+
+    /// Compute distances for a batch of exactly 16 ids in one call, writing
+    /// `dists[i]` for `ids[i]`.
+    ///
+    /// The default implementation issues 16 individual [`Self::distance`] calls,
+    /// so every backend is correct with no behavior change. Backends with a
+    /// batched distance kernel override this to compute all 16 in a single
+    /// fused pass.
+    fn distance_batch_16(&self, ids: &[u32; 16], dists: &mut [f32; 16]) {
+        for (dist, &id) in dists.iter_mut().zip(ids.iter()) {
+            *dist = self.distance(id);
+        }
+    }
+
     fn prefetch(&self, _id: u32) {}
 
     #[allow(clippy::too_many_arguments)]
