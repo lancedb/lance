@@ -520,22 +520,21 @@ impl ScalarIndex for BloomFilterIndex {
 
 /// Merge caller-selected BloomFilter segments into one self-contained segment.
 pub async fn merge_bloomfilter_indices(
-    source_indices: &[&BloomFilterIndex],
+    source_indices: &[(&BloomFilterIndex, &RoaringBitmap)],
     dest_store: &dyn IndexStore,
-    fragment_filter: &RoaringBitmap,
 ) -> Result<CreatedIndex> {
     let first = source_indices.first().ok_or_else(|| {
         Error::invalid_input("merge_bloomfilter_indices requires at least one source index")
     })?;
     let params = BloomFilterIndexBuilderParams {
-        number_of_items: first.number_of_items,
-        probability: first.probability,
+        number_of_items: first.0.number_of_items,
+        probability: first.0.probability,
     };
 
     let mut blocks = Vec::new();
     let mut merged_null_rows = RowAddrTreeMap::new();
     let mut has_missing_null_bitmap = false;
-    for source in source_indices {
+    for (source, fragment_filter) in source_indices {
         if source.number_of_items != params.number_of_items
             || source.probability != params.probability
         {
@@ -547,6 +546,9 @@ pub async fn merge_bloomfilter_indices(
                 source.number_of_items,
                 source.probability
             )));
+        }
+        if fragment_filter.is_empty() {
+            continue;
         }
         blocks.extend(
             source
@@ -2448,9 +2450,11 @@ mod tests {
             .await
             .unwrap();
         merge_bloomfilter_indices(
-            &[first.as_ref(), second.as_ref()],
+            &[
+                (first.as_ref(), &RoaringBitmap::from_iter([0])),
+                (second.as_ref(), &RoaringBitmap::from_iter([1])),
+            ],
             merged_store.as_ref(),
-            &RoaringBitmap::from_iter([0, 1]),
         )
         .await
         .unwrap();
@@ -2475,9 +2479,11 @@ mod tests {
             .await
             .unwrap();
         merge_bloomfilter_indices(
-            &[legacy.as_ref(), second.as_ref()],
+            &[
+                (legacy.as_ref(), &RoaringBitmap::from_iter([0])),
+                (second.as_ref(), &RoaringBitmap::from_iter([1])),
+            ],
             legacy_merged_store.as_ref(),
-            &RoaringBitmap::from_iter([0, 1]),
         )
         .await
         .unwrap();
@@ -2491,6 +2497,29 @@ mod tests {
                 .await
                 .unwrap()
                 .is_exact()
+        );
+
+        let (_trimmed_tmpdir, trimmed_store) = create_store();
+        merge_bloomfilter_indices(
+            &[
+                (legacy.as_ref(), &RoaringBitmap::new()),
+                (second.as_ref(), &RoaringBitmap::from_iter([1])),
+            ],
+            trimmed_store.as_ref(),
+        )
+        .await
+        .unwrap();
+        let trimmed = BloomFilterIndex::load(trimmed_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        let mut expected_nulls = RowAddrTreeMap::new();
+        expected_nulls.insert((1_u64 << 32) + 1);
+        assert_eq!(
+            trimmed
+                .search(&BloomFilterQuery::IsNull(), &NoOpMetricsCollector)
+                .await
+                .unwrap(),
+            SearchResult::exact(expected_nulls)
         );
     }
 }
