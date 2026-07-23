@@ -350,7 +350,15 @@ def is_nullable(field: Any) -> bool:
     """
     if not hasattr(field, "annotation"):
         # Pydantic v1 ModelField: Optional-ness is tracked via `allow_none`
-        # directly, since `outer_type_` already has Optional stripped.
+        # directly, since `outer_type_` already has Optional stripped. A
+        # nullable Vector/MultiVector still overrides this, same as v2.
+        v1_type = _field_annotation(field)
+        if inspect.isclass(v1_type):
+            try:
+                if issubclass(v1_type, FixedSizeListMixin):
+                    return v1_type.nullable()
+            except TypeError:
+                pass
         return bool(field.allow_none)
 
     annotation = field.annotation

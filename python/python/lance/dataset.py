@@ -45,6 +45,7 @@ from .blob import BlobFile
 from .dependencies import (
     _check_for_numpy,
     _check_for_torch,
+    _is_pydantic_base_model_class,
     model_to_dict,
     torch,
 )
@@ -878,6 +879,11 @@ class LanceDataset(pa.dataset.Dataset):
         **kwargs
             Additional arguments passed to write_dataset().
         """
+        if not _is_pydantic_base_model_class(model_class):
+            raise TypeError(
+                f"`model_class` must be a Pydantic BaseModel subclass, "
+                f"got {model_class!r}"
+            )
         if not data:
             raise ValueError(
                 "`data` must be a non-empty list of Pydantic model instances."

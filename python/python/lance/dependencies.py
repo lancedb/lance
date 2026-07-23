@@ -227,6 +227,14 @@ def _is_pydantic_base_model(obj: Any) -> bool:
     return isinstance(obj, BaseModel)
 
 
+def _is_pydantic_base_model_class(obj: Any) -> bool:
+    if not _PYDANTIC_AVAILABLE:
+        return False
+    from pydantic import BaseModel
+
+    return isinstance(obj, type) and issubclass(obj, BaseModel)
+
+
 def model_to_dict(obj: Any) -> dict[str, Any]:
     return obj.model_dump() if hasattr(obj, "model_dump") else obj.dict()
 
@@ -246,6 +254,7 @@ __all__ = [
     "_check_for_pydantic",
     "_check_for_torch",
     "_is_pydantic_base_model",
+    "_is_pydantic_base_model_class",
     "_LazyModule",
     "model_to_dict",
     # exported flags/guards

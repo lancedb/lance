@@ -12,7 +12,7 @@ import time
 import uuid
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 from unittest import mock
 
 import lance
@@ -77,7 +77,11 @@ input_data = [
 def test_input_data(tmp_path: Path, schema, data):
     base_dir = tmp_path / "test"
     dataset = lance.write_dataset(data, base_dir, schema=schema)
-    assert dataset.to_table() == input_data[0][1]
+    expected = input_data[0][1]
+    # Pydantic model instances derive their schema from the model class, so
+    # required (non-Optional) fields are correctly non-nullable -- stricter
+    # than, but castable to, the nullable reference schema below.
+    assert dataset.to_table().cast(expected.schema) == expected
 
 
 def test_from_pydantic_model(tmp_path: Path):
@@ -94,6 +98,36 @@ def test_from_pydantic_model(tmp_path: Path):
     assert table.schema.names == ["name", "score"]
     assert table.column("name").to_pylist() == ["alice", "bob"]
     assert table.column("score").to_pylist() == [0.9, 0.8]
+
+
+def test_from_pydantic_model_rejects_non_model_class(tmp_path: Path):
+    uri = str(tmp_path / "not_a_model")
+    with pytest.raises(TypeError, match="BaseModel subclass"):
+        lance.LanceDataset.from_pydantic_model(dict, [{"a": 1}], uri=uri)
+
+
+def test_write_dataset_pydantic_optional_field_typed_correctly_when_all_none(
+    tmp_path: Path,
+):
+    """Regression test: passing a list of Pydantic instances directly to
+    write_dataset() (not via from_pydantic_model()) must still derive the
+    schema from the model class, not from the batch's row data -- otherwise
+    an Optional field that happens to be None for every row in the batch
+    gets typed as Arrow's literal null type instead of its real type."""
+
+    class Record(BaseModel):
+        name: str
+        tag: Optional[str] = None
+
+    data = [Record(name="alice"), Record(name="bob")]
+    uri = str(tmp_path / "all_none_optional")
+    dataset = lance.write_dataset(data, uri)
+
+    assert dataset.schema.field("tag").type == pa.string()
+    assert dataset.schema.field("tag").nullable is True
+
+    dataset.insert([Record(name="carol", tag="vip")])
+    assert dataset.to_table().column("tag").to_pylist() == [None, None, "vip"]
 
 
 def test_roundtrip_types(tmp_path: Path):

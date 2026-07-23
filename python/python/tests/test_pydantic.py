@@ -153,3 +153,25 @@ def test_optional_field_is_nullable():
 
     schema = pydantic_to_schema(Counter)
     assert schema.field("count").nullable is True
+
+
+def test_v1_style_field_nullable_vector_overrides_allow_none():
+    """Simulates a Pydantic v1 ModelField (no `.annotation` attribute; type
+    is read off `.outer_type_`, nullability off `.allow_none`) to verify a
+    nullable Vector/MultiVector annotation overrides `allow_none=False`
+    under v1, matching the v2 behavior tested in test_vector_field above."""
+
+    class FakeV1Field:
+        def __init__(self, outer_type_, allow_none):
+            self.outer_type_ = outer_type_
+            self.allow_none = allow_none
+
+    nullable_vector = Vector(8, nullable=True)
+    assert is_nullable(FakeV1Field(nullable_vector, allow_none=False)) is True
+
+    non_nullable_vector = Vector(8, nullable=False)
+    assert is_nullable(FakeV1Field(non_nullable_vector, allow_none=False)) is False
+
+    # Plain (non-Vector) types still fall back to `allow_none`.
+    assert is_nullable(FakeV1Field(str, allow_none=True)) is True
+    assert is_nullable(FakeV1Field(str, allow_none=False)) is False

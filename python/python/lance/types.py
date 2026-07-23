@@ -154,6 +154,10 @@ def _coerce_reader(
         and len(data_obj) > 0
         and _is_pydantic_base_model(data_obj[0])
     ):
+        if schema is None:
+            from .pydantic import pydantic_to_schema
+
+            schema = pydantic_to_schema(type(data_obj[0]))
         dicts = [model_to_dict(item) for item in data_obj]
         batch = pa.RecordBatch.from_pylist(dicts, schema=schema)
         return pa.RecordBatchReader.from_batches(batch.schema, [batch])
