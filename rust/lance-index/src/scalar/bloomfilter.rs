@@ -50,6 +50,7 @@ const BLOOMFILTER_ITEM_META_KEY: &str = "bloomfilter_item";
 const NULL_BITMAP_META_KEY: &str = "null_bitmap";
 const BLOOMFILTER_PROBABILITY_META_KEY: &str = "bloomfilter_probability";
 const BLOOMFILTER_INDEX_VERSION: u32 = 0;
+pub const MAX_BINARY_VALUE_BUFFER_LEN: u64 = i32::MAX as u64;
 
 #[derive(Debug, Clone)]
 struct BloomFilterStatistics {
@@ -86,6 +87,7 @@ pub struct BloomFilterIndex {
     probability: f64,
     // Exact set of null row addresses; None for older indices without this bitmap.
     null_rows: Option<RowAddrTreeMap>,
+    frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
 }
 
 impl DeepSizeOf for BloomFilterIndex {
@@ -97,7 +99,7 @@ impl DeepSizeOf for BloomFilterIndex {
 impl BloomFilterIndex {
     async fn load(
         store: Arc<dyn IndexStore>,
-        _fri: Option<Arc<dyn RowIdRemapper>>,
+        fri: Option<Arc<dyn RowIdRemapper>>,
         _index_cache: &LanceCache,
     ) -> Result<Arc<Self>> {
         let index_file = store.open_index_file(BLOOMFILTER_FILENAME).await?;
@@ -133,6 +135,7 @@ impl BloomFilterIndex {
             number_of_items,
             probability,
             null_rows,
+            fri,
         )?))
     }
 
@@ -141,6 +144,7 @@ impl BloomFilterIndex {
         number_of_items: u64,
         probability: f64,
         null_rows: Option<RowAddrTreeMap>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<Self> {
         if data.num_rows() == 0 {
             return Ok(Self {
@@ -148,6 +152,7 @@ impl BloomFilterIndex {
                 number_of_items,
                 probability,
                 null_rows,
+                frag_reuse_index,
             });
         }
 
@@ -229,6 +234,7 @@ impl BloomFilterIndex {
             number_of_items,
             probability,
             null_rows,
+            frag_reuse_index,
         })
     }
 
@@ -496,8 +502,7 @@ impl ScalarIndex for BloomFilterIndex {
         let files = builder.write_index(dest_store).await?;
 
         Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&pb::BloomFilterIndexDetails::default())
-                .unwrap(),
+            index_details: prost_types::Any::from_msg(&pb::BloomFilterIndexDetails::default())?,
             index_version: BLOOMFILTER_INDEX_VERSION,
             files,
         })
@@ -516,6 +521,65 @@ impl ScalarIndex for BloomFilterIndex {
         })?;
         Ok(ScalarIndexParams::for_builtin(BuiltinIndexType::BloomFilter).with_params(&params))
     }
+}
+
+fn remap_zone(
+    zone: &BloomFilterStatistics,
+    remapper: &dyn RowIdRemapper,
+) -> Vec<BloomFilterStatistics> {
+    let zone_start = (zone.bound.fragment_id << 32).saturating_add(zone.bound.start);
+    let mut remapped = (0..zone.bound.length as u64)
+        .filter_map(|offset| remapper.remap_row_id(zone_start.saturating_add(offset)))
+        .collect::<Vec<_>>();
+    remapped.sort_unstable();
+    remapped.dedup();
+
+    let mut zones = Vec::new();
+    let mut run_start = None;
+    let mut previous = 0u64;
+    for row_id in remapped {
+        if run_start.is_none() {
+            run_start = Some(row_id);
+        } else if row_id != previous.saturating_add(1) || row_id >> 32 != previous >> 32 {
+            let start = run_start.take().unwrap();
+            zones.push(BloomFilterStatistics {
+                bound: ZoneBound {
+                    fragment_id: start >> 32,
+                    start: start & u64::from(u32::MAX),
+                    length: (previous - start + 1) as usize,
+                },
+                has_null: zone.has_null,
+                bloom_filter: zone.bloom_filter.clone(),
+            });
+            run_start = Some(row_id);
+        }
+        previous = row_id;
+    }
+    if let Some(start) = run_start {
+        zones.push(BloomFilterStatistics {
+            bound: ZoneBound {
+                fragment_id: start >> 32,
+                start: start & u64::from(u32::MAX),
+                length: (previous - start + 1) as usize,
+            },
+            has_null: zone.has_null,
+            bloom_filter: zone.bloom_filter.clone(),
+        });
+    }
+    zones
+}
+
+fn checked_merged_payload_size(current: u64, additional: usize) -> Result<u64> {
+    let total = current
+        .checked_add(additional as u64)
+        .ok_or_else(|| Error::invalid_input("merged BloomFilter payload size overflowed u64"))?;
+    if total > MAX_BINARY_VALUE_BUFFER_LEN {
+        return Err(Error::invalid_input(format!(
+            "merged BloomFilter payload is {total} bytes, exceeding the Arrow BinaryArray limit \
+             of {MAX_BINARY_VALUE_BUFFER_LEN} bytes; merge fewer segments at a time"
+        )));
+    }
+    Ok(total)
 }
 
 /// Merge caller-selected BloomFilter segments into one self-contained segment.
@@ -538,6 +602,7 @@ pub async fn merge_bloomfilter_indices(
     let mut blocks = Vec::new();
     let mut merged_null_rows = RowAddrTreeMap::new();
     let mut has_missing_null_bitmap = false;
+    let mut serialized_bytes = 0u64;
     for (source, fragment_filter) in source_indices {
         if fragment_filter.is_empty() {
             continue;
@@ -554,19 +619,26 @@ pub async fn merge_bloomfilter_indices(
                 source.probability
             )));
         }
-        blocks.extend(
-            source
-                .zones
-                .iter()
-                .filter(|block| {
-                    u32::try_from(block.bound.fragment_id)
-                        .is_ok_and(|fragment_id| fragment_filter.contains(fragment_id))
-                })
-                .cloned(),
-        );
+        let source_zones = source.zones.iter().flat_map(|block| {
+            source.frag_reuse_index.as_deref().map_or_else(
+                || vec![block.clone()],
+                |remapper| remap_zone(block, remapper),
+            )
+        });
+        for block in source_zones.filter(|block| {
+            u32::try_from(block.bound.fragment_id)
+                .is_ok_and(|fragment_id| fragment_filter.contains(fragment_id))
+        }) {
+            serialized_bytes =
+                checked_merged_payload_size(serialized_bytes, block.bloom_filter.to_bytes().len())?;
+            blocks.push(block);
+        }
         match &source.null_rows {
             Some(null_rows) => {
-                let mut filtered = null_rows.clone();
+                let mut filtered = source.frag_reuse_index.as_deref().map_or_else(
+                    || null_rows.clone(),
+                    |remapper| remapper.remap_row_addrs_tree_map(null_rows),
+                );
                 filtered.retain_fragments(fragment_filter.iter());
                 merged_null_rows |= &filtered;
             }
@@ -583,7 +655,7 @@ pub async fn merge_bloomfilter_indices(
     let files = builder.write_index(dest_store).await?;
 
     Ok(CreatedIndex {
-        index_details: prost_types::Any::from_msg(&pb::BloomFilterIndexDetails::default()).unwrap(),
+        index_details: prost_types::Any::from_msg(&pb::BloomFilterIndexDetails::default())?,
         index_version: BLOOMFILTER_INDEX_VERSION,
         files,
     })
@@ -1282,7 +1354,9 @@ impl TrainingRequest for BloomFilterIndexTrainingRequest {
 
 #[cfg(test)]
 mod tests {
+    use crate::frag_reuse::{FragReuseIndex, FragReuseIndexDetails, FragReuseIndexHandle};
     use crate::scalar::registry::VALUE_COLUMN_NAME;
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     use crate::scalar::bloomfilter::BloomFilterIndexPlugin;
@@ -1298,13 +1372,26 @@ mod tests {
 
     use crate::scalar::{
         BloomFilterQuery, IndexStore, ScalarIndex, SearchResult,
-        bloomfilter::{BloomFilterIndex, BloomFilterIndexBuilderParams, merge_bloomfilter_indices},
+        bloomfilter::{
+            BloomFilterIndex, BloomFilterIndexBuilderParams, MAX_BINARY_VALUE_BUFFER_LEN,
+            checked_merged_payload_size, merge_bloomfilter_indices,
+        },
         lance_format::LanceIndexStore,
     };
 
     use crate::Index; // Import Index trait to access calculate_included_frags
     use crate::metrics::NoOpMetricsCollector;
     use roaring::RoaringBitmap; // Import RoaringBitmap for the test
+
+    #[test]
+    fn test_checked_merged_payload_size_rejects_binary_overflow() {
+        assert_eq!(
+            checked_merged_payload_size(MAX_BINARY_VALUE_BUFFER_LEN - 1, 1).unwrap(),
+            MAX_BINARY_VALUE_BUFFER_LEN
+        );
+        let err = checked_merged_payload_size(MAX_BINARY_VALUE_BUFFER_LEN, 1).unwrap_err();
+        assert!(err.to_string().contains("Arrow BinaryArray limit"));
+    }
 
     // Adds a _rowaddr column emulating each batch as a new fragment
     fn add_row_addr(stream: SendableRecordBatchStream) -> SendableRecordBatchStream {
@@ -2447,7 +2534,7 @@ mod tests {
             .unwrap();
         }
 
-        let first = BloomFilterIndex::load(first_store, None, &LanceCache::no_cache())
+        let first = BloomFilterIndex::load(first_store.clone(), None, &LanceCache::no_cache())
             .await
             .unwrap();
         let second = BloomFilterIndex::load(second_store, None, &LanceCache::no_cache())
@@ -2474,6 +2561,59 @@ mod tests {
                 .await
                 .unwrap(),
             SearchResult::exact(expected_nulls)
+        );
+
+        let remapped_base = 2_u64 << 32;
+        let remapper = FragReuseIndexHandle(Arc::new(FragReuseIndex::new(
+            uuid::Uuid::new_v4(),
+            vec![HashMap::from([
+                (0, Some(remapped_base)),
+                (1, Some(remapped_base + 1)),
+                (2, Some(remapped_base + 2)),
+            ])],
+            FragReuseIndexDetails { versions: vec![] },
+        )));
+        let remapped_first = BloomFilterIndex::load(
+            first_store,
+            Some(Arc::new(remapper)),
+            &LanceCache::no_cache(),
+        )
+        .await
+        .unwrap();
+        let (_remapped_tmpdir, remapped_store) = create_store();
+        merge_bloomfilter_indices(
+            &[(remapped_first.as_ref(), &RoaringBitmap::from_iter([2]))],
+            remapped_store.as_ref(),
+        )
+        .await
+        .unwrap();
+        let remapped = BloomFilterIndex::load(remapped_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        let mut expected_remapped_nulls = RowAddrTreeMap::new();
+        expected_remapped_nulls.insert(remapped_base + 1);
+        assert_eq!(
+            remapped
+                .search(&BloomFilterQuery::IsNull(), &NoOpMetricsCollector)
+                .await
+                .unwrap(),
+            SearchResult::exact(expected_remapped_nulls)
+        );
+        let candidates = remapped
+            .search(
+                &BloomFilterQuery::Equals(ScalarValue::Int64(Some(10))),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+        assert!(
+            candidates
+                .row_addrs()
+                .true_rows()
+                .row_addrs()
+                .unwrap()
+                .map(u64::from)
+                .any(|row_id| row_id == remapped_base)
         );
 
         let (_legacy_tmpdir, legacy_store) = create_store();

@@ -164,6 +164,9 @@ pub(crate) async fn build_index_metadata_from_segments(
 
     let mut new_indices = Vec::with_capacity(segments.len());
     for segment in segments {
+        let dataset_version = segment
+            .dataset_version()
+            .unwrap_or(dataset.manifest.version);
         let (uuid, fragment_bitmap, index_details, index_version) = segment.into_parts();
         let is_inverted_index = index_details.type_url.ends_with("InvertedIndexDetails");
         if is_inverted_index {
@@ -171,7 +174,7 @@ pub(crate) async fn build_index_metadata_from_segments(
                 uuid,
                 name: index_name.to_string(),
                 fields: vec![field_id],
-                dataset_version: dataset.manifest.version,
+                dataset_version,
                 fragment_bitmap: Some(fragment_bitmap.clone()),
                 index_details: Some(index_details.clone()),
                 index_version,
@@ -191,7 +194,7 @@ pub(crate) async fn build_index_metadata_from_segments(
             uuid,
             name: index_name.to_string(),
             fields: vec![field_id],
-            dataset_version: dataset.manifest.version,
+            dataset_version,
             fragment_bitmap: Some(fragment_bitmap),
             index_details: Some(index_details),
             index_version,
@@ -1382,6 +1385,11 @@ impl DatasetIndexExt for Dataset {
         source_segments: Vec<IndexMetadata>,
     ) -> Result<IndexMetadata> {
         validate_segment_metadata("uncommitted", &source_segments)?;
+        let source_dataset_version = source_segments
+            .iter()
+            .map(|segment| segment.dataset_version)
+            .min()
+            .unwrap_or(self.manifest.version);
         let field_id = *source_segments[0].fields.first().ok_or_else(|| {
             Error::invalid_input(format!(
                 "CreateIndex: segment {} is missing field ids",
@@ -1441,7 +1449,7 @@ impl DatasetIndexExt for Dataset {
         } else {
             crate::index::scalar::btree::merge_segments(self, source_segments).await?
         };
-        merged_segment.dataset_version = self.manifest.version;
+        merged_segment.dataset_version = source_dataset_version;
         merged_segment.fields = vec![field_id];
         Ok(merged_segment)
     }

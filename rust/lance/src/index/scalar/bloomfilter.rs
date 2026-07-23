@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use lance_index::metrics::NoOpMetricsCollector;
-use lance_index::scalar::bloomfilter::BloomFilterIndex;
+use lance_index::scalar::bloomfilter::{BloomFilterIndex, MAX_BINARY_VALUE_BUFFER_LEN};
 use lance_index::scalar::index_files_to_table;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_table::format::IndexMetadata;
@@ -29,6 +29,25 @@ pub(in crate::index) async fn merge_segments(
         ))
     })?;
     let field_path = dataset.schema().field_path(field_id)?;
+    let dataset_version = segments
+        .iter()
+        .map(|segment| segment.dataset_version)
+        .min()
+        .unwrap_or(dataset.manifest.version);
+    if segments.iter().all(|segment| segment.files.is_some()) {
+        let total_size = segments
+            .iter()
+            .filter_map(IndexMetadata::total_size_bytes)
+            .try_fold(0u64, u64::checked_add)
+            .ok_or_else(|| Error::invalid_input("BloomFilter segment sizes overflowed u64"))?;
+        if total_size > MAX_BINARY_VALUE_BUFFER_LEN {
+            return Err(Error::invalid_input(format!(
+                "BloomFilter segment files total {total_size} bytes, exceeding the Arrow \
+                 BinaryArray merge limit of {MAX_BINARY_VALUE_BUFFER_LEN} bytes; merge fewer \
+                 segments at a time"
+            )));
+        }
+    }
 
     let mut fragment_bitmap = RoaringBitmap::new();
     let dataset_fragments = dataset.fragment_bitmap.as_ref();
@@ -83,7 +102,7 @@ pub(in crate::index) async fn merge_segments(
     Ok(IndexMetadata {
         uuid: new_uuid,
         fields: vec![field_id],
-        dataset_version: dataset.manifest.version,
+        dataset_version,
         fragment_bitmap: Some(fragment_bitmap),
         index_details: Some(Arc::new(created_index.index_details)),
         index_version: created_index.index_version as i32,
