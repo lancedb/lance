@@ -1432,16 +1432,19 @@ mod tests {
     fn test_batch_with_undelivered_slot_is_error() {
         let response = Arc::new(Mutex::new(None));
         let response_clone = response.clone();
+        let io_queue = Arc::new(IoQueue::new(1, 1024, IoStats::new()));
         let batch = MutableBatch::new(
             move |rsp| *response_clone.lock().unwrap() = Some(rsp),
             2, // num_data_buffers
             0, // priority
             2, // num_reqs
             false,
+            io_queue,
         );
         drop(batch);
 
-        let data = response.lock().unwrap().take().unwrap().data;
+        let mut rsp = response.lock().unwrap().take().unwrap();
+        let data = rsp.data.take().unwrap();
         assert!(
             data.is_err(),
             "undelivered slot must yield an error, got {data:?}",
