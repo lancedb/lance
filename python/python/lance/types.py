@@ -154,10 +154,19 @@ def _coerce_reader(
         and len(data_obj) > 0
         and _is_pydantic_base_model(data_obj[0])
     ):
+        model_class = type(data_obj[0])
+        for i, item in enumerate(data_obj):
+            if not isinstance(item, model_class):
+                raise TypeError(
+                    f"All items in a Pydantic model list must be instances of "
+                    f"the same model class; expected {model_class!r}, got "
+                    f"{type(item)!r} at index {i} (list has {len(data_obj)} "
+                    "items)."
+                )
         if schema is None:
             from .pydantic import pydantic_to_schema
 
-            schema = pydantic_to_schema(type(data_obj[0]))
+            schema = pydantic_to_schema(model_class)
         dicts = [model_to_dict(item) for item in data_obj]
         batch = pa.RecordBatch.from_pylist(dicts, schema=schema)
         return pa.RecordBatchReader.from_batches(batch.schema, [batch])

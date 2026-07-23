@@ -106,6 +106,50 @@ def test_from_pydantic_model_rejects_non_model_class(tmp_path: Path):
         lance.LanceDataset.from_pydantic_model(dict, [{"a": 1}], uri=uri)
 
 
+class _OtherRecord(BaseModel):
+    x: int
+
+
+@pytest.mark.parametrize(
+    "bad_item",
+    [{"name": "eve", "score": 1.0}, _OtherRecord(x=1)],
+    ids=["dict", "different_model"],
+)
+def test_from_pydantic_model_rejects_invalid_item(tmp_path: Path, bad_item):
+    """A dict or an instance of a different model slipped into `data` must be
+    rejected up front with the offending index, rather than either reaching
+    model_to_dict() and raising an opaque AttributeError (dict case) or being
+    silently serialized against the first item's schema (different-model
+    case)."""
+
+    class UserRecord(BaseModel):
+        name: str
+        score: float
+
+    data = [UserRecord(name="alice", score=0.9), bad_item]
+    uri = str(tmp_path / "invalid_item")
+    with pytest.raises(TypeError, match=r"data\[1\]"):
+        lance.LanceDataset.from_pydantic_model(UserRecord, data, uri=uri)
+
+
+@pytest.mark.parametrize(
+    "bad_item",
+    [{"name": "eve"}, _OtherRecord(x=1)],
+    ids=["dict", "different_model"],
+)
+def test_write_dataset_pydantic_list_rejects_invalid_item(tmp_path: Path, bad_item):
+    """Same guard as from_pydantic_model(), but via the plain write_dataset()
+    entry point (the _coerce_reader() Pydantic branch in types.py)."""
+
+    class Record(BaseModel):
+        name: str
+
+    data = [Record(name="alice"), bad_item]
+    uri = str(tmp_path / "invalid_item_write_dataset")
+    with pytest.raises(TypeError, match="same model class"):
+        lance.write_dataset(data, uri)
+
+
 def test_write_dataset_pydantic_optional_field_typed_correctly_when_all_none(
     tmp_path: Path,
 ):

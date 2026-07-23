@@ -888,6 +888,12 @@ class LanceDataset(pa.dataset.Dataset):
             raise ValueError(
                 "`data` must be a non-empty list of Pydantic model instances."
             )
+        for i, item in enumerate(data):
+            if not isinstance(item, model_class):
+                raise TypeError(
+                    f"`data[{i}]` must be an instance of {model_class!r}, "
+                    f"got {type(item)!r} (data has {len(data)} items)"
+                )
         if uri is None:
             uri = re.sub(r"(?<!^)(?=[A-Z])", "_", model_class.__name__).lower()
         from .pydantic import pydantic_to_schema
