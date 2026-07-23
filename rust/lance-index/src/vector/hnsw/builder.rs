@@ -40,7 +40,9 @@ use crate::vector::graph::{
     BorrowingGraph, DISTS_FIELD, Graph, NEIGHBORS_COL, NEIGHBORS_FIELD, OrderedFloat, OrderedNode,
     VisitedGenerator,
 };
-use crate::vector::graph::{Visited, beam_search_borrowed, greedy_search, greedy_search_borrowed};
+use crate::vector::graph::{
+    Visited, beam_search_acorn, beam_search_borrowed, greedy_search, greedy_search_borrowed,
+};
 use crate::vector::storage::{DistCalculator, VectorStore};
 use crate::vector::v3::subindex::IvfSubIndex;
 use crate::vector::{Query, VECTOR_RESULT_SCHEMA};
@@ -395,6 +397,114 @@ impl HNSW {
         }
 
         result
+    }
+
+    /// Like [Self::search_basic] but the bottom level runs
+    /// [beam_search_acorn], which only scores mask-passing nodes.
+    pub fn search_acorn(
+        &self,
+        query: ArrayRef,
+        k: usize,
+        params: &HnswQueryParams,
+        bitset: Visited,
+        storage: &impl VectorStore,
+    ) -> Result<Vec<OrderedNode>> {
+        let mut visited_generator = self
+            .inner
+            .visited_generator_queue
+            .pop()
+            .unwrap_or_else(|| VisitedGenerator::new(storage.len()));
+        let mut expanded_generator = self
+            .inner
+            .visited_generator_queue
+            .pop()
+            .unwrap_or_else(|| VisitedGenerator::new(storage.len()));
+
+        let result = self.search_acorn_inner(
+            query,
+            k,
+            params,
+            &bitset,
+            &mut visited_generator,
+            &mut expanded_generator,
+            storage,
+            Some(2),
+        );
+        drop(bitset);
+
+        // if the queue is full, we just don't push it back, so ignore the error here
+        let _ = self.inner.visited_generator_queue.push(visited_generator);
+        let _ = self.inner.visited_generator_queue.push(expanded_generator);
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn search_acorn_inner(
+        &self,
+        query: ArrayRef,
+        k: usize,
+        params: &HnswQueryParams,
+        bitset: &Visited,
+        visited_generator: &mut VisitedGenerator,
+        expanded_generator: &mut VisitedGenerator,
+        storage: &impl VectorStore,
+        prefetch_distance: Option<usize>,
+    ) -> Result<Vec<OrderedNode>> {
+        let dist_calc = storage.dist_calculator(query, params.dist_q_c);
+        let entry = self.inner.entry_point;
+        let mut ep = OrderedNode::new(entry, dist_calc.distance(entry).into());
+
+        let result = match &self.inner.graph {
+            HnswGraph::Built(nodes) => {
+                let nodes = nodes.as_slice();
+                for level in (0..self.max_level()).rev() {
+                    let cur_level = ImmutableHnswLevelView::new(level, nodes);
+                    ep = greedy_search_borrowed(
+                        &cur_level,
+                        ep,
+                        &dist_calc,
+                        self.inner.params.prefetch_distance,
+                    );
+                }
+                let mut visited = visited_generator.generate(storage.len());
+                let mut expanded = expanded_generator.generate(storage.len());
+                beam_search_acorn(
+                    &ImmutableHnswBottomView::new(nodes),
+                    &ep,
+                    params,
+                    &dist_calc,
+                    bitset,
+                    prefetch_distance,
+                    &mut visited,
+                    &mut expanded,
+                )
+            }
+            HnswGraph::Loaded(graph) => {
+                let graph = graph.as_ref();
+                for level in (0..self.max_level()).rev() {
+                    let cur_level = LoadedHnswLevelView::new(level, graph);
+                    ep = greedy_search_borrowed(
+                        &cur_level,
+                        ep,
+                        &dist_calc,
+                        self.inner.params.prefetch_distance,
+                    );
+                }
+                let mut visited = visited_generator.generate(storage.len());
+                let mut expanded = expanded_generator.generate(storage.len());
+                beam_search_acorn(
+                    &LoadedHnswBottomView::new(graph),
+                    &ep,
+                    params,
+                    &dist_calc,
+                    bitset,
+                    prefetch_distance,
+                    &mut visited,
+                    &mut expanded,
+                )
+            }
+        };
+        Ok(result.into_iter().take(k).collect())
     }
 
     #[instrument(level = "debug", skip(self, storage, query, prefilter_bitset))]
@@ -1151,27 +1261,23 @@ impl IvfSubIndex for HNSW {
             .visited_generator_queue
             .pop()
             .unwrap_or_else(|| VisitedGenerator::new(storage.len()));
-        let prefilter_bitset = if prefilter.is_empty() {
-            None
+        let results = if prefilter.is_empty() {
+            self.search_basic(query, k, &params, None, storage)?
         } else {
+            // the bitset must be moved into the callee so its borrow of
+            // `prefilter_generator` ends before the push below
             let indices = prefilter.filter_row_ids(Box::new(storage.row_ids()));
-            let mut bitset = prefilter_generator.generate(storage.len());
-            for indices in indices {
-                bitset.insert(indices as u32);
+            let mut prefilter_bitset = prefilter_generator.generate(storage.len());
+            for index in indices {
+                prefilter_bitset.insert(index as u32);
             }
-            Some(bitset)
-        };
-
-        let remained = prefilter_bitset
-            .as_ref()
-            .map(|b| b.count_ones())
-            .unwrap_or(storage.len());
-        let results = if remained < self.len() * 10 / 100 {
-            let prefilter_bitset =
-                prefilter_bitset.expect("the prefilter bitset must be set for flat search");
-            self.flat_search(storage, query, k, prefilter_bitset, &params)
-        } else {
-            self.search_basic(query, k, &params, prefilter_bitset, storage)?
+            let remained = prefilter_bitset.count_ones();
+            if remained < self.len() * 10 / 100 {
+                // few matching rows: brute force is cheaper and exact
+                self.flat_search(storage, query, k, prefilter_bitset, &params)
+            } else {
+                self.search_acorn(query, k, &params, prefilter_bitset, storage)?
+            }
         };
         // if the queue is full, we just don't push it back, so ignore the error here
         let _ = self.inner.visited_generator_queue.push(prefilter_generator);
@@ -1531,6 +1637,173 @@ mod tests {
             .count();
         let recall = hits as f32 / k as f32;
         assert!(recall >= 0.5, "recall {recall} below 0.5 (k={k})");
+    }
+
+    /// Brute-force top-`k` restricted to mask-passing ids.
+    fn brute_force_topk_masked(
+        store: &FlatFloatStorage,
+        query: ArrayRef,
+        k: usize,
+        passes: impl Fn(u32) -> bool,
+    ) -> Vec<u32> {
+        let dist_calc = store.dist_calculator(query, 0.0);
+        let mut matching: Vec<(f32, u32)> = (0..store.len() as u32)
+            .filter(|id| passes(*id))
+            .map(|id| (dist_calc.distance(id), id))
+            .collect();
+        matching.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        matching.into_iter().take(k).map(|(_, id)| id).collect()
+    }
+
+    /// The ACORN traversal must return only mask-passing nodes, search the
+    /// loaded graph identically to the in-memory build, and hold recall
+    /// against brute force over the mask.
+    #[tokio::test]
+    async fn test_acorn_filtered_search() {
+        const DIM: usize = 32;
+        const TOTAL: usize = 2048;
+        let fsl =
+            FixedSizeListArray::try_new_from_values(generate_random_array(TOTAL * DIM), DIM as i32)
+                .unwrap();
+        let store = Arc::new(FlatFloatStorage::new(fsl.clone(), DistanceType::L2));
+        let builder = HNSW::index_vectors(
+            store.as_ref(),
+            HnswBuildParams::default().num_edges(20).ef_construction(50),
+        )
+        .unwrap();
+        let loaded = HNSW::load(builder.to_batch().unwrap()).unwrap();
+
+        let mut mask_generator = crate::vector::graph::VisitedGenerator::new(TOTAL);
+        let k = 10;
+        let params = HnswQueryParams {
+            ef: 50,
+            lower_bound: None,
+            upper_bound: None,
+            dist_q_c: 0.0,
+        };
+        let query = fsl.value(0);
+        let truth: std::collections::HashSet<u32> =
+            brute_force_topk_masked(store.as_ref(), query.clone(), k, |id| id % 2 == 0)
+                .into_iter()
+                .collect();
+
+        let mut all_results = vec![];
+        for hnsw in [&builder, &loaded] {
+            let mut bitset = mask_generator.generate(TOTAL);
+            for id in (0..TOTAL as u32).step_by(2) {
+                bitset.insert(id);
+            }
+            let results = hnsw
+                .search_acorn(query.clone(), k, &params, bitset, store.as_ref())
+                .unwrap();
+            assert_eq!(results.len(), k);
+            assert!(results.iter().all(|node| node.id % 2 == 0));
+            assert!(results.windows(2).all(|w| w[0].dist <= w[1].dist));
+            let hits = results.iter().filter(|n| truth.contains(&n.id)).count();
+            let recall = hits as f32 / k as f32;
+            assert!(recall >= 0.5, "recall {recall} below 0.5 (k={k})");
+            all_results.push(results);
+        }
+        assert_eq!(all_results[0], all_results[1]);
+    }
+
+    /// `IvfSubIndex::search` must route a dense prefilter through the
+    /// filtered graph traversal and a sparse one through the exact flat scan,
+    /// returning only mask-passing row ids in both cases.
+    #[tokio::test]
+    async fn test_subindex_prefilter_dispatch() {
+        use arrow_array::cast::AsArray;
+        use async_trait::async_trait;
+        use lance_core::Result;
+        use lance_select::{RowAddrMask, RowAddrTreeMap};
+
+        use crate::metrics::NoOpMetricsCollector;
+        use crate::prefilter::PreFilter;
+
+        struct MaskPreFilter {
+            mask: Arc<RowAddrMask>,
+        }
+
+        #[async_trait]
+        impl PreFilter for MaskPreFilter {
+            async fn wait_for_ready(&self) -> Result<()> {
+                Ok(())
+            }
+            fn is_empty(&self) -> bool {
+                false
+            }
+            fn mask(&self) -> Arc<RowAddrMask> {
+                self.mask.clone()
+            }
+            fn filter_row_ids<'a>(
+                &self,
+                row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>,
+            ) -> Vec<u64> {
+                self.mask.selected_indices(row_ids)
+            }
+        }
+
+        const DIM: usize = 32;
+        const TOTAL: usize = 2048;
+        let fsl =
+            FixedSizeListArray::try_new_from_values(generate_random_array(TOTAL * DIM), DIM as i32)
+                .unwrap();
+        let store = Arc::new(FlatFloatStorage::new(fsl.clone(), DistanceType::L2));
+        let hnsw = HNSW::index_vectors(
+            store.as_ref(),
+            HnswBuildParams::default().num_edges(20).ef_construction(50),
+        )
+        .unwrap();
+
+        let k = 10;
+        let query_key = fsl.value(0);
+        let params = HnswQueryParams {
+            ef: 50,
+            lower_bound: None,
+            upper_bound: None,
+            dist_q_c: 0.0,
+        };
+
+        let search_row_ids = |allowed: Vec<u64>| {
+            let filter = Arc::new(MaskPreFilter {
+                mask: Arc::new(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(
+                    allowed,
+                ))),
+            });
+            let batch = hnsw
+                .search(
+                    query_key.clone(),
+                    k,
+                    params,
+                    store.as_ref(),
+                    filter,
+                    &NoOpMetricsCollector,
+                )
+                .unwrap();
+            batch[lance_core::ROW_ID]
+                .as_primitive::<arrow_array::types::UInt64Type>()
+                .values()
+                .to_vec()
+        };
+
+        // Dense mask (50% of rows): the filtered graph traversal.
+        let dense: Vec<u64> = (0..TOTAL as u64).step_by(2).collect();
+        let row_ids = search_row_ids(dense);
+        assert_eq!(row_ids.len(), k);
+        assert!(row_ids.iter().all(|id| id % 2 == 0));
+
+        // Sparse mask (< 10% of rows): the flat scan, which is exact.
+        let sparse: Vec<u64> = (0..TOTAL as u64).step_by(25).collect();
+        let row_ids = search_row_ids(sparse.clone());
+        assert_eq!(row_ids.len(), k);
+        let truth = brute_force_topk_masked(store.as_ref(), query_key.clone(), k, |id| {
+            sparse.contains(&(id as u64))
+        });
+        let mut got: Vec<u32> = row_ids.iter().map(|id| *id as u32).collect();
+        got.sort_unstable();
+        let mut expected = truth;
+        expected.sort_unstable();
+        assert_eq!(got, expected);
     }
 
     /// Regression guard for the `level_offsets` misalignment (issue #6746).

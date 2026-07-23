@@ -546,6 +546,98 @@ pub fn beam_search_borrowed(
     results.into_sorted_vec()
 }
 
+/// Number of mask-passing nodes used to seed [beam_search_acorn]'s frontier.
+const ACORN_SEED_COUNT: usize = 16;
+
+/// Beam search over the mask-passing subgraph (ACORN-1).
+///
+/// Only nodes in `bitset` get distances; a filtered-out neighbor instead
+/// contributes its own neighbors (a two-hop bridge), expanded at most once
+/// via `expanded`. The frontier starts from the entry point plus a sample
+/// of mask-passing nodes, so the search cannot strand when the passing set
+/// sits far from the entry point across a masked region.
+#[allow(clippy::too_many_arguments)]
+pub fn beam_search_acorn(
+    graph: &impl BorrowingGraph,
+    ep: &OrderedNode,
+    params: &HnswQueryParams,
+    dist_calc: &impl DistCalculator,
+    bitset: &Visited,
+    prefetch_distance: Option<usize>,
+    visited: &mut Visited,
+    expanded: &mut Visited,
+) -> Vec<OrderedNode> {
+    let ef = params.ef;
+    let lower_bound: OrderedFloat = params.lower_bound.unwrap_or(f32::MIN).into();
+    let upper_bound: OrderedFloat = params.upper_bound.unwrap_or(f32::MAX).into();
+    let mut candidates = BinaryHeap::with_capacity(ef);
+    let mut results = BinaryHeap::with_capacity(ef);
+    // collected per node before scoring so prefetch targets are the ids
+    // that actually get distances
+    let mut passing: Vec<u32> = Vec::with_capacity(64);
+
+    // the entry point may not pass the mask; it still seeds the traversal
+    visited.insert(ep.id);
+    candidates.push(Reverse(ep.clone()));
+    if bitset.contains(ep.id) && ep.dist >= lower_bound && ep.dist < upper_bound {
+        results.push(ep.clone());
+    }
+
+    let stride = (bitset.count_ones() / ACORN_SEED_COUNT).max(1);
+    for seed in bitset.iter_ones().step_by(stride).take(ACORN_SEED_COUNT) {
+        let seed = seed as u32;
+        if visited.contains(seed) {
+            continue;
+        }
+        visited.insert(seed);
+        let dist: OrderedFloat = dist_calc.distance(seed).into();
+        if dist >= lower_bound && dist < upper_bound {
+            push_result(&mut results, (dist, seed).into(), ef);
+        }
+        candidates.push(Reverse((dist, seed).into()));
+    }
+
+    while let Some(Reverse(current)) = candidates.pop() {
+        if current.dist > furthest_distance(&results) && results.len() == ef {
+            break;
+        }
+
+        passing.clear();
+        for &neighbor in graph.neighbors(current.id) {
+            if bitset.contains(neighbor) {
+                if !visited.contains(neighbor) {
+                    visited.insert(neighbor);
+                    passing.push(neighbor);
+                }
+            } else if !expanded.contains(neighbor) {
+                expanded.insert(neighbor);
+                for &second_hop in graph.neighbors(neighbor) {
+                    if bitset.contains(second_hop) && !visited.contains(second_hop) {
+                        visited.insert(second_hop);
+                        passing.push(second_hop);
+                    }
+                }
+            }
+        }
+
+        process_neighbors_with_look_ahead(
+            &passing,
+            |node| {
+                let dist: OrderedFloat = dist_calc.distance(node).into();
+                if dist <= furthest_distance(&results) || results.len() < ef {
+                    if dist >= lower_bound && dist < upper_bound {
+                        push_result(&mut results, (dist, node).into(), ef);
+                    }
+                    candidates.push(Reverse((dist, node).into()));
+                }
+            },
+            prefetch_distance,
+            dist_calc,
+        );
+    }
+    results.into_sorted_vec()
+}
+
 /// Greedy search over a graph
 ///
 /// This searches for only one result, only used for finding the entry point
