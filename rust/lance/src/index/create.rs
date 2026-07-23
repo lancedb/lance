@@ -932,12 +932,14 @@ mod tests {
     use lance_index::optimize::OptimizeOptions;
     use lance_index::progress::IndexBuildProgress;
     use lance_index::scalar::{
-        FullTextSearchQuery, SargableQuery, SearchResult, inverted::tokenizer::InvertedIndexParams,
+        BloomFilterQuery, FullTextSearchQuery, SargableQuery, SearchResult,
+        inverted::tokenizer::InvertedIndexParams,
     };
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::kmeans::{KMeansParams, train_kmeans};
     use lance_linalg::distance::{DistanceType, MetricType};
+    use roaring::RoaringBitmap;
     use std::{collections::BTreeSet, ops::Bound, sync::Arc};
     use uuid::Uuid;
 
@@ -1821,6 +1823,159 @@ mod tests {
             files.iter().all(|file| !file.path.starts_with("part_")),
             "staged bitmap segment should only reference canonical files"
         );
+    }
+
+    #[tokio::test]
+    async fn test_bloomfilter_distributed_segments_merge_and_query() {
+        #[derive(serde::Serialize)]
+        struct BloomParams {
+            number_of_items: u64,
+            probability: f64,
+        }
+
+        let mut dataset = gen_batch()
+            .col("value", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(3), FragmentRowCount::from(8))
+            .await
+            .unwrap();
+
+        let params =
+            ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BloomFilter)
+                .with_params(&BloomParams {
+                    number_of_items: 4,
+                    probability: 0.000_001,
+                });
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 3);
+        let mut staged = Vec::with_capacity(fragments.len());
+        for fragment in &fragments {
+            staged.push(
+                CreateIndexBuilder::new(&mut dataset, &["value"], IndexType::BloomFilter, &params)
+                    .name("value_bloom_segments".to_string())
+                    .fragments(vec![fragment.id() as u32])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+
+        dataset
+            .commit_existing_index_segments("value_bloom_segments", "value", staged.clone())
+            .await
+            .unwrap();
+        let logical = crate::index::scalar_logical::open_named_scalar_index(
+            &dataset,
+            "value",
+            "value_bloom_segments",
+            &NoOpMetricsCollector,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            logical.calculate_included_frags().await.unwrap(),
+            dataset.fragment_bitmap.as_ref().clone()
+        );
+
+        let mut trimmed = staged.clone();
+        trimmed[0].fragment_bitmap = Some(RoaringBitmap::new());
+        let trimmed_merged = dataset
+            .merge_existing_index_segments(trimmed)
+            .await
+            .unwrap();
+        assert_eq!(
+            trimmed_merged.fragment_bitmap.as_ref().unwrap(),
+            &RoaringBitmap::from_iter(fragments[1..].iter().map(|fragment| fragment.id() as u32))
+        );
+
+        let incompatible_params =
+            ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BloomFilter)
+                .with_params(&BloomParams {
+                    number_of_items: 8,
+                    probability: 0.01,
+                });
+        let incompatible = CreateIndexBuilder::new(
+            &mut dataset,
+            &["value"],
+            IndexType::BloomFilter,
+            &incompatible_params,
+        )
+        .name("value_bloom_incompatible".to_string())
+        .fragments(vec![fragments[1].id() as u32])
+        .execute_uncommitted()
+        .await
+        .unwrap();
+        let err = dataset
+            .merge_existing_index_segments(vec![staged[0].clone(), incompatible])
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("different parameters: number_of_items=4"),
+            "unexpected merge error: {err}"
+        );
+
+        let expected_dataset_version = staged
+            .iter()
+            .map(|segment| segment.dataset_version)
+            .min()
+            .unwrap();
+        let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
+        assert_eq!(merged.dataset_version, expected_dataset_version);
+        assert_eq!(
+            merged.fragment_bitmap.as_ref().unwrap(),
+            dataset.fragment_bitmap.as_ref()
+        );
+        assert!(
+            merged
+                .index_details
+                .as_ref()
+                .unwrap()
+                .type_url
+                .ends_with("BloomFilterIndexDetails")
+        );
+        dataset
+            .commit_existing_index_segments("value_bloom_merged", "value", vec![merged])
+            .await
+            .unwrap();
+        let committed = dataset
+            .load_indices_by_name("value_bloom_merged")
+            .await
+            .unwrap();
+        assert_eq!(committed[0].dataset_version, expected_dataset_version);
+        let merged_logical = crate::index::scalar_logical::open_named_scalar_index(
+            &dataset,
+            "value",
+            "value_bloom_merged",
+            &NoOpMetricsCollector,
+        )
+        .await
+        .unwrap();
+        let candidates = merged_logical
+            .search(
+                &BloomFilterQuery::Equals(ScalarValue::Int32(Some(17))),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+        assert!(
+            candidates
+                .row_addrs()
+                .true_rows()
+                .row_addrs()
+                .unwrap()
+                .map(u64::from)
+                .any(|row_addr| row_addr == (2_u64 << 32) + 1)
+        );
+
+        let result = dataset
+            .scan()
+            .filter("value = 17")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(result.num_rows(), 1);
+        assert_eq!(result["value"].as_primitive::<Int32Type>().value(0), 17);
     }
 
     #[tokio::test]

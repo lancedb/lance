@@ -5,6 +5,7 @@
 //!
 
 pub(crate) mod bitmap;
+pub(crate) mod bloomfilter;
 pub(crate) mod btree;
 pub(crate) mod fmindex;
 pub(crate) mod inverted;

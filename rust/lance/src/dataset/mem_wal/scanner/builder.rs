@@ -739,9 +739,6 @@ impl LsmScanner {
         if let Some(warmer) = &self.warmer {
             planner = planner.with_warmer(warmer.clone());
         }
-        if let Some(factor) = self.overfetch_factor {
-            planner = planner.with_overfetch_factor(factor);
-        }
 
         planner
             .plan_scan(
@@ -1003,44 +1000,69 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_overfetch_factor_is_rejected() {
-        let shard = Uuid::new_v4();
-        let scanner = LsmScanner::without_base_table(
+    async fn overfetch_factor_only_applies_to_searches() {
+        // Plain scans refill exactly via LocalLimitExec, so overfetch_factor is
+        // search-only and must not affect scan planning.
+        let scan = LsmScanner::without_base_table(
             pk_schema(),
-            "memory://t",
+            "memory://scan",
             vec![],
             vec!["id".to_string()],
         )
-        .with_in_memory_memtables(
-            shard,
-            InMemoryMemTables {
-                active: mk_pk_memtable(&[1, 2], 2),
-                frozen: vec![],
-            },
-        )
-        .with_overfetch_factor(0.5);
+        .with_overfetch_factor(0.5)
+        .try_into_batch()
+        .await
+        .unwrap();
+        assert_eq!(scan.num_rows(), 0);
 
-        let Err(err) = scanner.try_into_stream().await else {
-            panic!("invalid overfetch factor should fail planning");
+        let vector_schema = pk_schema_with(arrow_schema::Field::new(
+            "vector",
+            DataType::FixedSizeList(
+                Arc::new(arrow_schema::Field::new("item", DataType::Float32, true)),
+                4,
+            ),
+            false,
+        ));
+        let vector_search = LsmScanner::without_base_table(
+            vector_schema,
+            "memory://vector",
+            vec![],
+            vec!["id".to_string()],
+        )
+        .nearest(
+            "vector",
+            &arrow_array::Float32Array::from(vec![0.0f32, 0.0, 0.0, 0.0]),
+            1,
+        )
+        .unwrap()
+        .with_overfetch_factor(0.5);
+        let Err(err) = vector_search.try_into_stream().await else {
+            panic!("invalid overfetch factor should fail vector search planning");
         };
         assert!(
             err.to_string().contains("overfetch_factor"),
             "unexpected error for invalid overfetch factor: {err}"
         );
 
-        let empty_scanner = LsmScanner::without_base_table(
-            pk_schema(),
-            "memory://empty",
+        let fts_search = LsmScanner::without_base_table(
+            pk_schema_with(arrow_schema::Field::new("text", DataType::Utf8, true)),
+            "memory://fts",
             vec![],
             vec!["id".to_string()],
         )
+        .full_text_search(
+            FullTextSearchQuery::new("lance".to_string())
+                .with_column("text".to_string())
+                .unwrap(),
+        )
+        .unwrap()
         .with_overfetch_factor(0.5);
-        let Err(err) = empty_scanner.try_into_stream().await else {
-            panic!("invalid overfetch factor should fail even when there are no sources");
+        let Err(err) = fts_search.try_into_stream().await else {
+            panic!("invalid overfetch factor should fail full-text search planning");
         };
         assert!(
             err.to_string().contains("overfetch_factor"),
-            "unexpected error for invalid empty-source overfetch factor: {err}"
+            "unexpected error for invalid overfetch factor: {err}"
         );
     }
 
