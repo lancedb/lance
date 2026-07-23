@@ -44,13 +44,43 @@ impl std::fmt::Debug for QuickCacheBackend {
     }
 }
 
+/// Minimum weight budget per internal shard. quick_cache splits its weight
+/// capacity evenly across shards with no cross-shard borrowing, and an entry
+/// heavier than ~its shard's budget is silently refused admission — so the
+/// share must stay well above the largest cache entry. Large caches keep
+/// many shards for read concurrency; small caches trade shards for
+/// admissible entry size.
+const TARGET_SHARD_SHARE: usize = 4 << 30;
+
 impl QuickCacheBackend {
     pub fn with_capacity(capacity: usize) -> Self {
-        let estimated_items = 1_000_000;
-        let cache = quick_cache::sync::Cache::with_weighter(
-            estimated_items,
-            capacity as u64,
+        // Round down to a power of two: quick_cache rounds the shard count
+        // UP to one, which would silently halve the per-shard share.
+        let shards = (capacity / TARGET_SHARD_SHARE)
+            .next_power_of_two()
+            .min(1024)
+            .max(1);
+        let shards = if shards * TARGET_SHARD_SHARE > capacity.max(TARGET_SHARD_SHARE) {
+            shards / 2
+        } else {
+            shards
+        }
+        .max(1);
+        // Generous item estimate: pre-sizes the hash tables and keeps
+        // quick_cache's own "at least 32 items per shard" heuristic from
+        // shrinking the shard count below the explicit choice.
+        let estimated_items = 1_000_000.max(shards * 32);
+        let options = quick_cache::OptionsBuilder::new()
+            .estimated_items_capacity(estimated_items)
+            .weight_capacity(capacity as u64)
+            .shards(shards)
+            .build()
+            .expect("quick_cache options");
+        let cache = quick_cache::sync::Cache::with_options(
+            options,
             EntryWeighter,
+            Default::default(),
+            Default::default(),
         );
         Self { cache }
     }
