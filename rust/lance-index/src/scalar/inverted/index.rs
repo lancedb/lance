@@ -1148,6 +1148,8 @@ impl InvertedIndex {
         // element documents also resolve their coordinates from the local
         // posting document id.
         type DeferredGroup = Vec<(usize, u32)>;
+        type ResolvedDocumentKey = (u64, Vec<u32>);
+        type ResolvedGroup = (DeferredGroup, Vec<ResolvedDocumentKey>);
         let sorted = candidates.into_sorted_vec();
         let mut documents = Vec::with_capacity(sorted.len());
         let mut deferred: HashMap<u32, DeferredGroup> = HashMap::new();
@@ -1185,7 +1187,7 @@ impl InvertedIndex {
                 .into_iter()
                 .map(|(slot, entries)| (resolving_parts[slot as usize].clone(), entries))
                 .collect::<Vec<_>>();
-            let resolved: Vec<(DeferredGroup, Vec<(u64, Vec<u32>)>)> =
+            let resolved: Vec<ResolvedGroup> =
                 stream::iter(groups.into_iter().map(|(part, entries)| async move {
                     let doc_ids: Vec<u32> = entries.iter().map(|&(_, doc_id)| doc_id).collect();
                     let resolved = part.docs.resolve_document_keys(&doc_ids).await?;
@@ -11500,7 +11502,7 @@ mod tests {
                 shared_threshold,
             )
             .unwrap();
-        resolve_deferred_candidates(&partition.docs, &mut candidates, 0)
+        resolve_deferred_candidates(&partition.docs, &mut candidates)
             .await
             .unwrap();
         candidates

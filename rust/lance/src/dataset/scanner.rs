@@ -5021,7 +5021,20 @@ impl Scanner {
         let overlaid_frags = overlaid_fragments(target_fragments);
         let mut stale_frag_ids = RoaringBitmap::new();
         for seg in &segments {
-            collect_overlay_stale_frags(seg, &overlaid_frags, &mut stale_frag_ids)?;
+            // FTS metadata stores the stable id of the public field path.
+            // Overlay files store physical leaf ids, so a List<String>
+            // identity must be expanded to include its item field.
+            let overlay_field_ids = self
+                .dataset
+                .schema()
+                .project_by_ids(&seg.fields, true)
+                .field_ids();
+            collect_overlay_stale_frags(
+                seg,
+                &overlay_field_ids,
+                &overlaid_frags,
+                &mut stale_frag_ids,
+            )?;
         }
 
         if stale_frag_ids.is_empty() {

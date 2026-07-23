@@ -120,10 +120,14 @@ pub fn overlaid_fragments(fragments: &[Fragment]) -> HashMap<u32, &Fragment> {
 /// stale because an overlay committed after the segment was built touches a field the segment
 /// indexes. Field-aware and version-gated via [`overlay_exclusion_offsets`].
 ///
+/// `indexed_field_ids` are the physical ids written to overlay files. They may
+/// include descendants of the logical field ids stored in `segment`.
+///
 /// `overlaid_frags` holds only the fragments that actually carry overlays (rare), so the loop is
 /// `O(overlaid_frags)` rather than `O(fragments the segment covers)`.
 pub fn collect_overlay_stale_frags(
     segment: &IndexMetadata,
+    indexed_field_ids: &[i32],
     overlaid_frags: &HashMap<u32, &Fragment>,
     stale: &mut RoaringBitmap,
 ) -> Result<()> {
@@ -132,7 +136,7 @@ pub fn collect_overlay_stale_frags(
         if stale.contains(frag_id) || !covers_fragment(coverage, frag_id) {
             continue;
         }
-        if !stale_offsets_for_fragment(fragment, &segment.fields, segment.dataset_version)?
+        if !stale_offsets_for_fragment(fragment, indexed_field_ids, segment.dataset_version)?
             .is_empty()
         {
             stale.insert(frag_id);
@@ -1296,13 +1300,15 @@ mod tests {
         let overlaid: HashMap<u32, &Fragment> = HashMap::from([(3u32, &fragment)]);
 
         let mut stale = RoaringBitmap::new();
-        collect_overlay_stale_frags(&segment(vec![3], 1, None), &overlaid, &mut stale).unwrap();
+        collect_overlay_stale_frags(&segment(vec![3], 1, None), &[3], &overlaid, &mut stale)
+            .unwrap();
         assert_eq!(stale, bitmap([3]), "missing bitmap must cover fragment 3");
 
         // A present bitmap that excludes fragment 3 leaves it untouched.
         let mut stale = RoaringBitmap::new();
         collect_overlay_stale_frags(
             &segment(vec![3], 1, Some(bitmap([0]))),
+            &[3],
             &overlaid,
             &mut stale,
         )
@@ -1316,6 +1322,7 @@ mod tests {
         let mut stale = RoaringBitmap::new();
         collect_overlay_stale_frags(
             &segment(vec![3], 1, Some(bitmap([3]))),
+            &[3],
             &overlaid,
             &mut stale,
         )

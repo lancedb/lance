@@ -358,6 +358,7 @@ impl LazyDocSet {
     /// Not safe with a FragReuseIndex (see
     /// [`Self::has_frag_reuse_remap`]): the targeted reads return
     /// raw stored ids without applying the remap/skip.
+    #[cfg(test)]
     pub async fn resolve_row_ids(&self, doc_ids: &[u32]) -> Result<Vec<u64>> {
         match self {
             Self::Loaded(l) => Ok(doc_ids.iter().map(|&d| l.docs.row_id(d)).collect()),
