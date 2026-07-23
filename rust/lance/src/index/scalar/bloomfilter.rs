@@ -43,6 +43,9 @@ pub(in crate::index) async fn merge_segments(
                     segment.uuid
                 ))
             })?;
+        if effective.is_empty() {
+            continue;
+        }
         fragment_bitmap |= &effective;
         fragment_filters.push(effective);
         let scalar_index =

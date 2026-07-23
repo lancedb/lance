@@ -523,9 +523,14 @@ pub async fn merge_bloomfilter_indices(
     source_indices: &[(&BloomFilterIndex, &RoaringBitmap)],
     dest_store: &dyn IndexStore,
 ) -> Result<CreatedIndex> {
-    let first = source_indices.first().ok_or_else(|| {
-        Error::invalid_input("merge_bloomfilter_indices requires at least one source index")
-    })?;
+    let first = source_indices
+        .iter()
+        .find(|(_, fragment_filter)| !fragment_filter.is_empty())
+        .ok_or_else(|| {
+            Error::invalid_input(
+                "merge_bloomfilter_indices requires at least one source with fragment coverage",
+            )
+        })?;
     let params = BloomFilterIndexBuilderParams {
         number_of_items: first.0.number_of_items,
         probability: first.0.probability,
@@ -535,6 +540,9 @@ pub async fn merge_bloomfilter_indices(
     let mut merged_null_rows = RowAddrTreeMap::new();
     let mut has_missing_null_bitmap = false;
     for (source, fragment_filter) in source_indices {
+        if fragment_filter.is_empty() {
+            continue;
+        }
         if source.number_of_items != params.number_of_items
             || source.probability != params.probability
         {
@@ -546,9 +554,6 @@ pub async fn merge_bloomfilter_indices(
                 source.number_of_items,
                 source.probability
             )));
-        }
-        if fragment_filter.is_empty() {
-            continue;
         }
         blocks.extend(
             source
@@ -2500,9 +2505,11 @@ mod tests {
         );
 
         let (_trimmed_tmpdir, trimmed_store) = create_store();
+        let mut ignored_legacy = legacy.as_ref().clone();
+        ignored_legacy.probability = 0.5;
         merge_bloomfilter_indices(
             &[
-                (legacy.as_ref(), &RoaringBitmap::new()),
+                (&ignored_legacy, &RoaringBitmap::new()),
                 (second.as_ref(), &RoaringBitmap::from_iter([1])),
             ],
             trimmed_store.as_ref(),
