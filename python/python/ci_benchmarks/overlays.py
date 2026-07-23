@@ -16,7 +16,7 @@ import os
 # enable it here, before lance is imported, or reading overlay datasets fails.
 os.environ.setdefault("LANCE_ENABLE_UNSTABLE_DATA_OVERLAY_FILES", "1")
 
-from typing import List, Optional, Tuple  # noqa: E402
+from typing import List  # noqa: E402
 from urllib.parse import urlparse  # noqa: E402
 
 import lance  # noqa: E402
@@ -57,7 +57,6 @@ def make_base_dataset(
     rows_per_file: int,
     dtype: str,
     version: str,
-    payload_dim: int = 0,
     embedding_dim: int = EMBEDDING_DIM,
 ) -> lance.LanceDataset:
     """Create a base dataset with an ``id`` key and a ``val`` payload column.
@@ -65,15 +64,10 @@ def make_base_dataset(
     ``val`` is the column overlays target. ``rows_per_file`` controls the number
     of fragments (``num_rows // rows_per_file``). ``embedding_dim`` sets the width
     of the ``val`` column when ``dtype`` is ``embedding`` (e.g. 3072 for a wide
-    embedding). When ``payload_dim`` > 0 an extra ``payload`` fixed-size-list
-    float32 column of that width is added, making rows wider so the cost of
-    rewriting whole rows (update / merge_insert) can be compared against
-    overlaying just ``val``.
+    embedding).
     """
     vtype = _value_type(dtype, embedding_dim)
     fields = {"id": pa.int64(), "val": vtype}
-    if payload_dim:
-        fields["payload"] = pa.list_(pa.float32(), payload_dim)
     schema = pa.schema(fields)
     rng = np.random.default_rng(0)
 
@@ -83,11 +77,6 @@ def make_base_dataset(
             n = min(rows_per_file, num_rows - written)
             ids = pa.array(range(written, written + n), pa.int64())
             cols = [ids, _gen_values(dtype, n, rng, embedding_dim)]
-            if payload_dim:
-                flat = rng.random(n * payload_dim, dtype=np.float32)
-                cols.append(
-                    pa.FixedSizeListArray.from_arrays(pa.array(flat), payload_dim)
-                )
             yield pa.record_batch(cols, schema=schema)
             written += n
 
@@ -180,54 +169,6 @@ def commit_overlay_layers(
 def _local_path(ds: lance.LanceDataset) -> str:
     parsed = urlparse(ds.uri)
     return parsed.path if parsed.scheme == "file" else ds.uri
-
-
-def proc_io_counters() -> Optional[dict]:
-    """Process-wide /proc/self/io counters, or None if unavailable.
-
-    Captures IO regardless of which object store issued it, which is what makes
-    it the right tool for comparing mechanisms whose IO does not all flow through
-    a single dataset handle. Use ``rchar``/``wchar`` (bytes moved by read/write
-    syscalls) rather than ``read_bytes``/``write_bytes`` (physical storage IO):
-    freshly written data sits in the page cache, so physical reads under-report
-    what an operation actually read.
-    """
-    try:
-        stats = {}
-        with open("/proc/self/io") as f:
-            for line in f:
-                key, _, value = line.partition(":")
-                stats[key.strip()] = int(value)
-        return stats
-    except OSError:
-        return None
-
-
-def file_sizes(path: str) -> dict:
-    """Map of relative-path -> size in bytes for every file under ``path``."""
-    out = {}
-    for root, _, files in os.walk(path):
-        for name in files:
-            fp = os.path.join(root, name)
-            if os.path.isfile(fp):
-                out[os.path.relpath(fp, path)] = os.path.getsize(fp)
-    return out
-
-
-def written_breakdown(before: dict, after: dict) -> Tuple[int, int]:
-    """Split newly written/grown bytes (``after`` vs ``before`` snapshots) into
-    (data_bytes, metadata_bytes). Data is everything under ``data/``; metadata is
-    manifests, transactions, and deletion files."""
-    data = meta = 0
-    for path, size in after.items():
-        delta = size - before.get(path, 0)
-        if delta <= 0:
-            continue
-        if path.startswith("data" + os.sep):
-            data += delta
-        else:
-            meta += delta
-    return data, meta
 
 
 def manifest_size(ds: lance.LanceDataset) -> int:
