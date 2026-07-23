@@ -135,14 +135,6 @@ trait StructuralPageScheduler: std::fmt::Debug + Send {
     ) -> Result<Vec<PageLoadTask>>;
 }
 
-/// Metadata describing the decoded size of a mini-block
-#[derive(Debug)]
-struct ChunkMeta {
-    num_values: u64,
-    chunk_size_bytes: u64,
-    offset_bytes: u64,
-}
-
 /// A mini-block chunk that has been decoded and decompressed
 #[derive(Debug, Clone)]
 struct DecodedMiniBlockChunk {

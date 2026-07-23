@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use super::chunk_index::{MiniBlockChunkIndex, PrefixSums, RowMapping};
 use super::*;
 use arrow_array::new_empty_array;
 use arrow_buffer::ArrowNativeType;
@@ -1118,14 +1119,14 @@ struct SparseValiditySetDecoder {
 
 #[derive(Debug)]
 struct SparseStructuralCacheableState {
-    chunk_meta: Vec<ChunkMeta>,
-    chunk_value_offsets: Arc<[u64]>,
+    value_index: MiniBlockChunkIndex,
+    num_visible_items: u64,
     plan: SparseStructuralPlan,
     row_domain: u64,
 }
 
 impl DeepSizeOf for SparseStructuralCacheableState {
-    fn deep_size_of_children(&self, _context: &mut Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut Context) -> usize {
         let structural_size = self
             .plan
             .layers
@@ -1141,9 +1142,7 @@ impl DeepSizeOf for SparseStructuralCacheableState {
                 SparseStructuralLayerPlan::FixedSizeList { validity, .. } => validity.deep_size(),
             })
             .sum::<usize>();
-        self.chunk_meta.len() * std::mem::size_of::<ChunkMeta>()
-            + self.chunk_value_offsets.len() * std::mem::size_of::<u64>()
-            + structural_size
+        self.value_index.deep_size_of_children(context) + structural_size
     }
 }
 
@@ -2403,7 +2402,13 @@ impl SparseStructuralScheduler {
         })
     }
 
-    fn parse_chunk_meta(&self, meta_bytes: Bytes) -> Result<Vec<ChunkMeta>> {
+    /// Parses the sparse layout's per-chunk value metadata into the compact
+    /// [`MiniBlockChunkIndex`], validating chunk sizes and the total item/byte
+    /// counts.  Sparse value chunks are themselves mini-blocks, so this reuses
+    /// the same prefix-sum index the mini-block path builds, avoiding the
+    /// redundant per-chunk byte offsets and value offsets the layout used to
+    /// cache separately.
+    fn build_value_chunk_index(&self, meta_bytes: Bytes) -> Result<MiniBlockChunkIndex> {
         if !meta_bytes.len().is_multiple_of(8) {
             return Err(Error::invalid_input_source(
                 format!(
@@ -2420,9 +2425,11 @@ impl SparseStructuralScheduler {
             .ok_or_else(|| {
                 Error::invalid_input_source("Sparse layout value buffer range overflows".into())
             })?;
+        let num_chunks = meta_bytes.len() / 8;
+        let mut byte_deltas = Vec::with_capacity(num_chunks);
+        let mut value_counts = Vec::with_capacity(num_chunks);
         let mut rows_counter = 0_u64;
-        let mut offset_bytes = value_buf_position;
-        let mut chunk_meta = Vec::with_capacity(meta_bytes.len() / 8);
+        let mut bytes_counter = 0_u64;
         for chunk in meta_bytes.chunks_exact(8) {
             let entry: [u8; 8] = chunk.try_into().map_err(|_| {
                 Error::invalid_input_source(
@@ -2475,14 +2482,11 @@ impl SparseStructuralScheduler {
             rows_counter = rows_counter.checked_add(num_values).ok_or_else(|| {
                 Error::invalid_input_source("Sparse layout visible item count overflows".into())
             })?;
-            chunk_meta.push(ChunkMeta {
-                num_values,
-                chunk_size_bytes: num_bytes,
-                offset_bytes,
-            });
-            offset_bytes = offset_bytes.checked_add(num_bytes).ok_or_else(|| {
+            bytes_counter = bytes_counter.checked_add(num_bytes).ok_or_else(|| {
                 Error::invalid_input_source("Sparse layout value chunk byte range overflows".into())
             })?;
+            byte_deltas.push(num_bytes);
+            value_counts.push(num_values);
         }
         if rows_counter != self.num_visible_items {
             return Err(Error::invalid_input_source(
@@ -2493,17 +2497,52 @@ impl SparseStructuralScheduler {
                 .into(),
             ));
         }
-        if offset_bytes != value_buf_end {
+        // The chunk byte sizes must exactly fill the declared value buffer.
+        let described_end = value_buf_position
+            .checked_add(bytes_counter)
+            .ok_or_else(|| {
+                Error::invalid_input_source("Sparse layout value chunk byte range overflows".into())
+            })?;
+        if described_end != value_buf_end {
             return Err(Error::invalid_input_source(
                 format!(
                     "Sparse layout chunk metadata describes {} value bytes, but value buffer has {} bytes",
-                    offset_bytes - value_buf_position,
-                    value_buf_size
+                    bytes_counter, value_buf_size
                 )
                 .into(),
             ));
         }
-        Ok(chunk_meta)
+
+        let byte_starts =
+            PrefixSums::from_deltas(byte_deltas.into_iter(), num_chunks, bytes_counter);
+        // Sparse value chunks have row == value index (no repetition), so the row
+        // mapping is flat; use the arithmetic `UniformFlat` shape when every
+        // non-last chunk holds the same number of values, else an explicit array.
+        let values_per_chunk = value_counts.first().copied().unwrap_or(0);
+        let uniform = num_chunks > 0
+            && value_counts[..num_chunks - 1]
+                .iter()
+                .all(|&count| count == values_per_chunk);
+        let rows = if uniform {
+            RowMapping::UniformFlat {
+                values_per_chunk,
+                last_chunk_values: value_counts[num_chunks - 1],
+                num_chunks,
+            }
+        } else {
+            RowMapping::Flat {
+                value_starts: PrefixSums::from_deltas(
+                    value_counts.iter().copied(),
+                    num_chunks,
+                    rows_counter,
+                ),
+            }
+        };
+        Ok(MiniBlockChunkIndex::new(
+            value_buf_position,
+            byte_starts,
+            rows,
+        ))
     }
 
     fn validate_general_buffer_header(
@@ -2920,30 +2959,19 @@ impl SparseStructuralScheduler {
         let page_meta = self.page_meta.as_ref().ok_or_else(|| {
             Error::internal("Sparse page scheduler has not been initialized".to_string())
         })?;
+        let num_chunks = page_meta.value_index.num_chunks();
         chunk_indices
             .iter()
             .map(|&chunk_idx| {
-                let chunk_meta = page_meta.chunk_meta.get(chunk_idx).ok_or_else(|| {
-                    Error::invalid_input_source(
+                if chunk_idx >= num_chunks {
+                    return Err(Error::invalid_input_source(
                         format!("Sparse layout missing value chunk metadata for chunk {chunk_idx}")
                             .into(),
-                    )
-                })?;
-                let bytes_start = chunk_meta.offset_bytes;
-                let bytes_end = bytes_start
-                    .checked_add(chunk_meta.chunk_size_bytes)
-                    .ok_or_else(|| {
-                        Error::invalid_input_source(
-                            format!(
-                                "Sparse layout value chunk {} byte range overflows",
-                                chunk_idx
-                            )
-                            .into(),
-                        )
-                    })?;
+                    ));
+                }
                 Ok(LoadedChunk {
-                    byte_range: bytes_start..bytes_end,
-                    items_in_chunk: chunk_meta.num_values,
+                    byte_range: page_meta.value_index.byte_range(chunk_idx),
+                    items_in_chunk: page_meta.value_index.items_in_chunk(chunk_idx),
                     chunk_idx,
                     data: LanceBuffer::empty(),
                 })
@@ -2951,52 +2979,44 @@ impl SparseStructuralScheduler {
             .collect()
     }
 
-    fn value_chunk_index(chunk_value_offsets: &[u64], value: u64) -> Result<usize> {
-        let total_values = chunk_value_offsets.last().copied().ok_or_else(|| {
-            Error::invalid_input_source("Sparse layout has no value chunk offsets".into())
-        })?;
-        if chunk_value_offsets.len() < 2 || value >= total_values {
+    fn value_chunk_index(
+        value_index: &MiniBlockChunkIndex,
+        num_visible_items: u64,
+        value: u64,
+    ) -> Result<usize> {
+        if value >= num_visible_items {
             return Err(Error::invalid_input_source(
                 format!(
                     "Sparse layout value index {} is outside {} visible items",
-                    value, total_values
+                    value, num_visible_items
                 )
                 .into(),
             ));
         }
-        chunk_value_offsets
-            .partition_point(|&offset| offset <= value)
-            .checked_sub(1)
-            .ok_or_else(|| {
-                Error::invalid_input_source(
-                    format!("Sparse layout value index {value} is before the first chunk").into(),
-                )
-            })
+        Ok(value_index.find_chunk(value))
     }
 
     fn value_chunk_range(
-        chunk_value_offsets: &[u64],
+        value_index: &MiniBlockChunkIndex,
+        num_visible_items: u64,
         value_range: Range<u64>,
     ) -> Result<Range<usize>> {
         if value_range.is_empty() {
             return Ok(0..0);
         }
-        let total_values = chunk_value_offsets.last().copied().ok_or_else(|| {
-            Error::invalid_input_source("Sparse layout has no value chunk offsets".into())
-        })?;
-        if value_range.start > value_range.end || value_range.end > total_values {
+        if value_range.start > value_range.end || value_range.end > num_visible_items {
             return Err(Error::invalid_input_source(
                 format!(
                     "Sparse layout value range {}..{} is outside {} visible items",
-                    value_range.start, value_range.end, total_values
+                    value_range.start, value_range.end, num_visible_items
                 )
                 .into(),
             ));
         }
-        let start = Self::value_chunk_index(chunk_value_offsets, value_range.start)?;
-        let end = chunk_value_offsets
-            .partition_point(|&offset| offset < value_range.end)
-            .max(start + 1);
+        let start = Self::value_chunk_index(value_index, num_visible_items, value_range.start)?;
+        // The range is non-empty, so `end - 1` is a valid item; the chunk holding
+        // it is the last overlapped chunk, giving an exclusive end of `+ 1`.
+        let end = (value_index.find_chunk(value_range.end - 1) + 1).max(start + 1);
         Ok(start..end)
     }
 }
@@ -3033,18 +3053,7 @@ impl StructuralPageScheduler for SparseStructuralScheduler {
                 Error::invalid_input_source("Sparse layout is missing chunk metadata buffer".into())
             })?;
 
-            let chunk_meta = self.parse_chunk_meta(meta_bytes)?;
-            let mut chunk_value_offsets = Vec::with_capacity(chunk_meta.len() + 1);
-            let mut value_offset = 0_u64;
-            chunk_value_offsets.push(value_offset);
-            for chunk in &chunk_meta {
-                value_offset = value_offset.checked_add(chunk.num_values).ok_or_else(|| {
-                    Error::invalid_input_source(
-                        "Sparse layout visible item offset overflows".into(),
-                    )
-                })?;
-                chunk_value_offsets.push(value_offset);
-            }
+            let value_index = self.build_value_chunk_index(meta_bytes)?;
 
             let layers = self
                 .layer_decompressors
@@ -3064,8 +3073,8 @@ impl StructuralPageScheduler for SparseStructuralScheduler {
             }
 
             let page_meta = Arc::new(SparseStructuralCacheableState {
-                chunk_meta,
-                chunk_value_offsets: chunk_value_offsets.into(),
+                value_index,
+                num_visible_items: self.num_visible_items,
                 plan,
                 row_domain: self.row_domain,
             });
@@ -3120,7 +3129,8 @@ impl StructuralPageScheduler for SparseStructuralScheduler {
         let selection = slice_sparse_plan(&page_meta.plan, &ranges, page_meta.row_domain)?;
         for value_range in &selection.leaf_ranges {
             chunks_needed.extend(Self::value_chunk_range(
-                &page_meta.chunk_value_offsets,
+                &page_meta.value_index,
+                page_meta.num_visible_items,
                 value_range.clone(),
             )?);
         }
@@ -3941,29 +3951,13 @@ impl DecodeSparseStructuralTask {
         let mut value_start = value_range.start;
         while value_start < value_range.end {
             let chunk_idx = SparseStructuralScheduler::value_chunk_index(
-                &self.page_meta.chunk_value_offsets,
+                &self.page_meta.value_index,
+                self.page_meta.num_visible_items,
                 value_start,
             )?;
-            let chunk_value_start = *self
-                .page_meta
-                .chunk_value_offsets
-                .get(chunk_idx)
-                .ok_or_else(|| {
-                    Error::invalid_input_source(
-                        format!("Sparse value chunk {} has no start offset", chunk_idx).into(),
-                    )
-                })?;
-            let chunk_value_end = *self
-                .page_meta
-                .chunk_value_offsets
-                .get(chunk_idx.checked_add(1).ok_or_else(|| {
-                    Error::invalid_input_source("Sparse value chunk index overflows".into())
-                })?)
-                .ok_or_else(|| {
-                    Error::invalid_input_source(
-                        format!("Sparse value chunk {} has no end offset", chunk_idx).into(),
-                    )
-                })?;
+            let chunk_value_start = self.page_meta.value_index.first_row(chunk_idx);
+            let chunk_value_end =
+                chunk_value_start + self.page_meta.value_index.items_in_chunk(chunk_idx);
             let take_end = value_range.end.min(chunk_value_end);
             if value_start < chunk_value_start || take_end <= value_start {
                 return Err(Error::invalid_input_source(
@@ -5610,5 +5604,68 @@ mod tests {
         let calls = io.calls.lock().unwrap();
         assert_eq!(calls.len(), 2);
         assert!(calls[1].is_empty(), "value payload must not be requested");
+    }
+
+    /// Initializes a sparse scheduler over a value buffer described by `chunks`
+    /// (each `(divided_bytes_minus_one, num_values)`), returning the cached value
+    /// index's row-mapping variant, heap size, and chunk count.
+    async fn init_value_index(chunks: &[(u32, u32)]) -> (&'static str, usize, usize) {
+        let num_visible_items: u64 = chunks.iter().map(|&(_, values)| u64::from(values)).sum();
+        let value_size: u64 = chunks
+            .iter()
+            .map(|&(divided_minus_one, _)| {
+                (u64::from(divided_minus_one) + 1) * MINIBLOCK_ALIGNMENT as u64
+            })
+            .sum();
+        let mut metadata = Vec::new();
+        for &(divided_minus_one, num_values) in chunks {
+            metadata.extend_from_slice(&divided_minus_one.to_le_bytes());
+            metadata.extend_from_slice(&num_values.to_le_bytes());
+        }
+        let metadata_size = metadata.len() as u64;
+
+        let mut layout = sparse_layout();
+        layout.num_items = num_visible_items;
+        layout.num_visible_items = num_visible_items;
+        let decompressors = DefaultDecompressionStrategy::default();
+        let mut scheduler = SparseStructuralScheduler::try_new(
+            &[(0, metadata_size), (metadata_size, value_size)],
+            0,
+            num_visible_items,
+            DataType::Int32,
+            &layout,
+            &decompressors,
+        )
+        .unwrap();
+
+        // `initialize` only reads the metadata buffer, so a metadata-only blob suffices.
+        let io: Arc<dyn EncodingsIo> = Arc::new(SimulatedScheduler::new(Bytes::from(metadata)));
+        scheduler.initialize(&io).await.unwrap();
+
+        let value_index = &scheduler.page_meta.as_ref().unwrap().value_index;
+        (
+            value_index.row_mapping_debug(),
+            value_index.deep_size_of_children(&mut Context::new()),
+            value_index.num_chunks(),
+        )
+    }
+
+    #[tokio::test]
+    async fn value_chunk_index_stays_compact_across_row_mappings() {
+        // Uniform non-last chunks collapse the row axis to arithmetic (no per-chunk array).
+        let (uniform_variant, uniform_heap, num_chunks) =
+            init_value_index(&[(1, 2), (1, 2), (1, 2)]).await;
+        assert_eq!(uniform_variant, "uniform_flat");
+        // A differing non-last chunk forces an explicit value-starts array.
+        let (flat_variant, flat_heap, _) = init_value_index(&[(1, 2), (1, 3), (1, 1)]).await;
+        assert_eq!(flat_variant, "flat");
+
+        // The layout used to cache a 24-byte `ChunkMeta` plus an 8-byte value
+        // offset per chunk; both compact mappings must stay well under that.
+        const LEGACY_PER_CHUNK: usize = 32;
+        assert!(uniform_heap < LEGACY_PER_CHUNK * num_chunks);
+        assert!(flat_heap < LEGACY_PER_CHUNK * num_chunks);
+        // Dropping the redundant value offsets keeps uniform cheaper than flat.
+        assert!(uniform_heap < flat_heap);
     }
 }
