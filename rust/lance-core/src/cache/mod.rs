@@ -49,6 +49,7 @@ pub mod backend;
 pub mod codec;
 mod entry_io;
 mod moka;
+mod quick;
 
 pub use backend::{CacheBackend, CacheEntry, CacheKeyIterator, InternalCacheKey};
 pub use codec::{
@@ -56,6 +57,7 @@ pub use codec::{
 };
 pub use entry_io::{CacheEntryReader, CacheEntryWriter};
 pub use moka::MokaCacheBackend;
+pub use quick::QuickCacheBackend;
 
 use std::borrow::Cow;
 use std::sync::{
@@ -183,8 +185,16 @@ impl DeepSizeOf for LanceCache {
 
 impl LanceCache {
     pub fn with_capacity(capacity: usize) -> Self {
+        // LANCE_CACHE_BACKEND=quick opts into the quick_cache backend, whose
+        // read path stays contention-free at high concurrent hit rates.
+        let cache: Arc<dyn CacheBackend> =
+            if std::env::var("LANCE_CACHE_BACKEND").as_deref() == Ok("quick") {
+                Arc::new(QuickCacheBackend::with_capacity(capacity))
+            } else {
+                Arc::new(MokaCacheBackend::with_capacity(capacity))
+            };
         Self {
-            cache: Arc::new(MokaCacheBackend::with_capacity(capacity)),
+            cache,
             prefix: Arc::from(""),
             hits: Arc::new(AtomicU64::new(0)),
             misses: Arc::new(AtomicU64::new(0)),
