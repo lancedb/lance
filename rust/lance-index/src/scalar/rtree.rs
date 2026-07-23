@@ -55,6 +55,15 @@ const RTREE_INDEX_VERSION: u32 = 0;
 const RTREE_PAGES_NAME: &str = "page_data.lance";
 const RTREE_NULLS_NAME: &str = "nulls.lance";
 
+fn validate_page_size(page_size: u32) -> Result<()> {
+    if page_size < 2 {
+        return Err(Error::invalid_input(
+            "RTree page_size must be at least 2".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 static BBOX_FIELD: LazyLock<Arc<ArrowField>> = LazyLock::new(|| {
     let bbox_type = RectType::new(Dimension::XY, Default::default());
     Arc::new(bbox_type.to_field("bbox", false))
@@ -141,7 +150,9 @@ pub struct RTreeMetadata {
 impl RTreeMetadata {
     pub fn new(page_size: u32, num_pages: u64, num_items: usize, bbox: BoundingBox) -> Self {
         let page_offsets = Self::calculate_page_offsets(num_items, page_size);
-        debug_assert_eq!(page_offsets.len(), num_pages as usize);
+        if page_size >= 2 {
+            debug_assert_eq!(page_offsets.len(), num_pages as usize);
+        }
         Self {
             page_size,
             num_pages,
@@ -152,6 +163,9 @@ impl RTreeMetadata {
     }
 
     fn calculate_page_offsets(num_items: usize, page_size: u32) -> Vec<usize> {
+        if page_size < 2 {
+            return Vec::new();
+        }
         let mut page_offsets = vec![];
         let mut cur_level_items = num_items;
         let mut cur_offset = 0;
@@ -282,6 +296,7 @@ impl RTreeIndex {
     ) -> Result<Arc<Self>> {
         let pages_reader = store.open_index_file(RTREE_PAGES_NAME).await?;
         let metadata = RTreeMetadata::from(&pages_reader.schema().metadata);
+        validate_page_size(metadata.page_size)?;
         let nulls_reader = store.open_index_file(RTREE_NULLS_NAME).await?;
 
         Ok(Arc::new(Self {
@@ -461,12 +476,22 @@ fn remap_rtree_data(
     let schema = data.schema();
     let remapped = data.map(move |batch_result| {
         let batch = batch_result?;
+        // The row ID is column 1 in BBOX_ROWID_SCHEMA.
         Ok(remapper.remap_row_ids_record_batch(batch, 1)?)
     });
     Box::pin(RecordBatchStreamAdapter::new(schema, remapped))
 }
 
 /// Merge caller-selected RTree segments into one self-contained segment.
+///
+/// Each source may supply a filter for rows that are still live. The merged index recomputes its
+/// bounding box from the retained, remapped rows and preserves retained null row IDs.
+///
+/// # Examples
+///
+/// ```ignore
+/// let merged = merge_rtree_indices(&segments, destination.as_ref(), &filters).await?;
+/// ```
 pub async fn merge_rtree_indices(
     source_indices: &[Arc<RTreeIndex>],
     dest_store: &dyn IndexStore,
@@ -498,9 +523,9 @@ pub async fn merge_rtree_indices(
         .map(|(source, _)| source)
         .unwrap_or(&source_indices[0]);
     let page_size = first_contributing.metadata.page_size;
+    validate_page_size(page_size)?;
     let mut data_streams = Vec::with_capacity(source_indices.len());
     let mut null_map = RowAddrTreeMap::new();
-    let mut total_bbox = BoundingBox::new();
 
     for (source, filter) in source_indices.iter().zip(old_data_filters) {
         if filter_keeps_nothing(filter) {
@@ -512,10 +537,6 @@ pub async fn merge_rtree_indices(
                 page_size, source.metadata.page_size
             )));
         }
-        if source.metadata.num_items > 0 {
-            total_bbox.add_rect(&source.metadata.bbox);
-        }
-
         let mut source_nulls = source.search_null(&NoOpMetricsCollector).await?;
         if let Some(remapper) = &source.frag_reuse_index {
             source_nulls = remapper.remap_row_addrs_tree_map(&source_nulls);
@@ -548,7 +569,6 @@ pub async fn merge_rtree_indices(
     let (bbox_data, mut stats) =
         RTreeIndexPlugin::process_and_analyze_bbox_stream(combined, page_size, spill_store).await?;
     stats.null_map = null_map;
-    stats.total_bbox = total_bbox;
     let files =
         RTreeIndexPlugin::train_rtree_index(bbox_data, stats, page_size, dest_store).await?;
 
@@ -955,6 +975,7 @@ impl RTreeIndexPlugin {
         store: &dyn IndexStore,
         page_size: u32,
     ) -> Result<IndexFile> {
+        validate_page_size(page_size)?;
         let mut page_idx: u64 = 0;
         let mut writer = store
             .new_index_file(RTREE_PAGES_NAME, RTREE_PAGE_SCHEMA.clone())
@@ -1046,6 +1067,9 @@ impl BasicTrainer for RTreeIndexPlugin {
         _field: &ArrowField,
     ) -> Result<Box<dyn TrainingRequest>> {
         let params = serde_json::from_str::<RTreeParameters>(params)?;
+        if let Some(page_size) = params.page_size {
+            validate_page_size(page_size)?;
+        }
         Ok(Box::new(RTreeTrainingRequest::new(params)))
     }
 
@@ -1067,6 +1091,7 @@ impl BasicTrainer for RTreeIndexPlugin {
             .parameters
             .page_size
             .unwrap_or(DEFAULT_RTREE_PAGE_SIZE);
+        validate_page_size(page_size)?;
 
         let bbox_data = Self::convert_bbox_stream(data)?;
         let tmpdir = Arc::new(TempDir::default());
@@ -1150,6 +1175,17 @@ mod tests {
 
     fn expected_num_pages(num_items: usize, page_size: u32) -> u64 {
         RTreeMetadata::calculate_page_offsets(num_items, page_size).len() as u64
+    }
+
+    #[test]
+    fn test_rejects_page_size_that_cannot_reduce_tree_levels() {
+        let plugin = RTreeIndexPlugin;
+        let field = ArrowField::new("geometry", DataType::Null, true);
+        let error = plugin
+            .new_training_request(r#"{"page_size":1}"#, &field)
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("page_size must be at least 2"));
     }
 
     fn convert_bbox_rowid_batch_stream(
@@ -1376,6 +1412,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(merged.metadata.num_items, 1);
+        assert_eq!(merged.metadata.bbox.minx(), 10.0);
+        assert_eq!(merged.metadata.bbox.miny(), 10.0);
+        assert_eq!(merged.metadata.bbox.maxx(), 10.0);
+        assert_eq!(merged.metadata.bbox.maxy(), 10.0);
         assert!(
             merged.metadata.bbox.rect_intersects(&near_origin),
             "merged bounds {:?} do not intersect {:?}",

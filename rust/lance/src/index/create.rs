@@ -3110,8 +3110,10 @@ mod tests {
                 vec![IndexSegment::new(
                     uuid,
                     dataset.fragment_bitmap.as_ref().clone(),
+                    [dataset.schema().field("vector").unwrap().id],
                     Arc::new(vector_index_details(&params)),
                     IndexType::IvfHnswFlat.version(),
+                    dataset.manifest.version,
                 )],
             )
             .await

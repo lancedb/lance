@@ -146,6 +146,22 @@ pub(crate) async fn build_index_metadata_from_segments(
     let mut seen_segment_ids = HashSet::with_capacity(segments.len());
     let mut covered_fragments = RoaringBitmap::new();
     for segment in &segments {
+        if segment.dataset_version() > dataset.manifest.version {
+            return Err(Error::invalid_input(format!(
+                "CreateIndex: segment {} was built at future dataset version {} (current version {})",
+                segment.uuid(),
+                segment.dataset_version(),
+                dataset.manifest.version
+            )));
+        }
+        if segment.fields() != [field_id] {
+            return Err(Error::invalid_input(format!(
+                "CreateIndex: segment {} was built for fields {:?}, expected [{}]",
+                segment.uuid(),
+                segment.fields(),
+                field_id
+            )));
+        }
         if !seen_segment_ids.insert(segment.uuid()) {
             return Err(Error::invalid_input(format!(
                 "CreateIndex: duplicate segment uuid {} for index '{}'",
@@ -164,16 +180,14 @@ pub(crate) async fn build_index_metadata_from_segments(
 
     let mut new_indices = Vec::with_capacity(segments.len());
     for segment in segments {
-        let dataset_version = segment
-            .dataset_version()
-            .unwrap_or(dataset.manifest.version);
-        let (uuid, fragment_bitmap, index_details, index_version) = segment.into_parts();
+        let (uuid, fragment_bitmap, fields, index_details, index_version, dataset_version) =
+            segment.into_parts();
         let is_inverted_index = index_details.type_url.ends_with("InvertedIndexDetails");
         if is_inverted_index {
             let metadata = IndexMetadata {
                 uuid,
                 name: index_name.to_string(),
-                fields: vec![field_id],
+                fields: fields.clone(),
                 dataset_version,
                 fragment_bitmap: Some(fragment_bitmap.clone()),
                 index_details: Some(index_details.clone()),
@@ -193,7 +207,7 @@ pub(crate) async fn build_index_metadata_from_segments(
         new_indices.push(IndexMetadata {
             uuid,
             name: index_name.to_string(),
-            fields: vec![field_id],
+            fields,
             dataset_version,
             fragment_bitmap: Some(fragment_bitmap),
             index_details: Some(index_details),
@@ -1465,7 +1479,9 @@ impl DatasetIndexExt for Dataset {
                 crate::index::scalar::rtree::merge_segments(self, source_segments).await?
             }
             #[cfg(not(feature = "geo"))]
-            unreachable!("RTree segments require the geo feature")
+            return Err(Error::not_supported(
+                "RTree segment merge requires the `geo` feature".to_string(),
+            ));
         } else {
             crate::index::scalar::btree::merge_segments(self, source_segments).await?
         };
@@ -3010,12 +3026,14 @@ mod tests {
                 .as_ref()
                 .expect("test segment metadata should have fragment coverage")
                 .iter(),
+            metadata.fields.iter().copied(),
             metadata
                 .index_details
                 .as_ref()
                 .expect("test segment metadata should have index details")
                 .clone(),
             metadata.index_version,
+            metadata.dataset_version,
         )
     }
 
@@ -7189,6 +7207,83 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("at least one index segment"));
+    }
+
+    #[tokio::test]
+    async fn test_commit_existing_index_segments_rejects_wrong_field_provenance() {
+        use lance_datagen::{BatchCount, RowCount, array};
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .col(
+                "vector",
+                array::rand_vec::<arrow_array::types::Float32Type>(8.into()),
+            )
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let mut dataset = Dataset::write(reader, test_dir.path().to_str().unwrap(), None)
+            .await
+            .unwrap();
+
+        let vector_field_id = dataset.schema().field("vector").unwrap().id;
+        let mut metadata = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            vector_field_id,
+            Uuid::new_v4(),
+            [0_u32],
+            b"segment",
+        )
+        .await;
+        metadata.fields = vec![dataset.schema().field("id").unwrap().id];
+
+        let error = dataset
+            .commit_existing_index_segments(
+                "vector_idx",
+                "vector",
+                vec![segment_from_metadata(&metadata)],
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("was built for fields"));
+    }
+
+    #[tokio::test]
+    async fn test_commit_existing_index_segments_rejects_future_dataset_version() {
+        use lance_datagen::{BatchCount, RowCount, array};
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let reader = lance_datagen::gen_batch()
+            .col(
+                "vector",
+                array::rand_vec::<arrow_array::types::Float32Type>(8.into()),
+            )
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let mut dataset = Dataset::write(reader, test_dir.path().to_str().unwrap(), None)
+            .await
+            .unwrap();
+
+        let field_id = dataset.schema().field("vector").unwrap().id;
+        let mut metadata = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            field_id,
+            Uuid::new_v4(),
+            [0_u32],
+            b"segment",
+        )
+        .await;
+        metadata.dataset_version = dataset.manifest.version + 1;
+
+        let error = dataset
+            .commit_existing_index_segments(
+                "vector_idx",
+                "vector",
+                vec![segment_from_metadata(&metadata)],
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("future dataset version"));
     }
 
     #[tokio::test]
