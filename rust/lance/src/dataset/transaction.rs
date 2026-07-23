@@ -2695,18 +2695,18 @@ impl Transaction {
             let index_covers_modified_field = index.fields.iter().any(|field_id| {
                 value_updated_field_set.contains(&u32::try_from(*field_id).unwrap())
             });
-            if index_covers_modified_field || index.fragment_bitmap.is_none() {
+            if index_covers_modified_field {
                 continue;
             }
+            let Some(fragment_bitmap) = index.fragment_bitmap.as_ref() else {
+                continue;
+            };
 
             // Check that all the original fragments containing the updated rows are covered by
             // the index. If not, some updated rows were not indexed, so we cannot index them.
-            let index_covers_all_original_fragments = {
-                let fragment_bitmap = index.fragment_bitmap.as_ref().unwrap();
-                original_fragment_ids
-                    .iter()
-                    .all(|&fragment_id| fragment_bitmap.contains(fragment_id as u32))
-            };
+            let index_covers_all_original_fragments = original_fragment_ids
+                .iter()
+                .all(|&fragment_id| fragment_bitmap.contains(fragment_id as u32));
             if !index_covers_all_original_fragments {
                 continue;
             }
@@ -2730,9 +2730,10 @@ impl Transaction {
                 continue;
             }
 
-            let fragment_bitmap = index.fragment_bitmap.as_mut().unwrap();
-            for fragment_id in pure_update_frag_ids.iter().map(|f| *f as u32) {
-                fragment_bitmap.insert(fragment_id);
+            if let Some(fragment_bitmap) = index.fragment_bitmap.as_mut() {
+                for fragment_id in pure_update_frag_ids.iter().map(|f| *f as u32) {
+                    fragment_bitmap.insert(fragment_id);
+                }
             }
         }
         Ok(())
