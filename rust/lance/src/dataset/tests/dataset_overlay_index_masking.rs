@@ -641,6 +641,72 @@ async fn test_overlay_stale_with_compound_index_expression() {
     assert_eq!(ids_matching(&dataset, "id = 2").await, vec![2]);
 }
 
+/// A `RewriteRows` update (under stable row ids) that touches only a *non-indexed* column moves
+/// the matched rows to a new fragment and, because the scalar index's field was not modified,
+/// extends that index's fragment coverage onto the new fragment
+/// (`register_pure_rewrite_rows_update_frags_in_indices`) so its existing entries are reused.
+///
+/// That reuse is unsound when a moved row carried a data overlay on the *indexed* field: the
+/// update materializes the overlay's current value into the new fragment, but the reused index
+/// entry still holds the stale pre-overlay value, and the new fragment (now marked covered) no
+/// longer falls to the flat path that previously served the correct value via overlay masking.
+///
+/// Here `age` is indexed and overlaid (id=1: age 10 -> 999); the update sets the non-indexed
+/// `id` column on that row. After it, `age = 10` must stay dropped and `age = 999` must still
+/// find the row — otherwise the stale index entry has resurfaced.
+#[tokio::test]
+async fn test_update_nonindexed_column_preserves_overlay_masking() {
+    use crate::dataset::UpdateBuilder;
+
+    let mut dataset = create_base_dataset_with(true).await;
+    build_age_index(&mut dataset).await;
+
+    // Overlay fragment 0, offset 1 (id=1): age 10 -> 999, committed after the index.
+    let dataset = commit_overlay(
+        dataset,
+        "age_update",
+        0,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+        vec![i32_array([Some(999)])],
+    )
+    .await;
+
+    // Masking works before the update.
+    assert_eq!(ids_matching(&dataset, "age = 10").await, Vec::<i32>::new());
+    assert_eq!(ids_matching(&dataset, "age = 999").await, vec![1]);
+
+    // Update only the non-indexed `id` column of the overlaid row. This is a rewrite-rows move:
+    // the row (with age materialized to 999) is written to a new fragment and deleted from
+    // fragment 0, keeping its stable row id.
+    let dataset = UpdateBuilder::new(Arc::new(dataset))
+        .update_where("id = 1")
+        .unwrap()
+        .set("id", "100")
+        .unwrap()
+        .build()
+        .unwrap()
+        .execute()
+        .await
+        .unwrap()
+        .new_dataset;
+
+    // Still masked: the stale age=10 entry must stay dropped and the overlaid age=999 value must
+    // still be found (now on the moved row, whose id is 100).
+    assert_eq!(
+        ids_matching(&dataset, "age = 10").await,
+        Vec::<i32>::new(),
+        "stale index entry age=10 resurfaced after updating a non-indexed column"
+    );
+    assert_eq!(
+        ids_matching(&dataset, "age = 999").await,
+        vec![100],
+        "overlaid value age=999 lost after updating a non-indexed column"
+    );
+    // A row untouched by the overlay is unaffected.
+    assert_eq!(ids_matching(&dataset, "age = 20").await, vec![2]);
+}
+
 /// Text dataset: two fragments, 6 rows each. Schema: id (Int32), text (Utf8).
 /// Texts are unique tokens so each row can be identified by its term.
 async fn create_text_dataset() -> Dataset {
