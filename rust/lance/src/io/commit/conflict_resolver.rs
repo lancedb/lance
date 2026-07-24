@@ -2336,7 +2336,7 @@ mod tests {
                 "path1",
                 vec![0],
                 vec![0],
-                &LanceFileVersion::Stable,
+                LanceFileVersion::Stable.resolve(),
                 NonZero::new(10),
             )
             .with_physical_rows(3);
@@ -2479,7 +2479,7 @@ mod tests {
                 "path1",
                 vec![0],
                 vec![0],
-                &LanceFileVersion::Stable,
+                LanceFileVersion::Stable.resolve(),
                 NonZero::new(10),
             )
             .with_physical_rows(3);
@@ -3484,7 +3484,7 @@ mod tests {
                 "moved.lance",
                 vec![0],
                 vec![0],
-                &LanceFileVersion::Stable,
+                LanceFileVersion::Stable.resolve(),
                 NonZero::new(10),
             )
             .with_physical_rows(1);

@@ -23,8 +23,8 @@ use lance::io::ObjectStore;
 use lance_core::cache::LanceCache;
 use lance_core::datatypes::{BlobHandling, OnMissing, Projection, Schema};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
-use lance_encoding::version::LanceFileVersion;
 use lance_file::reader::{FileReader, FileReaderOptions, ReaderProjection};
+use lance_file::versions as file_versions;
 use lance_io::object_store::{ObjectStoreParams, ObjectStoreRegistry};
 use lance_io::{
     ReadBatchParams,
@@ -261,19 +261,17 @@ pub extern "system" fn Java_org_lance_file_LanceFileReader_readAllNative(
             }
 
             let transformed_schema = projection.to_bare_schema();
-
-            let field_id_to_column_index = base_schema
-                .fields_pre_order()
-                .filter(|field| {
-                    file_version < LanceFileVersion::V2_1
-                        || field.is_leaf()
-                        || field.is_packed_struct()
+            let (field_ids, column_indices) =
+                file_versions::data_file_columns(file_version, &base_schema);
+            let field_id_to_column_index = field_ids
+                .into_iter()
+                .zip(column_indices)
+                .filter_map(|(field_id, column_index)| {
+                    (column_index >= 0).then_some((field_id as u32, column_index as u32))
                 })
-                .enumerate()
-                .map(|(idx, field)| (field.id as u32, idx as u32))
                 .collect::<BTreeMap<_, _>>();
 
-            Some(ReaderProjection::from_field_ids(
+            Some(file_versions::reader_projection_from_field_ids(
                 file_version,
                 &transformed_schema,
                 &field_id_to_column_index,

@@ -5,9 +5,8 @@ use arrow::compute::cast;
 use arrow_array::types::{Float16Type, Float32Type, Float64Type};
 use arrow_array::{Array, ArrayRef, BooleanArray, FixedSizeListArray, cast::AsArray};
 use arrow_schema::{DataType, Field};
-use lance_arrow::FixedSizeListArrayExt;
+use lance_arrow::{FixedSizeListArrayExt, array_from_fixed_width_bytes};
 use lance_core::{Error, Result};
-use lance_io::encodings::plain::bytes_to_array;
 use lance_linalg::distance::DistanceType;
 use prost::bytes;
 use std::sync::LazyLock;
@@ -215,7 +214,7 @@ impl TryFrom<&pb::Tensor> for FixedSizeListArray {
         let num_rows = tensor.shape[0] as usize;
 
         let data = bytes::Bytes::from(tensor.data.clone());
-        let flat_array = bytes_to_array(
+        let flat_array = array_from_fixed_width_bytes(
             &DataType::from(pb::tensor::DataType::try_from(tensor.data_type).unwrap()),
             data,
             dim * num_rows,

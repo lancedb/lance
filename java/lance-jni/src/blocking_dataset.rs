@@ -1978,12 +1978,13 @@ fn inner_get_lance_file_format_version<'local>(
     let version_string = {
         let dataset_guard =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        let version = dataset_guard
+        dataset_guard
             .inner
             .manifest()
             .data_storage_format
-            .lance_file_version()?;
-        version.to_string()
+            .lance_file_format()
+            .to_manifest_string()
+            .to_string()
     };
 
     Ok(env

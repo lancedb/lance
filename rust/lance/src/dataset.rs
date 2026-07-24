@@ -5,7 +5,6 @@
 //!
 
 use arrow_array::{RecordBatch, RecordBatchReader};
-use arrow_schema::DataType;
 use byteorder::{ByteOrder, LittleEndian};
 use chrono::{Duration, prelude::*};
 use futures::future::BoxFuture;
@@ -27,9 +26,8 @@ use lance_core::utils::tracing::{
     DATASET_DELETING_EVENT, DATASET_DROPPING_COLUMN_EVENT, TRACE_DATASET_EVENTS,
 };
 use lance_datafusion::projection::ProjectionPlan;
-use lance_file::datatypes::populate_schema_dictionary;
 use lance_file::reader::{FileReader, FileReaderOptions};
-use lance_file::version::LanceFileVersion;
+use lance_file::versions as file_versions;
 use lance_index::{IndexType, progress::IndexBuildProgress};
 use lance_io::object_store::{
     ChainedWrappingObjectStore, LanceNamespaceStorageOptionsProvider, ObjectStore,
@@ -44,7 +42,7 @@ use lance_io::utils::{
 use lance_namespace::LanceNamespace;
 use lance_table::format::{
     DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, MAGIC, Manifest, RowIdMeta,
-    pb,
+    pb, populate_manifest_schema_dictionary,
 };
 use lance_table::io::commit::{
     CommitConfig, CommitError, CommitHandler, CommitLock, ManifestLocation, ManifestNamingScheme,
@@ -94,6 +92,7 @@ pub mod transaction;
 pub mod udtf;
 pub mod updater;
 mod utils;
+pub(crate) mod versions;
 pub mod write;
 
 pub(crate) use take::row_offsets_to_row_addresses;
@@ -549,7 +548,7 @@ impl Dataset {
             )
             .with_object_store(Arc::new(self.object_store.as_ref().clone()))
             .with_commit_handler(self.commit_handler.clone())
-            .with_storage_format(self.manifest.data_storage_format.lance_file_version()?);
+            .with_exact_storage_format(self.manifest.data_storage_format.lance_file_format());
         let dataset = builder.execute(transaction).await?;
 
         // Create BranchContents after shallow_clone
@@ -773,9 +772,7 @@ impl Dataset {
                 .await;
         }
 
-        if manifest.should_use_legacy_format() {
-            populate_schema_dictionary(&mut manifest.schema, object_reader.as_ref()).await?;
-        }
+        populate_manifest_schema_dictionary(&mut manifest, object_reader.as_ref()).await?;
 
         Ok(manifest)
     }
@@ -1151,15 +1148,6 @@ impl Dataset {
         delta::DatasetDeltaBuilder::new(self.clone())
     }
 
-    // TODO: Cache this
-    pub(crate) fn is_legacy_storage(&self) -> bool {
-        self.manifest
-            .data_storage_format
-            .lance_file_version()
-            .unwrap()
-            == LanceFileVersion::Legacy
-    }
-
     pub async fn latest_manifest(&self) -> Result<(Arc<Manifest>, ManifestLocation)> {
         let location = self
             .commit_handler
@@ -1180,7 +1168,7 @@ impl Dataset {
             return Ok((self.manifest.clone(), self.manifest_location.clone()));
         }
         let mut manifest = read_manifest(&self.object_store, &location.path, location.size).await?;
-        if manifest.schema.has_dictionary_types() && manifest.should_use_legacy_format() {
+        if manifest.schema.has_dictionary_types() {
             let reader = if let Some(size) = location.size {
                 self.object_store
                     .open_with_size(&location.path, size as usize)
@@ -1188,7 +1176,7 @@ impl Dataset {
             } else {
                 self.object_store.open(&location.path).await?
             };
-            populate_schema_dictionary(&mut manifest.schema, reader.as_ref()).await?;
+            populate_manifest_schema_dictionary(&mut manifest, reader.as_ref()).await?;
         }
         let manifest_arc = Arc::new(manifest);
         self.metadata_cache
@@ -2230,41 +2218,13 @@ impl Dataset {
             .await?;
         let file_metadata = FileReader::read_all_metadata(&file).await?;
 
-        let file_version = LanceFileVersion::try_from_major_minor(
-            file_metadata.major_version as u32,
-            file_metadata.minor_version as u32,
-        )?;
-
-        let is_structural = file_version >= LanceFileVersion::V2_1;
+        let lance_file_format = file_metadata.version;
         let physical_columns = file_metadata.column_metadatas.len();
         let has_footer_orphans = file_metadata.file_schema.fields.len() > physical_columns;
         let dataset_schema = self.schema();
         let mut represented_columns = 0usize;
         let mut column_names = Vec::new();
         let mut consumed_top_level_fields = 0usize;
-
-        fn physical_column_count(
-            field: &lance_core::datatypes::Field,
-            is_structural: bool,
-        ) -> usize {
-            if !is_structural {
-                return 1 + field
-                    .children
-                    .iter()
-                    .map(|child| physical_column_count(child, is_structural))
-                    .sum::<usize>();
-            }
-
-            if field.children.is_empty() || field.is_blob() || field.is_packed_struct() {
-                1
-            } else {
-                field
-                    .children
-                    .iter()
-                    .map(|child| physical_column_count(child, is_structural))
-                    .sum()
-            }
-        }
 
         fn field_contains_blob(field: &lance_core::datatypes::Field) -> bool {
             field.is_blob() || field.children.iter().any(field_contains_blob)
@@ -2299,38 +2259,6 @@ impl Dataset {
                 BLOB_V1_DESCRIPTOR_FIELDS.len()
             } else {
                 0
-            }
-        }
-
-        fn collect_columns(
-            field: &lance_core::datatypes::Field,
-            is_structural: bool,
-            fields: &mut Vec<i32>,
-            column_indices: &mut Vec<i32>,
-            curr_column_idx: &mut i32,
-        ) {
-            let contributes = !is_structural
-                || field.children.is_empty()
-                || field.is_blob()
-                || field.is_packed_struct();
-            let recurse = !is_structural || (!field.is_blob() && !field.is_packed_struct());
-
-            if contributes {
-                fields.push(field.id);
-                column_indices.push(*curr_column_idx);
-                *curr_column_idx += 1;
-            }
-
-            if recurse {
-                for child in &field.children {
-                    collect_columns(
-                        child,
-                        is_structural,
-                        fields,
-                        column_indices,
-                        curr_column_idx,
-                    );
-                }
             }
         }
 
@@ -2387,7 +2315,7 @@ impl Dataset {
             };
             validate_file_field_matches_dataset(dataset_field, field, &field.name)?;
 
-            represented_columns += physical_column_count(field, is_structural);
+            represented_columns += file_versions::physical_column_count(lance_file_format, field);
             column_names.push(field.name.as_str());
             consumed_top_level_fields = idx + 1;
             idx += 1;
@@ -2420,23 +2348,17 @@ impl Dataset {
 
         let projected_ds_schema = self.schema().project(&column_names)?;
 
-        let mut fields = Vec::new();
-        let mut column_indices = Vec::new();
-        let mut curr_column_idx: i32 = 0;
-        for field in &projected_ds_schema.fields {
-            collect_columns(
-                field,
-                is_structural,
-                &mut fields,
-                &mut column_indices,
-                &mut curr_column_idx,
-            );
-        }
+        let (fields, column_indices) =
+            file_versions::data_file_columns(lance_file_format, &projected_ds_schema);
+        let represented_dataset_columns = column_indices
+            .iter()
+            .filter(|column_index| **column_index >= 0)
+            .count();
 
-        if curr_column_idx as usize != physical_columns {
+        if represented_dataset_columns != physical_columns {
             return Err(Error::invalid_input(format!(
                 "Schema mismatch: dataset projection maps to {} physical columns but file has {} columns",
-                curr_column_idx, physical_columns
+                represented_dataset_columns, physical_columns
             )));
         }
 
@@ -2451,8 +2373,7 @@ impl Dataset {
             path,
             fields,
             column_indices,
-            file_metadata.major_version as u32,
-            file_metadata.minor_version as u32,
+            lance_file_format,
             file_size_nz,
             base_id,
         ))
@@ -3162,7 +3083,7 @@ impl Dataset {
             )
             .with_object_store(Arc::new(self.object_store.as_ref().clone()))
             .with_commit_handler(self.commit_handler.clone())
-            .with_storage_format(self.manifest.data_storage_format.lance_file_version()?);
+            .with_exact_storage_format(self.manifest.data_storage_format.lance_file_format());
         builder.execute(transaction).await
     }
 
@@ -3281,7 +3202,7 @@ impl Dataset {
             .with_object_store(target_store.clone())
             .with_source_store(src_ds.object_store.clone())
             .with_commit_handler(self.commit_handler.clone())
-            .with_storage_format(self.manifest.data_storage_format.lance_file_version()?);
+            .with_exact_storage_format(self.manifest.data_storage_format.lance_file_format());
         let new_ds = builder.execute(txn).await?;
         Ok(new_ds)
     }
@@ -3393,29 +3314,6 @@ impl Dataset {
     /// Please refer to the DataFusion documentation for supported SQL syntax.
     pub fn sql(&self, sql: &str) -> SqlQueryBuilder {
         SqlQueryBuilder::new(self.clone(), sql)
-    }
-
-    /// Returns true if Lance supports writing this datatype with nulls.
-    pub(crate) fn lance_supports_nulls(&self, datatype: &DataType) -> bool {
-        match self
-            .manifest()
-            .data_storage_format
-            .lance_file_version()
-            .unwrap_or(LanceFileVersion::Legacy)
-            .resolve()
-        {
-            LanceFileVersion::Legacy => matches!(
-                datatype,
-                DataType::Utf8
-                    | DataType::LargeUtf8
-                    | DataType::Binary
-                    | DataType::List(_)
-                    | DataType::FixedSizeBinary(_)
-                    | DataType::FixedSizeList(_, _)
-            ),
-            LanceFileVersion::V2_0 => !matches!(datatype, DataType::Struct(..)),
-            _ => true,
-        }
     }
 }
 

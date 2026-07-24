@@ -26,7 +26,7 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::stream;
 use lance_core::utils::tempfile::TempStdDir;
-use lance_file::previous::reader::FileReader as PreviousFileReader;
+use lance_file::versions::v1::reader::FileReader as V1FileReader;
 use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
@@ -1711,7 +1711,7 @@ pub(crate) async fn open_vector_index_v2(
     dataset: Arc<Dataset>,
     column: &str,
     uuid: &Uuid,
-    reader: PreviousFileReader,
+    reader: V1FileReader,
     frag_reuse_index: Option<Arc<FragReuseIndex>>,
 ) -> Result<Arc<dyn VectorIndex>> {
     let index_metadata = reader
@@ -2825,7 +2825,8 @@ mod tests {
             .await
             .unwrap();
         let arrow_schema = ArrowSchema::new(vec![Field::new("dummy", ArrowDataType::Int32, true)]);
-        let mut v2w = lance_file::writer::FileWriter::try_new(
+        let mut v2w = lance_file::versions::create_writer(
+            dataset_format_version(&dataset),
             writer,
             lance_core::datatypes::Schema::try_from(&arrow_schema).unwrap(),
             FileWriterOptions::default(),

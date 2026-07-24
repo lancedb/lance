@@ -2070,7 +2070,6 @@ mod tests {
     use lance_core::{ROW_ID, Result};
     use lance_encoding::decoder::DecoderPlugins;
     use lance_file::reader::{FileReader, FileReaderOptions};
-    use lance_file::writer::FileWriter;
     use lance_index::IndexType;
     use lance_index::optimize::OptimizeOptions;
     use lance_index::progress::IndexBuildProgress;
@@ -5295,7 +5294,7 @@ mod tests {
 
         // Rewrite auxiliary file with PQ codebook inlined into schema metadata.
         let mut metadata = reader.schema().metadata.clone();
-        let projection = lance_file::reader::ReaderProjection::from_whole_schema(
+        let projection = lance_file::versions::reader_projection_from_whole_schema(
             reader.schema(),
             reader.metadata().version(),
         );
@@ -5312,7 +5311,8 @@ mod tests {
         let batches = batches.try_collect::<Vec<_>>().await?;
         let batch = arrow::compute::concat_batches(&batches[0].schema(), &batches)?;
         let new_aux_path = new_dir.clone().join(INDEX_AUXILIARY_FILE_NAME);
-        let mut writer = FileWriter::try_new(
+        let mut writer = lance_file::versions::create_writer(
+            reader.metadata().version(),
             obj_store.create(&new_aux_path).await?,
             batch.schema_ref().as_ref().try_into()?,
             Default::default(),

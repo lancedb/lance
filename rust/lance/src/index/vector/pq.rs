@@ -18,7 +18,7 @@ use arrow_select::take::take;
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use lance_arrow::FixedSizeListArrayExt;
+use lance_arrow::{DataTypeExt, FixedSizeListArrayExt, array_from_fixed_width_bytes};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::spawn_cpu;
@@ -33,7 +33,7 @@ use lance_index::{
     Index, IndexType,
     vector::{Query, pq::ProductQuantizer},
 };
-use lance_io::{traits::Reader, utils::read_fixed_stride_array};
+use lance_io::traits::Reader;
 use lance_linalg::distance::{DistanceType, MetricType};
 use log::{info, warn};
 use roaring::RoaringBitmap;
@@ -69,6 +69,22 @@ pub struct PQIndex {
     metric_type: MetricType,
 
     frag_reuse_index: Option<Arc<FragReuseIndex>>,
+}
+
+async fn read_legacy_index_values(
+    reader: &dyn Reader,
+    data_type: &DataType,
+    offset: usize,
+    length: usize,
+) -> Result<ArrayRef> {
+    let byte_length = length
+        .checked_mul(data_type.byte_width())
+        .ok_or_else(|| Error::index("legacy IVF page byte length overflow".to_string()))?;
+    let end = offset
+        .checked_add(byte_length)
+        .ok_or_else(|| Error::index("legacy IVF page offset overflow".to_string()))?;
+    let bytes = reader.get_range(offset..end).await?;
+    Ok(array_from_fixed_width_bytes(data_type, bytes, length, 0)?)
 }
 
 impl DeepSizeOf for PQIndex {
@@ -331,24 +347,14 @@ impl VectorIndex for PQIndex {
         length: usize,
     ) -> Result<Box<dyn VectorIndex>> {
         let pq_code_length = self.pq.code_dim() * length;
-        let pq_codes = read_fixed_stride_array(
-            reader.as_ref(),
-            &DataType::UInt8,
-            offset,
-            pq_code_length,
-            ..,
-        )
-        .await?;
+        let pq_codes =
+            read_legacy_index_values(reader.as_ref(), &DataType::UInt8, offset, pq_code_length)
+                .await?;
 
         let row_id_offset = offset + pq_code_length /* *1 */;
-        let row_ids = read_fixed_stride_array(
-            reader.as_ref(),
-            &DataType::UInt64,
-            row_id_offset,
-            length,
-            ..,
-        )
-        .await?;
+        let row_ids =
+            read_legacy_index_values(reader.as_ref(), &DataType::UInt64, row_id_offset, length)
+                .await?;
 
         let pq_codes = transpose(
             pq_codes.as_primitive(),

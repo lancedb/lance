@@ -25,7 +25,7 @@ use arrow_schema::DataType;
 use lance::Result;
 use lance::datatypes::Schema;
 use lance_arrow::FixedSizeListArrayExt;
-use lance_file::previous::writer::FileWriter as PreviousFileWriter;
+use lance_file::versions::v1::writer::FileWriter as PreviousFileWriter;
 use lance_index::vector::hnsw::{HNSW, builder::HnswBuildParams};
 use lance_index::vector::kmeans::{
     KMeans as LanceKMeans, KMeansAlgoFloat, KMeansParams, compute_partitions,

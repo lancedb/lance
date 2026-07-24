@@ -26,13 +26,14 @@ use std::time::Instant;
 
 use conflict_resolver::TransactionRebase;
 use lance_core::utils::backoff::{Backoff, SlotBackoff};
+#[cfg(test)]
 use lance_file::version::LanceFileVersion;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_io::utils::CachedFileSize;
 use lance_select::RowAddrTreeMap;
 use lance_table::format::{
-    DETACHED_VERSION_MASK, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, Manifest,
-    WriterVersion, is_detached_version, list_index_files_with_sizes, pb,
+    DETACHED_VERSION_MASK, DeletionFile, Fragment, IndexMetadata, Manifest, WriterVersion,
+    is_detached_version, list_index_files_with_sizes, pb,
 };
 use lance_table::io::commit::{
     CommitConfig, CommitError, CommitHandler, ManifestLocation, ManifestNamingScheme,
@@ -375,98 +376,11 @@ async fn migrate_manifest(
 }
 
 fn check_storage_version(manifest: &mut Manifest) -> Result<()> {
-    let data_storage_version = manifest.data_storage_format.lance_file_version()?;
-    if manifest.data_storage_format.lance_file_version()? == LanceFileVersion::Legacy {
-        // Due to bugs in 0.16 it is possible the dataset's data storage version does not
-        // match the file version.  As a result, we need to check and see if they are out
-        // of sync.
-        if let Some(actual_file_version) =
-            Fragment::try_infer_version(&manifest.fragments).map_err(|e| Error::internal(format!(
-                "The dataset contains a mixture of file versions.  You will need to rollback to an earlier version: {}",
-                e
-            )))?
-                && actual_file_version > data_storage_version {
-                    log::warn!(
-                        "Data storage version {} is less than the actual file version {}.  This has been automatically updated.",
-                        data_storage_version,
-                        actual_file_version
-                    );
-                    manifest.data_storage_format = DataStorageFormat::new(actual_file_version);
-                }
-    } else {
-        // Otherwise, if we are on 2.0 or greater, we should ensure that the file versions
-        // match the data storage version.  This is a sanity assertion to prevent data corruption.
-        if let Some(actual_file_version) = Fragment::try_infer_version(&manifest.fragments)?
-            && actual_file_version != data_storage_version
-        {
-            return Err(Error::internal(format!(
-                "The operation added files with version {}.  However, the data storage version is {}.",
-                actual_file_version, data_storage_version
-            )));
-        }
-    }
-    Ok(())
+    crate::dataset::versions::check_manifest_storage_version(manifest)
 }
 
 fn check_column_indices(manifest: &Manifest) -> Result<()> {
-    let data_storage_version = manifest.data_storage_format.lance_file_version()?;
-    if data_storage_version < LanceFileVersion::V2_1 {
-        return Ok(());
-    }
-
-    for fragment in manifest.fragments.iter() {
-        for data_file in &fragment.files {
-            if data_file.is_legacy_file() || data_file.column_indices.is_empty() {
-                continue;
-            }
-            if data_file.fields.len() != data_file.column_indices.len() {
-                return Err(Error::invalid_input(format!(
-                    "Data file '{}' (fragment {}) has {} field ids but {} column indices. \
-                     These must be the same length.",
-                    data_file.path,
-                    fragment.id,
-                    data_file.fields.len(),
-                    data_file.column_indices.len()
-                )));
-            }
-            let file_version = LanceFileVersion::try_from_major_minor(
-                data_file.file_major_version,
-                data_file.file_minor_version,
-            )?;
-            if file_version < LanceFileVersion::V2_1 {
-                continue;
-            }
-            for (field_id, column_index) in
-                data_file.fields.iter().zip(data_file.column_indices.iter())
-            {
-                // Field ids may not exist in the current schema after schema
-                // evolution (e.g. cast/drop column). Skip those.
-                let Some(field) = manifest.schema.field_by_id(*field_id) else {
-                    continue;
-                };
-                let needs_column = field.is_leaf() || field.is_packed_struct() || field.is_blob();
-                if needs_column && *column_index == -1 {
-                    return Err(Error::invalid_input(format!(
-                        "Field '{}' (id={}) in data file '{}' (fragment {}) \
-                         has column_index=-1, but leaf fields, packed structs, \
-                         and blob fields must have a valid column index in \
-                         file format 2.1+.",
-                        field.name, field_id, data_file.path, fragment.id
-                    )));
-                }
-                if !needs_column && *column_index != -1 {
-                    return Err(Error::invalid_input(format!(
-                        "Non-leaf field '{}' (id={}) in data file '{}' (fragment {}) \
-                         has column_index={}, but non-leaf fields should have \
-                         column_index=-1 in file format 2.1+. Only leaf fields, \
-                         packed structs, and blob fields should have column indices.",
-                        field.name, field_id, data_file.path, fragment.id, column_index
-                    )));
-                }
-            }
-        }
-    }
-    Ok(())
+    crate::dataset::versions::validate_column_indices(manifest)
 }
 
 /// Fix schema in case of duplicate field ids.
@@ -1157,6 +1071,7 @@ mod tests {
     use lance_core::datatypes::{Field, Schema};
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::{BatchCount, RowCount, array, gen_batch};
+    use lance_file::version::ConcreteFileVersion;
     use lance_index::IndexType;
     use lance_linalg::distance::MetricType;
     use lance_table::format::{DataFile, DataStorageFormat};
@@ -1863,7 +1778,7 @@ mod tests {
         Manifest::new(
             schema,
             Arc::new(vec![fragment]),
-            DataStorageFormat::new(data_storage_version),
+            DataStorageFormat::new(data_storage_version.resolve()),
             HashMap::new(),
         )
     }
@@ -1885,7 +1800,14 @@ mod tests {
         };
 
         // field ids: struct=0, leaf=1; give struct a real column_index (wrong)
-        let data_file = DataFile::new("data.lance", vec![0, 1], vec![0, 1], 2, 1, None, None);
+        let data_file = DataFile::new(
+            "data.lance",
+            vec![0, 1],
+            vec![0, 1],
+            ConcreteFileVersion::V2_1,
+            None,
+            None,
+        );
         let manifest = make_manifest_with_file(schema, data_file, LanceFileVersion::V2_1);
         let result = check_column_indices(&manifest);
         assert!(
@@ -1913,7 +1835,14 @@ mod tests {
         };
 
         // field ids: list=0, item=1; give list a real column_index (wrong)
-        let data_file = DataFile::new("data.lance", vec![0, 1], vec![0, 1], 2, 1, None, None);
+        let data_file = DataFile::new(
+            "data.lance",
+            vec![0, 1],
+            vec![0, 1],
+            ConcreteFileVersion::V2_1,
+            None,
+            None,
+        );
         let manifest = make_manifest_with_file(schema, data_file, LanceFileVersion::V2_1);
         let result = check_column_indices(&manifest);
         assert!(
@@ -1941,7 +1870,14 @@ mod tests {
         };
 
         // struct=-1 (correct), leaf=0 (correct)
-        let data_file = DataFile::new("data.lance", vec![0, 1], vec![-1, 0], 2, 1, None, None);
+        let data_file = DataFile::new(
+            "data.lance",
+            vec![0, 1],
+            vec![-1, 0],
+            ConcreteFileVersion::V2_1,
+            None,
+            None,
+        );
         let manifest = make_manifest_with_file(schema, data_file, LanceFileVersion::V2_1);
         assert!(check_column_indices(&manifest).is_ok());
     }
@@ -1966,7 +1902,14 @@ mod tests {
         };
 
         // packed struct=0 (allowed), leaf=1
-        let data_file = DataFile::new("data.lance", vec![0, 1], vec![0, 1], 2, 1, None, None);
+        let data_file = DataFile::new(
+            "data.lance",
+            vec![0, 1],
+            vec![0, 1],
+            ConcreteFileVersion::V2_1,
+            None,
+            None,
+        );
         let manifest = make_manifest_with_file(schema, data_file, LanceFileVersion::V2_1);
         assert!(check_column_indices(&manifest).is_ok());
     }
@@ -1987,7 +1930,14 @@ mod tests {
             metadata: Default::default(),
         };
 
-        let data_file = DataFile::new("data.lance", vec![0, 1], vec![0, 1], 2, 0, None, None);
+        let data_file = DataFile::new(
+            "data.lance",
+            vec![0, 1],
+            vec![0, 1],
+            ConcreteFileVersion::V2_0,
+            None,
+            None,
+        );
         let manifest = make_manifest_with_file(schema, data_file, LanceFileVersion::V2_0);
         assert!(check_column_indices(&manifest).is_ok());
     }
@@ -2004,7 +1954,14 @@ mod tests {
         };
 
         // 1 field id but 2 column indices
-        let data_file = DataFile::new("data.lance", vec![0], vec![0, 1], 2, 1, None, None);
+        let data_file = DataFile::new(
+            "data.lance",
+            vec![0],
+            vec![0, 1],
+            ConcreteFileVersion::V2_1,
+            None,
+            None,
+        );
         let manifest = make_manifest_with_file(schema, data_file, LanceFileVersion::V2_1);
         let result = check_column_indices(&manifest);
         assert!(result.is_err(), "Expected error for mismatched lengths");
@@ -2024,7 +1981,14 @@ mod tests {
         };
 
         // field id 99 does not exist in the schema — should be skipped
-        let data_file = DataFile::new("data.lance", vec![0, 99], vec![0, 1], 2, 1, None, None);
+        let data_file = DataFile::new(
+            "data.lance",
+            vec![0, 99],
+            vec![0, 1],
+            ConcreteFileVersion::V2_1,
+            None,
+            None,
+        );
         let manifest = make_manifest_with_file(schema, data_file, LanceFileVersion::V2_1);
         assert!(check_column_indices(&manifest).is_ok());
     }
@@ -2046,7 +2010,14 @@ mod tests {
         };
 
         // struct=-1 (correct), but leaf=-1 (wrong — leaf must have a real column)
-        let data_file = DataFile::new("data.lance", vec![0, 1], vec![-1, -1], 2, 1, None, None);
+        let data_file = DataFile::new(
+            "data.lance",
+            vec![0, 1],
+            vec![-1, -1],
+            ConcreteFileVersion::V2_1,
+            None,
+            None,
+        );
         let manifest = make_manifest_with_file(schema, data_file, LanceFileVersion::V2_1);
         let result = check_column_indices(&manifest);
         assert!(

@@ -21,7 +21,6 @@ use crate::{
     constants::PACKED_STRUCT_META_KEY,
     decoder::PageEncoding,
     encoder::{EncodeTask, EncodedColumn, EncodedPage, FieldEncoder, OutOfLineBuffers},
-    encodings::logical::primitive::PrimitiveStructuralEncoder,
     format::ProtobufUtils21,
     repdef::{DefinitionInterpretation, RepDefBuilder},
 };
@@ -42,9 +41,7 @@ pub struct BlobStructuralEncoder {
 impl BlobStructuralEncoder {
     pub fn new(
         field: &Field,
-        column_index: u32,
-        options: &crate::encoder::EncodingOptions,
-        compression_strategy: Arc<dyn crate::compression::CompressionStrategy>,
+        make_descriptor_encoder: impl FnOnce(Field) -> Result<Box<dyn FieldEncoder>>,
     ) -> Result<Self> {
         // Create descriptor field: struct<position: u64, size: u64>
         // Preserve the original field's metadata for packed struct
@@ -63,13 +60,7 @@ impl BlobStructuralEncoder {
         )?;
 
         // Use PrimitiveStructuralEncoder to handle the descriptor
-        let descriptor_encoder = Box::new(PrimitiveStructuralEncoder::try_new(
-            options,
-            compression_strategy,
-            column_index,
-            descriptor_field,
-            Arc::new(HashMap::new()),
-        )?);
+        let descriptor_encoder = make_descriptor_encoder(descriptor_field)?;
 
         Ok(Self {
             descriptor_encoder,
@@ -236,9 +227,7 @@ pub struct BlobV2StructuralEncoder {
 impl BlobV2StructuralEncoder {
     pub fn new(
         field: &Field,
-        column_index: u32,
-        options: &crate::encoder::EncodingOptions,
-        compression_strategy: Arc<dyn crate::compression::CompressionStrategy>,
+        make_descriptor_encoder: impl FnOnce(Field) -> Result<Box<dyn FieldEncoder>>,
     ) -> Result<Self> {
         let mut descriptor_metadata = HashMap::with_capacity(1);
         descriptor_metadata.insert(PACKED_STRUCT_META_KEY.to_string(), "true".to_string());
@@ -250,13 +239,7 @@ impl BlobV2StructuralEncoder {
                 .with_metadata(descriptor_metadata),
         )?;
 
-        let descriptor_encoder = Box::new(PrimitiveStructuralEncoder::try_new(
-            options,
-            compression_strategy,
-            column_index,
-            descriptor_field,
-            Arc::new(HashMap::new()),
-        )?);
+        let descriptor_encoder = make_descriptor_encoder(descriptor_field)?;
 
         Ok(Self { descriptor_encoder })
     }
@@ -430,13 +413,12 @@ impl FieldEncoder for BlobV2StructuralEncoder {
 mod tests {
     use super::*;
     use crate::{
-        compression::DefaultCompressionStrategy,
         encoder::{ColumnIndexSequence, EncodingOptions},
         testing::{
-            TestCases, check_round_trip_encoding_of_data,
-            check_round_trip_encoding_of_data_with_expected,
+            TestCases, TestEncoding, check_round_trip_encoding_of_data,
+            check_round_trip_encoding_of_data_with_expected, create_test_field_encoder,
+            test_encoding_strategy,
         },
-        version::LanceFileVersion,
     };
     use arrow_array::{
         ArrayRef, LargeBinaryArray, StringArray, StructArray, UInt8Array, UInt32Array, UInt64Array,
@@ -445,14 +427,18 @@ mod tests {
 
     #[test]
     fn test_blob_encoder_creation() {
-        let field =
-            Field::try_from(ArrowField::new("blob_field", DataType::LargeBinary, true)).unwrap();
+        let field = Field::try_from(
+            ArrowField::new("blob_field", DataType::LargeBinary, true).with_metadata(
+                HashMap::from([(lance_arrow::BLOB_META_KEY.to_string(), "true".to_string())]),
+            ),
+        )
+        .unwrap();
         let mut column_index = ColumnIndexSequence::default();
-        let column_idx = column_index.next_column_index(0);
         let options = EncodingOptions::default();
-        let compression = Arc::new(DefaultCompressionStrategy::new());
+        let strategy = test_encoding_strategy(TestEncoding::StructuralU16);
 
-        let encoder = BlobStructuralEncoder::new(&field, column_idx, &options, compression);
+        let encoder =
+            create_test_field_encoder(strategy.as_ref(), &field, &mut column_index, &options);
 
         assert!(encoder.is_ok());
     }
@@ -466,12 +452,12 @@ mod tests {
         )
         .unwrap();
         let mut column_index = ColumnIndexSequence::default();
-        let column_idx = column_index.next_column_index(0);
         let options = EncodingOptions::default();
-        let compression = Arc::new(DefaultCompressionStrategy::new());
+        let strategy = test_encoding_strategy(TestEncoding::StructuralU16);
 
         let mut encoder =
-            BlobStructuralEncoder::new(&field, column_idx, &options, compression).unwrap();
+            create_test_field_encoder(strategy.as_ref(), &field, &mut column_index, &options)
+                .unwrap();
 
         // Create test data with larger blobs
         let large_data = vec![0u8; 1024 * 100]; // 100KB blob
@@ -524,7 +510,7 @@ mod tests {
         // Use the standard test harness
         check_round_trip_encoding_of_data(
             vec![array],
-            &TestCases::default().with_max_file_version(LanceFileVersion::V2_1),
+            &TestCases::default().with_array_and_u16_encodings(),
             blob_metadata,
         )
         .await;
@@ -628,7 +614,7 @@ mod tests {
         check_round_trip_encoding_of_data_with_expected(
             vec![Arc::new(struct_array)],
             Some(Arc::new(expected_descriptor)),
-            &TestCases::default().with_min_file_version(LanceFileVersion::V2_2),
+            &TestCases::default().with_u32_structural_encodings(),
             blob_metadata,
         )
         .await;
@@ -693,7 +679,7 @@ mod tests {
         check_round_trip_encoding_of_data_with_expected(
             vec![Arc::new(struct_array)],
             Some(Arc::new(expected_descriptor)),
-            &TestCases::default().with_min_file_version(LanceFileVersion::V2_2),
+            &TestCases::default().with_u32_structural_encodings(),
             blob_metadata,
         )
         .await;
@@ -755,7 +741,7 @@ mod tests {
         check_round_trip_encoding_of_data_with_expected(
             vec![Arc::new(struct_array)],
             Some(Arc::new(expected_descriptor)),
-            &TestCases::default().with_min_file_version(LanceFileVersion::V2_2),
+            &TestCases::default().with_u32_structural_encodings(),
             blob_metadata,
         )
         .await;
@@ -817,7 +803,7 @@ mod tests {
         check_round_trip_encoding_of_data_with_expected(
             vec![Arc::new(struct_array)],
             Some(Arc::new(expected_descriptor)),
-            &TestCases::default().with_min_file_version(LanceFileVersion::V2_2),
+            &TestCases::default().with_u32_structural_encodings(),
             blob_metadata,
         )
         .await;

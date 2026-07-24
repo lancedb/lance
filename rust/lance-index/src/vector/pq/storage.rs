@@ -24,8 +24,8 @@ use bytes::{Bytes, BytesMut};
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, ROW_ID, Result};
-use lance_file::previous::{
-    reader::FileReader as PreviousFileReader, writer::FileWriter as PreviousFileWriter,
+use lance_file::versions::v1::{
+    reader::FileReader as V1FileReader, writer::FileWriter as V1FileWriter,
 };
 use lance_io::{object_store::ObjectStore, utils::read_message};
 use lance_linalg::distance::{Cosine, DistanceType, Dot, L2};
@@ -126,7 +126,7 @@ impl QuantizerMetadata for ProductQuantizationMetadata {
         }
     }
 
-    async fn load(reader: &PreviousFileReader) -> Result<Self> {
+    async fn load(reader: &V1FileReader) -> Result<Self> {
         let metadata = reader
             .schema()
             .metadata
@@ -386,7 +386,7 @@ impl ProductQuantizationStorage {
         path: &Path,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
-        let reader = PreviousFileReader::try_new_self_described(object_store, path, None).await?;
+        let reader = V1FileReader::try_new_self_described(object_store, path, None).await?;
         let schema = reader.schema();
 
         let metadata_str = schema
@@ -469,7 +469,7 @@ impl ProductQuantizationStorage {
     ///
     pub async fn write_partition(
         &self,
-        writer: &mut PreviousFileWriter<ManifestDescribing>,
+        writer: &mut V1FileWriter<ManifestDescribing>,
     ) -> Result<usize> {
         let batch_size: usize = 10240; // TODO: make it configurable
         for offset in (0..self.batch.num_rows()).step_by(batch_size) {
@@ -613,9 +613,9 @@ impl QuantizerStorage for ProductQuantizationStorage {
     ///
     /// Parameters
     /// ----------
-    /// - *reader: &PreviousFileReader
+    /// - *reader: &V1FileReader
     async fn load_partition(
-        reader: &PreviousFileReader,
+        reader: &V1FileReader,
         range: std::ops::Range<usize>,
         distance_type: DistanceType,
         metadata: &Self::Metadata,
