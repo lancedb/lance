@@ -331,7 +331,12 @@ jobs:
         run: |
           QEMU_BIN_DIR="${RUNNER_TEMP}/lance-qemu/8.2.10"
           echo "${QEMU_BIN_DIR}" >> "${GITHUB_PATH}"
-          "${QEMU_BIN_DIR}/qemu-x86_64" --version
+          QEMU_VERSION_OUTPUT="$("${QEMU_BIN_DIR}/qemu-x86_64" --version)"
+          echo "${QEMU_VERSION_OUTPUT}"
+          if [[ "${QEMU_VERSION_OUTPUT}" != *"version 8.2.10"* ]]; then
+            echo "Expected QEMU 8.2.10, got: ${QEMU_VERSION_OUTPUT}" >&2
+            exit 1
+          fi
       - name: Build lance-linalg lib tests in release mode
         run: |
           cargo test --release -p lance-linalg --lib --no-run
