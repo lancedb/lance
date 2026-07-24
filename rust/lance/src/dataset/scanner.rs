@@ -4345,7 +4345,12 @@ impl Scanner {
             )
             .await?;
             for segment in &segments {
-                collect_overlay_stale_rows_for_segment(segment, &overlaid_frags, &mut stale)?;
+                collect_overlay_stale_rows_for_segment(
+                    segment,
+                    &overlaid_frags,
+                    &mut stale,
+                    self.dataset.schema(),
+                )?;
             }
         }
         Ok(stale)
@@ -4372,7 +4377,12 @@ impl Scanner {
         }
         let mut stale: HashMap<u32, RoaringBitmap> = HashMap::new();
         for segment in segments {
-            collect_overlay_stale_rows_for_segment(segment, &overlaid_frags, &mut stale)?;
+            collect_overlay_stale_rows_for_segment(
+                segment,
+                &overlaid_frags,
+                &mut stale,
+                self.dataset.schema(),
+            )?;
         }
         Ok(stale)
     }
@@ -4405,7 +4415,12 @@ impl Scanner {
         let overlaid_frags = overlaid_fragments(target_fragments);
         let mut stale_frag_ids = RoaringBitmap::new();
         for seg in &segments {
-            collect_overlay_stale_frags(seg, &overlaid_frags, &mut stale_frag_ids)?;
+            collect_overlay_stale_frags(
+                seg,
+                &overlaid_frags,
+                &mut stale_frag_ids,
+                self.dataset.schema(),
+            )?;
         }
 
         if stale_frag_ids.is_empty() {

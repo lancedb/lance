@@ -4279,8 +4279,8 @@ class LanceDataset(pa.dataset.Dataset):
         Create one segment without publishing it and return its metadata.
 
         This is the public distributed-build API for vector, BTREE scalar,
-        canonical bitmap scalar, INVERTED scalar, ZONEMAP scalar, and
-        BLOOMFILTER scalar index construction. Unlike
+        canonical bitmap scalar, INVERTED scalar, RTREE scalar, ZONEMAP scalar,
+        and BLOOMFILTER scalar index construction. Unlike
         :meth:`create_index`, this method does not publish the index into the
         dataset manifest. Instead, it writes one segment under
         ``_indices/<segment_uuid>/`` and returns the resulting

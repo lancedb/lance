@@ -64,6 +64,15 @@ fn validate_page_size(page_size: u32) -> Result<()> {
     Ok(())
 }
 
+fn validate_stored_page_size(page_size: u32, num_items: usize) -> Result<()> {
+    if page_size == 0 || (page_size == 1 && num_items > 1) {
+        return Err(Error::invalid_input(format!(
+            "stored RTree page_size {page_size} cannot represent {num_items} items"
+        )));
+    }
+    Ok(())
+}
+
 static BBOX_FIELD: LazyLock<Arc<ArrowField>> = LazyLock::new(|| {
     let bbox_type = RectType::new(Dimension::XY, Default::default());
     Arc::new(bbox_type.to_field("bbox", false))
@@ -296,7 +305,7 @@ impl RTreeIndex {
     ) -> Result<Arc<Self>> {
         let pages_reader = store.open_index_file(RTREE_PAGES_NAME).await?;
         let metadata = RTreeMetadata::from(&pages_reader.schema().metadata);
-        validate_page_size(metadata.page_size)?;
+        validate_stored_page_size(metadata.page_size, metadata.num_items)?;
         let nulls_reader = store.open_index_file(RTREE_NULLS_NAME).await?;
 
         Ok(Arc::new(Self {
@@ -489,8 +498,22 @@ fn remap_rtree_data(
 ///
 /// # Examples
 ///
-/// ```ignore
-/// let merged = merge_rtree_indices(&segments, destination.as_ref(), &filters).await?;
+/// ```no_run
+/// use std::sync::Arc;
+///
+/// use lance_core::Result;
+/// use lance_index::scalar::OldIndexDataFilter;
+/// use lance_index::scalar::lance_format::LanceIndexStore;
+/// use lance_index::scalar::rtree::{RTreeIndex, merge_rtree_indices};
+///
+/// async fn merge(
+///     segments: &[Arc<RTreeIndex>],
+///     destination: &LanceIndexStore,
+///     filters: &[Option<OldIndexDataFilter>],
+/// ) -> Result<()> {
+///     merge_rtree_indices(segments, destination, filters).await?;
+///     Ok(())
+/// }
 /// ```
 pub async fn merge_rtree_indices(
     source_indices: &[Arc<RTreeIndex>],
@@ -1186,6 +1209,14 @@ mod tests {
             .err()
             .unwrap();
         assert!(error.to_string().contains("page_size must be at least 2"));
+    }
+
+    #[test]
+    fn test_stored_page_size_preserves_single_item_compatibility() {
+        assert!(validate_stored_page_size(1, 1).is_ok());
+        assert!(validate_stored_page_size(1, 0).is_ok());
+        assert!(validate_stored_page_size(1, 2).is_err());
+        assert!(validate_stored_page_size(0, 0).is_err());
     }
 
     fn convert_bbox_rowid_batch_stream(

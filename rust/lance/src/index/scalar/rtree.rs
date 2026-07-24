@@ -4,13 +4,22 @@
 use std::sync::Arc;
 
 use lance_index::metrics::NoOpMetricsCollector;
-use lance_index::scalar::index_files_to_table;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::rtree::RTreeIndex;
+use lance_index::scalar::{OldIndexDataFilter, index_files_to_table};
+use lance_select::RowSetOps;
 use lance_table::format::IndexMetadata;
 use uuid::Uuid;
 
 use crate::{Dataset, Error, Result, dataset::index::LanceIndexStoreExt};
+
+fn filter_keeps_nothing(filter: &Option<OldIndexDataFilter>) -> bool {
+    match filter {
+        Some(OldIndexDataFilter::Fragments { to_keep, .. }) => to_keep.is_empty(),
+        Some(OldIndexDataFilter::RowIds(valid)) => valid.is_empty(),
+        None => false,
+    }
+}
 
 /// Merge one caller-defined group of source RTree segments into a single segment.
 pub(in crate::index) async fn merge_segments(
@@ -38,7 +47,12 @@ pub(in crate::index) async fn merge_segments(
         crate::index::append::build_per_segment_filters(dataset, &segment_refs).await?;
 
     let mut source_indices = Vec::with_capacity(segments.len());
-    for segment in &segments {
+    let mut source_filters = Vec::with_capacity(old_data_filters.len());
+    let all_keep_nothing = old_data_filters.iter().all(filter_keeps_nothing);
+    for (position, (segment, filter)) in segments.iter().zip(&old_data_filters).enumerate() {
+        if filter_keeps_nothing(filter) && !(all_keep_nothing && position == 0) {
+            continue;
+        }
         let scalar_index =
             super::open_scalar_index(dataset, &field_path, segment, &NoOpMetricsCollector).await?;
         let rtree_index = scalar_index
@@ -52,6 +66,7 @@ pub(in crate::index) async fn merge_segments(
                 ))
             })?;
         source_indices.push(Arc::new(rtree_index.clone()));
+        source_filters.push(filter.clone());
     }
 
     let new_uuid = Uuid::new_v4();
@@ -59,7 +74,7 @@ pub(in crate::index) async fn merge_segments(
     let created_index = lance_index::scalar::rtree::merge_rtree_indices(
         &source_indices,
         &new_store,
-        &old_data_filters,
+        &source_filters,
     )
     .await?;
 

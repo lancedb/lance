@@ -67,6 +67,10 @@ impl IndexSegment {
         &self.fragment_bitmap
     }
 
+    pub(crate) fn fragment_bitmap_mut(&mut self) -> &mut RoaringBitmap {
+        &mut self.fragment_bitmap
+    }
+
     /// Return the field IDs whose values are encoded in this segment.
     pub fn fields(&self) -> &[i32] {
         &self.fields
