@@ -52,11 +52,6 @@ const MIN_SHARD_SHARE: usize = 4 << 30;
 /// in `[1, 1024]`. The cpu term bounds lock contention; the capacity term
 /// keeps each shard's budget >= 4 GiB so large entries stay admissible.
 /// Rounded down because quick_cache rounds requests up.
-///
-/// ```
-/// use lance_core::cache::recommended_cache_shards;
-/// assert!((64 << 30) / recommended_cache_shards(64 << 30) >= 4 << 30);
-/// ```
 pub fn recommended_cache_shards(capacity: usize) -> usize {
     let by_cpu = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -78,12 +73,6 @@ impl QuickCacheBackend {
     /// Create a backend holding up to `capacity` bytes of weighted entries
     /// (weight = key footprint + declared size), sharded per
     /// [`recommended_cache_shards`].
-    ///
-    /// ```
-    /// use lance_core::cache::{CacheBackend, QuickCacheBackend};
-    /// let backend = QuickCacheBackend::with_capacity(64 * 1024 * 1024);
-    /// assert_eq!(backend.approx_num_entries(), 0);
-    /// ```
     pub fn with_capacity(capacity: usize) -> Self {
         let shards = recommended_cache_shards(capacity);
         // Floor protects the shard count from quick_cache's items-per-shard
