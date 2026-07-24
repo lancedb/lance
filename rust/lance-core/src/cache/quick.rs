@@ -46,21 +46,18 @@ impl std::fmt::Debug for QuickCacheBackend {
     }
 }
 
-/// Minimum weight budget per internal shard. quick_cache splits its weight
-/// capacity evenly across shards with no cross-shard borrowing, and an entry
-/// heavier than ~its shard's budget is silently refused admission — so the
-/// share must stay well above the largest cache entry.
+/// Minimum weight budget (4 GiB) per shard. Shards don't borrow capacity from
+/// each other, and an entry heavier than ~its shard's budget is silently
+/// refused — so the share must stay well above the largest cache entry.
 const MIN_SHARD_SHARE: usize = 4 << 30;
 
 impl QuickCacheBackend {
     /// Create a backend holding up to `capacity` bytes of weighted entries.
     ///
-    /// Entry weight is the same accounting as [`super::moka::MokaCacheBackend`]:
-    /// key footprint plus the entry's declared byte size. The weight budget is
-    /// split evenly across `min(cpus / 2, capacity / 4 GiB)` internal shards
-    /// (power of two, clamped to `[1, 1024]`) with no cross-shard borrowing;
-    /// an entry heavier than ~97% of one shard's share is refused admission,
-    /// so the 4 GiB minimum share keeps the largest index entries cacheable.
+    /// Entry weight = key footprint + declared byte size (same accounting as
+    /// [`super::moka::MokaCacheBackend`]). The budget is split evenly across
+    /// `min(cpus / 2, capacity / 4 GiB)` shards; an entry heavier than ~one
+    /// shard's share is refused admission.
     ///
     /// ```
     /// use lance_core::cache::{CacheBackend, QuickCacheBackend};
@@ -68,11 +65,9 @@ impl QuickCacheBackend {
     /// assert_eq!(backend.approx_num_entries(), 0);
     /// ```
     pub fn with_capacity(capacity: usize) -> Self {
-        // shards = min(cpus / 2, capacity / 4GiB), rounded DOWN to a power of
-        // two (quick_cache rounds requests UP, which would halve the share).
-        // The cpu term bounds lock contention — more shards than concurrent
-        // threads buys nothing — and the capacity term keeps every shard's
-        // share >= 4GiB so the largest cache entries stay admissible.
+        // cpu term bounds lock contention; capacity term keeps each share
+        // >= 4 GiB so large entries stay admissible. Round DOWN to a power of
+        // two — quick_cache rounds UP, which would halve the share.
         let by_cpu = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(2)
@@ -84,13 +79,9 @@ impl QuickCacheBackend {
             shards.next_power_of_two() / 2
         };
         let shards = shards.clamp(1, 1024);
-        // Estimate resident entries from the weight budget (~64 KiB average
-        // across posting blocks, metadata, and small structs) so small caches
-        // do not pre-allocate hash-table and ghost-key metadata for millions
-        // of items that can never fit. The floor keeps quick_cache's own "at
-        // least 32 items per shard" heuristic from shrinking the shard count
-        // below the explicit choice; the ceiling bounds pre-allocation for
-        // TiB-scale capacities.
+        // Sizes hash-table/ghost-key pre-allocation (~64 KiB avg entry). The
+        // floor stops quick_cache's items-per-shard heuristic from shrinking
+        // the shard count; the ceiling bounds pre-allocation at TiB scale.
         const ESTIMATED_AVG_ENTRY_BYTES: usize = 64 << 10;
         let estimated_items = (capacity / ESTIMATED_AVG_ENTRY_BYTES).clamp(shards * 32, 1_000_000);
         let options = quick_cache::OptionsBuilder::new()
@@ -98,8 +89,7 @@ impl QuickCacheBackend {
             .weight_capacity(capacity as u64)
             .shards(shards)
             .build()
-            // Infallible in practice: `build` errors only when weight or item
-            // capacity is missing, and both are always set above.
+            // Only errors when weight/item capacity is missing; both are set.
             .expect("quick_cache options");
         let cache = quick_cache::sync::Cache::with_options(
             options,
