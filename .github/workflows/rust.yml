@@ -282,7 +282,41 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt update
-          sudo apt install -y protobuf-compiler libssl-dev qemu-user
+          sudo apt install -y \
+            protobuf-compiler \
+            libssl-dev \
+            ninja-build \
+            pkg-config \
+            libglib2.0-dev \
+            python3-venv \
+            curl \
+            xz-utils
+      - name: Install QEMU 8.2.10
+        run: |
+          QEMU_VERSION=8.2.10
+          QEMU_ARCHIVE="qemu-${QEMU_VERSION}.tar.xz"
+          QEMU_SOURCE_DIR="${RUNNER_TEMP}/qemu-${QEMU_VERSION}"
+
+          # Ubuntu 24.04 ships QEMU 8.2.2, which is affected by
+          # https://gitlab.com/qemu-project/qemu/-/issues/2170.
+          curl --fail --location --silent --show-error \
+            "https://download.qemu.org/${QEMU_ARCHIVE}" \
+            --output "${RUNNER_TEMP}/${QEMU_ARCHIVE}"
+          echo "37b4a643da8ed6015eef35f5d7f06e7259d9c95359965a0a98e9667c621ab2bb  ${RUNNER_TEMP}/${QEMU_ARCHIVE}" \
+            | sha256sum --check -
+          tar --extract \
+            --file "${RUNNER_TEMP}/${QEMU_ARCHIVE}" \
+            --directory "${RUNNER_TEMP}"
+          mkdir "${QEMU_SOURCE_DIR}/build"
+          (
+            cd "${QEMU_SOURCE_DIR}/build"
+            ../configure --target-list=x86_64-linux-user --disable-docs
+            ninja qemu-x86_64
+          )
+          sudo install -m 0755 \
+            "${QEMU_SOURCE_DIR}/build/qemu-x86_64" \
+            /usr/local/bin/qemu-x86_64
+          qemu-x86_64 --version
       - name: Build lance-linalg lib tests in release mode
         run: |
           cargo test --release -p lance-linalg --lib --no-run
