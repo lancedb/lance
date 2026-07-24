@@ -279,10 +279,64 @@ jobs:
           rustup toolchain install stable
           rustup default stable
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      - name: Restore QEMU 8.2.10
+        id: qemu-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/lance-qemu/8.2.10/qemu-x86_64
+          key: qemu-user-8.2.10-x86_64-linux-user-${{ runner.os }}-${{ runner.arch }}-v1
       - name: Install dependencies
         run: |
           sudo apt update
-          sudo apt install -y protobuf-compiler libssl-dev qemu-user
+          sudo apt install -y protobuf-compiler libssl-dev
+      - name: Install QEMU build dependencies
+        if: steps.qemu-cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt install -y \
+            ninja-build \
+            pkg-config \
+            libglib2.0-dev \
+            python3-venv \
+            curl \
+            xz-utils
+      - name: Build QEMU 8.2.10
+        if: steps.qemu-cache.outputs.cache-hit != 'true'
+        run: |
+          QEMU_VERSION=8.2.10
+          QEMU_ARCHIVE="qemu-${QEMU_VERSION}.tar.xz"
+          QEMU_BIN_DIR="${RUNNER_TEMP}/lance-qemu/${QEMU_VERSION}"
+          QEMU_SOURCE_DIR="${RUNNER_TEMP}/qemu-${QEMU_VERSION}"
+
+          # Ubuntu 24.04 ships QEMU 8.2.2, which is affected by
+          # https://gitlab.com/qemu-project/qemu/-/issues/2170.
+          curl --fail --location --silent --show-error \
+            "https://download.qemu.org/${QEMU_ARCHIVE}" \
+            --output "${RUNNER_TEMP}/${QEMU_ARCHIVE}"
+          echo "37b4a643da8ed6015eef35f5d7f06e7259d9c95359965a0a98e9667c621ab2bb  ${RUNNER_TEMP}/${QEMU_ARCHIVE}" \
+            | sha256sum --check -
+          tar --extract \
+            --file "${RUNNER_TEMP}/${QEMU_ARCHIVE}" \
+            --directory "${RUNNER_TEMP}"
+          mkdir "${QEMU_SOURCE_DIR}/build"
+          (
+            cd "${QEMU_SOURCE_DIR}/build"
+            ../configure --target-list=x86_64-linux-user --disable-docs
+            ninja qemu-x86_64
+          )
+          mkdir -p "${QEMU_BIN_DIR}"
+          install -m 0755 \
+            "${QEMU_SOURCE_DIR}/build/qemu-x86_64" \
+            "${QEMU_BIN_DIR}/qemu-x86_64"
+      - name: Add QEMU to PATH
+        run: |
+          QEMU_BIN_DIR="${RUNNER_TEMP}/lance-qemu/8.2.10"
+          echo "${QEMU_BIN_DIR}" >> "${GITHUB_PATH}"
+          QEMU_VERSION_OUTPUT="$("${QEMU_BIN_DIR}/qemu-x86_64" --version)"
+          echo "${QEMU_VERSION_OUTPUT}"
+          if [[ "${QEMU_VERSION_OUTPUT}" != *"version 8.2.10"* ]]; then
+            echo "Expected QEMU 8.2.10, got: ${QEMU_VERSION_OUTPUT}" >&2
+            exit 1
+          fi
       - name: Build lance-linalg lib tests in release mode
         run: |
           cargo test --release -p lance-linalg --lib --no-run

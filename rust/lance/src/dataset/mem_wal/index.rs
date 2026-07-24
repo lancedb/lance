@@ -716,7 +716,7 @@ impl IndexStore {
     /// BTree (the sidecar dedup index). Single-column emits the typed PK value;
     /// composite emits the order-preserving `Binary` encoded tuple. Empty when
     /// there is no primary key. Row positions line up 1:1 with the forward-
-    /// written data file, so they are the flushed row ids directly.
+    /// written data file, so they are the SSTable row ids directly.
     pub fn pk_training_batches(&self, batch_size: usize) -> Result<Vec<RecordBatch>> {
         match &self.pk_index {
             None => Ok(Vec::new()),

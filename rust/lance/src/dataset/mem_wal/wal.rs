@@ -1011,7 +1011,7 @@ impl WalEntryData {
 /// First valid WAL entry position. Positions are 1-based so that a
 /// `ShardManifest::replay_after_wal_entry_position` of 0 unambiguously means
 /// "no flush has ever stamped the cursor" — replay then starts at position 1
-/// without needing to consult `flushed_generations`, which an external
+/// without needing to consult `sstables`, which an external
 /// compactor may legitimately drain back to empty.
 const FIRST_WAL_ENTRY_POSITION: u64 = 1;
 const MAX_APPEND_CREATE_CONFLICTS: usize = 1024;

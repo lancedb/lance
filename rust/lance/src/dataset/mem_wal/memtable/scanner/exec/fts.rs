@@ -115,9 +115,9 @@ impl FtsIndexExec {
             .map(|f| f.as_ref().clone())
             .collect();
         // `_score` is nullable here to stay schema-compatible with
-        // `lance_index::scalar::inverted::FTS_SCHEMA` (the schema base/flushed
+        // `lance_index::scalar::inverted::FTS_SCHEMA` (the schema base/SSTable
         // FTS exec nodes emit). The LSM `full_text_search` planner unions the
-        // active arm with base/flushed arms; UnionExec requires schema equality
+        // active arm with base/SSTable arms; UnionExec requires schema equality
         // including nullability. The actual emitted column is always populated.
         fields.push(Field::new(SCORE_COLUMN, DataType::Float32, true));
         if with_row_id {

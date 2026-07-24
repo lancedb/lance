@@ -34,11 +34,11 @@ use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
 use super::exec::{BloomFilterGuardExec, CoalesceFirstExec, compute_pk_hash_from_scalars};
-use super::flushed_cache::{DatasetCache, GenerationWarmer, open_flushed_dataset};
 use super::projection::{
     DISTANCE_COLUMN, build_scanner_projection, canonical_output_schema, null_columns,
     project_to_canonical, validate_projection_names, wants_row_address, wants_row_id,
 };
+use super::sstable_cache::{DatasetCache, SsTableWarmer, open_sstable};
 use crate::session::Session;
 use lance_io::object_store::ObjectStoreParams;
 
@@ -88,14 +88,14 @@ pub struct LsmPointLookupPlanner {
     /// Bloom filters for each memtable generation.
     /// Map: generation -> bloom filter
     bloom_filters: std::collections::HashMap<u64, Arc<Sbbf>>,
-    /// Session threaded into flushed-generation opens (shared caches).
+    /// Session threaded into SSTable opens (shared caches).
     session: Option<Arc<Session>>,
-    /// Store params for opening flushed generations, reusing the base dataset's store.
+    /// Store params for opening SSTables, reusing the base dataset's store.
     store_params: Option<ObjectStoreParams>,
-    /// Cache of opened flushed-generation datasets.
-    flushed_cache: Option<Arc<dyn DatasetCache>>,
-    /// Optional warmer fired on first open of a flushed generation.
-    warmer: Option<Arc<dyn GenerationWarmer>>,
+    /// Cache of opened SSTable datasets.
+    sstable_cache: Option<Arc<dyn DatasetCache>>,
+    /// Optional warmer fired on first open of an SSTable.
+    warmer: Option<Arc<dyn SsTableWarmer>>,
     /// Precomputed canonical output schema for the no-projection case, so the
     /// hot `lookup(.., None)` path clones an `Arc` instead of rebuilding the
     /// schema on every call.
@@ -128,37 +128,37 @@ impl LsmPointLookupPlanner {
             bloom_filters: std::collections::HashMap::new(),
             session: None,
             store_params: None,
-            flushed_cache: None,
+            sstable_cache: None,
             warmer: None,
             none_target,
             task_ctx: SessionContext::new().task_ctx(),
         }
     }
 
-    /// Set the session used to open flushed generations.
+    /// Set the session used to open SSTables.
     pub fn with_session(mut self, session: Arc<Session>) -> Self {
         self.session = Some(session);
         self
     }
 
-    /// Set the store params used to open flushed generations.
+    /// Set the store params used to open SSTables.
     pub fn with_store_params(mut self, store_params: ObjectStoreParams) -> Self {
         self.store_params = Some(store_params);
         self
     }
 
-    /// Inject a cache of opened flushed-generation datasets, making repeated
+    /// Inject a cache of opened SSTable datasets, making repeated
     /// lookups against the same generation a pure `Arc::clone`. Populate it up
     /// front during scan setup via
     /// [`DatasetMemWalExt::prewarm_mem_wal`](crate::dataset::mem_wal::DatasetMemWalExt::prewarm_mem_wal)
     /// so the first gen-key lookup does not pay the dataset open.
-    pub fn with_flushed_cache(mut self, cache: Arc<dyn DatasetCache>) -> Self {
-        self.flushed_cache = Some(cache);
+    pub fn with_sstable_cache(mut self, cache: Arc<dyn DatasetCache>) -> Self {
+        self.sstable_cache = Some(cache);
         self
     }
 
-    /// Inject the warmer fired on first open of a flushed generation.
-    pub fn with_warmer(mut self, warmer: Arc<dyn GenerationWarmer>) -> Self {
+    /// Inject the warmer fired on first open of an SSTable.
+    pub fn with_warmer(mut self, warmer: Arc<dyn SsTableWarmer>) -> Self {
         self.warmer = Some(warmer);
         self
     }
@@ -341,7 +341,7 @@ impl LsmPointLookupPlanner {
     /// For a single-column primary key this probes the in-memory memtables'
     /// BTree index directly — no DataFusion plan — newest generation first, and
     /// returns on the first hit. Only when the lookup must consult an on-disk
-    /// source (a flushed generation or the base table), a memtable lacks a
+    /// source (an SSTable or the base table), a memtable lacks a
     /// BTree on the key, the key is multi-column, or the projection requests
     /// system columns does it fall back to [`Self::plan_lookup`]. The result is
     /// identical to executing `plan_lookup` and taking the first row; the fast
@@ -416,7 +416,7 @@ impl LsmPointLookupPlanner {
                     None => {
                         // Every in-memory memtable missed. If there is no
                         // on-disk source, the key does not exist; otherwise the
-                        // plan path consults the base table / flushed gens.
+                        // plan path consults the base table / SSTables.
                         if !self.collector.has_on_disk_sources() {
                             return Ok(None);
                         }
@@ -660,12 +660,12 @@ impl LsmPointLookupPlanner {
                 // (E0275 downstream). Same for the other arms below.
                 Box::pin(scanner.create_plan()).await?
             }
-            LsmDataSource::FlushedMemTable { path, .. } => {
-                let dataset = open_flushed_dataset(
+            LsmDataSource::SsTable { path, .. } => {
+                let dataset = open_sstable(
                     path,
                     self.session.as_ref(),
                     self.store_params.as_ref(),
-                    self.flushed_cache.as_ref(),
+                    self.sstable_cache.as_ref(),
                     self.warmer.as_ref(),
                 )
                 .await?;
@@ -1119,7 +1119,7 @@ mod tests {
 
         let shard_snapshot = ShardSnapshot::new(shard_id)
             .with_current_generation(2)
-            .with_flushed_generation(1, "gen_1".to_string());
+            .with_sstable(1, "gen_1".to_string());
 
         // Create collector
         let collector = LsmDataSourceCollector::new(base_dataset, vec![shard_snapshot]);
@@ -1200,10 +1200,10 @@ mod tests {
         let base_path = temp_dir.path().to_str().unwrap();
 
         // No base dataset is created. We still need a base URI so the collector
-        // can resolve flushed-generation paths.
+        // can resolve SSTable paths.
         let base_uri = format!("{}/base", base_path);
 
-        // Create a flushed generation under {base_uri}/_mem_wal/{shard}/gen_1
+        // Create an SSTable under {base_uri}/_mem_wal/{shard}/gen_1
         let shard_id = Uuid::new_v4();
         let gen1_uri = format!("{}/_mem_wal/{}/gen_1", base_uri, shard_id);
         let gen1_batch = create_test_batch(&schema, &[2, 3], "gen1");
@@ -1211,12 +1211,12 @@ mod tests {
 
         let shard_snapshot = ShardSnapshot::new(shard_id)
             .with_current_generation(2)
-            .with_flushed_generation(1, "gen_1".to_string());
+            .with_sstable(1, "gen_1".to_string());
 
         let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![shard_snapshot]);
         let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema);
 
-        // id=3 lives in the flushed generation
+        // id=3 lives in the SSTable
         let pk_values = vec![ScalarValue::Int32(Some(3))];
         let plan = planner.plan_lookup(&pk_values, None).await.unwrap();
 
@@ -1540,10 +1540,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_point_lookup_flushed_memtable_returns_newest_duplicate() {
-        // Regression / invariant pin: when a flushed memtable contains two
+    async fn test_point_lookup_sstable_returns_newest_duplicate() {
+        // Regression / invariant pin: when an SSTable contains two
         // rows for the same PK, the lookup must return the newer one. The
-        // flushed dataset is reverse-written (newest at the smallest
+        // SSTable dataset is reverse-written (newest at the smallest
         // physical position), so we simulate that here by writing the
         // dataset with the new row first. The point-lookup plan today
         // returns the first match (smallest `_rowid`) under reverse-write,
@@ -1564,7 +1564,7 @@ mod tests {
 
         let shard_snapshot = ShardSnapshot::new(shard_id)
             .with_current_generation(2)
-            .with_flushed_generation(1, "gen_1".to_string());
+            .with_sstable(1, "gen_1".to_string());
 
         let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![shard_snapshot]);
         let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema);
@@ -1584,7 +1584,7 @@ mod tests {
         assert_eq!(
             name_arr.value(0),
             "new_1",
-            "flushed-arm lookup must return the row at the smallest _rowid (newest under reverse-write)"
+            "SSTable-arm lookup must return the row at the smallest _rowid (newest under reverse-write)"
         );
     }
 

@@ -1228,8 +1228,10 @@ fn index_metadata_to_segment(metadata: &IndexMetadata) -> Result<IndexSegment> {
     Ok(IndexSegment::new(
         metadata.uuid,
         fragment_bitmap,
+        metadata.fields.iter().copied(),
         index_details,
         metadata.index_version,
+        metadata.dataset_version,
     ))
 }
 
