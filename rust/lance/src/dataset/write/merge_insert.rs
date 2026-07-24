@@ -12029,9 +12029,18 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
             .take_blobs_by_indices(&[0, 1, 2], "blobs")
             .await
             .unwrap();
-        assert_eq!(blobs[0].read().await.unwrap().as_ref(), b"foo");
-        assert_eq!(blobs[1].read().await.unwrap().as_ref(), b"baz");
-        assert_eq!(blobs[2].read().await.unwrap().as_ref(), b"qux");
+        assert_eq!(
+            blobs[0].as_ref().unwrap().read().await.unwrap().as_ref(),
+            b"foo"
+        );
+        assert_eq!(
+            blobs[1].as_ref().unwrap().read().await.unwrap().as_ref(),
+            b"baz"
+        );
+        assert_eq!(
+            blobs[2].as_ref().unwrap().read().await.unwrap().as_ref(),
+            b"qux"
+        );
     }
 
     #[tokio::test]
@@ -12095,8 +12104,17 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
             .take_blobs_by_indices(&[0, 1, 2], "blobs")
             .await
             .unwrap();
-        assert_eq!(blobs[0].read().await.unwrap().as_ref(), b"foo");
-        assert_eq!(blobs[1].read().await.unwrap().as_ref(), b"baz");
-        assert_eq!(blobs[2].read().await.unwrap().as_ref(), b"qux");
+        assert_eq!(
+            blobs[0].as_ref().unwrap().read().await.unwrap().as_ref(),
+            b"foo"
+        );
+        assert_eq!(
+            blobs[1].as_ref().unwrap().read().await.unwrap().as_ref(),
+            b"baz"
+        );
+        assert_eq!(
+            blobs[2].as_ref().unwrap().read().await.unwrap().as_ref(),
+            b"qux"
+        );
     }
 }
