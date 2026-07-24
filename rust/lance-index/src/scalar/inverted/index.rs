@@ -912,9 +912,11 @@ impl InvertedIndex {
         // Shared top-k floor across this query's partitions. Seeded to -inf so
         // the first real score wins; each partition publishes its local k-th
         // and prunes against the running global k-th (a lower bound on the true
-        // global k-th - see `Wand::shared_threshold`).
+        // global k-th - see `Wand::shared_threshold`). Only sound for the
+        // impact (global) scorer, whose scores are comparable across
+        // partitions; legacy BM25 scores are partition-local scale, so those
+        // partitions each get a private floor below.
         let impact_shared_threshold = Arc::new(AtomicU32::new(f32::NEG_INFINITY.to_bits()));
-        let legacy_shared_threshold = Arc::new(AtomicU32::new(f32::NEG_INFINITY.to_bits()));
         // Partitions are processed in chunks: each chunk loads its postings
         // and scoring DocSets asynchronously, then ONE cpu-pool task searches
         // the whole chunk sequentially. Chunks pipeline against each other
@@ -933,7 +935,6 @@ impl InvertedIndex {
                 let metrics = metrics.clone();
                 let impact_scorer = impact_scorer.clone();
                 let impact_shared_threshold = impact_shared_threshold.clone();
-                let legacy_shared_threshold = legacy_shared_threshold.clone();
                 async move {
                     // Load the chunk's partitions concurrently; only the
                     // search below is batched onto one cpu task.
@@ -944,7 +945,6 @@ impl InvertedIndex {
                         let metrics = metrics.clone();
                         let impact_scorer = impact_scorer.clone();
                         let impact_shared_threshold = impact_shared_threshold.clone();
-                        let legacy_shared_threshold = legacy_shared_threshold.clone();
                         async move {
                             let loaded_postings = part
                                 .load_posting_lists(
@@ -983,7 +983,7 @@ impl InvertedIndex {
                             let partition_threshold = if use_global_scorer {
                                 impact_shared_threshold
                             } else {
-                                legacy_shared_threshold
+                                Arc::new(AtomicU32::new(f32::NEG_INFINITY.to_bits()))
                             };
                             let wand_scorer = use_global_scorer.then(|| impact_scorer.clone());
                             Result::Ok(Some((
@@ -10858,6 +10858,7 @@ mod tests {
     }
 
     async fn load_global_scoring_test_index(
+        first_partition_has_impacts: bool,
         second_partition_has_impacts: bool,
     ) -> (TempObjDir, Arc<InvertedIndex>) {
         let tmpdir = TempObjDir::default();
@@ -10867,7 +10868,7 @@ mod tests {
             Arc::new(LanceCache::no_cache()),
         ));
         let partition_specs = [
-            (0, 100, 5_000, 101..111, 5_000, true),
+            (0, 100, 5_000, 101..111, 5_000, first_partition_has_impacts),
             (1, 200, 1_000, 201..301, 1, second_partition_has_impacts),
         ];
         for (
@@ -10968,7 +10969,7 @@ mod tests {
         // Partition 0 wins under its local corpus statistics but loses under
         // the global statistics. If its local score escapes into the shared
         // floor, partition 1 will incorrectly prune the real global winner.
-        let (_tmpdir, index) = load_global_scoring_test_index(true).await;
+        let (_tmpdir, index) = load_global_scoring_test_index(true, true).await;
         let first_partition = index
             .partitions
             .iter()
@@ -11071,7 +11072,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_mixed_impact_and_legacy_partitions_use_global_final_scores() {
-        let (_tmpdir, index) = load_global_scoring_test_index(false).await;
+        let (_tmpdir, index) = load_global_scoring_test_index(true, false).await;
 
         let impact_partition = index
             .partitions
@@ -11123,6 +11124,55 @@ mod tests {
         assert!(
             (scores[0] - expected_score).abs() < 1e-6,
             "score: {}, expected: {}",
+            scores[0],
+            expected_score
+        );
+    }
+
+    #[tokio::test]
+    async fn test_two_legacy_partitions_keep_private_thresholds() {
+        // Both partitions are legacy (no impacts), so their BM25 statistics
+        // are partition-local scale. Partition 0's matching doc scores high
+        // under its own statistics while partition 1's matching doc (the true
+        // global winner, row 200) scores low under partition 1's local
+        // statistics. The chunked search runs both partitions sequentially in
+        // one chunk: if partition 0's local k-th score leaked into a shared
+        // threshold, partition 1 would prune row 200 before global rescoring
+        // and return the wrong winner.
+        let (_tmpdir, index) = load_global_scoring_test_index(false, false).await;
+        for partition in index.partitions.iter() {
+            let posting = partition
+                .inverted_list
+                .posting_list(0, false, &NoOpMetricsCollector)
+                .await
+                .unwrap();
+            assert!(!posting.has_impacts());
+        }
+
+        let tokens = Arc::new(Tokens::new(vec!["alpha".to_string()], DocType::Text));
+        let params = Arc::new(FtsSearchParams::new().with_limit(Some(1)));
+        let (row_ids, scores) = index
+            .bm25_search(
+                tokens.clone(),
+                params.clone(),
+                Operator::Or,
+                Arc::new(NoFilter),
+                Arc::new(NoOpMetricsCollector),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(row_ids, vec![200]);
+        assert_eq!(scores.len(), 1);
+        let scorer = index
+            .bm25_base_scorer(tokens.as_ref(), params.as_ref())
+            .await
+            .unwrap();
+        let expected_score = scorer.query_weight("alpha") * scorer.doc_weight(1, 1_000);
+        assert!(
+            (scores[0] - expected_score).abs() < 1e-6,
+            "score: {}, expected global score: {}",
             scores[0],
             expected_score
         );
