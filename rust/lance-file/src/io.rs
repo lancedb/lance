@@ -55,6 +55,10 @@ impl EncodingsIo for LanceEncodingsIo {
     ) -> BoxFuture<'static, lance_core::Result<Vec<bytes::Bytes>>> {
         let mut split_ranges = Vec::new();
         let mut split_indices = Vec::new(); // Track which original range each split came from
+        // Large ranges (above read_chunk_size) will be split into
+        // multiple reads.  Empty ranges will skip the I/O layer
+        // entirely.  If we have either of these we will need to
+        // reassemble our results, inserting empties and merging parts
         let mut needs_reassembly = false;
 
         // Split large ranges into smaller chunks
