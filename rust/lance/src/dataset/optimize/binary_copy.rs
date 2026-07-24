@@ -6,7 +6,7 @@ use crate::Result;
 use crate::dataset::DATA_DIR;
 use crate::dataset::WriteParams;
 use crate::dataset::fragment::write::generate_random_filename;
-use crate::datatypes::Schema;
+use crate::datatypes::{Field, Schema};
 use lance_arrow::DataTypeExt;
 use lance_core::Error;
 use lance_encoding::decoder::{ColumnInfo, PageEncoding, PageInfo as DecPageInfo};
@@ -65,26 +65,82 @@ async fn init_writer_if_necessary(
     Ok(false)
 }
 
-/// v2_0 vs v2_1+ field-to-column index mapping
-///  - v2_1+ stores only leaf columns; non-leaf fields get `-1` in the mapping
-///  - v2_0 includes structural headers as columns; non-leaf fields map to a concrete index
-fn compute_field_column_indices(
+/// The exact field-to-column mapping a file written from the current schema uses.
+///
+/// V2.0 gives ordinary structural fields their own header column, while V2.1+
+/// stores only leaf columns. Packed structs and blobs are opaque single columns
+/// in every non-legacy version.
+#[derive(Debug)]
+pub(super) struct BinaryCopySchemaMapping {
+    pub(super) field_ids: Arc<[i32]>,
+    pub(super) column_indices: Arc<[i32]>,
+    pub(super) physical_column_count: usize,
+    is_non_leaf_column: Arc<[bool]>,
+}
+
+pub(super) fn binary_copy_schema_mapping(
     schema: &Schema,
-    full_field_ids_len: usize,
     version: LanceFileVersion,
-) -> Vec<i32> {
-    let is_structural = version >= LanceFileVersion::V2_1;
-    let mut field_column_indices: Vec<i32> = Vec::with_capacity(full_field_ids_len);
-    let mut curr_col_idx: i32 = 0;
-    for field in schema.fields_pre_order() {
-        if field.is_packed_struct() || field.is_leaf() || !is_structural {
-            field_column_indices.push(curr_col_idx);
-            curr_col_idx += 1;
-        } else {
-            field_column_indices.push(-1);
+) -> BinaryCopySchemaMapping {
+    fn append_field(
+        field: &Field,
+        is_structural: bool,
+        field_ids: &mut Vec<i32>,
+        column_indices: &mut Vec<i32>,
+        is_non_leaf_column: &mut Vec<bool>,
+        next_column_index: &mut i32,
+    ) {
+        let is_opaque = field.is_packed_struct() || field.is_blob();
+        let contributes_column = is_opaque || field.is_leaf() || !is_structural;
+        if contributes_column {
+            field_ids.push(field.id);
+            column_indices.push(*next_column_index);
+            is_non_leaf_column.push(
+                !is_structural
+                    && field.data_type().is_struct()
+                    && !field.is_packed_struct()
+                    && !field.is_blob(),
+            );
+            *next_column_index += 1;
+        }
+
+        if !is_opaque {
+            for child in &field.children {
+                append_field(
+                    child,
+                    is_structural,
+                    field_ids,
+                    column_indices,
+                    is_non_leaf_column,
+                    next_column_index,
+                );
+            }
         }
     }
-    field_column_indices
+
+    let field_count = schema.fields_pre_order().count();
+    let mut field_ids = Vec::with_capacity(field_count);
+    let mut column_indices = Vec::with_capacity(field_count);
+    let mut is_non_leaf_column = Vec::with_capacity(field_count);
+    let mut next_column_index = 0;
+    let is_structural = version >= LanceFileVersion::V2_1;
+    for field in &schema.fields {
+        append_field(
+            field,
+            is_structural,
+            &mut field_ids,
+            &mut column_indices,
+            &mut is_non_leaf_column,
+            &mut next_column_index,
+        );
+    }
+
+    BinaryCopySchemaMapping {
+        physical_column_count: field_ids.len(),
+        field_ids: field_ids.into(),
+        column_indices: column_indices.into(),
+        is_non_leaf_column: is_non_leaf_column.into(),
+    }
 }
 
 /// Finalize the current output file and return it as a single [Fragment].
@@ -99,7 +155,7 @@ fn compute_field_column_indices(
 #[allow(clippy::too_many_arguments)]
 async fn finalize_current_output_file(
     schema: &Schema,
-    full_field_ids: &[i32],
+    schema_mapping: &BinaryCopySchemaMapping,
     current_writer: &mut Option<Box<dyn Writer>>,
     current_filename: &mut Option<String>,
     current_page_table: &[ColumnInfo],
@@ -136,10 +192,9 @@ async fn finalize_current_output_file(
     // Register the newly closed output file as a fragment data file
     let (maj, min) = version.to_numbers();
     let mut fragment = Fragment::new(0);
-    let field_column_indices = compute_field_column_indices(schema, full_field_ids.len(), version);
     let mut data_file = DataFile::new_unstarted(current_filename.take().unwrap(), maj, min);
-    data_file.fields = full_field_ids.to_vec().into();
-    data_file.column_indices = field_column_indices.into();
+    data_file.fields = schema_mapping.field_ids.clone();
+    data_file.column_indices = schema_mapping.column_indices.clone();
     fragment.files.push(data_file);
     fragment.physical_rows = Some(total_rows_in_current as usize);
     Ok(fragment)
@@ -190,7 +245,6 @@ pub async fn rewrite_files_binary_copy(
     // - Optionally carries forward stable row ids and persists them inline in fragment metadata
     // Merge small Lance files into larger ones by page-level binary copy.
     let schema = dataset.schema().clone();
-    let full_field_ids = schema.field_ids();
 
     // The previous checks have ensured that the file versions of all files are consistent.
     let version = LanceFileVersion::try_from_major_minor(
@@ -199,35 +253,9 @@ pub async fn rewrite_files_binary_copy(
     )
     .unwrap()
     .resolve();
-    // v2.0 and v2.1+ handle structural headers differently during file writing:
-    // - v2_0 materializes ALL fields in pre-order traversal (leaf fields + non-leaf struct headers),
-    //   which means the ColumnInfo set includes all fields in pre-order traversal.
-    // - v2_1+ materializes fields that are either leaf columns OR packed structs. Non-leaf structural
-    //   headers (unpacked structs with children) are not stored as columns.
-    //   As a result, the ColumnInfo set contains leaf fields and packed structs.
-    // To correctly align copy layout, we derive `column_count` by version:
-    // - v2_0: use total number of fields in pre-order (leaf + non-leaf headers)
-    // - v2_1+: use only the number of leaf fields plus packed structs
-    let column_count = if version == LanceFileVersion::V2_0 {
-        schema.fields_pre_order().count()
-    } else {
-        schema
-            .fields_pre_order()
-            .filter(|f| f.is_packed_struct() || f.is_leaf())
-            .count()
-    };
-
-    // v2_0 compatibility: build a map to identify non-leaf structural header columns
-    // - In v2_0 these headers exist as columns and must have a single page
-    // - In v2_1+ these headers are not stored as columns and this map is unused
-    let mut is_non_leaf_column: Vec<bool> = vec![false; column_count];
-    if version == LanceFileVersion::V2_0 {
-        for (col_idx, field) in schema.fields_pre_order().enumerate() {
-            // Only mark non-packed Struct fields (lists remain as leaf data carriers)
-            let is_non_leaf = field.data_type().is_struct() && !field.is_packed_struct();
-            is_non_leaf_column[col_idx] = is_non_leaf;
-        }
-    }
+    let schema_mapping = binary_copy_schema_mapping(&schema, version);
+    let column_count = schema_mapping.physical_column_count;
+    let is_non_leaf_column = schema_mapping.is_non_leaf_column.clone();
 
     let mut out: Vec<Fragment> = Vec::new();
     let mut current_writer: Option<Box<dyn Writer>> = None;
@@ -459,7 +487,7 @@ pub async fn rewrite_files_binary_copy(
             if total_rows_in_current >= max_rows_per_file {
                 let fragment_out = finalize_current_output_file(
                     &schema,
-                    &full_field_ids,
+                    &schema_mapping,
                     &mut current_writer,
                     &mut current_filename,
                     &current_page_table,
@@ -492,7 +520,7 @@ pub async fn rewrite_files_binary_copy(
         init_writer_if_necessary(dataset, &mut current_writer, &mut current_filename).await?;
         let frag = finalize_current_output_file(
             &schema,
-            &full_field_ids,
+            &schema_mapping,
             &mut current_writer,
             &mut current_filename,
             &current_page_table,

@@ -126,7 +126,7 @@ pub mod remapping;
 
 use crate::index::frag_reuse::build_new_frag_reuse_index;
 use crate::io::deletion::read_dataset_deletion_file;
-use binary_copy::rewrite_files_binary_copy;
+use binary_copy::{binary_copy_schema_mapping, rewrite_files_binary_copy};
 pub use remapping::{IgnoreRemap, IndexRemapper, IndexRemapperOptions, RemappedIndex};
 
 /// Controls how data is rewritten during compaction.
@@ -494,10 +494,12 @@ impl CompactionOptions {
 /// - Compaction mode is not `Reencode`
 /// - Dataset storage format is non-legacy
 /// - Fragment list is non-empty
+/// - Every fragment has at least one data file
 /// - All data files share identical Lance file versions
 /// - No fragment has a deletion file
-///   TODO: Need to support schema evolution case like add column and drop column
-/// - All data files share identical schema mappings (`fields`, `column_indices`)
+/// - No fragment has data overlays
+/// - Every data file's field-to-column mapping exactly matches the current schema
+/// - Every data file has the current schema's expected physical-column count
 /// - Input data files must not contain extra global buffers (beyond schema / file descriptor)
 async fn can_use_binary_copy(
     dataset: &Dataset,
@@ -556,23 +558,30 @@ async fn can_use_binary_copy_impl(
         .data_storage_format
         .lance_file_version()?
         .resolve();
+    let expected_schema_mapping =
+        binary_copy_schema_mapping(dataset.schema(), storage_file_version);
 
-    if fragments[0].files.is_empty() {
+    if let Some(fragment) = fragments.iter().find(|fragment| fragment.files.is_empty()) {
         log::debug!(
             "Binary copy disabled: fragment {} has no data files",
-            fragments[0].id
+            fragment.id
         );
         return Ok(false);
     }
-    let ref_fields = &fragments[0].files[0].fields;
-    let ref_cols = &fragments[0].files[0].column_indices;
-    let mut is_same_version = true;
 
     for fragment in fragments {
         if fragment.deletion_file.is_some() {
             log::debug!(
                 "Binary copy disabled: fragment {} has a deletion file",
                 fragment.id
+            );
+            return Ok(false);
+        }
+        if !fragment.overlays.is_empty() {
+            log::debug!(
+                "Binary copy disabled: fragment {} has {} data overlays",
+                fragment.id,
+                fragment.overlays.len()
             );
             return Ok(false);
         }
@@ -586,9 +595,23 @@ async fn can_use_binary_copy_impl(
             .is_ok_and(|v| v == storage_file_version);
 
             if !version_ok {
-                is_same_version = false;
+                log::debug!(
+                    "Binary copy disabled: data file '{}' in fragment {} does not use dataset file version {}",
+                    data_file.path,
+                    fragment.id,
+                    storage_file_version
+                );
+                return Ok(false);
             }
-            if data_file.fields != *ref_fields || data_file.column_indices != *ref_cols {
+            if data_file.fields.as_ref() != expected_schema_mapping.field_ids.as_ref()
+                || data_file.column_indices.as_ref()
+                    != expected_schema_mapping.column_indices.as_ref()
+            {
+                log::debug!(
+                    "Binary copy disabled: data file '{}' in fragment {} does not exactly represent the current schema",
+                    data_file.path,
+                    fragment.id
+                );
                 return Ok(false);
             }
 
@@ -609,6 +632,16 @@ async fn can_use_binary_copy_impl(
                 .open_file_with_priority(&full_path, 0, &data_file.file_size_bytes)
                 .await?;
             let file_meta = LFReader::read_all_metadata(&file_scheduler).await?;
+            if file_meta.column_infos.len() != expected_schema_mapping.physical_column_count {
+                log::debug!(
+                    "Binary copy disabled: data file '{}' in fragment {} has {} physical columns, expected {} for the current schema",
+                    data_file.path,
+                    fragment.id,
+                    file_meta.column_infos.len(),
+                    expected_schema_mapping.physical_column_count
+                );
+                return Ok(false);
+            }
             // Binary copy only preserves page and column-buffer bytes. The output file's footer
             // (including global buffers) is re-generated, not copied from inputs.
             //
@@ -622,11 +655,6 @@ async fn can_use_binary_copy_impl(
                 return Ok(false);
             }
         }
-    }
-
-    if !is_same_version {
-        log::debug!("Binary copy disabled: data files use different file versions");
-        return Ok(false);
     }
 
     Ok(true)
