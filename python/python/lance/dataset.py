@@ -3299,12 +3299,17 @@ class LanceDataset(pa.dataset.Dataset):
                     and not pa.types.is_boolean(field_type)
                     and not pa.types.is_string(field_type)
                     and not pa.types.is_large_string(field_type)
+                    and not pa.types.is_binary(field_type)
+                    and not pa.types.is_large_binary(field_type)
                     and not pa.types.is_temporal(field_type)
+                    and not pa.types.is_decimal128(field_type)
+                    and not pa.types.is_decimal256(field_type)
                     and not pa.types.is_fixed_size_binary(field_type)
                 ):
                     raise TypeError(
                         f"BTREE/BITMAP index column {column} must be int",
-                        ", float, bool, str, large_str, fixed-size-binary, or temporal",
+                        ", float, bool, str, large_str, binary, large_binary, "
+                        "decimal, fixed-size-binary, or temporal",
                     )
             elif index_type == "LABEL_LIST":
                 if not (
@@ -3335,10 +3340,6 @@ class LanceDataset(pa.dataset.Dataset):
                         f" or list of strings, or json, but got {value_type}"
                     )
 
-            if pa.types.is_duration(field_type):
-                raise TypeError(
-                    f"Scalar index column {column} cannot currently be a duration"
-                )
             return column, index_type, index_type
         elif isinstance(index_type, IndexConfig):
             logical_index_type = index_type.index_type.upper()
@@ -3493,7 +3494,8 @@ class LanceDataset(pa.dataset.Dataset):
         ----------
         column : str
             The column to be indexed.  Must be a boolean, integer, float,
-            or string column.
+            string, binary, decimal, fixed-size-binary, or
+            supported temporal column.
         index_type : str
             The type of the index.  One of ``"BTREE"``, ``"BITMAP"``,
             ``"LABEL_LIST"``, ``"NGRAM"``, ``"ZONEMAP"``, ``"INVERTED"``,
