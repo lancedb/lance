@@ -1586,8 +1586,8 @@ mod tests {
 
         let struct_block = StructDataBlock {
             children: vec![
-                DataBlock::FixedWidth(id_block.clone()),
-                DataBlock::FixedWidth(value_block.clone()),
+                DataBlock::FixedWidth(id_block),
+                DataBlock::FixedWidth(value_block),
             ],
             block_info: BlockInfo::new(),
             validity: None,
