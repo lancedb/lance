@@ -60,30 +60,35 @@ class InvertedIndexParamsTest {
   }
 
   @Test
-  void formatVersionThreeRequiresBlockSize256() {
-    ScalarIndexParams params =
-        InvertedIndexParams.builder().blockSize(256).formatVersion(3).build();
+  void formatVersionThreeSupportsBothBlockSizes() {
+    for (int blockSize : new int[] {128, 256}) {
+      ScalarIndexParams params =
+          InvertedIndexParams.builder().blockSize(blockSize).formatVersion(3).build();
+      Map<String, Object> json = JsonUtils.fromJson(params.getJsonParams().orElseThrow());
+      assertEquals(blockSize, ((Number) json.get("block_size")).intValue());
+      assertEquals(3, ((Number) json.get("format_version")).intValue());
+    }
 
-    Map<String, Object> json = JsonUtils.fromJson(params.getJsonParams().orElseThrow());
-    assertEquals(256, ((Number) json.get("block_size")).intValue());
-    assertEquals(3, ((Number) json.get("format_version")).intValue());
-
-    assertThrows(
-        IllegalArgumentException.class,
-        () -> InvertedIndexParams.builder().formatVersion(3).build());
     assertThrows(
         IllegalArgumentException.class,
         () -> InvertedIndexParams.builder().blockSize(256).formatVersion(2).build());
   }
 
   @Test
-  void formatVersionFourSupportsBothBlockSizes() {
-    for (int blockSize : new int[] {128, 256}) {
-      ScalarIndexParams params =
-          InvertedIndexParams.builder().blockSize(blockSize).formatVersion(4).build();
-      Map<String, Object> json = JsonUtils.fromJson(params.getJsonParams().orElseThrow());
-      assertEquals(blockSize, ((Number) json.get("block_size")).intValue());
-      assertEquals(4, ((Number) json.get("format_version")).intValue());
-    }
+  void formatVersionFourIsRejected() {
+    assertThrows(
+        IllegalArgumentException.class, () -> InvertedIndexParams.builder().formatVersion(4));
+  }
+
+  @Test
+  void codeAnalyzerRequiresFormatVersionThreeWhenExplicit() {
+    ScalarIndexParams params =
+        InvertedIndexParams.builder().baseTokenizer("code").formatVersion(3).build();
+    Map<String, Object> json = JsonUtils.fromJson(params.getJsonParams().orElseThrow());
+    assertEquals(3, ((Number) json.get("format_version")).intValue());
+
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> InvertedIndexParams.builder().baseTokenizer("code").formatVersion(2).build());
   }
 }

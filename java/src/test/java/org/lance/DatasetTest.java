@@ -80,6 +80,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
@@ -2023,6 +2024,16 @@ public class DatasetTest {
       assertEquals(0L, blobFile.size());
       assertArrayEquals(new byte[0], blobFile.read());
       blobFile.close();
+    }
+  }
+
+  @Test
+  void testTakeNullBlobPreservesSelection(@TempDir Path tempDir) throws Exception {
+    String base = tempDir.resolve("testTakeNullBlobPreservesSelection").toString();
+    try (Dataset ds = TestUtils.createBlobDataset(base, 128, 8)) {
+      List<BlobFile> blobs = ds.takeBlobsByIndices(Collections.singletonList(15L), "blobs");
+      assertEquals(1, blobs.size());
+      assertNull(blobs.get(0));
     }
   }
 

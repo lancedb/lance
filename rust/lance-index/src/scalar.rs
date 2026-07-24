@@ -43,6 +43,7 @@ pub mod ngram;
 pub mod registry;
 #[cfg(feature = "geo")]
 pub mod rtree;
+pub mod seed;
 pub mod zoned;
 pub mod zonemap;
 

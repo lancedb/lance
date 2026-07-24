@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use futures::{FutureExt, TryStreamExt};
 use lance_core::{Error, Result};
+use lance_file::reader::FileReaderOptions;
 use lance_index::{
     INDEX_FILE_NAME, IndexType,
     metrics::NoOpMetricsCollector,
@@ -12,9 +13,14 @@ use lance_index::{
     progress::NoopIndexBuildProgress,
     scalar::{
         CreatedIndex, OldIndexDataFilter, ScalarIndex, index_files_to_table,
-        inverted::InvertedIndex, lance_format::LanceIndexStore, table_files_to_index,
+        inverted::InvertedIndex,
+        lance_format::LanceIndexStore,
+        seed::{FragmentSeed, SEED_META_KEY_PREFIX},
+        table_files_to_index,
     },
 };
+use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+use lance_io::utils::CachedFileSize;
 use lance_select::{RowAddrTreeMap, RowSetOps};
 use lance_table::format::{Fragment, IndexMetadata};
 use roaring::RoaringBitmap;
@@ -26,7 +32,7 @@ use super::vector::ivf::{optimize_vector_indices, select_segment_for_single_reba
 use crate::dataset::Dataset;
 use crate::dataset::index::LanceIndexStoreExt;
 use crate::dataset::rowids::load_row_id_sequences;
-use crate::index::scalar::load_training_data;
+use crate::index::scalar::{IndexDetails, fetch_index_details, load_training_data};
 use crate::index::vector_index_details_default;
 
 #[derive(Debug, Clone)]
@@ -173,6 +179,88 @@ pub async fn build_per_segment_filters(
         filters.push(build_old_data_filter(dataset, &effective, &deleted).await?);
     }
     Ok((effective_union, filters))
+}
+
+/// Attempt to read seed buffers for `column_name` from `fragments`' data files.
+///
+/// Returns `Some(vec)` only if every fragment has a seed entry; returns `None`
+/// if any fragment is missing a seed or its data file cannot be opened.
+/// Index-type-specific validation (e.g. `rows_per_zone` checks) is left to the
+/// caller via [`FragmentSeed::metadata_value`].
+async fn try_harvest_seeds(
+    dataset: &Dataset,
+    fragments: &[Fragment],
+    column_name: &str,
+) -> Result<Option<Vec<FragmentSeed>>> {
+    if fragments.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+
+    let meta_key = format!("{}{}", SEED_META_KEY_PREFIX, column_name);
+    let mut seeds = Vec::with_capacity(fragments.len());
+
+    let scheduler = ScanScheduler::new(
+        dataset.object_store.clone(),
+        SchedulerConfig::max_bandwidth(&dataset.object_store),
+    );
+
+    for fragment in fragments {
+        let Some(data_file) = fragment.files.first() else {
+            return Ok(None);
+        };
+
+        let path = dataset
+            .base
+            .clone()
+            .join(crate::dataset::DATA_DIR)
+            .join(data_file.path.as_str());
+        let Ok(file_scheduler) = scheduler.open_file(&path, &CachedFileSize::unknown()).await
+        else {
+            return Ok(None);
+        };
+
+        let Ok(reader) = lance_file::reader::FileReader::try_open(
+            file_scheduler,
+            None,
+            Default::default(),
+            &dataset.metadata_cache.file_metadata_cache(&path),
+            FileReaderOptions::default(),
+        )
+        .await
+        else {
+            return Ok(None);
+        };
+
+        let Some(meta_value) = reader
+            .metadata()
+            .file_schema
+            .metadata
+            .get(&meta_key)
+            .cloned()
+        else {
+            return Ok(None);
+        };
+
+        // The buf_index is always the portion before the first ':'.
+        let Some(buf_index_str) = meta_value.split(':').next() else {
+            return Ok(None);
+        };
+        let Ok(buf_index) = buf_index_str.parse::<u32>() else {
+            return Ok(None);
+        };
+
+        let Ok(bytes) = reader.read_global_buffer(buf_index).await else {
+            return Ok(None);
+        };
+
+        seeds.push(FragmentSeed {
+            fragment_id: fragment.id,
+            bytes,
+            metadata_value: meta_value,
+        });
+    }
+
+    Ok(Some(seeds))
 }
 
 async fn load_unindexed_training_data(
@@ -356,38 +444,67 @@ async fn merge_scalar_indices<'a>(
         )
         .await?
     } else {
-        let new_data_stream =
-            load_unindexed_training_data(dataset.as_ref(), field_path, &update_criteria, unindexed)
-                .await?;
         let new_store = LanceIndexStore::from_dataset_for_new(&dataset, &new_uuid)?;
 
-        match index_type {
-            IndexType::BTree => {
-                let (_, old_data_filters) =
-                    build_per_segment_filters(dataset.as_ref(), &selected_old_indices).await?;
-                crate::index::scalar::btree::open_and_merge_segments(
-                    dataset.as_ref(),
-                    field_path,
-                    &selected_old_indices,
-                    new_data_stream,
-                    &new_store,
-                    &old_data_filters,
-                )
-                .await?
-            }
-            // NOTE: IndexType::Inverted never reaches here -- it is handled by the
-            // dedicated arm in merge_indices_with_unindexed_frags before this
-            // function is called.
-            _ => {
-                let old_data_filter = build_old_data_filter(
-                    dataset.as_ref(),
-                    &effective_old_frags,
-                    &deleted_old_frags,
-                )
-                .await?;
-                reference_index
-                    .update(new_data_stream, &new_store, old_data_filter)
+        // Try a seed-based update before falling back to a full column scan.
+        // Seeds are only available if every unindexed fragment had a seed buffer
+        // written during its data file write, and the plugin validates that the
+        // seeds are compatible with the current index configuration.
+        let index_details =
+            fetch_index_details(dataset.as_ref(), field_path, reference_idx).await?;
+        let details = IndexDetails(index_details.clone());
+        let plugin = details.get_plugin()?;
+        // Only open data files looking for seeds when the plugin confirms this
+        // index type and configuration can actually produce them.
+        let maybe_created = if plugin.might_use_seeds(&index_details) {
+            if let Some(seeds) = try_harvest_seeds(dataset.as_ref(), unindexed, column_name).await?
+            {
+                plugin
+                    .update_from_seeds(seeds, reference_index.clone(), &index_details, &new_store)
                     .await?
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some(created) = maybe_created {
+            created
+        } else {
+            let new_data_stream = load_unindexed_training_data(
+                dataset.as_ref(),
+                field_path,
+                &update_criteria,
+                unindexed,
+            )
+            .await?;
+
+            match index_type {
+                IndexType::BTree => {
+                    let (_, old_data_filters) =
+                        build_per_segment_filters(dataset.as_ref(), &selected_old_indices).await?;
+                    crate::index::scalar::btree::open_and_merge_segments(
+                        dataset.as_ref(),
+                        field_path,
+                        &selected_old_indices,
+                        new_data_stream,
+                        &new_store,
+                        &old_data_filters,
+                    )
+                    .await?
+                }
+                _ => {
+                    let old_data_filter = build_old_data_filter(
+                        dataset.as_ref(),
+                        &effective_old_frags,
+                        &deleted_old_frags,
+                    )
+                    .await?;
+                    reference_index
+                        .update(new_data_stream, &new_store, old_data_filter)
+                        .await?
+                }
             }
         }
     };

@@ -627,13 +627,13 @@ def test_partly_indexed_prefiltered_search(tmp_path):
     plan = make_vec_search(ds).explain_plan()
     assert "ScalarIndexQuery" in plan
     assert "KNNVectorDistance" not in plan
-    assert "LanceRead" not in plan
+    assert "num_fragments" not in plan  # no scan; the take prints as LanceRead
     assert make_vec_search(ds).to_table().num_rows == 6
 
     plan = make_fts_search(ds).explain_plan()
     assert "ScalarIndexQuery" in plan
     assert "KNNVectorDistance" not in plan
-    assert "LanceRead" not in plan
+    assert "num_fragments" not in plan  # no scan; the take prints as LanceRead
     assert make_fts_search(ds).to_table().num_rows == 6
 
     # Add new data (including 6 more results)
@@ -809,10 +809,17 @@ def test_full_text_search(dataset, with_position, base_tokenizer):
         )
 
 
-def test_code_analyzer_does_not_split_identifiers_by_default(tmp_path):
+@pytest.mark.parametrize("block_size", [128, 256])
+def test_code_analyzer_does_not_split_identifiers_by_default(tmp_path, block_size):
     table = pa.table({"code": ["GetUserName", "GetUserEmail", "user"]})
     ds = lance.write_dataset(table, tmp_path)
-    ds.create_scalar_index("code", index_type="INVERTED", analyzer="code")
+    ds.create_scalar_index(
+        "code",
+        index_type="INVERTED",
+        analyzer="code",
+        block_size=block_size,
+    )
+    assert ds.describe_indices()[0].segments[0].index_version == 3
 
     results = ds.to_table(
         columns=["code"],
@@ -924,6 +931,19 @@ def test_code_analyzer_flags_require_code_analyzer(tmp_path):
             "text",
             index_type="INVERTED",
             split_identifiers=True,
+        )
+
+
+def test_code_analyzer_requires_fts_v3(tmp_path):
+    table = pa.table({"code": ["getUserName"]})
+    ds = lance.write_dataset(table, tmp_path)
+
+    with pytest.raises(ValueError, match="requires FTS format_version=3"):
+        ds.create_scalar_index(
+            "code",
+            index_type="INVERTED",
+            analyzer="code",
+            format_version=2,
         )
 
 
@@ -1273,7 +1293,7 @@ def test_create_scalar_index_fts_block_size(dataset):
     )
     indices = dataset.describe_indices()
     doc_index = next(index for index in indices if index.name == "doc_idx")
-    assert doc_index.segments[0].index_version == 4
+    assert doc_index.segments[0].index_version == 3
 
     row = dataset.take(indices=[0], columns=["doc"])
     query = row.column(0)[0].as_py().split(" ")[0]
@@ -2789,6 +2809,36 @@ def test_json_index():
     assert ds.to_table(filter=filter) == ds.to_table(
         filter=filter, use_scalar_index=False
     )
+
+
+def test_json_index_non_exact_floats():
+    # A JSON-path btree index is trained on the value extracted from the JSON
+    # column, not on the raw column itself, so the index build must sort by
+    # the extracted value rather than assuming the raw column's order matches
+    # it. Without that, range/equality queries silently miss rows whenever
+    # the extracted floats are not exactly representable in float64 (#7485).
+    vals = ['{"latitude": 10.5}', '{"latitude": 40.1}', '{"latitude": -3.2}']
+    tbl = pa.table({"data": pa.array(vals, pa.json_())})
+    ds = lance.write_dataset(tbl, "memory://test")
+    ds.create_scalar_index(
+        "data",
+        IndexConfig(
+            index_type="json",
+            parameters={"target_index_type": "btree", "path": "latitude"},
+        ),
+    )
+
+    for filter in [
+        "json_get_float(data, 'latitude') > 0",
+        "json_get_float(data, 'latitude') >= 10.5",
+        "json_get_float(data, 'latitude') = 40.1",
+        "json_get_float(data, 'latitude') = 10.5",
+        "json_get_float(data, 'latitude') < 100",
+    ]:
+        assert "ScalarIndexQuery" in ds.scanner(filter=filter).explain_plan()
+        assert ds.to_table(filter=filter) == ds.to_table(
+            filter=filter, use_scalar_index=False
+        ), filter
 
 
 def test_null_handling():
@@ -4692,6 +4742,54 @@ def test_zonemap_segment_merge_and_commit_from_python(tmp_path):
     )
 
 
+def test_bloomfilter_segment_merge_and_commit_from_python(tmp_path):
+    ds = generate_multi_fragment_dataset(
+        tmp_path, num_fragments=3, rows_per_fragment=100
+    )
+
+    index_name = "id_bloomfilter_segments"
+    fragment_ids = [fragment.fragment_id for fragment in ds.get_fragments()]
+    staged_segments = [
+        ds.create_index_uncommitted(
+            column="id",
+            index_type="BLOOMFILTER",
+            name=index_name,
+            fragment_ids=[fragment_id],
+        )
+        for fragment_id in fragment_ids
+    ]
+
+    for segment, fragment_id in zip(staged_segments, fragment_ids):
+        assert segment.fragment_ids == {fragment_id}
+        assert any(file.path == "bloomfilter.lance" for file in segment.files)
+
+    merged_segment = ds.merge_existing_index_segments(staged_segments)
+    assert merged_segment.fragment_ids == set(fragment_ids)
+    assert any(file.path == "bloomfilter.lance" for file in merged_segment.files)
+
+    ds = ds.commit_existing_index_segments(index_name, "id", [merged_segment])
+    descriptions = {index.name: index for index in ds.describe_indices()}
+    assert descriptions[index_name].index_type == "BloomFilter"
+    assert len(descriptions[index_name].segments) == 1
+
+    filter_expr = "id = 117"
+    without_index = ds.scanner(
+        filter=filter_expr,
+        columns=["id", "text"],
+        use_scalar_index=False,
+    ).to_table()
+    with_index = ds.scanner(
+        filter=filter_expr,
+        columns=["id", "text"],
+        use_scalar_index=True,
+    ).to_table()
+    assert with_index.to_pydict() == without_index.to_pydict()
+    assert (
+        "ScalarIndexQuery"
+        in ds.scanner(filter=filter_expr, use_scalar_index=True).explain_plan()
+    )
+
+
 def test_merge_index_metadata_btree_soft_break(tmp_path):
     ds = generate_multi_fragment_dataset(
         tmp_path, num_fragments=2, rows_per_fragment=100
@@ -5392,7 +5490,7 @@ def test_json_inverted_match_query(tmp_path):
 
 @pytest.mark.parametrize(
     ("format_version", "expected_format_version"),
-    [(1, 1), (2, 2), (4, 4), ("v1", 1), ("v2", 2), ("v4", 4)],
+    [(1, 1), (2, 2), (3, 3), ("v1", 1), ("v2", 2), ("v3", 3)],
 )
 def test_describe_indices(tmp_path, format_version, expected_format_version):
     data = pa.table(
@@ -5568,8 +5666,8 @@ if expected_format_version is not None:
     [
         ("1", {}, 1),
         ("2", {}, 2),
+        ("3", {}, 3),
         ("3", {"block_size": 256}, 3),
-        ("4", {}, 4),
     ],
 )
 def test_create_inverted_index_uses_env_format_version(
@@ -5596,8 +5694,8 @@ def test_create_inverted_index_explicit_format_version_overrides_env(tmp_path):
     assert result.returncode == 0, result.stderr
 
 
-def test_create_inverted_index_defaults_to_v4_without_env(tmp_path):
-    result = _run_fts_format_creation_probe(tmp_path, None, expected_format_version=4)
+def test_create_text_inverted_index_defaults_to_v2_without_env(tmp_path):
+    result = _run_fts_format_creation_probe(tmp_path, None, expected_format_version=2)
 
     assert result.returncode == 0, result.stderr
 
@@ -5617,8 +5715,8 @@ def test_create_inverted_index_rejects_invalid_format_version(tmp_path):
     with pytest.raises(ValueError, match="unsupported FTS format version"):
         ds.create_scalar_index("text", index_type="INVERTED", format_version="v5")
 
-    with pytest.raises(ValueError, match="format_version=3"):
-        ds.create_scalar_index("text", index_type="INVERTED", format_version="v3")
+    with pytest.raises(ValueError, match="unsupported FTS format version"):
+        ds.create_scalar_index("text", index_type="INVERTED", format_version="v4")
 
 
 def test_vector_filter_fts_search(tmp_path):

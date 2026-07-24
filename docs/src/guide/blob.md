@@ -174,8 +174,9 @@ Choose the read API based on the payload shape you want:
 
 | API | Returns | Use When |
 |---|---|---|
-| `read_blobs` | `List[Tuple[int, bytes]]` | You need complete blob payloads in memory, such as training loaders or batch preprocessing. |
-| `take_blobs` | `List[BlobFile]` | You need file-like objects for streaming, seeking, or partial reads. |
+| `read_blobs` | `List[Tuple[int, Optional[bytes]]]` | You need complete blob payloads in memory, such as training loaders or batch preprocessing. |
+| `read_blob_ranges` | `List[Tuple[int, int, Optional[bytes]]]` | You need selected byte ranges from multiple rows without materializing complete blobs. |
+| `take_blobs` | `List[Optional[BlobFile]]` | You need file-like objects for streaming, seeking, or partial reads. |
 | `scanner(..., blob_handling="all_binary")` | Arrow binary columns | You want blob columns in a scan result or `pyarrow.Table`. |
 
 Do not wrap `take_blobs` in your own thread pool just to call `read()` or
@@ -183,7 +184,8 @@ Do not wrap `take_blobs` in your own thread pool just to call `read()` or
 batched blob reads through Lance's scheduler.
 
 Exactly one selector must be provided to `read_blobs` or `take_blobs`: `ids`,
-`indices`, or `addresses`.
+`indices`, or `addresses`. `read_blob_ranges` accepts the same selector kinds
+through its required `selector` argument.
 
 | Selector | Typical Use | Stability |
 |---|---|---|
@@ -223,6 +225,48 @@ row_addrs = ds.to_table(columns=[], with_row_address=True).column("_rowaddr").to
 rows = ds.read_blobs("blob", addresses=row_addrs[:2])
 ```
 
+Blob selection APIs preserve logical result cardinality. `read_blobs()` and
+`take_blobs()` return one element per selected row, and `read_blob_ranges()`
+returns one element per request. A null blob is returned as `None`; a valid
+empty blob remains a non-null empty payload or zero-length `BlobFile`.
+
+### Read row-specific byte ranges
+
+Use `read_blob_ranges` to read multiple blob-local ranges with one planned API
+call. Each request is a `(row, offset, length)` tuple, and `selector` determines
+whether every `row` is interpreted as a row ID, row address, or dataset index.
+
+```python
+import lance
+
+ds = lance.dataset("./blobs_v22.lance")
+results = ds.read_blob_ranges(
+    "blob",
+    requests=[
+        (7, 0, 1024),
+        (7, 4096, 1024),
+        (12, 0, 0),
+    ],
+    selector="indices",
+)
+
+for request_index, row_address, data in results:
+    if data is None:
+        # The selected blob is null.
+        continue
+    print(request_index, row_address, len(data))
+```
+
+Each result contains the zero-based `request_index`, the resolved physical row
+address, and the requested bytes. `request_index` identifies the original
+request when the same row appears more than once.
+
+A request on a null blob returns `None`, including when its range is empty. An
+empty range on a non-null blob returns `b""` without payload I/O. For every
+request, `offset + length` must fit in an unsigned 64-bit integer. A range on a
+non-null blob must not extend beyond its logical size; blob-local bounds are not
+evaluated for null blobs because they have no logical payload length.
+
 ### Read blob columns as Arrow binary
 
 ```python
@@ -241,8 +285,10 @@ import lance
 ds = lance.dataset("./blobs_v22.lance")
 blobs = ds.take_blobs("blob", indices=[0, 1])
 
-with blobs[0] as f:
-    header = f.read(1024)
+blob = blobs[0]
+if blob is not None:
+    with blob as f:
+        header = f.read(1024)
 ```
 
 ### Example: decode video frames lazily
@@ -253,6 +299,8 @@ import lance
 
 ds = lance.dataset("./videos_v22.lance")
 blob = ds.take_blobs("video", indices=[0])[0]
+if blob is None:
+    raise ValueError("video blob is null")
 
 start_ms, end_ms = 500, 1000
 
@@ -347,7 +395,7 @@ lance.write_dataset(
 
 Not every binary column needs to be a blob column. Plain Arrow `binary`/`large_binary` stores bytes *inline*, interleaved with your other columns, which is simplest and fastest for really small blobs (e.g., thumbnail images). Using a blob column to store the binary payload makes sense when either of these holds:
 
-- **You need partial or streaming reads.** Inline binary is always read in full; there is no way to fetch a byte range without materializing the entire value. Blob columns expose `take_blobs` → `BlobFile` handles that seek and range-read, so you pay only for the bytes you touch.
+- **You need partial or streaming reads.** Inline binary is always read in full; there is no way to fetch a byte range without materializing the entire value. Blob columns expose `read_blob_ranges` for planned row-specific range reads and `take_blobs` → `BlobFile` handles for caller-driven seeks, so you pay only for the bytes you touch.
 - **Your values are large (roughly 1 MB or more on average).** Operations that rewrite entire rows, such as compaction or some updates, must copy the large inline payloads forward into the new version — even when those bytes never changed. The bigger the payload, the more bytes you rewrite per logical change (write amplification). A blob column keeps large payloads in separate `.blob` files that are referenced rather than re-copied, so these operations don't rewrite the heavy bytes.
 
 !!! tip

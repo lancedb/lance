@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::ops::Deref;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::{
@@ -203,6 +202,17 @@ pub static FLAT_SEARCH_PERCENT_THRESHOLD: LazyLock<u64> = LazyLock::new(|| {
         .parse::<u64>()
         .unwrap_or(10)
 });
+
+/// Single shared definition of the flat-search predicate: [`Wand::search`]
+/// and `LazyDocSet::docs_for_wand` MUST agree — a masked query scored
+/// without row_ids silently skips the `mask.selected` filter.
+pub(super) fn should_flat_search(operator: Operator, mask: &RowAddrMask, num_docs: u64) -> bool {
+    operator == Operator::Or
+        && mask.iter_addrs().is_some()
+        && mask.max_len().is_some_and(|num_rows_matched| {
+            num_rows_matched * 100 <= *FLAT_SEARCH_PERCENT_THRESHOLD * num_docs
+        })
+}
 // Bulk MAXSCORE path for top-k disjunctions (Lucene MaxScoreBulkScorer
 // style). Default on: with right-sized partitions it wins by a wide margin
 // (Lucene-parity latency) and its results are score-identical to the classic
@@ -555,7 +565,7 @@ impl BlockMaxWindow {
             };
         }
 
-        // V3 postings score quantized doc lengths, which can be shorter than
+        // 256-document-block postings score quantized document lengths, which can be shorter than
         // the exact lengths used to bake a legacy max score. Without impacts,
         // use the score-independent BM25 ceiling instead of that stale bound.
         if list.block_size == MAX_POSTING_BLOCK_SIZE {
@@ -1752,7 +1762,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
 
     /// Per-search norm→BM25-denominator cache (Lucene's norm cache): the doc
     /// byte-norm slab plus the 256 possible denominator addends. Available
-    /// when the DocSet scores quantized (V3 partitions) and the scorer
+    /// when the DocSet scores quantized (256-document-block partitions) and the scorer
     /// factors `doc_weight` as `(K1+1)*freq/(freq + addend)`. Scoring through
     /// the cache is bit-identical to `scorer.doc_weight`, because both
     /// evaluate the same expressions on the same quantized lengths.
@@ -1804,15 +1814,11 @@ impl<'a, S: Scorer> Wand<'a, S> {
             return Ok(vec![]);
         }
 
-        match (mask.max_len(), mask.iter_addrs()) {
-            (Some(num_rows_matched), Some(row_ids))
-                if self.operator == Operator::Or
-                    && num_rows_matched * 100
-                        <= FLAT_SEARCH_PERCENT_THRESHOLD.deref() * self.docs.len() as u64 =>
-            {
-                return self.flat_search(params, row_ids, metrics);
-            }
-            _ => {}
+        if should_flat_search(self.operator, &mask, self.docs.len() as u64) {
+            let row_ids = mask
+                .iter_addrs()
+                .expect("should_flat_search guarantees an iterable mask");
+            return self.flat_search(params, row_ids, metrics);
         }
 
         // Top-k disjunctions over compressed lists can opt into the bulk
@@ -1993,6 +1999,11 @@ impl<'a, S: Scorer> Wand<'a, S> {
         if limit == 0 {
             return Ok(vec![]);
         }
+        debug_assert!(
+            self.docs.is_empty() || self.docs.supports_reverse_lookup(),
+            "flat_search needs reverse lookups (inv, or sorted legacy row_ids); \
+             the caller picked the wrong DocSet shape for this mask"
+        );
 
         // we need to map the row ids to doc ids, and sort them,
         // because WAND PostingIterator can't go back to the previous doc id.
@@ -6079,7 +6090,7 @@ mod tests {
     }
 
     #[test]
-    fn test_v3_without_impacts_uses_conservative_quantized_score_bound() {
+    fn test_256_document_blocks_without_impacts_use_conservative_quantized_score_bound() {
         let exact_doc_length = 300;
         let quantized_doc_length = super::super::index::dequantize_doc_length(
             super::super::index::quantize_doc_length(exact_doc_length),
@@ -6125,7 +6136,7 @@ mod tests {
     }
 
     #[test]
-    fn test_v3_without_impacts_unknown_scorer_uses_infinite_bound() {
+    fn test_256_document_blocks_without_impacts_unknown_scorer_uses_infinite_bound() {
         let doc_ids = [0_u32];
         let frequencies = [10_u32];
         let blocks = compress_posting_list_with_tail_codec_and_block_size(

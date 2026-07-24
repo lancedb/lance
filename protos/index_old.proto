@@ -24,7 +24,22 @@ message BTreeIndexDetails {}
 message BitmapIndexDetails {}
 message LabelListIndexDetails {}
 message NGramIndexDetails {}
-message ZoneMapIndexDetails {}
+message ZoneMapIndexDetails {
+  // Number of rows per zone. Optional for backwards compatibility: absent on
+  // datasets written before this field was added. When absent, no seed writer
+  // is created for the index.
+  optional uint64 rows_per_zone = 1;
+  // Whether seed-based incremental updates are enabled for this index.
+  // On-disk semantics: absent means seeds are disabled (old datasets written
+  // before this field was added). Present false means explicitly disabled.
+  // Present true means seeds are enabled: the index will embed per-fragment
+  // seed buffers in data files and harvest them during incremental updates
+  // to skip full column scans.
+  // Creation-time default: index creation code sets this to true for
+  // variable-length types (strings, binary) and fixed-width types wider than
+  // 8 bytes, and to false for narrow fixed-width types (e.g. Int64, Float64).
+  optional bool use_seeds = 2;
+}
 message InvertedIndexDetails {
   message CodeTokenizerConfig {
     // Split one lexical identifier into subwords, e.g. getUserName ->

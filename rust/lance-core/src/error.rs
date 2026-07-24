@@ -896,6 +896,17 @@ impl From<datafusion_common::DataFusionError> for Error {
                 Self::not_supported_source(box_error(e))
             }
             datafusion_common::DataFusionError::Execution(..) => Self::execution(e.to_string()),
+            datafusion_common::DataFusionError::Shared(shared) => {
+                // DataFusion shares an error across consumers (e.g. a join's
+                // build-side error fanned out to every probe partition) behind an
+                // `Arc`. If we are the sole owner we can recurse for full fidelity;
+                // otherwise the inner error can't be moved out, so we preserve its
+                // message under the execution category (its concrete type is lost).
+                match std::sync::Arc::try_unwrap(shared) {
+                    Ok(inner) => Self::from(inner),
+                    Err(shared) => Self::execution(shared.to_string()),
+                }
+            }
             datafusion_common::DataFusionError::External(source) => {
                 // Try to downcast to lance_core::Error first
                 match source.downcast::<Self>() {
