@@ -57,7 +57,7 @@ pub use codec::{
 };
 pub use entry_io::{CacheEntryReader, CacheEntryWriter};
 pub use moka::MokaCacheBackend;
-pub use quick::QuickCacheBackend;
+pub use quick::{QuickCacheBackend, recommended_cache_shards};
 
 use std::borrow::Cow;
 use std::sync::{

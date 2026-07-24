@@ -51,6 +51,37 @@ impl std::fmt::Debug for QuickCacheBackend {
 /// refused — so the share must stay well above the largest cache entry.
 const MIN_SHARD_SHARE: usize = 4 << 30;
 
+/// Recommended quick_cache shard count for a byte-weighted cache of
+/// `capacity`: `min(cpus / 2, capacity / 4 GiB)`, rounded down to a power of
+/// two and clamped to `[1, 1024]`.
+///
+/// The cpu term bounds lock contention (more shards than concurrent threads
+/// buys nothing); the capacity term keeps every shard's budget >= 4 GiB so
+/// large entries stay admissible. Rounds DOWN because quick_cache rounds
+/// requested shard counts UP, which would halve the per-shard budget. Also
+/// used by downstream backends (e.g. tiered caches) that build their own
+/// quick_cache instances over the same entry shapes.
+///
+/// ```
+/// use lance_core::cache::recommended_cache_shards;
+/// let shards = recommended_cache_shards(64 << 30);
+/// assert!(shards.is_power_of_two());
+/// assert!((64 << 30) / shards >= 4 << 30);
+/// ```
+pub fn recommended_cache_shards(capacity: usize) -> usize {
+    let by_cpu = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2)
+        / 2;
+    let shards = (capacity / MIN_SHARD_SHARE).min(by_cpu).max(1);
+    let shards = if shards.is_power_of_two() {
+        shards
+    } else {
+        shards.next_power_of_two() / 2
+    };
+    shards.clamp(1, 1024)
+}
+
 /// Assumed average entry size (64 KiB) for sizing hash-table and ghost-key
 /// pre-allocation from the weight budget.
 const ESTIMATED_AVG_ENTRY_BYTES: usize = 64 << 10;
@@ -69,20 +100,7 @@ impl QuickCacheBackend {
     /// assert_eq!(backend.approx_num_entries(), 0);
     /// ```
     pub fn with_capacity(capacity: usize) -> Self {
-        // cpu term bounds lock contention; capacity term keeps each share
-        // >= 4 GiB so large entries stay admissible. Round DOWN to a power of
-        // two — quick_cache rounds UP, which would halve the share.
-        let by_cpu = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(2)
-            / 2;
-        let shards = (capacity / MIN_SHARD_SHARE).min(by_cpu).max(1);
-        let shards = if shards.is_power_of_two() {
-            shards
-        } else {
-            shards.next_power_of_two() / 2
-        };
-        let shards = shards.clamp(1, 1024);
+        let shards = recommended_cache_shards(capacity);
         // Floor stops quick_cache's items-per-shard heuristic from shrinking
         // the shard count; ceiling bounds pre-allocation at TiB scale.
         let estimated_items = (capacity / ESTIMATED_AVG_ENTRY_BYTES).clamp(shards * 32, 1_000_000);
