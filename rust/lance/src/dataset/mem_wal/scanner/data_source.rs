@@ -44,7 +44,7 @@ pub struct FreshTierWatermark {
 pub struct LsmGeneration(u64);
 
 impl LsmGeneration {
-    /// Generation for the base table (merged data).
+    /// Generation for the base table (compacted data).
     pub const BASE_TABLE: Self = Self(0);
 
     /// Create a generation for a MemTable.

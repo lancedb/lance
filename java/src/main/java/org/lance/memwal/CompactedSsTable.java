@@ -17,12 +17,12 @@ import com.google.common.base.MoreObjects;
 import com.google.common.base.Preconditions;
 
 /**
- * Identifies an SSTable that has been merged into the base table.
+ * Points to an SSTable compacted into the base table.
  *
- * <p>Pass a list of these to {@link org.lance.merge.MergeInsertParams#markGenerationsAsMerged} so
- * Lance knows which generations are now part of the base table.
+ * <p>Pass a list of these to {@link org.lance.merge.MergeInsertParams#markSstablesAsCompacted} so
+ * Lance can record compaction progress.
  */
-public class MergedGeneration {
+public class CompactedSsTable {
   private final String shardId;
   private final long generation;
 
@@ -30,19 +30,19 @@ public class MergedGeneration {
    * @param shardId UUID string for the write shard
    * @param generation generation number from {@link ShardSnapshot#sstables()}
    */
-  public MergedGeneration(String shardId, long generation) {
+  public CompactedSsTable(String shardId, long generation) {
     Preconditions.checkNotNull(shardId, "shardId must not be null");
     this.shardId = shardId;
     this.generation = generation;
   }
 
   /** UUID string for the write shard. */
-  public String shardId() {
+  public String getShardId() {
     return shardId;
   }
 
-  /** The merged generation number. */
-  public long generation() {
+  /** The compacted SSTable's generation number. */
+  public long getGeneration() {
     return generation;
   }
 

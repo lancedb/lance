@@ -571,22 +571,21 @@ impl MergeInsertBuilder {
             .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 
-    /// Mark MemWAL generations as merged into the base table.
+    /// Mark MemWAL SSTables as compacted into the base table.
     ///
-    /// Call this when executing a merge_insert that incorporates MemWAL
-    /// flushed generation data. This updates the MemWAL generation tracking
-    /// to prevent duplicate merges.
-    pub fn mark_generations_as_merged<'a>(
+    /// Call this when executing a merge_insert that compacts MemWAL SSTables.
+    /// This updates MemWAL compaction progress to prevent duplicate compactions.
+    pub fn mark_sstables_as_compacted<'a>(
         mut slf: PyRefMut<'a, Self>,
-        generations: Vec<Bound<'a, crate::mem_wal::PyMergedGeneration>>,
+        sstables: Vec<Bound<'a, crate::mem_wal::PyCompactedSsTable>>,
     ) -> PyResult<PyRefMut<'a, Self>> {
-        use lance_index::mem_wal::MergedGeneration;
+        use lance_index::mem_wal::CompactedSsTable;
 
-        let gens: Vec<MergedGeneration> = generations
+        let compacted_sstables: Vec<CompactedSsTable> = sstables
             .iter()
-            .map(|g| g.borrow().to_lance())
+            .map(|sstable| sstable.borrow().to_lance())
             .collect::<PyResult<_>>()?;
-        slf.builder.mark_generations_as_merged(gens);
+        slf.builder.mark_sstables_as_compacted(compacted_sstables);
         Ok(slf)
     }
 }

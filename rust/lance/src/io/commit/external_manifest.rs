@@ -129,6 +129,7 @@ mod test {
     #[derive(Debug)]
     struct StaticExternalManifestStore {
         location: ManifestLocation,
+        verify_store: Option<Arc<dyn OSObjectStore>>,
     }
 
     #[async_trait]
@@ -182,10 +183,15 @@ mod test {
             &self,
             _uri: &str,
             _version: u64,
-            _path: &str,
-            _size: u64,
-            _e_tag: Option<String>,
+            path: &str,
+            size: u64,
+            e_tag: Option<String>,
         ) -> Result<()> {
+            if let Some(store) = &self.verify_store {
+                let final_meta = store.head(&Path::from(path)).await?;
+                assert_eq!(size, final_meta.size);
+                assert_eq!(e_tag, final_meta.e_tag);
+            }
             Ok(())
         }
     }
@@ -297,6 +303,7 @@ mod test {
                     naming_scheme: ManifestNamingScheme::V2,
                     e_tag: None,
                 },
+                verify_store: None,
             }),
         };
 
@@ -330,6 +337,7 @@ mod test {
                     naming_scheme: ManifestNamingScheme::V2,
                     e_tag: Some("stale-etag".to_string()),
                 },
+                verify_store: None,
             }),
         };
 
@@ -339,6 +347,103 @@ mod test {
             .expect_err("stale external manifest e_tag should be rejected");
         assert!(matches!(err, Error::CorruptFile { .. }), "{err:?}");
         assert!(err.to_string().contains("Manifest e_tag mismatch"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn external_manifest_store_put_records_destination_metadata() {
+        let object_store: Arc<dyn OSObjectStore> = Arc::new(InMemory::new());
+        let base_path = Path::from("repro");
+        let staging_path = Path::from("repro/_versions/1.manifest.staging-abcd");
+        object_store
+            .put(&staging_path, PutPayload::from_static(b"manifest body"))
+            .await
+            .expect("seed staging manifest");
+        let staging_meta = object_store
+            .head(&staging_path)
+            .await
+            .expect("read staging metadata");
+
+        let external_store = StaticExternalManifestStore {
+            location: ManifestLocation {
+                version: 1,
+                path: staging_path.clone(),
+                size: Some(staging_meta.size),
+                naming_scheme: ManifestNamingScheme::V2,
+                e_tag: staging_meta.e_tag.clone(),
+            },
+            verify_store: Some(object_store.clone()),
+        };
+        let location = external_store
+            .put(
+                &base_path,
+                1,
+                &staging_path,
+                staging_meta.size,
+                staging_meta.e_tag.clone(),
+                object_store.as_ref(),
+                ManifestNamingScheme::V2,
+            )
+            .await
+            .expect("finalize manifest");
+        let final_meta = object_store
+            .head(&location.path)
+            .await
+            .expect("read finalized metadata");
+
+        assert_ne!(
+            staging_meta.e_tag, final_meta.e_tag,
+            "test store must assign a new ETag to the copied object"
+        );
+        assert_eq!(location.size, Some(final_meta.size));
+        assert_eq!(location.e_tag, final_meta.e_tag);
+    }
+
+    #[tokio::test]
+    async fn external_manifest_handler_finalize_records_destination_metadata() {
+        let object_store = ObjectStore::memory();
+        let base_path = Path::from("repro");
+        let version = 1;
+        let staging_path = Path::from("repro/_versions/1.manifest.staging-abcd");
+        object_store
+            .inner
+            .put(&staging_path, PutPayload::from_static(b"manifest body"))
+            .await
+            .expect("seed staging manifest");
+        let staging_meta = object_store
+            .inner
+            .head(&staging_path)
+            .await
+            .expect("read staging metadata");
+
+        let handler = ExternalManifestCommitHandler {
+            external_manifest_store: Arc::new(StaticExternalManifestStore {
+                location: ManifestLocation {
+                    version,
+                    path: staging_path,
+                    size: Some(staging_meta.size),
+                    naming_scheme: ManifestNamingScheme::V2,
+                    e_tag: staging_meta.e_tag.clone(),
+                },
+                verify_store: Some(object_store.inner.clone()),
+            }),
+        };
+
+        let location = handler
+            .resolve_version_location(&base_path, version, object_store.inner.as_ref())
+            .await
+            .expect("finalize manifest");
+        let final_meta = object_store
+            .inner
+            .head(&location.path)
+            .await
+            .expect("read finalized metadata");
+
+        assert_ne!(
+            staging_meta.e_tag, final_meta.e_tag,
+            "test store must assign a new ETag to the copied object"
+        );
+        assert_eq!(location.size, Some(final_meta.size));
+        assert_eq!(location.e_tag, final_meta.e_tag);
     }
 
     #[tokio::test]

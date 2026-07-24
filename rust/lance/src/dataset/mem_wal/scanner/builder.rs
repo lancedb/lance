@@ -156,8 +156,8 @@ fn key_to_fsl(key: &dyn Array, dim: i32) -> Result<FixedSizeListArray> {
 ///
 /// This scanner provides a unified interface for querying data across multiple
 /// LSM tree levels:
-/// - Base table (merged data, generation = 0)
-/// - SSTables (persisted but not yet merged, generation = 1, 2, ...)
+/// - Base table (compacted data, generation = 0)
+/// - SSTables (persisted but not yet compacted, generation = 1, 2, ...)
 /// - Active MemTable (in-memory buffer, highest generation)
 ///
 /// The scanner automatically handles deduplication by primary key, keeping
@@ -229,7 +229,7 @@ impl LsmScanner {
     ///
     /// # Arguments
     ///
-    /// * `base_table` - The base Lance table (merged data)
+    /// * `base_table` - The base Lance table (compacted data)
     /// * `shard_snapshots` - Snapshots of shard states from MemWAL index
     /// * `pk_columns` - Primary key column names for deduplication
     pub fn new(

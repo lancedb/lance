@@ -10,7 +10,7 @@ dataset via an LSM-tree structure.  Data flows through three levels:
 1. **WAL** – append-only durable log (raw writes)
 2. **Active MemTable** – in-memory write buffer
 3. **SSTable** – Lance files written to object store
-4. **Base table** – canonical Lance dataset files (after merge_insert)
+4. **Base table** – canonical Lance dataset files (after SSTable compaction)
 """
 
 from __future__ import annotations
@@ -22,12 +22,12 @@ from typing import TYPE_CHECKING, Dict, Iterable, List, Mapping, Optional, Union
 import pyarrow as pa
 
 from .lance import (
+    _CompactedSsTable,
     _evaluate_sharding_spec,
     _ExecutionPlan,
     _LsmPointLookupPlanner,
     _LsmScanner,
     _LsmVectorSearchPlanner,
-    _MergedGeneration,
     _ShardSnapshot,
     _ShardWriter,
 )
@@ -40,7 +40,7 @@ __all__ = [
     "ShardingField",
     "ShardingSpec",
     "evaluate_sharding_spec",
-    "MergedGeneration",
+    "CompactedSsTable",
     "ShardSnapshot",
     "ShardWriter",
     "LsmScanner",
@@ -124,18 +124,18 @@ def _sharding_spec_to_dict(spec: Union[ShardingSpec, Mapping[str, object]]) -> d
 
 
 @dataclass
-class MergedGeneration:
-    """Identifies an SSTable (by generation) that has been merged.
+class CompactedSsTable:
+    """Points to an SSTable compacted into the base table.
 
-    Pass a list of these to mark_generations_as_merged
-    so Lance knows which generations are now in the base table.
+    Pass a list of these to mark_sstables_as_compacted
+    so Lance can record compaction progress.
 
     Parameters
     ----------
     shard_id : str
         UUID string for the write shard.
     generation : int
-        Generation number of the merged SSTable (as passed to
+        Generation number of the compacted SSTable (as passed to
         :meth:`ShardSnapshot.with_sstable`).
     """
 
@@ -627,8 +627,8 @@ def _unwrap_shard_id(shard_id: str) -> str:
     return shard_id
 
 
-def _to_raw_merged_generations(
-    generations: Iterable[MergedGeneration],
+def _to_raw_compacted_sstables(
+    sstables: Iterable[CompactedSsTable],
 ) -> list:
-    """Convert Python MergedGeneration list to PyO3 _MergedGeneration list."""
-    return [_MergedGeneration(g.shard_id, g.generation) for g in generations]
+    """Convert Python CompactedSsTable list to PyO3 _CompactedSsTable list."""
+    return [_CompactedSsTable(s.shard_id, s.generation) for s in sstables]

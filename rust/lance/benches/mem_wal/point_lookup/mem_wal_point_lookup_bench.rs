@@ -4,7 +4,7 @@
 //! Standalone CLI benchmark for PK-based point lookups across LSM levels.
 //!
 //! Measures lookup latency against three tiers of the LSM tree:
-//!   - Base table (on-disk, merged data)
+//!   - Base table (on-disk, compacted data)
 //!   - SSTables (on-disk L0)
 //!   - Active MemTable (in-memory write buffer)
 //!

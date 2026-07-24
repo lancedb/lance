@@ -49,7 +49,7 @@ pub struct InMemoryMemTables {
 ///
 /// This collector gathers all data sources that need to be scanned
 /// for a query, including:
-/// - The base table (merged data) — optional; omit for fresh-tier-only scans
+/// - The base table (compacted data) — optional; omit for fresh-tier-only scans
 /// - SSTables from each shard
 /// - In-memory memtables per shard (active + frozen-awaiting-flush)
 ///
@@ -73,7 +73,7 @@ impl LsmDataSourceCollector {
     ///
     /// # Arguments
     ///
-    /// * `base_table` - The base Lance table (merged data)
+    /// * `base_table` - The base Lance table (compacted data)
     /// * `shard_snapshots` - Snapshots of shard states from MemWAL index
     pub fn new(base_table: Arc<Dataset>, shard_snapshots: Vec<ShardSnapshot>) -> Self {
         // Use the dataset's URI as base path for resolving relative paths.

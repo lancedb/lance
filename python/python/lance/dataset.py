@@ -748,23 +748,22 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         reader = _coerce_reader(data_obj, schema)
         return super(MergeInsertBuilder, self).analyze_plan(reader)
 
-    def mark_generations_as_merged(
-        self, generations: "List[mem_wal.MergedGeneration]"
+    def mark_sstables_as_compacted(
+        self, sstables: "List[mem_wal.CompactedSsTable]"
     ) -> "MergeInsertBuilder":
-        """Mark MemWAL generations as merged into the base table.
+        """Mark MemWAL SSTables as compacted into the base table.
 
-        Call this before executing the merge_insert when the source data
-        includes rows from MemWAL flushed generations.
+        Call this before executing merge_insert when it compacts MemWAL SSTables.
 
         Parameters
         ----------
-        generations : list of MergedGeneration
-            Generations to mark as merged.
+        sstables : list of CompactedSsTable
+            SSTables to mark as compacted.
         """
-        from .mem_wal import _to_raw_merged_generations
+        from .mem_wal import _to_raw_compacted_sstables
 
-        raw_gens = _to_raw_merged_generations(generations)
-        super(MergeInsertBuilder, self).mark_generations_as_merged(raw_gens)
+        raw_sstables = _to_raw_compacted_sstables(sstables)
+        super(MergeInsertBuilder, self).mark_sstables_as_compacted(raw_sstables)
         return self
 
 

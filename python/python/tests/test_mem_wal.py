@@ -9,6 +9,7 @@ import lance
 import pyarrow as pa
 import pytest
 from lance.mem_wal import (
+    CompactedSsTable,
     LsmPointLookupPlanner,
     LsmScanner,
     LsmVectorSearchPlanner,
@@ -71,6 +72,25 @@ def _write_sstable(base_path: str, shard_id: str, gen_folder: str, data: pa.Tabl
     gen_path = os.path.join(base_path, "_mem_wal", shard_id, gen_folder)
     lance.write_dataset(data, gen_path, schema=_LOOKUP_SCHEMA)
     _write_pk_sidecar(gen_path, data, ["id"])
+
+
+def test_mark_sstables_as_compacted(tmp_path):
+    ds_path = str(tmp_path / "base")
+    shard_id = str(uuid.uuid4())
+    dataset = lance.write_dataset(
+        _lookup_table([1, 2, 3], "base"), ds_path, schema=_LOOKUP_SCHEMA
+    )
+    dataset.initialize_mem_wal()
+
+    (
+        dataset.merge_insert("id")
+        .when_matched_update_all()
+        .when_not_matched_insert_all()
+        .mark_sstables_as_compacted([CompactedSsTable(shard_id, 1)])
+        .execute(_lookup_table([2, 4], "compacted"))
+    )
+
+    assert dataset.count_rows() == 4
 
 
 def test_point_lookup_with_memtables(tmp_path):
