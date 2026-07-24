@@ -600,7 +600,7 @@ impl FieldEncoder for StructFieldEncoder {
             let mut header = EncodedColumn::default();
             header.final_pages.push(EncodedPage {
                 data: Vec::new(),
-                description: PageEncoding::Legacy(pb::ArrayEncoding {
+                description: PageEncoding::Array(pb::ArrayEncoding {
                     array_encoding: Some(pb::array_encoding::ArrayEncoding::Struct(
                         pb::SimpleStruct {},
                     )),
@@ -632,10 +632,7 @@ mod tests {
     use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, Fields};
 
-    use crate::{
-        testing::{TestCases, check_basic_random, check_round_trip_encoding_of_data},
-        version::LanceFileVersion,
-    };
+    use crate::testing::{TestCases, check_basic_random, check_round_trip_encoding_of_data};
 
     #[test_log::test(tokio::test)]
     async fn test_simple_struct() {
@@ -694,7 +691,7 @@ mod tests {
             Some(rows_validity),
         );
 
-        let test_cases = TestCases::default().with_min_file_version(LanceFileVersion::V2_1);
+        let test_cases = TestCases::default().with_structural_encodings();
 
         check_round_trip_encoding_of_data(vec![Arc::new(rows)], &test_cases, HashMap::new()).await;
     }
@@ -724,7 +721,7 @@ mod tests {
         );
         check_round_trip_encoding_of_data(
             vec![Arc::new(struct_array)],
-            &TestCases::default().with_min_file_version(LanceFileVersion::V2_1),
+            &TestCases::default().with_structural_encodings(),
             HashMap::new(),
         )
         .await;
@@ -755,7 +752,7 @@ mod tests {
         );
         check_round_trip_encoding_of_data(
             vec![Arc::new(struct_array)],
-            &TestCases::default().with_min_file_version(LanceFileVersion::V2_1),
+            &TestCases::default().with_structural_encodings(),
             HashMap::new(),
         )
         .await;
@@ -834,7 +831,7 @@ mod tests {
 
         check_round_trip_encoding_of_data(
             vec![Arc::new(list_array)],
-            &TestCases::default().with_min_file_version(LanceFileVersion::V2_2),
+            &TestCases::default().with_u32_structural_encodings(),
             HashMap::new(),
         )
         .await;
@@ -868,7 +865,7 @@ mod tests {
                 .with_range(1..2)
                 .with_indices(vec![0])
                 .with_indices(vec![1])
-                .with_min_file_version(LanceFileVersion::V2_1),
+                .with_structural_encodings(),
             HashMap::new(),
         )
         .await;
@@ -916,7 +913,7 @@ mod tests {
 
         check_round_trip_encoding_of_data(
             vec![Arc::new(row_array)],
-            &TestCases::default().with_min_file_version(LanceFileVersion::V2_1),
+            &TestCases::default().with_structural_encodings(),
             HashMap::new(),
         )
         .await;

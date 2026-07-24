@@ -24,7 +24,7 @@ use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
 use roaring::RoaringBitmap;
 use rstest::rstest;
 
-use lance_file::writer::{FileWriter, FileWriterOptions};
+use lance_file::writer::FileWriterOptions;
 
 use crate::Dataset;
 use crate::dataset::transaction::{DataOverlayGroup, Operation};
@@ -98,15 +98,20 @@ async fn commit_overlay(
     // For memory:// stores base is empty so the result is the same as before.
     let path = dataset.base.clone().join("data").join(filename.as_str());
     let obj_writer = dataset.object_store.create(&path).await.unwrap();
-    let mut writer =
-        FileWriter::try_new(obj_writer, overlay_schema, FileWriterOptions::default()).unwrap();
-    let (major, minor) = writer.version().to_numbers();
+    let file_version = dataset.manifest.data_storage_format.lance_file_format();
+    let mut writer = lance_file::versions::create_writer(
+        file_version,
+        obj_writer,
+        overlay_schema,
+        FileWriterOptions::default(),
+    )
+    .unwrap();
     for (i, array) in columns.into_iter().enumerate() {
         writer.write_column(i, array).await.unwrap();
     }
     let summary = writer.finish().await.unwrap();
 
-    let mut data_file = DataFile::new_unstarted(filename, major, minor);
+    let mut data_file = DataFile::new_unstarted(filename, file_version);
     data_file.fields = writer
         .field_id_to_column_indices()
         .iter()

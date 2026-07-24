@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use lance_file::version::LanceFileVersion;
+use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_select::RowAddrTreeMap;
 use lance_table::{
@@ -39,7 +39,7 @@ pub struct CommitBuilder<'a> {
     dest: WriteDestination<'a>,
     use_stable_row_ids: Option<bool>,
     enable_v2_manifest_paths: bool,
-    storage_format: Option<LanceFileVersion>,
+    storage_format: Option<ConcreteFileVersion>,
     commit_handler: Option<Arc<dyn CommitHandler>>,
     store_params: Option<ObjectStoreParams>,
     object_store: Option<Arc<ObjectStore>>,
@@ -95,6 +95,11 @@ impl<'a> CommitBuilder<'a> {
     /// All data files must use the same storage format as the existing dataset.
     /// If a different format is passed, an error will be returned.
     pub fn with_storage_format(mut self, storage_format: LanceFileVersion) -> Self {
+        self.storage_format = Some(storage_format.resolve());
+        self
+    }
+
+    pub(crate) fn with_exact_storage_format(mut self, storage_format: ConcreteFileVersion) -> Self {
         self.storage_format = Some(storage_format);
         self
     }
@@ -555,7 +560,8 @@ mod tests {
     use super::*;
 
     fn sample_fragment() -> Fragment {
-        let (major_version, minor_version) = LanceFileVersion::Stable.to_numbers();
+        let (major_version, minor_version) =
+            LanceFileVersion::Stable.resolve().to_data_file_numbers();
         Fragment {
             id: 0,
             files: vec![DataFile {

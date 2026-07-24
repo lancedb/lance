@@ -3646,10 +3646,7 @@ mod tests {
         utils::tempfile::{TempDir, TempStrDir},
     };
     use lance_datagen::{BatchCount, RowCount, array};
-    use lance_file::{
-        version::LanceFileVersion,
-        writer::{FileWriter, FileWriterOptions},
-    };
+    use lance_file::{version::LanceFileVersion, writer::FileWriterOptions};
     use uuid::Uuid;
 
     use super::{
@@ -4864,13 +4861,10 @@ mod tests {
         .unwrap();
 
         let object_writer = dataset.object_store.create(&data_file_path).await.unwrap();
-        let mut file_writer = FileWriter::try_new(
+        let mut file_writer = lance_file::versions::v2_2::create_writer(
             object_writer,
             crate::datatypes::Schema::try_from(append_schema.as_ref()).unwrap(),
-            FileWriterOptions {
-                format_version: Some(LanceFileVersion::V2_2),
-                ..Default::default()
-            },
+            FileWriterOptions::default(),
         )
         .unwrap();
         file_writer.write_batch(&replacement_batch).await.unwrap();
@@ -5050,13 +5044,10 @@ mod tests {
             RecordBatch::try_new(replacement_schema.clone(), vec![info_array]).unwrap();
 
         let object_writer = dataset.object_store.create(&data_file_path).await.unwrap();
-        let mut file_writer = FileWriter::try_new(
+        let mut file_writer = lance_file::versions::v2_2::create_writer(
             object_writer,
             crate::datatypes::Schema::try_from(replacement_schema.as_ref()).unwrap(),
-            FileWriterOptions {
-                format_version: Some(LanceFileVersion::V2_2),
-                ..Default::default()
-            },
+            FileWriterOptions::default(),
         )
         .unwrap();
         file_writer.write_batch(&replacement_batch).await.unwrap();
@@ -5157,13 +5148,10 @@ mod tests {
             RecordBatch::try_new(replacement_schema.clone(), vec![info_array]).unwrap();
 
         let object_writer = dataset.object_store.create(&data_file_path).await.unwrap();
-        let mut file_writer = FileWriter::try_new(
+        let mut file_writer = lance_file::versions::v2_2::create_writer(
             object_writer,
             crate::datatypes::Schema::try_from(replacement_schema.as_ref()).unwrap(),
-            FileWriterOptions {
-                format_version: Some(LanceFileVersion::V2_2),
-                ..Default::default()
-            },
+            FileWriterOptions::default(),
         )
         .unwrap();
         file_writer.write_batch(&replacement_batch).await.unwrap();

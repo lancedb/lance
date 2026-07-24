@@ -18,7 +18,7 @@ pub use index::{IndexFile, IndexMetadata, index_metadata_codec, list_index_files
 
 pub use manifest::{
     BasePath, DETACHED_VERSION_MASK, DataStorageFormat, Manifest, SelfDescribingFileReader,
-    WriterVersion, is_detached_version,
+    WriterVersion, is_detached_version, populate_manifest_schema_dictionary,
 };
 pub use transaction::Transaction;
 

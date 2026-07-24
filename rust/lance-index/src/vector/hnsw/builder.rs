@@ -1315,11 +1315,9 @@ mod tests {
     use arrow_schema::Schema;
     use lance_arrow::FixedSizeListArrayExt;
     use lance_core::deepsize::DeepSizeOf;
-    use lance_file::previous::{
-        reader::FileReader as PreviousFileReader,
-        writer::{
-            FileWriter as PreviousFileWriter, FileWriterOptions as PreviousFileWriterOptions,
-        },
+    use lance_file::versions::v1::{
+        reader::FileReader as V1FileReader,
+        writer::{FileWriter as V1FileWriter, FileWriterOptions as V1FileWriterOptions},
     };
     use lance_io::object_store::ObjectStore;
     use lance_linalg::distance::DistanceType;
@@ -1366,10 +1364,10 @@ mod tests {
             DISTS_FIELD.clone(),
         ]);
         let schema = lance_core::datatypes::Schema::try_from(&schema).unwrap();
-        let mut writer = PreviousFileWriter::<ManifestDescribing>::with_object_writer(
+        let mut writer = V1FileWriter::<ManifestDescribing>::with_object_writer(
             writer,
             schema,
-            &PreviousFileWriterOptions::default(),
+            &V1FileWriterOptions::default(),
         )
         .unwrap();
         let batch = builder.to_batch().unwrap();
@@ -1377,7 +1375,7 @@ mod tests {
         writer.write(&[batch]).await.unwrap();
         writer.finish_with_metadata(&metadata).await.unwrap();
 
-        let reader = PreviousFileReader::try_new_self_described(&object_store, &path, None)
+        let reader = V1FileReader::try_new_self_described(&object_store, &path, None)
             .await
             .unwrap();
         let batch = reader
@@ -1427,10 +1425,10 @@ mod tests {
             DISTS_FIELD.clone(),
         ]);
         let schema = lance_core::datatypes::Schema::try_from(&schema).unwrap();
-        let mut writer = PreviousFileWriter::<ManifestDescribing>::with_object_writer(
+        let mut writer = V1FileWriter::<ManifestDescribing>::with_object_writer(
             writer,
             schema,
-            &PreviousFileWriterOptions::default(),
+            &V1FileWriterOptions::default(),
         )
         .unwrap();
         let batch = builder.to_batch().unwrap();
@@ -1438,7 +1436,7 @@ mod tests {
         writer.write(&[batch]).await.unwrap();
         writer.finish_with_metadata(&metadata).await.unwrap();
 
-        let reader = PreviousFileReader::try_new_self_described(&object_store, &path, None)
+        let reader = V1FileReader::try_new_self_described(&object_store, &path, None)
             .await
             .unwrap();
         let batch = reader

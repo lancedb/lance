@@ -23,6 +23,7 @@ use jni::{
 use lance::io::ObjectStore;
 use lance_file::{
     version::LanceFileVersion,
+    versions as file_versions,
     writer::{FileWriter, FileWriterOptions},
 };
 use lance_io::object_store::{ObjectStoreParams, ObjectStoreRegistry};
@@ -108,15 +109,12 @@ fn inner_open<'local>(
         let obj_store = Arc::new(obj_store);
         let obj_writer = obj_store.create(&path).await?;
 
-        Result::Ok(FileWriter::new_lazy(
-            obj_writer,
-            FileWriterOptions {
-                format_version: data_storage_version_opt
-                    .map(|v| v.parse::<LanceFileVersion>())
-                    .transpose()?,
-                ..Default::default()
-            },
-        ))
+        let version = data_storage_version_opt
+            .map(|value| value.parse::<LanceFileVersion>())
+            .transpose()?
+            .unwrap_or_default()
+            .resolve();
+        file_versions::create_lazy_writer(version, obj_writer, FileWriterOptions::default())
     })?;
 
     let writer = BlockingFileWriter::create(writer);

@@ -4,9 +4,10 @@
 use async_trait::async_trait;
 use chrono::prelude::*;
 use lance_core::deepsize::DeepSizeOf;
-use lance_file::datatypes::{Fields, FieldsWithMeta, populate_schema_dictionary};
-use lance_file::previous::reader::FileReader as PreviousFileReader;
-use lance_file::version::{LEGACY_FORMAT_VERSION, LanceFileVersion};
+use lance_file::datatypes::{Fields, FieldsWithMeta};
+use lance_file::version::{ConcreteFileVersion, stable_file_version};
+use lance_file::versions::v1::encoding::populate_schema_dictionaries;
+use lance_file::versions::v1::reader::FileReader as V1FileReader;
 use lance_io::traits::{ProtoStruct, Reader};
 use object_store::path::Path;
 use prost::Message;
@@ -501,10 +502,6 @@ impl Manifest {
         pb_manifest.encode_to_vec()
     }
 
-    pub fn should_use_legacy_format(&self) -> bool {
-        self.data_storage_format.version == LEGACY_FORMAT_VERSION
-    }
-
     /// Get the summary information of a manifest.
     ///
     /// This function calculates various statistics about the manifest, including:
@@ -550,6 +547,27 @@ impl Manifest {
 
         summary
     }
+}
+
+/// Populate dictionary values stored outside a v1 manifest.
+///
+/// Current manifests carry dictionary values in the schema and require no work.
+/// Keeping this decision here prevents dataset readers from reconstructing
+/// manifest-format behavior from the data-file version.
+pub async fn populate_manifest_schema_dictionary(
+    manifest: &mut Manifest,
+    reader: &dyn Reader,
+) -> Result<()> {
+    match manifest.data_storage_format.version {
+        ConcreteFileVersion::V1 => {
+            populate_schema_dictionaries(&mut manifest.schema, reader).await?;
+        }
+        ConcreteFileVersion::V2_0
+        | ConcreteFileVersion::V2_1
+        | ConcreteFileVersion::V2_2
+        | ConcreteFileVersion::V2_3 => {}
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -606,36 +624,39 @@ pub struct WriterVersion {
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct DataStorageFormat {
     pub file_format: String,
-    pub version: String,
+    pub version: ConcreteFileVersion,
 }
 
 const LANCE_FORMAT_NAME: &str = "lance";
 
 impl DataStorageFormat {
-    pub fn new(version: LanceFileVersion) -> Self {
+    pub fn new(version: ConcreteFileVersion) -> Self {
         Self {
             file_format: LANCE_FORMAT_NAME.to_string(),
-            version: version.resolve().to_string(),
+            version,
         }
     }
 
-    pub fn lance_file_version(&self) -> Result<LanceFileVersion> {
-        self.version.parse::<LanceFileVersion>()
+    /// Return the exact file format version persisted by this manifest.
+    pub fn lance_file_format(&self) -> ConcreteFileVersion {
+        self.version
     }
 }
 
 impl Default for DataStorageFormat {
     fn default() -> Self {
-        Self::new(LanceFileVersion::default())
+        Self::new(stable_file_version())
     }
 }
 
-impl From<pb::manifest::DataStorageFormat> for DataStorageFormat {
-    fn from(pb: pb::manifest::DataStorageFormat) -> Self {
-        Self {
+impl TryFrom<pb::manifest::DataStorageFormat> for DataStorageFormat {
+    type Error = Error;
+
+    fn try_from(pb: pb::manifest::DataStorageFormat) -> Result<Self> {
+        Ok(Self {
             file_format: pb.file_format,
-            version: pb.version,
-        }
+            version: ConcreteFileVersion::from_manifest_string(&pb.version)?,
+        })
     }
 }
 
@@ -891,13 +912,13 @@ impl TryFrom<pb::Manifest> for Manifest {
                 } else {
                     // No fragments to inspect, best we can do is look at writer flags
                     if has_deprecated_v2_feature_flag(p.writer_feature_flags) {
-                        DataStorageFormat::new(LanceFileVersion::Stable)
+                        DataStorageFormat::new(stable_file_version())
                     } else {
-                        DataStorageFormat::new(LanceFileVersion::Legacy)
+                        DataStorageFormat::new(ConcreteFileVersion::V1)
                     }
                 }
             }
-            Some(format) => DataStorageFormat::from(format),
+            Some(format) => DataStorageFormat::try_from(format)?,
         };
 
         let schema = Schema::try_from(fields_with_meta)?;
@@ -980,7 +1001,11 @@ impl From<&Manifest> for pb::Manifest {
             next_row_id: m.next_row_id,
             data_format: Some(pb::manifest::DataStorageFormat {
                 file_format: m.data_storage_format.file_format.clone(),
-                version: m.data_storage_format.version.clone(),
+                version: m
+                    .data_storage_format
+                    .version
+                    .to_manifest_string()
+                    .to_string(),
             }),
             config: m.config.clone(),
             base_paths: m
@@ -1028,7 +1053,7 @@ pub trait SelfDescribingFileReader {
 }
 
 #[async_trait]
-impl SelfDescribingFileReader for PreviousFileReader {
+impl SelfDescribingFileReader for V1FileReader {
     async fn try_new_self_described_from_reader(
         reader: Arc<dyn Reader>,
         cache: Option<&LanceCache>,
@@ -1039,9 +1064,7 @@ impl SelfDescribingFileReader for PreviousFileReader {
             reader.path(),
         )))?;
         let mut manifest: Manifest = read_struct(reader.as_ref(), manifest_position).await?;
-        if manifest.should_use_legacy_format() {
-            populate_schema_dictionary(&mut manifest.schema, reader.as_ref()).await?;
-        }
+        populate_manifest_schema_dictionary(&mut manifest, reader.as_ref()).await?;
         let schema = manifest.schema;
         let max_field_id = schema.max_field_id().unwrap_or_default();
         Self::try_new_from_reader(
@@ -1060,6 +1083,7 @@ impl SelfDescribingFileReader for PreviousFileReader {
 
 #[cfg(test)]
 mod tests {
+    use crate::feature_flags::FLAG_USE_V2_FORMAT_DEPRECATED;
     use crate::format::{DataFile, DeletionFile, DeletionFileType};
     use std::num::NonZero;
 
@@ -1067,6 +1091,101 @@ mod tests {
 
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
     use lance_core::datatypes::Field;
+
+    #[test]
+    fn old_empty_manifest_recovers_v1_or_current_stable() {
+        let old_manifest = pb::Manifest {
+            data_format: None,
+            ..Default::default()
+        };
+        let recovered_v1 = Manifest::try_from(old_manifest.clone()).unwrap();
+        assert_eq!(
+            recovered_v1.data_storage_format.lance_file_format(),
+            ConcreteFileVersion::V1
+        );
+
+        let recovered_stable = Manifest::try_from(pb::Manifest {
+            writer_feature_flags: FLAG_USE_V2_FORMAT_DEPRECATED,
+            ..old_manifest
+        })
+        .unwrap();
+        assert_eq!(
+            recovered_stable.data_storage_format.lance_file_format(),
+            stable_file_version()
+        );
+    }
+
+    #[test]
+    fn manifest_persistence_rejects_selectors_and_public_aliases() {
+        for version in ["stable", "next", "legacy", "0.3"] {
+            let manifest = pb::Manifest {
+                data_format: Some(pb::manifest::DataStorageFormat {
+                    file_format: LANCE_FORMAT_NAME.to_string(),
+                    version: version.to_string(),
+                }),
+                ..Default::default()
+            };
+            assert!(Manifest::try_from(manifest).is_err(), "accepted {version}");
+        }
+    }
+
+    #[test]
+    fn manifest_codec_writes_canonical_exact_string() {
+        let manifest = Manifest::new(
+            Schema::default(),
+            Arc::new(Vec::new()),
+            DataStorageFormat::new(ConcreteFileVersion::V2_0),
+            HashMap::new(),
+        );
+        let encoded = pb::Manifest::from(&manifest);
+        assert_eq!(encoded.data_format.unwrap().version, "2.0");
+    }
+
+    #[test]
+    fn missing_format_infers_exact_version_and_rejects_mixed_files() {
+        let v2_0 = Fragment::new(0).with_file(
+            "v2_0.lance",
+            vec![0],
+            vec![0],
+            ConcreteFileVersion::V2_0,
+            None,
+        );
+        let manifest = Manifest::new(
+            Schema::default(),
+            Arc::new(vec![v2_0.clone()]),
+            DataStorageFormat::new(ConcreteFileVersion::V1),
+            HashMap::new(),
+        );
+        let mut encoded = pb::Manifest::from(&manifest);
+        encoded.data_format = None;
+        let recovered = Manifest::try_from(encoded).unwrap();
+        assert_eq!(
+            recovered.data_storage_format.lance_file_format(),
+            ConcreteFileVersion::V2_0
+        );
+
+        let v2_1 = Fragment::new(1).with_file(
+            "v2_1.lance",
+            vec![0],
+            vec![0],
+            ConcreteFileVersion::V2_1,
+            None,
+        );
+        let mixed_manifest = Manifest::new(
+            Schema::default(),
+            Arc::new(vec![v2_0, v2_1]),
+            DataStorageFormat::new(ConcreteFileVersion::V2_0),
+            HashMap::new(),
+        );
+        let mut encoded = pb::Manifest::from(&mixed_manifest);
+        encoded.data_format = None;
+        let error = Manifest::try_from(encoded).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("All data files must have the same version")
+        );
+    }
 
     #[test]
     fn test_writer_version() {
@@ -1450,14 +1569,13 @@ mod tests {
         assert_eq!(real_data_summary.total_data_file_rows, 425);
         assert_eq!(real_data_summary.total_deletion_files, 0);
 
-        let file_version = LanceFileVersion::default();
         // Step 4: write deletion files and verify summary
         let mut fragment_with_deletion = Fragment::new(0)
             .with_file(
                 "data_with_deletion.lance",
                 vec![0, 1],
                 vec![0, 1],
-                &file_version,
+                stable_file_version(),
                 NonZero::new(1000),
             )
             .with_physical_rows(50);

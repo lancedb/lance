@@ -2116,7 +2116,7 @@ mod tests {
         let mut manifest = Manifest::new(
             Schema::try_from(&arrow_schema).unwrap(),
             Arc::new(vec![]),
-            DataStorageFormat::new(LanceFileVersion::Stable),
+            DataStorageFormat::new(LanceFileVersion::Stable.resolve()),
             HashMap::new(),
         );
 
@@ -2175,7 +2175,7 @@ mod tests {
         let mut manifest = Manifest::new(
             Schema::try_from(&arrow_schema).unwrap(),
             Arc::new(vec![]),
-            DataStorageFormat::new(LanceFileVersion::Stable),
+            DataStorageFormat::new(LanceFileVersion::Stable.resolve()),
             HashMap::new(),
         );
 
