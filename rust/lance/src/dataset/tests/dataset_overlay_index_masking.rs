@@ -1053,8 +1053,8 @@ async fn bench_index_query_overlay_overhead() {
     }
 
     // --- Build 1M-row dataset on local disk --------------------------------
-    // Schema: id(0), age(1), vec(2), text(4) — 4 top-level fields.
-    // Lance field IDs (depth-first): id=0, age=1, vec=2, vec.item=3, text=4.
+    // Schema: id, age, vec, text. Resolve field IDs from the Lance schema instead of
+    // assuming how nested Arrow child fields are numbered.
 
     println!("Building {ROWS}-row dataset at {uri} (this takes ~30 s)...");
 
@@ -1110,6 +1110,7 @@ async fn bench_index_query_overlay_overhead() {
     let mut dataset = Dataset::write(reader, uri, Some(write_params))
         .await
         .unwrap();
+    let text_field_id = dataset.schema().field_id("text").unwrap();
 
     println!("Building BTree index on age...");
     dataset
@@ -1297,8 +1298,8 @@ async fn bench_index_query_overlay_overhead() {
             dataset = commit_overlay(
                 dataset,
                 "text_ol0",
-                0,    // fragment 0
-                &[4], // field 4 = text
+                0, // fragment 0
+                &[text_field_id],
                 OverlayCoverage::dense(RoaringBitmap::from_iter([0u32])),
                 vec![Arc::new(StringArray::from(vec![Some("updated")]))],
             )
