@@ -51,6 +51,7 @@ pub(crate) fn build_prefilter(
     prefilter_source: &PreFilterSource,
     ds: Arc<Dataset>,
     index_meta: &[IndexMetadata],
+    overlay_block: Option<RowAddrMask>,
 ) -> Result<Arc<DatasetPreFilter>> {
     let prefilter_loader = match &prefilter_source {
         PreFilterSource::FilteredRowIds(src_node) => {
@@ -63,11 +64,11 @@ pub(crate) fn build_prefilter(
         }
         PreFilterSource::None => None,
     };
-    Ok(Arc::new(DatasetPreFilter::new(
-        ds,
-        index_meta,
-        prefilter_loader,
-    )))
+    let mut prefilter = DatasetPreFilter::new(ds, index_meta, prefilter_loader);
+    if let Some(overlay_block) = overlay_block {
+        prefilter = prefilter.with_overlay_block(overlay_block);
+    }
+    Ok(Arc::new(prefilter))
 }
 
 // Utility to convert an input (containing row ids) into a prefilter

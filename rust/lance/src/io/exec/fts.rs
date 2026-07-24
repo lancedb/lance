@@ -51,9 +51,10 @@ use lance_index::scalar::inverted::query::{
 use lance_index::scalar::inverted::tokenizer::document_tokenizer::TextTokenizer;
 use lance_index::scalar::inverted::{
     FTS_SCHEMA, InvertedIndex, MemBM25Scorer, SCORE_COL, build_global_bm25_scorer,
-    flat_bm25_search_stream_with_metrics_and_operator,
+    flat_bm25_search_stream_with_metrics_and_operator, flat_phrase_search_stream_with_metrics,
 };
 use lance_index::{prefilter::PreFilter, scalar::inverted::query::BooleanQuery};
+use lance_select::RowAddrMask;
 use lance_tokenizer::{SimpleTokenizer, TextAnalyzer};
 use tracing::instrument;
 
@@ -238,6 +239,8 @@ pub struct MatchQueryExec {
     /// When set, `execute()` skips `load_segments` and searches exactly these
     /// segments.
     preset_segments: Option<Vec<IndexMetadata>>,
+    /// Rows whose indexed values were superseded by newer data overlays.
+    overlay_block: Option<RowAddrMask>,
 
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
@@ -296,6 +299,7 @@ impl MatchQueryExec {
             prefilter_source,
             base_scorer: None,
             preset_segments: None,
+            overlay_block: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -331,6 +335,7 @@ impl MatchQueryExec {
             prefilter_source,
             base_scorer: None,
             preset_segments: Some(segments),
+            overlay_block: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -350,6 +355,12 @@ impl MatchQueryExec {
     /// for constructing one.
     pub fn with_base_scorer(mut self, scorer: Arc<MemBM25Scorer>) -> Self {
         self.base_scorer = Some(scorer);
+        self
+    }
+
+    /// Exclude rows whose indexed text was superseded by a newer data overlay.
+    pub fn with_overlay_block(mut self, overlay_block: RowAddrMask) -> Self {
+        self.overlay_block = Some(overlay_block);
         self
     }
 
@@ -418,6 +429,7 @@ impl ExecutionPlan for MatchQueryExec {
                     prefilter_source: PreFilterSource::None,
                     base_scorer: self.base_scorer.clone(),
                     preset_segments: self.preset_segments.clone(),
+                    overlay_block: self.overlay_block.clone(),
                     properties: self.properties.clone(),
                     metrics: ExecutionPlanMetricsSet::new(),
                 }
@@ -445,6 +457,7 @@ impl ExecutionPlan for MatchQueryExec {
                     prefilter_source,
                     base_scorer: self.base_scorer.clone(),
                     preset_segments: self.preset_segments.clone(),
+                    overlay_block: self.overlay_block.clone(),
                     properties: self.properties.clone(),
                     metrics: ExecutionPlanMetricsSet::new(),
                 }
@@ -470,6 +483,7 @@ impl ExecutionPlan for MatchQueryExec {
         let prefilter_source = self.prefilter_source.clone();
         let preset_base_scorer = self.base_scorer.clone();
         let preset_segments = self.preset_segments.clone();
+        let overlay_block = self.overlay_block.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
         let column = query.column.ok_or(DataFusionError::Execution(format!(
             "column not set for MatchQuery {}",
@@ -490,8 +504,14 @@ impl ExecutionPlan for MatchQueryExec {
             let indices =
                 open_fts_segments(&ds, &column, &segments, &metrics.index_metrics).await?;
 
-            let mut pre_filter =
-                build_prefilter(context.clone(), partition, &prefilter_source, ds, &segments)?;
+            let mut pre_filter = build_prefilter(
+                context.clone(),
+                partition,
+                &prefilter_source,
+                ds,
+                &segments,
+                overlay_block,
+            )?;
             let deleted_fragments =
                 indices
                     .iter()
@@ -877,6 +897,7 @@ impl ExecutionPlan for FlatMatchFilterExec {
 pub struct FlatMatchQueryExec {
     dataset: Arc<Dataset>,
     query: MatchQuery,
+    phrase_slop: Option<u32>,
     params: FtsSearchParams,
     unindexed_input: Arc<dyn ExecutionPlan>,
     /// Optional override for the BM25 scorer normally built locally inside
@@ -892,11 +913,17 @@ pub struct FlatMatchQueryExec {
 
 impl DisplayAs for FlatMatchQueryExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let query_name = if self.phrase_slop.is_some() {
+            "FlatPhraseQuery"
+        } else {
+            "FlatMatchQuery"
+        };
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(
                     f,
-                    "FlatMatchQuery: column={}, query={}",
+                    "{}: column={}, query={}",
+                    query_name,
                     self.query.column.as_deref().unwrap_or_default(),
                     self.query.terms
                 )
@@ -904,7 +931,8 @@ impl DisplayAs for FlatMatchQueryExec {
             DisplayFormatType::TreeRender => {
                 write!(
                     f,
-                    "FlatMatchQuery\ncolumn={}\nquery={}",
+                    "{}\ncolumn={}\nquery={}",
+                    query_name,
                     self.query.column.as_deref().unwrap_or_default(),
                     self.query.terms
                 )
@@ -929,6 +957,7 @@ impl FlatMatchQueryExec {
         Self {
             dataset,
             query,
+            phrase_slop: None,
             params,
             unindexed_input,
             base_scorer: None,
@@ -955,6 +984,7 @@ impl FlatMatchQueryExec {
         Self {
             dataset,
             query,
+            phrase_slop: None,
             params,
             unindexed_input,
             base_scorer: None,
@@ -962,6 +992,23 @@ impl FlatMatchQueryExec {
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
+    }
+
+    /// Create a flat executor that requires the query tokens to match in phrase order.
+    pub fn new_phrase(
+        dataset: Arc<Dataset>,
+        query: PhraseQuery,
+        mut params: FtsSearchParams,
+        unindexed_input: Arc<dyn ExecutionPlan>,
+    ) -> Self {
+        let slop = query.slop;
+        let match_query = MatchQuery::new(query.terms)
+            .with_column(query.column)
+            .with_operator(lance_index::scalar::inverted::query::Operator::And);
+        params = params.with_phrase_slop(Some(slop));
+        let mut exec = Self::new(dataset, match_query, params, unindexed_input);
+        exec.phrase_slop = Some(slop);
+        exec
     }
 
     /// Override the local BM25 scorer; see [`MatchQueryExec::with_base_scorer`].
@@ -993,7 +1040,11 @@ impl FlatMatchQueryExec {
 
 impl ExecutionPlan for FlatMatchQueryExec {
     fn name(&self) -> &str {
-        "FlatMatchQueryExec"
+        if self.phrase_slop.is_some() {
+            "FlatPhraseQueryExec"
+        } else {
+            "FlatMatchQueryExec"
+        }
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -1021,6 +1072,7 @@ impl ExecutionPlan for FlatMatchQueryExec {
         Ok(Arc::new(Self {
             dataset: self.dataset.clone(),
             query: self.query.clone(),
+            phrase_slop: self.phrase_slop,
             params: self.params.clone(),
             unindexed_input,
             base_scorer: self.base_scorer.clone(),
@@ -1030,13 +1082,14 @@ impl ExecutionPlan for FlatMatchQueryExec {
         }))
     }
 
-    #[instrument(name = "flat_match_query_exec", level = "debug", skip_all)]
+    #[instrument(name = "flat_fts_query_exec", level = "debug", skip_all)]
     fn execute(
         &self,
         partition: usize,
         context: Arc<datafusion::execution::TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let query = self.query.clone();
+        let phrase_slop = self.phrase_slop;
         let ds = self.dataset.clone();
         let preset_base_scorer = self.base_scorer.clone();
         let preset_segments = self.preset_segments.clone();
@@ -1099,17 +1152,34 @@ impl ExecutionPlan for FlatMatchQueryExec {
                 ),
             };
 
-            flat_bm25_search_stream_with_metrics_and_operator(
-                unindexed_input,
-                column,
-                query.terms,
-                tokenizer,
-                base_scorer,
-                target_batch_size,
-                query.operator,
-                Some(elapsed_compute),
-            )
-            .await
+            match phrase_slop {
+                Some(slop) => {
+                    flat_phrase_search_stream_with_metrics(
+                        unindexed_input,
+                        column,
+                        query.terms,
+                        tokenizer,
+                        base_scorer,
+                        target_batch_size,
+                        slop,
+                        Some(elapsed_compute),
+                    )
+                    .await
+                }
+                None => {
+                    flat_bm25_search_stream_with_metrics_and_operator(
+                        unindexed_input,
+                        column,
+                        query.terms,
+                        tokenizer,
+                        base_scorer,
+                        target_batch_size,
+                        query.operator,
+                        Some(elapsed_compute),
+                    )
+                    .await
+                }
+            }
         })
         .try_flatten()
         .map(move |batch| {
@@ -1155,6 +1225,8 @@ pub struct PhraseQueryExec {
     /// Optional pre-resolved segment list. See
     /// [`MatchQueryExec::new_with_segments`].
     preset_segments: Option<Vec<IndexMetadata>>,
+    /// Rows whose indexed values were superseded by newer data overlays.
+    overlay_block: Option<RowAddrMask>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -1204,6 +1276,7 @@ impl PhraseQueryExec {
             prefilter_source,
             base_scorer: None,
             preset_segments: None,
+            overlay_block: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -1232,6 +1305,7 @@ impl PhraseQueryExec {
             prefilter_source,
             base_scorer: None,
             preset_segments: Some(segments),
+            overlay_block: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -1240,6 +1314,12 @@ impl PhraseQueryExec {
     /// Override the local BM25 scorer; see [`MatchQueryExec::with_base_scorer`].
     pub fn with_base_scorer(mut self, scorer: Arc<MemBM25Scorer>) -> Self {
         self.base_scorer = Some(scorer);
+        self
+    }
+
+    /// Exclude rows whose indexed text was superseded by a newer data overlay.
+    pub fn with_overlay_block(mut self, overlay_block: RowAddrMask) -> Self {
+        self.overlay_block = Some(overlay_block);
         self
     }
 
@@ -1301,6 +1381,7 @@ impl ExecutionPlan for PhraseQueryExec {
                 prefilter_source: PreFilterSource::None,
                 base_scorer: self.base_scorer.clone(),
                 preset_segments: self.preset_segments.clone(),
+                overlay_block: self.overlay_block.clone(),
                 properties: self.properties.clone(),
                 metrics: ExecutionPlanMetricsSet::new(),
             },
@@ -1326,6 +1407,7 @@ impl ExecutionPlan for PhraseQueryExec {
                     prefilter_source,
                     base_scorer: self.base_scorer.clone(),
                     preset_segments: self.preset_segments.clone(),
+                    overlay_block: self.overlay_block.clone(),
                     properties: self.properties.clone(),
                     metrics: ExecutionPlanMetricsSet::new(),
                 }
@@ -1351,6 +1433,7 @@ impl ExecutionPlan for PhraseQueryExec {
         let prefilter_source = self.prefilter_source.clone();
         let preset_base_scorer = self.base_scorer.clone();
         let preset_segments = self.preset_segments.clone();
+        let overlay_block = self.overlay_block.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
         let stream = stream::once(async move {
             let _timer = metrics.baseline_metrics.elapsed_compute().timer();
@@ -1371,8 +1454,14 @@ impl ExecutionPlan for PhraseQueryExec {
             let indices =
                 open_fts_segments(&ds, &column, &segments, &metrics.index_metrics).await?;
 
-            let mut pre_filter =
-                build_prefilter(context.clone(), partition, &prefilter_source, ds, &segments)?;
+            let mut pre_filter = build_prefilter(
+                context.clone(),
+                partition,
+                &prefilter_source,
+                ds,
+                &segments,
+                overlay_block,
+            )?;
             let deleted_fragments =
                 indices
                     .iter()

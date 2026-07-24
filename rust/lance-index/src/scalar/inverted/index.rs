@@ -18,7 +18,7 @@ use std::{
 use crate::metrics::NoOpMetricsCollector;
 use crate::prefilter::NoFilter;
 use crate::scalar::registry::{TrainingCriteria, TrainingOrdering};
-use arrow::array::{FixedSizeListBuilder, Float32Builder, Int32Builder};
+use arrow::array::{BooleanBuilder, FixedSizeListBuilder, Float32Builder, Int32Builder};
 use arrow::datatypes::{self, Float32Type, Int32Type, UInt64Type};
 use arrow::{
     array::{
@@ -28,8 +28,8 @@ use arrow::{
 };
 use arrow::{buffer::ScalarBuffer, datatypes::UInt32Type};
 use arrow_array::{
-    Array, ArrayRef, Float32Array, LargeBinaryArray, ListArray, OffsetSizeTrait, RecordBatch,
-    UInt32Array, UInt64Array,
+    Array, ArrayRef, BooleanArray, Float32Array, LargeBinaryArray, ListArray, OffsetSizeTrait,
+    RecordBatch, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
@@ -7004,6 +7004,7 @@ fn do_flat_full_text_search_list<ListOffset: OffsetSizeTrait>(
 const FLAT_ROW_ID_COL_IDX: usize = 0;
 const FLAT_ALL_TOKENS_COL_IDX: usize = 1;
 const FLAT_QUERY_TOKEN_COUNTS_COL_IDX: usize = 2;
+const FLAT_PHRASE_MATCH_COL: &str = "phrase_match";
 
 /// If we accumulate this many bytes we warn the user they probably want to use an FTS index instead.
 const BYTES_ACCUMULATED_WARNING_THRESHOLD: u64 = 1024 * 1024 * 1024; // 1GB
@@ -7026,9 +7027,10 @@ async fn tokenize_and_count(
     tokenizer: Box<dyn LanceTokenizer>,
     query_tokens: Arc<Tokens>,
     doc_col_idx: usize,
+    phrase_slop: Option<u32>,
     elapsed_compute: Option<Time>,
 ) -> DataFusionResult<RecordBatch> {
-    let output_schema = Arc::new(Schema::new(vec![
+    let mut output_fields = vec![
         ROW_ID_FIELD.clone(),
         Field::new("all_tokens", DataType::UInt64, false),
         Field::new(
@@ -7039,9 +7041,15 @@ async fn tokenize_and_count(
             ),
             false,
         ),
-    ]));
+    ];
+    if phrase_slop.is_some() {
+        output_fields.push(Field::new(FLAT_PHRASE_MATCH_COL, DataType::Boolean, false));
+    }
+    let output_schema = Arc::new(Schema::new(output_fields));
     let output_schema_clone = output_schema.clone();
     let query_token_indices = Arc::new(query_token_indices(query_tokens.as_ref()));
+    let query_position_groups =
+        phrase_slop.map(|_| Arc::new(query_position_groups(query_tokens.as_ref())));
     let bytes_accumulated = Arc::new(AtomicU64::new(0));
     let bytes_warning_emitted = Arc::new(AtomicBool::new(false));
 
@@ -7051,6 +7059,7 @@ async fn tokenize_and_count(
             let output_schema = output_schema.clone();
             let query_tokens = query_tokens.clone();
             let query_token_indices = query_token_indices.clone();
+            let query_position_groups = query_position_groups.clone();
             let bytes_accumulated = bytes_accumulated.clone();
             let bytes_warning_emitted = bytes_warning_emitted.clone();
             let elapsed_compute = elapsed_compute.clone();
@@ -7068,28 +7077,61 @@ async fn tokenize_and_count(
                     query_tokens.len() as i32,
                     batch.num_rows(),
                 );
+                let mut phrase_matches = phrase_slop
+                    .map(|_| BooleanBuilder::with_capacity(batch.num_rows()));
                 let mut temp_query_token_counts = Vec::with_capacity(query_tokens.len());
-                let mut count_text = |doc: &str, temp_query_token_counts: &mut Vec<u64>| -> u64 {
+                let mut temp_query_token_positions = phrase_slop
+                    .map(|_| vec![Vec::<u32>::new(); query_tokens.len()]);
+                let mut count_text =
+                    |row_id: u64,
+                     doc: &str,
+                     temp_query_token_counts: &mut Vec<u64>,
+                     temp_query_token_positions: Option<&mut Vec<Vec<u32>>>|
+                     -> DataFusionResult<u64> {
                     let mut stream = tokenizer.token_stream_for_doc(doc);
                     let mut all_tokens = 0;
+                    let mut temp_query_token_positions = temp_query_token_positions;
                     while let Some(token) = stream.next() {
                         all_tokens += 1;
                         if let Some(token_indices) = query_token_indices.get(&token.text) {
+                            let position = if temp_query_token_positions.is_some() {
+                                Some(u32::try_from(token.position).map_err(|_| {
+                                    datafusion_common::DataFusionError::Execution(format!(
+                                        "token position overflow for row_id={row_id}: token_position={}",
+                                        token.position
+                                    ))
+                                })?)
+                            } else {
+                                None
+                            };
                             for token_index in token_indices {
                                 temp_query_token_counts[*token_index] += 1;
+                                if let (Some(positions), Some(position)) =
+                                    (temp_query_token_positions.as_deref_mut(), position)
+                                {
+                                    positions[*token_index].push(position);
+                                }
                             }
                         }
                     }
-                    all_tokens
+                    Ok(all_tokens)
                 };
                 let mut append_counts =
-                    |row_id: u64, all_tokens: u64, temp_query_token_counts: &[u64]| {
+                    |row_id: u64,
+                     all_tokens: u64,
+                     temp_query_token_counts: &[u64],
+                     is_phrase_match: Option<bool>| {
                         row_ids.append_value(row_id);
                         all_token_counts.append_value(all_tokens);
                         for count in temp_query_token_counts.iter().copied() {
                             query_token_counts.values().append_value(count);
                         }
                         query_token_counts.append(true);
+                        if let (Some(builder), Some(is_phrase_match)) =
+                            (phrase_matches.as_mut(), is_phrase_match)
+                        {
+                            builder.append_value(is_phrase_match);
+                        }
                     };
                 match batch.column(doc_col_idx).data_type() {
                     DataType::Utf8 | DataType::LargeUtf8 => {
@@ -7098,36 +7140,101 @@ async fn tokenize_and_count(
                             temp_query_token_counts.clear();
                             temp_query_token_counts
                                 .extend(std::iter::repeat_n(0, query_tokens.len()));
+                            if let Some(positions) = temp_query_token_positions.as_mut() {
+                                positions.iter_mut().for_each(Vec::clear);
+                            }
 
                             let Some(doc) = doc else {
                                 continue;
                             };
 
-                            let all_tokens = count_text(doc, &mut temp_query_token_counts);
+                            let all_tokens = count_text(
+                                *row_id,
+                                doc,
+                                &mut temp_query_token_counts,
+                                temp_query_token_positions.as_mut(),
+                            )?;
                             if all_tokens > 0 {
-                                append_counts(*row_id, all_tokens, &temp_query_token_counts);
+                                let is_phrase_match = phrase_slop.map(|slop| {
+                                    phrase_matches_positions(
+                                        query_tokens.as_ref(),
+                                        query_position_groups
+                                            .as_deref()
+                                            .expect("phrase groups exist when slop is set"),
+                                        temp_query_token_positions
+                                            .as_deref()
+                                            .expect("phrase positions exist when slop is set"),
+                                        slop,
+                                    )
+                                });
+                                append_counts(
+                                    *row_id,
+                                    all_tokens,
+                                    &temp_query_token_counts,
+                                    is_phrase_match,
+                                );
                             }
                         }
                     }
                     DataType::List(_) => {
-                        tokenize_and_count_list::<i32>(
-                            batch.column(doc_col_idx),
-                            row_id_array,
-                            &mut count_text,
-                            &mut append_counts,
-                            &mut temp_query_token_counts,
-                            query_tokens.len(),
-                        )?;
+                        if let Some(slop) = phrase_slop {
+                            tokenize_and_count_phrase_list::<i32>(
+                                batch.column(doc_col_idx),
+                                row_id_array,
+                                &mut count_text,
+                                &mut append_counts,
+                                &mut temp_query_token_counts,
+                                temp_query_token_positions
+                                    .as_mut()
+                                    .expect("phrase positions exist when slop is set"),
+                                query_tokens.as_ref(),
+                                query_position_groups
+                                    .as_deref()
+                                    .expect("phrase groups exist when slop is set"),
+                                slop,
+                            )?;
+                        } else {
+                            tokenize_and_count_list::<i32>(
+                                batch.column(doc_col_idx),
+                                row_id_array,
+                                &mut |doc, counts| count_text(0, doc, counts, None),
+                                &mut |row_id, all_tokens, counts| {
+                                    append_counts(row_id, all_tokens, counts, None)
+                                },
+                                &mut temp_query_token_counts,
+                                query_tokens.len(),
+                            )?;
+                        }
                     }
                     DataType::LargeList(_) => {
-                        tokenize_and_count_list::<i64>(
-                            batch.column(doc_col_idx),
-                            row_id_array,
-                            &mut count_text,
-                            &mut append_counts,
-                            &mut temp_query_token_counts,
-                            query_tokens.len(),
-                        )?;
+                        if let Some(slop) = phrase_slop {
+                            tokenize_and_count_phrase_list::<i64>(
+                                batch.column(doc_col_idx),
+                                row_id_array,
+                                &mut count_text,
+                                &mut append_counts,
+                                &mut temp_query_token_counts,
+                                temp_query_token_positions
+                                    .as_mut()
+                                    .expect("phrase positions exist when slop is set"),
+                                query_tokens.as_ref(),
+                                query_position_groups
+                                    .as_deref()
+                                    .expect("phrase groups exist when slop is set"),
+                                slop,
+                            )?;
+                        } else {
+                            tokenize_and_count_list::<i64>(
+                                batch.column(doc_col_idx),
+                                row_id_array,
+                                &mut |doc, counts| count_text(0, doc, counts, None),
+                                &mut |row_id, all_tokens, counts| {
+                                    append_counts(row_id, all_tokens, counts, None)
+                                },
+                                &mut temp_query_token_counts,
+                                query_tokens.len(),
+                            )?;
+                        }
                     }
                     data_type => {
                         return DataFusionResult::Err(datafusion_common::DataFusionError::Execution(
@@ -7138,13 +7245,17 @@ async fn tokenize_and_count(
                 let row_ids = row_ids.finish();
                 let all_token_counts = all_token_counts.finish();
                 let query_token_counts = query_token_counts.finish();
+                let mut columns = vec![
+                    Arc::new(row_ids) as ArrayRef,
+                    Arc::new(all_token_counts) as ArrayRef,
+                    Arc::new(query_token_counts) as ArrayRef,
+                ];
+                if let Some(mut phrase_matches) = phrase_matches {
+                    columns.push(Arc::new(phrase_matches.finish()) as ArrayRef);
+                }
                 let result_batch = RecordBatch::try_new(
                     output_schema,
-                    vec![
-                        Arc::new(row_ids) as ArrayRef,
-                        Arc::new(all_token_counts) as ArrayRef,
-                        Arc::new(query_token_counts) as ArrayRef,
-                    ],
+                    columns,
                 )?;
                 let bytes_accumulated = bytes_accumulated.fetch_add(result_batch.get_array_memory_size() as u64, Ordering::Relaxed);
                 if bytes_accumulated > BYTES_ACCUMULATED_WARNING_THRESHOLD && !bytes_warning_emitted.swap(true, Ordering::Relaxed) {
@@ -7170,7 +7281,7 @@ async fn tokenize_and_count(
 fn tokenize_and_count_list<ListOffset: OffsetSizeTrait>(
     doc_col: &ArrayRef,
     row_id_array: &arrow_array::PrimitiveArray<UInt64Type>,
-    count_text: &mut impl FnMut(&str, &mut Vec<u64>) -> u64,
+    count_text: &mut impl FnMut(&str, &mut Vec<u64>) -> DataFusionResult<u64>,
     append_counts: &mut impl FnMut(u64, u64, &[u64]),
     temp_query_token_counts: &mut Vec<u64>,
     query_tokens_len: usize,
@@ -7197,11 +7308,82 @@ fn tokenize_and_count_list<ListOffset: OffsetSizeTrait>(
         let elements = doc_array.value(i);
         let mut all_tokens = 0;
         for element in iter_str_array(elements.as_ref()).flatten() {
-            all_tokens += count_text(element, temp_query_token_counts);
+            all_tokens += count_text(element, temp_query_token_counts)?;
         }
 
         if all_tokens > 0 {
             append_counts(row_id_array.value(i), all_tokens, temp_query_token_counts);
+        }
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn tokenize_and_count_phrase_list<ListOffset: OffsetSizeTrait>(
+    doc_col: &ArrayRef,
+    row_id_array: &arrow_array::PrimitiveArray<UInt64Type>,
+    count_text: &mut impl FnMut(
+        u64,
+        &str,
+        &mut Vec<u64>,
+        Option<&mut Vec<Vec<u32>>>,
+    ) -> DataFusionResult<u64>,
+    append_counts: &mut impl FnMut(u64, u64, &[u64], Option<bool>),
+    temp_query_token_counts: &mut Vec<u64>,
+    temp_query_token_positions: &mut Vec<Vec<u32>>,
+    query_tokens: &Tokens,
+    query_position_groups: &[Vec<usize>],
+    slop: u32,
+) -> DataFusionResult<()> {
+    let doc_array = doc_col.as_list::<ListOffset>();
+    match doc_array.value_type() {
+        DataType::Utf8 | DataType::LargeUtf8 => {}
+        data_type => {
+            return Err(datafusion_common::DataFusionError::Execution(format!(
+                "unsupported list item data type {} for flat full text search",
+                data_type
+            )));
+        }
+    }
+
+    for i in 0..row_id_array.len() {
+        if doc_array.is_null(i) {
+            continue;
+        }
+
+        temp_query_token_counts.clear();
+        temp_query_token_counts.extend(std::iter::repeat_n(0, query_tokens.len()));
+        temp_query_token_positions.iter_mut().for_each(Vec::clear);
+
+        let elements = doc_array.value(i);
+        let mut document = String::new();
+        for element in iter_str_array(elements.as_ref()).flatten() {
+            if !document.is_empty() {
+                document.push(' ');
+            }
+            document.push_str(element);
+        }
+
+        let row_id = row_id_array.value(i);
+        let all_tokens = count_text(
+            row_id,
+            &document,
+            temp_query_token_counts,
+            Some(temp_query_token_positions),
+        )?;
+        if all_tokens > 0 {
+            append_counts(
+                row_id,
+                all_tokens,
+                temp_query_token_counts,
+                Some(phrase_matches_positions(
+                    query_tokens,
+                    query_position_groups,
+                    temp_query_token_positions,
+                    slop,
+                )),
+            );
         }
     }
 
@@ -7283,6 +7465,7 @@ fn flat_bm25_score(
     counted_input: &RecordBatch,
     scorer: &MemBM25Scorer,
     operator: Operator,
+    require_phrase_match: bool,
 ) -> Result<RecordBatch> {
     let mut row_ids_builder = UInt64Builder::with_capacity(counted_input.num_rows());
     let mut scores_builder = Float32Builder::with_capacity(counted_input.num_rows());
@@ -7308,6 +7491,19 @@ fn flat_bm25_score(
         .values()
         .iter()
         .copied();
+    let mut phrase_matches_iter = if require_phrase_match {
+        Some(
+            counted_input
+                .column_by_name(FLAT_PHRASE_MATCH_COL)
+                .ok_or_else(|| Error::internal("flat phrase input is missing phrase_match"))?
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| Error::internal("flat phrase_match column is not boolean"))?
+                .iter(),
+        )
+    } else {
+        None
+    };
     for _ in 0..counted_input.num_rows() {
         let num_tokens_in_doc = all_token_counts_iter.next().expect_ok()?;
         let row_id = row_ids_iter.next().expect_ok()?;
@@ -7316,6 +7512,12 @@ fn flat_bm25_score(
             query_token_counts.push(query_token_counts_iter.next().expect_ok()?);
         }
         if num_tokens_in_doc == 0 {
+            continue;
+        }
+        if phrase_matches_iter
+            .as_mut()
+            .is_some_and(|matches| matches.next() != Some(Some(true)))
+        {
             continue;
         }
         if operator == Operator::And
@@ -7362,6 +7564,57 @@ fn query_position_groups(query_tokens: &Tokens) -> Vec<Vec<usize>> {
             .push(idx);
     }
     groups
+}
+
+fn phrase_matches_positions(
+    query_tokens: &Tokens,
+    query_position_groups: &[Vec<usize>],
+    token_positions: &[Vec<u32>],
+    slop: u32,
+) -> bool {
+    let mut reachable = Vec::<i64>::new();
+
+    for (group_idx, group) in query_position_groups.iter().enumerate() {
+        let Some(&first_token_idx) = group.first() else {
+            return false;
+        };
+        let query_position = i64::from(query_tokens.position(first_token_idx));
+        let mut relative_positions = group
+            .iter()
+            .flat_map(|token_idx| token_positions[*token_idx].iter())
+            .map(|position| i64::from(*position) - query_position)
+            .filter(|relative| slop > 0 || *relative >= 0)
+            .collect::<Vec<_>>();
+        relative_positions.sort_unstable();
+        relative_positions.dedup();
+        if relative_positions.is_empty() {
+            return false;
+        }
+
+        if group_idx == 0 {
+            reachable = relative_positions;
+            continue;
+        }
+
+        let slop = i64::from(slop);
+        let mut next_reachable = Vec::with_capacity(relative_positions.len());
+        let mut reachable_idx = 0;
+        for relative in relative_positions {
+            let least_previous = relative - slop;
+            while reachable_idx < reachable.len() && reachable[reachable_idx] < least_previous {
+                reachable_idx += 1;
+            }
+            if reachable_idx < reachable.len() && reachable[reachable_idx] <= relative {
+                next_reachable.push(relative);
+            }
+        }
+        if next_reachable.is_empty() {
+            return false;
+        }
+        reachable = next_reachable;
+    }
+
+    !reachable.is_empty()
 }
 
 #[deprecated(
@@ -7454,6 +7707,61 @@ pub async fn flat_bm25_search_stream_with_metrics_and_operator(
     operator: Operator,
     elapsed_compute: Option<Time>,
 ) -> DataFusionResult<SendableRecordBatchStream> {
+    flat_bm25_search_stream_impl(
+        input,
+        doc_col,
+        query,
+        tokenizer,
+        base_scorer,
+        target_batch_size,
+        operator,
+        None,
+        elapsed_compute,
+    )
+    .await
+}
+
+/// Flat-scan documents, retain exact phrase matches, and score them with BM25.
+///
+/// Phrase matching uses the configured analyzer's logical token positions and is
+/// applied before any caller-level limit.
+#[allow(clippy::too_many_arguments)]
+pub async fn flat_phrase_search_stream_with_metrics(
+    input: SendableRecordBatchStream,
+    doc_col: String,
+    query: String,
+    tokenizer: Box<dyn LanceTokenizer>,
+    base_scorer: Option<MemBM25Scorer>,
+    target_batch_size: usize,
+    slop: u32,
+    elapsed_compute: Option<Time>,
+) -> DataFusionResult<SendableRecordBatchStream> {
+    flat_bm25_search_stream_impl(
+        input,
+        doc_col,
+        query,
+        tokenizer,
+        base_scorer,
+        target_batch_size,
+        Operator::And,
+        Some(slop),
+        elapsed_compute,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn flat_bm25_search_stream_impl(
+    input: SendableRecordBatchStream,
+    doc_col: String,
+    query: String,
+    tokenizer: Box<dyn LanceTokenizer>,
+    base_scorer: Option<MemBM25Scorer>,
+    target_batch_size: usize,
+    operator: Operator,
+    phrase_slop: Option<u32>,
+    elapsed_compute: Option<Time>,
+) -> DataFusionResult<SendableRecordBatchStream> {
     let mut tokenizer = tokenizer;
 
     // Pre-await synchronous work: query tokenization + chunk-stream setup.
@@ -7500,6 +7808,7 @@ pub async fn flat_bm25_search_stream_with_metrics_and_operator(
         tokenizer,
         query_tokens.clone(),
         doc_col_idx,
+        phrase_slop,
         elapsed_compute.clone(),
     )
     .await?;
@@ -7508,7 +7817,13 @@ pub async fn flat_bm25_search_stream_with_metrics_and_operator(
     // All post-await work is synchronous; time the scorer + score + slicing loop together.
     let post_await_start = std::time::Instant::now();
     let scorer = initialize_scorer(base_scorer.as_ref(), query_tokens.as_ref(), &counted_input);
-    let scores = flat_bm25_score(query_tokens.as_ref(), &counted_input, &scorer, operator)?;
+    let scores = flat_bm25_score(
+        query_tokens.as_ref(),
+        &counted_input,
+        &scorer,
+        operator,
+        phrase_slop.is_some(),
+    )?;
 
     // Finally we emit batches according to the target batch size
     let num_out_batches = scores.num_rows().div_ceil(target_batch_size);
@@ -12508,6 +12823,7 @@ mod tests {
             query_tokens.clone(),
             1,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -12632,6 +12948,129 @@ mod tests {
         let row_ids = scored[ROW_ID].as_primitive::<UInt64Type>();
 
         assert_eq!(row_ids.values(), &[0]);
+    }
+
+    async fn flat_phrase_row_ids(
+        docs: ArrayRef,
+        query: &str,
+        slop: u32,
+        tokenizer: Box<dyn LanceTokenizer>,
+    ) -> Vec<u64> {
+        let schema = Arc::new(Schema::new(vec![
+            ROW_ID_FIELD.clone(),
+            Field::new("text", docs.data_type().clone(), true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(
+                    (0..docs.len() as u64).collect::<Vec<_>>(),
+                )) as ArrayRef,
+                docs,
+            ],
+        )
+        .unwrap();
+        let input: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::iter(vec![Ok(batch)]),
+        ));
+
+        let result_stream = flat_phrase_search_stream_with_metrics(
+            input,
+            "text".to_string(),
+            query.to_string(),
+            tokenizer,
+            None,
+            100,
+            slop,
+            None,
+        )
+        .await
+        .unwrap();
+        let batches: Vec<_> = result_stream.try_collect().await.unwrap();
+        let scored = arrow::compute::concat_batches(&FTS_SCHEMA, &batches).unwrap();
+        let mut row_ids = scored[ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .to_vec();
+        row_ids.sort_unstable();
+        row_ids
+    }
+
+    fn simple_text_tokenizer() -> Box<dyn LanceTokenizer> {
+        Box::new(TextTokenizer::new(
+            TextAnalyzer::builder(SimpleTokenizer::default()).build(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn flat_phrase_search_matches_exact_order_and_slop() {
+        let docs = Arc::new(StringArray::from(vec![
+            "alpha beta",
+            "alpha x beta",
+            "beta alpha",
+            "alpha beta beta",
+            "alpha alpha beta",
+        ])) as ArrayRef;
+
+        assert_eq!(
+            flat_phrase_row_ids(docs.clone(), "alpha beta", 0, simple_text_tokenizer()).await,
+            vec![0, 3, 4]
+        );
+        assert_eq!(
+            flat_phrase_row_ids(docs.clone(), "alpha beta", 1, simple_text_tokenizer()).await,
+            vec![0, 1, 3, 4]
+        );
+        assert_eq!(
+            flat_phrase_row_ids(docs, "alpha alpha", 0, simple_text_tokenizer()).await,
+            vec![4]
+        );
+    }
+
+    #[tokio::test]
+    async fn flat_phrase_search_respects_query_position_gaps() {
+        let docs = Arc::new(StringArray::from(vec![
+            "alpha beta",
+            "alpha quick beta",
+            "alpha the beta",
+            "beta alpha",
+        ])) as ArrayRef;
+        let tokenizer: Box<dyn LanceTokenizer> = Box::new(TextTokenizer::new(
+            TextAnalyzer::builder(SimpleTokenizer::default())
+                .filter(StopWordFilter::new(Language::English).unwrap())
+                .build(),
+        ));
+
+        assert_eq!(
+            flat_phrase_row_ids(docs, "alpha the beta", 0, tokenizer).await,
+            vec![1, 2]
+        );
+    }
+
+    #[tokio::test]
+    async fn flat_phrase_search_treats_string_lists_as_row_documents() {
+        let mut docs_builder =
+            GenericListBuilder::<i32, _>::new(GenericStringBuilder::<i32>::new());
+        docs_builder.values().append_value("alpha");
+        docs_builder.values().append_value("beta");
+        docs_builder.append(true);
+        docs_builder.values().append_value("alpha x");
+        docs_builder.values().append_value("beta");
+        docs_builder.append(true);
+        docs_builder.values().append_value("beta");
+        docs_builder.values().append_value("alpha");
+        docs_builder.append(true);
+
+        assert_eq!(
+            flat_phrase_row_ids(
+                Arc::new(docs_builder.finish()) as ArrayRef,
+                "alpha beta",
+                0,
+                simple_text_tokenizer(),
+            )
+            .await,
+            vec![0]
+        );
     }
 
     #[tokio::test]
