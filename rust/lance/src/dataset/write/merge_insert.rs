@@ -325,6 +325,32 @@ pub enum SourceDedupeBehavior {
     FirstSeen,
 }
 
+#[derive(Debug, Clone)]
+struct MergeWriteParams(Arc<WriteParams>);
+
+// WriteParams can contain runtime object-store state and is intentionally not
+// comparable. Plan copies retain the same Arc, so pointer identity distinguishes
+// merge plans configured with different write parameters.
+impl PartialEq for MergeWriteParams {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for MergeWriteParams {}
+
+impl PartialOrd for MergeWriteParams {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(Arc::as_ptr(&self.0).cmp(&Arc::as_ptr(&other.0)))
+    }
+}
+
+impl std::hash::Hash for MergeWriteParams {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        Arc::as_ptr(&self.0).hash(state);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Hash)]
 struct MergeInsertParams {
     // The column(s) to join on
@@ -351,6 +377,7 @@ struct MergeInsertParams {
     source_dedupe_behavior: SourceDedupeBehavior,
     // Number of inner commit retries for manifest version conflicts. Default is 20.
     commit_retries: Option<u32>,
+    write_params: MergeWriteParams,
 }
 
 /// A MergeInsertJob inserts new rows, deletes old rows, and updates existing rows all as
@@ -471,6 +498,7 @@ impl MergeInsertBuilder {
                 use_index: true,
                 source_dedupe_behavior: SourceDedupeBehavior::Fail,
                 commit_retries: None,
+                write_params: MergeWriteParams(Arc::new(WriteParams::default())),
             },
         })
     }
@@ -566,6 +594,17 @@ impl MergeInsertBuilder {
     /// Default: 20
     pub fn commit_retries(&mut self, retries: u32) -> &mut Self {
         self.params.commit_retries = Some(retries);
+        self
+    }
+
+    /// Configure write parameters used when merge insert creates data fragments.
+    ///
+    /// This is useful for configuring Blob V2 writes, such as ingesting
+    /// external blob URIs into Lance-managed storage.
+    pub fn with_write_params(mut self, configure: impl FnOnce(WriteParams) -> WriteParams) -> Self {
+        self.params.write_params = MergeWriteParams(Arc::new(configure(
+            self.params.write_params.0.as_ref().clone(),
+        )));
         self
     }
 
@@ -1816,7 +1855,7 @@ impl MergeInsertJob {
                 &self.dataset.base,
                 self.dataset.schema().clone(),
                 Box::pin(stream),
-                WriteParams::default(),
+                self.params.write_params.0.as_ref().clone(),
                 None, // Merge insert doesn't use target_bases
             )
             .await?;
@@ -10057,5 +10096,73 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
             baseline_files,
             "Newly written merge-insert data files should be cleaned up on apply_deletions failure"
         );
+    }
+
+    #[tokio::test]
+    async fn test_merge_insert_forwards_write_params_for_external_blobs() {
+        let test_dir = TempStrDir::default();
+        let dataset_uri = format!("{test_dir}/dataset");
+        let external_path = format!("{test_dir}/external.bin");
+        std::fs::write(&external_path, b"updated").unwrap();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            crate::blob_field("blob", false),
+        ]));
+
+        let mut initial_blobs = crate::BlobArrayBuilder::new(1);
+        initial_blobs.push_bytes(b"initial").unwrap();
+        let initial = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                initial_blobs.finish().unwrap(),
+            ],
+        )
+        .unwrap();
+        let dataset = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new([Ok(initial)], schema.clone()),
+                &dataset_uri,
+                Some(WriteParams {
+                    data_storage_version: Some(LanceFileVersion::V2_2),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+
+        let mut external_blobs = crate::BlobArrayBuilder::new(1);
+        external_blobs
+            .push_uri(format!("file://{external_path}"))
+            .unwrap();
+        let update = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                external_blobs.finish().unwrap(),
+            ],
+        )
+        .unwrap();
+
+        let (dataset, _) = MergeInsertBuilder::try_new(dataset, vec!["id".to_string()])
+            .unwrap()
+            .with_write_params(|params| WriteParams {
+                allow_external_blob_outside_bases: true,
+                ..params
+            })
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap()
+            .execute_reader(RecordBatchIterator::new([Ok(update)], schema))
+            .await
+            .unwrap();
+
+        let blobs = dataset.take_blobs_by_indices(&[0], "blob").await.unwrap();
+        assert_eq!(blobs.len(), 1);
+        assert!(blobs[0].uri().is_some());
+        assert_eq!(blobs[0].read().await.unwrap().as_ref(), b"updated");
     }
 }

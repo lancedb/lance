@@ -37,7 +37,6 @@ use crate::{
     dataset::{
         transaction::{Operation, Transaction},
         write::{
-            WriteParams,
             merge_insert::{
                 MERGE_ACTION_COLUMN, MergeInsertParams, MergeStats, assign_action::Action,
                 exec::MergeInsertMetrics,
@@ -871,6 +870,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
         let affected_rows_holder = self.affected_rows.clone();
         let inserted_rows_filter_holder = self.inserted_rows_filter.clone();
         let merged_generations = self.params.merged_generations.clone();
+        let write_params = self.params.write_params.0.as_ref().clone();
         let is_primary_key = self.is_primary_key;
         let updating_row_ids = {
             let state = merge_state.lock().unwrap();
@@ -885,7 +885,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
                 &dataset.base,
                 dataset.schema().clone(),
                 write_data_stream,
-                WriteParams::default(),
+                write_params,
                 None, // Merge insert doesn't use target_bases
             )
             .await?;
