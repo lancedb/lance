@@ -25,7 +25,7 @@ use crate::Result;
 ///
 /// - initial_rate: 2000 req/s
 /// - min_rate: 1 req/s
-/// - max_rate: 5000 req/s (0.0 disables ceiling)
+/// - max_rate: 5000 req/s (0.0 disables the ceiling; must be finite otherwise)
 /// - decrease_factor: 0.5 (halve on throttle)
 /// - additive_increment: 300 req/s per success window
 /// - window_duration: 1 second
@@ -384,6 +384,10 @@ mod tests {
         #[case] expected_msg: &str,
     ) {
         let err = config.validate().unwrap_err();
+        assert!(
+            matches!(&err, crate::Error::InvalidInput { .. }),
+            "expected InvalidInput, got: {err:?}"
+        );
         let msg = err.to_string();
         assert!(
             msg.contains(expected_msg),
