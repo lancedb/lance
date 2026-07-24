@@ -239,6 +239,27 @@ def model_to_dict(obj: Any) -> dict[str, Any]:
     return obj.model_dump() if hasattr(obj, "model_dump") else obj.dict()
 
 
+def _validate_pydantic_list(data: Any, model_class: type) -> None:
+    """Validate that `data` is a list of exact `model_class` instances.
+
+    Rejects non-list iterables (e.g. generators), which would otherwise be
+    drained by this validation loop and leave nothing for the caller to
+    serialize, and rejects subclass instances, whose extra/overridden fields
+    would not match the schema derived from `model_class`.
+    """
+    if not isinstance(data, list):
+        raise TypeError(
+            f"Pydantic model data must be provided as a list, got {type(data)!r}"
+        )
+    for i, item in enumerate(data):
+        if type(item) is not model_class:
+            raise TypeError(
+                f"data[{i}] must be an instance of {model_class!r} exactly "
+                f"(subclasses are not accepted), got {type(item)!r} "
+                f"(data has {len(data)} items)"
+            )
+
+
 __all__ = [
     # lazy-load third party libs
     "datasets",
@@ -257,6 +278,7 @@ __all__ = [
     "_is_pydantic_base_model_class",
     "_LazyModule",
     "model_to_dict",
+    "_validate_pydantic_list",
     # exported flags/guards
     "_NUMPY_AVAILABLE",
     "_PANDAS_AVAILABLE",

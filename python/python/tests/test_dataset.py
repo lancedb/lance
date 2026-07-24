@@ -146,8 +146,45 @@ def test_write_dataset_pydantic_list_rejects_invalid_item(tmp_path: Path, bad_it
 
     data = [Record(name="alice"), bad_item]
     uri = str(tmp_path / "invalid_item_write_dataset")
-    with pytest.raises(TypeError, match="same model class"):
+    with pytest.raises(TypeError, match=r"data\[1\]"):
         lance.write_dataset(data, uri)
+
+
+def test_from_pydantic_model_rejects_non_list_data(tmp_path: Path):
+    """A generator (or other non-list iterable) must be rejected up front --
+    otherwise it gets drained by item validation and the caller silently
+    writes a 0-row table instead of getting an error."""
+
+    class Record(BaseModel):
+        name: str
+
+    data = (Record(name=n) for n in ["alice", "bob"])
+    uri = str(tmp_path / "generator_input")
+    with pytest.raises(TypeError, match="must be provided as a list"):
+        lance.LanceDataset.from_pydantic_model(Record, data, uri=uri)
+
+
+class _RecordSubclass(_OtherRecord):
+    y: int = 0
+
+
+@pytest.mark.parametrize(
+    "entry_point",
+    ["from_pydantic_model", "write_dataset"],
+)
+def test_pydantic_list_rejects_subclass_instance(tmp_path: Path, entry_point):
+    """A subclass instance must not be accepted in place of the exact model
+    class: the schema is derived from the declared model class, but a
+    subclass instance may carry extra/overridden fields that model_to_dict()
+    would then try to serialize against that schema."""
+
+    data = [_OtherRecord(x=1), _RecordSubclass(x=2, y=3)]
+    uri = str(tmp_path / f"subclass_rejected_{entry_point}")
+    with pytest.raises(TypeError, match=r"data\[1\].*exactly"):
+        if entry_point == "from_pydantic_model":
+            lance.LanceDataset.from_pydantic_model(_OtherRecord, data, uri=uri)
+        else:
+            lance.write_dataset(data, uri)
 
 
 def test_write_dataset_pydantic_optional_field_typed_correctly_when_all_none(

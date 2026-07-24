@@ -46,6 +46,7 @@ from .dependencies import (
     _check_for_numpy,
     _check_for_torch,
     _is_pydantic_base_model_class,
+    _validate_pydantic_list,
     model_to_dict,
     torch,
 )
@@ -884,16 +885,11 @@ class LanceDataset(pa.dataset.Dataset):
                 f"`model_class` must be a Pydantic BaseModel subclass, "
                 f"got {model_class!r}"
             )
+        _validate_pydantic_list(data, model_class)
         if not data:
             raise ValueError(
                 "`data` must be a non-empty list of Pydantic model instances."
             )
-        for i, item in enumerate(data):
-            if not isinstance(item, model_class):
-                raise TypeError(
-                    f"`data[{i}]` must be an instance of {model_class!r}, "
-                    f"got {type(item)!r} (data has {len(data)} items)"
-                )
         if uri is None:
             uri = re.sub(r"(?<!^)(?=[A-Z])", "_", model_class.__name__).lower()
         from .pydantic import pydantic_to_schema

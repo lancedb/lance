@@ -13,6 +13,7 @@ from .dependencies import (
     _check_for_hugging_face,
     _check_for_pandas,
     _is_pydantic_base_model,
+    _validate_pydantic_list,
     model_to_dict,
 )
 from .dependencies import pandas as pd
@@ -155,14 +156,7 @@ def _coerce_reader(
         and _is_pydantic_base_model(data_obj[0])
     ):
         model_class = type(data_obj[0])
-        for i, item in enumerate(data_obj):
-            if not isinstance(item, model_class):
-                raise TypeError(
-                    f"All items in a Pydantic model list must be instances of "
-                    f"the same model class; expected {model_class!r}, got "
-                    f"{type(item)!r} at index {i} (list has {len(data_obj)} "
-                    "items)."
-                )
+        _validate_pydantic_list(data_obj, model_class)
         if schema is None:
             from .pydantic import pydantic_to_schema
 
