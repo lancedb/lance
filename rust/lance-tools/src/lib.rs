@@ -2,5 +2,6 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 pub mod cli;
+pub mod manifest;
 pub mod meta;
 pub mod util;

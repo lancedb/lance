@@ -27,15 +27,25 @@ use crate::format::{DataStorageFormat, IndexMetadata, MAGIC, Manifest, Transacti
 
 use super::commit::ManifestLocation;
 
-/// Read Manifest on URI.
+/// Read the raw Manifest protobuf from a URI.
 ///
-/// This only reads manifest files. It does not read data files.
+/// This only reads manifest files. It does not read data files or translate the
+/// protobuf into the semantic [`Manifest`] type.
 #[instrument(level = "debug", skip(object_store))]
-pub async fn read_manifest(
+pub async fn read_manifest_proto(
     object_store: &ObjectStore,
     path: &Path,
     known_size: Option<u64>,
-) -> Result<Manifest> {
+) -> Result<pb::Manifest> {
+    let buf = read_manifest_bytes(object_store, path, known_size).await?;
+    Ok(pb::Manifest::decode(buf)?)
+}
+
+async fn read_manifest_bytes(
+    object_store: &ObjectStore,
+    path: &Path,
+    known_size: Option<u64>,
+) -> Result<Bytes> {
     let file_size = if let Some(known_size) = known_size {
         known_size
     } else {
@@ -52,7 +62,7 @@ pub async fn read_manifest(
     // In case of corruption, the known_size might be wrong. We can retry without
     // the size to be more robust.
     if (buf.len() < 16 || !buf.ends_with(MAGIC)) && known_size.is_some() {
-        return Box::pin(read_manifest(object_store, path, None)).await;
+        return Box::pin(read_manifest_bytes(object_store, path, None)).await;
     }
 
     if buf.len() < 16 {
@@ -104,39 +114,20 @@ pub async fn read_manifest(
         )));
     }
 
-    let proto = pb::Manifest::decode(buf)?;
-    Manifest::try_from(proto)
+    Ok(buf)
 }
 
-#[instrument(level = "debug", skip(object_store, manifest))]
-pub async fn read_manifest_indexes(
+/// Read Manifest on URI.
+///
+/// This only reads manifest files. It does not read data files.
+#[instrument(level = "debug", skip(object_store))]
+pub async fn read_manifest(
     object_store: &ObjectStore,
-    location: &ManifestLocation,
-    manifest: &Manifest,
-) -> Result<Vec<IndexMetadata>> {
-    if let Some(pos) = manifest.index_section.as_ref() {
-        let result = read_index_section(object_store, &location.path, location.size, *pos).await;
-        // A stale cached size makes the index offset fall outside the sized view,
-        // so the read fails as "file size is too small". Retry once with the true
-        // size; surface any other error unchanged.
-        let section = match result {
-            Err(e)
-                if location.size.is_some() && e.to_string().contains("file size is too small") =>
-            {
-                read_index_section(object_store, &location.path, None, *pos).await?
-            }
-            other => other?,
-        };
-
-        let indices = section
-            .indices
-            .into_iter()
-            .map(IndexMetadata::try_from)
-            .collect::<Result<Vec<_>>>()?;
-        Ok(indices)
-    } else {
-        Ok(vec![])
-    }
+    path: &Path,
+    known_size: Option<u64>,
+) -> Result<Manifest> {
+    let proto = read_manifest_proto(object_store, path, known_size).await?;
+    Manifest::try_from(proto)
 }
 
 /// Read the index section message at `pos`, opening the manifest with a known
