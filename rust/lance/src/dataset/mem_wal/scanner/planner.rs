@@ -18,17 +18,17 @@ use crate::dataset::mem_wal::TOMBSTONE;
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
 use super::exec::{MEMTABLE_GEN_COLUMN, MemtableGenTagExec, PkBlockFilterExec, ROW_ADDRESS_COLUMN};
-use super::flushed_cache::{DatasetCache, GenerationWarmer, open_flushed_dataset};
 use super::projection::{
     build_scanner_projection, canonical_output_schema, null_columns, project_to_canonical,
     validate_projection_names,
 };
+use super::sstable_cache::{DatasetCache, SsTableWarmer, open_sstable};
 use crate::session::Session;
 use lance_io::object_store::ObjectStoreParams;
 
 /// Combine the user filter (if any) with `NOT _tombstone` so tombstone rows are
 /// dropped from a WAL-arm scan. Used only for sources whose schema carries the
-/// column (active / flushed generations written since deletes existed).
+/// column (active / SSTables written since deletes existed).
 fn fold_not_tombstone(filter: Option<&Expr>) -> Expr {
     let live = !col(TOMBSTONE);
     match filter {
@@ -45,14 +45,14 @@ pub struct LsmScanPlanner {
     pk_columns: Vec<String>,
     /// Schema of the base table.
     base_schema: SchemaRef,
-    /// Session threaded into flushed-generation opens (shared caches).
+    /// Session threaded into SSTable opens (shared caches).
     session: Option<Arc<Session>>,
-    /// Store params for opening flushed generations, reusing the base dataset's store.
+    /// Store params for opening SSTables, reusing the base dataset's store.
     store_params: Option<ObjectStoreParams>,
-    /// Cache of opened flushed-generation datasets.
-    flushed_cache: Option<Arc<dyn DatasetCache>>,
-    /// Optional warmer fired on first open of a flushed generation.
-    warmer: Option<Arc<dyn GenerationWarmer>>,
+    /// Cache of opened SSTable datasets.
+    sstable_cache: Option<Arc<dyn DatasetCache>>,
+    /// Optional warmer fired on first open of an SSTable.
+    warmer: Option<Arc<dyn SsTableWarmer>>,
 }
 
 impl LsmScanPlanner {
@@ -68,32 +68,32 @@ impl LsmScanPlanner {
             base_schema,
             session: None,
             store_params: None,
-            flushed_cache: None,
+            sstable_cache: None,
             warmer: None,
         }
     }
 
-    /// Set the session used to open flushed generations.
+    /// Set the session used to open SSTables.
     pub fn with_session(mut self, session: Arc<Session>) -> Self {
         self.session = Some(session);
         self
     }
 
-    /// Set the store params used to open flushed generations.
+    /// Set the store params used to open SSTables.
     pub fn with_store_params(mut self, store_params: ObjectStoreParams) -> Self {
         self.store_params = Some(store_params);
         self
     }
 
-    /// Inject a cache of opened flushed-generation datasets, making repeated
+    /// Inject a cache of opened SSTable datasets, making repeated
     /// queries against the same generation a pure `Arc::clone`.
-    pub fn with_flushed_cache(mut self, cache: Arc<dyn DatasetCache>) -> Self {
-        self.flushed_cache = Some(cache);
+    pub fn with_sstable_cache(mut self, cache: Arc<dyn DatasetCache>) -> Self {
+        self.sstable_cache = Some(cache);
         self
     }
 
-    /// Inject the warmer fired on first open of a flushed generation.
-    pub fn with_warmer(mut self, warmer: Arc<dyn GenerationWarmer>) -> Self {
+    /// Inject the warmer fired on first open of an SSTable.
+    pub fn with_warmer(mut self, warmer: Arc<dyn SsTableWarmer>) -> Self {
         self.warmer = Some(warmer);
         self
     }
@@ -154,7 +154,7 @@ impl LsmScanPlanner {
             &sources,
             self.session.as_ref(),
             self.store_params.as_ref(),
-            self.flushed_cache.as_ref(),
+            self.sstable_cache.as_ref(),
         ))
         .await?;
 
@@ -321,12 +321,12 @@ impl LsmScanPlanner {
 
                 scanner.create_plan().await
             }
-            LsmDataSource::FlushedMemTable { path, .. } => {
-                let dataset = open_flushed_dataset(
+            LsmDataSource::SsTable { path, .. } => {
+                let dataset = open_sstable(
                     path,
                     self.session.as_ref(),
                     self.store_params.as_ref(),
-                    self.flushed_cache.as_ref(),
+                    self.sstable_cache.as_ref(),
                     self.warmer.as_ref(),
                 )
                 .await?;
@@ -352,7 +352,7 @@ impl LsmScanPlanner {
                 if let Some(expr) = effective {
                     scanner.filter_expr(expr.clone());
                 }
-                // Per-source limit pushdown: flushed generations are
+                // Per-source limit pushdown: SSTables are
                 // within-gen live (dedup-on-flush deletion vectors), so any
                 // `fetch` post-filter rows are valid contributions.
                 if let Some(fetch) = fetch {
@@ -456,10 +456,10 @@ mod tests {
         let shard_id = uuid::Uuid::new_v4();
         let snapshot = ShardSnapshot::new(shard_id)
             .with_current_generation(5)
-            .with_flushed_generation(1, "gen_1".to_string())
-            .with_flushed_generation(2, "gen_2".to_string());
+            .with_sstable(1, "gen_1".to_string())
+            .with_sstable(2, "gen_2".to_string());
 
-        assert_eq!(snapshot.flushed_generations.len(), 2);
+        assert_eq!(snapshot.sstables.len(), 2);
         assert_eq!(snapshot.current_generation, 5);
     }
 }
@@ -519,7 +519,7 @@ mod integration_tests {
     }
 
     /// Create a dataset at the given URI with the provided batches. Also writes
-    /// the standalone PK sidecar (on `id`) so a flushed-generation source can be
+    /// the standalone PK sidecar (on `id`) so an SSTable source can be
     /// probed by the block-list; harmless for a base table (never probed).
     async fn create_dataset(uri: &str, batches: Vec<RecordBatch>) -> Dataset {
         let schema = batches[0].schema();
@@ -552,8 +552,8 @@ mod integration_tests {
 
     /// Setup a multi-level LSM structure with:
     /// - Base table: ids 1-5 with "base" prefix
-    /// - Flushed gen1: ids 3,4 (updates) with "gen1" prefix
-    /// - Flushed gen2: ids 4,5 (updates) + id 6 (new) with "gen2" prefix
+    /// - SSTable gen1: ids 3,4 (updates) with "gen1" prefix
+    /// - SSTable gen2: ids 4,5 (updates) + id 6 (new) with "gen2" prefix
     /// - Active memtable: ids 5,6 (updates) + id 7 (new) with "active" prefix
     ///
     /// Expected deduplication results:
@@ -580,13 +580,13 @@ mod integration_tests {
         let base_batch = create_test_batch(&schema, &[1, 2, 3, 4, 5], "base");
         let base_dataset = Arc::new(create_dataset(&base_uri, vec![base_batch]).await);
 
-        // Create flushed gen1 as a separate dataset
+        // Create SSTable gen1 as a separate dataset
         let shard_id = Uuid::new_v4();
         let gen1_uri = format!("{}/_mem_wal/{}/gen_1", base_uri, shard_id);
         let gen1_batch = create_test_batch(&schema, &[3, 4], "gen1");
         create_dataset(&gen1_uri, vec![gen1_batch]).await;
 
-        // Create flushed gen2 as a separate dataset
+        // Create SSTable gen2 as a separate dataset
         let gen2_uri = format!("{}/_mem_wal/{}/gen_2", base_uri, shard_id);
         let gen2_batch = create_test_batch(&schema, &[4, 5, 6], "gen2");
         create_dataset(&gen2_uri, vec![gen2_batch]).await;
@@ -594,8 +594,8 @@ mod integration_tests {
         // Build shard snapshot
         let shard_snapshot = ShardSnapshot::new(shard_id)
             .with_current_generation(3)
-            .with_flushed_generation(1, "gen_1".to_string())
-            .with_flushed_generation(2, "gen_2".to_string());
+            .with_sstable(1, "gen_1".to_string())
+            .with_sstable(2, "gen_2".to_string());
 
         // Create active memtable
         let (batch_store, index_store) =
@@ -819,11 +819,11 @@ mod integration_tests {
     }
 
     /// Regression for the concurrent-read-vs-flush hole: a sealed
-    /// (frozen-awaiting-flush) memtable is not yet recorded as a flushed
-    /// generation, but its rows must still be in the scan's read union and
+    /// (frozen-awaiting-flush) memtable is not yet recorded as an
+    /// SSTable, but its rows must still be in the scan's read union and
     /// dedup correctly by generation across the active/frozen seam.
     ///
-    /// Layout: base(0) ids 1-5, flushed gen1 ids 3,4, flushed gen2 ids
+    /// Layout: base(0) ids 1-5, SSTable gen1 ids 3,4, SSTable gen2 ids
     /// 4,5,6, frozen memtable gen3 ids 6,7, active memtable gen4 ids 7,8.
     #[tokio::test]
     async fn test_lsm_scan_frozen_memtable_in_read_union() {
@@ -852,8 +852,8 @@ mod integration_tests {
 
         let shard_snapshot = ShardSnapshot::new(shard_id)
             .with_current_generation(4)
-            .with_flushed_generation(1, "gen_1".to_string())
-            .with_flushed_generation(2, "gen_2".to_string());
+            .with_sstable(1, "gen_1".to_string())
+            .with_sstable(2, "gen_2".to_string());
 
         // Frozen gen3 (sealed, NOT in the manifest) and active gen4.
         let (frozen_store, frozen_index) =
@@ -912,7 +912,7 @@ mod integration_tests {
         assert_eq!(results.get(&3), Some(&"gen1_3".to_string()));
         assert_eq!(results.get(&4), Some(&"gen2_4".to_string()));
         assert_eq!(results.get(&5), Some(&"gen2_5".to_string()));
-        // id=6: in flushed gen2 AND frozen gen3 -> frozen wins. This is the
+        // id=6: in SSTable gen2 AND frozen gen3 -> frozen wins. This is the
         // bug: pre-fix the frozen memtable fell out of the read union and
         // id=6 resolved to "gen2_6".
         assert_eq!(results.get(&6), Some(&"frozen_6".to_string()));
@@ -1129,7 +1129,7 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    async fn test_lsm_scan_flushed_only_no_active() {
+    async fn test_lsm_scan_sstable_only_no_active() {
         let (base_dataset, shard_snapshots, _, pk_columns, _temp_path) =
             setup_multi_level_lsm().await;
 
@@ -1291,7 +1291,7 @@ mod integration_tests {
     ///
     /// Similar to setup_multi_level_lsm but:
     /// - Active memtable has a BTree index on the `id` column
-    /// - Flushed datasets have BTree index created (enabling ScalarIndexQuery)
+    /// - SSTables have BTree index created (enabling ScalarIndexQuery)
     async fn setup_multi_level_lsm_with_btree_index() -> (
         Arc<Dataset>,
         Vec<ShardSnapshot>,
@@ -1321,7 +1321,7 @@ mod integration_tests {
         // Reload dataset to pick up the index
         let base_dataset = Arc::new(Dataset::open(&base_uri).await.unwrap());
 
-        // Create flushed gen1 with BTree index
+        // Create SSTable gen1 with BTree index
         let shard_id = Uuid::new_v4();
         let gen1_uri = format!("{}/_mem_wal/{}/gen_1", base_uri, shard_id);
         let gen1_batch = create_test_batch(&schema, &[3, 4], "gen1");
@@ -1330,7 +1330,7 @@ mod integration_tests {
             .await
             .unwrap();
 
-        // Create flushed gen2 with BTree index
+        // Create SSTable gen2 with BTree index
         let gen2_uri = format!("{}/_mem_wal/{}/gen_2", base_uri, shard_id);
         let gen2_batch = create_test_batch(&schema, &[4, 5, 6], "gen2");
         let mut gen2_dataset = create_dataset(&gen2_uri, vec![gen2_batch]).await;
@@ -1341,8 +1341,8 @@ mod integration_tests {
         // Build shard snapshot
         let shard_snapshot = ShardSnapshot::new(shard_id)
             .with_current_generation(3)
-            .with_flushed_generation(1, "gen_1".to_string())
-            .with_flushed_generation(2, "gen_2".to_string());
+            .with_sstable(1, "gen_1".to_string())
+            .with_sstable(2, "gen_2".to_string());
 
         // Create active memtable with BTree index
         let batch_store = Arc::new(BatchStore::with_capacity(100));
@@ -1677,7 +1677,7 @@ mod integration_tests {
         let (base_dataset, shard_snapshots, active_memtable, pk_columns, _temp_path) =
             setup_multi_level_lsm().await;
 
-        // Use the same base URI the flushed generations were created under, so
+        // Use the same base URI the SSTables were created under, so
         // relative `gen_N` folders resolve to real datasets on disk.
         let base_uri = base_dataset.uri().to_string();
         let arrow_schema: arrow_schema::Schema = base_dataset.schema().into();
@@ -1702,7 +1702,7 @@ mod integration_tests {
         );
         assert!(
             plan_str.contains("gen_1") && plan_str.contains("gen_2"),
-            "Plan must scan flushed generations, got: {}",
+            "Plan must scan SSTables, got: {}",
             plan_str
         );
         assert!(
@@ -1809,8 +1809,8 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    async fn test_lsm_scan_without_base_table_no_flushed_no_active() {
-        // No base, no flushed, no active → empty result, valid plan.
+    async fn test_lsm_scan_without_base_table_no_sstable_no_active() {
+        // No base, no SSTable, no active → empty result, valid plan.
         let schema = create_pk_schema();
         let scanner = LsmScanner::without_base_table(
             schema,
@@ -2184,8 +2184,8 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    async fn test_lsm_scan_flushed_tombstone_masks_base() {
-        // A tombstone living in a flushed generation masks the older base row by
+    async fn test_lsm_scan_sstable_tombstone_masks_base() {
+        // A tombstone living in an SSTable masks the older base row by
         // PK presence (block-list) and is itself dropped by the folded predicate.
         let base_schema = create_pk_schema();
         let mem_schema = ts_pk_schema();
@@ -2200,14 +2200,14 @@ mod integration_tests {
             .await,
         );
 
-        // Flushed gen 1 holds only a tombstone for id=2 (written with the
-        // `_tombstone` schema, so the flushed arm folds `NOT _tombstone`).
+        // SSTable gen 1 holds only a tombstone for id=2 (written with the
+        // `_tombstone` schema, so the SSTable arm folds `NOT _tombstone`).
         let shard_id = Uuid::new_v4();
         let gen1_uri = format!("{}/_mem_wal/{}/gen_1", base_uri, shard_id);
         create_dataset(&gen1_uri, vec![ts_batch(&mem_schema, &[(2, None, true)])]).await;
         let shard_snapshot = ShardSnapshot::new(shard_id)
             .with_current_generation(2)
-            .with_flushed_generation(1, "gen_1".to_string());
+            .with_sstable(1, "gen_1".to_string());
 
         let scanner = LsmScanner::new(base, vec![shard_snapshot], vec!["id".to_string()]);
         let batches: Vec<RecordBatch> = scanner
@@ -2220,13 +2220,13 @@ mod integration_tests {
         assert_eq!(
             collect_sorted_ids(&batches),
             vec![1, 3],
-            "id=2 deleted via flushed-generation tombstone"
+            "id=2 deleted via an SSTable tombstone"
         );
     }
 
     #[tokio::test]
     async fn test_lsm_scan_tombstone_does_not_consume_limit() {
-        // A single (newest) flushed generation holds both tombstones and live
+        // A single (newest) SSTable holds both tombstones and live
         // rows. With LIMIT 2 the folded `NOT _tombstone` runs *before* the
         // per-source pushdown limit, so the limit counts only live rows — we get
         // 2 live rows, not 0 (which is what a post-limit tombstone filter, or a
@@ -2254,7 +2254,7 @@ mod integration_tests {
         .await;
         let shard_snapshot = ShardSnapshot::new(shard_id)
             .with_current_generation(2)
-            .with_flushed_generation(1, "gen_1".to_string());
+            .with_sstable(1, "gen_1".to_string());
 
         let scanner = LsmScanner::without_base_table(
             base_schema,

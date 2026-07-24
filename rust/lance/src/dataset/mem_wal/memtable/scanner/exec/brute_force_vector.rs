@@ -39,7 +39,7 @@ use crate::dataset::mem_wal::write::BatchStore;
 /// Distance metric used when [`VectorQuery::distance_type`] is `None`. The
 /// indexed path defers to the index's own metric, but with no index there is
 /// no inherent default — L2 matches what most callers configure and what the
-/// flushed/base arms use when re-ranking unindexed candidates.
+/// SSTable/base arms use when re-ranking unindexed candidates.
 const DEFAULT_DISTANCE_TYPE: DistanceType = DistanceType::L2;
 
 /// Brute-force KNN over an active memtable without an HNSW. Produces the same

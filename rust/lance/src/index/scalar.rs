@@ -10,6 +10,8 @@ pub(crate) mod btree;
 pub(crate) mod fmindex;
 pub(crate) mod inverted;
 pub(crate) mod label_list;
+#[cfg(feature = "geo")]
+pub(crate) mod rtree;
 pub(crate) mod zonemap;
 
 pub use inverted::{load_segment_details, load_segment_params, load_segments};

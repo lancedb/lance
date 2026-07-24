@@ -2507,7 +2507,7 @@ impl Dataset {
 
     /// The `ObjectStoreParams` this dataset was opened with, or `None` when
     /// opened without explicit params. Lets a caller re-open a derived path
-    /// (e.g. a MemWAL flushed generation) with the same store this dataset used.
+    /// (e.g. a MemWAL SSTable) with the same store this dataset used.
     pub fn store_params(&self) -> Option<&ObjectStoreParams> {
         self.store_params.as_deref()
     }
