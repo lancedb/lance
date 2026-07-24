@@ -2811,6 +2811,36 @@ def test_json_index():
     )
 
 
+def test_json_index_non_exact_floats():
+    # A JSON-path btree index is trained on the value extracted from the JSON
+    # column, not on the raw column itself, so the index build must sort by
+    # the extracted value rather than assuming the raw column's order matches
+    # it. Without that, range/equality queries silently miss rows whenever
+    # the extracted floats are not exactly representable in float64 (#7485).
+    vals = ['{"latitude": 10.5}', '{"latitude": 40.1}', '{"latitude": -3.2}']
+    tbl = pa.table({"data": pa.array(vals, pa.json_())})
+    ds = lance.write_dataset(tbl, "memory://test")
+    ds.create_scalar_index(
+        "data",
+        IndexConfig(
+            index_type="json",
+            parameters={"target_index_type": "btree", "path": "latitude"},
+        ),
+    )
+
+    for filter in [
+        "json_get_float(data, 'latitude') > 0",
+        "json_get_float(data, 'latitude') >= 10.5",
+        "json_get_float(data, 'latitude') = 40.1",
+        "json_get_float(data, 'latitude') = 10.5",
+        "json_get_float(data, 'latitude') < 100",
+    ]:
+        assert "ScalarIndexQuery" in ds.scanner(filter=filter).explain_plan()
+        assert ds.to_table(filter=filter) == ds.to_table(
+            filter=filter, use_scalar_index=False
+        ), filter
+
+
 def test_null_handling():
     tbl = pa.table(
         {
@@ -4706,6 +4736,54 @@ def test_zonemap_segment_merge_and_commit_from_python(tmp_path):
 
     assert with_index.num_rows == without_index.num_rows
     assert with_index["id"].to_pylist() == without_index["id"].to_pylist()
+    assert (
+        "ScalarIndexQuery"
+        in ds.scanner(filter=filter_expr, use_scalar_index=True).explain_plan()
+    )
+
+
+def test_bloomfilter_segment_merge_and_commit_from_python(tmp_path):
+    ds = generate_multi_fragment_dataset(
+        tmp_path, num_fragments=3, rows_per_fragment=100
+    )
+
+    index_name = "id_bloomfilter_segments"
+    fragment_ids = [fragment.fragment_id for fragment in ds.get_fragments()]
+    staged_segments = [
+        ds.create_index_uncommitted(
+            column="id",
+            index_type="BLOOMFILTER",
+            name=index_name,
+            fragment_ids=[fragment_id],
+        )
+        for fragment_id in fragment_ids
+    ]
+
+    for segment, fragment_id in zip(staged_segments, fragment_ids):
+        assert segment.fragment_ids == {fragment_id}
+        assert any(file.path == "bloomfilter.lance" for file in segment.files)
+
+    merged_segment = ds.merge_existing_index_segments(staged_segments)
+    assert merged_segment.fragment_ids == set(fragment_ids)
+    assert any(file.path == "bloomfilter.lance" for file in merged_segment.files)
+
+    ds = ds.commit_existing_index_segments(index_name, "id", [merged_segment])
+    descriptions = {index.name: index for index in ds.describe_indices()}
+    assert descriptions[index_name].index_type == "BloomFilter"
+    assert len(descriptions[index_name].segments) == 1
+
+    filter_expr = "id = 117"
+    without_index = ds.scanner(
+        filter=filter_expr,
+        columns=["id", "text"],
+        use_scalar_index=False,
+    ).to_table()
+    with_index = ds.scanner(
+        filter=filter_expr,
+        columns=["id", "text"],
+        use_scalar_index=True,
+    ).to_table()
+    assert with_index.to_pydict() == without_index.to_pydict()
     assert (
         "ScalarIndexQuery"
         in ds.scanner(filter=filter_expr, use_scalar_index=True).explain_plan()

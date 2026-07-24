@@ -50,17 +50,17 @@ pub struct InMemoryMemTables {
 /// This collector gathers all data sources that need to be scanned
 /// for a query, including:
 /// - The base table (merged data) — optional; omit for fresh-tier-only scans
-/// - Flushed MemTables from each shard
+/// - SSTables from each shard
 /// - In-memory memtables per shard (active + frozen-awaiting-flush)
 ///
 /// When the base table is omitted (see [`Self::without_base_table`]), `collect`
-/// returns only flushed-generation and active-memtable sources. This is used
+/// returns only SSTable and active-memtable sources. This is used
 /// by callers that own the base read path elsewhere and only need the WAL's
-/// fresh tier (active memtable ∪ L0 flushed generations).
+/// fresh tier (active memtable ∪ L0 SSTables).
 pub struct LsmDataSourceCollector {
     /// Base Lance table (None when scanning only the fresh tier).
     base_table: Option<Arc<Dataset>>,
-    /// Base path for resolving relative flushed-generation paths.
+    /// Base path for resolving relative SSTable paths.
     base_path: String,
     /// Shard snapshots from MemWAL index.
     shard_snapshots: Vec<ShardSnapshot>,
@@ -89,8 +89,8 @@ impl LsmDataSourceCollector {
 
     /// Create a collector without a base table (fresh-tier scan only).
     ///
-    /// The collector emits only flushed-generation and active-memtable sources.
-    /// `base_path` is the table-root URI used to resolve relative flushed paths
+    /// The collector emits only SSTable and active-memtable sources.
+    /// `base_path` is the table-root URI used to resolve relative SSTable paths
     /// (typically the same URI that would have been the base dataset's URI).
     pub fn without_base_table(
         base_path: impl Into<String>,
@@ -147,16 +147,12 @@ impl LsmDataSourceCollector {
         &self.in_memory_memtables
     }
 
-    /// Whether the collector has any on-disk source (base table or a flushed
-    /// generation). The point-lookup fast path uses this to decide, after
+    /// Whether the collector has any on-disk source (base table or an
+    /// SSTable). The point-lookup fast path uses this to decide, after
     /// missing every in-memory memtable, between "definitely absent" (`false`)
     /// and "must consult disk via the plan path" (`true`). Cheap: no allocation.
     pub fn has_on_disk_sources(&self) -> bool {
-        self.base_table.is_some()
-            || self
-                .shard_snapshots
-                .iter()
-                .any(|s| !s.flushed_generations.is_empty())
+        self.base_table.is_some() || self.shard_snapshots.iter().any(|s| !s.sstables.is_empty())
     }
 
     /// The in-memory memtables (active + frozen across all shards) as
@@ -233,10 +229,10 @@ impl LsmDataSourceCollector {
     /// frozen memtable. During the post-flush grace window a generation is both
     /// committed to the manifest (a flushed source) and held in memory (an
     /// in-memory source); it must be served only from memory — which preserves
-    /// the per-batch boundaries the flushed dataset has lost, so as-of reads
+    /// the per-batch boundaries the SSTable dataset has lost, so as-of reads
     /// stay snapshot-bounded — and its on-disk copy skipped to avoid scanning
     /// the generation twice. See `ShardWriterConfig::frozen_memtable_grace`.
-    fn flushed_gen_pinned_in_memory(&self, shard_id: &Uuid, generation: u64) -> bool {
+    fn sstable_pinned_in_memory(&self, shard_id: &Uuid, generation: u64) -> bool {
         self.in_memory_memtables
             .get(shard_id)
             .is_some_and(|mems| mems.frozen.iter().any(|f| f.generation == generation))
@@ -246,7 +242,7 @@ impl LsmDataSourceCollector {
     ///
     /// Returns sources in a consistent order:
     /// 1. Base table (gen=0), if configured
-    /// 2. Flushed MemTables per shard, ordered by generation
+    /// 2. SSTables per shard, ordered by generation
     /// 3. In-memory memtables per shard (active + frozen-awaiting-flush)
     pub fn collect(&self) -> Result<Vec<LsmDataSource>> {
         let mut sources = Vec::new();
@@ -258,15 +254,15 @@ impl LsmDataSourceCollector {
         }
 
         for snapshot in &self.shard_snapshots {
-            for flushed in &snapshot.flushed_generations {
-                if self.flushed_gen_pinned_in_memory(&snapshot.shard_id, flushed.generation) {
+            for sstable in &snapshot.sstables {
+                if self.sstable_pinned_in_memory(&snapshot.shard_id, sstable.generation) {
                     continue;
                 }
-                let path = self.resolve_flushed_path(&snapshot.shard_id, &flushed.path);
-                sources.push(LsmDataSource::FlushedMemTable {
+                let path = self.resolve_sstable_path(&snapshot.shard_id, &sstable.path);
+                sources.push(LsmDataSource::SsTable {
                     path,
                     shard_id: snapshot.shard_id,
-                    generation: LsmGeneration::memtable(flushed.generation),
+                    generation: LsmGeneration::memtable(sstable.generation),
                 });
             }
         }
@@ -299,15 +295,15 @@ impl LsmDataSourceCollector {
                 continue;
             }
 
-            for flushed in &snapshot.flushed_generations {
-                if self.flushed_gen_pinned_in_memory(&snapshot.shard_id, flushed.generation) {
+            for sstable in &snapshot.sstables {
+                if self.sstable_pinned_in_memory(&snapshot.shard_id, sstable.generation) {
                     continue;
                 }
-                let path = self.resolve_flushed_path(&snapshot.shard_id, &flushed.path);
-                sources.push(LsmDataSource::FlushedMemTable {
+                let path = self.resolve_sstable_path(&snapshot.shard_id, &sstable.path);
+                sources.push(LsmDataSource::SsTable {
                     path,
                     shard_id: snapshot.shard_id,
-                    generation: LsmGeneration::memtable(flushed.generation),
+                    generation: LsmGeneration::memtable(sstable.generation),
                 });
             }
         }
@@ -325,25 +321,21 @@ impl LsmDataSourceCollector {
 
     /// Get the total number of data sources.
     pub fn num_sources(&self) -> usize {
-        let flushed_count: usize = self
-            .shard_snapshots
-            .iter()
-            .map(|s| s.flushed_generations.len())
-            .sum();
+        let sstable_count: usize = self.shard_snapshots.iter().map(|s| s.sstables.len()).sum();
         let base_count = if self.base_table.is_some() { 1 } else { 0 };
         let in_memory_count: usize = self
             .in_memory_memtables
             .values()
             .map(|m| 1 + m.frozen.len())
             .sum();
-        base_count + flushed_count + in_memory_count
+        base_count + sstable_count + in_memory_count
     }
 
-    /// Resolve a flushed MemTable path to an absolute path.
+    /// Resolve an SSTable path to an absolute path.
     ///
-    /// Flushed MemTables are stored at: `{base_path}/_mem_wal/{shard_id}/{folder_name}`
-    /// The `folder_name` is what's stored in `FlushedGeneration.path`.
-    fn resolve_flushed_path(&self, shard_id: &Uuid, folder_name: &str) -> String {
+    /// SSTables are stored at: `{base_path}/_mem_wal/{shard_id}/{folder_name}`
+    /// The `folder_name` is what's stored in `SsTable.path`.
+    fn resolve_sstable_path(&self, shard_id: &Uuid, folder_name: &str) -> String {
         format!("{}/_mem_wal/{}/{}", self.base_path, shard_id, folder_name)
     }
 }
@@ -351,7 +343,7 @@ impl LsmDataSourceCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dataset::mem_wal::scanner::data_source::FlushedGeneration;
+    use crate::dataset::mem_wal::scanner::data_source::SsTable;
 
     fn create_test_snapshots() -> Vec<ShardSnapshot> {
         let shard_a = Uuid::new_v4();
@@ -362,12 +354,12 @@ mod tests {
                 shard_id: shard_a,
                 spec_id: 1,
                 current_generation: 3,
-                flushed_generations: vec![
-                    FlushedGeneration {
+                sstables: vec![
+                    SsTable {
                         generation: 1,
                         path: "abc_gen_1".to_string(),
                     },
-                    FlushedGeneration {
+                    SsTable {
                         generation: 2,
                         path: "def_gen_2".to_string(),
                     },
@@ -377,7 +369,7 @@ mod tests {
                 shard_id: shard_b,
                 spec_id: 1,
                 current_generation: 2,
-                flushed_generations: vec![FlushedGeneration {
+                sstables: vec![SsTable {
                     generation: 1,
                     path: "xyz_gen_1".to_string(),
                 }],
@@ -390,8 +382,8 @@ mod tests {
         let snapshots = create_test_snapshots();
         // 1 base table + 2 flushed from shard_a + 1 flushed from shard_b = 4
         // Using a mock dataset is complex, so we just test the counting logic
-        assert_eq!(snapshots[0].flushed_generations.len(), 2);
-        assert_eq!(snapshots[1].flushed_generations.len(), 1);
+        assert_eq!(snapshots[0].sstables.len(), 2);
+        assert_eq!(snapshots[1].sstables.len(), 1);
     }
 
     #[test]
@@ -466,10 +458,10 @@ mod tests {
     /// During the post-flush grace window a generation is both committed to the
     /// manifest (a flushed source) and still pinned in memory (a frozen
     /// source). The collector must emit it once, from memory — so as-of reads
-    /// keep batch-resolved membership — and skip the on-disk copy. Flushed
-    /// generations NOT pinned in memory are still emitted from disk.
+    /// keep batch-resolved membership — and skip the on-disk copy. SSTables
+    /// NOT pinned in memory are still emitted from disk.
     #[test]
-    fn test_collect_suppresses_flushed_gen_pinned_in_memory() {
+    fn test_collect_suppresses_sstable_pinned_in_memory() {
         let shard = Uuid::new_v4();
         // Manifest lists gens 1 and 2 as flushed; gen 2 is still pinned in
         // memory (just flushed, within grace), gen 1 has been swept.
@@ -477,12 +469,12 @@ mod tests {
             shard_id: shard,
             spec_id: 0,
             current_generation: 3,
-            flushed_generations: vec![
-                FlushedGeneration {
+            sstables: vec![
+                SsTable {
                     generation: 1,
                     path: "gen_1".to_string(),
                 },
-                FlushedGeneration {
+                SsTable {
                     generation: 2,
                     path: "gen_2".to_string(),
                 },
@@ -498,7 +490,7 @@ mod tests {
         let sources = collector.collect().unwrap();
         // gen 1: on-disk (not pinned). gen 2: in-memory only (pinned, disk
         // copy suppressed). gen 3: active. No duplicate gen 2.
-        let flushed: Vec<u64> = sources
+        let sstable_gens: Vec<u64> = sources
             .iter()
             .filter(|s| !s.is_active_memtable())
             .map(|s| s.generation().as_u64())
@@ -508,7 +500,11 @@ mod tests {
             .filter(|s| s.is_active_memtable())
             .map(|s| s.generation().as_u64())
             .collect();
-        assert_eq!(flushed, vec![1], "only the unpinned flushed gen from disk");
+        assert_eq!(
+            sstable_gens,
+            vec![1],
+            "only the unpinned SSTable gen from disk"
+        );
         assert_eq!(in_memory, vec![2, 3], "pinned gen 2 served from memory");
     }
 }

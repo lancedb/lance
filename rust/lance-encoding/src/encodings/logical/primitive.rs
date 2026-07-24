@@ -15,6 +15,7 @@ use std::{
 use crate::{
     constants::{
         STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK,
+        STRUCTURAL_ENCODING_SPARSE,
     },
     data::DictionaryDataBlock,
     encodings::logical::primitive::blob::{BlobDescriptionPageScheduler, BlobPageScheduler},
@@ -36,7 +37,7 @@ use lance_core::{
     error::{Error, LanceOptionExt},
     utils::bit::pad_bytes,
 };
-use log::trace;
+use log::{debug, trace};
 
 use crate::encodings::logical::primitive::miniblock::MiniBlockChunk;
 use crate::utils::bytepack::ByteUnpacker;
@@ -88,10 +89,15 @@ use crate::{
 };
 
 pub mod blob;
+mod chunk_index;
 pub mod constant;
 pub mod dict;
 pub mod fullzip;
+mod layout;
 pub mod miniblock;
+pub(crate) mod sparse;
+
+use chunk_index::{ItemCounts, MiniBlockChunkIndex, PrefixSums, RowMapping, parse_nested_rep};
 
 const FILL_BYTE: u8 = 0xFE;
 const DEFAULT_DICT_DIVISOR: u64 = 2;
@@ -1206,121 +1212,18 @@ struct MiniBlockSchedulerDictionary {
     num_dictionary_items: u64,
 }
 
-/// Individual block metadata within a MiniBlock repetition index.
-#[derive(Debug)]
-struct MiniBlockRepIndexBlock {
-    // The index of the first row that starts after the beginning of this block.  If the block
-    // has a preamble this will be the row after the preamble.  If the block is entirely preamble
-    // then this will be a row that starts in some future block.
-    first_row: u64,
-    // The number of rows in the block, including the trailer but not the preamble.
-    // Can be 0 if the block is entirely preamble
-    starts_including_trailer: u64,
-    // Whether the block has a preamble
-    has_preamble: bool,
-    // Whether the block has a trailer
-    has_trailer: bool,
-}
-
-impl DeepSizeOf for MiniBlockRepIndexBlock {
-    fn deep_size_of_children(&self, _context: &mut Context) -> usize {
-        0
-    }
-}
-
-/// Repetition index for MiniBlock encoding.
-///
-/// Stores block-level offset information to enable efficient random
-/// access to nested data structures within mini-blocks.
-#[derive(Debug)]
-struct MiniBlockRepIndex {
-    blocks: Vec<MiniBlockRepIndexBlock>,
-}
-
-impl DeepSizeOf for MiniBlockRepIndex {
-    fn deep_size_of_children(&self, context: &mut Context) -> usize {
-        self.blocks.deep_size_of_children(context)
-    }
-}
-
-impl MiniBlockRepIndex {
-    /// Decode repetition index from chunk metadata using default values.
-    ///
-    /// This creates a repetition index where each chunk has no partial values
-    /// and no trailers, suitable for simple sequential data layouts.
-    pub fn default_from_chunks(chunks: &[ChunkMeta]) -> Self {
-        let mut blocks = Vec::with_capacity(chunks.len());
-        let mut offset: u64 = 0;
-
-        for c in chunks {
-            blocks.push(MiniBlockRepIndexBlock {
-                first_row: offset,
-                starts_including_trailer: c.num_values,
-                has_preamble: false,
-                has_trailer: false,
-            });
-
-            offset += c.num_values;
-        }
-
-        Self { blocks }
-    }
-
-    /// Decode repetition index from raw bytes in little-endian format.
-    ///
-    /// The bytes should contain u64 values arranged in groups of `stride` elements,
-    /// where the first two values of each group represent ends_count and partial_count.
-    /// Returns an empty index if no bytes are provided.
-    pub fn decode_from_bytes(rep_bytes: &[u8], stride: usize) -> Self {
-        // Convert bytes to u64 slice, handling alignment automatically
-        let buffer = crate::buffer::LanceBuffer::from(rep_bytes.to_vec());
-        let u64_slice = buffer.borrow_to_typed_slice::<u64>();
-        let n = u64_slice.len() / stride;
-
-        let mut blocks = Vec::with_capacity(n);
-        let mut chunk_has_preamble = false;
-        let mut offset: u64 = 0;
-
-        // Extract first two values from each block: ends_count and partial_count
-        for i in 0..n {
-            let base_idx = i * stride;
-            let ends = u64_slice[base_idx];
-            let partial = u64_slice[base_idx + 1];
-
-            let has_trailer = partial > 0;
-            // Convert branches to arithmetic for better compiler optimization
-            let starts_including_trailer =
-                ends + (has_trailer as u64) - (chunk_has_preamble as u64);
-
-            blocks.push(MiniBlockRepIndexBlock {
-                first_row: offset,
-                starts_including_trailer,
-                has_preamble: chunk_has_preamble,
-                has_trailer,
-            });
-
-            chunk_has_preamble = has_trailer;
-            offset += starts_including_trailer;
-        }
-
-        Self { blocks }
-    }
-}
-
 /// State that is loaded once and cached for future lookups
 #[derive(Debug)]
 struct MiniBlockCacheableState {
-    /// Metadata that describes each chunk in the page
-    chunk_meta: Vec<ChunkMeta>,
-    /// The decoded repetition index
-    rep_index: MiniBlockRepIndex,
+    /// Compact per-chunk index (byte ranges + row/item mapping) for the page
+    chunk_index: MiniBlockChunkIndex,
     /// The dictionary for the page, if any
     dictionary: Option<Arc<DataBlock>>,
 }
 
 impl DeepSizeOf for MiniBlockCacheableState {
     fn deep_size_of_children(&self, context: &mut Context) -> usize {
-        self.rep_index.deep_size_of_children(context)
+        self.chunk_index.deep_size_of_children(context)
             + self
                 .dictionary
                 .as_ref()
@@ -1465,19 +1368,14 @@ impl MiniBlockScheduler {
     }
 
     fn lookup_chunks(&self, chunk_indices: &[usize]) -> Vec<LoadedChunk> {
-        let page_meta = self.page_meta.as_ref().unwrap();
+        let chunk_index = &self.page_meta.as_ref().unwrap().chunk_index;
         chunk_indices
             .iter()
-            .map(|&chunk_idx| {
-                let chunk_meta = &page_meta.chunk_meta[chunk_idx];
-                let bytes_start = chunk_meta.offset_bytes;
-                let bytes_end = bytes_start + chunk_meta.chunk_size_bytes;
-                LoadedChunk {
-                    byte_range: bytes_start..bytes_end,
-                    items_in_chunk: chunk_meta.num_values,
-                    chunk_idx,
-                    data: LanceBuffer::empty(),
-                }
+            .map(|&chunk_idx| LoadedChunk {
+                byte_range: chunk_index.byte_range(chunk_idx),
+                items_in_chunk: chunk_index.items_in_chunk(chunk_idx),
+                chunk_idx,
+                data: LanceBuffer::empty(),
             })
             .collect()
     }
@@ -1582,9 +1480,12 @@ impl ChunkInstructions {
     //
     // The output will be a set of `ChunkInstructions` which tell us how to read from the chunks
     fn schedule_instructions(
-        rep_index: &MiniBlockRepIndex,
+        chunk_index: &MiniBlockChunkIndex,
         user_ranges: &[Range<u64>],
     ) -> Vec<Self> {
+        // Bind the per-page chunk count once; re-deriving it each iteration
+        // costs a width match plus a length read.
+        let num_chunks = chunk_index.num_chunks();
         // This is an in-exact capacity guess but pretty good.  The actual capacity can be
         // smaller if instructions are merged.  It can be larger if there are multiple instructions
         // per row which can happen with lists.
@@ -1596,43 +1497,30 @@ impl ChunkInstructions {
 
             // Need to find the first chunk with a first row >= user_range.start.  If there are
             // multiple chunks with the same first row we need to take the first one.
-            let mut block_index = match rep_index
-                .blocks
-                .binary_search_by_key(&user_range.start, |block| block.first_row)
-            {
-                Ok(idx) => {
-                    // Slightly tricky case, we may need to walk backwards a bit to make sure we
-                    // are grabbing first eligible chunk
-                    let mut idx = idx;
-                    while idx > 0 && rep_index.blocks[idx - 1].first_row == user_range.start {
-                        idx -= 1;
-                    }
-                    idx
-                }
-                // Easy case.  idx is greater, and idx - 1 is smaller, so idx - 1 contains the start
-                Err(idx) => idx - 1,
-            };
+            let mut block_index = chunk_index.find_chunk(user_range.start);
 
-            let mut to_skip = user_range.start - rep_index.blocks[block_index].first_row;
+            let mut to_skip = user_range.start - chunk_index.first_row(block_index);
 
             while rows_needed > 0 || need_preamble {
                 // Check if we've gone past the last block (should not happen)
-                if block_index >= rep_index.blocks.len() {
+                if block_index >= num_chunks {
                     log::warn!(
-                        "schedule_instructions inconsistency: block_index >= rep_index.blocks.len(), exiting early"
+                        "schedule_instructions inconsistency: block_index >= num_chunks, exiting early"
                     );
                     break;
                 }
 
-                let chunk = &rep_index.blocks[block_index];
-                let rows_avail = chunk.starts_including_trailer.saturating_sub(to_skip);
+                let starts_including_trailer = chunk_index.rows_in_chunk(block_index);
+                let has_preamble = chunk_index.has_preamble(block_index);
+                let has_trailer = chunk_index.has_trailer(block_index);
+                let rows_avail = starts_including_trailer.saturating_sub(to_skip);
 
                 // Handle blocks that are entirely preamble (rows_avail = 0)
                 // These blocks have no rows to take but may have a preamble we need
                 // We only look for preamble if to_skip == 0 (we're not skipping rows)
                 if rows_avail == 0 && to_skip == 0 {
                     // Only process if this chunk has a preamble we need
-                    if chunk.has_preamble && need_preamble {
+                    if has_preamble && need_preamble {
                         chunk_instructions.push(Self {
                             chunk_idx: block_index,
                             preamble: PreambleAction::Take,
@@ -1641,14 +1529,12 @@ impl ChunkInstructions {
                             // We still need to look at has_trailer to distinguish between "all preamble
                             // and row ends at end of chunk" and "all preamble and row bleeds into next
                             // chunk".  Both cases will have 0 rows available.
-                            take_trailer: chunk.has_trailer,
+                            take_trailer: has_trailer,
                         });
                         // Only set need_preamble = false if the chunk has at least one row,
                         // Or we are reaching the last block,
                         // Otherwise, the chunk is entirely preamble and we need the next chunk's preamble too
-                        if chunk.starts_including_trailer > 0
-                            || block_index == rep_index.blocks.len() - 1
-                        {
+                        if starts_including_trailer > 0 || block_index == num_chunks - 1 {
                             need_preamble = false;
                         }
                     }
@@ -1663,7 +1549,7 @@ impl ChunkInstructions {
                 if rows_avail == 0 && to_skip > 0 {
                     // This block doesn't have enough rows to skip, move to next block
                     // Adjust to_skip by the number of rows in this block
-                    to_skip -= chunk.starts_including_trailer;
+                    to_skip -= starts_including_trailer;
                     block_index += 1;
                     continue;
                 }
@@ -1672,7 +1558,7 @@ impl ChunkInstructions {
                 rows_needed -= rows_to_take;
 
                 let mut take_trailer = false;
-                let preamble = if chunk.has_preamble {
+                let preamble = if has_preamble {
                     if need_preamble {
                         PreambleAction::Take
                     } else {
@@ -1683,7 +1569,7 @@ impl ChunkInstructions {
                 };
 
                 // Are we taking the trailer?  If so, make sure we mark that we need the preamble
-                if rows_to_take == rows_avail && chunk.has_trailer {
+                if rows_to_take == rows_avail && has_trailer {
                     take_trailer = true;
                     need_preamble = true;
                 } else {
@@ -1707,25 +1593,33 @@ impl ChunkInstructions {
         // are _adjacent_ (i.e. don't merge "take first row of chunk 0" and "take third row of chunk 0" into "take 2
         // rows of chunk 0 starting at 0")
         if user_ranges.len() > 1 {
-            // TODO: Could probably optimize this allocation away
-            let mut merged_instructions = Vec::with_capacity(chunk_instructions.len());
-            let mut instructions_iter = chunk_instructions.into_iter();
-            merged_instructions.push(instructions_iter.next().unwrap());
-            for instruction in instructions_iter {
-                let last = merged_instructions.last_mut().unwrap();
-                if last.chunk_idx == instruction.chunk_idx
-                    && last.rows_to_take + last.rows_to_skip == instruction.rows_to_skip
-                {
-                    last.rows_to_take += instruction.rows_to_take;
-                    last.take_trailer |= instruction.take_trailer;
+            // Merge adjacent instructions in place.  `write` indexes the last
+            // retained instruction; each following instruction is either folded
+            // into it (contiguous within the same chunk) or compacted forward.
+            let mut write = 0;
+            for read in 1..chunk_instructions.len() {
+                let merges = {
+                    let last = &chunk_instructions[write];
+                    let candidate = &chunk_instructions[read];
+                    last.chunk_idx == candidate.chunk_idx
+                        && last.rows_to_take + last.rows_to_skip == candidate.rows_to_skip
+                };
+                if merges {
+                    let rows_to_take = chunk_instructions[read].rows_to_take;
+                    let take_trailer = chunk_instructions[read].take_trailer;
+                    let last = &mut chunk_instructions[write];
+                    last.rows_to_take += rows_to_take;
+                    last.take_trailer |= take_trailer;
                 } else {
-                    merged_instructions.push(instruction);
+                    write += 1;
+                    if write != read {
+                        chunk_instructions.swap(write, read);
+                    }
                 }
             }
-            merged_instructions
-        } else {
-            chunk_instructions
+            chunk_instructions.truncate(write + 1);
         }
+        chunk_instructions
     }
 
     fn drain_from_instruction(
@@ -1836,6 +1730,129 @@ impl<'a> Iterator for WordsIter<'a> {
     }
 }
 
+/// Per-chunk leaf value-count analysis derived from the metadata words.
+///
+/// `values_per_chunk` is the count shared by every non-last chunk (meaningful
+/// when `uniform`), and `last_chunk_values` is the final chunk's count.
+struct FlatValueCounts {
+    logs: Vec<u8>,
+    uniform: bool,
+    values_per_chunk: u64,
+    last_chunk_values: u64,
+}
+
+fn analyze_value_counts(words: &Words, items_in_page: u64) -> FlatValueCounts {
+    let num_chunks = words.len();
+    let logs = words.iter().map(|w| (w & 0x0F) as u8).collect::<Vec<_>>();
+    let mut counted = 0u64;
+    for &log in logs.iter().take(num_chunks.saturating_sub(1)) {
+        // Non-last chunks always encode a positive log value count.
+        debug_assert!(log > 0);
+        counted += 1u64 << log;
+    }
+    let last_chunk_values = items_in_page - counted;
+    if let Some(&last_log) = logs.last() {
+        debug_assert!(last_log == 0 || (1u64 << last_log) == last_chunk_values);
+    }
+    let uniform = num_chunks <= 1 || logs[..num_chunks - 1].iter().all(|&log| log == logs[0]);
+    // A single-chunk page has no "non-last" chunk to derive a stride from; use the
+    // page item count (min 1 so it stays a valid divisor in `find_chunk`).
+    let values_per_chunk = if num_chunks <= 1 {
+        items_in_page.max(1)
+    } else {
+        1u64 << logs[0]
+    };
+    FlatValueCounts {
+        logs,
+        uniform,
+        values_per_chunk,
+        last_chunk_values,
+    }
+}
+
+/// Iterator over per-chunk value counts for a non-uniform flat page.  Non-last
+/// chunks yield `1 << log`; the last yields the remaining items in the page.
+fn flat_value_counts_iter(logs: &[u8], items_in_page: u64) -> impl Iterator<Item = u64> + '_ {
+    let num_chunks = logs.len();
+    let mut counted = 0u64;
+    (0..num_chunks).map(move |i| {
+        let count = if i + 1 < num_chunks {
+            1u64 << logs[i]
+        } else {
+            items_in_page - counted
+        };
+        counted += count;
+        count
+    })
+}
+
+/// Builds the compact per-chunk index from the metadata words and, for nested
+/// pages, the raw repetition-index bytes.  The row axis is picked by page shape:
+/// `UniformFlat` when all non-last chunks share a value count (fixed-width /
+/// bitpacking), `Flat` for non-uniform flat pages (RLE / FSST), else `Nested`.
+fn build_chunk_index(
+    words: &Words,
+    items_in_page: u64,
+    base: u64,
+    data_buf_size: u64,
+    rep_index_bytes: Option<&[u8]>,
+    repetition_index_depth: u16,
+) -> MiniBlockChunkIndex {
+    let num_chunks = words.len();
+    // Each chunk stores `(divided_bytes + 1) * MINIBLOCK_ALIGNMENT` bytes, so the
+    // deltas are the chunk sizes and their grand total is the data buffer size.
+    let byte_starts = PrefixSums::from_deltas(
+        words
+            .iter()
+            .map(|word| ((word >> 4) as u64 + 1) * MINIBLOCK_ALIGNMENT as u64),
+        num_chunks,
+        data_buf_size,
+    );
+
+    // Nested pages track rows via the repetition index and keep leaf item counts
+    // separately; flat pages have row == value index, so value counts are rows.
+    let rows = if let Some(rep_index_data) = rep_index_bytes {
+        assert!(rep_index_data.len() % 8 == 0);
+        let stride = repetition_index_depth as usize + 1;
+        let (row_starts, has_trailer) = parse_nested_rep(rep_index_data, stride);
+        let value_counts = analyze_value_counts(words, items_in_page);
+        let item_counts = if value_counts.uniform {
+            ItemCounts::Uniform {
+                values_per_chunk: value_counts.values_per_chunk,
+                last_chunk_values: value_counts.last_chunk_values,
+            }
+        } else {
+            ItemCounts::PerChunkLog {
+                logs: value_counts.logs,
+                last_chunk_values: value_counts.last_chunk_values,
+            }
+        };
+        RowMapping::Nested {
+            row_starts,
+            has_trailer,
+            item_counts,
+        }
+    } else {
+        let value_counts = analyze_value_counts(words, items_in_page);
+        if value_counts.uniform {
+            RowMapping::UniformFlat {
+                values_per_chunk: value_counts.values_per_chunk,
+                last_chunk_values: value_counts.last_chunk_values,
+                num_chunks,
+            }
+        } else {
+            let value_starts = PrefixSums::from_deltas(
+                flat_value_counts_iter(&value_counts.logs, items_in_page),
+                num_chunks,
+                items_in_page,
+            );
+            RowMapping::Flat { value_starts }
+        }
+    };
+
+    MiniBlockChunkIndex::new(base, byte_starts, rows)
+}
+
 impl StructuralPageScheduler for MiniBlockScheduler {
     fn initialize<'a>(
         &'a mut self,
@@ -1845,7 +1862,8 @@ impl StructuralPageScheduler for MiniBlockScheduler {
         // we may also need to fetch the repetition index.  Here, we gather what buffers we
         // need.
         let (meta_buf_position, meta_buf_size) = self.buffer_offsets_and_sizes[0];
-        let value_buf_position = self.buffer_offsets_and_sizes[1].0;
+        let base = self.buffer_offsets_and_sizes[1].0;
+        let data_buf_size = self.buffer_offsets_and_sizes[1].1;
         let mut bufs_needed = 1;
         if self.dictionary.is_some() {
             bufs_needed += 1;
@@ -1874,65 +1892,31 @@ impl StructuralPageScheduler for MiniBlockScheduler {
             let dictionary_bytes = self.dictionary.as_ref().and_then(|_| buffers.next());
             let rep_index_bytes = buffers.next();
 
-            // Parse the metadata and build the chunk meta
             let words = Words::from_bytes(meta_bytes, self.has_large_chunk)?;
-            let mut chunk_meta = Vec::with_capacity(words.len());
-
-            let mut rows_counter = 0;
-            let mut offset_bytes = value_buf_position;
-            for (word_idx, word) in words.iter().enumerate() {
-                let log_num_values = word & 0x0F;
-                let divided_bytes = word >> 4;
-                let num_bytes = (divided_bytes as usize + 1) * MINIBLOCK_ALIGNMENT;
-                debug_assert!(num_bytes > 0);
-                let num_values = if word_idx < words.len() - 1 {
-                    debug_assert!(log_num_values > 0);
-                    1 << log_num_values
-                } else {
-                    debug_assert!(
-                        log_num_values == 0
-                            || (1 << log_num_values) == (self.items_in_page - rows_counter)
-                    );
-                    self.items_in_page - rows_counter
-                };
-                rows_counter += num_values;
-
-                chunk_meta.push(ChunkMeta {
-                    num_values,
-                    chunk_size_bytes: num_bytes as u64,
-                    offset_bytes,
-                });
-                offset_bytes += num_bytes as u64;
-            }
-
-            // Build the repetition index
-            let rep_index = if let Some(rep_index_data) = rep_index_bytes {
-                assert!(rep_index_data.len() % 8 == 0);
-                let stride = self.repetition_index_depth as usize + 1;
-                MiniBlockRepIndex::decode_from_bytes(&rep_index_data, stride)
-            } else {
-                MiniBlockRepIndex::default_from_chunks(&chunk_meta)
-            };
-
-            let mut page_meta = MiniBlockCacheableState {
-                chunk_meta,
-                rep_index,
-                dictionary: None,
-            };
+            let chunk_index = build_chunk_index(
+                &words,
+                self.items_in_page,
+                base,
+                data_buf_size,
+                rep_index_bytes.as_deref(),
+                self.repetition_index_depth,
+            );
 
             // decode dictionary
-            if let Some(ref mut dictionary) = self.dictionary {
+            let dictionary = if let Some(ref mut dictionary) = self.dictionary {
                 let dictionary_data = dictionary_bytes.unwrap();
-                page_meta.dictionary =
-                    Some(Arc::new(dictionary.dictionary_decompressor.decompress(
-                        LanceBuffer::from_bytes(
-                            dictionary_data,
-                            dictionary.dictionary_data_alignment,
-                        ),
-                        dictionary.num_dictionary_items,
-                    )?));
+                Some(Arc::new(dictionary.dictionary_decompressor.decompress(
+                    LanceBuffer::from_bytes(dictionary_data, dictionary.dictionary_data_alignment),
+                    dictionary.num_dictionary_items,
+                )?))
+            } else {
+                None
             };
-            let page_meta = Arc::new(page_meta);
+
+            let page_meta = Arc::new(MiniBlockCacheableState {
+                chunk_index,
+                dictionary,
+            });
             self.page_meta = Some(page_meta.clone());
             Ok(page_meta as Arc<dyn CachedPageData>)
         }
@@ -1958,7 +1942,7 @@ impl StructuralPageScheduler for MiniBlockScheduler {
         let page_meta = self.page_meta.as_ref().unwrap();
 
         let chunk_instructions =
-            ChunkInstructions::schedule_instructions(&page_meta.rep_index, ranges);
+            ChunkInstructions::schedule_instructions(&page_meta.chunk_index, ranges);
 
         debug_assert_eq!(
             num_rows,
@@ -3349,6 +3333,16 @@ impl StructuralPrimitiveFieldScheduler {
                 mini_block,
                 decompressors,
             )?),
+            Layout::SparseLayout(sparse_layout) => {
+                Box::new(sparse::SparseStructuralScheduler::try_new(
+                    &page_info.buffer_offsets_and_sizes,
+                    page_info.priority,
+                    page_info.num_rows,
+                    target_field.data_type(),
+                    sparse_layout,
+                    decompressors,
+                )?)
+            }
             Layout::FullZipLayout(full_zip) => {
                 let mut scheduler = FullZipScheduler::try_new(
                     &page_info.buffer_offsets_and_sizes,
@@ -3585,25 +3579,34 @@ impl StructuralCompositeDecodeArrayTask {
     fn restore_validity(
         array: Arc<dyn Array>,
         unraveler: &mut CompositeRepDefUnraveler,
-    ) -> Arc<dyn Array> {
-        let validity = unraveler.unravel_validity(array.len());
+    ) -> Result<Arc<dyn Array>> {
+        let validity = unraveler.unravel_validity(array.len())?;
         let Some(validity) = validity else {
-            return array;
+            return Ok(array);
         };
         if array.data_type() == &DataType::Null {
             // We unravel from a null array but we don't add the null buffer because arrow-rs doesn't like it
-            return array;
+            return Ok(array);
         }
-        assert_eq!(validity.len(), array.len());
-        // SAFETY: We've should have already asserted the buffers are all valid, we are just
-        // adding null buffers to the array here
-        make_array(unsafe {
+        if validity.len() != array.len() {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "Structural validity has {} entries for an array with {} values",
+                    validity.len(),
+                    array.len()
+                )
+                .into(),
+            ));
+        }
+        // SAFETY: The array buffers have already been validated and the null buffer length
+        // matches the array. We are only attaching the null buffer here.
+        Ok(make_array(unsafe {
             array
                 .to_data()
                 .into_builder()
                 .nulls(Some(validity))
                 .build_unchecked()
-        })
+        }))
     }
 }
 
@@ -3629,7 +3632,7 @@ impl StructuralDecodeArrayTask for StructuralCompositeDecodeArrayTask {
         let array = arrow_select::concat::concat(&array_refs)?;
         let mut repdef = CompositeRepDefUnraveler::new(unravelers);
 
-        let array = Self::restore_validity(array, &mut repdef);
+        let array = Self::restore_validity(array, &mut repdef)?;
 
         Ok(DecodedArray {
             array,
@@ -3796,18 +3799,27 @@ struct DictEncodingBudget {
     max_encoded_size: usize,
 }
 
-// A primitive page after applying the dense mini-block rep/def budget.
+enum PrimitivePageStructure {
+    Dense {
+        repdef: SerializedRepDefs,
+        single_row_miniblock_repdef_levels: Option<u64>,
+    },
+    Sparse {
+        plan: sparse::SparseStructuralPlan,
+        prepared_values: Option<sparse::writer::PreparedSparseValues>,
+    },
+}
+
+// A primitive page after structural encoding selection and optional dense splitting.
 struct PrimitivePageData {
     // Arrow leaf arrays that contain this page's visible values.
     arrays: Vec<ArrayRef>,
-    // Repetition / definition levels aligned to this page.
-    repdef: SerializedRepDefs,
+    // Structural representation aligned to this page.
+    structure: PrimitivePageStructure,
     // Top-level row number of the first row in this page.
     row_number: u64,
     // Number of top-level rows in this page.
     num_rows: u64,
-    // Present when one top-level row is too large for one mini-block rep/def page.
-    single_row_miniblock_repdef_levels: Option<u64>,
 }
 
 // Immutable encoder state shared by per-page encode tasks.
@@ -3842,6 +3854,19 @@ impl PrimitiveStructuralEncoder {
         field: Field,
         encoding_metadata: Arc<HashMap<String, String>>,
     ) -> Result<Self> {
+        let requests_sparse = encoding_metadata
+            .get(STRUCTURAL_ENCODING_META_KEY)
+            .is_some_and(|requested| requested.eq_ignore_ascii_case(STRUCTURAL_ENCODING_SPARSE));
+        if requests_sparse && options.version.resolve() < LanceFileVersion::V2_3 {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "Field '{}' requests sparse structural encoding, which requires Lance file format 2.3+; current version is {}",
+                    field.name,
+                    options.version.resolve()
+                )
+                .into(),
+            ));
+        }
         Ok(Self {
             accumulation_queue: AccumulationQueue::new(
                 options.cache_bytes_per_column,
@@ -4371,7 +4396,7 @@ impl PrimitiveStructuralEncoder {
             return Ok(None);
         }
         let mut validity = BooleanBufferBuilder::new(num_values);
-        unraveler.unravel_validity(&mut validity);
+        unraveler.unravel_validity(&mut validity)?;
         Ok(Some(validity.finish()))
     }
 
@@ -5311,19 +5336,23 @@ impl PrimitiveStructuralEncoder {
         if budget == MiniBlockRepDefBudget::WithinBudget {
             return Ok(vec![PrimitivePageData {
                 arrays,
-                repdef,
+                structure: PrimitivePageStructure::Dense {
+                    repdef,
+                    single_row_miniblock_repdef_levels: None,
+                },
                 row_number,
                 num_rows,
-                single_row_miniblock_repdef_levels: None,
             }]);
         }
         if let MiniBlockRepDefBudget::SingleRowOverBudget(num_levels) = budget {
             return Ok(vec![PrimitivePageData {
                 arrays,
-                repdef,
+                structure: PrimitivePageStructure::Dense {
+                    repdef,
+                    single_row_miniblock_repdef_levels: Some(num_levels),
+                },
                 row_number,
                 num_rows,
-                single_row_miniblock_repdef_levels: Some(num_levels),
             }]);
         }
 
@@ -5337,10 +5366,12 @@ impl PrimitiveStructuralEncoder {
             let repdef = Self::slice_repdef(&repdef, split.level_range);
             pages.push(PrimitivePageData {
                 arrays,
-                repdef,
+                structure: PrimitivePageStructure::Dense {
+                    repdef,
+                    single_row_miniblock_repdef_levels: None,
+                },
                 row_number: row_number + split.row_start,
                 num_rows: split.num_rows,
-                single_row_miniblock_repdef_levels: None,
             });
         }
         Ok(pages)
@@ -5359,12 +5390,46 @@ impl PrimitiveStructuralEncoder {
         } = ctx;
         let PrimitivePageData {
             arrays,
-            repdef,
+            structure,
             row_number,
             num_rows,
-            single_row_miniblock_repdef_levels,
         } = page;
         let num_values = arrays.iter().map(|arr| arr.len() as u64).sum();
+
+        let (repdef, single_row_miniblock_repdef_levels) = match structure {
+            PrimitivePageStructure::Dense {
+                repdef,
+                single_row_miniblock_repdef_levels,
+            } => (repdef, single_row_miniblock_repdef_levels),
+            PrimitivePageStructure::Sparse {
+                plan,
+                prepared_values,
+            } => {
+                log::debug!(
+                    "Encoding column {} with {} visible items ({} rows) using sparse layout",
+                    column_idx,
+                    num_values,
+                    num_rows
+                );
+                return sparse::writer::encode_page(
+                    column_idx,
+                    &field,
+                    compression_strategy.as_ref(),
+                    prepared_values.map_or_else(
+                        || {
+                            sparse::writer::SparseValueInput::Unprepared(DataBlock::from_arrays(
+                                &arrays, num_values,
+                            ))
+                        },
+                        sparse::writer::SparseValueInput::Prepared,
+                    ),
+                    plan,
+                    row_number,
+                    num_rows,
+                    support_large_chunk,
+                );
+            }
+        };
 
         if num_values == 0 {
             // This page contains only structural events, such as empty/null list rows.
@@ -5672,20 +5737,82 @@ impl PrimitiveStructuralEncoder {
         let num_values = arrays.iter().map(|arr| arr.len() as u64).sum();
         let is_simple_validity = repdefs.iter().all(|rd| rd.is_simple_validity());
         let has_repdef_info = repdefs.iter().any(|rd| !rd.is_empty());
-        let (repdef, miniblock_repdef_budget) =
-            RepDefBuilder::serialize_with_miniblock_repdef_budget(
-                repdefs,
-                miniblock::max_repdef_levels_per_chunk,
+        let normalized = RepDefBuilder::normalize(repdefs);
+        let requested_encoding = self.encoding_metadata.get(STRUCTURAL_ENCODING_META_KEY);
+        let requests_sparse = requested_encoding
+            .is_some_and(|requested| requested.eq_ignore_ascii_case(STRUCTURAL_ENCODING_SPARSE));
+        let sparse_plan = requests_sparse
+            .then(|| sparse::writer::plan(&normalized, num_values))
+            .transpose()?;
+        let pages = if let Some(plan) = sparse_plan
+            && !sparse::writer::uses_constant_layout(&plan, &self.field)
+        {
+            vec![PrimitivePageData {
+                arrays,
+                structure: PrimitivePageStructure::Sparse {
+                    plan,
+                    prepared_values: None,
+                },
+                row_number,
                 num_rows,
-                num_values,
+            }]
+        } else {
+            let (repdef, miniblock_repdef_budget) = normalized
+                .serialize_with_miniblock_repdef_budget(
+                    miniblock::max_repdef_levels_per_chunk,
+                    num_rows,
+                    num_values,
+                )?;
+            let automatic_sparse = layout::select_automatic_sparse(
+                self.version.resolve(),
+                requested_encoding.map(String::as_str),
+                &miniblock_repdef_budget,
+                || {
+                    let data = DataBlock::from_arrays(&arrays, num_values);
+                    if !sparse::writer::supports_value_block(&data) {
+                        return Ok(None);
+                    }
+                    let prepared_values = match sparse::writer::prepare_values(
+                        &self.field,
+                        self.compression_strategy.as_ref(),
+                        data,
+                        self.support_large_chunk,
+                    ) {
+                        Ok(prepared_values) => prepared_values,
+                        Err(error) => {
+                            debug!(
+                                "Keeping column {} on its dense structural path because sparse value preparation is unavailable: {}",
+                                self.column_index, error
+                            );
+                            return Ok(None);
+                        }
+                    };
+                    let plan = sparse::writer::plan(&normalized, num_values)?;
+                    if sparse::writer::uses_constant_layout(&plan, &self.field) {
+                        return Ok(None);
+                    }
+                    Ok(Some((plan, prepared_values)))
+                },
             )?;
-        let pages = Self::split_pages_for_miniblock_repdef_budget(
-            arrays,
-            repdef,
-            miniblock_repdef_budget,
-            row_number,
-            num_rows,
-        )?;
+            match automatic_sparse {
+                Some((plan, prepared_values)) => vec![PrimitivePageData {
+                    arrays,
+                    structure: PrimitivePageStructure::Sparse {
+                        plan,
+                        prepared_values: Some(prepared_values),
+                    },
+                    row_number,
+                    num_rows,
+                }],
+                None => Self::split_pages_for_miniblock_repdef_budget(
+                    arrays,
+                    repdef,
+                    miniblock_repdef_budget,
+                    row_number,
+                    num_rows,
+                )?,
+            }
+        };
 
         let mut tasks = Vec::with_capacity(pages.len());
         let ctx = PrimitiveEncodeContext {
@@ -5803,8 +5930,8 @@ mod tests {
     use super::{
         ChunkInstructions, DataBlock, DecodeMiniBlockTask, FixedPerValueDecompressor,
         FixedWidthDataBlock, FullZipCacheableState, FullZipDecodeDetails, FullZipReadSource,
-        FullZipRepIndexDetails, FullZipScheduler, MiniBlockChunk, MiniBlockCompressed,
-        MiniBlockRepIndex, PerValueDecompressor, PreambleAction, StructuralPageScheduler,
+        FullZipRepIndexDetails, FullZipScheduler, MiniBlockChunk, MiniBlockChunkIndex,
+        MiniBlockCompressed, PerValueDecompressor, PreambleAction, StructuralPageScheduler,
         VariableFullZipDecoder,
     };
     use crate::buffer::LanceBuffer;
@@ -6299,11 +6426,10 @@ mod tests {
         // Convert repetition index to bytes for testing
         let rep_data: Vec<u64> = vec![5, 2, 3, 0, 4, 7, 2, 0];
         let rep_bytes: Vec<u8> = rep_data.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let repetition_index = MiniBlockRepIndex::decode_from_bytes(&rep_bytes, 2);
+        let chunk_index = MiniBlockChunkIndex::new_nested_for_test(&rep_bytes, 2);
 
         let check = |user_ranges, expected_instructions| {
-            let instructions =
-                ChunkInstructions::schedule_instructions(&repetition_index, user_ranges);
+            let instructions = ChunkInstructions::schedule_instructions(&chunk_index, user_ranges);
             assert_eq!(instructions, expected_instructions);
         };
 
@@ -6455,11 +6581,11 @@ mod tests {
         // Convert repetition index to bytes for testing
         let rep_data: Vec<u64> = vec![5, 2, 3, 0, 4, 7, 2, 0];
         let rep_bytes: Vec<u8> = rep_data.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let repetition_index = MiniBlockRepIndex::decode_from_bytes(&rep_bytes, 2);
+        let chunk_index = MiniBlockChunkIndex::new_nested_for_test(&rep_bytes, 2);
         let user_ranges = vec![1..7, 10..14];
 
         // First, schedule the ranges
-        let scheduled = ChunkInstructions::schedule_instructions(&repetition_index, &user_ranges);
+        let scheduled = ChunkInstructions::schedule_instructions(&chunk_index, &user_ranges);
 
         let mut to_drain = VecDeque::from(scheduled.clone());
 
@@ -6540,11 +6666,11 @@ mod tests {
         // Regression case.  Need a chunk with preamble, rows, and trailer (the middle chunk here)
         let rep_data: Vec<u64> = vec![5, 2, 3, 3, 20, 0];
         let rep_bytes: Vec<u8> = rep_data.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let repetition_index = MiniBlockRepIndex::decode_from_bytes(&rep_bytes, 2);
+        let chunk_index = MiniBlockChunkIndex::new_nested_for_test(&rep_bytes, 2);
         let user_ranges = vec![0..28];
 
         // First, schedule the ranges
-        let scheduled = ChunkInstructions::schedule_instructions(&repetition_index, &user_ranges);
+        let scheduled = ChunkInstructions::schedule_instructions(&chunk_index, &user_ranges);
 
         let mut to_drain = VecDeque::from(scheduled.clone());
 
@@ -6602,6 +6728,181 @@ mod tests {
 
         assert!(!need_preamble);
         assert_eq!(skip_in_chunk, 0);
+    }
+
+    use super::chunk_index::{PrefixSums, RowMapping};
+    use super::{MINIBLOCK_ALIGNMENT, Words, build_chunk_index};
+    use bytes::Bytes;
+    use lance_core::cache::{Context, DeepSizeOf};
+    use rstest::rstest;
+
+    /// Builds a `Words` metadata buffer (u16 words) from `(log_num_values, num_bytes)`
+    /// pairs, returning the words and the total data-buffer size.
+    fn words_from(entries: &[(u32, u32)]) -> (Words, u64) {
+        let mut raw = Vec::with_capacity(entries.len() * 2);
+        let mut total = 0u64;
+        for &(log, num_bytes) in entries {
+            assert!(num_bytes > 0 && num_bytes % MINIBLOCK_ALIGNMENT as u32 == 0);
+            let divided = num_bytes / MINIBLOCK_ALIGNMENT as u32 - 1;
+            let word = (divided << 4) | log;
+            assert!(word <= u16::MAX as u32, "test word {word} exceeds u16");
+            raw.extend_from_slice(&(word as u16).to_le_bytes());
+            total += num_bytes as u64;
+        }
+        (Words::from_bytes(Bytes::from(raw), false).unwrap(), total)
+    }
+
+    fn rep_bytes_from(values: &[u64]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    #[rstest]
+    // Two full chunks of 8 values (log 3) plus a partial last chunk; byte sizes vary
+    // independently of value counts.
+    #[case::uniform_partial_last(&[(3, 16), (3, 24), (0, 8)], 19, "uniform_flat", 8, 3)]
+    // Single chunk covers the whole page.
+    #[case::single_chunk(&[(0, 24)], 5, "uniform_flat", 5, 5)]
+    // Last chunk is also full (exact multiple).
+    #[case::exact_multiple(&[(3, 16), (3, 16)], 16, "uniform_flat", 8, 8)]
+    // Non-last chunks differ in size, so this is a non-uniform flat page.
+    #[case::non_uniform(&[(4, 16), (2, 16), (0, 8)], 21, "flat", 16, 1)]
+    fn test_flat_detection(
+        #[case] entries: &[(u32, u32)],
+        #[case] items_in_page: u64,
+        #[case] expected_kind: &str,
+        #[case] expected_first_items: u64,
+        #[case] expected_last_items: u64,
+    ) {
+        let base = 100u64;
+        let (words, data_buf_size) = words_from(entries);
+        let index = build_chunk_index(&words, items_in_page, base, data_buf_size, None, 0);
+
+        assert_eq!(index.row_mapping_debug(), expected_kind);
+        assert_eq!(index.num_chunks(), entries.len());
+        assert_eq!(index.items_in_chunk(0), expected_first_items);
+        assert_eq!(index.items_in_chunk(entries.len() - 1), expected_last_items);
+
+        // Byte ranges are absolute, contiguous, and exactly cover the data buffer.
+        let mut expected_start = base;
+        for (i, &(_, num_bytes)) in entries.iter().enumerate() {
+            let range = index.byte_range(i);
+            assert_eq!(range.start, expected_start);
+            assert_eq!(range.end - range.start, num_bytes as u64);
+            expected_start = range.end;
+        }
+        assert_eq!(expected_start, base + data_buf_size);
+
+        // For flat pages rows == items, so the per-chunk items sum to the page total.
+        let total_items: u64 = (0..index.num_chunks())
+            .map(|i| index.items_in_chunk(i))
+            .sum();
+        assert_eq!(total_items, items_in_page);
+    }
+
+    #[test]
+    fn test_nested_detection_and_axes() {
+        // Repetition index (stride 2): three chunks holding 5, 4, 3 rows, no trailers.
+        let rep = rep_bytes_from(&[5, 0, 4, 0, 3, 0]);
+
+        // Uniform leaf chunking: value counts 4, 4, 2.
+        let (words, data_buf_size) = words_from(&[(2, 8), (2, 8), (0, 8)]);
+        let index = build_chunk_index(&words, 10, 0, data_buf_size, Some(&rep), 1);
+        assert_eq!(index.row_mapping_debug(), "nested");
+        assert_eq!(index.num_chunks(), 3);
+        // Rows come from the repetition index, not the value counts.
+        assert_eq!(index.first_row(0), 0);
+        assert_eq!(index.rows_in_chunk(0), 5);
+        assert_eq!(index.first_row(1), 5);
+        assert_eq!(index.rows_in_chunk(1), 4);
+        assert_eq!(index.first_row(2), 9);
+        assert_eq!(index.rows_in_chunk(2), 3);
+        // Items come from the value words.
+        assert_eq!(index.items_in_chunk(0), 4);
+        assert_eq!(index.items_in_chunk(1), 4);
+        assert_eq!(index.items_in_chunk(2), 2);
+
+        // Non-uniform leaf chunking: value counts 8, 2, 5.
+        let (words_nu, dbs_nu) = words_from(&[(3, 8), (1, 8), (0, 8)]);
+        let index_nu = build_chunk_index(&words_nu, 15, 0, dbs_nu, Some(&rep), 1);
+        assert_eq!(index_nu.row_mapping_debug(), "nested");
+        assert_eq!(index_nu.items_in_chunk(0), 8);
+        assert_eq!(index_nu.items_in_chunk(1), 2);
+        assert_eq!(index_nu.items_in_chunk(2), 5);
+        // The row axis is unchanged by the leaf chunking.
+        assert_eq!(index_nu.rows_in_chunk(0), 5);
+    }
+
+    #[test]
+    fn test_uniform_flat_matches_prefix_sum_flat() {
+        // Distribution: 4 chunks of 4 values, last chunk 3 (15 items total).
+        let (words, data_buf_size) = words_from(&[(2, 8), (2, 8), (2, 8), (0, 8)]);
+        let uniform = build_chunk_index(&words, 15, 0, data_buf_size, None, 0);
+        assert_eq!(uniform.row_mapping_debug(), "uniform_flat");
+
+        // The same distribution expressed as a non-uniform Flat prefix-sum index.
+        let byte_starts = PrefixSums::from_deltas([8u64, 8, 8, 8].into_iter(), 4, 32);
+        let value_starts = PrefixSums::from_deltas([4u64, 4, 4, 3].into_iter(), 4, 15);
+        let flat = MiniBlockChunkIndex::new(0, byte_starts, RowMapping::Flat { value_starts });
+        assert_eq!(flat.row_mapping_debug(), "flat");
+
+        // Lookup parity: identical byte ranges and item counts.
+        for i in 0..4 {
+            assert_eq!(uniform.byte_range(i), flat.byte_range(i));
+            assert_eq!(uniform.items_in_chunk(i), flat.items_in_chunk(i));
+        }
+
+        // Scheduler parity across scan / single-row / partial / scattered multi-range.
+        let range_sets: Vec<Vec<std::ops::Range<u64>>> = vec![
+            vec![0..15],
+            vec![0..1],
+            vec![7..8],
+            vec![14..15],
+            vec![3..10],
+            vec![0..2, 5..6, 12..15],
+        ];
+        for ranges in &range_sets {
+            let from_uniform = ChunkInstructions::schedule_instructions(&uniform, ranges);
+            let from_flat = ChunkInstructions::schedule_instructions(&flat, ranges);
+            assert_eq!(from_uniform, from_flat, "mismatch for ranges {ranges:?}");
+        }
+
+        // A full scan yields one Absent, no-trailer instruction per chunk.
+        let full = ChunkInstructions::schedule_instructions(&uniform, &[0..15]);
+        assert_eq!(full.len(), 4);
+        for (i, inst) in full.iter().enumerate() {
+            assert_eq!(inst.chunk_idx, i);
+            assert_eq!(inst.preamble, PreambleAction::Absent);
+            assert_eq!(inst.rows_to_skip, 0);
+            assert!(!inst.take_trailer);
+        }
+        assert_eq!(full.iter().map(|i| i.rows_to_take).sum::<u64>(), 15);
+    }
+
+    #[test]
+    fn test_deep_size_per_variant_below_legacy() {
+        // The previous representation cached 48 bytes per chunk (24 for ChunkMeta plus
+        // 24 for a rep-index block); every variant's heap must be well below that.
+        const LEGACY_PER_CHUNK: usize = 48;
+        let num_chunks = 3;
+        let heap = |index: &MiniBlockChunkIndex| index.deep_size_of_children(&mut Context::new());
+
+        let (uniform_words, uniform_dbs) = words_from(&[(2, 8), (2, 8), (0, 8)]);
+        let uniform = build_chunk_index(&uniform_words, 10, 0, uniform_dbs, None, 0);
+        assert_eq!(uniform.row_mapping_debug(), "uniform_flat");
+        assert!(heap(&uniform) < LEGACY_PER_CHUNK * num_chunks);
+
+        let (flat_words, flat_dbs) = words_from(&[(3, 8), (1, 8), (0, 8)]);
+        let flat = build_chunk_index(&flat_words, 11, 0, flat_dbs, None, 0);
+        assert_eq!(flat.row_mapping_debug(), "flat");
+        assert!(heap(&flat) < LEGACY_PER_CHUNK * num_chunks);
+        // Flat carries a value-starts array that UniformFlat derives arithmetically.
+        assert!(heap(&flat) > heap(&uniform));
+
+        let rep = rep_bytes_from(&[4, 0, 3, 0, 3, 0]);
+        let (nested_words, nested_dbs) = words_from(&[(2, 8), (2, 8), (0, 8)]);
+        let nested = build_chunk_index(&nested_words, 10, 0, nested_dbs, Some(&rep), 1);
+        assert_eq!(nested.row_mapping_debug(), "nested");
+        assert!(heap(&nested) < LEGACY_PER_CHUNK * num_chunks);
     }
 
     #[tokio::test]

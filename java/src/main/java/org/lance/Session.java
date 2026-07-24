@@ -177,6 +177,19 @@ public class Session implements Closeable {
   }
 
   /**
+   * Returns statistics for the metadata cache of this session.
+   *
+   * <p>The returned statistics are a snapshot; call this method periodically to observe how hits
+   * and misses evolve over time.
+   *
+   * @return the metadata cache statistics
+   */
+  public CacheStats metadataCacheStats() {
+    Preconditions.checkArgument(nativeSessionHandle != 0, "Session is closed");
+    return metadataCacheStatsNative();
+  }
+
+  /**
    * Returns whether the other session is the same as this one.
    *
    * <p>Two sessions are considered the same if they share the same underlying native session. This
@@ -241,6 +254,8 @@ public class Session implements Closeable {
   private static native long createNative(long indexCacheSizeBytes, long metadataCacheSizeBytes);
 
   private native long sizeBytesNative();
+
+  private native CacheStats metadataCacheStatsNative();
 
   private static native void releaseNative(long handle);
 

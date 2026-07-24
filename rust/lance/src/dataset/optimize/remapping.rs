@@ -61,8 +61,13 @@ pub trait IndexRemapper: Send + Sync {
 ///
 /// Currently we don't have any options but we may need options in the future and so we
 /// want to keep a placeholder
+#[async_trait]
 pub trait IndexRemapperOptions: Send + Sync {
-    fn create_remapper(&self, dataset: &Dataset) -> Result<Box<dyn IndexRemapper>>;
+    /// Creates a remapper when the dataset has indices that need row address remapping.
+    ///
+    /// Returns `None` when no remappable indices exist, allowing compaction to avoid
+    /// materializing an unused row address map.
+    async fn create_remapper(&self, dataset: &Dataset) -> Result<Option<Box<dyn IndexRemapper>>>;
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
@@ -75,9 +80,10 @@ impl IndexRemapper for IgnoreRemap {
     }
 }
 
+#[async_trait]
 impl IndexRemapperOptions for IgnoreRemap {
-    fn create_remapper(&self, _: &Dataset) -> Result<Box<dyn IndexRemapper>> {
-        Ok(Box::new(Self {}))
+    async fn create_remapper(&self, _: &Dataset) -> Result<Option<Box<dyn IndexRemapper>>> {
+        Ok(None)
     }
 }
 

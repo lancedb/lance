@@ -347,6 +347,69 @@ pub struct ExternalManifestCommitHandler {
 }
 
 impl ExternalManifestCommitHandler {
+    async fn verify_finalized_manifest_location(
+        &self,
+        base_path: &Path,
+        location: ManifestLocation,
+        object_store: &dyn OSObjectStore,
+    ) -> std::result::Result<ManifestLocation, Error> {
+        match object_store.head(&location.path).await {
+            Ok(ObjectMeta { size, e_tag, .. }) => {
+                let ManifestLocation {
+                    version,
+                    path,
+                    size: expected_size,
+                    naming_scheme,
+                    e_tag: expected_e_tag,
+                } = location;
+
+                let size = match expected_size {
+                    Some(expected_size) if expected_size != size => {
+                        return Err(Error::corrupt_file(
+                            path,
+                            format!(
+                                "Manifest size mismatch for version {}: external store expected {}, object store returned {}",
+                                version, expected_size, size
+                            ),
+                        ));
+                    }
+                    Some(expected_size) => Some(expected_size),
+                    None => Some(size),
+                };
+
+                let e_tag = match expected_e_tag {
+                    Some(expected_e_tag) => {
+                        if e_tag.as_ref() != Some(&expected_e_tag) {
+                            return Err(Error::corrupt_file(
+                                path,
+                                format!(
+                                    "Manifest e_tag mismatch for version {}: external store expected {:?}, object store returned {:?}",
+                                    version, expected_e_tag, e_tag
+                                ),
+                            ));
+                        }
+                        Some(expected_e_tag)
+                    }
+                    None => e_tag,
+                };
+
+                Ok(ManifestLocation {
+                    version,
+                    path,
+                    size,
+                    naming_scheme,
+                    e_tag,
+                })
+            }
+            Err(ObjectStoreError::NotFound { .. }) => {
+                // The external store may hold a stale finalized V2 path while
+                // the object store still has the manifest at the V1 location.
+                default_resolve_version(base_path, location.version, object_store).await
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// The manifest is considered committed once the staging manifest is written
     /// to object store and that path is committed to the external store.
     ///
@@ -441,23 +504,24 @@ impl CommitHandler for ExternalManifestCommitHandler {
             .await?;
 
         match location {
-            Some(ManifestLocation {
-                version,
-                path,
-                size,
-                naming_scheme,
-                e_tag,
-            }) => {
-                // The path is finalized, no need to check object store
-                if path.extension() == Some(MANIFEST_EXTENSION) {
-                    return Ok(ManifestLocation {
-                        version,
-                        path,
-                        size,
-                        naming_scheme,
-                        e_tag,
-                    });
+            Some(location) => {
+                if location.path.extension() == Some(MANIFEST_EXTENSION) {
+                    return self
+                        .verify_finalized_manifest_location(
+                            base_path,
+                            location,
+                            object_store.inner.as_ref(),
+                        )
+                        .await;
                 }
+
+                let ManifestLocation {
+                    version,
+                    path,
+                    size,
+                    naming_scheme,
+                    e_tag,
+                } = location;
 
                 let (size, e_tag) = if let Some(size) = size {
                     (size, e_tag)
@@ -552,9 +616,10 @@ impl CommitHandler for ExternalManifestCommitHandler {
             Err(e) => return Err(e),
         };
 
-        // finalized path, just return
         if location.path.extension() == Some(MANIFEST_EXTENSION) {
-            return Ok(location);
+            return self
+                .verify_finalized_manifest_location(base_path, location, object_store)
+                .await;
         }
 
         let naming_scheme =

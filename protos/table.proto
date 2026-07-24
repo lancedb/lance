@@ -648,8 +648,8 @@ message ShardManifest {
   // Field 7 removed: merged_generation moved to MemWalIndexDetails.merged_generations
   // which is the authoritative source for merge progress.
 
-  // List of flushed MemTable generations and their directory paths.
-  repeated FlushedGeneration flushed_generations = 8;
+  // List of SSTables (flushed MemTable generations) and their directory paths.
+  repeated SsTable sstables = 8;
 
   // Lifecycle status. Default ACTIVE; SEALED marks an in-flight drop
   // (drop-table 2PC). A SEALED manifest refuses claims at claim_epoch.
@@ -666,9 +666,9 @@ message ShardFieldEntry {
   bytes value = 2;
 }
 
-// A flushed MemTable generation and its storage location.
-message FlushedGeneration {
-  // Generation number.
+// An SSTable: a flushed MemTable generation, stored as a Lance dataset.
+message SsTable {
+  // Generation number identifying this SSTable.
   uint64 generation = 1;
 
   // Directory name relative to the shard directory.
@@ -685,7 +685,7 @@ message MergedGeneration {
 }
 
 // Tracks which merged generation a base table index has been rebuilt to cover.
-// Used to determine whether to read from flushed MemTable indexes or base table.
+// Used to determine whether to read from SSTable indexes or base table.
 message IndexCatchupProgress {
   // Name of the base table index (must match an entry in maintained_indexes).
   string index_name = 1;

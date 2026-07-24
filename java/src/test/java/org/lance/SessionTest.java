@@ -260,6 +260,49 @@ public class SessionTest {
   }
 
   @Test
+  void testMetadataCacheStats(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("dataset_metadata_cache_stats").toString();
+
+    try (BufferAllocator allocator = new RootAllocator();
+        Session session = Session.builder().build()) {
+      CacheStats initialStats = session.metadataCacheStats();
+      assertEquals(0, initialStats.getHits());
+      assertEquals(0, initialStats.getMisses());
+      assertEquals(0, initialStats.getNumEntries());
+      assertEquals(0, initialStats.getSizeBytes());
+      assertEquals(0.0, initialStats.getHitRatio());
+
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+
+      // First open populates the metadata cache, producing misses
+      try (Dataset ds =
+          Dataset.open().allocator(allocator).uri(datasetPath).session(session).build()) {
+        ds.countRows();
+      }
+      CacheStats statsAfterFirstOpen = session.metadataCacheStats();
+      assertTrue(statsAfterFirstOpen.getMisses() > 0);
+      assertTrue(statsAfterFirstOpen.getNumEntries() > 0);
+      assertTrue(statsAfterFirstOpen.getSizeBytes() > 0);
+
+      // Reopening the same dataset should hit the shared metadata cache
+      try (Dataset ds =
+          Dataset.open().allocator(allocator).uri(datasetPath).session(session).build()) {
+        ds.countRows();
+      }
+      CacheStats statsAfterSecondOpen = session.metadataCacheStats();
+      assertTrue(statsAfterSecondOpen.getHits() > statsAfterFirstOpen.getHits());
+      assertTrue(statsAfterSecondOpen.getHitRatio() > 0.0);
+
+      // Stats are not accessible once the session is closed (close is idempotent,
+      // so the implicit close from try-with-resources remains safe)
+      session.close();
+      assertThrows(IllegalArgumentException.class, session::metadataCacheStats);
+    }
+  }
+
+  @Test
   void testInvalidCacheSizes() {
     assertThrows(
         IllegalArgumentException.class, () -> Session.builder().indexCacheSizeBytes(-1).build());

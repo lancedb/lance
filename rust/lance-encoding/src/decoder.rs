@@ -2717,8 +2717,9 @@ pub trait DecodeArrayTask: Send {
 
 impl DecodeArrayTask for Box<dyn StructuralDecodeArrayTask> {
     fn decode(self: Box<Self>) -> Result<(ArrayRef, u64)> {
-        StructuralDecodeArrayTask::decode(*self)
-            .map(|decoded_array| (decoded_array.array, decoded_array.data_size))
+        let decoded_array = StructuralDecodeArrayTask::decode(*self)?;
+        decoded_array.repdef.ensure_exhausted()?;
+        Ok((decoded_array.array, decoded_array.data_size))
     }
 }
 
@@ -2740,10 +2741,7 @@ impl NextDecodeTask {
     // suggesting the user try a smaller batch size.
     #[instrument(name = "task_to_batch", level = "debug", skip_all)]
     fn into_batch(self, emitted_batch_size_warning: Arc<Once>) -> Result<(RecordBatch, u64)> {
-        let (struct_arr, data_size) = self
-            .task
-            .decode()
-            .map_err(|e| Error::internal(format!("Error decoding batch: {}", e)))?;
+        let (struct_arr, data_size) = self.task.decode()?;
         let batch = RecordBatch::from(struct_arr.as_struct());
         if data_size > BATCH_SIZE_BYTES_WARNING {
             emitted_batch_size_warning.call_once(|| {
@@ -2981,6 +2979,25 @@ mod tests {
         fn data_type(&self) -> &DataType {
             &self.page_data_type
         }
+    }
+
+    struct InvalidInputDecodeTask;
+
+    impl DecodeArrayTask for InvalidInputDecodeTask {
+        fn decode(self: Box<Self>) -> Result<(ArrayRef, u64)> {
+            Err(Error::invalid_input_source("malformed sparse page".into()))
+        }
+    }
+
+    #[test]
+    fn next_decode_task_preserves_invalid_input_errors() {
+        let err = NextDecodeTask {
+            task: Box::new(InvalidInputDecodeTask),
+            num_rows: 0,
+        }
+        .into_batch(Arc::new(Once::new()))
+        .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }));
     }
 
     #[test]

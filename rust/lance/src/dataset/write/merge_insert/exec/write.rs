@@ -49,6 +49,48 @@ use crate::{
 
 use super::apply_deletions;
 
+fn blob_v2_user_view_schema(
+    input_schema: arrow_schema::SchemaRef,
+    dataset_schema: &lance_core::datatypes::Schema,
+) -> arrow_schema::SchemaRef {
+    let fields = input_schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let Some(dataset_field) = dataset_schema
+                .field(field.name())
+                .filter(|dataset_field| dataset_field.is_blob_v2())
+            else {
+                return field.clone();
+            };
+            let is_descriptor = matches!(
+                field.data_type(),
+                arrow_schema::DataType::Struct(fields)
+                    if fields.iter().any(|child| child.name() == "kind")
+            );
+            if !is_descriptor {
+                return field.clone();
+            }
+            let logical_field = arrow_schema::Field::from(dataset_field);
+            Arc::new(
+                arrow_schema::Field::new(
+                    field.name(),
+                    lance_core::datatypes::BLOB_V2_USER_TYPE.clone(),
+                    field.is_nullable(),
+                )
+                .with_metadata(logical_field.metadata().clone()),
+            )
+        })
+        .collect::<Vec<_>>();
+    Arc::new(arrow_schema::Schema::new_with_metadata(
+        fields
+            .iter()
+            .map(|field| field.as_ref().clone())
+            .collect::<Vec<_>>(),
+        input_schema.metadata().clone(),
+    ))
+}
+
 /// Shared state for merge insert operations to simplify lock management
 struct MergeState {
     /// Row addresses that need to be deleted, due to a row update or delete action
@@ -864,6 +906,36 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
 
         // Execute the input plan to get the merge data stream
         let input_stream = self.input.execute(partition, context)?;
+        let has_blob_v2_columns = self
+            .dataset
+            .schema()
+            .fields_pre_order()
+            .any(|field| field.is_blob_v2());
+        let input_stream = if has_blob_v2_columns {
+            let input_schema = input_stream.schema();
+            let output_schema = blob_v2_user_view_schema(input_schema, self.dataset.schema());
+            let dataset = self.dataset.clone();
+            let dataset_schema = self.dataset.schema().clone();
+            let transformed = input_stream.then(move |batch_result| {
+                let dataset = dataset.clone();
+                let dataset_schema = dataset_schema.clone();
+                async move {
+                    let batch = batch_result?;
+                    crate::dataset::optimize::transform_blob_v2_batch(
+                        &dataset,
+                        &dataset_schema,
+                        batch,
+                        true,
+                    )
+                    .await
+                    .map_err(|error| DataFusionError::External(Box::new(error)))
+                }
+            });
+            Box::pin(RecordBatchStreamAdapter::new(output_schema, transformed))
+                as SendableRecordBatchStream
+        } else {
+            input_stream
+        };
 
         // Step 1: Create shared state and streaming processor for row addresses and write data
         // Get field IDs for the ON columns from the dataset schema
