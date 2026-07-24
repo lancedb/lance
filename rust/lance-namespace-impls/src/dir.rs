@@ -1761,7 +1761,15 @@ impl DirectoryNamespace {
     ) -> Result<()> {
         let latest = self.list_versions_under(table_path, true, Some(1)).await?;
         let expected = match latest.first() {
-            Some(v) => (v.version as u64).saturating_add(1),
+            Some(v) => (v.version as u64).checked_add(1).ok_or_else(|| {
+                lance_core::Error::from(NamespaceError::ConcurrentModification {
+                    message: format!(
+                        "Version overflow computing next version for table at '{}': \
+                             latest version {} cannot advance",
+                        table_uri, v.version
+                    ),
+                })
+            })?,
             // Empty chain: main starts at v1, but a branch bootstraps at its fork
             // version which can be > 1.
             None => {
