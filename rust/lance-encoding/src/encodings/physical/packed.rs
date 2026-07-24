@@ -1468,8 +1468,8 @@ mod tests {
         let data_block = DataBlock::Struct(struct_block);
 
         let compression_strategy =
-            DefaultCompressionStrategy::new().with_version(LanceFileVersion::V2_2);
-        let compressor = crate::compression::CompressionStrategy::create_per_value(
+            DefaultCompressionStrategy::new().with_version(LanceFileVersion::V2_3);
+        let compressor = CompressionStrategy::create_per_value(
             &compression_strategy,
             &struct_field,
             &data_block,
@@ -1533,7 +1533,7 @@ mod tests {
         ]));
 
         let test_cases = TestCases::default()
-            .with_min_file_version(LanceFileVersion::V2_2)
+            .with_min_file_version(LanceFileVersion::V2_3)
             .with_expected_encoding("packed_struct");
 
         check_round_trip_encoding_of_data(vec![array], &test_cases, meta).await;
@@ -1569,5 +1569,40 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn fixed_per_value_packed_struct_requires_v23() {
+        let arrow_fields: Fields = vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("value", DataType::Int64, false),
+        ]
+        .into();
+        let arrow_struct = ArrowField::new("item", DataType::Struct(arrow_fields), false);
+        let struct_field = Field::try_from(&arrow_struct).unwrap();
+
+        let id_block = fixed_i32_block_from_array(Int32Array::from(vec![1, 2, 3, 4]));
+        let value_block = fixed_block_from_array(Int64Array::from(vec![10, 20, 30, 40]));
+
+        let struct_block = StructDataBlock {
+            children: vec![
+                DataBlock::FixedWidth(id_block.clone()),
+                DataBlock::FixedWidth(value_block.clone()),
+            ],
+            block_info: BlockInfo::new(),
+            validity: None,
+        };
+
+        let data_block = DataBlock::Struct(struct_block);
+
+        let compression_strategy =
+            DefaultCompressionStrategy::new().with_version(LanceFileVersion::V2_2);
+        let compressor = CompressionStrategy::create_per_value(
+            &compression_strategy,
+            &struct_field,
+            &data_block,
+        );
+
+        assert!(matches!(compressor, Err(Error::NotSupported { .. })));
     }
 }

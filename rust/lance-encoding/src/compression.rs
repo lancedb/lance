@@ -889,6 +889,39 @@ fn create_per_value(
 ) -> Result<Box<dyn PerValueCompressor>> {
     let field_params = self.get_merged_field_params(field);
 
+        match data {
+            DataBlock::FixedWidth(_) => Ok(Box::new(ValueEncoder::default())),
+            DataBlock::FixedSizeList(_) => Ok(Box::new(ValueEncoder::default())),
+            DataBlock::Struct(struct_block) => {
+                if field.children.len() != struct_block.children.len() {
+                    return Err(Error::invalid_input(
+                        "Struct field metadata does not match data block children",
+                    ));
+                }
+                let has_variable_child = struct_block.has_variable_width_child();
+                if has_variable_child {
+                    if self.version < LanceFileVersion::V2_2 {
+                        return Err(Error::not_supported_source("Variable packed struct encoding requires Lance file version 2.2 or later".into()));
+                    }
+                    Ok(Box::new(PackedStructVariablePerValueEncoder::new(
+                        self.clone(),
+                        field.children.clone(),
+                    )))
+                } else {
+                    if self.version < LanceFileVersion::V2_3 {
+                        return Err(Error::not_supported_source("Fixed-Width per-value packed struct encoding requires Lance file version 2.3 or later".into()));
+                    }
+                    Ok(Box::new(PackedStructFixedPerValueEncoder::new(
+                        field.children.clone(),
+                    )))
+                }
+            }
+            DataBlock::VariableWidth(variable_width) => {
+                let compression = field_params.compression.as_deref();
+                // Check for explicit "none" compression
+                if compression == Some("none") {
+                    return Ok(Box::new(VariableEncoder::default()));
+                }
     match data {
         DataBlock::FixedWidth(_) => Ok(Box::new(ValueEncoder::default())),
         DataBlock::FixedSizeList(_) => Ok(Box::new(ValueEncoder::default())),
