@@ -185,16 +185,8 @@ impl DeepSizeOf for LanceCache {
 
 impl LanceCache {
     pub fn with_capacity(capacity: usize) -> Self {
-        // LANCE_CACHE_BACKEND=quick opts into the quick_cache backend, whose
-        // read path stays contention-free at high concurrent hit rates.
-        let cache: Arc<dyn CacheBackend> =
-            if std::env::var("LANCE_CACHE_BACKEND").as_deref() == Ok("quick") {
-                Arc::new(QuickCacheBackend::with_capacity(capacity))
-            } else {
-                Arc::new(MokaCacheBackend::with_capacity(capacity))
-            };
         Self {
-            cache,
+            cache: Arc::new(MokaCacheBackend::with_capacity(capacity)),
             prefix: Arc::from(""),
             hits: Arc::new(AtomicU64::new(0)),
             misses: Arc::new(AtomicU64::new(0)),

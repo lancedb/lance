@@ -5,8 +5,8 @@
 //!
 //! quick_cache records a hit by setting one atomic bit (CLOCK-style), with no
 //! read-op channel or inline housekeeping, so warm hits stay cheap at high
-//! read rates. Prototype for A/B against the moka backend; enable with
-//! `LANCE_CACHE_BACKEND=quick`.
+//! read rates. Used as the backend for the session index cache, whose search
+//! paths issue thousands of cache reads per query.
 
 use std::pin::Pin;
 
@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use futures::Future;
 
 use super::CacheCodec;
-use super::backend::{CacheBackend, CacheEntry, InternalCacheKey};
+use super::backend::{CacheBackend, CacheEntry, CacheKeyIterator, InternalCacheKey};
 use super::moka::key_footprint;
 use crate::Result;
 
@@ -53,6 +53,20 @@ impl std::fmt::Debug for QuickCacheBackend {
 const MIN_SHARD_SHARE: usize = 4 << 30;
 
 impl QuickCacheBackend {
+    /// Create a backend holding up to `capacity` bytes of weighted entries.
+    ///
+    /// Entry weight is the same accounting as [`super::moka::MokaCacheBackend`]:
+    /// key footprint plus the entry's declared byte size. The weight budget is
+    /// split evenly across `min(cpus / 2, capacity / 4 GiB)` internal shards
+    /// (power of two, clamped to `[1, 1024]`) with no cross-shard borrowing;
+    /// an entry heavier than ~97% of one shard's share is refused admission,
+    /// so the 4 GiB minimum share keeps the largest index entries cacheable.
+    ///
+    /// ```
+    /// use lance_core::cache::{CacheBackend, QuickCacheBackend};
+    /// let backend = QuickCacheBackend::with_capacity(64 * 1024 * 1024);
+    /// assert_eq!(backend.approx_num_entries(), 0);
+    /// ```
     pub fn with_capacity(capacity: usize) -> Self {
         // shards = min(cpus / 2, capacity / 4GiB), rounded DOWN to a power of
         // two (quick_cache rounds requests UP, which would halve the share).
@@ -70,15 +84,22 @@ impl QuickCacheBackend {
             shards.next_power_of_two() / 2
         };
         let shards = shards.clamp(1, 1024);
-        // Generous item estimate: pre-sizes the hash tables and keeps
-        // quick_cache's own "at least 32 items per shard" heuristic from
-        // shrinking the shard count below the explicit choice.
-        let estimated_items = 1_000_000.max(shards * 32);
+        // Estimate resident entries from the weight budget (~64 KiB average
+        // across posting blocks, metadata, and small structs) so small caches
+        // do not pre-allocate hash-table and ghost-key metadata for millions
+        // of items that can never fit. The floor keeps quick_cache's own "at
+        // least 32 items per shard" heuristic from shrinking the shard count
+        // below the explicit choice; the ceiling bounds pre-allocation for
+        // TiB-scale capacities.
+        const ESTIMATED_AVG_ENTRY_BYTES: usize = 64 << 10;
+        let estimated_items = (capacity / ESTIMATED_AVG_ENTRY_BYTES).clamp(shards * 32, 1_000_000);
         let options = quick_cache::OptionsBuilder::new()
             .estimated_items_capacity(estimated_items)
             .weight_capacity(capacity as u64)
             .shards(shards)
             .build()
+            // Infallible in practice: `build` errors only when weight or item
+            // capacity is missing, and both are always set above.
             .expect("quick_cache options");
         let cache = quick_cache::sync::Cache::with_options(
             options,
@@ -140,6 +161,10 @@ impl CacheBackend for QuickCacheBackend {
 
     async fn clear(&self) {
         self.cache.clear();
+    }
+
+    async fn keys(&self) -> Option<CacheKeyIterator<'_>> {
+        Some(Box::new(self.cache.iter().map(|(key, _)| key)))
     }
 
     async fn num_entries(&self) -> usize {
@@ -245,5 +270,32 @@ mod tests {
 
         cache.clear().await;
         assert_eq!(cache.size().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_quick_backend_tiny_capacity() {
+        // A tiny cache must not over-provision item metadata and must still
+        // admit and evict correctly within its weight budget.
+        const CAPACITY: usize = 64 << 10;
+        let cache = LanceCache::with_backend(Arc::new(QuickCacheBackend::with_capacity(CAPACITY)));
+        for i in 0..64 {
+            cache
+                .insert_with_key(
+                    &TestKey::<Vec<u8>>::new(&format!("k-{i}")),
+                    Arc::new(vec![0u8; 4 << 10]),
+                )
+                .await;
+        }
+        assert!(cache.size_bytes().await <= CAPACITY);
+        assert!(cache.size().await >= 1);
+        let hit = cache
+            .get_with_key(&TestKey::<Vec<u8>>::new("k-63"))
+            .await
+            .is_some()
+            || cache
+                .get_with_key(&TestKey::<Vec<u8>>::new("k-62"))
+                .await
+                .is_some();
+        assert!(hit, "recently inserted entries should be resident");
     }
 }
