@@ -488,6 +488,13 @@ impl ObjectStore {
             let mut inner = store.clone();
             let store_prefix =
                 registry.calculate_object_store_prefix(uri, params.storage_options())?;
+
+            #[cfg(feature = "metrics")]
+            {
+                use crate::object_store::metrics::ObjectStoreMetricsExt;
+                inner = inner.metered(store_prefix.clone());
+            }
+
             if let Some(wrapper) = params.object_store_wrapper.as_ref() {
                 inner = wrapper.wrap(&store_prefix, inner);
             }
@@ -643,6 +650,16 @@ impl ObjectStore {
         self.io_tracker.incremental_stats()
     }
 
+    /// A handle on this store's IO tracker for the readers, writers and
+    /// shortcuts that talk to the filesystem directly instead of going through
+    /// [`Self::inner`]. It carries the store prefix so the metrics they publish
+    /// land under the same `base` label as the store's metered operations.
+    fn local_io_tracker(&self) -> IOTracker {
+        self.io_tracker
+            .clone()
+            .with_metrics_base(&self.store_prefix)
+    }
+
     /// Open a file for path.
     ///
     /// Parameters
@@ -654,7 +671,7 @@ impl ObjectStore {
                     path,
                     self.block_size,
                     None,
-                    Arc::new(self.io_tracker.clone()),
+                    Arc::new(self.local_io_tracker()),
                 )
                 .await
             }
@@ -670,7 +687,7 @@ impl ObjectStore {
                         path,
                         self.block_size,
                         None,
-                        Arc::new(self.io_tracker.clone()),
+                        Arc::new(self.local_io_tracker()),
                     )
                     .await
                 } else {
@@ -678,7 +695,7 @@ impl ObjectStore {
                         path,
                         self.block_size,
                         None,
-                        Arc::new(self.io_tracker.clone()),
+                        Arc::new(self.local_io_tracker()),
                     )
                     .await
                 }
@@ -716,7 +733,7 @@ impl ObjectStore {
                     path,
                     self.block_size,
                     Some(known_size),
-                    Arc::new(self.io_tracker.clone()),
+                    Arc::new(self.local_io_tracker()),
                 )
                 .await
             }
@@ -732,7 +749,7 @@ impl ObjectStore {
                         path,
                         self.block_size,
                         Some(known_size),
-                        Arc::new(self.io_tracker.clone()),
+                        Arc::new(self.local_io_tracker()),
                     )
                     .await
                 } else {
@@ -740,7 +757,7 @@ impl ObjectStore {
                         path,
                         self.block_size,
                         Some(known_size),
-                        Arc::new(self.io_tracker.clone()),
+                        Arc::new(self.local_io_tracker()),
                     )
                     .await
                 }
@@ -794,7 +811,7 @@ impl ObjectStore {
                     file,
                     path.clone(),
                     temp_path,
-                    Arc::new(self.io_tracker.clone()),
+                    Arc::new(self.local_io_tracker()),
                 )))
             }
             _ => Ok(Box::new(ObjectWriter::new(self, path).await?)),
@@ -847,7 +864,10 @@ impl ObjectStore {
     ) -> Result<()> {
         if self.is_local() {
             // Use std::fs::copy for local filesystem to support cross-filesystem copies
-            return super::local::copy_file(from, to);
+            let metrics = self.local_io_tracker().begin_io("copy");
+            let result = super::local::copy_file(from, to);
+            metrics.record(&result, 0);
+            return result;
         }
         if multipart_copy_fallback {
             // Reuse the reader for both the size lookup (a single cached HEAD)
@@ -911,7 +931,12 @@ impl ObjectStore {
 
         if self.is_local() {
             // The local file system provider needs to delete both files and directories.
-            return super::local::remove_dir_all(&path);
+            // Counted as a single delete request, matching how `delete_stream`
+            // counts one batched request regardless of how many paths it removes.
+            let metrics = self.local_io_tracker().begin_io("delete");
+            let result = super::local::remove_dir_all(&path);
+            metrics.record(&result, 0);
+            return result;
         }
         let sub_entries = self
             .inner

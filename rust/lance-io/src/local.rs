@@ -165,14 +165,22 @@ impl Reader for LocalObjectReader {
             let file = self.file.clone();
             self.size
                 .get_or_try_init(|| async move {
-                    let metadata = tokio::task::spawn_blocking(move || {
+                    // The metadata lookup is this reader's equivalent of the HEAD
+                    // request a cloud reader makes to learn the object size.
+                    let metrics = self.io_tracker.begin_io("head");
+                    let result = match tokio::task::spawn_blocking(move || {
                         file.metadata().map_err(|err| object_store::Error::Generic {
                             store: "LocalFileSystem",
                             source: err.into(),
                         })
                     })
-                    .await??;
-                    Ok(metadata.len() as usize)
+                    .await
+                    {
+                        Ok(metadata) => metadata,
+                        Err(err) => Err(err.into()),
+                    };
+                    metrics.record(&result, 0);
+                    Ok(result?.len() as usize)
                 })
                 .await
                 .cloned()
@@ -189,6 +197,7 @@ impl Reader for LocalObjectReader {
         let range_u64 = (range.start as u64)..(range.end as u64);
 
         Box::pin(async move {
+            let metrics = io_tracker.begin_io("get");
             let result = tokio::task::spawn_blocking(move || {
                 let mut buf = BytesMut::with_capacity(range.len());
                 // Safety: `buf` is set with appropriate capacity above. It is
@@ -207,6 +216,7 @@ impl Reader for LocalObjectReader {
                 source: err.into(),
             });
 
+            metrics.record(&result, num_bytes);
             if result.is_ok() {
                 io_tracker.record_read("get_range", path, num_bytes, Some(range_u64));
             }
@@ -223,6 +233,7 @@ impl Reader for LocalObjectReader {
             let io_tracker = self.io_tracker.clone();
             let path = self.path.clone();
 
+            let metrics = io_tracker.begin_io("get");
             let result = tokio::task::spawn_blocking(move || {
                 let mut buf = Vec::new();
                 file.read_to_end(buf.as_mut())?;
@@ -234,6 +245,8 @@ impl Reader for LocalObjectReader {
                 source: err.into(),
             });
 
+            let num_bytes = result.as_ref().map_or(0, |bytes| bytes.len() as u64);
+            metrics.record(&result, num_bytes);
             if let Ok(bytes) = &result {
                 io_tracker.record_read("get_all", path, bytes.len() as u64, None);
             }
