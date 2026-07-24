@@ -330,12 +330,14 @@ mod tests {
                         .as_ref()
                         .expect("test segment metadata should have fragment coverage")
                         .iter(),
+                    segment.fields.iter().copied(),
                     segment
                         .index_details
                         .as_ref()
                         .expect("test segment metadata should have index details")
                         .clone(),
                     segment.index_version,
+                    segment.dataset_version,
                 )
             })
             .collect::<Vec<_>>();

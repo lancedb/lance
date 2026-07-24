@@ -608,8 +608,10 @@ fn index_metadata_to_segment(metadata: IndexMetadata) -> PyResult<IndexSegment> 
     Ok(IndexSegment::new(
         metadata.uuid,
         fragment_bitmap.iter(),
+        metadata.fields,
         index_details,
         metadata.index_version,
+        metadata.dataset_version,
     ))
 }
 

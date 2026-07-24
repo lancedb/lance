@@ -550,12 +550,14 @@ async fn do_load_shuffled_vectors(
             .as_ref()
             .expect("vector metadata should include fragment coverage")
             .iter(),
+        metadata.fields.iter().copied(),
         metadata
             .index_details
             .as_ref()
             .expect("vector metadata should include index details")
             .clone(),
         metadata.index_version,
+        metadata.dataset_version,
     );
     ds.commit_existing_index_segments(index_name, column, vec![segment])
         .await
