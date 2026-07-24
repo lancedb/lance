@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow::array::{AsArray, BooleanBuilder};
@@ -171,6 +171,12 @@ enum FtsSegmentSelection {
 }
 
 impl FtsSegmentSelection {
+    fn exact_uuids(mut uuids: Vec<Uuid>) -> Self {
+        let mut seen = HashSet::with_capacity(uuids.len());
+        uuids.retain(|uuid| seen.insert(*uuid));
+        Self::ExactUuids(Arc::from(uuids))
+    }
+
     fn preset_segments(&self) -> Option<&[IndexMetadata]> {
         match self {
             Self::ExactResolved(segments) => Some(segments),
@@ -434,8 +440,9 @@ impl MatchQueryExec {
     /// FTS segment UUIDs.
     ///
     /// The UUIDs are resolved from this exec's dataset snapshot when the output
-    /// stream is polled. Resolution preserves order and duplicates, and fails
-    /// if the list is empty or any UUID is not committed for the query column.
+    /// stream is polled. Duplicate UUIDs are removed while preserving their
+    /// first-occurrence order. Resolution fails if the list is empty or any UUID
+    /// is not committed for the query column.
     pub fn new_with_segment_uuids(
         dataset: Arc<Dataset>,
         query: MatchQuery,
@@ -456,7 +463,7 @@ impl MatchQueryExec {
             params,
             prefilter_source,
             base_scorer: None,
-            segment_selection: FtsSegmentSelection::ExactUuids(Arc::from(segment_uuids)),
+            segment_selection: FtsSegmentSelection::exact_uuids(segment_uuids),
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -505,8 +512,9 @@ impl MatchQueryExec {
 
     /// Return the ordered segment UUIDs for an explicit selection.
     ///
-    /// Returns `None` when this exec searches all committed segments. Both
-    /// pre-resolved and UUID-based exact selections preserve duplicates.
+    /// Returns `None` when this exec searches all committed segments. UUID-based
+    /// selections omit duplicates while preserving first-occurrence order.
+    /// Pre-resolved selections preserve the supplied metadata order.
     pub fn explicit_segment_uuids(&self) -> Option<Vec<Uuid>> {
         self.segment_selection.explicit_segment_uuids()
     }
@@ -1367,8 +1375,9 @@ impl PhraseQueryExec {
     /// FTS segment UUIDs.
     ///
     /// The UUIDs are resolved from this exec's dataset snapshot when the output
-    /// stream is polled. Resolution preserves order and duplicates, and fails
-    /// if the list is empty or any UUID is not committed for the query column.
+    /// stream is polled. Duplicate UUIDs are removed while preserving their
+    /// first-occurrence order. Resolution fails if the list is empty or any UUID
+    /// is not committed for the query column.
     pub fn new_with_segment_uuids(
         dataset: Arc<Dataset>,
         query: PhraseQuery,
@@ -1390,7 +1399,7 @@ impl PhraseQueryExec {
             params,
             prefilter_source,
             base_scorer: None,
-            segment_selection: FtsSegmentSelection::ExactUuids(Arc::from(segment_uuids)),
+            segment_selection: FtsSegmentSelection::exact_uuids(segment_uuids),
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -1428,8 +1437,9 @@ impl PhraseQueryExec {
 
     /// Return the ordered segment UUIDs for an explicit selection.
     ///
-    /// Returns `None` when this exec searches all committed segments. Both
-    /// pre-resolved and UUID-based exact selections preserve duplicates.
+    /// Returns `None` when this exec searches all committed segments. UUID-based
+    /// selections omit duplicates while preserving first-occurrence order.
+    /// Pre-resolved selections preserve the supplied metadata order.
     pub fn explicit_segment_uuids(&self) -> Option<Vec<Uuid>> {
         self.segment_selection.explicit_segment_uuids()
     }
@@ -2702,24 +2712,29 @@ mod tests {
             "successful UUID binding should record a duration"
         );
 
-        let ordered_uuids = vec![
+        let input_uuids = vec![
             segment_uuid_for_fragment(&segments, fragment_ids[2]),
             segment_uuid_for_fragment(&segments, fragment_ids[0]),
             segment_uuid_for_fragment(&segments, fragment_ids[2]),
         ];
+        let deduplicated_uuids = input_uuids[..2].to_vec();
         let ordered_plan = Arc::new(MatchQueryExec::new_with_segment_uuids(
             dataset.clone(),
             query.clone(),
             params.clone(),
             PreFilterSource::None,
-            ordered_uuids.clone(),
+            input_uuids,
         ))
         .with_new_children(vec![])
         .unwrap();
         let rewritten = ordered_plan.downcast_ref::<MatchQueryExec>().unwrap();
         assert_eq!(
             rewritten.explicit_segment_uuids(),
-            Some(ordered_uuids.clone())
+            Some(deduplicated_uuids.clone())
+        );
+        assert_eq!(
+            execute_row_ids(rewritten).await.unwrap(),
+            expected_row_ids(&[fragment_ids[2], fragment_ids[0]])
         );
         let resolver_metrics_set = ExecutionPlanMetricsSet::new();
         let resolver_metrics = super::FtsIndexMetrics::new(&resolver_metrics_set, 0);
@@ -2733,7 +2748,7 @@ mod tests {
                 .iter()
                 .map(|segment| segment.uuid)
                 .collect::<Vec<_>>(),
-            ordered_uuids
+            deduplicated_uuids
         );
 
         let empty = MatchQueryExec::new_with_segment_uuids(
@@ -2865,24 +2880,29 @@ mod tests {
             "successful UUID binding should record a duration"
         );
 
-        let ordered_uuids = vec![
+        let input_uuids = vec![
             segment_uuid_for_fragment(&segments, fragment_ids[2]),
             segment_uuid_for_fragment(&segments, fragment_ids[0]),
             segment_uuid_for_fragment(&segments, fragment_ids[2]),
         ];
+        let deduplicated_uuids = input_uuids[..2].to_vec();
         let ordered_plan = Arc::new(PhraseQueryExec::new_with_segment_uuids(
             dataset.clone(),
             query.clone(),
             params.clone(),
             PreFilterSource::None,
-            ordered_uuids.clone(),
+            input_uuids,
         ))
         .with_new_children(vec![])
         .unwrap();
         let rewritten = ordered_plan.downcast_ref::<PhraseQueryExec>().unwrap();
         assert_eq!(
             rewritten.explicit_segment_uuids(),
-            Some(ordered_uuids.clone())
+            Some(deduplicated_uuids.clone())
+        );
+        assert_eq!(
+            execute_row_ids(rewritten).await.unwrap(),
+            expected_row_ids(&[fragment_ids[2], fragment_ids[0]])
         );
         let resolver_metrics_set = ExecutionPlanMetricsSet::new();
         let resolver_metrics = super::FtsIndexMetrics::new(&resolver_metrics_set, 0);
@@ -2896,7 +2916,7 @@ mod tests {
                 .iter()
                 .map(|segment| segment.uuid)
                 .collect::<Vec<_>>(),
-            ordered_uuids
+            deduplicated_uuids
         );
 
         let empty = PhraseQueryExec::new_with_segment_uuids(
