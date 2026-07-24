@@ -1748,16 +1748,29 @@ impl DirectoryNamespace {
     }
 
     /// Enforce version CAS: requested version must be `latest + 1` (or `1` if empty).
+    ///
+    /// A branch's first commit is its fork version, which may be greater than 1
+    /// (e.g. forking main at v2), so an empty branch chain accepts the requested
+    /// version as its bootstrap. An empty *main* chain must still start at v1.
     async fn enforce_create_table_version_cas(
         &self,
         table_path: &Path,
         version: u64,
         table_uri: &str,
+        is_branch: bool,
     ) -> Result<()> {
         let latest = self.list_versions_under(table_path, true, Some(1)).await?;
         let expected = match latest.first() {
             Some(v) => (v.version as u64).saturating_add(1),
-            None => 1,
+            // Empty chain: main starts at v1, but a branch bootstraps at its fork
+            // version which can be > 1.
+            None => {
+                if is_branch {
+                    version
+                } else {
+                    1
+                }
+            }
         };
         if version != expected {
             let latest_display = latest
@@ -3941,8 +3954,10 @@ impl LanceNamespace for DirectoryNamespace {
             }
         }
 
-        // Strict CAS: only allow appending latest+1 (or version 1 on an empty chain).
-        self.enforce_create_table_version_cas(&table_path, version, &table_uri)
+        // Strict CAS: only allow appending latest+1 (or version 1 on an empty main
+        // chain; an empty branch chain bootstraps at its fork version).
+        let is_branch = branch.is_some();
+        self.enforce_create_table_version_cas(&table_path, version, &table_uri, is_branch)
             .await?;
 
         // Materialize with Create / copy_if_not_exists only — never overwrite.
