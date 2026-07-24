@@ -743,7 +743,7 @@ def _evaluate_sharding_spec(
     schema: LanceSchema,
 ) -> pa.RecordBatch: ...
 
-class _MergedGeneration:
+class _CompactedSsTable:
     shard_id: str
     generation: int
     def __init__(self, shard_id: str, generation: int) -> None: ...

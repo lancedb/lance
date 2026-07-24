@@ -299,7 +299,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<namespace::PyRestAdapter>()?;
     m.add_class::<storage_options::PyStorageOptionsAccessor>()?;
     // MemWAL classes
-    m.add_class::<mem_wal::PyMergedGeneration>()?;
+    m.add_class::<mem_wal::PyCompactedSsTable>()?;
     m.add_class::<mem_wal::PyShardSnapshot>()?;
     m.add_class::<mem_wal::PyShardWriter>()?;
     m.add_class::<mem_wal::PyLsmScanner>()?;

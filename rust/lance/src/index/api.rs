@@ -15,40 +15,45 @@ use crate::{Error, Result};
 /// A single physical segment of a logical index.
 ///
 /// Each segment is stored independently and will become one manifest entry when committed.
-/// The logical index identity (name / target column / dataset version) is provided separately
-/// by the commit API.
+/// The logical index name is provided separately by the commit API, while physical field and
+/// dataset-version provenance travel with the segment.
 #[derive(Debug, Clone, PartialEq)]
 pub struct IndexSegment {
     /// Unique ID of the physical segment.
     uuid: Uuid,
     /// The fragments covered by this segment.
     fragment_bitmap: RoaringBitmap,
+    /// Field IDs whose physical values are encoded in this segment.
+    fields: Vec<i32>,
     /// Metadata specific to the index type.
     index_details: Arc<prost_types::Any>,
     /// The on-disk index version for this segment.
     index_version: i32,
     /// Dataset version at which this segment's physical contents were built.
-    dataset_version: Option<u64>,
+    dataset_version: u64,
 }
 
 impl IndexSegment {
-    /// Create a fully described segment with the given UUID, fragment coverage, and index
-    /// metadata.
-    pub fn new<I>(
+    /// Create a fully described segment with its physical build provenance.
+    pub fn new<I, F>(
         uuid: Uuid,
         fragment_bitmap: I,
+        fields: F,
         index_details: Arc<prost_types::Any>,
         index_version: i32,
+        dataset_version: u64,
     ) -> Self
     where
         I: IntoIterator<Item = u32>,
+        F: IntoIterator<Item = i32>,
     {
         Self {
             uuid,
             fragment_bitmap: fragment_bitmap.into_iter().collect(),
+            fields: fields.into_iter().collect(),
             index_details,
             index_version,
-            dataset_version: None,
+            dataset_version,
         }
     }
 
@@ -62,6 +67,15 @@ impl IndexSegment {
         &self.fragment_bitmap
     }
 
+    pub(crate) fn fragment_bitmap_mut(&mut self) -> &mut RoaringBitmap {
+        &mut self.fragment_bitmap
+    }
+
+    /// Return the field IDs whose values are encoded in this segment.
+    pub fn fields(&self) -> &[i32] {
+        &self.fields
+    }
+
     /// Return the serialized index details for this segment.
     pub fn index_details(&self) -> &Arc<prost_types::Any> {
         &self.index_details
@@ -72,18 +86,29 @@ impl IndexSegment {
         self.index_version
     }
 
-    /// Return the source dataset version when this segment came from index metadata.
-    pub fn dataset_version(&self) -> Option<u64> {
+    /// Return the source dataset version for this segment.
+    pub fn dataset_version(&self) -> u64 {
         self.dataset_version
     }
 
     /// Consume the segment and return its component parts.
-    pub fn into_parts(self) -> (Uuid, RoaringBitmap, Arc<prost_types::Any>, i32) {
+    pub fn into_parts(
+        self,
+    ) -> (
+        Uuid,
+        RoaringBitmap,
+        Vec<i32>,
+        Arc<prost_types::Any>,
+        i32,
+        u64,
+    ) {
         (
             self.uuid,
             self.fragment_bitmap,
+            self.fields,
             self.index_details,
             self.index_version,
+            self.dataset_version,
         )
     }
 }
@@ -115,14 +140,14 @@ impl IntoIndexSegment for IndexMetadata {
             ))
         })?;
 
-        let mut segment = IndexSegment::new(
+        Ok(IndexSegment::new(
             self.uuid,
             fragment_bitmap.iter(),
+            self.fields,
             index_details,
             self.index_version,
-        );
-        segment.dataset_version = Some(self.dataset_version);
-        Ok(segment)
+            self.dataset_version,
+        ))
     }
 }
 
@@ -282,4 +307,32 @@ pub trait DatasetIndexExt {
         partition_id: usize,
         with_vector: bool,
     ) -> Result<SendableRecordBatchStream>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_index_metadata_conversion_preserves_provenance() {
+        let metadata = IndexMetadata {
+            uuid: Uuid::new_v4(),
+            name: "test".to_string(),
+            fields: vec![3, 7],
+            dataset_version: 42,
+            fragment_bitmap: Some(RoaringBitmap::from_iter([1, 2])),
+            index_details: Some(Arc::new(prost_types::Any {
+                type_url: "example.IndexDetails".to_string(),
+                value: vec![1, 2, 3],
+            })),
+            index_version: 5,
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+
+        let segment = metadata.into_index_segment().unwrap();
+        assert_eq!(segment.fields(), [3, 7]);
+        assert_eq!(segment.dataset_version(), 42);
+    }
 }

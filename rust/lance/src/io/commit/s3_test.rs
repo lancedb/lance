@@ -304,9 +304,12 @@ async fn test_ddb_open_iops() {
     //    * write staged file
     //    * copy to final file
     //    * delete staged file
+    // Commit: 2 read IOPs:
+    // * list versions before creating the dataset
+    // * HEAD the finalized manifest to record destination metadata after copy
     let io_stats = committed_ds.object_store.as_ref().io_stats_incremental();
     assert_io_eq!(io_stats, write_iops, 4);
-    assert_io_eq!(io_stats, read_iops, 1);
+    assert_io_eq!(io_stats, read_iops, 2);
 
     let dataset = DatasetBuilder::from_uri(&uri)
         .with_read_params(ReadParams {
@@ -335,9 +338,11 @@ async fn test_ddb_open_iops() {
     let io_stats = dataset.object_store.as_ref().io_stats_incremental();
     // Append: 5 IOPS: data file, transaction file, 3x manifest file
     assert_io_eq!(io_stats, write_iops, 5);
+    // Append reads once to list versions and once to HEAD the finalized manifest
+    // so the destination metadata can be recorded after copy.
     // TODO: we can reduce this by implementing a specialized CommitHandler::list_manifest_locations()
     // for the DDB commit handler.
-    assert_io_eq!(io_stats, read_iops, 1);
+    assert_io_eq!(io_stats, read_iops, 2);
 
     // Checkout original version
     dataset.checkout_version(1).await.unwrap();

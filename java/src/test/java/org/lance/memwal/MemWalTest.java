@@ -520,7 +520,7 @@ public class MemWalTest {
   }
 
   @Test
-  void testMergeInsertMarkGenerationsAsMerged(@TempDir Path tempDir) throws Exception {
+  void testMergeInsertMarkSstablesAsCompacted(@TempDir Path tempDir) throws Exception {
     String path = tempDir.resolve("base").toString();
     String shardId = UUID.randomUUID().toString();
     try (BufferAllocator allocator = new RootAllocator()) {
@@ -532,8 +532,8 @@ public class MemWalTest {
             new MergeInsertParams(Collections.singletonList("id"))
                 .withMatchedUpdateAll()
                 .withNotMatched(MergeInsertParams.WhenNotMatched.InsertAll)
-                .markGenerationsAsMerged(
-                    Collections.singletonList(new MergedGeneration(shardId, 1)));
+                .markSstablesAsCompacted(
+                    Collections.singletonList(new CompactedSsTable(shardId, 1)));
 
         try (VectorSchemaRoot root = lookupRoot(allocator, new long[] {2, 4}, "merged");
             ArrowReader reader = toReader(allocator, root);

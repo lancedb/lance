@@ -642,13 +642,13 @@ message ShardManifest {
   // files to find actual state.
   uint64 wal_entry_position_last_seen = 4;
 
-  // Next generation ID to create (incremented after each MemTable flush).
+  // Generation to assign to the next SSTable (incremented after each MemTable flush).
   uint64 current_generation = 6;
 
-  // Field 7 removed: merged_generation moved to MemWalIndexDetails.merged_generations
-  // which is the authoritative source for merge progress.
+  // Field 7 removed: compaction progress lives in
+  // MemWalIndexDetails.compacted_sstables.
 
-  // List of SSTables (flushed MemTable generations) and their directory paths.
+  // List of SSTables created by flushing MemTables and their directory paths.
   repeated SsTable sstables = 8;
 
   // Lifecycle status. Default ACTIVE; SEALED marks an in-flight drop
@@ -666,7 +666,7 @@ message ShardFieldEntry {
   bytes value = 2;
 }
 
-// An SSTable: a flushed MemTable generation, stored as a Lance dataset.
+// An SSTable: the immutable result of flushing a MemTable, stored as a Lance dataset.
 message SsTable {
   // Generation number identifying this SSTable.
   uint64 generation = 1;
@@ -675,16 +675,16 @@ message SsTable {
   string path = 2;
 }
 
-// A shard's merged generation, used in MemWalIndexDetails.
-message MergedGeneration {
+// A pointer to the latest SSTable compacted for a shard.
+message CompactedSsTable {
   // Shard identifier (UUID v4).
   UUID shard_id = 1;
 
-  // Last generation merged to base table for this shard.
+  // Generation of the latest SSTable compacted into the base table for this shard.
   uint64 generation = 2;
 }
 
-// Tracks which merged generation a base table index has been rebuilt to cover.
+// Tracks which compacted SSTable generation a base table index has been rebuilt to cover.
 // Used to determine whether to read from SSTable indexes or base table.
 message IndexCatchupProgress {
   // Name of the base table index (must match an entry in maintained_indexes).
@@ -692,14 +692,14 @@ message IndexCatchupProgress {
 
   // Per-shard progress: the generation up to which this index covers.
   // If a shard is not present, the index is assumed to be fully caught up
-  // (i.e., caught_up_generation >= merged_generation for that shard).
-  repeated MergedGeneration caught_up_generations = 2;
+  // (i.e., caught_up_generation >= compacted_generation for that shard).
+  repeated CompactedSsTable caught_up_generations = 2;
 }
 
 // Index details for MemWAL Index, stored in IndexMetadata.index_details.
 // This is the centralized structure for all MemWAL metadata:
 // - Configuration (sharding specs, indexes to maintain)
-// - Merge progress (merged generations per shard)
+// - SSTable compaction progress
 // - Shard state snapshots
 //
 // Writers read this index to get configuration before writing.
@@ -741,21 +741,21 @@ message MemWalIndexDetails {
   // SQ params) from the base table index to ensure distance comparability.
   repeated string maintained_indexes = 8;
 
-  // Last generation merged to base table for each shard.
+  // Latest SSTable compacted into the base table for each shard.
   // This is updated atomically with merge-insert data commits, enabling
-  // conflict resolution when multiple mergers operate concurrently.
+  // conflict resolution when multiple compactors operate concurrently.
   //
   // Note: This is separate from shard snapshots because:
-  // 1. merged_generations is updated by mergers (atomic with data commit)
+  // 1. compacted_sstables is updated by compactors (atomic with data commit)
   // 2. shard snapshots are updated by background index builder
-  repeated MergedGeneration merged_generations = 9;
+  repeated CompactedSsTable compacted_sstables = 9;
 
   // Per-index catchup progress tracking.
-  // When data is merged to the base table, base table indexes are rebuilt
+  // When data is compacted into the base table, base table indexes are rebuilt
   // asynchronously. This field tracks which generation each index covers.
   //
-  // For indexed queries, if an index's caught_up_generation < merged_generation,
-  // readers should use flushed MemTable indexes for the gap instead of
+  // For indexed queries, if an index's caught_up_generation < compacted_generation,
+  // readers should use SSTable indexes for the gap instead of
   // scanning unindexed data in the base table.
   //
   // If an index is not present in this list, it is assumed to be fully caught up.

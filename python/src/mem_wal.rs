@@ -24,7 +24,7 @@ use lance::dataset::mem_wal::scanner::{
 use lance::dataset::mem_wal::write::{MemTableStats, WriteStatsSnapshot};
 use lance::dataset::mem_wal::{LsmScanner, ShardSnapshot, ShardWriter, evaluate_sharding_spec};
 use lance_index::mem_wal::{
-    MergedGeneration as LanceMergedGeneration, ShardingField, ShardingSpec,
+    CompactedSsTable as LanceCompactedSsTable, ShardingField, ShardingSpec,
 };
 use lance_linalg::distance::DistanceType;
 use pyo3::exceptions::{PyIOError, PyRuntimeError, PyValueError};
@@ -115,16 +115,17 @@ fn optional_string(value: Bound<'_, PyAny>) -> PyResult<Option<String>> {
     }
 }
 
-/// Represents a single generation of a MemWAL shard that has been merged
-/// into the base table. Used with `MergeInsertBuilder.mark_generations_as_merged()`.
-#[pyclass(name = "_MergedGeneration", module = "_lib")]
-pub struct PyMergedGeneration {
+/// Points to an SSTable compacted into the base table.
+///
+/// Used with `MergeInsertBuilder.mark_sstables_as_compacted()`.
+#[pyclass(name = "_CompactedSsTable", module = "_lib")]
+pub struct PyCompactedSsTable {
     pub shard_id: String,
     pub generation: u64,
 }
 
 #[pymethods]
-impl PyMergedGeneration {
+impl PyCompactedSsTable {
     #[new]
     pub fn new(shard_id: String, generation: u64) -> Self {
         Self {
@@ -145,17 +146,17 @@ impl PyMergedGeneration {
 
     pub fn __repr__(&self) -> String {
         format!(
-            "_MergedGeneration(shard_id='{}', generation={})",
+            "_CompactedSsTable(shard_id='{}', generation={})",
             self.shard_id, self.generation
         )
     }
 }
 
-impl PyMergedGeneration {
-    pub fn to_lance(&self) -> PyResult<LanceMergedGeneration> {
+impl PyCompactedSsTable {
+    pub fn to_lance(&self) -> PyResult<LanceCompactedSsTable> {
         let uuid = Uuid::parse_str(&self.shard_id)
             .map_err(|e| PyValueError::new_err(format!("Invalid shard_id UUID: {}", e)))?;
-        Ok(LanceMergedGeneration::new(uuid, self.generation))
+        Ok(LanceCompactedSsTable::new(uuid, self.generation))
     }
 }
 

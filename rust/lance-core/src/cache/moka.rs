@@ -22,7 +22,7 @@ struct MokaCacheEntry {
 }
 
 /// Per-entry key cost for eviction.
-fn key_footprint(_key: &InternalCacheKey) -> usize {
+pub(super) fn key_footprint(_key: &InternalCacheKey) -> usize {
     std::mem::size_of::<InternalCacheKey>()
 }
 
