@@ -1,12 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Experimental [`CacheBackend`] backed by [quick_cache](https://crates.io/crates/quick_cache).
-//!
-//! quick_cache records a hit by setting one atomic bit (CLOCK-style), with no
-//! read-op channel or inline housekeeping, so warm hits stay cheap at high
-//! read rates. Used as the backend for the session index cache, whose search
-//! paths issue thousands of cache reads per query.
+//! [`CacheBackend`] backed by [quick_cache](https://crates.io/crates/quick_cache),
+//! whose hit path is one atomic bit — no read-op channel or inline
+//! housekeeping. Used for the session index cache, which sees thousands of
+//! cache reads per query.
 
 use std::pin::Pin;
 
@@ -29,7 +27,7 @@ struct EntryWeighter;
 
 impl quick_cache::Weighter<InternalCacheKey, QuickEntry> for EntryWeighter {
     fn weight(&self, key: &InternalCacheKey, value: &QuickEntry) -> u64 {
-        // Same accounting as the moka backend: key footprint + entry bytes.
+        // Same accounting as the moka backend.
         (key_footprint(key) + value.size_bytes).max(1) as u64
     }
 }
@@ -46,27 +44,18 @@ impl std::fmt::Debug for QuickCacheBackend {
     }
 }
 
-/// Minimum weight budget (4 GiB) per shard. Shards don't borrow capacity from
-/// each other, and an entry heavier than ~its shard's budget is silently
-/// refused — so the share must stay well above the largest cache entry.
+/// Minimum weight budget (4 GiB) per shard: shards don't borrow capacity, and
+/// an entry heavier than ~its shard's budget is silently refused admission.
 const MIN_SHARD_SHARE: usize = 4 << 30;
 
-/// Recommended quick_cache shard count for a byte-weighted cache of
-/// `capacity`: `min(cpus / 2, capacity / 4 GiB)`, rounded down to a power of
-/// two and clamped to `[1, 1024]`.
-///
-/// The cpu term bounds lock contention (more shards than concurrent threads
-/// buys nothing); the capacity term keeps every shard's budget >= 4 GiB so
-/// large entries stay admissible. Rounds DOWN because quick_cache rounds
-/// requested shard counts UP, which would halve the per-shard budget. Also
-/// used by downstream backends (e.g. tiered caches) that build their own
-/// quick_cache instances over the same entry shapes.
+/// Recommended shard count: `min(cpus / 2, capacity / 4 GiB)`, power of two
+/// in `[1, 1024]`. The cpu term bounds lock contention; the capacity term
+/// keeps each shard's budget >= 4 GiB so large entries stay admissible.
+/// Rounded down because quick_cache rounds requests up.
 ///
 /// ```
 /// use lance_core::cache::recommended_cache_shards;
-/// let shards = recommended_cache_shards(64 << 30);
-/// assert!(shards.is_power_of_two());
-/// assert!((64 << 30) / shards >= 4 << 30);
+/// assert!((64 << 30) / recommended_cache_shards(64 << 30) >= 4 << 30);
 /// ```
 pub fn recommended_cache_shards(capacity: usize) -> usize {
     let by_cpu = std::thread::available_parallelism()
@@ -82,17 +71,13 @@ pub fn recommended_cache_shards(capacity: usize) -> usize {
     shards.clamp(1, 1024)
 }
 
-/// Assumed average entry size (64 KiB) for sizing hash-table and ghost-key
-/// pre-allocation from the weight budget.
+/// Assumed average entry size for pre-allocation sizing.
 const ESTIMATED_AVG_ENTRY_BYTES: usize = 64 << 10;
 
 impl QuickCacheBackend {
-    /// Create a backend holding up to `capacity` bytes of weighted entries.
-    ///
-    /// Entry weight = key footprint + declared byte size (same accounting as
-    /// [`super::moka::MokaCacheBackend`]). The budget is split evenly across
-    /// `min(cpus / 2, capacity / 4 GiB)` shards; an entry heavier than ~one
-    /// shard's share is refused admission.
+    /// Create a backend holding up to `capacity` bytes of weighted entries
+    /// (weight = key footprint + declared size), sharded per
+    /// [`recommended_cache_shards`].
     ///
     /// ```
     /// use lance_core::cache::{CacheBackend, QuickCacheBackend};
@@ -101,8 +86,8 @@ impl QuickCacheBackend {
     /// ```
     pub fn with_capacity(capacity: usize) -> Self {
         let shards = recommended_cache_shards(capacity);
-        // Floor stops quick_cache's items-per-shard heuristic from shrinking
-        // the shard count; ceiling bounds pre-allocation at TiB scale.
+        // Floor protects the shard count from quick_cache's items-per-shard
+        // heuristic; ceiling bounds pre-allocation.
         let estimated_items = (capacity / ESTIMATED_AVG_ENTRY_BYTES).clamp(shards * 32, 1_000_000);
         let options = quick_cache::OptionsBuilder::new()
             .estimated_items_capacity(estimated_items)

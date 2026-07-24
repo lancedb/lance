@@ -95,10 +95,8 @@ impl Session {
     ///
     /// Parameters:
     ///
-    /// - ***index_cache_size***: the size of the index cache. The index cache
-    ///   is backed by [`QuickCacheBackend`], whose hit path stays
-    ///   contention-free under high concurrent read rates (index searches
-    ///   issue thousands of cache reads per query).
+    /// - ***index_cache_size***: the size of the index cache, backed by
+    ///   [`QuickCacheBackend`].
     /// - ***metadata_cache_size***: the size of the metadata cache.
     /// - ***store_registry***: the object store registry to use when opening
     ///   datasets. This determines which schemes are available, and also allows
