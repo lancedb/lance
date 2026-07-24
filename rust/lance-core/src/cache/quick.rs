@@ -51,6 +51,10 @@ impl std::fmt::Debug for QuickCacheBackend {
 /// refused — so the share must stay well above the largest cache entry.
 const MIN_SHARD_SHARE: usize = 4 << 30;
 
+/// Assumed average entry size (64 KiB) for sizing hash-table and ghost-key
+/// pre-allocation from the weight budget.
+const ESTIMATED_AVG_ENTRY_BYTES: usize = 64 << 10;
+
 impl QuickCacheBackend {
     /// Create a backend holding up to `capacity` bytes of weighted entries.
     ///
@@ -79,10 +83,8 @@ impl QuickCacheBackend {
             shards.next_power_of_two() / 2
         };
         let shards = shards.clamp(1, 1024);
-        // Sizes hash-table/ghost-key pre-allocation (~64 KiB avg entry). The
-        // floor stops quick_cache's items-per-shard heuristic from shrinking
-        // the shard count; the ceiling bounds pre-allocation at TiB scale.
-        const ESTIMATED_AVG_ENTRY_BYTES: usize = 64 << 10;
+        // Floor stops quick_cache's items-per-shard heuristic from shrinking
+        // the shard count; ceiling bounds pre-allocation at TiB scale.
         let estimated_items = (capacity / ESTIMATED_AVG_ENTRY_BYTES).clamp(shards * 32, 1_000_000);
         let options = quick_cache::OptionsBuilder::new()
             .estimated_items_capacity(estimated_items)
