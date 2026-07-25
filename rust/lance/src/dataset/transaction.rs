@@ -2132,6 +2132,53 @@ impl Transaction {
                 removed_indices,
             } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
+
+                // The transaction may have been staged against an older version,
+                // and the pairwise conflict checks cannot enumerate every
+                // hazardous concurrent operation. Enforce the invariants that
+                // make it safe to apply here, where the final manifest is known:
+                // every indexed field must still exist in the schema (a
+                // concurrent projection or column cast drops or re-ids fields),
+                // and every non-system segment staged for removal must still be
+                // present (a concurrent drop or replacement would otherwise be
+                // silently undone). System-index removals are reconciled during
+                // conflict rebasing and are exempt.
+                let field_ids = schema
+                    .fields_pre_order()
+                    .map(|f| f.id)
+                    .collect::<HashSet<_>>();
+                for new_index in new_indices {
+                    if let Some(field_id) = new_index
+                        .fields
+                        .iter()
+                        .find(|field_id| !field_ids.contains(*field_id))
+                    {
+                        return Err(Error::incompatible_transaction_source(
+                            format!(
+                                "CreateIndex: field {} covered by index '{}' no longer \
+                                 exists in the schema",
+                                field_id, new_index.name
+                            )
+                            .into(),
+                        ));
+                    }
+                }
+                if let Some(missing) = removed_indices.iter().find(|removed| {
+                    !is_system_index(removed)
+                        && !final_indices.iter().any(|idx| idx.uuid == removed.uuid)
+                }) {
+                    return Err(Error::retryable_commit_conflict_source(
+                        current_manifest.map(|m| m.version).unwrap_or_default(),
+                        format!(
+                            "CreateIndex: segment {} of index '{}' staged for removal was \
+                             removed by a concurrent transaction; please re-stage against \
+                             the latest version",
+                            missing.uuid, missing.name
+                        )
+                        .into(),
+                    ));
+                }
+
                 let removed_uuids = removed_indices
                     .iter()
                     .map(|old_index| old_index.uuid)

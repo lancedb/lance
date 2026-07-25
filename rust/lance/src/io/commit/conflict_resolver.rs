@@ -590,34 +590,26 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::UpdateBases { .. } => Ok(()),
                 Operation::CreateIndex {
                     new_indices: created_indices,
-                    ..
+                    removed_indices: other_removed_indices,
                 } => {
-                    let self_has_frag_reuse = new_indices
-                        .iter()
-                        .any(|idx| idx.name == FRAG_REUSE_INDEX_NAME);
-                    let other_has_frag_reuse = created_indices
-                        .iter()
-                        .any(|idx| idx.name == FRAG_REUSE_INDEX_NAME);
-                    let self_has_mem_wal =
-                        new_indices.iter().any(|idx| idx.name == MEM_WAL_INDEX_NAME);
-                    let other_has_mem_wal = created_indices
-                        .iter()
-                        .any(|idx| idx.name == MEM_WAL_INDEX_NAME);
-                    let has_regular_name_conflict = new_indices
-                        .iter()
-                        .filter(|idx| {
-                            idx.name != FRAG_REUSE_INDEX_NAME && idx.name != MEM_WAL_INDEX_NAME
-                        })
-                        .any(|new_index| {
-                            created_indices
-                                .iter()
-                                .any(|created_index| created_index.name == new_index.name)
-                        });
-
-                    if (self_has_frag_reuse && other_has_frag_reuse)
-                        || (self_has_mem_wal && other_has_mem_wal)
-                        || has_regular_name_conflict
-                    {
+                    // Two index transactions conflict when they touch any index
+                    // name in common, in either direction: committing a creation
+                    // over a concurrent same-name removal would resurrect the
+                    // dropped index, and committing a removal over a concurrent
+                    // same-name replacement would silently no-op the drop (its
+                    // stale UUIDs no longer match anything at apply time).
+                    // System singletons need no special casing under this rule.
+                    let names_intersect =
+                        new_indices
+                            .iter()
+                            .chain(removed_indices.iter())
+                            .any(|self_index| {
+                                created_indices
+                                    .iter()
+                                    .chain(other_removed_indices.iter())
+                                    .any(|other_index| other_index.name == self_index.name)
+                            });
+                    if names_intersect {
                         Err(self.retryable_conflict_err(other_transaction, other_version))
                     } else {
                         Ok(())
@@ -626,10 +618,23 @@ impl<'a> TransactionRebase<'a> {
                 // Although some of the rows we indexed may have been deleted / moved,
                 // row ids are still valid, so we allow this optimistically.
                 Operation::Delete { .. } | Operation::Update { .. } => Ok(()),
-                // Merge, reserve, and project don't change row ids, so this should be fine.
+                // Merge and reserve don't change row ids, so this should be fine.
                 Operation::Merge { .. } => Ok(()),
                 Operation::ReserveFragments { .. } => Ok(()),
-                Operation::Project { .. } => Ok(()),
+                // A projection doesn't change row ids either, but it can drop the
+                // indexed column. Committing this index afterwards would publish
+                // metadata referencing a field that no longer exists.
+                Operation::Project { schema } => {
+                    let missing_field = new_indices
+                        .iter()
+                        .flat_map(|idx| idx.fields.iter())
+                        .any(|field_id| schema.field_by_id(*field_id).is_none());
+                    if missing_field {
+                        Err(self.incompatible_conflict_err(other_transaction, other_version))
+                    } else {
+                        Ok(())
+                    }
+                }
                 // Should be compatible with rewrite if it didn't move the rows
                 // we indexed. If it did, we could retry.
                 // TODO: this will change with stable row ids.
@@ -4648,5 +4653,78 @@ mod tests {
         );
 
         assert_eq!(dataset_v2.count_rows(None).await.unwrap(), 5);
+    }
+
+    #[tokio::test]
+    async fn test_index_transactions_conflict_on_shared_names() {
+        fn index_meta(name: &str) -> IndexMetadata {
+            IndexMetadata {
+                uuid: Uuid::new_v4(),
+                name: name.to_string(),
+                fields: vec![0],
+                dataset_version: 1,
+                fragment_bitmap: Some([0u32].into_iter().collect()),
+                index_details: None,
+                index_version: 0,
+                created_at: None,
+                base_id: None,
+                files: None,
+            }
+        }
+        fn create_op(name: &str) -> Operation {
+            Operation::CreateIndex {
+                new_indices: vec![index_meta(name)],
+                removed_indices: vec![],
+            }
+        }
+        fn removal_op(name: &str) -> Operation {
+            Operation::CreateIndex {
+                new_indices: vec![],
+                removed_indices: vec![index_meta(name)],
+            }
+        }
+
+        let dataset = test_dataset(10, 1).await;
+        // Index transactions touching the same name conflict in every
+        // direction: a creation over a concurrent removal must not resurrect
+        // the dropped index, and a removal over a concurrent replacement must
+        // not silently no-op the drop. Regular names and both system
+        // singletons behave identically.
+        for name in ["my_idx", FRAG_REUSE_INDEX_NAME, MEM_WAL_INDEX_NAME] {
+            for (self_op, other_op) in [
+                (create_op(name), removal_op(name)),
+                (removal_op(name), create_op(name)),
+                (removal_op(name), removal_op(name)),
+            ] {
+                let staged = Transaction::new(dataset.manifest.version, self_op, None);
+                let committed = Transaction::new(dataset.manifest.version, other_op, None);
+                let mut rebase = TransactionRebase::try_new(&dataset, staged, None)
+                    .await
+                    .unwrap();
+                let err = rebase
+                    .check_txn(&committed, dataset.manifest.version + 1)
+                    .unwrap_err();
+                assert!(
+                    matches!(err, Error::RetryableCommitConflict { .. }),
+                    "{name}: expected a retryable commit conflict, got: {err}"
+                );
+                assert!(
+                    err.to_string()
+                        .contains("preempted by concurrent transaction CreateIndex"),
+                    "{name}: conflict message must identify the concurrent CreateIndex, got: {err}"
+                );
+            }
+
+            // Transactions on disjoint names never conflict, singletons included.
+            let staged = Transaction::new(dataset.manifest.version, create_op(name), None);
+            let unrelated =
+                Transaction::new(dataset.manifest.version, removal_op("other_idx"), None);
+            let mut rebase = TransactionRebase::try_new(&dataset, staged, None)
+                .await
+                .unwrap();
+            rebase
+                .check_txn(&unrelated, dataset.manifest.version + 1)
+                .unwrap_or_else(|err| panic!("{name}: disjoint names must not conflict: {err}"));
+        }
     }
 }

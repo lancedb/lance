@@ -1237,6 +1237,159 @@ impl IndexDescription for IndexDescriptionImpl {
     }
 }
 
+impl Dataset {
+    /// Build, without committing, the transaction that publishes one or more
+    /// existing physical index segments as a logical index.
+    ///
+    /// This stages the same manifest update as
+    /// [`commit_existing_index_segments`](DatasetIndexExt::commit_existing_index_segments)
+    /// but does not advance the dataset version. Use
+    /// [`CommitBuilder`](crate::dataset::CommitBuilder) to commit the returned
+    /// [`Transaction`].
+    ///
+    /// The transaction is a snapshot built against the current dataset version.
+    /// Conflicting concurrent changes are rejected at commit time: creating or
+    /// dropping a same-name index between staging and commit fails the commit
+    /// with a retryable conflict, and a schema change that drops or re-ids the
+    /// indexed column (e.g. [`Dataset::drop_columns`] or an
+    /// [`Dataset::alter_columns`] type cast) fails it as incompatible. A
+    /// concurrent compaction/rewrite that defers index remapping is not
+    /// conflict-checked; the committed segments may then cover
+    /// already-compacted fragments until the deferred remap catches up, so
+    /// commit promptly.
+    ///
+    /// # Side effects
+    ///
+    /// For most index types this only reads the segment directories. For inverted
+    /// (full-text) segments it also finalizes the segment's on-disk files within
+    /// the segment's UUID directory before returning. Finalization is idempotent,
+    /// and any files left behind if the returned transaction is never committed
+    /// are reclaimed by `cleanup_old_versions` like other unreferenced index
+    /// files.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use lance::Result;
+    /// # use lance::dataset::{CommitBuilder, Dataset};
+    /// # use lance::index::IndexSegment;
+    /// # async fn example(dataset: Arc<Dataset>, segments: Vec<IndexSegment>) -> Result<()> {
+    /// let transaction = dataset
+    ///     .build_existing_index_segments_transaction("vector_idx", "vector", segments)
+    ///     .await?;
+    /// CommitBuilder::new(dataset).execute(transaction).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn build_existing_index_segments_transaction(
+        &self,
+        index_name: &str,
+        column: &str,
+        segments: Vec<impl IntoIndexSegment + Send>,
+    ) -> Result<Transaction> {
+        let Some(field) = self.schema().field(column) else {
+            return Err(Error::index(format!(
+                "CreateIndex: column '{column}' does not exist"
+            )));
+        };
+
+        let segments = segments
+            .into_iter()
+            .map(IntoIndexSegment::into_index_segment)
+            .collect::<Result<Vec<_>>>()?;
+        let new_indices =
+            build_index_metadata_from_segments(self, index_name, field.id, segments).await?;
+        validate_segment_metadata(index_name, &new_indices)?;
+        validate_segment_index_details(index_name, &new_indices)?;
+
+        let incoming_type_url = new_indices[0]
+            .index_details
+            .as_ref()
+            .map(|details| details.type_url.clone());
+        let dataset_fragments = self.fragment_bitmap.as_ref().clone();
+        let mut incoming_fragments = RoaringBitmap::new();
+        for segment in &new_indices {
+            if segment.fields != [field.id] {
+                return Err(Error::invalid_input(format!(
+                    "CreateIndex: segment {} was built for fields {:?}, expected [{}]",
+                    segment.uuid, segment.fields, field.id
+                )));
+            }
+            if let Some(fragment_bitmap) = &segment.fragment_bitmap {
+                incoming_fragments |= fragment_bitmap.clone();
+            }
+        }
+
+        let existing_named_indices = self.load_indices_by_name(index_name).await?;
+        if existing_named_indices
+            .iter()
+            .any(|idx| idx.fields != [field.id])
+        {
+            return Err(Error::index(format!(
+                "Index name '{index_name}' already exists with different fields, \
+                please specify a different name"
+            )));
+        }
+        let removed_indices = existing_named_indices
+            .into_iter()
+            .filter(|idx| {
+                idx.index_details
+                    .as_ref()
+                    .zip(incoming_type_url.as_deref())
+                    .is_none_or(|(details, expected)| details.type_url == expected)
+            })
+            .map(|idx| -> Result<Option<IndexMetadata>> {
+                let Some(existing_fragments) = idx.effective_fragment_bitmap(&dataset_fragments)
+                else {
+                    if incoming_fragments != dataset_fragments {
+                        return Err(Error::invalid_input(format!(
+                            "CreateIndex: cannot replace legacy index segment {} for '{}' with partial fragment coverage; rebuild all fragments in one commit",
+                            idx.uuid, index_name
+                        )));
+                    }
+                    return Ok(Some(idx));
+                };
+
+                // A zero-fragment segment can be used to create an index while
+                // deferring the actual build. Such a segment is disjoint from every
+                // other segment but should still be removed.
+                if existing_fragments.is_empty() {
+                    return Ok(Some(idx));
+                }
+
+                if existing_fragments.is_disjoint(&incoming_fragments) {
+                    return Ok(None);
+                }
+
+                let uncovered = existing_fragments - &incoming_fragments;
+                if !uncovered.is_empty() {
+                    return Err(Error::invalid_input(format!(
+                        "CreateIndex: incoming segments for '{}' would orphan fragments {:?} from existing segment {}",
+                        index_name,
+                        uncovered.iter().collect::<Vec<_>>(),
+                        idx.uuid
+                    )));
+                }
+
+                Ok(Some(idx))
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+
+        Ok(Transaction::new(
+            self.manifest.version,
+            Operation::CreateIndex {
+                new_indices,
+                removed_indices,
+            },
+            None,
+        ))
+    }
+}
+
 #[async_trait]
 impl DatasetIndexExt for Dataset {
     type IndexBuilder<'a> = CreateIndexBuilder<'a>;
@@ -1616,105 +1769,9 @@ impl DatasetIndexExt for Dataset {
         column: &str,
         segments: Vec<impl IntoIndexSegment + Send>,
     ) -> Result<()> {
-        let Some(field) = self.schema().field(column) else {
-            return Err(Error::index(format!(
-                "CreateIndex: column '{column}' does not exist"
-            )));
-        };
-
-        let segments = segments
-            .into_iter()
-            .map(IntoIndexSegment::into_index_segment)
-            .collect::<Result<Vec<_>>>()?;
-        let new_indices =
-            build_index_metadata_from_segments(self, index_name, field.id, segments).await?;
-        validate_segment_metadata(index_name, &new_indices)?;
-        validate_segment_index_details(index_name, &new_indices)?;
-
-        let incoming_type_url = new_indices[0]
-            .index_details
-            .as_ref()
-            .map(|details| details.type_url.clone());
-        let dataset_fragments = self.fragment_bitmap.as_ref().clone();
-        let mut incoming_fragments = RoaringBitmap::new();
-        for segment in &new_indices {
-            if segment.fields != [field.id] {
-                return Err(Error::invalid_input(format!(
-                    "CreateIndex: segment {} was built for fields {:?}, expected [{}]",
-                    segment.uuid, segment.fields, field.id
-                )));
-            }
-            if let Some(fragment_bitmap) = &segment.fragment_bitmap {
-                incoming_fragments |= fragment_bitmap.clone();
-            }
-        }
-
-        let existing_named_indices = self.load_indices_by_name(index_name).await?;
-        if existing_named_indices
-            .iter()
-            .any(|idx| idx.fields != [field.id])
-        {
-            return Err(Error::index(format!(
-                "Index name '{index_name}' already exists with different fields, \
-                please specify a different name"
-            )));
-        }
-        let removed_indices = existing_named_indices
-            .into_iter()
-            .filter(|idx| {
-                idx.index_details
-                    .as_ref()
-                    .zip(incoming_type_url.as_deref())
-                    .is_none_or(|(details, expected)| details.type_url == expected)
-            })
-            .map(|idx| -> Result<Option<IndexMetadata>> {
-                let Some(existing_fragments) = idx.effective_fragment_bitmap(&dataset_fragments)
-                else {
-                    if incoming_fragments != dataset_fragments {
-                        return Err(Error::invalid_input(format!(
-                            "CreateIndex: cannot replace legacy index segment {} for '{}' with partial fragment coverage; rebuild all fragments in one commit",
-                            idx.uuid, index_name
-                        )));
-                    }
-                    return Ok(Some(idx));
-                };
-
-                // A zero-fragment segment can be used to create an index while
-                // deferring the actual build. Such a segment is disjoint from every
-                // other segment but should still be removed.
-                if existing_fragments.is_empty() {
-                    return Ok(Some(idx));
-                }
-
-                if existing_fragments.is_disjoint(&incoming_fragments) {
-                    return Ok(None);
-                }
-
-                let uncovered = existing_fragments - &incoming_fragments;
-                if !uncovered.is_empty() {
-                    return Err(Error::invalid_input(format!(
-                        "CreateIndex: incoming segments for '{}' would orphan fragments {:?} from existing segment {}",
-                        index_name,
-                        uncovered.iter().collect::<Vec<_>>(),
-                        idx.uuid
-                    )));
-                }
-
-                Ok(Some(idx))
-            })
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
-
-        let transaction = Transaction::new(
-            self.manifest.version,
-            Operation::CreateIndex {
-                new_indices,
-                removed_indices,
-            },
-            None,
-        );
+        let transaction = self
+            .build_existing_index_segments_transaction(index_name, column, segments)
+            .await?;
 
         self.apply_commit(transaction, &Default::default(), &Default::default())
             .await?;
@@ -7626,6 +7683,546 @@ mod tests {
             committed.iter().map(|i| i.uuid).collect::<HashSet<_>>(),
             HashSet::from([seg.uuid]),
             "empty segment should be removed once a real segment covers the dataset",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_existing_index_segments_transaction_does_not_commit() {
+        use crate::dataset::CommitBuilder;
+        use lance_datagen::{BatchCount, RowCount, array};
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .col(
+                "vector",
+                array::rand_vec::<arrow_array::types::Float32Type>(8.into()),
+            )
+            .into_reader_rows(RowCount::from(10), BatchCount::from(2));
+
+        let dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 10,
+                max_rows_per_group: 10,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        // 20 rows with max_rows_per_file=10 yields two single-fragment files.
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        let read_version = dataset.manifest.version;
+        let field_id = dataset.schema().field("vector").unwrap().id;
+        let seg0 = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            field_id,
+            Uuid::new_v4(),
+            [0_u32],
+            b"seg0",
+        )
+        .await;
+        let seg1 = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            field_id,
+            Uuid::new_v4(),
+            [1_u32],
+            b"seg1",
+        )
+        .await;
+
+        let transaction = dataset
+            .build_existing_index_segments_transaction(
+                "vector_idx",
+                "vector",
+                vec![segment_from_metadata(&seg0), segment_from_metadata(&seg1)],
+            )
+            .await
+            .unwrap();
+
+        // Building the transaction must not publish the index.
+        assert!(
+            dataset
+                .load_indices_by_name("vector_idx")
+                .await
+                .unwrap()
+                .is_empty(),
+            "building a transaction must not publish the index"
+        );
+        assert_eq!(transaction.read_version, read_version);
+        let Operation::CreateIndex {
+            new_indices,
+            removed_indices,
+        } = &transaction.operation
+        else {
+            panic!("expected index creation transaction");
+        };
+        assert_eq!(
+            new_indices.iter().map(|i| i.uuid).collect::<HashSet<_>>(),
+            HashSet::from([seg0.uuid, seg1.uuid]),
+        );
+        assert!(removed_indices.is_empty());
+
+        // The returned transaction can be committed via CommitBuilder.
+        let committed = CommitBuilder::new(Arc::new(dataset))
+            .execute(transaction)
+            .await
+            .unwrap();
+        let indices = committed.load_indices_by_name("vector_idx").await.unwrap();
+        assert_eq!(
+            indices.iter().map(|i| i.uuid).collect::<HashSet<_>>(),
+            HashSet::from([seg0.uuid, seg1.uuid]),
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_existing_index_segments_transaction_removes_empty_segment() {
+        use lance_datagen::{BatchCount, RowCount, array};
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .col(
+                "vector",
+                array::rand_vec::<arrow_array::types::Float32Type>(8.into()),
+            )
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let mut dataset = Dataset::write(reader, test_dir.path().to_str().unwrap(), None)
+            .await
+            .unwrap();
+        let field_id = dataset.schema().field("vector").unwrap().id;
+
+        // Commit a 0-fragment placeholder segment.
+        let empty = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            field_id,
+            Uuid::new_v4(),
+            std::iter::empty::<u32>(),
+            b"empty",
+        )
+        .await;
+        dataset
+            .commit_existing_index_segments(
+                "vector_idx",
+                "vector",
+                vec![segment_from_metadata(&empty)],
+            )
+            .await
+            .unwrap();
+
+        // Staging a real segment that covers the dataset must mark the placeholder
+        // for removal at build time, exercising the zero-fragment guard on the
+        // staged path (not just the committed path).
+        let seg = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            field_id,
+            Uuid::new_v4(),
+            [0_u32],
+            b"seg",
+        )
+        .await;
+        let transaction = dataset
+            .build_existing_index_segments_transaction(
+                "vector_idx",
+                "vector",
+                vec![segment_from_metadata(&seg)],
+            )
+            .await
+            .unwrap();
+        let Operation::CreateIndex {
+            new_indices,
+            removed_indices,
+        } = &transaction.operation
+        else {
+            panic!("expected index creation transaction");
+        };
+        assert_eq!(
+            new_indices.iter().map(|i| i.uuid).collect::<HashSet<_>>(),
+            HashSet::from([seg.uuid]),
+        );
+        assert_eq!(
+            removed_indices
+                .iter()
+                .map(|i| i.uuid)
+                .collect::<HashSet<_>>(),
+            HashSet::from([empty.uuid]),
+            "the zero-fragment placeholder must be staged for removal",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_existing_index_segments_transaction_commits_after_version_advances() {
+        use crate::dataset::CommitBuilder;
+        use lance_datagen::{BatchCount, RowCount, array};
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .col(
+                "vector",
+                array::rand_vec::<arrow_array::types::Float32Type>(8.into()),
+            )
+            .into_reader_rows(RowCount::from(10), BatchCount::from(2));
+        let dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 10,
+                max_rows_per_group: 10,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let read_version = dataset.manifest.version;
+        let field_id = dataset.schema().field("vector").unwrap().id;
+        let seg0 = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            field_id,
+            Uuid::new_v4(),
+            [0_u32],
+            b"seg0",
+        )
+        .await;
+        let seg1 = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            field_id,
+            Uuid::new_v4(),
+            [1_u32],
+            b"seg1",
+        )
+        .await;
+
+        // Stage the transaction at `read_version`.
+        let transaction = dataset
+            .build_existing_index_segments_transaction(
+                "vector_idx",
+                "vector",
+                vec![segment_from_metadata(&seg0), segment_from_metadata(&seg1)],
+            )
+            .await
+            .unwrap();
+        assert_eq!(transaction.read_version, read_version);
+
+        // Advance the dataset with an unrelated append, moving HEAD past read_version.
+        let more = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .col(
+                "vector",
+                array::rand_vec::<arrow_array::types::Float32Type>(8.into()),
+            )
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let dataset = Dataset::write(
+            more,
+            test_uri,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(dataset.manifest.version > read_version);
+
+        // The staged transaction still commits cleanly against the advanced HEAD.
+        let committed = CommitBuilder::new(Arc::new(dataset))
+            .execute(transaction)
+            .await
+            .unwrap();
+        let indices = committed.load_indices_by_name("vector_idx").await.unwrap();
+        assert_eq!(
+            indices.iter().map(|i| i.uuid).collect::<HashSet<_>>(),
+            HashSet::from([seg0.uuid, seg1.uuid]),
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_existing_index_segments_transaction_conflicts_with_index_drop() {
+        use crate::dataset::CommitBuilder;
+        use lance_datagen::{BatchCount, RowCount, array};
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .col(
+                "vector",
+                array::rand_vec::<arrow_array::types::Float32Type>(8.into()),
+            )
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let mut dataset = Dataset::write(reader, test_dir.path().to_str().unwrap(), None)
+            .await
+            .unwrap();
+        let field_id = dataset.schema().field("vector").unwrap().id;
+
+        // Publish an initial index covering the whole dataset.
+        let initial = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            field_id,
+            Uuid::new_v4(),
+            [0_u32],
+            b"initial",
+        )
+        .await;
+        dataset
+            .commit_existing_index_segments(
+                "vector_idx",
+                "vector",
+                vec![segment_from_metadata(&initial)],
+            )
+            .await
+            .unwrap();
+
+        // Stage a replacement for the published index.
+        let replacement = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            field_id,
+            Uuid::new_v4(),
+            [0_u32],
+            b"replacement",
+        )
+        .await;
+        let transaction = dataset
+            .build_existing_index_segments_transaction(
+                "vector_idx",
+                "vector",
+                vec![segment_from_metadata(&replacement)],
+            )
+            .await
+            .unwrap();
+
+        // The index is dropped before the staged transaction commits.
+        dataset.drop_index("vector_idx").await.unwrap();
+
+        // Committing the staged transaction must not resurrect the dropped index.
+        let err = CommitBuilder::new(Arc::new(dataset.clone()))
+            .execute(transaction)
+            .await
+            .expect_err("staged index commit over a concurrent drop must conflict");
+        assert!(
+            matches!(err, Error::RetryableCommitConflict { .. }),
+            "expected a retryable commit conflict, got: {err}"
+        );
+        assert!(
+            err.to_string()
+                .contains("preempted by concurrent transaction CreateIndex"),
+            "conflict message must identify the concurrent CreateIndex removal, got: {err}"
+        );
+        assert!(
+            dataset
+                .load_indices_by_name("vector_idx")
+                .await
+                .unwrap()
+                .is_empty(),
+            "the dropped index must stay dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_existing_index_segments_transaction_conflicts_with_column_drop() {
+        use crate::dataset::CommitBuilder;
+        use lance_datagen::{BatchCount, RowCount, array};
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .col(
+                "vector",
+                array::rand_vec::<arrow_array::types::Float32Type>(8.into()),
+            )
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let mut dataset = Dataset::write(reader, test_dir.path().to_str().unwrap(), None)
+            .await
+            .unwrap();
+        let field_id = dataset.schema().field("vector").unwrap().id;
+
+        let seg = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            field_id,
+            Uuid::new_v4(),
+            [0_u32],
+            b"seg",
+        )
+        .await;
+        let transaction = dataset
+            .build_existing_index_segments_transaction(
+                "vector_idx",
+                "vector",
+                vec![segment_from_metadata(&seg)],
+            )
+            .await
+            .unwrap();
+
+        // The indexed column is dropped before the staged transaction commits.
+        dataset.drop_columns(&["vector"]).await.unwrap();
+
+        // Committing the staged transaction must not publish index metadata for
+        // a field that no longer exists.
+        let err = CommitBuilder::new(Arc::new(dataset))
+            .execute(transaction)
+            .await
+            .expect_err("staged index commit for a dropped column must fail");
+        assert!(
+            matches!(err, Error::IncompatibleTransaction { .. }),
+            "expected an incompatible transaction error, got: {err}"
+        );
+        assert!(
+            err.to_string()
+                .contains("incompatible with concurrent transaction Project"),
+            "conflict message must identify the concurrent Project, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_existing_index_segments_transaction_conflicts_with_column_cast() {
+        use crate::dataset::{ColumnAlteration, CommitBuilder};
+        use lance_datagen::{BatchCount, RowCount, array};
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .col(
+                "vector",
+                array::rand_vec::<arrow_array::types::Float32Type>(8.into()),
+            )
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let mut dataset = Dataset::write(reader, test_dir.path().to_str().unwrap(), None)
+            .await
+            .unwrap();
+        let field_id = dataset.schema().field("id").unwrap().id;
+
+        let seg = write_vector_segment_metadata(
+            &dataset,
+            "id_idx",
+            field_id,
+            Uuid::new_v4(),
+            [0_u32],
+            b"seg",
+        )
+        .await;
+        let transaction = dataset
+            .build_existing_index_segments_transaction(
+                "id_idx",
+                "id",
+                vec![segment_from_metadata(&seg)],
+            )
+            .await
+            .unwrap();
+
+        // A type cast commits Operation::Merge and assigns the column a new
+        // field id, so the staged transaction's field no longer exists.
+        dataset
+            .alter_columns(&[
+                ColumnAlteration::new("id".into()).cast_to(arrow_schema::DataType::Int64)
+            ])
+            .await
+            .unwrap();
+        assert!(dataset.schema().field_by_id(field_id).is_none());
+
+        let err = CommitBuilder::new(Arc::new(dataset))
+            .execute(transaction)
+            .await
+            .expect_err("staged index commit for a re-identified column must fail");
+        assert!(
+            matches!(err, Error::IncompatibleTransaction { .. }),
+            "expected an incompatible transaction error, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("no longer exists in the schema"),
+            "conflict message must identify the missing field, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_drop_index_conflicts_with_concurrent_replacement() {
+        use lance_datagen::{BatchCount, RowCount, array};
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .col(
+                "vector",
+                array::rand_vec::<arrow_array::types::Float32Type>(8.into()),
+            )
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let mut dataset = Dataset::write(reader, test_dir.path().to_str().unwrap(), None)
+            .await
+            .unwrap();
+        let field_id = dataset.schema().field("vector").unwrap().id;
+
+        let initial = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            field_id,
+            Uuid::new_v4(),
+            [0_u32],
+            b"initial",
+        )
+        .await;
+        dataset
+            .commit_existing_index_segments(
+                "vector_idx",
+                "vector",
+                vec![segment_from_metadata(&initial)],
+            )
+            .await
+            .unwrap();
+
+        // A stale handle prepares to drop while the index is replaced.
+        let mut stale = dataset.clone();
+        let replacement = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            field_id,
+            Uuid::new_v4(),
+            [0_u32],
+            b"replacement",
+        )
+        .await;
+        dataset
+            .commit_existing_index_segments(
+                "vector_idx",
+                "vector",
+                vec![segment_from_metadata(&replacement)],
+            )
+            .await
+            .unwrap();
+
+        // The stale drop must conflict instead of silently no-op'ing (its
+        // removal targets a UUID the replacement already removed).
+        let err = stale
+            .drop_index("vector_idx")
+            .await
+            .expect_err("a drop racing a same-name replacement must conflict");
+        assert!(
+            matches!(err, Error::RetryableCommitConflict { .. }),
+            "expected a retryable commit conflict, got: {err}"
+        );
+
+        // Retrying against the latest version drops the replacement for real.
+        stale.checkout_latest().await.unwrap();
+        stale.drop_index("vector_idx").await.unwrap();
+        assert!(
+            stale
+                .load_indices_by_name("vector_idx")
+                .await
+                .unwrap()
+                .is_empty(),
+            "the retried drop must remove the replaced index"
         );
     }
 
