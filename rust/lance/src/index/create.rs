@@ -1686,7 +1686,7 @@ mod tests {
             );
             assert!(
                 err.to_string().contains(
-                    "index_uuid is no longer accepted for segmented scalar distributed index builds"
+                    "index_uuid is no longer accepted for BTree distributed index builds"
                 ),
                 "unexpected error: {err}"
             );
@@ -3136,6 +3136,7 @@ mod tests {
             .await
             .unwrap();
 
+        let source_dataset_version = dataset.manifest.version;
         dataset
             .commit_existing_index_segments(
                 "vector_idx",
@@ -3146,7 +3147,7 @@ mod tests {
                     [dataset.schema().field("vector").unwrap().id],
                     Arc::new(vector_index_details(&params)),
                     IndexType::IvfHnswFlat.version(),
-                    dataset.manifest.version,
+                    source_dataset_version,
                 )],
             )
             .await
@@ -3159,7 +3160,7 @@ mod tests {
             indices[0].fragment_bitmap.as_ref().unwrap(),
             dataset.fragment_bitmap.as_ref()
         );
-        assert_eq!(indices[0].dataset_version, 0);
+        assert_eq!(indices[0].dataset_version, source_dataset_version);
 
         let err = dataset
             .commit_existing_index_segments(
