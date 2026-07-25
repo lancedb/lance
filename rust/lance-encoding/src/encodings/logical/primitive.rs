@@ -2415,7 +2415,7 @@ struct FlatValueCounts {
     last_chunk_values: u64,
 }
 
-fn analyze_value_counts(words: &Words, items_in_page: u64) -> FlatValueCounts {
+fn analyze_value_counts(words: &Words, items_in_page: u64) -> Result<FlatValueCounts> {
     let num_chunks = words.len();
     let logs = words.iter().map(|w| (w & 0x0F) as u8).collect::<Vec<_>>();
     let mut counted = 0u64;
@@ -2424,7 +2424,15 @@ fn analyze_value_counts(words: &Words, items_in_page: u64) -> FlatValueCounts {
         debug_assert!(log > 0);
         counted += 1u64 << log;
     }
-    let last_chunk_values = items_in_page - counted;
+    // The last chunk holds whatever items the non-last chunks did not. Corrupted
+    // metadata can make the non-last chunks claim more items than the page holds,
+    // so validate rather than underflow on the subtraction.
+    let last_chunk_values = items_in_page.checked_sub(counted).ok_or_else(|| {
+        Error::invalid_input(format!(
+            "miniblock metadata is corrupt: chunk value counts sum to at least {counted}, \
+             which exceeds the page item count {items_in_page}"
+        ))
+    })?;
     if let Some(&last_log) = logs.last() {
         debug_assert!(last_log == 0 || (1u64 << last_log) == last_chunk_values);
     }
@@ -2436,12 +2444,12 @@ fn analyze_value_counts(words: &Words, items_in_page: u64) -> FlatValueCounts {
     } else {
         1u64 << logs[0]
     };
-    FlatValueCounts {
+    Ok(FlatValueCounts {
         logs,
         uniform,
         values_per_chunk,
         last_chunk_values,
-    }
+    })
 }
 
 /// Iterator over per-chunk value counts for a non-uniform flat page.  Non-last
@@ -2471,7 +2479,7 @@ fn build_chunk_index(
     data_buf_size: u64,
     rep_index_bytes: Option<&[u8]>,
     repetition_index_depth: u16,
-) -> MiniBlockChunkIndex {
+) -> Result<MiniBlockChunkIndex> {
     let num_chunks = words.len();
     // Each chunk stores `(divided_bytes + 1) * MINIBLOCK_ALIGNMENT` bytes, so the
     // deltas are the chunk sizes and their grand total is the data buffer size.
@@ -2489,7 +2497,7 @@ fn build_chunk_index(
         assert!(rep_index_data.len() % 8 == 0);
         let stride = repetition_index_depth as usize + 1;
         let (row_starts, has_trailer) = parse_nested_rep(rep_index_data, stride);
-        let value_counts = analyze_value_counts(words, items_in_page);
+        let value_counts = analyze_value_counts(words, items_in_page)?;
         let item_counts = if value_counts.uniform {
             ItemCounts::Uniform {
                 values_per_chunk: value_counts.values_per_chunk,
@@ -2507,7 +2515,7 @@ fn build_chunk_index(
             item_counts,
         }
     } else {
-        let value_counts = analyze_value_counts(words, items_in_page);
+        let value_counts = analyze_value_counts(words, items_in_page)?;
         if value_counts.uniform {
             RowMapping::UniformFlat {
                 values_per_chunk: value_counts.values_per_chunk,
@@ -2524,7 +2532,7 @@ fn build_chunk_index(
         }
     };
 
-    MiniBlockChunkIndex::new(base, byte_starts, rows)
+    Ok(MiniBlockChunkIndex::new(base, byte_starts, rows))
 }
 
 impl StructuralPageScheduler for MiniBlockScheduler {
@@ -2574,7 +2582,7 @@ impl StructuralPageScheduler for MiniBlockScheduler {
                 data_buf_size,
                 rep_index_bytes.as_deref(),
                 self.repetition_index_depth,
-            );
+            )?;
 
             // decode dictionary
             let dictionary = if let Some(ref mut dictionary) = self.dictionary {
@@ -7399,6 +7407,7 @@ mod tests {
     use super::{MINIBLOCK_ALIGNMENT, Words, build_chunk_index};
     use bytes::Bytes;
     use lance_core::cache::{Context, DeepSizeOf};
+    use lance_core::error::Error;
     use rstest::rstest;
 
     /// Builds a `Words` metadata buffer (u16 words) from `(log_num_values, num_bytes)`
@@ -7440,7 +7449,7 @@ mod tests {
     ) {
         let base = 100u64;
         let (words, data_buf_size) = words_from(entries);
-        let index = build_chunk_index(&words, items_in_page, base, data_buf_size, None, 0);
+        let index = build_chunk_index(&words, items_in_page, base, data_buf_size, None, 0).unwrap();
 
         assert_eq!(index.row_mapping_debug(), expected_kind);
         assert_eq!(index.num_chunks(), entries.len());
@@ -7464,6 +7473,27 @@ mod tests {
         assert_eq!(total_items, items_in_page);
     }
 
+    #[rstest]
+    // Non-last chunks alone (log 3 => 8 values) already exceed the page item count.
+    #[case::single_overflowing_chunk(&[(3, 16), (0, 8)], 5)]
+    // Two non-last chunks (8 + 8) overrun a page that claims only 10 items.
+    #[case::accumulated_overflow(&[(3, 16), (3, 16), (0, 8)], 10)]
+    fn test_corrupt_chunk_counts_error(#[case] entries: &[(u32, u32)], #[case] items_in_page: u64) {
+        let (words, data_buf_size) = words_from(entries);
+        // A corrupt page must surface an error rather than panicking on an
+        // underflowing subtraction (previously `attempt to subtract with overflow`).
+        let err =
+            build_chunk_index(&words, items_in_page, 100, data_buf_size, None, 0).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "expected InvalidInput, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("miniblock metadata is corrupt"),
+            "unexpected message: {err}"
+        );
+    }
+
     #[test]
     fn test_nested_detection_and_axes() {
         // Repetition index (stride 2): three chunks holding 5, 4, 3 rows, no trailers.
@@ -7471,7 +7501,7 @@ mod tests {
 
         // Uniform leaf chunking: value counts 4, 4, 2.
         let (words, data_buf_size) = words_from(&[(2, 8), (2, 8), (0, 8)]);
-        let index = build_chunk_index(&words, 10, 0, data_buf_size, Some(&rep), 1);
+        let index = build_chunk_index(&words, 10, 0, data_buf_size, Some(&rep), 1).unwrap();
         assert_eq!(index.row_mapping_debug(), "nested");
         assert_eq!(index.num_chunks(), 3);
         // Rows come from the repetition index, not the value counts.
@@ -7488,7 +7518,7 @@ mod tests {
 
         // Non-uniform leaf chunking: value counts 8, 2, 5.
         let (words_nu, dbs_nu) = words_from(&[(3, 8), (1, 8), (0, 8)]);
-        let index_nu = build_chunk_index(&words_nu, 15, 0, dbs_nu, Some(&rep), 1);
+        let index_nu = build_chunk_index(&words_nu, 15, 0, dbs_nu, Some(&rep), 1).unwrap();
         assert_eq!(index_nu.row_mapping_debug(), "nested");
         assert_eq!(index_nu.items_in_chunk(0), 8);
         assert_eq!(index_nu.items_in_chunk(1), 2);
@@ -7501,7 +7531,7 @@ mod tests {
     fn test_uniform_flat_matches_prefix_sum_flat() {
         // Distribution: 4 chunks of 4 values, last chunk 3 (15 items total).
         let (words, data_buf_size) = words_from(&[(2, 8), (2, 8), (2, 8), (0, 8)]);
-        let uniform = build_chunk_index(&words, 15, 0, data_buf_size, None, 0);
+        let uniform = build_chunk_index(&words, 15, 0, data_buf_size, None, 0).unwrap();
         assert_eq!(uniform.row_mapping_debug(), "uniform_flat");
 
         // The same distribution expressed as a non-uniform Flat prefix-sum index.
@@ -7552,12 +7582,12 @@ mod tests {
         let heap = |index: &MiniBlockChunkIndex| index.deep_size_of_children(&mut Context::new());
 
         let (uniform_words, uniform_dbs) = words_from(&[(2, 8), (2, 8), (0, 8)]);
-        let uniform = build_chunk_index(&uniform_words, 10, 0, uniform_dbs, None, 0);
+        let uniform = build_chunk_index(&uniform_words, 10, 0, uniform_dbs, None, 0).unwrap();
         assert_eq!(uniform.row_mapping_debug(), "uniform_flat");
         assert!(heap(&uniform) < LEGACY_PER_CHUNK * num_chunks);
 
         let (flat_words, flat_dbs) = words_from(&[(3, 8), (1, 8), (0, 8)]);
-        let flat = build_chunk_index(&flat_words, 11, 0, flat_dbs, None, 0);
+        let flat = build_chunk_index(&flat_words, 11, 0, flat_dbs, None, 0).unwrap();
         assert_eq!(flat.row_mapping_debug(), "flat");
         assert!(heap(&flat) < LEGACY_PER_CHUNK * num_chunks);
         // Flat carries a value-starts array that UniformFlat derives arithmetically.
@@ -7565,7 +7595,7 @@ mod tests {
 
         let rep = rep_bytes_from(&[4, 0, 3, 0, 3, 0]);
         let (nested_words, nested_dbs) = words_from(&[(2, 8), (2, 8), (0, 8)]);
-        let nested = build_chunk_index(&nested_words, 10, 0, nested_dbs, Some(&rep), 1);
+        let nested = build_chunk_index(&nested_words, 10, 0, nested_dbs, Some(&rep), 1).unwrap();
         assert_eq!(nested.row_mapping_debug(), "nested");
         assert!(heap(&nested) < LEGACY_PER_CHUNK * num_chunks);
     }
