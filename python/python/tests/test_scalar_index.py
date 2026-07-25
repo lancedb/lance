@@ -4669,6 +4669,59 @@ def test_bitmap_uncommitted_segments_can_be_committed_from_python(tmp_path):
     )
 
 
+def test_ngram_segment_merge_and_commit_from_python(tmp_path):
+    ds = lance.write_dataset(
+        pa.table(
+            {
+                "text": [
+                    "alpha needle",
+                    None,
+                    "beta needle",
+                    "gamma stack",
+                    "delta needle",
+                    "",
+                ]
+            }
+        ),
+        tmp_path,
+        max_rows_per_file=2,
+    )
+    index_name = "text_ngram_segments"
+    fragment_ids = [fragment.fragment_id for fragment in ds.get_fragments()]
+    staged_segments = [
+        ds.create_index_uncommitted(
+            column="text",
+            index_type="NGRAM",
+            name=index_name,
+            fragment_ids=[fragment_id],
+        )
+        for fragment_id in fragment_ids
+    ]
+    source_version = staged_segments[0].dataset_version
+
+    for segment, fragment_id in zip(staged_segments, fragment_ids):
+        assert segment.fragment_ids == {fragment_id}
+        assert any(file.path == "ngram_postings.lance" for file in segment.files)
+
+    merged_segment = ds.merge_existing_index_segments(staged_segments)
+    assert merged_segment.dataset_version == source_version
+    assert merged_segment.fragment_ids == set(fragment_ids)
+    assert any(file.path == "ngram_postings.lance" for file in merged_segment.files)
+
+    ds.insert(pa.table({"text": ["new stack"]}))
+    assert ds.version > source_version
+    ds = ds.commit_existing_index_segments(index_name, "text", [merged_segment])
+    descriptions = {index.name: index for index in ds.describe_indices()}
+    assert descriptions[index_name].index_type == "NGram"
+    assert len(descriptions[index_name].segments) == 1
+    assert (
+        descriptions[index_name].segments[0].dataset_version_at_last_update
+        == source_version
+    )
+    assert ds.count_rows("contains(text, 'needle')") == 3
+    assert ds.count_rows("text IS NULL") == 1
+
+
 def test_zonemap_fragment_ids_parameter_validation(tmp_path):
     ds = generate_multi_fragment_dataset(
         tmp_path, num_fragments=2, rows_per_fragment=100

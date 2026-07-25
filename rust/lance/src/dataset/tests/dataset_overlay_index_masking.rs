@@ -14,6 +14,8 @@ use arrow_array::types::Int32Type;
 use arrow_array::{ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, StringArray};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance_index::IndexType;
+use lance_index::optimize::OptimizeOptions;
+use lance_index::scalar::BuiltinIndexType;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::ScalarIndexParams;
 use lance_index::scalar::inverted::InvertedIndexParams;
@@ -27,10 +29,11 @@ use rstest::rstest;
 use lance_file::writer::{FileWriter, FileWriterOptions};
 
 use crate::Dataset;
+use crate::dataset::optimize::{CompactionOptions, compact_files, remapping};
 use crate::dataset::transaction::{DataOverlayGroup, Operation};
 use crate::dataset::{WriteDestination, WriteParams};
-use crate::index::DatasetIndexExt;
 use crate::index::vector::VectorIndexParams;
+use crate::index::{CreateIndexBuilder, DatasetIndexExt};
 
 /// Two-fragment Int32 dataset: `id` (field 0) = 0..12 and `age` (field 1) = id * 10,
 /// six rows per file (fragments 0 and 1). In-memory store so overlay files can be written
@@ -676,6 +679,162 @@ async fn fts_ids(dataset: &Dataset, query: FullTextSearchQuery) -> Vec<i32> {
 
 async fn fts_ids_matching(dataset: &Dataset, term: &str) -> Vec<i32> {
     fts_ids(dataset, FullTextSearchQuery::new(term.to_owned())).await
+}
+
+#[tokio::test]
+async fn test_ngram_optimize_preserves_overlay_staleness() {
+    let mut dataset = create_text_dataset().await;
+    let params = ScalarIndexParams::for_builtin(BuiltinIndexType::NGram);
+    let fragment_ids = dataset
+        .get_fragments()
+        .into_iter()
+        .map(|fragment| fragment.id() as u32)
+        .collect::<Vec<_>>();
+    let mut segments = Vec::with_capacity(fragment_ids.len());
+    for fragment_id in fragment_ids {
+        segments.push(
+            CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::NGram, &params)
+                .name("text_ngram".to_string())
+                .fragments(vec![fragment_id])
+                .execute_uncommitted()
+                .await
+                .unwrap(),
+        );
+    }
+    let source_version = segments[0].dataset_version;
+    dataset
+        .commit_existing_index_segments("text_ngram", "text", segments)
+        .await
+        .unwrap();
+
+    let mut dataset = commit_overlay(
+        dataset,
+        "ngram_text_overlay",
+        0,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+        vec![Arc::new(StringArray::from(vec![Some("cherry mango")]))],
+    )
+    .await;
+    dataset
+        .optimize_indices(&OptimizeOptions::merge(2))
+        .await
+        .unwrap();
+
+    let committed = dataset.load_indices_by_name("text_ngram").await.unwrap();
+    assert_eq!(committed.len(), 1);
+    assert_eq!(committed[0].dataset_version, source_version);
+    assert_eq!(
+        ids_matching(&dataset, "contains(text, 'apple')").await,
+        vec![0]
+    );
+    assert_eq!(
+        ids_matching(&dataset, "contains(text, 'mango')").await,
+        vec![1, 6]
+    );
+}
+
+#[tokio::test]
+async fn test_btree_physical_merge_preserves_overlay_staleness() {
+    let mut dataset = create_base_dataset().await;
+    let params = ScalarIndexParams::default();
+    let mut segments = Vec::new();
+    for fragment in dataset.get_fragments() {
+        segments.push(
+            CreateIndexBuilder::new(&mut dataset, &["age"], IndexType::BTree, &params)
+                .name("age_btree".to_string())
+                .fragments(vec![fragment.id() as u32])
+                .execute_uncommitted()
+                .await
+                .unwrap(),
+        );
+    }
+    let source_version = segments[0].dataset_version;
+    let mut dataset = commit_overlay(
+        dataset,
+        "btree_before_merge",
+        0,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+        vec![i32_array([Some(999)])],
+    )
+    .await;
+
+    let merged = dataset
+        .merge_existing_index_segments(segments)
+        .await
+        .unwrap();
+    assert_eq!(merged.dataset_version, source_version);
+    dataset
+        .commit_existing_index_segments("age_btree", "age", vec![merged])
+        .await
+        .unwrap();
+
+    assert_eq!(ids_matching(&dataset, "age = 10").await, Vec::<i32>::new());
+    assert_eq!(ids_matching(&dataset, "age = 999").await, vec![1]);
+}
+
+#[tokio::test]
+async fn test_ngram_remap_excludes_newer_overlay_fragments() {
+    let mut dataset = create_text_dataset().await;
+    let params = ScalarIndexParams::for_builtin(BuiltinIndexType::NGram);
+    dataset
+        .create_index(
+            &["text"],
+            IndexType::NGram,
+            Some("text_ngram".to_string()),
+            &params,
+            false,
+        )
+        .await
+        .unwrap();
+    let source_version =
+        dataset.load_indices_by_name("text_ngram").await.unwrap()[0].dataset_version;
+
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            target_rows_per_fragment: 12,
+            defer_index_remap: true,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    let compacted_fragment_id = dataset.get_fragments()[0].id();
+    let mut dataset = commit_overlay(
+        dataset,
+        "ngram_after_compaction",
+        compacted_fragment_id as u64,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+        vec![Arc::new(StringArray::from(vec![Some("cherry mango")]))],
+    )
+    .await;
+
+    remapping::remap_column_index(&mut dataset, &["text"], Some("text_ngram".to_string()))
+        .await
+        .unwrap();
+
+    let committed = dataset.load_indices_by_name("text_ngram").await.unwrap();
+    assert_eq!(committed.len(), 1);
+    assert!(committed[0].dataset_version > source_version);
+    assert!(
+        !committed[0]
+            .fragment_bitmap
+            .as_ref()
+            .unwrap()
+            .contains(compacted_fragment_id as u32)
+    );
+    assert_eq!(
+        ids_matching(&dataset, "contains(text, 'apple')").await,
+        vec![0]
+    );
+    assert_eq!(
+        ids_matching(&dataset, "contains(text, 'mango')").await,
+        vec![1, 6]
+    );
 }
 
 async fn fts_phrase_ids_matching(dataset: &Dataset, phrase: &str) -> Vec<i32> {

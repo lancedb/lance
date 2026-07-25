@@ -203,9 +203,9 @@ mod tests {
     use super::*;
     use crate::dataset::WriteParams;
     use crate::dataset::transaction::{Operation, Transaction};
-    use crate::index::DatasetIndexExt;
     use crate::index::frag_reuse::build_frag_reuse_index_metadata;
     use crate::index::vector::VectorIndexParams;
+    use crate::index::{DatasetIndexExt, IntoIndexSegment};
     use lance_datagen::{BatchCount, RowCount, array};
     use lance_index::IndexType;
     use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragReuseIndexDetails};
@@ -323,22 +323,10 @@ mod tests {
         let segments = segments
             .iter()
             .map(|segment| {
-                crate::index::IndexSegment::new(
-                    segment.uuid,
-                    segment
-                        .fragment_bitmap
-                        .as_ref()
-                        .expect("test segment metadata should have fragment coverage")
-                        .iter(),
-                    segment.fields.iter().copied(),
-                    segment
-                        .index_details
-                        .as_ref()
-                        .expect("test segment metadata should have index details")
-                        .clone(),
-                    segment.index_version,
-                    segment.dataset_version,
-                )
+                segment
+                    .clone()
+                    .into_index_segment()
+                    .expect("test segment metadata should convert to an index segment")
             })
             .collect::<Vec<_>>();
 

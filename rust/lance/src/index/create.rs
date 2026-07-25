@@ -798,6 +798,13 @@ fn is_btree_scalar_params(params: &dyn IndexParams) -> bool {
         .is_some_and(|p| p.index_type.eq_ignore_ascii_case("btree"))
 }
 
+fn is_ngram_scalar_params(params: &dyn IndexParams) -> bool {
+    params
+        .as_any()
+        .downcast_ref::<ScalarIndexParams>()
+        .is_some_and(|params| params.index_type.eq_ignore_ascii_case("ngram"))
+}
+
 fn is_builtin_vector_index(index_type: IndexType, params: &dyn IndexParams) -> bool {
     params.index_name() == LANCE_VECTOR_INDEX
         && matches!(
@@ -867,6 +874,10 @@ fn ensure_index_uuid_allowed(
         || scalar_index_type.is_some_and(|index_type| index_type.eq_ignore_ascii_case("rtree"))
     {
         Some("RTree")
+    } else if index_type == IndexType::NGram
+        || scalar_index_type.is_some_and(|index_type| index_type.eq_ignore_ascii_case("ngram"))
+    {
+        Some("NGram")
     } else {
         None
     };
@@ -906,8 +917,9 @@ fn uses_segment_commit_path(index_type: IndexType, params: &dyn IndexParams) -> 
 
     if params_family == LANCE_SCALAR_INDEX {
         match index_type {
-            IndexType::BTree => return true,
+            IndexType::BTree | IndexType::NGram => return true,
             IndexType::Scalar if is_btree_scalar_params(params) => return true,
+            IndexType::Scalar if is_ngram_scalar_params(params) => return true,
             _ => {}
         }
     }
@@ -3124,6 +3136,7 @@ mod tests {
             .await
             .unwrap();
 
+        let source_dataset_version = dataset.manifest.version;
         dataset
             .commit_existing_index_segments(
                 "vector_idx",
@@ -3134,7 +3147,7 @@ mod tests {
                     [dataset.schema().field("vector").unwrap().id],
                     Arc::new(vector_index_details(&params)),
                     IndexType::IvfHnswFlat.version(),
-                    dataset.manifest.version,
+                    source_dataset_version,
                 )],
             )
             .await
@@ -3146,6 +3159,27 @@ mod tests {
         assert_eq!(
             indices[0].fragment_bitmap.as_ref().unwrap(),
             dataset.fragment_bitmap.as_ref()
+        );
+        assert_eq!(indices[0].dataset_version, source_dataset_version);
+
+        let err = dataset
+            .commit_existing_index_segments(
+                "future_vector_idx",
+                "vector",
+                vec![IndexSegment::new(
+                    Uuid::new_v4(),
+                    dataset.fragment_bitmap.as_ref().clone(),
+                    [dataset.schema().field("vector").unwrap().id],
+                    Arc::new(vector_index_details(&params)),
+                    IndexType::IvfHnswFlat.version(),
+                    dataset.manifest.version + 1,
+                )],
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("future dataset version"),
+            "unexpected error: {err}"
         );
     }
 

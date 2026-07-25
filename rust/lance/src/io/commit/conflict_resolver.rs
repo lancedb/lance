@@ -644,6 +644,27 @@ impl<'a> TransactionRebase<'a> {
                     // triggers a CreateIndex, and it needs to add the new reuse
                     // version created by the rewrite
                     if let Some(committed_fri) = frag_reuse_index {
+                        let ngram_coverage = new_indices
+                            .iter()
+                            .filter(|idx| {
+                                idx.index_details.as_ref().is_some_and(|details| {
+                                    details.type_url.ends_with("NGramIndexDetails")
+                                })
+                            })
+                            .filter_map(|idx| idx.fragment_bitmap.as_ref())
+                            .fold(RoaringBitmap::new(), |coverage, fragments| {
+                                coverage | fragments
+                            });
+                        if groups
+                            .iter()
+                            .flat_map(|group| group.old_fragments.iter())
+                            .any(|fragment| ngram_coverage.contains(fragment.id as u32))
+                        {
+                            return Err(
+                                self.retryable_conflict_err(other_transaction, other_version)
+                            );
+                        }
+
                         if new_indices
                             .iter()
                             .any(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
@@ -3644,6 +3665,79 @@ mod tests {
             "Expected compatibility for different-name CreateIndex, got {:?}",
             different_name_result
         );
+    }
+
+    #[test]
+    fn test_create_ngram_index_conflicts_with_overlapping_deferred_rewrite() {
+        let ngram_index = |fragment_id| IndexMetadata {
+            uuid: Uuid::new_v4(),
+            name: "text_ngram".to_string(),
+            fields: vec![0],
+            dataset_version: 1,
+            fragment_bitmap: Some(RoaringBitmap::from_iter([fragment_id])),
+            index_details: Some(Arc::new(prost_types::Any {
+                type_url: "lance.index.NGramIndexDetails".to_string(),
+                value: Vec::new(),
+            })),
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+        let frag_reuse_index = IndexMetadata {
+            uuid: Uuid::new_v4(),
+            name: FRAG_REUSE_INDEX_NAME.to_string(),
+            fields: vec![],
+            dataset_version: 2,
+            fragment_bitmap: Some(RoaringBitmap::from_iter([2u32])),
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+        let rewrite = Transaction::new(
+            1,
+            Operation::Rewrite {
+                groups: vec![RewriteGroup {
+                    old_fragments: vec![Fragment::new(1)],
+                    new_fragments: vec![Fragment::new(2)],
+                }],
+                rewritten_indices: vec![],
+                frag_reuse_index: Some(frag_reuse_index),
+            },
+            None,
+        );
+
+        for (covered_fragment, expect_conflict) in [(1u32, true), (3u32, false)] {
+            let mut rebase = TransactionRebase {
+                transaction: Transaction::new(
+                    1,
+                    Operation::CreateIndex {
+                        new_indices: vec![ngram_index(covered_fragment)],
+                        removed_indices: vec![],
+                    },
+                    None,
+                ),
+                initial_fragments: HashMap::new(),
+                modified_fragment_ids: HashSet::new(),
+                affected_rows: None,
+                conflicting_frag_reuse_indices: Vec::new(),
+                conflicting_mem_wal_compacted_sstables: Vec::new(),
+            };
+            let result = rebase.check_txn(&rewrite, 2);
+            if expect_conflict {
+                assert!(
+                    matches!(result, Err(Error::RetryableCommitConflict { .. })),
+                    "overlapping staged NGram index should conflict, got {result:?}"
+                );
+            } else {
+                assert!(
+                    result.is_ok(),
+                    "disjoint staged NGram index should remain compatible, got {result:?}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
