@@ -16,11 +16,15 @@ package org.lance.ipc;
 /**
  * Controls the speed / accuracy tradeoff for approximate vector search.
  *
- * <p>This setting currently only affects RQ-quantized vector indexes, such as IVF_RQ. Other index
- * types ignore this setting.
+ * <p>This setting currently affects RQ-quantized vector indexes (such as IVF_RQ) and prefiltered
+ * search on HNSW sub-indexes, where {@code FAST} enables the ACORN traversal. Other index types
+ * ignore this setting.
  */
 public enum ApproxMode {
-  /** Prefer faster approximate scoring when supported by the RQ index. */
+  /**
+   * Prefer faster approximate scoring when supported by the RQ index, and the ACORN traversal for
+   * prefiltered HNSW search.
+   */
   FAST("fast"),
 
   /** Use the index's default approximation behavior. */
