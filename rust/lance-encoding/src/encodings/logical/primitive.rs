@@ -3310,7 +3310,8 @@ impl StructuralPrimitiveFieldScheduler {
         column_info: &ColumnInfo,
         decompressors: &dyn DecompressionStrategy,
         cache_repetition_index: bool,
-        target_field: &Field,
+        storage_data_type: &DataType,
+        requested_data_type: &DataType,
     ) -> Result<Self> {
         let page_schedulers = column_info
             .page_infos
@@ -3322,14 +3323,15 @@ impl StructuralPrimitiveFieldScheduler {
                     page_index,
                     decompressors,
                     cache_repetition_index,
-                    target_field,
+                    storage_data_type,
+                    requested_data_type,
                 )
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             page_schedulers,
             column_index: column_info.index,
-            view_tag: format!("{:?}", target_field.data_type()),
+            view_tag: format!("{requested_data_type:?}"),
         })
     }
 
@@ -3338,7 +3340,8 @@ impl StructuralPrimitiveFieldScheduler {
         page_layout: &PageLayout,
         decompressors: &dyn DecompressionStrategy,
         cache_repetition_index: bool,
-        target_field: &Field,
+        storage_data_type: &DataType,
+        requested_data_type: &DataType,
     ) -> Result<Box<dyn StructuralPageScheduler>> {
         use pb21::page_layout::Layout;
         Ok(match page_layout.layout.as_ref().expect_ok()? {
@@ -3373,7 +3376,8 @@ impl StructuralPrimitiveFieldScheduler {
                     Box::new(constant::ConstantPageScheduler::try_new(
                         page_info.buffer_offsets_and_sizes.clone(),
                         constant_layout.inline_value.clone(),
-                        target_field.data_type(),
+                        storage_data_type.clone(),
+                        requested_data_type.clone(),
                         def_meaning.into(),
                     )?) as Box<dyn StructuralPageScheduler>
                 } else if def_meaning.len() == 1
@@ -3411,14 +3415,15 @@ impl StructuralPrimitiveFieldScheduler {
                     blob.inner_layout.as_ref().expect_ok()?.as_ref(),
                     decompressors,
                     cache_repetition_index,
-                    target_field,
+                    storage_data_type,
+                    requested_data_type,
                 )?;
                 let def_meaning = blob
                     .layers
                     .iter()
                     .map(|l| ProtobufUtils21::repdef_layer_to_def_interp(*l))
                     .collect::<Vec<_>>();
-                if matches!(target_field.data_type(), DataType::Struct(_)) {
+                if matches!(requested_data_type, DataType::Struct(_)) {
                     // User wants to decode blob into struct
                     Box::new(BlobDescriptionPageScheduler::new(
                         inner_scheduler,
@@ -3442,7 +3447,8 @@ impl StructuralPrimitiveFieldScheduler {
         page_index: usize,
         decompressors: &dyn DecompressionStrategy,
         cache_repetition_index: bool,
-        target_field: &Field,
+        storage_data_type: &DataType,
+        requested_data_type: &DataType,
     ) -> Result<PageInfoAndScheduler> {
         let page_layout = page_info.encoding.as_structural();
         let scheduler = Self::page_layout_to_scheduler(
@@ -3450,7 +3456,8 @@ impl StructuralPrimitiveFieldScheduler {
             page_layout,
             decompressors,
             cache_repetition_index,
-            target_field,
+            storage_data_type,
+            requested_data_type,
         )?;
         Ok(PageInfoAndScheduler {
             page_index,

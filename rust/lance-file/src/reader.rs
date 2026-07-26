@@ -10,7 +10,7 @@ use std::{
 };
 
 use arrow_array::RecordBatchReader;
-use arrow_schema::Schema as ArrowSchema;
+use arrow_schema::{DataType, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
 use byteorder::{ByteOrder, LittleEndian, ReadBytesExt};
 use bytes::{Bytes, BytesMut};
 use futures::{Stream, StreamExt, stream::BoxStream};
@@ -19,8 +19,8 @@ use lance_encoding::{
     EncodingsIo,
     decoder::{
         ColumnInfo, DecoderConfig, DecoderPlugins, FilterExpression, PageEncoding, PageInfo,
-        ReadBatchTask, RequestedRows, SchedulerDecoderConfig, schedule_and_decode,
-        schedule_and_decode_blocking,
+        ReadBatchTask, RequestedRows, SchedulerDecoderConfig,
+        schedule_and_decode_blocking_with_output_schema, schedule_and_decode_with_output_schema,
     },
     encoder::EncodedBatch,
     version::LanceFileVersion,
@@ -210,20 +210,11 @@ impl CachedFileMetadata {
     }
 }
 
-/// Selecting columns from a lance file requires specifying both the
-/// index of the column and the data type of the column
+/// Selecting columns from a Lance file requires specifying both the
+/// index of the column and the stored semantic type of the column.
 ///
-/// Partly, this is because it is not strictly required that columns
-/// be read into the same type.  For example, a string column may be
-/// read as a string, large_string or string_view type.
-///
-/// A read will only succeed if the decoder for a column is capable
-/// of decoding into the requested type.
-///
-/// Note that this should generally be limited to different in-memory
-/// representations of the same semantic type.  An encoding could
-/// theoretically support "casting" (e.g. int to string, etc.) but
-/// there is little advantage in doing so here.
+/// Use [`ReaderRequest`] when a different supported in-memory Arrow
+/// representation is desired.
 ///
 /// Note: in order to specify a projection the user will need some way
 /// to figure out the column indices.  In the table format we do this
@@ -399,6 +390,109 @@ impl ReaderProjection {
             schema: Arc::new(projected),
             column_indices,
         })
+    }
+}
+
+/// A file read request with separate storage and Arrow output schemas.
+///
+/// The projection identifies stored columns and their Lance types. The output
+/// schema controls the in-memory Arrow representation. Exact type matches are
+/// supported, along with top-level `Utf8` to `Utf8View` and `Binary` to
+/// `BinaryView` aliases.
+#[derive(Debug, Clone)]
+pub struct ReaderRequest {
+    projection: ReaderProjection,
+    output_schema: ArrowSchemaRef,
+}
+
+impl ReaderRequest {
+    /// Creates a request that preserves the projection's default Arrow types.
+    pub fn from_projection(projection: ReaderProjection) -> Self {
+        let output_schema = Arc::new(ArrowSchema::from(projection.schema.as_ref()));
+        Self {
+            projection,
+            output_schema,
+        }
+    }
+
+    /// Creates a request with an explicit Arrow output schema.
+    ///
+    /// Field order, names, nullability, and metadata must match the projection.
+    /// Only top-level `Utf8` to `Utf8View` and `Binary` to `BinaryView` type
+    /// aliases are accepted.
+    pub fn try_new(projection: ReaderProjection, output_schema: ArrowSchemaRef) -> Result<Self> {
+        let projected_schema = ArrowSchema::from(projection.schema.as_ref());
+        if projected_schema.metadata() != output_schema.metadata() {
+            return Err(Error::invalid_input(
+                "The requested output schema metadata does not match the projection schema metadata",
+            ));
+        }
+        if projected_schema.fields().len() != output_schema.fields().len() {
+            return Err(Error::invalid_input(format!(
+                "The requested output schema has {} fields but the projection schema has {}",
+                output_schema.fields().len(),
+                projected_schema.fields().len()
+            )));
+        }
+        for (index, (projected_field, output_field)) in projected_schema
+            .fields()
+            .iter()
+            .zip(output_schema.fields())
+            .enumerate()
+        {
+            if projected_field.name() != output_field.name() {
+                return Err(Error::invalid_input(format!(
+                    "The requested output field at index {index} is named '{}' but the projection field is named '{}'",
+                    output_field.name(),
+                    projected_field.name()
+                )));
+            }
+            if projected_field.is_nullable() != output_field.is_nullable() {
+                return Err(Error::invalid_input(format!(
+                    "The requested output field '{}' has nullable={} but the projection field has nullable={}",
+                    output_field.name(),
+                    output_field.is_nullable(),
+                    projected_field.is_nullable()
+                )));
+            }
+            if projected_field.metadata() != output_field.metadata() {
+                return Err(Error::invalid_input(format!(
+                    "The requested output field '{}' metadata does not match the projection field metadata",
+                    output_field.name()
+                )));
+            }
+            let is_supported_type = projected_field.data_type() == output_field.data_type()
+                || matches!(
+                    (projected_field.data_type(), output_field.data_type()),
+                    (DataType::Utf8, DataType::Utf8View) | (DataType::Binary, DataType::BinaryView)
+                );
+            if !is_supported_type {
+                return Err(Error::invalid_input(format!(
+                    "The requested output field '{}' has type {} but the projection field has type {}; only exact matches, Utf8 to Utf8View, and Binary to BinaryView are supported",
+                    output_field.name(),
+                    output_field.data_type(),
+                    projected_field.data_type()
+                )));
+            }
+        }
+        Ok(Self {
+            projection,
+            output_schema,
+        })
+    }
+
+    /// Returns the stored-column projection for this request.
+    pub fn projection(&self) -> &ReaderProjection {
+        &self.projection
+    }
+
+    /// Returns the requested in-memory Arrow schema.
+    pub fn output_schema(&self) -> &ArrowSchemaRef {
+        &self.output_schema
+    }
+
+    fn into_parts(self) -> (ReaderProjection, ArrowSchemaRef) {
+        (self.projection, self.output_schema)
     }
 }
 
@@ -996,6 +1090,7 @@ impl FileReader {
         range: Range<u64>,
         batch_size: u32,
         projection: ReaderProjection,
+        output_schema: ArrowSchemaRef,
         filter: FilterExpression,
         decoder_config: DecoderConfig,
         batch_size_bytes: Option<u64>,
@@ -1020,12 +1115,13 @@ impl FileReader {
 
         let requested_rows = RequestedRows::Ranges(vec![range]);
 
-        schedule_and_decode(
+        schedule_and_decode_with_output_schema(
             column_infos,
             requested_rows,
             filter,
             projection.column_indices,
             projection.schema,
+            output_schema,
             config,
         )
         .await
@@ -1035,9 +1131,10 @@ impl FileReader {
         &self,
         range: Range<u64>,
         batch_size: u32,
-        projection: ReaderProjection,
+        request: ReaderRequest,
         filter: FilterExpression,
     ) -> Result<BoxStream<'static, ReadBatchTask>> {
+        let (projection, output_schema) = request.into_parts();
         // Create and initialize the stream
         Self::do_read_range(
             self.collect_columns_from_projection(&projection)?,
@@ -1048,6 +1145,7 @@ impl FileReader {
             range,
             batch_size,
             projection,
+            output_schema,
             filter,
             self.options.decoder_config.clone(),
             self.options.batch_size_bytes,
@@ -1064,6 +1162,7 @@ impl FileReader {
         indices: Vec<u64>,
         batch_size: u32,
         projection: ReaderProjection,
+        output_schema: ArrowSchemaRef,
         filter: FilterExpression,
         decoder_config: DecoderConfig,
         batch_size_bytes: Option<u64>,
@@ -1088,12 +1187,13 @@ impl FileReader {
 
         let requested_rows = RequestedRows::Indices(indices);
 
-        schedule_and_decode(
+        schedule_and_decode_with_output_schema(
             column_infos,
             requested_rows,
             filter,
             projection.column_indices,
             projection.schema,
+            output_schema,
             config,
         )
         .await
@@ -1103,8 +1203,9 @@ impl FileReader {
         &self,
         indices: Vec<u64>,
         batch_size: u32,
-        projection: ReaderProjection,
+        request: ReaderRequest,
     ) -> Result<BoxStream<'static, ReadBatchTask>> {
+        let (projection, output_schema) = request.into_parts();
         // Create and initialize the stream
         Self::do_take_rows(
             self.collect_columns_from_projection(&projection)?,
@@ -1114,6 +1215,7 @@ impl FileReader {
             indices,
             batch_size,
             projection,
+            output_schema,
             FilterExpression::no_filter(),
             self.options.decoder_config.clone(),
             self.options.batch_size_bytes,
@@ -1130,6 +1232,7 @@ impl FileReader {
         ranges: Vec<Range<u64>>,
         batch_size: u32,
         projection: ReaderProjection,
+        output_schema: ArrowSchemaRef,
         filter: FilterExpression,
         decoder_config: DecoderConfig,
         batch_size_bytes: Option<u64>,
@@ -1156,12 +1259,13 @@ impl FileReader {
 
         let requested_rows = RequestedRows::Ranges(ranges);
 
-        schedule_and_decode(
+        schedule_and_decode_with_output_schema(
             column_infos,
             requested_rows,
             filter,
             projection.column_indices,
             projection.schema,
+            output_schema,
             config,
         )
         .await
@@ -1171,9 +1275,10 @@ impl FileReader {
         &self,
         ranges: Vec<Range<u64>>,
         batch_size: u32,
-        projection: ReaderProjection,
+        request: ReaderRequest,
         filter: FilterExpression,
     ) -> Result<BoxStream<'static, ReadBatchTask>> {
+        let (projection, output_schema) = request.into_parts();
         Self::do_read_ranges(
             self.collect_columns_from_projection(&projection)?,
             self.scheduler.clone(),
@@ -1182,6 +1287,7 @@ impl FileReader {
             ranges,
             batch_size,
             projection,
+            output_schema,
             filter,
             self.options.decoder_config.clone(),
             self.options.batch_size_bytes,
@@ -1220,7 +1326,24 @@ impl FileReader {
         filter: FilterExpression,
     ) -> Result<Pin<Box<dyn Stream<Item = ReadBatchTask> + Send>>> {
         let projection = projection.unwrap_or_else(|| self.base_projection.clone());
-        Self::validate_projection(&projection, &self.metadata)?;
+        self.read_tasks_with_request(
+            params,
+            batch_size,
+            ReaderRequest::from_projection(projection),
+            filter,
+        )
+        .await
+    }
+
+    /// Creates decode tasks using an explicit Arrow output schema.
+    pub async fn read_tasks_with_request(
+        &self,
+        params: ReadBatchParams,
+        batch_size: u32,
+        request: ReaderRequest,
+        filter: FilterExpression,
+    ) -> Result<Pin<Box<dyn Stream<Item = ReadBatchTask> + Send>>> {
+        Self::validate_projection(request.projection(), &self.metadata)?;
         let verify_bound = |params: &ReadBatchParams, bound: u64, inclusive: bool| {
             if bound > self.num_rows || bound == self.num_rows && inclusive {
                 Err(Error::invalid_input(format!(
@@ -1244,14 +1367,14 @@ impl FileReader {
                     }
                 }
                 let indices = indices.iter().map(|idx| idx.unwrap() as u64).collect();
-                self.take_rows(indices, batch_size, projection).await
+                self.take_rows(indices, batch_size, request).await
             }
             ReadBatchParams::Range(range) => {
                 verify_bound(&params, range.end as u64, false)?;
                 self.read_range(
                     range.start as u64..range.end as u64,
                     batch_size,
-                    projection,
+                    request,
                     filter,
                 )
                 .await
@@ -1262,7 +1385,7 @@ impl FileReader {
                     verify_bound(&params, range.end, false)?;
                     ranges_u64.push(range.start..range.end);
                 }
-                self.read_ranges(ranges_u64, batch_size, projection, filter)
+                self.read_ranges(ranges_u64, batch_size, request, filter)
                     .await
             }
             ReadBatchParams::RangeFrom(range) => {
@@ -1270,18 +1393,18 @@ impl FileReader {
                 self.read_range(
                     range.start as u64..self.num_rows,
                     batch_size,
-                    projection,
+                    request,
                     filter,
                 )
                 .await
             }
             ReadBatchParams::RangeTo(range) => {
                 verify_bound(&params, range.end as u64, false)?;
-                self.read_range(0..range.end as u64, batch_size, projection, filter)
+                self.read_range(0..range.end as u64, batch_size, request, filter)
                     .await
             }
             ReadBatchParams::RangeFull => {
-                self.read_range(0..self.num_rows, batch_size, projection, filter)
+                self.read_range(0..self.num_rows, batch_size, request, filter)
                     .await
             }
         }
@@ -1324,16 +1447,35 @@ impl FileReader {
         projection: ReaderProjection,
         filter: FilterExpression,
     ) -> Result<Pin<Box<dyn RecordBatchStream>>> {
-        let arrow_schema = Arc::new(ArrowSchema::from(projection.schema.as_ref()));
+        self.read_stream_projected_with_request(
+            params,
+            batch_size,
+            batch_readahead,
+            ReaderRequest::from_projection(projection),
+            filter,
+        )
+        .await
+    }
+
+    /// Reads projected data using an explicit Arrow output schema.
+    pub async fn read_stream_projected_with_request(
+        &self,
+        params: ReadBatchParams,
+        batch_size: u32,
+        batch_readahead: u32,
+        request: ReaderRequest,
+        filter: FilterExpression,
+    ) -> Result<Pin<Box<dyn RecordBatchStream>>> {
+        let output_schema = request.output_schema().clone();
         let tasks_stream = self
-            .read_tasks(params, batch_size, Some(projection), filter)
+            .read_tasks_with_request(params, batch_size, request, filter)
             .await?;
         let batch_stream = tasks_stream
             .map(|task| task.task)
             .buffered(batch_readahead as usize)
             .boxed();
         Ok(Box::pin(RecordBatchStreamAdapter::new(
-            arrow_schema,
+            output_schema,
             batch_stream,
         )))
     }
@@ -1343,6 +1485,7 @@ impl FileReader {
         indices: Vec<u64>,
         batch_size: u32,
         projection: ReaderProjection,
+        output_schema: ArrowSchemaRef,
         filter: FilterExpression,
     ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
         let column_infos = self.collect_columns_from_projection(&projection)?;
@@ -1366,12 +1509,13 @@ impl FileReader {
 
         let requested_rows = RequestedRows::Indices(indices);
 
-        schedule_and_decode_blocking(
+        schedule_and_decode_blocking_with_output_schema(
             column_infos,
             requested_rows,
             filter,
             projection.column_indices,
             projection.schema,
+            output_schema,
             config,
         )
     }
@@ -1381,6 +1525,7 @@ impl FileReader {
         ranges: Vec<Range<u64>>,
         batch_size: u32,
         projection: ReaderProjection,
+        output_schema: ArrowSchemaRef,
         filter: FilterExpression,
     ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
         let column_infos = self.collect_columns_from_projection(&projection)?;
@@ -1406,12 +1551,13 @@ impl FileReader {
 
         let requested_rows = RequestedRows::Ranges(ranges);
 
-        schedule_and_decode_blocking(
+        schedule_and_decode_blocking_with_output_schema(
             column_infos,
             requested_rows,
             filter,
             projection.column_indices,
             projection.schema,
+            output_schema,
             config,
         )
     }
@@ -1421,6 +1567,7 @@ impl FileReader {
         range: Range<u64>,
         batch_size: u32,
         projection: ReaderProjection,
+        output_schema: ArrowSchemaRef,
         filter: FilterExpression,
     ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
         let column_infos = self.collect_columns_from_projection(&projection)?;
@@ -1446,12 +1593,13 @@ impl FileReader {
 
         let requested_rows = RequestedRows::Ranges(vec![range]);
 
-        schedule_and_decode_blocking(
+        schedule_and_decode_blocking_with_output_schema(
             column_infos,
             requested_rows,
             filter,
             projection.column_indices,
             projection.schema,
+            output_schema,
             config,
         )
     }
@@ -1475,7 +1623,24 @@ impl FileReader {
         filter: FilterExpression,
     ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
         let projection = projection.unwrap_or_else(|| self.base_projection.clone());
-        Self::validate_projection(&projection, &self.metadata)?;
+        self.read_stream_projected_blocking_with_request(
+            params,
+            batch_size,
+            ReaderRequest::from_projection(projection),
+            filter,
+        )
+    }
+
+    /// Blocking read using an explicit Arrow output schema.
+    pub fn read_stream_projected_blocking_with_request(
+        &self,
+        params: ReadBatchParams,
+        batch_size: u32,
+        request: ReaderRequest,
+        filter: FilterExpression,
+    ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
+        Self::validate_projection(request.projection(), &self.metadata)?;
+        let (projection, output_schema) = request.into_parts();
         let verify_bound = |params: &ReadBatchParams, bound: u64, inclusive: bool| {
             if bound > self.num_rows || bound == self.num_rows && inclusive {
                 Err(Error::invalid_input(format!(
@@ -1499,7 +1664,7 @@ impl FileReader {
                     }
                 }
                 let indices = indices.iter().map(|idx| idx.unwrap() as u64).collect();
-                self.take_rows_blocking(indices, batch_size, projection, filter)
+                self.take_rows_blocking(indices, batch_size, projection, output_schema, filter)
             }
             ReadBatchParams::Range(range) => {
                 verify_bound(&params, range.end as u64, false)?;
@@ -1507,6 +1672,7 @@ impl FileReader {
                     range.start as u64..range.end as u64,
                     batch_size,
                     projection,
+                    output_schema,
                     filter,
                 )
             }
@@ -1516,7 +1682,7 @@ impl FileReader {
                     verify_bound(&params, range.end, false)?;
                     ranges_u64.push(range.start..range.end);
                 }
-                self.read_ranges_blocking(ranges_u64, batch_size, projection, filter)
+                self.read_ranges_blocking(ranges_u64, batch_size, projection, output_schema, filter)
             }
             ReadBatchParams::RangeFrom(range) => {
                 verify_bound(&params, range.start as u64, true)?;
@@ -1524,16 +1690,27 @@ impl FileReader {
                     range.start as u64..self.num_rows,
                     batch_size,
                     projection,
+                    output_schema,
                     filter,
                 )
             }
             ReadBatchParams::RangeTo(range) => {
                 verify_bound(&params, range.end as u64, false)?;
-                self.read_range_blocking(0..range.end as u64, batch_size, projection, filter)
+                self.read_range_blocking(
+                    0..range.end as u64,
+                    batch_size,
+                    projection,
+                    output_schema,
+                    filter,
+                )
             }
-            ReadBatchParams::RangeFull => {
-                self.read_range_blocking(0..self.num_rows, batch_size, projection, filter)
-            }
+            ReadBatchParams::RangeFull => self.read_range_blocking(
+                0..self.num_rows,
+                batch_size,
+                projection,
+                output_schema,
+                filter,
+            ),
         }
     }
 
@@ -1723,10 +1900,15 @@ impl EncodedBatchReaderExt for EncodedBatch {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, pin::Pin, sync::Arc};
+    use std::{
+        collections::{BTreeMap, HashMap},
+        pin::Pin,
+        sync::Arc,
+    };
 
     use arrow_array::{
-        RecordBatch, UInt32Array,
+        BinaryViewArray, RecordBatch, StringViewArray, UInt32Array,
+        cast::AsArray,
         types::{Float64Type, Int32Type},
     };
     use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema};
@@ -1740,12 +1922,14 @@ mod tests {
         encoder::{EncodedBatch, EncodingOptions, default_encoding_strategy, encode_batch},
         version::LanceFileVersion,
     };
-    use lance_io::{stream::RecordBatchStream, utils::CachedFileSize};
+    use lance_io::{ReadBatchParams, stream::RecordBatchStream, utils::CachedFileSize};
     use log::debug;
     use rstest::rstest;
     use tokio::sync::mpsc;
 
-    use crate::reader::{EncodedBatchReaderExt, FileReader, FileReaderOptions, ReaderProjection};
+    use crate::reader::{
+        EncodedBatchReaderExt, FileReader, FileReaderOptions, ReaderProjection, ReaderRequest,
+    };
     use crate::testing::{FsFixture, WrittenFile, test_cache, write_lance_file};
     use crate::writer::{EncodedBatchWriteExt, FileWriter, FileWriterOptions};
     use lance_encoding::decoder::DecoderConfig;
@@ -1776,6 +1960,208 @@ mod tests {
             },
         )
         .await
+    }
+
+    async fn create_view_file(fs: &FsFixture, version: LanceFileVersion) -> WrittenFile {
+        let reader = gen_batch()
+            .col("text", array::rand_type(&DataType::Utf8))
+            .col("bytes", array::rand_type(&DataType::Binary))
+            .into_reader_rows(RowCount::from(100), BatchCount::from(1));
+        write_lance_file(
+            reader,
+            fs,
+            FileWriterOptions {
+                format_version: Some(version),
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    fn request_projection() -> ReaderProjection {
+        let arrow_schema = ArrowSchema::new(vec![
+            Field::new("text", DataType::Utf8, true),
+            Field::new("bytes", DataType::Binary, false),
+        ]);
+        ReaderProjection {
+            schema: Arc::new(Schema::try_from(&arrow_schema).unwrap()),
+            column_indices: vec![0, 1],
+        }
+    }
+
+    #[test]
+    fn test_reader_request_validation() {
+        let projection = request_projection();
+        let valid_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("text", DataType::Utf8View, true),
+            Field::new("bytes", DataType::BinaryView, false),
+        ]));
+        let request = ReaderRequest::try_new(projection.clone(), valid_schema.clone()).unwrap();
+        assert_eq!(request.output_schema(), &valid_schema);
+
+        let invalid_schemas = [
+            (
+                ArrowSchema::new(vec![Field::new("text", DataType::Utf8View, true)]),
+                "has 1 fields",
+            ),
+            (
+                ArrowSchema::new(vec![
+                    Field::new("renamed", DataType::Utf8View, true),
+                    Field::new("bytes", DataType::BinaryView, false),
+                ]),
+                "named 'renamed'",
+            ),
+            (
+                ArrowSchema::new(vec![
+                    Field::new("text", DataType::Utf8View, false),
+                    Field::new("bytes", DataType::BinaryView, false),
+                ]),
+                "nullable=false",
+            ),
+            (
+                ArrowSchema::new(vec![
+                    Field::new("text", DataType::LargeUtf8, true),
+                    Field::new("bytes", DataType::BinaryView, false),
+                ]),
+                "only exact matches",
+            ),
+            (
+                ArrowSchema::new(vec![
+                    Field::new(
+                        "text",
+                        DataType::List(Arc::new(Field::new("item", DataType::Utf8View, true))),
+                        true,
+                    ),
+                    Field::new("bytes", DataType::BinaryView, false),
+                ]),
+                "only exact matches",
+            ),
+        ];
+        for (output_schema, expected_message) in invalid_schemas {
+            let error =
+                ReaderRequest::try_new(projection.clone(), Arc::new(output_schema)).unwrap_err();
+            assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+            assert!(error.to_string().contains(expected_message));
+        }
+
+        let field_metadata_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("text", DataType::Utf8View, true)
+                .with_metadata(HashMap::from([("key".to_string(), "value".to_string())])),
+            Field::new("bytes", DataType::BinaryView, false),
+        ]));
+        let error = ReaderRequest::try_new(projection.clone(), field_metadata_schema).unwrap_err();
+        assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("metadata does not match"));
+
+        let schema_metadata = Arc::new(ArrowSchema::new_with_metadata(
+            valid_schema.fields().clone(),
+            HashMap::from([("key".to_string(), "value".to_string())]),
+        ));
+        let error = ReaderRequest::try_new(projection, schema_metadata).unwrap_err();
+        assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("schema metadata"));
+    }
+
+    #[rstest]
+    #[test_log::test(tokio::test)]
+    async fn test_requested_view_decode(
+        #[values(
+            LanceFileVersion::V2_0,
+            LanceFileVersion::V2_1,
+            LanceFileVersion::V2_2,
+            LanceFileVersion::V2_3
+        )]
+        version: LanceFileVersion,
+    ) {
+        let fs = FsFixture::default();
+        let written = create_view_file(&fs, version).await;
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let file_reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &test_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        let projection = ReaderProjection::from_whole_schema(&written.schema, version);
+        let projected_arrow = ArrowSchema::from(projection.schema.as_ref());
+        let output_schema = Arc::new(ArrowSchema::new_with_metadata(
+            projected_arrow
+                .fields()
+                .iter()
+                .map(|field| {
+                    let data_type = match field.data_type() {
+                        DataType::Utf8 => DataType::Utf8View,
+                        DataType::Binary => DataType::BinaryView,
+                        data_type => data_type.clone(),
+                    };
+                    Arc::new(field.as_ref().clone().with_data_type(data_type))
+                })
+                .collect::<Vec<_>>(),
+            projected_arrow.metadata().clone(),
+        ));
+        let request = ReaderRequest::try_new(projection.clone(), output_schema.clone()).unwrap();
+
+        let batches = file_reader
+            .read_stream_projected_with_request(
+                ReadBatchParams::RangeFull,
+                1024,
+                1,
+                request,
+                FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].schema_ref(), &output_schema);
+
+        let actual_text = batches[0]
+            .column_by_name("text")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .unwrap();
+        let expected_text = written.data[0]["text"].as_string::<i32>();
+        assert_eq!(
+            actual_text.iter().collect::<Vec<_>>(),
+            expected_text.iter().collect::<Vec<_>>()
+        );
+        let actual_bytes = batches[0]
+            .column_by_name("bytes")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BinaryViewArray>()
+            .unwrap();
+        let expected_bytes = written.data[0]["bytes"].as_binary::<i32>();
+        assert_eq!(
+            actual_bytes.iter().collect::<Vec<_>>(),
+            expected_bytes.iter().collect::<Vec<_>>()
+        );
+
+        let default_batches = file_reader
+            .read_stream_projected(
+                ReadBatchParams::RangeFull,
+                1024,
+                1,
+                projection,
+                FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(default_batches[0]["text"].data_type(), &DataType::Utf8);
+        assert_eq!(default_batches[0]["bytes"].data_type(), &DataType::Binary);
     }
 
     type Transformer = Box<dyn Fn(&RecordBatch) -> RecordBatch>;

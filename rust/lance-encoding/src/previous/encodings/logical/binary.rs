@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use arrow_array::{
-    Array, ArrayRef, GenericByteArray, GenericListArray,
+    Array, ArrayRef, BinaryViewArray, GenericByteArray, GenericListArray, StringViewArray,
     cast::AsArray,
     types::{BinaryType, ByteArrayType, LargeBinaryType, LargeUtf8Type, UInt8Type, Utf8Type},
 };
@@ -152,7 +152,9 @@ pub struct BinaryArrayDecoder {
 }
 
 impl BinaryArrayDecoder {
-    fn from_list_array<T: ByteArrayType>(array: &GenericListArray<T::Offset>) -> ArrayRef {
+    fn from_list_array<T: ByteArrayType>(
+        array: &GenericListArray<T::Offset>,
+    ) -> GenericByteArray<T> {
         let values = array
             .values()
             .as_primitive::<UInt8Type>()
@@ -160,11 +162,7 @@ impl BinaryArrayDecoder {
             .inner()
             .clone();
         let offsets = array.offsets().clone();
-        Arc::new(GenericByteArray::<T>::new(
-            offsets,
-            values,
-            array.nulls().cloned(),
-        ))
+        GenericByteArray::<T>::new(offsets, values, array.nulls().cloned())
     }
 }
 
@@ -173,10 +171,26 @@ impl DecodeArrayTask for BinaryArrayDecoder {
         let data_type = self.data_type;
         let (arr, _) = self.inner.decode()?;
         let result = match data_type {
-            DataType::Binary => Self::from_list_array::<BinaryType>(arr.as_list::<i32>()),
-            DataType::LargeBinary => Self::from_list_array::<LargeBinaryType>(arr.as_list::<i64>()),
-            DataType::Utf8 => Self::from_list_array::<Utf8Type>(arr.as_list::<i32>()),
-            DataType::LargeUtf8 => Self::from_list_array::<LargeUtf8Type>(arr.as_list::<i64>()),
+            DataType::Binary => {
+                Arc::new(Self::from_list_array::<BinaryType>(arr.as_list::<i32>())) as ArrayRef
+            }
+            DataType::LargeBinary => Arc::new(Self::from_list_array::<LargeBinaryType>(
+                arr.as_list::<i64>(),
+            )) as ArrayRef,
+            DataType::Utf8 => {
+                Arc::new(Self::from_list_array::<Utf8Type>(arr.as_list::<i32>())) as ArrayRef
+            }
+            DataType::LargeUtf8 => {
+                Arc::new(Self::from_list_array::<LargeUtf8Type>(arr.as_list::<i64>())) as ArrayRef
+            }
+            DataType::BinaryView => {
+                Arc::new(BinaryViewArray::from(&Self::from_list_array::<BinaryType>(
+                    arr.as_list::<i32>(),
+                )))
+            }
+            DataType::Utf8View => Arc::new(StringViewArray::from(
+                &Self::from_list_array::<Utf8Type>(arr.as_list::<i32>()),
+            )),
             _ => panic!("Binary decoder does not support this data type"),
         };
         // data_size is only tracked in the v2.1 structural decode path; the legacy

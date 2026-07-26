@@ -5,6 +5,7 @@ use std::{any::Any, collections::VecDeque, ops::Range, sync::Arc};
 
 use arrow_array::{Array, ArrayRef, new_empty_array};
 use arrow_buffer::ScalarBuffer;
+use arrow_cast::cast;
 use arrow_schema::DataType;
 use bytes::Bytes;
 use futures::FutureExt;
@@ -108,6 +109,7 @@ pub struct ConstantPageScheduler {
     rep_buf_idx: Option<usize>,
     def_buf_idx: Option<usize>,
     data_type: DataType,
+    requested_data_type: DataType,
     def_meaning: Arc<[DefinitionInterpretation]>,
     max_rep: u16,
     max_visible_def: u16,
@@ -119,6 +121,7 @@ impl ConstantPageScheduler {
         buffer_offsets_and_sizes: Arc<[(u64, u64)]>,
         inline_value: Option<Bytes>,
         data_type: DataType,
+        requested_data_type: DataType,
         def_meaning: Arc<[DefinitionInterpretation]>,
     ) -> Result<Self> {
         let max_rep = def_meaning.iter().filter(|d| d.is_list()).count() as u16;
@@ -175,6 +178,7 @@ impl ConstantPageScheduler {
             rep_buf_idx,
             def_buf_idx,
             data_type,
+            requested_data_type,
             def_meaning,
             max_rep,
             max_visible_def,
@@ -231,7 +235,10 @@ impl crate::encodings::logical::primitive::StructuralPageScheduler for ConstantP
                 &self.data_type,
                 inline.as_slice(),
             ) {
-                Ok(s) => s,
+                Ok(s) => match cast(&s, &self.requested_data_type) {
+                    Ok(s) => s,
+                    Err(e) => return std::future::ready(Err(e.into())).boxed(),
+                },
                 Err(e) => return std::future::ready(Err(e.into())).boxed(),
             };
             let cached = Arc::new(CachedConstantState {
@@ -246,6 +253,7 @@ impl crate::encodings::logical::primitive::StructuralPageScheduler for ConstantP
         let data = io.submit_request(reads, 0);
         let scalar_source = self.scalar_source.clone();
         let data_type = self.data_type.clone();
+        let requested_data_type = self.requested_data_type.clone();
         async move {
             let mut data_iter = data.await?.into_iter();
 
@@ -259,6 +267,7 @@ impl crate::encodings::logical::primitive::StructuralPageScheduler for ConstantP
                     lance_arrow::scalar::decode_scalar_from_value_buffer(&data_type, buf.as_ref())?
                 }
             };
+            let scalar = cast(&scalar, &requested_data_type)?;
 
             let rep = rep_range.map(|_| {
                 let rep = data_iter.next().unwrap();

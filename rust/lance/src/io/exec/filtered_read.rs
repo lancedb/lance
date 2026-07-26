@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::{ops::Range, sync::Arc};
 
 use arrow_array::RecordBatch;
-use arrow_schema::SchemaRef;
+use arrow_schema::{DataType, Schema as ArrowSchema, SchemaRef};
 use datafusion::common::runtime::SpawnedTask;
 use datafusion::common::stats::Precision;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
@@ -117,6 +117,34 @@ impl ScopedFragmentRead {
         }
         config
     }
+}
+
+fn use_view_types_for_predicate_columns(
+    read_schema: &ArrowSchema,
+    output_schema: &ArrowSchema,
+    filter_columns: &[String],
+) -> ArrowSchema {
+    let fields = read_schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let is_predicate_only = filter_columns.contains(field.name())
+                && output_schema.field_with_name(field.name()).is_err();
+            let data_type = if is_predicate_only {
+                match field.data_type() {
+                    DataType::Utf8 => Some(DataType::Utf8View),
+                    DataType::Binary => Some(DataType::BinaryView),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            data_type
+                .map(|data_type| Arc::new(field.as_ref().clone().with_data_type(data_type)))
+                .unwrap_or_else(|| field.clone())
+        })
+        .collect::<Vec<_>>();
+    ArrowSchema::new_with_metadata(fields, read_schema.metadata().clone())
 }
 
 /// A fragment with all of its metadata loaded
@@ -1082,24 +1110,37 @@ impl FilteredReadStream {
     ) -> Result<impl Stream<Item = Result<ReadBatchFut>>> {
         let output_schema = Arc::new(fragment_read_task.projection.to_arrow_schema());
 
-        if let Some(filter) = &fragment_read_task.filter {
-            let filter_cols = Planner::column_names_in_expr(filter);
-            if !filter_cols.is_empty() {
+        let filter_columns = if let Some(filter) = &fragment_read_task.filter {
+            let filter_columns = Planner::column_names_in_expr(filter);
+            if !filter_columns.is_empty() {
                 fragment_read_task.projection = Arc::new(
                     fragment_read_task
                         .projection
                         .as_ref()
                         .clone()
-                        .union_columns(filter_cols, OnMissing::Error)?,
+                        .union_columns(filter_columns.iter(), OnMissing::Error)?,
                 );
             }
-        }
+            filter_columns
+        } else {
+            Vec::new()
+        };
 
         let read_schema = fragment_read_task.projection.to_bare_schema();
+        let internal_data_schema = Arc::new(use_view_types_for_predicate_columns(
+            &ArrowSchema::from(&read_schema),
+            output_schema.as_ref(),
+            &filter_columns,
+        ));
         let mut fragment_reader = fragment_read_task
             .fragment
-            .open(&read_schema, fragment_read_task.frag_read_config())
+            .open_with_output_schema(
+                &read_schema,
+                internal_data_schema,
+                fragment_read_task.frag_read_config(),
+            )
             .await?;
+        let internal_schema = Arc::new(fragment_reader.output_schema().clone());
 
         if fragment_read_task.with_deleted_rows {
             fragment_reader.with_make_deletions_null();
@@ -1111,11 +1152,7 @@ impl FilteredReadStream {
 
         let physical_filter = fragment_read_task
             .filter
-            .map(|filter| {
-                let planner =
-                    Planner::new(Arc::new(fragment_read_task.projection.to_arrow_schema()));
-                planner.create_physical_expr(&filter)
-            })
+            .map(|filter| Planner::new(internal_schema).create_physical_expr(&filter))
             .transpose()?;
 
         // We are going to count the fragment as scanned on the first batch we
@@ -2376,6 +2413,48 @@ mod tests {
         ))
     }
 
+    #[test]
+    fn test_use_view_types_for_predicate_columns() {
+        let read_schema = ArrowSchema::new_with_metadata(
+            vec![
+                arrow_schema::Field::new("output_text", DataType::Utf8, true).with_metadata(
+                    HashMap::from([("field".to_string(), "metadata".to_string())]),
+                ),
+                arrow_schema::Field::new("predicate_text", DataType::Utf8, true),
+                arrow_schema::Field::new("predicate_binary", DataType::Binary, true),
+                arrow_schema::Field::new("large_text", DataType::LargeUtf8, true),
+                arrow_schema::Field::new("other", DataType::Int32, true),
+            ],
+            HashMap::from([("schema".to_string(), "metadata".to_string())]),
+        );
+        let output_schema = ArrowSchema::new(vec![arrow_schema::Field::new(
+            "output_text",
+            DataType::Utf8,
+            true,
+        )]);
+        let filter_columns = vec![
+            "output_text".to_string(),
+            "predicate_text".to_string(),
+            "predicate_binary".to_string(),
+            "large_text".to_string(),
+            "other".to_string(),
+        ];
+
+        let view_schema =
+            use_view_types_for_predicate_columns(&read_schema, &output_schema, &filter_columns);
+
+        assert_eq!(view_schema.field(0).data_type(), &DataType::Utf8);
+        assert_eq!(view_schema.field(1).data_type(), &DataType::Utf8View);
+        assert_eq!(view_schema.field(2).data_type(), &DataType::BinaryView);
+        assert_eq!(view_schema.field(3).data_type(), &DataType::LargeUtf8);
+        assert_eq!(view_schema.field(4).data_type(), &DataType::Int32);
+        assert_eq!(view_schema.metadata(), read_schema.metadata());
+        assert_eq!(
+            view_schema.field(0).metadata(),
+            read_schema.field(0).metadata()
+        );
+    }
+
     /// Round-trip every interval shape through the arrow wire format and
     /// confirm the endpoints survive. Exercises both
     /// `IndexExprResult::serialize` and `EvaluatedIndex::try_from_arrow`
@@ -2540,6 +2619,25 @@ mod tests {
         let batches = stream.try_collect::<Vec<_>>().await.unwrap();
         let batch_sizes = batches.iter().map(|b| b.num_rows()).collect::<Vec<_>>();
         assert_eq!(batch_sizes, vec![67]);
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_predicate_only_utf8_column() {
+        let fixture = TestFixture::new().await;
+        let filter_plan = fixture
+            .filter_plan("contains(recheck_idx, 'cat')", false)
+            .await;
+        let projection = fixture
+            .dataset
+            .empty_projection()
+            .union_column("not_indexed", OnMissing::Error)
+            .unwrap();
+        let options = FilteredReadOptions::basic_full_read(&fixture.dataset)
+            .with_projection(projection)
+            .with_filter_plan(filter_plan);
+        let expected = UInt32Array::from_iter_values((0..100).filter(|value| value % 3 != 2));
+
+        fixture.test_plan(options, &expected).await;
     }
 
     #[test_log::test(tokio::test)]

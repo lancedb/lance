@@ -20,7 +20,8 @@ use std::{
 };
 
 use arrow_array::{
-    Array, ArrayRef, OffsetSizeTrait, UInt64Array,
+    Array, ArrayRef, BinaryArray, BinaryViewArray, LargeBinaryArray, LargeStringArray,
+    OffsetSizeTrait, StringArray, StringViewArray, UInt64Array,
     cast::AsArray,
     new_empty_array, new_null_array,
     types::{ArrowDictionaryKeyType, UInt8Type, UInt16Type, UInt32Type, UInt64Type},
@@ -590,18 +591,69 @@ pub struct VariableWidthBlock {
 
 impl VariableWidthBlock {
     fn into_arrow(self, data_type: DataType, validate: bool) -> Result<ArrayData> {
+        if !matches!(data_type, DataType::Utf8View | DataType::BinaryView) {
+            let data_buffer = self.data.into_buffer();
+            let offsets_buffer = self.offsets.into_buffer();
+            let builder = ArrayDataBuilder::new(data_type)
+                .add_buffer(offsets_buffer)
+                .add_buffer(data_buffer)
+                .len(self.num_values as usize)
+                .null_count(0);
+            return if validate {
+                Ok(builder.build()?)
+            } else {
+                Ok(unsafe { builder.build_unchecked() })
+            };
+        }
+
+        let base_data_type = match (&data_type, self.bits_per_offset) {
+            (DataType::Utf8View, 32) => DataType::Utf8,
+            (DataType::Utf8View, 64) => DataType::LargeUtf8,
+            (DataType::BinaryView, 32) => DataType::Binary,
+            (DataType::BinaryView, 64) => DataType::LargeBinary,
+            (_, bits_per_offset) => {
+                return Err(Error::invalid_input(format!(
+                    "Cannot convert VariableWidthBlock to {data_type} with \
+                     bits_per_offset={bits_per_offset}; expected 32 or 64"
+                )));
+            }
+        };
+
         let data_buffer = self.data.into_buffer();
         let offsets_buffer = self.offsets.into_buffer();
-        let builder = ArrayDataBuilder::new(data_type)
+        let builder = ArrayDataBuilder::new(base_data_type)
             .add_buffer(offsets_buffer)
             .add_buffer(data_buffer)
             .len(self.num_values as usize)
             .null_count(0);
-        if validate {
-            Ok(builder.build()?)
+        let base_data = if validate {
+            builder.build()?
         } else {
-            Ok(unsafe { builder.build_unchecked() })
-        }
+            unsafe { builder.build_unchecked() }
+        };
+
+        let view_data = match (data_type, self.bits_per_offset) {
+            (DataType::Utf8View, 32) => {
+                StringViewArray::from(&StringArray::from(base_data)).into_data()
+            }
+            (DataType::Utf8View, 64) => {
+                StringViewArray::from(&LargeStringArray::from(base_data)).into_data()
+            }
+            (DataType::BinaryView, 32) => {
+                BinaryViewArray::from(&BinaryArray::from(base_data)).into_data()
+            }
+            (DataType::BinaryView, 64) => {
+                BinaryViewArray::from(&LargeBinaryArray::from(base_data)).into_data()
+            }
+            (data_type, bits_per_offset) => {
+                return Err(Error::invalid_input(format!(
+                    "Cannot convert VariableWidthBlock to {data_type} with \
+                     bits_per_offset={bits_per_offset}; expected Utf8View or BinaryView with \
+                     32 or 64 bit offsets"
+                )));
+            }
+        };
+        Ok(view_data)
     }
 
     fn into_buffers(self) -> Vec<LanceBuffer> {
@@ -1661,10 +1713,11 @@ mod tests {
     use arrow_schema::{DataType, Field, Fields};
     use lance_datagen::{ArrayGeneratorExt, DEFAULT_SEED, RowCount, array};
     use rand::SeedableRng;
+    use rstest::rstest;
 
     use crate::buffer::LanceBuffer;
 
-    use super::{AllNullDataBlock, DataBlock};
+    use super::{AllNullDataBlock, BlockInfo, DataBlock, NullableDataBlock, VariableWidthBlock};
 
     use arrow_array::Array;
 
@@ -1782,6 +1835,135 @@ mod tests {
         let block = block.as_nullable().unwrap();
         let data = block.data.as_variable_width().unwrap();
         assert_eq!(data.data, LanceBuffer::copy_slice(b"foobar"));
+    }
+
+    fn variable_width_block(data: &[u8], offsets: &[i64], bits_per_offset: u8) -> DataBlock {
+        let num_values = offsets.len() - 1;
+        let offsets_buffer = match bits_per_offset {
+            32 => LanceBuffer::reinterpret_vec(
+                offsets
+                    .iter()
+                    .map(|offset| i32::try_from(*offset).unwrap())
+                    .collect(),
+            ),
+            64 => LanceBuffer::reinterpret_vec(offsets.to_vec()),
+            _ => LanceBuffer::empty(),
+        };
+        DataBlock::VariableWidth(VariableWidthBlock {
+            data: LanceBuffer::copy_slice(data),
+            offsets: offsets_buffer,
+            bits_per_offset,
+            num_values: num_values as u64,
+            block_info: BlockInfo::new(),
+        })
+    }
+
+    #[rstest]
+    #[case(32)]
+    #[case(64)]
+    fn test_variable_width_to_view(#[case] bits_per_offset: u8) {
+        let values = b"abcdefghijklmnopqrstuvwxy";
+        let offsets = [0, 0, 12, 25];
+
+        let string_block = variable_width_block(values, &offsets, bits_per_offset);
+        let values_ptr = string_block.as_variable_width_ref().unwrap().data.as_ptr();
+        let string_data = string_block.into_arrow(DataType::Utf8View, true).unwrap();
+        let string_array = make_array(string_data);
+        let string_array = string_array
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .unwrap();
+        assert_eq!(
+            string_array.iter().collect::<Vec<_>>(),
+            vec![Some(""), Some("abcdefghijkl"), Some("mnopqrstuvwxy")]
+        );
+        assert_eq!(string_array.data_buffers()[0].as_ptr(), values_ptr);
+
+        let inline_view = string_array.views()[1].to_le_bytes();
+        assert_eq!(u32::from_le_bytes(inline_view[..4].try_into().unwrap()), 12);
+        assert_eq!(&inline_view[4..], b"abcdefghijkl");
+
+        let referenced_view = string_array.views()[2].to_le_bytes();
+        assert_eq!(
+            u32::from_le_bytes(referenced_view[..4].try_into().unwrap()),
+            13
+        );
+        assert_eq!(
+            u32::from_le_bytes(referenced_view[8..12].try_into().unwrap()),
+            0
+        );
+        assert_eq!(
+            u32::from_le_bytes(referenced_view[12..].try_into().unwrap()),
+            12
+        );
+
+        let binary_block = variable_width_block(values, &offsets, bits_per_offset);
+        let values_ptr = binary_block.as_variable_width_ref().unwrap().data.as_ptr();
+        let binary_data = binary_block.into_arrow(DataType::BinaryView, true).unwrap();
+        let binary_array = make_array(binary_data);
+        let binary_array = binary_array
+            .as_any()
+            .downcast_ref::<BinaryViewArray>()
+            .unwrap();
+        assert_eq!(
+            binary_array.iter().collect::<Vec<_>>(),
+            vec![
+                Some(b"".as_slice()),
+                Some(b"abcdefghijkl".as_slice()),
+                Some(b"mnopqrstuvwxy".as_slice()),
+            ]
+        );
+        assert_eq!(binary_array.data_buffers()[0].as_ptr(), values_ptr);
+    }
+
+    #[rstest]
+    #[case(32)]
+    #[case(64)]
+    fn test_nullable_variable_width_to_view(#[case] bits_per_offset: u8) {
+        let data = variable_width_block(b"hellomaskedworld", &[0, 5, 11, 16], bits_per_offset);
+        let block = DataBlock::Nullable(NullableDataBlock {
+            data: Box::new(data),
+            nulls: LanceBuffer::from(vec![0b00000101]),
+            block_info: BlockInfo::new(),
+        });
+
+        let array = make_array(block.into_arrow(DataType::Utf8View, true).unwrap());
+        let array = array.as_any().downcast_ref::<StringViewArray>().unwrap();
+        assert_eq!(array.len(), 3);
+        assert_eq!(array.null_count(), 1);
+        assert_eq!(array.value(0), "hello");
+        assert!(array.is_null(1));
+        assert_eq!(array.value(2), "world");
+    }
+
+    #[test]
+    fn test_variable_width_to_view_validation() {
+        let error = variable_width_block(&[0xff], &[0, 1], 32)
+            .into_arrow(DataType::Utf8View, true)
+            .unwrap_err();
+        assert!(matches!(error, lance_core::Error::Arrow { .. }));
+        assert!(error.to_string().contains("Invalid UTF8 sequence"));
+
+        let data = variable_width_block(&[0xff], &[0, 1], 32)
+            .into_arrow(DataType::BinaryView, true)
+            .unwrap();
+        let array = make_array(data);
+        let array = array.as_any().downcast_ref::<BinaryViewArray>().unwrap();
+        assert_eq!(array.value(0), &[0xff]);
+    }
+
+    #[rstest]
+    #[case(DataType::Utf8View)]
+    #[case(DataType::BinaryView)]
+    fn test_variable_width_to_view_rejects_unsupported_offsets(#[case] data_type: DataType) {
+        let error = variable_width_block(b"", &[0], 16)
+            .into_arrow(data_type.clone(), true)
+            .unwrap_err();
+        assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+        let message = error.to_string();
+        assert!(message.contains(&data_type.to_string()));
+        assert!(message.contains("bits_per_offset=16"));
+        assert!(message.contains("expected 32 or 64"));
     }
 
     #[test]

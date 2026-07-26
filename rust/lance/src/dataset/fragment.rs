@@ -17,7 +17,7 @@ use arrow_array::types::UInt64Type;
 use arrow_array::{
     Array, RecordBatch, RecordBatchReader, StructArray, UInt32Array, UInt64Array, new_null_array,
 };
-use arrow_schema::Schema as ArrowSchema;
+use arrow_schema::{DataType, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
 use datafusion::logical_expr::Expr;
 use datafusion::scalar::ScalarValue;
 use futures::future::{BoxFuture, try_join_all};
@@ -37,7 +37,7 @@ use lance_encoding::decoder::DecoderPlugins;
 use lance_file::previous::reader::{
     FileReader as PreviousFileReader, read_batch as previous_read_batch,
 };
-use lance_file::reader::{CachedFileMetadata, FileReaderOptions, ReaderProjection};
+use lance_file::reader::{CachedFileMetadata, FileReaderOptions, ReaderProjection, ReaderRequest};
 use lance_file::version::LanceFileVersion;
 use lance_file::{LanceEncodingsIo, determine_file_version};
 use lance_io::ReadBatchParams;
@@ -321,6 +321,32 @@ impl GenericFileReader for V1Reader {
     }
 }
 
+fn project_output_schema(
+    output_schema: &ArrowSchema,
+    projection: &Schema,
+) -> Result<ArrowSchemaRef> {
+    let projected_schema = ArrowSchema::from(projection);
+    let fields = projected_schema
+        .fields()
+        .iter()
+        .map(|projected_field| {
+            let output_field = output_schema.field_with_name(projected_field.name())?;
+            if matches!(
+                (projected_field.data_type(), output_field.data_type()),
+                (DataType::Utf8, DataType::Utf8View) | (DataType::Binary, DataType::BinaryView)
+            ) {
+                Ok(Arc::new(output_field.clone()))
+            } else {
+                Ok(projected_field.clone())
+            }
+        })
+        .collect::<std::result::Result<Vec<_>, arrow_schema::ArrowError>>()?;
+    Ok(Arc::new(ArrowSchema::new_with_metadata(
+        fields,
+        projected_schema.metadata().clone(),
+    )))
+}
+
 mod v2_adapter {
     use lance_encoding::decoder::FilterExpression;
 
@@ -330,6 +356,7 @@ mod v2_adapter {
     pub struct Reader {
         reader: Arc<lance_file::reader::FileReader>,
         projection: Arc<Schema>,
+        output_schema: ArrowSchemaRef,
         field_id_to_column_idx: Arc<BTreeMap<u32, u32>>,
         default_priority: u32,
         file_scheduler: FileScheduler,
@@ -339,6 +366,7 @@ mod v2_adapter {
         pub fn new(
             reader: Arc<lance_file::reader::FileReader>,
             projection: Arc<Schema>,
+            output_schema: ArrowSchemaRef,
             field_id_to_column_idx: Arc<BTreeMap<u32, u32>>,
             default_priority: u32,
             file_scheduler: FileScheduler,
@@ -346,6 +374,7 @@ mod v2_adapter {
             Self {
                 reader,
                 projection,
+                output_schema,
                 field_id_to_column_idx,
                 default_priority,
                 file_scheduler,
@@ -362,17 +391,20 @@ mod v2_adapter {
             projection: Arc<Schema>,
         ) -> BoxFuture<'_, Result<ReadBatchTaskStream>> {
             async move {
+                let output_schema =
+                    project_output_schema(self.output_schema.as_ref(), projection.as_ref())?;
                 let projection = ReaderProjection::from_field_ids(
                     self.reader.metadata().version(),
                     projection.as_ref(),
                     self.field_id_to_column_idx.as_ref(),
                 )?;
+                let request = ReaderRequest::try_new(projection, output_schema)?;
                 Ok(self
                     .reader
-                    .read_tasks(
+                    .read_tasks_with_request(
                         ReadBatchParams::Range(range.start as usize..range.end as usize),
                         batch_size,
-                        Some(projection),
+                        request,
                         FilterExpression::no_filter(),
                     )
                     .await?
@@ -392,17 +424,20 @@ mod v2_adapter {
             projection: Arc<Schema>,
         ) -> BoxFuture<'_, Result<ReadBatchTaskStream>> {
             async move {
+                let output_schema =
+                    project_output_schema(self.output_schema.as_ref(), projection.as_ref())?;
                 let projection = ReaderProjection::from_field_ids(
                     self.reader.metadata().version(),
                     projection.as_ref(),
                     self.field_id_to_column_idx.as_ref(),
                 )?;
+                let request = ReaderRequest::try_new(projection, output_schema)?;
                 Ok(self
                     .reader
-                    .read_tasks(
+                    .read_tasks_with_request(
                         ReadBatchParams::Ranges(ranges),
                         batch_size,
-                        Some(projection),
+                        request,
                         FilterExpression::no_filter(),
                     )
                     .await?
@@ -421,17 +456,20 @@ mod v2_adapter {
             projection: Arc<Schema>,
         ) -> BoxFuture<'_, Result<ReadBatchTaskStream>> {
             async move {
+                let output_schema =
+                    project_output_schema(self.output_schema.as_ref(), projection.as_ref())?;
                 let projection = ReaderProjection::from_field_ids(
                     self.reader.metadata().version(),
                     projection.as_ref(),
                     self.field_id_to_column_idx.as_ref(),
                 )?;
+                let request = ReaderRequest::try_new(projection, output_schema)?;
                 Ok(self
                     .reader
-                    .read_tasks(
+                    .read_tasks_with_request(
                         ReadBatchParams::RangeFull,
                         batch_size,
-                        Some(projection),
+                        request,
                         FilterExpression::no_filter(),
                     )
                     .await?
@@ -453,11 +491,14 @@ mod v2_adapter {
         ) -> BoxFuture<'_, Result<ReadBatchTaskStream>> {
             let indices = UInt32Array::from(indices.to_vec());
             async move {
+                let output_schema =
+                    project_output_schema(self.output_schema.as_ref(), projection.as_ref())?;
                 let projection = ReaderProjection::from_field_ids(
                     self.reader.metadata().version(),
                     projection.as_ref(),
                     self.field_id_to_column_idx.as_ref(),
                 )?;
+                let request = ReaderRequest::try_new(projection, output_schema)?;
 
                 let reader = if let Some(take_priority) = take_priority {
                     let op_priority = ((take_priority as u64) << 32) | self.default_priority as u64;
@@ -471,10 +512,10 @@ mod v2_adapter {
                 };
 
                 Ok(reader
-                    .read_tasks(
+                    .read_tasks_with_request(
                         ReadBatchParams::Indices(indices),
                         batch_size,
-                        Some(projection),
+                        request,
                         FilterExpression::no_filter(),
                     )
                     .await?
@@ -540,12 +581,17 @@ mod v2_adapter {
 #[derive(Debug, Clone)]
 struct NullReader {
     schema: Arc<Schema>,
+    output_schema: ArrowSchemaRef,
     num_rows: u32,
 }
 
 impl NullReader {
-    fn new(schema: Arc<Schema>, num_rows: u32) -> Self {
-        Self { schema, num_rows }
+    fn new(schema: Arc<Schema>, output_schema: ArrowSchemaRef, num_rows: u32) -> Self {
+        Self {
+            schema,
+            output_schema,
+            num_rows,
+        }
     }
 
     fn batch(projection: Arc<ArrowSchema>, num_rows: usize) -> RecordBatch {
@@ -574,25 +620,26 @@ impl GenericFileReader for NullReader {
         batch_size: u32,
         projection: Arc<Schema>,
     ) -> BoxFuture<'_, Result<ReadBatchTaskStream>> {
-        let mut remaining_rows = ranges.iter().map(|r| r.end - r.start).sum::<u64>();
-        let projection: Arc<ArrowSchema> = Arc::new(projection.as_ref().into());
+        async move {
+            let mut remaining_rows = ranges.iter().map(|r| r.end - r.start).sum::<u64>();
+            let projection =
+                project_output_schema(self.output_schema.as_ref(), projection.as_ref())?;
+            let task_iter = std::iter::from_fn(move || {
+                if remaining_rows == 0 {
+                    return None;
+                }
 
-        let task_iter = std::iter::from_fn(move || {
-            if remaining_rows == 0 {
-                return None;
-            }
-
-            let num_rows = remaining_rows.min(batch_size as u64) as usize;
-            remaining_rows -= num_rows as u64;
-            let batch = Self::batch(projection.clone(), num_rows);
-            let task = ReadBatchTask {
-                task: futures::future::ready(Ok(batch)).boxed(),
-                num_rows: num_rows as u32,
-            };
-            Some(task)
-        });
-
-        async move { Ok(futures::stream::iter(task_iter).boxed()) }.boxed()
+                let num_rows = remaining_rows.min(batch_size as u64) as usize;
+                remaining_rows -= num_rows as u64;
+                let batch = Self::batch(projection.clone(), num_rows);
+                Some(ReadBatchTask {
+                    task: futures::future::ready(Ok(batch)).boxed(),
+                    num_rows: num_rows as u32,
+                })
+            });
+            Ok(futures::stream::iter(task_iter).boxed())
+        }
+        .boxed()
     }
 
     fn read_all_tasks(
@@ -838,9 +885,11 @@ impl FileFragment {
         scan_scheduler: Arc<ScanScheduler>,
     ) -> Result<Vec<(u32, u64)>> {
         let mut stats = Vec::new();
+        let output_schema = Arc::new(ArrowSchema::from(dataset_schema));
         for reader in self
             .open_readers(
                 dataset_schema,
+                &output_schema,
                 &FragReadConfig::default().with_scan_scheduler(scan_scheduler),
             )
             .await?
@@ -900,7 +949,28 @@ impl FileFragment {
         projection: &Schema,
         read_config: FragReadConfig,
     ) -> Result<FragmentReader> {
-        let open_files = self.open_readers(projection, &read_config);
+        self.open_with_output_schema(
+            projection,
+            Arc::new(ArrowSchema::from(projection)),
+            read_config,
+        )
+        .await
+    }
+
+    /// Opens a fragment while requesting a different Arrow representation for
+    /// the projected storage fields.
+    pub(crate) async fn open_with_output_schema(
+        &self,
+        projection: &Schema,
+        output_schema: ArrowSchemaRef,
+        read_config: FragReadConfig,
+    ) -> Result<FragmentReader> {
+        let output_schema = if self.metadata.files.iter().any(DataFile::is_legacy_file) {
+            Arc::new(ArrowSchema::from(projection))
+        } else {
+            output_schema
+        };
+        let open_files = self.open_readers(projection, &output_schema, &read_config);
         let deletion_vec_load = self.get_deletion_vector();
 
         let row_id_load = if self.dataset.manifest.uses_stable_row_ids() {
@@ -926,13 +996,12 @@ impl FileFragment {
         }
 
         let num_physical_rows = self.physical_rows().await?;
-
         let mut reader = FragmentReader::try_new(
             self.id(),
             deletion_vec,
             row_id_sequence,
             opened_files,
-            ArrowSchema::from(projection),
+            output_schema.as_ref().clone(),
             self.count_rows(None).await?,
             num_physical_rows,
             Arc::new(self.metadata.clone()),
@@ -962,6 +1031,7 @@ impl FileFragment {
         &self,
         data_file: &DataFile,
         projection: Option<&Schema>,
+        output_schema: Option<&ArrowSchema>,
         read_config: &FragReadConfig,
     ) -> Result<Option<Box<dyn GenericFileReader>>> {
         let full_schema = self.dataset.schema();
@@ -970,6 +1040,11 @@ impl FileFragment {
         let projection = projection.unwrap_or(full_schema);
         // Also remove any fields that are not part of the user's provided projection
         let schema_per_file = Arc::new(projection.intersection_ignore_types(&data_file_schema)?);
+        let output_schema_per_file = if let Some(output_schema) = output_schema {
+            project_output_schema(output_schema, schema_per_file.as_ref())?
+        } else {
+            Arc::new(ArrowSchema::from(schema_per_file.as_ref()))
+        };
 
         if data_file.is_legacy_file() {
             let max_field_id = data_file.fields.iter().max().unwrap();
@@ -1069,6 +1144,7 @@ impl FileFragment {
             let reader = v2_adapter::Reader::new(
                 reader,
                 schema_per_file,
+                output_schema_per_file,
                 field_id_to_column_idx,
                 reader_priority,
                 file_scheduler,
@@ -1080,12 +1156,18 @@ impl FileFragment {
     async fn open_readers(
         &self,
         projection: &Schema,
+        output_schema: &ArrowSchemaRef,
         read_config: &FragReadConfig,
     ) -> Result<Vec<Box<dyn GenericFileReader>>> {
         let mut opened_files = vec![];
         for data_file in &self.metadata.files {
             if let Some(reader) = self
-                .open_reader(data_file, Some(projection), read_config)
+                .open_reader(
+                    data_file,
+                    Some(projection),
+                    Some(output_schema.as_ref()),
+                    read_config,
+                )
                 .await?
             {
                 opened_files.push(reader);
@@ -1106,7 +1188,13 @@ impl FileFragment {
         missing_fields.retain(|f| !field_ids_in_files.contains(f) && *f >= 0);
         if !missing_fields.is_empty() {
             let missing_projection = projection.project_by_ids(&missing_fields, true);
-            let null_reader = NullReader::new(Arc::new(missing_projection), num_rows as u32);
+            let missing_output_schema =
+                project_output_schema(output_schema.as_ref(), &missing_projection)?;
+            let null_reader = NullReader::new(
+                Arc::new(missing_projection),
+                missing_output_schema,
+                num_rows as u32,
+            );
             opened_files.push(Box::new(null_reader));
         }
 
@@ -1230,7 +1318,7 @@ impl FileFragment {
         // Just open any file. All of them should have same size.
         let some_file = &self.metadata.files[0];
         let reader = self
-            .open_reader(some_file, None, &FragReadConfig::default())
+            .open_reader(some_file, None, None, &FragReadConfig::default())
             .await?
             .ok_or_else(|| {
                 Error::internal(format!(
@@ -1301,7 +1389,7 @@ impl FileFragment {
         let get_lengths = self.metadata.files.iter().map(|data_file| async move {
             let data_file_dir = self.dataset.data_file_dir(data_file)?;
             let reader = self
-                .open_reader(data_file, None, &FragReadConfig::default())
+                .open_reader(data_file, None, None, &FragReadConfig::default())
                 .await?
                 .ok_or_else(|| {
                     Error::corrupt_file(
@@ -2095,6 +2183,10 @@ fn merge_batches(batches: &[RecordBatch]) -> Result<RecordBatch> {
 }
 
 impl FragmentReader {
+    pub(crate) fn output_schema(&self) -> &ArrowSchema {
+        &self.output_schema
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn try_new(
         fragment_id: usize,
@@ -2772,6 +2864,38 @@ mod tests {
         session::Session,
         utils::test::TestDatasetGenerator,
     };
+
+    #[tokio::test]
+    async fn test_null_reader_uses_requested_output_schema() {
+        let storage_arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("text", DataType::Utf8, true),
+            ArrowField::new("bytes", DataType::Binary, true),
+        ]);
+        let storage_schema = Arc::new(Schema::try_from(&storage_arrow_schema).unwrap());
+        let output_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("text", DataType::Utf8View, true),
+            ArrowField::new("bytes", DataType::BinaryView, true),
+        ]));
+        let reader = NullReader::new(storage_schema.clone(), output_schema.clone(), 3);
+        let bytes_projection = Arc::new(
+            storage_schema
+                .project_by_schema(
+                    &ArrowSchema::new(vec![ArrowField::new("bytes", DataType::Binary, true)]),
+                    OnMissing::Error,
+                    OnTypeMismatch::Error,
+                )
+                .unwrap(),
+        );
+
+        let mut tasks = reader.read_all_tasks(10, bytes_projection).await.unwrap();
+        let batch = tasks.next().await.unwrap().task.await.unwrap();
+
+        assert_eq!(batch.schema().fields().len(), 1);
+        assert_eq!(batch.schema().field(0), output_schema.field(1));
+        assert_eq!(batch.num_rows(), 3);
+        assert_eq!(batch.column(0).data_type(), &DataType::BinaryView);
+        assert_eq!(batch.column(0).null_count(), 3);
+    }
 
     async fn create_dataset(test_uri: &str, data_storage_version: LanceFileVersion) -> Dataset {
         let schema = Arc::new(ArrowSchema::new(vec![
