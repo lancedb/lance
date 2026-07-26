@@ -418,7 +418,7 @@ impl FromPyObject<'_, '_> for PyLance<Operation> {
                     updated_fragments,
                     new_fragments,
                     fields_modified,
-                    merged_generations: vec![],
+                    compacted_sstables: vec![],
                     fields_for_preserving_frag_bitmap,
                     update_mode,
                     inserted_rows_filter: None,

@@ -39,6 +39,7 @@ pub struct LanceTableProvider {
     row_id_idx: Option<usize>,
     row_addr_idx: Option<usize>,
     ordered: bool,
+    blob_handling: Option<lance_core::datatypes::BlobHandling>,
 }
 
 impl LanceTableProvider {
@@ -69,7 +70,17 @@ impl LanceTableProvider {
             row_id_idx,
             row_addr_idx,
             ordered,
+            blob_handling: None,
         }
+    }
+
+    /// Overrides how blob columns are read during [`TableProvider::scan`].
+    ///
+    /// When unset, the underlying dataset scan uses its default
+    /// [`BlobHandling`](lance_core::datatypes::BlobHandling) policy.
+    pub fn with_blob_handling(mut self, handling: lance_core::datatypes::BlobHandling) -> Self {
+        self.blob_handling = Some(handling);
+        self
     }
 
     pub fn dataset(&self) -> Arc<Dataset> {
@@ -95,6 +106,10 @@ impl TableProvider for LanceTableProvider {
         limit: Option<usize>,
     ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
         let mut scan = self.dataset.scan();
+        if let Some(handling) = self.blob_handling.clone() {
+            scan.blob_handling(handling);
+        }
+
         match projection {
             Some(projection) if projection.is_empty() => {
                 scan.empty_project()?;
@@ -159,13 +174,7 @@ pub trait SessionContextExt {
         with_row_id: bool,
         with_row_addr: bool,
     ) -> datafusion::common::Result<DataFrame>;
-    /// Creates a DataFrame for reading a Lance dataset without ordering
-    fn read_lance_unordered(
-        &self,
-        dataset: Arc<Dataset>,
-        with_row_id: bool,
-        with_row_addr: bool,
-    ) -> datafusion::common::Result<DataFrame>;
+
     /// Creates a DataFrame for reading a stream of data
     ///
     /// This dataframe may only be queried once, future queries will fail
@@ -222,20 +231,6 @@ impl SessionContextExt for SessionContext {
             dataset,
             with_row_id,
             with_row_addr,
-        )))
-    }
-
-    fn read_lance_unordered(
-        &self,
-        dataset: Arc<Dataset>,
-        with_row_id: bool,
-        with_row_addr: bool,
-    ) -> datafusion::common::Result<DataFrame> {
-        self.read_table(Arc::new(LanceTableProvider::new_with_ordering(
-            dataset,
-            with_row_id,
-            with_row_addr,
-            false,
         )))
     }
 

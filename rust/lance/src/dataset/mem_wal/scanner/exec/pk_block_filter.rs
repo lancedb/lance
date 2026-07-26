@@ -5,7 +5,7 @@
 //!
 //! Drops a row when any newer generation's membership ([`GenMembership`])
 //! contains its primary key — in-memory generations probe their PK index by
-//! value, flushed generations probe their on-disk PK BTree. Each generation is
+//! value, SSTables probe their on-disk PK BTree. Each generation is
 //! probed once per batch (see the perf note below). Used both as the KNN
 //! post-filter (vector search, with over-fetch) and the cross-generation scan
 //! filter (`k = 0`).
@@ -22,7 +22,7 @@
 //! `BTreeIndex::contains_keys` (one page pass, no per-key `SearchResult`
 //! allocation); the in-memory arm maps a sync PK lookup over the keys. Probes
 //! are not disk-bound in steady state: the opened index and its (small,
-//! memtable-sized) pages are held by the injected `FlushedMemTableCache` /
+//! memtable-sized) pages are held by the injected `SsTableCache` /
 //! `LanceCache`, so after the first touch every probe is memory-resident.
 //! Already-blocked rows are dropped from the key set before probing older
 //! generations, preserving the per-row short-circuit.
@@ -180,8 +180,8 @@ struct PkBlockFilterStream {
     warned: bool,
 }
 
-/// Keep only the rows no newer-gen membership contains. Async because flushed
-/// generations are probed against their on-disk PK BTree.
+/// Keep only the rows no newer-gen membership contains. Async because SSTables
+/// are probed against their on-disk PK BTree.
 async fn filter_batch(batch: RecordBatch, config: Arc<FilterConfig>) -> DFResult<RecordBatch> {
     let FilterConfig {
         pk_columns,

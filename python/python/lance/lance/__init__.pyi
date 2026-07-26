@@ -371,38 +371,38 @@ class _Dataset:
         self,
         row_ids: List[int],
         blob_column: str,
-    ) -> List[LanceBlobFile]: ...
+    ) -> List[Optional[LanceBlobFile]]: ...
     def take_blobs_by_addresses(
         self,
         row_addresses: List[int],
         blob_column: str,
-    ) -> List[LanceBlobFile]: ...
+    ) -> List[Optional[LanceBlobFile]]: ...
     def take_blobs_by_indices(
         self,
         row_indices: List[int],
         blob_column: str,
-    ) -> List[LanceBlobFile]: ...
+    ) -> List[Optional[LanceBlobFile]]: ...
     def read_blobs(
         self,
         row_ids: List[int],
         blob_column: str,
         io_buffer_size: Optional[int] = None,
         preserve_order: Optional[bool] = None,
-    ) -> List[Tuple[int, bytes]]: ...
+    ) -> List[Tuple[int, Optional[bytes]]]: ...
     def read_blobs_by_addresses(
         self,
         row_addresses: List[int],
         blob_column: str,
         io_buffer_size: Optional[int] = None,
         preserve_order: Optional[bool] = None,
-    ) -> List[Tuple[int, bytes]]: ...
+    ) -> List[Tuple[int, Optional[bytes]]]: ...
     def read_blobs_by_indices(
         self,
         row_indices: List[int],
         blob_column: str,
         io_buffer_size: Optional[int] = None,
         preserve_order: Optional[bool] = None,
-    ) -> List[Tuple[int, bytes]]: ...
+    ) -> List[Tuple[int, Optional[bytes]]]: ...
     def read_blob_ranges(
         self,
         requests: List[Tuple[int, int, int]],
@@ -410,7 +410,7 @@ class _Dataset:
         selector: Literal["ids", "addresses", "indices"],
         io_buffer_size: Optional[int] = None,
         preserve_order: Optional[bool] = None,
-    ) -> List[Tuple[int, int, bytes]]: ...
+    ) -> List[Tuple[int, int, Optional[bytes]]]: ...
     def take_scan(
         self,
         row_slices: Iterable[Tuple[int, int]],
@@ -743,7 +743,7 @@ def _evaluate_sharding_spec(
     schema: LanceSchema,
 ) -> pa.RecordBatch: ...
 
-class _MergedGeneration:
+class _CompactedSsTable:
     shard_id: str
     generation: int
     def __init__(self, shard_id: str, generation: int) -> None: ...
@@ -753,7 +753,7 @@ class _ShardSnapshot:
     def __init__(self, shard_id: str) -> None: ...
     def with_spec_id(self, spec_id: int) -> Self: ...
     def with_current_generation(self, generation: int) -> Self: ...
-    def with_flushed_generation(self, generation: int, path: str) -> Self: ...
+    def with_sstable(self, generation: int, path: str) -> Self: ...
 
 class _ShardWriter:
     shard_id: str

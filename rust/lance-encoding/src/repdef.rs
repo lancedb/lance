@@ -263,7 +263,7 @@ impl NormalizedStructuralPlan {
         })
     }
 
-    fn into_serializer(self) -> (SerializerContext, Option<u64>) {
+    fn to_serializer(&self) -> (SerializerContext, Option<u64>) {
         if self.dense_all_valid {
             let def_meaning = self
                 .layers
@@ -310,27 +310,27 @@ impl NormalizedStructuralPlan {
 
         let num_layers = self.layers.len();
         let mut context = SerializerContext::new(total_len, num_layers, max_rep, max_def);
-        for layer in self.layers {
+        for layer in &self.layers {
             match layer {
-                RawRepDef::Validity(def) => context.record_validity(&def),
-                RawRepDef::Offsets(rep) => context.record_offsets(&rep),
-                RawRepDef::Fsl(fsl) => context.record_fsl(&fsl),
+                RawRepDef::Validity(def) => context.record_validity(def),
+                RawRepDef::Offsets(rep) => context.record_offsets(rep),
+                RawRepDef::Fsl(fsl) => context.record_fsl(fsl),
             }
         }
         (context, bits_per_level)
     }
 
-    pub(crate) fn serialize(self) -> SerializedRepDefs {
-        self.into_serializer().0.build()
+    pub(crate) fn serialize(&self) -> SerializedRepDefs {
+        self.to_serializer().0.build()
     }
 
     pub(crate) fn serialize_with_miniblock_repdef_budget(
-        self,
+        &self,
         max_levels_for_bits: impl FnOnce(u64) -> u64,
         num_rows: u64,
         num_values: u64,
     ) -> Result<(SerializedRepDefs, MiniBlockRepDefBudget)> {
-        let (context, bits_per_level) = self.into_serializer();
+        let (context, bits_per_level) = self.to_serializer();
         context.build_with_miniblock_repdef_budget(
             bits_per_level.map(max_levels_for_bits),
             num_rows,

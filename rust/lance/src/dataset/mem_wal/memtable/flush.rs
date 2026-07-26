@@ -12,7 +12,7 @@ use lance_core::cache::LanceCache;
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::{Error, Result};
 use lance_index::IndexType;
-use lance_index::mem_wal::{FlushedGeneration, ShardManifest};
+use lance_index::mem_wal::{ShardManifest, SsTable};
 use lance_index::scalar::{IndexStore, ScalarIndexParams};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_table::format::IndexMetadata;
@@ -30,16 +30,14 @@ use super::super::memtable::MemTable;
 use crate::Dataset;
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::mem_wal::manifest::ShardManifestStore;
-use crate::dataset::mem_wal::scanner::GenerationWarmer;
+use crate::dataset::mem_wal::scanner::SsTableWarmer;
 use crate::dataset::mem_wal::scanner::exec::{compute_pk_hash, validate_pk_types};
-use crate::dataset::mem_wal::util::{
-    derived_store_params, flushed_memtable_path, generate_random_hash,
-};
+use crate::dataset::mem_wal::util::{derived_store_params, generate_random_hash, sstable_path};
 use crate::session::Session;
 
 #[derive(Debug, Clone)]
 pub struct FlushResult {
-    pub generation: FlushedGeneration,
+    pub sstable: SsTable,
     pub rows_flushed: usize,
     pub covered_wal_entry_position: u64,
 }
@@ -75,7 +73,7 @@ pub struct MemTableFlusher {
     manifest_store: Arc<ShardManifestStore>,
     /// When present, each new generation is warmed before it is committed, so
     /// the first query sees zero cold reads. `None` => no warming.
-    warmer: Option<Arc<dyn GenerationWarmer>>,
+    warmer: Option<Arc<dyn SsTableWarmer>>,
     /// Store params the base dataset was opened with, reused for the flusher's
     /// own opens + writes. Used verbatim only for the base's own URI; generation
     /// URIs go through [`derived_store_params`]. `None` opens by URI alone.
@@ -106,7 +104,7 @@ impl MemTableFlusher {
     }
 
     /// Attach the warmer fired pre-commit for each new generation.
-    pub fn with_warmer(mut self, warmer: Option<Arc<dyn GenerationWarmer>>) -> Self {
+    pub fn with_warmer(mut self, warmer: Option<Arc<dyn SsTableWarmer>>) -> Self {
         self.warmer = warmer;
         self
     }
@@ -131,7 +129,7 @@ impl MemTableFlusher {
             .await
     }
 
-    /// Open a flushed generation under `_mem_wal/`. The params must be adapted
+    /// Open an SSTable under `_mem_wal/`. The params must be adapted
     /// first: a path-bound store binding would redirect the open at the base
     /// table (see [`derived_store_params`]).
     async fn open_generation(&self, uri: &str) -> Result<Dataset> {
@@ -188,9 +186,9 @@ impl MemTableFlusher {
         }
     }
 
-    /// Storage file version of the shard's base dataset. Flushed generations
+    /// Storage file version of the shard's base dataset. SSTables
     /// (data fragments and index files) are written at this same version so the
-    /// whole shard stays on one format (e.g. a 2.2 base => 2.2 flushed gens).
+    /// whole shard stays on one format (e.g. a 2.2 base => 2.2 SSTables).
     ///
     /// Falls back to [`LanceFileVersion::default`] when no base dataset exists at
     /// `base_uri` (e.g. flusher unit tests that run without a committed base).
@@ -236,8 +234,7 @@ impl MemTableFlusher {
         let random_hash = generate_random_hash();
         let generation = memtable.generation();
         let gen_folder_name = format!("{}_gen_{}", random_hash, generation);
-        let gen_path =
-            flushed_memtable_path(&self.base_path, &self.shard_id, &random_hash, generation);
+        let gen_path = sstable_path(&self.base_path, &self.shard_id, &random_hash, generation);
 
         info!(
             "Flushing MemTable generation {} to {} ({} rows, {} batches)",
@@ -249,8 +246,8 @@ impl MemTableFlusher {
 
         let (rows_flushed, deleted) = self.write_data_file(&gen_path, memtable).await?;
 
-        // Persist the within-generation deletion vector so the flushed
-        // generation exposes newest-per-PK on every read path.
+        // Persist the within-generation deletion vector so the
+        // SSTable exposes newest-per-PK on every read path.
         if !deleted.is_empty() {
             let uri = self.path_to_uri(&gen_path);
             let dataset = self.open_generation(&uri).await?;
@@ -281,12 +278,12 @@ impl MemTableFlusher {
             .await?;
 
         info!(
-            "Flushed generation {} for shard {} (manifest version {})",
+            "Flushed SSTable {} for shard {} (manifest version {})",
             generation, self.shard_id, new_manifest.version
         );
 
         Ok(FlushResult {
-            generation: FlushedGeneration {
+            sstable: SsTable {
                 generation,
                 path: gen_folder_name,
             },
@@ -355,8 +352,8 @@ impl MemTableFlusher {
         let reader =
             RecordBatchIterator::new(batches.into_iter().map(Ok), memtable.schema().clone());
 
-        // Use very large max_rows_per_file to ensure 1 fragment per flushed memtable.
-        // Inherit the base dataset's storage version so the flushed generation
+        // Use very large max_rows_per_file to ensure 1 fragment per SSTable.
+        // Inherit the base dataset's storage version so the SSTable
         // matches it (a 2.2 base also fixes the v2.1 miniblock 32 KiB chunk cap
         // that the dense HNSW graph List columns overflow at scale).
         let write_params = WriteParams {
@@ -399,7 +396,7 @@ impl MemTableFlusher {
             let dv = DeletionVector::from(deleted.clone());
             let deletion_file = write_deletion_file(
                 &dataset.base,
-                0, // 1 fragment per flushed generation
+                0, // 1 fragment per SSTable
                 dataset.version().version,
                 &dv,
                 dataset.object_store.as_ref(),
@@ -470,8 +467,7 @@ impl MemTableFlusher {
         let random_hash = generate_random_hash();
         let generation = memtable.generation();
         let gen_folder_name = format!("{}_gen_{}", random_hash, generation);
-        let gen_path =
-            flushed_memtable_path(&self.base_path, &self.shard_id, &random_hash, generation);
+        let gen_path = sstable_path(&self.base_path, &self.shard_id, &random_hash, generation);
 
         info!(
             "Flushing MemTable generation {} with indexes to {} ({} rows, {} batches)",
@@ -497,7 +493,7 @@ impl MemTableFlusher {
             .await?;
         if !btree_indexes.is_empty() {
             info!(
-                "Created {} BTree indexes on flushed generation {}",
+                "Created {} BTree indexes on SSTable {}",
                 btree_indexes.len(),
                 generation
             );
@@ -516,7 +512,7 @@ impl MemTableFlusher {
                         .await?
                     else {
                         info!(
-                            "Skipped empty HNSW index '{}' on flushed generation {} (no vectors)",
+                            "Skipped empty HNSW index '{}' on SSTable {} (no vectors)",
                             hnsw_config.name, generation
                         );
                         continue;
@@ -540,7 +536,7 @@ impl MemTableFlusher {
                     all_indexes.push(index_meta);
 
                     info!(
-                        "Created HNSW index '{}' on flushed generation {}",
+                        "Created HNSW index '{}' on SSTable {}",
                         hnsw_config.name, generation
                     );
                 }
@@ -586,12 +582,12 @@ impl MemTableFlusher {
             .await?;
 
         info!(
-            "Flushed generation {} for shard {} (manifest version {})",
+            "Flushed SSTable {} for shard {} (manifest version {})",
             generation, self.shard_id, new_manifest.version
         );
 
         Ok(FlushResult {
-            generation: FlushedGeneration {
+            sstable: SsTable {
                 generation,
                 path: gen_folder_name,
             },
@@ -600,7 +596,7 @@ impl MemTableFlusher {
         })
     }
 
-    /// Create BTree indexes on the flushed dataset (uncommitted).
+    /// Create BTree indexes on the SSTable dataset (uncommitted).
     ///
     /// Returns index metadata without committing to the dataset manifest.
     /// The caller is responsible for writing a single manifest with all indexes.
@@ -668,7 +664,7 @@ impl MemTableFlusher {
     /// keys index the typed value; composite keys index the order-preserving
     /// `Binary` encoded tuple (see [`super::super::index::encode_pk_tuple`]).
     /// Row positions line up 1:1 with the forward-written data file, so they are
-    /// the flushed row ids directly. No-op without a primary-key index.
+    /// the SSTable row ids directly. No-op without a primary-key index.
     async fn create_pk_index(
         &self,
         gen_path: &Path,
@@ -882,7 +878,7 @@ impl MemTableFlusher {
     /// the existing Lance `IVF_HNSW_SQ` reader path.
     ///
     /// # Arguments
-    /// * `gen_path` - Path to the flushed generation folder
+    /// * `gen_path` - Path to the SSTable folder
     /// * `config` - HNSW index configuration
     /// * `mem_index` - In-memory HNSW index (snapshotted, not consumed)
     ///
@@ -1129,7 +1125,7 @@ impl MemTableFlusher {
         Ok(Some(index_meta))
     }
 
-    /// Update the shard manifest with the new flushed generation.
+    /// Update the shard manifest with the new SSTable.
     async fn update_manifest(
         &self,
         epoch: u64,
@@ -1141,8 +1137,8 @@ impl MemTableFlusher {
 
         self.manifest_store
             .commit_update(epoch, |current| {
-                let mut flushed_generations = current.flushed_generations.clone();
-                flushed_generations.push(FlushedGeneration {
+                let mut sstables = current.sstables.clone();
+                sstables.push(SsTable {
                     generation,
                     path: gen_path.clone(),
                 });
@@ -1154,7 +1150,7 @@ impl MemTableFlusher {
                         .wal_entry_position_last_seen
                         .max(covered_wal_entry_position),
                     current_generation: generation + 1,
-                    flushed_generations,
+                    sstables,
                     ..current.clone()
                 }
             })
@@ -1335,7 +1331,7 @@ mod tests {
         );
         let result = flusher.flush(&memtable, epoch, 1, durable).await.unwrap();
 
-        assert_eq!(result.generation.generation, 1);
+        assert_eq!(result.sstable.generation, 1);
         assert_eq!(result.rows_flushed, 10);
         assert_eq!(result.covered_wal_entry_position, 1);
 
@@ -1344,10 +1340,10 @@ mod tests {
         assert_eq!(updated_manifest.version, 2);
         assert_eq!(updated_manifest.replay_after_wal_entry_position, 1);
         assert_eq!(updated_manifest.current_generation, 2);
-        assert_eq!(updated_manifest.flushed_generations.len(), 1);
+        assert_eq!(updated_manifest.sstables.len(), 1);
     }
 
-    /// A `GenerationWarmer` that counts calls and optionally fails.
+    /// A `SsTableWarmer` that counts calls and optionally fails.
     #[derive(Debug)]
     struct CountingWarmer {
         calls: Arc<std::sync::atomic::AtomicUsize>,
@@ -1355,7 +1351,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl GenerationWarmer for CountingWarmer {
+    impl SsTableWarmer for CountingWarmer {
         async fn warm(&self, _path: &str) -> Result<()> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if self.fail {
@@ -1390,7 +1386,7 @@ mod tests {
         let durable = frag_id + 1;
 
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let warmer: Arc<dyn GenerationWarmer> = Arc::new(CountingWarmer {
+        let warmer: Arc<dyn SsTableWarmer> = Arc::new(CountingWarmer {
             calls: calls.clone(),
             fail: true,
         });
@@ -1406,7 +1402,7 @@ mod tests {
         // Flush must succeed despite the warmer erroring.
         let result = flusher.flush(&memtable, epoch, 1, durable).await.unwrap();
 
-        assert_eq!(result.generation.generation, 1);
+        assert_eq!(result.sstable.generation, 1);
         assert_eq!(
             calls.load(std::sync::atomic::Ordering::SeqCst),
             1,
@@ -1414,14 +1410,14 @@ mod tests {
         );
         let updated = manifest_store.read_latest().await.unwrap().unwrap();
         assert_eq!(
-            updated.flushed_generations.len(),
+            updated.sstables.len(),
             1,
             "generation still committed after a failed warm"
         );
     }
 
     /// Flushing a generation with within-generation duplicate PKs writes a
-    /// deletion vector so the flushed dataset exposes newest-per-PK on scan.
+    /// deletion vector so the SSTable dataset exposes newest-per-PK on scan.
     #[tokio::test]
     async fn test_flush_writes_dedup_deletion_vector() {
         use futures::TryStreamExt;
@@ -1460,13 +1456,13 @@ mod tests {
         let result = flusher.flush(&memtable, epoch, 1, durable).await.unwrap();
         assert_eq!(result.rows_flushed, 5, "all physical rows are written");
 
-        // Scanning the flushed generation must honor the deletion vector and
+        // Scanning the SSTable must honor the deletion vector and
         // return only the newest version of each PK.
         let gen_uri = format!(
             "{}/_mem_wal/{}/{}",
             base_uri.trim_end_matches('/'),
             shard_id,
-            result.generation.path
+            result.sstable.path
         );
         let dataset = Dataset::open(&gen_uri).await.unwrap();
         let batches: Vec<RecordBatch> = dataset
@@ -1513,7 +1509,7 @@ mod tests {
     /// probe by value — including for a within-gen-superseded PK (existence,
     /// not visibility).
     #[tokio::test]
-    async fn flushed_pk_index_sidecar_is_probeable() {
+    async fn sstable_pk_index_sidecar_is_probeable() {
         use lance_core::cache::LanceCache;
         use lance_index::metrics::NoOpMetricsCollector;
         use lance_index::registry::IndexPluginRegistry;
@@ -1570,7 +1566,7 @@ mod tests {
             .clone()
             .join("_mem_wal")
             .join(shard_id.to_string())
-            .join(result.generation.path.as_str());
+            .join(result.sstable.path.as_str());
         let index_store = Arc::new(LanceIndexStore::new(
             store.clone(),
             pk_index_path(&gen_path),
@@ -1667,7 +1663,7 @@ mod tests {
             .clone()
             .join("_mem_wal")
             .join(shard_id.to_string())
-            .join(result.generation.path.as_str());
+            .join(result.sstable.path.as_str());
         let index_store = Arc::new(LanceIndexStore::new(
             store.clone(),
             pk_index_path(&gen_path),
@@ -1764,13 +1760,13 @@ mod tests {
             "{}/_mem_wal/{}/{}",
             base_uri.trim_end_matches('/'),
             shard_id,
-            result.generation.path
+            result.sstable.path
         );
         let dataset = Dataset::open(&gen_uri).await.unwrap();
         assert_eq!(
             dataset.version().version,
             1,
-            "flushed dataset must be a single-version dataset"
+            "SSTable dataset must be a single-version dataset"
         );
 
         // Index half of the combined manifest.
@@ -1891,19 +1887,16 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result.generation.generation, 1);
+        assert_eq!(result.sstable.generation, 1);
         assert_eq!(result.rows_flushed, 10);
 
-        // Verify the flushed dataset is a single-version dataset with the BTree index
-        let gen_uri = format!(
-            "{}/_mem_wal/{}/{}",
-            base_uri, shard_id, result.generation.path
-        );
+        // Verify the SSTable dataset is a single-version dataset with the BTree index
+        let gen_uri = format!("{}/_mem_wal/{}/{}", base_uri, shard_id, result.sstable.path);
         let dataset = Dataset::open(&gen_uri).await.unwrap();
         assert_eq!(
             dataset.version().version,
             1,
-            "flushed dataset must be a single-version dataset"
+            "SSTable dataset must be a single-version dataset"
         );
         let indices = dataset.load_indices().await.unwrap();
 
@@ -2028,26 +2021,23 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result.generation.generation, 1);
+        assert_eq!(result.sstable.generation, 1);
         assert_eq!(result.rows_flushed, num_vectors);
 
-        // Verify the flushed dataset is a single-version dataset with the HNSW index
-        let gen_uri = format!(
-            "{}/_mem_wal/{}/{}",
-            base_uri, shard_id, result.generation.path
-        );
+        // Verify the SSTable dataset is a single-version dataset with the HNSW index
+        let gen_uri = format!("{}/_mem_wal/{}/{}", base_uri, shard_id, result.sstable.path);
         let dataset = Dataset::open(&gen_uri).await.unwrap();
         assert_eq!(
             dataset.version().version,
             1,
-            "flushed dataset must be a single-version dataset"
+            "SSTable dataset must be a single-version dataset"
         );
         let indices = dataset.load_indices().await.unwrap();
 
         assert_eq!(indices.len(), 1);
         assert_eq!(indices[0].name, "vector_hnsw");
 
-        // End-to-end query: pick a row from the flushed dataset, query for
+        // End-to-end query: pick a row from the SSTable dataset, query for
         // it, and verify the index path returns it as the nearest neighbor.
         // This exercises the on-disk HNSW + SQ8 format including the IVF
         // partition routing and the storage_metadata ScalarQuantizationMetadata
@@ -2178,19 +2168,16 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result.generation.generation, 1);
+        assert_eq!(result.sstable.generation, 1);
         assert_eq!(result.rows_flushed, 3);
 
-        // Verify the flushed dataset is a single-version dataset with the FTS index
-        let gen_uri = format!(
-            "{}/_mem_wal/{}/{}",
-            base_uri, shard_id, result.generation.path
-        );
+        // Verify the SSTable dataset is a single-version dataset with the FTS index
+        let gen_uri = format!("{}/_mem_wal/{}/{}", base_uri, shard_id, result.sstable.path);
         let dataset = Dataset::open(&gen_uri).await.unwrap();
         assert_eq!(
             dataset.version().version,
             1,
-            "flushed dataset must be a single-version dataset"
+            "SSTable dataset must be a single-version dataset"
         );
         let indices = dataset.load_indices().await.unwrap();
 

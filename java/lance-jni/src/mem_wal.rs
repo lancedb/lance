@@ -26,7 +26,7 @@ use jni::objects::{JClass, JMap, JObject, JString, JValueGen};
 use jni::sys::{jdouble, jint, jlong};
 use lance::dataset::Dataset as LanceDataset;
 use lance::dataset::mem_wal::scanner::{
-    FlushedGeneration, LsmDataSourceCollector, LsmPointLookupPlanner, LsmVectorSearchPlanner,
+    LsmDataSourceCollector, LsmPointLookupPlanner, LsmVectorSearchPlanner, SsTable,
     parse_filter_expr as parse_lsm_filter_expr, write_pk_sidecar,
 };
 use lance::dataset::mem_wal::write::{MemTableStats, WriteStatsSnapshot};
@@ -204,10 +204,10 @@ fn inner_delete(env: &mut JNIEnv, this: JObject, stream_addr: jlong) -> Result<(
     Ok(())
 }
 
-/// Test-support: write a primary-key dedup sidecar (`_pk_index/`) for a
-/// flushed-generation dataset already staged at `gen_path`, mirroring what
-/// production flush emits. Lets Java tests stage a *faithful* flushed
-/// generation (dataset + sidecar); production always writes the sidecar during
+/// Test-support: write a primary-key dedup sidecar (`_pk_index/`) for an
+/// SSTable dataset already staged at `gen_path`, mirroring what
+/// production flush emits. Lets Java tests stage a *faithful* SSTable
+/// (dataset + sidecar); production always writes the sidecar during
 /// flush, so a dataset-without-sidecar is not a state the system produces.
 /// Mirrors the Python `_write_pk_sidecar` binding.
 #[unsafe(no_mangle)]
@@ -1119,13 +1119,13 @@ fn read_shard_snapshots(env: &mut JNIEnv, list_obj: &JObject) -> Result<Vec<Shar
             .with_spec_id(spec_id)
             .with_current_generation(current_generation);
 
-        let flushed_list = env
-            .call_method(&obj, "flushedGenerations", "()Ljava/util/List;", &[])?
+        let sstable_list = env
+            .call_method(&obj, "sstables", "()Ljava/util/List;", &[])?
             .l()?;
-        for flushed in import_vec(env, &flushed_list)? {
-            let generation = env.get_u64_from_method(&flushed, "generation")?;
-            let path = env.get_string_from_method(&flushed, "path")?;
-            snapshot = snapshot.with_flushed_generation(generation, path);
+        for sstable in import_vec(env, &sstable_list)? {
+            let generation = env.get_u64_from_method(&sstable, "generation")?;
+            let path = env.get_string_from_method(&sstable, "path")?;
+            snapshot = snapshot.with_sstable(generation, path);
         }
         Ok(snapshot)
     })
@@ -1137,12 +1137,12 @@ fn shard_snapshot_from_manifest(manifest: ShardManifest) -> ShardSnapshot {
         shard_id: manifest.shard_id,
         spec_id: manifest.shard_spec_id,
         current_generation: manifest.current_generation,
-        flushed_generations: manifest
-            .flushed_generations
+        sstables: manifest
+            .sstables
             .into_iter()
-            .map(|generation| FlushedGeneration {
-                generation: generation.generation,
-                path: generation.path,
+            .map(|sstable| SsTable {
+                generation: sstable.generation,
+                path: sstable.path,
             })
             .collect(),
     }

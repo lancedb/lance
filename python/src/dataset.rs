@@ -61,7 +61,8 @@ use lance::dataset::{
 };
 use lance::index::vector::utils::get_vector_type;
 use lance::index::{
-    DatasetIndexExt, DatasetIndexInternalExt, IndexSegment, vector::VectorIndexParams,
+    DatasetIndexExt, DatasetIndexInternalExt, IndexSegment, IntoIndexSegment,
+    vector::VectorIndexParams,
 };
 use lance::{dataset::builder::DatasetBuilder, index::vector::IndexFileVersion};
 use lance_arrow::as_fixed_size_list_array;
@@ -125,27 +126,33 @@ const DEFAULT_NPROBES: usize = 1;
 const LANCE_COMMIT_MESSAGE_KEY: &str = "__lance_commit_message";
 const INDEX_PROGRESS_QUEUE_SIZE: usize = 1024;
 
-fn read_blobs_to_python(
-    py: Python<'_>,
-    blobs: Vec<lance::dataset::ReadBlob>,
-) -> Vec<(u64, Py<PyBytes>)> {
+type PyBlobBytes = Option<Py<PyBytes>>;
+type PyReadBlob = (u64, PyBlobBytes);
+type PyReadBlobRange = (usize, u64, PyBlobBytes);
+
+fn read_blobs_to_python(py: Python<'_>, blobs: Vec<lance::dataset::ReadBlob>) -> Vec<PyReadBlob> {
     blobs
         .into_iter()
-        .map(|blob| (blob.row_address, PyBytes::new(py, &blob.data).unbind()))
+        .map(|blob| {
+            (
+                blob.row_address,
+                blob.data.map(|data| PyBytes::new(py, &data).unbind()),
+            )
+        })
         .collect()
 }
 
 fn read_blob_ranges_to_python(
     py: Python<'_>,
     ranges: Vec<lance::dataset::ReadBlobRange>,
-) -> Vec<(usize, u64, Py<PyBytes>)> {
+) -> Vec<PyReadBlobRange> {
     ranges
         .into_iter()
         .map(|range| {
             (
                 range.request_index,
                 range.row_address,
-                PyBytes::new(py, &range.data).unbind(),
+                range.data.map(|data| PyBytes::new(py, &data).unbind()),
             )
         })
         .collect()
@@ -565,46 +572,27 @@ impl MergeInsertBuilder {
             .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 
-    /// Mark MemWAL generations as merged into the base table.
+    /// Mark MemWAL SSTables as compacted into the base table.
     ///
-    /// Call this when executing a merge_insert that incorporates MemWAL
-    /// flushed generation data. This updates the MemWAL generation tracking
-    /// to prevent duplicate merges.
-    pub fn mark_generations_as_merged<'a>(
+    /// Call this when executing a merge_insert that compacts MemWAL SSTables.
+    /// This updates MemWAL compaction progress to prevent duplicate compactions.
+    pub fn mark_sstables_as_compacted<'a>(
         mut slf: PyRefMut<'a, Self>,
-        generations: Vec<Bound<'a, crate::mem_wal::PyMergedGeneration>>,
+        sstables: Vec<Bound<'a, crate::mem_wal::PyCompactedSsTable>>,
     ) -> PyResult<PyRefMut<'a, Self>> {
-        use lance_index::mem_wal::MergedGeneration;
+        use lance_index::mem_wal::CompactedSsTable;
 
-        let gens: Vec<MergedGeneration> = generations
+        let compacted_sstables: Vec<CompactedSsTable> = sstables
             .iter()
-            .map(|g| g.borrow().to_lance())
+            .map(|sstable| sstable.borrow().to_lance())
             .collect::<PyResult<_>>()?;
-        slf.builder.mark_generations_as_merged(gens);
+        slf.builder.mark_sstables_as_compacted(compacted_sstables);
         Ok(slf)
     }
 }
 
 fn index_metadata_to_segment(metadata: IndexMetadata) -> PyResult<IndexSegment> {
-    let fragment_bitmap = metadata.fragment_bitmap.ok_or_else(|| {
-        PyValueError::new_err(format!(
-            "Index metadata {} is missing fragment coverage",
-            metadata.uuid
-        ))
-    })?;
-    let index_details = metadata.index_details.ok_or_else(|| {
-        PyValueError::new_err(format!(
-            "Index metadata {} is missing index details",
-            metadata.uuid
-        ))
-    })?;
-
-    Ok(IndexSegment::new(
-        metadata.uuid,
-        fragment_bitmap.iter(),
-        index_details,
-        metadata.index_version,
-    ))
+    metadata.into_index_segment().infer_error()
 }
 
 fn extract_index_segments(segments: &Bound<'_, PyAny>) -> PyResult<Vec<IndexSegment>> {
@@ -1618,18 +1606,21 @@ impl Dataset {
         self_: PyRef<'_, Self>,
         row_ids: Vec<u64>,
         blob_column: &str,
-    ) -> PyResult<Vec<LanceBlobFile>> {
+    ) -> PyResult<Vec<Option<LanceBlobFile>>> {
         let blobs = rt()
             .block_on(Some(self_.py()), self_.ds.take_blobs(&row_ids, blob_column))?
             .infer_error()?;
-        Ok(blobs.into_iter().map(LanceBlobFile::from).collect())
+        Ok(blobs
+            .into_iter()
+            .map(|blob| blob.map(LanceBlobFile::from))
+            .collect())
     }
 
     fn take_blobs_by_addresses(
         self_: PyRef<'_, Self>,
         row_addresses: Vec<u64>,
         blob_column: &str,
-    ) -> PyResult<Vec<LanceBlobFile>> {
+    ) -> PyResult<Vec<Option<LanceBlobFile>>> {
         let blobs = rt()
             .block_on(
                 Some(self_.py()),
@@ -1638,21 +1629,27 @@ impl Dataset {
                     .take_blobs_by_addresses(&row_addresses, blob_column),
             )?
             .infer_error()?;
-        Ok(blobs.into_iter().map(LanceBlobFile::from).collect())
+        Ok(blobs
+            .into_iter()
+            .map(|blob| blob.map(LanceBlobFile::from))
+            .collect())
     }
 
     fn take_blobs_by_indices(
         self_: PyRef<'_, Self>,
         row_indices: Vec<u64>,
         blob_column: &str,
-    ) -> PyResult<Vec<LanceBlobFile>> {
+    ) -> PyResult<Vec<Option<LanceBlobFile>>> {
         let blobs = rt()
             .block_on(
                 Some(self_.py()),
                 self_.ds.take_blobs_by_indices(&row_indices, blob_column),
             )?
             .infer_error()?;
-        Ok(blobs.into_iter().map(LanceBlobFile::from).collect())
+        Ok(blobs
+            .into_iter()
+            .map(|blob| blob.map(LanceBlobFile::from))
+            .collect())
     }
 
     #[pyo3(signature=(
@@ -1667,7 +1664,7 @@ impl Dataset {
         blob_column: &str,
         io_buffer_size: Option<u64>,
         preserve_order: Option<bool>,
-    ) -> PyResult<Vec<(u64, Py<PyBytes>)>> {
+    ) -> PyResult<Vec<PyReadBlob>> {
         let builder = configure_read_blobs_builder(
             self_
                 .ds
@@ -1695,7 +1692,7 @@ impl Dataset {
         blob_column: &str,
         io_buffer_size: Option<u64>,
         preserve_order: Option<bool>,
-    ) -> PyResult<Vec<(u64, Py<PyBytes>)>> {
+    ) -> PyResult<Vec<PyReadBlob>> {
         let builder = configure_read_blobs_builder(
             self_
                 .ds
@@ -1723,7 +1720,7 @@ impl Dataset {
         blob_column: &str,
         io_buffer_size: Option<u64>,
         preserve_order: Option<bool>,
-    ) -> PyResult<Vec<(u64, Py<PyBytes>)>> {
+    ) -> PyResult<Vec<PyReadBlob>> {
         let builder = configure_read_blobs_builder(
             self_
                 .ds
@@ -1753,7 +1750,7 @@ impl Dataset {
         selector: &str,
         io_buffer_size: Option<u64>,
         preserve_order: Option<bool>,
-    ) -> PyResult<Vec<(usize, u64, Py<PyBytes>)>> {
+    ) -> PyResult<Vec<PyReadBlobRange>> {
         let requests = blob_range_requests_from_tuples(requests);
         let builder = self_.ds.read_blob_ranges(blob_column).infer_error()?;
         let builder = match selector {

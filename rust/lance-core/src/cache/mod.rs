@@ -49,6 +49,7 @@ pub mod backend;
 pub mod codec;
 mod entry_io;
 mod moka;
+mod quick;
 
 pub use backend::{CacheBackend, CacheEntry, CacheKeyIterator, InternalCacheKey};
 pub use codec::{
@@ -56,6 +57,7 @@ pub use codec::{
 };
 pub use entry_io::{CacheEntryReader, CacheEntryWriter};
 pub use moka::MokaCacheBackend;
+pub use quick::{QuickCacheBackend, recommended_cache_shards};
 
 use std::borrow::Cow;
 use std::sync::{

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
-"""Disk-ANN comparison: Lance on-disk IVF_HNSW_SQ (the flushed-memtable index)
+"""Disk-ANN comparison: Lance on-disk IVF_HNSW_SQ (the SSTable index)
 vs DiskANN vs FAISS, all backed by local NVMe.
 
 faiss/diskannpy/lance bundle conflicting tcmalloc/MKL/OpenMP and crash if
@@ -82,7 +82,6 @@ def numpy_ground_truth(corpus, queries):
     gt = np.empty((len(queries), K), dtype=np.int64)
     # corpus is normalized -> cosine == inner product; chunk over corpus.
     chunk = 200_000
-    sims_top = None
     # Compute full similarity in query-major chunks to bound memory.
     sim = np.zeros((len(queries), len(corpus)), dtype=np.float32)
     for s in range(0, len(corpus), chunk):
@@ -170,7 +169,7 @@ def run_lance(base, rows, corpus, queries, gt):
     )
     tbl = pa.table({"id": pa.array(np.arange(rows, dtype=np.int64)), "vec": vecs})
     ds = lance.write_dataset(tbl, uri, mode="overwrite")
-    # The flushed memtable index is a SINGLE-partition HNSW+SQ, so model it with
+    # The SSTable index is a SINGLE-partition HNSW+SQ, so model it with
     # num_partitions=1 (nprobes=1); ef is the search knob, like DiskANN/FAISS.
     t = time.perf_counter()
     ds.create_index(
@@ -204,8 +203,8 @@ def run_lance(base, rows, corpus, queries, gt):
     }
 
 
-def run_lance_flushed(base, rows, corpus, queries, gt, lance_path, id_offset, column):
-    # Open a flushed MemTable generation directly from its dataset path and
+def run_lance_sstable(base, rows, corpus, queries, gt, lance_path, id_offset, column):
+    # Open an SSTable generation directly from its dataset path and
     # benchmark its on-disk IVF_HNSW_SQ index (single partition), fully cached.
     import lance
 
