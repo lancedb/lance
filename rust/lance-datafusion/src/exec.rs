@@ -58,8 +58,9 @@ use crate::udf::register_functions;
 use crate::{
     chunker::StrictBatchSizeStream,
     utils::{
-        BYTES_READ_METRIC, INDEX_COMPARISONS_METRIC, INDICES_LOADED_METRIC, IOPS_METRIC,
-        MetricsExt, PARTS_LOADED_METRIC, REQUESTS_METRIC,
+        BYTES_READ_METRIC, INDEX_CACHE_HITS_METRIC, INDEX_CACHE_MISSES_METRIC,
+        INDEX_COMPARISONS_METRIC, INDICES_LOADED_METRIC, IOPS_METRIC, MetricsExt,
+        PARTS_LOADED_METRIC, REQUESTS_METRIC,
     },
 };
 
@@ -490,10 +491,86 @@ pub struct ExecutionSummaryCounts {
     pub index_comparisons: usize,
     /// Additional metrics for more detailed statistics.  These are subject to change in the future
     /// and should only be used for debugging purposes.
+    ///
+    /// Newer metrics (e.g. [`INDEX_CACHE_HITS_METRIC`], [`INDEX_CACHE_MISSES_METRIC`]) are added
+    /// here rather than as `pub` fields, so this struct stays backwards compatible for callers
+    /// that construct or destructure it. Prefer the typed accessors below.
     pub all_counts: HashMap<String, usize>,
     /// Additional time metrics for more detailed statistics, stored in nanoseconds.
     /// These are subject to change in the future and should only be used for debugging purposes.
     pub all_times: HashMap<String, usize>,
+}
+
+impl ExecutionSummaryCounts {
+    /// Number of index cache page lookups where the loader was not executed
+    /// (per-page granularity).
+    ///
+    /// A "hit" is any page-level lookup at an instrumented cache boundary that
+    /// did not run the loader on this call. That covers both a true cache hit
+    /// on an already-populated entry and a coalesced concurrent load where an
+    /// in-flight loader started by a different caller produced the value.
+    ///
+    /// Instrumented boundaries in this release:
+    /// BTree page, IVF partition (v2, `write_cache=true` scan path), inverted
+    /// posting list (grouped and per-token), inverted per-token metadata
+    /// (`PostingMetadataKey`), inverted phrase positions (`PositionKey`),
+    /// bitmap posting (Equals / Range / IsIn), ngram posting, and rtree page
+    /// / null slot.
+    ///
+    /// Caveats:
+    /// * IVF v2 streaming scans and legacy v1 IVF partitions run
+    ///   `load_partition` with `write_cache=false`. Those loads always execute
+    ///   the loader and never write the result back, so they are reported as a
+    ///   miss on every call. See [`Self::index_cache_hit_ratio`].
+    /// * A cold posting-list lookup on the grouped inverted layout can record
+    ///   up to two misses (posting-list group + per-token metadata) for a
+    ///   single term.
+    ///
+    /// Other index cache boundaries such as HNSW graph pages and quantizer
+    /// codebooks are not yet instrumented; a scan that only touches those
+    /// paths returns `0` here.
+    pub fn index_cache_hits(&self) -> usize {
+        self.all_counts
+            .get(INDEX_CACHE_HITS_METRIC)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Number of index cache page lookups that had to execute the loader
+    /// (per-page granularity).
+    ///
+    /// A "miss" is any page-level lookup at an instrumented cache boundary
+    /// where the loader ran, i.e. the page was not resident and had to be
+    /// materialised (typically from storage). See
+    /// [`Self::index_cache_hits`] for the paired counter and the list of
+    /// instrumented boundaries.
+    pub fn index_cache_misses(&self) -> usize {
+        self.all_counts
+            .get(INDEX_CACHE_MISSES_METRIC)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Ratio of index cache hits to total lookups. Returns `0.0` when no lookups
+    /// were recorded in this scan.
+    ///
+    /// This ratio only reflects paths that write their result back to the
+    /// index cache. Streaming scans (IVF v2 `write_cache=false` and legacy v1
+    /// IVF `load_partition_stream`) intentionally bypass the cache and are
+    /// counted as misses on every call, so a workload dominated by streaming
+    /// vector scans will report a hit ratio near `0.0` regardless of cache
+    /// size.
+    pub fn index_cache_hit_ratio(&self) -> f32 {
+        // Widen to u128 before summing so a pathological (hits + misses)
+        // overflow can't panic in debug builds nor wrap in release builds.
+        let hits = self.index_cache_hits() as u128;
+        let total = hits + self.index_cache_misses() as u128;
+        if total == 0 {
+            0.0
+        } else {
+            hits as f32 / total as f32
+        }
+    }
 }
 
 pub fn collect_execution_metrics(node: &dyn ExecutionPlan, counts: &mut ExecutionSummaryCounts) {
@@ -556,6 +633,8 @@ fn report_plan_summary_metrics(plan: &dyn ExecutionPlan, options: &LanceExecutio
             indices_loaded = counts.indices_loaded,
             parts_loaded = counts.parts_loaded,
             index_comparisons = counts.index_comparisons,
+            index_cache_hits = counts.index_cache_hits(),
+            index_cache_misses = counts.index_cache_misses(),
         );
     }
     if let Some(callback) = options.execution_stats_callback.as_ref() {

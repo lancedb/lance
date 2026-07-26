@@ -49,6 +49,28 @@ pub trait MetricsCollector: Send + Sync {
     /// The goal is to provide some visibility into the compute cost of the search
     fn record_comparisons(&self, num_comparisons: usize);
 
+    /// Record index cache hits observed while serving this query.
+    ///
+    /// A "hit" is one page-level lookup (partition, posting list, BTree page, etc.)
+    /// that was served from the in-memory index cache without touching storage.
+    fn record_index_cache_hits(&self, _num_hits: usize) {}
+
+    /// Convenience for a single cache hit.
+    fn record_index_cache_hit(&self) {
+        self.record_index_cache_hits(1);
+    }
+
+    /// Record index cache misses observed while serving this query.
+    ///
+    /// A "miss" is one page-level lookup that had to be loaded from storage
+    /// because it was not present in the cache.
+    fn record_index_cache_misses(&self, _num_misses: usize) {}
+
+    /// Convenience for a single cache miss.
+    fn record_index_cache_miss(&self) {
+        self.record_index_cache_misses(1);
+    }
+
     /// Record AND candidates returned from WAND alignment to the scoring loop.
     ///
     /// This excludes candidates pruned before `next()` returns. Use this with
@@ -91,6 +113,12 @@ pub struct LocalMetricsCollector {
     pub parts_loaded: AtomicUsize,
     pub index_loads: AtomicUsize,
     pub comparisons: AtomicUsize,
+    // Kept `pub(crate)` so that adding new metric fields to this public struct
+    // does not break downstream callers that construct or destructure the
+    // existing three fields. Callers can still read cumulative values via
+    // [`Self::index_cache_hits`] / [`Self::index_cache_misses`].
+    pub(crate) index_cache_hits: AtomicUsize,
+    pub(crate) index_cache_misses: AtomicUsize,
 }
 
 impl LocalMetricsCollector {
@@ -98,6 +126,18 @@ impl LocalMetricsCollector {
         other.record_parts_loaded(self.parts_loaded.load(Ordering::Relaxed));
         other.record_index_loads(self.index_loads.load(Ordering::Relaxed));
         other.record_comparisons(self.comparisons.load(Ordering::Relaxed));
+        other.record_index_cache_hits(self.index_cache_hits.load(Ordering::Relaxed));
+        other.record_index_cache_misses(self.index_cache_misses.load(Ordering::Relaxed));
+    }
+
+    /// Cumulative index cache hits recorded so far.
+    pub fn index_cache_hits(&self) -> usize {
+        self.index_cache_hits.load(Ordering::Relaxed)
+    }
+
+    /// Cumulative index cache misses recorded so far.
+    pub fn index_cache_misses(&self) -> usize {
+        self.index_cache_misses.load(Ordering::Relaxed)
     }
 }
 
@@ -113,5 +153,82 @@ impl MetricsCollector for LocalMetricsCollector {
     fn record_comparisons(&self, num_comparisons: usize) {
         self.comparisons
             .fetch_add(num_comparisons, Ordering::Relaxed);
+    }
+
+    fn record_index_cache_hits(&self, num_hits: usize) {
+        self.index_cache_hits.fetch_add(num_hits, Ordering::Relaxed);
+    }
+
+    fn record_index_cache_misses(&self, num_misses: usize) {
+        self.index_cache_misses
+            .fetch_add(num_misses, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct SumSink {
+        parts: AtomicUsize,
+        loads: AtomicUsize,
+        comparisons: AtomicUsize,
+        hits: AtomicUsize,
+        misses: AtomicUsize,
+    }
+
+    impl MetricsCollector for SumSink {
+        fn record_parts_loaded(&self, n: usize) {
+            self.parts.fetch_add(n, Ordering::Relaxed);
+        }
+        fn record_index_loads(&self, n: usize) {
+            self.loads.fetch_add(n, Ordering::Relaxed);
+        }
+        fn record_comparisons(&self, n: usize) {
+            self.comparisons.fetch_add(n, Ordering::Relaxed);
+        }
+        fn record_index_cache_hits(&self, n: usize) {
+            self.hits.fetch_add(n, Ordering::Relaxed);
+        }
+        fn record_index_cache_misses(&self, n: usize) {
+            self.misses.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn local_metrics_collector_forwards_cache_counts() {
+        let local = LocalMetricsCollector::default();
+        local.record_index_cache_hit();
+        local.record_index_cache_hit();
+        local.record_index_cache_misses(3);
+        local.record_part_load();
+        local.record_index_load();
+        local.record_comparisons(5);
+
+        let sink = SumSink {
+            parts: AtomicUsize::new(0),
+            loads: AtomicUsize::new(0),
+            comparisons: AtomicUsize::new(0),
+            hits: AtomicUsize::new(0),
+            misses: AtomicUsize::new(0),
+        };
+        local.dump_into(&sink);
+
+        assert_eq!(sink.parts.load(Ordering::Relaxed), 1);
+        assert_eq!(sink.loads.load(Ordering::Relaxed), 1);
+        assert_eq!(sink.comparisons.load(Ordering::Relaxed), 5);
+        assert_eq!(sink.hits.load(Ordering::Relaxed), 2);
+        assert_eq!(sink.misses.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn no_op_metrics_collector_ignores_cache_counts() {
+        // Ensures existing implementors that do not override cache-count methods
+        // remain sound (default impl is a no-op).
+        let collector = NoOpMetricsCollector;
+        collector.record_index_cache_hit();
+        collector.record_index_cache_miss();
+        collector.record_index_cache_hits(10);
+        collector.record_index_cache_misses(20);
     }
 }
