@@ -17,7 +17,7 @@ pub use lance_encoding::version::{
 /// `stable` or `next`. Exact versions deliberately have no ordering because format
 /// capabilities are not implied by release order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum LanceFileFormat {
+pub enum ConcreteFileVersion {
     /// The legacy v1 file format.
     V1,
     /// The v2.0 file format.
@@ -30,13 +30,13 @@ pub enum LanceFileFormat {
     V2_3,
 }
 
-impl DeepSizeOf for LanceFileFormat {
+impl DeepSizeOf for ConcreteFileVersion {
     fn deep_size_of_children(&self, _context: &mut Context) -> usize {
         0
     }
 }
 
-impl LanceFileFormat {
+impl ConcreteFileVersion {
     /// Decode the exact version string stored in a dataset manifest.
     ///
     /// Public selector aliases such as `legacy`, `0.3`, `stable`, and `next` are
@@ -129,25 +129,25 @@ impl LanceFileFormat {
     }
 }
 
-impl Display for LanceFileFormat {
+impl Display for ConcreteFileVersion {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.to_manifest_string())
     }
 }
 
-impl From<LanceFileFormat> for LanceFileVersion {
-    fn from(value: LanceFileFormat) -> Self {
+impl From<ConcreteFileVersion> for LanceFileVersion {
+    fn from(value: ConcreteFileVersion) -> Self {
         match value {
-            LanceFileFormat::V1 => Self::Legacy,
-            LanceFileFormat::V2_0 => Self::V2_0,
-            LanceFileFormat::V2_1 => Self::V2_1,
-            LanceFileFormat::V2_2 => Self::V2_2,
-            LanceFileFormat::V2_3 => Self::V2_3,
+            ConcreteFileVersion::V1 => Self::Legacy,
+            ConcreteFileVersion::V2_0 => Self::V2_0,
+            ConcreteFileVersion::V2_1 => Self::V2_1,
+            ConcreteFileVersion::V2_2 => Self::V2_2,
+            ConcreteFileVersion::V2_3 => Self::V2_3,
         }
     }
 }
 
-impl From<LanceFileVersion> for LanceFileFormat {
+impl From<LanceFileVersion> for ConcreteFileVersion {
     fn from(value: LanceFileVersion) -> Self {
         match value.resolve() {
             LanceFileVersion::Legacy => Self::V1,
@@ -175,28 +175,28 @@ mod tests {
 
     use super::*;
 
-    const EXACT_VERSIONS: [LanceFileFormat; 5] = [
-        LanceFileFormat::V1,
-        LanceFileFormat::V2_0,
-        LanceFileFormat::V2_1,
-        LanceFileFormat::V2_2,
-        LanceFileFormat::V2_3,
+    const EXACT_VERSIONS: [ConcreteFileVersion; 5] = [
+        ConcreteFileVersion::V1,
+        ConcreteFileVersion::V2_0,
+        ConcreteFileVersion::V2_1,
+        ConcreteFileVersion::V2_2,
+        ConcreteFileVersion::V2_3,
     ];
 
     #[test]
     fn selector_resolution_is_exact() {
         let cases = [
-            (LanceFileVersion::Legacy, LanceFileFormat::V1),
-            (LanceFileVersion::V2_0, LanceFileFormat::V2_0),
-            (LanceFileVersion::V2_1, LanceFileFormat::V2_1),
-            (LanceFileVersion::Stable, LanceFileFormat::V2_1),
-            (LanceFileVersion::V2_2, LanceFileFormat::V2_2),
-            (LanceFileVersion::Next, LanceFileFormat::V2_3),
-            (LanceFileVersion::V2_3, LanceFileFormat::V2_3),
+            (LanceFileVersion::Legacy, ConcreteFileVersion::V1),
+            (LanceFileVersion::V2_0, ConcreteFileVersion::V2_0),
+            (LanceFileVersion::V2_1, ConcreteFileVersion::V2_1),
+            (LanceFileVersion::Stable, ConcreteFileVersion::V2_1),
+            (LanceFileVersion::V2_2, ConcreteFileVersion::V2_2),
+            (LanceFileVersion::Next, ConcreteFileVersion::V2_3),
+            (LanceFileVersion::V2_3, ConcreteFileVersion::V2_3),
         ];
 
         for (selector, expected) in cases {
-            assert_eq!(LanceFileFormat::from(selector), expected);
+            assert_eq!(ConcreteFileVersion::from(selector), expected);
             assert_eq!(LanceFileVersion::from(expected), selector.resolve());
         }
     }
@@ -225,80 +225,80 @@ mod tests {
         for version in EXACT_VERSIONS {
             let encoded = version.to_manifest_string();
             assert_eq!(
-                LanceFileFormat::from_manifest_string(encoded).unwrap(),
+                ConcreteFileVersion::from_manifest_string(encoded).unwrap(),
                 version
             );
         }
 
         for selector_or_alias in ["legacy", "0.3", "stable", "next"] {
-            assert!(LanceFileFormat::from_manifest_string(selector_or_alias).is_err());
+            assert!(ConcreteFileVersion::from_manifest_string(selector_or_alias).is_err());
         }
     }
 
     #[test]
     fn data_file_codec_preserves_wire_numbers() {
         let cases = [
-            (LanceFileFormat::V1, (0, 2)),
-            (LanceFileFormat::V2_0, (2, 0)),
-            (LanceFileFormat::V2_1, (2, 1)),
-            (LanceFileFormat::V2_2, (2, 2)),
-            (LanceFileFormat::V2_3, (2, 3)),
+            (ConcreteFileVersion::V1, (0, 2)),
+            (ConcreteFileVersion::V2_0, (2, 0)),
+            (ConcreteFileVersion::V2_1, (2, 1)),
+            (ConcreteFileVersion::V2_2, (2, 2)),
+            (ConcreteFileVersion::V2_3, (2, 3)),
         ];
 
         for (version, encoded) in cases {
             assert_eq!(version.to_data_file_numbers(), encoded);
             assert_eq!(
-                LanceFileFormat::from_data_file_numbers(encoded.0, encoded.1).unwrap(),
+                ConcreteFileVersion::from_data_file_numbers(encoded.0, encoded.1).unwrap(),
                 version
             );
         }
         for minor in 0..=2 {
             assert_eq!(
-                LanceFileFormat::from_data_file_numbers(0, minor).unwrap(),
-                LanceFileFormat::V1
+                ConcreteFileVersion::from_data_file_numbers(0, minor).unwrap(),
+                ConcreteFileVersion::V1
             );
         }
         assert_eq!(
-            LanceFileFormat::from_data_file_numbers(0, 3).unwrap(),
-            LanceFileFormat::V2_0
+            ConcreteFileVersion::from_data_file_numbers(0, 3).unwrap(),
+            ConcreteFileVersion::V2_0
         );
     }
 
     #[test]
     fn footer_codec_preserves_both_v2_0_writer_representations() {
         let standard_cases = [
-            (LanceFileFormat::V1, (0, 2)),
-            (LanceFileFormat::V2_0, (0, 3)),
-            (LanceFileFormat::V2_1, (2, 1)),
-            (LanceFileFormat::V2_2, (2, 2)),
-            (LanceFileFormat::V2_3, (2, 3)),
+            (ConcreteFileVersion::V1, (0, 2)),
+            (ConcreteFileVersion::V2_0, (0, 3)),
+            (ConcreteFileVersion::V2_1, (2, 1)),
+            (ConcreteFileVersion::V2_2, (2, 2)),
+            (ConcreteFileVersion::V2_3, (2, 3)),
         ];
         let embedded_cases = [
-            (LanceFileFormat::V1, (0, 2)),
-            (LanceFileFormat::V2_0, (2, 0)),
-            (LanceFileFormat::V2_1, (2, 1)),
-            (LanceFileFormat::V2_2, (2, 2)),
-            (LanceFileFormat::V2_3, (2, 3)),
+            (ConcreteFileVersion::V1, (0, 2)),
+            (ConcreteFileVersion::V2_0, (2, 0)),
+            (ConcreteFileVersion::V2_1, (2, 1)),
+            (ConcreteFileVersion::V2_2, (2, 2)),
+            (ConcreteFileVersion::V2_3, (2, 3)),
         ];
 
         for (version, encoded) in standard_cases {
             assert_eq!(version.to_standard_footer_numbers(), encoded);
             assert_eq!(
-                LanceFileFormat::from_footer_numbers(encoded.0, encoded.1).unwrap(),
+                ConcreteFileVersion::from_footer_numbers(encoded.0, encoded.1).unwrap(),
                 version
             );
         }
         for (version, encoded) in embedded_cases {
             assert_eq!(version.to_embedded_footer_numbers(), encoded);
             assert_eq!(
-                LanceFileFormat::from_footer_numbers(encoded.0, encoded.1).unwrap(),
+                ConcreteFileVersion::from_footer_numbers(encoded.0, encoded.1).unwrap(),
                 version
             );
         }
         for minor in 0..=2 {
             assert_eq!(
-                LanceFileFormat::from_footer_numbers(0, minor).unwrap(),
-                LanceFileFormat::V1
+                ConcreteFileVersion::from_footer_numbers(0, minor).unwrap(),
+                ConcreteFileVersion::V1
             );
         }
     }
