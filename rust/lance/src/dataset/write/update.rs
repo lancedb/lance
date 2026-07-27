@@ -320,18 +320,13 @@ impl UpdateJob {
             });
         let stream = RecordBatchStreamAdapter::new(schema, stream);
 
-        let version = self
-            .dataset
-            .manifest()
-            .data_storage_format
-            .lance_file_version()?;
         let (mut new_fragments, _) = write_fragments_internal(
             Some(&self.dataset),
             self.dataset.object_store.clone(),
             &self.dataset.base,
             self.dataset.schema().clone(),
             Box::pin(stream),
-            WriteParams::with_storage_version(version),
+            WriteParams::default(),
             None, // TODO: support multiple bases for update
         )
         .await?;

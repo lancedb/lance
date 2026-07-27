@@ -93,6 +93,7 @@ pub mod transaction;
 pub mod udtf;
 pub mod updater;
 mod utils;
+pub(crate) mod versions;
 pub mod write;
 
 pub(crate) use take::row_offsets_to_row_addresses;

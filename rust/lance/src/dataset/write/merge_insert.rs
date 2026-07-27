@@ -57,7 +57,7 @@ use crate::{
     dataset::{
         fragment::{FileFragment, FragReadConfig},
         transaction::{Operation, Transaction},
-        write::{merge_insert::logical_plan::MergeInsertPlanner, open_writer},
+        write::merge_insert::logical_plan::MergeInsertPlanner,
     },
     index::DatasetIndexInternalExt,
     io::exec::{
@@ -1260,11 +1260,11 @@ impl MergeInsertJob {
                         .manifest()
                         .data_storage_format
                         .lance_file_version()?;
-                    let mut writer = open_writer(
+                    let mut writer = crate::dataset::versions::open_data_writer(
+                        data_storage_version.into(),
                         &dataset.object_store,
                         &write_schema,
                         &dataset.base,
-                        data_storage_version,
                     )
                     .await?;
 
