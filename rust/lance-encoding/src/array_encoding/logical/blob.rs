@@ -23,9 +23,9 @@ use crate::{
         DecodeArrayTask, FilterExpression, MessageType, NextDecodeTask, PriorityRange,
         ScheduledScanLine, SchedulerContext,
     },
+    decoder::{DecoderReady, FieldScheduler, LogicalPageDecoder, SchedulingJob},
     encoder::{EncodeTask, FieldEncoder, OutOfLineBuffers},
     format::pb::{Blob, ColumnEncoding, column_encoding},
-    previous::decoder::{DecoderReady, FieldScheduler, LogicalPageDecoder, SchedulingJob},
     repdef::RepDefBuilder,
 };
 
@@ -67,7 +67,7 @@ impl SchedulingJob for BlobFieldSchedulingJob<'_> {
         let next_descriptions = self.descriptions_job.schedule_next(context, priority)?;
         let mut priority = priority.current_priority();
         let decoders = next_descriptions.decoders.into_iter().map(|decoder| {
-            let decoder = decoder.into_legacy();
+            let decoder = decoder.into_array();
             let path = decoder.path;
             let mut decoder = decoder.decoder;
             let num_rows = decoder.num_rows();
@@ -285,7 +285,7 @@ impl DecodeArrayTask for BlobArrayDecodeTask {
             buffer.extend_from_slice(&bytes);
         }
         let data_buf = Buffer::from_vec(buffer);
-        // data_size is only tracked in the v2.1 structural decode path; the legacy
+        // data_size is only tracked in the v2.1 structural decode path; the v2.0 array
         // v2.0 path does not need it so we return 0.
         Ok((
             Arc::new(LargeBinaryArray::new(offsets, data_buf, self.validity)),
@@ -417,10 +417,10 @@ mod tests {
     use super::BlobFieldDecoder;
     use crate::{
         EncodingsIo,
+        decoder::LogicalPageDecoder,
         format::pb::column_encoding,
-        previous::decoder::LogicalPageDecoder,
+        testing::TestEncoding,
         testing::{TestCases, check_round_trip_encoding_of_data, check_specific_random},
-        version::LanceFileVersion,
     };
 
     static BLOB_META: LazyLock<HashMap<String, String>> = LazyLock::new(|| {
@@ -433,11 +433,7 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn test_basic_blob() {
         let field = Field::new("", DataType::LargeBinary, false).with_metadata(BLOB_META.clone());
-        check_specific_random(
-            field,
-            TestCases::basic().with_max_file_version(LanceFileVersion::V2_1),
-        )
-        .await;
+        check_specific_random(field, TestCases::basic().with_array_and_u16_encodings()).await;
     }
 
     #[test_log::test(tokio::test)]
@@ -446,10 +442,10 @@ mod tests {
         let val2: &[u8] = &[7, 8, 9];
         let array = Arc::new(LargeBinaryArray::from(vec![Some(val1), None, Some(val2)]));
         let test_cases = TestCases::default()
-            .with_max_file_version(LanceFileVersion::V2_1)
+            .with_array_and_u16_encodings()
             .with_expected_encoding("packed_struct")
-            .with_verify_encoding(Arc::new(|cols, version| {
-                if version < &LanceFileVersion::V2_1 {
+            .with_verify_encoding(Arc::new(|cols, encoding| {
+                if *encoding == TestEncoding::Array {
                     // In 2.0 we used a special "column encoding" to mark blob fields.  In 2.1 we
                     // don't do this and just rely on the regular page encoding.
                     assert_eq!(cols.len(), 1);
@@ -465,9 +461,9 @@ mod tests {
             .await;
 
         let test_cases = TestCases::default()
-            .with_min_file_version(LanceFileVersion::V2_1)
-            .with_verify_encoding(Arc::new(|cols, version| {
-                if version < &LanceFileVersion::V2_1 {
+            .with_structural_encodings()
+            .with_verify_encoding(Arc::new(|cols, encoding| {
+                if *encoding == TestEncoding::Array {
                     assert_eq!(cols.len(), 1);
                     let col = &cols[0];
                     assert!(!matches!(

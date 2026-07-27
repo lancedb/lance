@@ -23,8 +23,8 @@ use crate::buffer::LanceBuffer;
 use crate::data::BlockInfo;
 use crate::data::{DataBlock, FixedWidthDataBlock, NullableDataBlock};
 use crate::decoder::{PageScheduler, PrimitivePageDecoder};
+use crate::encoder::{ArrayEncoder, EncodedArray};
 use crate::format::ProtobufUtils;
-use crate::previous::encoder::{ArrayEncoder, EncodedArray};
 use bytemuck::cast_slice;
 
 const LOG_ELEMS_PER_CHUNK: u8 = 10;
@@ -1146,7 +1146,6 @@ pub mod test {
     use crate::{
         format::pb,
         testing::{ArrayGeneratorProvider, TestCases, check_round_trip_encoding_generated},
-        version::LanceFileVersion,
     };
 
     use super::*;
@@ -1677,7 +1676,7 @@ pub mod test {
 
         for (data_type, array_gen_provider) in bitpacked_test_cases {
             let field = Field::new("", data_type.clone(), false);
-            let test_cases = TestCases::basic().with_min_file_version(LanceFileVersion::V2_1);
+            let test_cases = TestCases::basic().with_structural_encodings();
             check_round_trip_encoding_generated(field, array_gen_provider.copy(), test_cases).await;
         }
     }

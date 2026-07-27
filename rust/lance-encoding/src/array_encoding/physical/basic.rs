@@ -11,8 +11,8 @@ use crate::{
     EncodingsIo,
     data::{AllNullDataBlock, BlockInfo, DataBlock, NullableDataBlock},
     decoder::{PageScheduler, PrimitivePageDecoder},
+    encoder::{ArrayEncoder, EncodedArray},
     format::ProtobufUtils,
-    previous::encoder::{ArrayEncoder, EncodedArray},
 };
 
 use lance_core::Result;

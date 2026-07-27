@@ -13,8 +13,8 @@ use crate::{
     buffer::LanceBuffer,
     data::{BlockInfo, DataBlock, FixedWidthDataBlock, VariableWidthBlock},
     decoder::{PageScheduler, PrimitivePageDecoder},
+    encoder::{ArrayEncoder, EncodedArray},
     format::ProtobufUtils,
-    previous::encoder::{ArrayEncoder, EncodedArray},
 };
 
 /// A scheduler for fixed size binary data
@@ -173,9 +173,9 @@ mod tests {
     use arrow_data::ArrayData;
     use arrow_schema::{DataType, Field};
 
+    use crate::array_encoding::physical::fixed_size_binary::FixedSizeBinaryDecoder;
     use crate::data::{DataBlock, FixedWidthDataBlock};
     use crate::decoder::PrimitivePageDecoder;
-    use crate::previous::encodings::physical::fixed_size_binary::FixedSizeBinaryDecoder;
     use crate::testing::{TestCases, check_basic_random, check_round_trip_encoding_of_data};
 
     #[test_log::test(tokio::test)]

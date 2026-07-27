@@ -1214,7 +1214,7 @@ impl FileReader {
                 let num_rows = page.length;
                 let encoding = match file_version {
                     LanceFileVersion::V2_0 => {
-                        PageEncoding::Legacy(Self::fetch_encoding::<pbenc::ArrayEncoding>(
+                        PageEncoding::Array(Self::fetch_encoding::<pbenc::ArrayEncoding>(
                             page.encoding.as_ref().ok_or_else(|| {
                                 Error::invalid_input_source(
                                     format!(
@@ -2725,10 +2725,10 @@ mod tests {
     use lance_encoding::{
         constants::{STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_SPARSE},
         decoder::{
-            DecodeBatchScheduler, DecoderPlugins, FilterExpression, PageEncoding, ReadBatchTask,
-            decode_batch,
+            DecodeBatchScheduler, DecoderPlugins, EncodedBatchLayout, FilterExpression,
+            PageEncoding, ReadBatchTask, decode_batch,
         },
-        encoder::{EncodedBatch, EncodingOptions, default_encoding_strategy, encode_batch},
+        encoder::{EncodedBatch, EncodingOptions, encode_batch},
         format::pb21,
         version::LanceFileVersion,
     };
@@ -3121,10 +3121,9 @@ mod tests {
             max_page_bytes: 32 * 1024 * 1024,
             keep_original_array: true,
             buffer_alignment: 64,
-            version,
         };
 
-        let encoding_strategy = default_encoding_strategy(version);
+        let encoding_strategy = crate::versions::v2_0::encoding_strategy();
 
         let encoded_batch = encode_batch(
             &data,
@@ -3146,7 +3145,7 @@ mod tests {
             &FilterExpression::no_filter(),
             Arc::<DecoderPlugins>::default(),
             false,
-            version,
+            EncodedBatchLayout::Array,
             None,
         )
         .await
@@ -3165,7 +3164,7 @@ mod tests {
             &FilterExpression::no_filter(),
             Arc::<DecoderPlugins>::default(),
             false,
-            version,
+            EncodedBatchLayout::Array,
             None,
         )
         .await

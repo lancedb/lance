@@ -12,7 +12,7 @@ use crate::{
         DecodeArrayTask, FilterExpression, MessageType, NextDecodeTask, PriorityRange,
         ScheduledScanLine, SchedulerContext,
     },
-    previous::decoder::{DecoderReady, FieldScheduler, LogicalPageDecoder, SchedulingJob},
+    decoder::{DecoderReady, FieldScheduler, LogicalPageDecoder, SchedulingJob},
 };
 use arrow_array::{ArrayRef, StructArray};
 use arrow_schema::{DataType, Field, Fields};
@@ -57,7 +57,7 @@ struct EmptyStructDecodeTask {
 
 impl DecodeArrayTask for EmptyStructDecodeTask {
     fn decode(self: Box<Self>) -> Result<(ArrayRef, u64)> {
-        // data_size is only tracked in the v2.1 structural decode path; the legacy
+        // data_size is only tracked in the v2.1 structural decode path; the v2.0 array
         // v2.0 path does not need it so we return 0.
         Ok((
             Arc::new(StructArray::new_empty_fields(self.num_rows as usize, None)),
@@ -607,7 +607,7 @@ impl DecodeArrayTask for SimpleStructDecodeTask {
             .into_iter()
             .map(|child| child.decode())
             .collect::<Result<Vec<_>>>()?;
-        // data_size is only tracked in the v2.1 structural decode path; the legacy
+        // data_size is only tracked in the v2.1 structural decode path; the v2.0 array
         // v2.0 path does not need it so we return 0.
         Ok((
             Arc::new(StructArray::try_new(self.child_fields, child_arrays, None)?),

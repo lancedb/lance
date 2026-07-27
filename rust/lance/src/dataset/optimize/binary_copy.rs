@@ -394,7 +394,7 @@ pub async fn rewrite_files_binary_copy(
                         let encoding = if page.encoding.is_structural() {
                             PageEncoding::Structural(page.encoding.as_structural().clone())
                         } else {
-                            PageEncoding::Legacy(page.encoding.as_legacy().clone())
+                            PageEncoding::Array(page.encoding.as_array().clone())
                         };
                         // `priority` acts as the global row offset for this page, ensuring
                         // downstream iterators maintain the correct logical order across
@@ -545,7 +545,7 @@ async fn flush_footer(
             .iter()
             .map(|page_info| {
                 let encoded_encoding = match &page_info.encoding {
-                    PageEncoding::Legacy(array_encoding) => {
+                    PageEncoding::Array(array_encoding) => {
                         Any::from_msg(array_encoding)?.encode_to_vec()
                     }
                     PageEncoding::Structural(page_layout) => {

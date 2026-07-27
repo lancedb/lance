@@ -14,8 +14,8 @@ use crate::{
     buffer::LanceBuffer,
     data::{BlockInfo, DataBlock, NullableDataBlock, VariableWidthBlock},
     decoder::{PageScheduler, PrimitivePageDecoder},
+    encoder::{ArrayEncoder, EncodedArray},
     format::ProtobufUtils,
-    previous::encoder::{ArrayEncoder, EncodedArray},
 };
 
 #[derive(Debug)]

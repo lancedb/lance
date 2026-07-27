@@ -15,10 +15,11 @@ use futures::stream::FuturesOrdered;
 use lance_core::datatypes::{Field, Schema as LanceSchema};
 use lance_core::utils::bit::pad_bytes;
 use lance_core::{Error, Result};
+use lance_encoding::compression_config::CompressionParams;
 use lance_encoding::decoder::PageEncoding;
 use lance_encoding::encoder::{
     BatchEncoder, EncodeTask, EncodedBatch, EncodedPage, EncodingOptions, FieldEncoder,
-    FieldEncodingStrategy, OutOfLineBuffers, default_encoding_strategy,
+    FieldEncodingStrategy, OutOfLineBuffers,
 };
 use lance_encoding::repdef::RepDefBuilder;
 use lance_io::object_store::ObjectStore;
@@ -37,6 +38,7 @@ use crate::format::pb;
 use crate::format::pbfile;
 use crate::format::pbfile::DirectEncoding;
 use crate::version::{ConcreteFileVersion, LanceFileVersion};
+use crate::versions;
 
 /// Pages buffers are aligned to 64 bytes
 pub(crate) const PAGE_BUFFER_ALIGNMENT: usize = 64;
@@ -48,6 +50,39 @@ const PAD_BUFFER: [u8; PAGE_BUFFER_ALIGNMENT] = [72; PAGE_BUFFER_ALIGNMENT];
 // This limit is not applied in the 2.1 writer
 const MAX_PAGE_BYTES: usize = 32 * 1024 * 1024;
 const ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES: &str = "LANCE_FILE_WRITER_MAX_PAGE_BYTES";
+
+#[cfg(test)]
+fn encoding_strategy_with_params(
+    version: LanceFileVersion,
+    params: CompressionParams,
+) -> Result<Arc<dyn FieldEncodingStrategy>> {
+    match version.resolve() {
+        LanceFileVersion::Legacy | LanceFileVersion::V2_0 => Err(Error::invalid_input(
+            "Compression parameters are only supported in Lance file version 2.1 and later",
+        )),
+        LanceFileVersion::V2_1 => Ok(versions::v2_1::encoding_strategy(params)),
+        LanceFileVersion::V2_2 => Ok(versions::v2_2::encoding_strategy(params)),
+        LanceFileVersion::V2_3 => Ok(versions::v2_3::encoding_strategy(params)),
+        LanceFileVersion::Stable | LanceFileVersion::Next => {
+            unreachable!("resolved file-version selector must be exact")
+        }
+    }
+}
+
+fn encoding_strategy(version: LanceFileVersion) -> Arc<dyn FieldEncodingStrategy> {
+    match version.resolve() {
+        LanceFileVersion::Legacy => {
+            panic!("legacy v1 files require versions::v1::writer::FileWriter")
+        }
+        LanceFileVersion::V2_0 => versions::v2_0::encoding_strategy(),
+        LanceFileVersion::V2_1 => versions::v2_1::encoding_strategy(CompressionParams::default()),
+        LanceFileVersion::V2_2 => versions::v2_2::encoding_strategy(CompressionParams::default()),
+        LanceFileVersion::V2_3 => versions::v2_3::encoding_strategy(CompressionParams::default()),
+        LanceFileVersion::Stable | LanceFileVersion::Next => {
+            unreachable!("resolved file-version selector must be exact")
+        }
+    }
+}
 
 /// Summary of a completed Lance file write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -343,7 +378,7 @@ impl FileWriter {
             Self::do_write_buffer(&mut self.writer, &buffer).await?;
         }
         let encoded_encoding = match encoded_page.description {
-            PageEncoding::Legacy(array_encoding) => Any::from_msg(&array_encoding)?.encode_to_vec(),
+            PageEncoding::Array(array_encoding) => Any::from_msg(&array_encoding)?.encode_to_vec(),
             PageEncoding::Structural(page_layout) => Any::from_msg(&page_layout)?.encode_to_vec(),
         };
         let page = pbfile::column_metadata::Page {
@@ -457,17 +492,17 @@ impl FileWriter {
         schema.validate()?;
 
         let keep_original_array = self.options.keep_original_array.unwrap_or(false);
-        let encoding_strategy = self.options.encoding_strategy.clone().unwrap_or_else(|| {
-            let version = self.version();
-            default_encoding_strategy(version).into()
-        });
+        let encoding_strategy = self
+            .options
+            .encoding_strategy
+            .clone()
+            .unwrap_or_else(|| encoding_strategy(self.version()));
 
         let encoding_options = EncodingOptions {
             cache_bytes_per_column,
             max_page_bytes,
             keep_original_array,
             buffer_alignment: PAGE_BUFFER_ALIGNMENT as u64,
-            version: self.version(),
         };
         let encoder =
             BatchEncoder::try_new(&schema, encoding_strategy.as_ref(), &encoding_options)?;
@@ -1008,7 +1043,7 @@ fn concat_lance_footer(
             .iter()
             .map(|page_info| {
                 let encoded_encoding = match &page_info.encoding {
-                    PageEncoding::Legacy(array_encoding) => {
+                    PageEncoding::Array(array_encoding) => {
                         Any::from_msg(array_encoding)?.encode_to_vec()
                     }
                     PageEncoding::Structural(page_layout) => {
@@ -1984,11 +2019,8 @@ mod tests {
         // In a real implementation, you could add other compression types here
 
         // Build encoding strategy with compression parameters
-        let encoding_strategy = lance_encoding::encoder::default_encoding_strategy_with_params(
-            LanceFileVersion::V2_1,
-            params,
-        )
-        .unwrap();
+        let encoding_strategy =
+            super::encoding_strategy_with_params(LanceFileVersion::V2_1, params).unwrap();
 
         // Configure file writer options
         let options = FileWriterOptions {
@@ -2132,11 +2164,8 @@ mod tests {
 
         // Create encoding strategy that will read from field metadata
         let params = CompressionParams::new();
-        let encoding_strategy = lance_encoding::encoder::default_encoding_strategy_with_params(
-            LanceFileVersion::V2_1,
-            params,
-        )
-        .unwrap();
+        let encoding_strategy =
+            super::encoding_strategy_with_params(LanceFileVersion::V2_1, params).unwrap();
 
         let options = FileWriterOptions {
             encoding_strategy: Some(Arc::from(encoding_strategy)),
@@ -2231,11 +2260,8 @@ mod tests {
 
         // Create encoding strategy that will read from field metadata
         let params = CompressionParams::new();
-        let encoding_strategy = lance_encoding::encoder::default_encoding_strategy_with_params(
-            LanceFileVersion::V2_1,
-            params,
-        )
-        .unwrap();
+        let encoding_strategy =
+            super::encoding_strategy_with_params(LanceFileVersion::V2_1, params).unwrap();
 
         let options = FileWriterOptions {
             encoding_strategy: Some(Arc::from(encoding_strategy)),

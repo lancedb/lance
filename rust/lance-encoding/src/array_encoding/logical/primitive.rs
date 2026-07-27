@@ -10,10 +10,10 @@ use futures::{FutureExt, future::BoxFuture};
 use log::trace;
 
 use crate::decoder::{ColumnBuffers, PageBuffers};
-use crate::previous::decoder::{FieldScheduler, LogicalPageDecoder, SchedulingJob};
-use crate::previous::encoder::ArrayEncodingStrategy;
+use crate::decoder::{FieldScheduler, LogicalPageDecoder, SchedulingJob};
+use crate::encoder::ArrayEncodingStrategy;
 use crate::utils::accumulation::AccumulationQueue;
-use crate::{data::DataBlock, previous::encodings::physical::decoder_from_array_encoding};
+use crate::{array_encoding::physical::decoder_from_array_encoding, data::DataBlock};
 use lance_core::{Error, Result, datatypes::Field};
 
 use crate::{
@@ -74,7 +74,7 @@ impl PrimitiveFieldScheduler {
                     positions_and_sizes: &page.buffer_offsets_and_sizes,
                 };
                 let scheduler = decoder_from_array_encoding(
-                    page.encoding.as_legacy(),
+                    page.encoding.as_array(),
                     &page_buffers,
                     &data_type,
                 );
@@ -316,7 +316,7 @@ impl DecodeArrayTask for PrimitiveFieldDecodeTask {
                 return Ok((new_array, 0));
             }
         }
-        // data_size is only tracked in the v2.1 structural decode path; the legacy
+        // data_size is only tracked in the v2.1 structural decode path; the v2.0 array
         // v2.0 path does not need it so we return 0.
         Ok((array, 0))
     }
@@ -436,10 +436,10 @@ impl PrimitiveFieldEncoder {
             let (data, description) = array.into_buffers();
             Ok(EncodedPage {
                 data,
-                description: PageEncoding::Legacy(description),
+                description: PageEncoding::Array(description),
                 num_rows: num_values,
                 column_idx,
-                row_number: 0, // legacy encoders do not use
+                row_number: 0, // v2.0 encoders do not use
             })
         })
         .map(|res_res| {

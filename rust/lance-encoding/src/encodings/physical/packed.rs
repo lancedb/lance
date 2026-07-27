@@ -18,7 +18,7 @@ use lance_core::{Error, Result, datatypes::Field};
 use crate::{
     buffer::LanceBuffer,
     compression::{
-        DefaultCompressionStrategy, FixedPerValueDecompressor, MiniBlockDecompressor,
+        CompressionStrategy, FixedPerValueDecompressor, MiniBlockDecompressor,
         VariablePerValueDecompressor,
     },
     data::{
@@ -282,12 +282,12 @@ impl VariablePackedFieldData {
 
 #[derive(Debug)]
 pub struct PackedStructVariablePerValueEncoder {
-    strategy: DefaultCompressionStrategy,
+    strategy: Arc<dyn CompressionStrategy>,
     fields: Vec<Field>,
 }
 
 impl PackedStructVariablePerValueEncoder {
-    pub fn new(strategy: DefaultCompressionStrategy, fields: Vec<Field>) -> Self {
+    pub fn new(strategy: Arc<dyn CompressionStrategy>, fields: Vec<Field>) -> Self {
         Self { strategy, fields }
     }
 }
@@ -324,11 +324,7 @@ impl PerValueCompressor for PackedStructVariablePerValueEncoder {
         let mut field_metadata = Vec::with_capacity(self.fields.len());
 
         for (field, child_block) in self.fields.iter().zip(struct_block.children) {
-            let compressor = crate::compression::CompressionStrategy::create_per_value(
-                &self.strategy,
-                field,
-                &child_block,
-            )?;
+            let compressor = self.strategy.create_per_value(field, &child_block)?;
             let (compressed, encoding) = compressor.compress(child_block)?;
             match compressed {
                 PerValueDataBlock::Fixed(block) => {
@@ -758,12 +754,13 @@ impl VariablePerValueDecompressor for PackedStructVariablePerValueDecompressor {
 mod tests {
     use super::*;
     use crate::{
-        compression::CompressionStrategy,
-        compression::{DefaultCompressionStrategy, DefaultDecompressionStrategy},
+        compression::DefaultDecompressionStrategy,
+        compression_config::CompressionParams,
         constants::PACKED_STRUCT_META_KEY,
         statistics::ComputeStat,
-        testing::{TestCases, check_round_trip_encoding_of_data},
-        version::LanceFileVersion,
+        testing::{
+            TestCases, TestEncoding, check_round_trip_encoding_of_data, test_compression_strategy,
+        },
     };
     use arrow_array::{
         Array, ArrayRef, BinaryArray, Int32Array, Int64Array, LargeStringArray, StringArray,
@@ -863,9 +860,9 @@ mod tests {
         let data_block = DataBlock::Struct(struct_block);
 
         let compression_strategy =
-            DefaultCompressionStrategy::new().with_version(LanceFileVersion::V2_2);
+            test_compression_strategy(TestEncoding::StructuralU32, CompressionParams::default());
         let compressor = crate::compression::CompressionStrategy::create_per_value(
-            &compression_strategy,
+            compression_strategy.as_ref(),
             &struct_field,
             &data_block,
         )?;
@@ -931,9 +928,9 @@ mod tests {
         let data_block = DataBlock::Struct(struct_block);
 
         let compression_strategy =
-            DefaultCompressionStrategy::new().with_version(LanceFileVersion::V2_2);
+            test_compression_strategy(TestEncoding::StructuralU32, CompressionParams::default());
         let compressor = crate::compression::CompressionStrategy::create_per_value(
-            &compression_strategy,
+            compression_strategy.as_ref(),
             &struct_field,
             &data_block,
         )?;
@@ -1013,7 +1010,7 @@ mod tests {
         ]));
 
         let test_cases = TestCases::default()
-            .with_min_file_version(LanceFileVersion::V2_2)
+            .with_u32_structural_encodings()
             .with_expected_encoding("variable_packed_struct");
 
         check_round_trip_encoding_of_data(vec![array], &test_cases, meta).await;
@@ -1052,9 +1049,9 @@ mod tests {
         let data_block = DataBlock::Struct(struct_block);
 
         let compression_strategy =
-            DefaultCompressionStrategy::new().with_version(LanceFileVersion::V2_2);
+            test_compression_strategy(TestEncoding::StructuralU32, CompressionParams::default());
         let compressor = crate::compression::CompressionStrategy::create_per_value(
-            &compression_strategy,
+            compression_strategy.as_ref(),
             &struct_field,
             &data_block,
         )?;
@@ -1135,7 +1132,7 @@ mod tests {
         };
 
         let compression_strategy =
-            DefaultCompressionStrategy::new().with_version(LanceFileVersion::V2_1);
+            test_compression_strategy(TestEncoding::StructuralU16, CompressionParams::default());
         let result =
             compression_strategy.create_per_value(&struct_field, &DataBlock::Struct(struct_block));
 

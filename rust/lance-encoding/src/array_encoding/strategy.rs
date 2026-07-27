@@ -3,23 +3,14 @@
 
 use std::{collections::HashMap, env, hash::RandomState, sync::Arc};
 
-use arrow_array::{ArrayRef, UInt8Array, cast::AsArray};
+#[cfg(test)]
+use arrow_array::cast::AsArray;
+use arrow_array::{ArrayRef, UInt8Array};
 use arrow_schema::DataType;
 use hyperloglogplus::{HyperLogLog, HyperLogLogPlus};
 
 use crate::{
-    buffer::LanceBuffer,
-    data::DataBlock,
-    encoder::{ColumnIndexSequence, EncodingOptions, FieldEncoder, FieldEncodingStrategy},
-    encodings::{
-        logical::r#struct::StructFieldEncoder,
-        physical::{
-            block::{CompressionConfig, CompressionScheme},
-            value::ValueEncoder,
-        },
-    },
-    format::pb,
-    previous::encodings::{
+    array_encoding::{
         logical::{
             blob::BlobFieldEncoder, list::ListFieldEncoder, primitive::PrimitiveFieldEncoder,
         },
@@ -27,98 +18,49 @@ use crate::{
             basic::BasicEncoder,
             binary::BinaryEncoder,
             dictionary::{AlreadyDictionaryEncoder, DictionaryEncoder},
-            fixed_size_binary::FixedSizeBinaryEncoder,
             fixed_size_list::FslEncoder,
             fsst::FsstArrayEncoder,
             packed_struct::PackedStructEncoder,
         },
     },
-    version::LanceFileVersion,
-};
-
-#[cfg(feature = "bitpacking")]
-use crate::previous::encodings::physical::bitpack::{
-    BitpackedForNonNegArrayEncoder, compute_compressed_bit_width_for_non_neg,
-};
-
-use crate::constants::{
-    COMPRESSION_LEVEL_META_KEY, COMPRESSION_META_KEY, PACKED_STRUCT_LEGACY_META_KEY,
-    PACKED_STRUCT_META_KEY,
+    constants::{
+        COMPRESSION_LEVEL_META_KEY, COMPRESSION_META_KEY, PACKED_STRUCT_LEGACY_META_KEY,
+        PACKED_STRUCT_META_KEY,
+    },
+    encoder::{
+        ArrayEncoder, ArrayEncodingStrategy, ColumnIndexSequence, FieldEncoder,
+        FieldEncodingContext, FieldEncodingStrategy,
+    },
+    encodings::{
+        logical::r#struct::StructFieldEncoder,
+        physical::{
+            block::{CompressionConfig, CompressionScheme},
+            value::ValueEncoder,
+        },
+    },
 };
 
 use lance_arrow::BLOB_META_KEY;
 use lance_core::datatypes::{BLOB_DESC_FIELD, Field};
 use lance_core::{Error, Result};
 
-/// An encoded array
-///
-/// Maps to a single Arrow array
-///
-/// This contains the encoded data as well as a description of the encoding that was applied which
-/// can be used to decode the data later.
+/// Field-to-column composition for the `pb::ArrayEncoding` grammar.
 #[derive(Debug)]
-pub struct EncodedArray {
-    /// The encoded buffers
-    pub data: DataBlock,
-    /// A description of the encoding used to encode the array
-    pub encoding: pb::ArrayEncoding,
+pub struct ArrayFieldEncodingStrategy {
+    array_encoding_strategy: Arc<dyn ArrayEncodingStrategy>,
 }
 
-impl EncodedArray {
-    pub fn new(data: DataBlock, encoding: pb::ArrayEncoding) -> Self {
-        Self { data, encoding }
-    }
-
-    pub fn into_buffers(self) -> (Vec<LanceBuffer>, pb::ArrayEncoding) {
-        let buffers = self.data.into_buffers();
-        (buffers, self.encoding)
-    }
-}
-
-/// Encodes data from one format to another (hopefully more compact or useful) format
-///
-/// The array encoder must be Send + Sync.  Encoding is always done on its own
-/// thread task in the background and there could potentially be multiple encode
-/// tasks running for a column at once.
-pub trait ArrayEncoder: std::fmt::Debug + Send + Sync {
-    /// Encode data
+impl ArrayFieldEncodingStrategy {
+    /// Create the field strategy for the `pb::ArrayEncoding` grammar.
     ///
-    /// The result should contain a description of the encoding that was chosen.
-    /// This can be used to decode the data later.
-    fn encode(
-        &self,
-        data: DataBlock,
-        data_type: &DataType,
-        buffer_index: &mut u32,
-    ) -> Result<EncodedArray>;
-}
-
-/// A trait to pick which encoding strategy to use for a single page
-/// of data
-///
-/// Presumably, implementations will make encoding decisions based on
-/// array statistics.
-pub trait ArrayEncodingStrategy: Send + Sync + std::fmt::Debug {
-    fn create_array_encoder(
-        &self,
-        arrays: &[ArrayRef],
-        field: &Field,
-    ) -> Result<Box<dyn ArrayEncoder>>;
-}
-
-/// The core field encoding strategy is a set of basic encodings that
-/// are generally applicable in most scenarios.
-#[derive(Debug)]
-pub struct CoreFieldEncodingStrategy {
-    pub array_encoding_strategy: Arc<dyn ArrayEncodingStrategy>,
-    pub version: LanceFileVersion,
-}
-
-impl CoreFieldEncodingStrategy {
-    pub fn new(version: LanceFileVersion) -> Self {
+    /// ```
+    /// use lance_encoding::array_encoding::ArrayFieldEncodingStrategy;
+    ///
+    /// let strategy = ArrayFieldEncodingStrategy::new();
+    /// ```
+    pub fn new() -> Self {
         Self {
-            array_encoding_strategy: Arc::new(CoreArrayEncodingStrategy::new(version)),
-            version,
+            array_encoding_strategy: Arc::new(ArrayStrategy),
         }
     }
 
@@ -157,14 +99,20 @@ impl CoreFieldEncodingStrategy {
     }
 }
 
-impl FieldEncodingStrategy for CoreFieldEncodingStrategy {
+impl Default for ArrayFieldEncodingStrategy {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FieldEncodingStrategy for ArrayFieldEncodingStrategy {
     fn create_field_encoder(
         &self,
-        encoding_strategy_root: &dyn FieldEncodingStrategy,
         field: &Field,
         column_index: &mut ColumnIndexSequence,
-        options: &EncodingOptions,
+        context: &FieldEncodingContext<'_>,
     ) -> Result<Box<dyn FieldEncoder>> {
+        let options = context.options;
         let data_type = field.data_type();
         if Self::is_primitive_type(&data_type) {
             let column_index = column_index.next_column_index(field.id as u32);
@@ -192,11 +140,10 @@ impl FieldEncodingStrategy for CoreFieldEncodingStrategy {
             match data_type {
                 DataType::List(_child) | DataType::LargeList(_child) => {
                     let list_idx = column_index.next_column_index(field.id as u32);
-                    let inner_encoding = encoding_strategy_root.create_field_encoder(
-                        encoding_strategy_root,
+                    let inner_encoding = context.strategy.create_field_encoder(
                         &field.children[0],
                         column_index,
-                        options,
+                        context,
                     )?;
                     let offsets_encoder =
                         Arc::new(BasicEncoder::new(Box::new(ValueEncoder::default())));
@@ -227,12 +174,9 @@ impl FieldEncodingStrategy for CoreFieldEncodingStrategy {
                             .children
                             .iter()
                             .map(|field| {
-                                self.create_field_encoder(
-                                    encoding_strategy_root,
-                                    field,
-                                    column_index,
-                                    options,
-                                )
+                                context
+                                    .strategy
+                                    .create_field_encoder(field, column_index, context)
                             })
                             .collect::<Result<Vec<_>>>()?;
                         Ok(Box::new(StructFieldEncoder::new(
@@ -265,33 +209,11 @@ impl FieldEncodingStrategy for CoreFieldEncodingStrategy {
     }
 }
 
-/// The core array encoding strategy is a set of basic encodings that
-/// are generally applicable in most scenarios.
+/// Page-encoding selection for the `pb::ArrayEncoding` grammar.
 #[derive(Debug)]
-pub struct CoreArrayEncodingStrategy {
-    pub version: LanceFileVersion,
-}
+struct ArrayStrategy;
 
-const BINARY_DATATYPES: [DataType; 4] = [
-    DataType::Binary,
-    DataType::LargeBinary,
-    DataType::Utf8,
-    DataType::LargeUtf8,
-];
-
-impl CoreArrayEncodingStrategy {
-    fn new(version: LanceFileVersion) -> Self {
-        Self { version }
-    }
-}
-
-impl CoreArrayEncodingStrategy {
-    fn can_use_fsst(data_type: &DataType, data_size: u64, version: LanceFileVersion) -> bool {
-        version >= LanceFileVersion::V2_1
-            && matches!(data_type, DataType::Utf8 | DataType::Binary)
-            && data_size > 4 * 1024 * 1024
-    }
-
+impl ArrayStrategy {
     fn get_field_compression(field_meta: &HashMap<String, String>) -> Option<CompressionConfig> {
         let compression = field_meta.get(COMPRESSION_META_KEY)?;
         let compression_scheme = compression.parse::<CompressionScheme>();
@@ -308,16 +230,14 @@ impl CoreArrayEncodingStrategy {
 
     fn default_binary_encoder(
         arrays: &[ArrayRef],
-        data_type: &DataType,
         field_meta: Option<&HashMap<String, String>>,
         data_size: u64,
-        version: LanceFileVersion,
     ) -> Result<Box<dyn ArrayEncoder>> {
         let bin_indices_encoder =
-            Self::choose_array_encoder(arrays, &DataType::UInt64, data_size, false, version, None)?;
+            Self::choose_array_encoder(arrays, &DataType::UInt64, data_size, false, None)?;
 
         if let Some(compression) = field_meta.and_then(Self::get_field_compression) {
-            if compression.scheme == CompressionScheme::Fsst {
+            if compression.scheme() == CompressionScheme::Fsst {
                 // User requested FSST
                 let raw_encoder = Box::new(BinaryEncoder::try_new(bin_indices_encoder, None)?);
                 Ok(Box::new(FsstArrayEncoder::new(raw_encoder)))
@@ -329,13 +249,7 @@ impl CoreArrayEncodingStrategy {
                 )?))
             }
         } else {
-            // No user-specified compression, use FSST if we can
-            let bin_encoder = Box::new(BinaryEncoder::try_new(bin_indices_encoder, None)?);
-            if Self::can_use_fsst(data_type, data_size, version) {
-                Ok(Box::new(FsstArrayEncoder::new(bin_encoder)))
-            } else {
-                Ok(bin_encoder)
-            }
+            Ok(Box::new(BinaryEncoder::try_new(bin_indices_encoder, None)?))
         }
     }
 
@@ -344,7 +258,6 @@ impl CoreArrayEncodingStrategy {
         data_type: &DataType,
         data_size: u64,
         use_dict_encoding: bool,
-        version: LanceFileVersion,
         field_meta: Option<&HashMap<String, String>>,
     ) -> Result<Box<dyn ArrayEncoder>> {
         match data_type {
@@ -355,7 +268,6 @@ impl CoreArrayEncodingStrategy {
                         inner.data_type(),
                         data_size,
                         use_dict_encoding,
-                        version,
                         None,
                     )?,
                     *dimension as u32,
@@ -363,10 +275,9 @@ impl CoreArrayEncodingStrategy {
             }
             DataType::Dictionary(key_type, value_type) => {
                 let key_encoder =
-                    Self::choose_array_encoder(arrays, key_type, data_size, false, version, None)?;
-                let value_encoder = Self::choose_array_encoder(
-                    arrays, value_type, data_size, false, version, None,
-                )?;
+                    Self::choose_array_encoder(arrays, key_type, data_size, false, None)?;
+                let value_encoder =
+                    Self::choose_array_encoder(arrays, value_type, data_size, false, None)?;
 
                 Ok(Box::new(AlreadyDictionaryEncoder::new(
                     key_encoder,
@@ -384,7 +295,6 @@ impl CoreArrayEncodingStrategy {
                         &DataType::UInt8,
                         data_size,
                         false,
-                        version,
                         None,
                     )?;
                     let dict_items_encoder = Self::choose_array_encoder(
@@ -392,7 +302,6 @@ impl CoreArrayEncodingStrategy {
                         &DataType::Utf8,
                         data_size,
                         false,
-                        version,
                         None,
                     )?;
 
@@ -400,31 +309,8 @@ impl CoreArrayEncodingStrategy {
                         dict_indices_encoder,
                         dict_items_encoder,
                     )))
-                }
-                // The parent datatype should be binary or utf8 to use the fixed size encoding
-                // The variable 'data_type' is passed through recursion so comparing with it would be incorrect
-                else if BINARY_DATATYPES.contains(arrays[0].data_type()) {
-                    if let Some(byte_width) = check_fixed_size_encoding(arrays, version) {
-                        // use FixedSizeBinaryEncoder
-                        let bytes_encoder = Self::choose_array_encoder(
-                            arrays,
-                            &DataType::UInt8,
-                            data_size,
-                            false,
-                            version,
-                            None,
-                        )?;
-
-                        Ok(Box::new(BasicEncoder::new(Box::new(
-                            FixedSizeBinaryEncoder::new(bytes_encoder, byte_width as usize),
-                        ))))
-                    } else {
-                        Self::default_binary_encoder(
-                            arrays, data_type, field_meta, data_size, version,
-                        )
-                    }
                 } else {
-                    Self::default_binary_encoder(arrays, data_type, field_meta, data_size, version)
+                    Self::default_binary_encoder(arrays, field_meta, data_size)
                 }
             }
             DataType::Struct(fields) => {
@@ -438,7 +324,6 @@ impl CoreArrayEncodingStrategy {
                         inner_datatype,
                         data_size,
                         use_dict_encoding,
-                        version,
                         None,
                     )?;
                     inner_encoders.push(inner_encoder);
@@ -446,54 +331,16 @@ impl CoreArrayEncodingStrategy {
 
                 Ok(Box::new(PackedStructEncoder::new(inner_encoders)))
             }
-            DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
-                if version >= LanceFileVersion::V2_1 && arrays[0].data_type() == data_type {
-                    #[cfg(feature = "bitpacking")]
-                    {
-                        let compressed_bit_width = compute_compressed_bit_width_for_non_neg(arrays);
-                        Ok(Box::new(BitpackedForNonNegArrayEncoder::new(
-                            compressed_bit_width as usize,
-                            data_type.clone(),
-                        )))
-                    }
-                    #[cfg(not(feature = "bitpacking"))]
-                    {
-                        Ok(Box::new(BasicEncoder::new(Box::new(
-                            ValueEncoder::default(),
-                        ))))
-                    }
-                } else {
-                    Ok(Box::new(BasicEncoder::new(Box::new(
-                        ValueEncoder::default(),
-                    ))))
-                }
-            }
+            DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => Ok(
+                Box::new(BasicEncoder::new(Box::new(ValueEncoder::default()))),
+            ),
 
             // TODO: for signed integers, I intend to make it a cascaded encoding, a sparse array for the negative values and very wide(bit-width) values,
             // then a bitpacked array for the narrow(bit-width) values, I need `BitpackedForNeg` to be merged first, I am
             // thinking about putting this sparse array in the metadata so bitpacking remain using one page buffer only.
-            DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
-                if version >= LanceFileVersion::V2_1 && arrays[0].data_type() == data_type {
-                    #[cfg(feature = "bitpacking")]
-                    {
-                        let compressed_bit_width = compute_compressed_bit_width_for_non_neg(arrays);
-                        Ok(Box::new(BitpackedForNonNegArrayEncoder::new(
-                            compressed_bit_width as usize,
-                            data_type.clone(),
-                        )))
-                    }
-                    #[cfg(not(feature = "bitpacking"))]
-                    {
-                        Ok(Box::new(BasicEncoder::new(Box::new(
-                            ValueEncoder::default(),
-                        ))))
-                    }
-                } else {
-                    Ok(Box::new(BasicEncoder::new(Box::new(
-                        ValueEncoder::default(),
-                    ))))
-                }
-            }
+            DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => Ok(Box::new(
+                BasicEncoder::new(Box::new(ValueEncoder::default())),
+            )),
             _ => Ok(Box::new(BasicEncoder::new(Box::new(
                 ValueEncoder::default(),
             )))),
@@ -539,8 +386,9 @@ fn check_dict_encoding(arrays: &[ArrayRef], threshold: u64) -> bool {
     true
 }
 
-fn check_fixed_size_encoding(arrays: &[ArrayRef], version: LanceFileVersion) -> Option<u64> {
-    if version < LanceFileVersion::V2_1 || arrays.is_empty() {
+#[cfg(test)]
+fn check_fixed_size_encoding(arrays: &[ArrayRef]) -> Option<u64> {
+    if arrays.is_empty() {
         return None;
     }
 
@@ -612,7 +460,7 @@ fn check_fixed_size_encoding(arrays: &[ArrayRef], version: LanceFileVersion) -> 
     }
 }
 
-impl ArrayEncodingStrategy for CoreArrayEncodingStrategy {
+impl ArrayEncodingStrategy for ArrayStrategy {
     fn create_array_encoder(
         &self,
         arrays: &[ArrayRef],
@@ -632,7 +480,6 @@ impl ArrayEncodingStrategy for CoreArrayEncodingStrategy {
             data_type,
             data_size,
             use_dict_encoding,
-            self.version,
             Some(&field.metadata),
         )
     }
@@ -640,12 +487,10 @@ impl ArrayEncodingStrategy for CoreArrayEncodingStrategy {
 
 #[cfg(test)]
 mod tests {
-    use crate::constants::{COMPRESSION_LEVEL_META_KEY, COMPRESSION_META_KEY};
-    use crate::previous::encoder::{
-        ArrayEncodingStrategy, CoreArrayEncodingStrategy, check_dict_encoding,
-        check_fixed_size_encoding,
+    use super::{
+        ArrayEncodingStrategy, ArrayStrategy, check_dict_encoding, check_fixed_size_encoding,
     };
-    use crate::version::LanceFileVersion;
+    use crate::constants::{COMPRESSION_LEVEL_META_KEY, COMPRESSION_META_KEY};
     use arrow_array::{ArrayRef, StringArray};
     use arrow_schema::Field;
     use std::collections::HashMap;
@@ -691,10 +536,7 @@ mod tests {
         assert!(!is_dict_encoding_applicable(vec![Some("a"), Some("a")], 3));
     }
 
-    fn is_fixed_size_encoding_applicable(
-        arrays: Vec<Vec<Option<&str>>>,
-        version: LanceFileVersion,
-    ) -> bool {
+    fn is_fixed_size_encoding_applicable(arrays: Vec<Vec<Option<&str>>>) -> bool {
         let mut final_arrays = Vec::new();
         for arr in arrays {
             let arr = StringArray::from(arr);
@@ -702,82 +544,78 @@ mod tests {
             final_arrays.push(arr);
         }
 
-        check_fixed_size_encoding(&final_arrays.clone(), version).is_some()
+        check_fixed_size_encoding(&final_arrays).is_some()
     }
 
     #[test]
     fn test_fixed_size_binary_encoding_applicable() {
-        assert!(!is_fixed_size_encoding_applicable(
-            vec![vec![]],
-            LanceFileVersion::V2_1
-        ));
+        assert!(!is_fixed_size_encoding_applicable(vec![vec![]]));
 
-        assert!(is_fixed_size_encoding_applicable(
-            vec![vec![Some("a"), Some("b")]],
-            LanceFileVersion::V2_1
-        ));
+        assert!(is_fixed_size_encoding_applicable(vec![vec![
+            Some("a"),
+            Some("b")
+        ]]));
 
-        assert!(!is_fixed_size_encoding_applicable(
-            vec![vec![Some("abc"), Some("de")]],
-            LanceFileVersion::V2_1
-        ));
+        assert!(!is_fixed_size_encoding_applicable(vec![vec![
+            Some("abc"),
+            Some("de")
+        ]]));
 
-        assert!(is_fixed_size_encoding_applicable(
-            vec![vec![Some("pqr"), None]],
-            LanceFileVersion::V2_1
-        ));
+        assert!(is_fixed_size_encoding_applicable(vec![vec![
+            Some("pqr"),
+            None
+        ]]));
 
-        assert!(!is_fixed_size_encoding_applicable(
-            vec![vec![Some("pqr"), Some("")]],
-            LanceFileVersion::V2_1
-        ));
+        assert!(!is_fixed_size_encoding_applicable(vec![vec![
+            Some("pqr"),
+            Some("")
+        ]]));
 
-        assert!(!is_fixed_size_encoding_applicable(
-            vec![vec![Some(""), Some("")]],
-            LanceFileVersion::V2_1
-        ));
+        assert!(!is_fixed_size_encoding_applicable(vec![vec![
+            Some(""),
+            Some("")
+        ]]));
     }
 
     #[test]
     fn test_fixed_size_binary_encoding_applicable_multiple_arrays() {
-        assert!(is_fixed_size_encoding_applicable(
-            vec![vec![Some("a"), Some("b")], vec![Some("c"), Some("d")]],
-            LanceFileVersion::V2_1
-        ));
+        assert!(is_fixed_size_encoding_applicable(vec![
+            vec![Some("a"), Some("b")],
+            vec![Some("c"), Some("d")]
+        ]));
 
-        assert!(!is_fixed_size_encoding_applicable(
-            vec![vec![Some("ab"), Some("bc")], vec![Some("c"), Some("d")]],
-            LanceFileVersion::V2_1
-        ));
+        assert!(!is_fixed_size_encoding_applicable(vec![
+            vec![Some("ab"), Some("bc")],
+            vec![Some("c"), Some("d")]
+        ]));
 
-        assert!(!is_fixed_size_encoding_applicable(
-            vec![vec![Some("ab"), None], vec![None, Some("d")]],
-            LanceFileVersion::V2_1
-        ));
+        assert!(!is_fixed_size_encoding_applicable(vec![
+            vec![Some("ab"), None],
+            vec![None, Some("d")]
+        ]));
 
-        assert!(is_fixed_size_encoding_applicable(
-            vec![vec![Some("a"), None], vec![None, Some("d")]],
-            LanceFileVersion::V2_1
-        ));
+        assert!(is_fixed_size_encoding_applicable(vec![
+            vec![Some("a"), None],
+            vec![None, Some("d")]
+        ]));
 
-        assert!(!is_fixed_size_encoding_applicable(
-            vec![vec![Some(""), None], vec![None, Some("")]],
-            LanceFileVersion::V2_1
-        ));
+        assert!(!is_fixed_size_encoding_applicable(vec![
+            vec![Some(""), None],
+            vec![None, Some("")]
+        ]));
 
-        assert!(!is_fixed_size_encoding_applicable(
-            vec![vec![None, None], vec![None, None]],
-            LanceFileVersion::V2_1
-        ));
+        assert!(!is_fixed_size_encoding_applicable(vec![
+            vec![None, None],
+            vec![None, None]
+        ]));
     }
 
     fn verify_array_encoder(
         array: ArrayRef,
         field_meta: Option<HashMap<String, String>>,
-        version: LanceFileVersion,
         expected_encoder: &str,
     ) {
-        let encoding_strategy = CoreArrayEncodingStrategy { version };
+        let encoding_strategy = ArrayStrategy;
         let mut field = Field::new("test_field", array.data_type().clone(), true);
         if let Some(field_meta) = field_meta {
             field.set_metadata(field_meta);
@@ -797,7 +635,6 @@ mod tests {
                 COMPRESSION_META_KEY.to_string(),
                 "zstd".to_string(),
             )])),
-            LanceFileVersion::V2_1,
             "BinaryEncoder { indices_encoder: BasicEncoder { values_encoder: ValueEncoder }, compression_config: Some(CompressionConfig { scheme: Zstd, level: None }), buffer_compressor: Some(ZstdBufferCompressor { compression_level: 0 }) }",
         );
     }
@@ -810,7 +647,6 @@ mod tests {
                 (COMPRESSION_META_KEY.to_string(), "zstd".to_string()),
                 (COMPRESSION_LEVEL_META_KEY.to_string(), "22".to_string()),
             ])),
-            LanceFileVersion::V2_1,
             "BinaryEncoder { indices_encoder: BasicEncoder { values_encoder: ValueEncoder }, compression_config: Some(CompressionConfig { scheme: Zstd, level: Some(22) }), buffer_compressor: Some(ZstdBufferCompressor { compression_level: 22 }) }",
         );
     }

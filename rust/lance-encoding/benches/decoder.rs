@@ -11,14 +11,17 @@ use lance_core::cache::LanceCache;
 use lance_datagen::ArrayGeneratorExt;
 use lance_encoding::{
     decoder::{
-        DecodeBatchScheduler, DecoderConfig, DecoderPlugins, FilterExpression, create_decode_stream,
+        DecodeBatchScheduler, DecoderConfig, DecoderPlugins, EncodedBatchLayout, FilterExpression,
+        create_decode_stream,
     },
-    encoder::{EncodingOptions, default_encoding_strategy, encode_batch},
-    version::LanceFileVersion,
+    encoder::{EncodingOptions, encode_batch},
 };
 use tokio::sync::mpsc::unbounded_channel;
 
 use rand::Rng;
+
+pub mod common;
+use common::{BenchEncoding, encoding_strategy};
 
 const PRIMITIVE_TYPES: &[DataType] = &[
     DataType::Date32,
@@ -49,6 +52,15 @@ const PRIMITIVE_TYPES: &[DataType] = &[
 // schema doesn't yet parse them in the context of a fixed size list.
 const PRIMITIVE_TYPES_FOR_FSL: &[DataType] = &[DataType::Int8, DataType::Float32];
 
+fn encoded_batch_layout(encoding: BenchEncoding) -> EncodedBatchLayout {
+    match encoding {
+        BenchEncoding::Array => EncodedBatchLayout::Array,
+        BenchEncoding::StructuralU16 | BenchEncoding::StructuralU32 => {
+            EncodedBatchLayout::Structural
+        }
+    }
+}
+
 fn bench_decode(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let mut group = c.benchmark_group("decode_primitive");
@@ -64,7 +76,7 @@ fn bench_decode(c: &mut Criterion) {
                 .unwrap();
             let lance_schema =
                 Arc::new(lance_core::datatypes::Schema::try_from(data.schema().as_ref()).unwrap());
-            let encoding_strategy = default_encoding_strategy(LanceFileVersion::default());
+            let encoding_strategy = encoding_strategy(BenchEncoding::StructuralU16);
             let encoded = rt
                 .block_on(encode_batch(
                     &data,
@@ -81,7 +93,7 @@ fn bench_decode(c: &mut Criterion) {
                         &FilterExpression::no_filter(),
                         Arc::<DecoderPlugins>::default(),
                         false,
-                        LanceFileVersion::default(),
+                        EncodedBatchLayout::Structural,
                         Some(Arc::new(LanceCache::no_cache())),
                     ))
                     .unwrap();
@@ -95,14 +107,14 @@ fn bench_decode_fsl(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let mut group = c.benchmark_group("decode_fsl");
     const NUM_BYTES: u64 = 1024 * 1024 * 128;
-    for version in [
-        LanceFileVersion::V2_0,
-        LanceFileVersion::V2_1,
-        LanceFileVersion::V2_2,
+    for encoding in [
+        BenchEncoding::Array,
+        BenchEncoding::StructuralU16,
+        BenchEncoding::StructuralU32,
     ] {
         for data_type in PRIMITIVE_TYPES_FOR_FSL {
             for dimension in [4, 16, 32, 64, 128] {
-                let nullable_choices: &[bool] = if version == LanceFileVersion::V2_0 {
+                let nullable_choices: &[bool] = if encoding == BenchEncoding::Array {
                     &[false]
                 } else {
                     &[false, true]
@@ -110,7 +122,7 @@ fn bench_decode_fsl(c: &mut Criterion) {
                 for nullable in nullable_choices {
                     let func_name = format!(
                         "{:?}_{}_v{}_null{}",
-                        data_type, dimension, version, nullable
+                        data_type, dimension, encoding, nullable
                     )
                     .to_lowercase();
                     group.throughput(criterion::Throughput::Bytes(NUM_BYTES));
@@ -133,7 +145,7 @@ fn bench_decode_fsl(c: &mut Criterion) {
                             lance_core::datatypes::Schema::try_from(data.schema().as_ref())
                                 .unwrap(),
                         );
-                        let encoding_strategy = default_encoding_strategy(version);
+                        let encoding_strategy = encoding_strategy(encoding);
                         let encoded = rt
                             .block_on(encode_batch(
                                 &data,
@@ -149,7 +161,7 @@ fn bench_decode_fsl(c: &mut Criterion) {
                                     &FilterExpression::no_filter(),
                                     Arc::<DecoderPlugins>::default(),
                                     false,
-                                    version,
+                                    encoded_batch_layout(encoding),
                                     Some(Arc::new(LanceCache::no_cache())),
                                 ))
                                 .unwrap();
@@ -199,7 +211,7 @@ fn bench_decode_str_with_dict_encoding(c: &mut Criterion) {
 
         let lance_schema =
             Arc::new(lance_core::datatypes::Schema::try_from(data.schema().as_ref()).unwrap());
-        let encoding_strategy = default_encoding_strategy(LanceFileVersion::default());
+        let encoding_strategy = encoding_strategy(BenchEncoding::StructuralU16);
         let encoded = rt
             .block_on(encode_batch(
                 &data,
@@ -215,7 +227,7 @@ fn bench_decode_str_with_dict_encoding(c: &mut Criterion) {
                     &FilterExpression::no_filter(),
                     Arc::<DecoderPlugins>::default(),
                     false,
-                    LanceFileVersion::default(),
+                    EncodedBatchLayout::Structural,
                     Some(Arc::new(LanceCache::no_cache())),
                 ))
                 .unwrap();
@@ -274,7 +286,7 @@ fn bench_decode_packed_struct(c: &mut Criterion) {
             RecordBatch::try_new(Arc::new(new_schema.clone()), data.columns().to_vec()).unwrap();
 
         let lance_schema = Arc::new(lance_core::datatypes::Schema::try_from(&new_schema).unwrap());
-        let encoding_strategy = default_encoding_strategy(LanceFileVersion::V2_2);
+        let encoding_strategy = encoding_strategy(BenchEncoding::StructuralU32);
         let encoded = rt
             .block_on(encode_batch(
                 &data,
@@ -291,7 +303,7 @@ fn bench_decode_packed_struct(c: &mut Criterion) {
                     &FilterExpression::no_filter(),
                     Arc::<DecoderPlugins>::default(),
                     false,
-                    LanceFileVersion::V2_2,
+                    EncodedBatchLayout::Structural,
                     Some(Arc::new(LanceCache::no_cache())),
                 ))
                 .unwrap();
@@ -331,7 +343,7 @@ fn bench_decode_str_with_fixed_size_binary_encoding(c: &mut Criterion) {
 
         let lance_schema =
             Arc::new(lance_core::datatypes::Schema::try_from(data.schema().as_ref()).unwrap());
-        let encoding_strategy = default_encoding_strategy(LanceFileVersion::default());
+        let encoding_strategy = encoding_strategy(BenchEncoding::StructuralU16);
         let encoded = rt
             .block_on(encode_batch(
                 &data,
@@ -347,7 +359,7 @@ fn bench_decode_str_with_fixed_size_binary_encoding(c: &mut Criterion) {
                     &FilterExpression::no_filter(),
                     Arc::<DecoderPlugins>::default(),
                     false,
-                    LanceFileVersion::default(),
+                    EncodedBatchLayout::Structural,
                     Some(Arc::new(LanceCache::no_cache())),
                 ))
                 .unwrap();
@@ -398,7 +410,7 @@ fn bench_decode_compressed(c: &mut Criterion) {
         let lance_schema =
             Arc::new(lance_core::datatypes::Schema::try_from(schema.as_ref()).unwrap());
         // V2_2+ required for general compression
-        let encoding_strategy = default_encoding_strategy(LanceFileVersion::V2_2);
+        let encoding_strategy = encoding_strategy(BenchEncoding::StructuralU32);
 
         // Encode once during setup
         let encoded = rt
@@ -423,7 +435,7 @@ fn bench_decode_compressed(c: &mut Criterion) {
                             &FilterExpression::no_filter(),
                             Arc::<DecoderPlugins>::default(),
                             false,
-                            LanceFileVersion::V2_2,
+                            EncodedBatchLayout::Structural,
                             Some(Arc::new(LanceCache::no_cache())),
                         ))
                         .unwrap();
@@ -476,7 +488,7 @@ fn bench_decode_compressed_parallel(c: &mut Criterion) {
 
         let lance_schema =
             Arc::new(lance_core::datatypes::Schema::try_from(schema.as_ref()).unwrap());
-        let encoding_strategy = default_encoding_strategy(LanceFileVersion::V2_2);
+        let encoding_strategy = encoding_strategy(BenchEncoding::StructuralU32);
 
         let encoded = rt
             .block_on(encode_batch(

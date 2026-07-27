@@ -377,16 +377,13 @@ mod tests {
 
     use lance_datagen::{ByteCount, RowCount};
 
-    use crate::{
-        testing::{TestCases, check_round_trip_encoding_of_data},
-        version::LanceFileVersion,
-    };
+    use crate::testing::{TestCases, check_round_trip_encoding_of_data};
 
     #[test_log::test(tokio::test)]
     async fn test_fsst() {
         let test_cases = TestCases::default()
             .with_expected_encoding("fsst")
-            .with_min_file_version(LanceFileVersion::V2_1);
+            .with_structural_encodings();
 
         // Generate data suitable for FSST (large strings, total size > 32KB)
         let arr = lance_datagen::gen_batch()
