@@ -117,7 +117,8 @@ message Manifest {
   // * 1 << 5: transaction file writes are disabled
   // * 1 << 6: data overlay files are present (see DataOverlayFile). Readers that do
   //   not understand overlays must refuse the dataset, since ignoring an overlay
-  //   would silently return stale base values.
+  //   would silently return stale base values. Writers set this flag when a commit
+  //   attaches the first overlay and clear it when a commit removes the last one.
   uint64 reader_feature_flags = 9;
 
   // Feature flags for writers.
