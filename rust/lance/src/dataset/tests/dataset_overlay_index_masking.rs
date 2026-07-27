@@ -62,6 +62,7 @@ async fn create_base_dataset_with(stable_row_ids: bool) -> Dataset {
     let write_params = WriteParams {
         max_rows_per_file: 6,
         enable_stable_row_ids: stable_row_ids,
+        enable_overlays: Some(true),
         ..Default::default()
     };
     let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
@@ -530,6 +531,7 @@ async fn create_vector_overlay_dataset(stable_row_ids: bool) -> Dataset {
     let write_params = WriteParams {
         max_rows_per_file: 32,
         enable_stable_row_ids: stable_row_ids,
+        enable_overlays: Some(true),
         ..Default::default()
     };
     let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
@@ -760,6 +762,7 @@ async fn create_text_dataset(stable_row_ids: bool) -> Dataset {
     let write_params = WriteParams {
         max_rows_per_file: 6,
         enable_stable_row_ids: stable_row_ids,
+        enable_overlays: Some(true),
         ..Default::default()
     };
     let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
@@ -1358,6 +1361,7 @@ async fn test_list_element_fts_overlay_uses_exact_index_and_flat_fallback() {
         "memory://",
         Some(WriteParams {
             max_rows_per_file: 2,
+            enable_overlays: Some(true),
             ..Default::default()
         }),
     )
@@ -1548,6 +1552,7 @@ async fn bench_index_query_overlay_overhead() {
 
     let write_params = WriteParams {
         max_rows_per_file: ROWS_PER_FRAG as usize,
+        enable_overlays: Some(true),
         ..Default::default()
     };
     let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
@@ -1905,6 +1910,7 @@ async fn test_optimize_seed_path_respects_overlay() {
         "memory://",
         Some(WriteParams {
             max_rows_per_file: 6,
+            enable_overlays: Some(true),
             ..Default::default()
         }),
     )

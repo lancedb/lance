@@ -30,6 +30,13 @@ pub const FLAG_DISABLE_TRANSACTION_FILE: u64 = 32;
 /// that removes the last one (compaction folding overlays into base data, or the
 /// overlaid fragments being deleted). A dataset that no longer carries overlays is
 /// therefore readable by writers and readers that predate the feature.
+///
+/// So this reports that overlays are *present*. Whether a writer may create one is
+/// the separate [`LANCE_OVERLAYS_ENABLED`] setting, which persists across the flag
+/// being cleared -- a dataset only stays open to pre-overlay readers if its overlays
+/// are both removed and disabled.
+///
+/// [`LANCE_OVERLAYS_ENABLED`]: crate::format::LANCE_OVERLAYS_ENABLED
 pub const FLAG_DATA_OVERLAY_FILES: u64 = 64;
 /// `index_catchup` is maintained on this table, so a missing entry means the
 /// index is *not* caught up rather than fully caught up.

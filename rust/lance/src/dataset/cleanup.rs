@@ -1629,6 +1629,7 @@ mod tests {
         ObjectStore, ObjectStoreParams, ObjectStoreRegistry, WrappingObjectStore,
     };
     use lance_linalg::distance::MetricType;
+    use lance_table::format::LANCE_OVERLAYS_ENABLED;
     use lance_table::io::commit::RenameCommitHandler;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector, some_batch};
     use mock_instant::thread_local::MockClock;
@@ -2796,7 +2797,10 @@ mod tests {
             Operation::Overwrite {
                 fragments,
                 schema: dataset.schema().clone(),
-                config_upsert_values: None,
+                config_upsert_values: Some(HashMap::from([(
+                    LANCE_OVERLAYS_ENABLED.to_string(),
+                    "true".to_string(),
+                )])),
                 initial_bases: None,
             },
             None,
@@ -2873,7 +2877,10 @@ mod tests {
             Operation::Overwrite {
                 fragments,
                 schema: dataset.schema().clone(),
-                config_upsert_values: None,
+                config_upsert_values: Some(HashMap::from([(
+                    LANCE_OVERLAYS_ENABLED.to_string(),
+                    "true".to_string(),
+                )])),
                 initial_bases: None,
             },
             None,

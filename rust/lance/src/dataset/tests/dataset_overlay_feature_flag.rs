@@ -1,34 +1,48 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! End-to-end tests for the data overlay feature flag lifecycle: the manifest advertises
-//! [`FLAG_DATA_OVERLAY_FILES`] exactly while some fragment carries an overlay. The commit
-//! that attaches the first overlay sets it, and the commit that removes the last one --
-//! by deleting the overlaid fragments or by compacting the overlays into base data --
-//! clears it again, so the dataset becomes readable by pre-overlay readers once more.
+//! End-to-end tests for the two facts a dataset records about data overlay files.
+//!
+//! [`FLAG_DATA_OVERLAY_FILES`] says overlays are *present*: the manifest advertises it
+//! exactly while some fragment carries an overlay. The commit that attaches the first
+//! overlay sets it, and the commit that removes the last one -- by deleting the overlaid
+//! fragments or by compacting the overlays into base data -- clears it again, so the
+//! dataset becomes readable by pre-overlay readers once more.
+//!
+//! `lance.overlays.enabled` says overlays are *permitted*, and is what a writer consults
+//! before choosing to store an update as an overlay. It is a two-way door: it can be
+//! turned off again, but only once no overlay remains, since a disabled dataset must be
+//! resolvable without overlay support.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, Int32Array, RecordBatchIterator, record_batch};
-use lance_file::writer::{FileWriter, FileWriterOptions};
+use lance_file::version::LanceFileVersion;
+use lance_file::versions::create_writer;
+use lance_file::writer::FileWriterOptions;
 use lance_io::utils::CachedFileSize;
 use lance_table::feature_flags::FLAG_DATA_OVERLAY_FILES;
-use lance_table::format::DataFile;
 use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
+use lance_table::format::{DataFile, LANCE_OVERLAYS_ENABLED};
 use roaring::RoaringBitmap;
 use tempfile::{TempDir, tempdir};
 use uuid::Uuid;
 
-use crate::Dataset;
-use crate::dataset::optimize::{CompactionOptions, compact_files};
-use crate::dataset::transaction::{DataOverlayGroup, Operation};
+use crate::dataset::optimize::{CompactionMetrics, CompactionOptions, compact_files};
+use crate::dataset::transaction::{DataOverlayGroup, Operation, UpdateMap, UpdateMapEntry};
 use crate::dataset::{DATA_DIR, WriteDestination, WriteParams};
+use crate::{Dataset, Result};
 
 /// Two-fragment Int32 dataset: `id` (field 0) = 0..12 and `val` (field 1) = id * 10,
-/// six rows per fragment (fragments 0 and 1). Backed by a temp dir rather than
-/// `memory://` so tests can reopen the dataset and check the persisted manifest.
+/// six rows per fragment (fragments 0 and 1), with overlay writes enabled. Backed by a
+/// temp dir rather than `memory://` so tests can reopen the dataset and check the
+/// persisted manifest.
 async fn create_base_dataset() -> (TempDir, Dataset) {
+    create_base_dataset_with(Some(true)).await
+}
+
+async fn create_base_dataset_with(enable_overlays: Option<bool>) -> (TempDir, Dataset) {
     let test_dir = tempdir().unwrap();
     let uri = test_dir.path().to_str().unwrap().to_string();
     let batch = record_batch!(
@@ -40,6 +54,7 @@ async fn create_base_dataset() -> (TempDir, Dataset) {
     let write_params = WriteParams {
         max_rows_per_file: 6,
         max_rows_per_group: 6,
+        enable_overlays,
         ..Default::default()
     };
     let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
@@ -62,6 +77,19 @@ fn advertises_overlays(dataset: &Dataset) -> bool {
     reader
 }
 
+/// Fold every overlay into base data, the prerequisite for disabling overlays.
+/// `overlays_only` keeps the size and deletion triggers out of it, so fragments that
+/// were never overlaid are left alone. The default `target_rows_per_fragment` still
+/// applies as the rewritten files' row limit, so an overlaid fragment is not split.
+async fn compact_overlays(dataset: &mut Dataset) -> CompactionMetrics {
+    let options = CompactionOptions {
+        max_overlays_per_fragment: Some(0),
+        overlays_only: true,
+        ..Default::default()
+    };
+    compact_files(dataset, options, None).await.unwrap()
+}
+
 /// Reopen the dataset from storage so assertions see the persisted manifest rather
 /// than the in-memory one produced by the commit.
 async fn reopen(dataset: &Dataset) -> Dataset {
@@ -70,19 +98,38 @@ async fn reopen(dataset: &Dataset) -> Dataset {
 
 /// Commit a dense overlay setting `val` at `offset` of `fragment_id` to `value`.
 async fn commit_overlay(dataset: Dataset, fragment_id: u64, offset: u32, value: i32) -> Dataset {
-    let read_version = dataset.version().version;
+    try_commit_overlay(dataset, fragment_id, offset, value, None)
+        .await
+        .unwrap()
+}
+
+/// Like [`commit_overlay`] but surfaces the commit error, and lets a test commit
+/// against a stale `read_version` to exercise conflict rebase.
+async fn try_commit_overlay(
+    dataset: Dataset,
+    fragment_id: u64,
+    offset: u32,
+    value: i32,
+    read_version: Option<u64>,
+) -> Result<Dataset> {
+    let read_version = read_version.unwrap_or_else(|| dataset.version().version);
     let overlay_schema = dataset.schema().project_by_ids(&[1], true);
     let filename = format!("{}.lance", Uuid::new_v4());
     let path = dataset.base.clone().join(DATA_DIR).join(filename.as_str());
     let obj_writer = dataset.object_store.create(&path).await.unwrap();
-    let mut writer =
-        FileWriter::try_new(obj_writer, overlay_schema, FileWriterOptions::default()).unwrap();
-    let (major, minor) = writer.version().to_numbers();
+    let file_version = LanceFileVersion::Stable.resolve();
+    let mut writer = create_writer(
+        file_version,
+        obj_writer,
+        overlay_schema,
+        FileWriterOptions::default(),
+    )
+    .unwrap();
     let column: ArrayRef = Arc::new(Int32Array::from(vec![value]));
     writer.write_column(0, column).await.unwrap();
     let summary = writer.finish().await.unwrap();
 
-    let mut data_file = DataFile::new_unstarted(filename, major, minor);
+    let mut data_file = DataFile::new_unstarted(filename, file_version);
     data_file.fields = writer
         .field_id_to_column_indices()
         .iter()
@@ -116,7 +163,36 @@ async fn commit_overlay(dataset: Dataset, fragment_id: u64, offset: u32, value: 
         false,
     )
     .await
-    .unwrap()
+}
+
+/// Commit a `lance.overlays.enabled` change against an explicit read version, so a test
+/// can issue a disable that was planned before a concurrent overlay landed.
+async fn commit_overlays_enabled_at(
+    dataset: Dataset,
+    enabled: bool,
+    read_version: u64,
+) -> Result<Dataset> {
+    Dataset::commit(
+        WriteDestination::Dataset(Arc::new(dataset)),
+        Operation::UpdateConfig {
+            config_updates: Some(UpdateMap {
+                update_entries: vec![UpdateMapEntry {
+                    key: LANCE_OVERLAYS_ENABLED.to_string(),
+                    value: Some(enabled.to_string()),
+                }],
+                replace: false,
+            }),
+            table_metadata_updates: None,
+            schema_metadata_updates: None,
+            field_metadata_updates: HashMap::new(),
+        },
+        Some(read_version),
+        None,
+        None,
+        Arc::new(Default::default()),
+        false,
+    )
+    .await
 }
 
 /// Scan `id` and `val` and return an `id -> val` map (order-independent).
@@ -207,4 +283,175 @@ async fn test_compacting_overlays_clears_feature_flag() {
     assert_eq!(values[&0], 1000);
     assert_eq!(values[&1], 1001);
     assert_eq!(values[&2], 20);
+}
+
+#[tokio::test]
+async fn test_overlays_disabled_unless_enabled() {
+    // A dataset that says nothing follows the library default, which is currently
+    // off, so an overlay commit is refused rather than silently allowed.
+    let (_test_dir, dataset) = create_base_dataset_with(None).await;
+    assert!(!dataset.manifest.overlays_enabled());
+    let error = try_commit_overlay(dataset, 0, 0, 1000, None)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("while they are disabled"),
+        "unexpected error: {error}"
+    );
+
+    // The same dataset created with the setting on accepts the commit.
+    let (_test_dir, dataset) = create_base_dataset_with(Some(true)).await;
+    assert!(dataset.manifest.overlays_enabled());
+    let dataset = commit_overlay(dataset, 0, 0, 1000).await;
+    assert!(advertises_overlays(&dataset));
+}
+
+#[tokio::test]
+async fn test_enablement_survives_the_flag_clearing() {
+    // The two facts are independent: compacting the overlays away clears the
+    // feature flag but must leave the dataset free to write overlays again.
+    let (_test_dir, dataset) = create_base_dataset().await;
+    let mut dataset = commit_overlay(dataset, 0, 0, 1000).await;
+    compact_overlays(&mut dataset).await;
+
+    assert!(!advertises_overlays(&dataset));
+    assert!(dataset.manifest.overlays_enabled());
+    assert!(reopen(&dataset).await.manifest.overlays_enabled());
+    commit_overlay(dataset, 1, 0, 2000).await;
+}
+
+#[tokio::test]
+async fn test_cannot_disable_while_overlays_remain() {
+    let (_test_dir, dataset) = create_base_dataset().await;
+    let mut dataset = commit_overlay(dataset, 0, 0, 1000).await;
+
+    let error = dataset.set_overlays_enabled(false).await.unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("still carry overlays"), "{message}");
+    // The offending fragment is named so the caller knows what to compact.
+    assert!(message.contains('0'), "{message}");
+    assert!(dataset.manifest.overlays_enabled());
+}
+
+#[tokio::test]
+async fn test_compacting_overlays_then_disable() {
+    let (_test_dir, dataset) = create_base_dataset().await;
+    let dataset = commit_overlay(dataset, 0, 0, 1000).await;
+    let mut dataset = commit_overlay(dataset, 0, 1, 1001).await;
+
+    let metrics = compact_overlays(&mut dataset).await;
+    // Only the overlaid fragment is rewritten. Fragment 1 is well under the
+    // default row target, so a plain compaction would have swept it up too.
+    assert_eq!(metrics.fragments_removed, 1);
+    assert_eq!(metrics.fragments_added, 1);
+    assert!(dataset.get_fragment(1).is_some());
+    assert!(!advertises_overlays(&dataset));
+
+    dataset.set_overlays_enabled(false).await.unwrap();
+    assert!(!dataset.manifest.overlays_enabled());
+    assert!(!reopen(&dataset).await.manifest.overlays_enabled());
+
+    // Disabling did not cost any data.
+    let values = id_val_map(&dataset).await;
+    assert_eq!(values[&0], 1000);
+    assert_eq!(values[&1], 1001);
+    assert_eq!(values[&2], 20);
+
+    // And it is a real gate, not just a label. Fragment 1 was never overlaid, so
+    // compaction left it in place.
+    let error = try_commit_overlay(dataset, 1, 0, 2000, None)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("while they are disabled"),
+        "unexpected error: {error}"
+    );
+}
+
+#[tokio::test]
+async fn test_disable_racing_a_concurrent_overlay_is_rejected() {
+    // The disable is planned against a version with no overlays, so it is valid
+    // when issued. A concurrent writer then adds one. The check lives in
+    // build_manifest, which re-runs when the transaction is rebased onto the
+    // newer version, so the race is caught rather than silently committed.
+    let (_test_dir, dataset) = create_base_dataset().await;
+    let stale_version = dataset.version().version;
+    let dataset = commit_overlay(dataset, 0, 0, 1000).await;
+    assert!(dataset.version().version > stale_version);
+    let uri = dataset.uri().to_string();
+
+    let error = commit_overlays_enabled_at(dataset, false, stale_version)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("still carry overlays"),
+        "unexpected error: {error}"
+    );
+
+    // The dataset is untouched: still enabled, still carrying its overlay.
+    let dataset = Dataset::open(&uri).await.unwrap();
+    assert!(dataset.manifest.overlays_enabled());
+    assert!(advertises_overlays(&dataset));
+}
+
+#[tokio::test]
+async fn test_unparsable_setting_is_rejected_at_write() {
+    let (_test_dir, mut dataset) = create_base_dataset().await;
+    let error = dataset
+        .update_config([(LANCE_OVERLAYS_ENABLED.to_string(), "yes".to_string())])
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("must be \"true\" or \"false\""),
+        "unexpected error: {error}"
+    );
+
+    // An overwrite writes config too, so it is gated the same way. Otherwise the
+    // dataset would end up with a value that silently resolves to the default.
+    let schema = dataset.schema().clone();
+    let read_version = dataset.version().version;
+    let error = Dataset::commit(
+        WriteDestination::Dataset(Arc::new(dataset)),
+        Operation::Overwrite {
+            fragments: vec![],
+            schema,
+            config_upsert_values: Some(HashMap::from([(
+                LANCE_OVERLAYS_ENABLED.to_string(),
+                "yes".to_string(),
+            )])),
+            initial_bases: None,
+        },
+        Some(read_version),
+        None,
+        None,
+        Arc::new(Default::default()),
+        false,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("must be \"true\" or \"false\""),
+        "unexpected error: {error}"
+    );
+}
+
+#[tokio::test]
+async fn test_dataset_with_overlays_but_no_setting_stays_writable() {
+    // Datasets written while overlays were experimental carry overlays without
+    // the setting. Removing the key reproduces that shape: the dataset must stay
+    // overlay-writable rather than becoming un-updatable.
+    let (_test_dir, dataset) = create_base_dataset().await;
+    let mut dataset = commit_overlay(dataset, 0, 0, 1000).await;
+    dataset
+        .update_config([(LANCE_OVERLAYS_ENABLED.to_string(), None)])
+        .await
+        .unwrap();
+    assert!(!dataset.config().contains_key(LANCE_OVERLAYS_ENABLED));
+
+    assert!(dataset.manifest.overlays_enabled());
+    let dataset = commit_overlay(dataset, 0, 1, 1001).await;
+    assert_eq!(
+        dataset.get_fragment(0).unwrap().metadata().overlays.len(),
+        2
+    );
 }

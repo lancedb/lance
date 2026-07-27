@@ -302,6 +302,17 @@ pub struct CompactionOptions {
     /// carries any overlay, or `None` to disable the overlay-count trigger
     /// entirely.
     pub max_overlays_per_fragment: Option<usize>,
+    /// Restrict compaction to fragments selected by `max_overlays_per_fragment`,
+    /// skipping the size and deletion triggers entirely.
+    ///
+    /// Without this, removing overlays from a table of small fragments also bins
+    /// those fragments together, which is a much larger rewrite than the caller
+    /// asked for. The size trigger cannot be turned off by tuning
+    /// `target_rows_per_fragment`, because it fires on fragments *below* the
+    /// target and the same value caps the rewritten files: raising it selects
+    /// more fragments, and lowering it to dodge the trigger splits the fragments
+    /// that are rewritten. Defaults to `false`.
+    pub overlays_only: bool,
     /// Transaction properties to store with this commit.
     ///
     /// These key-value pairs are stored in the transaction file
@@ -335,6 +346,7 @@ impl Default for CompactionOptions {
             max_source_bytes: None,
             excluded_fragment_ids: Vec::new(),
             max_overlays_per_fragment: Some(10),
+            overlays_only: false,
             transaction_properties: None,
         }
     }
@@ -364,6 +376,7 @@ impl CompactionOptions {
     /// - `lance.compaction.max_source_rows`
     /// - `lance.compaction.max_source_bytes`
     /// - `lance.compaction.max_overlays_per_fragment`
+    /// - `lance.compaction.overlays_only`
     pub fn from_dataset_config(config: &HashMap<String, String>) -> Result<Self> {
         let mut opts = Self::default();
         opts.apply_dataset_config(config)?;
@@ -502,6 +515,14 @@ impl CompactionOptions {
                             ))
                         })?),
                     };
+                }
+                "overlays_only" => {
+                    self.overlays_only = value.parse().map_err(|_| {
+                        Error::invalid_input(format!(
+                            "Invalid value for {}: '{}' (expected a boolean)",
+                            key, value
+                        ))
+                    })?;
                 }
                 _ => {
                     warn!("Ignoring unknown compaction config key: {}", key);
@@ -801,6 +822,8 @@ impl CompactionPlanner for DefaultCompactionPlanner {
                 // Too many overlays: fully compact this fragment on its own,
                 // regardless of its size or deletion count.
                 Some(CompactionCandidacy::CompactItself)
+            } else if self.options.overlays_only {
+                None
             } else if self.options.materialize_deletions
                 && metrics.deletion_percentage() > self.options.materialize_deletions_threshold
             {
@@ -7526,6 +7549,25 @@ mod tests {
     }
 
     #[test]
+    fn test_from_dataset_config_overlays_only() {
+        let key = "lance.compaction.overlays_only".to_string();
+
+        let config = HashMap::from([(key.clone(), "true".to_string())]);
+        assert!(
+            CompactionOptions::from_dataset_config(&config)
+                .unwrap()
+                .overlays_only
+        );
+
+        let config = HashMap::from([(key, "sometimes".to_string())]);
+        let err_msg = CompactionOptions::from_dataset_config(&config)
+            .unwrap_err()
+            .to_string();
+        assert!(err_msg.contains("overlays_only"));
+        assert!(err_msg.contains("sometimes"));
+    }
+
+    #[test]
     fn test_apply_dataset_config_overrides() {
         let config = HashMap::from([(
             "lance.compaction.target_rows_per_fragment".to_string(),
@@ -7646,6 +7688,7 @@ mod tests {
         let schema = data.schema();
         let write_params = WriteParams {
             max_rows_per_file: 100,
+            enable_overlays: Some(true),
             ..Default::default()
         };
         Dataset::write(
@@ -9478,6 +9521,7 @@ mod tests {
             max_rows_per_file: 6,
             max_rows_per_group: 6,
             data_storage_version: Some(LanceFileVersion::Stable),
+            enable_overlays: Some(true),
             ..Default::default()
         };
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
@@ -9650,6 +9694,44 @@ mod tests {
             })
             .collect();
         assert_eq!(values, expected);
+    }
+
+    #[tokio::test]
+    async fn test_overlays_only_skips_the_size_trigger() {
+        // Both fragments hold 6 rows, far below the default 1M-row target, so
+        // the size trigger alone would bin them together.
+        let dataset = create_base_dataset("memory://").await;
+        let mut dataset = commit_n_overlays(dataset, 1).await;
+
+        let options = CompactionOptions {
+            max_overlays_per_fragment: Some(0),
+            overlays_only: true,
+            ..Default::default()
+        };
+        let metrics = compact_files(&mut dataset, options, None).await.unwrap();
+
+        // Only the overlaid fragment was rewritten; fragment 1 was left alone.
+        assert_eq!(metrics.fragments_removed, 1);
+        assert_eq!(metrics.fragments_added, 1);
+        assert!(dataset.get_fragment(1).is_some());
+        assert_eq!(dataset.get_fragments().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_without_overlays_only_the_size_trigger_still_applies() {
+        // Same setup, but leaving `overlays_only` off folds the untouched
+        // neighbor in as well -- the behavior `overlays_only` avoids.
+        let dataset = create_base_dataset("memory://").await;
+        let mut dataset = commit_n_overlays(dataset, 1).await;
+
+        let options = CompactionOptions {
+            max_overlays_per_fragment: Some(0),
+            ..Default::default()
+        };
+        let metrics = compact_files(&mut dataset, options, None).await.unwrap();
+
+        assert_eq!(metrics.fragments_removed, 2);
+        assert_eq!(metrics.fragments_added, 1);
     }
 
     #[tokio::test]

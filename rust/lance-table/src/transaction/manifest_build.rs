@@ -16,8 +16,8 @@ use crate::feature_flags::{
 };
 use crate::format::overlay::TOMBSTONE_FIELD_ID;
 use crate::format::{
-    DataFile, DataStorageFormat, Fragment, IndexMetadata, Manifest, ManifestBuildConfig,
-    overlay::DataOverlayFile,
+    DataFile, DataStorageFormat, Fragment, IndexMetadata, LANCE_OVERLAYS_ENABLED, Manifest,
+    ManifestBuildConfig, overlay::DataOverlayFile, overlays_enabled_with,
 };
 use crate::io::{
     commit::CommitHandler,
@@ -31,7 +31,7 @@ use crate::system_index::mem_wal::{
 };
 use crate::transaction::UpdateMode::{RewriteColumns, RewriteRows};
 use crate::transaction::row_version::resolve_update_version_metadata;
-use crate::transaction::update_map::apply_update_map;
+use crate::transaction::update_map::{apply_update_map, validate_config_updates};
 use crate::transaction::validate::merge_fragment_physically_rewritten;
 use crate::transaction::{
     CoverageIdentity, DataReplacementGroup, LogicalIndexSegments, Operation, ReadVersionState,
@@ -1422,6 +1422,9 @@ impl Transaction {
                 config_upsert_values: Some(tm),
                 ..
             } => {
+                validate_config_updates(
+                    tm.iter().map(|(key, value)| (key.as_str(), value.as_str())),
+                )?;
                 manifest.config_mut().extend(tm.clone());
             }
             Operation::UpdateConfig {
@@ -1431,6 +1434,14 @@ impl Transaction {
                 field_metadata_updates,
             } => {
                 if let Some(config_updates) = config_updates {
+                    validate_config_updates(config_updates.update_entries.iter().filter_map(
+                        |entry| {
+                            entry
+                                .value
+                                .as_deref()
+                                .map(|value| (entry.key.as_str(), value))
+                        },
+                    ))?;
                     let mut config = manifest.config.clone();
                     apply_update_map(&mut config, config_updates);
                     manifest.config = config;
@@ -1554,6 +1565,40 @@ impl Transaction {
             _ => {}
         }
 
+        // "Overlays disabled" and "overlays in the manifest" are mutually
+        // exclusive: a disabled dataset must be resolvable without overlay
+        // support. One invariant covers both ways to violate it -- disabling
+        // while overlays remain, and writing an overlay while disabled.
+        //
+        // This lives in build_manifest rather than at the API boundary because
+        // build_manifest re-runs on conflict rebase, so it also rejects a
+        // disable that races a concurrent DataOverlay commit.
+        //
+        // Enablement resolves against the pre-commit fragments so a DataOverlay
+        // cannot authorize itself through the overlays it is adding.
+        let was_overlaid = current_manifest.is_some_and(|current| current.has_overlays());
+        if !overlays_enabled_with(&manifest.config, was_overlaid) {
+            let overlaid = manifest
+                .fragments
+                .iter()
+                .filter(|fragment| !fragment.overlays.is_empty())
+                .map(|fragment| fragment.id)
+                .collect::<Vec<_>>();
+            if !overlaid.is_empty() {
+                return Err(Error::invalid_input(match &self.operation {
+                    Operation::DataOverlay { .. } => format!(
+                        "cannot write data overlay files while they are disabled for this \
+                         dataset; set {LANCE_OVERLAYS_ENABLED} to \"true\" first"
+                    ),
+                    _ => format!(
+                        "cannot disable data overlay files while fragments {overlaid:?} still \
+                         carry overlays; compact them into base data first (see \
+                         CompactionOptions::overlays_only)"
+                    ),
+                }));
+            }
+        }
+
         // Handle UpdateBases operation to update manifest base_paths
         if let Operation::UpdateBases { new_bases } = &self.operation {
             // Validate and add new base paths to the manifest
@@ -1630,8 +1675,8 @@ mod tests {
     use crate::format::{RowDatasetVersionMeta, RowDatasetVersionSequence, RowIdMeta};
     use crate::rowids::{RowIdSequence, write_row_ids};
     use crate::transaction::test_support::{
-        default_build_config, make_stable_row_id_manifest, overlay_with_field,
-        sample_index_metadata, sample_manifest,
+        default_build_config, make_stable_row_id_manifest, overlay_enabled_manifest,
+        overlay_with_field, sample_index_metadata, sample_manifest,
     };
     use crate::transaction::{DataOverlayGroup, UpdateMode, validate_operation};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
@@ -2932,7 +2977,7 @@ mod tests {
     fn test_data_overlay_build_manifest_merges_duplicate_groups() {
         // Two groups targeting the same fragment must both survive (a HashMap
         // collapse would have dropped the first).
-        let manifest = sample_manifest();
+        let manifest = overlay_enabled_manifest();
         let txn = Transaction::new(
             manifest.version,
             Operation::DataOverlay {

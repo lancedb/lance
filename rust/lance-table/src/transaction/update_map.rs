@@ -8,7 +8,9 @@
 //! entries where a `None` value means delete the key, plus a flag choosing between
 //! merging into the existing map and replacing it outright.
 
+use crate::format::{LANCE_OVERLAYS_ENABLED, parse_overlays_enabled};
 use lance_core::deepsize::DeepSizeOf;
+use lance_core::{Error, Result};
 
 /// An entry for a map update. If value is None, the key will be removed from the map.
 #[derive(Debug, Clone, DeepSizeOf, PartialEq)]
@@ -78,6 +80,22 @@ pub(super) fn apply_update_map(
             }
         }
     }
+}
+
+// Reject config values the reader cannot make sense of at the point they are
+// written. Validating the resolved config on every commit instead would let one
+// bad value wedge all later writes.
+pub(super) fn validate_config_updates<'a>(
+    entries: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Result<()> {
+    for (key, value) in entries {
+        if key == LANCE_OVERLAYS_ENABLED && parse_overlays_enabled(value).is_none() {
+            return Err(Error::invalid_input(format!(
+                "{LANCE_OVERLAYS_ENABLED} must be \"true\" or \"false\", got {value:?}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Helper function to translate old-style config updates to new UpdateMap format

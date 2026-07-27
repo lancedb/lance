@@ -151,6 +151,7 @@ use lance_namespace::models::{DeclareTableRequest, DescribeTableRequest};
 use lance_table::feature_flags::{
     apply_feature_flags, can_read_dataset, validate_mem_wal_index_catchup_flags,
 };
+use lance_table::format::LANCE_OVERLAYS_ENABLED;
 use lance_table::io::deletion::{DELETIONS_DIR, relative_deletion_file_path};
 use lance_table::rowids::{RowIdSequence, write_row_ids};
 pub use schema_evolution::{
@@ -3901,6 +3902,34 @@ impl Dataset {
         values: impl IntoIterator<Item = impl Into<UpdateMapEntry>>,
     ) -> metadata::UpdateMetadataBuilder<'_> {
         metadata::UpdateMetadataBuilder::new(self, values, metadata::MetadataType::Config)
+    }
+
+    /// Enable or disable data overlay files for this dataset.
+    ///
+    /// Unlike stable row ids this is a two-way door, but only in one direction at a
+    /// time: disabling requires that no fragment still carries an overlay, since a
+    /// disabled dataset must be readable without overlay support. Compact the
+    /// remaining overlays into base data first, which is also how a dataset drops
+    /// `FLAG_DATA_OVERLAY_FILES` so pre-overlay readers can open it again.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # use lance::dataset::optimize::{compact_files, CompactionOptions};
+    /// # async fn example(dataset: &mut Dataset) -> Result<()> {
+    /// let options = CompactionOptions {
+    ///     max_overlays_per_fragment: Some(0),
+    ///     overlays_only: true,
+    ///     ..Default::default()
+    /// };
+    /// compact_files(dataset, options, None).await?;
+    /// dataset.set_overlays_enabled(false).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn set_overlays_enabled(&mut self, enabled: bool) -> Result<()> {
+        self.update_config([(LANCE_OVERLAYS_ENABLED.to_string(), enabled.to_string())])
+            .await?;
+        Ok(())
     }
 
     /// Update schema metadata.

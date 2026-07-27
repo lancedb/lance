@@ -70,7 +70,11 @@ def make_base_dataset(
     reader = rand_batches(
         schema, num_batches=num_rows // rows_per_file, rows_per_batch=rows_per_file
     )
-    return lance.write_dataset(reader, base_path, max_rows_per_file=rows_per_file)
+    ds = lance.write_dataset(reader, base_path, max_rows_per_file=rows_per_file)
+    # Overlay writes are opt-in per dataset; without this the DataOverlay commits
+    # in commit_overlay_layers are rejected.
+    ds.update_config({"lance.overlays.enabled": "true"})
+    return ds
 
 
 def coverage_offsets(num_rows: int, fraction: float, pattern: str) -> List[int]:
