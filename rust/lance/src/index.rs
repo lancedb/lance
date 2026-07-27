@@ -131,11 +131,109 @@ fn validate_segment_metadata(index_name: &str, segments: &[IndexMetadata]) -> Re
     Ok(())
 }
 
+fn collect_subtree_field_ids(field: &Field, field_ids: &mut HashSet<i32>) {
+    field_ids.insert(field.id);
+    for child in &field.children {
+        collect_subtree_field_ids(child, field_ids);
+    }
+}
+
+fn fragment_field_paths<'a>(
+    fragment: &'a Fragment,
+    indexed_field_ids: &HashSet<i32>,
+) -> HashMap<i32, &'a str> {
+    fragment
+        .files
+        .iter()
+        .flat_map(|file| {
+            file.fields
+                .iter()
+                .filter(|field_id| indexed_field_ids.contains(field_id))
+                .map(|field_id| (*field_id, file.path.as_str()))
+        })
+        .collect()
+}
+
+async fn prune_stale_segment_coverage(
+    dataset: &Dataset,
+    field_id: i32,
+    segments: &mut [IndexSegment],
+    prune_historically_missing: bool,
+    prune_newer_overlays: bool,
+) -> Result<()> {
+    let field = dataset.schema().field_by_id(field_id).ok_or_else(|| {
+        Error::invalid_input(format!(
+            "CreateIndex: field id {field_id} does not exist in the current schema"
+        ))
+    })?;
+    let mut indexed_field_ids = HashSet::new();
+    collect_subtree_field_ids(field, &mut indexed_field_ids);
+
+    let current_fragments = dataset
+        .fragments()
+        .iter()
+        .map(|fragment| (fragment.id as u32, fragment))
+        .collect::<HashMap<_, _>>();
+    let historical_versions = segments
+        .iter()
+        .map(IndexSegment::dataset_version)
+        .filter(|version| *version < dataset.manifest.version)
+        .collect::<HashSet<_>>();
+
+    for version in historical_versions {
+        let historical = dataset.checkout_version(version).await.map_err(|error| {
+            Error::invalid_input(format!(
+                "CreateIndex: cannot validate segment coverage built at dataset version {version}: {error}"
+            ))
+        })?;
+        let historical_fragments = historical
+            .fragments()
+            .iter()
+            .map(|fragment| (fragment.id as u32, fragment))
+            .collect::<HashMap<_, _>>();
+
+        for segment in segments
+            .iter_mut()
+            .filter(|segment| segment.dataset_version() == version)
+        {
+            let stale_fragments = segment
+                .fragment_bitmap()
+                .iter()
+                .filter(|fragment_id| {
+                    let Some(historical_fragment) = historical_fragments.get(fragment_id) else {
+                        return prune_historically_missing;
+                    };
+                    let Some(current_fragment) = current_fragments.get(fragment_id) else {
+                        return true;
+                    };
+                    let changed_files =
+                        fragment_field_paths(historical_fragment, &indexed_field_ids)
+                            != fragment_field_paths(current_fragment, &indexed_field_ids);
+                    let changed_overlays = prune_newer_overlays
+                        && current_fragment.overlays.iter().any(|overlay| {
+                            overlay.committed_version > version
+                                && overlay
+                                    .data_file
+                                    .fields
+                                    .iter()
+                                    .any(|field_id| indexed_field_ids.contains(field_id))
+                        });
+                    changed_files || changed_overlays
+                })
+                .collect::<Vec<_>>();
+            for fragment_id in stale_fragments {
+                segment.fragment_bitmap_mut().remove(fragment_id);
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) async fn build_index_metadata_from_segments(
     dataset: &Dataset,
     index_name: &str,
     field_id: i32,
-    segments: Vec<IndexSegment>,
+    mut segments: Vec<IndexSegment>,
 ) -> Result<Vec<IndexMetadata>> {
     if segments.is_empty() {
         return Err(Error::invalid_input(
@@ -146,6 +244,22 @@ pub(crate) async fn build_index_metadata_from_segments(
     let mut seen_segment_ids = HashSet::with_capacity(segments.len());
     let mut covered_fragments = RoaringBitmap::new();
     for segment in &segments {
+        if segment.dataset_version() > dataset.manifest.version {
+            return Err(Error::invalid_input(format!(
+                "CreateIndex: segment {} was built at future dataset version {} (current version {})",
+                segment.uuid(),
+                segment.dataset_version(),
+                dataset.manifest.version
+            )));
+        }
+        if segment.fields() != [field_id] {
+            return Err(Error::invalid_input(format!(
+                "CreateIndex: segment {} was built for fields {:?}, expected [{}]",
+                segment.uuid(),
+                segment.fields(),
+                field_id
+            )));
+        }
         if !seen_segment_ids.insert(segment.uuid()) {
             return Err(Error::invalid_input(format!(
                 "CreateIndex: duplicate segment uuid {} for index '{}'",
@@ -162,16 +276,19 @@ pub(crate) async fn build_index_metadata_from_segments(
         covered_fragments |= segment.fragment_bitmap().clone();
     }
 
+    prune_stale_segment_coverage(dataset, field_id, &mut segments, false, false).await?;
+
     let mut new_indices = Vec::with_capacity(segments.len());
     for segment in segments {
-        let (uuid, fragment_bitmap, index_details, index_version) = segment.into_parts();
+        let (uuid, fragment_bitmap, fields, index_details, index_version, dataset_version) =
+            segment.into_parts();
         let is_inverted_index = index_details.type_url.ends_with("InvertedIndexDetails");
         if is_inverted_index {
             let metadata = IndexMetadata {
                 uuid,
                 name: index_name.to_string(),
-                fields: vec![field_id],
-                dataset_version: dataset.manifest.version,
+                fields: fields.clone(),
+                dataset_version,
                 fragment_bitmap: Some(fragment_bitmap.clone()),
                 index_details: Some(index_details.clone()),
                 index_version,
@@ -190,8 +307,8 @@ pub(crate) async fn build_index_metadata_from_segments(
         new_indices.push(IndexMetadata {
             uuid,
             name: index_name.to_string(),
-            fields: vec![field_id],
-            dataset_version: dataset.manifest.version,
+            fields,
+            dataset_version,
             fragment_bitmap: Some(fragment_bitmap),
             index_details: Some(index_details),
             index_version,
@@ -487,6 +604,13 @@ fn segment_has_bitmap_details(segment: &IndexMetadata) -> bool {
         .is_some_and(|details| details.type_url.ends_with("BitmapIndexDetails"))
 }
 
+fn segment_has_bloomfilter_details(segment: &IndexMetadata) -> bool {
+    segment
+        .index_details
+        .as_ref()
+        .is_some_and(|details| details.type_url.ends_with("BloomFilterIndexDetails"))
+}
+
 /// Detect BTree segments, preserving a legacy pre-details fallback.
 fn segment_has_btree_details(segment: &IndexMetadata) -> bool {
     segment.index_details.as_ref().map_or_else(
@@ -519,6 +643,20 @@ fn segment_has_label_list_details(segment: &IndexMetadata) -> bool {
         .index_details
         .as_ref()
         .is_some_and(|details| details.type_url.ends_with("LabelListIndexDetails"))
+}
+
+fn segment_has_rtree_details(segment: &IndexMetadata) -> bool {
+    segment
+        .index_details
+        .as_ref()
+        .is_some_and(|details| details.type_url.ends_with("RTreeIndexDetails"))
+}
+
+fn segment_has_ngram_details(segment: &IndexMetadata) -> bool {
+    segment
+        .index_details
+        .as_ref()
+        .is_some_and(|details| details.type_url.ends_with("NGramIndexDetails"))
 }
 
 // Cache keys for different index types
@@ -1372,9 +1510,23 @@ impl DatasetIndexExt for Dataset {
 
     async fn merge_existing_index_segments(
         &self,
-        source_segments: Vec<IndexMetadata>,
+        mut source_segments: Vec<IndexMetadata>,
     ) -> Result<IndexMetadata> {
         validate_segment_metadata("uncommitted", &source_segments)?;
+        if let Some(segment) = source_segments
+            .iter()
+            .find(|segment| segment.dataset_version > self.manifest.version)
+        {
+            return Err(Error::invalid_input(format!(
+                "merge_existing_index_segments: segment {} was built at future dataset version {} (current version {})",
+                segment.uuid, segment.dataset_version, self.manifest.version
+            )));
+        }
+        let source_dataset_version = source_segments
+            .iter()
+            .map(|segment| segment.dataset_version)
+            .min()
+            .unwrap_or(self.manifest.version);
         let field_id = *source_segments[0].fields.first().ok_or_else(|| {
             Error::invalid_input(format!(
                 "CreateIndex: segment {} is missing field ids",
@@ -1392,23 +1544,44 @@ impl DatasetIndexExt for Dataset {
         let all_vector = source_segments.iter().all(segment_has_vector_details);
         let all_inverted = source_segments.iter().all(segment_has_inverted_details);
         let all_bitmap = source_segments.iter().all(segment_has_bitmap_details);
+        let all_bloomfilter = source_segments.iter().all(segment_has_bloomfilter_details);
         let all_btree = source_segments.iter().all(segment_has_btree_details);
         let all_fmindex = source_segments.iter().all(segment_has_fmindex_details);
         let all_zonemap = source_segments.iter().all(segment_has_zonemap_details);
         let all_label_list = source_segments.iter().all(segment_has_label_list_details);
+        let all_rtree = source_segments.iter().all(segment_has_rtree_details);
+        let all_ngram = source_segments.iter().all(segment_has_ngram_details);
         if !all_vector
             && !all_inverted
             && !all_bitmap
+            && !all_bloomfilter
             && !all_btree
             && !all_fmindex
             && !all_zonemap
             && !all_label_list
+            && !all_rtree
+            && !all_ngram
         {
             return Err(Error::invalid_input(
                 "merge_existing_index_segments requires all segments to have the same supported index type"
                     .to_string(),
             ));
         }
+
+        let merged_dataset_version = if all_rtree {
+            let mut source_coverage = source_segments
+                .iter()
+                .cloned()
+                .map(IntoIndexSegment::into_index_segment)
+                .collect::<Result<Vec<_>>>()?;
+            prune_stale_segment_coverage(self, field_id, &mut source_coverage, true, true).await?;
+            for (source, coverage) in source_segments.iter_mut().zip(source_coverage) {
+                source.fragment_bitmap = Some(coverage.fragment_bitmap().clone());
+            }
+            self.manifest.version
+        } else {
+            source_dataset_version
+        };
 
         let mut merged_segment = if all_vector {
             crate::index::vector::ivf::merge_segments(
@@ -1423,14 +1596,29 @@ impl DatasetIndexExt for Dataset {
             crate::index::scalar::fmindex::merge_segments(self, source_segments).await?
         } else if all_bitmap {
             crate::index::scalar::bitmap::merge_segments(self, source_segments).await?
+        } else if all_bloomfilter {
+            crate::index::scalar::bloomfilter::merge_segments(self, source_segments).await?
         } else if all_label_list {
             crate::index::scalar::label_list::merge_segments(self, source_segments).await?
         } else if all_zonemap {
             crate::index::scalar::zonemap::merge_segments(self, source_segments).await?
+        } else if all_ngram {
+            crate::index::scalar::ngram::merge_segments(self, source_segments).await?
+        } else if all_rtree {
+            #[cfg(feature = "geo")]
+            {
+                crate::index::scalar::rtree::merge_segments(self, source_segments).await?
+            }
+            #[cfg(not(feature = "geo"))]
+            return Err(Error::not_supported(
+                "RTree segment merge requires the `geo` feature".to_string(),
+            ));
         } else {
             crate::index::scalar::btree::merge_segments(self, source_segments).await?
         };
-        merged_segment.dataset_version = self.manifest.version;
+        if !all_ngram && !all_fmindex {
+            merged_segment.dataset_version = merged_dataset_version;
+        }
         merged_segment.fields = vec![field_id];
         Ok(merged_segment)
     }
@@ -1451,6 +1639,34 @@ impl DatasetIndexExt for Dataset {
             .into_iter()
             .map(IntoIndexSegment::into_index_segment)
             .collect::<Result<Vec<_>>>()?;
+        let dataset_fragments = self.fragment_bitmap.as_ref().clone();
+        if segments.first().is_some_and(|segment| {
+            segment
+                .index_details()
+                .type_url
+                .ends_with("NGramIndexDetails")
+        }) {
+            let has_retired_coverage = segments
+                .iter()
+                .any(|segment| !(segment.fragment_bitmap() - &dataset_fragments).is_empty());
+            let frag_reuse_index = self.open_frag_reuse_index(&NoOpMetricsCollector).await?;
+            let requires_rebuild = frag_reuse_index.as_ref().is_some_and(|frag_reuse_index| {
+                segments.iter().any(|segment| {
+                    append::fragment_reuse_affects_segment(
+                        frag_reuse_index,
+                        segment.fragment_bitmap(),
+                        segment.dataset_version(),
+                    )
+                })
+            });
+            if has_retired_coverage || requires_rebuild {
+                return Err(Error::invalid_input(
+                    "CreateIndex: NGram segments built before compaction must be rebuilt or merged \
+                     with merge_existing_index_segments before commit"
+                        .to_string(),
+                ));
+            }
+        }
         let new_indices =
             build_index_metadata_from_segments(self, index_name, field.id, segments).await?;
         validate_segment_metadata(index_name, &new_indices)?;
@@ -1460,7 +1676,6 @@ impl DatasetIndexExt for Dataset {
             .index_details
             .as_ref()
             .map(|details| details.type_url.clone());
-        let dataset_fragments = self.fragment_bitmap.as_ref().clone();
         let mut incoming_fragments = RoaringBitmap::new();
         for segment in &new_indices {
             if segment.fields != [field.id] {
@@ -1657,7 +1872,7 @@ impl DatasetIndexExt for Dataset {
                 uuid: res.new_uuid,
                 name: last_idx.name.clone(), // Keep the same name
                 fields: last_idx.fields.clone(),
-                dataset_version: self.manifest.version,
+                dataset_version: res.new_dataset_version,
                 fragment_bitmap: Some(res.new_fragment_bitmap),
                 index_details: Some(Arc::new(res.new_index_details)),
                 index_version: res.new_index_version,
@@ -2881,7 +3096,7 @@ mod tests {
     use crate::session::Session;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount, copy_test_data_to_tmp};
     use arrow::array::AsArray;
-    use arrow::datatypes::{Float32Type, Int32Type};
+    use arrow::datatypes::{Float32Type, Int32Type, Int64Type};
     use arrow_array::Int32Array;
     use arrow_array::{
         FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator, StringArray,
@@ -2894,7 +3109,10 @@ mod tests {
     use lance_datagen::{BatchCount, ByteCount, Dimension, RowCount, array};
     use lance_index::pbold::{BTreeIndexDetails, InvertedIndexDetails};
     use lance_index::scalar::bitmap::BITMAP_LOOKUP_NAME;
-    use lance_index::scalar::inverted::INVERTED_INDEX_VERSION_V3;
+    use lance_index::scalar::inverted::query::{FtsQuery, PhraseQuery};
+    use lance_index::scalar::inverted::{
+        INVERTED_INDEX_VERSION_V1, INVERTED_INDEX_VERSION_V2, INVERTED_INDEX_VERSION_V3,
+    };
     use lance_index::scalar::{
         BuiltinIndexType, FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams,
     };
@@ -2961,20 +3179,10 @@ mod tests {
     }
 
     fn segment_from_metadata(metadata: &IndexMetadata) -> IndexSegment {
-        IndexSegment::new(
-            metadata.uuid,
-            metadata
-                .fragment_bitmap
-                .as_ref()
-                .expect("test segment metadata should have fragment coverage")
-                .iter(),
-            metadata
-                .index_details
-                .as_ref()
-                .expect("test segment metadata should have index details")
-                .clone(),
-            metadata.index_version,
-        )
+        metadata
+            .clone()
+            .into_index_segment()
+            .expect("test segment metadata should convert to an index segment")
     }
 
     async fn write_fragmented_vector_dataset(uri: &str, dimension: i32) -> Dataset {
@@ -3888,6 +4096,53 @@ mod tests {
         assert_eq!(stats["num_indexed_fragments"], 2);
         assert_eq!(stats["num_unindexed_fragments"], 0);
         assert_eq!(stats["num_indices"], 1);
+    }
+
+    #[rstest]
+    #[case::v1("v3.0.1/fts_v1", INVERTED_INDEX_VERSION_V1)]
+    #[case::v2("v4.0.1/fts_v2", INVERTED_INDEX_VERSION_V2)]
+    #[tokio::test]
+    async fn test_read_fts_format_fixture(
+        #[case] fixture_path: &str,
+        #[case] expected_version: u32,
+    ) {
+        async fn search_ids(dataset: &Dataset, query: FullTextSearchQuery) -> Vec<i64> {
+            let result = dataset
+                .scan()
+                .project(&["id"])
+                .unwrap()
+                .full_text_search(query)
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            let mut ids = result["id"].as_primitive::<Int64Type>().values().to_vec();
+            ids.sort_unstable();
+            ids
+        }
+
+        let test_dir = copy_test_data_to_tmp(fixture_path).unwrap();
+        let dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
+
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1);
+        assert_eq!(indices[0].index_version, expected_version as i32);
+
+        let match_ids = search_ids(
+            &dataset,
+            FullTextSearchQuery::new("compatibility".to_string()),
+        )
+        .await;
+        assert_eq!(match_ids, (0..300).collect::<Vec<_>>());
+
+        let phrase =
+            PhraseQuery::new("lance database".to_string()).with_column(Some("text".to_string()));
+        let phrase_ids = search_ids(
+            &dataset,
+            FullTextSearchQuery::new_query(FtsQuery::Phrase(phrase)),
+        )
+        .await;
+        assert_eq!(phrase_ids, (0..300).step_by(3).collect::<Vec<_>>());
     }
 
     #[rstest]
@@ -7100,6 +7355,83 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("at least one index segment"));
+    }
+
+    #[tokio::test]
+    async fn test_commit_existing_index_segments_rejects_wrong_field_provenance() {
+        use lance_datagen::{BatchCount, RowCount, array};
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let reader = lance_datagen::gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .col(
+                "vector",
+                array::rand_vec::<arrow_array::types::Float32Type>(8.into()),
+            )
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let mut dataset = Dataset::write(reader, test_dir.path().to_str().unwrap(), None)
+            .await
+            .unwrap();
+
+        let vector_field_id = dataset.schema().field("vector").unwrap().id;
+        let mut metadata = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            vector_field_id,
+            Uuid::new_v4(),
+            [0_u32],
+            b"segment",
+        )
+        .await;
+        metadata.fields = vec![dataset.schema().field("id").unwrap().id];
+
+        let error = dataset
+            .commit_existing_index_segments(
+                "vector_idx",
+                "vector",
+                vec![segment_from_metadata(&metadata)],
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("was built for fields"));
+    }
+
+    #[tokio::test]
+    async fn test_commit_existing_index_segments_rejects_future_dataset_version() {
+        use lance_datagen::{BatchCount, RowCount, array};
+
+        let test_dir = tempfile::tempdir().unwrap();
+        let reader = lance_datagen::gen_batch()
+            .col(
+                "vector",
+                array::rand_vec::<arrow_array::types::Float32Type>(8.into()),
+            )
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let mut dataset = Dataset::write(reader, test_dir.path().to_str().unwrap(), None)
+            .await
+            .unwrap();
+
+        let field_id = dataset.schema().field("vector").unwrap().id;
+        let mut metadata = write_vector_segment_metadata(
+            &dataset,
+            "vector_idx",
+            field_id,
+            Uuid::new_v4(),
+            [0_u32],
+            b"segment",
+        )
+        .await;
+        metadata.dataset_version = dataset.manifest.version + 1;
+
+        let error = dataset
+            .commit_existing_index_segments(
+                "vector_idx",
+                "vector",
+                vec![segment_from_metadata(&metadata)],
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("future dataset version"));
     }
 
     #[tokio::test]

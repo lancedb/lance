@@ -23,7 +23,7 @@ struct MokaCacheEntry {
 
 /// Per-entry key cost for eviction: the struct plus the unique `key` bytes.
 /// Excludes the shared `prefix` `Arc<str>`, which isn't freed per eviction.
-fn key_footprint(key: &InternalCacheKey) -> usize {
+pub(super) fn key_footprint(key: &InternalCacheKey) -> usize {
     std::mem::size_of::<InternalCacheKey>() + key.key().len()
 }
 

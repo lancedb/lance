@@ -31,3 +31,8 @@ folder contains a `datagen.py` script that generates one or more lance datasets.
   metadata in the schema metadata in the index file. We switched to storing them
   in a global buffer in https://github.com/lancedb/lance/pull/3829, but still
   need to be able to read the old format.
+* `v3.0.1/fts_v1` and `v4.0.1/fts_v2`: These datasets cover the supported FTS
+  layouts written by stable Lance releases. Each fixture contains posting lists
+  that cross the layout's block boundary and positions used by phrase queries.
+  The v1 fixture also retains the retired `skip_merge` parameter written by Lance
+  3.0.1.

@@ -666,6 +666,11 @@ fn collect_page_encoding(layout: &PageLayout, actual_chain: &mut Vec<String>) ->
                     collect_page_encoding(inner_layout.as_ref(), actual_chain)?
                 }
             }
+            Layout::SparseLayout(sparse) => {
+                if let Some(value_compression) = &sparse.value_compression {
+                    actual_chain.extend(extract_array_encoding_chain(value_compression));
+                }
+            }
         }
     }
 

@@ -556,6 +556,38 @@ def test_read_blobs_without_preserve_order_returns_same_rows(
 
 
 @pytest.mark.parametrize("selection_kind", ["ids", "addresses", "indices"])
+@pytest.mark.parametrize(
+    "selected_indices",
+    [
+        [0, 5],
+        [0, 5, 4],
+        [5],
+        [0, 5, 1],
+        [4, 4, 5],
+    ],
+)
+def test_blob_selection_apis_preserve_nulls_and_empty_values(
+    dataset_with_mixed_blob_v2, selection_kind, selected_indices
+):
+    dataset, payloads = dataset_with_mixed_blob_v2
+    if selection_kind == "ids":
+        all_selectors = _blob_row_ids(dataset)
+    elif selection_kind == "addresses":
+        all_selectors = _blob_row_addresses(dataset)
+    else:
+        all_selectors = list(range(len(payloads)))
+    selectors = [all_selectors[index] for index in selected_indices]
+    kwargs = {selection_kind: selectors}
+    expected = [payloads[index] for index in selected_indices]
+
+    blob_files = dataset.take_blobs("blobs", **kwargs)
+    assert [None if blob is None else blob.readall() for blob in blob_files] == expected
+
+    blobs = dataset.read_blobs("blobs", **kwargs, preserve_order=True)
+    assert [data for _, data in blobs] == expected
+
+
+@pytest.mark.parametrize("selection_kind", ["ids", "addresses", "indices"])
 def test_read_blob_ranges_mixed_sources_preserves_request_identity(
     dataset_with_mixed_blob_v2, selection_kind
 ):
@@ -587,18 +619,17 @@ def test_read_blob_ranges_mixed_sources_preserves_request_identity(
         zip(selected_indices, ranges)
     ):
         payload = payloads[row_index]
-        if payload is not None:
-            expected.append(
-                (
-                    request_index,
-                    addresses[row_index],
-                    payload[offset : offset + length],
-                )
+        expected.append(
+            (
+                request_index,
+                addresses[row_index],
+                None if payload is None else payload[offset : offset + length],
             )
+        )
     assert results == expected
 
 
-def test_read_blob_ranges_skips_blob_v1_nulls(tmp_path):
+def test_blob_selection_apis_preserve_blob_v1_nulls_and_empty_values(tmp_path):
     schema = pa.schema(
         [
             pa.field(
@@ -616,13 +647,28 @@ def test_read_blob_ranges_skips_blob_v1_nulls(tmp_path):
     )
     addresses = _blob_row_addresses(dataset)
 
+    blob_files = dataset.take_blobs("blobs", indices=[0, 1, 2])
+    assert [None if blob is None else blob.readall() for blob in blob_files] == [
+        None,
+        b"",
+        b"abc",
+    ]
+
+    blobs = dataset.read_blobs("blobs", indices=[0, 1, 2])
+    assert [data for _, data in blobs] == [None, b"", b"abc"]
+
     results = dataset.read_blob_ranges(
         "blobs",
         [(0, 0, 0), (0, 0, 1), (1, 0, 0), (2, 1, 1)],
         selector="indices",
     )
 
-    assert results == [(2, addresses[1], b""), (3, addresses[2], b"b")]
+    assert results == [
+        (0, addresses[0], None),
+        (1, addresses[0], None),
+        (2, addresses[1], b""),
+        (3, addresses[2], b"b"),
+    ]
 
 
 def test_read_blob_ranges_without_preserve_order_keeps_request_identity(
@@ -631,7 +677,7 @@ def test_read_blob_ranges_without_preserve_order_keeps_request_identity(
     dataset, _ = dataset_with_mixed_blob_v2
     results = dataset.read_blob_ranges(
         "blobs",
-        [(3, 0, 1), (1, 1, 2), (0, 0, 2)],
+        [(3, 0, 1), (4, 0, 1), (1, 1, 2), (0, 0, 2)],
         selector="indices",
         preserve_order=False,
     )
@@ -639,8 +685,9 @@ def test_read_blob_ranges_without_preserve_order_keeps_request_identity(
     assert sorted(results) == sorted(
         [
             (0, _blob_row_addresses(dataset)[3], b"e"),
-            (1, _blob_row_addresses(dataset)[1], b"ac"),
-            (2, _blob_row_addresses(dataset)[0], b"in"),
+            (1, _blob_row_addresses(dataset)[4], None),
+            (2, _blob_row_addresses(dataset)[1], b"ac"),
+            (3, _blob_row_addresses(dataset)[0], b"in"),
         ]
     )
 
@@ -704,8 +751,7 @@ def test_null_blobs(tmp_path):
     ds = lance.write_dataset(table, tmp_path / "test_ds")
 
     blobs = ds.take_blobs("blob", ids=range(100))
-    for blob in blobs:
-        assert blob.size() == 0
+    assert blobs == [None] * 100
 
     ds.insert(pa.table({"id": pa.array(range(100, 200), pa.uint64())}))
 
@@ -719,8 +765,7 @@ def test_null_blobs(tmp_path):
 
     for blob_col in ["blob", "more_blob"]:
         blobs = ds.take_blobs(blob_col, indices=range(100, 200))
-        for blob in blobs:
-            assert blob.size() == 0
+        assert blobs == [None] * 100
 
         blobs = ds.to_table(columns=[blob_col])
         for blob in blobs.column(blob_col):
@@ -1214,7 +1259,14 @@ def test_blob_extension_add_columns_all_nulls_blob_v2(tmp_path):
     ds.add_columns(lance.blob_field("blob"))
 
     assert ds.to_table(columns=["blob"]).column("blob").to_pylist() == [None] * 4
-    assert ds.take_blobs("blob", indices=range(4)) == []
+    assert ds.take_blobs("blob", indices=range(4)) == [None] * 4
+    assert [data for _, data in ds.read_blobs("blob", indices=range(4))] == [None] * 4
+    ranges = ds.read_blob_ranges(
+        "blob",
+        [(index, 0, 1) for index in range(4)],
+        selector="indices",
+    )
+    assert [data for _, _, data in ranges] == [None] * 4
 
 
 def test_blob_descriptor_array_builder_writes_prepared_packed_blob_for_data_replacement(
@@ -2123,7 +2175,7 @@ def test_write_nested_blob_v2_and_take_by_field_path(tmp_path):
     with blobs[1] as f:
         assert f.read() == packed
 
-    assert dataset.take_blobs("info.blob", indices=[2]) == []
+    assert dataset.take_blobs("info.blob", indices=[2]) == [None]
 
 
 def test_to_pandas_returns_blob_files_for_projected_nested_fields(

@@ -61,7 +61,8 @@ use lance::dataset::{
 };
 use lance::index::vector::utils::get_vector_type;
 use lance::index::{
-    DatasetIndexExt, DatasetIndexInternalExt, IndexSegment, vector::VectorIndexParams,
+    DatasetIndexExt, DatasetIndexInternalExt, IndexSegment, IntoIndexSegment,
+    vector::VectorIndexParams,
 };
 use lance::{dataset::builder::DatasetBuilder, index::vector::IndexFileVersion};
 use lance_arrow::as_fixed_size_list_array;
@@ -125,27 +126,33 @@ const DEFAULT_NPROBES: usize = 1;
 const LANCE_COMMIT_MESSAGE_KEY: &str = "__lance_commit_message";
 const INDEX_PROGRESS_QUEUE_SIZE: usize = 1024;
 
-fn read_blobs_to_python(
-    py: Python<'_>,
-    blobs: Vec<lance::dataset::ReadBlob>,
-) -> Vec<(u64, Py<PyBytes>)> {
+type PyBlobBytes = Option<Py<PyBytes>>;
+type PyReadBlob = (u64, PyBlobBytes);
+type PyReadBlobRange = (usize, u64, PyBlobBytes);
+
+fn read_blobs_to_python(py: Python<'_>, blobs: Vec<lance::dataset::ReadBlob>) -> Vec<PyReadBlob> {
     blobs
         .into_iter()
-        .map(|blob| (blob.row_address, PyBytes::new(py, &blob.data).unbind()))
+        .map(|blob| {
+            (
+                blob.row_address,
+                blob.data.map(|data| PyBytes::new(py, &data).unbind()),
+            )
+        })
         .collect()
 }
 
 fn read_blob_ranges_to_python(
     py: Python<'_>,
     ranges: Vec<lance::dataset::ReadBlobRange>,
-) -> Vec<(usize, u64, Py<PyBytes>)> {
+) -> Vec<PyReadBlobRange> {
     ranges
         .into_iter()
         .map(|range| {
             (
                 range.request_index,
                 range.row_address,
-                PyBytes::new(py, &range.data).unbind(),
+                range.data.map(|data| PyBytes::new(py, &data).unbind()),
             )
         })
         .collect()
@@ -203,7 +210,6 @@ fn stats_log_interval_from_millis(ms: u64) -> Option<std::time::Duration> {
 #[allow(clippy::too_many_arguments)]
 fn writer_config_from_kwargs(
     durable_write: Option<bool>,
-    sync_indexed_write: Option<bool>,
     max_wal_buffer_size: Option<usize>,
     max_wal_flush_interval_ms: Option<u64>,
     max_memtable_size: Option<usize>,
@@ -211,8 +217,6 @@ fn writer_config_from_kwargs(
     max_memtable_batches: Option<usize>,
     max_unflushed_memtable_bytes: Option<usize>,
     manifest_scan_batch_size: Option<usize>,
-    async_index_buffer_rows: Option<usize>,
-    async_index_interval_ms: Option<u64>,
     backpressure_log_interval_ms: Option<u64>,
     stats_log_interval_ms: Option<u64>,
     hnsw_params: Option<HashMap<String, HashMap<String, u32>>>,
@@ -223,10 +227,6 @@ fn writer_config_from_kwargs(
     let mut any = false;
     if let Some(v) = durable_write {
         config = config.with_durable_write(v);
-        any = true;
-    }
-    if let Some(v) = sync_indexed_write {
-        config = config.with_sync_indexed_write(v);
         any = true;
     }
     if let Some(v) = max_wal_buffer_size {
@@ -255,14 +255,6 @@ fn writer_config_from_kwargs(
     }
     if let Some(v) = manifest_scan_batch_size {
         config = config.with_manifest_scan_batch_size(v);
-        any = true;
-    }
-    if let Some(v) = async_index_buffer_rows {
-        config = config.with_async_index_buffer_rows(v);
-        any = true;
-    }
-    if let Some(v) = async_index_interval_ms {
-        config = config.with_async_index_interval(Duration::from_millis(v));
         any = true;
     }
     if let Some(v) = backpressure_log_interval_ms {
@@ -495,6 +487,60 @@ impl MergeInsertBuilder {
         Ok((PyLance(transaction), stats))
     }
 
+    /// Execute the merge insert from fully-materialized data.
+    ///
+    /// The data is read into memory and wrapped in an in-memory table, so retries
+    /// never spill to disk and the source's statistics drive the join. Callers
+    /// should only route in-memory inputs (e.g. a `pa.Table`) here.
+    pub fn execute_batches(&mut self, new_data: &Bound<PyAny>) -> PyResult<Py<PyAny>> {
+        let py = new_data.py();
+        let reader = convert_reader(new_data)?;
+        let batches = reader
+            .collect::<std::result::Result<Vec<RecordBatch>, _>>()
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        let job = self
+            .builder
+            .try_build()
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        let (new_dataset, stats) = rt()
+            .spawn(Some(py), job.execute_batches(batches))?
+            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
+
+        let dataset = self.dataset.bind(py);
+        dataset.borrow_mut().ds = new_dataset;
+
+        Ok(Self::build_stats(&stats, py)?.into())
+    }
+
+    /// [`Self::execute_batches`] without committing; returns the transaction.
+    pub fn execute_uncommitted_batches<'a>(
+        &mut self,
+        new_data: &Bound<'a, PyAny>,
+    ) -> PyResult<(PyLance<Transaction>, Bound<'a, PyDict>)> {
+        let py = new_data.py();
+        let reader = convert_reader(new_data)?;
+        let batches = reader
+            .collect::<std::result::Result<Vec<RecordBatch>, _>>()
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        let job = self
+            .builder
+            .try_build()
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        let UncommittedMergeInsert {
+            transaction, stats, ..
+        } = rt()
+            .spawn(Some(py), job.execute_uncommitted_batches(batches))?
+            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
+
+        let stats = Self::build_stats(&stats, py)?;
+
+        Ok((PyLance(transaction), stats))
+    }
+
     #[pyo3(signature=(schema = None, verbose = false))]
     pub fn explain_plan(
         &mut self,
@@ -526,46 +572,27 @@ impl MergeInsertBuilder {
             .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 
-    /// Mark MemWAL generations as merged into the base table.
+    /// Mark MemWAL SSTables as compacted into the base table.
     ///
-    /// Call this when executing a merge_insert that incorporates MemWAL
-    /// flushed generation data. This updates the MemWAL generation tracking
-    /// to prevent duplicate merges.
-    pub fn mark_generations_as_merged<'a>(
+    /// Call this when executing a merge_insert that compacts MemWAL SSTables.
+    /// This updates MemWAL compaction progress to prevent duplicate compactions.
+    pub fn mark_sstables_as_compacted<'a>(
         mut slf: PyRefMut<'a, Self>,
-        generations: Vec<Bound<'a, crate::mem_wal::PyMergedGeneration>>,
+        sstables: Vec<Bound<'a, crate::mem_wal::PyCompactedSsTable>>,
     ) -> PyResult<PyRefMut<'a, Self>> {
-        use lance_index::mem_wal::MergedGeneration;
+        use lance_index::mem_wal::CompactedSsTable;
 
-        let gens: Vec<MergedGeneration> = generations
+        let compacted_sstables: Vec<CompactedSsTable> = sstables
             .iter()
-            .map(|g| g.borrow().to_lance())
+            .map(|sstable| sstable.borrow().to_lance())
             .collect::<PyResult<_>>()?;
-        slf.builder.mark_generations_as_merged(gens);
+        slf.builder.mark_sstables_as_compacted(compacted_sstables);
         Ok(slf)
     }
 }
 
 fn index_metadata_to_segment(metadata: IndexMetadata) -> PyResult<IndexSegment> {
-    let fragment_bitmap = metadata.fragment_bitmap.ok_or_else(|| {
-        PyValueError::new_err(format!(
-            "Index metadata {} is missing fragment coverage",
-            metadata.uuid
-        ))
-    })?;
-    let index_details = metadata.index_details.ok_or_else(|| {
-        PyValueError::new_err(format!(
-            "Index metadata {} is missing index details",
-            metadata.uuid
-        ))
-    })?;
-
-    Ok(IndexSegment::new(
-        metadata.uuid,
-        fragment_bitmap.iter(),
-        index_details,
-        metadata.index_version,
-    ))
+    metadata.into_index_segment().infer_error()
 }
 
 fn extract_index_segments(segments: &Bound<'_, PyAny>) -> PyResult<Vec<IndexSegment>> {
@@ -1579,18 +1606,21 @@ impl Dataset {
         self_: PyRef<'_, Self>,
         row_ids: Vec<u64>,
         blob_column: &str,
-    ) -> PyResult<Vec<LanceBlobFile>> {
+    ) -> PyResult<Vec<Option<LanceBlobFile>>> {
         let blobs = rt()
             .block_on(Some(self_.py()), self_.ds.take_blobs(&row_ids, blob_column))?
             .infer_error()?;
-        Ok(blobs.into_iter().map(LanceBlobFile::from).collect())
+        Ok(blobs
+            .into_iter()
+            .map(|blob| blob.map(LanceBlobFile::from))
+            .collect())
     }
 
     fn take_blobs_by_addresses(
         self_: PyRef<'_, Self>,
         row_addresses: Vec<u64>,
         blob_column: &str,
-    ) -> PyResult<Vec<LanceBlobFile>> {
+    ) -> PyResult<Vec<Option<LanceBlobFile>>> {
         let blobs = rt()
             .block_on(
                 Some(self_.py()),
@@ -1599,21 +1629,27 @@ impl Dataset {
                     .take_blobs_by_addresses(&row_addresses, blob_column),
             )?
             .infer_error()?;
-        Ok(blobs.into_iter().map(LanceBlobFile::from).collect())
+        Ok(blobs
+            .into_iter()
+            .map(|blob| blob.map(LanceBlobFile::from))
+            .collect())
     }
 
     fn take_blobs_by_indices(
         self_: PyRef<'_, Self>,
         row_indices: Vec<u64>,
         blob_column: &str,
-    ) -> PyResult<Vec<LanceBlobFile>> {
+    ) -> PyResult<Vec<Option<LanceBlobFile>>> {
         let blobs = rt()
             .block_on(
                 Some(self_.py()),
                 self_.ds.take_blobs_by_indices(&row_indices, blob_column),
             )?
             .infer_error()?;
-        Ok(blobs.into_iter().map(LanceBlobFile::from).collect())
+        Ok(blobs
+            .into_iter()
+            .map(|blob| blob.map(LanceBlobFile::from))
+            .collect())
     }
 
     #[pyo3(signature=(
@@ -1628,7 +1664,7 @@ impl Dataset {
         blob_column: &str,
         io_buffer_size: Option<u64>,
         preserve_order: Option<bool>,
-    ) -> PyResult<Vec<(u64, Py<PyBytes>)>> {
+    ) -> PyResult<Vec<PyReadBlob>> {
         let builder = configure_read_blobs_builder(
             self_
                 .ds
@@ -1656,7 +1692,7 @@ impl Dataset {
         blob_column: &str,
         io_buffer_size: Option<u64>,
         preserve_order: Option<bool>,
-    ) -> PyResult<Vec<(u64, Py<PyBytes>)>> {
+    ) -> PyResult<Vec<PyReadBlob>> {
         let builder = configure_read_blobs_builder(
             self_
                 .ds
@@ -1684,7 +1720,7 @@ impl Dataset {
         blob_column: &str,
         io_buffer_size: Option<u64>,
         preserve_order: Option<bool>,
-    ) -> PyResult<Vec<(u64, Py<PyBytes>)>> {
+    ) -> PyResult<Vec<PyReadBlob>> {
         let builder = configure_read_blobs_builder(
             self_
                 .ds
@@ -1714,7 +1750,7 @@ impl Dataset {
         selector: &str,
         io_buffer_size: Option<u64>,
         preserve_order: Option<bool>,
-    ) -> PyResult<Vec<(usize, u64, Py<PyBytes>)>> {
+    ) -> PyResult<Vec<PyReadBlobRange>> {
         let requests = blob_range_requests_from_tuples(requests);
         let builder = self_.ds.read_blob_ranges(blob_column).infer_error()?;
         let builder = match selector {
@@ -3586,7 +3622,6 @@ impl Dataset {
         identity_column=None,
         unsharded=false,
         durable_write=None,
-        sync_indexed_write=None,
         max_wal_buffer_size=None,
         max_wal_flush_interval_ms=None,
         max_memtable_size=None,
@@ -3594,8 +3629,6 @@ impl Dataset {
         max_memtable_batches=None,
         max_unflushed_memtable_bytes=None,
         manifest_scan_batch_size=None,
-        async_index_buffer_rows=None,
-        async_index_interval_ms=None,
         backpressure_log_interval_ms=None,
         stats_log_interval_ms=None,
         hnsw_params=None,
@@ -3609,7 +3642,6 @@ impl Dataset {
         identity_column: Option<String>,
         unsharded: bool,
         durable_write: Option<bool>,
-        sync_indexed_write: Option<bool>,
         max_wal_buffer_size: Option<usize>,
         max_wal_flush_interval_ms: Option<u64>,
         max_memtable_size: Option<usize>,
@@ -3617,8 +3649,6 @@ impl Dataset {
         max_memtable_batches: Option<usize>,
         max_unflushed_memtable_bytes: Option<usize>,
         manifest_scan_batch_size: Option<usize>,
-        async_index_buffer_rows: Option<usize>,
-        async_index_interval_ms: Option<u64>,
         backpressure_log_interval_ms: Option<u64>,
         stats_log_interval_ms: Option<u64>,
         hnsw_params: Option<HashMap<String, HashMap<String, u32>>>,
@@ -3646,7 +3676,6 @@ impl Dataset {
 
         let writer_config = writer_config_from_kwargs(
             durable_write,
-            sync_indexed_write,
             max_wal_buffer_size,
             max_wal_flush_interval_ms,
             max_memtable_size,
@@ -3654,8 +3683,6 @@ impl Dataset {
             max_memtable_batches,
             max_unflushed_memtable_bytes,
             manifest_scan_batch_size,
-            async_index_buffer_rows,
-            async_index_interval_ms,
             backpressure_log_interval_ms,
             stats_log_interval_ms,
             hnsw_params,
@@ -3737,7 +3764,6 @@ impl Dataset {
         shard_id,
         *,
         durable_write=None,
-        sync_indexed_write=None,
         max_wal_buffer_size=None,
         max_wal_flush_interval_ms=None,
         max_memtable_size=None,
@@ -3745,8 +3771,6 @@ impl Dataset {
         max_memtable_batches=None,
         max_unflushed_memtable_bytes=None,
         manifest_scan_batch_size=None,
-        async_index_buffer_rows=None,
-        async_index_interval_ms=None,
         backpressure_log_interval_ms=None,
         stats_log_interval_ms=None,
         hnsw_params=None,
@@ -3756,7 +3780,6 @@ impl Dataset {
         py: Python<'_>,
         shard_id: String,
         durable_write: Option<bool>,
-        sync_indexed_write: Option<bool>,
         max_wal_buffer_size: Option<usize>,
         max_wal_flush_interval_ms: Option<u64>,
         max_memtable_size: Option<usize>,
@@ -3764,8 +3787,6 @@ impl Dataset {
         max_memtable_batches: Option<usize>,
         max_unflushed_memtable_bytes: Option<usize>,
         manifest_scan_batch_size: Option<usize>,
-        async_index_buffer_rows: Option<usize>,
-        async_index_interval_ms: Option<u64>,
         backpressure_log_interval_ms: Option<u64>,
         stats_log_interval_ms: Option<u64>,
         hnsw_params: Option<HashMap<String, HashMap<String, u32>>>,
@@ -3777,7 +3798,6 @@ impl Dataset {
 
         let config = writer_config_from_kwargs(
             durable_write,
-            sync_indexed_write,
             max_wal_buffer_size,
             max_wal_flush_interval_ms,
             max_memtable_size,
@@ -3785,8 +3805,6 @@ impl Dataset {
             max_memtable_batches,
             max_unflushed_memtable_bytes,
             manifest_scan_batch_size,
-            async_index_buffer_rows,
-            async_index_interval_ms,
             backpressure_log_interval_ms,
             stats_log_interval_ms,
             hnsw_params,

@@ -378,7 +378,7 @@ impl ScalarPredicate {
 ///
 /// # Index Visibility Model
 ///
-/// The scanner captures `max_visible_batch_position` from the `IndexStore` at
+/// The scanner captures `visible_count` from the `IndexStore` at
 /// construction time. This frozen visibility ensures queries only see data
 /// that has been indexed, providing consistent results.
 ///
@@ -401,8 +401,8 @@ pub struct MemTableScanner {
     indexes: Arc<IndexStore>,
     schema: SchemaRef,
     /// Frozen visibility captured at scanner construction time.
-    /// This is the `max_visible_batch_position` from the IndexStore.
-    max_visible_batch_position: usize,
+    /// This is the `visible_count` from the IndexStore.
+    visible_count: usize,
     projection: Option<Vec<String>>,
     filter: Option<Expr>,
     limit: Option<usize>,
@@ -427,7 +427,7 @@ pub struct MemTableScanner {
 impl MemTableScanner {
     /// Create a new scanner.
     ///
-    /// Captures `max_visible_batch_position` from the `IndexStore` at construction
+    /// Captures `visible_count` from the `IndexStore` at construction
     /// time to ensure consistent query visibility.
     ///
     /// # Arguments
@@ -439,13 +439,13 @@ impl MemTableScanner {
         // Snapshot the visibility cursor at construction time. The cursor is
         // advanced by `flush_from_batch_store` after the WAL append succeeds,
         // so this snapshot reflects WAL-durable data.
-        let max_visible_batch_position = indexes.max_visible_batch_position();
+        let visible_count = indexes.visible_count();
 
         Self {
             batch_store,
             indexes,
             schema,
-            max_visible_batch_position,
+            visible_count,
             projection: None,
             filter: None,
             limit: None,
@@ -504,12 +504,12 @@ impl MemTableScanner {
         self
     }
 
-    /// The `max_visible_batch_position` snapshot this scanner latched at
+    /// The `visible_count` snapshot this scanner latched at
     /// construction. A downstream recency filter must key on this same snapshot
     /// (not a fresh read of the IndexStore watermark, which a concurrent append
     /// could have advanced) so it stays consistent with the rows the search saw.
-    pub fn max_visible_batch_position(&self) -> usize {
-        self.max_visible_batch_position
+    pub fn visible_count(&self) -> usize {
+        self.visible_count
     }
 
     /// Include the _rowaddr column in output.
@@ -971,7 +971,7 @@ impl MemTableScanner {
 
         let scan = MemTableScanExec::with_filter(
             self.batch_store.clone(),
-            self.max_visible_batch_position,
+            self.visible_count,
             projection_indices,
             self.output_schema(),
             self.schema.clone(),
@@ -1033,7 +1033,7 @@ impl MemTableScanner {
 
         Ok(Arc::new(MemTableDedupScanExec::new(
             self.batch_store.clone(),
-            self.max_visible_batch_position,
+            self.visible_count,
             projection_indices,
             self.output_schema(),
             pk_indices,
@@ -1056,7 +1056,7 @@ impl MemTableScanner {
             return self.plan_full_scan().await;
         }
 
-        let max_visible = self.max_visible_batch_position;
+        let max_visible = self.visible_count;
         let projection_indices = self.compute_projection_indices()?;
 
         let index_exec = BTreeIndexExec::new(
@@ -1095,7 +1095,7 @@ impl MemTableScanner {
     }
 
     async fn plan_vector_search(&self, query: &VectorQuery) -> Result<Arc<dyn ExecutionPlan>> {
-        let max_visible = self.max_visible_batch_position;
+        let max_visible = self.visible_count;
         let projection_indices = self.compute_projection_indices()?;
         let base_schema = self.base_output_schema();
         let filter_predicate = self.filter_predicate()?;
@@ -1154,7 +1154,7 @@ impl MemTableScanner {
             return self.empty_fts_plan();
         }
 
-        let max_visible = self.max_visible_batch_position;
+        let max_visible = self.visible_count;
         let projection_indices = self.compute_projection_indices()?;
         let filter_predicate = self.filter_predicate()?;
         if let Some(pk_columns) = &self.pk_columns {
@@ -1426,7 +1426,7 @@ mod tests {
         let indexes = Arc::new(index_store);
         let scanner = MemTableScanner::new(batch_store, indexes, schema.clone());
         let result = scanner.try_into_batch().await.unwrap();
-        // max_visible_batch_position is 1, so we see batches 0 and 1 (20 rows)
+        // visible_count is 1, so we see batches 0 and 1 (20 rows)
         assert_eq!(result.num_rows(), 20);
     }
 

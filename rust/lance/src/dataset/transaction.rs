@@ -15,7 +15,7 @@
 use super::ManifestWriteConfig;
 use super::write::merge_insert::inserted_rows::KeyExistenceFilter;
 use crate::dataset::transaction::UpdateMode::{RewriteColumns, RewriteRows};
-use crate::index::mem_wal::update_mem_wal_index_merged_generations;
+use crate::index::mem_wal::update_mem_wal_index_compacted_sstables;
 use crate::utils::temporal::timestamp_to_nanos;
 use lance_core::datatypes::{
     LANCE_UNENFORCED_CLUSTERING_KEY_POSITION, LANCE_UNENFORCED_PRIMARY_KEY,
@@ -24,7 +24,7 @@ use lance_core::datatypes::{
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result, datatypes::Schema};
 use lance_file::{datatypes::Fields, version::LanceFileVersion};
-use lance_index::mem_wal::MergedGeneration;
+use lance_index::mem_wal::CompactedSsTable;
 use lance_index::{frag_reuse::FRAG_REUSE_INDEX_NAME, is_system_index};
 use lance_io::object_store::ObjectStore;
 use lance_table::feature_flags::{FLAG_STABLE_ROW_IDS, apply_feature_flags};
@@ -424,8 +424,8 @@ pub enum Operation {
         new_fragments: Vec<Fragment>,
         /// The fields that have been modified
         fields_modified: Vec<u32>,
-        /// List of MemWAL region generations to mark as merged after this transaction
-        merged_generations: Vec<MergedGeneration>,
+        /// MemWAL SSTables to mark as compacted after this transaction.
+        compacted_sstables: Vec<CompactedSsTable>,
         /// The fields that used to judge whether to preserve the new frag's id into
         /// the frag bitmap of the specified indices.
         fields_for_preserving_frag_bitmap: Vec<u32>,
@@ -449,11 +449,12 @@ pub enum Operation {
         schema_metadata_updates: Option<UpdateMap>,
         field_metadata_updates: HashMap<i32, UpdateMap>,
     },
-    /// Update merged generations in MemWAL index.
+    /// Update SSTable compaction progress in the MemWAL index.
+    ///
     /// This is used during merge-insert to atomically record which
-    /// generations have been merged to the base table.
+    /// SSTables have been compacted into the base table.
     UpdateMemWalState {
-        merged_generations: Vec<MergedGeneration>,
+        compacted_sstables: Vec<CompactedSsTable>,
     },
 
     /// Clone a dataset.
@@ -649,7 +650,7 @@ impl PartialEq for Operation {
                     updated_fragments: a_updated,
                     new_fragments: a_new,
                     fields_modified: a_fields,
-                    merged_generations: a_merged_generations,
+                    compacted_sstables: a_compacted_sstables,
                     fields_for_preserving_frag_bitmap: a_fields_for_preserving_frag_bitmap,
                     update_mode: a_update_mode,
                     inserted_rows_filter: a_inserted_rows_filter,
@@ -660,7 +661,7 @@ impl PartialEq for Operation {
                     updated_fragments: b_updated,
                     new_fragments: b_new,
                     fields_modified: b_fields,
-                    merged_generations: b_merged_generations,
+                    compacted_sstables: b_compacted_sstables,
                     fields_for_preserving_frag_bitmap: b_fields_for_preserving_frag_bitmap,
                     update_mode: b_update_mode,
                     inserted_rows_filter: b_inserted_rows_filter,
@@ -671,7 +672,7 @@ impl PartialEq for Operation {
                     && compare_vec(a_updated, b_updated)
                     && compare_vec(a_new, b_new)
                     && compare_vec(a_fields, b_fields)
-                    && compare_vec(a_merged_generations, b_merged_generations)
+                    && compare_vec(a_compacted_sstables, b_compacted_sstables)
                     && compare_vec(
                         a_fields_for_preserving_frag_bitmap,
                         b_fields_for_preserving_frag_bitmap,
@@ -1228,12 +1229,12 @@ impl PartialEq for Operation {
             }
             (
                 Self::UpdateMemWalState {
-                    merged_generations: a_merged,
+                    compacted_sstables: a_compacted,
                 },
                 Self::UpdateMemWalState {
-                    merged_generations: b_merged,
+                    compacted_sstables: b_compacted,
                 },
-            ) => compare_vec(a_merged, b_merged),
+            ) => compare_vec(a_compacted, b_compacted),
             (Self::Clone { .. }, Self::Append { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
@@ -1928,7 +1929,7 @@ impl Transaction {
                 updated_fragments,
                 new_fragments,
                 fields_modified,
-                merged_generations,
+                compacted_sstables,
                 fields_for_preserving_frag_bitmap,
                 update_mode,
                 updated_fragment_offsets,
@@ -2063,11 +2064,11 @@ impl Transaction {
                 final_fragments.extend(new_fragments);
                 Self::retain_relevant_indices(&mut final_indices, &schema, &final_fragments);
 
-                if !merged_generations.is_empty() {
-                    update_mem_wal_index_merged_generations(
+                if !compacted_sstables.is_empty() {
+                    update_mem_wal_index_compacted_sstables(
                         &mut final_indices,
                         new_version,
-                        merged_generations.clone(),
+                        compacted_sstables.clone(),
                     )?;
                 }
             }
@@ -2398,11 +2399,11 @@ impl Transaction {
                     final_fragments.push(fragment);
                 }
             }
-            Operation::UpdateMemWalState { merged_generations } => {
-                update_mem_wal_index_merged_generations(
+            Operation::UpdateMemWalState { compacted_sstables } => {
+                update_mem_wal_index_compacted_sstables(
                     &mut final_indices,
                     new_version,
-                    merged_generations.clone(),
+                    compacted_sstables.clone(),
                 )?;
             }
             Operation::UpdateBases { .. } => {
@@ -3380,7 +3381,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                 updated_fragments,
                 new_fragments,
                 fields_modified,
-                merged_generations,
+                compacted_sstables,
                 fields_for_preserving_frag_bitmap,
                 update_mode,
                 inserted_rows,
@@ -3396,9 +3397,9 @@ impl TryFrom<pb::Transaction> for Transaction {
                     .map(Fragment::try_from)
                     .collect::<Result<Vec<_>>>()?,
                 fields_modified,
-                merged_generations: merged_generations
+                compacted_sstables: compacted_sstables
                     .into_iter()
-                    .map(|m| MergedGeneration::try_from(m).unwrap())
+                    .map(|m| CompactedSsTable::try_from(m).unwrap())
                     .collect(),
                 fields_for_preserving_frag_bitmap,
                 update_mode: match update_mode {
@@ -3516,11 +3517,11 @@ impl TryFrom<pb::Transaction> for Transaction {
                     .collect::<Result<Vec<_>>>()?,
             },
             Some(pb::transaction::Operation::UpdateMemWalState(
-                pb::transaction::UpdateMemWalState { merged_generations },
+                pb::transaction::UpdateMemWalState { compacted_sstables },
             )) => Operation::UpdateMemWalState {
-                merged_generations: merged_generations
+                compacted_sstables: compacted_sstables
                     .into_iter()
-                    .map(|m| MergedGeneration::try_from(m).unwrap())
+                    .map(|m| CompactedSsTable::try_from(m).unwrap())
                     .collect(),
             },
             Some(pb::transaction::Operation::UpdateBases(pb::transaction::UpdateBases {
@@ -3727,7 +3728,7 @@ impl From<&Transaction> for pb::Transaction {
                 updated_fragments,
                 new_fragments,
                 fields_modified,
-                merged_generations,
+                compacted_sstables,
                 fields_for_preserving_frag_bitmap,
                 update_mode,
                 inserted_rows_filter,
@@ -3740,9 +3741,9 @@ impl From<&Transaction> for pb::Transaction {
                     .collect(),
                 new_fragments: new_fragments.iter().map(pb::DataFragment::from).collect(),
                 fields_modified: fields_modified.clone(),
-                merged_generations: merged_generations
+                compacted_sstables: compacted_sstables
                     .iter()
-                    .map(pb::MergedGeneration::from)
+                    .map(pb::CompactedSsTable::from)
                     .collect(),
                 fields_for_preserving_frag_bitmap: fields_for_preserving_frag_bitmap.clone(),
                 update_mode: update_mode
@@ -3814,11 +3815,11 @@ impl From<&Transaction> for pb::Transaction {
                         .collect(),
                 })
             }
-            Operation::UpdateMemWalState { merged_generations } => {
+            Operation::UpdateMemWalState { compacted_sstables } => {
                 pb::transaction::Operation::UpdateMemWalState(pb::transaction::UpdateMemWalState {
-                    merged_generations: merged_generations
+                    compacted_sstables: compacted_sstables
                         .iter()
-                        .map(pb::MergedGeneration::from)
+                        .map(pb::CompactedSsTable::from)
                         .collect::<Vec<_>>(),
                 })
             }
@@ -5117,7 +5118,7 @@ mod tests {
                 updated_fragments: vec![fragment],
                 new_fragments: vec![],
                 fields_modified: vec![],
-                merged_generations: vec![],
+                compacted_sstables: vec![],
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: Some(UpdateMode::RewriteColumns),
                 inserted_rows_filter: None,
@@ -5270,7 +5271,7 @@ mod tests {
             updated_fragments: vec![u.fragment],
             new_fragments: vec![],
             fields_modified: u.fields_modified,
-            merged_generations: Vec::new(),
+            compacted_sstables: Vec::new(),
             fields_for_preserving_frag_bitmap: vec![],
             update_mode: Some(UpdateMode::RewriteColumns),
             inserted_rows_filter: None,
@@ -5411,7 +5412,7 @@ mod tests {
                 updated_fragments: vec![],
                 new_fragments,
                 fields_modified: vec![],
-                merged_generations: vec![],
+                compacted_sstables: vec![],
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
                 inserted_rows_filter: None,

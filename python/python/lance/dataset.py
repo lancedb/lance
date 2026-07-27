@@ -71,7 +71,7 @@ from .lance import (
 from .lance import __version__ as __version__
 from .lance import _Session as Session
 from .query import FullTextQuery
-from .types import _coerce_reader
+from .types import _coerce_reader, _is_materialized
 from .udf import BatchUDF, normalize_transform
 from .udf import BatchUDFCheckpoint as BatchUDFCheckpoint
 from .udf import batch_udf as batch_udf
@@ -397,6 +397,12 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         """
         reader = _coerce_reader(data_obj, schema)
 
+        # Materialized sources are wrapped in an in-memory table so retries never
+        # spill and the source's statistics can drive the join; everything else is
+        # treated as a one-shot stream.
+        if _is_materialized(data_obj):
+            return super(MergeInsertBuilder, self).execute_batches(reader)
+
         return super(MergeInsertBuilder, self).execute(reader)
 
     def execute_uncommitted(
@@ -420,6 +426,9 @@ class MergeInsertBuilder(_MergeInsertBuilder):
             source is some kind of generator.
         """
         reader = _coerce_reader(data_obj, schema)
+
+        if _is_materialized(data_obj):
+            return super(MergeInsertBuilder, self).execute_uncommitted_batches(reader)
 
         return super(MergeInsertBuilder, self).execute_uncommitted(reader)
 
@@ -739,23 +748,22 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         reader = _coerce_reader(data_obj, schema)
         return super(MergeInsertBuilder, self).analyze_plan(reader)
 
-    def mark_generations_as_merged(
-        self, generations: "List[mem_wal.MergedGeneration]"
+    def mark_sstables_as_compacted(
+        self, sstables: "List[mem_wal.CompactedSsTable]"
     ) -> "MergeInsertBuilder":
-        """Mark MemWAL generations as merged into the base table.
+        """Mark MemWAL SSTables as compacted into the base table.
 
-        Call this before executing the merge_insert when the source data
-        includes rows from MemWAL flushed generations.
+        Call this before executing merge_insert when it compacts MemWAL SSTables.
 
         Parameters
         ----------
-        generations : list of MergedGeneration
-            Generations to mark as merged.
+        sstables : list of CompactedSsTable
+            SSTables to mark as compacted.
         """
-        from .mem_wal import _to_raw_merged_generations
+        from .mem_wal import _to_raw_compacted_sstables
 
-        raw_gens = _to_raw_merged_generations(generations)
-        super(MergeInsertBuilder, self).mark_generations_as_merged(raw_gens)
+        raw_sstables = _to_raw_compacted_sstables(sstables)
+        super(MergeInsertBuilder, self).mark_sstables_as_compacted(raw_sstables)
         return self
 
 
@@ -2166,7 +2174,7 @@ class LanceDataset(pa.dataset.Dataset):
         ids: Optional[Union[List[int], pa.Array]] = None,
         addresses: Optional[Union[List[int], pa.Array]] = None,
         indices: Optional[Union[List[int], pa.Array]] = None,
-    ) -> List[BlobFile]:
+    ) -> List[Optional[BlobFile]]:
         """
         Select blobs by row IDs.
 
@@ -2193,7 +2201,9 @@ class LanceDataset(pa.dataset.Dataset):
 
         Returns
         -------
-        blob_files : List[BlobFile]
+        blob_files : List[Optional[BlobFile]]
+            One element per selected row. Null blob values return ``None``;
+            valid empty blobs return a ``BlobFile`` with size zero.
         """
         selection_kind, selection_values = _resolve_blob_selection(
             ids, addresses, indices
@@ -2209,7 +2219,10 @@ class LanceDataset(pa.dataset.Dataset):
             lance_blob_files = self._ds.take_blobs_by_indices(
                 selection_values, blob_column
             )
-        return [BlobFile(lance_blob_file) for lance_blob_file in lance_blob_files]
+        return [
+            BlobFile(lance_blob_file) if lance_blob_file is not None else None
+            for lance_blob_file in lance_blob_files
+        ]
 
     def read_blobs(
         self,
@@ -2220,7 +2233,7 @@ class LanceDataset(pa.dataset.Dataset):
         *,
         io_buffer_size: Optional[int] = None,
         preserve_order: Optional[bool] = None,
-    ) -> List[Tuple[int, bytes]]:
+    ) -> List[Tuple[int, Optional[bytes]]]:
         """
         Read blobs directly into memory using Lance's planned blob reader.
 
@@ -2248,8 +2261,9 @@ class LanceDataset(pa.dataset.Dataset):
 
         Returns
         -------
-        blobs : List[Tuple[int, bytes]]
-            A list of ``(row_address, blob_bytes)`` pairs.
+        blobs : List[Tuple[int, Optional[bytes]]]
+            One ``(row_address, blob_bytes)`` pair per selected row. Null blob
+            values return ``None``; valid empty blobs return ``b""``.
         """
         selection_kind, selection_values = _resolve_blob_selection(
             ids, addresses, indices
@@ -2275,7 +2289,7 @@ class LanceDataset(pa.dataset.Dataset):
         selector: Literal["ids", "addresses", "indices"],
         io_buffer_size: Optional[int] = None,
         preserve_order: Optional[bool] = None,
-    ) -> List[Tuple[int, int, bytes]]:
+    ) -> List[Tuple[int, int, Optional[bytes]]]:
         """
         Read row-specific blob-local byte ranges with one planned API call.
 
@@ -2286,9 +2300,13 @@ class LanceDataset(pa.dataset.Dataset):
         request coalescing, and bounded I/O scheduling all happen in Rust; this
         method does not use a Python thread pool.
 
-        Null blob requests produce no result. Empty ranges on non-null blobs
-        return empty bytes without issuing payload I/O. By default results
-        preserve the input order among non-null requests.
+        Every request produces one result. Requests on null blobs return ``None``,
+        including when the requested range is empty. Empty ranges on non-null
+        blobs return empty bytes without issuing payload I/O. For every request,
+        offset plus length must fit in an unsigned 64-bit integer. Ranges on
+        non-null blobs must not extend beyond the logical blob size. Blob-local
+        bounds are not evaluated for null values because they have no logical
+        payload length. By default results preserve the input request order.
 
         Parameters
         ----------
@@ -2318,8 +2336,8 @@ class LanceDataset(pa.dataset.Dataset):
 
         Returns
         -------
-        results : List[Tuple[int, int, bytes]]
-            ``(request_index, row_address, data)`` for each non-null request.
+        results : List[Tuple[int, int, Optional[bytes]]]
+            One ``(request_index, row_address, data)`` tuple per request.
             The Python list retains all returned payload bytes in memory; peak
             result memory is therefore proportional to their total logical size.
         """
@@ -3289,7 +3307,10 @@ class LanceDataset(pa.dataset.Dataset):
             "BITMAP",
             "INVERTED",
             "FTS",
+            "NGRAM",
+            "RTREE",
             "ZONEMAP",
+            "BLOOMFILTER",
         }
 
     @classmethod
@@ -3300,7 +3321,10 @@ class LanceDataset(pa.dataset.Dataset):
         return cls._normalized_index_type(index_type) in {
             "BTREE",
             "BITMAP",
+            "NGRAM",
+            "RTREE",
             "ZONEMAP",
+            "BLOOMFILTER",
         }
 
     def create_scalar_index(
@@ -4256,8 +4280,9 @@ class LanceDataset(pa.dataset.Dataset):
         Create one segment without publishing it and return its metadata.
 
         This is the public distributed-build API for vector, BTREE scalar,
-        canonical bitmap scalar, INVERTED scalar, and ZONEMAP scalar index
-        construction. Unlike
+        canonical bitmap scalar, INVERTED scalar, NGRAM scalar, RTREE scalar,
+        ZONEMAP scalar,
+        and BLOOMFILTER scalar index construction. Unlike
         :meth:`create_index`, this method does not publish the index into the
         dataset manifest. Instead, it writes one segment under
         ``_indices/<segment_uuid>/`` and returns the resulting
@@ -4273,8 +4298,10 @@ class LanceDataset(pa.dataset.Dataset):
         4. commit the final segment list with
            :meth:`commit_existing_index_segments`
 
-        BTREE, BITMAP, INVERTED, and ZONEMAP segments may
+        BTREE, BITMAP, INVERTED, NGRAM, RTREE, ZONEMAP, and BLOOMFILTER segments may
         be merged with :meth:`merge_existing_index_segments` before commit.
+        NGRAM segments built before a deferred compaction must be merged before
+        commit so their postings can be rebuilt against current row addresses.
         Parameters are the same as :meth:`create_index`, with one additional
         requirement:
 
@@ -5150,7 +5177,6 @@ class LanceDataset(pa.dataset.Dataset):
         identity_column: Optional[str] = None,
         unsharded: bool = False,
         durable_write: Optional[bool] = None,
-        sync_indexed_write: Optional[bool] = None,
         max_wal_buffer_size: Optional[int] = None,
         max_wal_flush_interval_ms: Optional[int] = None,
         max_memtable_size: Optional[int] = None,
@@ -5158,8 +5184,6 @@ class LanceDataset(pa.dataset.Dataset):
         max_memtable_batches: Optional[int] = None,
         max_unflushed_memtable_bytes: Optional[int] = None,
         manifest_scan_batch_size: Optional[int] = None,
-        async_index_buffer_rows: Optional[int] = None,
-        async_index_interval_ms: Optional[int] = None,
         backpressure_log_interval_ms: Optional[int] = None,
         stats_log_interval_ms: Optional[int] = None,
         hnsw_params: Optional[Dict[str, Dict[str, int]]] = None,
@@ -5220,7 +5244,6 @@ class LanceDataset(pa.dataset.Dataset):
             identity_column=identity_column,
             unsharded=unsharded,
             durable_write=durable_write,
-            sync_indexed_write=sync_indexed_write,
             max_wal_buffer_size=max_wal_buffer_size,
             max_wal_flush_interval_ms=max_wal_flush_interval_ms,
             max_memtable_size=max_memtable_size,
@@ -5228,8 +5251,6 @@ class LanceDataset(pa.dataset.Dataset):
             max_memtable_batches=max_memtable_batches,
             max_unflushed_memtable_bytes=max_unflushed_memtable_bytes,
             manifest_scan_batch_size=manifest_scan_batch_size,
-            async_index_buffer_rows=async_index_buffer_rows,
-            async_index_interval_ms=async_index_interval_ms,
             backpressure_log_interval_ms=backpressure_log_interval_ms,
             stats_log_interval_ms=stats_log_interval_ms,
             hnsw_params=hnsw_params,
@@ -5252,7 +5273,6 @@ class LanceDataset(pa.dataset.Dataset):
         shard_id: str,
         *,
         durable_write: Optional[bool] = None,
-        sync_indexed_write: Optional[bool] = None,
         max_wal_buffer_size: Optional[int] = None,
         max_wal_flush_interval_ms: Optional[int] = None,
         max_memtable_size: Optional[int] = None,
@@ -5260,8 +5280,6 @@ class LanceDataset(pa.dataset.Dataset):
         max_memtable_batches: Optional[int] = None,
         max_unflushed_memtable_bytes: Optional[int] = None,
         manifest_scan_batch_size: Optional[int] = None,
-        async_index_buffer_rows: Optional[int] = None,
-        async_index_interval_ms: Optional[int] = None,
         backpressure_log_interval_ms: Optional[int] = None,
         stats_log_interval_ms: Optional[int] = None,
         hnsw_params: Optional[Dict[str, Dict[str, int]]] = None,
@@ -5279,8 +5297,6 @@ class LanceDataset(pa.dataset.Dataset):
             ``str(uuid.uuid4())``).
         durable_write : bool, optional
             Whether to fsync WAL writes (default: ``True``).
-        sync_indexed_write : bool, optional
-            Whether index updates are synchronous (default: ``True``).
         max_wal_buffer_size : int, optional
             Maximum WAL buffer size in bytes (default: 10 MB).
         max_wal_flush_interval_ms : int, optional
@@ -5295,10 +5311,6 @@ class LanceDataset(pa.dataset.Dataset):
             Maximum unflushed bytes before backpressure (default: 1 GB).
         manifest_scan_batch_size : int, optional
             Batch size for manifest scans (default: 2).
-        async_index_buffer_rows : int, optional
-            Buffer rows for async index updates (default: 10 000).
-        async_index_interval_ms : int, optional
-            Interval for async index updates in milliseconds (default: 1000).
         backpressure_log_interval_ms : int, optional
             Interval for backpressure log messages in milliseconds
             (default: 30 000).
@@ -5346,7 +5358,6 @@ class LanceDataset(pa.dataset.Dataset):
             name: val
             for name, val in [
                 ("durable_write", durable_write),
-                ("sync_indexed_write", sync_indexed_write),
                 ("max_wal_buffer_size", max_wal_buffer_size),
                 ("max_wal_flush_interval_ms", max_wal_flush_interval_ms),
                 ("max_memtable_size", max_memtable_size),
@@ -5354,8 +5365,6 @@ class LanceDataset(pa.dataset.Dataset):
                 ("max_memtable_batches", max_memtable_batches),
                 ("max_unflushed_memtable_bytes", max_unflushed_memtable_bytes),
                 ("manifest_scan_batch_size", manifest_scan_batch_size),
-                ("async_index_buffer_rows", async_index_buffer_rows),
-                ("async_index_interval_ms", async_index_interval_ms),
                 ("backpressure_log_interval_ms", backpressure_log_interval_ms),
                 ("stats_log_interval_ms", stats_log_interval_ms),
                 ("hnsw_params", hnsw_params),

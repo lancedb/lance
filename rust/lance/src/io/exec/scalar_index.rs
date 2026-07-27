@@ -6,7 +6,7 @@ use std::sync::{Arc, LazyLock};
 use super::utils::{IndexMetrics, InstrumentedRecordBatchStreamAdapter};
 use crate::{
     Dataset,
-    dataset::rowids::{load_row_id_sequence, load_row_id_sequences},
+    dataset::rowids::{load_row_id_sequences, translate_addr_treemap_to_row_ids},
     index::{
         prefilter::DatasetPreFilter,
         scalar_logical::{open_named_scalar_index, scalar_index_fragment_bitmap},
@@ -43,7 +43,7 @@ use lance_index::{
 };
 use lance_select::{
     IndexExprResult, NullableIndexExprResult, NullableRowAddrMask, NullableRowAddrSet, RowAddrMask,
-    RowAddrSelection, RowAddrTreeMap, RowSetOps, result::IndexExprResultWireFormat,
+    RowAddrTreeMap, RowSetOps, result::IndexExprResultWireFormat,
 };
 use lance_table::format::Fragment;
 use roaring::RoaringBitmap;
@@ -103,68 +103,6 @@ async fn translate_addr_set_to_row_ids(
     let selected = translate_addr_treemap_to_row_ids(dataset, set.selected_rows()).await?;
     let nulls = translate_addr_treemap_to_row_ids(dataset, set.null_rows()).await?;
     Ok(NullableRowAddrSet::new(selected, nulls))
-}
-
-/// Map a set of physical row addresses to their stable row ids
-///
-/// For each fragment present in `addrs`, the live rows in physical order carry
-/// the stable ids yielded by the fragment's [`RowIdSequence`] in the same
-/// order. Zipping the two (skipping deleted physical offsets) gives the
-/// `physical offset -> stable id` mapping. Addresses that point at deleted rows
-/// have no live counterpart and are dropped, which is correct: those rows are
-/// not part of the answer.
-async fn translate_addr_treemap_to_row_ids(
-    dataset: &Dataset,
-    addrs: &RowAddrTreeMap,
-) -> Result<RowAddrTreeMap> {
-    let mut row_ids = RowAddrTreeMap::new();
-    for (fragment_id, selection) in addrs.iter() {
-        let file_fragment = dataset.get_fragment(*fragment_id as usize).ok_or_else(|| {
-            Error::internal(format!(
-                "fragment {fragment_id} referenced by an address-domain index result \
-                 was not found in the dataset"
-            ))
-        })?;
-        let sequence = load_row_id_sequence(dataset, file_fragment.metadata()).await?;
-
-        match selection {
-            RowAddrSelection::Full => {
-                // The whole fragment is selected: every live row's id qualifies.
-                row_ids |= RowAddrTreeMap::from(sequence.as_ref());
-            }
-            RowAddrSelection::Partial(offsets) => {
-                let Some(max_offset) = offsets.max() else {
-                    continue;
-                };
-                let (deletion_vector, num_physical_rows) = futures::try_join!(
-                    file_fragment.get_deletion_vector(),
-                    file_fragment.physical_rows()
-                )?;
-                let num_physical_rows = num_physical_rows as u32;
-                let mut ids = sequence.iter();
-                for physical_offset in 0..num_physical_rows {
-                    if physical_offset > max_offset {
-                        break;
-                    }
-                    let deleted = deletion_vector
-                        .as_ref()
-                        .is_some_and(|dv| dv.contains(physical_offset));
-                    if deleted {
-                        continue;
-                    }
-                    match ids.next() {
-                        Some(id) => {
-                            if offsets.contains(physical_offset) {
-                                row_ids.insert(id);
-                            }
-                        }
-                        None => break,
-                    }
-                }
-            }
-        }
-    }
-    Ok(row_ids)
 }
 
 /// An execution node that performs a scalar index search
@@ -660,6 +598,10 @@ pub struct MaterializeIndexExec {
     dataset: Arc<Dataset>,
     expr: ScalarIndexExpr,
     fragments: Arc<Vec<Fragment>>,
+    /// Row addresses blocked from the index result due to data overlay files committed after the
+    /// index was built. ANDead into the candidate mask before row ID materialisation so that stale
+    /// index entries never reach downstream operators.
+    overlay_block: Option<RowAddrMask>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -732,9 +674,16 @@ impl MaterializeIndexExec {
             dataset,
             expr,
             fragments,
+            overlay_block: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
+    }
+
+    /// Block specific row addresses (see the `overlay_block` field) from the index result.
+    pub fn with_overlay_block(mut self, block: RowAddrMask) -> Self {
+        self.overlay_block = Some(block);
+        self
     }
 
     #[instrument(name = "materialize_scalar_index", skip_all, level = "debug")]
@@ -742,6 +691,7 @@ impl MaterializeIndexExec {
         expr: ScalarIndexExpr,
         dataset: Arc<Dataset>,
         fragments: Arc<Vec<Fragment>>,
+        overlay_block: Option<RowAddrMask>,
         metrics: Arc<IndexMetrics>,
     ) -> Result<RecordBatch> {
         let expr_result = expr.evaluate(dataset.as_ref(), metrics.as_ref());
@@ -769,12 +719,15 @@ impl MaterializeIndexExec {
             }
             Ok(result.upper)
         };
-        let mask = if let Some(prefilter) = prefilter {
+        let mut mask = if let Some(prefilter) = prefilter {
             let (expr_result, prefilter) = futures::try_join!(expr_result, prefilter)?;
             take_upper(expr_result)? & (*prefilter).clone()
         } else {
             take_upper(expr_result.await?)?
         };
+        if let Some(block) = overlay_block {
+            mask = mask & block;
+        }
         let ids = row_ids_for_mask(mask, &dataset, &fragments).await?;
         let ids = UInt64Array::from(ids);
         Ok(RecordBatch::try_new(
@@ -906,6 +859,7 @@ impl ExecutionPlan for MaterializeIndexExec {
             self.expr.clone(),
             self.dataset.clone(),
             self.fragments.clone(),
+            self.overlay_block.clone(),
             metrics,
         );
         let stream = futures::stream::iter(vec![batch_fut])

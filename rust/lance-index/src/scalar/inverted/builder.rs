@@ -3570,8 +3570,9 @@ mod tests {
             .await?;
 
         let index = InvertedIndex::load(store, None, &LanceCache::no_cache()).await?;
-        let (total_tokens, num_docs, token_docs) =
-            index.bm25_stats_for_terms(&["hello".to_string()]).await?;
+        let (total_tokens, num_docs, token_docs) = index
+            .bm25_stats_for_terms(&["hello".to_string()], None)
+            .await?;
         assert_eq!(total_tokens, 1);
         assert_eq!(num_docs, 1);
         assert_eq!(token_docs, vec![1]);
