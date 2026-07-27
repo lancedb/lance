@@ -981,16 +981,6 @@ async fn test_fts_combines_indexed_overlay_stale_and_unindexed_rows(
     let mut dataset = create_text_dataset(stable_row_ids).await;
     build_text_fts_index_with_positions(&mut dataset).await;
 
-    let dataset = commit_overlay(
-        dataset,
-        "fts_combined_flat_paths",
-        0,
-        &[1],
-        OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
-        vec![Arc::new(StringArray::from(vec![Some("cherry mango")]))],
-    )
-    .await;
-
     let batch =
         arrow_array::record_batch!(("id", Int32, [12]), ("text", Utf8, ["cherry mango"])).unwrap();
     let schema = batch.schema();
@@ -1005,6 +995,16 @@ async fn test_fts_combines_indexed_overlay_stale_and_unindexed_rows(
     )
     .await
     .unwrap();
+
+    let dataset = commit_overlay(
+        dataset,
+        "fts_combined_flat_paths",
+        0,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+        vec![Arc::new(StringArray::from(vec![Some("cherry mango")]))],
+    )
+    .await;
 
     assert_eq!(fts_ids_matching(&dataset, "mango").await, vec![1, 6, 12]);
     assert_eq!(
