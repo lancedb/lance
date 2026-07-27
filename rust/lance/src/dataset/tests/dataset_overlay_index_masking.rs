@@ -409,6 +409,55 @@ async fn test_overlay_multi_fragment(#[values(false, true)] stable_row_ids: bool
     assert_eq!(ids_matching(&dataset, "age = 30").await, vec![3]);
 }
 
+/// A deletion below an overlaid row must not corrupt the physical-offset → stable-row-id
+/// translation used to build the overlay block mask.
+///
+/// Under stable row ids the stale-row block/take set is computed by mapping each stale
+/// *physical offset* to its stable row id via the fragment's `RowIdSequence`. The sequence
+/// keeps one entry per physical row (deleted rows are tracked separately by the deletion
+/// vector, not compacted out), so the correct mapping is `sequence.get(offset)`. A regression
+/// that instead advanced a `sequence.iter()` cursor only for non-deleted offsets desynced the
+/// cursor after any deletion at an offset *below* the stale one, blocking/taking the wrong row
+/// id: the stale index hit then leaked and the new value was never surfaced.
+///
+/// Setup (stable row ids): fragment 1 holds ids 6..12 at offsets 0..6. Delete id=6 (offset 0),
+/// then overlay offset 2 (id=8, age 80 → 999). The deletion at offset 0 sits below the stale
+/// offset 2, so a cursor-based translation would map offset 2 to id=7 instead of id=8.
+///
+/// Parametrized over `stable_row_ids`: only the stable-row-id path translates offsets to row
+/// ids, so the bug is specific to it; the non-stable case (addresses are row ids) is a control.
+#[rstest]
+#[tokio::test]
+async fn test_btree_overlay_stale_row_with_prior_deletion(
+    #[values(false, true)] stable_row_ids: bool,
+) {
+    let mut dataset = create_base_dataset_with(stable_row_ids).await;
+    build_age_index(&mut dataset).await;
+
+    // Delete id=6 (fragment 1, offset 0) — a deletion hole below the row the overlay marks stale.
+    dataset.delete("id = 6").await.unwrap();
+
+    // Fragment 1, offset 2 is id=8 (age 80). The overlay (committed after the index) → age 999.
+    let dataset = commit_overlay(
+        dataset,
+        "age_overlay_del",
+        1,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([2])),
+        vec![i32_array([Some(999)])],
+    )
+    .await;
+
+    // Stale-drop: id=8's old age=80 index entry must not be returned.
+    assert_eq!(ids_matching(&dataset, "age = 80").await, Vec::<i32>::new());
+    // New-match: id=8's current age=999 is found by re-evaluating the stale row.
+    assert_eq!(ids_matching(&dataset, "age = 999").await, vec![8]);
+    // A non-stale row in the same deletion-bearing fragment is still served by the index.
+    assert_eq!(ids_matching(&dataset, "age = 70").await, vec![7]);
+    // The deleted row is gone.
+    assert_eq!(ids_matching(&dataset, "age = 60").await, Vec::<i32>::new());
+}
+
 const VEC_DIM: i32 = 8;
 
 fn vec_query() -> Vec<f32> {
