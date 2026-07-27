@@ -1,9 +1,6 @@
-// SPDX-License-Identifier: Apache-2.0
-// SPDX-FileCopyrightText: Copyright The Lance Authors
+//! Lance v2.2 file composition.
 
-//! Lance v2.2 encoding composition.
-
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use bytes::Bytes;
 use lance_core::{
@@ -24,12 +21,40 @@ use lance_encoding::{
 };
 use lance_io::traits::Writer as ObjectWriter;
 
-use crate::writer::FileWriterOptions;
+use crate::{
+    reader::{ReadProjection, structural},
+    writer::FileWriterOptions,
+};
 
 mod compression;
+mod reader;
 mod writer;
 
+pub(crate) use reader::{
+    decode_column_metadata, finish_metadata, finish_metadata_index, validate_global_buffers,
+};
+pub use reader::{
+    projection_from_column_names, projection_from_field_ids, projection_from_whole_schema,
+};
+
+pub(crate) fn read_projection() -> Arc<dyn ReadProjection> {
+    structural::read_projection(reader::decode_column)
+}
 pub use writer::Writer;
+
+/// Count physical columns represented by a field in a v2.2 footer.
+pub fn physical_column_count(field: &Field) -> usize {
+    structural::physical_column_count(field)
+}
+
+/// Build persisted field-to-column entries for a v2.2 data file.
+pub fn data_file_columns(schema: &Schema) -> (Vec<i32>, Vec<i32>) {
+    structural::data_file_columns(schema)
+}
+
+pub(super) fn field_id_to_column_index(schema: &Schema) -> BTreeMap<u32, u32> {
+    structural::field_id_to_column_index(schema)
+}
 
 #[derive(Debug)]
 struct FieldStrategy {

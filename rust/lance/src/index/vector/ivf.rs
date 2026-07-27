@@ -2536,7 +2536,7 @@ async fn write_root_vector_index_from_auxiliary(
     let arrow_schema = HNSW::schema();
     let schema = lance_core::datatypes::Schema::try_from(arrow_schema.as_ref())?;
     let mut v2_writer = lance_file::versions::create_writer(
-        lance_file::version::ConcreteFileVersion::from(format_version),
+        format_version,
         obj_writer,
         schema,
         V2WriterOptions::default(),
