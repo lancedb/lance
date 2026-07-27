@@ -2711,14 +2711,11 @@ impl Transaction {
                 continue;
             }
 
-            // Reusing the index entries of the moved rows is only sound when those rows' current
-            // value equals what the index holds. A moved row that carried an overlay on this
-            // index's fields (committed after the index was built) breaks that: the update
-            // materialized the overlay's value into the new fragment, but the index still holds
-            // the stale pre-overlay value. Extending coverage onto the new fragment would resurface
-            // that stale entry and strip the flat-path re-evaluation overlay masking relied on. So
-            // leave the new fragments unindexed for such an index — they fall to the flat path
-            // against current values.
+            // A rewrite materializes overlays.  If any of those overlays touched the
+            // column being indexed then the rewrite will modify that column.  As a
+            // result, that index will no longer cover the fragment and it does not
+            // count as a pure rewrite and we must exclude it from the index's fragment
+            // bitmap.
             let mut overlay_stale = RoaringBitmap::new();
             collect_overlay_stale_frags(
                 index,
