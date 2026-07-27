@@ -18,10 +18,10 @@ use lance_core::utils::tracing::{AUDIT_MODE_CREATE, AUDIT_TYPE_DATA, TRACE_FILE_
 use lance_core::{Error, Result, datatypes::Schema};
 use lance_datafusion::chunker::{break_stream, chunk_stream};
 use lance_datafusion::utils::StreamingWriteSource;
-use lance_file::previous::writer::{
-    FileWriter as PreviousFileWriter, ManifestProvider as PreviousManifestProvider,
-};
 use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
+use lance_file::versions::v1::writer::{
+    FileWriter as V1FileWriter, ManifestProvider as V1ManifestProvider,
+};
 use lance_file::writer::{self as current_writer, FileWriterOptions};
 use lance_io::object_store::{
     ObjectStore, ObjectStoreParams, ObjectStoreRegistry, parse_base_scoped_key,
@@ -1471,9 +1471,9 @@ pub trait GenericWriter: Send {
 
 struct V1WriterAdapter<M>
 where
-    M: PreviousManifestProvider + Send + Sync,
+    M: V1ManifestProvider + Send + Sync,
 {
-    writer: PreviousFileWriter<M>,
+    writer: V1FileWriter<M>,
     path: String,
     base_id: Option<u32>,
 }
@@ -1481,7 +1481,7 @@ where
 #[async_trait::async_trait]
 impl<M> GenericWriter for V1WriterAdapter<M>
 where
-    M: PreviousManifestProvider + Send + Sync,
+    M: V1ManifestProvider + Send + Sync,
 {
     async fn write(&mut self, batches: &[RecordBatch]) -> Result<()> {
         self.writer.write(batches).await
@@ -1667,7 +1667,7 @@ async fn open_writer_with_options(
 
     let writer = if storage_version == LanceFileVersion::Legacy {
         Box::new(V1WriterAdapter {
-            writer: PreviousFileWriter::<ManifestDescribing>::try_new(
+            writer: V1FileWriter::<ManifestDescribing>::try_new(
                 object_store,
                 &full_path,
                 schema.clone(),
@@ -1889,8 +1889,8 @@ mod tests {
     use datafusion_physical_plan::RecordBatchStream;
     use futures::TryStreamExt;
     use lance_datagen::{BatchCount, RowCount, array, gen_batch};
-    use lance_file::previous::reader::FileReader as PreviousFileReader;
     use lance_file::version::ConcreteFileVersion;
+    use lance_file::versions::v1::reader::FileReader as V1FileReader;
     use lance_io::object_store::StorageOptionsAccessor;
     use lance_io::traits::Reader;
     use lance_table::format::BasePath;
@@ -2333,7 +2333,7 @@ mod tests {
             .join(DATA_DIR)
             .join(fragment.files[0].path.as_str());
         let file_reader: Arc<dyn Reader> = object_store.open(&path).await.unwrap().into();
-        let reader = PreviousFileReader::try_new_from_reader(
+        let reader = V1FileReader::try_new_from_reader(
             &path,
             file_reader,
             None,

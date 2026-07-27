@@ -21,13 +21,13 @@ use lance_io::utils::CachedFileSize;
 use rstest::rstest;
 use tokio::io::AsyncWriteExt;
 
-use crate::previous::reader::FileReader as V1Reader;
-use crate::previous::writer::{
-    FileWriter as V1Writer, FileWriterOptions as V1WriterOptions, NotSelfDescribing,
-};
 use crate::reader::{FileReader, FileReaderOptions};
 use crate::testing::FsFixture;
 use crate::version::ConcreteFileVersion;
+use crate::versions::v1::reader::FileReader as V1Reader;
+use crate::versions::v1::writer::{
+    FileWriter as V1Writer, FileWriterOptions as V1WriterOptions, NotSelfDescribing,
+};
 use crate::writer::{FileWriter, FileWriterOptions};
 
 fn compatibility_fixture_batch() -> RecordBatch {

@@ -19,7 +19,11 @@ use crate::index::vector::open_index_file;
 use crate::index::vector::utils::{get_vector_dim, get_vector_type};
 use crate::{
     dataset::Dataset,
-    index::{INDEX_FILE_NAME, pb, prefilter::PreFilter, vector::ivf::io::write_pq_partitions},
+    index::{
+        INDEX_FILE_NAME, pb,
+        prefilter::PreFilter,
+        vector::ivf::io::{write_pq_partition_payload, write_pq_partitions},
+    },
 };
 use crate::{dataset::builder::DatasetBuilder, index::vector::IndexFileVersion};
 use arrow::array::ArrayData;
@@ -55,10 +59,8 @@ use lance_core::{
 use lance_encoding::decoder::FilterExpression;
 use lance_file::{
     format::MAGIC,
-    previous::writer::{
-        FileWriter as PreviousFileWriter, FileWriterOptions as PreviousFileWriterOptions,
-    },
     reader::{FileReader as V2Reader, FileReaderOptions as V2ReaderOptions},
+    versions::v1::writer::{FileWriter as V1FileWriter, FileWriterOptions as V1FileWriterOptions},
     writer::{FileWriter as V2Writer, FileWriterOptions as V2WriterOptions},
 };
 use lance_index::metrics::MetricsCollector;
@@ -102,7 +104,6 @@ use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
 use lance_io::{
     ReadBatchParams,
-    encodings::plain::PlainEncoder,
     local::to_local_path,
     object_store::ObjectStore,
     stream::RecordBatchStream,
@@ -971,11 +972,8 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
 
     // Prepare the HNSW writer
     let schema = lance_core::datatypes::Schema::try_from(HNSW::schema().as_ref())?;
-    let mut writer = PreviousFileWriter::with_object_writer(
-        writer,
-        schema,
-        &PreviousFileWriterOptions::default(),
-    )?;
+    let mut writer =
+        V1FileWriter::with_object_writer(writer, schema, &V1FileWriterOptions::default())?;
     writer.add_metadata(
         INDEX_METADATA_SCHEMA_KEY,
         json!(IndexMetadata {
@@ -999,11 +997,8 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
         ),
     ]);
     let schema = lance_core::datatypes::Schema::try_from(&schema)?;
-    let mut aux_writer = PreviousFileWriter::with_object_writer(
-        aux_writer,
-        schema,
-        &PreviousFileWriterOptions::default(),
-    )?;
+    let mut aux_writer =
+        V1FileWriter::with_object_writer(aux_writer, schema, &V1FileWriterOptions::default())?;
     aux_writer.add_metadata(
         INDEX_METADATA_SCHEMA_KEY,
         json!(IndexMetadata {
@@ -1845,8 +1840,12 @@ impl RemapPageTask {
             page.pq.code_dim(),
             page.row_ids.as_ref().unwrap().len(),
         );
-        PlainEncoder::write(writer, &[&original_pq]).await?;
-        PlainEncoder::write(writer, &[page.row_ids.as_ref().unwrap().as_ref()]).await?;
+        write_pq_partition_payload(
+            writer,
+            &[&original_pq],
+            &[page.row_ids.as_ref().unwrap().as_ref()],
+        )
+        .await?;
         Ok(())
     }
 }
@@ -2165,11 +2164,8 @@ async fn write_ivf_hnsw_file(
     let writer = object_store.create(&path).await?;
 
     let schema = lance_core::datatypes::Schema::try_from(HNSW::schema().as_ref())?;
-    let mut writer = PreviousFileWriter::with_object_writer(
-        writer,
-        schema,
-        &PreviousFileWriterOptions::default(),
-    )?;
+    let mut writer =
+        V1FileWriter::with_object_writer(writer, schema, &V1FileWriterOptions::default())?;
     writer.add_metadata(
         INDEX_METADATA_SCHEMA_KEY,
         json!(IndexMetadata {
@@ -2197,11 +2193,8 @@ async fn write_ivf_hnsw_file(
         ),
     ]);
     let schema = lance_core::datatypes::Schema::try_from(&schema)?;
-    let mut aux_writer = PreviousFileWriter::with_object_writer(
-        aux_writer,
-        schema,
-        &PreviousFileWriterOptions::default(),
-    )?;
+    let mut aux_writer =
+        V1FileWriter::with_object_writer(aux_writer, schema, &V1FileWriterOptions::default())?;
     aux_writer.add_metadata(
         INDEX_METADATA_SCHEMA_KEY,
         json!(IndexMetadata {

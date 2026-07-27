@@ -25,21 +25,18 @@ use lance_core::cache::{CacheKey, LanceCache};
 use lance_core::datatypes::{Field, Schema};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
-use lance_io::encodings::AsyncIndex;
-use lance_io::encodings::dictionary::DictionaryDecoder;
 use lance_io::stream::{RecordBatchStream, RecordBatchStreamAdapter};
 use lance_io::traits::Reader;
-use lance_io::utils::{
-    read_fixed_stride_array, read_metadata_offset, read_struct, read_struct_from_buf,
-};
+use lance_io::utils::{read_metadata_offset, read_struct, read_struct_from_buf};
 use lance_io::{ReadBatchParams, object_store::ObjectStore};
 use std::borrow::Cow;
 
 use object_store::path::Path;
 use tracing::instrument;
 
-use crate::previous::format::metadata::Metadata;
-use crate::previous::page_table::{PageInfo, PageTable};
+use crate::versions::v1::encoding::{dictionary::DictionaryDecoder, read_fixed_stride_array};
+use crate::versions::v1::format::metadata::Metadata;
+use crate::versions::v1::page_table::{PageInfo, PageTable};
 
 /// Lance File Reader.
 ///
@@ -607,7 +604,7 @@ async fn read_binary_array(
 ) -> Result<ArrayRef> {
     let page_info = get_page_info(page_table, field, batch_id)?;
 
-    lance_io::utils::read_binary_array(
+    crate::versions::v1::encoding::read_binary_array(
         reader.object_reader.as_ref(),
         &field.data_type(),
         field.nullable,
@@ -785,7 +782,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::previous::writer::{FileWriter as PreviousFileWriter, NotSelfDescribing};
+    use crate::versions::v1::writer::{FileWriter as V1FileWriter, NotSelfDescribing};
 
     use super::*;
 
@@ -840,7 +837,7 @@ mod tests {
         }
         schema.set_dictionary(&batches[0]).unwrap();
 
-        let mut file_writer = PreviousFileWriter::<NotSelfDescribing>::try_new(
+        let mut file_writer = V1FileWriter::<NotSelfDescribing>::try_new(
             &store,
             &path,
             schema.clone(),
@@ -904,7 +901,7 @@ mod tests {
         )]));
         let batch = RecordBatch::try_new(arrow_schema.clone(), vec![struct_arr]).unwrap();
 
-        let mut file_writer = PreviousFileWriter::<NotSelfDescribing>::try_new(
+        let mut file_writer = V1FileWriter::<NotSelfDescribing>::try_new(
             &store,
             &path,
             schema.clone(),
@@ -958,7 +955,7 @@ mod tests {
             .collect::<Vec<_>>();
         let batches_ref = batches.iter().collect::<Vec<_>>();
 
-        let mut file_writer = PreviousFileWriter::<NotSelfDescribing>::try_new(
+        let mut file_writer = V1FileWriter::<NotSelfDescribing>::try_new(
             &store,
             &path,
             schema.clone(),
@@ -985,7 +982,7 @@ mod tests {
         let schema: Schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
         let batch = RecordBatch::try_new(arrow_schema.clone(), vec![struct_array.clone()]).unwrap();
 
-        let mut file_writer = PreviousFileWriter::<NotSelfDescribing>::try_new(
+        let mut file_writer = V1FileWriter::<NotSelfDescribing>::try_new(
             &store,
             &path,
             schema.clone(),
@@ -1110,7 +1107,7 @@ mod tests {
         // write to a lance file
         let store = ObjectStore::memory();
         let path = Path::from("/takes");
-        let mut file_writer = PreviousFileWriter::<NotSelfDescribing>::try_new(
+        let mut file_writer = V1FileWriter::<NotSelfDescribing>::try_new(
             &store,
             &path,
             schema.clone(),
@@ -1227,7 +1224,7 @@ mod tests {
         let store = ObjectStore::memory();
         let path = Path::from("/take_list");
         let schema: Schema = (&arrow_schema).try_into().unwrap();
-        let mut file_writer = PreviousFileWriter::<NotSelfDescribing>::try_new(
+        let mut file_writer = V1FileWriter::<NotSelfDescribing>::try_new(
             &store,
             &path,
             schema.clone(),
@@ -1304,7 +1301,7 @@ mod tests {
         .unwrap();
 
         let schema: Schema = (&arrow_schema).try_into().unwrap();
-        let mut file_writer = PreviousFileWriter::<NotSelfDescribing>::try_new(
+        let mut file_writer = V1FileWriter::<NotSelfDescribing>::try_new(
             &store,
             &path,
             schema.clone(),
@@ -1338,7 +1335,7 @@ mod tests {
         // write to a lance file
         let store = ObjectStore::memory();
         let path = Path::from("/read_range");
-        let mut file_writer = PreviousFileWriter::<NotSelfDescribing>::try_new(
+        let mut file_writer = V1FileWriter::<NotSelfDescribing>::try_new(
             &store,
             &path,
             schema.clone(),
@@ -1365,7 +1362,7 @@ mod tests {
 
         let arrow_schema = ArrowSchema::new(vec![ArrowField::new("i", DataType::Int32, true)]);
         let schema = Schema::try_from(&arrow_schema).unwrap();
-        let mut writer = PreviousFileWriter::<NotSelfDescribing>::try_new(
+        let mut writer = V1FileWriter::<NotSelfDescribing>::try_new(
             &store,
             &path,
             schema.clone(),
@@ -1425,7 +1422,7 @@ mod tests {
             false,
         )]));
         let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
-        let mut file_writer = PreviousFileWriter::<NotSelfDescribing>::try_new(
+        let mut file_writer = V1FileWriter::<NotSelfDescribing>::try_new(
             &store,
             &path,
             schema.clone(),
@@ -1470,7 +1467,7 @@ mod tests {
         let partial_schema = schema.project(&["f50"]).unwrap();
         let partial_arrow: ArrowSchema = (&partial_schema).into();
 
-        let mut file_writer = PreviousFileWriter::<NotSelfDescribing>::try_new(
+        let mut file_writer = V1FileWriter::<NotSelfDescribing>::try_new(
             &store,
             &path,
             partial_schema.clone(),

@@ -35,13 +35,13 @@ use lance_core::{
 };
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_encoding::decoder::DecoderPlugins;
-use lance_file::previous::reader::{
-    FileReader as PreviousFileReader, read_batch as previous_read_batch,
-};
 use lance_file::reader::{
     CachedFileMetadata, FileMetadataIndex, FileReaderOptions, ProjectedFileReader, ReaderProjection,
 };
 use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
+use lance_file::versions::v1::reader::{
+    FileReader as V1FileReader, read_batch as previous_read_batch,
+};
 use lance_file::{LanceEncodingsIo, determine_file_version};
 use lance_io::ReadBatchParams;
 use lance_io::scheduler::{FileScheduler, ScanScheduler, SchedulerConfig};
@@ -151,20 +151,20 @@ pub trait GenericFileReader: std::fmt::Debug + Send + Sync {
     fn is_legacy(&self) -> bool;
     // Return a reference to the legacy reader, panics if called on a v2
     // file.
-    fn as_legacy(&self) -> &PreviousFileReader {
+    fn as_legacy(&self) -> &V1FileReader {
         self.as_legacy_opt()
             .expect("legacy function called on v2 file")
     }
     // Return a reference to the legacy reader if this is a v1 reader and
     // return None otherwise
-    fn as_legacy_opt(&self) -> Option<&PreviousFileReader>;
+    fn as_legacy_opt(&self) -> Option<&V1FileReader>;
     // Return a mutable reference to the legacy reader if this is a v1 reader
     // and return None otherwise
-    fn as_legacy_opt_mut(&mut self) -> Option<&mut PreviousFileReader>;
+    fn as_legacy_opt_mut(&mut self) -> Option<&mut V1FileReader>;
 }
 
 fn ranges_to_tasks(
-    reader: &PreviousFileReader,
+    reader: &V1FileReader,
     ranges: Vec<(i32, Range<usize>)>,
     projection: Arc<Schema>,
 ) -> ReadBatchTaskStream {
@@ -195,12 +195,12 @@ fn ranges_to_tasks(
 
 #[derive(Clone, Debug)]
 struct V1Reader {
-    reader: PreviousFileReader,
+    reader: V1FileReader,
     projection: Arc<Schema>,
 }
 
 impl V1Reader {
-    fn new(reader: PreviousFileReader, projection: Arc<Schema>) -> Self {
+    fn new(reader: V1FileReader, projection: Arc<Schema>) -> Self {
         Self { reader, projection }
     }
 }
@@ -318,11 +318,11 @@ impl GenericFileReader for V1Reader {
         true
     }
 
-    fn as_legacy_opt(&self) -> Option<&PreviousFileReader> {
+    fn as_legacy_opt(&self) -> Option<&V1FileReader> {
         Some(&self.reader)
     }
 
-    fn as_legacy_opt_mut(&mut self) -> Option<&mut PreviousFileReader> {
+    fn as_legacy_opt_mut(&mut self) -> Option<&mut V1FileReader> {
         Some(&mut self.reader)
     }
 }
@@ -533,11 +533,11 @@ mod v2_adapter {
             false
         }
 
-        fn as_legacy_opt(&self) -> Option<&PreviousFileReader> {
+        fn as_legacy_opt(&self) -> Option<&V1FileReader> {
             None
         }
 
-        fn as_legacy_opt_mut(&mut self) -> Option<&mut PreviousFileReader> {
+        fn as_legacy_opt_mut(&mut self) -> Option<&mut V1FileReader> {
             None
         }
     }
@@ -643,11 +643,11 @@ impl GenericFileReader for NullReader {
         false
     }
 
-    fn as_legacy_opt(&self) -> Option<&PreviousFileReader> {
+    fn as_legacy_opt(&self) -> Option<&V1FileReader> {
         None
     }
 
-    fn as_legacy_opt_mut(&mut self) -> Option<&mut PreviousFileReader> {
+    fn as_legacy_opt_mut(&mut self) -> Option<&mut V1FileReader> {
         None
     }
 }
@@ -1052,7 +1052,7 @@ impl FileFragment {
                         .join(data_file.path.as_str());
                     let object_store = self.dataset.object_store_for_data_file(data_file).await?;
                     let field_id_offset = Self::get_field_id_offset(data_file);
-                    let reader = PreviousFileReader::try_new_with_fragment_id(
+                    let reader = V1FileReader::try_new_with_fragment_id(
                         &object_store,
                         &path,
                         self.schema().clone(),
@@ -5717,7 +5717,7 @@ mod tests {
         .unwrap();
 
         let (object_store, base_path) = ObjectStore::from_uri(test_uri).await.unwrap();
-        let file_reader = PreviousFileReader::try_new_with_fragment_id(
+        let file_reader = V1FileReader::try_new_with_fragment_id(
             &object_store,
             &base_path
                 .clone()
