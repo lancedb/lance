@@ -7,11 +7,12 @@
 //! keeps that identity separate from dataset-version row addresses so scoring
 //! never has to infer which value a numeric slot represents.
 
-use std::ops::Range;
+use std::borrow::Cow;
 use std::sync::{Arc, OnceLock};
 
 use arrow::buffer::ScalarBuffer;
 use arrow_array::{Array, RecordBatch, UInt32Array, UInt64Array};
+use lance_core::cache::{CacheKey, WeakLanceCache};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::spawn_cpu;
@@ -27,11 +28,6 @@ use super::index::{DocSet, NUM_TOKEN_COL, dequantize_doc_length, quantize_doc_le
 
 /// Schema metadata key persisted in every modern `docs.lance` partition.
 pub(super) const TOTAL_TOKENS_KEY: &str = "total_tokens";
-
-/// Maximum number of disjoint point ranges used to resolve final addresses.
-const MAX_POINT_ADDRESS_RANGES: usize = 256;
-/// Maximum projected address bytes used by the point-read plan.
-const MAX_POINT_ADDRESS_BYTES: usize = 64 * 1024;
 
 /// Dense, immutable document identity inside one FTS partition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -56,6 +52,40 @@ impl DocId {
 pub(super) struct PartitionStats {
     pub(crate) num_docs: usize,
     pub(crate) total_tokens: u64,
+}
+
+/// One partition's immutable `DocId -> row address` column.
+///
+/// Cold top-k resolution borrows the independently weighed cache entry without
+/// retaining another owned copy. Explicit prewarm shares its buffer with the
+/// resident address projection so prewarmed queries stay synchronous.
+#[derive(Debug)]
+pub(super) struct CachedDocRowIds {
+    pub(crate) row_ids: Arc<UInt64Array>,
+}
+
+impl DeepSizeOf for CachedDocRowIds {
+    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
+        self.row_ids.len() * std::mem::size_of::<u64>()
+    }
+}
+
+/// Cache key for one partition's [`CachedDocRowIds`].
+#[derive(Debug, Clone)]
+pub(super) struct DocRowIdsKey {
+    pub(crate) partition_id: u64,
+}
+
+impl CacheKey for DocRowIdsKey {
+    type ValueType = CachedDocRowIds;
+
+    fn key(&self) -> Cow<'_, str> {
+        format!("doc-row-ids-{}", self.partition_id).into()
+    }
+
+    fn type_name() -> &'static str {
+        "DocRowIds"
+    }
 }
 
 /// Exact document lengths plus the optional quantized scoring representation.
@@ -493,6 +523,8 @@ impl DocVisibility {
 pub(super) struct PartitionDocuments {
     store: Arc<dyn IndexStore>,
     path: String,
+    partition_id: u64,
+    index_cache: WeakLanceCache,
     num_docs: usize,
     persisted_total_tokens: Option<u64>,
     quantized_scoring: bool,
@@ -614,6 +646,8 @@ impl PartitionDocuments {
     pub(crate) fn try_new(
         store: Arc<dyn IndexStore>,
         path: String,
+        partition_id: u64,
+        index_cache: WeakLanceCache,
         reader: &dyn IndexReader,
         remapper: Option<Arc<dyn RowIdRemapper>>,
         quantized_scoring: bool,
@@ -641,6 +675,8 @@ impl PartitionDocuments {
         Ok(Self {
             store,
             path,
+            partition_id,
+            index_cache,
             num_docs,
             persisted_total_tokens,
             quantized_scoring,
@@ -680,6 +716,44 @@ impl PartitionDocuments {
         self.store.open_index_file(&self.path).await
     }
 
+    async fn row_ids_column(&self) -> Result<Arc<UInt64Array>> {
+        let store = self.store.clone();
+        let path = self.path.clone();
+        let num_docs = self.num_docs;
+        let cached = self
+            .index_cache
+            .get_or_insert_with_key(
+                DocRowIdsKey {
+                    partition_id: self.partition_id,
+                },
+                || async move {
+                    let reader = store.open_index_file(&path).await?;
+                    let batch = reader.read_range(0..num_docs, Some(&[ROW_ID])).await?;
+                    let row_ids = required_u64_column(&batch, ROW_ID, &path)?;
+                    if row_ids.null_count() != 0 {
+                        return Err(corrupt_docs(
+                            &path,
+                            format!("{ROW_ID} contains null values"),
+                        ));
+                    }
+                    if row_ids.len() != num_docs {
+                        return Err(corrupt_docs(
+                            &path,
+                            format!(
+                                "{ROW_ID} has {} rows but the file footer reports {num_docs}",
+                                row_ids.len()
+                            ),
+                        ));
+                    }
+                    Ok(CachedDocRowIds {
+                        row_ids: Arc::new(row_ids.clone()),
+                    })
+                },
+            )
+            .await?;
+        Ok(cached.row_ids.clone())
+    }
+
     fn lengths_from_batch(&self, batch: &RecordBatch) -> Result<Arc<DocLengths>> {
         let column = required_u32_column(batch, NUM_TOKEN_COL, &self.path)?;
         if column.null_count() != 0 {
@@ -693,16 +767,6 @@ impl PartitionDocuments {
             self.num_docs,
             self.persisted_total_tokens,
             self.quantized_scoring,
-            &self.path,
-        )?))
-    }
-
-    fn projection_from_batch(&self, batch: &RecordBatch) -> Result<Arc<VersionAddressProjection>> {
-        let column = required_u64_column(batch, ROW_ID, &self.path)?;
-        Ok(Arc::new(VersionAddressProjection::try_new(
-            column,
-            self.num_docs,
-            self.remapper.as_deref(),
             &self.path,
         )?))
     }
@@ -748,9 +812,13 @@ impl PartitionDocuments {
     pub(crate) async fn projection(&self) -> Result<Arc<VersionAddressProjection>> {
         self.projection
             .get_or_try_init(|| async {
-                let reader = self.reader().await?;
-                let batch = reader.read_range(0..self.num_docs, Some(&[ROW_ID])).await?;
-                self.projection_from_batch(&batch)
+                let row_ids = self.row_ids_column().await?;
+                Ok(Arc::new(VersionAddressProjection::try_new(
+                    row_ids.as_ref(),
+                    self.num_docs,
+                    self.remapper.as_deref(),
+                    &self.path,
+                )?))
             })
             .await
             .cloned()
@@ -845,100 +913,22 @@ impl PartitionDocuments {
                 .collect();
         }
 
-        let mut unique = doc_ids
+        let row_ids = self.row_ids_column().await?;
+        Ok(doc_ids
             .iter()
-            .map(|doc_id| doc_id.get())
-            .collect::<Vec<_>>();
-        unique.sort_unstable();
-        unique.dedup();
-        let ranges = coalesce_doc_ids(&unique);
-        let point_bytes = unique.len().saturating_mul(std::mem::size_of::<u64>());
-        let use_bulk = ranges.len() > MAX_POINT_ADDRESS_RANGES
-            || point_bytes > MAX_POINT_ADDRESS_BYTES
-            || unique.len() == self.num_docs;
-        let reader = self.reader().await?;
-        let address_column = if use_bulk {
-            let batch = reader.read_range(0..self.num_docs, Some(&[ROW_ID])).await?;
-            required_u64_column(&batch, ROW_ID, &self.path)?.clone()
-        } else {
-            let batch = reader.read_ranges(&ranges, Some(&[ROW_ID])).await?;
-            required_u64_column(&batch, ROW_ID, &self.path)?.clone()
-        };
-        if address_column.null_count() != 0 {
-            return Err(corrupt_docs(
-                &self.path,
-                format!("{ROW_ID} contains null values"),
-            ));
-        }
-        let addresses = address_column.values();
-        if use_bulk && addresses.len() != self.num_docs {
-            return Err(corrupt_docs(
-                &self.path,
-                format!(
-                    "{ROW_ID} bulk read returned {} rows, expected {}",
-                    addresses.len(),
-                    self.num_docs
-                ),
-            ));
-        }
-        if !use_bulk && addresses.len() != unique.len() {
-            return Err(corrupt_docs(
-                &self.path,
-                format!(
-                    "{ROW_ID} point read returned {} rows, expected {}",
-                    addresses.len(),
-                    unique.len()
-                ),
-            ));
-        }
-
-        if use_bulk {
-            Ok(doc_ids
-                .iter()
-                .map(|doc_id| addresses[doc_id.as_usize()])
-                .collect())
-        } else {
-            let by_doc_id = unique
-                .into_iter()
-                .zip(addresses.iter().copied())
-                .collect::<std::collections::HashMap<_, _>>();
-            doc_ids
-                .iter()
-                .map(|doc_id| {
-                    by_doc_id.get(&doc_id.get()).copied().ok_or_else(|| {
-                        Error::internal(format!(
-                            "resolved address missing for DocId {}",
-                            doc_id.get()
-                        ))
-                    })
-                })
-                .collect()
-        }
+            .map(|doc_id| row_ids.value(doc_id.as_usize()))
+            .collect())
     }
 
-    /// Estimated Arrow payload retained while resolving these final candidates.
+    /// Estimated Arrow payload retained while loading this partition's cached
+    /// row-address column.
     /// The estimate is used to cap cross-partition read concurrency; a single
     /// oversized partition is still allowed to make progress.
     pub(crate) fn estimated_address_read_bytes(&self, doc_ids: &[DocId]) -> usize {
         if doc_ids.is_empty() || self.projection.initialized() {
             return 0;
         }
-        if self.remapper.is_some() {
-            return self.num_docs.saturating_mul(std::mem::size_of::<u64>());
-        }
-
-        // Avoid repeating the sort/dedup performed by `resolve_addresses`.
-        // Treating every requested DocId as distinct and disjoint can only
-        // overestimate the payload, which makes the concurrency bound safer.
-        let point_bytes = doc_ids.len().saturating_mul(std::mem::size_of::<u64>());
-        let use_bulk = doc_ids.len() > MAX_POINT_ADDRESS_RANGES
-            || point_bytes > MAX_POINT_ADDRESS_BYTES
-            || doc_ids.len() >= self.num_docs;
-        if use_bulk {
-            self.num_docs.saturating_mul(std::mem::size_of::<u64>())
-        } else {
-            point_bytes
-        }
+        self.num_docs.saturating_mul(std::mem::size_of::<u64>())
     }
 
     /// Materialize the build-side table for rewrite/update operations.
@@ -982,7 +972,28 @@ impl PartitionDocuments {
                         .read_range(0..self.num_docs, Some(&[ROW_ID, NUM_TOKEN_COL]))
                         .await?;
                     let lengths = self.lengths_from_batch(&batch)?;
-                    let projection = self.projection_from_batch(&batch)?;
+                    let row_ids =
+                        Arc::new(required_u64_column(&batch, ROW_ID, &self.path)?.clone());
+                    if row_ids.null_count() != 0 {
+                        return Err(corrupt_docs(
+                            &self.path,
+                            format!("{ROW_ID} contains null values"),
+                        ));
+                    }
+                    let projection = Arc::new(VersionAddressProjection::try_new(
+                        row_ids.as_ref(),
+                        self.num_docs,
+                        self.remapper.as_deref(),
+                        &self.path,
+                    )?);
+                    self.index_cache
+                        .insert_with_key(
+                            &DocRowIdsKey {
+                                partition_id: self.partition_id,
+                            },
+                            Arc::new(CachedDocRowIds { row_ids }),
+                        )
+                        .await;
 
                     // A concurrent single-column request may win either OnceCell.
                     // Awaiting the accessors below joins that initialization without
@@ -1049,26 +1060,6 @@ fn required_u64_column<'a>(
         })
 }
 
-fn coalesce_doc_ids(doc_ids: &[u32]) -> Vec<Range<usize>> {
-    let mut ranges = Vec::new();
-    let Some((&first, rest)) = doc_ids.split_first() else {
-        return ranges;
-    };
-    let mut start = first;
-    let mut end = first + 1;
-    for &doc_id in rest {
-        if doc_id == end {
-            end += 1;
-        } else {
-            ranges.push(start as usize..end as usize);
-            start = doc_id;
-            end = doc_id + 1;
-        }
-    }
-    ranges.push(start as usize..end as usize);
-    ranges
-}
-
 fn corrupt_docs(path: &str, message: impl Into<String>) -> Error {
     Error::corrupt_file(Path::from(path), message)
 }
@@ -1076,6 +1067,7 @@ fn corrupt_docs(path: &str, message: impl Into<String>) -> Error {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::ops::Range;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
@@ -1294,14 +1286,15 @@ mod tests {
         }
     }
 
-    fn test_store() -> (TempObjDir, Arc<LanceIndexStore>) {
+    fn test_store() -> (TempObjDir, Arc<LanceIndexStore>, Arc<LanceCache>) {
         let directory = TempObjDir::default();
+        let cache = Arc::new(LanceCache::with_capacity(1024 * 1024));
         let store = Arc::new(LanceIndexStore::new(
             ObjectStore::local().into(),
             directory.clone(),
-            Arc::new(LanceCache::no_cache()),
+            cache.clone(),
         ));
-        (directory, store)
+        (directory, store, cache)
     }
 
     async fn write_documents(
@@ -1341,10 +1334,19 @@ mod tests {
     async fn open_documents(
         store: Arc<dyn IndexStore>,
         path: &str,
+        index_cache: &LanceCache,
         remapper: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<PartitionDocuments> {
         let reader = store.open_index_file(path).await?;
-        PartitionDocuments::try_new(store, path.to_owned(), reader.as_ref(), remapper, false)
+        PartitionDocuments::try_new(
+            store,
+            path.to_owned(),
+            0,
+            WeakLanceCache::from(index_cache),
+            reader.as_ref(),
+            remapper,
+            false,
+        )
     }
 
     fn counted_store(
@@ -1404,14 +1406,6 @@ mod tests {
         fn remap_row_ids_record_batch(&self, _: RecordBatch, _: usize) -> Result<RecordBatch> {
             unreachable!("not used by document projection tests")
         }
-    }
-
-    #[test]
-    fn coalesces_sorted_doc_ids() {
-        assert_eq!(
-            coalesce_doc_ids(&[1, 2, 3, 7, 9, 10]),
-            vec![1..4, 7..8, 9..11]
-        );
     }
 
     #[test]
@@ -1588,7 +1582,7 @@ mod tests {
 
     #[tokio::test]
     async fn persisted_stats_are_footer_only_and_compatible_with_full_docset_reader() {
-        let (_directory, store) = test_store();
+        let (_directory, store, cache) = test_store();
         let path = "docs.lance";
         write_documents(
             store.as_ref(),
@@ -1610,7 +1604,9 @@ mod tests {
         assert_eq!(complete.total_tokens_num(), 10);
 
         let (counting, counts) = counted_store(store, path);
-        let documents = open_documents(counting, path, None).await.unwrap();
+        let documents = open_documents(counting, path, cache.as_ref(), None)
+            .await
+            .unwrap();
         assert_eq!(
             documents.stats().await.unwrap(),
             PartitionStats {
@@ -1625,7 +1621,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_stats_fall_back_once_to_lengths() {
-        let (_directory, store) = test_store();
+        let (_directory, store, cache) = test_store();
         let path = "docs.lance";
         write_documents(
             store.as_ref(),
@@ -1636,7 +1632,9 @@ mod tests {
         )
         .await;
         let (counting, counts) = counted_store(store, path);
-        let documents = open_documents(counting, path, None).await.unwrap();
+        let documents = open_documents(counting, path, cache.as_ref(), None)
+            .await
+            .unwrap();
 
         assert_eq!(documents.stats().await.unwrap().total_tokens, 10);
         assert_eq!(documents.stats().await.unwrap().total_tokens, 10);
@@ -1649,7 +1647,7 @@ mod tests {
 
     #[tokio::test]
     async fn prewarm_loads_document_columns_and_address_lookup_once() {
-        let (_directory, store) = test_store();
+        let (_directory, store, cache) = test_store();
         let path = "docs.lance";
         write_documents(
             store.as_ref(),
@@ -1660,7 +1658,9 @@ mod tests {
         )
         .await;
         let (counting, counts) = counted_store(store, path);
-        let documents = open_documents(counting, path, None).await.unwrap();
+        let documents = open_documents(counting, path, cache.as_ref(), None)
+            .await
+            .unwrap();
 
         futures::future::join_all((0..8).map(|_| documents.prewarm()))
             .await
@@ -1693,11 +1693,17 @@ mod tests {
         assert_eq!(counts.range_calls.load(Ordering::Relaxed), 1);
         assert_eq!(counts.length_rows.load(Ordering::Relaxed), 3);
         assert_eq!(counts.address_rows.load(Ordering::Relaxed), 3);
+        assert!(
+            cache
+                .get_with_key(&DocRowIdsKey { partition_id: 0 })
+                .await
+                .is_some()
+        );
     }
 
     #[tokio::test]
     async fn prewarm_materializes_quantized_norms_before_becoming_query_ready() {
-        let (_directory, store) = test_store();
+        let (_directory, store, cache) = test_store();
         let path = "docs.lance";
         write_documents(
             store.as_ref(),
@@ -1708,9 +1714,16 @@ mod tests {
         )
         .await;
         let reader = store.open_index_file(path).await.unwrap();
-        let documents =
-            PartitionDocuments::try_new(store, path.to_owned(), reader.as_ref(), None, true)
-                .unwrap();
+        let documents = PartitionDocuments::try_new(
+            store,
+            path.to_owned(),
+            0,
+            WeakLanceCache::from(cache.as_ref()),
+            reader.as_ref(),
+            None,
+            true,
+        )
+        .unwrap();
 
         assert!(!documents.query_ready());
         documents.prewarm().await.unwrap();
@@ -1722,7 +1735,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_or_failed_prewarm_can_retry_without_partial_publication() {
-        let (_directory, store) = test_store();
+        let (_directory, store, cache) = test_store();
         let path = "docs.lance";
         write_documents(
             store.as_ref(),
@@ -1734,7 +1747,11 @@ mod tests {
         .await;
 
         let (pausing, pause) = faulting_store(store.clone(), path, PAUSE_ONCE);
-        let documents = Arc::new(open_documents(pausing, path, None).await.unwrap());
+        let documents = Arc::new(
+            open_documents(pausing, path, cache.as_ref(), None)
+                .await
+                .unwrap(),
+        );
         let task = tokio::spawn({
             let documents = documents.clone();
             async move { documents.prewarm().await }
@@ -1751,7 +1768,9 @@ mod tests {
         assert!(documents.query_ready());
 
         let (failing, _fault) = faulting_store(store, path, FAIL_ONCE);
-        let documents = open_documents(failing, path, None).await.unwrap();
+        let documents = open_documents(failing, path, cache.as_ref(), None)
+            .await
+            .unwrap();
         let error = documents.prewarm().await.unwrap_err();
         assert!(error.to_string().contains("injected document read failure"));
         assert!(!documents.lengths_loaded());
@@ -1763,7 +1782,7 @@ mod tests {
 
     #[tokio::test]
     async fn prewarm_reuses_an_already_loaded_document_column() {
-        let (_directory, store) = test_store();
+        let (_directory, store, cache) = test_store();
         let path = "docs.lance";
         write_documents(
             store.as_ref(),
@@ -1774,7 +1793,9 @@ mod tests {
         )
         .await;
         let (counting, counts) = counted_store(store, path);
-        let documents = open_documents(counting, path, None).await.unwrap();
+        let documents = open_documents(counting, path, cache.as_ref(), None)
+            .await
+            .unwrap();
 
         documents.lengths().await.unwrap();
         documents.prewarm().await.unwrap();
@@ -1788,7 +1809,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_or_mismatched_stats_are_corruption_not_fallback() {
-        let (_directory, store) = test_store();
+        let (_directory, store, cache) = test_store();
         write_documents(
             store.as_ref(),
             "invalid.lance",
@@ -1797,7 +1818,7 @@ mod tests {
             Some("not-a-u64"),
         )
         .await;
-        let error = open_documents(store.clone(), "invalid.lance", None)
+        let error = open_documents(store.clone(), "invalid.lance", cache.as_ref(), None)
             .await
             .unwrap_err();
         assert!(error.to_string().contains("invalid total_tokens"));
@@ -1811,7 +1832,7 @@ mod tests {
         )
         .await;
         let (counting, counts) = counted_store(store, "mismatch.lance");
-        let documents = open_documents(counting, "mismatch.lance", None)
+        let documents = open_documents(counting, "mismatch.lance", cache.as_ref(), None)
             .await
             .unwrap();
         assert_eq!(documents.stats().await.unwrap().total_tokens, 11);
@@ -1822,8 +1843,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn final_address_resolution_obeys_point_and_bulk_budgets() {
-        let (_directory, store) = test_store();
+    async fn final_address_resolution_reuses_the_cached_row_id_column() {
+        let (_directory, store, cache) = test_store();
         let path = "docs.lance";
         let num_docs = 600_u64;
         write_documents(
@@ -1835,23 +1856,33 @@ mod tests {
         )
         .await;
         let (counting, counts) = counted_store(store, path);
-        let documents = open_documents(counting, path, None).await.unwrap();
+        let documents = open_documents(counting, path, cache.as_ref(), None)
+            .await
+            .unwrap();
 
         assert!(documents.resolve_addresses(&[]).await.unwrap().is_empty());
         assert_eq!(counts.rows.load(Ordering::Relaxed), 0);
 
         let point_ids = [DocId::new(5), DocId::new(6), DocId::new(10), DocId::new(5)];
-        assert_eq!(documents.estimated_address_read_bytes(&point_ids), 32);
+        assert_eq!(
+            documents.estimated_address_read_bytes(&point_ids),
+            num_docs as usize * std::mem::size_of::<u64>()
+        );
         assert_eq!(
             documents.resolve_addresses(&point_ids).await.unwrap(),
             vec![1005, 1006, 1010, 1005]
         );
-        assert_eq!(counts.ranges_calls.load(Ordering::Relaxed), 1);
-        assert_eq!(counts.range_calls.load(Ordering::Relaxed), 0);
-        assert_eq!(counts.address_rows.load(Ordering::Relaxed), 3);
+        assert_eq!(counts.ranges_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(counts.range_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(counts.address_rows.load(Ordering::Relaxed), 600);
+        assert!(
+            cache
+                .get_with_key(&DocRowIdsKey { partition_id: 0 })
+                .await
+                .is_some()
+        );
 
         let bulk_ids = (0..=512).step_by(2).map(DocId::new).collect::<Vec<_>>();
-        assert_eq!(bulk_ids.len(), MAX_POINT_ADDRESS_RANGES + 1);
         assert_eq!(
             documents.estimated_address_read_bytes(&bulk_ids),
             num_docs as usize * std::mem::size_of::<u64>()
@@ -1859,15 +1890,48 @@ mod tests {
         let resolved = documents.resolve_addresses(&bulk_ids).await.unwrap();
         assert_eq!(resolved.first(), Some(&1000));
         assert_eq!(resolved.last(), Some(&1512));
-        assert_eq!(counts.ranges_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(counts.ranges_calls.load(Ordering::Relaxed), 0);
         assert_eq!(counts.range_calls.load(Ordering::Relaxed), 1);
-        assert_eq!(counts.address_rows.load(Ordering::Relaxed), 603);
+        assert_eq!(counts.address_rows.load(Ordering::Relaxed), 600);
+        assert!(!documents.projection_loaded());
+    }
+
+    #[tokio::test]
+    async fn final_address_resolution_reloads_after_cache_eviction() {
+        let (_directory, store, _cache) = test_store();
+        let path = "docs.lance";
+        write_documents(
+            store.as_ref(),
+            path,
+            UInt64Array::from(vec![10, 20, 30]),
+            UInt32Array::from(vec![2, 3, 5]),
+            Some("10"),
+        )
+        .await;
+        let (counting, counts) = counted_store(store, path);
+        let no_retention_cache = LanceCache::no_cache();
+        let documents = open_documents(counting, path, &no_retention_cache, None)
+            .await
+            .unwrap();
+
+        for _ in 0..2 {
+            assert_eq!(
+                documents
+                    .resolve_addresses(&[DocId::new(2), DocId::new(0)])
+                    .await
+                    .unwrap(),
+                vec![30, 10]
+            );
+        }
+        assert_eq!(counts.ranges_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(counts.range_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(counts.address_rows.load(Ordering::Relaxed), 6);
         assert!(!documents.projection_loaded());
     }
 
     #[tokio::test]
     async fn document_column_nulls_are_reported_as_corruption() {
-        let (_directory, store) = test_store();
+        let (_directory, store, cache) = test_store();
         write_documents(
             store.as_ref(),
             "null-length.lance",
@@ -1876,7 +1940,7 @@ mod tests {
             Some("2"),
         )
         .await;
-        let documents = open_documents(store.clone(), "null-length.lance", None)
+        let documents = open_documents(store.clone(), "null-length.lance", cache.as_ref(), None)
             .await
             .unwrap();
         assert!(
@@ -1896,7 +1960,7 @@ mod tests {
             Some("5"),
         )
         .await;
-        let documents = open_documents(store, "null-address.lance", None)
+        let documents = open_documents(store, "null-address.lance", cache.as_ref(), None)
             .await
             .unwrap();
         assert!(

@@ -104,6 +104,21 @@ pub const INVERT_LIST_FILE: &str = "invert.lance";
 pub const DOCS_FILE: &str = "docs.lance";
 pub const METADATA_FILE: &str = "metadata.lance";
 
+/// Partitions searched per CPU-pool task. Each chunk loads concurrently and
+/// then scores sequentially so query concurrency does not flood the pool with
+/// one small task per partition. `LANCE_FTS_SEARCH_CHUNK=1` restores the
+/// per-partition task shape.
+fn fts_search_chunk() -> usize {
+    static CHUNK: LazyLock<usize> = LazyLock::new(|| {
+        std::env::var("LANCE_FTS_SEARCH_CHUNK")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|&value| value >= 1)
+            .unwrap_or(16)
+    });
+    *CHUNK
+}
+
 pub const TOKEN_COL: &str = "_token";
 pub const TOKEN_ID_COL: &str = "_token_id";
 pub const TOKEN_FST_BYTES_COL: &str = "_token_fst_bytes";
@@ -277,16 +292,6 @@ struct PartitionCandidates<C> {
     tokens_by_position: Vec<String>,
     grouped_expansions: Vec<GroupedExpansionTerms>,
     candidates: Vec<DocCandidate<C>>,
-}
-
-impl<C> PartitionCandidates<C> {
-    fn empty() -> Self {
-        Self {
-            tokens_by_position: Vec::new(),
-            grouped_expansions: Vec::new(),
-            candidates: Vec::new(),
-        }
-    }
 }
 
 struct ModernSearchRequest<'a> {
@@ -871,12 +876,14 @@ impl InvertedIndex {
         &self,
         query_tokens: &Tokens,
         params: &FtsSearchParams,
+        metrics: Option<&dyn MetricsCollector>,
     ) -> Result<MemBM25Scorer> {
         if matches!(params.fuzziness, Some(n) if n != 0) {
             let expanded = self.expand_fuzzy_tokens(query_tokens, params)?;
-            self.bm25_scorer_for_final_tokens(&expanded).await
+            self.bm25_scorer_for_final_tokens(&expanded, metrics).await
         } else {
-            self.bm25_scorer_for_final_tokens(query_tokens).await
+            self.bm25_scorer_for_final_tokens(query_tokens, metrics)
+                .await
         }
     }
 
@@ -884,7 +891,11 @@ impl InvertedIndex {
     /// the terms and pull their document frequencies. `bm25_search` calls
     /// this with the tokens it already expanded, so the expansion runs once
     /// per query rather than once for the scorer and once per partition.
-    async fn bm25_scorer_for_final_tokens(&self, tokens: &Tokens) -> Result<MemBM25Scorer> {
+    async fn bm25_scorer_for_final_tokens(
+        &self,
+        tokens: &Tokens,
+        metrics: Option<&dyn MetricsCollector>,
+    ) -> Result<MemBM25Scorer> {
         let (total_tokens, num_docs) = self.aggregate_corpus_stats().await?;
         let mut terms: Vec<String> = Vec::new();
         let mut seen = HashSet::new();
@@ -895,16 +906,21 @@ impl InvertedIndex {
         }
         let mut token_docs = HashMap::with_capacity(terms.len());
         for term in &terms {
-            let df = self.df_for_term(term).await?;
+            let df = self.df_for_term(term, metrics).await?;
             token_docs.insert(term.clone(), df);
         }
         Ok(MemBM25Scorer::new(total_tokens, num_docs, token_docs))
     }
 
-    pub async fn bm25_stats_for_terms(&self, terms: &[String]) -> Result<(u64, usize, Vec<usize>)> {
+    pub async fn bm25_stats_for_terms(
+        &self,
+        terms: &[String],
+        metrics: Option<&dyn MetricsCollector>,
+    ) -> Result<(u64, usize, Vec<usize>)> {
         let (total_tokens, num_docs) = self.aggregate_corpus_stats().await?;
         let token_docs =
-            futures::future::try_join_all(terms.iter().map(|term| self.df_for_term(term))).await?;
+            futures::future::try_join_all(terms.iter().map(|term| self.df_for_term(term, metrics)))
+                .await?;
         Ok((total_tokens, num_docs, token_docs))
     }
 
@@ -946,7 +962,11 @@ impl InvertedIndex {
     /// Sum the posting-list length for `term` across this index's partitions
     /// via single-row reads, with partition lookups bounded by the store's
     /// `io_parallelism()`.
-    async fn df_for_term(&self, term: &str) -> Result<usize> {
+    async fn df_for_term(
+        &self,
+        term: &str,
+        metrics: Option<&dyn MetricsCollector>,
+    ) -> Result<usize> {
         let io_parallelism = self.store.io_parallelism();
         let futures = self
             .partitions
@@ -955,7 +975,11 @@ impl InvertedIndex {
                 let part = part.clone();
                 async move {
                     match part.tokens.get(term) {
-                        Some(token_id) => part.inverted_list.posting_len_for_token(token_id).await,
+                        Some(token_id) => {
+                            part.inverted_list
+                                .posting_len_for_token(token_id, metrics)
+                                .await
+                        }
                         None => Ok(0),
                     }
                 }
@@ -1064,7 +1088,9 @@ impl InvertedIndex {
         let scorer: &MemBM25Scorer = if let Some(base_scorer) = base_scorer {
             base_scorer
         } else {
-            local_scorer = self.bm25_scorer_for_final_tokens(tokens.as_ref()).await?;
+            local_scorer = self
+                .bm25_scorer_for_final_tokens(tokens.as_ref(), Some(metrics.as_ref()))
+                .await?;
             &local_scorer
         };
         let impact_scorer = Arc::new(scorer.clone());
@@ -1114,83 +1140,127 @@ impl InvertedIndex {
         limit: usize,
     ) -> Result<(Vec<u64>, Vec<f32>)> {
         let impact_shared_threshold = Arc::new(AtomicU32::new(f32::NEG_INFINITY.to_bits()));
-        let local_shared_threshold = Arc::new(AtomicU32::new(f32::NEG_INFINITY.to_bits()));
+        let io_parallelism = self.store.io_parallelism();
         let parts = self
             .partitions
-            .iter()
-            .map(|part| {
-                let part = part.clone();
+            .chunks(fts_search_chunk())
+            .map(|chunk| {
+                let chunk = chunk.to_vec();
                 let tokens = tokens.clone();
                 let params = params.clone();
                 let mask = mask.clone();
                 let metrics = metrics.clone();
                 let impact_scorer = impact_scorer.clone();
                 let impact_shared_threshold = impact_shared_threshold.clone();
-                let local_shared_threshold = local_shared_threshold.clone();
                 async move {
-                    let LoadedPostings {
-                        postings,
-                        grouped_expansions,
-                        impact_safe,
-                        exact_scoring_required,
-                    } = part
-                        .load_posting_lists(
-                            tokens.as_ref(),
-                            params.as_ref(),
-                            operator,
-                            impact_scorer.as_ref(),
-                            metrics.as_ref(),
-                        )
-                        .await?;
-                    if postings.is_empty() {
-                        return Result::Ok(PartitionCandidates::empty());
+                    let loads = chunk.into_iter().map(|part| {
+                        let tokens = tokens.clone();
+                        let params = params.clone();
+                        let metrics = metrics.clone();
+                        let impact_scorer = impact_scorer.clone();
+                        let impact_shared_threshold = impact_shared_threshold.clone();
+                        async move {
+                            let LoadedPostings {
+                                postings,
+                                grouped_expansions,
+                                impact_safe,
+                                exact_scoring_required,
+                            } = part
+                                .load_posting_lists(
+                                    tokens.as_ref(),
+                                    params.as_ref(),
+                                    operator,
+                                    impact_scorer.as_ref(),
+                                    metrics.as_ref(),
+                                )
+                                .await?;
+                            if postings.is_empty() {
+                                return Result::Ok(None);
+                            }
+                            let max_position = postings
+                                .iter()
+                                .map(|posting| posting.term_index() as usize)
+                                .max()
+                                .unwrap_or_default();
+                            let mut tokens_by_position = vec![String::new(); max_position + 1];
+                            for posting in &postings {
+                                tokens_by_position[posting.term_index() as usize] =
+                                    posting.token().to_owned();
+                            }
+                            let docs = part.docs.legacy().cloned().ok_or_else(|| {
+                                Error::internal("legacy index contains modern partition documents")
+                            })?;
+                            let use_global_scorer = impact_safe || exact_scoring_required;
+                            let threshold = if use_global_scorer {
+                                impact_shared_threshold
+                            } else {
+                                Arc::new(AtomicU32::new(f32::NEG_INFINITY.to_bits()))
+                            };
+                            let wand_scorer = use_global_scorer.then(|| impact_scorer.clone());
+                            Result::Ok(Some((
+                                part,
+                                docs,
+                                postings,
+                                wand_scorer,
+                                threshold,
+                                tokens_by_position,
+                                grouped_expansions,
+                            )))
+                        }
+                    });
+                    let loaded = stream::iter(loads)
+                        .buffer_unordered(io_parallelism)
+                        .try_collect::<Vec<_>>()
+                        .await?
+                        .into_iter()
+                        .flatten()
+                        .collect::<Vec<_>>();
+                    if loaded.is_empty() {
+                        return Result::Ok(Vec::new());
                     }
-                    let max_position = postings
-                        .iter()
-                        .map(|posting| posting.term_index() as usize)
-                        .max()
-                        .unwrap_or_default();
-                    let mut tokens_by_position = vec![String::new(); max_position + 1];
-                    for posting in &postings {
-                        tokens_by_position[posting.term_index() as usize] =
-                            posting.token().to_owned();
-                    }
-                    let docs = part.docs.legacy().cloned().ok_or_else(|| {
-                        Error::internal("legacy index contains modern partition documents")
-                    })?;
-                    let use_global_scorer = impact_safe || exact_scoring_required;
-                    let threshold = if use_global_scorer {
-                        impact_shared_threshold
-                    } else {
-                        local_shared_threshold
-                    };
-                    let wand_scorer = use_global_scorer.then(|| impact_scorer.clone());
-                    let part_for_wand = part.clone();
-                    let candidates = spawn_cpu(move || {
-                        part_for_wand.bm25_search_legacy(
-                            docs.as_ref(),
-                            params.as_ref(),
-                            operator,
-                            mask.as_ref(),
+
+                    let results = spawn_cpu(move || {
+                        let mut results = Vec::with_capacity(loaded.len());
+                        for (
+                            part,
+                            docs,
                             postings,
                             wand_scorer,
-                            metrics.as_ref(),
                             threshold,
-                        )
+                            tokens_by_position,
+                            grouped_expansions,
+                        ) in loaded
+                        {
+                            let candidates = part.bm25_search_legacy(
+                                docs.as_ref(),
+                                params.as_ref(),
+                                operator,
+                                mask.as_ref(),
+                                postings,
+                                wand_scorer,
+                                metrics.as_ref(),
+                                threshold,
+                            )?;
+                            results.push(PartitionCandidates {
+                                tokens_by_position,
+                                grouped_expansions,
+                                candidates,
+                            });
+                        }
+                        Result::Ok(results)
                     })
                     .await?;
-                    Result::Ok(PartitionCandidates {
-                        tokens_by_position,
-                        grouped_expansions,
-                        candidates,
-                    })
+                    Result::Ok(results)
                 }
             })
             .collect::<Vec<_>>();
 
         let mut ranked = BinaryHeap::new();
         let mut idf_cache = HashMap::new();
-        let mut parts = stream::iter(parts).buffer_unordered(get_num_compute_intensive_cpus());
+        let mut parts = stream::iter(parts)
+            .buffer_unordered(get_num_compute_intensive_cpus().min(32))
+            .map_ok(|results| stream::iter(results.into_iter().map(Result::Ok)))
+            .try_flatten();
         while let Some(partition) = parts.try_next().await? {
             for (row_id, score) in rescore_partition_candidates(partition, scorer, &mut idf_cache) {
                 push_scored_key(&mut ranked, limit, row_id, score);
@@ -1279,109 +1349,165 @@ impl InvertedIndex {
             )));
         }
         let impact_shared_threshold = Arc::new(AtomicU32::new(f32::NEG_INFINITY.to_bits()));
-        let local_shared_threshold = Arc::new(AtomicU32::new(f32::NEG_INFINITY.to_bits()));
+        let io_parallelism = self.store.io_parallelism();
         let parts = self
             .partitions
-            .iter()
+            .chunks(fts_search_chunk())
             .enumerate()
-            .map(|(partition_ordinal, part)| {
-                let part = part.clone();
+            .map(|(chunk_ordinal, chunk)| {
+                let first_partition_ordinal = chunk_ordinal * fts_search_chunk();
+                let chunk = chunk
+                    .iter()
+                    .cloned()
+                    .enumerate()
+                    .map(|(offset, part)| (first_partition_ordinal + offset, part))
+                    .collect::<Vec<_>>();
                 let tokens = tokens.clone();
                 let params = params.clone();
                 let mask = mask.clone();
                 let metrics = metrics.clone();
                 let impact_scorer = impact_scorer.clone();
                 let impact_shared_threshold = impact_shared_threshold.clone();
-                let local_shared_threshold = local_shared_threshold.clone();
                 async move {
-                    let LoadedPostings {
-                        postings,
-                        grouped_expansions,
-                        impact_safe,
-                        exact_scoring_required,
-                    } = part
-                        .load_posting_lists(
-                            tokens.as_ref(),
-                            params.as_ref(),
-                            operator,
-                            impact_scorer.as_ref(),
-                            metrics.as_ref(),
-                        )
-                        .await?;
-                    if postings.is_empty() {
-                        return Result::Ok((partition_ordinal, PartitionCandidates::empty()));
-                    }
-                    let documents = part.docs.modern().cloned().ok_or_else(|| {
-                        Error::internal("modern index contains legacy partition documents")
-                    })?;
-                    let materialize_selected = operator == Operator::Or
-                        && mask.max_len().is_some_and(|selected| {
-                            u128::from(selected).saturating_mul(100)
-                                <= u128::from(*FLAT_SEARCH_PERCENT_THRESHOLD)
-                                    .saturating_mul(documents.len() as u128)
-                        });
-                    let visibility =
-                        match documents.immediate_visibility(mask.clone(), materialize_selected) {
-                            Some(visibility) => visibility,
-                            None => {
-                                documents
-                                    .visibility(mask.clone(), materialize_selected)
-                                    .await?
+                    let loads = chunk.into_iter().map(|(partition_ordinal, part)| {
+                        let tokens = tokens.clone();
+                        let params = params.clone();
+                        let mask = mask.clone();
+                        let metrics = metrics.clone();
+                        let impact_scorer = impact_scorer.clone();
+                        let impact_shared_threshold = impact_shared_threshold.clone();
+                        async move {
+                            let LoadedPostings {
+                                postings,
+                                grouped_expansions,
+                                impact_safe,
+                                exact_scoring_required,
+                            } = part
+                                .load_posting_lists(
+                                    tokens.as_ref(),
+                                    params.as_ref(),
+                                    operator,
+                                    impact_scorer.as_ref(),
+                                    metrics.as_ref(),
+                                )
+                                .await?;
+                            if postings.is_empty() {
+                                return Result::Ok(None);
                             }
-                        };
-                    if visibility.is_empty() {
-                        return Result::Ok((partition_ordinal, PartitionCandidates::empty()));
+                            let documents = part.docs.modern().cloned().ok_or_else(|| {
+                                Error::internal("modern index contains legacy partition documents")
+                            })?;
+                            let materialize_selected = operator == Operator::Or
+                                && mask.max_len().is_some_and(|selected| {
+                                    u128::from(selected).saturating_mul(100)
+                                        <= u128::from(*FLAT_SEARCH_PERCENT_THRESHOLD)
+                                            .saturating_mul(documents.len() as u128)
+                                });
+                            let visibility = match documents
+                                .immediate_visibility(mask.clone(), materialize_selected)
+                            {
+                                Some(visibility) => visibility,
+                                None => {
+                                    documents
+                                        .visibility(mask.clone(), materialize_selected)
+                                        .await?
+                                }
+                            };
+                            if visibility.is_empty() {
+                                return Result::Ok(None);
+                            }
+                            let lengths = match documents.cached_lengths() {
+                                Some(lengths) => lengths,
+                                None => documents.lengths().await?,
+                            };
+                            let max_position = postings
+                                .iter()
+                                .map(|posting| posting.term_index() as usize)
+                                .max()
+                                .unwrap_or_default();
+                            let mut tokens_by_position = vec![String::new(); max_position + 1];
+                            for posting in &postings {
+                                tokens_by_position[posting.term_index() as usize] =
+                                    posting.token().to_owned();
+                            }
+                            let use_global_scorer = impact_safe || exact_scoring_required;
+                            let threshold = if use_global_scorer {
+                                impact_shared_threshold
+                            } else {
+                                Arc::new(AtomicU32::new(f32::NEG_INFINITY.to_bits()))
+                            };
+                            let wand_scorer = use_global_scorer.then(|| impact_scorer.clone());
+                            Result::Ok(Some((
+                                partition_ordinal,
+                                part,
+                                lengths,
+                                visibility,
+                                postings,
+                                wand_scorer,
+                                threshold,
+                                tokens_by_position,
+                                grouped_expansions,
+                            )))
+                        }
+                    });
+                    let loaded = stream::iter(loads)
+                        .buffer_unordered(io_parallelism)
+                        .try_collect::<Vec<_>>()
+                        .await?
+                        .into_iter()
+                        .flatten()
+                        .collect::<Vec<_>>();
+                    if loaded.is_empty() {
+                        return Result::Ok(Vec::new());
                     }
-                    let lengths = match documents.cached_lengths() {
-                        Some(lengths) => lengths,
-                        None => documents.lengths().await?,
-                    };
-                    let max_position = postings
-                        .iter()
-                        .map(|posting| posting.term_index() as usize)
-                        .max()
-                        .unwrap_or_default();
-                    let mut tokens_by_position = vec![String::new(); max_position + 1];
-                    for posting in &postings {
-                        tokens_by_position[posting.term_index() as usize] =
-                            posting.token().to_owned();
-                    }
-                    let use_global_scorer = impact_safe || exact_scoring_required;
-                    let threshold = if use_global_scorer {
-                        impact_shared_threshold
-                    } else {
-                        local_shared_threshold
-                    };
-                    let wand_scorer = use_global_scorer.then(|| impact_scorer.clone());
-                    let part_for_wand = part.clone();
-                    let candidates = spawn_cpu(move || {
-                        part_for_wand.bm25_search_modern(
-                            lengths.as_ref(),
-                            &visibility,
-                            params.as_ref(),
-                            operator,
+
+                    let results = spawn_cpu(move || {
+                        let mut results = Vec::with_capacity(loaded.len());
+                        for (
+                            partition_ordinal,
+                            part,
+                            lengths,
+                            visibility,
                             postings,
                             wand_scorer,
-                            metrics.as_ref(),
                             threshold,
-                        )
-                    })
-                    .await?;
-                    Result::Ok((
-                        partition_ordinal,
-                        PartitionCandidates {
                             tokens_by_position,
                             grouped_expansions,
-                            candidates,
-                        },
-                    ))
+                        ) in loaded
+                        {
+                            let candidates = part.bm25_search_modern(
+                                lengths.as_ref(),
+                                &visibility,
+                                params.as_ref(),
+                                operator,
+                                postings,
+                                wand_scorer,
+                                metrics.as_ref(),
+                                threshold,
+                            )?;
+                            results.push((
+                                partition_ordinal,
+                                PartitionCandidates {
+                                    tokens_by_position,
+                                    grouped_expansions,
+                                    candidates,
+                                },
+                            ));
+                        }
+                        Result::Ok(results)
+                    })
+                    .await?;
+                    Result::Ok(results)
                 }
             })
             .collect::<Vec<_>>();
 
         let mut ranked = BinaryHeap::new();
         let mut idf_cache = HashMap::new();
-        let mut parts = stream::iter(parts).buffer_unordered(get_num_compute_intensive_cpus());
+        let mut parts = stream::iter(parts)
+            .buffer_unordered(get_num_compute_intensive_cpus().min(32))
+            .map_ok(|results| stream::iter(results.into_iter().map(Result::Ok)))
+            .try_flatten();
         while let Some((partition_ordinal, partition)) = parts.try_next().await? {
             for (doc_id, score) in rescore_partition_candidates(partition, scorer, &mut idf_cache) {
                 push_scored_partition_doc(
@@ -2141,6 +2267,8 @@ impl InvertedPartition {
         let docs = PartitionDocuments::try_new(
             store.clone(),
             docs_path,
+            id,
+            WeakLanceCache::from(index_cache),
             docs_reader.as_ref(),
             frag_reuse_index,
             // 256-document blocks score with quantized document lengths.
@@ -3490,14 +3618,18 @@ impl PostingListReader {
     /// not been loaded yet, and never triggers the bulk load itself. The stats
     /// path uses this so a single-term `df` lookup costs O(1) bytes rather
     /// than O(num_unique_tokens).
-    pub(crate) async fn posting_len_for_token(&self, token_id: u32) -> Result<usize> {
+    pub(crate) async fn posting_len_for_token(
+        &self,
+        token_id: u32,
+        metrics: Option<&dyn MetricsCollector>,
+    ) -> Result<usize> {
         match &self.metadata {
             PostingMetadata::LegacyV1 { .. } => Ok(self.posting_len(token_id)),
             PostingMetadata::V2 { metadata } => {
                 if let Some(metadata) = metadata.get() {
                     return Ok(metadata.lengths[token_id as usize] as usize);
                 }
-                let (_, length) = self.posting_metadata_for_token(token_id).await?;
+                let (_, length) = self.posting_metadata_for_token(token_id, metrics).await?;
                 length
                     .map(|len| len as usize)
                     .ok_or_else(|| Error::index("posting length metadata missing".to_string()))
@@ -3514,6 +3646,7 @@ impl PostingListReader {
     pub(crate) async fn posting_metadata_for_token(
         &self,
         token_id: u32,
+        metrics: Option<&dyn MetricsCollector>,
     ) -> Result<(Option<f32>, Option<u32>)> {
         match &self.metadata {
             PostingMetadata::LegacyV1 { max_scores, .. } => {
@@ -3526,9 +3659,9 @@ impl PostingListReader {
                         Some(loaded.lengths[token_id as usize]),
                     ));
                 }
-                let metadata = self
+                let result = self
                     .index_cache
-                    .get_or_insert_with_key(PostingMetadataKey { token_id }, || async move {
+                    .get_or_insert_with_key_hit(PostingMetadataKey { token_id }, || async move {
                         let token_id = token_id as usize;
                         let batch = self
                             .reader
@@ -3538,7 +3671,14 @@ impl PostingListReader {
                         let length = batch[LENGTH_COL].as_primitive::<UInt32Type>().value(0);
                         Ok(PostingMetadataValue { max_score, length })
                     })
-                    .await?;
+                    .await;
+                if let Some(metrics) = metrics {
+                    match &result {
+                        Ok((_, true)) => metrics.record_index_cache_hit(),
+                        _ => metrics.record_index_cache_miss(),
+                    }
+                }
+                let metadata = result.map(|(value, _)| value)?;
                 Ok((Some(metadata.max_score), Some(metadata.length)))
             }
         }
@@ -3646,9 +3786,9 @@ impl PostingListReader {
             // Grouped path (issue #7040): one cache entry covers rows
             // [start, end), so neighbouring rare terms share a single read.
             Some((start, end)) => {
-                let group = self
+                let result = self
                     .index_cache
-                    .get_or_insert_with_key(
+                    .get_or_insert_with_key_hit(
                         posting_list_group_cache_key(start, end, self.has_impacts),
                         || async move {
                             metrics.record_part_load();
@@ -3656,9 +3796,15 @@ impl PostingListReader {
                             self.load_posting_list_group(start, end).await
                         },
                     )
-                    .await?;
+                    .await;
+                match &result {
+                    Ok((_, true)) => metrics.record_index_cache_hit(),
+                    _ => metrics.record_index_cache_miss(),
+                }
+                let (group, _) = result?;
                 let (max_score, length) = if group.needs_external_metadata() {
-                    self.posting_metadata_for_token(token_id).await?
+                    self.posting_metadata_for_token(token_id, Some(metrics))
+                        .await?
                 } else {
                     (None, None)
                 };
@@ -3673,27 +3819,32 @@ impl PostingListReader {
             }
             // Fallback for layouts that cannot use row-based groups: one cache
             // entry per token.
-            None => self
-                .index_cache
-                .get_or_insert_with_key(
-                    posting_list_cache_key(token_id, self.has_impacts),
-                    || async move {
-                        metrics.record_part_load();
-                        info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_SCALAR_PART, index_type="inverted", part_id=token_id);
-                        // Fetch the posting batch and this token's (max_score,
-                        // length) in parallel; for cold v2 partitions this is one
-                        // single-row metadata read plus one posting-row read,
-                        // instead of pulling the full per-token metadata table.
-                        let (batch, (max_score, length)) = futures::try_join!(
-                            self.posting_batch(token_id, false),
-                            self.posting_metadata_for_token(token_id),
-                        )?;
-                        self.posting_list_from_batch(&batch, max_score, length)
-                    },
-                )
-                .await?
-                .as_ref()
-                .clone(),
+            None => {
+                let result = self
+                    .index_cache
+                    .get_or_insert_with_key_hit(
+                        posting_list_cache_key(token_id, self.has_impacts),
+                        || async move {
+                            metrics.record_part_load();
+                            info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_SCALAR_PART, index_type="inverted", part_id=token_id);
+                            // Fetch the posting batch and this token's (max_score,
+                            // length) in parallel; for cold v2 partitions this is one
+                            // single-row metadata read plus one posting-row read,
+                            // instead of pulling the full per-token metadata table.
+                            let (batch, (max_score, length)) = futures::try_join!(
+                                self.posting_batch(token_id, false),
+                                self.posting_metadata_for_token(token_id, Some(metrics)),
+                            )?;
+                            self.posting_list_from_batch(&batch, max_score, length)
+                        },
+                    )
+                    .await;
+                match &result {
+                    Ok((_, true)) => metrics.record_index_cache_hit(),
+                    _ => metrics.record_index_cache_miss(),
+                }
+                result?.0.as_ref().clone()
+            }
         };
 
         if !self.modern_posting_is_validated(token_id)? {
@@ -3703,7 +3854,7 @@ impl PostingListReader {
 
         if is_phrase_query && !posting.has_position() {
             // hit the cache and when the cache was populated, the positions column was not loaded
-            let positions = self.read_positions(token_id).await?;
+            let positions = self.read_positions(token_id, metrics).await?;
             posting.set_positions(positions);
         }
 
@@ -4334,8 +4485,12 @@ impl PostingListReader {
         }
     }
 
-    async fn read_positions(&self, token_id: u32) -> Result<CompressedPositionStorage> {
-        let positions = self.index_cache.get_or_insert_with_key(PositionKey { token_id }, || async move {
+    async fn read_positions(
+        &self,
+        token_id: u32,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<CompressedPositionStorage> {
+        let result = self.index_cache.get_or_insert_with_key_hit(PositionKey { token_id }, || async move {
             let positions = match self.positions_layout {
                 PositionsLayout::None => {
                     return Err(Error::invalid_input(
@@ -4387,7 +4542,12 @@ impl PostingListReader {
                 }
             };
             Result::Ok(Positions(positions))
-        }).await?;
+        }).await;
+        match &result {
+            Ok((_, true)) => metrics.record_index_cache_hit(),
+            _ => metrics.record_index_cache_miss(),
+        }
+        let (positions, _) = result?;
         Ok(positions.0.clone())
     }
 
@@ -9095,12 +9255,12 @@ mod tests {
         // forcing the V2-only bulk metadata load.
         let pl_0_0 = index.partitions[0]
             .inverted_list
-            .posting_len_for_token(0)
+            .posting_len_for_token(0, None)
             .await
             .unwrap();
         let pl_1_0 = index.partitions[1]
             .inverted_list
-            .posting_len_for_token(0)
+            .posting_len_for_token(0, None)
             .await
             .unwrap();
         if index.partitions[0].id() == 0 {
@@ -9952,7 +10112,7 @@ mod tests {
         assert_eq!(counter.rows_read(), 0);
 
         let (total_tokens, num_docs, dfs) = index
-            .bm25_stats_for_terms(&["t0".to_string()])
+            .bm25_stats_for_terms(&["t0".to_string()], None)
             .await
             .unwrap();
         assert_eq!(total_tokens, num_tokens as u64);
@@ -9980,17 +10140,46 @@ mod tests {
         let (index, counter, _tmpdir) = load_counted_v2_index(100, cache.clone()).await;
 
         let terms = ["t0".to_string()];
-        let first = index.bm25_stats_for_terms(&terms).await.unwrap();
+        let first = index.bm25_stats_for_terms(&terms, None).await.unwrap();
         assert_eq!(first, (100, 100, vec![1]));
         assert_eq!(counter.metadata_rows_read(), 1);
 
-        let second = index.bm25_stats_for_terms(&terms).await.unwrap();
+        let second = index.bm25_stats_for_terms(&terms, None).await.unwrap();
         assert_eq!(second, first);
         assert_eq!(
             counter.metadata_rows_read(),
             1,
             "repeated stats for the same token should reuse cached posting metadata",
         );
+    }
+
+    #[tokio::test]
+    async fn test_bm25_stats_for_terms_records_metadata_cache_stats() {
+        let cache = LanceCache::with_capacity(1024 * 1024);
+        let (index, _counter, _tmpdir) = load_counted_v2_index(100, cache.clone()).await;
+        assert!(
+            !index.partitions[0].inverted_list.is_legacy_layout(),
+            "this test only proves the v2 metadata boundary",
+        );
+
+        let terms = ["t0".to_string(), "t1".to_string(), "t2".to_string()];
+        let cold = LocalMetricsCollector::default();
+        let cold_stats = index
+            .bm25_stats_for_terms(&terms, Some(&cold))
+            .await
+            .unwrap();
+        assert_eq!(cold_stats.2, vec![1, 1, 1]);
+        assert_eq!(cold.index_cache_misses(), terms.len());
+        assert_eq!(cold.index_cache_hits(), 0);
+
+        let warm = LocalMetricsCollector::default();
+        let warm_stats = index
+            .bm25_stats_for_terms(&terms, Some(&warm))
+            .await
+            .unwrap();
+        assert_eq!(warm_stats, cold_stats);
+        assert_eq!(warm.index_cache_misses(), 0);
+        assert_eq!(warm.index_cache_hits(), terms.len());
     }
 
     #[tokio::test]
@@ -10788,6 +10977,7 @@ mod tests {
     }
 
     async fn load_global_scoring_test_index(
+        first_partition_has_impacts: bool,
         second_partition_has_impacts: bool,
     ) -> (TempObjDir, Arc<InvertedIndex>) {
         let tmpdir = TempObjDir::default();
@@ -10797,7 +10987,7 @@ mod tests {
             Arc::new(LanceCache::no_cache()),
         ));
         let partition_specs = [
-            (0, 100, 5_000, 101..111, 5_000, true),
+            (0, 100, 5_000, 101..111, 5_000, first_partition_has_impacts),
             (1, 200, 1_000, 201..301, 1, second_partition_has_impacts),
         ];
         for (
@@ -10844,8 +11034,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_chunked_modern_search_preserves_cold_and_prewarmed_results() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let matching_partitions = 17_u64;
+        for partition_id in 0..matching_partitions {
+            let mut builder = InnerBuilder::new(partition_id, false, TokenSetFormat::default());
+            builder.tokens.add("pipeline".to_owned());
+            builder.posting_lists.push(PostingListBuilder::new(false));
+            builder.posting_lists[0].add(0, PositionRecorder::Count(1));
+            builder.docs.append(partition_id * 1_000 + 7, 1);
+            builder.write(store.as_ref()).await.unwrap();
+        }
+        let unmatched_partition = matching_partitions;
+        let mut builder = InnerBuilder::new(unmatched_partition, false, TokenSetFormat::default());
+        builder.tokens.add("unrelated".to_owned());
+        builder.posting_lists.push(PostingListBuilder::new(false));
+        builder.posting_lists[0].add(0, PositionRecorder::Count(1));
+        builder.docs.append(999_999, 1);
+        builder.write(store.as_ref()).await.unwrap();
+
+        write_test_metadata(
+            &store,
+            (0..=unmatched_partition).collect(),
+            InvertedIndexParams::default(),
+        )
+        .await;
+        let cache = Arc::new(LanceCache::with_capacity(64 * 1024 * 1024));
+        let index = InvertedIndex::load(store, None, cache.as_ref())
+            .await
+            .unwrap();
+        let tokens = Arc::new(Tokens::new(vec!["pipeline".to_owned()], DocType::Text));
+        let params =
+            Arc::new(FtsSearchParams::new().with_limit(Some(matching_partitions as usize)));
+
+        let search = || {
+            index.bm25_search(
+                tokens.clone(),
+                params.clone(),
+                Operator::Or,
+                Arc::new(NoFilter),
+                Arc::new(NoOpMetricsCollector),
+                None,
+            )
+        };
+        let (mut cold_row_ids, cold_scores) = search().await.unwrap();
+        cold_row_ids.sort_unstable();
+        let expected = (0..matching_partitions)
+            .map(|partition_id| partition_id * 1_000 + 7)
+            .collect::<Vec<_>>();
+        assert_eq!(cold_row_ids, expected);
+        assert_eq!(cold_scores.len(), expected.len());
+
+        index
+            .prewarm_with_options(&FtsPrewarmOptions::default())
+            .await
+            .unwrap();
+        let (mut prewarmed_row_ids, prewarmed_scores) = search().await.unwrap();
+        prewarmed_row_ids.sort_unstable();
+        assert_eq!(prewarmed_row_ids, expected);
+        assert_eq!(prewarmed_scores, cold_scores);
+    }
+
+    #[tokio::test]
     async fn test_prewarmed_modern_search_uses_resident_address_projection() {
-        let (_tmpdir, index) = load_global_scoring_test_index(true).await;
+        let (_tmpdir, index) = load_global_scoring_test_index(true, true).await;
         let tokens = Arc::new(Tokens::new(vec!["alpha".to_owned()], DocType::Text));
         let params = Arc::new(FtsSearchParams::new().with_limit(Some(2)));
 
@@ -10919,7 +11176,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_resident_modern_search_loads_partition_stats_without_global_stats() {
-        let (_tmpdir, index) = load_global_scoring_test_index(false).await;
+        let (_tmpdir, index) = load_global_scoring_test_index(true, false).await;
         assert!(index.corpus_stats.get().is_none());
         assert!(
             index
@@ -11006,7 +11263,7 @@ mod tests {
         // Partition 0 wins under its local corpus statistics but loses under
         // the global statistics. If its local score escapes into the shared
         // floor, partition 1 will incorrectly prune the real global winner.
-        let (_tmpdir, index) = load_global_scoring_test_index(true).await;
+        let (_tmpdir, index) = load_global_scoring_test_index(true, true).await;
         let first_partition = index
             .partitions
             .iter()
@@ -11022,7 +11279,7 @@ mod tests {
         let params = Arc::new(FtsSearchParams::new().with_limit(Some(1)));
         let scorer = Arc::new(
             index
-                .bm25_base_scorer(tokens.as_ref(), params.as_ref())
+                .bm25_base_scorer(tokens.as_ref(), params.as_ref(), None)
                 .await
                 .unwrap(),
         );
@@ -11103,7 +11360,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_mixed_impact_and_legacy_partitions_use_global_final_scores() {
-        let (_tmpdir, index) = load_global_scoring_test_index(false).await;
+        let (_tmpdir, index) = load_global_scoring_test_index(true, false).await;
 
         let impact_partition = index
             .partitions
@@ -11148,13 +11405,56 @@ mod tests {
         assert_eq!(row_ids.len(), scores.len());
 
         let scorer = index
-            .bm25_base_scorer(tokens.as_ref(), params.as_ref())
+            .bm25_base_scorer(tokens.as_ref(), params.as_ref(), None)
             .await
             .unwrap();
         let expected_score = scorer.query_weight("alpha") * scorer.doc_weight(1, 1_000);
         assert!(
             (scores[0] - expected_score).abs() < 1e-6,
             "score: {}, expected: {}",
+            scores[0],
+            expected_score
+        );
+    }
+
+    #[tokio::test]
+    async fn test_two_legacy_partitions_keep_private_thresholds() {
+        // Legacy BM25 scores use partition-local statistics, so sharing one
+        // pruning floor across partitions can discard the global winner.
+        let (_tmpdir, index) = load_global_scoring_test_index(false, false).await;
+        for partition in index.partitions.iter() {
+            let posting = partition
+                .inverted_list
+                .posting_list(0, false, &NoOpMetricsCollector)
+                .await
+                .unwrap();
+            assert!(!posting.has_impacts());
+        }
+
+        let tokens = Arc::new(Tokens::new(vec!["alpha".to_string()], DocType::Text));
+        let params = Arc::new(FtsSearchParams::new().with_limit(Some(1)));
+        let (row_ids, scores) = index
+            .bm25_search(
+                tokens.clone(),
+                params.clone(),
+                Operator::Or,
+                Arc::new(NoFilter),
+                Arc::new(NoOpMetricsCollector),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(row_ids, vec![200]);
+        assert_eq!(scores.len(), 1);
+        let scorer = index
+            .bm25_base_scorer(tokens.as_ref(), params.as_ref(), None)
+            .await
+            .unwrap();
+        let expected_score = scorer.query_weight("alpha") * scorer.doc_weight(1, 1_000);
+        assert!(
+            (scores[0] - expected_score).abs() < 1e-6,
+            "score: {}, expected global score: {}",
             scores[0],
             expected_score
         );
