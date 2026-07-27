@@ -20,7 +20,7 @@ use tokio::try_join;
 
 use super::{
     AnyQuery, BloomFilterQuery, LabelListQuery, MetricsCollector, SargableQuery, ScalarIndex,
-    SearchResult, TextQuery, TokenQuery,
+    SearchResult, TextQuery, TokenQuery, label_list::validate_label_list_data_type,
 };
 #[cfg(feature = "geo")]
 use super::{GeoQuery, RelationQuery};
@@ -772,6 +772,11 @@ impl ScalarQueryParser for LabelListQueryParser {
         args: &[Expr],
     ) -> Option<IndexedExpression> {
         if args.len() != 2 {
+            return None;
+        }
+        // LABEL_LIST stores unnested items as bitmap keys. Nested items cannot be
+        // ordered by the bitmap lookup, so legacy indexes must fall back to a scan.
+        if validate_label_list_data_type(data_type).is_err() {
             return None;
         }
         // DataFusion normalizes array_contains to array_has
@@ -2794,6 +2799,40 @@ mod tests {
                     "distributed".to_string(),
                 ))])),
             )),
+            true,
+            schema,
+        );
+    }
+
+    #[rstest]
+    #[case::list(DataType::List(Arc::new(Field::new(
+        "item",
+        DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+        true,
+    ))))]
+    #[case::large_list(DataType::LargeList(Arc::new(Field::new(
+        "item",
+        DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+        true,
+    ))))]
+    fn test_label_list_nested_item(#[case] label_type: DataType) {
+        let index_info = MockIndexInfoProvider::new(vec![(
+            "labels",
+            ColInfo::new(
+                label_type.clone(),
+                Box::new(LabelListQueryParser::new(
+                    "labels_idx".to_string(),
+                    "LabelList".to_string(),
+                )),
+            ),
+        )]);
+        let schema = Schema::new(vec![Field::new("labels", label_type, true)]);
+
+        // Nested item types must not produce a scalar index query.
+        check_with_schema(
+            &index_info,
+            "array_has_any(labels, [[1]])",
+            None,
             true,
             schema,
         );
