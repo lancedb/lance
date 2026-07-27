@@ -14,6 +14,7 @@
 
 use super::ManifestWriteConfig;
 use super::write::merge_insert::inserted_rows::KeyExistenceFilter;
+use crate::dataset::overlay::collect_overlay_stale_frags;
 use crate::dataset::transaction::UpdateMode::{RewriteColumns, RewriteRows};
 use crate::index::mem_wal::update_mem_wal_index_compacted_sstables;
 use crate::utils::temporal::timestamp_to_nanos;
@@ -2044,12 +2045,22 @@ impl Transaction {
                         .copied()
                         .collect();
 
+                    // The original fragments that carried an overlay: their moved rows may have a
+                    // stale index entry (see `register_pure_rewrite_rows_update_frags_in_indices`).
+                    let original_overlaid_frags: HashMap<u32, &Fragment> = existing_fragments
+                        .iter()
+                        .filter(|f| original_fragment_ids.contains(&f.id) && !f.overlays.is_empty())
+                        .map(|f| (f.id as u32, f))
+                        .collect();
+
                     Self::register_pure_rewrite_rows_update_frags_in_indices(
                         &mut final_indices,
                         &pure_updated_frag_ids,
                         &original_fragment_ids,
                         fields_for_preserving_frag_bitmap,
-                    );
+                        &original_overlaid_frags,
+                        &schema,
+                    )?;
                 }
 
                 if let Some(next_row_id) = &mut next_row_id {
@@ -2665,9 +2676,11 @@ impl Transaction {
         pure_update_frag_ids: &[u64],
         original_fragment_ids: &[u64],
         fields_for_preserving_frag_bitmap: &[u32],
-    ) {
+        original_overlaid_frags: &HashMap<u32, &Fragment>,
+        schema: &Schema,
+    ) -> Result<()> {
         if pure_update_frag_ids.is_empty() {
-            return;
+            return Ok(());
         }
 
         let value_updated_field_set = fields_for_preserving_frag_bitmap
@@ -2678,25 +2691,45 @@ impl Transaction {
             let index_covers_modified_field = index.fields.iter().any(|field_id| {
                 value_updated_field_set.contains(&u32::try_from(*field_id).unwrap())
             });
+            if index_covers_modified_field {
+                continue;
+            }
+            let Some(fragment_bitmap) = index.fragment_bitmap.as_ref() else {
+                continue;
+            };
 
-            if !index_covers_modified_field
-                && let Some(fragment_bitmap) = &mut index.fragment_bitmap
-            {
-                // check if all the original fragments contains the updating rows are covered
-                // by the index(index fragment bitmap contains these frag ids).
-                // if not, that means not all the updating rows are indexed, so we could not
-                // index them.
-                let index_covers_all_original_fragments = original_fragment_ids
-                    .iter()
-                    .all(|&fragment_id| fragment_bitmap.contains(fragment_id as u32));
+            // Check that all the original fragments containing the updated rows are covered by
+            // the index. If not, some updated rows were not indexed, so we cannot index them.
+            let index_covers_all_original_fragments = original_fragment_ids
+                .iter()
+                .all(|&fragment_id| fragment_bitmap.contains(fragment_id as u32));
+            if !index_covers_all_original_fragments {
+                continue;
+            }
 
-                if index_covers_all_original_fragments {
-                    for fragment_id in pure_update_frag_ids.iter().map(|f| *f as u32) {
-                        fragment_bitmap.insert(fragment_id);
-                    }
+            // A rewrite materializes overlays.  If any of those overlays touched the
+            // column being indexed then the rewrite will modify that column.  As a
+            // result, that index will no longer cover the fragment and it does not
+            // count as a pure rewrite and we must exclude it from the index's fragment
+            // bitmap.
+            let mut overlay_stale = RoaringBitmap::new();
+            collect_overlay_stale_frags(
+                index,
+                original_overlaid_frags,
+                &mut overlay_stale,
+                schema,
+            )?;
+            if !overlay_stale.is_empty() {
+                continue;
+            }
+
+            if let Some(fragment_bitmap) = index.fragment_bitmap.as_mut() {
+                for fragment_id in pure_update_frag_ids.iter().map(|f| *f as u32) {
+                    fragment_bitmap.insert(fragment_id);
                 }
             }
         }
+        Ok(())
     }
 
     /// If an operation modifies one or more fields in a fragment then we need to remove
