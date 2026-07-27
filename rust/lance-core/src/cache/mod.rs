@@ -343,6 +343,37 @@ impl LanceCache {
         F: FnOnce() -> Fut + Send,
         Fut: Future<Output = Result<K::ValueType>> + Send,
     {
+        self.get_or_insert_with_key_hit(cache_key, loader)
+            .await
+            .map(|(value, _)| value)
+    }
+
+    /// Same as [`get_or_insert_with_key`](Self::get_or_insert_with_key), but
+    /// also returns a boolean indicating whether the loader was skipped for
+    /// this call.
+    ///
+    /// - `true` means this call did **not** execute the loader. That covers
+    ///   both a true cache hit on an already-populated entry and a coalesced
+    ///   concurrent load where an in-flight loader started by a different
+    ///   caller produced the value.
+    /// - `false` means the loader ran on this call (a real cache miss).
+    ///
+    /// Callers that want strict "served from cache" semantics should treat
+    /// coalesced loads as misses; the current backend does not distinguish the
+    /// two cases. Prefer this over rolling a caller-side `Arc<AtomicBool>`
+    /// when the caller needs per-query hit/miss counters — the backend already
+    /// tracks this bit internally and this method just exposes it.
+    pub async fn get_or_insert_with_key_hit<K, F, Fut>(
+        &self,
+        cache_key: K,
+        loader: F,
+    ) -> Result<(Arc<K::ValueType>, bool)>
+    where
+        K: CacheKey,
+        K::ValueType: DeepSizeOf + Send + Sync + 'static,
+        F: FnOnce() -> Fut + Send,
+        Fut: Future<Output = Result<K::ValueType>> + Send,
+    {
         let key = self.sized_key(&cache_key);
         let typed_loader = Box::pin(async move {
             let value = Arc::new(loader().await?);
@@ -367,7 +398,7 @@ impl LanceCache {
         } else {
             self.state.misses.fetch_add(1, Ordering::Relaxed);
         }
-        Ok(entry)
+        Ok((entry, was_cached))
     }
 
     pub async fn insert_unsized_with_key<K>(&self, cache_key: &K, metadata: Arc<K::ValueType>)
@@ -485,11 +516,31 @@ impl WeakLanceCache {
         F: FnOnce() -> Fut + Send,
         Fut: Future<Output = Result<K::ValueType>> + Send,
     {
+        self.get_or_insert_with_key_hit(cache_key, loader)
+            .await
+            .map(|(value, _)| value)
+    }
+
+    /// Same as [`get_or_insert_with_key`](Self::get_or_insert_with_key), but
+    /// also returns a boolean indicating whether the loader was skipped for
+    /// this call. See [`LanceCache::get_or_insert_with_key_hit`] for the
+    /// coalesced-load caveat.
+    pub async fn get_or_insert_with_key_hit<K, F, Fut>(
+        &self,
+        cache_key: K,
+        loader: F,
+    ) -> Result<(Arc<K::ValueType>, bool)>
+    where
+        K: CacheKey,
+        K::ValueType: DeepSizeOf + Send + Sync + 'static,
+        F: FnOnce() -> Fut + Send,
+        Fut: Future<Output = Result<K::ValueType>> + Send,
+    {
         let Some(cache) = self.upgrade() else {
             log::warn!("WeakLanceCache: cache no longer available, computing without caching");
-            return loader().await.map(Arc::new);
+            return loader().await.map(|value| (Arc::new(value), false));
         };
-        cache.get_or_insert_with_key(cache_key, loader).await
+        cache.get_or_insert_with_key_hit(cache_key, loader).await
     }
 
     pub async fn get_unsized_with_key<K>(&self, cache_key: &K) -> Option<Arc<K::ValueType>>
@@ -858,6 +909,29 @@ mod tests {
             .insert_with_key(&TestKey::new(1), Arc::new(vec![10]))
             .await;
         assert!(cache.get_with_key(&TestKeyV2::new(1)).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_or_insert_with_key_hit_reports_loader_execution() {
+        let cache = LanceCache::with_capacity(4096);
+
+        // Cold: loader runs, was_cached = false.
+        let (value, was_cached) = cache
+            .get_or_insert_with_key_hit(TestKey::new(1), || async { Ok(vec![1, 2, 3]) })
+            .await
+            .unwrap();
+        assert_eq!(*value, vec![1, 2, 3]);
+        assert!(!was_cached);
+
+        // Warm: loader must not run and was_cached = true.
+        let (value, was_cached) = cache
+            .get_or_insert_with_key_hit(TestKey::new(1), || async {
+                panic!("should not be called")
+            })
+            .await
+            .unwrap();
+        assert_eq!(*value, vec![1, 2, 3]);
+        assert!(was_cached);
     }
 
     #[tokio::test]

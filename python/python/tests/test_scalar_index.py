@@ -3346,6 +3346,166 @@ def test_btree_prewarm(tmp_path: Path):
     assert scan_stats.parts_loaded == 0
 
 
+def test_btree_index_cache_hit_miss_stats(tmp_path: Path):
+    """Cold scan reports index cache misses; warm scan reports hits.
+
+    ScanStatistics.index_cache_{hits,misses} are populated at page-level cache
+    boundaries. On a freshly-loaded dataset the BTree page fetch must be a
+    miss; a second scan against the same in-memory Dataset re-uses the cached
+    page and therefore reports a hit with zero misses.
+    """
+    scan_stats = None
+
+    def scan_stats_callback(stats: lance.ScanStatistics):
+        nonlocal scan_stats
+        scan_stats = stats
+
+    test_table = pa.table({"val": list(range(1000))})
+    ds = lance.write_dataset(test_table, tmp_path)
+    ds.create_scalar_index("val", index_type="BTREE")
+
+    # Reopen so the session cache starts cold. A single-key point lookup on
+    # a small dataset resolves to exactly one BTree page, so cold/warm counts
+    # are deterministic 1/0 and 0/1.
+    ds = lance.dataset(tmp_path)
+    ds.scanner(filter="val = 42", scan_stats_callback=scan_stats_callback).to_table()
+    assert scan_stats is not None
+    assert scan_stats.index_cache_misses == 1
+    assert scan_stats.index_cache_hits == 0
+
+    # Same Dataset, warm cache — no new page loads, only hits.
+    ds.scanner(filter="val = 42", scan_stats_callback=scan_stats_callback).to_table()
+    assert scan_stats.index_cache_hits == 1
+    assert scan_stats.index_cache_misses == 0
+
+
+def test_bitmap_index_cache_hit_miss_stats(tmp_path: Path):
+    """Bitmap Range/IN queries report cold misses and warm hits; a value
+    that is not in the index never reaches the loader and must not count.
+
+    Guards against the ``BitmapIndex::search`` regressions where the
+    ``Range`` / ``IsIn`` branches used to drop the ``MetricsCollector`` (so
+    every lookup was silently ``0/0``), and where an equality on a value
+    absent from ``index_map`` recorded a spurious miss before short-circuiting
+    to the empty result.
+    """
+    scan_stats = None
+
+    def scan_stats_callback(stats: lance.ScanStatistics):
+        nonlocal scan_stats
+        scan_stats = stats
+
+    test_table = pa.table({"color": ["red", "green", "blue", "yellow"] * 25})
+    ds = lance.write_dataset(test_table, tmp_path)
+    ds.create_scalar_index("color", index_type="BITMAP")
+
+    # Reopen so the session cache starts cold.
+    ds = lance.dataset(tmp_path)
+    ds.scanner(
+        filter="color IN ('red', 'blue')", scan_stats_callback=scan_stats_callback
+    ).to_table()
+    assert scan_stats is not None
+    assert scan_stats.index_cache_misses == 2
+    assert scan_stats.index_cache_hits == 0
+
+    ds.scanner(
+        filter="color IN ('red', 'blue')", scan_stats_callback=scan_stats_callback
+    ).to_table()
+    assert scan_stats.index_cache_hits == 2
+    assert scan_stats.index_cache_misses == 0
+
+    # A value that is not in the index short-circuits before the loader and
+    # must not touch either counter.
+    ds.scanner(
+        filter="color = 'purple'", scan_stats_callback=scan_stats_callback
+    ).to_table()
+    assert scan_stats.index_cache_hits == 0
+    assert scan_stats.index_cache_misses == 0
+
+
+def test_phrase_query_cache_hit_miss_stats(tmp_path: Path):
+    """Phrase-query fallback populates ``PositionKey``; that boundary must
+    show up in per-query cache statistics.
+
+    Guards against ``read_positions`` silently using the non-metric
+    ``get_or_insert_with_key`` API — before this fix, a warm phrase query
+    would report zero hits for the phrase-position cache slot even though
+    the loader was skipped.
+
+    The cold path can already record a few hits (``bm25_stats_for_terms``
+    populates ``PostingMetadataKey``, which is then re-read on the
+    posting-list path as a cross-boundary hit), so the cold assertion is
+    ``misses > hits`` rather than a strict zero.
+    """
+    scan_stats = None
+
+    def scan_stats_callback(stats: lance.ScanStatistics):
+        nonlocal scan_stats
+        scan_stats = stats
+
+    test_table = pa.table(
+        {"text": ["quick brown fox jumps over lazy dog" for _ in range(50)]}
+    )
+    ds = lance.write_dataset(test_table, tmp_path)
+    ds.create_scalar_index("text", index_type="INVERTED", with_position=True)
+
+    ds = lance.dataset(tmp_path)
+    ds.scanner(
+        scan_stats_callback=scan_stats_callback,
+        full_text_query='"quick brown"',
+    ).to_table()
+    assert scan_stats is not None
+    assert scan_stats.index_cache_misses > 0
+    assert scan_stats.index_cache_misses > scan_stats.index_cache_hits
+
+    ds.scanner(
+        scan_stats_callback=scan_stats_callback,
+        full_text_query='"quick brown"',
+    ).to_table()
+    assert scan_stats.index_cache_hits > 0
+    assert scan_stats.index_cache_misses == 0
+
+
+def test_fts_index_cache_hit_miss_stats(tmp_path: Path):
+    """Cold FTS scan reports misses; warm FTS scan reports hits.
+
+    Guards the wrapper-forwarding fix in ``FtsIndexMetrics``: previously the
+    two new cache-hit/miss trait methods had default no-op implementations
+    that swallowed FTS-side events, so cache activity was reported as ``0/0``
+    even for hot inverted-index scans.
+
+    The cold path can still record a few hits when the same cache key is
+    read across boundaries in one query (e.g. ``bm25_stats_for_terms``
+    populates ``PostingMetadataKey`` before ``posting_list`` re-reads it),
+    so the cold assertion is ``misses > hits`` rather than a strict zero.
+    """
+    scan_stats = None
+
+    def scan_stats_callback(stats: lance.ScanStatistics):
+        nonlocal scan_stats
+        scan_stats = stats
+
+    test_table = pa.table({"fts": ["word" for _ in range(100)]})
+    ds = lance.write_dataset(test_table, tmp_path)
+    ds.create_scalar_index("fts", index_type="INVERTED")
+
+    # Reopen so the session cache starts cold.
+    ds = lance.dataset(tmp_path)
+    ds.scanner(
+        scan_stats_callback=scan_stats_callback, full_text_query="word"
+    ).to_table()
+    assert scan_stats is not None
+    assert scan_stats.index_cache_misses > 0
+    assert scan_stats.index_cache_misses > scan_stats.index_cache_hits
+
+    # Same Dataset, warm cache — posting-list / metadata reads must now hit.
+    ds.scanner(
+        scan_stats_callback=scan_stats_callback, full_text_query="word"
+    ).to_table()
+    assert scan_stats.index_cache_hits > 0
+    assert scan_stats.index_cache_misses == 0
+
+
 def test_fts_backward_v0_27_0(tmp_path: Path):
     path = (
         Path(__file__).parent.parent.parent.parent
@@ -4667,6 +4827,59 @@ def test_bitmap_uncommitted_segments_can_be_committed_from_python(tmp_path):
         "ScalarIndexQuery"
         in ds.scanner(filter=filter_expr, use_scalar_index=True).explain_plan()
     )
+
+
+def test_ngram_segment_merge_and_commit_from_python(tmp_path):
+    ds = lance.write_dataset(
+        pa.table(
+            {
+                "text": [
+                    "alpha needle",
+                    None,
+                    "beta needle",
+                    "gamma stack",
+                    "delta needle",
+                    "",
+                ]
+            }
+        ),
+        tmp_path,
+        max_rows_per_file=2,
+    )
+    index_name = "text_ngram_segments"
+    fragment_ids = [fragment.fragment_id for fragment in ds.get_fragments()]
+    staged_segments = [
+        ds.create_index_uncommitted(
+            column="text",
+            index_type="NGRAM",
+            name=index_name,
+            fragment_ids=[fragment_id],
+        )
+        for fragment_id in fragment_ids
+    ]
+    source_version = staged_segments[0].dataset_version
+
+    for segment, fragment_id in zip(staged_segments, fragment_ids):
+        assert segment.fragment_ids == {fragment_id}
+        assert any(file.path == "ngram_postings.lance" for file in segment.files)
+
+    merged_segment = ds.merge_existing_index_segments(staged_segments)
+    assert merged_segment.dataset_version == source_version
+    assert merged_segment.fragment_ids == set(fragment_ids)
+    assert any(file.path == "ngram_postings.lance" for file in merged_segment.files)
+
+    ds.insert(pa.table({"text": ["new stack"]}))
+    assert ds.version > source_version
+    ds = ds.commit_existing_index_segments(index_name, "text", [merged_segment])
+    descriptions = {index.name: index for index in ds.describe_indices()}
+    assert descriptions[index_name].index_type == "NGram"
+    assert len(descriptions[index_name].segments) == 1
+    assert (
+        descriptions[index_name].segments[0].dataset_version_at_last_update
+        == source_version
+    )
+    assert ds.count_rows("contains(text, 'needle')") == 3
+    assert ds.count_rows("text IS NULL") == 1
 
 
 def test_zonemap_fragment_ids_parameter_validation(tmp_path):

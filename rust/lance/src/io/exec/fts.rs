@@ -311,6 +311,14 @@ impl MetricsCollector for FtsIndexMetrics {
         self.index_metrics.record_comparisons(num_comparisons);
     }
 
+    fn record_index_cache_hits(&self, num_hits: usize) {
+        self.index_metrics.record_index_cache_hits(num_hits);
+    }
+
+    fn record_index_cache_misses(&self, num_misses: usize) {
+        self.index_metrics.record_index_cache_misses(num_misses);
+    }
+
     fn record_and_candidates_seen(&self, num_candidates: usize) {
         self.and_candidates_seen.add(num_candidates);
     }
@@ -668,9 +676,14 @@ impl ExecutionPlan for MatchQueryExec {
                 None => {
                     let scorer_start = std::time::Instant::now();
                     let scorer = Arc::new(
-                        build_global_bm25_scorer(&indices, &tokens, &params)
-                            .boxed()
-                            .await?,
+                        build_global_bm25_scorer(
+                            &indices,
+                            &tokens,
+                            &params,
+                            Some(metrics.as_ref()),
+                        )
+                        .boxed()
+                        .await?,
                     );
                     metrics.record_scorer_build(scorer_start.elapsed());
                     scorer
@@ -1220,6 +1233,7 @@ impl ExecutionPlan for FlatMatchQueryExec {
                                 &indices,
                                 &query_tokens,
                                 &FtsSearchParams::new(),
+                                Some(metrics.as_ref()),
                             )
                             .boxed()
                             .await?;
@@ -1570,9 +1584,14 @@ impl ExecutionPlan for PhraseQueryExec {
                 None => {
                     let scorer_start = std::time::Instant::now();
                     let scorer = Arc::new(
-                        build_global_bm25_scorer(&indices, &tokens, &params)
-                            .boxed()
-                            .await?,
+                        build_global_bm25_scorer(
+                            &indices,
+                            &tokens,
+                            &params,
+                            Some(metrics.as_ref()),
+                        )
+                        .boxed()
+                        .await?,
                     );
                     metrics.record_scorer_build(scorer_start.elapsed());
                     scorer
@@ -3081,7 +3100,7 @@ mod tests {
         let mut tokenizer = indices[0].tokenizer();
         let tokens = collect_query_tokens(&query.terms, &mut tokenizer);
         let global_scorer = Arc::new(
-            build_global_bm25_scorer(&indices, &tokens, &search_params)
+            build_global_bm25_scorer(&indices, &tokens, &search_params, None)
                 .await
                 .unwrap(),
         );

@@ -61,7 +61,8 @@ use lance::dataset::{
 };
 use lance::index::vector::utils::get_vector_type;
 use lance::index::{
-    DatasetIndexExt, DatasetIndexInternalExt, IndexSegment, vector::VectorIndexParams,
+    DatasetIndexExt, DatasetIndexInternalExt, IndexSegment, IntoIndexSegment,
+    vector::VectorIndexParams,
 };
 use lance::{dataset::builder::DatasetBuilder, index::vector::IndexFileVersion};
 use lance_arrow::as_fixed_size_list_array;
@@ -591,27 +592,7 @@ impl MergeInsertBuilder {
 }
 
 fn index_metadata_to_segment(metadata: IndexMetadata) -> PyResult<IndexSegment> {
-    let fragment_bitmap = metadata.fragment_bitmap.ok_or_else(|| {
-        PyValueError::new_err(format!(
-            "Index metadata {} is missing fragment coverage",
-            metadata.uuid
-        ))
-    })?;
-    let index_details = metadata.index_details.ok_or_else(|| {
-        PyValueError::new_err(format!(
-            "Index metadata {} is missing index details",
-            metadata.uuid
-        ))
-    })?;
-
-    Ok(IndexSegment::new(
-        metadata.uuid,
-        fragment_bitmap.iter(),
-        metadata.fields,
-        index_details,
-        metadata.index_version,
-        metadata.dataset_version,
-    ))
+    metadata.into_index_segment().infer_error()
 }
 
 fn extract_index_segments(segments: &Bound<'_, PyAny>) -> PyResult<Vec<IndexSegment>> {

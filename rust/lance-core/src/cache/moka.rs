@@ -51,6 +51,7 @@ fn entry_weight(key: &InternalCacheKey, size_bytes: usize, weight_unit: usize) -
 /// via moka's built-in `optionally_get_with`.
 pub struct MokaCacheBackend {
     cache: moka::future::Cache<InternalCacheKey, MokaCacheEntry>,
+    weight_unit: usize,
 }
 
 impl std::fmt::Debug for MokaCacheBackend {
@@ -71,13 +72,22 @@ impl MokaCacheBackend {
                 entry_weight(key, entry.size_bytes, weight_unit)
             })
             .build();
-        Self { cache }
+        Self { cache, weight_unit }
     }
 
     pub fn no_cache() -> Self {
         Self {
             cache: moka::future::Cache::new(0),
+            weight_unit: 1,
         }
+    }
+
+    fn weighted_size_bytes(&self) -> usize {
+        self.cache
+            .weighted_size()
+            .saturating_mul(self.weight_unit as u64)
+            .try_into()
+            .unwrap_or(usize::MAX)
     }
 }
 
@@ -139,9 +149,7 @@ impl CacheBackend for MokaCacheBackend {
 
     async fn size_bytes(&self) -> usize {
         self.cache.run_pending_tasks().await;
-        self.cache.iter().fold(0, |total, (key, entry)| {
-            total.saturating_add(physical_size(key.as_ref(), entry.size_bytes))
-        })
+        self.weighted_size_bytes()
     }
 
     fn approx_num_entries(&self) -> usize {
@@ -149,12 +157,9 @@ impl CacheBackend for MokaCacheBackend {
     }
 
     fn approx_size_bytes(&self) -> usize {
-        // Iterate rather than using `weighted_size()` because moka's
-        // weighted_size can be stale without `run_pending_tasks()`, which
+        // `weighted_size()` can be stale without `run_pending_tasks()`, which
         // is async and can't be called from this synchronous context.
-        self.cache.iter().fold(0, |total, (key, entry)| {
-            total.saturating_add(physical_size(key.as_ref(), entry.size_bytes))
-        })
+        self.weighted_size_bytes()
     }
 }
 
@@ -167,6 +172,20 @@ mod tests {
         let key = InternalCacheKey::from_bytes([0; 16]);
         assert_eq!(weight_unit(4096), 1);
         assert_eq!(entry_weight(&key, 7, 1), 23);
+    }
+
+    #[tokio::test]
+    async fn size_methods_use_constant_time_weighted_accounting() {
+        let backend = MokaCacheBackend::with_capacity(4096);
+        let key = InternalCacheKey::from_bytes([0; 16]);
+        let entry: CacheEntry = Arc::new(());
+        let value_size = 7;
+        let expected = physical_size(&key, value_size);
+
+        backend.insert(&key, entry, value_size, None).await;
+
+        assert_eq!(backend.size_bytes().await, expected);
+        assert_eq!(backend.approx_size_bytes(), expected);
     }
 
     #[cfg(target_pointer_width = "64")]

@@ -3307,6 +3307,7 @@ class LanceDataset(pa.dataset.Dataset):
             "BITMAP",
             "INVERTED",
             "FTS",
+            "NGRAM",
             "RTREE",
             "ZONEMAP",
             "BLOOMFILTER",
@@ -3320,6 +3321,7 @@ class LanceDataset(pa.dataset.Dataset):
         return cls._normalized_index_type(index_type) in {
             "BTREE",
             "BITMAP",
+            "NGRAM",
             "RTREE",
             "ZONEMAP",
             "BLOOMFILTER",
@@ -4278,7 +4280,8 @@ class LanceDataset(pa.dataset.Dataset):
         Create one segment without publishing it and return its metadata.
 
         This is the public distributed-build API for vector, BTREE scalar,
-        canonical bitmap scalar, INVERTED scalar, RTREE scalar, ZONEMAP scalar,
+        canonical bitmap scalar, INVERTED scalar, NGRAM scalar, RTREE scalar,
+        ZONEMAP scalar,
         and BLOOMFILTER scalar index construction. Unlike
         :meth:`create_index`, this method does not publish the index into the
         dataset manifest. Instead, it writes one segment under
@@ -4295,8 +4298,10 @@ class LanceDataset(pa.dataset.Dataset):
         4. commit the final segment list with
            :meth:`commit_existing_index_segments`
 
-        BTREE, BITMAP, INVERTED, RTREE, ZONEMAP, and BLOOMFILTER segments may
+        BTREE, BITMAP, INVERTED, NGRAM, RTREE, ZONEMAP, and BLOOMFILTER segments may
         be merged with :meth:`merge_existing_index_segments` before commit.
+        NGRAM segments built before a deferred compaction must be merged before
+        commit so their postings can be rebuilt against current row addresses.
         Parameters are the same as :meth:`create_index`, with one additional
         requirement:
 

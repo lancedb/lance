@@ -132,18 +132,17 @@ pub struct BitmapIndex {
 
 #[derive(Debug, Clone)]
 pub struct BitmapKey {
-    value: OrderableScalarValue,
     row_offset: u64,
 }
 
 impl BitmapKey {
-    fn try_new(value: OrderableScalarValue, row_offset: usize) -> Result<Self> {
+    fn try_new(row_offset: usize) -> Result<Self> {
         let row_offset = u64::try_from(row_offset).map_err(|_| {
             Error::internal(format!(
                 "bitmap row offset {row_offset} does not fit in u64"
             ))
         })?;
-        Ok(Self { value, row_offset })
+        Ok(Self { row_offset })
     }
 }
 
@@ -151,7 +150,7 @@ impl CacheKey for BitmapKey {
     type ValueType = RowAddrTreeMap;
 
     fn key(&self) -> std::borrow::Cow<'_, str> {
-        format!("{}", self.value.0).into()
+        self.row_offset.to_string().into()
     }
 
     fn type_name() -> &'static str {
@@ -474,18 +473,27 @@ impl BitmapIndex {
             return Ok(self.null_map.clone());
         }
 
+        // A value that isn't in `index_map` never reaches the loader or the
+        // cache, so it should not touch the per-query cache counters either.
+        // Checking here (before the cached-lookup fast path) also avoids
+        // returning an unmapped-value response as a spurious cache hit if a
+        // prior insert somehow ended up under `cache_key`.
         let row_offset = match self.index_map.get(key) {
             Some(loc) => *loc,
             None => return Ok(Arc::new(RowAddrTreeMap::default())),
         };
-        let cache_key = BitmapKey::try_new(key.clone(), row_offset)?;
+        let cache_key = BitmapKey::try_new(row_offset)?;
 
         if let Some(cached) = self.index_cache.get_with_key(&cache_key).await {
+            if let Some(metrics) = metrics {
+                metrics.record_index_cache_hit();
+            }
             return Ok(cached);
         }
 
         // Record that we're loading a partition from disk
         if let Some(metrics) = metrics {
+            metrics.record_index_cache_miss();
             metrics.record_part_load();
         }
 
@@ -634,7 +642,7 @@ impl Index for BitmapIndex {
                         "bitmap row offset overflow: start_row={start_row}, idx={idx}"
                     ))
                 })?;
-                let cache_key = BitmapKey::try_new(key, row_offset)?;
+                let cache_key = BitmapKey::try_new(row_offset)?;
                 self.index_cache
                     .insert_with_key(&cache_key, Arc::new(bitmap))
                     .await;
@@ -730,7 +738,7 @@ impl ScalarIndex for BitmapIndex {
                 } else {
                     let bitmaps: Vec<_> = stream::iter(
                         keys.into_iter()
-                            .map(|key| async move { self.load_bitmap(&key, None).await }),
+                            .map(|key| async move { self.load_bitmap(&key, Some(metrics)).await }),
                     )
                     .buffer_unordered(get_num_compute_intensive_cpus())
                     .try_collect()
@@ -772,7 +780,7 @@ impl ScalarIndex for BitmapIndex {
                 // Load bitmaps in parallel
                 let mut bitmaps: Vec<_> = stream::iter(
                     keys.into_iter()
-                        .map(|key| async move { self.load_bitmap(&key, None).await }),
+                        .map(|key| async move { self.load_bitmap(&key, Some(metrics)).await }),
                 )
                 .buffer_unordered(get_num_compute_intensive_cpus())
                 .try_collect()
@@ -1910,7 +1918,7 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metrics::NoOpMetricsCollector;
+    use crate::metrics::{LocalMetricsCollector, NoOpMetricsCollector};
     use crate::scalar::lance_format::LanceIndexStore;
     use arrow_array::{RecordBatch, StringArray, UInt64Array, record_batch};
     use arrow_schema::{DataType, Field, Schema};
@@ -2028,9 +2036,8 @@ mod tests {
     #[tokio::test]
     async fn test_bitmap_cache_key_uses_row_offset_identity() {
         let cache = LanceCache::with_capacity(1024);
-        let value = OrderableScalarValue(ScalarValue::Int32(Some(7)));
-        let first = BitmapKey::try_new(value.clone(), 3).unwrap();
-        let second = BitmapKey::try_new(value, 4).unwrap();
+        let first = BitmapKey::try_new(3).unwrap();
+        let second = BitmapKey::try_new(4).unwrap();
 
         cache
             .insert_with_key(&first, Arc::new(RowAddrTreeMap::default()))
@@ -2172,6 +2179,95 @@ mod tests {
             actual.sort();
             assert_eq!(actual, expected_in_rows);
         }
+    }
+
+    /// Regression test for the review fix that gates `load_bitmap` on
+    /// `index_map.contains_key` before recording a miss: a value that is
+    /// not present in the index must short-circuit before touching the
+    /// per-query cache counters. Previously an Equals query for a missing
+    /// value would silently bump `index_cache_misses` and `parts_loaded`
+    /// on every call even though no bitmap page was actually loaded.
+    #[tokio::test]
+    async fn test_bitmap_absent_value_records_no_cache_activity() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let colors = vec!["red", "blue", "green", "yellow"];
+        let row_ids = (0u64..4u64).collect::<Vec<_>>();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Utf8, false),
+            Field::new("_rowid", DataType::UInt64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(colors)),
+                Arc::new(UInt64Array::from(row_ids)),
+            ],
+        )
+        .unwrap();
+        let batch = sort_batch_by_value(&batch);
+        let stream = stream::once(async move { Ok(batch) });
+        let stream = Box::pin(RecordBatchStreamAdapter::new(schema, stream));
+        BitmapIndexPlugin::train_bitmap_index(stream, store.as_ref())
+            .await
+            .unwrap();
+
+        // Keep the `LanceCache` alive in test scope so the `WeakLanceCache`
+        // inside `BitmapIndex` can upgrade during search.
+        let cache = LanceCache::with_capacity(1024 * 1024);
+        let index = BitmapIndex::load(store.clone(), None, &cache)
+            .await
+            .unwrap();
+
+        // Equals on a value that is not in `index_map` must not touch
+        // the cache counters and must not report a part load.
+        let metrics = LocalMetricsCollector::default();
+        let query = SargableQuery::Equals(ScalarValue::Utf8(Some("purple".to_string())));
+        let result = index.search(&query, &metrics).await.unwrap();
+        if let SearchResult::Exact(row_ids) = result {
+            assert!(row_ids.true_rows().is_empty());
+        } else {
+            panic!("Expected exact search result");
+        }
+        assert_eq!(
+            metrics.index_cache_hits(),
+            0,
+            "absent value must not record any cache hits",
+        );
+        assert_eq!(
+            metrics.index_cache_misses(),
+            0,
+            "absent value must not record a cache miss (no loader ran)",
+        );
+
+        // IsIn covering only absent values also stays at 0/0.
+        let metrics = LocalMetricsCollector::default();
+        let query = SargableQuery::IsIn(vec![
+            ScalarValue::Utf8(Some("purple".to_string())),
+            ScalarValue::Utf8(Some("teal".to_string())),
+        ]);
+        let result = index.search(&query, &metrics).await.unwrap();
+        if let SearchResult::Exact(row_ids) = result {
+            assert!(row_ids.true_rows().is_empty());
+        } else {
+            panic!("Expected exact search result");
+        }
+        assert_eq!(metrics.index_cache_hits(), 0);
+        assert_eq!(metrics.index_cache_misses(), 0);
+
+        // Sanity: a present value on the same cold cache still records
+        // exactly one miss, proving the counters are wired up and the
+        // absent-value path above is not silently no-op.
+        let metrics = LocalMetricsCollector::default();
+        let query = SargableQuery::Equals(ScalarValue::Utf8(Some("red".to_string())));
+        index.search(&query, &metrics).await.unwrap();
+        assert_eq!(metrics.index_cache_hits(), 0);
+        assert_eq!(metrics.index_cache_misses(), 1);
     }
 
     // Regression test for the O(N log N) warm-cache rebuild introduced in
@@ -2445,10 +2541,8 @@ mod tests {
         // Verify no bitmaps are cached yet
         let red = OrderableScalarValue(ScalarValue::Utf8(Some("red".to_string())));
         let blue = OrderableScalarValue(ScalarValue::Utf8(Some("blue".to_string())));
-        let cache_key_red =
-            BitmapKey::try_new(red.clone(), *index.index_map.get(&red).unwrap()).unwrap();
-        let cache_key_blue =
-            BitmapKey::try_new(blue.clone(), *index.index_map.get(&blue).unwrap()).unwrap();
+        let cache_key_red = BitmapKey::try_new(*index.index_map.get(&red).unwrap()).unwrap();
+        let cache_key_blue = BitmapKey::try_new(*index.index_map.get(&blue).unwrap()).unwrap();
 
         assert!(
             cache

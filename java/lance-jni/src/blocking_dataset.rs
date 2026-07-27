@@ -41,7 +41,7 @@ use lance::dataset::{
     ColumnAlteration, CommitBuilder, Dataset, NewColumnTransform, ProjectionRequest, ReadParams,
     Version, WriteParams,
 };
-use lance::index::{DatasetIndexExt, IndexSegment};
+use lance::index::{DatasetIndexExt, IndexSegment, IntoIndexSegment};
 use lance::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 use lance::io::{ObjectStore, ObjectStoreParams};
 use lance::session::Session as LanceSession;
@@ -1212,27 +1212,7 @@ fn inner_commit_existing_index_segments<'local>(
 }
 
 fn index_metadata_to_segment(metadata: &IndexMetadata) -> Result<IndexSegment> {
-    let fragment_bitmap = metadata.fragment_bitmap.clone().ok_or_else(|| {
-        Error::input_error(format!(
-            "Segment '{}' is missing fragment coverage metadata",
-            metadata.uuid
-        ))
-    })?;
-    let index_details = metadata.index_details.clone().ok_or_else(|| {
-        Error::input_error(format!(
-            "Segment '{}' is missing index details metadata",
-            metadata.uuid
-        ))
-    })?;
-
-    Ok(IndexSegment::new(
-        metadata.uuid,
-        fragment_bitmap,
-        metadata.fields.iter().copied(),
-        index_details,
-        metadata.index_version,
-        metadata.dataset_version,
-    ))
+    Ok(metadata.clone().into_index_segment()?)
 }
 
 #[unsafe(no_mangle)]

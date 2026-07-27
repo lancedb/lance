@@ -1496,6 +1496,224 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_ngram_segment_merge_rebuilds_after_deferred_compaction() {
+        let test_dir = TempStrDir::default();
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "text",
+            arrow_schema::DataType::Utf8,
+            true,
+        )]));
+        let make_batch = |values| {
+            arrow_array::RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(arrow_array::StringArray::from(values))],
+            )
+            .unwrap()
+        };
+        let reader = arrow_array::RecordBatchIterator::new(
+            vec![Ok(make_batch(vec![Some("alpha needle"), None]))],
+            schema.clone(),
+        );
+        Dataset::write(
+            reader,
+            test_dir.as_str(),
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let appended = arrow_array::RecordBatchIterator::new(
+            vec![Ok(make_batch(vec![
+                Some("beta needle"),
+                Some("gamma stack"),
+            ]))],
+            schema.clone(),
+        );
+        let mut dataset = Dataset::write(
+            appended,
+            test_dir.as_str(),
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::NGram);
+        let mut segments = Vec::new();
+        for fragment in dataset.get_fragments() {
+            segments.push(
+                CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::NGram, &params)
+                    .name("text_ngram".to_string())
+                    .fragments(vec![fragment.id() as u32])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        let source_version = segments[0].dataset_version;
+        dataset
+            .create_index(
+                &["text"],
+                IndexType::NGram,
+                Some("compaction_guard".to_string()),
+                &params,
+                false,
+            )
+            .await
+            .unwrap();
+
+        let metrics = compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 10,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(metrics.fragments_removed > 0 && metrics.fragments_added > 0);
+        assert!(dataset.version().version > source_version);
+
+        let direct_commit_err = dataset
+            .commit_existing_index_segments("text_ngram_direct", "text", segments.clone())
+            .await
+            .unwrap_err();
+        assert!(
+            direct_commit_err
+                .to_string()
+                .contains("must be rebuilt or merged")
+        );
+
+        let rebuild_version = dataset.version().version;
+        let merged = dataset
+            .merge_existing_index_segments(segments)
+            .await
+            .unwrap();
+        assert_eq!(merged.dataset_version, rebuild_version);
+        dataset
+            .commit_existing_index_segments("text_ngram", "text", vec![merged])
+            .await
+            .unwrap();
+
+        let committed = dataset.load_indices_by_name("text_ngram").await.unwrap();
+        assert_eq!(committed.len(), 1);
+        assert_eq!(committed[0].dataset_version, rebuild_version);
+        assert_eq!(
+            committed[0].fragment_bitmap.as_ref().unwrap(),
+            dataset.fragment_bitmap.as_ref()
+        );
+
+        let logical =
+            open_named_scalar_index(&dataset, "text", "text_ngram", &NoOpMetricsCollector)
+                .await
+                .unwrap();
+        let result = logical
+            .search(
+                &lance_index::scalar::TextQuery::StringContains("needle".to_string()),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+        let row_addrs = match result {
+            SearchResult::AtMost(row_addrs) => row_addrs,
+            other => panic!("expected AtMost result from ngram, got {other:?}"),
+        };
+        assert_eq!(row_addrs.true_rows().row_addrs().unwrap().count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_ngram_segment_merge_rejects_retired_coverage_without_remap() {
+        let test_dir = TempStrDir::default();
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "text",
+            arrow_schema::DataType::Utf8,
+            true,
+        )]));
+        let make_batch = |values| {
+            arrow_array::RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(arrow_array::StringArray::from(values))],
+            )
+            .unwrap()
+        };
+        let reader = arrow_array::RecordBatchIterator::new(
+            vec![Ok(make_batch(vec!["alpha", "beta"]))],
+            schema.clone(),
+        );
+        Dataset::write(
+            reader,
+            test_dir.as_str(),
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let appended = arrow_array::RecordBatchIterator::new(
+            vec![Ok(make_batch(vec!["gamma", "delta"]))],
+            schema,
+        );
+        let mut dataset = Dataset::write(
+            appended,
+            test_dir.as_str(),
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::NGram);
+        let mut segments = Vec::new();
+        for fragment in dataset.get_fragments() {
+            segments.push(
+                CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::NGram, &params)
+                    .name("text_ngram".to_string())
+                    .fragments(vec![fragment.id() as u32])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 10,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        let direct_err = dataset
+            .commit_existing_index_segments("text_ngram", "text", segments.clone())
+            .await
+            .unwrap_err();
+        assert!(direct_err.to_string().contains("must be rebuilt or merged"));
+
+        let merge_err = dataset
+            .merge_existing_index_segments(segments)
+            .await
+            .unwrap_err();
+        assert!(
+            merge_err
+                .to_string()
+                .contains("no applicable fragment-reuse mapping is available")
+        );
+    }
+
+    #[tokio::test]
     async fn test_fmindex_merge_single_segment_passthrough() {
         let test_dir = TempStrDir::default();
 
