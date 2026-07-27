@@ -2535,13 +2535,11 @@ async fn write_root_vector_index_from_auxiliary(
     // Schema for HNSW sub-index: include neighbors/dist fields; empty batch is fine.
     let arrow_schema = HNSW::schema();
     let schema = lance_core::datatypes::Schema::try_from(arrow_schema.as_ref())?;
-    let mut v2_writer = V2Writer::try_new(
+    let mut v2_writer = lance_file::versions::create_writer(
+        lance_file::version::ConcreteFileVersion::from(format_version),
         obj_writer,
         schema,
-        V2WriterOptions {
-            format_version: Some(format_version),
-            ..Default::default()
-        },
+        V2WriterOptions::default(),
     )?;
 
     // For HNSW variants, attach per-partition metadata list; for FLAT-based

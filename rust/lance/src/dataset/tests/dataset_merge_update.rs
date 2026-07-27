@@ -36,7 +36,6 @@ use lance_core::utils::tempfile::{TempDir, TempStrDir};
 use lance_datafusion::utils::reader_to_stream;
 use lance_datagen::{BatchCount, RowCount, array, gen_batch};
 use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
-use lance_file::writer::FileWriter;
 use lance_io::utils::CachedFileSize;
 use lance_table::format::{BasePath, DataFile, Fragment};
 
@@ -745,7 +744,7 @@ async fn test_datafile_replacement() {
         .create(&Path::from("data/test.lance"))
         .await
         .unwrap();
-    let mut writer = FileWriter::try_new(
+    let mut writer = lance_file::versions::v2_1::create_writer(
         object_writer,
         schema.as_ref().try_into().unwrap(),
         Default::default(),
@@ -852,7 +851,7 @@ async fn test_datafile_partial_replacement() {
         .create(&Path::from("data/test.lance"))
         .await
         .unwrap();
-    let mut writer = FileWriter::try_new(
+    let mut writer = lance_file::versions::v2_1::create_writer(
         object_writer,
         partial_schema.as_ref().try_into().unwrap(),
         Default::default(),
@@ -2199,7 +2198,7 @@ async fn test_data_replacement_invalidates_index_bitmap() {
         .create(&Path::from("data/replacement.lance"))
         .await
         .unwrap();
-    let mut writer = FileWriter::try_new(
+    let mut writer = lance_file::versions::v2_1::create_writer(
         object_writer,
         single_col_schema.as_ref().try_into().unwrap(),
         Default::default(),
@@ -2377,7 +2376,7 @@ async fn test_merge_rewriting_indexed_column_keeps_index_consistent() {
     .unwrap();
     let new_a_path = dataset.data_dir().join("merge_new_a.lance");
     let object_writer = dataset.object_store.create(&new_a_path).await.unwrap();
-    let mut writer = FileWriter::try_new(
+    let mut writer = lance_file::versions::v2_1::create_writer(
         object_writer,
         a_only.as_ref().try_into().unwrap(),
         Default::default(),
@@ -2425,7 +2424,6 @@ async fn test_merge_rewriting_indexed_column_keeps_index_consistent() {
 /// stale index entries are blocked at query time.
 #[tokio::test]
 async fn test_data_replacement_populates_invalidated_bitmap() {
-    use lance_file::writer::FileWriter;
     use object_store::path::Path;
 
     let schema = Arc::new(ArrowSchema::new(vec![
@@ -2481,7 +2479,7 @@ async fn test_data_replacement_populates_invalidated_bitmap() {
         .create(&Path::from("data/replacement_inv.lance"))
         .await
         .unwrap();
-    let mut writer = FileWriter::try_new(
+    let mut writer = lance_file::versions::v2_1::create_writer(
         object_writer,
         value_schema.as_ref().try_into().unwrap(),
         Default::default(),
@@ -2606,7 +2604,7 @@ async fn test_fts_stale_entries_after_data_replacement() {
         .create(&replacement_path)
         .await
         .unwrap();
-    let mut writer = FileWriter::try_new(
+    let mut writer = lance_file::versions::v2_1::create_writer(
         object_writer,
         schema.as_ref().try_into().unwrap(),
         Default::default(),
@@ -2783,7 +2781,7 @@ async fn test_vector_index_after_data_replacement() {
         .create(&replacement_path)
         .await
         .unwrap();
-    let mut writer = FileWriter::try_new(
+    let mut writer = lance_file::versions::v2_1::create_writer(
         object_writer,
         schema.as_ref().try_into().unwrap(),
         Default::default(),

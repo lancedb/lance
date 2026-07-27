@@ -3226,7 +3226,7 @@ mod tests {
         use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
         use lance_core::datatypes::Schema;
         use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
-        use lance_file::writer::{FileWriter, FileWriterOptions};
+        use lance_file::writer::FileWriterOptions;
         use lance_io::utils::CachedFileSize;
         use lance_table::format::DataFile;
         use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
@@ -3295,16 +3295,14 @@ mod tests {
             let filename = format!("{name}.lance");
             let path = Path::from(format!("data/{filename}"));
             let obj_writer = dataset.object_store.create(&path).await.unwrap();
-            let mut writer = FileWriter::try_new(
+            let file_version = ConcreteFileVersion::from(version);
+            let mut writer = lance_file::versions::create_writer(
+                file_version,
                 obj_writer,
                 overlay_schema,
-                FileWriterOptions {
-                    format_version: Some(version),
-                    ..Default::default()
-                },
+                FileWriterOptions::default(),
             )
             .unwrap();
-            let file_version = ConcreteFileVersion::from(writer.version());
             for (column_index, array) in columns.into_iter().enumerate() {
                 writer.write_column(column_index, array).await.unwrap();
             }
@@ -5908,8 +5906,10 @@ mod tests {
         let store = ObjectStore::local();
         let file_path = dataset.data_dir().join("some_file.lance");
         let object_writer = store.create(&file_path).await.unwrap();
-        let mut file_writer =
-            lance_file::writer::FileWriter::new_lazy(object_writer, FileWriterOptions::default());
+        let mut file_writer = lance_file::versions::v2_1::create_lazy_writer(
+            object_writer,
+            FileWriterOptions::default(),
+        );
         file_writer.write_batch(&new_data).await.unwrap();
         file_writer.finish().await.unwrap();
 
