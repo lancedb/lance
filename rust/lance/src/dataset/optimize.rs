@@ -2382,7 +2382,7 @@ mod tests {
                 },
                 3,
             )
-                .collect(),
+            .collect(),
             pos_range: 0..3,
             candidacy: std::iter::repeat_n(CompactionCandidacy::CompactItself, 3).collect(),
             row_counts: vec![600, 100, 100],
