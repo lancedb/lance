@@ -3,8 +3,8 @@
 
 //! [`CacheBackend`] backed by [quick_cache](https://crates.io/crates/quick_cache),
 //! whose hit path is one atomic bit — no read-op channel or inline
-//! housekeeping. Used for the session index cache, which sees thousands of
-//! cache reads per query.
+//! housekeeping. Used for the session index and metadata caches; the index
+//! cache sees thousands of cache reads per query.
 
 use std::pin::Pin;
 
