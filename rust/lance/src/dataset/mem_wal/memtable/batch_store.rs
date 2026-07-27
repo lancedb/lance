@@ -195,10 +195,14 @@ pub struct BatchStore {
     /// Estimated size in bytes (for flush threshold).
     estimated_bytes: AtomicUsize,
 
-    /// WAL flush watermark: the last batch ID that has been flushed to WAL (inclusive).
-    /// Uses usize::MAX as sentinel for "nothing flushed yet".
-    /// This is per-memtable tracking, not global.
-    max_flushed_batch_position: AtomicUsize,
+    /// Writer-global coordinate of this store's batch 0.
+    ///
+    /// A *coordinate*, not a cursor: stamped once at construction and never
+    /// moved. `global_position = global_offset + local_position`. Batch
+    /// positions restart at 0 in every memtable, so this is the only thing that
+    /// lets a writer-global cursor (the WAL durability count) be mapped onto a
+    /// particular store.
+    global_offset: usize,
 }
 
 // SAFETY: Safe to share across threads because:
@@ -221,6 +225,13 @@ impl BatchStore {
     ///
     /// Panics if capacity is 0.
     pub fn with_capacity(capacity: usize) -> Self {
+        Self::with_capacity_at(capacity, 0)
+    }
+
+    /// Create a store whose batch 0 sits at `global_offset` in the writer's
+    /// batch sequence. Used by `freeze_memtable` for every memtable after the
+    /// first; the first starts at 0.
+    pub fn with_capacity_at(capacity: usize, global_offset: usize) -> Self {
         assert!(capacity > 0, "capacity must be > 0");
 
         // Allocate uninitialized storage
@@ -235,7 +246,7 @@ impl BatchStore {
             capacity,
             total_rows: AtomicUsize::new(0),
             estimated_bytes: AtomicUsize::new(0),
-            max_flushed_batch_position: AtomicUsize::new(usize::MAX), // Nothing flushed yet
+            global_offset,
         }
     }
 
@@ -437,74 +448,54 @@ impl BatchStore {
     // WAL Flush Tracking API
     // =========================================================================
 
-    /// Get the WAL flush watermark (the last batch ID that was flushed, inclusive).
-    /// Returns None if nothing has been flushed yet.
+    /// Writer-global coordinate one past this store's last committed batch.
     #[inline]
-    pub fn max_flushed_batch_position(&self) -> Option<usize> {
-        let watermark = self.max_flushed_batch_position.load(Ordering::Acquire);
-        if watermark == usize::MAX {
-            None
-        } else {
-            Some(watermark)
-        }
+    pub fn global_end(&self) -> usize {
+        self.global_offset + self.committed_len.load(Ordering::Acquire)
     }
 
-    /// Update the WAL flush watermark after successful WAL flush.
+    /// This store's writer-global coordinate for batch 0.
+    #[inline]
+    pub fn global_offset(&self) -> usize {
+        self.global_offset
+    }
+
+    /// The local exclusive end of this store covered by a writer-global cursor.
     ///
-    /// # Arguments
+    /// Saturating in both directions, and both directions are reachable in
+    /// normal operation: a cursor *below* this store's offset means "nothing
+    /// here yet" (the store was rotated in after the cursor last advanced —
+    /// the ordinary state of a fresh memtable), and a cursor beyond its end
+    /// clamps to what is committed.
     ///
-    /// * `batch_position` - The last batch ID that was flushed (inclusive)
+    /// This is the **only** place the global-to-local subtraction is written.
+    /// Open-coding it underflows on every memtable rotation, which in release
+    /// wraps to a huge end and makes the whole new memtable instantly visible.
     #[inline]
-    pub fn set_max_flushed_batch_position(&self, batch_position: usize) {
-        debug_assert!(
-            batch_position != usize::MAX,
-            "batch_position cannot be usize::MAX (reserved as sentinel)"
-        );
-        self.max_flushed_batch_position
-            .store(batch_position, Ordering::Release);
+    pub fn local_end(&self, global_cursor: usize) -> usize {
+        global_cursor
+            .saturating_sub(self.global_offset)
+            .min(self.committed_len.load(Ordering::Acquire))
     }
 
-    /// Get the number of batches pending WAL flush.
+    /// Batches in this store still waiting on their WAL append.
     #[inline]
-    pub fn pending_wal_flush_count(&self) -> usize {
-        let committed = self.committed_len.load(Ordering::Acquire);
-        let watermark = self.max_flushed_batch_position.load(Ordering::Acquire);
-        if watermark == usize::MAX {
-            // Nothing flushed yet, all committed batches are pending
-            committed
-        } else {
-            // Batches [0, watermark] are flushed, so pending = committed - (watermark + 1)
-            committed.saturating_sub(watermark + 1)
-        }
+    pub fn pending_wal_flush_count(&self, durable: usize) -> usize {
+        self.committed_len.load(Ordering::Acquire) - self.local_end(durable)
     }
 
-    /// Check if all committed batches have been WAL-flushed.
+    /// Local range `[start, end)` of batches still waiting on their WAL append,
+    /// or `None` when the store is fully durable.
     #[inline]
-    pub fn is_wal_flush_complete(&self) -> bool {
-        self.pending_wal_flush_count() == 0
-    }
-
-    /// Get the range of batch IDs pending WAL flush: [start, end).
-    /// Returns None if nothing pending.
-    #[inline]
-    pub fn pending_wal_flush_range(&self) -> Option<(usize, usize)> {
-        let committed = self.committed_len.load(Ordering::Acquire);
-        let watermark = self.max_flushed_batch_position.load(Ordering::Acquire);
-        let start = if watermark == usize::MAX {
-            0
-        } else {
-            watermark + 1
-        };
-        if committed > start {
-            Some((start, committed))
-        } else {
-            None
-        }
+    pub fn pending_wal_flush_range(&self, durable: usize) -> Option<(usize, usize)> {
+        let start = self.local_end(durable);
+        let end = self.committed_len.load(Ordering::Acquire);
+        (end > start).then_some((start, end))
     }
 
     /// Get a point-in-time summary of batches pending WAL flush.
-    pub fn pending_wal_flush_stats(&self) -> PendingWalFlushStats {
-        let Some((start, end)) = self.pending_wal_flush_range() else {
+    pub fn pending_wal_flush_stats(&self, durable: usize) -> PendingWalFlushStats {
+        let Some((start, end)) = self.pending_wal_flush_range(durable) else {
             return PendingWalFlushStats::default();
         };
 
@@ -643,66 +634,53 @@ impl BatchStore {
     // Visibility API
     // =========================================================================
 
-    /// Get batches visible up to a specific batch position (inclusive).
+    /// Batches in the visible prefix `[0, visible_count)`.
     ///
-    /// A batch at position `i` is visible if `i <= max_visible_batch_position`.
-    pub fn visible_batches(&self, max_visible_batch_position: usize) -> Vec<&StoredBatch> {
-        let len = self.committed_len.load(Ordering::Acquire);
-        let end = (max_visible_batch_position + 1).min(len);
+    /// `visible_count` is an **exclusive count**, not an inclusive position: 0
+    /// means nothing is visible. As an inclusive position, 0 meant *both*
+    /// "nothing visible" and "batch 0 is visible", so a batch that was committed
+    /// to the store but not yet indexed or WAL-durable was readable for a full
+    /// PUT round-trip. The count makes that off-by-one inexpressible.
+    pub fn visible_batches(&self, visible_count: usize) -> Vec<&StoredBatch> {
+        let end = visible_count.min(self.committed_len.load(Ordering::Acquire));
         (0..end).filter_map(|i| self.get(i)).collect()
     }
 
-    /// Get batch positions visible up to a specific batch position (inclusive).
-    pub fn max_visible_batch_positions(&self, max_visible_batch_position: usize) -> Vec<usize> {
-        let len = self.committed_len.load(Ordering::Acquire);
-        let end = (max_visible_batch_position + 1).min(len);
+    /// Positions of the batches in the visible prefix.
+    pub fn visible_batch_positions(&self, visible_count: usize) -> Vec<usize> {
+        let end = visible_count.min(self.committed_len.load(Ordering::Acquire));
         (0..end).collect()
     }
 
-    /// The inclusive maximum visible *row* position at `max_visible_batch_position`,
-    /// or `None` when no rows are visible. The visible batches are the committed
-    /// prefix `[0, last_visible_idx]`; each batch carries its cumulative
-    /// `row_offset`, so this is the end of the last visible batch minus one.
-    /// Used to bound MVCC seeks against the maintained PK-position index.
-    pub fn max_visible_row(&self, max_visible_batch_position: usize) -> Option<u64> {
-        let len = self.committed_len.load(Ordering::Acquire);
-        if len == 0 {
-            return None;
-        }
-        let last_visible_idx = max_visible_batch_position.min(len - 1);
-        let last = self.get(last_visible_idx)?;
+    /// The inclusive maximum visible *row* position, or `None` when no rows are
+    /// visible. Each batch carries its cumulative `row_offset`, so this is the
+    /// end of the last visible batch minus one. Bounds MVCC seeks against the
+    /// maintained PK-position index.
+    pub fn max_visible_row(&self, visible_count: usize) -> Option<u64> {
+        let end = visible_count.min(self.committed_len.load(Ordering::Acquire));
+        let last = self.get(end.checked_sub(1)?)?;
         let visible_end = last.row_offset + last.num_rows as u64; // exclusive
         visible_end.checked_sub(1)
     }
 
-    /// Check if a specific batch is visible at a given visibility position.
+    /// Whether a batch falls inside the visible prefix.
     #[inline]
-    pub fn is_batch_visible(
-        &self,
-        batch_position: usize,
-        max_visible_batch_position: usize,
-    ) -> bool {
+    pub fn is_batch_visible(&self, batch_position: usize, visible_count: usize) -> bool {
         let len = self.committed_len.load(Ordering::Acquire);
-        batch_position < len && batch_position <= max_visible_batch_position
+        batch_position < len && batch_position < visible_count
     }
 
-    /// Get visible RecordBatches (clones the data).
-    pub fn visible_record_batches(&self, max_visible_batch_position: usize) -> Vec<RecordBatch> {
-        self.visible_batches(max_visible_batch_position)
+    /// Visible RecordBatches (clones the data).
+    pub fn visible_record_batches(&self, visible_count: usize) -> Vec<RecordBatch> {
+        self.visible_batches(visible_count)
             .into_iter()
             .map(|b| b.data.clone())
             .collect()
     }
 
-    /// Get visible RecordBatches with their row offsets.
-    ///
-    /// Returns tuples of (batch, row_offset) for each visible batch.
-    /// The row_offset is the starting row position for that batch.
-    pub fn visible_batches_with_offsets(
-        &self,
-        max_visible_batch_position: usize,
-    ) -> Vec<(RecordBatch, u64)> {
-        self.visible_batches(max_visible_batch_position)
+    /// Visible RecordBatches paired with the row position each one starts at.
+    pub fn visible_batches_with_offsets(&self, visible_count: usize) -> Vec<(RecordBatch, u64)> {
+        self.visible_batches(visible_count)
             .into_iter()
             .map(|b| (b.data.clone(), b.row_offset))
             .collect()
@@ -935,17 +913,52 @@ mod tests {
         store.append(create_test_batch(10)).unwrap(); // position 3
         store.append(create_test_batch(10)).unwrap(); // position 4
 
-        // max_visible_batch_position=2 means positions 0, 1, 2 are visible
-        let visible = store.max_visible_batch_positions(2);
-        assert_eq!(visible, vec![0, 1, 2]);
+        // A count of N exposes the prefix [0, N).
+        assert_eq!(store.visible_batch_positions(3), vec![0, 1, 2]);
+        assert_eq!(store.visible_batch_positions(5), vec![0, 1, 2, 3, 4]);
 
-        // max_visible_batch_position=4 means all visible
-        let visible = store.max_visible_batch_positions(4);
-        assert_eq!(visible, vec![0, 1, 2, 3, 4]);
+        // A count of 0 exposes nothing. Under the old inclusive cursor this
+        // case was indistinguishable from "batch 0 is visible", so every
+        // memtable leaked its first batch before it was indexed or durable.
+        assert!(store.visible_batch_positions(0).is_empty());
 
-        // max_visible_batch_position=0 means only position 0 visible
-        let visible = store.max_visible_batch_positions(0);
-        assert_eq!(visible, vec![0]);
+        // Beyond the committed range, clamp.
+        assert_eq!(store.visible_batch_positions(99), vec![0, 1, 2, 3, 4]);
+    }
+
+    /// The zero of the visibility cursor must be unambiguous.
+    ///
+    /// `BatchStore::append` publishes `committed_len` on the put path, under the
+    /// state lock, *before* the WAL flush that indexes the batch is even
+    /// triggered — and that flush is a ~100ms S3 PUT on another task. So batch 0
+    /// sits committed and readable for a full round-trip before it is indexed or
+    /// durable. As an inclusive position, a cursor of 0 meant both "nothing is
+    /// visible" and "batch 0 is visible", so every read arm backed by the batch
+    /// store served that batch while the index-backed arms did not — the tiers
+    /// actively disagreed. An exclusive count makes the state inexpressible.
+    #[test]
+    fn test_zero_cursor_hides_the_committed_but_unindexed_prefix() {
+        let store = BatchStore::with_capacity(4);
+        store.append(create_test_batch(10)).unwrap();
+        store.append(create_test_batch(10)).unwrap();
+
+        // Committed, but nothing indexed yet: every visibility query must agree
+        // that there is nothing to read.
+        assert!(store.visible_batches(0).is_empty());
+        assert!(store.visible_batch_positions(0).is_empty());
+        assert!(store.visible_record_batches(0).is_empty());
+        assert!(store.visible_batches_with_offsets(0).is_empty());
+        assert!(!store.is_batch_visible(0, 0));
+        assert_eq!(store.max_visible_row(0), None);
+
+        // The batches are there — they are simply not yet published.
+        assert_eq!(store.len(), 2);
+
+        // Indexing batch 0 publishes exactly batch 0.
+        assert_eq!(store.visible_batches(1).len(), 1);
+        assert!(store.is_batch_visible(0, 1));
+        assert!(!store.is_batch_visible(1, 1));
+        assert_eq!(store.max_visible_row(1), Some(9));
     }
 
     #[test]
@@ -956,14 +969,17 @@ mod tests {
         store.append(create_test_batch(10)).unwrap(); // position 1
         store.append(create_test_batch(10)).unwrap(); // position 2
 
-        // Batch at position 0 is visible when max_visible_batch_position >= 0
-        assert!(store.is_batch_visible(0, 0));
+        // A count of 0 means *nothing* is visible — including batch 0. As an
+        // inclusive position this case was indistinguishable from "batch 0 is
+        // visible", so a batch that was committed to the store but not yet
+        // indexed or WAL-durable was readable for a full PUT round-trip.
+        assert!(!store.is_batch_visible(0, 0));
+
+        // Batch i is visible once the count exceeds i.
         assert!(store.is_batch_visible(0, 1));
         assert!(store.is_batch_visible(0, 2));
-
-        // Batch at position 2 is only visible when max_visible_batch_position >= 2
         assert!(!store.is_batch_visible(2, 1));
-        assert!(store.is_batch_visible(2, 2));
+        assert!(!store.is_batch_visible(2, 2));
         assert!(store.is_batch_visible(2, 3));
 
         // Batch 3 doesn't exist
@@ -972,7 +988,7 @@ mod tests {
 
     #[test]
     fn test_max_visible_row() {
-        // (1) Empty store: no rows are visible at any position.
+        // (1) Empty store: no rows are visible at any count.
         let store = BatchStore::with_capacity(10);
         assert_eq!(store.max_visible_row(0), None);
         assert_eq!(store.max_visible_row(100), None);
@@ -982,23 +998,24 @@ mod tests {
         store.append(create_test_batch(20)).unwrap(); // position 1
         store.append(create_test_batch(30)).unwrap(); // position 2
 
-        // (2) A position within range yields the inclusive end of that prefix.
-        assert_eq!(store.max_visible_row(0), Some(9)); // batch 0: 0..10
-        assert_eq!(store.max_visible_row(1), Some(29)); // batch 1: 10..30
-        assert_eq!(store.max_visible_row(2), Some(59)); // batch 2: 30..60
+        // (2) A count of 0 means nothing is visible — not "batch 0 is visible".
+        assert_eq!(store.max_visible_row(0), None);
 
-        // (3) A position beyond the committed range clamps to the last batch,
-        // i.e. the inclusive max over all rows.
+        // (3) A count of N yields the inclusive last row of the prefix [0, N).
+        assert_eq!(store.max_visible_row(1), Some(9)); // batch 0: 0..10
+        assert_eq!(store.max_visible_row(2), Some(29)); // + batch 1: 10..30
+        assert_eq!(store.max_visible_row(3), Some(59)); // + batch 2: 30..60
+
+        // (4) A count beyond the committed range clamps to the last batch.
         assert_eq!(store.max_visible_row(100), Some(59));
 
-        // (4) An empty leading batch contributes no rows: at its own position
-        // the inclusive end underflows to None, while a later non-empty batch
-        // is reported correctly.
+        // (5) An empty leading batch contributes no rows, so a prefix covering
+        // only it still yields None, while a later non-empty batch is reported.
         let store = BatchStore::with_capacity(10);
         store.append(create_test_batch(0)).unwrap(); // position 0: rows [0,0)
         store.append(create_test_batch(5)).unwrap(); // position 1: rows [0,5)
-        assert_eq!(store.max_visible_row(0), None); // empty prefix → no rows
-        assert_eq!(store.max_visible_row(1), Some(4)); // through batch 1
+        assert_eq!(store.max_visible_row(1), None); // empty prefix → no rows
+        assert_eq!(store.max_visible_row(2), Some(4)); // through batch 1
     }
 
     #[test]

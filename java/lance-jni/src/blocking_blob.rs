@@ -63,19 +63,22 @@ fn inner_take_blobs<'local>(
     };
     let j_blobs = blobs
         .into_iter()
-        .map(BlockingBlobFile::from)
-        .collect::<Vec<BlockingBlobFile>>();
+        .map(|blob| blob.map(BlockingBlobFile::from))
+        .collect::<Vec<_>>();
     transform_vec(env, j_blobs)
 }
 
 fn transform_vec<'local>(
     env: &mut JNIEnv<'local>,
-    vec: Vec<BlockingBlobFile>,
+    vec: Vec<Option<BlockingBlobFile>>,
 ) -> Result<JObject<'local>> {
     let array_list_class = env.find_class("java/util/ArrayList")?;
     let array_list = env.new_object(array_list_class, "()V", &[])?;
     for blob_file in vec {
-        let blob_file_obj = blob_file.into_java(env)?;
+        let blob_file_obj = match blob_file {
+            Some(blob_file) => blob_file.into_java(env)?,
+            None => JObject::null(),
+        };
         env.call_method(
             &array_list,
             "add",
@@ -117,8 +120,8 @@ fn inner_take_blobs_by_indices<'local>(
     };
     let j_blobs = blobs
         .into_iter()
-        .map(BlockingBlobFile::from)
-        .collect::<Vec<BlockingBlobFile>>();
+        .map(|blob| blob.map(BlockingBlobFile::from))
+        .collect::<Vec<_>>();
     transform_vec(env, j_blobs)
 }
 

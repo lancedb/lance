@@ -30,7 +30,7 @@ pub struct BTreeIndexExec {
     batch_store: Arc<BatchStore>,
     indexes: Arc<IndexStore>,
     predicate: ScalarPredicate,
-    max_visible_batch_position: usize,
+    visible_count: usize,
     projection: Option<Vec<usize>>,
     output_schema: SchemaRef,
     properties: Arc<PlanProperties>,
@@ -47,10 +47,7 @@ impl Debug for BTreeIndexExec {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BTreeIndexExec")
             .field("predicate", &self.predicate)
-            .field(
-                "max_visible_batch_position",
-                &self.max_visible_batch_position,
-            )
+            .field("visible_count", &self.visible_count)
             .field("with_row_id", &self.with_row_id)
             .field("with_row_address", &self.with_row_address)
             .field("column", &self.column)
@@ -66,7 +63,7 @@ impl BTreeIndexExec {
     /// * `batch_store` - Lock-free batch store containing data
     /// * `indexes` - Index registry with BTree indexes
     /// * `predicate` - Scalar predicate to apply
-    /// * `max_visible_batch_position` - MVCC visibility sequence number
+    /// * `visible_count` - MVCC visibility sequence number
     /// * `projection` - Optional column indices to project
     /// * `output_schema` - Schema after projection (should include _rowid/_rowaddr if requested)
     /// * `with_row_id` - Whether to include _rowid column (row position)
@@ -76,7 +73,7 @@ impl BTreeIndexExec {
         batch_store: Arc<BatchStore>,
         indexes: Arc<IndexStore>,
         predicate: ScalarPredicate,
-        max_visible_batch_position: usize,
+        visible_count: usize,
         projection: Option<Vec<usize>>,
         output_schema: SchemaRef,
         with_row_id: bool,
@@ -102,7 +99,7 @@ impl BTreeIndexExec {
             batch_store,
             indexes,
             predicate,
-            max_visible_batch_position,
+            visible_count,
             projection,
             output_schema,
             properties,
@@ -113,7 +110,7 @@ impl BTreeIndexExec {
         })
     }
 
-    /// Compute the maximum visible row position based on max_visible_batch_position.
+    /// Compute the maximum visible row position based on visible_count.
     /// Returns None if no batches are visible.
     fn compute_max_visible_row(&self) -> Option<u64> {
         let mut max_visible_row_exclusive: u64 = 0;
@@ -121,7 +118,7 @@ impl BTreeIndexExec {
 
         for (batch_position, stored_batch) in self.batch_store.iter().enumerate() {
             let batch_end = current_row + stored_batch.num_rows as u64;
-            if batch_position <= self.max_visible_batch_position {
+            if batch_position < self.visible_count {
                 max_visible_row_exclusive = batch_end;
             }
             current_row = batch_end;
@@ -429,7 +426,7 @@ mod tests {
             batch_store,
             indexes,
             predicate,
-            0, // max_visible_batch_position (batch at position 0)
+            1, // visible_count (batch at position 0)
             None,
             schema,
             false,
@@ -473,7 +470,7 @@ mod tests {
             batch_store,
             indexes,
             predicate,
-            0,
+            1,
             None,
             schema,
             false,
@@ -518,7 +515,7 @@ mod tests {
             batch_store.clone(),
             indexes.clone(),
             predicate.clone(),
-            0,
+            1,
             None,
             schema.clone(),
             false,
@@ -538,7 +535,7 @@ mod tests {
             batch_store,
             indexes,
             predicate,
-            1,
+            2,
             None,
             schema,
             false,
@@ -587,7 +584,7 @@ mod tests {
             batch_store,
             indexes,
             predicate,
-            0,
+            1,
             None,
             schema_with_rowid.clone(),
             true,
@@ -651,7 +648,7 @@ mod tests {
                 batch_store.clone(),
                 indexes.clone(),
                 predicate.clone(),
-                0,
+                1,
                 None,
                 schema.clone(),
                 false,
@@ -679,7 +676,7 @@ mod tests {
                 batch_store,
                 indexes,
                 predicate,
-                0,
+                1,
                 None,
                 schema_with_rowid,
                 true,

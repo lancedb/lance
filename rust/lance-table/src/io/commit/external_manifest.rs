@@ -134,20 +134,18 @@ pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
             info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_MANIFEST, path = final_path.as_ref());
         }
 
-        // Get final e_tag (may change after copy for large files)
-        let e_tag = if copied && size < 5 * 1024 * 1024 {
-            e_tag
-        } else {
-            let meta = object_store.head(&final_path).await?;
-            meta.e_tag
-        };
+        // A copy creates a new object whose metadata may differ from the source.
+        // Read the destination metadata before publishing the final path.
+        let final_meta = object_store.head(&final_path).await?;
+        let final_size = final_meta.size;
+        let final_e_tag = final_meta.e_tag;
 
         let location = ManifestLocation {
             version,
             path: final_path.clone(),
-            size: Some(size),
+            size: Some(final_size),
             naming_scheme,
-            e_tag: e_tag.clone(),
+            e_tag: final_e_tag.clone(),
         };
 
         if !copied {
@@ -159,8 +157,8 @@ pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
             base_path.as_ref(),
             version,
             final_path.as_ref(),
-            size,
-            e_tag,
+            final_size,
+            final_e_tag,
         )
         .await?;
 
@@ -347,6 +345,69 @@ pub struct ExternalManifestCommitHandler {
 }
 
 impl ExternalManifestCommitHandler {
+    async fn verify_finalized_manifest_location(
+        &self,
+        base_path: &Path,
+        location: ManifestLocation,
+        object_store: &dyn OSObjectStore,
+    ) -> std::result::Result<ManifestLocation, Error> {
+        match object_store.head(&location.path).await {
+            Ok(ObjectMeta { size, e_tag, .. }) => {
+                let ManifestLocation {
+                    version,
+                    path,
+                    size: expected_size,
+                    naming_scheme,
+                    e_tag: expected_e_tag,
+                } = location;
+
+                let size = match expected_size {
+                    Some(expected_size) if expected_size != size => {
+                        return Err(Error::corrupt_file(
+                            path,
+                            format!(
+                                "Manifest size mismatch for version {}: external store expected {}, object store returned {}",
+                                version, expected_size, size
+                            ),
+                        ));
+                    }
+                    Some(expected_size) => Some(expected_size),
+                    None => Some(size),
+                };
+
+                let e_tag = match expected_e_tag {
+                    Some(expected_e_tag) => {
+                        if e_tag.as_ref() != Some(&expected_e_tag) {
+                            return Err(Error::corrupt_file(
+                                path,
+                                format!(
+                                    "Manifest e_tag mismatch for version {}: external store expected {:?}, object store returned {:?}",
+                                    version, expected_e_tag, e_tag
+                                ),
+                            ));
+                        }
+                        Some(expected_e_tag)
+                    }
+                    None => e_tag,
+                };
+
+                Ok(ManifestLocation {
+                    version,
+                    path,
+                    size,
+                    naming_scheme,
+                    e_tag,
+                })
+            }
+            Err(ObjectStoreError::NotFound { .. }) => {
+                // The external store may hold a stale finalized V2 path while
+                // the object store still has the manifest at the V1 location.
+                default_resolve_version(base_path, location.version, object_store).await
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// The manifest is considered committed once the staging manifest is written
     /// to object store and that path is committed to the external store.
     ///
@@ -363,7 +424,6 @@ impl ExternalManifestCommitHandler {
         staging_manifest_path: &Path,
         version: u64,
         size: u64,
-        e_tag: Option<String>,
         store: &dyn OSObjectStore,
         naming_scheme: ManifestNamingScheme,
     ) -> std::result::Result<ManifestLocation, Error> {
@@ -380,25 +440,18 @@ impl ExternalManifestCommitHandler {
             info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_MANIFEST, path = final_manifest_path.as_ref());
         }
 
-        // On S3, the etag can change if originally was MultipartUpload and later was Copy
-        // https://docs.aws.amazon.com/AmazonS3/latest/API/API_Object.html#AmazonS3-Type-Object-ETag
-        // We only do MultipartUpload for > 5MB files, so we can skip this check
-        // if size < 5MB. However, we need to double check the final_manifest_path
-        // exists before we change the external store, otherwise we may point to a
-        // non-existing manifest.
-        let e_tag = if copied && size < 5 * 1024 * 1024 {
-            e_tag
-        } else {
-            let meta = store.head(&final_manifest_path).await?;
-            meta.e_tag
-        };
+        // A copy creates a new object whose metadata may differ from the source.
+        // Read the destination metadata before publishing the final path.
+        let final_meta = store.head(&final_manifest_path).await?;
+        let final_size = final_meta.size;
+        let final_e_tag = final_meta.e_tag;
 
         let location = ManifestLocation {
             version,
             path: final_manifest_path,
-            size: Some(size),
+            size: Some(final_size),
             naming_scheme,
-            e_tag,
+            e_tag: final_e_tag,
         };
 
         if !copied {
@@ -411,7 +464,7 @@ impl ExternalManifestCommitHandler {
                 base_path.as_ref(),
                 version,
                 location.path.as_ref(),
-                size,
+                final_size,
                 location.e_tag.clone(),
             )
             .await?;
@@ -441,29 +494,30 @@ impl CommitHandler for ExternalManifestCommitHandler {
             .await?;
 
         match location {
-            Some(ManifestLocation {
-                version,
-                path,
-                size,
-                naming_scheme,
-                e_tag,
-            }) => {
-                // The path is finalized, no need to check object store
-                if path.extension() == Some(MANIFEST_EXTENSION) {
-                    return Ok(ManifestLocation {
-                        version,
-                        path,
-                        size,
-                        naming_scheme,
-                        e_tag,
-                    });
+            Some(location) => {
+                if location.path.extension() == Some(MANIFEST_EXTENSION) {
+                    return self
+                        .verify_finalized_manifest_location(
+                            base_path,
+                            location,
+                            object_store.inner.as_ref(),
+                        )
+                        .await;
                 }
 
-                let (size, e_tag) = if let Some(size) = size {
-                    (size, e_tag)
+                let ManifestLocation {
+                    version,
+                    path,
+                    size,
+                    naming_scheme,
+                    e_tag: _,
+                } = location;
+
+                let size = if let Some(size) = size {
+                    size
                 } else {
                     match object_store.inner.head(&path).await {
-                        Ok(meta) => (meta.size, meta.e_tag),
+                        Ok(meta) => meta.size,
                         Err(ObjectStoreError::NotFound { .. }) => {
                             // there may be other threads that have finished executing finalize_manifest.
                             let new_location = self
@@ -482,7 +536,6 @@ impl CommitHandler for ExternalManifestCommitHandler {
                         &path,
                         version,
                         size,
-                        e_tag.clone(),
                         &object_store.inner,
                         naming_scheme,
                     )
@@ -552,19 +605,20 @@ impl CommitHandler for ExternalManifestCommitHandler {
             Err(e) => return Err(e),
         };
 
-        // finalized path, just return
         if location.path.extension() == Some(MANIFEST_EXTENSION) {
-            return Ok(location);
+            return self
+                .verify_finalized_manifest_location(base_path, location, object_store)
+                .await;
         }
 
         let naming_scheme =
             ManifestNamingScheme::detect_scheme_staging(location.path.filename().unwrap());
 
-        let (size, e_tag) = if let Some(size) = location.size {
-            (size, location.e_tag.clone())
+        let size = if let Some(size) = location.size {
+            size
         } else {
             let meta = object_store.head(&location.path).await?;
-            (meta.size as u64, meta.e_tag)
+            meta.size
         };
 
         self.finalize_manifest(
@@ -572,7 +626,6 @@ impl CommitHandler for ExternalManifestCommitHandler {
             &location.path,
             version,
             size,
-            e_tag,
             object_store,
             naming_scheme,
         )
