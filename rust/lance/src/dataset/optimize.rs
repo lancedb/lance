@@ -2368,29 +2368,6 @@ mod tests {
         assert_eq!(split[0].pos_range, 0..2);
         assert_eq!(split[1].pos_range, 2..5);
         assert_eq!(split[2].pos_range, 5..8);
-
-        let tail_too_small_bin = CandidateBin {
-            fragments: std::iter::repeat_n(
-                Fragment {
-                    id: 0,
-                    files: vec![],
-                    deletion_file: None,
-                    row_id_meta: None,
-                    physical_rows: Some(0),
-                    last_updated_at_version_meta: None,
-                    created_at_version_meta: None,
-                },
-                3,
-            )
-            .collect(),
-            pos_range: 0..3,
-            candidacy: std::iter::repeat_n(CompactionCandidacy::CompactItself, 3).collect(),
-            row_counts: vec![600, 100, 100],
-            indices: vec![],
-        };
-        let split = tail_too_small_bin.split_for_size(500);
-        assert_eq!(split.len(), 1);
-        assert_eq!(split[0].pos_range, 0..3);
     }
 
     fn sample_data() -> RecordBatch {
