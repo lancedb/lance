@@ -687,7 +687,7 @@ async fn fts_ids_matching(dataset: &Dataset, term: &str) -> Vec<i32> {
 
 #[tokio::test]
 async fn test_ngram_optimize_preserves_overlay_staleness() {
-    let mut dataset = create_text_dataset().await;
+    let mut dataset = create_text_dataset(false).await;
     let params = ScalarIndexParams::for_builtin(BuiltinIndexType::NGram);
     let fragment_ids = dataset
         .get_fragments()
@@ -780,7 +780,7 @@ async fn test_btree_physical_merge_preserves_overlay_staleness() {
 
 #[tokio::test]
 async fn test_ngram_remap_excludes_newer_overlay_fragments() {
-    let mut dataset = create_text_dataset().await;
+    let mut dataset = create_text_dataset(false).await;
     let params = ScalarIndexParams::for_builtin(BuiltinIndexType::NGram);
     dataset
         .create_index(
