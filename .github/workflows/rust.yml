@@ -12,6 +12,7 @@ on:
       - rust/**
       - protos/**
       - .github/workflows/rust.yml
+      - ci/check_file_version_boundaries.py
       - rust-toolchain.toml
       - Cargo.toml
       - Cargo.lock
@@ -41,6 +42,10 @@ jobs:
           components: rustfmt
       - name: Check formatting
         run: cargo fmt -- --check
+      - name: Check file-version boundaries
+        run: |
+          python3 ci/check_file_version_boundaries.py --self-test
+          python3 ci/check_file_version_boundaries.py
 
   package:
     name: Check crates are publishable
