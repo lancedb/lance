@@ -28,6 +28,7 @@ itertools.workspace = true
 libc.workspace = true
 libm.workspace = true
 moka.workspace = true
+quick_cache = "0.6"
 num_cpus = "1.0"
 object_store = { workspace = true }
 pin-project.workspace = true

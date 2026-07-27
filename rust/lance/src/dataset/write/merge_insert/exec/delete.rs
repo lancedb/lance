@@ -279,7 +279,7 @@ impl ExecutionPlan for DeleteOnlyMergeInsertExec {
         let merge_stats_holder = self.merge_stats.clone();
         let transaction_holder = self.transaction.clone();
         let affected_rows_holder = self.affected_rows.clone();
-        let merged_generations = self.params.merged_generations.clone();
+        let compacted_sstables = self.params.compacted_sstables.clone();
         let source_dedupe_behavior = self.params.source_dedupe_behavior;
         let on_columns = self.params.on.clone();
 
@@ -304,7 +304,7 @@ impl ExecutionPlan for DeleteOnlyMergeInsertExec {
                 updated_fragments,
                 new_fragments: vec![],
                 fields_modified: vec![],
-                merged_generations,
+                compacted_sstables,
                 fields_for_preserving_frag_bitmap: dataset
                     .schema()
                     .fields

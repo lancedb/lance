@@ -249,7 +249,8 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
     // coverage-remapped + persisted before the data was remapped (e.g. while
     // remapping a *sibling* index).
     let baseline_version = curr_index_meta.dataset_version;
-    let (should_remap, bitmap_after_remap) = match curr_index_meta.fragment_bitmap.clone() {
+    let has_unknown_coverage = curr_index_meta.fragment_bitmap.is_none();
+    let (should_remap, mut bitmap_after_remap) = match curr_index_meta.fragment_bitmap.clone() {
         Some(mut index_frag_bitmap) => {
             let mut should_remap = false;
             for version in frag_reuse_index.details.versions.iter() {
@@ -291,8 +292,6 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
             }
             (should_remap, Some(index_frag_bitmap))
         }
-        // if there is no fragment bitmap for the index,
-        // we attempt remapping but will not update the fragment bitmap.
         None => (true, None),
     };
 
@@ -322,6 +321,30 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
     let remapper = RowAddrRemap::direct(composed_row_id_map);
     let remap_result = index::remap_index(dataset, index_id, &remapper).await?;
 
+    // Remapping advances the index watermark for fragment-reuse cleanup, but it
+    // does not incorporate overlays committed after the source index was built.
+    // Exclude those fragments so queries scan their current values instead.
+    if let Some(fragment_bitmap) = &mut bitmap_after_remap {
+        for fragment in dataset.manifest.fragments.iter() {
+            let has_newer_indexed_overlay = fragment.overlays.iter().any(|overlay| {
+                overlay.committed_version > curr_index_meta.dataset_version
+                    && overlay
+                        .data_file
+                        .fields
+                        .iter()
+                        .any(|field_id| curr_index_meta.fields.contains(field_id))
+            });
+            if has_newer_indexed_overlay {
+                fragment_bitmap.remove(fragment.id as u32);
+            }
+        }
+    }
+    let new_dataset_version = if has_unknown_coverage {
+        curr_index_meta.dataset_version
+    } else {
+        dataset.manifest.version
+    };
+
     let new_index_meta = match remap_result {
         // The composed remap emptied the index (every row deleted). Matching the
         // prior per-version behavior, leave the existing index untouched and
@@ -331,7 +354,7 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
             uuid: new_id,
             name: curr_index_meta.name.clone(),
             fields: curr_index_meta.fields.clone(),
-            dataset_version: dataset.manifest.version,
+            dataset_version: new_dataset_version,
             fragment_bitmap: bitmap_after_remap,
             index_details: curr_index_meta.index_details.clone(),
             index_version: curr_index_meta.index_version,
@@ -343,7 +366,7 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
             uuid: remapped_index.new_id,
             name: curr_index_meta.name.clone(),
             fields: curr_index_meta.fields.clone(),
-            dataset_version: dataset.manifest.version,
+            dataset_version: new_dataset_version,
             fragment_bitmap: bitmap_after_remap,
             index_details: Some(Arc::new(remapped_index.index_details)),
             index_version: remapped_index.index_version as i32,

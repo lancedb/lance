@@ -6393,7 +6393,7 @@ mod tests {
     /// Regression for the OSS-WAL compactor-drain bug: after a flush
     /// records its generation in the manifest and an external compactor
     /// later drains `sstables` back to empty (the legitimate
-    /// outcome of merging the generation into the base table), reopening
+    /// outcome after compacting the SSTable into the base table), reopening
     /// the writer must not re-replay the already-flushed WAL entry into
     /// the active memtable.
     ///
@@ -6432,7 +6432,7 @@ mod tests {
             writer_a.close().await.unwrap();
         }
 
-        // Simulate an external compactor merging the SSTable
+        // Simulate an external compactor compacting the SSTable.
         // into the base table: drain `sstables` to empty via a
         // direct manifest commit. The cursor stays where the flush put it.
         let manifest_store = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2);

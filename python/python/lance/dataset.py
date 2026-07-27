@@ -748,23 +748,22 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         reader = _coerce_reader(data_obj, schema)
         return super(MergeInsertBuilder, self).analyze_plan(reader)
 
-    def mark_generations_as_merged(
-        self, generations: "List[mem_wal.MergedGeneration]"
+    def mark_sstables_as_compacted(
+        self, sstables: "List[mem_wal.CompactedSsTable]"
     ) -> "MergeInsertBuilder":
-        """Mark MemWAL generations as merged into the base table.
+        """Mark MemWAL SSTables as compacted into the base table.
 
-        Call this before executing the merge_insert when the source data
-        includes rows from MemWAL flushed generations.
+        Call this before executing merge_insert when it compacts MemWAL SSTables.
 
         Parameters
         ----------
-        generations : list of MergedGeneration
-            Generations to mark as merged.
+        sstables : list of CompactedSsTable
+            SSTables to mark as compacted.
         """
-        from .mem_wal import _to_raw_merged_generations
+        from .mem_wal import _to_raw_compacted_sstables
 
-        raw_gens = _to_raw_merged_generations(generations)
-        super(MergeInsertBuilder, self).mark_generations_as_merged(raw_gens)
+        raw_sstables = _to_raw_compacted_sstables(sstables)
+        super(MergeInsertBuilder, self).mark_sstables_as_compacted(raw_sstables)
         return self
 
 
@@ -3308,6 +3307,7 @@ class LanceDataset(pa.dataset.Dataset):
             "BITMAP",
             "INVERTED",
             "FTS",
+            "NGRAM",
             "RTREE",
             "ZONEMAP",
             "BLOOMFILTER",
@@ -3321,6 +3321,7 @@ class LanceDataset(pa.dataset.Dataset):
         return cls._normalized_index_type(index_type) in {
             "BTREE",
             "BITMAP",
+            "NGRAM",
             "RTREE",
             "ZONEMAP",
             "BLOOMFILTER",
@@ -4279,7 +4280,8 @@ class LanceDataset(pa.dataset.Dataset):
         Create one segment without publishing it and return its metadata.
 
         This is the public distributed-build API for vector, BTREE scalar,
-        canonical bitmap scalar, INVERTED scalar, RTREE scalar, ZONEMAP scalar,
+        canonical bitmap scalar, INVERTED scalar, NGRAM scalar, RTREE scalar,
+        ZONEMAP scalar,
         and BLOOMFILTER scalar index construction. Unlike
         :meth:`create_index`, this method does not publish the index into the
         dataset manifest. Instead, it writes one segment under
@@ -4296,8 +4298,10 @@ class LanceDataset(pa.dataset.Dataset):
         4. commit the final segment list with
            :meth:`commit_existing_index_segments`
 
-        BTREE, BITMAP, INVERTED, RTREE, ZONEMAP, and BLOOMFILTER segments may
+        BTREE, BITMAP, INVERTED, NGRAM, RTREE, ZONEMAP, and BLOOMFILTER segments may
         be merged with :meth:`merge_existing_index_segments` before commit.
+        NGRAM segments built before a deferred compaction must be merged before
+        commit so their postings can be rebuilt against current row addresses.
         Parameters are the same as :meth:`create_index`, with one additional
         requirement:
 

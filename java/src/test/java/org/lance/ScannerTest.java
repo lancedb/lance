@@ -212,6 +212,10 @@ public class ScannerTest {
           assertTrue(statsOpt.isPresent());
           ScanStats stats = statsOpt.get();
           assertTrue(stats.getBytesRead() > 0 || !stats.getAllCounts().isEmpty());
+          // Even without an index on this dataset, the two new counters must
+          // still marshal through JNI and default to zero rather than throwing.
+          assertTrue(stats.getIndexCacheHits() >= 0);
+          assertTrue(stats.getIndexCacheMisses() >= 0);
         }
       }
     }

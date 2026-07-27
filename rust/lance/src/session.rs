@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use lance_core::cache::{CacheBackend, CacheKeyIterator, LanceCache};
+use lance_core::cache::{CacheBackend, CacheKeyIterator, LanceCache, QuickCacheBackend};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 use lance_index::IndexType;
@@ -95,7 +95,8 @@ impl Session {
     ///
     /// Parameters:
     ///
-    /// - ***index_cache_size***: the size of the index cache.
+    /// - ***index_cache_size***: the size of the index cache, backed by
+    ///   [`QuickCacheBackend`].
     /// - ***metadata_cache_size***: the size of the metadata cache.
     /// - ***store_registry***: the object store registry to use when opening
     ///   datasets. This determines which schemes are available, and also allows
@@ -106,7 +107,9 @@ impl Session {
         store_registry: Arc<ObjectStoreRegistry>,
     ) -> Self {
         Self {
-            index_cache: GlobalIndexCache(LanceCache::with_capacity(index_cache_size)),
+            index_cache: GlobalIndexCache(LanceCache::with_backend(Arc::new(
+                QuickCacheBackend::with_capacity(index_cache_size),
+            ))),
             metadata_cache: GlobalMetadataCache(LanceCache::with_capacity(metadata_cache_size)),
             index_extensions: HashMap::new(),
             store_registry,

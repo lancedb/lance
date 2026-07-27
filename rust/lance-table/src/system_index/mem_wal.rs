@@ -15,7 +15,7 @@ pub const MEM_WAL_INDEX_NAME: &str = "__lance_mem_wal";
 /// Type alias for shard identifier (UUID v4).
 pub type ShardId = Uuid;
 
-/// An SSTable: a flushed MemTable generation, stored as a Lance dataset.
+/// An SSTable: the immutable result of flushing a MemTable, stored as a Lance dataset.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
 pub struct SsTable {
     pub generation: u64,
@@ -40,20 +40,20 @@ impl From<pb::SsTable> for SsTable {
     }
 }
 
-/// A shard's merged generation, used in MemWalIndexDetails.
+/// A pointer to the latest SSTable compacted for a shard.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Hash, Serialize, Deserialize)]
-pub struct MergedGeneration {
+pub struct CompactedSsTable {
     pub shard_id: Uuid,
     pub generation: u64,
 }
 
-impl DeepSizeOf for MergedGeneration {
+impl DeepSizeOf for CompactedSsTable {
     fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
         0 // UUID is 16 bytes fixed size, no heap allocations
     }
 }
 
-impl MergedGeneration {
+impl CompactedSsTable {
     pub fn new(shard_id: Uuid, generation: u64) -> Self {
         Self {
             shard_id,
@@ -62,41 +62,41 @@ impl MergedGeneration {
     }
 }
 
-impl From<&MergedGeneration> for pb::MergedGeneration {
-    fn from(mg: &MergedGeneration) -> Self {
+impl From<&CompactedSsTable> for pb::CompactedSsTable {
+    fn from(sstable: &CompactedSsTable) -> Self {
         Self {
-            shard_id: Some((&mg.shard_id).into()),
-            generation: mg.generation,
+            shard_id: Some((&sstable.shard_id).into()),
+            generation: sstable.generation,
         }
     }
 }
 
-impl TryFrom<pb::MergedGeneration> for MergedGeneration {
+impl TryFrom<pb::CompactedSsTable> for CompactedSsTable {
     type Error = Error;
 
-    fn try_from(mg: pb::MergedGeneration) -> lance_core::Result<Self> {
-        let shard_id = mg
+    fn try_from(sstable: pb::CompactedSsTable) -> lance_core::Result<Self> {
+        let shard_id = sstable
             .shard_id
             .as_ref()
             .map(Uuid::try_from)
-            .ok_or_else(|| Error::invalid_input("Missing shard_id in MergedGeneration"))??;
+            .ok_or_else(|| Error::invalid_input("Missing shard_id in CompactedSsTable"))??;
         Ok(Self {
             shard_id,
-            generation: mg.generation,
+            generation: sstable.generation,
         })
     }
 }
 
-/// Tracks which merged generation a base table index has been rebuilt to cover.
+/// Tracks which compacted SSTable generation a base table index covers.
 /// Used to determine whether to read from SSTable indexes or base table.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
 pub struct IndexCatchupProgress {
     pub index_name: String,
-    pub caught_up_generations: Vec<MergedGeneration>,
+    pub caught_up_generations: Vec<CompactedSsTable>,
 }
 
 impl IndexCatchupProgress {
-    pub fn new(index_name: String, caught_up_generations: Vec<MergedGeneration>) -> Self {
+    pub fn new(index_name: String, caught_up_generations: Vec<CompactedSsTable>) -> Self {
         Self {
             index_name,
             caught_up_generations,
@@ -108,8 +108,8 @@ impl IndexCatchupProgress {
     pub fn caught_up_generation_for_shard(&self, shard_id: &Uuid) -> Option<u64> {
         self.caught_up_generations
             .iter()
-            .find(|mg| &mg.shard_id == shard_id)
-            .map(|mg| mg.generation)
+            .find(|sstable| &sstable.shard_id == shard_id)
+            .map(|sstable| sstable.generation)
     }
 }
 
@@ -120,7 +120,7 @@ impl From<&IndexCatchupProgress> for pb::IndexCatchupProgress {
             caught_up_generations: icp
                 .caught_up_generations
                 .iter()
-                .map(|mg| mg.into())
+                .map(|sstable| sstable.into())
                 .collect(),
         }
     }
@@ -135,7 +135,7 @@ impl TryFrom<pb::IndexCatchupProgress> for IndexCatchupProgress {
             caught_up_generations: icp
                 .caught_up_generations
                 .into_iter()
-                .map(MergedGeneration::try_from)
+                .map(CompactedSsTable::try_from)
                 .collect::<lance_core::Result<_>>()?,
         })
     }
@@ -334,7 +334,7 @@ pub struct MemWalIndexDetails {
     pub inline_snapshots: Option<Vec<u8>>,
     pub sharding_specs: Vec<ShardingSpec>,
     pub maintained_indexes: Vec<String>,
-    pub merged_generations: Vec<MergedGeneration>,
+    pub compacted_sstables: Vec<CompactedSsTable>,
     pub index_catchup: Vec<IndexCatchupProgress>,
     /// Default `ShardWriter` configuration values for this MemWAL index.
     ///
@@ -353,10 +353,10 @@ impl From<&MemWalIndexDetails> for pb::MemWalIndexDetails {
             inline_snapshots: details.inline_snapshots.clone(),
             sharding_specs: details.sharding_specs.iter().map(|rs| rs.into()).collect(),
             maintained_indexes: details.maintained_indexes.clone(),
-            merged_generations: details
-                .merged_generations
+            compacted_sstables: details
+                .compacted_sstables
                 .iter()
-                .map(|mg| mg.into())
+                .map(|sstable| sstable.into())
                 .collect(),
             index_catchup: details.index_catchup.iter().map(|icp| icp.into()).collect(),
             writer_config_defaults: details.writer_config_defaults.clone(),
@@ -378,10 +378,10 @@ impl TryFrom<pb::MemWalIndexDetails> for MemWalIndexDetails {
                 .map(ShardingSpec::from)
                 .collect(),
             maintained_indexes: details.maintained_indexes,
-            merged_generations: details
-                .merged_generations
+            compacted_sstables: details
+                .compacted_sstables
                 .into_iter()
-                .map(MergedGeneration::try_from)
+                .map(CompactedSsTable::try_from)
                 .collect::<lance_core::Result<_>>()?,
             index_catchup: details
                 .index_catchup
@@ -404,12 +404,12 @@ impl MemWalIndex {
         Self { details }
     }
 
-    pub fn merged_generation_for_shard(&self, shard_id: &Uuid) -> Option<u64> {
+    pub fn compacted_generation_for_shard(&self, shard_id: &Uuid) -> Option<u64> {
         self.details
-            .merged_generations
+            .compacted_sstables
             .iter()
-            .find(|mg| &mg.shard_id == shard_id)
-            .map(|mg| mg.generation)
+            .find(|sstable| &sstable.shard_id == shard_id)
+            .map(|sstable| sstable.generation)
     }
 
     /// Get the caught up generation for a specific index and shard.
@@ -423,12 +423,12 @@ impl MemWalIndex {
     }
 
     /// Check if an index is fully caught up for a shard.
-    /// Returns true if the index covers all merged data for the shard.
+    /// Returns true if the index covers all compacted data for the shard.
     pub fn is_index_caught_up(&self, index_name: &str, shard_id: &Uuid) -> bool {
-        let merged_gen = self.merged_generation_for_shard(shard_id).unwrap_or(0);
+        let compacted_gen = self.compacted_generation_for_shard(shard_id).unwrap_or(0);
         let caught_up_gen = self.index_caught_up_generation(index_name, shard_id);
 
         // If not tracked in index_catchup, assumed fully caught up
-        caught_up_gen.is_none_or(|generation| generation >= merged_gen)
+        caught_up_gen.is_none_or(|generation| generation >= compacted_gen)
     }
 }

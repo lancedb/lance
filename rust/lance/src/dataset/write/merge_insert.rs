@@ -126,7 +126,7 @@ use lance_datafusion::{
 };
 use lance_file::version::LanceFileVersion;
 use lance_index::IndexCriteria;
-use lance_index::mem_wal::MergedGeneration;
+use lance_index::mem_wal::CompactedSsTable;
 use lance_select::RowAddrTreeMap;
 use lance_table::format::{Fragment, IndexMetadata, RowIdMeta};
 use log::info;
@@ -352,8 +352,8 @@ struct MergeInsertParams {
     // spill.
     spill_for_retry: bool,
     retry_timeout: Duration,
-    // List of MemWAL region generations to mark as merged when this commit succeeds.
-    merged_generations: Vec<MergedGeneration>,
+    // MemWAL SSTables to mark as compacted when this commit succeeds.
+    compacted_sstables: Vec<CompactedSsTable>,
     // If true, skip auto cleanup during commits. This should be set to true
     // for high frequency writes to improve performance. This is also useful
     // if the writer does not have delete permissions and the clean up would
@@ -490,7 +490,7 @@ impl MergeInsertBuilder {
                 conflict_retries: 10,
                 spill_for_retry: true,
                 retry_timeout: Duration::from_secs(30),
-                merged_generations: Vec::new(),
+                compacted_sstables: Vec::new(),
                 skip_auto_cleanup: false,
                 use_index: true,
                 source_dedupe_behavior: SourceDedupeBehavior::Fail,
@@ -602,10 +602,12 @@ impl MergeInsertBuilder {
         self
     }
 
-    /// Mark MemWAL region generations as merged when this commit succeeds.
-    /// This updates the merged_generations in the MemWAL Index atomically with the data commit.
-    pub fn mark_generations_as_merged(&mut self, generations: Vec<MergedGeneration>) -> &mut Self {
-        self.params.merged_generations.extend(generations);
+    /// Mark MemWAL SSTables as compacted when this commit succeeds.
+    ///
+    /// This updates `compacted_sstables` in the MemWAL index atomically with
+    /// the data commit.
+    pub fn mark_sstables_as_compacted(&mut self, sstables: Vec<CompactedSsTable>) -> &mut Self {
+        self.params.compacted_sstables.extend(sstables);
         self
     }
 
@@ -2214,7 +2216,7 @@ impl MergeInsertJob {
                 updated_fragments,
                 new_fragments: vec![],
                 fields_modified: vec![],
-                merged_generations: self.params.merged_generations.clone(),
+                compacted_sstables: self.params.compacted_sstables.clone(),
                 fields_for_preserving_frag_bitmap: full_schema
                     .fields
                     .iter()
@@ -2253,7 +2255,7 @@ impl MergeInsertJob {
                 updated_fragments,
                 new_fragments,
                 fields_modified,
-                merged_generations: self.params.merged_generations.clone(),
+                compacted_sstables: self.params.compacted_sstables.clone(),
                 fields_for_preserving_frag_bitmap: vec![], // in-place update do not affect preserving frag bitmap
                 update_mode: Some(RewriteColumns),
                 inserted_rows_filter: None, // not implemented for v1
@@ -2355,7 +2357,7 @@ impl MergeInsertJob {
                 // On this path we only make deletions against updated_fragments and will not
                 // modify any field values.
                 fields_modified: vec![],
-                merged_generations: self.params.merged_generations.clone(),
+                compacted_sstables: self.params.compacted_sstables.clone(),
                 fields_for_preserving_frag_bitmap: full_schema
                     .fields
                     .iter()
