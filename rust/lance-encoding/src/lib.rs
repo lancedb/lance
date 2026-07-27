@@ -23,7 +23,6 @@ pub mod statistics;
 #[cfg(test)]
 pub mod testing;
 pub mod utils;
-pub mod version;
 
 // We can definitely add support for big-endian machines someday.  However, it's not a priority and
 // would involve extensive testing (probably through emulation) to ensure that the encodings are
