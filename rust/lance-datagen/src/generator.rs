@@ -570,6 +570,9 @@ where
         self.leftover_count = ((self.leftover_count as u64 + length.0) % self.repeat as u64) as u32;
         self.leftover = values.last().copied().unwrap_or(T::default());
         let array = ArrayType::from(values);
+        // `ArrayType::from` uses the primitive type's default metadata. For
+        // timezone-aware timestamps this drops the timezone, so restore the
+        // generator's declared type when it differs.
         if array.data_type() == &self.data_type {
             return Ok(Arc::new(array));
         }
