@@ -5,7 +5,8 @@ use arrow_buffer::{BooleanBufferBuilder, bit_util};
 
 use crate::buffer::LanceBuffer;
 use crate::compression::{
-    BlockCompressor, BlockDecompressor, FixedPerValueDecompressor, MiniBlockDecompressor,
+    BlockCompressor, BlockDecompressor, BlockValueType, FixedPerValueDecompressor,
+    MiniBlockDecompressor, require_block_payload,
 };
 use crate::data::{
     BlockInfo, DataBlock, FixedSizeListBlock, FixedWidthDataBlock, NullableDataBlock,
@@ -13,7 +14,7 @@ use crate::data::{
 use crate::encodings::logical::primitive::fullzip::{PerValueCompressor, PerValueDataBlock};
 use crate::encodings::logical::primitive::miniblock::{
     MAX_MINIBLOCK_BYTES, MAX_MINIBLOCK_VALUES, MiniBlockChunk, MiniBlockCompressed,
-    MiniBlockCompressor,
+    MiniBlockCompressionContext, MiniBlockCompressor,
 };
 use crate::format::ProtobufUtils21;
 use crate::format::pb21::compressive_encoding::Compression;
@@ -458,20 +459,66 @@ impl ValueEncoder {
 }
 
 impl BlockCompressor for ValueEncoder {
-    fn compress(&self, data: DataBlock) -> Result<LanceBuffer> {
+    fn compress(&self, data: DataBlock) -> Result<Option<LanceBuffer>> {
         let data = match data {
             DataBlock::FixedWidth(fixed_width) => fixed_width.data,
-            _ => unimplemented!(
-                "Cannot compress block of type {} with ValueEncoder",
-                data.name()
-            ),
+            _ => {
+                return Err(Error::invalid_input(format!(
+                    "ValueEncoder cannot compress a {} block",
+                    data.name()
+                )));
+            }
         };
-        Ok(data)
+        Ok(Some(data))
+    }
+}
+
+/// Flat fixed-width block compressor used by the generic block selector.
+#[derive(Debug)]
+pub(crate) struct FixedWidthBlockCompressor {
+    value_type: BlockValueType,
+}
+
+impl FixedWidthBlockCompressor {
+    pub(crate) fn new(value_type: BlockValueType) -> Self {
+        Self { value_type }
+    }
+}
+
+impl BlockCompressor for FixedWidthBlockCompressor {
+    fn compress(&self, data: DataBlock) -> Result<Option<LanceBuffer>> {
+        let DataBlock::FixedWidth(data) = data else {
+            return Err(Error::invalid_input(
+                "Flat block compression requires fixed-width data",
+            ));
+        };
+        if data.bits_per_value != self.value_type.bits_per_value() {
+            return Err(Error::invalid_input(format!(
+                "Flat block compressor expects {}-bit values, got {}",
+                self.value_type.bits_per_value(),
+                data.bits_per_value
+            )));
+        }
+        let expected = usize::try_from(data.num_values)
+            .ok()
+            .and_then(|values| values.checked_mul(self.value_type.bits_per_value() as usize / 8))
+            .ok_or_else(|| Error::invalid_input("Flat block payload length overflows usize"))?;
+        if data.data.len() != expected {
+            return Err(Error::invalid_input(format!(
+                "Flat block input has {} bytes, expected {expected}",
+                data.data.len()
+            )));
+        }
+        Ok(Some(data.data))
     }
 }
 
 impl MiniBlockCompressor for ValueEncoder {
-    fn compress(&self, chunk: DataBlock) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
+    fn compress(
+        &self,
+        chunk: DataBlock,
+        _context: MiniBlockCompressionContext,
+    ) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
         match chunk {
             DataBlock::FixedWidth(fixed_width) => {
                 let encoding = ProtobufUtils21::flat(fixed_width.bits_per_value, None);
@@ -571,10 +618,45 @@ impl ValueDecompressor {
 }
 
 impl BlockDecompressor for ValueDecompressor {
-    fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
+    fn decompress(&self, data: Option<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
+        let data = require_block_payload(data, "Flat block")?;
         let block = self.buffer_to_block(data, num_values);
         assert_eq!(block.num_values(), num_values);
         Ok(block)
+    }
+}
+
+/// Flat fixed-width block decompressor with fallible payload validation.
+#[derive(Debug)]
+pub(crate) struct FixedWidthBlockDecompressor {
+    value_type: BlockValueType,
+}
+
+impl FixedWidthBlockDecompressor {
+    pub(crate) fn new(value_type: BlockValueType) -> Self {
+        Self { value_type }
+    }
+}
+
+impl BlockDecompressor for FixedWidthBlockDecompressor {
+    fn decompress(&self, data: Option<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
+        let data = require_block_payload(data, "Flat block")?;
+        let expected = usize::try_from(num_values)
+            .ok()
+            .and_then(|values| values.checked_mul(self.value_type.bits_per_value() as usize / 8))
+            .ok_or_else(|| Error::invalid_input("Flat block payload length overflows usize"))?;
+        if data.len() != expected {
+            return Err(Error::invalid_input(format!(
+                "Flat block payload has {} bytes, expected {expected}",
+                data.len()
+            )));
+        }
+        Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
+            bits_per_value: self.value_type.bits_per_value(),
+            num_values,
+            data,
+            block_info: BlockInfo::new(),
+        }))
     }
 }
 
@@ -775,7 +857,9 @@ mod tests {
         encodings::{
             logical::primitive::{
                 fullzip::{PerValueCompressor, PerValueDataBlock},
-                miniblock::MiniBlockCompressor,
+                miniblock::{
+                    MiniBlockCompressed, MiniBlockCompressionContext, MiniBlockCompressor,
+                },
             },
             physical::value::ValueDecompressor,
         },
@@ -788,6 +872,16 @@ mod tests {
     };
 
     use super::ValueEncoder;
+
+    fn compress_miniblock(
+        compressor: &dyn MiniBlockCompressor,
+        data: DataBlock,
+    ) -> lance_core::Result<(
+        MiniBlockCompressed,
+        crate::format::pb21::CompressiveEncoding,
+    )> {
+        compressor.compress(data, MiniBlockCompressionContext::new(0, true, true))
+    }
 
     const PRIMITIVE_TYPES: &[DataType] = &[
         DataType::Null,
@@ -969,7 +1063,7 @@ mod tests {
         let starting_data = DataBlock::from_array(sample_list.clone());
 
         let encoder = ValueEncoder::default();
-        let (data, compression) = MiniBlockCompressor::compress(&encoder, starting_data).unwrap();
+        let (data, compression) = compress_miniblock(&encoder, starting_data).unwrap();
 
         assert_eq!(data.num_values, 3);
         assert_eq!(data.data.len(), 3);
@@ -1030,7 +1124,7 @@ mod tests {
         let starting_data = DataBlock::from_array(array);
 
         let encoder = ValueEncoder::default();
-        let result = MiniBlockCompressor::compress(&encoder, starting_data);
+        let result = compress_miniblock(&encoder, starting_data);
 
         let err = result.expect_err("wide values should not be encodable as miniblock");
         assert!(
@@ -1142,7 +1236,7 @@ mod tests {
         );
 
         let encoder = ValueEncoder::default();
-        let (data, compression) = MiniBlockCompressor::compress(&encoder, starting_data).unwrap();
+        let (data, compression) = compress_miniblock(&encoder, starting_data).unwrap();
 
         let Compression::FixedSizeList(fsl) = compression.compression.unwrap() else {
             panic!()

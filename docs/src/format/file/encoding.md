@@ -584,7 +584,10 @@ on a per-value basis. We use ☑️ to mark a technique that is applied on a per
 | --------------- | --------------------- | ------------------------ | -------------------------- |
 | Flat            | ✅ (2.1)              | ✅ (2.1)                 | ✅ (2.1)                   |
 | Variable        | ✅ (2.1)              | ✅ (2.1)                 | ✅ (2.1)                   |
-| Constant        | ✅ (2.1)              | ❓                       | ❓                         |
+| Constant        | ✅ (2.1)              | ❓                       | ✅ (2.3, variable offsets) |
+| Range           | ✅ (2.3)              | ❌                       | ✅ (2.3, variable offsets) |
+| Delta           | ✅ (2.3)              | ❌                       | ✅ (2.3, variable offsets) |
+| Dictionary      | ✅ (2.3)              | ❌                       | ✅ (2.3, variable offsets) |
 | Bitpacking      | ✅ (2.1)              | ❓                       | ✅ (2.1)                   |
 | Fsst            | ❓                    | ✅ (2.1)                 | ✅ (2.1)                   |
 | Rle             | ✅ (2.2)              | ❌                       | ✅ (2.1)                   |
@@ -593,6 +596,64 @@ on a per-value basis. We use ☑️ to mark a technique that is applied on a per
 
 In the following sections we will describe each technique in a bit more detail and explain how it is utilized
 in various contexts.
+
+### Generic Block Sequences
+
+Starting in Lance 2.3, block compression can encode unsigned `u32` and `u64` sequences with a shared descriptor
+contract. Direct codecs such as Flat, bitpacking, RLE, and Dictionary also support non-monotonic values; Range and
+Delta require non-decreasing input. The containing layout supplies the value type and cardinality. A descriptor
+constructs a concrete decoder tree whose nodes own their child codecs and framing validation.
+
+Writers select a concrete compressor from a bounded set: `Constant`, `Range`, `Flat`, bitpacking, RLE,
+`Dictionary`, `Delta`, and general compression. Candidate costs include the protobuf descriptor, codec framing,
+buffer entries, and alignment. Payload estimates are exact except for `General`, which extrapolates from a bounded
+sample; only the selected compressor is invoked to materialize payloads. Writers use the following canonical
+metadata-only codecs:
+
+- An empty sequence uses `Constant` with no scalar.
+- A non-empty constant sequence uses `Constant` with one little-endian scalar.
+- An arithmetic progression with a positive step uses `Range`.
+
+The first block-dictionary writer only emits Dictionary for `u64` sequences.
+The first block-sequence grammar permits `General` only as the outer root around a `Flat` child; readers reject
+inner, sibling, repeated, or non-`Flat` `General` transforms.
+
+`Range` stores the unsigned width, first value, and positive step. The value at index `i` is
+`start + step * i`; readers reject overflow and widths other than 32 or 64 bits.
+
+```protobuf
+%%% proto.message.Range %%%
+```
+
+`Delta` stores the first value inline. Its child represents the `n - 1` non-negative adjacent differences. Delta
+has a payload exactly when its child has one. Zero differences are valid. Readers reconstruct the sequence with
+checked prefix sums.
+
+```protobuf
+%%% proto.message.Delta %%%
+```
+
+RLE and block Dictionary expose no outer payload when both children are metadata-only. Otherwise, they
+combine their children into one framed outer payload:
+
+```text
+RLE payload:
+  u64 values_payload_bytes
+  values payload
+  run-lengths payload
+
+Dictionary payload:
+  u64 indices_payload_bytes
+  u64 items_payload_bytes
+  indices payload
+  dictionary-items payload
+```
+
+The framed length for a metadata-only child must be zero. Readers validate child cardinalities, run-length sums,
+dictionary index bounds, and all frame boundaries.
+
+Lance 2.0 through 2.2 writers do not emit `Range`, `Delta`, or block Dictionary. Their block selector order
+and payload shapes remain unchanged.
 
 ### Flat
 
@@ -610,6 +671,25 @@ a buffer of offsets.
 When applied in a mini-block context each block may have a different number of values. We walk through the values
 until we find the point that would exceed 4,096 bytes and then use the most recent power of 2 number of values that
 we have passed.
+
+Lance 2.0 through 2.2 store each mini-block as one legacy buffer containing chunk-local Flat offsets followed by
+the value bytes. Starting in Lance 2.3, the writer also evaluates a generic-offset container. Generic offsets are
+zero-based and independently encoded in each chunk with one page-wide concrete offset codec:
+
+```text
+Legacy chunk:
+  [adjusted Flat offsets][value bytes]
+
+Generic chunk:
+  [optional offset payload][value bytes]
+```
+
+The generic form has one buffer size per chunk for metadata-only offset codecs and two for payload-bearing offset
+codecs. It is selected only when its complete serialized size is strictly smaller than the legacy form. A Flat
+offset descriptor always denotes the legacy form, which keeps the two wire shapes unambiguous. Both forms keep
+offsets and values in the same mini-block chunk, so a random read still fetches only the selected chunk. Fields that
+explicitly request an outer General compressor retain the legacy form because that transform can change the
+complete-container winner after offset selection.
 
 ### Constant
 

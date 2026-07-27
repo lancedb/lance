@@ -545,6 +545,8 @@ fn tag(e: &Compression) -> &'static str {
         FixedSizeList(_) => "fixed_size_list",
         PackedStruct(_) => "packed_struct",
         VariablePackedStruct(_) => "variable_packed_struct",
+        Range(_) => "range",
+        Delta(_) => "delta",
     }
 }
 
@@ -571,6 +573,7 @@ fn child(c: &Compression) -> Option<Vec<&CompressiveEncoding>> {
         Fsst(f) => f.values.as_ref().map(|b| vec![b.as_ref()]),
         ByteStreamSplit(b) => b.values.as_ref().map(|b| vec![b.as_ref()]),
         General(g) => g.values.as_ref().map(|b| vec![b.as_ref()]),
+        Delta(d) => d.deltas.as_ref().map(|b| vec![b.as_ref()]),
         Dictionary(d) => {
             let mut children = Vec::new();
             if let Some(values) = d.items.as_ref() {

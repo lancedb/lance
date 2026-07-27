@@ -34,7 +34,7 @@ use crate::format::{
 };
 use crate::{
     buffer::LanceBuffer,
-    compression::VariablePerValueDecompressor,
+    compression::{VariablePerValueDecompressor, require_block_payload},
     data::{BlockInfo, DataBlock, VariableWidthBlock},
     encodings::logical::primitive::fullzip::{PerValueCompressor, PerValueDataBlock},
 };
@@ -130,12 +130,40 @@ impl FromStr for CompressionScheme {
 pub trait BufferCompressor: std::fmt::Debug + Send + Sync {
     fn compress(&self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()>;
     fn decompress(&self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()>;
+    /// Decompresses at most `max_output_len` bytes.
+    fn decompress_bounded(
+        &self,
+        input_buf: &[u8],
+        output_buf: &mut Vec<u8>,
+        max_output_len: usize,
+    ) -> Result<()>;
+    /// Decompresses exactly `expected_output_len` bytes without trusting an
+    /// embedded size prefix to choose the allocation size.
+    fn decompress_exact(
+        &self,
+        input_buf: &[u8],
+        output_buf: &mut Vec<u8>,
+        expected_output_len: usize,
+    ) -> Result<()> {
+        let start = output_buf.len();
+        self.decompress_bounded(input_buf, output_buf, expected_output_len)?;
+        let actual_output_len = output_buf.len().checked_sub(start).ok_or_else(|| {
+            Error::internal("Buffer decompressor shortened its output".to_string())
+        })?;
+        if actual_output_len != expected_output_len {
+            output_buf.truncate(start);
+            return Err(Error::invalid_input(format!(
+                "Decompression produced {actual_output_len} bytes, expected exactly {expected_output_len}"
+            )));
+        }
+        Ok(())
+    }
     fn config(&self) -> CompressionConfig;
 }
 
 #[cfg(feature = "zstd")]
 mod zstd {
-    use std::io::{Cursor, Write};
+    use std::io::{Cursor, Read, Write};
     use std::sync::{Mutex, OnceLock};
 
     use super::*;
@@ -279,6 +307,101 @@ mod zstd {
             Ok(())
         }
 
+        fn decompress_bounded(
+            &self,
+            input_buf: &[u8],
+            output_buf: &mut Vec<u8>,
+            max_output_len: usize,
+        ) -> Result<()> {
+            if self.is_raw_stream_format(input_buf) {
+                let read_limit = max_output_len.checked_add(1).ok_or_else(|| {
+                    Error::invalid_input("Zstd maximum output length overflows usize")
+                })?;
+                let read_limit_u64 = u64::try_from(read_limit).map_err(|_| {
+                    Error::invalid_input("Zstd maximum output length does not fit u64")
+                })?;
+                let start = output_buf.len();
+                output_buf.try_reserve_exact(read_limit).map_err(|error| {
+                    Error::invalid_input(format!(
+                        "Zstd could not reserve {read_limit} bounded output bytes: {error}"
+                    ))
+                })?;
+                let result = (|| {
+                    let decoder = ::zstd::stream::read::Decoder::new(Cursor::new(input_buf))?;
+                    let mut bounded = decoder.take(read_limit_u64);
+                    bounded.read_to_end(output_buf)
+                })();
+                let actual_output_len = match result {
+                    Ok(actual_output_len) => actual_output_len,
+                    Err(error) => {
+                        output_buf.truncate(start);
+                        return Err(Error::invalid_input(format!(
+                            "Zstd decompression failed: {error}"
+                        )));
+                    }
+                };
+                if actual_output_len > max_output_len {
+                    output_buf.truncate(start);
+                    return Err(Error::invalid_input(format!(
+                        "Zstd output exceeds the {max_output_len}-byte limit"
+                    )));
+                }
+                return Ok(());
+            }
+
+            const LENGTH_PREFIX_SIZE: usize = 8;
+            if input_buf.len() < LENGTH_PREFIX_SIZE {
+                return Err(Error::invalid_input(format!(
+                    "Length-prefixed Zstd payload has {} bytes, shorter than its {LENGTH_PREFIX_SIZE}-byte prefix",
+                    input_buf.len()
+                )));
+            }
+            let declared_output_len =
+                u64::from_le_bytes(input_buf[..LENGTH_PREFIX_SIZE].try_into().map_err(|_| {
+                    Error::invalid_input("Length-prefixed Zstd size prefix is truncated")
+                })?);
+            let declared_output_len = usize::try_from(declared_output_len).map_err(|_| {
+                Error::invalid_input("Length-prefixed Zstd output length does not fit usize")
+            })?;
+            if declared_output_len > max_output_len {
+                return Err(Error::invalid_input(format!(
+                    "Length-prefixed Zstd payload declares {declared_output_len} output bytes, exceeding the {max_output_len}-byte limit"
+                )));
+            }
+
+            let start = output_buf.len();
+            let end = start
+                .checked_add(declared_output_len)
+                .ok_or_else(|| Error::invalid_input("Zstd output buffer length overflows usize"))?;
+            output_buf
+                .try_reserve_exact(declared_output_len)
+                .map_err(|error| {
+                    Error::invalid_input(format!(
+                        "Zstd could not reserve {declared_output_len} output bytes: {error}"
+                    ))
+                })?;
+            output_buf.resize(end, 0);
+            let decompressed_size = match decompress_to_buffer(
+                &input_buf[LENGTH_PREFIX_SIZE..],
+                &mut output_buf[start..end],
+            ) {
+                Ok(decompressed_size) => decompressed_size,
+                Err(error) => {
+                    output_buf.truncate(start);
+                    return Err(Error::invalid_input(format!(
+                        "Zstd decompression failed: {error}"
+                    )));
+                }
+            };
+            if decompressed_size != declared_output_len {
+                output_buf.truncate(start);
+                return Err(Error::invalid_input(format!(
+                    "Zstd decompressed {decompressed_size} bytes, but its prefix declares {declared_output_len}"
+                )));
+            }
+            Ok(())
+        }
+
         fn config(&self) -> CompressionConfig {
             CompressionConfig {
                 scheme: CompressionScheme::Zstd,
@@ -347,6 +470,62 @@ mod lz4 {
             Ok(())
         }
 
+        fn decompress_bounded(
+            &self,
+            input_buf: &[u8],
+            output_buf: &mut Vec<u8>,
+            max_output_len: usize,
+        ) -> Result<()> {
+            const LENGTH_PREFIX_SIZE: usize = 4;
+            if input_buf.len() < LENGTH_PREFIX_SIZE {
+                return Err(Error::invalid_input(format!(
+                    "LZ4 payload has {} bytes, shorter than its {LENGTH_PREFIX_SIZE}-byte prefix",
+                    input_buf.len()
+                )));
+            }
+            let declared_output_len = u32::from_le_bytes(
+                input_buf[..LENGTH_PREFIX_SIZE]
+                    .try_into()
+                    .map_err(|_| Error::invalid_input("LZ4 size prefix is truncated"))?,
+            ) as usize;
+            if declared_output_len > max_output_len {
+                return Err(Error::invalid_input(format!(
+                    "LZ4 payload declares {declared_output_len} output bytes, exceeding the {max_output_len}-byte limit"
+                )));
+            }
+
+            let start = output_buf.len();
+            let end = start
+                .checked_add(declared_output_len)
+                .ok_or_else(|| Error::invalid_input("LZ4 output buffer length overflows usize"))?;
+            output_buf
+                .try_reserve_exact(declared_output_len)
+                .map_err(|error| {
+                    Error::invalid_input(format!(
+                        "LZ4 could not reserve {declared_output_len} output bytes: {error}"
+                    ))
+                })?;
+            output_buf.resize(end, 0);
+            let decompressed_size =
+                match ::lz4::block::decompress_to_buffer(input_buf, None, &mut output_buf[start..])
+                {
+                    Ok(decompressed_size) => decompressed_size,
+                    Err(error) => {
+                        output_buf.truncate(start);
+                        return Err(Error::invalid_input(format!(
+                            "LZ4 decompression failed: {error}"
+                        )));
+                    }
+                };
+            if decompressed_size != declared_output_len {
+                output_buf.truncate(start);
+                return Err(Error::invalid_input(format!(
+                    "LZ4 decompressed {decompressed_size} bytes, but its prefix declares {declared_output_len}"
+                )));
+            }
+            Ok(())
+        }
+
         fn config(&self) -> CompressionConfig {
             CompressionConfig {
                 scheme: CompressionScheme::Lz4,
@@ -366,6 +545,30 @@ impl BufferCompressor for NoopBufferCompressor {
     }
 
     fn decompress(&self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()> {
+        output_buf.extend_from_slice(input_buf);
+        Ok(())
+    }
+
+    fn decompress_bounded(
+        &self,
+        input_buf: &[u8],
+        output_buf: &mut Vec<u8>,
+        max_output_len: usize,
+    ) -> Result<()> {
+        if input_buf.len() > max_output_len {
+            return Err(Error::invalid_input(format!(
+                "Uncompressed payload has {} bytes, exceeding the {max_output_len}-byte limit",
+                input_buf.len()
+            )));
+        }
+        output_buf
+            .try_reserve_exact(input_buf.len())
+            .map_err(|error| {
+                Error::invalid_input(format!(
+                    "Uncompressed payload could not reserve {} output bytes: {error}",
+                    input_buf.len()
+                ))
+            })?;
         output_buf.extend_from_slice(input_buf);
         Ok(())
     }
@@ -439,11 +642,12 @@ impl GeneralBlockDecompressor {
 }
 
 impl BlockDecompressor for GeneralBlockDecompressor {
-    fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
+    fn decompress(&self, data: Option<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
+        let data = require_block_payload(data, "General block compression")?;
         let mut decompressed = Vec::new();
         self.compressor.decompress(&data, &mut decompressed)?;
         self.inner
-            .decompress(LanceBuffer::from(decompressed), num_values)
+            .decompress(Some(LanceBuffer::from(decompressed)), num_values)
     }
 }
 
@@ -603,13 +807,19 @@ impl VariablePerValueDecompressor for CompressedBufferEncoder {
 }
 
 impl BlockCompressor for CompressedBufferEncoder {
-    fn compress(&self, data: DataBlock) -> Result<LanceBuffer> {
+    fn compress(&self, data: DataBlock) -> Result<Option<LanceBuffer>> {
         let encoded = match data {
             DataBlock::FixedWidth(fixed_width) => fixed_width.data,
             DataBlock::VariableWidth(variable_width) => {
                 // Wrap VariableEncoder to handle the encoding
                 let encoder = VariableEncoder::default();
                 BlockCompressor::compress(&encoder, DataBlock::VariableWidth(variable_width))?
+                    .ok_or_else(|| {
+                        Error::internal(
+                            "VariableEncoder returned no payload for general compression"
+                                .to_string(),
+                        )
+                    })?
             }
             _ => {
                 return Err(Error::invalid_input_source(
@@ -620,18 +830,19 @@ impl BlockCompressor for CompressedBufferEncoder {
 
         let mut compressed = Vec::new();
         self.compressor.compress(&encoded, &mut compressed)?;
-        Ok(LanceBuffer::from(compressed))
+        Ok(Some(LanceBuffer::from(compressed)))
     }
 }
 
 impl BlockDecompressor for CompressedBufferEncoder {
-    fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
+    fn decompress(&self, data: Option<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
+        let data = require_block_payload(data, "Compressed variable block")?;
         let mut decompressed = Vec::new();
         self.compressor.decompress(&data, &mut decompressed)?;
 
         // Delegate to BinaryBlockDecompressor which handles the inline metadata
         let inner_decoder = BinaryBlockDecompressor::default();
-        inner_decoder.decompress(LanceBuffer::from(decompressed), num_values)
+        inner_decoder.decompress(Some(LanceBuffer::from(decompressed)), num_values)
     }
 }
 
@@ -640,6 +851,7 @@ mod tests {
     use super::*;
     use std::str::FromStr;
 
+    #[cfg(feature = "zstd")]
     use crate::encodings::physical::block::zstd::ZstdBufferCompressor;
 
     #[test]
@@ -679,6 +891,32 @@ mod tests {
                 .decompress(&compressed_data, &mut decompressed_data)
                 .unwrap();
             assert_eq!(input_data, decompressed_data.as_slice());
+
+            let mut exact = Vec::new();
+            compressor
+                .decompress_exact(&compressed_data, &mut exact, input_data.len())
+                .unwrap();
+            assert_eq!(input_data, exact.as_slice());
+        }
+
+        #[test]
+        fn test_length_prefixed_zstd_rejects_untrusted_output_size() {
+            let compressor = ZstdBufferCompressor::new(0);
+            let mut compressed_data = Vec::new();
+            compressor
+                .compress(b"bounded", &mut compressed_data)
+                .unwrap();
+            compressed_data[..8].copy_from_slice(&u64::MAX.to_le_bytes());
+
+            let mut output = vec![7, 9];
+            let error = compressor
+                .decompress_exact(&compressed_data, &mut output, 7)
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("exceeding the 7-byte limit"),
+                "unexpected error: {error}"
+            );
+            assert_eq!(output, [7, 9]);
         }
 
         #[test]
@@ -745,6 +983,22 @@ mod tests {
                 .decompress(&compressed_data, &mut decompressed_data)
                 .unwrap();
             assert_eq!(input_data, decompressed_data.as_slice());
+
+            let mut exact = Vec::new();
+            compressor
+                .decompress_exact(&compressed_data, &mut exact, input_data.len())
+                .unwrap();
+            assert_eq!(input_data, exact.as_slice());
+
+            let mut bounded = vec![3, 5];
+            let error = compressor
+                .decompress_exact(&compressed_data, &mut bounded, input_data.len() - 1)
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("exceeds the 12-byte limit"),
+                "unexpected error: {error}"
+            );
+            assert_eq!(bounded, [3, 5]);
         }
     }
 
@@ -782,6 +1036,32 @@ mod tests {
                 .decompress(&compressed_data, &mut decompressed_data)
                 .unwrap();
             assert_eq!(input_data, decompressed_data.as_slice());
+
+            let mut exact = Vec::new();
+            compressor
+                .decompress_exact(&compressed_data, &mut exact, input_data.len())
+                .unwrap();
+            assert_eq!(input_data, exact.as_slice());
+        }
+
+        #[test]
+        fn test_lz4_rejects_untrusted_output_size() {
+            let compressor = Lz4BufferCompressor::default();
+            let mut compressed_data = Vec::new();
+            compressor
+                .compress(b"bounded", &mut compressed_data)
+                .unwrap();
+            compressed_data[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+
+            let mut output = vec![7, 9];
+            let error = compressor
+                .decompress_exact(&compressed_data, &mut output, 7)
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("exceeding the 7-byte limit"),
+                "unexpected error: {error}"
+            );
+            assert_eq!(output, [7, 9]);
         }
 
         #[test_log::test(tokio::test)]
