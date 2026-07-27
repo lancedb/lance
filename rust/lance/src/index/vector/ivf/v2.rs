@@ -1199,20 +1199,27 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         let cache_key = IVFPartitionKey::<S, Q>::new(partition_id);
 
         if write_cache {
-            let entry = self
+            let result = self
                 .index_cache
-                .get_or_insert_with_key(cache_key, || async {
+                .get_or_insert_with_key_hit(cache_key, || async {
                     info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_VECTOR_PART, index_type="ivf", part_id=partition_id);
                     metrics.record_part_load();
                     self.load_partition_entry(partition_id, metrics.io_stats())
                         .await
                 })
-                .await?;
+                .await;
+            match &result {
+                Ok((_, true)) => metrics.record_index_cache_hit(),
+                _ => metrics.record_index_cache_miss(),
+            }
+            let (entry, _) = result?;
             Ok(entry as Arc<dyn VectorIndexCacheEntry>)
         } else {
             if let Some(part_idx) = self.index_cache.get_with_key(&cache_key).await {
+                metrics.record_index_cache_hit();
                 return Ok(part_idx);
             }
+            metrics.record_index_cache_miss();
             info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_VECTOR_PART, index_type="ivf", part_id=partition_id);
             metrics.record_part_load();
             Ok(Arc::new(
