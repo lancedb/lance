@@ -2652,9 +2652,38 @@ impl ExecutionPlan for ANNIvfBatchExec {
                     )
                     .await?;
 
+                // `search_partitions_batch` must return exactly one result batch
+                // per input query, in order, so `query_index` lines up with the
+                // `candidates` slot below. A mismatch means the index disagreed
+                // with the per-query fan-out and would otherwise silently drop or
+                // misattribute results (or panic on out-of-bounds indexing).
+                if per_query.len() != query_count {
+                    return Err(DataFusionError::Internal(format!(
+                        "batch partition search returned {} result batches for {} queries",
+                        per_query.len(),
+                        query_count
+                    )));
+                }
                 for (query_index, batch) in per_query.into_iter().enumerate() {
-                    let dists = batch.column(0).as_primitive::<Float32Type>();
-                    let row_ids = batch.column(1).as_primitive::<UInt64Type>();
+                    // Access by name rather than position: the result schema is
+                    // `VECTOR_RESULT_SCHEMA` (`_distance`, `_rowid`), and looking
+                    // up by name keeps this correct if that column order changes.
+                    let dists = batch
+                        .column_by_name(DIST_COL)
+                        .ok_or_else(|| {
+                            DataFusionError::Internal(format!(
+                                "batch partition search result missing '{DIST_COL}' column"
+                            ))
+                        })?
+                        .as_primitive::<Float32Type>();
+                    let row_ids = batch
+                        .column_by_name(ROW_ID)
+                        .ok_or_else(|| {
+                            DataFusionError::Internal(format!(
+                                "batch partition search result missing '{ROW_ID}' column"
+                            ))
+                        })?
+                        .as_primitive::<UInt64Type>();
                     candidates[query_index].extend(
                         dists
                             .values()
