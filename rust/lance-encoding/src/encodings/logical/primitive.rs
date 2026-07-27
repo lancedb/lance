@@ -6628,6 +6628,14 @@ impl PrimitiveStructuralEncoder {
             } else {
                 repdef.add_validity_bitmap(deep_copy_nulls(Some(validity)).unwrap());
             }
+            // An empty dictionary can only contain null keys. Removing their validity would turn
+            // key 0 into a valid index into an empty values array.
+            if array
+                .as_any_dictionary_opt()
+                .is_some_and(|dictionary| dictionary.values().is_empty())
+            {
+                return Ok(array);
+            }
             let data_no_nulls = array.to_data().into_builder().nulls(None).build()?;
             Ok(make_array(data_no_nulls))
         } else {
@@ -7032,7 +7040,7 @@ mod tests {
     use crate::testing::{TestCases, check_round_trip_encoding_of_data};
     use arrow_array::{
         Array, ArrayRef, FixedSizeListArray, Float32Array, Int8Array, StringArray, UInt8Array,
-        make_array,
+        make_array, new_null_array,
     };
     use arrow_buffer::ScalarBuffer;
     use arrow_schema::{DataType, Field as ArrowField};
@@ -7057,6 +7065,15 @@ mod tests {
         ]);
         let block = DataBlock::from_array(string_array);
         assert!((!PrimitiveStructuralEncoder::is_narrow(&block)));
+    }
+
+    #[tokio::test]
+    async fn test_all_null_dictionary_round_trip() {
+        let data_type = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+        let dictionary = new_null_array(&data_type, 3);
+
+        check_round_trip_encoding_of_data(vec![dictionary], &TestCases::default(), HashMap::new())
+            .await;
     }
 
     #[test]
