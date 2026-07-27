@@ -3594,9 +3594,12 @@ impl Scanner {
             .fragments
             .clone()
             .unwrap_or_else(|| self.dataset.fragments().to_vec());
+        if target_fragments.is_empty() {
+            return Ok(Arc::new(EmptyExec::new(FTS_SCHEMA.clone())));
+        }
         let unindexed_fragments =
             self.retain_target_fragments(self.dataset.unindexed_fragments(&index.name).await?);
-        if !target_fragments.is_empty() && unindexed_fragments.len() == target_fragments.len() {
+        if unindexed_fragments.len() == target_fragments.len() {
             if self.fast_search {
                 return Ok(Arc::new(EmptyExec::new(FTS_SCHEMA.clone())));
             }
@@ -3701,15 +3704,16 @@ impl Scanner {
             .fragments
             .clone()
             .unwrap_or_else(|| self.dataset.fragments().to_vec());
+        if target_fragments.is_empty() {
+            return Ok(Arc::new(EmptyExec::new(FTS_SCHEMA.clone())));
+        }
 
         let (match_plan, flat_match_plan) = match &index {
             Some(index) => {
                 let unindexed_fragments = self
                     .retain_target_fragments(self.dataset.unindexed_fragments(&index.name).await?);
 
-                if !target_fragments.is_empty()
-                    && unindexed_fragments.len() == target_fragments.len()
-                {
+                if unindexed_fragments.len() == target_fragments.len() {
                     if self.fast_search {
                         return Ok(Arc::new(EmptyExec::new(FTS_SCHEMA.clone())));
                     }

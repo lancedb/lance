@@ -950,6 +950,70 @@ async fn test_fts_phrase_overlay_stale_drop_and_new_match(
 }
 
 #[tokio::test]
+async fn test_fts_empty_fragment_selection_is_empty() {
+    let mut dataset = create_text_dataset(false).await;
+    build_text_fts_index_with_positions(&mut dataset).await;
+
+    let mut match_scan = dataset.scan();
+    match_scan.with_fragments(Vec::new());
+    match_scan
+        .full_text_search(FullTextSearchQuery::new("apple".to_owned()))
+        .unwrap();
+    match_scan.project(&["id"]).unwrap();
+    assert_eq!(match_scan.try_into_batch().await.unwrap().num_rows(), 0);
+
+    let mut phrase_scan = dataset.scan();
+    phrase_scan.with_fragments(Vec::new());
+    phrase_scan
+        .full_text_search(FullTextSearchQuery::new_query(FtsQuery::Phrase(
+            PhraseQuery::new("apple pie".to_owned()).with_column(Some("text".to_owned())),
+        )))
+        .unwrap();
+    phrase_scan.project(&["id"]).unwrap();
+    assert_eq!(phrase_scan.try_into_batch().await.unwrap().num_rows(), 0);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_fts_combines_indexed_overlay_stale_and_unindexed_rows(
+    #[values(false, true)] stable_row_ids: bool,
+) {
+    let mut dataset = create_text_dataset(stable_row_ids).await;
+    build_text_fts_index_with_positions(&mut dataset).await;
+
+    let dataset = commit_overlay(
+        dataset,
+        "fts_combined_flat_paths",
+        0,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+        vec![Arc::new(StringArray::from(vec![Some("cherry mango")]))],
+    )
+    .await;
+
+    let batch =
+        arrow_array::record_batch!(("id", Int32, [12]), ("text", Utf8, ["cherry mango"])).unwrap();
+    let schema = batch.schema();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let dataset = Dataset::write(
+        reader,
+        Arc::new(dataset),
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(fts_ids_matching(&dataset, "mango").await, vec![1, 6, 12]);
+    assert_eq!(
+        fts_phrase_ids_matching(&dataset, "cherry mango").await,
+        vec![1, 12]
+    );
+}
+
+#[tokio::test]
 async fn test_fts_overlay_row_level_masking_under_fast_search() {
     let mut dataset = create_text_dataset(false).await;
     build_text_fts_index_with_positions(&mut dataset).await;
