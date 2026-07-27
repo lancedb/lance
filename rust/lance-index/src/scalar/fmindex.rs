@@ -50,6 +50,10 @@ use crate::scalar::{
 };
 use crate::{Index, IndexType};
 
+mod suffix_array;
+
+use suffix_array::build_suffix_array;
+
 const FMINDEX_INDEX_VERSION: u32 = 10;
 const BLOCK_WORDS: usize = 4096;
 const PARTITION_SIZE: usize = 10_000;
@@ -381,24 +385,6 @@ impl HuffmanWaveletTree {
                 .map(|c| c.node_path.len() * 8)
                 .sum::<usize>()
             + self.children.len() * 24
-    }
-}
-
-// ── Suffix Array ─────────────────────────────────────────────────────────────
-
-fn build_suffix_array(text: &[u8]) -> Vec<usize> {
-    let n = text.len();
-    if n == 0 {
-        return Vec::new();
-    }
-    if n > i32::MAX as usize {
-        let mut sa = vec![0i64; n];
-        assert_eq!(libsais_rs::libsais64(text, &mut sa, 0, None), 0);
-        sa.iter().map(|&x| x as usize).collect()
-    } else {
-        let mut sa = vec![0i32; n];
-        assert_eq!(libsais_rs::libsais(text, &mut sa, 0, None), 0);
-        sa.iter().map(|&x| x as usize).collect()
     }
 }
 
