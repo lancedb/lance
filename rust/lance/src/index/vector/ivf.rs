@@ -60,6 +60,7 @@ use lance_encoding::decoder::FilterExpression;
 use lance_file::{
     format::MAGIC,
     reader::{FileReader as V2Reader, FileReaderOptions as V2ReaderOptions},
+    versions as file_versions,
     versions::v1::writer::{FileWriter as V1FileWriter, FileWriterOptions as V1FileWriterOptions},
     writer::{FileWriter as V2Writer, FileWriterOptions as V2WriterOptions},
 };
@@ -609,12 +610,7 @@ pub(crate) async fn optimize_vector_indices_v2(
 
     let temp_dir = lance_core::utils::tempfile::TempStdDir::default();
     let temp_dir_path = Path::from_filesystem_path(&temp_dir)?;
-    let shuffler = create_ivf_shuffler(
-        temp_dir_path,
-        num_partitions,
-        format_version.to_selector(),
-        None,
-    );
+    let shuffler = create_ivf_shuffler(temp_dir_path, num_partitions, format_version, None);
 
     let (_, element_type) = get_vector_type(dataset.schema(), vector_column)?;
     let summary = match index_type {
@@ -2540,7 +2536,7 @@ async fn write_root_vector_index_from_auxiliary(
     // Schema for HNSW sub-index: include neighbors/dist fields; empty batch is fine.
     let arrow_schema = HNSW::schema();
     let schema = lance_core::datatypes::Schema::try_from(arrow_schema.as_ref())?;
-    let mut v2_writer = lance_file::versions::create_writer(
+    let mut v2_writer = file_versions::create_writer(
         format_version,
         obj_writer,
         schema,

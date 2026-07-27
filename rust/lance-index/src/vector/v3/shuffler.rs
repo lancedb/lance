@@ -22,7 +22,6 @@ use lance_core::{
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::reader::{FileReader, FileReaderOptions};
 use lance_file::version::ConcreteFileVersion;
-use lance_file::version::LanceFileVersion;
 use lance_file::versions;
 use lance_file::writer::FileWriterOptions;
 use lance_io::{
@@ -73,7 +72,7 @@ pub struct IvfShuffler {
     object_store: Arc<ObjectStore>,
     output_dir: Path,
     num_partitions: usize,
-    format_version: LanceFileVersion,
+    format_version: ConcreteFileVersion,
 
     progress: Arc<dyn crate::progress::IndexBuildProgress>,
 }
@@ -84,12 +83,12 @@ impl IvfShuffler {
             object_store: Arc::new(ObjectStore::local()),
             output_dir,
             num_partitions,
-            format_version: LanceFileVersion::V2_0,
+            format_version: ConcreteFileVersion::V2_0,
             progress: crate::progress::noop_progress(),
         }
     }
 
-    pub fn with_format_version(mut self, format_version: LanceFileVersion) -> Self {
+    pub fn with_format_version(mut self, format_version: ConcreteFileVersion) -> Self {
         self.format_version = format_version;
         self
     }
@@ -125,7 +124,7 @@ impl Shuffler for IvfShuffler {
                 async move {
                     let writer = object_store.create(&part_path).await?;
                     let file_writer = versions::create_writer(
-                        ConcreteFileVersion::from(format_version),
+                        format_version,
                         writer,
                         lance_core::datatypes::Schema::try_from(&schema)?,
                         FileWriterOptions::default(),
@@ -315,7 +314,7 @@ impl ShuffleReader for EmptyReader {
 pub fn create_ivf_shuffler(
     output_dir: Path,
     num_partitions: usize,
-    format_version: LanceFileVersion,
+    format_version: ConcreteFileVersion,
     progress: Option<Arc<dyn crate::progress::IndexBuildProgress>>,
 ) -> Box<dyn Shuffler> {
     let use_legacy = std::env::var("LANCE_LEGACY_SHUFFLER")
@@ -478,7 +477,7 @@ impl Shuffler for TwoFileShuffler {
         let mut file_writer = versions::v2_1::create_writer(
             writer,
             lance_core::datatypes::Schema::try_from(&schema)?,
-            Default::default(),
+            FileWriterOptions::default(),
         )?
         .with_page_metadata_spill(self.object_store.clone(), spill_path);
 
@@ -489,7 +488,7 @@ impl Shuffler for TwoFileShuffler {
         let mut offsets_writer = versions::v2_1::create_writer(
             writer,
             lance_core::datatypes::Schema::try_from(offsets_schema.as_ref())?,
-            Default::default(),
+            FileWriterOptions::default(),
         )?
         .with_page_metadata_spill(self.object_store.clone(), spill_path);
 

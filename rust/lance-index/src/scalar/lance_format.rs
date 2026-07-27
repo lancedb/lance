@@ -14,9 +14,8 @@ use lance_core::{Error, Result, cache::LanceCache};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::reader::{FileReader as CurrentFileReader, FileReaderOptions};
 use lance_file::version::ConcreteFileVersion;
-use lance_file::version::LanceFileVersion;
-use lance_file::versions;
 use lance_file::versions::v1::reader::FileReader as V1FileReader;
+use lance_file::versions::{self, OpenedFileReader};
 use lance_file::writer as current_writer;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
@@ -43,7 +42,7 @@ pub struct LanceIndexStore {
     /// Cached file sizes (filename -> size in bytes)
     /// When set, used to avoid HEAD calls when opening files
     file_sizes: HashMap<String, u64>,
-    format_version: LanceFileVersion,
+    format_version: ConcreteFileVersion,
     /// Base I/O priority for all requests this store submits to `scheduler`.
     io_priority: u64,
 }
@@ -70,7 +69,7 @@ impl LanceIndexStore {
             object_store,
             index_dir,
             metadata_cache,
-            LanceFileVersion::V2_0,
+            ConcreteFileVersion::V2_0,
         )
     }
 
@@ -79,7 +78,7 @@ impl LanceIndexStore {
         object_store: Arc<ObjectStore>,
         index_dir: Path,
         metadata_cache: Arc<LanceCache>,
-        format_version: LanceFileVersion,
+        format_version: ConcreteFileVersion,
     ) -> Self {
         let scheduler = ScanScheduler::new(
             object_store.clone(),
@@ -420,7 +419,7 @@ impl IndexStore for LanceIndexStore {
         let schema = schema.as_ref().try_into()?;
         let writer = self.object_store.create(&path).await?;
         let writer = versions::create_writer(
-            ConcreteFileVersion::from(self.format_version),
+            self.format_version,
             writer,
             schema,
             current_writer::FileWriterOptions::default(),
@@ -452,31 +451,24 @@ impl IndexStore for LanceIndexStore {
             .scheduler
             .open_file_with_priority(&path, self.io_priority, &cached_size)
             .await?;
-        match CurrentFileReader::try_open(
+        match versions::open_self_described_reader(
             file_scheduler,
-            None,
             Arc::<DecoderPlugins>::default(),
             &self.metadata_cache,
             FileReaderOptions::default(),
         )
-        .await
+        .await?
         {
-            Ok(reader) => Ok(Arc::new(CurrentIndexReader(reader))),
-            Err(e) => {
-                // If the error is a version conflict we can try to read the file with v1 reader
-                if let Error::VersionConflict { .. } = e {
-                    let path = self.index_file_path(name)?;
-                    let file_reader = V1FileReader::try_new_self_described(
-                        &self.object_store,
-                        &path,
-                        Some(&self.metadata_cache),
-                    )
-                    .await?;
-                    Ok(Arc::new(V1IndexReader(file_reader)))
-                } else {
-                    Err(e)
-                }
+            OpenedFileReader::V1 { .. } => {
+                let reader = V1FileReader::try_new_self_described(
+                    &self.object_store,
+                    &path,
+                    Some(&self.metadata_cache),
+                )
+                .await?;
+                Ok(Arc::new(V1IndexReader(reader)))
             }
+            OpenedFileReader::Current(reader) => Ok(Arc::new(CurrentIndexReader(reader))),
         }
     }
 

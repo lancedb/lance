@@ -113,8 +113,7 @@ fn inner_open<'local>(
             .map(|value| value.parse::<LanceFileVersion>())
             .transpose()?
             .unwrap_or_default()
-            .resolve()
-            .into();
+            .resolve();
         file_versions::create_lazy_writer(version, obj_writer, FileWriterOptions::default())
     })?;
 

@@ -261,7 +261,6 @@ pub extern "system" fn Java_org_lance_file_LanceFileReader_readAllNative(
             }
 
             let transformed_schema = projection.to_bare_schema();
-
             let (field_ids, column_indices) =
                 file_versions::data_file_columns(file_version, &base_schema);
             let field_id_to_column_index = field_ids

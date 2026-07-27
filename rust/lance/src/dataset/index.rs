@@ -176,7 +176,7 @@ impl LanceIndexStoreExt for LanceIndexStore {
             dataset.object_store.clone(),
             index_dir,
             Arc::new(cache),
-            format_version.to_selector(),
+            format_version,
         ))
     }
 
@@ -187,12 +187,8 @@ impl LanceIndexStoreExt for LanceIndexStore {
         let cache = dataset.metadata_cache.file_metadata_cache(&index_dir);
         let format_version = dataset_format_version(dataset);
         let object_store = dataset.object_store_for_index(index).await?;
-        let store = Self::with_format_version(
-            object_store,
-            index_dir,
-            Arc::new(cache),
-            format_version.to_selector(),
-        );
+        let store =
+            Self::with_format_version(object_store, index_dir, Arc::new(cache), format_version);
         Ok(store.with_file_sizes(index.file_size_map()))
     }
 }
