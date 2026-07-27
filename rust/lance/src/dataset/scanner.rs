@@ -3590,16 +3590,16 @@ impl Scanner {
                 .to_string()));
         }
 
-        let target_fragments = self
-            .fragments
-            .clone()
-            .unwrap_or_else(|| self.dataset.fragments().to_vec());
-        if target_fragments.is_empty() {
-            return Ok(Arc::new(EmptyExec::new(FTS_SCHEMA.clone())));
-        }
+        let target_fragments = match self.fragments.as_ref() {
+            Some(fragments) if fragments.is_empty() => {
+                return Ok(Arc::new(EmptyExec::new(FTS_SCHEMA.clone())));
+            }
+            Some(fragments) => fragments.clone(),
+            None => self.dataset.fragments().to_vec(),
+        };
         let unindexed_fragments =
             self.retain_target_fragments(self.dataset.unindexed_fragments(&index.name).await?);
-        if unindexed_fragments.len() == target_fragments.len() {
+        if !target_fragments.is_empty() && unindexed_fragments.len() == target_fragments.len() {
             if self.fast_search {
                 return Ok(Arc::new(EmptyExec::new(FTS_SCHEMA.clone())));
             }
@@ -3700,20 +3700,22 @@ impl Scanner {
             .await?;
 
         // Get target fragments
-        let target_fragments = self
-            .fragments
-            .clone()
-            .unwrap_or_else(|| self.dataset.fragments().to_vec());
-        if target_fragments.is_empty() {
-            return Ok(Arc::new(EmptyExec::new(FTS_SCHEMA.clone())));
-        }
+        let target_fragments = match self.fragments.as_ref() {
+            Some(fragments) if fragments.is_empty() => {
+                return Ok(Arc::new(EmptyExec::new(FTS_SCHEMA.clone())));
+            }
+            Some(fragments) => fragments.clone(),
+            None => self.dataset.fragments().to_vec(),
+        };
 
         let (match_plan, flat_match_plan) = match &index {
             Some(index) => {
                 let unindexed_fragments = self
                     .retain_target_fragments(self.dataset.unindexed_fragments(&index.name).await?);
 
-                if unindexed_fragments.len() == target_fragments.len() {
+                if !target_fragments.is_empty()
+                    && unindexed_fragments.len() == target_fragments.len()
+                {
                     if self.fast_search {
                         return Ok(Arc::new(EmptyExec::new(FTS_SCHEMA.clone())));
                     }

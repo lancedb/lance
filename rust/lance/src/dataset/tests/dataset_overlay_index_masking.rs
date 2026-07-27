@@ -960,6 +960,11 @@ async fn test_fts_empty_fragment_selection_is_empty() {
         .full_text_search(FullTextSearchQuery::new("apple".to_owned()))
         .unwrap();
     match_scan.project(&["id"]).unwrap();
+    let match_plan = match_scan.explain_plan(false).await.unwrap();
+    assert!(
+        match_plan.contains("EmptyExec"),
+        "explicit empty fragment selection should produce EmptyExec: {match_plan}"
+    );
     assert_eq!(match_scan.try_into_batch().await.unwrap().num_rows(), 0);
 
     let mut phrase_scan = dataset.scan();
@@ -970,6 +975,11 @@ async fn test_fts_empty_fragment_selection_is_empty() {
         )))
         .unwrap();
     phrase_scan.project(&["id"]).unwrap();
+    let phrase_plan = phrase_scan.explain_plan(false).await.unwrap();
+    assert!(
+        phrase_plan.contains("EmptyExec"),
+        "explicit empty fragment selection should produce EmptyExec: {phrase_plan}"
+    );
     assert_eq!(phrase_scan.try_into_batch().await.unwrap().num_rows(), 0);
 }
 
