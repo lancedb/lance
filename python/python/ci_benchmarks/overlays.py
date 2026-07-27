@@ -10,20 +10,14 @@ helpers build synthetic base datasets, commit overlay layers through the public
 """
 
 import os
+from typing import List
+from urllib.parse import urlparse
 
-# Data overlay support is gated off in release builds unless this is set (it is
-# always on in debug builds). Benchmarks usually run against a release build, so
-# enable it here, before lance is imported, or reading overlay datasets fails.
-os.environ.setdefault("LANCE_ENABLE_UNSTABLE_DATA_OVERLAY_FILES", "1")
-
-from typing import List  # noqa: E402
-from urllib.parse import urlparse  # noqa: E402
-
-import lance  # noqa: E402
-import numpy as np  # noqa: E402
-import pyarrow as pa  # noqa: E402
-from lance._datagen import rand_batches  # noqa: E402
-from lance.file import LanceFileWriter  # noqa: E402
+import lance
+import numpy as np
+import pyarrow as pa
+from lance._datagen import rand_batches
+from lance.file import LanceFileWriter
 
 # Default width for the ``embedding`` dtype. Individual benchmarks override it
 # via ``embedding_dim`` to model narrow vs. wide (e.g. 3072-d) value columns.

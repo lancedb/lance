@@ -170,14 +170,11 @@ However, this invalidates row addresses and requires rebuilding indices, which c
 
 ## Data Overlay Files
 
-!!! warning "Experimental"
-
-    This feature is currently experimental and not yet supported in any library.
-
-<!-- TODO: When overlay file support is implemented, update this note to state
-     the released version that first supports the feature. -->
-
 !!! note "Overlay files require feature flag 64 (data overlay files)"
+
+    The flag is set by the commit that attaches the first overlay and cleared by
+    the commit that removes the last one, so it tracks the current manifest rather
+    than the dataset's history.
 
 Overlay files supply new values for a subset of cells within
 a fragment without rewriting the base data files. They make updates cheap when only
