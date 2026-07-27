@@ -31,9 +31,10 @@ use lance_table::feature_flags::{FLAG_STABLE_ROW_IDS, apply_feature_flags};
 use lance_table::rowids::read_row_ids;
 use lance_table::{
     format::{
-        BasePath, DataFile, DataStorageFormat, Fragment, IndexFile, IndexMetadata, Manifest,
-        RowDatasetVersionMeta, RowDatasetVersionRun, RowDatasetVersionSequence, RowIdMeta,
-        overlay::DataOverlayFile, pb,
+        BasePath, DataFile, DataStorageFormat, Fragment, IndexFile, IndexMetadata,
+        LANCE_OVERLAYS_ENABLED, Manifest, RowDatasetVersionMeta, RowDatasetVersionRun,
+        RowDatasetVersionSequence, RowIdMeta, overlay::DataOverlayFile, overlays_enabled_with,
+        parse_overlays_enabled, pb,
     },
     io::{
         commit::CommitHandler,
@@ -2496,6 +2497,20 @@ impl Transaction {
                 field_metadata_updates,
             } => {
                 if let Some(config_updates) = config_updates {
+                    // Reject an unparsable overlay setting at the point it is
+                    // written. Validating the resolved config on every commit
+                    // instead would let one bad value wedge all later writes.
+                    if let Some(entry) = config_updates
+                        .update_entries
+                        .iter()
+                        .find(|entry| entry.key == LANCE_OVERLAYS_ENABLED)
+                        && let Some(value) = &entry.value
+                        && parse_overlays_enabled(value).is_none()
+                    {
+                        return Err(Error::invalid_input(format!(
+                            "{LANCE_OVERLAYS_ENABLED} must be \"true\" or \"false\", got {value:?}"
+                        )));
+                    }
                     let mut config = manifest.config.clone();
                     apply_update_map(&mut config, config_updates);
                     manifest.config = config;
@@ -2617,6 +2632,39 @@ impl Transaction {
                 }
             }
             _ => {}
+        }
+
+        // "Overlays disabled" and "overlays in the manifest" are mutually
+        // exclusive: a disabled dataset must be resolvable without overlay
+        // support. One invariant covers both ways to violate it -- disabling
+        // while overlays remain, and writing an overlay while disabled.
+        //
+        // This lives in build_manifest rather than at the API boundary because
+        // build_manifest re-runs on conflict rebase, so it also rejects a
+        // disable that races a concurrent DataOverlay commit.
+        //
+        // Enablement resolves against the pre-commit fragments so a DataOverlay
+        // cannot authorize itself through the overlays it is adding.
+        let was_overlaid = current_manifest.is_some_and(|current| current.has_overlays());
+        if !overlays_enabled_with(&manifest.config, was_overlaid) {
+            let overlaid = manifest
+                .fragments
+                .iter()
+                .filter(|fragment| !fragment.overlays.is_empty())
+                .map(|fragment| fragment.id)
+                .collect::<Vec<_>>();
+            if !overlaid.is_empty() {
+                return Err(Error::invalid_input(match &self.operation {
+                    Operation::DataOverlay { .. } => format!(
+                        "cannot write data overlay files while they are disabled for this \
+                         dataset; set {LANCE_OVERLAYS_ENABLED} to \"true\" first"
+                    ),
+                    _ => format!(
+                        "cannot disable data overlay files while fragments {overlaid:?} still \
+                         carry overlays; remove them first (see Dataset::remove_overlays)"
+                    ),
+                }));
+            }
         }
 
         // Handle UpdateBases operation to update manifest base_paths
@@ -4115,6 +4163,17 @@ mod tests {
             DataStorageFormat::new(LanceFileVersion::V2_0),
             HashMap::new(),
         )
+    }
+
+    /// A [`sample_manifest`] that permits overlay writes. Without the setting a
+    /// `DataOverlay` commit is rejected, since a dataset with no overlays yet
+    /// resolves to the (currently disabled) library default.
+    fn overlay_enabled_manifest() -> Manifest {
+        let mut manifest = sample_manifest();
+        manifest
+            .config
+            .insert(LANCE_OVERLAYS_ENABLED.to_string(), "true".to_string());
+        manifest
     }
 
     fn sample_index_metadata(name: &str) -> IndexMetadata {
@@ -6655,7 +6714,7 @@ mod tests {
     fn test_data_overlay_build_manifest_merges_duplicate_groups() {
         // Two groups targeting the same fragment must both survive (a HashMap
         // collapse would have dropped the first).
-        let manifest = sample_manifest();
+        let manifest = overlay_enabled_manifest();
         let txn = Transaction::new(
             manifest.version,
             Operation::DataOverlay {

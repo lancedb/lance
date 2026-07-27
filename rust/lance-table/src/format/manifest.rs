@@ -110,6 +110,50 @@ pub fn is_detached_version(version: u64) -> bool {
     version & DETACHED_VERSION_MASK != 0
 }
 
+/// Dataset config key controlling whether writers may store new values as data
+/// overlay files. See [`Manifest::overlays_enabled`].
+pub const LANCE_OVERLAYS_ENABLED: &str = "lance.overlays.enabled";
+
+/// What [`LANCE_OVERLAYS_ENABLED`] resolves to when a dataset has not set it.
+///
+/// Flipping this to `true` opts every dataset that never configured the setting
+/// into overlay writes, including datasets created long before the feature. That
+/// is intended, but it is a behavior change for existing tables: the first overlay
+/// written to such a table sets `FLAG_DATA_OVERLAY_FILES`, which pre-overlay
+/// readers refuse. A table can always get back by compacting its overlays away and
+/// setting the key to `false`.
+// TODO: flip to `true` once overlay-capable readers have been GA long enough that
+// writing overlays into an existing table is safe by default, and once a
+// session-level default exists so a deployment can opt out fleet-wide first.
+const DEFAULT_OVERLAYS_ENABLED: bool = false;
+
+/// Resolve [`LANCE_OVERLAYS_ENABLED`] from a config map and whether the dataset
+/// already carries overlays.
+///
+/// Split out from [`Manifest::overlays_enabled`] so a commit can resolve enablement
+/// against the *pre-commit* fragment list. Resolving it against the post-commit
+/// fragments would let a `DataOverlay` commit authorize itself: the overlays it is
+/// adding would satisfy the `has_overlays` fallback.
+pub fn overlays_enabled_with(config: &HashMap<String, String>, has_overlays: bool) -> bool {
+    config
+        .get(LANCE_OVERLAYS_ENABLED)
+        .and_then(|value| parse_overlays_enabled(value))
+        // Unconfigured. Datasets written before this setting existed carry
+        // overlays without it, so presence implies enablement; once
+        // DEFAULT_OVERLAYS_ENABLED flips, that clause is subsumed.
+        .unwrap_or(DEFAULT_OVERLAYS_ENABLED || has_overlays)
+}
+
+/// Parse a [`LANCE_OVERLAYS_ENABLED`] value, returning `None` if it is not a
+/// recognized boolean.
+pub fn parse_overlays_enabled(value: &str) -> Option<bool> {
+    match value.to_ascii_lowercase().as_str() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
 fn compute_fragment_offsets(fragments: &[Fragment]) -> Vec<usize> {
     fragments
         .iter()
@@ -492,6 +536,31 @@ impl Manifest {
     /// Whether the dataset uses stable row ids.
     pub fn uses_stable_row_ids(&self) -> bool {
         self.reader_feature_flags & FLAG_STABLE_ROW_IDS != 0
+    }
+
+    /// Whether any fragment currently carries data overlay files. This is the
+    /// condition that drives [`FLAG_DATA_OVERLAY_FILES`], and is distinct from
+    /// [`Self::overlays_enabled`], which says whether new overlays may be written.
+    ///
+    /// [`FLAG_DATA_OVERLAY_FILES`]: crate::feature_flags::FLAG_DATA_OVERLAY_FILES
+    pub fn has_overlays(&self) -> bool {
+        self.fragments.iter().any(|frag| !frag.overlays.is_empty())
+    }
+
+    /// Whether writers may store new values as data overlay files for this dataset.
+    ///
+    /// Enablement is a dataset setting held in [`LANCE_OVERLAYS_ENABLED`], not a
+    /// feature flag, so it survives writers that predate overlays (config round-trips
+    /// untouched) without locking pre-overlay readers out of a dataset that has no
+    /// overlays in it yet.
+    ///
+    /// An unparsable value is treated as unset rather than rejected here, so a bad
+    /// value cannot wedge every subsequent commit; writes of the key are validated at
+    /// commit time instead.
+    // TODO: when a session-level default lands, resolution becomes
+    // explicit config -> session default -> DEFAULT_OVERLAYS_ENABLED.
+    pub fn overlays_enabled(&self) -> bool {
+        overlays_enabled_with(&self.config, self.has_overlays())
     }
 
     /// Creates a serialized copy of the manifest, suitable for IPC or temp storage
@@ -1378,6 +1447,40 @@ mod tests {
         config.remove("other-key");
         manifest.config_mut().remove("other-key");
         assert_eq!(manifest.config, config);
+    }
+
+    #[rstest::rstest]
+    // An explicit value always wins, whether or not overlays are present.
+    #[case::explicit_true(Some("true"), false, true)]
+    #[case::explicit_false(Some("false"), false, false)]
+    #[case::explicit_true_with_overlays(Some("true"), true, true)]
+    #[case::case_insensitive(Some("TRUE"), false, true)]
+    // Unset falls back to the library default, except that a dataset already
+    // carrying overlays counts as enabled -- that is what keeps datasets written
+    // before this setting existed writable.
+    #[case::unset_without_overlays(None, false, DEFAULT_OVERLAYS_ENABLED)]
+    #[case::unset_with_overlays(None, true, true)]
+    // An unparsable value is treated as unset rather than as `false`, so a bad
+    // value cannot strand a dataset that already has overlays in it.
+    #[case::unparsable_with_overlays(Some("yes"), true, true)]
+    #[case::unparsable_without_overlays(Some(""), false, DEFAULT_OVERLAYS_ENABLED)]
+    fn test_overlays_enabled_resolution(
+        #[case] configured: Option<&str>,
+        #[case] has_overlays: bool,
+        #[case] expected: bool,
+    ) {
+        let config = configured
+            .map(|value| HashMap::from([(LANCE_OVERLAYS_ENABLED.to_string(), value.to_string())]))
+            .unwrap_or_default();
+        assert_eq!(overlays_enabled_with(&config, has_overlays), expected);
+    }
+
+    #[test]
+    fn test_parse_overlays_enabled() {
+        assert_eq!(parse_overlays_enabled("true"), Some(true));
+        assert_eq!(parse_overlays_enabled("False"), Some(false));
+        assert_eq!(parse_overlays_enabled("1"), None);
+        assert_eq!(parse_overlays_enabled(""), None);
     }
 
     #[test]

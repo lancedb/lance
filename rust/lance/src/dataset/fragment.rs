@@ -3271,6 +3271,7 @@ mod tests {
                 max_rows_per_file: 6,
                 max_rows_per_group: 6,
                 data_storage_version: Some(version),
+                enable_overlays: Some(true),
                 ..Default::default()
             };
             let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
@@ -3515,6 +3516,7 @@ mod tests {
                 max_rows_per_file: 6,
                 max_rows_per_group: 6,
                 data_storage_version: Some(version),
+                enable_overlays: Some(true),
                 ..Default::default()
             };
             let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
@@ -3653,6 +3655,7 @@ mod tests {
                 max_rows_per_file: N,
                 max_rows_per_group: N,
                 data_storage_version: Some(version),
+                enable_overlays: Some(true),
                 ..Default::default()
             };
             let reader = RecordBatchIterator::new(vec![Ok(base)], schema.clone());
@@ -4008,6 +4011,7 @@ mod tests {
                 max_rows_per_file: 100,
                 max_rows_per_group: 100,
                 data_storage_version: Some(version),
+                enable_overlays: Some(true),
                 ..Default::default()
             };
             let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
@@ -4110,6 +4114,7 @@ mod tests {
                 max_rows_per_file: 6,
                 max_rows_per_group: 6,
                 data_storage_version: Some(version),
+                enable_overlays: Some(true),
                 ..Default::default()
             };
             let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
@@ -4234,6 +4239,7 @@ mod tests {
                 max_rows_per_file: 6,
                 max_rows_per_group: 6,
                 data_storage_version: Some(version),
+                enable_overlays: Some(true),
                 ..Default::default()
             };
             let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
@@ -4314,6 +4320,7 @@ mod tests {
                 max_rows_per_file: 6,
                 max_rows_per_group: 6,
                 data_storage_version: Some(version),
+                enable_overlays: Some(true),
                 ..Default::default()
             };
             let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
@@ -4392,6 +4399,7 @@ mod tests {
                 max_rows_per_file: 6,
                 max_rows_per_group: 6,
                 data_storage_version: Some(version),
+                enable_overlays: Some(true),
                 ..Default::default()
             };
             let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
@@ -4465,6 +4473,7 @@ mod tests {
                 max_rows_per_file: 6,
                 max_rows_per_group: 6,
                 data_storage_version: Some(version),
+                enable_overlays: Some(true),
                 ..Default::default()
             };
             let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
@@ -4668,6 +4677,7 @@ mod tests {
                 max_rows_per_file: 6,
                 max_rows_per_group: 6,
                 data_storage_version: Some(version),
+                enable_overlays: Some(true),
                 ..Default::default()
             };
             let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());

@@ -174,7 +174,8 @@ However, this invalidates row addresses and requires rebuilding indices, which c
 
     The flag is set by the commit that attaches the first overlay and cleared by
     the commit that removes the last one, so it tracks the current manifest rather
-    than the dataset's history.
+    than the dataset's history. Whether a writer may *create* overlays is a
+    separate setting, `lance.overlays.enabled`.
 
 Overlay files supply new values for a subset of cells within
 a fragment without rewriting the base data files. They make updates cheap when only

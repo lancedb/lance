@@ -14,7 +14,7 @@ use lance_datafusion::utils::StreamingWriteSource;
 use lance_file::version::LanceFileVersion;
 use lance_io::object_store::ObjectStore;
 use lance_table::feature_flags::can_write_dataset;
-use lance_table::format::Fragment;
+use lance_table::format::{Fragment, LANCE_OVERLAYS_ENABLED};
 use lance_table::io::commit::CommitHandler;
 use object_store::path::Path;
 
@@ -229,6 +229,19 @@ impl<'a> InsertBuilder<'a> {
         Ok((transaction, context))
     }
 
+    /// The `lance.overlays.enabled` config entry this write should stamp, if the
+    /// caller asked for one. Left unset otherwise so the dataset follows the
+    /// library default rather than freezing today's default into the manifest.
+    fn overlays_enabled_upsert(
+        context: &WriteContext<'_>,
+    ) -> impl Iterator<Item = (String, String)> {
+        context
+            .params
+            .enable_overlays
+            .map(|enabled| (LANCE_OVERLAYS_ENABLED.to_string(), enabled.to_string()))
+            .into_iter()
+    }
+
     fn build_transaction(
         schema: Schema,
         fragments: Vec<Fragment>,
@@ -252,6 +265,7 @@ impl<'a> InsertBuilder<'a> {
                         format_duration(duration).to_string(),
                     );
                 }
+                upsert_values.extend(Self::overlays_enabled_upsert(context));
                 let config_upsert_values = if upsert_values.is_empty() {
                     None
                 } else {
@@ -265,12 +279,15 @@ impl<'a> InsertBuilder<'a> {
                     initial_bases: context.params.initial_bases.clone(),
                 }
             }
-            WriteMode::Overwrite => Operation::Overwrite {
-                schema,
-                fragments,
-                config_upsert_values: None,
-                initial_bases: context.params.initial_bases.clone(),
-            },
+            WriteMode::Overwrite => {
+                let upsert_values: HashMap<_, _> = Self::overlays_enabled_upsert(context).collect();
+                Operation::Overwrite {
+                    schema,
+                    fragments,
+                    config_upsert_values: (!upsert_values.is_empty()).then_some(upsert_values),
+                    initial_bases: context.params.initial_bases.clone(),
+                }
+            }
             WriteMode::Append => Operation::Append { fragments },
         };
 

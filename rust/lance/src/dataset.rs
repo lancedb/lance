@@ -129,7 +129,9 @@ use lance_core::box_error;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_namespace::models::{DeclareTableRequest, DescribeTableRequest};
 use lance_table::feature_flags::{apply_feature_flags, can_read_dataset};
+use lance_table::format::LANCE_OVERLAYS_ENABLED;
 use lance_table::io::deletion::{DELETIONS_DIR, relative_deletion_file_path};
+use optimize::{CompactionMetrics, CompactionOptions, compact_files};
 pub use schema_evolution::{
     BatchInfo, BatchUDF, ColumnAlteration, NewColumnTransform, UDFCheckpointStore,
 };
@@ -3829,6 +3831,55 @@ impl Dataset {
         values: impl IntoIterator<Item = impl Into<UpdateMapEntry>>,
     ) -> metadata::UpdateMetadataBuilder<'_> {
         metadata::UpdateMetadataBuilder::new(self, values, metadata::MetadataType::Config)
+    }
+
+    /// Whether writers may store new values as data overlay files for this dataset.
+    ///
+    /// See [`Manifest::overlays_enabled`] for how an unconfigured dataset resolves.
+    pub fn overlays_enabled(&self) -> bool {
+        self.manifest.overlays_enabled()
+    }
+
+    /// Enable or disable data overlay files for this dataset.
+    ///
+    /// Unlike stable row ids this is a two-way door, but only in one direction at a
+    /// time: disabling requires that no fragment still carries an overlay, since a
+    /// disabled dataset must be readable without overlay support. Call
+    /// [`Self::remove_overlays`] first if any remain.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # async fn example(dataset: &mut Dataset) -> Result<()> {
+    /// dataset.remove_overlays().await?;
+    /// dataset.set_overlays_enabled(false).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn set_overlays_enabled(&mut self, enabled: bool) -> Result<()> {
+        self.update_config([(LANCE_OVERLAYS_ENABLED.to_string(), enabled.to_string())])
+            .await?;
+        Ok(())
+    }
+
+    /// Compact every fragment carrying data overlay files, folding the overlaid
+    /// cells into fresh base data files, and leave every other fragment alone.
+    ///
+    /// This is the prerequisite for [`Self::set_overlays_enabled(false)`], and is
+    /// also how a dataset drops `FLAG_DATA_OVERLAY_FILES` so pre-overlay readers can
+    /// open it again.
+    ///
+    /// [`Self::set_overlays_enabled(false)`]: Self::set_overlays_enabled
+    pub async fn remove_overlays(&mut self) -> Result<CompactionMetrics> {
+        // `overlays_only` keeps the size and deletion triggers out of it, so this
+        // rewrites overlaid fragments and nothing else. The default
+        // `target_rows_per_fragment` still applies as the rewritten files' row
+        // limit, so an overlaid fragment is not split.
+        let options = CompactionOptions {
+            max_overlays_per_fragment: Some(0),
+            overlays_only: true,
+            ..Default::default()
+        };
+        compact_files(self, options, None).await
     }
 
     /// Update schema metadata.

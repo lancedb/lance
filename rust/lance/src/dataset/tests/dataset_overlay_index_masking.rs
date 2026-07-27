@@ -58,6 +58,7 @@ async fn create_base_dataset_with(stable_row_ids: bool) -> Dataset {
     let write_params = WriteParams {
         max_rows_per_file: 6,
         enable_stable_row_ids: stable_row_ids,
+        enable_overlays: Some(true),
         ..Default::default()
     };
     let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
@@ -509,6 +510,7 @@ async fn create_vector_overlay_dataset(stable_row_ids: bool) -> Dataset {
     let write_params = WriteParams {
         max_rows_per_file: 32,
         enable_stable_row_ids: stable_row_ids,
+        enable_overlays: Some(true),
         ..Default::default()
     };
     let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
@@ -672,6 +674,7 @@ async fn create_text_dataset() -> Dataset {
     .unwrap();
     let write_params = WriteParams {
         max_rows_per_file: 6,
+        enable_overlays: Some(true),
         ..Default::default()
     };
     let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
@@ -1092,6 +1095,7 @@ async fn bench_index_query_overlay_overhead() {
 
     let write_params = WriteParams {
         max_rows_per_file: ROWS_PER_FRAG as usize,
+        enable_overlays: Some(true),
         ..Default::default()
     };
     let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
