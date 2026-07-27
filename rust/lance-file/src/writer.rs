@@ -2026,7 +2026,7 @@ mod tests {
 
         // Configure file writer options
         let options = FileWriterOptions {
-            encoding_strategy: Some(Arc::from(encoding_strategy)),
+            encoding_strategy: Some(encoding_strategy),
             format_version: Some(LanceFileVersion::V2_1),
             max_page_bytes: Some(64 * 1024), // 64KB pages
             ..Default::default()
@@ -2170,7 +2170,7 @@ mod tests {
             super::encoding_strategy_with_params(LanceFileVersion::V2_1, params).unwrap();
 
         let options = FileWriterOptions {
-            encoding_strategy: Some(Arc::from(encoding_strategy)),
+            encoding_strategy: Some(encoding_strategy),
             format_version: Some(LanceFileVersion::V2_1),
             ..Default::default()
         };
@@ -2266,7 +2266,7 @@ mod tests {
             super::encoding_strategy_with_params(LanceFileVersion::V2_1, params).unwrap();
 
         let options = FileWriterOptions {
-            encoding_strategy: Some(Arc::from(encoding_strategy)),
+            encoding_strategy: Some(encoding_strategy),
             format_version: Some(LanceFileVersion::V2_1),
             ..Default::default()
         };
