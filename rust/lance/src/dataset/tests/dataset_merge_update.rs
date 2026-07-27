@@ -35,7 +35,7 @@ use lance_arrow::BLOB_META_KEY;
 use lance_core::utils::tempfile::{TempDir, TempStrDir};
 use lance_datafusion::utils::reader_to_stream;
 use lance_datagen::{BatchCount, RowCount, array, gen_batch};
-use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
+use lance_file::version::LanceFileVersion;
 use lance_io::utils::CachedFileSize;
 use lance_table::format::{BasePath, DataFile, Fragment};
 
@@ -863,7 +863,7 @@ async fn test_datafile_partial_replacement() {
     writer.write_batch(&batch).await.unwrap();
     writer.finish().await.unwrap();
 
-    let (major, minor) = ConcreteFileVersion::from(LanceFileVersion::Stable).to_data_file_numbers();
+    let (major, minor) = LanceFileVersion::Stable.resolve().to_data_file_numbers();
 
     // find the datafile we want to replace
     let new_data_file = DataFile {
@@ -2311,7 +2311,7 @@ fn build_overlay_frag(prev: &Fragment, field_id: i32, new_file: &str) -> Fragmen
         new_file,
         vec![field_id],
         vec![0],
-        ConcreteFileVersion::from(LanceFileVersion::default()),
+        LanceFileVersion::default().resolve(),
         None,
     );
     overlay

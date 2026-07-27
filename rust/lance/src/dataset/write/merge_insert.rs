@@ -55,15 +55,14 @@ use crate::{
     Dataset,
     datafusion::dataframe::SessionContextExt,
     dataset::{
-        fragment::{FileFragment, FragReadConfig},
+        fragment::FileFragment,
         transaction::{Operation, Transaction},
+        versions,
         write::merge_insert::logical_plan::MergeInsertPlanner,
     },
     index::DatasetIndexInternalExt,
     io::exec::{
-        AddRowAddrExec, Planner, TakeExec,
-        filtered_read::{FilteredReadExec, FilteredReadOptions},
-        project,
+        Planner, project,
         scalar_index::{IndexLookup, MapIndexExec},
         utils::ReplayExec,
     },
@@ -124,6 +123,7 @@ use lance_datafusion::{
     spill::spilling_table_provider,
     utils::{StreamingWriteSource, reader_to_stream},
 };
+#[cfg(test)]
 use lance_file::version::LanceFileVersion;
 use lance_index::IndexCriteria;
 use lance_index::mem_wal::CompactedSsTable;
@@ -756,11 +756,13 @@ impl MergeInsertJob {
         let lance_schema: lance_core::datatypes::Schema = schema.try_into()?;
         let target_schema = self.dataset.schema();
 
-        let mut options = SchemaCompareOptions {
-            compare_dictionary: self.dataset.is_legacy_storage(),
-            compare_nullability: NullabilityComparison::Ignore,
-            ..Default::default()
-        };
+        let version = self
+            .dataset
+            .manifest()
+            .data_storage_format
+            .lance_file_format();
+        let mut options = versions::schema_compare_options(version);
+        options.compare_nullability = NullabilityComparison::Ignore;
 
         // Try full schema match first.
         if lance_schema
@@ -870,7 +872,7 @@ impl MergeInsertJob {
             .iter()
             .map(|(col, idx)| IndexLookup::new(col.clone(), idx.name.clone()))
             .collect::<Vec<_>>();
-        let mut index_mapper: Arc<dyn ExecutionPlan> = Arc::new(MapIndexExec::new_multi(
+        let index_mapper: Arc<dyn ExecutionPlan> = Arc::new(MapIndexExec::new_multi(
             self.dataset.clone(),
             lookups,
             index_mapper_input,
@@ -882,29 +884,16 @@ impl MergeInsertJob {
             .dataset
             .empty_projection()
             .union_arrow_schema(schema.as_ref(), OnMissing::Error)?;
-        let mut target: Arc<dyn ExecutionPlan> = if self.dataset.is_legacy_storage() {
-            if add_row_addr {
-                let pos = index_mapper.schema().fields().len(); // Add to end
-                index_mapper = Arc::new(AddRowAddrExec::try_new(
-                    index_mapper,
-                    self.dataset.clone(),
-                    pos,
-                )?);
-            }
-            Arc::new(TakeExec::try_new(self.dataset.clone(), index_mapper, projection)?.unwrap())
-        } else {
-            // Keep the mapped row ids; the read synthesizes the row addresses
-            // if requested (no AddRowAddrExec needed)
-            let mut projection = projection.with_row_id();
-            if add_row_addr {
-                projection = projection.with_row_addr();
-            }
-            Arc::new(FilteredReadExec::try_new(
-                self.dataset.clone(),
-                FilteredReadOptions::new(projection),
-                Some(index_mapper),
-            )?)
-        };
+        let mut target = versions::merge_insert_indexed_take(
+            self.dataset
+                .manifest()
+                .data_storage_format
+                .lance_file_format(),
+            self.dataset.clone(),
+            index_mapper,
+            projection,
+            add_row_addr,
+        )?;
 
         // 5 - Take puts the row id and row addr at the beginning.  A full scan (used when there is
         //     no scalar index) puts the row id and addr at the end.  We need to match these up so
@@ -1256,12 +1245,10 @@ impl MergeInsertJob {
                     // Also, because we already sorted by row address, the rows
                     // will be in the correct order.
 
-                    let data_storage_version = dataset
-                        .manifest()
-                        .data_storage_format
-                        .lance_file_version()?;
-                    let mut writer = crate::dataset::versions::open_data_writer(
-                        data_storage_version.into(),
+                    let data_storage_version =
+                        dataset.manifest().data_storage_format.lance_file_format();
+                    let mut writer = versions::open_data_writer(
+                        data_storage_version,
                         &dataset.object_store,
                         &write_schema,
                         &dataset.base,
@@ -1293,16 +1280,12 @@ impl MergeInsertJob {
                         }
                     }
 
-                    if data_storage_version == LanceFileVersion::Legacy {
+                    if let Some(batch_size) =
+                        versions::row_group_size_for_rewrite(data_storage_version, &fragment)
+                            .await?
+                    {
                         // Need to match the existing batch size exactly, otherwise
                         // we'll get errors.
-                        let reader = fragment
-                            .open(
-                                dataset.schema(),
-                                FragReadConfig::default().with_row_address(true),
-                            )
-                            .await?;
-                        let batch_size = reader.legacy_num_rows_in_batch(0).unwrap();
                         let stream = stream::iter(batches.into_iter().map(Ok));
                         let stream = Box::pin(RecordBatchStreamAdapter::new(
                             Arc::new((&write_schema).into()),

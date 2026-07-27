@@ -5,10 +5,9 @@ use async_trait::async_trait;
 use chrono::prelude::*;
 use lance_core::deepsize::DeepSizeOf;
 use lance_file::datatypes::{Fields, FieldsWithMeta};
-use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
-use lance_file::versions::v1::{
-    encoding::populate_schema_dictionaries, reader::FileReader as V1FileReader,
-};
+use lance_file::version::{ConcreteFileVersion, stable_file_version};
+use lance_file::versions::v1::encoding::populate_schema_dictionaries;
+use lance_file::versions::v1::reader::FileReader as V1FileReader;
 use lance_io::traits::{ProtoStruct, Reader};
 use object_store::path::Path;
 use prost::Message;
@@ -503,10 +502,6 @@ impl Manifest {
         pb_manifest.encode_to_vec()
     }
 
-    pub fn should_use_legacy_format(&self) -> bool {
-        self.data_storage_format.version == ConcreteFileVersion::V1
-    }
-
     /// Get the summary information of a manifest.
     ///
     /// This function calculates various statistics about the manifest, including:
@@ -555,6 +550,10 @@ impl Manifest {
 }
 
 /// Populate dictionary values stored outside a v1 manifest.
+///
+/// Current manifests carry dictionary values in the schema and require no work.
+/// Keeping this decision here prevents dataset readers from reconstructing
+/// manifest-format behavior from the data-file version.
 pub async fn populate_manifest_schema_dictionary(
     manifest: &mut Manifest,
     reader: &dyn Reader,
@@ -642,16 +641,11 @@ impl DataStorageFormat {
     pub fn lance_file_format(&self) -> ConcreteFileVersion {
         self.version
     }
-
-    // Retained until all selector-based execution APIs migrate to exact versions.
-    pub fn lance_file_version(&self) -> Result<LanceFileVersion> {
-        Ok(self.version.into())
-    }
 }
 
 impl Default for DataStorageFormat {
     fn default() -> Self {
-        Self::new(ConcreteFileVersion::from(LanceFileVersion::Stable))
+        Self::new(stable_file_version())
     }
 }
 
@@ -918,7 +912,7 @@ impl TryFrom<pb::Manifest> for Manifest {
                 } else {
                     // No fragments to inspect, best we can do is look at writer flags
                     if has_deprecated_v2_feature_flag(p.writer_feature_flags) {
-                        DataStorageFormat::new(ConcreteFileVersion::from(LanceFileVersion::Stable))
+                        DataStorageFormat::new(stable_file_version())
                     } else {
                         DataStorageFormat::new(ConcreteFileVersion::V1)
                     }
@@ -1117,7 +1111,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             recovered_stable.data_storage_format.lance_file_format(),
-            ConcreteFileVersion::from(LanceFileVersion::Stable)
+            stable_file_version()
         );
     }
 
@@ -1581,7 +1575,7 @@ mod tests {
                 "data_with_deletion.lance",
                 vec![0, 1],
                 vec![0, 1],
-                ConcreteFileVersion::from(LanceFileVersion::Stable),
+                stable_file_version(),
                 NonZero::new(1000),
             )
             .with_physical_rows(50);

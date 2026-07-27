@@ -454,10 +454,7 @@ impl WriteParams {
     }
 
     pub fn storage_version_or_default(&self) -> ConcreteFileVersion {
-        self.data_storage_version
-            .unwrap_or_default()
-            .resolve()
-            .into()
+        self.data_storage_version.unwrap_or_default().resolve()
     }
 
     pub fn store_registry(&self) -> Arc<ObjectStoreRegistry> {
@@ -1360,7 +1357,7 @@ fn resolve_storage_version(dataset: Option<&Dataset>, params: &WriteParams) -> C
                 // dataset.
                 params
                     .data_storage_version
-                    .map(|version| ConcreteFileVersion::from(version.resolve()))
+                    .map(LanceFileVersion::resolve)
                     .unwrap_or_else(|| dataset.manifest().data_storage_format.lance_file_format())
             }
         }
@@ -2288,8 +2285,7 @@ mod tests {
             LanceFileVersion::Next,
         ];
         for version in versions {
-            let (major, minor) =
-                ConcreteFileVersion::from(version.resolve()).to_data_file_numbers();
+            let (major, minor) = version.resolve().to_data_file_numbers();
             let write_params = WriteParams {
                 data_storage_version: Some(version),
                 // This parameter should be ignored
@@ -2640,7 +2636,7 @@ mod tests {
             &object_store,
             &schema,
             &base_dir,
-            ConcreteFileVersion::from(LanceFileVersion::Stable.resolve()),
+            LanceFileVersion::Stable.resolve(),
             WriterOptions {
                 add_data_dir: false, // Don't add /data
                 ..Default::default()

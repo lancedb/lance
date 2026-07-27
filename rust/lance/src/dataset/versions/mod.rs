@@ -1,15 +1,19 @@
-//! Dataset write policies that differ across exact Lance file versions.
+//! Dataset policies that differ across exact Lance file versions.
 //!
 //! File grammar belongs to `lance_file::versions`. This module contains only
 //! operation-level dataset choices whose behavior actually differs by version.
 
-use std::sync::Arc;
+use std::{collections::HashMap, ops::Range, sync::Arc};
 
+use arrow_schema::{DataType, Field as ArrowField};
 use datafusion::execution::SendableRecordBatchStream;
+use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use futures::{StreamExt, TryStreamExt};
+use lance_arrow::DataTypeExt;
 use lance_core::{
-    Result,
-    datatypes::{Schema, SchemaCompareOptions},
+    Error, Result,
+    datatypes::{Field, Projection, Schema, SchemaCompareOptions},
 };
 use lance_datafusion::chunker::{break_stream, chunk_stream};
 use lance_file::{
@@ -20,13 +24,50 @@ use lance_file::{
 use lance_index::scalar::seed::IndexSeedWriter;
 use lance_io::object_store::ObjectStore;
 use lance_io::traits::Writer as ObjectWriter;
-use lance_table::format::{DataFile, Fragment};
+use lance_table::format::{DataFile, DataStorageFormat, Fragment, Manifest};
 use object_store::path::Path;
 
 use super::Dataset;
-use super::fragment::write::FragmentCreateBuilder;
+use super::fragment::{
+    FileFragment, FragReadConfig, GenericFileReader, MetadataMode, V1FragmentReader,
+    write::FragmentCreateBuilder,
+};
+use super::optimize::CompactionOptions;
+use super::scanner::{PlannedFilteredScan, Scanner};
+use super::schema_evolution::optimize::{
+    ChainedNewColumnTransformOptimizer, SqlToAllNullsOptimizer,
+};
+use super::statistics::FieldStatistics;
 use super::utils::SchemaAdapter;
-use super::write::{self, TargetBaseInfo, WriteParams, WriterOptions};
+use super::write::{self, GenericWriter, TargetBaseInfo, WriteParams, WriterOptions};
+use crate::io::exec::filtered_read::{FilteredReadExec, FilteredReadOptions};
+use crate::io::exec::{
+    AddRowAddrExec, FilterPlan as ExprFilterPlan, LanceScanConfig, LanceStream, TakeExec,
+};
+
+#[allow(clippy::too_many_arguments)]
+pub fn create_scan_stream(
+    version: ConcreteFileVersion,
+    dataset: Arc<Dataset>,
+    fragments: Arc<Vec<Fragment>>,
+    offsets: Option<Range<u64>>,
+    projection: Arc<Schema>,
+    config: LanceScanConfig,
+    metrics: &ExecutionPlanMetricsSet,
+    partition: usize,
+) -> datafusion::error::Result<LanceStream> {
+    match version {
+        ConcreteFileVersion::V1 => LanceStream::try_new_v1(
+            dataset, fragments, offsets, projection, config, metrics, partition,
+        ),
+        ConcreteFileVersion::V2_0
+        | ConcreteFileVersion::V2_1
+        | ConcreteFileVersion::V2_2
+        | ConcreteFileVersion::V2_3 => LanceStream::try_new_v2(
+            dataset, fragments, offsets, projection, config, metrics, partition,
+        ),
+    }
+}
 
 pub fn schema_compare_options(version: ConcreteFileVersion) -> SchemaCompareOptions {
     match version {
@@ -157,6 +198,142 @@ pub async fn write_fragments_direct(
     .await
 }
 
+fn binary_copy_files_match(fragments: &[Fragment], expected: ConcreteFileVersion) -> Result<bool> {
+    for fragment in fragments {
+        for data_file in &fragment.files {
+            if data_file.file_version()? != expected {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+pub async fn can_use_binary_copy(
+    version: ConcreteFileVersion,
+    dataset: &Dataset,
+    options: &CompactionOptions,
+    fragments: &[Fragment],
+) -> Result<bool> {
+    match version {
+        ConcreteFileVersion::V1 => Ok(false),
+        ConcreteFileVersion::V2_0
+        | ConcreteFileVersion::V2_1
+        | ConcreteFileVersion::V2_2
+        | ConcreteFileVersion::V2_3 => {
+            if !binary_copy_files_match(fragments, version)? {
+                return Ok(false);
+            }
+            super::optimize::can_use_binary_copy_current(dataset, options, fragments).await
+        }
+    }
+}
+
+pub async fn rewrite_files_binary_copy(
+    version: ConcreteFileVersion,
+    dataset: &Dataset,
+    fragments: &[Fragment],
+    params: &WriteParams,
+    read_batch_bytes: Option<usize>,
+) -> Result<Vec<Fragment>> {
+    match version {
+        ConcreteFileVersion::V1 => Err(Error::not_supported(
+            "binary-copy compaction is not supported for Lance file version 1".to_string(),
+        )),
+        ConcreteFileVersion::V2_0
+        | ConcreteFileVersion::V2_1
+        | ConcreteFileVersion::V2_2
+        | ConcreteFileVersion::V2_3 => {
+            super::optimize::binary_copy::rewrite_files_binary_copy(
+                version,
+                dataset,
+                fragments,
+                params,
+                read_batch_bytes,
+            )
+            .await
+        }
+    }
+}
+
+pub fn check_manifest_storage_version(manifest: &mut Manifest) -> Result<()> {
+    let version = manifest.data_storage_format.lance_file_format();
+    match version {
+        ConcreteFileVersion::V1 => repair_legacy_manifest_storage(manifest),
+        ConcreteFileVersion::V2_0
+        | ConcreteFileVersion::V2_1
+        | ConcreteFileVersion::V2_2
+        | ConcreteFileVersion::V2_3 => validate_exact_manifest_storage(manifest, version),
+    }
+}
+
+pub fn validate_column_indices(manifest: &Manifest) -> Result<()> {
+    match manifest.data_storage_format.lance_file_format() {
+        ConcreteFileVersion::V1 | ConcreteFileVersion::V2_0 => Ok(()),
+        ConcreteFileVersion::V2_1 | ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3 => {
+            validate_leaf_column_indices(manifest)
+        }
+    }
+}
+
+fn validate_leaf_column_indices(manifest: &Manifest) -> Result<()> {
+    for fragment in manifest.fragments.iter() {
+        for data_file in &fragment.files {
+            if data_file.column_indices.is_empty() {
+                continue;
+            }
+            if data_file.fields.len() != data_file.column_indices.len() {
+                return Err(Error::invalid_input(format!(
+                    "Data file '{}' (fragment {}) has {} field ids but {} column indices. These must be the same length.",
+                    data_file.path,
+                    fragment.id,
+                    data_file.fields.len(),
+                    data_file.column_indices.len()
+                )));
+            }
+            for (field_id, column_index) in
+                data_file.fields.iter().zip(data_file.column_indices.iter())
+            {
+                let Some(field) = manifest.schema.field_by_id(*field_id) else {
+                    continue;
+                };
+                let needs_column = field.is_leaf() || field.is_packed_struct() || field.is_blob();
+                if needs_column && *column_index == -1 {
+                    return Err(Error::invalid_input(format!(
+                        "Field '{}' (id={}) in data file '{}' (fragment {}) has column_index=-1, but leaf fields, packed structs, and blob fields must have a valid column index in file format 2.1+.",
+                        field.name, field_id, data_file.path, fragment.id
+                    )));
+                }
+                if !needs_column && *column_index != -1 {
+                    return Err(Error::invalid_input(format!(
+                        "Non-leaf field '{}' (id={}) in data file '{}' (fragment {}) has column_index={}, but non-leaf fields should have column_index=-1 in file format 2.1+.",
+                        field.name, field_id, data_file.path, fragment.id, column_index
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_fragment_schema(
+    version: ConcreteFileVersion,
+    schema: &Schema,
+    fragments: &[Fragment],
+) -> Result<()> {
+    match version {
+        ConcreteFileVersion::V1 => {
+            super::transaction::schema_fragments_legacy_valid(schema, fragments)
+        }
+        ConcreteFileVersion::V2_0
+        | ConcreteFileVersion::V2_1
+        | ConcreteFileVersion::V2_2
+        | ConcreteFileVersion::V2_3 => {
+            super::transaction::schema_fragments_modern_valid(schema, fragments)
+        }
+    }
+}
+
 pub async fn write_fragment(
     version: ConcreteFileVersion,
     builder: &FragmentCreateBuilder<'_>,
@@ -190,7 +367,7 @@ pub async fn open_writer(
     schema: &Schema,
     base_dir: &Path,
     options: WriterOptions,
-) -> Result<Box<dyn write::GenericWriter>> {
+) -> Result<Box<dyn GenericWriter>> {
     match version {
         ConcreteFileVersion::V1 => {
             write::open_v1_writer(object_store, schema, base_dir, options).await
@@ -227,7 +404,7 @@ pub async fn open_data_writer(
     object_store: &ObjectStore,
     schema: &Schema,
     base_dir: &Path,
-) -> Result<Box<dyn write::GenericWriter>> {
+) -> Result<Box<dyn GenericWriter>> {
     open_writer(
         version,
         object_store,
@@ -242,7 +419,7 @@ pub async fn open_update_writer(
     version: ConcreteFileVersion,
     dataset: &Dataset,
     schema: &Schema,
-) -> Result<Box<dyn write::GenericWriter>> {
+) -> Result<Box<dyn GenericWriter>> {
     let external_base_resolver = match version {
         ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3 => {
             write::blob_v2_external_base_resolver(Some(dataset), &WriteParams::default(), schema)
@@ -258,4 +435,441 @@ pub async fn open_update_writer(
         WriterOptions::update(dataset.session.store_registry(), external_base_resolver),
     )
     .await
+}
+
+pub async fn create_fragment_from_file(
+    file_version: ConcreteFileVersion,
+    dataset_version: ConcreteFileVersion,
+    filename: &str,
+    dataset: &Dataset,
+    fragment_id: usize,
+    physical_rows: Option<usize>,
+) -> Result<Fragment> {
+    if file_version != dataset_version {
+        return Err(Error::invalid_input(format!(
+            "File version mismatch. Dataset version: {:?} Fragment version: {:?}",
+            dataset_version, file_version
+        )));
+    }
+    match file_version {
+        ConcreteFileVersion::V1 => {
+            FileFragment::create_from_v1_file(filename, dataset, fragment_id, physical_rows).await
+        }
+        ConcreteFileVersion::V2_0
+        | ConcreteFileVersion::V2_1
+        | ConcreteFileVersion::V2_2
+        | ConcreteFileVersion::V2_3 => {
+            FileFragment::create_from_current_file(filename, dataset, fragment_id).await
+        }
+    }
+}
+
+pub fn index_file_version(version: ConcreteFileVersion) -> ConcreteFileVersion {
+    match version {
+        ConcreteFileVersion::V1 | ConcreteFileVersion::V2_0 => ConcreteFileVersion::V2_0,
+        ConcreteFileVersion::V2_1 => ConcreteFileVersion::V2_1,
+        ConcreteFileVersion::V2_2 => ConcreteFileVersion::V2_2,
+        ConcreteFileVersion::V2_3 => ConcreteFileVersion::V2_3,
+    }
+}
+
+pub async fn open_file_reader(
+    version: ConcreteFileVersion,
+    fragment: &FileFragment,
+    data_file: &DataFile,
+    projection: Option<&Schema>,
+    read_config: &FragReadConfig,
+    metadata_mode: MetadataMode,
+) -> Result<Option<Box<dyn GenericFileReader>>> {
+    match version {
+        ConcreteFileVersion::V1 => fragment.open_v1_file_reader(data_file, projection).await,
+        ConcreteFileVersion::V2_0
+        | ConcreteFileVersion::V2_1
+        | ConcreteFileVersion::V2_2
+        | ConcreteFileVersion::V2_3 => {
+            fragment
+                .open_current_file_reader(data_file, projection, read_config, metadata_mode)
+                .await
+        }
+    }
+}
+
+pub async fn open_v1_fragment_reader(
+    fragment: &FileFragment,
+    projection: &Schema,
+    read_config: &FragReadConfig,
+) -> Result<V1FragmentReader> {
+    for data_file in &fragment.metadata().files {
+        let actual = data_file.file_version()?;
+        if actual != ConcreteFileVersion::V1 {
+            return Err(Error::invalid_input(format!(
+                "Cannot open file {} with the v1 reader because it has version {}",
+                data_file.path, actual
+            )));
+        }
+    }
+    fragment
+        .open_v1_fragment_reader(projection, read_config)
+        .await
+}
+
+pub async fn row_group_size_for_rewrite(
+    version: ConcreteFileVersion,
+    fragment: &FileFragment,
+) -> Result<Option<u32>> {
+    match version {
+        ConcreteFileVersion::V1 => {
+            let reader = open_v1_fragment_reader(
+                fragment,
+                fragment.dataset().schema(),
+                &FragReadConfig::default(),
+            )
+            .await?;
+            Ok(reader.num_rows_in_batch(0))
+        }
+        ConcreteFileVersion::V2_0
+        | ConcreteFileVersion::V2_1
+        | ConcreteFileVersion::V2_2
+        | ConcreteFileVersion::V2_3 => Ok(None),
+    }
+}
+
+pub fn is_upcast_downcast(
+    version: ConcreteFileVersion,
+    from_type: &DataType,
+    to_type: &DataType,
+) -> bool {
+    is_upcast_downcast_impl(
+        from_type,
+        to_type,
+        !matches!(version, ConcreteFileVersion::V1),
+    )
+}
+
+fn is_upcast_downcast_impl(
+    from_type: &DataType,
+    to_type: &DataType,
+    dictionary_materialization: bool,
+) -> bool {
+    use DataType::*;
+    match (from_type, to_type) {
+        (_, Dictionary(_, _)) if !dictionary_materialization => false,
+        (Dictionary(_, from_value_type), _) => {
+            is_upcast_downcast_impl(from_value_type, to_type, dictionary_materialization)
+        }
+        (_, Dictionary(_, to_value_type)) => {
+            is_upcast_downcast_impl(from_type, to_value_type, dictionary_materialization)
+        }
+        (from, to) if from.is_integer() => to.is_integer(),
+        (from, to) if from.is_floating() => to.is_floating(),
+        (from, to) if from.is_temporal() => to.is_temporal(),
+        (Boolean, to) => matches!(to, Boolean),
+        (Utf8 | LargeUtf8, to) => matches!(to, Utf8 | LargeUtf8),
+        (Binary | LargeBinary, to) => matches!(to, Binary | LargeBinary),
+        (Decimal128(_, _) | Decimal256(_, _), to) => {
+            matches!(to, Decimal128(_, _) | Decimal256(_, _))
+        }
+        (List(from_field) | LargeList(from_field) | FixedSizeList(from_field, _), to_type) => {
+            match to_type {
+                List(to_field) | LargeList(to_field) | FixedSizeList(to_field, _) => {
+                    is_upcast_downcast_impl(
+                        from_field.data_type(),
+                        to_field.data_type(),
+                        dictionary_materialization,
+                    )
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+pub fn validate_nulls(
+    version: ConcreteFileVersion,
+    datatype: &DataType,
+    has_nulls: bool,
+) -> Result<()> {
+    let supported = match version {
+        ConcreteFileVersion::V1 => matches!(
+            datatype,
+            DataType::Utf8
+                | DataType::LargeUtf8
+                | DataType::Binary
+                | DataType::List(_)
+                | DataType::FixedSizeBinary(_)
+                | DataType::FixedSizeList(_, _)
+        ),
+        ConcreteFileVersion::V2_0 => !matches!(datatype, DataType::Struct(..)),
+        ConcreteFileVersion::V2_1 | ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3 => true,
+    };
+    if has_nulls && !supported {
+        return Err(Error::invalid_input(format!(
+            "Join produced null values for type: {:?}, but storing nulls for this data type is not supported by the dataset's current Lance file format version: {:?}. This can be caused by an explicit null in the new data.",
+            datatype, version
+        )));
+    }
+    Ok(())
+}
+
+fn reject_nested_column_add(field: &ArrowField, version: ConcreteFileVersion) -> Result<()> {
+    Err(Error::invalid_input(format!(
+        "Column {} is a struct col, add sub column is not supported in Lance file version {}",
+        field.name(),
+        version
+    )))
+}
+
+fn reject_nested_v1(field: &ArrowField) -> Result<()> {
+    reject_nested_column_add(field, ConcreteFileVersion::V1)
+}
+
+fn reject_nested_v2_0(field: &ArrowField) -> Result<()> {
+    reject_nested_column_add(field, ConcreteFileVersion::V2_0)
+}
+
+fn reject_nested_v2_1(field: &ArrowField) -> Result<()> {
+    reject_nested_column_add(field, ConcreteFileVersion::V2_1)
+}
+
+fn allow_nested(_field: &ArrowField) -> Result<()> {
+    Ok(())
+}
+
+pub fn check_field_conflict(
+    version: ConcreteFileVersion,
+    left: &ArrowField,
+    right: &ArrowField,
+) -> Result<()> {
+    let validate = match version {
+        ConcreteFileVersion::V1 => reject_nested_v1,
+        ConcreteFileVersion::V2_0 => reject_nested_v2_0,
+        ConcreteFileVersion::V2_1 => reject_nested_v2_1,
+        ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3 => allow_nested,
+    };
+    super::schema_evolution::check_field_conflict_with(left, right, validate)
+}
+
+fn exclude_struct_field(field: &Field, other: &Field) -> Option<Field> {
+    field
+        .data_type()
+        .is_struct()
+        .then(|| field.exclude(other))
+        .flatten()
+}
+
+fn exclude_nested_field(field: &Field, other: &Field) -> Option<Field> {
+    field
+        .data_type()
+        .is_nested()
+        .then(|| field.exclude(other))
+        .flatten()
+}
+
+pub fn exclude_schema(
+    version: ConcreteFileVersion,
+    source: &Schema,
+    other: &Schema,
+) -> Result<Schema> {
+    let exclude = match version {
+        ConcreteFileVersion::V1 | ConcreteFileVersion::V2_0 | ConcreteFileVersion::V2_1 => {
+            exclude_struct_field
+        }
+        ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3 => exclude_nested_field,
+    };
+    super::schema_evolution::exclude_with(source, other, exclude)
+}
+
+pub fn configure_new_column_optimizers(
+    version: ConcreteFileVersion,
+    optimizer: &mut ChainedNewColumnTransformOptimizer,
+) {
+    match version {
+        ConcreteFileVersion::V1 => {}
+        ConcreteFileVersion::V2_0
+        | ConcreteFileVersion::V2_1
+        | ConcreteFileVersion::V2_2
+        | ConcreteFileVersion::V2_3 => {
+            optimizer.add_optimizer(Box::new(SqlToAllNullsOptimizer::new()));
+        }
+    }
+}
+
+pub fn validate_metadata_only_null_columns(version: ConcreteFileVersion) -> Result<()> {
+    match version {
+        ConcreteFileVersion::V1 => Err(Error::not_supported_source(
+            "Cannot add all-null columns to legacy dataset version.".into(),
+        )),
+        ConcreteFileVersion::V2_0
+        | ConcreteFileVersion::V2_1
+        | ConcreteFileVersion::V2_2
+        | ConcreteFileVersion::V2_3 => Ok(()),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(in crate::dataset) async fn filtered_read(
+    version: ConcreteFileVersion,
+    scanner: &Scanner,
+    filter_plan: &ExprFilterPlan,
+    projection: Projection,
+    make_deletions_null: bool,
+    fragments: Option<Arc<Vec<Fragment>>>,
+    scan_range: Option<Range<u64>>,
+    is_prefilter: bool,
+) -> Result<PlannedFilteredScan> {
+    match version {
+        ConcreteFileVersion::V1 => {
+            scanner
+                .legacy_filtered_read(
+                    filter_plan,
+                    projection,
+                    make_deletions_null,
+                    fragments,
+                    scan_range,
+                    is_prefilter,
+                )
+                .await
+        }
+        ConcreteFileVersion::V2_0
+        | ConcreteFileVersion::V2_1
+        | ConcreteFileVersion::V2_2
+        | ConcreteFileVersion::V2_3 => {
+            let limit_pushed_down = scan_range.is_some();
+            let plan = scanner
+                .new_filtered_read(
+                    filter_plan,
+                    projection,
+                    make_deletions_null,
+                    fragments,
+                    scan_range,
+                )
+                .await?;
+            Ok(PlannedFilteredScan {
+                filter_pushed_down: true,
+                limit_pushed_down,
+                plan,
+            })
+        }
+    }
+}
+
+pub fn take(
+    version: ConcreteFileVersion,
+    scanner: &Scanner,
+    input: Arc<dyn ExecutionPlan>,
+    output_projection: Projection,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    match version {
+        ConcreteFileVersion::V1 => scanner.take_legacy(input, output_projection),
+        ConcreteFileVersion::V2_0
+        | ConcreteFileVersion::V2_1
+        | ConcreteFileVersion::V2_2
+        | ConcreteFileVersion::V2_3 => scanner.take_current(input, output_projection),
+    }
+}
+
+pub async fn collect_data_stats(
+    version: ConcreteFileVersion,
+    dataset: &Arc<Dataset>,
+    field_stats: &mut HashMap<u32, FieldStatistics>,
+) -> Result<()> {
+    match version {
+        ConcreteFileVersion::V1 => Ok(()),
+        ConcreteFileVersion::V2_0
+        | ConcreteFileVersion::V2_1
+        | ConcreteFileVersion::V2_2
+        | ConcreteFileVersion::V2_3 => {
+            super::statistics::collect_current_data_stats(dataset, field_stats).await
+        }
+    }
+}
+
+pub fn merge_insert_indexed_take(
+    version: ConcreteFileVersion,
+    dataset: Arc<Dataset>,
+    mut index_mapper: Arc<dyn ExecutionPlan>,
+    projection: Projection,
+    add_row_addr: bool,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    match version {
+        ConcreteFileVersion::V1 => {
+            if add_row_addr {
+                let position = index_mapper.schema().fields().len();
+                index_mapper = Arc::new(AddRowAddrExec::try_new(
+                    index_mapper,
+                    dataset.clone(),
+                    position,
+                )?);
+            }
+            Ok(Arc::new(
+                TakeExec::try_new(dataset, index_mapper, projection)?.ok_or_else(|| {
+                    Error::internal("merge-insert legacy take unexpectedly needed no columns")
+                })?,
+            ))
+        }
+        ConcreteFileVersion::V2_0
+        | ConcreteFileVersion::V2_1
+        | ConcreteFileVersion::V2_2
+        | ConcreteFileVersion::V2_3 => {
+            let mut projection = projection.with_row_id();
+            if add_row_addr {
+                projection = projection.with_row_addr();
+            }
+            Ok(Arc::new(FilteredReadExec::try_new(
+                dataset,
+                FilteredReadOptions::new(projection),
+                Some(index_mapper),
+            )?))
+        }
+    }
+}
+
+pub fn validate_row_stream_read(version: ConcreteFileVersion) -> Result<()> {
+    match version {
+        ConcreteFileVersion::V1 => Err(Error::not_supported_source(
+            "taking rows through FilteredReadExec requires the v2 storage format"
+                .to_string()
+                .into(),
+        )),
+        ConcreteFileVersion::V2_0
+        | ConcreteFileVersion::V2_1
+        | ConcreteFileVersion::V2_2
+        | ConcreteFileVersion::V2_3 => Ok(()),
+    }
+}
+
+fn repair_legacy_manifest_storage(manifest: &mut Manifest) -> Result<()> {
+    let declared = manifest.data_storage_format.lance_file_format();
+    if let Some(actual) = Fragment::try_infer_version(&manifest.fragments)
+        .map_err(|error| {
+            Error::internal(format!(
+                "The dataset contains a mixture of file versions. You will need to rollback to an earlier version: {error}"
+            ))
+        })?
+        && actual != ConcreteFileVersion::V1
+    {
+        log::warn!(
+            "Data storage version {} is less than the actual file version {}. This has been automatically updated.",
+            declared,
+            actual
+        );
+        manifest.data_storage_format = DataStorageFormat::new(actual);
+    }
+    Ok(())
+}
+
+fn validate_exact_manifest_storage(
+    manifest: &Manifest,
+    expected: ConcreteFileVersion,
+) -> Result<()> {
+    if let Some(actual) = Fragment::try_infer_version(&manifest.fragments)?
+        && actual != expected
+    {
+        return Err(Error::internal(format!(
+            "The operation added files with version {}. However, the data storage version is {}.",
+            actual, expected
+        )));
+    }
+    Ok(())
 }

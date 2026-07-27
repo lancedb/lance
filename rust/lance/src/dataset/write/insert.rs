@@ -11,9 +11,7 @@ use lance_core::datatypes::{NullabilityComparison, Schema};
 use lance_core::is_system_column;
 use lance_core::utils::tracing::{DATASET_WRITING_EVENT, TRACE_DATASET_EVENTS};
 use lance_datafusion::utils::StreamingWriteSource;
-use lance_file::version::ConcreteFileVersion;
-#[cfg(test)]
-use lance_file::version::LanceFileVersion;
+use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use lance_io::object_store::ObjectStore;
 use lance_table::feature_flags::can_write_dataset;
 use lance_table::format::Fragment;
@@ -418,7 +416,7 @@ impl<'a> InsertBuilder<'a> {
                 // the existing version if they don't
                 params
                     .data_storage_version
-                    .map(|version| ConcreteFileVersion::from(version.resolve()))
+                    .map(LanceFileVersion::resolve)
                     .unwrap_or_else(|| dataset.manifest.data_storage_format.lance_file_format())
             }
             (_, WriteDestination::Dataset(dataset)) => {

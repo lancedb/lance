@@ -982,15 +982,18 @@ async fn test_write_params(
     assert_eq!(dataset.count_fragments(), 10);
     for fragment in &fragments {
         assert_eq!(fragment.count_rows(None).await.unwrap(), 100);
-        let reader = fragment
-            .open(dataset.schema(), FragReadConfig::default())
-            .await
-            .unwrap();
         // No group / batch concept in v2
         if data_storage_version == LanceFileVersion::Legacy {
-            assert_eq!(reader.legacy_num_batches(), 10);
-            for i in 0..reader.legacy_num_batches() as u32 {
-                assert_eq!(reader.legacy_num_rows_in_batch(i).unwrap(), 10);
+            let reader = crate::dataset::versions::open_v1_fragment_reader(
+                fragment,
+                dataset.schema(),
+                &FragReadConfig::default(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(reader.num_batches(), 10);
+            for i in 0..reader.num_batches() as u32 {
+                assert_eq!(reader.num_rows_in_batch(i).unwrap(), 10);
             }
         }
     }
@@ -1052,7 +1055,7 @@ async fn test_write_manifest(
 
     assert_eq!(
         manifest.data_storage_format,
-        DataStorageFormat::new(ConcreteFileVersion::from(data_storage_version))
+        DataStorageFormat::new(data_storage_version.resolve())
     );
     assert!(!matches!(
         manifest.data_storage_format.version.to_manifest_string(),
@@ -1176,8 +1179,8 @@ async fn test_rle_v2_v23_write_and_append() {
     .await
     .unwrap();
     assert_eq!(
-        manifest.data_storage_format.lance_file_version().unwrap(),
-        LanceFileVersion::V2_3
+        manifest.data_storage_format.lance_file_format(),
+        ConcreteFileVersion::V2_3
     );
 
     let append_batch = RecordBatch::try_new(
@@ -1199,12 +1202,8 @@ async fn test_rle_v2_v23_write_and_append() {
     .unwrap();
 
     assert_eq!(
-        dataset
-            .manifest
-            .data_storage_format
-            .lance_file_version()
-            .unwrap(),
-        LanceFileVersion::V2_3
+        dataset.manifest.data_storage_format.lance_file_format(),
+        ConcreteFileVersion::V2_3
     );
 
     let actual = dataset.scan().try_into_batch().await.unwrap();
@@ -1246,12 +1245,8 @@ async fn test_rle_v2_uncommitted_create_commits_v23_storage() {
         .await
         .unwrap();
     assert_eq!(
-        dataset
-            .manifest
-            .data_storage_format
-            .lance_file_version()
-            .unwrap(),
-        LanceFileVersion::V2_3
+        dataset.manifest.data_storage_format.lance_file_format(),
+        ConcreteFileVersion::V2_3
     );
 }
 
@@ -1286,12 +1281,8 @@ async fn test_rle_v2_shallow_clone_preserves_v23_storage() {
         .await
         .unwrap();
     assert_eq!(
-        clone
-            .manifest
-            .data_storage_format
-            .lance_file_version()
-            .unwrap(),
-        LanceFileVersion::V2_3
+        clone.manifest.data_storage_format.lance_file_format(),
+        ConcreteFileVersion::V2_3
     );
 }
 
@@ -2420,12 +2411,8 @@ async fn test_overwrite_mixed_version() {
     .unwrap();
 
     assert_eq!(
-        dataset
-            .manifest
-            .data_storage_format
-            .lance_file_version()
-            .unwrap(),
-        LanceFileVersion::Legacy
+        dataset.manifest.data_storage_format.lance_file_format(),
+        ConcreteFileVersion::V1
     );
 
     let reader = RecordBatchIterator::new(vec![data].into_iter().map(Ok), schema);
@@ -2441,12 +2428,8 @@ async fn test_overwrite_mixed_version() {
     .unwrap();
 
     assert_eq!(
-        dataset
-            .manifest
-            .data_storage_format
-            .lance_file_version()
-            .unwrap(),
-        LanceFileVersion::Legacy
+        dataset.manifest.data_storage_format.lance_file_format(),
+        ConcreteFileVersion::V1
     );
 }
 

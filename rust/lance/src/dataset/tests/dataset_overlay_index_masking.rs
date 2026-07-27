@@ -101,13 +101,14 @@ async fn commit_overlay(
     // For memory:// stores base is empty so the result is the same as before.
     let path = dataset.base.clone().join("data").join(filename.as_str());
     let obj_writer = dataset.object_store.create(&path).await.unwrap();
-    let mut writer = lance_file::versions::v2_1::create_writer(
+    let file_version = dataset.manifest.data_storage_format.lance_file_format();
+    let mut writer = lance_file::versions::create_writer(
+        file_version,
         obj_writer,
         overlay_schema,
         FileWriterOptions::default(),
     )
     .unwrap();
-    let file_version = lance_file::version::ConcreteFileVersion::V2_1;
     for (i, array) in columns.into_iter().enumerate() {
         writer.write_column(i, array).await.unwrap();
     }

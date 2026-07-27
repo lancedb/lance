@@ -95,7 +95,7 @@ impl<'a> CommitBuilder<'a> {
     /// All data files must use the same storage format as the existing dataset.
     /// If a different format is passed, an error will be returned.
     pub fn with_storage_format(mut self, storage_format: LanceFileVersion) -> Self {
-        self.storage_format = Some(storage_format.resolve().into());
+        self.storage_format = Some(storage_format.resolve());
         self
     }
 
@@ -561,7 +561,7 @@ mod tests {
 
     fn sample_fragment() -> Fragment {
         let (major_version, minor_version) =
-            ConcreteFileVersion::from(LanceFileVersion::Stable.resolve()).to_data_file_numbers();
+            LanceFileVersion::Stable.resolve().to_data_file_numbers();
         Fragment {
             id: 0,
             files: vec![DataFile {

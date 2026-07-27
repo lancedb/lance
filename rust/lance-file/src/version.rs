@@ -6,8 +6,6 @@ use std::{
     str::FromStr,
 };
 
-use lance_arrow::DataTypeExt;
-use lance_core::datatypes::Field;
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::{Error, Result};
 
@@ -17,11 +15,21 @@ pub const V2_FORMAT_2_1: &str = "2.1";
 pub const V2_FORMAT_2_2: &str = "2.2";
 pub const V2_FORMAT_2_3: &str = "2.3";
 
+/// Resolve the current stable release policy to an exact file version.
+pub const fn stable_file_version() -> ConcreteFileVersion {
+    ConcreteFileVersion::V2_1
+}
+
+/// Resolve the current next release policy to an exact file version.
+pub const fn next_file_version() -> ConcreteFileVersion {
+    ConcreteFileVersion::V2_3
+}
+
 /// A caller-facing Lance file-version request.
 ///
-/// This selector remains separate from [`ConcreteFileVersion`] because `Stable`
-/// and `Next` are release policy rather than persisted identities.
-#[derive(Debug, Default, PartialEq, Eq, Clone, Copy, Ord, PartialOrd, Hash)]
+/// `Stable` and `Next` are release selectors. They resolve to an exact
+/// [`ConcreteFileVersion`] before file or dataset dispatch and are never persisted.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum LanceFileVersion {
     /// The legacy v1 format.
     Legacy,
@@ -47,42 +55,22 @@ impl DeepSizeOf for LanceFileVersion {
 }
 
 impl LanceFileVersion {
-    /// Resolve release selectors to their current exact selector.
-    pub fn resolve(&self) -> Self {
+    /// Resolve this request through the current release policy.
+    pub const fn resolve(self) -> ConcreteFileVersion {
         match self {
-            Self::Stable => Self::default(),
-            Self::Next => Self::V2_3,
-            _ => *self,
+            Self::Legacy => ConcreteFileVersion::V1,
+            Self::V2_0 => ConcreteFileVersion::V2_0,
+            Self::V2_1 => ConcreteFileVersion::V2_1,
+            Self::Stable => stable_file_version(),
+            Self::V2_2 => ConcreteFileVersion::V2_2,
+            Self::Next => next_file_version(),
+            Self::V2_3 => ConcreteFileVersion::V2_3,
         }
     }
 
-    pub fn is_unstable(&self) -> bool {
-        self >= &Self::Next
-    }
-
-    pub fn try_from_major_minor(major: u32, minor: u32) -> Result<Self> {
-        ConcreteFileVersion::from_data_file_numbers(major, minor).map(Into::into)
-    }
-
-    pub fn to_numbers(&self) -> (u32, u32) {
-        let (major, minor) = ConcreteFileVersion::from(*self).to_data_file_numbers();
-        (major, minor)
-    }
-
-    pub fn iter_non_legacy() -> impl Iterator<Item = Self> {
-        [Self::V2_0, Self::V2_1, Self::V2_2, Self::V2_3].into_iter()
-    }
-
-    pub fn support_add_sub_column(&self) -> bool {
-        self > &Self::V2_1
-    }
-
-    pub fn support_remove_sub_column(&self, field: &Field) -> bool {
-        if self <= &Self::V2_1 {
-            field.data_type().is_struct()
-        } else {
-            field.data_type().is_nested()
-        }
+    /// Whether this request resolves to an unstable exact format.
+    pub const fn is_unstable(self) -> bool {
+        self.resolve().is_unstable()
     }
 }
 
@@ -143,6 +131,24 @@ impl DeepSizeOf for ConcreteFileVersion {
 }
 
 impl ConcreteFileVersion {
+    /// Convert this exact identity to the corresponding exact public selector.
+    ///
+    /// This never produces the release selectors `stable` or `next`.
+    pub const fn to_selector(self) -> LanceFileVersion {
+        match self {
+            Self::V1 => LanceFileVersion::Legacy,
+            Self::V2_0 => LanceFileVersion::V2_0,
+            Self::V2_1 => LanceFileVersion::V2_1,
+            Self::V2_2 => LanceFileVersion::V2_2,
+            Self::V2_3 => LanceFileVersion::V2_3,
+        }
+    }
+
+    /// Whether this exact format is covered only by the unstable release policy.
+    pub const fn is_unstable(self) -> bool {
+        matches!(self, Self::V2_3)
+    }
+
     /// Decode the exact version string stored in a dataset manifest.
     ///
     /// Public selector aliases such as `legacy`, `0.3`, `stable`, and `next` are
@@ -241,30 +247,15 @@ impl Display for ConcreteFileVersion {
     }
 }
 
-impl From<ConcreteFileVersion> for LanceFileVersion {
-    fn from(value: ConcreteFileVersion) -> Self {
-        match value {
-            ConcreteFileVersion::V1 => Self::Legacy,
-            ConcreteFileVersion::V2_0 => Self::V2_0,
-            ConcreteFileVersion::V2_1 => Self::V2_1,
-            ConcreteFileVersion::V2_2 => Self::V2_2,
-            ConcreteFileVersion::V2_3 => Self::V2_3,
-        }
+impl From<LanceFileVersion> for ConcreteFileVersion {
+    fn from(value: LanceFileVersion) -> Self {
+        value.resolve()
     }
 }
 
-impl From<LanceFileVersion> for ConcreteFileVersion {
-    fn from(value: LanceFileVersion) -> Self {
-        match value.resolve() {
-            LanceFileVersion::Legacy => Self::V1,
-            LanceFileVersion::V2_0 => Self::V2_0,
-            LanceFileVersion::V2_1 => Self::V2_1,
-            LanceFileVersion::V2_2 => Self::V2_2,
-            LanceFileVersion::V2_3 => Self::V2_3,
-            LanceFileVersion::Stable | LanceFileVersion::Next => {
-                unreachable!("resolved file-version selector must be exact")
-            }
-        }
+impl From<ConcreteFileVersion> for LanceFileVersion {
+    fn from(value: ConcreteFileVersion) -> Self {
+        value.to_selector()
     }
 }
 
@@ -302,8 +293,7 @@ mod tests {
         ];
 
         for (selector, expected) in cases {
-            assert_eq!(ConcreteFileVersion::from(selector), expected);
-            assert_eq!(LanceFileVersion::from(expected), selector.resolve());
+            assert_eq!(selector.resolve(), expected);
         }
     }
 

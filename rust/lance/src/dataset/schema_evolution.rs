@@ -25,14 +25,13 @@ use lance_arrow::SchemaExt;
 use lance_core::datatypes::{Field, Schema};
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_encoding::constants::{PACKED_STRUCT_LEGACY_META_KEY, PACKED_STRUCT_META_KEY};
-use lance_file::version::LanceFileVersion;
+#[cfg(test)]
+use lance_file::version::ConcreteFileVersion;
 use lance_table::format::Fragment;
 
-mod optimize;
+pub mod optimize;
 
-use optimize::{
-    ChainedNewColumnTransformOptimizer, NewColumnTransformOptimizer, SqlToAllNullsOptimizer,
-};
+use optimize::{ChainedNewColumnTransformOptimizer, NewColumnTransformOptimizer};
 
 async fn validate_no_nulls_before_making_non_nullable(dataset: &Dataset, path: &str) -> Result<()> {
     let field = dataset.schema().field(path).ok_or_else(|| {
@@ -148,42 +147,17 @@ impl ColumnAlteration {
     }
 }
 
-/// Limit casts to same type. This is mostly to filter out weird casts like
-/// casting a string to a boolean or float to string.
-fn is_upcast_downcast(from_type: &DataType, to_type: &DataType, version: LanceFileVersion) -> bool {
-    use DataType::*;
-    match (from_type, to_type) {
-        // Legacy storage cannot materialize a fresh Dictionary column via
-        // alter because the writer expects `field.dictionary` metadata to be
-        // pre-populated, which the alter pipeline does not compute.
-        (_, Dictionary(_, _)) if matches!(version, LanceFileVersion::Legacy) => false,
-        // These need to be in front
-        (Dictionary(_, from_value_type), _) => {
-            is_upcast_downcast(from_value_type, to_type, version)
-        }
-        (_, Dictionary(_, to_value_type)) => is_upcast_downcast(from_type, to_value_type, version),
-        (from, to) if from.is_integer() => to.is_integer(),
-        (from, to) if from.is_floating() => to.is_floating(),
-        (from, to) if from.is_temporal() => to.is_temporal(),
-        (Boolean, to) => matches!(to, Boolean),
-        (Utf8 | LargeUtf8, to) => matches!(to, Utf8 | LargeUtf8),
-        (Binary | LargeBinary, to) => matches!(to, Binary | LargeBinary),
-        (Decimal128(_, _) | Decimal256(_, _), to) => {
-            matches!(to, Decimal128(_, _) | Decimal256(_, _))
-        }
-        (List(from_field) | LargeList(from_field) | FixedSizeList(from_field, _), to) => match to {
-            List(to_field) | LargeList(to_field) | FixedSizeList(to_field, _) => {
-                is_upcast_downcast(from_field.data_type(), to_field.data_type(), version)
-            }
-            _ => false,
-        },
-
-        _ => false,
-    }
-}
-
 trait ArrowFieldExt {
     fn is_packed(&self) -> bool;
+}
+
+#[cfg(test)]
+fn is_upcast_downcast(
+    from_type: &DataType,
+    to_type: &DataType,
+    version: ConcreteFileVersion,
+) -> bool {
+    super::versions::is_upcast_downcast(version, from_type, to_type)
 }
 
 impl ArrowFieldExt for ArrowField {
@@ -196,10 +170,10 @@ impl ArrowFieldExt for ArrowField {
     }
 }
 
-fn check_field_conflict(
+pub fn check_field_conflict_with(
     left: &ArrowField,
     right: &ArrowField,
-    version: &LanceFileVersion,
+    validate_nested_column_add: fn(&ArrowField) -> Result<()>,
 ) -> Result<()> {
     if left.name() != right.name() {
         return Ok(());
@@ -207,13 +181,7 @@ fn check_field_conflict(
 
     match (left.data_type(), right.data_type()) {
         (DataType::Struct(fl), DataType::Struct(fr)) => {
-            if !version.support_add_sub_column() {
-                return Err(Error::invalid_input(format!(
-                    "Column {} is a struct col, add sub column is not supported in Lance file version {}",
-                    left.name(),
-                    version
-                )));
-            }
+            validate_nested_column_add(left)?;
 
             if left.is_packed() || right.is_packed() {
                 return Err(Error::invalid_input(format!(
@@ -224,15 +192,19 @@ fn check_field_conflict(
 
             for l_field in fl.iter() {
                 if let Some((_, r_field)) = fr.find(l_field.name()) {
-                    check_field_conflict(l_field, r_field, version)?;
+                    check_field_conflict_with(l_field, r_field, validate_nested_column_add)?;
                 }
             }
             Ok(())
         }
-        (DataType::List(fl), DataType::List(fr)) => check_field_conflict(fl, fr, version),
-        (DataType::LargeList(fl), DataType::LargeList(fr)) => check_field_conflict(fl, fr, version),
+        (DataType::List(fl), DataType::List(fr)) => {
+            check_field_conflict_with(fl, fr, validate_nested_column_add)
+        }
+        (DataType::LargeList(fl), DataType::LargeList(fr)) => {
+            check_field_conflict_with(fl, fr, validate_nested_column_add)
+        }
         (DataType::FixedSizeList(fl, _), DataType::FixedSizeList(fr, _)) => {
-            check_field_conflict(fl, fr, version)
+            check_field_conflict_with(fl, fr, validate_nested_column_add)
         }
         (l_type, r_type) if l_type == r_type => Err(Error::invalid_input(format!(
             "Column {} already exists in the dataset",
@@ -248,6 +220,15 @@ fn check_field_conflict(
     }
 }
 
+#[cfg(test)]
+fn check_field_conflict(
+    left: &ArrowField,
+    right: &ArrowField,
+    version: &ConcreteFileVersion,
+) -> Result<()> {
+    super::versions::check_field_conflict(*version, left, right)
+}
+
 pub(super) async fn add_columns_to_fragments(
     dataset: &Dataset,
     transforms: NewColumnTransform,
@@ -257,12 +238,12 @@ pub(super) async fn add_columns_to_fragments(
 ) -> Result<(Vec<Fragment>, Schema, Vec<Fragment>)> {
     // Check names early (before calling add_columns_impl) to avoid extra work if
     // the names are wrong.
-    let version = dataset.manifest.data_storage_format.lance_file_version()?;
+    let version = dataset.manifest.data_storage_format.lance_file_format();
     let check_names = |output_schema: &ArrowSchema| {
         for field in &dataset.schema().fields {
             if let Ok(out_field) = output_schema.field_with_name(&field.name) {
                 let ds_field = ArrowField::from(field);
-                check_field_conflict(&ds_field, out_field, &version)?;
+                super::versions::check_field_conflict(version, &ds_field, out_field)?;
             }
         }
         Ok::<(), Error>(())
@@ -270,10 +251,7 @@ pub(super) async fn add_columns_to_fragments(
 
     // Optimize the transforms
     let mut optimizer = ChainedNewColumnTransformOptimizer::new(vec![]);
-    // ALlNull transform can not performed on legacy files
-    if !dataset.is_legacy_storage() {
-        optimizer.add_optimizer(Box::new(SqlToAllNullsOptimizer::new()));
-    }
+    super::versions::configure_new_column_optimizers(version, &mut optimizer);
     let transforms = optimizer.optimize(dataset, transforms)?;
 
     let (output_schema, new_fragments, fragments_to_cleanup) = match transforms {
@@ -392,15 +370,7 @@ pub(super) async fn add_columns_to_fragments(
                 .map(|f| f.metadata.clone())
                 .collect::<Vec<_>>();
 
-            // Check if any of the fragment's files are using the legacy dataset version if so, we
-            // can't add all-null columns as a metadata-only operation. The reason is because we
-            // use the NullReader for fragments that have missing columns and we can't mix legacy
-            // and non-legacy readers when reading the fragment.
-            if dataset.is_legacy_storage() {
-                return Err(Error::not_supported_source(
-                    "Cannot add all-null columns to legacy dataset version.".into(),
-                ));
-            }
+            super::versions::validate_metadata_only_null_columns(version)?;
 
             Ok((output_schema, fragments, Vec::new()))
         }
@@ -713,7 +683,7 @@ pub(super) async fn alter_columns(
     let mut cast_fields: Vec<(Field, Field)> = Vec::new();
 
     let mut next_field_id = dataset.manifest.max_field_id() + 1;
-    let version = dataset.manifest.data_storage_format.lance_file_version()?;
+    let version = dataset.manifest.data_storage_format.lance_file_format();
 
     for alteration in alterations {
         let field_src = dataset.schema().field(&alteration.path).ok_or_else(|| {
@@ -740,7 +710,7 @@ pub(super) async fn alter_columns(
 
         if let Some(data_type) = &alteration.data_type {
             if !(can_cast_types(&field_src.data_type(), data_type)
-                && is_upcast_downcast(&field_src.data_type(), data_type, version))
+                && super::versions::is_upcast_downcast(version, &field_src.data_type(), data_type))
             {
                 return Err(Error::invalid_input(format!(
                     "Cannot cast column \"{}\" from {:?} to {:?}",
@@ -909,9 +879,10 @@ pub(super) async fn drop_columns(dataset: &mut Dataset, columns: &[&str]) -> Res
         }
     }
 
-    let version = dataset.manifest.data_storage_format.lance_file_version()?;
+    let version = dataset.manifest.data_storage_format.lance_file_format();
     let columns_to_remove = dataset.manifest.schema.project(columns)?;
-    let new_schema = exclude(&dataset.manifest.schema, &columns_to_remove, &version)?;
+    let new_schema =
+        super::versions::exclude_schema(version, &dataset.manifest.schema, &columns_to_remove)?;
 
     if new_schema.fields.is_empty() {
         return Err(Error::invalid_input(
@@ -932,17 +903,19 @@ pub(super) async fn drop_columns(dataset: &mut Dataset, columns: &[&str]) -> Res
     Ok(())
 }
 
-/// Exclude the fields from `other` Schema, and returns a new Schema.
-pub fn exclude(source: &Schema, other: &Schema, version: &LanceFileVersion) -> Result<Schema> {
+/// Exclude the fields from `other` Schema using the selected nested-field rule.
+pub fn exclude_with(
+    source: &Schema,
+    other: &Schema,
+    exclude_nested_field: fn(&Field, &Field) -> Option<Field>,
+) -> Result<Schema> {
     let other: Schema = other.try_into().map_err(|_| {
         Error::schema("The other schema is not compatible with this schema".to_string())
     })?;
     let mut fields = vec![];
     for field in source.fields.iter() {
         if let Some(other_field) = other.field(&field.name) {
-            if version.support_remove_sub_column(field)
-                && let Some(f) = field.exclude(other_field)
-            {
+            if let Some(f) = exclude_nested_field(field, other_field) {
                 fields.push(f)
             }
         } else {
@@ -953,6 +926,11 @@ pub fn exclude(source: &Schema, other: &Schema, version: &LanceFileVersion) -> R
         fields,
         metadata: source.metadata.clone(),
     })
+}
+
+#[cfg(test)]
+fn exclude(source: &Schema, other: &Schema, version: &ConcreteFileVersion) -> Result<Schema> {
+    super::versions::exclude_schema(*version, source, other)
 }
 
 #[cfg(test)]
@@ -2458,7 +2436,7 @@ mod test {
         let schema = Schema::try_from(&arrow_schema).unwrap();
 
         let projection = schema.project(&["a", "b.f2", "b.f3"]).unwrap();
-        let excluded = exclude(&schema, &projection, &LanceFileVersion::V2_2).unwrap();
+        let excluded = exclude(&schema, &projection, &ConcreteFileVersion::V2_2).unwrap();
 
         let expected_arrow_schema = ArrowSchema::new(vec![
             ArrowField::new(
@@ -3126,8 +3104,8 @@ mod test {
         let dict_i16_utf8 = Dictionary(Box::new(Int16), Box::new(Utf8));
         let dict_i32_large_utf8 = Dictionary(Box::new(Int32), Box::new(LargeUtf8));
         let dict_i32_int64 = Dictionary(Box::new(Int32), Box::new(Int64));
-        let stable = LanceFileVersion::Stable;
-        let legacy = LanceFileVersion::Legacy;
+        let stable = LanceFileVersion::Stable.resolve();
+        let legacy = LanceFileVersion::Legacy.resolve();
 
         // Dict(_, Utf8) -> Utf8 / LargeUtf8 (decode direction): both versions.
         assert!(is_upcast_downcast(&dict_i32_utf8, &Utf8, stable));
@@ -3623,7 +3601,7 @@ mod test {
             DataType::Struct(vec![ArrowField::new("a", DataType::Int32, false)].into()),
             false,
         );
-        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_err());
+        assert!(check_field_conflict(&field1, &field2, &ConcreteFileVersion::V2_2).is_err());
 
         // different struct
         let field1 = ArrowField::new(
@@ -3636,7 +3614,7 @@ mod test {
             DataType::Struct(vec![ArrowField::new("b", DataType::Int32, false)].into()),
             false,
         );
-        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_ok());
+        assert!(check_field_conflict(&field1, &field2, &ConcreteFileVersion::V2_2).is_ok());
 
         // same nested struct
         let inner_struct1 = ArrowField::new(
@@ -3651,22 +3629,22 @@ mod test {
         );
         let field1 = ArrowField::new("test", DataType::Struct(vec![inner_struct1].into()), false);
         let field2 = ArrowField::new("test", DataType::Struct(vec![inner_struct2].into()), false);
-        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_err());
+        assert!(check_field_conflict(&field1, &field2, &ConcreteFileVersion::V2_2).is_err());
 
         // basic type with different name
         let field1 = ArrowField::new("test1", DataType::Int32, false);
         let field2 = ArrowField::new("test2", DataType::Int32, false);
-        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_ok());
+        assert!(check_field_conflict(&field1, &field2, &ConcreteFileVersion::V2_2).is_ok());
 
         // basic type with same name
         let field1 = ArrowField::new("test", DataType::Int32, false);
         let field2 = ArrowField::new("test", DataType::Int32, false);
-        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_err());
+        assert!(check_field_conflict(&field1, &field2, &ConcreteFileVersion::V2_2).is_err());
 
         // different basic type
         let field1 = ArrowField::new("test", DataType::Int32, false);
         let field2 = ArrowField::new("test", DataType::Float64, false);
-        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_err());
+        assert!(check_field_conflict(&field1, &field2, &ConcreteFileVersion::V2_2).is_err());
 
         // partial conflict
         let field1 = ArrowField::new(
@@ -3691,7 +3669,7 @@ mod test {
             ),
             false,
         );
-        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_err());
+        assert!(check_field_conflict(&field1, &field2, &ConcreteFileVersion::V2_2).is_err());
 
         // same list
         let field1 = ArrowField::new(
@@ -3704,7 +3682,7 @@ mod test {
             DataType::List(Arc::new(ArrowField::new("item", DataType::Int32, true))),
             false,
         );
-        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_err());
+        assert!(check_field_conflict(&field1, &field2, &ConcreteFileVersion::V2_2).is_err());
 
         // list with struct
         let field1 = ArrowField::new(
@@ -3725,7 +3703,7 @@ mod test {
             ))),
             false,
         );
-        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_err());
+        assert!(check_field_conflict(&field1, &field2, &ConcreteFileVersion::V2_2).is_err());
 
         // list with different struct
         let field1 = ArrowField::new(
@@ -3746,7 +3724,7 @@ mod test {
             ))),
             false,
         );
-        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_ok());
+        assert!(check_field_conflict(&field1, &field2, &ConcreteFileVersion::V2_2).is_ok());
 
         // list of struct and basic
         let field1 = ArrowField::new(
@@ -3763,7 +3741,7 @@ mod test {
             DataType::List(Arc::new(ArrowField::new("item", DataType::Int32, true))),
             false,
         );
-        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_err());
+        assert!(check_field_conflict(&field1, &field2, &ConcreteFileVersion::V2_2).is_err());
 
         // FixedSizeList with struct
         let field1 = ArrowField::new(
@@ -3790,7 +3768,7 @@ mod test {
             ),
             false,
         );
-        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_err());
+        assert!(check_field_conflict(&field1, &field2, &ConcreteFileVersion::V2_2).is_err());
 
         // FixedSizeList with different struct
         let field1 = ArrowField::new(
@@ -3817,7 +3795,7 @@ mod test {
             ),
             false,
         );
-        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_ok());
+        assert!(check_field_conflict(&field1, &field2, &ConcreteFileVersion::V2_2).is_ok());
 
         // LargeList with struct
         let field1 = ArrowField::new(
@@ -3838,7 +3816,7 @@ mod test {
             ))),
             false,
         );
-        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_err());
+        assert!(check_field_conflict(&field1, &field2, &ConcreteFileVersion::V2_2).is_err());
 
         // LargeList with different struct
         let field1 = ArrowField::new(
@@ -3859,7 +3837,7 @@ mod test {
             ))),
             false,
         );
-        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_ok());
+        assert!(check_field_conflict(&field1, &field2, &ConcreteFileVersion::V2_2).is_ok());
 
         // packed struct
         let mut packed_meta = HashMap::new();
@@ -3878,7 +3856,7 @@ mod test {
             DataType::Struct(vec![ArrowField::new("b", DataType::Int32, false)].into()),
             false,
         );
-        assert!(check_field_conflict(&field1, &field2, &LanceFileVersion::V2_2).is_ok());
+        assert!(check_field_conflict(&field1, &field2, &ConcreteFileVersion::V2_2).is_ok());
 
         let new_packed_field = ArrowField::new(
             "new_packed",
@@ -3891,7 +3869,7 @@ mod test {
             DataType::Struct(vec![new_packed_field].into()),
             false,
         );
-        assert!(check_field_conflict(&field1, &field3, &LanceFileVersion::V2_2).is_ok());
+        assert!(check_field_conflict(&field1, &field3, &ConcreteFileVersion::V2_2).is_ok());
 
         let conflict_field = ArrowField::new(
             "packed",
@@ -3900,6 +3878,6 @@ mod test {
         )
         .with_metadata(packed_meta);
         let field4 = ArrowField::new("test", DataType::Struct(vec![conflict_field].into()), false);
-        assert!(check_field_conflict(&field1, &field4, &LanceFileVersion::V2_2).is_err());
+        assert!(check_field_conflict(&field1, &field4, &ConcreteFileVersion::V2_2).is_err());
     }
 }
