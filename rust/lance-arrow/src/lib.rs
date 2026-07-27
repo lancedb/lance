@@ -1017,34 +1017,25 @@ fn merge_list_struct(left: &dyn Array, right: &dyn Array) -> Arc<dyn Array> {
     }
 }
 
-/// Helper function to normalize validity buffers
-/// Returns None for all-null validity (placeholder structs)
-fn normalize_validity(
-    validity: Option<&arrow_buffer::NullBuffer>,
-) -> Option<&arrow_buffer::NullBuffer> {
-    validity.filter(|v| v.null_count() != v.len())
-}
-
-/// Helper function to merge validity buffers from two struct arrays
-/// Returns None only if both arrays are null at the same position
+/// Helper function to merge validity buffers from two struct arrays.
 ///
-/// Special handling for placeholder structs (all-null validity)
+/// A row is valid if it is valid in either input.
+/// An absent validity buffer means all rows are valid, an all-null buffer acts as the identity for this merge.
 fn merge_struct_validity(
     left_validity: Option<&arrow_buffer::NullBuffer>,
     right_validity: Option<&arrow_buffer::NullBuffer>,
 ) -> Option<arrow_buffer::NullBuffer> {
-    // Normalize both validity buffers (convert all-null to None)
-    let left_normalized = normalize_validity(left_validity);
-    let right_normalized = normalize_validity(right_validity);
-
-    match (left_normalized, right_normalized) {
+    match (left_validity, right_validity) {
         // Fast paths: no computation needed
-        (None, None) => None,
-        (Some(left), None) => Some(left.clone()),
-        (None, Some(right)) => Some(right.clone()),
+        (None, _) | (_, None) => None,
         (Some(left), Some(right)) => {
-            // Fast path: if both have no nulls, can return either one
-            if left.null_count() == 0 && right.null_count() == 0 {
+            if left.null_count() == 0 || right.null_count() == 0 {
+                return None;
+            }
+            if left.null_count() == left.len() {
+                return Some(right.clone());
+            }
+            if right.null_count() == right.len() {
                 return Some(left.clone());
             }
 
@@ -2051,6 +2042,41 @@ mod tests {
         assert_eq!(width_values.value(0), 300);
         assert_eq!(width_values.value(1), 200);
         assert!(width_values.is_null(2)); // width is null when right struct was null
+
+        // An all-null validity buffer is data, not a placeholder meaning "this side has no
+        // validity": merging two of them keeps the rows null.
+        let all_null_left = StructArray::new(
+            Fields::from(vec![Field::new("height", DataType::Int32, true)]),
+            vec![Arc::new(Int32Array::from(vec![None, None])) as ArrayRef],
+            Some(vec![false, false].into()),
+        );
+        let all_null_right = StructArray::new(
+            Fields::from(vec![Field::new("width", DataType::Int32, true)]),
+            vec![Arc::new(Int32Array::from(vec![None, None])) as ArrayRef],
+            Some(vec![false, false].into()),
+        );
+
+        let merged = merge(&all_null_left, &all_null_right);
+        assert_eq!(merged.null_count(), 2);
+
+        // An all-null side is the identity of the merge, so the other side decides each row.
+        let partial_left = StructArray::new(
+            Fields::from(vec![Field::new("height", DataType::Int32, true)]),
+            vec![Arc::new(Int32Array::from(vec![Some(1), None])) as ArrayRef],
+            Some(vec![true, false].into()),
+        );
+        let merged = merge(&partial_left, &all_null_right);
+        assert!(!merged.is_null(0));
+        assert!(merged.is_null(1));
+
+        // A missing validity buffer means all rows are valid, which absorbs an all-null side.
+        let all_valid_left = StructArray::new(
+            Fields::from(vec![Field::new("height", DataType::Int32, true)]),
+            vec![Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef],
+            None,
+        );
+        let merged = merge(&all_valid_left, &all_null_right);
+        assert_eq!(merged.null_count(), 0);
     }
 
     #[test]
