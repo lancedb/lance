@@ -878,6 +878,10 @@ fn ensure_index_uuid_allowed(
         || scalar_index_type.is_some_and(|index_type| index_type.eq_ignore_ascii_case("ngram"))
     {
         Some("NGram")
+    } else if index_type == IndexType::LabelList
+        || scalar_index_type.is_some_and(|index_type| index_type.eq_ignore_ascii_case("labellist"))
+    {
+        Some("LabelList")
     } else {
         None
     };
@@ -1691,6 +1695,110 @@ mod tests {
                 "unexpected error: {err}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_label_list_distributed_index_uuid_collision_rejected() {
+        use lance_datagen::{Dimension, array};
+        use lance_index::scalar::label_list::BITMAP_LOOKUP_NAME;
+
+        let test_dir = TempStrDir::default();
+        let labels = |label| {
+            array::cycle_vec_var(
+                array::cycle::<Int64Type>(vec![label]),
+                Dimension::from(1),
+                Dimension::from(2),
+            )
+        };
+        let mut dataset = gen_batch()
+            .col("labels_a", labels(1))
+            .col("labels_b", labels(3))
+            .into_dataset(
+                test_dir.as_str(),
+                FragmentCount::from(2),
+                FragmentRowCount::from(4),
+            )
+            .await
+            .unwrap();
+        let params =
+            ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::LabelList);
+        let live_index = dataset
+            .create_index(
+                &["labels_a"],
+                IndexType::LabelList,
+                Some("labels_a_idx".to_string()),
+                &params,
+                false,
+            )
+            .await
+            .unwrap();
+        let artifact_path = dataset
+            .indices_dir()
+            .join(live_index.uuid.to_string())
+            .join(BITMAP_LOOKUP_NAME);
+        let artifact_before = dataset
+            .object_store
+            .read_one_all(&artifact_path)
+            .await
+            .unwrap();
+        let version_before = dataset.version().version;
+        let fragment_id = dataset.get_fragments()[0].id() as u32;
+
+        for index_type in [IndexType::LabelList, IndexType::Scalar] {
+            let err = dataset
+                .create_index_builder(&["labels_b"], index_type, &params)
+                .name("labels_b_idx".to_string())
+                .fragments(vec![fragment_id])
+                .index_uuid(live_index.uuid)
+                .execute_uncommitted()
+                .await
+                .unwrap_err();
+
+            assert!(
+                matches!(err, Error::InvalidInput { .. }),
+                "expected invalid input error, got: {err}"
+            );
+            assert!(
+                err.to_string().contains(
+                    "index_uuid is no longer accepted for LabelList distributed index builds"
+                ),
+                "unexpected error: {err}"
+            );
+        }
+        assert_eq!(dataset.version().version, version_before);
+        let artifact_after = dataset
+            .object_store
+            .read_one_all(&artifact_path)
+            .await
+            .unwrap();
+        assert_eq!(artifact_after, artifact_before);
+
+        let dataset = Dataset::open(test_dir.as_str()).await.unwrap();
+        assert_eq!(
+            dataset
+                .count_rows(Some("array_has_any(labels_a, [1])".to_string()))
+                .await
+                .unwrap(),
+            8
+        );
+        assert_eq!(
+            dataset
+                .count_rows(Some("array_has_any(labels_a, [3])".to_string()))
+                .await
+                .unwrap(),
+            0
+        );
+        let plan = dataset
+            .scan()
+            .filter("array_has_any(labels_a, [1])")
+            .unwrap()
+            .explain_plan(false)
+            .await
+            .unwrap();
+        assert!(
+            plan.contains("ScalarIndexQuery") && plan.contains("LabelList"),
+            "expected LabelList scalar index query in plan: {plan}"
+        );
     }
 
     #[tokio::test]
