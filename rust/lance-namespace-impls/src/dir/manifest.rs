@@ -3492,7 +3492,7 @@ impl LanceNamespace for ManifestNamespace {
 
         // Atomically create the .lance-reserved file to mark the table as declared.
         // Shared with DirectoryNamespace via put_marker_file_atomic (dotfile-safe
-        // staging + AlreadyExists → TableAlreadyExists mapping).
+        // staging + MarkerFileError::AlreadyExists → TableAlreadyExists).
         let reserved_file_path = table_path.clone().join(".lance-reserved");
         super::put_marker_file_atomic(
             &self.object_store,
@@ -3500,13 +3500,14 @@ impl LanceNamespace for ManifestNamespace {
             &format!("table {}", table_name),
         )
         .await
-        .map_err(|e| {
-            if e.contains("already exists") {
+        .map_err(|e| match e {
+            super::MarkerFileError::AlreadyExists { .. } => {
                 lance_core::Error::from(NamespaceError::TableAlreadyExists {
                     message: table_name.to_string(),
                 })
-            } else {
-                lance_core::Error::from(NamespaceError::Internal { message: e })
+            }
+            super::MarkerFileError::Other { message } => {
+                lance_core::Error::from(NamespaceError::Internal { message })
             }
         })?;
 
