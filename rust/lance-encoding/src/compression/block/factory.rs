@@ -103,7 +103,7 @@ pub fn validate_inline_bitpacking_payload(
 }
 
 #[cfg(feature = "bitpacking")]
-fn out_of_line_payload_bytes(
+pub fn out_of_line_payload_bytes(
     value_type: BlockValueType,
     num_values: u64,
     compressed_bits_per_value: u64,

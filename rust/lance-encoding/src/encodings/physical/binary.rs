@@ -33,6 +33,9 @@ use crate::format::{ProtobufUtils21, pb21};
 use lance_core::utils::bit::pad_bytes_to;
 use lance_core::{Error, Result};
 
+#[cfg(test)]
+mod offsets;
+
 #[derive(Debug)]
 pub struct BinaryMiniBlockEncoder {
     minichunk_size: i64,

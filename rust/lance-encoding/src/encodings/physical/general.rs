@@ -3,7 +3,7 @@
 
 use log::trace;
 
-#[cfg(all(test, any(feature = "lz4", feature = "zstd")))]
+#[cfg(test)]
 use crate::compression::BlockCompressor;
 use crate::{
     Result,
@@ -22,7 +22,7 @@ use crate::{
 };
 use lance_core::Error;
 
-#[cfg(all(test, any(feature = "lz4", feature = "zstd")))]
+#[cfg(test)]
 pub(crate) fn compress_block(
     compression: CompressionConfig,
     payload: &[u8],
@@ -45,21 +45,21 @@ pub(crate) fn decompress_block_exact(
 }
 
 /// General-purpose block compressor that owns its child block compressor.
-#[cfg(all(test, any(feature = "lz4", feature = "zstd")))]
+#[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct GeneralBlockCompressor {
     child: Box<dyn BlockCompressor>,
     compression: CompressionConfig,
 }
 
-#[cfg(all(test, any(feature = "lz4", feature = "zstd")))]
+#[cfg(test)]
 impl GeneralBlockCompressor {
     pub(crate) fn new(child: Box<dyn BlockCompressor>, compression: CompressionConfig) -> Self {
         Self { child, compression }
     }
 }
 
-#[cfg(all(test, any(feature = "lz4", feature = "zstd")))]
+#[cfg(test)]
 impl BlockCompressor for GeneralBlockCompressor {
     fn compress(&self, data: DataBlock) -> Result<Option<LanceBuffer>> {
         let payload = self.child.compress(data)?.ok_or_else(|| {

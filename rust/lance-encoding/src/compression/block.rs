@@ -67,6 +67,8 @@ pub(crate) mod fixed;
 
 #[cfg(test)]
 pub(crate) use factory::encode_scalar;
+#[cfg(all(test, feature = "bitpacking"))]
+pub(crate) use factory::out_of_line_payload_bytes;
 pub(crate) use factory::{
     create_block_decompressor, infer_block_value_type, validate_fixed_payload_len,
 };
