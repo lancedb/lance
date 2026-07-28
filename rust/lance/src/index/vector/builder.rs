@@ -2414,24 +2414,8 @@ mod tests {
             .await
             .unwrap();
 
-        let appended_indices = dataset.load_indices_by_name("idx").await.unwrap();
-        assert_eq!(
-            appended_indices.len(),
-            2,
-            "append must add a segment without rewriting the existing segment"
-        );
-
-        dataset
-            .optimize_indices(&OptimizeOptions::merge(2))
-            .await
-            .unwrap();
-        dataset
-            .optimize_indices(&OptimizeOptions::default())
-            .await
-            .unwrap();
-
         let indices = dataset.load_indices_by_name("idx").await.unwrap();
-        assert_eq!(indices.len(), 1, "expected explicit merge-all on split");
+        assert_eq!(indices.len(), 1, "expected merge-all on split");
         let optimized = dataset
             .open_vector_index("vec", &indices[0].uuid, &NoOpMetricsCollector)
             .await

@@ -2604,24 +2604,6 @@ mod tests {
             .await
             .unwrap();
 
-        let appended_stats: serde_json::Value =
-            serde_json::from_str(&dataset.index_statistics(INDEX_NAME).await.unwrap()).unwrap();
-        assert_eq!(
-            appended_stats["num_indices"].as_u64().unwrap(),
-            2,
-            "Append should add a segment before an explicit compatible merge, got stats: {}",
-            appended_stats
-        );
-
-        dataset
-            .optimize_indices(&OptimizeOptions::merge(2))
-            .await
-            .unwrap();
-        dataset
-            .optimize_indices(&OptimizeOptions::new())
-            .await
-            .unwrap();
-
         let dataset = Dataset::open(test_uri).await.unwrap();
         let final_ctx = load_vector_index_context(&dataset, "vector", INDEX_NAME).await;
         assert!(
@@ -2674,21 +2656,6 @@ mod tests {
         compact_after_deletions(dataset).await;
 
         append_constant_vector(dataset, ROWS_TO_APPEND_FOR_JOIN, &template_values).await;
-        dataset
-            .optimize_indices(&OptimizeOptions::new())
-            .await
-            .unwrap();
-
-        let segments_after_append = dataset.load_indices_by_name(index_name).await.unwrap();
-        assert_eq!(
-            segments_after_append.len(),
-            2,
-            "join setup append must preserve the existing segment"
-        );
-        dataset
-            .optimize_indices(&OptimizeOptions::merge(segments_after_append.len()))
-            .await
-            .unwrap();
         dataset
             .optimize_indices(&OptimizeOptions::new())
             .await
@@ -2815,38 +2782,11 @@ mod tests {
         expected_index_count: usize,
         expect_split: bool,
     ) {
-        let index_count_before = dataset
-            .load_indices_by_name(index_name)
-            .await
-            .unwrap()
-            .len();
         append_constant_vector(dataset, rows_to_append, template).await;
         dataset
             .optimize_indices(&OptimizeOptions::new())
             .await
             .unwrap();
-
-        let index_count_after_append = dataset
-            .load_indices_by_name(index_name)
-            .await
-            .unwrap()
-            .len();
-        assert_eq!(
-            index_count_after_append,
-            index_count_before + 1,
-            "append must add exactly one segment without rewriting existing segments"
-        );
-
-        if expect_split {
-            dataset
-                .optimize_indices(&OptimizeOptions::merge(index_count_after_append))
-                .await
-                .unwrap();
-            dataset
-                .optimize_indices(&OptimizeOptions::new())
-                .await
-                .unwrap();
-        }
 
         let stats_json = dataset.index_statistics(index_name).await.unwrap();
         let stats: serde_json::Value = serde_json::from_str(&stats_json).unwrap();
@@ -5718,23 +5658,6 @@ mod tests {
             .await
             .unwrap();
 
-        let stats_after_append: serde_json::Value =
-            serde_json::from_str(&dataset.index_statistics(INDEX_NAME).await.unwrap()).unwrap();
-        assert_eq!(
-            stats_after_append["num_indices"].as_u64().unwrap(),
-            3,
-            "append must preserve both existing segments"
-        );
-
-        dataset
-            .optimize_indices(&OptimizeOptions::merge(3))
-            .await
-            .unwrap();
-        dataset
-            .optimize_indices(&OptimizeOptions::new())
-            .await
-            .unwrap();
-
         let dataset = Dataset::open(test_uri).await.unwrap();
         let stats_after_split: serde_json::Value =
             serde_json::from_str(&dataset.index_statistics(INDEX_NAME).await.unwrap()).unwrap();
@@ -5753,9 +5676,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_spfresh_join_split() {
-        // Two join cycles followed by three append cycles. Append remains
-        // segment-native; compatible merge and single-segment rebalance are
-        // separate operations when a join or split is expected.
+        // Two join cycles followed by three append cycles:
+        // 1. Each deletion shrinks the smallest partition and verifies the partition count.
+        // 2. Append #1 (10k rows) creates a delta index without splitting.
+        // 3. Append #2 and #3 (40k rows each) trigger splits, forcing merges and validating partition sizes.
 
         const INDEX_NAME: &str = "vector_idx";
         const NLIST: usize = 3;
@@ -5891,7 +5815,7 @@ mod tests {
         .await;
         expected_rows += rows;
 
-        // Append #2: explicit merge followed by rebalance triggers a split.
+        // Append #2: triggers split and merge.
         expected_partitions += 1;
         let rows = SECOND_APPEND_ROWS;
         append_and_verify_append_phase(
@@ -5907,7 +5831,7 @@ mod tests {
         .await;
         expected_rows += rows;
 
-        // Append #3: explicit merge followed by rebalance triggers another split.
+        // Append #3: triggers another split, remains a single merged index.
         expected_partitions += 1;
         let rows = THIRD_APPEND_ROWS;
         append_and_verify_append_phase(
@@ -6004,23 +5928,6 @@ mod tests {
 
         append_partition_templates(&mut dataset, APPEND_ROWS_PER_PARTITION, &templates).await;
 
-        dataset
-            .optimize_indices(&OptimizeOptions::new())
-            .await
-            .unwrap();
-
-        let appended_stats: serde_json::Value =
-            serde_json::from_str(&dataset.index_statistics(INDEX_NAME).await.unwrap()).unwrap();
-        assert_eq!(
-            appended_stats["num_indices"].as_u64().unwrap(),
-            2,
-            "append must add a segment before an explicit compatible merge"
-        );
-
-        dataset
-            .optimize_indices(&OptimizeOptions::merge(2))
-            .await
-            .unwrap();
         dataset
             .optimize_indices(&OptimizeOptions::new())
             .await

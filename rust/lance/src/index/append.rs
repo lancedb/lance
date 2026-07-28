@@ -27,7 +27,10 @@ use lance_table::format::{Fragment, IndexMetadata};
 use roaring::RoaringBitmap;
 use uuid::Uuid;
 
-use super::vector::ivf::{optimize_vector_indices, select_segment_for_single_rebalance};
+use super::vector::ivf::{
+    VectorSegmentCompatibility, index_type_for_segmented_optimize, optimize_vector_indices,
+    select_segment_for_single_rebalance, vector_segment_compatibility,
+};
 use super::vector::{LogicalVectorIndex, fresh_vector_segment_params};
 use super::{CreateIndexBuilder, DatasetIndexInternalExt};
 use crate::dataset::Dataset;
@@ -820,7 +823,15 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 .map(Some);
             }
 
-            if !unindexed.is_empty() && options.num_indices_to_merge.is_none_or(|n| n == 0) {
+            let ivf_view = logical_index.as_ivf()?;
+            let compatibility =
+                vector_segment_compatibility(&ivf_view, "optimizing logical vector index")?;
+            let explicit_append = options.num_indices_to_merge == Some(0);
+            let default_append_for_heterogeneous_models = options.num_indices_to_merge.is_none()
+                && compatibility == VectorSegmentCompatibility::QueryCompatibleModelsDiffer;
+
+            if !unindexed.is_empty() && (explicit_append || default_append_for_heterogeneous_models)
+            {
                 // CreateIndex commits append new segments at the end of the manifest's
                 // stable index order. Reusing the current suffix model keeps consecutive
                 // appends directly mergeable without requiring unrelated older segments
@@ -867,7 +878,8 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     removed_indices: Vec::new(),
                     new_fragment_bitmap: base_unindexed_bitmap,
                     new_dataset_version: dataset.manifest.version,
-                    new_index_version: reference_metadata.index_version,
+                    new_index_version: index_type_for_segmented_optimize(reference_index.as_ref())?
+                        .version(),
                     new_index_details: reference_metadata
                         .index_details
                         .as_deref()
@@ -876,8 +888,6 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     files,
                 }));
             }
-
-            let ivf_view = logical_index.as_ivf()?;
 
             // Append is a steady-state no-op when every fragment is already
             // indexed. Default optimize may still rebalance one segment.
@@ -1025,22 +1035,32 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
 
                 // Metadata must come from an actual merge source. Older incompatible
                 // segments outside the selected suffix may describe a different model.
+                let (reference_metadata, reference_index) =
+                    merge_logical_index.iter().last().ok_or_else(|| {
+                        Error::index(
+                            "Optimize vector index merge did not select a reference segment"
+                                .to_string(),
+                        )
+                    })?;
                 let index_details = removed_indices
                     .iter()
                     .rev()
                     .filter_map(|idx| idx.index_details.as_ref())
                     .find(|d| !d.value.is_empty())
                     .map(|d| d.as_ref().clone())
+                    .or_else(|| {
+                        reference_metadata
+                            .index_details
+                            .as_deref()
+                            .filter(|details| !details.value.is_empty())
+                            .cloned()
+                    })
                     .unwrap_or_else(vector_index_details_default);
-                let index_version = removed_indices
-                    .first()
-                    .ok_or_else(|| {
-                        Error::index(
-                            "Optimize vector index merge did not select any source segments"
-                                .to_string(),
-                        )
-                    })?
-                    .index_version as u32;
+                let index_version = if let Some(metadata) = removed_indices.first() {
+                    metadata.index_version as u32
+                } else {
+                    index_type_for_segmented_optimize(reference_index.as_ref())?.version() as u32
+                };
 
                 Ok((
                     new_uuid,
@@ -1290,7 +1310,7 @@ mod tests {
         vector::{ivf::IvfBuildParams, pq::PQBuildParams},
     };
     use lance_linalg::distance::MetricType;
-    use lance_testing::datagen::generate_random_array;
+    use lance_testing::datagen::{generate_random_array, generate_random_array_with_seed};
     use rstest::rstest;
 
     use crate::dataset::builder::DatasetBuilder;
@@ -1719,6 +1739,146 @@ mod tests {
                 "explicit retrain must not restore a deleted stable-row-id row"
             );
         }
+    }
+
+    #[rstest]
+    #[case::metric(
+        VectorIndexParams::ivf_flat(1, MetricType::L2),
+        VectorIndexParams::ivf_flat(1, MetricType::Cosine),
+        "has metric"
+    )]
+    #[case::index_family(
+        VectorIndexParams::ivf_flat(1, MetricType::L2),
+        VectorIndexParams::ivf_hnsw(
+            MetricType::L2,
+            IvfBuildParams::new(1),
+            HnswBuildParams::default()
+        ),
+        "has type"
+    )]
+    #[tokio::test]
+    async fn test_vector_append_validates_logical_query_compatibility(
+        #[case] first_params: VectorIndexParams,
+        #[case] second_params: VectorIndexParams,
+        #[case] expected_error: &str,
+    ) {
+        const DIMENSION: usize = 8;
+        const ROWS_PER_FRAGMENT: usize = 64;
+        const INDEX_NAME: &str = "vector_idx";
+
+        let test_dir = TempStrDir::default();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    DIMENSION as i32,
+                ),
+                false,
+            ),
+        ]));
+        let (first_batch, _) =
+            clustered_vector_batch(schema.clone(), 0, ROWS_PER_FRAGMENT, DIMENSION, 1.0);
+        let (second_batch, _) = clustered_vector_batch(
+            schema.clone(),
+            ROWS_PER_FRAGMENT as i32,
+            ROWS_PER_FRAGMENT,
+            DIMENSION,
+            100.0,
+        );
+        let reader =
+            RecordBatchIterator::new(vec![Ok(first_batch), Ok(second_batch)], schema.clone());
+        let mut dataset = Dataset::write(
+            reader,
+            test_dir.as_str(),
+            Some(WriteParams {
+                max_rows_per_file: ROWS_PER_FRAGMENT,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let initial_fragments = dataset.get_fragments();
+        let mut segments = Vec::with_capacity(initial_fragments.len());
+        for (fragment, params) in initial_fragments.iter().zip([first_params, second_params]) {
+            segments.push(
+                CreateIndexBuilder::new(&mut dataset, &["vector"], IndexType::Vector, &params)
+                    .name(INDEX_NAME.to_string())
+                    .fragments(vec![fragment.id() as u32])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        dataset
+            .commit_existing_index_segments(INDEX_NAME, "vector", segments)
+            .await
+            .unwrap();
+
+        let (appended_batch, _) = clustered_vector_batch(
+            schema.clone(),
+            (2 * ROWS_PER_FRAGMENT) as i32,
+            ROWS_PER_FRAGMENT,
+            DIMENSION,
+            200.0,
+        );
+        dataset
+            .append(
+                RecordBatchIterator::new(vec![Ok(appended_batch)], schema),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let version_before = dataset.version().version;
+        let segments_before = dataset.load_indices_by_name(INDEX_NAME).await.unwrap();
+        let object_store = dataset.object_store.clone();
+        let directories_before = object_store
+            .read_dir(dataset.indices_dir())
+            .await
+            .unwrap()
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+
+        let error = dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains(expected_error),
+            "expected logical query compatibility error containing '{expected_error}', got {error}"
+        );
+
+        let latest = DatasetBuilder::from_uri(test_dir.as_str())
+            .load()
+            .await
+            .unwrap();
+        assert_eq!(
+            latest.version().version,
+            version_before,
+            "incompatible logical segments must fail before committing"
+        );
+        let mut segments_after = latest.load_indices_by_name(INDEX_NAME).await.unwrap();
+        let mut segments_before = segments_before;
+        for segment in segments_after.iter_mut().chain(segments_before.iter_mut()) {
+            segment.created_at = None;
+        }
+        assert_eq!(
+            segments_after, segments_before,
+            "incompatible logical segments must remain unchanged"
+        );
+        let directories_after = object_store
+            .read_dir(latest.indices_dir())
+            .await
+            .unwrap()
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            directories_after, directories_before,
+            "query compatibility validation must run before staging a new segment"
+        );
     }
 
     #[tokio::test]
@@ -2187,7 +2347,7 @@ mod tests {
         let test_dir = TempStrDir::default();
         let test_uri = test_dir.as_str();
 
-        let vectors = generate_random_array(INITIAL_ROWS * DIM);
+        let vectors = generate_random_array_with_seed::<Float32Type>(INITIAL_ROWS * DIM, [42; 32]);
 
         let schema = Arc::new(Schema::new(vec![
             Field::new(
@@ -2235,6 +2395,7 @@ mod tests {
 
         let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
         dataset.append(batches, None).await.unwrap();
+        let appended_fragment_id = dataset.get_fragments().last().unwrap().id() as u32;
         let stats: serde_json::Value =
             serde_json::from_str(&dataset.index_statistics("vector_idx").await.unwrap()).unwrap();
         assert_eq!(stats["num_indices"], 1);
@@ -2285,36 +2446,48 @@ mod tests {
             );
         }
 
-        let results = dataset
-            .scan()
+        let mut fanout_scanner = dataset.scan();
+        fanout_scanner
             .project(&["id"])
             .unwrap()
             .nearest("vector", array.value(0).as_primitive::<Float32Type>(), 2)
             .unwrap()
             .nprobes(2)
-            .refine(1)
-            .try_into_batch()
-            .await
-            .unwrap();
+            .refine(1);
+        let fanout_plan = fanout_scanner.explain_plan(true).await.unwrap();
+        assert!(
+            fanout_plan.contains("ANNSubIndex: name=vector_idx, k=2, deltas=2"),
+            "logical vector query must fan out across both physical segments, plan was:\n{fanout_plan}"
+        );
+        let results = fanout_scanner.try_into_batch().await.unwrap();
         assert_eq!(results.num_rows(), 2);
-        let mut id_arr = results["id"].as_primitive::<UInt32Type>().values().to_vec();
-        id_arr.sort();
-        // For exact indexes (e.g. IvfFlat) the top-2 nearest neighbors of the
-        // query vector are deterministic (id 0 in the first delta and id 1000
-        // in the second delta, since the same vector is duplicated across
-        // the two fragments). For approximate indexes (e.g. IvfPq, IvfHnswSq)
-        // the returned ids are not guaranteed to be exactly [0, 1000]; the key
-        // property this test verifies is that both delta indices are queried
-        // (i.e. one result comes from each delta), so we only assert that.
-        let is_approximate = !matches!(index_params.index_type(), IndexType::IvfFlat);
-        if is_approximate {
-            assert!(
-                id_arr[0] < INITIAL_ROWS as u32 && id_arr[1] >= INITIAL_ROWS as u32,
-                "expected one result from each delta index, got {:?}",
-                id_arr
+
+        for segment in &appended_segments {
+            let fragment_bitmap = segment
+                .fragment_bitmap
+                .as_ref()
+                .expect("vector segment must record fragment coverage");
+            let expected_appended_row = fragment_bitmap.contains(appended_fragment_id);
+            let mut segment_scanner = dataset.scan();
+            segment_scanner
+                .project(&["id"])
+                .unwrap()
+                .nearest("vector", array.value(0).as_primitive::<Float32Type>(), 1)
+                .unwrap()
+                .nprobes(2)
+                .refine(1)
+                .with_index_segments(vec![segment.uuid])
+                .unwrap();
+            let segment_result = segment_scanner.try_into_batch().await.unwrap();
+            assert_eq!(segment_result.num_rows(), 1);
+            let id = segment_result["id"].as_primitive::<UInt32Type>().value(0);
+            assert_eq!(
+                id >= INITIAL_ROWS as u32,
+                expected_appended_row,
+                "segment {} returned row {id} outside its fragment coverage {:?}",
+                segment.uuid,
+                fragment_bitmap
             );
-        } else {
-            assert_eq!(id_arr, vec![0, INITIAL_ROWS as u32]);
         }
 
         dataset
