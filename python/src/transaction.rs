@@ -13,7 +13,7 @@ use lance::dataset::transaction::{
 use lance::datatypes::Schema;
 use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
 use lance_table::format::{BasePath, DataFile, Fragment, IndexFile, IndexMetadata};
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyNotImplementedError, PyValueError};
 use pyo3::types::PySet;
 use pyo3::{Bound, FromPyObject, PyAny, PyResult, Python};
 use pyo3::{intern, prelude::*};
@@ -732,6 +732,11 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                     base_op.call0()
                 }
             }
+            // Action-based operations have no Python surface yet. An explicit arm
+            // keeps them off the `todo!()` below, which would panic.
+            Operation::UserOperation(..) => Err(PyNotImplementedError::new_err(
+                "action-based transactions are not supported from the Python binding",
+            )),
             _ => todo!(),
         }
     }

@@ -118,6 +118,20 @@ impl Transaction {
                 "Cannot enable stable row ids on existing dataset".into(),
             ));
         }
+        // An action-based operation assembles its own manifest. Keeping it out of
+        // the legacy assembly below is deliberate: that code is a frozen
+        // compatibility surface, and an action applies to the manifest directly
+        // rather than being folded into this function's post-image matches.
+        if let Operation::UserOperation(user_operation) = &self.operation {
+            return user_operation.build_manifest(
+                current_manifest,
+                current_indices,
+                self.tag.as_deref(),
+                transaction_file_path,
+                config,
+            );
+        }
+
         let mut reference_paths = match current_manifest {
             Some(m) => m.base_paths.clone(),
             None => HashMap::new(),
@@ -740,6 +754,13 @@ impl Transaction {
                 // UpdateBases operation doesn't modify fragments or indices
                 // Base paths are handled in the manifest creation section below
                 final_fragments.extend(maybe_existing_fragments?.clone());
+            }
+            Operation::UserOperation(_) => {
+                return Err(Error::internal(
+                    "an action-based operation reached the legacy manifest assembly; \
+                     it should have been dispatched to UserOperation::build_manifest"
+                        .to_string(),
+                ));
             }
         };
 

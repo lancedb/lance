@@ -12,8 +12,27 @@
 //! `PartialEq` is hand-written rather than derived because several operations
 //! carry `Vec<T>` fields whose order is not meaningful.
 
+use crate::transaction::action::mask::{Key, ManifestMask, Region};
 use crate::transaction::{Operation, UpdateMap};
 use std::collections::HashSet;
+
+/// Fold an [`UpdateMap`]'s footprint into `mask`. A replacing update claims the
+/// whole region; an incremental one claims only the keys it edits.
+fn map_writes(mask: ManifestMask, region: Region, updates: Option<&UpdateMap>) -> ManifestMask {
+    let Some(updates) = updates else {
+        return mask;
+    };
+    if updates.replace {
+        return mask.with_all(region);
+    }
+    mask.with_keys(
+        region,
+        updates
+            .update_entries
+            .iter()
+            .map(|entry| Key::Entry(entry.key.clone())),
+    )
+}
 
 impl PartialEq for Operation {
     fn eq(&self, other: &Self) -> bool {
@@ -847,11 +866,89 @@ impl PartialEq for Operation {
             }
             (Self::DataOverlay { groups: a }, Self::DataOverlay { groups: b }) => compare_vec(a, b),
             (Self::DataOverlay { .. }, _) | (_, Self::DataOverlay { .. }) => false,
+            (Self::UserOperation(a), Self::UserOperation(b)) => a == b,
+            (Self::UserOperation(..), _) | (_, Self::UserOperation(..)) => false,
         }
     }
 }
 
 impl Operation {
+    /// The manifest regions this operation writes.
+    ///
+    /// This restates as a footprint what the `check_*_txn` matrix in
+    /// `conflict_resolver` decides pairwise, and it is what lets an action-based
+    /// operation be checked against a legacy one without translating every legacy
+    /// operation into actions: both sides declare where they write, and conflict is
+    /// intersection. `test_writes_agrees_with_conflict_oracle` asserts it never
+    /// *under*-declares relative to that matrix, which is the unsafe direction —
+    /// over-declaring only costs a retry.
+    pub fn writes(&self) -> ManifestMask {
+        let mask = ManifestMask::default;
+        match self {
+            Self::UpdateBases { new_bases } => mask().with_keys(
+                Region::Bases,
+                new_bases.iter().flat_map(|base| {
+                    base.name
+                        .clone()
+                        .map(Key::Name)
+                        .into_iter()
+                        .chain([Key::Path(base.path.clone())])
+                }),
+            ),
+            // Overwrite replaces the manifest, Restore replaces it with an older
+            // one without merging anything forward, and Clone resets the table to
+            // another dataset's state.
+            Self::Overwrite { .. } | Self::Restore { .. } | Self::Clone { .. } => {
+                ManifestMask::everything()
+            }
+            Self::UpdateConfig {
+                config_updates,
+                table_metadata_updates,
+                schema_metadata_updates,
+                field_metadata_updates,
+            } => {
+                let mut mask = mask();
+                mask = map_writes(mask, Region::Config, config_updates.as_ref());
+                mask = map_writes(mask, Region::TableMetadata, table_metadata_updates.as_ref());
+                if schema_metadata_updates.is_some() {
+                    // Any two schema-metadata updates conflict, matching
+                    // `modifies_same_metadata`, so this is not refined to keys.
+                    mask = mask.with_all(Region::SchemaMetadata);
+                }
+                // Field metadata shares the schema-metadata region, keyed by field
+                // id: two operations touching different fields commute.
+                mask.with_keys(
+                    Region::SchemaMetadata,
+                    field_metadata_updates
+                        .keys()
+                        .map(|field_id| Key::Entry(field_id.to_string())),
+                )
+            }
+            Self::Append { .. } | Self::ReserveFragments { .. } => {
+                // ReserveFragments depends on the fragment *list*, not on the id
+                // counter: Overwrite and Restore conflict with it because they reset
+                // the fragment space and so invalidate the reservation.
+                mask().with_all(Region::Fragments)
+            }
+            Self::Delete { .. }
+            | Self::Update { .. }
+            | Self::Rewrite { .. }
+            | Self::DataReplacement { .. }
+            | Self::DataOverlay { .. } => {
+                mask().with_all(Region::Fragments).with_all(Region::Indices)
+            }
+            Self::Project { .. } | Self::Merge { .. } => mask()
+                .with_all(Region::Schema)
+                .with_all(Region::Fragments)
+                .with_all(Region::Indices),
+            Self::CreateIndex { .. } => mask().with_all(Region::Indices),
+            Self::UpdateMemWalState { .. } => mask()
+                .with_all(Region::Generations)
+                .with_all(Region::Indices),
+            Self::UserOperation(operation) => operation.writes(),
+        }
+    }
+
     /// Returns the config keys that have been upserted by this operation.
     fn get_upsert_config_keys(&self) -> Vec<String> {
         match self {
@@ -977,8 +1074,11 @@ impl Operation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::format::BasePath;
     use crate::transaction::test_support::overlay_with_field;
-    use crate::transaction::{DataOverlayGroup, UpdateMapEntry};
+    use crate::transaction::{
+        Action, AddBase, Conflict, DataOverlayGroup, UpdateMapEntry, UserAction, UserOperation,
+    };
     use std::collections::HashMap;
 
     fn table_metadata_update(entries: Vec<(&str, Option<&str>)>, replace: bool) -> Operation {
@@ -1023,5 +1123,98 @@ mod tests {
             frag_reuse_index: None,
         };
         assert_ne!(overlay(1), rewrite);
+    }
+
+    fn user_operation(name: &str) -> Operation {
+        Operation::UserOperation(UserOperation {
+            description: "ALTER TABLE t ADD BASE".to_string(),
+            uuid: "u".to_string(),
+            read_version: 1,
+            actions: vec![UserAction {
+                description: "register base".to_string(),
+                actions: vec![Action::AddBase(AddBase {
+                    local: 0,
+                    name: Some(name.to_string()),
+                    is_dataset_root: false,
+                    path: format!("s3://bucket/{name}"),
+                })],
+            }],
+        })
+    }
+
+    #[test]
+    fn test_user_operation_equality() {
+        assert_eq!(user_operation("warm"), user_operation("warm"));
+        assert_ne!(user_operation("warm"), user_operation("cold"));
+
+        for other in [
+            Operation::Append { fragments: vec![] },
+            Operation::Restore { version: 1 },
+            Operation::ReserveFragments { num_fragments: 1 },
+            Operation::UpdateBases { new_bases: vec![] },
+        ] {
+            assert_ne!(user_operation("warm"), other);
+            assert_ne!(other, user_operation("warm"));
+        }
+    }
+
+    #[test]
+    fn test_user_operation_writes_is_the_union_of_its_actions() {
+        let mask = user_operation("warm").writes();
+        assert_eq!(
+            mask.conflicts_with(&user_operation("warm").writes()),
+            Some(Conflict::Incompatible)
+        );
+        assert_eq!(mask.conflicts_with(&user_operation("cold").writes()), None);
+        // A base-only operation commutes with an append.
+        assert_eq!(
+            mask.conflicts_with(&Operation::Append { fragments: vec![] }.writes()),
+            None
+        );
+    }
+
+    #[test]
+    fn test_update_bases_writes_claims_name_and_path() {
+        let warm = Operation::UpdateBases {
+            new_bases: vec![BasePath::new(
+                0,
+                "s3://bucket/warm".into(),
+                Some("warm".into()),
+                false,
+            )],
+        };
+        // The legacy operation and its action form declare the same footprint,
+        // which is what lets the two vocabularies be compared at all.
+        assert_eq!(warm.writes(), user_operation("warm").writes());
+    }
+
+    #[test]
+    fn test_restore_writes_everything() {
+        // Restore replaces the manifest wholesale without merging base_paths
+        // forward, so it must conflict with a concurrent base addition.
+        assert_eq!(
+            Operation::Restore { version: 1 }
+                .writes()
+                .conflicts_with(&user_operation("warm").writes()),
+            Some(Conflict::Retryable)
+        );
+    }
+
+    #[test]
+    fn test_update_config_writes_is_key_level() {
+        let a = table_metadata_update(vec![("a", Some("1"))], false);
+        let b = table_metadata_update(vec![("b", Some("1"))], false);
+        assert_eq!(a.writes().conflicts_with(&b.writes()), None);
+        assert_eq!(
+            a.writes().conflicts_with(&a.writes()),
+            Some(Conflict::Incompatible)
+        );
+
+        // A replacing update claims the whole region, so it collides with any key.
+        let replace = table_metadata_update(vec![("c", Some("1"))], true);
+        assert_eq!(
+            replace.writes().conflicts_with(&a.writes()),
+            Some(Conflict::Retryable)
+        );
     }
 }

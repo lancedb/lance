@@ -7,6 +7,10 @@
 //! produced, so these conversions are the format contract for everything in this
 //! module: a field added to an `Operation` is only durable once it round-trips
 //! here.
+//!
+//! One exception: the action vocabulary's wire code lives with the actions, in
+//! [`super::action`] — the envelope in `action.rs` and each action's payload in its
+//! own module, next to its logic and tests.
 
 use crate::format::key_existence::KeyExistenceFilter;
 use crate::format::pb;
@@ -370,18 +374,15 @@ impl TryFrom<pb::Transaction> for Transaction {
                     .map(DataOverlayGroup::try_from)
                     .collect::<Result<Vec<_>>>()?,
             },
-            Some(pb::transaction::Operation::UserOperation(_)) => {
-                // Action-based transactions (Transaction V2) are a draft wire
-                // format (OSS-1530). This version of Lance recognizes the message
-                // but has no support for it: reject on load, fail-closed. Because
-                // load_and_sort_new_transactions collects transactions with
-                // try_collect, a concurrent V2 commit in the conflict window
-                // aborts the whole commit rather than being silently skipped.
-                // Do NOT make this parsing lenient.
-                return Err(Error::not_supported(
-                    "action-based transactions (Transaction V2) are not supported \
-                     by this version of Lance; please upgrade",
-                ));
+            Some(pb::transaction::Operation::UserOperation(operation)) => {
+                // The fail-closed contract #7954 held at this level now lives one
+                // level down, in `Action`'s decode: an action this version does not
+                // recognize errors rather than being dropped. That is what matters,
+                // because `load_and_sort_new_transactions` collects concurrent
+                // transactions with `try_collect` — erroring aborts the in-flight
+                // commit, whereas a lenient parse would drop a concurrent action out
+                // of conflict detection and let two colliding commits both succeed.
+                Operation::UserOperation(operation.try_into()?)
             }
             None => {
                 return Err(Error::internal(
@@ -670,6 +671,9 @@ impl From<&Transaction> for pb::Transaction {
                         .collect::<Vec<pb::BasePath>>(),
                 })
             }
+            Operation::UserOperation(operation) => {
+                pb::transaction::Operation::UserOperation(operation.into())
+            }
         };
 
         let transaction_properties = value
@@ -820,11 +824,11 @@ mod tests {
     }
 
     #[test]
-    fn test_user_operation_rejected_on_load() {
-        // Action-based transactions (Transaction V2) are a draft wire format that
-        // this version of Lance does not support. Loading one must fail closed
-        // (never be silently skipped or leniently parsed), so that a concurrent
-        // V2 commit in the conflict window aborts an in-flight commit.
+    fn test_transaction_carrying_unsupported_action_is_rejected_on_load() {
+        // A `UserOperation` now decodes, but an action this version does not
+        // implement must still fail closed: never silently skipped, never leniently
+        // parsed, so that a concurrent V2 commit in the conflict window aborts an
+        // in-flight commit instead of vanishing from conflict detection.
         let message = pb::Transaction {
             read_version: 1,
             uuid: Uuid::new_v4().to_string(),
@@ -854,5 +858,39 @@ mod tests {
             matches!(err, Error::NotSupported { .. }),
             "expected NotSupported, got: {err:?}"
         );
+    }
+
+    #[test]
+    fn test_user_operation_transaction_roundtrips() {
+        let operation = Operation::UserOperation(crate::transaction::UserOperation {
+            description: "ALTER TABLE t ADD BASE".to_string(),
+            uuid: Uuid::new_v4().to_string(),
+            read_version: 4,
+            actions: vec![crate::transaction::UserAction {
+                description: "register bases".to_string(),
+                actions: vec![
+                    crate::transaction::Action::AddBase(crate::transaction::AddBase {
+                        local: 0,
+                        name: Some("warm".to_string()),
+                        is_dataset_root: false,
+                        path: "s3://bucket/warm".to_string(),
+                    }),
+                    crate::transaction::Action::AddBase(crate::transaction::AddBase {
+                        local: 1,
+                        name: None,
+                        is_dataset_root: true,
+                        path: "/local/cold".to_string(),
+                    }),
+                ],
+            }],
+        });
+        let transaction = Transaction::new(4, operation, None);
+
+        let message = pb::Transaction::from(&transaction);
+        let decoded = Transaction::try_from(message).unwrap();
+
+        assert_eq!(decoded.operation, transaction.operation);
+        assert_eq!(decoded.read_version, transaction.read_version);
+        assert_eq!(decoded.uuid, transaction.uuid);
     }
 }

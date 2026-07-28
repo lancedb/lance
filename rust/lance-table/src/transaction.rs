@@ -23,9 +23,11 @@
 //! index_maintenance    how that narrows or drops index metadata
 //! row_version          how it assigns row ids and per-row version metadata
 //! conflicts          whether two operations collide, for the commit retry path
+//! action             the composable action vocabulary, and its own apply path
 //! proto              the persisted protobuf encoding of all of the above
 //! ```
 
+mod action;
 mod builder;
 mod conflicts;
 mod index_maintenance;
@@ -39,6 +41,8 @@ mod validate;
 #[cfg(test)]
 pub(crate) mod test_support;
 
+pub use action::mask::{Conflict, Key, ManifestMask, Region, Scope};
+pub use action::{Action, AddBase, Ref, UserAction, UserOperation};
 pub use builder::{Transaction, TransactionBuilder};
 pub use operation::{
     DataOverlayGroup, DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, UpdateMode,

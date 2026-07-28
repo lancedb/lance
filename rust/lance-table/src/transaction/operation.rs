@@ -14,6 +14,7 @@ use crate::format::overlay::DataOverlayFile;
 use crate::format::{BasePath, DataFile, Fragment, IndexFile, IndexMetadata};
 use crate::system_index::mem_wal::CompactedSsTable;
 use crate::transaction::UpdateMap;
+use crate::transaction::action::UserOperation;
 use lance_core::datatypes::Schema;
 use lance_core::deepsize::DeepSizeOf;
 use roaring::RoaringBitmap;
@@ -190,6 +191,13 @@ pub enum Operation {
         /// The new base paths to add to the manifest.
         new_bases: Vec<BasePath>,
     },
+
+    /// A composable operation expressed as a list of manifest deltas.
+    ///
+    /// Unlike the variants above, which each describe one kind of change, this
+    /// carries an ordered list of [`Action`]s that commit atomically. See
+    /// [`crate::transaction::action`].
+    UserOperation(UserOperation),
 }
 
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
@@ -240,6 +248,7 @@ impl std::fmt::Display for Operation {
             Self::Clone { .. } => write!(f, "Clone"),
             Self::UpdateMemWalState { .. } => write!(f, "UpdateMemWalState"),
             Self::UpdateBases { .. } => write!(f, "UpdateBases"),
+            Self::UserOperation(op) => write!(f, "UserOperation({})", op.description),
         }
     }
 }
@@ -299,6 +308,7 @@ impl Operation {
             Self::UpdateMemWalState { .. } => "UpdateMemWalState",
             Self::Clone { .. } => "Clone",
             Self::UpdateBases { .. } => "UpdateBases",
+            Self::UserOperation { .. } => "UserOperation",
         }
     }
 }

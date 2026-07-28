@@ -9,10 +9,11 @@
 
 use crate::format::{Fragment, Manifest};
 use crate::transaction::Operation;
+use crate::transaction::action::{Action, UserOperation};
 use lance_core::datatypes::Schema;
 use lance_core::{Error, Result};
 use lance_file::version::LanceFileVersion;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Validate the operation is valid for the given manifest.
 pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) -> Result<()> {
@@ -69,8 +70,36 @@ pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) ->
             schema_fragments_valid(Some(manifest), &manifest.schema, updated_fragments)?;
             schema_fragments_valid(Some(manifest), &manifest.schema, new_fragments)
         }
+        Operation::UserOperation(operation) => validate_user_operation(operation),
         _ => Ok(()),
     }
+}
+
+/// Check an action-based operation's own structure, independent of the manifest.
+///
+/// Local tokens are scoped to the whole operation, not to a single `UserAction`,
+/// so distinctness is checked across the flattened action list. Apply would also
+/// catch a duplicate, but rejecting here keeps the diagnostic at the API boundary
+/// where the caller built the operation.
+fn validate_user_operation(operation: &UserOperation) -> Result<()> {
+    if operation.actions.iter().all(|step| step.actions.is_empty()) {
+        return Err(Error::invalid_input(
+            "a UserOperation must contain at least one action",
+        ));
+    }
+
+    let mut seen = HashSet::new();
+    for action in operation.actions() {
+        let Action::AddBase(add_base) = action;
+        if !seen.insert(add_base.local) {
+            return Err(Error::invalid_input(format!(
+                "local token {} appears more than once in this UserOperation; \
+                 local tokens must be distinct within an operation",
+                add_base.local
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn schema_fragments_valid(
@@ -353,5 +382,76 @@ mod tests {
         // This should succeed — the old manifest's LEGACY format should not
         // cause strict validation of the new STABLE fragments.
         validate_operation(Some(&legacy_manifest), &operation).unwrap();
+    }
+
+    fn user_operation(steps: Vec<Vec<u32>>) -> Operation {
+        Operation::UserOperation(UserOperation {
+            description: "test".to_string(),
+            uuid: "u".to_string(),
+            read_version: 1,
+            actions: steps
+                .into_iter()
+                .map(|locals| crate::transaction::UserAction {
+                    description: "step".to_string(),
+                    actions: locals
+                        .into_iter()
+                        .map(|local| {
+                            Action::AddBase(crate::transaction::AddBase {
+                                local,
+                                name: Some(format!("base-{local}")),
+                                is_dataset_root: false,
+                                path: format!("s3://bucket/{local}"),
+                            })
+                        })
+                        .collect(),
+                })
+                .collect(),
+        })
+    }
+
+    fn manifest() -> Manifest {
+        Manifest::new(
+            LanceSchema::default(),
+            Arc::new(Vec::new()),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        )
+    }
+
+    #[test]
+    fn test_user_operation_with_distinct_local_tokens_is_valid() {
+        validate_operation(
+            Some(&manifest()),
+            &user_operation(vec![vec![0, 1], vec![2]]),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_user_operation_with_duplicate_local_token_is_rejected() {
+        // Tokens are scoped to the whole operation, not to a single UserAction, so a
+        // token reused across two steps is still a duplicate.
+        let err = validate_operation(Some(&manifest()), &user_operation(vec![vec![0], vec![0]]))
+            .unwrap_err();
+
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "expected InvalidInput, got: {err:?}"
+        );
+        assert!(
+            err.to_string()
+                .contains("local token 0 appears more than once")
+        );
+    }
+
+    #[test]
+    fn test_user_operation_with_no_actions_is_rejected() {
+        for steps in [vec![], vec![vec![]]] {
+            let err = validate_operation(Some(&manifest()), &user_operation(steps)).unwrap_err();
+            assert!(
+                err.to_string().contains("at least one action"),
+                "got: {err}"
+            );
+        }
     }
 }

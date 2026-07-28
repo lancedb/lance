@@ -16,6 +16,7 @@ use lance_index::mem_wal::{CompactedSsTable, MEM_WAL_INDEX_NAME};
 use lance_select::{RowAddrTreeMap, RowSetOps};
 use lance_table::format::IndexMetadata;
 use lance_table::format::overlay::OverlayCoverage;
+use lance_table::transaction::{Conflict, Region};
 use lance_table::{format::Fragment, io::deletion::write_deletion_file};
 use roaring::RoaringBitmap;
 use std::{
@@ -23,6 +24,17 @@ use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
 };
+
+/// Regions whose *legacy* rebase needs side effects derived from the concurrent
+/// operation's contents, which no action family supplies yet.
+///
+/// While a region is listed here, a concurrent action-based operation touching it
+/// is answered with a retry instead of being compared by footprint. A slice that
+/// wants its region removed has to supply those side effects first: fragments
+/// drive deletion-file rewrites and frag-reuse index collection, indices drive
+/// index invalidation, and generations drive compacted-SSTable collection.
+const REGIONS_WITH_REBASE_SIDE_EFFECTS: [Region; 3] =
+    [Region::Fragments, Region::Indices, Region::Generations];
 
 #[derive(Debug)]
 pub struct TransactionRebase<'a> {
@@ -56,7 +68,8 @@ impl<'a> TransactionRebase<'a> {
             | Operation::UpdateMemWalState { .. }
             | Operation::Clone { .. }
             | Operation::Restore { .. }
-            | Operation::UpdateBases { .. } => Ok(Self {
+            | Operation::UpdateBases { .. }
+            | Operation::UserOperation(..) => Ok(Self {
                 transaction,
                 affected_rows,
                 initial_fragments: HashMap::new(),
@@ -221,6 +234,46 @@ impl<'a> TransactionRebase<'a> {
     /// Will return an error if the transaction is not valid. Otherwise, it will
     /// return Ok(()).
     pub fn check_txn(&mut self, other_transaction: &Transaction, other_version: u64) -> Result<()> {
+        // A V2 `other` is decided by footprint intersection, before any legacy
+        // dispatch. This ordering is load-bearing: several `check_*_txn` bodies do
+        // not merely decide, they mutate rebase state derived from the other
+        // operation's contents (`check_delete_txn` marks fragments needing a
+        // deletion-file rewrite, `check_create_index_txn` collects conflicting
+        // frag-reuse indices, `check_update_mem_wal_state_txn` collects compacted
+        // SSTables). Most end in a permissive arm, so a `UserOperation` reaching
+        // them would be silently allowed while the side effect it should have
+        // triggered was never computed.
+        if matches!(&other_transaction.operation, Operation::UserOperation(..)) {
+            let other_mask = other_transaction.operation.writes();
+            // Until an action family supplies those rebase side effects, an `other`
+            // that touches their regions is answered with a retry. A V2 operation
+            // confined to `Bases` provably needs none — that is what makes AddBase a
+            // safe first slice, and the gate every later slice must clear before
+            // removing its region from this set. The failure mode is a spurious retry.
+            //
+            // The gate also applies when *self* is action-based, where no legacy
+            // rebase is involved and it is therefore stricter than it needs to be.
+            // Keeping one rule is worth the occasional extra retry until a region
+            // leaves the set.
+            if other_mask.intersects_any(&REGIONS_WITH_REBASE_SIDE_EFFECTS) {
+                return Err(self.retryable_conflict_err(other_transaction, other_version));
+            }
+            return match self
+                .transaction
+                .operation
+                .writes()
+                .conflicts_with(&other_mask)
+            {
+                None => Ok(()),
+                Some(Conflict::Retryable) => {
+                    Err(self.retryable_conflict_err(other_transaction, other_version))
+                }
+                Some(Conflict::Incompatible) => {
+                    Err(self.incompatible_conflict_err(other_transaction, other_version))
+                }
+            };
+        }
+
         let op = &self.transaction.operation;
         match op {
             Operation::Delete { .. } => self.check_delete_txn(other_transaction, other_version),
@@ -255,6 +308,25 @@ impl<'a> TransactionRebase<'a> {
             Operation::UpdateBases { .. } => {
                 self.check_add_bases_txn(other_transaction, other_version)
             }
+            // Legacy `other`, V2 self: the same footprint intersection, without the
+            // frontier check. The regions in that set are ones whose *legacy rebase*
+            // needs side effects derived from the other operation; here it is this
+            // side that is action-based, and an action re-applies from scratch on
+            // retry rather than carrying rebase state forward.
+            Operation::UserOperation(..) => {
+                match op
+                    .writes()
+                    .conflicts_with(&other_transaction.operation.writes())
+                {
+                    None => Ok(()),
+                    Some(Conflict::Retryable) => {
+                        Err(self.retryable_conflict_err(other_transaction, other_version))
+                    }
+                    Some(Conflict::Incompatible) => {
+                        Err(self.incompatible_conflict_err(other_transaction, other_version))
+                    }
+                }
+            }
         }
     }
 
@@ -265,6 +337,12 @@ impl<'a> TransactionRebase<'a> {
     ) -> Result<()> {
         if let Operation::Delete { .. } = &self.transaction.operation {
             match &other_transaction.operation {
+                // Unreachable: check_txn answers a V2 `other` by footprint before
+                // dispatching here. Fail safe rather than fall through to an arm
+                // that would silently permit it.
+                Operation::UserOperation(..) => {
+                    Err(self.retryable_conflict_err(other_transaction, other_version))
+                }
                 Operation::CreateIndex { .. }
                 | Operation::ReserveFragments { .. }
                 | Operation::Clone { .. }
@@ -419,6 +497,12 @@ impl<'a> TransactionRebase<'a> {
             }
 
             match &other_transaction.operation {
+                // Unreachable: check_txn answers a V2 `other` by footprint before
+                // dispatching here. Fail safe rather than fall through to an arm
+                // that would silently permit it.
+                Operation::UserOperation(..) => {
+                    Err(self.retryable_conflict_err(other_transaction, other_version))
+                }
                 Operation::CreateIndex { .. }
                 | Operation::ReserveFragments { .. }
                 | Operation::Project { .. }
@@ -581,6 +665,12 @@ impl<'a> TransactionRebase<'a> {
         } = &self.transaction.operation
         {
             match &other_transaction.operation {
+                // Unreachable: check_txn answers a V2 `other` by footprint before
+                // dispatching here. Fail safe rather than fall through to an arm
+                // that would silently permit it.
+                Operation::UserOperation(..) => {
+                    Err(self.retryable_conflict_err(other_transaction, other_version))
+                }
                 Operation::Append { .. }
                 | Operation::Clone { .. }
                 // An overlay committed after this index's version is newer than
@@ -759,6 +849,12 @@ impl<'a> TransactionRebase<'a> {
         } = &self.transaction.operation
         {
             match &other_transaction.operation {
+                // Unreachable: check_txn answers a V2 `other` by footprint before
+                // dispatching here. Fail safe rather than fall through to an arm
+                // that would silently permit it.
+                Operation::UserOperation(..) => {
+                    Err(self.retryable_conflict_err(other_transaction, other_version))
+                }
                 // Rewrite is only compatible with operations that don't touch
                 // existing fragments or update fragments we don't touch.
                 Operation::Append { .. }
@@ -949,6 +1045,12 @@ impl<'a> TransactionRebase<'a> {
         other_version: u64,
     ) -> Result<()> {
         match &other_transaction.operation {
+            // Unreachable: check_txn answers a V2 `other` by footprint before
+            // dispatching here. Fail safe rather than fall through to an arm
+            // that would silently permit it.
+            Operation::UserOperation(..) => {
+                Err(self.retryable_conflict_err(other_transaction, other_version))
+            }
             Operation::Overwrite { .. } => {
                 if self
                     .transaction
@@ -998,6 +1100,12 @@ impl<'a> TransactionRebase<'a> {
         other_version: u64,
     ) -> Result<()> {
         match &other_transaction.operation {
+            // Unreachable: check_txn answers a V2 `other` by footprint before
+            // dispatching here. Fail safe rather than fall through to an arm
+            // that would silently permit it.
+            Operation::UserOperation(..) => {
+                Err(self.retryable_conflict_err(other_transaction, other_version))
+            }
             // Append is not compatible with any operation that completely
             // overwrites the schema.
             Operation::Overwrite { .. }
@@ -1028,6 +1136,12 @@ impl<'a> TransactionRebase<'a> {
     ) -> Result<()> {
         if let Operation::DataReplacement { replacements } = &self.transaction.operation {
             match &other_transaction.operation {
+                // Unreachable: check_txn answers a V2 `other` by footprint before
+                // dispatching here. Fail safe rather than fall through to an arm
+                // that would silently permit it.
+                Operation::UserOperation(..) => {
+                    Err(self.retryable_conflict_err(other_transaction, other_version))
+                }
                 Operation::Append { .. }
                 | Operation::Clone { .. }
                 | Operation::UpdateConfig { .. }
@@ -1189,6 +1303,12 @@ impl<'a> TransactionRebase<'a> {
         other_version: u64,
     ) -> Result<()> {
         match &other_transaction.operation {
+            // Unreachable: check_txn answers a V2 `other` by footprint before
+            // dispatching here. Fail safe rather than fall through to an arm
+            // that would silently permit it.
+            Operation::UserOperation(..) => {
+                Err(self.retryable_conflict_err(other_transaction, other_version))
+            }
             Operation::Append { .. }
             | Operation::CreateIndex { .. }
             | Operation::ReserveFragments { .. }
@@ -1287,6 +1407,12 @@ impl<'a> TransactionRebase<'a> {
         other_version: u64,
     ) -> Result<()> {
         match &other_transaction.operation {
+            // Unreachable: check_txn answers a V2 `other` by footprint before
+            // dispatching here. Fail safe rather than fall through to an arm
+            // that would silently permit it.
+            Operation::UserOperation(..) => {
+                Err(self.retryable_conflict_err(other_transaction, other_version))
+            }
             Operation::CreateIndex { .. }
             | Operation::ReserveFragments { .. }
             | Operation::Clone { .. }
@@ -1317,6 +1443,12 @@ impl<'a> TransactionRebase<'a> {
         other_version: u64,
     ) -> Result<()> {
         match &other_transaction.operation {
+            // Unreachable: check_txn answers a V2 `other` by footprint before
+            // dispatching here. Fail safe rather than fall through to an arm
+            // that would silently permit it.
+            Operation::UserOperation(..) => {
+                Err(self.retryable_conflict_err(other_transaction, other_version))
+            }
             Operation::Append { .. }
             | Operation::Delete { .. }
             | Operation::Overwrite { .. }
@@ -1344,6 +1476,12 @@ impl<'a> TransactionRebase<'a> {
         other_version: u64,
     ) -> Result<()> {
         match &other_transaction.operation {
+            // Unreachable: check_txn answers a V2 `other` by footprint before
+            // dispatching here. Fail safe rather than fall through to an arm
+            // that would silently permit it.
+            Operation::UserOperation(..) => {
+                Err(self.retryable_conflict_err(other_transaction, other_version))
+            }
             Operation::Overwrite { .. } | Operation::Restore { .. } => {
                 Err(self.incompatible_conflict_err(other_transaction, other_version))
             }
@@ -1370,6 +1508,12 @@ impl<'a> TransactionRebase<'a> {
         other_version: u64,
     ) -> Result<()> {
         match &other_transaction.operation {
+            // Unreachable: check_txn answers a V2 `other` by footprint before
+            // dispatching here. Fail safe rather than fall through to an arm
+            // that would silently permit it.
+            Operation::UserOperation(..) => {
+                Err(self.retryable_conflict_err(other_transaction, other_version))
+            }
             // Project is compatible with anything that doesn't change the schema
             Operation::Append { .. }
             | Operation::Update { .. }
@@ -1406,6 +1550,12 @@ impl<'a> TransactionRebase<'a> {
         } = &self.transaction.operation
         {
             match &other_transaction.operation {
+                // Unreachable: check_txn answers a V2 `other` by footprint before
+                // dispatching here. Fail safe rather than fall through to an arm
+                // that would silently permit it.
+                Operation::UserOperation(..) => {
+                    Err(self.retryable_conflict_err(other_transaction, other_version))
+                }
                 Operation::Overwrite { .. } => {
                     // Updates to schema metadata or field metadata conflict with any kind
                     // of overwrite.
@@ -1466,6 +1616,12 @@ impl<'a> TransactionRebase<'a> {
         } = &self.transaction.operation
         {
             match &other_transaction.operation {
+                // Unreachable: check_txn answers a V2 `other` by footprint before
+                // dispatching here. Fail safe rather than fall through to an arm
+                // that would silently permit it.
+                Operation::UserOperation(..) => {
+                    Err(self.retryable_conflict_err(other_transaction, other_version))
+                }
                 Operation::UpdateMemWalState {
                     compacted_sstables: other_compacted_sstables,
                 } => {
@@ -1618,7 +1774,11 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Clone { .. }
             | Operation::UpdateConfig { .. }
             | Operation::UpdateMemWalState { .. }
-            | Operation::UpdateBases { .. } => Ok(self.transaction),
+            | Operation::UpdateBases { .. }
+            // AddBase needs no rebase mutation: `build_manifest` re-mints the base
+            // id from the current manifest on every retry, so the id simply comes
+            // out right. That is the property the minting design buys.
+            | Operation::UserOperation(..) => Ok(self.transaction),
         }
     }
 
@@ -3094,6 +3254,23 @@ mod tests {
             };
 
             for (other, expected_conflict) in other_transactions.iter().zip(expected_conflicts) {
+                // This table doubles as the oracle for `Operation::writes()`, which
+                // restates it as a footprint. Over-declaring is safe — it costs a
+                // spurious retry — so the assertion runs one way only: if two
+                // footprints are disjoint, the table must have said `Compatible`.
+                // An under-declared mask, the unsafe direction, fails here.
+                if operation
+                    .writes()
+                    .conflicts_with(&other.operation.writes())
+                    .is_none()
+                {
+                    assert_eq!(
+                        expected_conflict, &Compatible,
+                        "the footprints of {:?} and {:?} are disjoint, but the table expects {:?}",
+                        operation, other.operation, expected_conflict
+                    );
+                }
+
                 match expected_conflict {
                     Compatible => {
                         let result = rebase.check_txn(other, 1);
@@ -3949,6 +4126,233 @@ mod tests {
         }
     }
 
+    /// An action-based operation that mints one base.
+    fn add_base_operation(name: Option<&str>, path: &str) -> Operation {
+        use lance_table::transaction::{Action, AddBase, UserAction, UserOperation};
+
+        Operation::UserOperation(UserOperation {
+            description: format!("ALTER TABLE t ADD BASE {path}"),
+            uuid: uuid::Uuid::new_v4().to_string(),
+            read_version: 1,
+            actions: vec![UserAction {
+                description: "register base".to_string(),
+                actions: vec![Action::AddBase(AddBase {
+                    local: 0,
+                    name: name.map(str::to_string),
+                    is_dataset_root: false,
+                    path: path.to_string(),
+                })],
+            }],
+        })
+    }
+
+    async fn check_against(dataset: &Dataset, ours: Operation, other: Operation) -> Result<()> {
+        let mut rebase =
+            TransactionRebase::try_new(dataset, Transaction::new_from_version(1, ours), None)
+                .await
+                .unwrap();
+        rebase.check_txn(&Transaction::new_from_version(1, other), 2)
+    }
+
+    #[tokio::test]
+    async fn test_user_operation_add_base_commits() {
+        let dataset = test_dataset(10, 2).await;
+        let version = dataset.version().version;
+
+        let dataset = CommitBuilder::new(Arc::new(dataset))
+            .execute(Transaction::new_from_version(
+                version,
+                add_base_operation(Some("warm"), "s3://bucket/warm"),
+            ))
+            .await
+            .unwrap();
+
+        let bases = &dataset.manifest().base_paths;
+        assert_eq!(bases.len(), 1);
+        let (id, base) = bases.iter().next().unwrap();
+        assert_eq!(*id, 1);
+        assert_eq!(base.name.as_deref(), Some("warm"));
+        assert_eq!(base.path, "s3://bucket/warm");
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_add_bases_with_distinct_names_get_distinct_ids() {
+        // Both transactions are planned against the same version, so the second
+        // commit rebases over the first. No rebase mutation is needed: the id is
+        // re-minted from the current manifest, which is the property minting buys.
+        let dataset = Arc::new(test_dataset(10, 2).await);
+        let version = dataset.version().version;
+
+        let first = CommitBuilder::new(dataset.clone())
+            .execute(Transaction::new_from_version(
+                version,
+                add_base_operation(Some("warm"), "s3://bucket/warm"),
+            ))
+            .await
+            .unwrap();
+
+        let second = CommitBuilder::new(Arc::new(first))
+            .execute(Transaction::new_from_version(
+                version,
+                add_base_operation(Some("cold"), "s3://bucket/cold"),
+            ))
+            .await
+            .unwrap();
+
+        let bases = &second.manifest().base_paths;
+        assert_eq!(bases.len(), 2, "both bases should survive: {bases:?}");
+        let mut named: Vec<_> = bases
+            .iter()
+            .map(|(id, base)| (*id, base.name.clone().unwrap()))
+            .collect();
+        named.sort();
+        assert_eq!(
+            named,
+            vec![(1, "warm".to_string()), (2, "cold".to_string())],
+            "ids must be distinct and minted in commit order"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_add_base_conflicts_are_incompatible_on_name_and_path() {
+        let dataset = test_dataset(10, 2).await;
+
+        for (ours, other, what) in [
+            (
+                add_base_operation(Some("warm"), "s3://bucket/a"),
+                add_base_operation(Some("warm"), "s3://bucket/b"),
+                "name",
+            ),
+            (
+                add_base_operation(Some("a"), "s3://bucket/warm"),
+                add_base_operation(Some("b"), "s3://bucket/warm"),
+                "path",
+            ),
+        ] {
+            let result = check_against(&dataset, ours, other).await;
+            assert!(
+                matches!(result, Err(Error::IncompatibleTransaction { .. })),
+                "a taken base {what} is not freed by a retry, so it must be \
+                 incompatible; got {result:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_add_base_commutes_with_distinct_add_base_and_with_append() {
+        let dataset = test_dataset(10, 2).await;
+
+        let commuting = [
+            add_base_operation(Some("cold"), "s3://bucket/cold"),
+            Operation::Append { fragments: vec![] },
+        ];
+        for other in commuting {
+            check_against(
+                &dataset,
+                add_base_operation(Some("warm"), "s3://bucket/warm"),
+                other.clone(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("AddBase should commute with {other:?}: {e:?}"));
+
+            // And the same in the other direction: a legacy self against a V2 other
+            // takes the frontier path in `check_txn`.
+            check_against(
+                &dataset,
+                other.clone(),
+                add_base_operation(Some("warm"), "s3://bucket/warm"),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{other:?} should commute with AddBase: {e:?}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_add_base_conflicts_with_restore_retryably() {
+        // Restore replaces the manifest wholesale and does not merge base_paths
+        // forward, so re-adding the base on top of the restored state is the correct
+        // resolution. (Legacy `check_add_bases_txn` returns Ok here and silently
+        // drops the base; that pre-existing gap is untouched.)
+        let dataset = test_dataset(10, 2).await;
+
+        for (ours, other) in [
+            (
+                add_base_operation(Some("warm"), "s3://bucket/warm"),
+                Operation::Restore { version: 1 },
+            ),
+            (
+                Operation::Restore { version: 1 },
+                add_base_operation(Some("warm"), "s3://bucket/warm"),
+            ),
+        ] {
+            let result = check_against(&dataset, ours, other).await;
+            assert!(
+                matches!(result, Err(Error::RetryableCommitConflict { .. })),
+                "expected a retryable conflict, got {result:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_add_base_conflicts_with_legacy_update_bases_across_vocabularies() {
+        let dataset = test_dataset(10, 2).await;
+        let legacy = |name: &str, path: &str| Operation::UpdateBases {
+            new_bases: vec![lance_table::format::BasePath {
+                id: 0,
+                path: path.to_string(),
+                name: Some(name.to_string()),
+                is_dataset_root: false,
+            }],
+        };
+
+        // Same name across the two vocabularies, in both directions.
+        for (ours, other) in [
+            (
+                add_base_operation(Some("warm"), "s3://bucket/a"),
+                legacy("warm", "s3://bucket/b"),
+            ),
+            (
+                legacy("warm", "s3://bucket/b"),
+                add_base_operation(Some("warm"), "s3://bucket/a"),
+            ),
+        ] {
+            let result = check_against(&dataset, ours, other).await;
+            assert!(
+                matches!(result, Err(Error::IncompatibleTransaction { .. })),
+                "expected an incompatible conflict, got {result:?}"
+            );
+        }
+
+        // Distinct names commute across vocabularies too.
+        check_against(
+            &dataset,
+            add_base_operation(Some("warm"), "s3://bucket/a"),
+            legacy("cold", "s3://bucket/b"),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_legacy_self_against_fragment_touching_other_is_unaffected() {
+        // The frontier rule keys on the *other* operation's regions. A V2 other
+        // confined to Bases needs none of the legacy rebase side effects, so a
+        // fragment-touching legacy self is compared by footprint and commutes.
+        let dataset = test_dataset(10, 2).await;
+
+        check_against(
+            &dataset,
+            Operation::Delete {
+                updated_fragments: vec![],
+                deleted_fragment_ids: vec![0],
+                predicate: "a > 5".to_string(),
+            },
+            add_base_operation(Some("warm"), "s3://bucket/warm"),
+        )
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn test_add_bases_multiple_bases() {
         let dataset = test_dataset(10, 2).await;
@@ -4087,6 +4491,9 @@ mod tests {
             | Operation::UpdateBases { .. }
             | Operation::Restore { .. }
             | Operation::UpdateMemWalState { .. } => Box::new(std::iter::empty()),
+            // TODO: the only action today is AddBase, which touches no fragments.
+            // A fragment-level action must derive the ids from the action list here.
+            Operation::UserOperation(..) => Box::new(std::iter::empty()),
             Operation::Delete {
                 updated_fragments,
                 deleted_fragment_ids,
