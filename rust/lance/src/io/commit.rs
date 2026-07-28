@@ -821,6 +821,11 @@ pub(crate) async fn do_commit_detached_transaction(
         String::new()
     };
 
+    // The inline copy is moved into the first commit attempt; a retry (only on
+    // a random-version collision) rebuilds it instead of cloning up front.
+    let mut inline_tx: Option<lance_table::format::Transaction> =
+        inline_transaction.then(|| pb_transaction.into());
+
     // We still do a loop since we may have conflicts in the random version we pick
     let mut backoff = Backoff::default();
     while backoff.attempt() < commit_config.num_retries {
@@ -872,8 +877,7 @@ pub(crate) async fn do_commit_detached_transaction(
             },
             write_config,
             ManifestNamingScheme::V2,
-            // Cloned because the loop may retry on a random-version collision.
-            inline_transaction.then(|| pb_transaction.clone().into()),
+            inline_tx.take(),
         )
         .await;
 
@@ -884,6 +888,7 @@ pub(crate) async fn do_commit_detached_transaction(
             Err(CommitError::CommitConflict) => {
                 // We pick a random u64 for the version, so it's possible (though extremely unlikely)
                 // that we have a conflict. In that case, we just try again.
+                inline_tx = inline_transaction.then(|| pb::Transaction::from(transaction).into());
                 tokio::time::sleep(backoff.next_backoff()).await;
             }
             Err(CommitError::OtherError(err)) => {
