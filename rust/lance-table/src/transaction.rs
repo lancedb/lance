@@ -12,13 +12,33 @@
 //! For more details please refer to the
 //! [Transaction Specification](https://lance.org/format/table/transaction/#transaction-types).
 
-use super::write::merge_insert::inserted_rows::KeyExistenceFilter;
-use crate::dataset::overlay::collect_overlay_stale_frags;
-use crate::dataset::transaction::UpdateMode::{RewriteColumns, RewriteRows};
-use crate::index::index_results_are_row_addrs;
-use crate::index::mem_wal::{
-    load_mem_wal_index_details, new_mem_wal_index_meta, update_mem_wal_index_compacted_sstables,
+use crate::feature_flags::{
+    FLAG_MEM_WAL_INDEX_CATCHUP, FLAG_STABLE_ROW_IDS, apply_feature_flags,
+    inherit_mem_wal_index_catchup, validate_mem_wal_index_catchup_flags,
 };
+use crate::format::key_existence::KeyExistenceFilter;
+use crate::format::overlay::TOMBSTONE_FIELD_ID;
+use crate::format::overlay::staleness::collect_overlay_stale_frags;
+use crate::format::{
+    BasePath, DataFile, DataStorageFormat, Fragment, IndexFile, IndexMetadata, Manifest,
+    ManifestBuildConfig, RowDatasetVersionMeta, RowDatasetVersionRun, RowDatasetVersionSequence,
+    RowIdMeta, overlay::DataOverlayFile, pb,
+};
+use crate::io::{
+    commit::CommitHandler,
+    deletion::relative_deletion_file_path,
+    manifest::{read_manifest, read_manifest_indexes},
+};
+use crate::rowids::{
+    RowIdSequence, read_row_ids, segment::U64Segment, version::build_version_meta, write_row_ids,
+};
+use crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
+use crate::system_index::is_system_index;
+use crate::system_index::mem_wal::{
+    CompactedSsTable, IndexCatchupProgress, MEM_WAL_INDEX_NAME, load_mem_wal_index_details,
+    new_mem_wal_index_meta, update_mem_wal_index_compacted_sstables,
+};
+use crate::transaction::UpdateMode::{RewriteColumns, RewriteRows};
 use lance_core::datatypes::{
     Field, LANCE_UNENFORCED_CLUSTERING_KEY_POSITION, LANCE_UNENFORCED_PRIMARY_KEY,
     LANCE_UNENFORCED_PRIMARY_KEY_POSITION,
@@ -26,28 +46,7 @@ use lance_core::datatypes::{
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result, datatypes::Schema};
 use lance_file::{datatypes::Fields, version::ConcreteFileVersion};
-use lance_index::mem_wal::{CompactedSsTable, IndexCatchupProgress, MEM_WAL_INDEX_NAME};
-use lance_index::{frag_reuse::FRAG_REUSE_INDEX_NAME, is_system_index};
 use lance_io::object_store::ObjectStore;
-use lance_table::feature_flags::{
-    FLAG_MEM_WAL_INDEX_CATCHUP, FLAG_STABLE_ROW_IDS, apply_feature_flags,
-    inherit_mem_wal_index_catchup, validate_mem_wal_index_catchup_flags,
-};
-use lance_table::format::overlay::TOMBSTONE_FIELD_ID;
-use lance_table::rowids::read_row_ids;
-use lance_table::{
-    format::{
-        BasePath, DataFile, DataStorageFormat, Fragment, IndexFile, IndexMetadata, Manifest,
-        ManifestBuildConfig, RowDatasetVersionMeta, RowDatasetVersionRun,
-        RowDatasetVersionSequence, RowIdMeta, overlay::DataOverlayFile, pb,
-    },
-    io::{
-        commit::CommitHandler,
-        deletion::relative_deletion_file_path,
-        manifest::{read_manifest, read_manifest_indexes},
-    },
-    rowids::{RowIdSequence, segment::U64Segment, version::build_version_meta, write_row_ids},
-};
 use object_store::path::Path;
 use roaring::RoaringBitmap;
 use std::cmp::Ordering;
@@ -328,7 +327,7 @@ pub struct UpdateMap {
 /// prune a segment's fragment bitmap while keeping its UUID, so a UUID-only
 /// comparison would keep coverage for an index that no longer spans the same
 /// base fragments.
-type LogicalIndexSegments = BTreeMap<String, Vec<CoverageIdentity>>;
+pub type LogicalIndexSegments = BTreeMap<String, Vec<CoverageIdentity>>;
 
 /// What one physical index segment contributes to coverage.
 ///
@@ -341,7 +340,7 @@ type LogicalIndexSegments = BTreeMap<String, Vec<CoverageIdentity>>;
 /// timestamps and inferred details, is filled in by migrations routinely;
 /// comparing it would withdraw coverage for no reason.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CoverageIdentity {
+pub struct CoverageIdentity {
     uuid: Uuid,
     fragment_bitmap: Option<RoaringBitmap>,
 }
@@ -359,7 +358,7 @@ pub(crate) struct CoverageIdentity {
 /// different head: other commits move the compacted generations and the
 /// positions already recorded.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct ReadVersionState<'a> {
+pub struct ReadVersionState<'a> {
     pub manifest: &'a Manifest,
     pub indices: &'a [IndexMetadata],
 }
@@ -604,7 +603,7 @@ impl std::fmt::Display for Operation {
     }
 }
 
-impl From<&Transaction> for lance_table::format::Transaction {
+impl From<&Transaction> for crate::format::Transaction {
     fn from(value: &Transaction) -> Self {
         let pb_transaction: pb::Transaction = value.into();
         Self {
@@ -1552,7 +1551,7 @@ impl Operation {
         }
     }
 
-    pub(crate) fn modifies_same_metadata(&self, other: &Self) -> bool {
+    pub fn modifies_same_metadata(&self, other: &Self) -> bool {
         match (self, other) {
             (
                 Self::UpdateConfig {
@@ -1609,7 +1608,7 @@ impl Operation {
     }
 
     /// Check whether another operation upserts a key that is referenced by another operation
-    pub(crate) fn upsert_key_conflict(&self, other: &Self) -> bool {
+    pub fn upsert_key_conflict(&self, other: &Self) -> bool {
         let self_upsert_keys = self.get_upsert_config_keys();
         let other_upsert_keys = other.get_upsert_config_keys();
 
@@ -1853,7 +1852,7 @@ impl Transaction {
         }
     }
 
-    pub(crate) async fn restore_old_manifest(
+    pub async fn restore_old_manifest(
         object_store: &ObjectStore,
         commit_handler: &dyn CommitHandler,
         base_path: &Path,
@@ -1946,7 +1945,7 @@ impl Transaction {
     /// A logical index may be backed by several physical segments, so "did this
     /// index change" is a question about the whole set. Sorted by UUID so the
     /// two sides compare positionally.
-    pub(crate) fn logical_index_segments(indices: &[IndexMetadata]) -> LogicalIndexSegments {
+    pub fn logical_index_segments(indices: &[IndexMetadata]) -> LogicalIndexSegments {
         let mut by_name: LogicalIndexSegments = BTreeMap::new();
         for idx in indices.iter().filter(|idx| !is_system_index(idx)) {
             by_name
@@ -1986,7 +1985,7 @@ impl Transaction {
     /// "not caught up" and the SSTables stay. A legacy table reads a missing
     /// entry as "fully caught up", so this leaves it untouched rather than
     /// making the table look more covered than it is.
-    pub(crate) fn apply_mem_wal_index_coverage(
+    pub fn apply_mem_wal_index_coverage(
         final_indices: &mut [IndexMetadata],
         segments_before: &LogicalIndexSegments,
         read_version_state: Option<ReadVersionState<'_>>,
@@ -2163,7 +2162,7 @@ impl Transaction {
     /// fragment bitmap and keep its UUID, so an index can narrow after its
     /// position was decided. It reports which ones it touched rather than the
     /// caller re-snapshotting every bitmap to find out. Only ever removes.
-    pub(crate) fn withdraw_coverage_invalidated_after_build(
+    pub fn withdraw_coverage_invalidated_after_build(
         indices: &mut [IndexMetadata],
         changed: &[String],
         new_version: u64,
@@ -2196,7 +2195,7 @@ impl Transaction {
     /// Create a new manifest from the current manifest and the transaction.
     ///
     /// `current_manifest` should only be None if the dataset does not yet exist.
-    pub(crate) fn build_manifest(
+    pub fn build_manifest(
         &self,
         current_manifest: Option<&Manifest>,
         current_indices: Vec<IndexMetadata>,
@@ -2218,7 +2217,7 @@ impl Transaction {
     /// `None` where there is none to read -- dataset creation and detached
     /// commits -- in which case no index can be shown to cover it and coverage
     /// is left as the invalidation rules put it.
-    pub(crate) fn build_manifest_with_read_version(
+    pub fn build_manifest_with_read_version(
         &self,
         current_manifest: Option<&Manifest>,
         current_indices: Vec<IndexMetadata>,
@@ -2439,7 +2438,7 @@ impl Transaction {
                             // supersede them.
                             updated.overlays = f.overlays.clone();
                             if matches!(update_mode, Some(RewriteColumns)) {
-                                lance_table::format::overlay::tombstone_overlay_fields(
+                                crate::format::overlay::tombstone_overlay_fields(
                                     &mut updated.overlays,
                                     fields_modified,
                                 );
@@ -2509,7 +2508,7 @@ impl Transaction {
                             )));
                         }
                         let offsets: Vec<usize> = bitmap.iter().map(|o| o as usize).collect();
-                        lance_table::rowids::version::refresh_row_latest_update_meta_for_partial_frag_rewrite_cols(
+                        crate::rowids::version::refresh_row_latest_update_meta_for_partial_frag_rewrite_cols(
                             fragment,
                             &offsets,
                             new_version,
@@ -2642,7 +2641,7 @@ impl Transaction {
                     // We can re-use indices, but need to rewrite the fragment bitmaps
                     debug_assert!(rewritten_indices.is_empty());
                     for index in final_indices.iter_mut() {
-                        let results_are_row_addrs = index_results_are_row_addrs(index);
+                        let results_are_row_addrs = index.results_are_row_addrs();
                         if let Some(fragment_bitmap) = &mut index.fragment_bitmap {
                             *fragment_bitmap = if results_are_row_addrs {
                                 // Stable row ids survive a rewrite, so a row-id-domain index
@@ -2707,7 +2706,7 @@ impl Transaction {
                         match prev_by_id.get(&fragment.id) {
                             Some(prev) => {
                                 if merge_fragment_physically_rewritten(prev, fragment) {
-                                    lance_table::rowids::version::refresh_row_latest_update_meta_for_full_frag_rewrite_cols(
+                                    crate::rowids::version::refresh_row_latest_update_meta_for_full_frag_rewrite_cols(
                                         fragment,
                                         new_version,
                                     )?;
@@ -2717,7 +2716,7 @@ impl Transaction {
                                 // Brand-new fragment ID not present in the previous manifest.
                                 // Set both last_updated and created version meta, consistent
                                 // with Append/Overwrite for genuinely new fragments.
-                                lance_table::rowids::version::refresh_row_latest_update_meta_for_full_frag_rewrite_cols(
+                                crate::rowids::version::refresh_row_latest_update_meta_for_full_frag_rewrite_cols(
                                     fragment,
                                     new_version,
                                 )?;
@@ -2933,7 +2932,7 @@ impl Transaction {
                         .overlays
                         .drain(..)
                         .partition(|overlay| overlay.committed_version <= self.read_version);
-                    lance_table::format::overlay::tombstone_overlay_fields(
+                    crate::format::overlay::tombstone_overlay_fields(
                         &mut superseded,
                         &replaced_fields,
                     );
@@ -2974,7 +2973,7 @@ impl Transaction {
                         .iter_mut()
                         .filter(|f| fragments_changed.contains(&f.id))
                     {
-                        lance_table::rowids::version::refresh_row_latest_update_meta_for_full_frag_rewrite_cols(
+                        crate::rowids::version::refresh_row_latest_update_meta_for_full_frag_rewrite_cols(
                             fragment,
                             new_version,
                         )?;
@@ -3063,7 +3062,7 @@ impl Transaction {
         // that assembled a fragment's overlays out of order.
         for fragment in &final_fragments {
             if !fragment.overlays.is_empty() {
-                lance_table::format::overlay::verify_overlays_newest_last(&fragment.overlays)?;
+                crate::format::overlay::verify_overlays_newest_last(&fragment.overlays)?;
             }
         }
 
@@ -3118,7 +3117,7 @@ impl Transaction {
         manifest.tag.clone_from(&self.tag);
 
         if config.auto_set_feature_flags {
-            // Internal operations (e.g. CreateIndex) use ManifestWriteConfig::default()
+            // Internal operations (e.g. CreateIndex) build with the default config,
             // which has use_stable_row_ids = false. Without inheriting from the previous
             // manifest, apply_feature_flags would clear FLAG_STABLE_ROW_IDS.
             let inherited = current_manifest
@@ -3381,7 +3380,7 @@ impl Transaction {
         for index in indices.iter_mut() {
             // Physical row addresses cannot follow moved rows into a new fragment.
             // Leave that fragment uncovered so the scanner reads it directly.
-            if index_results_are_row_addrs(index) {
+            if index.results_are_row_addrs() {
                 continue;
             }
             let index_covers_modified_field = index.fields.iter().any(|field_id| {
@@ -3430,7 +3429,7 @@ impl Transaction {
 
     /// If an operation modifies one or more fields in a fragment then we need to remove
     /// that fragment from any indices that cover one of the modified fields.
-    pub(crate) fn prune_updated_fields_from_indices(
+    pub fn prune_updated_fields_from_indices(
         indices: &mut [IndexMetadata],
         updated_fragments: &[Fragment],
         fields_modified: &[u32],
@@ -4785,11 +4784,13 @@ fn schema_fragments_valid(
     fragments: &[Fragment],
 ) -> Result<()> {
     if let Some(manifest) = manifest {
-        return super::versions::validate_fragment_schema(
-            manifest.data_storage_format.lance_file_format(),
-            schema,
-            fragments,
-        );
+        return match manifest.data_storage_format.lance_file_format() {
+            ConcreteFileVersion::V1 => schema_fragments_legacy_valid(schema, fragments),
+            ConcreteFileVersion::V2_0
+            | ConcreteFileVersion::V2_1
+            | ConcreteFileVersion::V2_2
+            | ConcreteFileVersion::V2_3 => schema_fragments_modern_valid(schema, fragments),
+        };
     }
     schema_fragments_modern_valid(schema, fragments)
 }
@@ -5081,27 +5082,35 @@ fn shared_field_binding_changes(prior: &Field, new: &Field) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::cast::AsArray;
-    use arrow_array::types::{Int32Type, Int64Type};
-    use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StructArray};
-    use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
+    use crate::format::overlay::OverlayCoverage;
+    use crate::format::{
+        RowDatasetVersionMeta, RowDatasetVersionRun, RowDatasetVersionSequence, RowIdMeta,
+    };
+    use crate::rowids::segment::U64Segment;
+    use crate::rowids::write_row_ids;
+    use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use chrono::Utc;
     use lance_core::datatypes::{Field as LanceCoreField, LogicalType, Schema as LanceSchema};
     use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
     use lance_io::utils::CachedFileSize;
-    use lance_table::format::overlay::OverlayCoverage;
-    use lance_table::format::{
-        RowDatasetVersionMeta, RowDatasetVersionRun, RowDatasetVersionSequence, RowIdMeta,
-    };
-    use lance_table::rowids::segment::U64Segment;
-    use lance_table::rowids::write_row_ids;
     use std::collections::HashMap;
     use std::sync::Arc;
     use uuid::Uuid;
 
-    use crate::Dataset;
-    use crate::dataset::ManifestWriteConfig;
-    use crate::dataset::{ColumnAlteration, NewColumnTransform};
+    /// The build config that `lance`'s `ManifestWriteConfig::default()` resolves to.
+    fn default_build_config() -> ManifestBuildConfig {
+        ManifestBuildConfig {
+            auto_set_feature_flags: true,
+            timestamp_nanos: std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            use_stable_row_ids: false,
+            use_legacy_format: None,
+            storage_format: None,
+            disable_transaction_file: false,
+        }
+    }
 
     fn sample_manifest() -> Manifest {
         sample_manifest_with_fragments(0..1)
@@ -5261,89 +5270,6 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    /// Repro shape for issue 7700: write a, b, c; drop one column; add d. The
-    /// dropped id stays referenced by the data files and max_field_id stays 3.
-    async fn dataset_with_dropped_column(uri: &str, dropped: &str) -> Dataset {
-        let arrow_schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("a", DataType::Int32, true),
-            ArrowField::new("b", DataType::Int32, true),
-            ArrowField::new("c", DataType::Int32, true),
-        ]));
-        let batch = RecordBatch::try_new(
-            arrow_schema.clone(),
-            vec![
-                Arc::new(Int32Array::from(vec![1, 2])),
-                Arc::new(Int32Array::from(vec![10, 20])),
-                Arc::new(Int32Array::from(vec![100, 200])),
-            ],
-        )
-        .unwrap();
-        let reader = RecordBatchIterator::new(vec![Ok(batch)], arrow_schema);
-        let mut dataset = Dataset::write(reader, uri, None).await.unwrap();
-        dataset.drop_columns(&[dropped]).await.unwrap();
-        dataset
-            .add_columns(
-                NewColumnTransform::SqlExpressions(vec![("d".into(), "CAST(5 AS INT)".into())]),
-                None,
-                None,
-            )
-            .await
-            .unwrap();
-        let dropped_id = ["a", "b", "c"].iter().position(|c| *c == dropped).unwrap() as i32;
-        let mut expected_ids: Vec<i32> = (0..3).filter(|id| *id != dropped_id).collect();
-        expected_ids.push(3);
-        assert_eq!(dataset.schema().field_ids(), expected_ids);
-        assert_eq!(dataset.manifest.max_field_id(), 3);
-        dataset
-    }
-
-    /// Expected values of every column surviving `dropped`, plus d.
-    fn surviving_columns(dropped: &str) -> Vec<(&'static str, [i32; 2])> {
-        [
-            ("a", [1, 2]),
-            ("b", [10, 20]),
-            ("c", [100, 200]),
-            ("d", [5, 5]),
-        ]
-        .into_iter()
-        .filter(|(name, _)| *name != dropped)
-        .collect()
-    }
-
-    fn assert_columns(batch: &RecordBatch, cols: &[(&str, [i32; 2])]) {
-        for (name, expected) in cols {
-            let col = &batch[*name];
-            assert_eq!(
-                col.as_primitive::<Int32Type>().values(),
-                expected,
-                "column {}",
-                name
-            );
-        }
-    }
-
-    async fn commit_merge(dataset: &Dataset, schema: LanceSchema) -> Result<Dataset> {
-        let fragments = dataset
-            .get_fragments()
-            .iter()
-            .map(|f| f.metadata().clone())
-            .collect();
-        Dataset::commit(
-            Arc::new(dataset.clone()),
-            Operation::Merge {
-                fragments,
-                schema,
-                preserves_nullability: true,
-            },
-            Some(dataset.manifest.version),
-            None,
-            None,
-            dataset.session(),
-            false,
-        )
-        .await
-    }
-
     fn one_field_schema() -> LanceSchema {
         LanceSchema::try_from(&ArrowSchema::new(vec![ArrowField::new(
             "a",
@@ -5368,202 +5294,6 @@ mod tests {
             DataStorageFormat::new(ConcreteFileVersion::V2_0),
             HashMap::new(),
         )
-    }
-
-    // Which clause rejects the lossy round-trip depends on the hole's
-    // position: a hole before the last field remaps a shared id, while a
-    // hole at the end reuses the dropped id for the new field.
-    #[rstest::rstest]
-    #[case::drop_a_remaps_shared_id("a", "remaps field id 1 from \"b\" to \"c\"")]
-    #[case::drop_b_remaps_shared_id("b", "remaps field id 2 from \"c\" to \"d\"")]
-    #[case::drop_c_reuses_dropped_id("c", "assigns id 2 to new field \"d\"")]
-    #[tokio::test]
-    async fn test_merge_rejects_renumbered_field_ids(
-        #[case] dropped: &str,
-        #[case] expected: &str,
-    ) {
-        let dataset = dataset_with_dropped_column("memory://", dropped).await;
-
-        let arrow_schema = ArrowSchema::from(dataset.schema());
-        let renumbered = LanceSchema::try_from(&arrow_schema).unwrap();
-        assert_eq!(renumbered.field_ids(), vec![0, 1, 2]);
-
-        let err = commit_merge(&dataset, renumbered).await.unwrap_err();
-        assert!(matches!(err, Error::InvalidInput { .. }), "got {:?}", err);
-        let message = err.to_string();
-        assert!(message.contains(expected), "unexpected error: {}", message);
-    }
-
-    #[tokio::test]
-    async fn test_merge_rejects_dropped_field_id_reuse() {
-        // Deliberate reuse of a tombstoned id, as opposed to the renumbering
-        // accident covered above.
-        let dataset = dataset_with_dropped_column("memory://", "b").await;
-
-        let mut schema = dataset.schema().clone();
-        let mut field =
-            LanceCoreField::try_from(&ArrowField::new("e", DataType::Int32, true)).unwrap();
-        field.id = 1;
-        schema.fields.push(field);
-
-        let err = commit_merge(&dataset, schema).await.unwrap_err();
-        assert!(matches!(err, Error::InvalidInput { .. }), "got {:?}", err);
-        let message = err.to_string();
-        assert!(
-            message.contains("assigns id 1 to new field \"e\"")
-                && message.contains("must use ids of at least 4"),
-            "unexpected error: {}",
-            message
-        );
-    }
-
-    #[tokio::test]
-    async fn test_merge_rejects_renumbered_nested_field_ids() {
-        // A hole inside a struct shifts a nested leaf's id onto a field
-        // outside the struct on renumbering; the full-path comparison must
-        // catch the cross-parent remap.
-        let struct_fields = Fields::from(vec![
-            ArrowField::new("x", DataType::Int32, true),
-            ArrowField::new("y", DataType::Int32, true),
-        ]);
-        let arrow_schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("s", DataType::Struct(struct_fields.clone()), true),
-            ArrowField::new("z", DataType::Int32, true),
-        ]));
-        let batch = RecordBatch::try_new(
-            arrow_schema.clone(),
-            vec![
-                Arc::new(StructArray::new(
-                    struct_fields,
-                    vec![
-                        Arc::new(Int32Array::from(vec![1, 2])),
-                        Arc::new(Int32Array::from(vec![10, 20])),
-                    ],
-                    None,
-                )),
-                Arc::new(Int32Array::from(vec![100, 200])),
-            ],
-        )
-        .unwrap();
-        let reader = RecordBatchIterator::new(vec![Ok(batch)], arrow_schema);
-        let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
-        dataset.drop_columns(&["s.x"]).await.unwrap();
-        assert_eq!(dataset.schema().field_ids(), vec![0, 2, 3]);
-
-        let arrow_schema = ArrowSchema::from(dataset.schema());
-        let renumbered = LanceSchema::try_from(&arrow_schema).unwrap();
-        assert_eq!(renumbered.field_ids(), vec![0, 1, 2]);
-
-        let err = commit_merge(&dataset, renumbered).await.unwrap_err();
-        assert!(matches!(err, Error::InvalidInput { .. }), "got {:?}", err);
-        let message = err.to_string();
-        assert!(
-            message.contains("remaps field id 2 from \"s.y\" to \"z\""),
-            "unexpected error: {}",
-            message
-        );
-    }
-
-    #[rstest::rstest]
-    #[case::drop_a("a")]
-    #[case::drop_b("b")]
-    #[case::drop_c("c")]
-    #[tokio::test]
-    async fn test_merge_allows_id_preserving_schema_change(#[case] dropped: &str) {
-        let dataset = dataset_with_dropped_column("memory://", dropped).await;
-
-        let survivors = surviving_columns(dropped);
-        let first_id = dataset.schema().field(survivors[0].0).unwrap().id;
-        let mut schema = dataset.schema().clone();
-        schema
-            .mut_field_by_id(first_id)
-            .unwrap()
-            .metadata
-            .insert("wm".into(), "42".into());
-
-        let dataset = commit_merge(&dataset, schema).await.unwrap();
-        assert_eq!(
-            dataset
-                .schema()
-                .field(survivors[0].0)
-                .unwrap()
-                .metadata
-                .get("wm"),
-            Some(&"42".to_string())
-        );
-
-        let batch = dataset.scan().try_into_batch().await.unwrap();
-        assert_columns(&batch, &survivors);
-    }
-
-    #[rstest::rstest]
-    #[case::drop_a("a")]
-    #[case::drop_b("b")]
-    #[case::drop_c("c")]
-    #[tokio::test]
-    async fn test_merge_allows_dropping_field(#[case] dropped: &str) {
-        let dataset = dataset_with_dropped_column("memory://", dropped).await;
-
-        let mut survivors = surviving_columns(dropped);
-        let omitted = survivors.remove(0);
-        let names: Vec<&str> = survivors.iter().map(|(n, _)| *n).collect();
-        let schema = dataset.schema().project(&names).unwrap();
-
-        let dataset = commit_merge(&dataset, schema).await.unwrap();
-        assert!(dataset.schema().field(omitted.0).is_none());
-
-        let batch = dataset.scan().try_into_batch().await.unwrap();
-        assert_columns(&batch, &survivors);
-    }
-
-    #[tokio::test]
-    async fn test_merge_rejects_schema_only_path_remap() {
-        let dataset = dataset_with_dropped_column("memory://", "c").await;
-        let prior_id = dataset.schema().field("a").unwrap().id;
-        let fresh_id = dataset.manifest.max_field_id() + 1;
-
-        let mut schema = dataset.schema().clone();
-        schema.mut_field_by_id(prior_id).unwrap().id = fresh_id;
-
-        let err = commit_merge(&dataset, schema).await.unwrap_err();
-        assert!(matches!(err, Error::InvalidInput { .. }), "got {:?}", err);
-        let message = err.to_string();
-        assert!(
-            message.contains(&format!(
-                "remaps existing field \"a\" from id {} to id {}",
-                prior_id, fresh_id
-            )) && message.contains("base data file"),
-            "unexpected error: {}",
-            message
-        );
-    }
-
-    #[rstest::rstest]
-    #[case::logical_type(DataType::Float32, true, "logical type")]
-    #[case::nullability(DataType::Int32, false, "nullable")]
-    #[tokio::test]
-    async fn test_merge_rejects_shared_id_type_or_nullability_change(
-        #[case] data_type: DataType,
-        #[case] nullable: bool,
-        #[case] expected: &str,
-    ) {
-        let dataset = dataset_with_dropped_column("memory://", "c").await;
-        let field_id = dataset.schema().field("a").unwrap().id;
-
-        let mut schema = dataset.schema().clone();
-        let field = schema.mut_field_by_id(field_id).unwrap();
-        field.logical_type = LogicalType::try_from(&data_type).unwrap();
-        field.nullable = nullable;
-
-        let err = commit_merge(&dataset, schema).await.unwrap_err();
-        assert!(matches!(err, Error::InvalidInput { .. }), "got {:?}", err);
-        let message = err.to_string();
-        assert!(
-            message.contains(&format!("changes field id {} (\"a\")", field_id))
-                && message.contains(expected),
-            "unexpected error: {}",
-            message
-        );
     }
 
     #[rstest::rstest]
@@ -5636,8 +5366,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_merge_allows_rewritten_fresh_field_id() {
+    #[test]
+    fn test_merge_allows_rewritten_fresh_field_id() {
         let schema = one_field_schema();
         let manifest = manifest_with_file_fields(schema.clone(), vec![0]);
         let mut rewritten_schema = schema.clone();
@@ -5645,27 +5375,6 @@ mod tests {
         let mut rewritten = manifest.fragments[0].clone();
         rewritten.files[0] = DataFile::new_legacy_from_fields("rewritten.lance", vec![1], None);
         merge_schema_valid(&manifest, &rewritten_schema, &[rewritten]).unwrap();
-
-        let mut dataset = dataset_with_dropped_column("memory://", "c").await;
-        let prior_id = dataset.schema().field("a").unwrap().id;
-        dataset
-            .alter_columns(&[ColumnAlteration::new("a".into()).cast_to(DataType::Int64)])
-            .await
-            .unwrap();
-        let new_id = dataset.schema().field("a").unwrap().id;
-        assert_ne!(new_id, prior_id);
-        assert!(
-            dataset.get_fragments().iter().all(|fragment| {
-                fragment
-                    .metadata()
-                    .files
-                    .iter()
-                    .any(|file| file.fields.contains(&new_id))
-            }),
-            "alter_columns must materialize the fresh id in every fragment base file"
-        );
-        let batch = dataset.scan().try_into_batch().await.unwrap();
-        assert_eq!(batch["a"].as_primitive::<Int64Type>().values(), &[1, 2]);
     }
 
     #[test]
@@ -5711,7 +5420,7 @@ mod tests {
                 Some(&manifest),
                 vec![first_index.clone(), second_index.clone()],
                 "txn",
-                &ManifestWriteConfig::default().to_build_config(),
+                &default_build_config(),
             )
             .unwrap();
 
@@ -5746,7 +5455,7 @@ mod tests {
                 Some(&manifest),
                 vec![first_index.clone(), second_index.clone()],
                 "txn",
-                &ManifestWriteConfig::default().to_build_config(),
+                &default_build_config(),
             )
             .unwrap();
 
@@ -5798,7 +5507,7 @@ mod tests {
                 Some(&manifest),
                 vec![],
                 "txn",
-                &ManifestWriteConfig::default().to_build_config(),
+                &default_build_config(),
             )
             .unwrap();
 
@@ -5834,7 +5543,7 @@ mod tests {
                 Some(&manifest),
                 vec![],
                 "txn",
-                &ManifestWriteConfig::default().to_build_config(),
+                &default_build_config(),
             )
             .unwrap();
 
@@ -6218,7 +5927,7 @@ mod tests {
 
     #[test]
     fn test_retain_indices_keeps_system_indices() {
-        use lance_index::mem_wal::MEM_WAL_INDEX_NAME;
+        use crate::system_index::mem_wal::MEM_WAL_INDEX_NAME;
 
         let schema = create_test_schema(&[1, 2]);
         let fragments = vec![Fragment::new(1)];
@@ -6656,12 +6365,7 @@ mod tests {
         );
 
         let (out, _) = tx
-            .build_manifest(
-                Some(&manifest),
-                vec![],
-                "txn",
-                &ManifestWriteConfig::default().to_build_config(),
-            )
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
             .unwrap();
 
         assert!(
@@ -6722,7 +6426,7 @@ mod tests {
             Some(&manifest),
             vec![],
             "txn",
-            &ManifestWriteConfig::default().to_build_config(),
+            &default_build_config(),
         );
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
@@ -6784,7 +6488,7 @@ mod tests {
             Some(&manifest),
             vec![],
             "txn",
-            &ManifestWriteConfig::default().to_build_config(),
+            &default_build_config(),
         );
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
@@ -6846,7 +6550,7 @@ mod tests {
             Some(&manifest),
             vec![],
             "txn",
-            &ManifestWriteConfig::default().to_build_config(),
+            &default_build_config(),
         )
         .expect("bitmap at exact physical_rows boundary should succeed");
     }
@@ -7167,8 +6871,8 @@ mod tests {
 
     #[test]
     fn merge_build_manifest_refreshes_last_updated_when_data_files_change_stable_row_ids() {
+        use crate::feature_flags::FLAG_STABLE_ROW_IDS;
         use lance_file::version::LanceFileVersion;
-        use lance_table::feature_flags::FLAG_STABLE_ROW_IDS;
 
         let mk_file = |path: &str| {
             DataFile::new(
@@ -7223,12 +6927,7 @@ mod tests {
         );
 
         let (out, _) = tx
-            .build_manifest(
-                Some(&manifest),
-                vec![],
-                "txn",
-                &ManifestWriteConfig::default().to_build_config(),
-            )
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
             .unwrap();
 
         assert_eq!(out.version, 2);
@@ -7245,9 +6944,9 @@ mod tests {
 
     #[test]
     fn merge_build_manifest_skips_refresh_when_carry_forward_stable_row_ids() {
+        use crate::feature_flags::FLAG_STABLE_ROW_IDS;
+        use crate::rowids::version::{RowDatasetVersionMeta, RowDatasetVersionSequence};
         use lance_file::version::LanceFileVersion;
-        use lance_table::feature_flags::FLAG_STABLE_ROW_IDS;
-        use lance_table::rowids::version::{RowDatasetVersionMeta, RowDatasetVersionSequence};
 
         let data_file = DataFile::new(
             "same.lance",
@@ -7309,12 +7008,7 @@ mod tests {
         );
 
         let (out, _) = tx
-            .build_manifest(
-                Some(&manifest),
-                vec![],
-                "txn",
-                &ManifestWriteConfig::default().to_build_config(),
-            )
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
             .unwrap();
 
         let seq = out.fragments[0]
@@ -7329,8 +7023,8 @@ mod tests {
 
     #[test]
     fn merge_build_manifest_no_last_updated_refresh_without_stable_row_ids() {
+        use crate::feature_flags::FLAG_STABLE_ROW_IDS;
         use lance_file::version::LanceFileVersion;
-        use lance_table::feature_flags::FLAG_STABLE_ROW_IDS;
 
         let mk_file = |path: &str| {
             DataFile::new(
@@ -7385,12 +7079,7 @@ mod tests {
         );
 
         let (out, _) = tx
-            .build_manifest(
-                Some(&manifest),
-                vec![],
-                "txn",
-                &ManifestWriteConfig::default().to_build_config(),
-            )
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
             .unwrap();
 
         assert!(
@@ -7401,8 +7090,8 @@ mod tests {
 
     #[test]
     fn merge_build_manifest_sets_both_version_meta_for_new_fragment_id_stable_row_ids() {
+        use crate::feature_flags::FLAG_STABLE_ROW_IDS;
         use lance_file::version::LanceFileVersion;
-        use lance_table::feature_flags::FLAG_STABLE_ROW_IDS;
 
         let mk_file = |path: &str| {
             DataFile::new(
@@ -7465,12 +7154,7 @@ mod tests {
         );
 
         let (out, _) = tx
-            .build_manifest(
-                Some(&manifest),
-                vec![],
-                "txn",
-                &ManifestWriteConfig::default().to_build_config(),
-            )
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
             .unwrap();
 
         assert_eq!(out.version, 2);
@@ -7534,12 +7218,7 @@ mod tests {
 
         let manifest = make_stable_row_id_manifest(vec![existing_fragment]);
         let (result, _) = update_txn(vec![new_fragment])
-            .build_manifest(
-                Some(&manifest),
-                vec![],
-                "txn",
-                &ManifestWriteConfig::default().to_build_config(),
-            )
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
             .unwrap();
 
         assert_eq!(created_at_versions(&result, 10), vec![5, 5]);
@@ -7604,12 +7283,7 @@ mod tests {
         };
 
         let (result, _) = update_txn(vec![new_fragment])
-            .build_manifest(
-                Some(&manifest),
-                vec![],
-                "txn",
-                &ManifestWriteConfig::default().to_build_config(),
-            )
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
             .unwrap();
 
         // Row 11 came from frag_a (offset 1, version 2), row 20 came from frag_b (offset 0, version 3)
@@ -7663,12 +7337,7 @@ mod tests {
         // update_txn uses read_version 4 → new_version is 5
         let manifest = make_stable_row_id_manifest(vec![existing_fragment]);
         let (result, _) = update_txn(vec![new_fragment])
-            .build_manifest(
-                Some(&manifest),
-                vec![],
-                "txn",
-                &ManifestWriteConfig::default().to_build_config(),
-            )
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
             .unwrap();
 
         // Row 10 (UPDATE branch): created_at copied from source (version 5).
@@ -7722,12 +7391,7 @@ mod tests {
         // update_txn uses read_version 4 → new_version is 5
         let manifest = make_stable_row_id_manifest(vec![existing_fragment]);
         let (result, _) = update_txn(vec![new_fragment])
-            .build_manifest(
-                Some(&manifest),
-                vec![],
-                "txn",
-                &ManifestWriteConfig::default().to_build_config(),
-            )
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
             .unwrap();
 
         // UPDATE branch rows (10, 11): created_at preserved from source (version 3).
@@ -7767,12 +7431,7 @@ mod tests {
 
         let manifest = make_stable_row_id_manifest(vec![existing_fragment]);
         let (result, _) = update_txn(vec![new_fragment])
-            .build_manifest(
-                Some(&manifest),
-                vec![],
-                "txn",
-                &ManifestWriteConfig::default().to_build_config(),
-            )
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
             .unwrap();
 
         // Row 50 is found in source but source has no created_at_version_meta → default 1
@@ -7807,12 +7466,7 @@ mod tests {
 
         let manifest = make_stable_row_id_manifest(vec![existing_fragment]);
         let (result, _) = update_txn(vec![new_fragment])
-            .build_manifest(
-                Some(&manifest),
-                vec![],
-                "txn",
-                &ManifestWriteConfig::default().to_build_config(),
-            )
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
             .unwrap();
 
         // Fragment starts with no row_id_meta → assign_row_ids gives it fresh IDs →
@@ -7852,12 +7506,7 @@ mod tests {
 
         let manifest = make_stable_row_id_manifest(vec![existing_fragment]);
         let (result, _) = update_txn(vec![new_fragment])
-            .build_manifest(
-                Some(&manifest),
-                vec![],
-                "txn",
-                &ManifestWriteConfig::default().to_build_config(),
-            )
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
             .unwrap();
 
         // Corrupt metadata causes decode to fail → falls back to UNKNOWN_CREATED_AT_VERSION (1)
@@ -7930,12 +7579,7 @@ mod tests {
 
         let manifest = make_stable_row_id_manifest(vec![in_range_frag, out_of_range_frag]);
         let (result, _) = update_txn(vec![new_frag])
-            .build_manifest(
-                Some(&manifest),
-                vec![],
-                "txn",
-                &ManifestWriteConfig::default().to_build_config(),
-            )
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
             .unwrap();
 
         // Both rows originate from the in-range fragment (version 5).
@@ -7982,12 +7626,7 @@ mod tests {
 
         let manifest = make_stable_row_id_manifest(vec![existing]);
         let (result, _) = update_txn(vec![new_frag])
-            .build_manifest(
-                Some(&manifest),
-                vec![],
-                "txn",
-                &ManifestWriteConfig::default().to_build_config(),
-            )
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
             .unwrap();
 
         // Boundary IDs must be found and resolved correctly
@@ -8046,12 +7685,7 @@ mod tests {
 
         let manifest = make_stable_row_id_manifest(vec![src_frag]);
         let (result, _) = update_txn(vec![new_frag])
-            .build_manifest(
-                Some(&manifest),
-                vec![],
-                "txn",
-                &ManifestWriteConfig::default().to_build_config(),
-            )
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
             .unwrap();
 
         let versions = created_at_versions(&result, 10);
@@ -8121,12 +7755,7 @@ mod tests {
         };
 
         let (result, _) = update_txn(vec![new_frag])
-            .build_manifest(
-                Some(&manifest),
-                vec![],
-                "txn",
-                &ManifestWriteConfig::default().to_build_config(),
-            )
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
             .unwrap();
 
         // Row 12 → frag A offset 2 → version 2; row 20 → frag B offset 0 → version 8
@@ -8287,7 +7916,7 @@ mod tests {
         let mut manifest = Manifest::new(
             LanceSchema::try_from(&schema).unwrap(),
             Arc::new(vec![frag0, frag1, frag2]),
-            lance_table::format::DataStorageFormat::new(ConcreteFileVersion::V2_0),
+            crate::format::DataStorageFormat::new(ConcreteFileVersion::V2_0),
             HashMap::new(),
         );
         // The pre-existing overlays were committed at v3, so the current
@@ -8313,12 +7942,7 @@ mod tests {
         );
 
         let (result, _) = txn
-            .build_manifest(
-                Some(&manifest),
-                vec![],
-                "txn",
-                &ManifestWriteConfig::default().to_build_config(),
-            )
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
             .unwrap();
 
         let frag = |id: u64| {
@@ -8374,7 +7998,7 @@ mod tests {
         let manifest = Manifest::new(
             LanceSchema::try_from(&schema).unwrap(),
             Arc::new(vec![fragment]),
-            lance_table::format::DataStorageFormat::new(ConcreteFileVersion::V2_0),
+            crate::format::DataStorageFormat::new(ConcreteFileVersion::V2_0),
             HashMap::new(),
         );
 
@@ -8390,12 +8014,7 @@ mod tests {
         );
 
         let (result, _) = txn
-            .build_manifest(
-                Some(&manifest),
-                vec![],
-                "txn",
-                &ManifestWriteConfig::default().to_build_config(),
-            )
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
             .unwrap();
 
         let frag = &result.fragments[0];
@@ -8430,7 +8049,7 @@ mod tests {
         let mut manifest = Manifest::new(
             lance_schema,
             Arc::new(vec![fragment]),
-            lance_table::format::DataStorageFormat::new(ConcreteFileVersion::V2_0),
+            crate::format::DataStorageFormat::new(ConcreteFileVersion::V2_0),
             HashMap::new(),
         );
         manifest.version = manifest_version;
@@ -8457,7 +8076,7 @@ mod tests {
             Some(&manifest),
             vec![],
             "txn",
-            &ManifestWriteConfig::default().to_build_config(),
+            &default_build_config(),
         )
         .map(|(manifest, _)| manifest.fragments[0].clone())
     }
@@ -8648,12 +8267,7 @@ mod tests {
         );
 
         let (result, _) = txn
-            .build_manifest(
-                Some(&manifest),
-                vec![],
-                "txn",
-                &ManifestWriteConfig::default().to_build_config(),
-            )
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
             .unwrap();
 
         let overlays = &result.fragments[0].overlays;
@@ -8676,12 +8290,7 @@ mod tests {
             None,
         );
         let err = txn
-            .build_manifest(
-                Some(&manifest),
-                vec![],
-                "txn",
-                &ManifestWriteConfig::default().to_build_config(),
-            )
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
             .unwrap_err();
         assert!(err.to_string().contains("does not exist"), "{err}");
     }
@@ -8750,10 +8359,10 @@ mod tests {
 
     mod mem_wal_index_coverage {
         use super::*;
-        use lance_index::mem_wal::{
+        use crate::system_index::mem_wal::{
             CompactedSsTable, IndexCatchupProgress, MEM_WAL_INDEX_NAME, MemWalIndexDetails,
         };
-        use lance_table::feature_flags::FLAG_MEM_WAL_INDEX_CATCHUP;
+        use crate::feature_flags::FLAG_MEM_WAL_INDEX_CATCHUP;
 
         fn user_index(name: &str, uuid: Uuid, frags: &[u32]) -> IndexMetadata {
             IndexMetadata {
@@ -8771,7 +8380,7 @@ mod tests {
         }
 
         fn mem_wal_index(details: MemWalIndexDetails) -> IndexMetadata {
-            crate::index::mem_wal::new_mem_wal_index_meta(1, details).unwrap()
+            crate::system_index::mem_wal::new_mem_wal_index_meta(1, details).unwrap()
         }
 
         fn coverage_for(indices: &[IndexMetadata], name: &str) -> Option<Vec<CompactedSsTable>> {
@@ -9361,7 +8970,7 @@ mod tests {
                         Some(&current),
                         vec![mem_wal_index(MemWalIndexDetails::default())],
                         "txn",
-                        &ManifestWriteConfig::default().to_build_config(),
+                        &default_build_config(),
                     )
                     .unwrap_err();
 
@@ -9382,7 +8991,7 @@ mod tests {
                     Some(&current),
                     vec![mem_wal_index(MemWalIndexDetails::default())],
                     "txn",
-                    &ManifestWriteConfig::default().to_build_config(),
+                    &default_build_config(),
                 )
                 .unwrap();
 
