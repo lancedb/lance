@@ -1505,17 +1505,20 @@ impl DirectoryNamespace {
             .uri)
     }
 
-    /// Resolves a branch to its `(uri, object-store path)` for `create_table_version`.
+    /// Resolves a branch to its `(uri, object-store path, parent_version)` for
+    /// `create_table_version`.
     ///
     /// `BranchContents` is the source of truth, so check the ref first: a
-    /// registered branch commits directly. With no ref, accept the commit only on
-    /// an empty chain (the `create_branch` bootstrap, whose first commit precedes
-    /// its ref); reject a chain that already holds committed versions as a zombie.
+    /// registered branch commits directly and returns its `parent_version` for
+    /// empty-chain CAS. With no ref, accept the commit only on an empty chain
+    /// (the `create_branch` bootstrap, whose first commit precedes its ref) and
+    /// return `parent_version = None`; reject a chain that already holds
+    /// committed versions as a zombie.
     async fn resolve_branch_for_commit(
         &self,
         table_uri: &str,
         branch: &str,
-    ) -> Result<(String, Path)> {
+    ) -> Result<(String, Path, Option<u64>)> {
         let main = self
             .configured_builder(table_uri)
             .load()
@@ -1526,7 +1529,11 @@ impl DirectoryNamespace {
             })?;
         let branch_location = main.branch_location().find_branch(Some(branch))?;
         match main.branches().get(branch).await {
-            Ok(_) => Ok((branch_location.uri, branch_location.path)),
+            Ok(contents) => Ok((
+                branch_location.uri,
+                branch_location.path,
+                Some(contents.parent_version),
+            )),
             Err(lance_core::Error::RefNotFound { .. }) => {
                 if self
                     .branch_has_committed_versions(&branch_location.path)
@@ -1540,7 +1547,7 @@ impl DirectoryNamespace {
                     }
                     .into());
                 }
-                Ok((branch_location.uri, branch_location.path))
+                Ok((branch_location.uri, branch_location.path, None))
             }
             Err(e) => Err(e),
         }
@@ -1747,17 +1754,21 @@ impl DirectoryNamespace {
         ))
     }
 
-    /// Enforce version CAS: requested version must be `latest + 1` (or `1` if empty).
+    /// Enforce version CAS: requested version must be `latest + 1` (or bootstrap).
     ///
-    /// A branch's first commit is its fork version, which may be greater than 1
-    /// (e.g. forking main at v2), so an empty branch chain accepts the requested
-    /// version as its bootstrap. An empty *main* chain must still start at v1.
+    /// Empty-chain bootstrap:
+    /// - main must start at v1
+    /// - a registered branch must start at `BranchContents.parent_version` (the
+    ///   shallow-clone fork version, which may be > 1)
+    /// - an unregistered branch (create_branch phase-1, ref not written yet)
+    ///   accepts the requested version because `parent_version` is not known yet
     async fn enforce_create_table_version_cas(
         &self,
         table_path: &Path,
         version: u64,
         table_uri: &str,
         is_branch: bool,
+        branch_parent_version: Option<u64>,
     ) -> Result<()> {
         let latest = self.list_versions_under(table_path, true, Some(1)).await?;
         let expected = match latest.first() {
@@ -1770,11 +1781,14 @@ impl DirectoryNamespace {
                     ),
                 })
             })?,
-            // Empty chain: main starts at v1, but a branch bootstraps at its fork
-            // version which can be > 1.
             None => {
                 if is_branch {
-                    version
+                    // Prefer BranchContents.parent_version when the ref exists so a
+                    // branch forked at v5 cannot bootstrap at an arbitrary version.
+                    match branch_parent_version {
+                        Some(parent_version) => parent_version,
+                        None => version,
+                    }
                 } else {
                     1
                 }
@@ -2785,86 +2799,6 @@ impl DirectoryNamespace {
         not_found.into()
     }
 
-    async fn put_marker_file_atomic(
-        &self,
-        path: &Path,
-        file_description: &str,
-    ) -> std::result::Result<(), String> {
-        // Some object stores implement `PutMode::Create` using a temp+rename
-        // that reuses the final basename. Dotfile targets such as
-        // `.lance-reserved` therefore produce temp names containing `..`,
-        // which these stores reject. Stage under a non-dot sibling, then claim
-        // the final path with rename_if_not_exists (conditional no-replace
-        // rename) so Create semantics are preserved without changing the store.
-        let staging_name = format!("lance-marker.staging.{}", uuid::Uuid::new_v4().simple());
-        let path_str = path.as_ref();
-        let staging_path = match path_str.rfind('/') {
-            Some(idx) => Path::from(format!("{}/{}", &path_str[..idx], staging_name)),
-            None => Path::from(staging_name.as_str()),
-        };
-
-        // Some object stores write via temp+rename and may not flush empty
-        // objects through to the underlying filesystem, so the conditional
-        // rename can fail with NotFound. Use a tiny non-empty payload.
-        self.object_store
-            .inner
-            .put(&staging_path, bytes::Bytes::from_static(b"reserved").into())
-            .await
-            .map_err(|e| format!("Failed to stage {}: {:?}", file_description, e))?;
-
-        let publish_result = match self
-            .object_store
-            .inner
-            .rename_if_not_exists(&staging_path, path)
-            .await
-        {
-            Ok(()) => Ok(()),
-            Err(ObjectStoreError::NotImplemented { .. })
-            | Err(ObjectStoreError::NotSupported { .. }) => {
-                let result = self
-                    .object_store
-                    .inner
-                    .put_opts(
-                        path,
-                        bytes::Bytes::from_static(b"reserved").into(),
-                        PutOptions {
-                            mode: PutMode::Create,
-                            ..Default::default()
-                        },
-                    )
-                    .await
-                    .map(|_| ());
-                if let Err(e) = self.object_store.inner.delete(&staging_path).await {
-                    log::warn!(
-                        "Failed to delete staging marker at '{}': {:?}",
-                        staging_path,
-                        e
-                    );
-                }
-                result
-            }
-            Err(e) => {
-                if let Err(del_err) = self.object_store.inner.delete(&staging_path).await {
-                    log::warn!(
-                        "Failed to delete staging marker at '{}': {:?}",
-                        staging_path,
-                        del_err
-                    );
-                }
-                Err(e)
-            }
-        };
-
-        match publish_result {
-            Ok(()) => Ok(()),
-            Err(ObjectStoreError::AlreadyExists { .. })
-            | Err(ObjectStoreError::Precondition { .. }) => {
-                Err(format!("{} already exists", file_description))
-            }
-            Err(e) => Err(format!("Failed to create {}: {:?}", file_description, e)),
-        }
-    }
-
     /// Get storage options for a table, using credential vending if configured.
     ///
     /// If credential vendor properties are configured and the table location matches
@@ -3612,17 +3546,21 @@ impl LanceNamespace for DirectoryNamespace {
         // concurrent declare_table calls.
         let reserved_file_path = self.table_reserved_file_path(&table_name);
 
-        self.put_marker_file_atomic(&reserved_file_path, &format!("table {}", table_name))
-            .await
-            .map_err(|e| {
-                if e.contains("already exists") {
-                    lance_core::Error::from(NamespaceError::TableAlreadyExists {
-                        message: table_name.to_string(),
-                    })
-                } else {
-                    lance_core::Error::from(NamespaceError::Internal { message: e })
-                }
-            })?;
+        put_marker_file_atomic(
+            &self.object_store,
+            &reserved_file_path,
+            &format!("table {}", table_name),
+        )
+        .await
+        .map_err(|e| {
+            if e.contains("already exists") {
+                lance_core::Error::from(NamespaceError::TableAlreadyExists {
+                    message: table_name.to_string(),
+                })
+            } else {
+                lance_core::Error::from(NamespaceError::Internal { message: e })
+            }
+        })?;
 
         // For backwards compatibility, only skip vending credentials when explicitly set to false
         let vend_credentials = request.vend_credentials.unwrap_or(true);
@@ -3699,7 +3637,8 @@ impl LanceNamespace for DirectoryNamespace {
         // If a race occurs and another process already created the file,
         // we'll get an AlreadyExists error which we convert to a proper message.
         let deregistered_path = self.table_deregistered_file_path(&table_name);
-        self.put_marker_file_atomic(
+        put_marker_file_atomic(
+            &self.object_store,
             &deregistered_path,
             &format!("deregistration marker for table {}", table_name),
         )
@@ -3907,11 +3846,11 @@ impl LanceNamespace for DirectoryNamespace {
         self.record_op("create_table_version");
         let branch = Self::normalized_branch(request.branch.as_deref())?;
         let table_uri = self.resolve_table_location(&request.id).await?;
-        let (table_uri, table_path) = match branch {
+        let (table_uri, table_path, branch_parent_version) = match branch {
             Some(b) => self.resolve_branch_for_commit(&table_uri, b).await?,
             None => {
                 let table_path = self.object_store_path_from_uri(&table_uri)?;
-                (table_uri, table_path)
+                (table_uri, table_path, None)
             }
         };
 
@@ -3962,11 +3901,17 @@ impl LanceNamespace for DirectoryNamespace {
             }
         }
 
-        // Strict CAS: only allow appending latest+1 (or version 1 on an empty main
-        // chain; an empty branch chain bootstraps at its fork version).
+        // Strict CAS: only allow appending latest+1 (or the empty-chain bootstrap
+        // version: v1 on main, BranchContents.parent_version on a registered branch).
         let is_branch = branch.is_some();
-        self.enforce_create_table_version_cas(&table_path, version, &table_uri, is_branch)
-            .await?;
+        self.enforce_create_table_version_cas(
+            &table_path,
+            version,
+            &table_uri,
+            is_branch,
+            branch_parent_version,
+        )
+        .await?;
 
         // Materialize with Create / copy_if_not_exists only — never overwrite.
         let copy_result = self
@@ -5787,6 +5732,84 @@ impl LanceNamespace for DirectoryNamespace {
 
     fn namespace_id(&self) -> String {
         format!("DirectoryNamespace {{ root: {:?} }}", self.root)
+    }
+}
+
+/// Atomically create a marker file (e.g. `.lance-reserved`) with Create semantics.
+///
+/// Some object stores implement `PutMode::Create` via temp+rename that reuses the
+/// final basename. Dotfile targets such as `.lance-reserved` therefore produce
+/// temp names containing `..`, which these stores reject. Stage under a non-dot
+/// sibling, then claim the final path with `rename_if_not_exists`.
+///
+/// Some object stores also fail to flush empty objects, so the conditional rename
+/// can fail with NotFound. Use a tiny non-empty payload.
+pub(crate) async fn put_marker_file_atomic(
+    object_store: &ObjectStore,
+    path: &Path,
+    file_description: &str,
+) -> std::result::Result<(), String> {
+    let staging_name = format!("lance-marker.staging.{}", uuid::Uuid::new_v4().simple());
+    let path_str = path.as_ref();
+    let staging_path = match path_str.rfind('/') {
+        Some(idx) => Path::from(format!("{}/{}", &path_str[..idx], staging_name)),
+        None => Path::from(staging_name.as_str()),
+    };
+
+    object_store
+        .inner
+        .put(&staging_path, bytes::Bytes::from_static(b"reserved").into())
+        .await
+        .map_err(|e| format!("Failed to stage {}: {:?}", file_description, e))?;
+
+    let publish_result = match object_store
+        .inner
+        .rename_if_not_exists(&staging_path, path)
+        .await
+    {
+        Ok(()) => Ok(()),
+        Err(ObjectStoreError::NotImplemented { .. })
+        | Err(ObjectStoreError::NotSupported { .. }) => {
+            let result = object_store
+                .inner
+                .put_opts(
+                    path,
+                    bytes::Bytes::from_static(b"reserved").into(),
+                    PutOptions {
+                        mode: PutMode::Create,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map(|_| ());
+            if let Err(e) = object_store.inner.delete(&staging_path).await {
+                log::warn!(
+                    "Failed to delete staging marker at '{}': {:?}",
+                    staging_path,
+                    e
+                );
+            }
+            result
+        }
+        Err(e) => {
+            if let Err(del_err) = object_store.inner.delete(&staging_path).await {
+                log::warn!(
+                    "Failed to delete staging marker at '{}': {:?}",
+                    staging_path,
+                    del_err
+                );
+            }
+            Err(e)
+        }
+    };
+
+    match publish_result {
+        Ok(()) => Ok(()),
+        Err(ObjectStoreError::AlreadyExists { .. })
+        | Err(ObjectStoreError::Precondition { .. }) => {
+            Err(format!("{} already exists", file_description))
+        }
+        Err(e) => Err(format!("Failed to create {}: {:?}", file_description, e)),
     }
 }
 
@@ -10867,6 +10890,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_declare_table_with_manifest_marker_already_exists() {
+        // Pre-existing .lance-reserved (concurrent/incomplete declare) must map to
+        // TableAlreadyExists, not Internal.
+        use lance_namespace::error::ErrorCode;
+        use lance_namespace::models::DeclareTableRequest;
+
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+
+        let namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .manifest_enabled(true)
+            .dir_listing_enabled(true)
+            .build()
+            .await
+            .unwrap();
+
+        let table_dir = temp_dir.join("test_table.lance");
+        std::fs::create_dir_all(&table_dir).unwrap();
+        std::fs::write(table_dir.join(".lance-reserved"), b"reserved").unwrap();
+
+        let mut declare_req = DeclareTableRequest::new();
+        declare_req.id = Some(vec!["test_table".to_string()]);
+        let err = namespace
+            .declare_table(declare_req)
+            .await
+            .expect_err("declare with existing marker must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("already exists") || msg.contains("TableAlreadyExists"),
+            "expected TableAlreadyExists, got: {msg}"
+        );
+        assert_eq!(
+            mutation_error_code(err),
+            ErrorCode::TableAlreadyExists,
+            "expected TableAlreadyExists error code"
+        );
+    }
+
+    #[tokio::test]
     async fn test_declare_table_when_table_exists() {
         use lance_namespace::models::DeclareTableRequest;
 
@@ -12038,6 +12100,135 @@ mod tests {
             msg.contains("CAS") || msg.contains("ConcurrentModification"),
             "expected CAS ConcurrentModification, got: {msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_create_table_version_branch_cas_requires_parent_version() {
+        // Empty branch chain with BranchContents must bootstrap at parent_version,
+        // not an arbitrary version (e.g. 1 when forked from v2).
+        use futures::TryStreamExt;
+        use lance_namespace::models::CreateTableVersionRequest;
+
+        let (namespace, _temp_dir) = create_test_namespace().await;
+        create_scalar_table(&namespace, "users").await;
+        let main_uri = open_dataset(&namespace, "users").await.uri().to_string();
+        append_scalar_version(&main_uri, 10).await; // main -> v2
+
+        let mut main = open_dataset(&namespace, "users").await;
+        let fork_version = main.version().version;
+        assert_eq!(fork_version, 2);
+        let branch_uri = main
+            .create_branch("exp", fork_version, None)
+            .await
+            .unwrap()
+            .uri()
+            .to_string();
+
+        let branch_ds = Dataset::open(&branch_uri).await.unwrap();
+        let versions_dir = branch_ds.versions_dir();
+        let store = branch_ds.object_store(None).await.unwrap();
+        let manifests: Vec<_> = store
+            .inner
+            .list(Some(&versions_dir))
+            .try_collect()
+            .await
+            .unwrap();
+        for meta in &manifests {
+            if meta
+                .location
+                .filename()
+                .is_some_and(|f| f.ends_with(".manifest"))
+            {
+                store.inner.delete(&meta.location).await.unwrap();
+            }
+        }
+        // Confirm the branch object-store chain is empty (do not open the dataset:
+        // with no manifests, Dataset::open would fail).
+        let remaining_manifests = store
+            .inner
+            .list(Some(&versions_dir))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|m| {
+                m.location
+                    .filename()
+                    .is_some_and(|f| f.ends_with(".manifest"))
+            })
+            .count();
+        assert_eq!(
+            remaining_manifests, 0,
+            "branch version chain should be empty after deleting manifests"
+        );
+
+        // Stage bytes from a main manifest.
+        let main_ds = open_dataset(&namespace, "users").await;
+        let main_versions = main_ds.versions_dir();
+        let main_store = main_ds.object_store(None).await.unwrap();
+        let source_meta = main_store
+            .inner
+            .list(Some(&main_versions))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|m| {
+                m.location
+                    .filename()
+                    .is_some_and(|f| f.ends_with(".manifest"))
+            })
+            .expect("main should have a manifest");
+        let source_bytes = main_store
+            .inner
+            .get(&source_meta.location)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+
+        let staging_wrong = versions_dir.clone().join("staging_wrong");
+        store
+            .inner
+            .put(&staging_wrong, source_bytes.clone().into())
+            .await
+            .unwrap();
+        let err = namespace
+            .create_table_version(CreateTableVersionRequest {
+                id: Some(vec!["users".to_string()]),
+                version: 1,
+                manifest_path: staging_wrong.to_string(),
+                naming_scheme: Some("V2".to_string()),
+                branch: Some("exp".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect_err("bootstrap at v1 must fail when parent_version is 2");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("CAS") || msg.contains("ConcurrentModification"),
+            "expected CAS ConcurrentModification, got: {msg}"
+        );
+
+        let staging_ok = versions_dir.join("staging_ok");
+        store
+            .inner
+            .put(&staging_ok, source_bytes.into())
+            .await
+            .unwrap();
+        let resp = namespace
+            .create_table_version(CreateTableVersionRequest {
+                id: Some(vec!["users".to_string()]),
+                version: 2,
+                manifest_path: staging_ok.to_string(),
+                naming_scheme: Some("V2".to_string()),
+                branch: Some("exp".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("bootstrap at parent_version must succeed");
+        assert_eq!(resp.version.as_ref().map(|v| v.version), Some(2));
     }
 
     #[tokio::test]
