@@ -35,7 +35,7 @@ use lance_table::format::IndexMetadata;
 
 use super::PreFilterSource;
 use super::utils::{IndexMetrics, build_prefilter};
-use crate::index::scalar::inverted::{load_segment_details, load_segments};
+use crate::index::scalar::inverted::load_segments;
 use crate::{Dataset, index::DatasetIndexInternalExt};
 use lance_index::metrics::{
     AND_CANDIDATES_PRUNED_BEFORE_RETURN_METRIC, AND_CANDIDATES_SEEN_METRIC, AND_FULL_SCORES_METRIC,
@@ -90,12 +90,50 @@ async fn open_fts_segments(
     segments: &[IndexMetadata],
     metrics: &IndexMetrics,
 ) -> Result<Vec<Arc<InvertedIndex>>> {
-    try_join_all(
+    let indices = try_join_all(
         segments
             .iter()
             .map(|segment| open_fts_segment(dataset, column, segment, metrics)),
     )
-    .await
+    .await?;
+    validate_fts_segment_params(column, segments, &indices)?;
+    Ok(indices)
+}
+
+/// Validate complete persisted FTS parameters after opening all segments.
+///
+/// The opened indices are authoritative for query semantics and already carry
+/// their persisted params. Comparing them here includes fields omitted from
+/// manifest details, such as custom stop words, without reading index metadata
+/// separately from the scalar-index cache.
+fn validate_fts_segment_params(
+    column: &str,
+    segments: &[IndexMetadata],
+    indices: &[Arc<InvertedIndex>],
+) -> Result<()> {
+    if segments.len() != indices.len() {
+        return Err(Error::invalid_input(format!(
+            "FTS index for column {} resolved {} segments but opened {} indices",
+            column,
+            segments.len(),
+            indices.len()
+        )));
+    }
+    let Some((expected_segment, expected_index)) = segments.first().zip(indices.first()) else {
+        return Err(Error::invalid_input(format!(
+            "FTS index for column {} requires at least one segment",
+            column
+        )));
+    };
+    for (segment, index) in segments.iter().zip(indices).skip(1) {
+        if index.params() != expected_index.params() {
+            return Err(Error::invalid_input(format!(
+                "FTS index {} has inconsistent inverted index parameters across segments {} and {}",
+                segment.name, expected_segment.uuid, segment.uuid
+            )));
+        }
+    }
+    Ok(())
 }
 
 async fn search_segments(
@@ -622,7 +660,6 @@ impl ExecutionPlan for MatchQueryExec {
             let segments = segment_selection
                 .resolve(&ds, &column, &metrics.segment_bind_duration)
                 .await?;
-            let _details = load_segment_details(&ds, &column, &segments).await?;
             let indices =
                 open_fts_segments(&ds, &column, &segments, &metrics.index_metrics).await?;
 
@@ -732,9 +769,9 @@ pub struct FlatMatchFilterExec {
     query: MatchQuery,
     params: FtsSearchParams,
     /// Optional pre-resolved segment list. See
-    /// [`MatchQueryExec::new_with_segments`]. `FlatMatchFilterExec` only
-    /// uses the first segment's tokenizer, but the full list is preserved so
-    /// the field round-trips through `with_new_children`.
+    /// [`MatchQueryExec::new_with_segments`]. All segments are opened to
+    /// validate their complete persisted params before using the first
+    /// segment's tokenizer.
     preset_segments: Option<Vec<IndexMetadata>>,
 
     metrics: ExecutionPlanMetricsSet,
@@ -770,15 +807,14 @@ impl FlatMatchFilterExec {
         metrics: &IndexMetrics,
     ) -> DataFusionResult<Box<dyn LanceTokenizer>> {
         if let Some(segments) = load_segments(dataset, column).await? {
-            let index_meta = segments.first().ok_or_else(|| {
+            let indices = open_fts_segments(dataset, column, &segments, metrics).await?;
+            let index = indices.first().ok_or_else(|| {
                 DataFusionError::Execution(format!(
                     "FTS index for column {} has no segments",
                     column
                 ))
             })?;
-            return Ok(open_fts_segment(dataset, column, index_meta, metrics)
-                .await?
-                .tokenizer());
+            return Ok(index.tokenizer());
         }
         Ok(default_text_tokenizer())
     }
@@ -789,12 +825,11 @@ impl FlatMatchFilterExec {
         segments: &[IndexMetadata],
         metrics: &IndexMetrics,
     ) -> DataFusionResult<Box<dyn LanceTokenizer>> {
-        let index_meta = segments.first().ok_or_else(|| {
+        let indices = open_fts_segments(dataset, column, segments, metrics).await?;
+        let index = indices.first().ok_or_else(|| {
             DataFusionError::Execution(format!("FTS index for column {} has no segments", column))
         })?;
-        Ok(open_fts_segment(dataset, column, index_meta, metrics)
-            .await?
-            .tokenizer())
+        Ok(index.tokenizer())
     }
 
     pub fn new(
@@ -813,9 +848,9 @@ impl FlatMatchFilterExec {
         }
     }
 
-    /// See [`MatchQueryExec::new_with_segments`]. `FlatMatchFilterExec`
-    /// uses the first segment's tokenizer; the rest are kept for caller-side
-    /// bookkeeping.
+    /// See [`MatchQueryExec::new_with_segments`]. The first segment supplies
+    /// the tokenizer after every segment's complete params have been
+    /// validated.
     pub fn new_with_segments(
         input: Arc<dyn ExecutionPlan>,
         dataset: Arc<Dataset>,
@@ -1201,7 +1236,6 @@ impl ExecutionPlan for FlatMatchQueryExec {
             };
             let (tokenizer, base_scorer) = match segments {
                 Some(segments) => {
-                    let _details = load_segment_details(&ds, &column, &segments).await?;
                     let indices =
                         open_fts_segments(&ds, &column, &segments, &metrics.index_metrics).await?;
                     metrics.record_parts_searched(
@@ -1538,7 +1572,6 @@ impl ExecutionPlan for PhraseQueryExec {
             let segments = segment_selection
                 .resolve(&ds, &column, &metrics.segment_bind_duration)
                 .await?;
-            let _details = load_segment_details(&ds, &column, &segments).await?;
             let indices =
                 open_fts_segments(&ds, &column, &segments, &metrics.index_metrics).await?;
 
