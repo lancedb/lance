@@ -56,7 +56,7 @@ pub struct UpdateMap {
 }
 
 /// Helper function to apply UpdateMap changes to a HashMap<String, String>
-pub(crate) fn apply_update_map(
+pub(super) fn apply_update_map(
     target: &mut std::collections::HashMap<String, String>,
     update_map: &UpdateMap,
 ) {

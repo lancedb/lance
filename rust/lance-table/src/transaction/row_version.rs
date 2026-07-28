@@ -55,7 +55,7 @@ fn resolve_created_at_version(
 
 /// For each new fragment produced by an update, set `created_at_version_meta`
 /// (preserved from the original rows) and `last_updated_at_version_meta`.
-pub(crate) fn resolve_update_version_metadata(
+pub(super) fn resolve_update_version_metadata(
     existing_fragments: &[Fragment],
     new_fragments: &mut [Fragment],
     new_version: u64,
@@ -213,7 +213,7 @@ fn encode_version_runs(versions: &[u64]) -> Vec<RowDatasetVersionRun> {
 
 impl Transaction {
     /// collect the pure(the num of row IDs are equal to the physical rows) "rewrite rows" updated fragment ids
-    pub(crate) fn collect_pure_rewrite_row_update_frags_ids(
+    pub(super) fn collect_pure_rewrite_row_update_frags_ids(
         fragments: &[Fragment],
     ) -> Result<Vec<u64>> {
         let mut pure_update_frag_ids = Vec::new();
@@ -244,7 +244,7 @@ impl Transaction {
         Ok(pure_update_frag_ids)
     }
 
-    pub(crate) fn assign_row_ids(next_row_id: &mut u64, fragments: &mut [Fragment]) -> Result<()> {
+    pub(super) fn assign_row_ids(next_row_id: &mut u64, fragments: &mut [Fragment]) -> Result<()> {
         for fragment in fragments {
             let physical_rows = fragment
                 .physical_rows

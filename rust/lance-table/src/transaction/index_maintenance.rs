@@ -20,7 +20,7 @@ use roaring::RoaringBitmap;
 use std::collections::{HashMap, HashSet};
 
 impl Transaction {
-    pub(crate) fn register_pure_rewrite_rows_update_frags_in_indices(
+    pub(super) fn register_pure_rewrite_rows_update_frags_in_indices(
         indices: &mut [IndexMetadata],
         pure_update_frag_ids: &[u64],
         original_fragment_ids: &[u64],
@@ -129,7 +129,7 @@ impl Transaction {
     /// only drops indices for *removed* fields, so without this the index keeps
     /// covering the rewritten fragments with stale entries. Remove each such fragment
     /// from any index covering a field whose backing data file changed.
-    pub(crate) fn prune_merge_rewritten_fields_from_indices(
+    pub(super) fn prune_merge_rewritten_fields_from_indices(
         indices: &mut [IndexMetadata],
         prev_fragments: &[Fragment],
         new_fragments: &[Fragment],
@@ -170,7 +170,7 @@ impl Transaction {
     /// fragment no longer signals that staleness to the query path. Drop each
     /// rewritten (new) fragment from the coverage of any index covering a field
     /// such an overlay supplied, so those rows fall back to a flat scan.
-    pub(crate) fn prune_overlay_stale_fields_from_indices(
+    pub(super) fn prune_overlay_stale_fields_from_indices(
         indices: &mut [IndexMetadata],
         groups: &[RewriteGroup],
     ) {
@@ -296,7 +296,7 @@ impl Transaction {
         });
     }
 
-    pub(crate) fn recalculate_fragment_bitmap(
+    pub(super) fn recalculate_fragment_bitmap(
         old: &RoaringBitmap,
         groups: &[RewriteGroup],
     ) -> Result<RoaringBitmap> {
@@ -330,7 +330,7 @@ impl Transaction {
         Ok(new_bitmap)
     }
 
-    pub(crate) fn handle_rewrite_indices(
+    pub(super) fn handle_rewrite_indices(
         indices: &mut [IndexMetadata],
         rewritten_indices: &[RewrittenIndex],
         groups: &[RewriteGroup],
@@ -371,7 +371,7 @@ impl Transaction {
         Ok(())
     }
 
-    pub(crate) fn handle_rewrite_fragments(
+    pub(super) fn handle_rewrite_fragments(
         final_fragments: &mut Vec<Fragment>,
         groups: &[RewriteGroup],
         fragment_id: &mut u64,
