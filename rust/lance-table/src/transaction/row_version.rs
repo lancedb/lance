@@ -19,7 +19,6 @@ use crate::transaction::Transaction;
 use lance_core::{Error, Result};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 
 /// Fallback version for rows whose original creation version cannot be determined.
 /// Version 1 is the initial dataset version in the Lance format.
@@ -326,6 +325,7 @@ mod tests {
         created_at_versions, default_build_config, last_updated_at_versions,
         make_stable_row_id_manifest, update_txn,
     };
+    use std::sync::Arc;
 
     #[test]
     fn test_assign_row_ids_new_fragment() {
