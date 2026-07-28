@@ -10,7 +10,7 @@ use lance_core::{Error, Result, datatypes::Field, utils::bit::pad_bytes};
 
 use crate::{
     buffer::LanceBuffer,
-    compression::CompressionStrategy,
+    compression::{CompressionStrategy, compress_required_block},
     data::{BlockInfo, DataBlock, FixedWidthDataBlock},
     decoder::PageEncoding,
     encoder::EncodedPage,
@@ -588,8 +588,7 @@ fn encode_u64_values(
     });
     block.compute_stat();
     let field = Field::new_arrow("", arrow_schema::DataType::UInt64, false)?;
-    let (compressor, encoding) = compression_strategy.create_block_compressor(&field, &block)?;
-    Ok((compressor.compress(block)?, encoding))
+    compress_required_block(compression_strategy, &field, block)
 }
 
 fn positions_to_deltas(positions: &[u64], label: &str) -> Result<Vec<u64>> {
@@ -887,8 +886,9 @@ mod tests {
 
     use crate::{
         constants::{
-            PACKED_STRUCT_META_KEY, STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY,
-            STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_SPARSE,
+            COMPRESSION_META_KEY, PACKED_STRUCT_META_KEY, STRUCTURAL_ENCODING_FULLZIP,
+            STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK,
+            STRUCTURAL_ENCODING_SPARSE,
         },
         data::FixedSizeListBlock,
         encoder::{
@@ -1543,6 +1543,62 @@ mod tests {
             .with_range(1..5)
             .with_indices(vec![0, 2, 4]);
         check_round_trip_encoding_of_data(vec![array], &cases, sparse_metadata()).await;
+    }
+
+    #[tokio::test]
+    async fn test_v2_3_sparse_variable_values_keep_legacy_flat_offsets() {
+        let num_values = 4_096;
+        let values = Arc::new(StringArray::from_iter_values((0..num_values).map(
+            |index| {
+                let length = [4_usize, 10, 5, 8][index % 4];
+                format!("{index:04x}{}", "x".repeat(length - 4))
+            },
+        ))) as ArrayRef;
+        let array =
+            sparse_list_values(
+                num_values * 2,
+                2,
+                values,
+                Arc::new(ArrowField::new("item", DataType::Utf8, true).with_metadata(
+                    HashMap::from([(COMPRESSION_META_KEY.to_string(), "none".to_string())]),
+                )),
+            );
+        let metadata = sparse_metadata();
+        let pages = encode_pages(array.clone(), LanceFileVersion::V2_3, metadata.clone())
+            .await
+            .unwrap();
+        assert_eq!(pages.len(), 1);
+        let sparse = sparse_layout(&pages[0]);
+        assert_eq!(sparse.num_buffers, 1);
+        let Some(pb21::compressive_encoding::Compression::Variable(variable)) = sparse
+            .value_compression
+            .as_ref()
+            .and_then(|encoding| encoding.compression.as_ref())
+        else {
+            panic!(
+                "expected sparse variable value compression, got {:?}",
+                sparse.value_compression
+            );
+        };
+        assert!(variable.values.is_none());
+        assert!(matches!(
+            variable
+                .offsets
+                .as_deref()
+                .and_then(|offsets| offsets.compression.as_ref()),
+            Some(pb21::compressive_encoding::Compression::Flat(pb21::Flat {
+                bits_per_value: 32,
+                data: None,
+            }))
+        ));
+
+        let cases = TestCases::default()
+            .with_min_file_version(LanceFileVersion::V2_3)
+            .with_max_file_version(LanceFileVersion::V2_3)
+            .with_page_sizes(vec![1])
+            .with_range(1..17)
+            .with_indices(vec![0, 7, (num_values * 2 - 1) as u64]);
+        check_round_trip_encoding_of_data(vec![array], &cases, metadata).await;
     }
 
     #[tokio::test]

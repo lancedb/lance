@@ -15,6 +15,7 @@ use core::panic;
 
 use crate::compression::{
     BlockCompressor, BlockDecompressor, MiniBlockDecompressor, VariablePerValueDecompressor,
+    require_block_payload,
 };
 
 use crate::buffer::LanceBuffer;
@@ -275,20 +276,35 @@ impl BinaryMiniBlockDecompressor {
         Self { bits_per_offset }
     }
 
-    pub fn from_variable(variable: &pb21::Variable) -> Self {
-        if let Compression::Flat(flat) = variable
+    pub fn from_variable(variable: &pb21::Variable) -> Result<Self> {
+        if variable.values.is_some() {
+            return Err(Error::invalid_input(
+                "Binary mini-block Variable values encoding must be absent",
+            ));
+        }
+        let offsets = variable
             .offsets
             .as_ref()
-            .unwrap()
+            .ok_or_else(|| Error::invalid_input("Variable encoding is missing offsets"))?;
+        let compression = offsets
             .compression
             .as_ref()
-            .unwrap()
-        {
-            Self {
-                bits_per_offset: flat.bits_per_value as u8,
+            .ok_or_else(|| Error::invalid_input("Variable offsets are missing compression"))?;
+        match compression {
+            Compression::Flat(flat)
+                if matches!(flat.bits_per_value, 32 | 64) && flat.data.is_none() =>
+            {
+                Ok(Self {
+                    bits_per_offset: flat.bits_per_value as u8,
+                })
             }
-        } else {
-            panic!("Unsupported offsets compression: {:?}", variable.offsets);
+            Compression::Flat(flat) => Err(Error::invalid_input(format!(
+                "Variable offsets require uncompressed 32 or 64-bit Flat encoding, got {} bits",
+                flat.bits_per_value
+            ))),
+            other => Err(Error::invalid_input(format!(
+                "Unsupported legacy variable offset compression: {other:?}"
+            ))),
         }
     }
 }
@@ -361,7 +377,7 @@ impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
 pub struct VariableEncoder {}
 
 impl BlockCompressor for VariableEncoder {
-    fn compress(&self, mut data: DataBlock) -> Result<LanceBuffer> {
+    fn compress(&self, mut data: DataBlock) -> Result<Option<LanceBuffer>> {
         match data {
             DataBlock::VariableWidth(ref mut variable_width_data) => {
                 match variable_width_data.bits_per_offset {
@@ -413,18 +429,17 @@ impl BlockCompressor for VariableEncoder {
                         output.extend_from_slice(&variable_width_data.data);
                         Ok(LanceBuffer::from(output))
                     }
-                    _ => {
-                        panic!(
-                            "BinaryBlockEncoder does not work with {} bits per offset VariableWidth DataBlock.",
-                            variable_width_data.bits_per_offset
-                        );
-                    }
+                    _ => Err(Error::invalid_input(format!(
+                        "BinaryBlockEncoder does not support {}-bit offsets",
+                        variable_width_data.bits_per_offset
+                    ))),
                 }
             }
-            _ => {
-                panic!("BinaryBlockEncoder can only work with Variable Width DataBlock.");
-            }
+            _ => Err(Error::invalid_input(
+                "BinaryBlockEncoder requires a variable-width block",
+            )),
         }
+        .map(Some)
     }
 }
 
@@ -455,7 +470,8 @@ impl VariablePerValueDecompressor for VariableDecoder {
 pub struct BinaryBlockDecompressor {}
 
 impl BlockDecompressor for BinaryBlockDecompressor {
-    fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
+    fn decompress(&self, data: Option<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
+        let data = require_block_payload(data, "Binary block")?;
         // In older (not quite stable) versions we stored the bits per offset as a single byte and then the num_values
         // as four bytes.  However, this led to alignment problems and was wasteful since we already store the num_values
         // in higher layers.

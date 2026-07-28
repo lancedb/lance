@@ -16,7 +16,7 @@
 //! we can easily jump to the correct value.
 
 use arrow_array::types::UInt64Type;
-use arrow_array::{Array, PrimitiveArray};
+use arrow_array::{Array, PrimitiveArray, UInt64Array};
 use arrow_buffer::ArrowNativeType;
 use byteorder::{ByteOrder, LittleEndian};
 use lance_bitpacking::BitPacking;
@@ -24,7 +24,13 @@ use lance_bitpacking::BitPacking;
 use lance_core::{Error, Result};
 
 use crate::buffer::LanceBuffer;
-use crate::compression::{BlockCompressor, BlockDecompressor, MiniBlockDecompressor};
+use crate::compression::{
+    BlockCompressor, BlockDecompressor, BlockValueType, MiniBlockDecompressor,
+    block::{
+        validate_inline_bitpacking_payload, validate_out_of_line_payload, visit_unsigned_values,
+    },
+    require_block_payload,
+};
 use crate::data::BlockInfo;
 use crate::data::{DataBlock, FixedWidthDataBlock};
 use crate::encodings::logical::primitive::miniblock::{
@@ -34,9 +40,16 @@ use crate::format::pb21::CompressiveEncoding;
 use crate::format::{ProtobufUtils21, pb21};
 use crate::statistics::{GetStat, Stat};
 use bytemuck::{AnyBitPattern, cast_slice};
+#[cfg(test)]
+use std::cell::Cell;
 
 const LOG_ELEMS_PER_CHUNK: u8 = 10;
 const ELEMS_PER_CHUNK: u64 = 1 << LOG_ELEMS_PER_CHUNK;
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static BLOCK_WIDTH_VALIDATION_COUNT: Cell<usize> = const { Cell::new(0) };
+}
 
 #[derive(Debug, Default)]
 pub struct InlineBitpacking {
@@ -234,10 +247,42 @@ impl MiniBlockCompressor for InlineBitpacking {
 }
 
 impl BlockCompressor for InlineBitpacking {
-    fn compress(&self, data: DataBlock) -> Result<LanceBuffer> {
-        let fixed_width = data.as_fixed_width().unwrap();
+    fn compress(&self, data: DataBlock) -> Result<Option<LanceBuffer>> {
+        let DataBlock::FixedWidth(fixed_width) = data else {
+            return Err(Error::invalid_input(
+                "Inline bitpacking requires fixed-width data",
+            ));
+        };
+        if fixed_width.bits_per_value != self.uncompressed_bit_width {
+            return Err(Error::invalid_input(format!(
+                "Inline bitpacking expects {}-bit values, got {}",
+                self.uncompressed_bit_width, fixed_width.bits_per_value
+            )));
+        }
+        let value_type = BlockValueType::from_bits(self.uncompressed_bit_width)?;
+        if fixed_width.num_values == 0 || fixed_width.num_values > ELEMS_PER_CHUNK {
+            return Err(Error::invalid_input(format!(
+                "Inline block bitpacking requires 1..={ELEMS_PER_CHUNK} values, got {}",
+                fixed_width.num_values
+            )));
+        }
+        let mut max_value = 0_u64;
+        visit_unsigned_values(&fixed_width, value_type, |value| {
+            max_value = max_value.max(value);
+            Ok(())
+        })?;
+        let compressed_bit_width = u64::from(u64::BITS - max_value.leading_zeros()).max(1);
+        fixed_width.block_info.0.write().unwrap().insert(
+            Stat::BitWidth,
+            std::sync::Arc::new(UInt64Array::from(vec![compressed_bit_width])),
+        );
         let (chunked, _) = self.chunk_data(fixed_width);
-        Ok(chunked.data.into_iter().next().unwrap())
+        chunked
+            .data
+            .into_iter()
+            .next()
+            .map(Some)
+            .ok_or_else(|| Error::internal("Inline bitpacking produced no payload".to_string()))
     }
 }
 
@@ -265,7 +310,13 @@ impl MiniBlockDecompressor for InlineBitpacking {
 }
 
 impl BlockDecompressor for InlineBitpacking {
-    fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
+    fn decompress(&self, data: Option<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
+        let data = require_block_payload(data, "Inline bitpacking")?;
+        validate_inline_bitpacking_payload(
+            &data,
+            BlockValueType::from_bits(self.uncompressed_bit_width)?,
+            num_values,
+        )?;
         match self.uncompressed_bit_width {
             8 => Self::unchunk::<u8>(data, num_values),
             16 => Self::unchunk::<u16>(data, num_values),
@@ -477,27 +528,45 @@ impl OutOfLineBitpacking {
 }
 
 impl BlockCompressor for OutOfLineBitpacking {
-    fn compress(&self, data: DataBlock) -> Result<LanceBuffer> {
-        let fixed_width = data.as_fixed_width().unwrap();
+    fn compress(&self, data: DataBlock) -> Result<Option<LanceBuffer>> {
+        let DataBlock::FixedWidth(fixed_width) = data else {
+            return Err(Error::invalid_input(
+                "Out-of-line bitpacking requires fixed-width data",
+            ));
+        };
+        if fixed_width.bits_per_value != self.uncompressed_bit_width {
+            return Err(Error::invalid_input(format!(
+                "Out-of-line bitpacking expects {}-bit values, got {}",
+                self.uncompressed_bit_width, fixed_width.bits_per_value
+            )));
+        }
+        validate_frozen_block_width(&fixed_width, self.compressed_bit_width)?;
         let compressed = match fixed_width.bits_per_value {
             8 => bitpack_out_of_line::<u8>(fixed_width, self.compressed_bit_width as usize),
             16 => bitpack_out_of_line::<u16>(fixed_width, self.compressed_bit_width as usize),
             32 => bitpack_out_of_line::<u32>(fixed_width, self.compressed_bit_width as usize),
             64 => bitpack_out_of_line::<u64>(fixed_width, self.compressed_bit_width as usize),
-            _ => panic!("Bitpacking word size must be 8,16,32,64"),
+            _ => unreachable!("bitpacking word size was validated"),
         };
-        Ok(compressed)
+        Ok(Some(compressed))
     }
 }
 
 impl BlockDecompressor for OutOfLineBitpacking {
-    fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
+    fn decompress(&self, data: Option<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
+        let data = require_block_payload(data, "Out-of-line bitpacking")?;
+        validate_out_of_line_payload(
+            &data,
+            BlockValueType::from_bits(self.uncompressed_bit_width)?,
+            num_values,
+            self.compressed_bit_width,
+        )?;
         let word_size = match self.uncompressed_bit_width {
             8 => std::mem::size_of::<u8>(),
             16 => std::mem::size_of::<u16>(),
             32 => std::mem::size_of::<u32>(),
             64 => std::mem::size_of::<u64>(),
-            _ => panic!("Bitpacking word size must be 8,16,32,64"),
+            _ => unreachable!("bitpacking word size was validated"),
         };
         debug_assert_eq!(data.len() % word_size, 0);
         let total_words = (data.len() / word_size) as u64;
@@ -535,6 +604,38 @@ impl BlockDecompressor for OutOfLineBitpacking {
     }
 }
 
+fn validate_frozen_block_width(
+    block: &FixedWidthDataBlock,
+    compressed_bits_per_value: u64,
+) -> Result<()> {
+    #[cfg(test)]
+    BLOCK_WIDTH_VALIDATION_COUNT.with(|count| count.set(count.get().saturating_add(1)));
+
+    let value_type = BlockValueType::from_bits(block.bits_per_value)?;
+    if compressed_bits_per_value >= value_type.bits_per_value() {
+        return Err(Error::invalid_input(format!(
+            "Out-of-line bitpacking width {compressed_bits_per_value} must be less than the {}-bit input width",
+            value_type.bits_per_value()
+        )));
+    }
+    let max_value = if compressed_bits_per_value == 0 {
+        0
+    } else {
+        (1_u64 << compressed_bits_per_value) - 1
+    };
+    let mut index = 0_u64;
+    visit_unsigned_values(block, value_type, |value| {
+        if value > max_value {
+            let required_bits = u64::from(u64::BITS - value.leading_zeros());
+            return Err(Error::invalid_input(format!(
+                "Out-of-line bitpacking codec uses {compressed_bits_per_value} bits but input value {value} at index {index} requires {required_bits} bits"
+            )));
+        }
+        index += 1;
+        Ok(())
+    })
+}
+
 #[cfg(test)]
 mod test {
     use std::{collections::HashMap, sync::Arc};
@@ -546,7 +647,7 @@ mod test {
     use super::{ELEMS_PER_CHUNK, InlineBitpacking, bitpack_out_of_line, unpack_out_of_line};
     use crate::{
         buffer::LanceBuffer,
-        compression::MiniBlockDecompressor,
+        compression::{BlockCompressor, BlockDecompressor, MiniBlockDecompressor},
         data::{BlockInfo, DataBlock, FixedWidthDataBlock},
         testing::{TestCases, check_round_trip_encoding_of_data},
         version::LanceFileVersion,
@@ -569,6 +670,27 @@ mod test {
         assert_eq!(block.bits_per_value, bit_width);
         assert_eq!(block.num_values, 0);
         assert_eq!(block.data.len(), 0);
+    }
+
+    #[test]
+    fn test_inline_block_bitpacking_computes_its_own_bit_width() {
+        let codec = InlineBitpacking::new(32);
+        let input = DataBlock::FixedWidth(FixedWidthDataBlock {
+            data: LanceBuffer::reinterpret_vec(vec![0_u32, 1, 7]),
+            bits_per_value: 32,
+            num_values: 3,
+            block_info: BlockInfo::new(),
+        });
+
+        let payload = BlockCompressor::compress(&codec, input).unwrap().unwrap();
+        let decoded = BlockDecompressor::decompress(&codec, Some(payload), 3).unwrap();
+        let DataBlock::FixedWidth(decoded) = decoded else {
+            panic!("Expected FixedWidth block");
+        };
+        assert_eq!(
+            decoded.data.borrow_to_typed_view::<u32>().as_ref(),
+            &[0, 1, 7]
+        );
     }
 
     #[test_log::test(tokio::test)]

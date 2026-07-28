@@ -3,10 +3,14 @@
 
 use log::trace;
 
+#[cfg(all(test, any(feature = "lz4", feature = "zstd")))]
+use crate::compression::BlockCompressor;
 use crate::{
     Result,
     buffer::LanceBuffer,
-    compression::MiniBlockDecompressor,
+    compression::{
+        BlockDecompressor, BlockValueType, MiniBlockDecompressor, require_block_payload,
+    },
     data::DataBlock,
     encodings::{
         logical::primitive::miniblock::{
@@ -16,6 +20,88 @@ use crate::{
     },
     format::{ProtobufUtils21, pb21::CompressiveEncoding},
 };
+use lance_core::Error;
+
+#[cfg(all(test, any(feature = "lz4", feature = "zstd")))]
+pub(crate) fn compress_block(
+    compression: CompressionConfig,
+    payload: &[u8],
+) -> Result<LanceBuffer> {
+    let compressor = GeneralBufferCompressor::get_compressor(compression)?;
+    let mut compressed = Vec::new();
+    compressor.compress(payload, &mut compressed)?;
+    Ok(LanceBuffer::from(compressed))
+}
+
+pub(crate) fn decompress_block_exact(
+    compression: CompressionConfig,
+    payload: &LanceBuffer,
+    expected_bytes: usize,
+) -> Result<LanceBuffer> {
+    let compressor = GeneralBufferCompressor::get_compressor(compression)?;
+    let mut decompressed = Vec::new();
+    compressor.decompress_exact(payload, &mut decompressed, expected_bytes)?;
+    Ok(LanceBuffer::from(decompressed))
+}
+
+/// General-purpose block compressor that owns its child block compressor.
+#[cfg(all(test, any(feature = "lz4", feature = "zstd")))]
+#[derive(Debug)]
+pub(crate) struct GeneralBlockCompressor {
+    child: Box<dyn BlockCompressor>,
+    compression: CompressionConfig,
+}
+
+#[cfg(all(test, any(feature = "lz4", feature = "zstd")))]
+impl GeneralBlockCompressor {
+    pub(crate) fn new(child: Box<dyn BlockCompressor>, compression: CompressionConfig) -> Self {
+        Self { child, compression }
+    }
+}
+
+#[cfg(all(test, any(feature = "lz4", feature = "zstd")))]
+impl BlockCompressor for GeneralBlockCompressor {
+    fn compress(&self, data: DataBlock) -> Result<Option<LanceBuffer>> {
+        let payload = self.child.compress(data)?.ok_or_else(|| {
+            Error::invalid_input("General block compression requires a payload-bearing child")
+        })?;
+        compress_block(self.compression, &payload).map(Some)
+    }
+}
+
+/// Bounded general block decompressor used by generic fixed-width sequences.
+#[derive(Debug)]
+pub(crate) struct GenericGeneralBlockDecompressor {
+    child: Box<dyn BlockDecompressor>,
+    compression: CompressionConfig,
+    value_type: BlockValueType,
+}
+
+impl GenericGeneralBlockDecompressor {
+    pub(crate) fn new(
+        child: Box<dyn BlockDecompressor>,
+        compression: CompressionConfig,
+        value_type: BlockValueType,
+    ) -> Self {
+        Self {
+            child,
+            compression,
+            value_type,
+        }
+    }
+}
+
+impl BlockDecompressor for GenericGeneralBlockDecompressor {
+    fn decompress(&self, data: Option<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
+        let data = require_block_payload(data, "General block compression")?;
+        let expected_bytes = usize::try_from(num_values)
+            .ok()
+            .and_then(|values| values.checked_mul(self.value_type.bits_per_value() as usize / 8))
+            .ok_or_else(|| Error::invalid_input("General block output length overflows usize"))?;
+        let decompressed = decompress_block_exact(self.compression, &data, expected_bytes)?;
+        self.child.decompress(Some(decompressed), num_values)
+    }
+}
 
 /// A miniblock compressor that wraps another miniblock compressor and applies
 /// general-purpose compression (LZ4, Zstd) to the resulting buffers.
@@ -29,22 +115,12 @@ impl GeneralMiniBlockCompressor {
     pub fn new(inner: Box<dyn MiniBlockCompressor>, compression: CompressionConfig) -> Self {
         Self { inner, compression }
     }
-}
 
-/// Minimum buffer size to consider for compression
-const MIN_BUFFER_SIZE_FOR_COMPRESSION: usize = 4 * 1024;
-
-use super::super::logical::primitive::miniblock::MiniBlockChunk;
-
-impl MiniBlockCompressor for GeneralMiniBlockCompressor {
-    fn compress(
+    fn compress_inner(
         &self,
-        page: DataBlock,
-        context: MiniBlockCompressionContext,
+        inner_compressed: MiniBlockCompressed,
+        inner_encoding: CompressiveEncoding,
     ) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
-        // First, compress with the inner compressor
-        let (inner_compressed, inner_encoding) = self.inner.compress(page, context)?;
-
         // Return the original encoding without compression if there's no data or
         // the first buffer is not large enough
         if inner_compressed.data.is_empty()
@@ -111,6 +187,22 @@ impl MiniBlockCompressor for GeneralMiniBlockCompressor {
         // Return compressed encoding
         let encoding = ProtobufUtils21::wrapped(self.compression, inner_encoding)?;
         Ok((compressed_result, encoding))
+    }
+}
+
+/// Minimum buffer size to consider for compression
+const MIN_BUFFER_SIZE_FOR_COMPRESSION: usize = 4 * 1024;
+
+use super::super::logical::primitive::miniblock::MiniBlockChunk;
+
+impl MiniBlockCompressor for GeneralMiniBlockCompressor {
+    fn compress(
+        &self,
+        page: DataBlock,
+        context: MiniBlockCompressionContext,
+    ) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
+        let (inner_compressed, inner_encoding) = self.inner.compress(page, context)?;
+        self.compress_inner(inner_compressed, inner_encoding)
     }
 }
 

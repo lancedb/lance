@@ -1069,7 +1069,6 @@ enum SparsePositionSetDecoder {
     },
     Explicit {
         decompressor: Arc<dyn BlockDecompressor>,
-        encoding: CompressiveEncoding,
         count: u64,
         domain_len: u64,
     },
@@ -1084,7 +1083,6 @@ enum SparseCountSetDecoder {
     },
     Explicit {
         decompressor: Arc<dyn BlockDecompressor>,
-        encoding: CompressiveEncoding,
         count: u64,
     },
 }
@@ -1297,7 +1295,7 @@ impl SparseStructuralScheduler {
         let layer_decompressors = layout
             .structural_layers
             .iter()
-            .map(|layer| Self::layer_decompressors(layer, decompressors))
+            .map(Self::layer_decompressors)
             .collect::<Result<Vec<_>>>()?;
 
         Ok(Self {
@@ -2095,35 +2093,30 @@ impl SparseStructuralScheduler {
     fn create_position_decompressor(
         compression: &CompressiveEncoding,
         label: &str,
-        decompressors: &dyn DecompressionStrategy,
     ) -> Result<Arc<dyn BlockDecompressor>> {
         let compression = Self::validate_compression(compression, label)?;
-        Self::validate_block_encoding(compression, label)?;
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            decompressors.create_block_decompressor(compression)
-        }))
-        .map_err(|_| {
-            Error::invalid_input_source(
-                format!(
-                    "Sparse structural {label} descriptor caused decompressor construction to panic"
-                )
-                .into(),
-            )
-        })?
-        .map(Arc::from)
+        let (decompressor, has_payload) = crate::compression::block::create_block_decompressor(
+            compression,
+            crate::compression::BlockValueType::UInt64,
+        )
         .map_err(|error| {
             Error::invalid_input_source(
-                format!("Sparse structural {label} decompressor construction failed: {error}")
-                    .into(),
+                format!("Sparse structural {label} block validation failed: {error}").into(),
             )
-        })
+        })?;
+        if !has_payload {
+            return Err(Error::invalid_input_source(
+                format!("Sparse structural {label} explicit encoding must require one payload")
+                    .into(),
+            ));
+        }
+        Ok(Arc::from(decompressor))
     }
 
     fn position_set_decoder(
         position_set: &pb21::SparsePositionSet,
         domain_len: u64,
         label: &str,
-        decompressors: &dyn DecompressionStrategy,
     ) -> Result<(SparsePositionSetDecoder, u64)> {
         let cardinality = Self::position_cardinality(position_set, domain_len, label)?;
         let positions = position_set.positions.as_ref().ok_or_else(|| {
@@ -2145,12 +2138,7 @@ impl SparseStructuralScheduler {
                 }
                 pb21::sparse_position_set::Positions::Explicit(compression) => {
                     SparsePositionSetDecoder::Explicit {
-                        decompressor: Self::create_position_decompressor(
-                            compression,
-                            label,
-                            decompressors,
-                        )?,
-                        encoding: compression.clone(),
+                        decompressor: Self::create_position_decompressor(compression, label)?,
                         count: cardinality,
                         domain_len,
                     }
@@ -2164,7 +2152,6 @@ impl SparseStructuralScheduler {
         validity_set: &pb21::SparseValiditySet,
         domain_len: u64,
         label: &str,
-        decompressors: &dyn DecompressionStrategy,
     ) -> Result<(SparseValiditySetDecoder, u64)> {
         let meaning = Self::validity_meaning(validity_set, label)?;
         let position_set = validity_set.positions.as_ref().ok_or_else(|| {
@@ -2172,8 +2159,7 @@ impl SparseStructuralScheduler {
                 format!("Sparse structural {label} positions are required").into(),
             )
         })?;
-        let (positions, cardinality) =
-            Self::position_set_decoder(position_set, domain_len, label, decompressors)?;
+        let (positions, cardinality) = Self::position_set_decoder(position_set, domain_len, label)?;
         Ok((SparseValiditySetDecoder { meaning, positions }, cardinality))
     }
 
@@ -2203,7 +2189,6 @@ impl SparseStructuralScheduler {
         count_set: &pb21::SparseCountSet,
         cardinality: u64,
         label: &str,
-        decompressors: &dyn DecompressionStrategy,
     ) -> Result<SparseCountSetDecoder> {
         Self::count_buffer_count(count_set, cardinality, label)?;
         let counts = count_set.counts.as_ref().ok_or_else(|| {
@@ -2219,12 +2204,7 @@ impl SparseStructuralScheduler {
             },
             pb21::sparse_count_set::Counts::Explicit(compression) => {
                 SparseCountSetDecoder::Explicit {
-                    decompressor: Self::create_position_decompressor(
-                        compression,
-                        label,
-                        decompressors,
-                    )?,
-                    encoding: compression.clone(),
+                    decompressor: Self::create_position_decompressor(compression, label)?,
                     count: cardinality,
                 }
             }
@@ -2335,7 +2315,6 @@ impl SparseStructuralScheduler {
 
     fn layer_decompressors(
         layer: &pb21::SparseStructuralLayer,
-        decompressors: &dyn DecompressionStrategy,
     ) -> Result<SparseLayerDecompressors> {
         Ok(match Self::require_layer(layer)? {
             pb21::sparse_structural_layer::Layer::Validity(layer) => {
@@ -2343,7 +2322,6 @@ impl SparseStructuralScheduler {
                     Self::require_validity_set(&layer.validity, "validity")?,
                     layer.num_slots,
                     "validity positions",
-                    decompressors,
                 )?;
                 SparseLayerDecompressors::Validity {
                     num_slots: layer.num_slots,
@@ -2357,19 +2335,16 @@ impl SparseStructuralScheduler {
                     non_empty_positions,
                     layer.num_slots,
                     "list non-empty positions",
-                    decompressors,
                 )?;
                 let counts = Self::count_set_decoder(
                     Self::require_count_set(&layer.counts, "list counts")?,
                     num_non_empty,
                     "list counts",
-                    decompressors,
                 )?;
                 let (validity, _) = Self::validity_set_decoder(
                     Self::require_validity_set(&layer.validity, "list")?,
                     layer.num_slots,
                     "list validity positions",
-                    decompressors,
                 )?;
                 SparseLayerDecompressors::List {
                     num_slots: layer.num_slots,
@@ -2384,7 +2359,6 @@ impl SparseStructuralScheduler {
                     Self::require_validity_set(&layer.validity, "fixed-size-list")?,
                     layer.num_slots,
                     "fixed-size-list validity positions",
-                    decompressors,
                 )?;
                 SparseLayerDecompressors::FixedSizeList {
                     num_slots: layer.num_slots,
@@ -2575,88 +2549,19 @@ impl SparseStructuralScheduler {
         Ok(())
     }
 
-    fn validate_structural_buffer_headers(
-        encoding: &CompressiveEncoding,
-        data: &[u8],
-        label: &str,
-    ) -> Result<()> {
-        use pb21::compressive_encoding::Compression;
-
-        match encoding.compression.as_ref() {
-            Some(Compression::General(general)) => {
-                Self::validate_general_buffer_header(general, data, label)
-            }
-            Some(Compression::Rle(rle)) => {
-                let values_size = u64::from_le_bytes(
-                    data.get(..8)
-                        .ok_or_else(|| {
-                            Error::invalid_input_source(
-                                format!(
-                                    "Sparse structural {label} RLE buffer is missing its header"
-                                )
-                                .into(),
-                            )
-                        })?
-                        .try_into()
-                        .map_err(|_| {
-                            Error::invalid_input_source(
-                                format!("Sparse structural {label} RLE header is malformed").into(),
-                            )
-                        })?,
-                );
-                let values_size = usize_from_u64(values_size, "RLE values buffer size")?;
-                let values_end = 8_usize.checked_add(values_size).ok_or_else(|| {
-                    Error::invalid_input_source(
-                        format!("Sparse structural {label} RLE values range overflows").into(),
-                    )
-                })?;
-                let values_data = data.get(8..values_end).ok_or_else(|| {
-                    Error::invalid_input_source(
-                        format!("Sparse structural {label} RLE values buffer is truncated").into(),
-                    )
-                })?;
-                let lengths_data = data.get(values_end..).ok_or_else(|| {
-                    Error::invalid_input_source(
-                        format!("Sparse structural {label} RLE run-length buffer is missing")
-                            .into(),
-                    )
-                })?;
-                Self::validate_general_child_buffer(
-                    Self::require_encoding(&rle.values, "RLE values")?,
-                    values_data,
-                    "RLE values",
-                )?;
-                Self::validate_general_child_buffer(
-                    Self::require_encoding(&rle.run_lengths, "RLE run lengths")?,
-                    lengths_data,
-                    "RLE run lengths",
-                )
-            }
-            _ => Ok(()),
-        }
-    }
-
     fn decode_u64_values(
         decompressor: &dyn BlockDecompressor,
-        encoding: &CompressiveEncoding,
         data: Bytes,
         num_values: u64,
         label: &str,
     ) -> Result<Vec<u64>> {
-        Self::validate_structural_buffer_headers(encoding, &data, label)?;
-        let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            decompressor.decompress(LanceBuffer::from_bytes(data, 1), num_values)
-        }))
-        .map_err(|_| {
-            Error::invalid_input_source(
-                format!("Sparse structural {label} decompression panicked").into(),
-            )
-        })?
-        .map_err(|error| {
-            Error::invalid_input_source(
-                format!("Sparse structural {label} decompression failed: {error}").into(),
-            )
-        })?;
+        let decoded = decompressor
+            .decompress(Some(LanceBuffer::from_bytes(data, 1)), num_values)
+            .map_err(|error| {
+                Error::invalid_input_source(
+                    format!("Sparse structural {label} decompression failed: {error}").into(),
+                )
+            })?;
         let fixed = decoded.as_fixed_width().ok_or_else(|| {
             Error::invalid_input_source(
                 format!("Sparse structural {label} did not decode to fixed width data").into(),
@@ -2718,14 +2623,12 @@ impl SparseStructuralScheduler {
 
     fn decode_explicit_positions(
         decompressor: &Arc<dyn BlockDecompressor>,
-        encoding: &CompressiveEncoding,
         data: Bytes,
         num_positions: u64,
         num_slots: u64,
         label: &str,
     ) -> Result<SparsePositionSet> {
-        let deltas =
-            Self::decode_u64_values(decompressor.as_ref(), encoding, data, num_positions, label)?;
+        let deltas = Self::decode_u64_values(decompressor.as_ref(), data, num_positions, label)?;
         let mut positions = Vec::with_capacity(deltas.len());
         let mut current = 0_u64;
         for (idx, delta) in deltas.into_iter().enumerate() {
@@ -2771,12 +2674,10 @@ impl SparseStructuralScheduler {
             }
             SparsePositionSetDecoder::Explicit {
                 decompressor,
-                encoding,
                 count,
                 domain_len,
             } => Self::decode_explicit_positions(
                 decompressor,
-                encoding,
                 Self::next_structural_buffer(buffers, label)?,
                 *count,
                 *domain_len,
@@ -2808,12 +2709,10 @@ impl SparseStructuralScheduler {
             }
             SparseCountSetDecoder::Explicit {
                 decompressor,
-                encoding,
                 count,
             } => {
                 let counts = Self::decode_u64_values(
                     decompressor.as_ref(),
-                    encoding,
                     Self::next_structural_buffer(buffers, label)?,
                     *count,
                     label,
@@ -4684,11 +4583,9 @@ fn slice_sparse_plan(
 mod tests {
     use std::sync::Mutex;
 
-    use crate::{
-        compression::DefaultDecompressionStrategy,
-        encodings::physical::block::{CompressionConfig, CompressionScheme},
-        testing::SimulatedScheduler,
-    };
+    #[cfg(feature = "lz4")]
+    use crate::encodings::physical::block::{CompressionConfig, CompressionScheme};
+    use crate::{compression::DefaultDecompressionStrategy, testing::SimulatedScheduler};
 
     use super::*;
 
@@ -4723,6 +4620,7 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "lz4")]
     fn general_lz4(values: CompressiveEncoding) -> CompressiveEncoding {
         ProtobufUtils21::wrapped(CompressionConfig::new(CompressionScheme::Lz4, None), values)
             .unwrap()
