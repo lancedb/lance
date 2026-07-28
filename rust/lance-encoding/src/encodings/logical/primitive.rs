@@ -6602,16 +6602,18 @@ mod tests {
         ChunkInstructions, DataBlock, DecodeMiniBlockTask, FixedPerValueDecompressor,
         FixedWidthDataBlock, FullZipCacheableState, FullZipDecodeDetails, FullZipReadSource,
         FullZipRepIndexDetails, FullZipScheduler, LazyLevels, LevelCodec, LevelCursor, LevelPlan,
-        MiniBlockChunk, MiniBlockChunkIndex, MiniBlockCompressed, PerValueDecompressor,
-        PreambleAction, RunEndsBuilder, RunPosition, RunStorage, StructuralPageScheduler,
-        VariableFullZipDecoder, dense_levels_from_block, validate_complex_all_null_levels,
+        MiniBlockChunk, MiniBlockChunkIndex, MiniBlockCompressed, MiniBlockScheduler,
+        PerValueDecompressor, PreambleAction, RunEndsBuilder, RunPosition, RunStorage,
+        StructuralPageScheduler, VariableFullZipDecoder, dense_levels_from_block,
+        validate_complex_all_null_levels,
     };
+    use crate::EncodingsIo;
     use crate::buffer::LanceBuffer;
     use crate::compression::{BlockCompressor, DefaultDecompressionStrategy};
     use crate::constants::{
-        COMPRESSION_LEVEL_META_KEY, COMPRESSION_META_KEY, DICT_VALUES_COMPRESSION_LEVEL_META_KEY,
-        DICT_VALUES_COMPRESSION_META_KEY, STRUCTURAL_ENCODING_META_KEY,
-        STRUCTURAL_ENCODING_MINIBLOCK,
+        COMPRESSION_LEVEL_META_KEY, COMPRESSION_META_KEY, DICT_DIVISOR_META_KEY,
+        DICT_VALUES_COMPRESSION_LEVEL_META_KEY, DICT_VALUES_COMPRESSION_META_KEY,
+        STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK,
     };
     use crate::data::BlockInfo;
     use crate::decoder::{PageEncoding, StructuralFieldDecoder};
@@ -6628,8 +6630,14 @@ mod tests {
     use arrow_array::{ArrayRef, Int8Array, StringArray};
     use arrow_buffer::ScalarBuffer;
     use arrow_schema::{DataType, Field as ArrowField};
+    use futures::{FutureExt, future::BoxFuture};
+    use prost::Message;
     use std::collections::HashMap;
-    use std::{collections::VecDeque, sync::Arc};
+    use std::{
+        collections::VecDeque,
+        ops::Range,
+        sync::{Arc, Mutex},
+    };
 
     #[test]
     fn test_is_narrow() {
@@ -8679,6 +8687,268 @@ mod tests {
             pages.push(task.await.unwrap());
         }
         pages.into_iter().next().unwrap()
+    }
+
+    fn variable_offset_test_field() -> arrow_schema::Field {
+        arrow_schema::Field::new("c", DataType::Utf8, false).with_metadata(HashMap::from([
+            (
+                STRUCTURAL_ENCODING_META_KEY.to_string(),
+                STRUCTURAL_ENCODING_MINIBLOCK.to_string(),
+            ),
+            (COMPRESSION_META_KEY.to_string(), "none".to_string()),
+            (DICT_DIVISOR_META_KEY.to_string(), "100000".to_string()),
+        ]))
+    }
+
+    fn variable_offset_test_array(lengths: &[usize], num_rows: usize) -> ArrayRef {
+        Arc::new(StringArray::from_iter_values((0..num_rows).map(|index| {
+            let length = lengths[index % lengths.len()];
+            assert!(length >= 4);
+            format!("{index:04x}{}", "x".repeat(length - 4))
+        })))
+    }
+
+    fn miniblock_layout(page: &crate::encoder::EncodedPage) -> &pb21::MiniBlockLayout {
+        let PageEncoding::Structural(layout) = &page.description else {
+            panic!("Expected structural page encoding");
+        };
+        let pb21::page_layout::Layout::MiniBlockLayout(layout) = layout.layout.as_ref().unwrap()
+        else {
+            panic!("Expected mini-block page layout");
+        };
+        layout
+    }
+
+    fn variable_offset_compression(
+        page: &crate::encoder::EncodedPage,
+    ) -> &pb21::compressive_encoding::Compression {
+        let value_encoding = miniblock_layout(page).value_compression.as_ref().unwrap();
+        let Compression::Variable(variable) = value_encoding.compression.as_ref().unwrap() else {
+            panic!("Expected Variable value compression");
+        };
+        variable
+            .offsets
+            .as_deref()
+            .and_then(|offsets| offsets.compression.as_ref())
+            .unwrap()
+    }
+
+    fn variable_value_wire_bytes(page: &crate::encoder::EncodedPage) -> usize {
+        let descriptor_bytes = miniblock_layout(page)
+            .value_compression
+            .as_ref()
+            .unwrap()
+            .encoded_len();
+        descriptor_bytes + page.data.iter().map(LanceBuffer::len).sum::<usize>()
+    }
+
+    #[derive(Debug)]
+    struct RecordingScheduler {
+        data: Bytes,
+        requests: Mutex<Vec<Vec<Range<u64>>>>,
+    }
+
+    impl RecordingScheduler {
+        fn new(data: Bytes) -> Self {
+            Self {
+                data,
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn take_requests(&self) -> Vec<Vec<Range<u64>>> {
+            std::mem::take(&mut *self.requests.lock().unwrap())
+        }
+    }
+
+    impl EncodingsIo for RecordingScheduler {
+        fn submit_request(
+            &self,
+            ranges: Vec<Range<u64>>,
+            _priority: u64,
+        ) -> BoxFuture<'static, lance_core::Result<Vec<Bytes>>> {
+            self.requests.lock().unwrap().push(ranges.clone());
+            let data = ranges
+                .into_iter()
+                .map(|range| self.data.slice(range.start as usize..range.end as usize))
+                .collect();
+            std::future::ready(Ok(data)).boxed()
+        }
+    }
+
+    async fn miniblock_take_request_shape(page: &crate::encoder::EncodedPage) -> [usize; 6] {
+        let mut position = 0_u64;
+        let buffer_offsets_and_sizes = page
+            .data
+            .iter()
+            .map(|buffer| {
+                let size = buffer.len() as u64;
+                let descriptor = (position, size);
+                position += size;
+                descriptor
+            })
+            .collect::<Vec<_>>();
+        let mut bytes = Vec::with_capacity(position as usize);
+        for buffer in &page.data {
+            bytes.extend_from_slice(buffer);
+        }
+
+        let recorder = Arc::new(RecordingScheduler::new(Bytes::from(bytes)));
+        let io: Arc<dyn EncodingsIo> = recorder.clone();
+        let decompression = DefaultDecompressionStrategy::default();
+        let mut cold = MiniBlockScheduler::try_new(
+            &buffer_offsets_and_sizes,
+            0,
+            page.num_rows,
+            miniblock_layout(page),
+            &decompression,
+        )
+        .unwrap();
+        let cached = cold.initialize(&io).await.unwrap();
+        let initialize_requests = recorder.take_requests();
+
+        let cold_tasks = cold.schedule_ranges(&[123..124], &io).unwrap();
+        let cold_requests = recorder.take_requests();
+        for task in cold_tasks {
+            task.decoder_fut.await.unwrap();
+        }
+
+        let mut warm = MiniBlockScheduler::try_new(
+            &buffer_offsets_and_sizes,
+            0,
+            page.num_rows,
+            miniblock_layout(page),
+            &decompression,
+        )
+        .unwrap();
+        warm.load(&cached);
+        let warm_tasks = warm.schedule_ranges(&[123..124], &io).unwrap();
+        let warm_requests = recorder.take_requests();
+        for task in warm_tasks {
+            task.decoder_fut.await.unwrap();
+        }
+
+        [
+            initialize_requests.len(),
+            initialize_requests.iter().map(Vec::len).sum(),
+            cold_requests.len(),
+            cold_requests.iter().map(Vec::len).sum(),
+            warm_requests.len(),
+            warm_requests.iter().map(Vec::len).sum(),
+        ]
+    }
+
+    #[tokio::test]
+    async fn test_v2_3_variable_offsets_use_complete_serialized_cost() {
+        let cases = [
+            (&[16_usize, 22, 17, 20][..], "legacy"),
+            (&[4_usize, 10, 5, 8][..], "delta"),
+            (&[8_usize][..], "range"),
+        ];
+        for (lengths, expected) in cases {
+            let array = variable_offset_test_array(lengths, 10_000);
+            let legacy = encode_first_page(
+                variable_offset_test_field(),
+                array.clone(),
+                LanceFileVersion::V2_2,
+            )
+            .await;
+            let selected =
+                encode_first_page(variable_offset_test_field(), array, LanceFileVersion::V2_3)
+                    .await;
+
+            match expected {
+                "legacy" => {
+                    assert!(matches!(
+                        variable_offset_compression(&selected),
+                        Compression::Flat(_)
+                    ));
+                    assert_eq!(
+                        variable_value_wire_bytes(&selected),
+                        variable_value_wire_bytes(&legacy)
+                    );
+                }
+                "delta" => assert!(matches!(
+                    variable_offset_compression(&selected),
+                    Compression::Delta(_)
+                )),
+                "range" => assert!(matches!(
+                    variable_offset_compression(&selected),
+                    Compression::Range(_)
+                )),
+                _ => unreachable!(),
+            }
+            if expected != "legacy" {
+                assert!(
+                    variable_value_wire_bytes(&selected) < variable_value_wire_bytes(&legacy),
+                    "{expected} generic container must be strictly smaller than legacy"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_v2_3_variable_offsets_use_delta_range_for_increasing_lengths() {
+        let array = Arc::new(StringArray::from_iter_values(
+            (0..262_144).map(|index| "x".repeat(4 + index % 64)),
+        ));
+        let legacy = encode_first_page(
+            variable_offset_test_field(),
+            array.clone(),
+            LanceFileVersion::V2_2,
+        )
+        .await;
+        let selected =
+            encode_first_page(variable_offset_test_field(), array, LanceFileVersion::V2_3).await;
+
+        let Compression::Delta(delta) = variable_offset_compression(&selected) else {
+            panic!(
+                "expected Delta offsets, got {:?}",
+                variable_offset_compression(&selected)
+            );
+        };
+        assert!(matches!(
+            delta
+                .deltas
+                .as_deref()
+                .and_then(|deltas| deltas.compression.as_ref()),
+            Some(Compression::Range(_))
+        ));
+        assert!(
+            variable_value_wire_bytes(&selected) < variable_value_wire_bytes(&legacy),
+            "Delta(Range) generic container must be strictly smaller than legacy"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_v2_3_generic_offsets_do_not_add_take_requests() {
+        let array = variable_offset_test_array(&[4, 10, 5, 8], 10_000);
+        let legacy = encode_first_page(
+            variable_offset_test_field(),
+            array.clone(),
+            LanceFileVersion::V2_2,
+        )
+        .await;
+        let generic =
+            encode_first_page(variable_offset_test_field(), array, LanceFileVersion::V2_3).await;
+
+        assert!(matches!(
+            variable_offset_compression(&legacy),
+            Compression::Flat(_)
+        ));
+        assert!(matches!(
+            variable_offset_compression(&generic),
+            Compression::Delta(_)
+        ));
+        assert_eq!(miniblock_layout(&legacy).num_buffers, 1);
+        assert_eq!(miniblock_layout(&generic).num_buffers, 2);
+        assert_eq!(legacy.data.len(), 2);
+        assert_eq!(generic.data.len(), 2);
+
+        let legacy_requests = miniblock_take_request_shape(&legacy).await;
+        let generic_requests = miniblock_take_request_shape(&generic).await;
+        assert_eq!(legacy_requests, [1, 1, 1, 1, 1, 1]);
+        assert_eq!(generic_requests, legacy_requests);
     }
 
     #[tokio::test]

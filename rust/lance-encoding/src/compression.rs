@@ -684,9 +684,21 @@ impl DefaultCompressionStrategy {
         let data_size = data.expect_single_stat::<UInt64Type>(Stat::DataSize);
         let max_len = data.expect_single_stat::<UInt64Type>(Stat::MaxLength);
 
-        // Explicitly disable all compression.
+        let build_binary = || {
+            let generic_offsets_own_final_payload =
+                compression.is_none() || compression == Some("none");
+            if self.version.resolve() >= LanceFileVersion::V2_3 && generic_offsets_own_final_payload
+            {
+                BinaryMiniBlockEncoder::with_generic_offsets(params.minichunk_size, params.clone())
+            } else {
+                BinaryMiniBlockEncoder::new(params.minichunk_size)
+            }
+        };
+
+        // "none" disables general compression but still permits structural
+        // offset codecs in 2.3.
         if compression == Some("none") {
-            return Ok(Box::new(BinaryMiniBlockEncoder::new(params.minichunk_size)));
+            return Ok(Box::new(build_binary()));
         }
 
         let use_fsst = compression == Some("fsst")
@@ -699,7 +711,7 @@ impl DefaultCompressionStrategy {
         let mut base_encoder: Box<dyn MiniBlockCompressor> = if use_fsst {
             Box::new(FsstMiniBlockEncoder::new(params.minichunk_size))
         } else {
-            Box::new(BinaryMiniBlockEncoder::new(params.minichunk_size))
+            Box::new(build_binary())
         };
 
         // Wrap with general compression when configured (except FSST / none).
@@ -1885,6 +1897,109 @@ mod tests {
         let compressor = strategy.create_per_value(&field, &variable_data).unwrap();
         let (_block, encoding) = compressor.compress(variable_data).unwrap();
         check_uncompressed_encoding(&encoding, true);
+    }
+
+    #[test]
+    fn test_variable_offset_codec_is_version_gated() {
+        let num_values = 2_048_u64;
+        let offsets = (0..=num_values)
+            .map(|index| (index * 3) as i32)
+            .collect::<Vec<_>>();
+        let mut variable = VariableWidthBlock {
+            data: LanceBuffer::from(vec![7_u8; num_values as usize * 3]),
+            offsets: LanceBuffer::reinterpret_vec(offsets),
+            bits_per_offset: 32,
+            num_values,
+            block_info: BlockInfo::default(),
+        };
+        variable.compute_stat();
+        let data = DataBlock::VariableWidth(variable);
+        let field = create_test_field("bytes", DataType::Binary);
+
+        for version in [
+            LanceFileVersion::V2_0,
+            LanceFileVersion::V2_1,
+            LanceFileVersion::V2_2,
+        ] {
+            let strategy = DefaultCompressionStrategy::new().with_version(version);
+            let compressor = strategy.create_miniblock_compressor(&field, &data).unwrap();
+            let (compressed, encoding) = compressor
+                .compress(data.clone(), miniblock_context())
+                .unwrap();
+            let Some(Compression::Variable(variable)) = encoding.compression.as_ref() else {
+                panic!("expected Variable encoding for {version}");
+            };
+            assert!(matches!(
+                variable
+                    .offsets
+                    .as_deref()
+                    .and_then(|offsets| offsets.compression.as_ref()),
+                Some(Compression::Flat(_))
+            ));
+            assert_eq!(compressed.data.len(), 1);
+            assert!(
+                compressed
+                    .chunks
+                    .iter()
+                    .all(|chunk| chunk.buffer_sizes.len() == 1)
+            );
+        }
+
+        let strategy = DefaultCompressionStrategy::new().with_version(LanceFileVersion::V2_3);
+        let compressor = strategy.create_miniblock_compressor(&field, &data).unwrap();
+        let (compressed, encoding) = compressor.compress(data, miniblock_context()).unwrap();
+        let Some(Compression::Variable(variable)) = encoding.compression.as_ref() else {
+            panic!("expected Variable encoding for 2.3");
+        };
+        assert!(matches!(
+            variable
+                .offsets
+                .as_deref()
+                .and_then(|offsets| offsets.compression.as_ref()),
+            Some(Compression::Range(_))
+        ));
+        assert_eq!(compressed.data.len(), 1);
+    }
+
+    #[test]
+    #[cfg(any(feature = "lz4", feature = "zstd"))]
+    fn test_v2_3_explicit_general_compression_keeps_legacy_offsets() {
+        let num_values = 2_048_u64;
+        let offsets = (0..=num_values)
+            .map(|index| (index * 3) as i32)
+            .collect::<Vec<_>>();
+        let mut variable = VariableWidthBlock {
+            data: LanceBuffer::from(vec![7_u8; num_values as usize * 3]),
+            offsets: LanceBuffer::reinterpret_vec(offsets),
+            bits_per_offset: 32,
+            num_values,
+            block_info: BlockInfo::default(),
+        };
+        variable.compute_stat();
+        let data = DataBlock::VariableWidth(variable);
+        let mut field = create_test_field("bytes", DataType::Binary);
+        field.metadata.insert(
+            COMPRESSION_META_KEY.to_string(),
+            if cfg!(feature = "lz4") { "lz4" } else { "zstd" }.to_string(),
+        );
+
+        let strategy = DefaultCompressionStrategy::new().with_version(LanceFileVersion::V2_3);
+        let compressor = strategy.create_miniblock_compressor(&field, &data).unwrap();
+        let (_, encoding) = compressor.compress(data, miniblock_context()).unwrap();
+        let value_encoding = match encoding.compression.as_ref().unwrap() {
+            Compression::General(general) => general.values.as_deref().unwrap(),
+            _ => &encoding,
+        };
+        let Some(Compression::Variable(variable)) = value_encoding.compression.as_ref() else {
+            panic!("expected Variable encoding");
+        };
+        assert!(matches!(
+            variable
+                .offsets
+                .as_deref()
+                .and_then(|offsets| offsets.compression.as_ref()),
+            Some(Compression::Flat(_))
+        ));
     }
 
     #[test]
