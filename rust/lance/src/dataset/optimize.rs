@@ -1459,9 +1459,7 @@ impl CandidateBin {
 
             // Only split once the current bin is large enough and there is
             // enough left over to form another worthwhile non-empty bin.
-            if current_rows >= min_num_rows
-                && remaining_rows > 0
-                && remaining_rows >= min_num_rows
+            if current_rows >= min_num_rows && remaining_rows > 0 && remaining_rows >= min_num_rows
             {
                 split_lengths.push(current_len);
                 current_rows = 0;
