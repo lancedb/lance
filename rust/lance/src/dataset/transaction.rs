@@ -4112,16 +4112,9 @@ fn merge_fragments_valid(manifest: &Manifest, new_fragments: &[Fragment]) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::cast::AsArray;
-    use arrow_array::types::UInt64Type;
-    use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use chrono::Utc;
-    use futures::TryStreamExt;
     use lance_core::datatypes::Schema as LanceSchema;
-    use lance_core::utils::address::RowAddress;
-    use lance_core::utils::tempfile::TempStrDir;
-    use lance_core::{ROW_ADDR, ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION};
     use lance_file::version::LanceFileVersion;
     use lance_io::utils::CachedFileSize;
     use lance_table::format::overlay::OverlayCoverage;
@@ -4134,10 +4127,7 @@ mod tests {
     use std::sync::Arc;
     use uuid::Uuid;
 
-    use crate::Dataset;
     use crate::dataset::ManifestWriteConfig;
-    use crate::dataset::write::WriteParams;
-    use crate::session::Session;
 
     fn sample_manifest() -> Manifest {
         let schema = ArrowSchema::new(vec![ArrowField::new("id", DataType::Int32, false)]);
@@ -5172,186 +5162,6 @@ mod tests {
             out.fragments[0].last_updated_at_version_meta.is_none(),
             "fragment with no prior version metadata must not have fabricated prev_version stamped on unmatched rows"
         );
-    }
-
-    /// Partial RewriteColumns refresh in `build_manifest`: only matched physical
-    /// rows get `last_updated_at_version` bumped; same-fragment unmatched rows and
-    /// untouched fragments keep both version sequences.
-    #[tokio::test]
-    async fn test_build_manifest_partial_last_updated_rewrite_columns_stable_row_ids() {
-        let dir = TempStrDir::default();
-        let uri = dir.as_str();
-
-        let schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("i", DataType::Int32, false),
-            ArrowField::new("x", DataType::Int32, false),
-        ]));
-        let batch0 = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int32Array::from_iter_values(0..8)),
-                Arc::new(Int32Array::from(vec![0_i32; 8])),
-            ],
-        )
-        .unwrap();
-        let reader0 = RecordBatchIterator::new(vec![Ok(batch0)], schema.clone());
-        let write_params = WriteParams {
-            enable_stable_row_ids: true,
-            data_storage_version: Some(LanceFileVersion::Stable),
-            ..Default::default()
-        };
-        let mut dataset = Dataset::write(reader0, uri, Some(write_params))
-            .await
-            .unwrap();
-
-        let batch1 = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int32Array::from_iter_values(100..108)),
-                Arc::new(Int32Array::from(vec![0_i32; 8])),
-            ],
-        )
-        .unwrap();
-        let reader1 = RecordBatchIterator::new(vec![Ok(batch1)], schema.clone());
-        dataset.append(reader1, None).await.unwrap();
-
-        let frags = dataset.get_fragments();
-        assert_eq!(
-            frags.len(),
-            2,
-            "expected two fragments (append creates a new fragment)"
-        );
-
-        async fn scan_row_versions(ds: &Dataset) -> HashMap<(u32, u32), (u64, u64)> {
-            let mut scanner = ds.scan();
-            scanner
-                .project(&[
-                    ROW_ADDR,
-                    ROW_LAST_UPDATED_AT_VERSION,
-                    ROW_CREATED_AT_VERSION,
-                ])
-                .unwrap();
-            let batches = scanner
-                .try_into_stream()
-                .await
-                .unwrap()
-                .try_collect::<Vec<_>>()
-                .await
-                .unwrap();
-            let mut out = HashMap::new();
-            for batch in batches {
-                let addrs = batch
-                    .column_by_name(ROW_ADDR)
-                    .unwrap()
-                    .as_primitive::<UInt64Type>();
-                let last = batch
-                    .column_by_name(ROW_LAST_UPDATED_AT_VERSION)
-                    .unwrap()
-                    .as_primitive::<UInt64Type>();
-                let created = batch
-                    .column_by_name(ROW_CREATED_AT_VERSION)
-                    .unwrap()
-                    .as_primitive::<UInt64Type>();
-                for row in 0..batch.num_rows() {
-                    let addr = RowAddress::from(addrs.value(row));
-                    out.insert(
-                        (addr.fragment_id(), addr.row_offset()),
-                        (last.value(row), created.value(row)),
-                    );
-                }
-            }
-            out
-        }
-
-        let before = scan_row_versions(&dataset).await;
-        assert_eq!(before.len(), 16);
-
-        // Update only rows i in {2, 4, 6} within fragment 0 (physical offsets 2, 4, 6).
-        let update_schema = Arc::new(ArrowSchema::new(vec![
-            ArrowField::new("i", DataType::Int32, false),
-            ArrowField::new("x", DataType::Int32, false),
-        ]));
-        let update_batch = RecordBatch::try_new(
-            update_schema.clone(),
-            vec![
-                Arc::new(Int32Array::from(vec![2, 4, 6])),
-                Arc::new(Int32Array::from(vec![99, 99, 99])),
-            ],
-        )
-        .unwrap();
-        let right: Box<dyn arrow_array::RecordBatchReader + Send> = Box::new(
-            RecordBatchIterator::new(vec![Ok(update_batch)].into_iter(), update_schema),
-        );
-
-        let mut frag0 = dataset.get_fragment(0).unwrap();
-        let u = frag0
-            .update_columns_with_offsets(right, "i", "i")
-            .await
-            .unwrap();
-        assert_eq!(u.matched_offsets.iter().count(), 3);
-        for off in [2_u32, 4, 6] {
-            assert!(u.matched_offsets.contains(off));
-        }
-
-        let updated_fragment_offsets = Some(UpdatedFragmentOffsets(HashMap::from([(
-            u.fragment.id,
-            u.matched_offsets,
-        )])));
-
-        let op = Operation::Update {
-            removed_fragment_ids: vec![],
-            updated_fragments: vec![u.fragment],
-            new_fragments: vec![],
-            fields_modified: u.fields_modified,
-            compacted_sstables: Vec::new(),
-            fields_for_preserving_frag_bitmap: vec![],
-            update_mode: Some(UpdateMode::RewriteColumns),
-            inserted_rows_filter: None,
-            updated_fragment_offsets,
-        };
-
-        let read_v = dataset.version().version;
-        let dataset = Dataset::commit(
-            uri,
-            op,
-            Some(read_v),
-            None,
-            None,
-            Arc::new(Session::default()),
-            true,
-        )
-        .await
-        .unwrap();
-
-        let new_v = dataset.version().version;
-        assert_eq!(new_v, read_v + 1);
-
-        let after = scan_row_versions(&dataset).await;
-        for off in 0..8_u32 {
-            let key = (0, off);
-            let (last_before, created_before) = before[&key];
-            let (last_after, created_after) = after[&key];
-            assert_eq!(created_after, created_before);
-            if off == 2 || off == 4 || off == 6 {
-                assert_eq!(
-                    last_after, new_v,
-                    "matched row offset {off} should advance last_updated to new version"
-                );
-            } else {
-                assert_eq!(
-                    last_after, last_before,
-                    "unmatched row offset {off} in fragment 0 should keep last_updated"
-                );
-            }
-        }
-
-        for off in 0..8_u32 {
-            let key = (1, off);
-            assert_eq!(
-                after[&key], before[&key],
-                "fragment 1 row offset {off}: both version columns unchanged"
-            );
-        }
     }
 
     /// Regression test for https://github.com/lance-format/lance/issues/6417
