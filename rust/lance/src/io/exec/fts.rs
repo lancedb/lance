@@ -3413,6 +3413,19 @@ mod tests {
             0
         );
 
+        let mismatched_granularity = MatchQueryExec::new_with_segments_and_document_granularity(
+            dataset.clone(),
+            query.clone(),
+            params.clone(),
+            PreFilterSource::None,
+            segments.clone(),
+            DocumentGranularity::ListElement,
+        );
+        assert_execution_error(
+            execute_row_ids(&mismatched_granularity).await.unwrap_err(),
+            "use Row document granularity",
+        );
+
         let selected_fragment = fragment_ids[1];
         let selected_uuid = segment_uuid_for_fragment(&segments, selected_fragment);
         let unpolled = MatchQueryExec::new_with_segment_uuids(

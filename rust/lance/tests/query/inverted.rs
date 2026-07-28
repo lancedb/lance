@@ -400,7 +400,7 @@ async fn test_element_document_fts_flat_indexed_and_mixed() {
         .downcast_ref::<lance_index::scalar::inverted::InvertedIndex>()
         .unwrap();
     let (total_tokens, num_docs, token_docs) = element_index
-        .bm25_stats_for_terms(&["alpha".to_string()])
+        .bm25_stats_for_terms(&["alpha".to_string()], None)
         .await
         .unwrap();
     assert_eq!((total_tokens, num_docs, token_docs), (8, 11, vec![2]));

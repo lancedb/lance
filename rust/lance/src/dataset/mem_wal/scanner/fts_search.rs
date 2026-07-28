@@ -368,12 +368,12 @@ impl LsmFtsSearchPlanner {
                         .map(|(_, document_granularity)| document_granularity)
                         .collect::<Vec<_>>()
                 }
-                LsmDataSource::FlushedMemTable { path, .. } => {
-                    let dataset = open_flushed_dataset(
+                LsmDataSource::SsTable { path, .. } => {
+                    let dataset = open_sstable(
                         path,
                         self.session.as_ref(),
                         self.store_params.as_ref(),
-                        self.flushed_cache.as_ref(),
+                        self.sstable_cache.as_ref(),
                         self.warmer.as_ref(),
                     )
                     .await?;
