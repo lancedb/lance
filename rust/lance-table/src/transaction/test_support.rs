@@ -3,10 +3,12 @@
 
 //! Fixtures shared between the tests of several submodules.
 
+use crate::feature_flags::FLAG_STABLE_ROW_IDS;
 use crate::format::overlay::{DataOverlayFile, OverlayCoverage};
 use crate::format::{
     DataFile, DataStorageFormat, Fragment, IndexMetadata, Manifest, ManifestBuildConfig,
 };
+use crate::transaction::{Operation, Transaction};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use chrono::Utc;
 use lance_core::datatypes::Schema as LanceSchema;
@@ -61,4 +63,60 @@ pub fn overlay_with_field(field: i32, committed_version: u64) -> DataOverlayFile
         coverage: OverlayCoverage::dense(roaring::RoaringBitmap::from_iter([0u32])),
         committed_version,
     }
+}
+
+/// Existing fragments use id >= 1 to avoid collision with `Fragment::new(0)`
+/// used by `sample_manifest`. New (updated) fragments use id = 10.
+pub fn make_stable_row_id_manifest(fragments: Vec<Fragment>) -> Manifest {
+    let schema = ArrowSchema::new(vec![ArrowField::new("id", DataType::Int32, false)]);
+    let mut manifest = Manifest::new(
+        LanceSchema::try_from(&schema).unwrap(),
+        Arc::new(fragments),
+        DataStorageFormat::new(LanceFileVersion::V2_0),
+        HashMap::new(),
+    );
+    manifest.reader_feature_flags = FLAG_STABLE_ROW_IDS;
+    manifest.next_row_id = 1000;
+    manifest.version = 4;
+    manifest
+}
+
+pub fn update_txn(new_fragments: Vec<Fragment>) -> Transaction {
+    Transaction::new(
+        4,
+        Operation::Update {
+            removed_fragment_ids: vec![],
+            updated_fragments: vec![],
+            new_fragments,
+            fields_modified: vec![],
+            compacted_sstables: vec![],
+            fields_for_preserving_frag_bitmap: vec![],
+            update_mode: None,
+            inserted_rows_filter: None,
+            updated_fragment_offsets: None,
+        },
+        None,
+    )
+}
+
+pub fn created_at_versions(manifest: &Manifest, frag_id: u64) -> Vec<u64> {
+    let frag = manifest.fragments.iter().find(|f| f.id == frag_id).unwrap();
+    let seq = frag
+        .created_at_version_meta
+        .as_ref()
+        .unwrap()
+        .load_sequence()
+        .unwrap();
+    seq.versions().collect()
+}
+
+pub fn last_updated_at_versions(manifest: &Manifest, frag_id: u64) -> Vec<u64> {
+    let frag = manifest.fragments.iter().find(|f| f.id == frag_id).unwrap();
+    let seq = frag
+        .last_updated_at_version_meta
+        .as_ref()
+        .unwrap()
+        .load_sequence()
+        .unwrap();
+    seq.versions().collect()
 }
