@@ -161,7 +161,6 @@ async fn finalize_current_output_file(
     current_page_table: &[ColumnInfo],
     col_pages: &mut [Vec<DecPageInfo>],
     col_buffers: &mut [Vec<(u64, u64)>],
-    is_non_leaf_column: &[bool],
     total_rows_in_current: u64,
     version: LanceFileVersion,
 ) -> Result<Fragment> {
@@ -170,7 +169,11 @@ async fn finalize_current_output_file(
         let mut pages_vec = std::mem::take(&mut col_pages[i]);
         // For v2_0 struct headers, force a single page and set num_rows to total
         if version == LanceFileVersion::V2_0
-            && is_non_leaf_column.get(i).copied().unwrap_or(false)
+            && schema_mapping
+                .is_non_leaf_column
+                .get(i)
+                .copied()
+                .unwrap_or(false)
             && !pages_vec.is_empty()
         {
             pages_vec[0].num_rows = total_rows_in_current;
@@ -255,7 +258,6 @@ pub async fn rewrite_files_binary_copy(
     .resolve();
     let schema_mapping = binary_copy_schema_mapping(&schema, version);
     let column_count = schema_mapping.physical_column_count;
-    let is_non_leaf_column = schema_mapping.is_non_leaf_column.clone();
 
     let mut out: Vec<Fragment> = Vec::new();
     let mut current_writer: Option<Box<dyn Writer>> = None;
@@ -322,7 +324,11 @@ pub async fn rewrite_files_binary_copy(
                 // - During finalization we also normalize the single remaining page’s `num_rows` to the
                 //   total number of rows in the output file and reset `priority` to 0.
                 // - For v2_1+ this logic does not apply because non-leaf headers are not stored as columns.
-                let is_non_leaf = col_idx < is_non_leaf_column.len() && is_non_leaf_column[col_idx];
+                let is_non_leaf = schema_mapping
+                    .is_non_leaf_column
+                    .get(col_idx)
+                    .copied()
+                    .unwrap_or(false);
                 if is_non_leaf && !col_pages[col_idx].is_empty() {
                     continue;
                 }
@@ -493,7 +499,6 @@ pub async fn rewrite_files_binary_copy(
                     &current_page_table,
                     &mut col_pages,
                     &mut col_buffers,
-                    &is_non_leaf_column,
                     total_rows_in_current,
                     version,
                 )
@@ -526,7 +531,6 @@ pub async fn rewrite_files_binary_copy(
             &current_page_table,
             &mut col_pages,
             &mut col_buffers,
-            &is_non_leaf_column,
             total_rows_in_current,
             version,
         )

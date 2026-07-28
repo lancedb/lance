@@ -1511,6 +1511,8 @@ impl FileFragment {
             data_file.validate(&self.dataset.data_file_dir(data_file)?)?;
         }
 
+        // File-less fragments only have a trustworthy cached row count when the
+        // manifest records the writer version; reject legacy manifests instead.
         if self.metadata.files.is_empty() && self.dataset.manifest.writer_version.is_none() {
             return Err(Error::corrupt_file(
                 self.dataset.base.clone(),
@@ -1576,6 +1578,8 @@ impl FileFragment {
             }
             *first_length
         } else {
+            // No data file was opened to measure the length, so a file-less
+            // fragment can only be validated using its persisted physical_rows.
             self.metadata.physical_rows.ok_or_else(|| {
                 Error::corrupt_file(
                     self.dataset.base.clone(),
