@@ -6,6 +6,7 @@ use uuid::Uuid;
 
 mod fragment;
 mod index;
+pub mod key_existence;
 mod manifest;
 pub mod overlay;
 mod transaction;
