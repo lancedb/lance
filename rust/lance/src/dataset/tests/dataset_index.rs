@@ -19,11 +19,11 @@ use crate::index::DatasetIndexExt;
 use arrow::array::{AsArray, GenericListBuilder, GenericStringBuilder};
 use arrow::datatypes::UInt64Type;
 use arrow_array::RecordBatch;
-use arrow_array::{Array, GenericStringArray, StructArray, UInt64Array};
+use arrow_array::{Array, GenericStringArray, LargeListArray, ListArray, StructArray, UInt64Array};
 use arrow_array::{
     ArrayRef, Float32Array, Int32Array, RecordBatchIterator, StringArray,
     builder::StringDictionaryBuilder,
-    types::{Float32Type, Int32Type},
+    types::{Float32Type, Int32Type, Int64Type},
 };
 use arrow_schema::{
     DataType, Field as ArrowField, Field, Fields as ArrowFields, Schema as ArrowSchema,
@@ -2806,6 +2806,95 @@ async fn test_bitmap_prewarm_with_serializing_backend_serves_query_with_no_io() 
         0,
         "Bitmap filter query should not perform IO after prewarm; the serializing \
          cache backend must serve the index state and every per-value bitmap from memory"
+    );
+}
+
+#[rstest]
+#[case::list(false)]
+#[case::large_list(true)]
+#[tokio::test]
+async fn test_label_list_index_types(#[case] large_list: bool) {
+    let test_uri = TempStrDir::default();
+    let label_values = vec![
+        Some(vec![Some(1), Some(2)]),
+        Some(vec![Some(2)]),
+        Some(vec![Some(1)]),
+        Some(vec![Some(3)]),
+    ];
+    let labels: ArrayRef = if large_list {
+        Arc::new(LargeListArray::from_iter_primitive::<Int64Type, _, _>(
+            label_values,
+        ))
+    } else {
+        Arc::new(ListArray::from_iter_primitive::<Int64Type, _, _>(
+            label_values,
+        ))
+    };
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new("labels", labels.data_type().clone(), true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![0, 1, 2, 3])), labels],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let mut dataset = Dataset::write(reader, &test_uri, None).await.unwrap();
+
+    let expected = dataset
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .filter("array_has_any(labels, [1])")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let expected_ids = expected
+        .column(0)
+        .as_primitive::<Int32Type>()
+        .values()
+        .to_vec();
+    assert_eq!(expected_ids, vec![0, 2]);
+
+    dataset
+        .create_index(
+            &["labels"],
+            IndexType::LabelList,
+            Some("labels_idx".to_owned()),
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let result = dataset
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .filter("array_has_any(labels, [1])")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let result_ids = result
+        .column(0)
+        .as_primitive::<Int32Type>()
+        .values()
+        .to_vec();
+    assert_eq!(result_ids, expected_ids);
+
+    let plan = dataset
+        .scan()
+        .filter("array_has_any(labels, [1])")
+        .unwrap()
+        .explain_plan(false)
+        .await
+        .unwrap();
+    assert!(
+        plan.contains("ScalarIndexQuery") && plan.contains("LabelList"),
+        "Expected LabelList scalar index query in plan: {plan}"
     );
 }
 
