@@ -8,6 +8,7 @@
 
 use lance_core::{Error, Result};
 
+pub(crate) const MAX_DICTIONARY_ITEMS: usize = 4096;
 #[cfg(feature = "bitpacking")]
 pub(crate) const BITPACK_CHUNK_VALUES: u64 = 1024;
 

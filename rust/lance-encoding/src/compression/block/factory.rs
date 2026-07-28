@@ -14,6 +14,7 @@ use crate::{
         block::{CompressionConfig, CompressionScheme},
         constant::ConstantBlockDecompressor,
         delta::DeltaDecompressor,
+        dictionary::DictionaryBlockDecompressor,
         general::GenericGeneralBlockDecompressor,
         range::RangeDecompressor,
         rle::{BlockRleDecompressor, BlockRunCount, MetadataRunLengths},
@@ -436,6 +437,47 @@ fn create_inner(
                 values_have_payload || run_lengths_have_payload,
             ))
         }
+        Compression::Dictionary(dictionary) => {
+            if position != Position::Root {
+                return Err(Error::invalid_input(
+                    "Dictionary is not supported as a block codec child",
+                ));
+            }
+            if dictionary.num_dictionary_items == 0
+                || dictionary.num_dictionary_items as usize > MAX_DICTIONARY_ITEMS
+            {
+                return Err(Error::invalid_input(format!(
+                    "Dictionary item count {} is outside 1..={MAX_DICTIONARY_ITEMS}",
+                    dictionary.num_dictionary_items
+                )));
+            }
+            let indices_encoding = dictionary.indices.as_deref().ok_or_else(|| {
+                Error::invalid_input("Dictionary is missing its indices encoding")
+            })?;
+            let items_encoding = dictionary
+                .items
+                .as_deref()
+                .ok_or_else(|| Error::invalid_input("Dictionary is missing its items encoding"))?;
+            let (indices, indices_have_payload) = create_inner(
+                indices_encoding,
+                BlockValueType::UInt32,
+                Position::Child,
+                false,
+            )?;
+            let (items, items_have_payload) =
+                create_inner(items_encoding, expected_type, Position::Child, false)?;
+            Ok((
+                Box::new(DictionaryBlockDecompressor::new(
+                    expected_type,
+                    dictionary.num_dictionary_items,
+                    indices,
+                    items,
+                    indices_have_payload,
+                    items_have_payload,
+                )),
+                indices_have_payload || items_have_payload,
+            ))
+        }
         other => Err(Error::invalid_input(format!(
             "Unsupported block sequence encoding: {}",
             compression_name(other)
@@ -557,6 +599,13 @@ fn infer_inner(encoding: &CompressiveEncoding, position: Position) -> Result<Blo
             rle.values
                 .as_deref()
                 .ok_or_else(|| Error::invalid_input("RLE is missing its values encoding"))?,
+            Position::Child,
+        ),
+        Compression::Dictionary(dictionary) if position == Position::Root => infer_inner(
+            dictionary
+                .items
+                .as_deref()
+                .ok_or_else(|| Error::invalid_input("Dictionary is missing its items encoding"))?,
             Position::Child,
         ),
         other => Err(Error::invalid_input(format!(

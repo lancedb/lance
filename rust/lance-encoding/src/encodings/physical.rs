@@ -10,6 +10,7 @@ pub mod block;
 pub mod byte_stream_split;
 pub mod constant;
 pub mod delta;
+pub mod dictionary;
 pub mod fsst;
 pub mod general;
 pub mod packed;

@@ -587,6 +587,7 @@ on a per-value basis. We use ☑️ to mark a technique that is applied on a per
 | Constant        | ✅ (2.1)              | ❓                       | ❓                         |
 | Range           | ✅ (2.3)              | ❌                       | ❓                         |
 | Delta           | ✅ (2.3)              | ❌                       | ❓                         |
+| Dictionary      | ✅ (2.3)              | ❌                       | ❓                         |
 | Bitpacking      | ✅ (2.1)              | ❓                       | ✅ (2.1)                   |
 | Fsst            | ❓                    | ✅ (2.1)                 | ✅ (2.1)                   |
 | Rle             | ✅ (2.2)              | ❌                       | ✅ (2.1)                   |
@@ -616,7 +617,19 @@ with checked prefix sums.
 %%% proto.message.Delta %%%
 ```
 
-Lance 2.0 through 2.2 writers do not emit either encoding.
+Block Dictionary stores `u32` indices and typed dictionary items as child codec trees. When at least one child
+has a payload, both children are combined into one outer payload:
+
+```text
+Dictionary payload:
+  u64 indices_payload_bytes
+  u64 items_payload_bytes
+  indices payload
+  dictionary-items payload
+```
+
+The framed length for a metadata-only child must be zero. Readers validate the item count, frame boundaries,
+child cardinalities, and every index. Lance 2.0 through 2.2 writers do not emit Range, Delta, or block Dictionary.
 
 ### Flat
 

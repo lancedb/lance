@@ -1209,7 +1209,7 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
             Compression::OutOfLineBitpacking(_) => Err(Error::not_supported_source(
                 "this runtime was not built with bitpacking support".into(),
             )),
-            Compression::Range(_) | Compression::Delta(_) => {
+            Compression::Dictionary(_) | Compression::Range(_) | Compression::Delta(_) => {
                 let value_type = block::infer_block_value_type(description)?;
                 block::create_block_decompressor(description, value_type)
                     .map(|(decompressor, _)| decompressor)

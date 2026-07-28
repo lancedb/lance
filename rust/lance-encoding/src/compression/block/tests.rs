@@ -3,13 +3,15 @@
 
 use super::*;
 
+use std::sync::Arc;
+
 use crate::{
     buffer::LanceBuffer,
     compression::BlockCompressor,
     data::{BlockInfo, DataBlock, FixedWidthDataBlock},
     encodings::physical::{
-        constant::ConstantBlockCompressor, range::RangeEncoder, rle::BlockRleCompressor,
-        value::FixedWidthBlockCompressor,
+        constant::ConstantBlockCompressor, dictionary::DictionaryBlockCompressor,
+        range::RangeEncoder, rle::BlockRleCompressor, value::FixedWidthBlockCompressor,
     },
     format::{ProtobufUtils21, pb21::CompressiveEncoding},
 };
@@ -145,6 +147,30 @@ fn rle_compressor_owns_and_reuses_children() {
     round_trip_u64(&values, compressor, encoding);
 }
 
+#[test]
+fn dictionary_materializes_once_when_built() {
+    use crate::encodings::physical::dictionary::BLOCK_MATERIALIZATION_COUNT;
+
+    let values = (0..4096_u64)
+        .map(|index| [u64::MAX - 9, 17, 1_u64 << 50, 991][index as usize % 4])
+        .collect::<Vec<_>>();
+    let dictionary_items = Arc::from([17_u64, 991, 1_u64 << 50, u64::MAX - 9].as_slice());
+    let compressor = Box::new(DictionaryBlockCompressor::new(
+        BlockValueType::UInt64,
+        dictionary_items,
+        Box::new(FixedWidthBlockCompressor::new(BlockValueType::UInt32)),
+        Box::new(FixedWidthBlockCompressor::new(BlockValueType::UInt64)),
+    ));
+    let encoding = ProtobufUtils21::dictionary(
+        ProtobufUtils21::flat(32, None),
+        ProtobufUtils21::flat(64, None),
+        4,
+    );
+    BLOCK_MATERIALIZATION_COUNT.with(|count| count.set(0));
+    round_trip_u64(&values, compressor, encoding);
+    BLOCK_MATERIALIZATION_COUNT.with(|count| assert_eq!(count.get(), 1));
+}
+
 #[cfg(feature = "bitpacking")]
 #[test]
 fn out_of_line_bitpacking_round_trip() {
@@ -205,6 +231,18 @@ fn factory_rejects_unbounded_or_mistyped_trees() {
             .unwrap_err()
             .to_string()
             .contains("expected 64")
+    );
+
+    let oversized = ProtobufUtils21::dictionary(
+        ProtobufUtils21::flat(32, None),
+        ProtobufUtils21::flat(64, None),
+        (MAX_DICTIONARY_ITEMS + 1) as u32,
+    );
+    assert!(
+        create_block_decompressor(&oversized, BlockValueType::UInt64)
+            .unwrap_err()
+            .to_string()
+            .contains("outside")
     );
 }
 
@@ -326,6 +364,60 @@ fn rle_framing_is_fallible() {
         .decompress(Some(LanceBuffer::from(payload)), 4)
         .unwrap_err();
     assert!(error.to_string().contains("Metadata-only RLE run-length"));
+}
+
+#[test]
+fn metadata_dictionary_checks_index_bounds() {
+    let encoding = ProtobufUtils21::dictionary(
+        ProtobufUtils21::range(32, 0, 1),
+        ProtobufUtils21::range(64, 10, 1),
+        2,
+    );
+    let (decoder, has_payload) =
+        create_block_decompressor(&encoding, BlockValueType::UInt64).unwrap();
+    assert!(!has_payload);
+    let error = decoder.decompress(None, 3).unwrap_err();
+    assert!(error.to_string().contains("out of bounds"));
+}
+
+#[test]
+fn dictionary_framing_rejects_inconsistent_lengths() {
+    let encoding = ProtobufUtils21::dictionary(
+        ProtobufUtils21::flat(32, None),
+        ProtobufUtils21::flat(64, None),
+        2,
+    );
+    let (decoder, has_payload) =
+        create_block_decompressor(&encoding, BlockValueType::UInt64).unwrap();
+    assert!(has_payload);
+    let mut payload = 4_u64.to_le_bytes().to_vec();
+    payload.extend_from_slice(&16_u64.to_le_bytes());
+    payload.extend_from_slice(&[0; 8]);
+    assert!(
+        decoder
+            .decompress(Some(LanceBuffer::from(payload)), 1)
+            .is_err()
+    );
+}
+
+#[test]
+fn dictionary_framing_rejects_payload_for_metadata_child() {
+    let encoding = ProtobufUtils21::dictionary(
+        ProtobufUtils21::flat(32, None),
+        ProtobufUtils21::range(64, 10, 1),
+        2,
+    );
+    let (decoder, has_payload) =
+        create_block_decompressor(&encoding, BlockValueType::UInt64).unwrap();
+    assert!(has_payload);
+    let mut payload = 4_u64.to_le_bytes().to_vec();
+    payload.extend_from_slice(&1_u64.to_le_bytes());
+    payload.extend_from_slice(&0_u32.to_le_bytes());
+    payload.push(0);
+    let error = decoder
+        .decompress(Some(LanceBuffer::from(payload)), 1)
+        .unwrap_err();
+    assert!(error.to_string().contains("Metadata-only Dictionary items"));
 }
 
 #[test]
