@@ -16,15 +16,10 @@ use lance_index::scalar::inverted::{InvertedIndex, InvertedIndexParams};
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::registry::VALUE_COLUMN_NAME;
 use lance_table::format::IndexMetadata;
-use prost::Message;
 use roaring::RoaringBitmap;
 use uuid::Uuid;
 
-use crate::{
-    Dataset, Error, Result,
-    dataset::index::LanceIndexStoreExt,
-    index::{DatasetIndexExt, scalar::fetch_index_details},
-};
+use crate::{Dataset, Error, Result, dataset::index::LanceIndexStoreExt, index::DatasetIndexExt};
 
 /// Build an empty update stream for the inverted merge API.
 ///
@@ -180,53 +175,41 @@ pub async fn load_segments(dataset: &Dataset, column: &str) -> Result<Option<Vec
     Ok(Some(indices))
 }
 
-/// Load and validate the shared [`InvertedIndexDetails`] across committed
-/// segments returned by [`load_segments`].
+/// Load and validate the shared [`InvertedIndexParams`] across committed
+/// segments returned by [`load_segments`], then derive their manifest-facing
+/// [`InvertedIndexDetails`].
 ///
-/// All segments are required to agree on their semantic `InvertedIndexDetails`
-/// payload (tokenizer, position settings, etc.); inconsistent
-/// segments return an error. Details are canonicalized before comparison so
-/// legacy segments that omit default fields remain compatible with newly
-/// written text FTS segments. Returns the canonical details that may be used
-/// when constructing a tokenizer or running a query against the index.
+/// The persisted params are the authoritative query contract because
+/// `InvertedIndexDetails` is intentionally lossy (for example, it omits custom
+/// stop words). All segments must agree on the complete persisted params before
+/// a query may select one segment's tokenizer. Legacy segments remain
+/// compatible because [`InvertedIndex::load_params`] reads their tokenizer
+/// config from the legacy tokens file and applies defaults for missing fields.
 pub async fn load_segment_details(
     dataset: &Dataset,
     column: &str,
     segments: &[IndexMetadata],
 ) -> Result<InvertedIndexDetails> {
-    let mut expected_details: Option<InvertedIndexDetails> = None;
+    let mut expected_params: Option<(Uuid, InvertedIndexParams)> = None;
     for meta in segments {
-        let details_any = fetch_index_details(dataset, column, meta).await?;
-        let details =
-            InvertedIndexDetails::decode(details_any.value.as_slice()).map_err(|err| {
-                Error::io(format!(
-                    "failed to decode InvertedIndexDetails payload: {err}"
-                ))
-            })?;
-        let details = canonicalize_inverted_index_details(details)?;
-        match &expected_details {
-            Some(expected) if expected != &details => {
+        let params = load_segment_params(dataset, meta).await?;
+        match &expected_params {
+            Some((expected_uuid, expected)) if expected != &params => {
                 return Err(Error::invalid_input(format!(
-                    "FTS index {} has inconsistent inverted index details across segments",
-                    meta.name
+                    "FTS index {} has inconsistent inverted index parameters across segments {} and {}",
+                    meta.name, expected_uuid, meta.uuid
                 )));
             }
             Some(_) => {}
-            None => expected_details = Some(details),
+            None => expected_params = Some((meta.uuid, params)),
         }
     }
-    expected_details.ok_or_else(|| {
+    let (_, params) = expected_params.ok_or_else(|| {
         Error::invalid_input(format!(
             "FTS index for column {} requires at least one segment",
             column
         ))
-    })
-}
-
-fn canonicalize_inverted_index_details(
-    details: InvertedIndexDetails,
-) -> Result<InvertedIndexDetails> {
-    let params = InvertedIndexParams::try_from(&details)?;
+    })?;
     InvertedIndexDetails::try_from(&params)
 }
 
@@ -240,7 +223,17 @@ pub async fn load_segment_params(
 }
 
 #[cfg(test)]
+fn canonicalize_inverted_index_details(
+    details: InvertedIndexDetails,
+) -> Result<InvertedIndexDetails> {
+    let params = InvertedIndexParams::try_from(&details)?;
+    InvertedIndexDetails::try_from(&params)
+}
+
+#[cfg(test)]
 mod tests {
+    use prost::Message;
+
     use super::*;
 
     #[test]

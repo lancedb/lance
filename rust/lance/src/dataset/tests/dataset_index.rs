@@ -4160,3 +4160,142 @@ async fn test_load_segment_params_full_fidelity() {
         .expect("inverted index");
     assert_eq!(&read, opened.params());
 }
+
+#[tokio::test]
+async fn test_full_text_search_loads_segment_params_from_shallow_clone_base() {
+    let test_uri = TempStrDir::default();
+    let clone_uri = format!("{test_uri}/clone");
+    let batch = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "text",
+            DataType::Utf8,
+            false,
+        )])),
+        vec![Arc::new(StringArray::from(vec!["the alpha", "the beta"]))],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let mut source = Dataset::write(reader, &test_uri, None).await.unwrap();
+    source
+        .create_index(
+            &["text"],
+            IndexType::Inverted,
+            Some("fts_idx".to_string()),
+            &InvertedIndexParams::default().custom_stop_words(Some(vec!["alpha".to_string()])),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let source_version = source.version().version;
+    let cloned = source
+        .shallow_clone(&clone_uri, source_version, None)
+        .await
+        .unwrap();
+    let segments = crate::index::scalar::load_segments(&cloned, "text")
+        .await
+        .unwrap()
+        .expect("cloned FTS segment");
+    assert_eq!(segments.len(), 1);
+    assert!(
+        segments[0].base_id.is_some(),
+        "shallow-cloned index must resolve through its source base"
+    );
+
+    let mut scanner = cloned.scan();
+    scanner
+        .full_text_search(FullTextSearchQuery::new("the".to_string()))
+        .unwrap();
+    let results = scanner.try_into_batch().await.unwrap();
+    assert_eq!(
+        results.num_rows(),
+        2,
+        "custom stop words replace built-ins after loading through the clone base"
+    );
+}
+
+#[rstest]
+#[case::none_vs_empty(None, Some(Vec::new()))]
+#[case::empty_vs_nonempty(
+    Some(Vec::new()),
+    Some(vec!["alpha".to_string()])
+)]
+#[tokio::test]
+async fn test_full_text_search_rejects_inconsistent_segment_params(
+    #[case] first_custom_stop_words: Option<Vec<String>>,
+    #[case] second_custom_stop_words: Option<Vec<String>>,
+) {
+    let test_uri = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "text",
+        DataType::Utf8,
+        false,
+    )]));
+    let batches = vec![
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["the alpha", "beta"]))],
+        )
+        .unwrap(),
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["the alpha", "gamma"]))],
+        )
+        .unwrap(),
+    ];
+    let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
+    let mut dataset = Dataset::write(
+        reader,
+        &test_uri,
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            max_rows_per_group: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let fragment_ids = dataset
+        .get_fragments()
+        .iter()
+        .map(|fragment| fragment.id() as u32)
+        .collect::<Vec<_>>();
+    assert_eq!(fragment_ids.len(), 2);
+
+    let params = [
+        InvertedIndexParams::default().custom_stop_words(first_custom_stop_words),
+        InvertedIndexParams::default().custom_stop_words(second_custom_stop_words),
+    ];
+    let mut segments = Vec::with_capacity(fragment_ids.len());
+    for (fragment_id, params) in fragment_ids.into_iter().zip(params.iter()) {
+        let mut builder = dataset
+            .create_index_builder(&["text"], IndexType::Inverted, params)
+            .name("fts_idx".to_string())
+            .fragments(vec![fragment_id]);
+        segments.push(builder.execute_uncommitted().await.unwrap());
+    }
+    assert_eq!(
+        segments[0].index_details, segments[1].index_details,
+        "manifest details intentionally omit custom stop words"
+    );
+    dataset
+        .commit_existing_index_segments("fts_idx", "text", segments)
+        .await
+        .unwrap();
+
+    let mut scanner = dataset.scan();
+    scanner
+        .full_text_search(FullTextSearchQuery::new("alpha".to_string()))
+        .unwrap();
+    let error = scanner.try_into_batch().await.unwrap_err();
+
+    assert!(
+        matches!(error, Error::InvalidInput { .. }),
+        "expected InvalidInput, got {error:?}"
+    );
+    assert_contains!(
+        error.to_string(),
+        "inconsistent inverted index parameters across segments"
+    );
+}
