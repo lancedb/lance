@@ -9,7 +9,7 @@ use lance_core::datatypes::Schema;
 use lance_datafusion::chunker::{break_stream, chunk_stream};
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_file::previous::writer::FileWriter as PreviousFileWriter;
-use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
+use lance_file::version::{LanceFileFormat, LanceFileVersion};
 use lance_file::writer::FileWriterOptions;
 use lance_io::object_store::ObjectStore;
 use lance_io::utils::CachedFileSize;
@@ -156,8 +156,7 @@ impl<'a> FragmentCreateBuilder<'a> {
             },
         )?;
 
-        let data_file =
-            DataFile::new_unstarted(filename, ConcreteFileVersion::from(writer.version()));
+        let data_file = DataFile::new_unstarted(filename, LanceFileFormat::from(writer.version()));
         fragment.files.push(data_file);
 
         progress.begin(&fragment).await?;
@@ -693,7 +692,7 @@ mod tests {
         assert!(!fragment.files.is_empty());
         fragment.files.iter().for_each(|f| {
             let (major_version, minor_version) =
-                ConcreteFileVersion::from(file_version).to_data_file_numbers();
+                LanceFileFormat::from(file_version).to_data_file_numbers();
             assert_eq!(f.file_major_version, major_version);
             assert_eq!(f.file_minor_version, minor_version);
         })
@@ -726,7 +725,7 @@ mod tests {
         assert!(!fragment.is_empty());
         fragment[0].files.iter().for_each(|f| {
             let (major_version, minor_version) =
-                ConcreteFileVersion::from(file_version).to_data_file_numbers();
+                LanceFileFormat::from(file_version).to_data_file_numbers();
             assert_eq!(f.file_major_version, major_version);
             assert_eq!(f.file_minor_version, minor_version);
         })

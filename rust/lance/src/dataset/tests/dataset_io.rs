@@ -35,7 +35,7 @@ use lance_arrow::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY};
 use lance_core::utils::tempfile::{TempStdDir, TempStrDir};
 use lance_datagen::{BatchCount, RowCount, array, gen_batch};
 use lance_file::{
-    version::{ConcreteFileVersion, LanceFileVersion},
+    version::{LanceFileFormat, LanceFileVersion},
     writer::{FileWriter, FileWriterOptions},
 };
 use lance_io::assert_io_eq;
@@ -1055,7 +1055,7 @@ async fn test_write_manifest(
 
     assert_eq!(
         manifest.data_storage_format,
-        DataStorageFormat::new(ConcreteFileVersion::from(data_storage_version))
+        DataStorageFormat::new(LanceFileFormat::from(data_storage_version))
     );
     assert!(!matches!(
         manifest.data_storage_format.version.to_manifest_string(),

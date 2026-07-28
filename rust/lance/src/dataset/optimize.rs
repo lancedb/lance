@@ -518,7 +518,7 @@ async fn can_use_binary_copy_impl(
     fragments: &[Fragment],
 ) -> Result<bool> {
     use lance_file::reader::FileReader as LFReader;
-    use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
+    use lance_file::version::{LanceFileFormat, LanceFileVersion};
     use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 
     if matches!(options.compaction_mode(), CompactionMode::Reencode) {
@@ -580,7 +580,7 @@ async fn can_use_binary_copy_impl(
         for data_file in &fragment.files {
             let version_ok = data_file
                 .file_version()
-                .is_ok_and(|v| v == ConcreteFileVersion::from(storage_file_version));
+                .is_ok_and(|v| v == LanceFileFormat::from(storage_file_version));
 
             if !version_ok {
                 is_same_version = false;
@@ -8411,7 +8411,7 @@ mod tests {
             },
         )
         .unwrap();
-        let file_version = lance_file::version::ConcreteFileVersion::from(writer.version());
+        let file_version = lance_file::version::LanceFileFormat::from(writer.version());
         for (column_index, array) in columns.into_iter().enumerate() {
             writer.write_column(column_index, array).await.unwrap();
         }

@@ -13,7 +13,7 @@ use lance_encoding::decoder::{ColumnInfo, PageEncoding, PageInfo as DecPageInfo}
 use lance_encoding::version::LanceFileVersion;
 use lance_file::format::pbfile;
 use lance_file::reader::FileReader as LFReader;
-use lance_file::version::ConcreteFileVersion;
+use lance_file::version::LanceFileFormat;
 use lance_file::writer::{FileWriter, FileWriterOptions};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::traits::Writer;
@@ -139,7 +139,7 @@ async fn finalize_current_output_file(
     let field_column_indices = compute_field_column_indices(schema, full_field_ids.len(), version);
     let mut data_file = DataFile::new_unstarted(
         current_filename.take().unwrap(),
-        ConcreteFileVersion::from(version),
+        LanceFileFormat::from(version),
     );
     data_file.fields = full_field_ids.to_vec().into();
     data_file.column_indices = field_column_indices.into();
@@ -196,7 +196,7 @@ pub async fn rewrite_files_binary_copy(
     let full_field_ids = schema.field_ids();
 
     // The previous checks have ensured that the file versions of all files are consistent.
-    let version: LanceFileVersion = ConcreteFileVersion::from_data_file_numbers(
+    let version: LanceFileVersion = LanceFileFormat::from_data_file_numbers(
         fragments[0].files[0].file_major_version,
         fragments[0].files[0].file_minor_version,
     )

@@ -47,7 +47,7 @@ use crate::{
     datatypes::{Fields, FieldsWithMeta},
     format::{MAGIC, MAJOR_VERSION, MINOR_VERSION, pb, pbfile},
     io::LanceEncodingsIo,
-    version::ConcreteFileVersion,
+    version::LanceFileFormat,
     writer::PAGE_BUFFER_ALIGNMENT,
 };
 
@@ -1016,7 +1016,7 @@ impl FileReader {
         let footer = Self::decode_footer(&tail_bytes)?;
 
         let file_version: LanceFileVersion =
-            ConcreteFileVersion::from_footer_numbers(footer.major_version, footer.minor_version)?
+            LanceFileFormat::from_footer_numbers(footer.major_version, footer.minor_version)?
                 .into();
 
         let gbo_table =
@@ -1087,7 +1087,7 @@ impl FileReader {
         let footer = Self::decode_footer(&tail_bytes)?;
 
         let file_version: LanceFileVersion =
-            ConcreteFileVersion::from_footer_numbers(footer.major_version, footer.minor_version)?
+            LanceFileFormat::from_footer_numbers(footer.major_version, footer.minor_version)?
                 .into();
 
         let gbo_table =
@@ -2637,7 +2637,7 @@ impl EncodedBatchReaderExt for EncodedBatch {
             FileReader::read_all_column_metadata(column_metadata_bytes, &footer)?;
 
         let file_version: LanceFileVersion =
-            ConcreteFileVersion::from_footer_numbers(footer.major_version, footer.minor_version)?
+            LanceFileFormat::from_footer_numbers(footer.major_version, footer.minor_version)?
                 .into();
 
         let page_table = FileReader::meta_to_col_infos(&column_metadatas, file_version)?;
@@ -2660,7 +2660,7 @@ impl EncodedBatchReaderExt for EncodedBatch {
     {
         let footer = FileReader::decode_footer(&bytes)?;
         let file_version: LanceFileVersion =
-            ConcreteFileVersion::from_footer_numbers(footer.major_version, footer.minor_version)?
+            LanceFileFormat::from_footer_numbers(footer.major_version, footer.minor_version)?
                 .into();
 
         let gbo_table = FileReader::do_decode_gbo_table(

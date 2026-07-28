@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use lance_core::Error;
 use lance_core::deepsize::DeepSizeOf;
-use lance_file::version::ConcreteFileVersion;
+use lance_file::version::LanceFileFormat;
 use lance_io::utils::CachedFileSize;
 use object_store::path::Path;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -108,7 +108,7 @@ impl DataFile {
         path: impl Into<String>,
         fields: Vec<i32>,
         column_indices: Vec<i32>,
-        file_version: ConcreteFileVersion,
+        file_version: LanceFileFormat,
         file_size_bytes: Option<NonZero<u64>>,
         base_id: Option<u32>,
     ) -> Self {
@@ -125,7 +125,7 @@ impl DataFile {
     }
 
     /// Create a new `DataFile` whose fields and column indices will be set later.
-    pub fn new_unstarted(path: impl Into<String>, file_version: ConcreteFileVersion) -> Self {
+    pub fn new_unstarted(path: impl Into<String>, file_version: LanceFileFormat) -> Self {
         let (file_major_version, file_minor_version) = file_version.to_data_file_numbers();
         Self {
             path: path.into(),
@@ -143,7 +143,7 @@ impl DataFile {
         fields: Vec<i32>,
         base_id: Option<u32>,
     ) -> Self {
-        Self::new(path, fields, vec![], ConcreteFileVersion::V1, None, base_id)
+        Self::new(path, fields, vec![], LanceFileFormat::V1, None, base_id)
     }
 
     pub fn new_legacy(
@@ -158,7 +158,7 @@ impl DataFile {
             path,
             field_ids,
             vec![],
-            ConcreteFileVersion::V1,
+            LanceFileFormat::V1,
             file_size_bytes,
             base_id,
         )
@@ -173,11 +173,8 @@ impl DataFile {
     }
 
     /// Decode the exact file version stored in this `DataFile` metadata.
-    pub fn file_version(&self) -> Result<ConcreteFileVersion> {
-        ConcreteFileVersion::from_data_file_numbers(
-            self.file_major_version,
-            self.file_minor_version,
-        )
+    pub fn file_version(&self) -> Result<LanceFileFormat> {
+        LanceFileFormat::from_data_file_numbers(self.file_major_version, self.file_minor_version)
     }
 
     pub fn validate(&self, base_path: &Path) -> Result<()> {
@@ -576,7 +573,7 @@ impl Fragment {
         path: impl Into<String>,
         field_ids: Vec<i32>,
         column_indices: Vec<i32>,
-        version: ConcreteFileVersion,
+        version: LanceFileFormat,
         file_size_bytes: Option<NonZero<u64>>,
     ) -> Self {
         let data_file = DataFile::new(
@@ -601,7 +598,7 @@ impl Fragment {
         path: impl Into<String>,
         field_ids: Vec<i32>,
         column_indices: Vec<i32>,
-        version: ConcreteFileVersion,
+        version: LanceFileFormat,
         file_size_bytes: Option<NonZero<u64>>,
     ) {
         self.files.push(DataFile::new(
@@ -630,7 +627,7 @@ impl Fragment {
     //
     // Returns None if there are no data files
     // Returns an error if the data files have different versions
-    pub fn try_infer_version(fragments: &[Self]) -> Result<Option<ConcreteFileVersion>> {
+    pub fn try_infer_version(fragments: &[Self]) -> Result<Option<LanceFileFormat>> {
         // Otherwise we need to check the actual file versions
         // Determine version from first file
         let Some(sample_file) = fragments
@@ -901,13 +898,8 @@ mod tests {
     fn infer_exact_file_version_and_reject_mixed_fragments() {
         assert_eq!(Fragment::try_infer_version(&[]).unwrap(), None);
 
-        let v2_0 = Fragment::new(0).with_file(
-            "v2_0.lance",
-            vec![0],
-            vec![0],
-            ConcreteFileVersion::V2_0,
-            None,
-        );
+        let v2_0 =
+            Fragment::new(0).with_file("v2_0.lance", vec![0], vec![0], LanceFileFormat::V2_0, None);
         assert_eq!(
             (
                 v2_0.files[0].file_major_version,
@@ -915,7 +907,7 @@ mod tests {
             ),
             (2, 0)
         );
-        let unstarted = DataFile::new_unstarted("unstarted.lance", ConcreteFileVersion::V2_0);
+        let unstarted = DataFile::new_unstarted("unstarted.lance", LanceFileFormat::V2_0);
         assert_eq!(
             (unstarted.file_major_version, unstarted.file_minor_version),
             (2, 0)
@@ -924,21 +916,16 @@ mod tests {
             "v2_0_second.lance",
             vec![0],
             vec![0],
-            ConcreteFileVersion::V2_0,
+            LanceFileFormat::V2_0,
             None,
         );
         assert_eq!(
             Fragment::try_infer_version(&[v2_0.clone(), v2_0_second]).unwrap(),
-            Some(ConcreteFileVersion::V2_0)
+            Some(LanceFileFormat::V2_0)
         );
 
-        let v2_1 = Fragment::new(2).with_file(
-            "v2_1.lance",
-            vec![0],
-            vec![0],
-            ConcreteFileVersion::V2_1,
-            None,
-        );
+        let v2_1 =
+            Fragment::new(2).with_file("v2_1.lance", vec![0], vec![0], LanceFileFormat::V2_1, None);
         let error = Fragment::try_infer_version(&[v2_0, v2_1]).unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }));
         let message = error.to_string();

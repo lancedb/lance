@@ -41,7 +41,7 @@ use lance_file::previous::reader::{
 use lance_file::reader::{
     CachedFileMetadata, FileMetadataIndex, FileReaderOptions, ProjectedFileReader, ReaderProjection,
 };
-use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
+use lance_file::version::{LanceFileFormat, LanceFileVersion};
 use lance_file::{LanceEncodingsIo, determine_file_version};
 use lance_io::ReadBatchParams;
 use lance_io::scheduler::{FileScheduler, ScanScheduler, SchedulerConfig};
@@ -838,7 +838,7 @@ impl FileFragment {
                 filename,
                 dataset.schema().field_ids(),
                 column_indices,
-                ConcreteFileVersion::from(file_version),
+                LanceFileFormat::from(file_version),
                 None,
             );
             Ok(frag)
@@ -3131,7 +3131,7 @@ mod tests {
     use lance_core::ROW_ID;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::{RowCount, array, gen_batch};
-    use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
+    use lance_file::version::{LanceFileFormat, LanceFileVersion};
     use lance_file::writer::FileWriterOptions;
     use lance_io::{assert_io_eq, assert_io_lt, object_store::ObjectStore};
     use pretty_assertions::assert_eq;
@@ -3225,7 +3225,7 @@ mod tests {
         };
         use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
         use lance_core::datatypes::Schema;
-        use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
+        use lance_file::version::{LanceFileFormat, LanceFileVersion};
         use lance_file::writer::{FileWriter, FileWriterOptions};
         use lance_io::utils::CachedFileSize;
         use lance_table::format::DataFile;
@@ -3304,7 +3304,7 @@ mod tests {
                 },
             )
             .unwrap();
-            let file_version = ConcreteFileVersion::from(writer.version());
+            let file_version = LanceFileFormat::from(writer.version());
             for (column_index, array) in columns.into_iter().enumerate() {
                 writer.write_column(column_index, array).await.unwrap();
             }
@@ -5921,7 +5921,7 @@ mod tests {
             Fragment::try_infer_version(std::slice::from_ref(&frag))
                 .unwrap()
                 .unwrap(),
-            ConcreteFileVersion::from(LanceFileVersion::Stable)
+            LanceFileFormat::from(LanceFileVersion::Stable)
         );
 
         let op = Operation::Append {

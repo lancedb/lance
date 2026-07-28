@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
+use lance_file::version::{LanceFileFormat, LanceFileVersion};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_select::RowAddrTreeMap;
 use lance_table::{
@@ -367,7 +367,7 @@ impl<'a> CommitBuilder<'a> {
             && let Some(storage_format) = self.storage_format
         {
             let passed_storage_format =
-                DataStorageFormat::new(ConcreteFileVersion::from(storage_format));
+                DataStorageFormat::new(LanceFileFormat::from(storage_format));
             if ds.manifest.data_storage_format != passed_storage_format
                 && !matches!(transaction.operation, Operation::Overwrite { .. })
             {
@@ -383,7 +383,7 @@ impl<'a> CommitBuilder<'a> {
             use_stable_row_ids,
             storage_format: self
                 .storage_format
-                .map(ConcreteFileVersion::from)
+                .map(LanceFileFormat::from)
                 .map(DataStorageFormat::new),
             ..Default::default()
         };
@@ -560,7 +560,7 @@ mod tests {
 
     fn sample_fragment() -> Fragment {
         let (major_version, minor_version) =
-            ConcreteFileVersion::from(LanceFileVersion::Stable).to_data_file_numbers();
+            LanceFileFormat::from(LanceFileVersion::Stable).to_data_file_numbers();
         Fragment {
             id: 0,
             files: vec![DataFile {
