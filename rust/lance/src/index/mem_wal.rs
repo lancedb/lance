@@ -3,125 +3,22 @@
 
 //! MemWAL Index operations.
 //!
-//! The MemWAL Index stores:
-//! - Configuration (sharding_specs, maintained_indexes)
-//! - SSTable compaction progress
-//! - Shard state snapshots (eventually consistent)
-//!
-//! Writers no longer update the index on every write. Instead, they update
-//! shard manifests directly. This module provides functions to:
-//! - Load the MemWAL index
-//! - Update compacted SSTables (called during merge-insert commits)
+//! The index data structures and the helpers that read and update the index's
+//! `IndexMetadata` entry live in [`lance_table::system_index::mem_wal`]; this
+//! module holds the dataset-level operations built on top of them.
 
-use std::sync::Arc;
-
-use lance_core::{Error, Result};
-use lance_index::mem_wal::{CompactedSsTable, MEM_WAL_INDEX_NAME, MemWalIndex, MemWalIndexDetails};
-use lance_table::format::{IndexMetadata, pb};
-use uuid::Uuid;
-
-/// Load MemWalIndexDetails from an IndexMetadata.
-pub(crate) fn load_mem_wal_index_details(index: IndexMetadata) -> Result<MemWalIndexDetails> {
-    if let Some(details_any) = index.index_details.as_ref() {
-        if !details_any.type_url.ends_with("MemWalIndexDetails") {
-            return Err(Error::index(format!(
-                "Index details is not for the MemWAL index, but {}",
-                details_any.type_url
-            )));
-        }
-
-        Ok(MemWalIndexDetails::try_from(
-            details_any.to_msg::<pb::MemWalIndexDetails>()?,
-        )?)
-    } else {
-        Err(Error::index("Index details not found for the MemWAL index"))
-    }
-}
-
-/// Open the MemWAL index from its metadata.
-pub(crate) fn open_mem_wal_index(index: IndexMetadata) -> Result<Arc<MemWalIndex>> {
-    Ok(Arc::new(MemWalIndex::new(load_mem_wal_index_details(
-        index,
-    )?)))
-}
-
-/// Update `compacted_sstables` in the MemWAL index.
-///
-/// This is called during merge-insert commits to atomically record which
-/// SSTables have been compacted into the base table.
-pub(crate) fn update_mem_wal_index_compacted_sstables(
-    indices: &mut Vec<IndexMetadata>,
-    dataset_version: u64,
-    new_compacted_sstables: Vec<CompactedSsTable>,
-) -> Result<()> {
-    if new_compacted_sstables.is_empty() {
-        return Ok(());
-    }
-
-    let pos = indices
-        .iter()
-        .position(|idx| idx.name == MEM_WAL_INDEX_NAME);
-
-    let new_meta = if let Some(pos) = pos {
-        let current_meta = indices.remove(pos);
-        let mut details = load_mem_wal_index_details(current_meta)?;
-
-        // Update compacted_sstables - for each shard, keep the higher generation
-        for new_sstable in new_compacted_sstables {
-            if let Some(existing) = details
-                .compacted_sstables
-                .iter_mut()
-                .find(|sstable| sstable.shard_id == new_sstable.shard_id)
-            {
-                if new_sstable.generation > existing.generation {
-                    existing.generation = new_sstable.generation;
-                }
-            } else {
-                details.compacted_sstables.push(new_sstable);
-            }
-        }
-
-        new_mem_wal_index_meta(dataset_version, details)?
-    } else {
-        // Create a MemWAL index containing only compaction progress.
-        let details = MemWalIndexDetails {
-            compacted_sstables: new_compacted_sstables,
-            ..Default::default()
-        };
-        new_mem_wal_index_meta(dataset_version, details)?
-    };
-
-    indices.push(new_meta);
-    Ok(())
-}
-
-/// Create a new MemWAL index metadata entry.
-pub(crate) fn new_mem_wal_index_meta(
-    dataset_version: u64,
-    details: MemWalIndexDetails,
-) -> Result<IndexMetadata> {
-    Ok(IndexMetadata {
-        uuid: Uuid::new_v4(),
-        name: MEM_WAL_INDEX_NAME.to_string(),
-        fields: vec![],
-        dataset_version,
-        fragment_bitmap: None,
-        index_details: Some(Arc::new(prost_types::Any::from_msg(
-            &pb::MemWalIndexDetails::from(&details),
-        )?)),
-        index_version: 0,
-        created_at: Some(chrono::Utc::now()),
-        base_id: None,
-        // Memory WAL index is inline (no files)
-        files: None,
-    })
-}
+pub(crate) use lance_table::system_index::mem_wal::{
+    load_mem_wal_index_details, new_mem_wal_index_meta, open_mem_wal_index,
+    update_mem_wal_index_compacted_sstables,
+};
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    use lance_index::mem_wal::{CompactedSsTable, MEM_WAL_INDEX_NAME, MemWalIndexDetails};
     use std::sync::Arc;
+    use uuid::Uuid;
 
     use crate::index::DatasetIndexExt;
     use arrow_array::{Int32Array, RecordBatch};
