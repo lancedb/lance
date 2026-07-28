@@ -382,10 +382,13 @@ async fn test_inline_transaction() {
     // Case 3: manifest does not contain inline transaction, read should fall back to external transaction file
     let ds = create_dataset(2).await;
     let tx = make_tx(ds.manifest().version);
-    let tx_file =
-        crate::io::commit::write_transaction_file(ds.object_store.as_ref(), &ds.base, &tx)
-            .await
-            .unwrap();
+    let tx_file = crate::io::commit::write_transaction_file(
+        ds.object_store.as_ref(),
+        &ds.base,
+        &lance_table::format::pb::Transaction::from(&tx),
+    )
+    .await
+    .unwrap();
     let (mut manifest, indices) = tx
         .build_manifest(
             Some(ds.manifest.as_ref()),

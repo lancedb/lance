@@ -122,7 +122,7 @@ async fn cleanup_transaction_file(
 pub(crate) async fn write_transaction_file(
     object_store: &ObjectStore,
     base_path: &Path,
-    transaction: &Transaction,
+    transaction: &pb::Transaction,
 ) -> Result<String> {
     let file_name = format!("{}-{}.txn", transaction.read_version, transaction.uuid);
     let path = base_path
@@ -130,8 +130,7 @@ pub(crate) async fn write_transaction_file(
         .join(TRANSACTIONS_DIR)
         .join(file_name.as_str());
 
-    let message = pb::Transaction::from(transaction);
-    let buf = message.encode_to_vec();
+    let buf = transaction.encode_to_vec();
     object_store.put(&path, &buf).await?;
 
     Ok(file_name)
@@ -145,10 +144,10 @@ pub(crate) const MAX_INLINE_TRANSACTION_BYTES: usize = 64 * 1024;
 /// inline must be written to the external transaction file unconditionally —
 /// it is then the only durable copy — even if the config asked to skip it.
 fn inline_transaction_config(
-    transaction: &Transaction,
+    transaction: &pb::Transaction,
     write_config: &ManifestWriteConfig,
 ) -> (bool, ManifestWriteConfig) {
-    let inline = pb::Transaction::from(transaction).encoded_len() <= MAX_INLINE_TRANSACTION_BYTES;
+    let inline = transaction.encoded_len() <= MAX_INLINE_TRANSACTION_BYTES;
     let write_config = if inline {
         write_config.clone()
     } else {
@@ -168,11 +167,13 @@ async fn do_commit_new_dataset(
     metadata_cache: &DSMetadataCache,
     store_registry: Arc<ObjectStoreRegistry>,
 ) -> Result<(Manifest, ManifestLocation)> {
-    let (inline_transaction, write_config) = inline_transaction_config(transaction, write_config);
+    let pb_transaction = pb::Transaction::from(transaction);
+    let (inline_transaction, write_config) =
+        inline_transaction_config(&pb_transaction, write_config);
     let write_config = &write_config;
 
     let transaction_file = if !write_config.disable_transaction_file() {
-        write_transaction_file(object_store, base_path, transaction).await?
+        write_transaction_file(object_store, base_path, &pb_transaction).await?
     } else {
         String::new()
     };
@@ -286,7 +287,7 @@ async fn do_commit_new_dataset(
         },
         write_config,
         manifest_naming_scheme,
-        inline_transaction.then_some(transaction),
+        inline_transaction.then(|| pb_transaction.into()),
     )
     .await;
 
@@ -807,13 +808,15 @@ pub(crate) async fn do_commit_detached_transaction(
     write_config: &ManifestWriteConfig,
     commit_config: &CommitConfig,
 ) -> Result<(Manifest, ManifestLocation)> {
-    let (inline_transaction, write_config) = inline_transaction_config(transaction, write_config);
+    let pb_transaction = pb::Transaction::from(transaction);
+    let (inline_transaction, write_config) =
+        inline_transaction_config(&pb_transaction, write_config);
     let write_config = &write_config;
 
     // We don't strictly need a transaction file but we go ahead and create one for
     // record-keeping if nothing else.
     let transaction_file = if !write_config.disable_transaction_file() {
-        write_transaction_file(object_store, &dataset.base, transaction).await?
+        write_transaction_file(object_store, &dataset.base, &pb_transaction).await?
     } else {
         String::new()
     };
@@ -869,7 +872,8 @@ pub(crate) async fn do_commit_detached_transaction(
             },
             write_config,
             ManifestNamingScheme::V2,
-            inline_transaction.then_some(transaction),
+            // Cloned because the loop may retry on a random-version collision.
+            inline_transaction.then(|| pb_transaction.clone().into()),
         )
         .await;
 
@@ -1010,12 +1014,13 @@ pub(crate) async fn commit_transaction(
 
         // Recomputed every attempt: the rebase above may have rewritten the
         // transaction.
+        let pb_transaction = pb::Transaction::from(&transaction);
         let (inline_transaction, write_config) =
-            inline_transaction_config(&transaction, write_config);
+            inline_transaction_config(&pb_transaction, write_config);
         let write_config = &write_config;
 
         current_transaction_file = if !write_config.disable_transaction_file() {
-            write_transaction_file(object_store, &dataset.base, &transaction).await?
+            write_transaction_file(object_store, &dataset.base, &pb_transaction).await?
         } else {
             String::new()
         };
@@ -1080,7 +1085,7 @@ pub(crate) async fn commit_transaction(
             },
             write_config,
             manifest_naming_scheme,
-            inline_transaction.then_some(&transaction),
+            inline_transaction.then(|| pb_transaction.into()),
         )
         .await;
 
@@ -1335,9 +1340,13 @@ mod tests {
             Some("hello world".to_string()),
         );
 
-        let file_name = write_transaction_file(&object_store, &base_path, &transaction)
-            .await
-            .unwrap();
+        let file_name = write_transaction_file(
+            &object_store,
+            &base_path,
+            &pb::Transaction::from(&transaction),
+        )
+        .await
+        .unwrap();
         let read_transaction = read_transaction_file(&object_store, &base_path, &file_name)
             .await
             .unwrap();
