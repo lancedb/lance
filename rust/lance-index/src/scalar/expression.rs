@@ -843,6 +843,10 @@ pub struct TextQueryParser {
     index_type: String,
     needs_recheck: bool,
     supports_regex: bool,
+    /// The shortest `contains` pattern (in characters, not bytes) the index can
+    /// say anything useful about.  Shorter patterns bypass the index entirely so
+    /// they are answered by a full scan.  Use 0 for indices with no such limit.
+    min_contains_chars: usize,
 }
 
 impl TextQueryParser {
@@ -851,12 +855,14 @@ impl TextQueryParser {
         index_type: String,
         needs_recheck: bool,
         supports_regex: bool,
+        min_contains_chars: usize,
     ) -> Self {
         Self {
             index_name,
             index_type,
             needs_recheck,
             supports_regex,
+            min_contains_chars,
         }
     }
 }
@@ -914,7 +920,11 @@ impl ScalarQueryParser for TextQueryParser {
 
         let query = match func.name() {
             "contains" if args.len() == 2 => {
-                if self.index_type == "NGram" && pattern.len() < crate::scalar::ngram::NGRAM_N {
+                // A pattern shorter than the index's token width produces no
+                // tokens, so the index can only answer "recheck everything".
+                // Leave it to a full scan instead.  The count is in characters
+                // because tokenizers split on characters, not bytes.
+                if pattern.chars().count() < self.min_contains_chars {
                     return None;
                 }
                 TextQuery::StringContains(pattern)

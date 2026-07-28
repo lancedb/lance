@@ -120,7 +120,13 @@ fn tokenize_visitor(tokenizer: &TextAnalyzer, text: &str, mut visitor: impl FnMu
 const ALPHA_SPAN: usize = 37;
 const MAX_TOKEN: usize = ALPHA_SPAN.pow(2) + ALPHA_SPAN;
 const MIN_TOKEN: usize = 0;
-pub(crate) const NGRAM_N: usize = 3;
+/// The width, in characters, of the tokens stored in an ngram index.
+///
+/// Trigrams are the standard choice for substring search: they are selective
+/// enough to prune well while keeping the token space small enough
+/// (`ALPHA_SPAN^3`) to address with a `u32`.  This must match the tokenizer
+/// configured in [`NGRAM_TOKENIZER`].
+const NGRAM_N: usize = 3;
 
 // Convert an ngram (string) to a token (u32).  This helps avoid heap allocations
 // and it makes it easier to partition the tokens for shuffling
@@ -488,7 +494,10 @@ impl ScalarIndex for NGramIndex {
             .ok_or_else(|| Error::invalid_input_source("Query is not a TextQuery".into()))?;
         match query {
             TextQuery::StringContains(substr) => {
-                if substr.len() < NGRAM_N {
+                // Count characters, not bytes: the tokenizer splits on
+                // characters, so a two character multi-byte needle is just as
+                // untokenizable as a two byte one.
+                if substr.chars().count() < NGRAM_N {
                     // We know nothing on short searches, need to recheck all
                     return Ok(SearchResult::at_least(RowAddrTreeMap::new()));
                 }
@@ -506,6 +515,12 @@ impl ScalarIndex for NGramIndex {
                 // At least one token was missing, so we know there are zero results
                 if missing {
                     return Ok(SearchResult::exact(RowAddrTreeMap::new()));
+                }
+                // The needle was long enough but still yielded no tokens (e.g. the
+                // tokenizer's filters dropped every character).  As with a short
+                // needle, the index knows nothing and every row must be rechecked.
+                if row_offsets.is_empty() {
+                    return Ok(SearchResult::at_least(RowAddrTreeMap::new()));
                 }
                 let posting_lists = futures::stream::iter(
                     row_offsets
@@ -1733,6 +1748,9 @@ impl ScalarIndexPlugin for NGramIndexPlugin {
             true,
             // supports_regex: the ngram index can answer regex queries.
             true,
+            // min_contains_chars: a needle shorter than one trigram yields no
+            // tokens, so the index cannot narrow the search at all.
+            NGRAM_N,
         )))
     }
 
@@ -2000,6 +2018,30 @@ mod tests {
         let res = index
             .search(
                 &TextQuery::StringContains("ab".to_string()),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+        let expected = SearchResult::at_least(RowAddrTreeMap::new());
+        assert_eq!(expected, res);
+
+        // Two characters but four bytes: still too short to tokenize, so the
+        // length check must count characters and not bytes.
+        let res = index
+            .search(
+                &TextQuery::StringContains("éé".to_string()),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+        let expected = SearchResult::at_least(RowAddrTreeMap::new());
+        assert_eq!(expected, res);
+
+        // Long enough to tokenize, but the tokenizer's alphanumeric filter drops
+        // every trigram, so again we know nothing.
+        let res = index
+            .search(
+                &TextQuery::StringContains("---".to_string()),
                 &NoOpMetricsCollector,
             )
             .await
