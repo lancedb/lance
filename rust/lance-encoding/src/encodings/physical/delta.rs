@@ -12,7 +12,6 @@ use crate::{
 use lance_core::{Error, Result};
 
 /// Converts a non-decreasing u32/u64 block into adjacent differences.
-#[cfg(test)]
 pub(crate) fn encode_deltas(
     data: FixedWidthDataBlock,
     expected_base: u64,

@@ -3,12 +3,11 @@
 
 //! Routines for compressing and decompressing constant-encoded data
 
-#[cfg(test)]
-use crate::compression::{BlockCompressor, block::validate_fixed_payload_len};
 use crate::{
     buffer::LanceBuffer,
     compression::{
-        BlockDecompressor, BlockValueType, FixedPerValueDecompressor, require_no_block_payload,
+        BlockCompressor, BlockDecompressor, BlockValueType, FixedPerValueDecompressor,
+        block::validate_fixed_payload_len, require_no_block_payload,
     },
     data::{AllNullDataBlock, BlockInfo, ConstantDataBlock, DataBlock, FixedWidthDataBlock},
     encodings::physical::try_vec_with_capacity,
@@ -62,21 +61,18 @@ impl FixedPerValueDecompressor for ConstantDecompressor {
 }
 
 /// Metadata-only fixed-width constant (or typed empty) block compressor.
-#[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct ConstantBlockCompressor {
     value_type: BlockValueType,
     value: Option<u64>,
 }
 
-#[cfg(test)]
 impl ConstantBlockCompressor {
     pub(crate) fn new(value_type: BlockValueType, value: Option<u64>) -> Self {
         Self { value_type, value }
     }
 }
 
-#[cfg(test)]
 impl BlockCompressor for ConstantBlockCompressor {
     fn compress(&self, data: DataBlock) -> Result<Option<LanceBuffer>> {
         let DataBlock::FixedWidth(data) = data else {

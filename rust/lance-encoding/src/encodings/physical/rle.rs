@@ -58,11 +58,12 @@ use arrow_buffer::{ArrowNativeType, ScalarBuffer};
 use log::trace;
 
 use crate::buffer::LanceBuffer;
-#[cfg(test)]
-use crate::compression::block::{fixed_from_u64_values, visit_unsigned_values};
 use crate::compression::{
     BlockCompressor, BlockDecompressor, BlockValueType, MiniBlockDecompressor,
-    block::{fixed_block, read_unsigned_values, validate_fixed_payload_len},
+    block::{
+        fixed_block, fixed_from_u64_values, read_unsigned_values, validate_fixed_payload_len,
+        visit_unsigned_values,
+    },
     require_block_payload,
 };
 use crate::data::DataBlock;
@@ -1932,7 +1933,6 @@ impl RleDecompressor {
 pub(crate) const BLOCK_FRAME_BYTES: u64 = 8;
 
 /// Generic RLE compressor that owns both child compressors.
-#[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct BlockRleCompressor {
     value_type: BlockValueType,
@@ -1941,7 +1941,6 @@ pub(crate) struct BlockRleCompressor {
     run_lengths: Box<dyn BlockCompressor>,
 }
 
-#[cfg(test)]
 impl BlockRleCompressor {
     pub(crate) fn new(
         value_type: BlockValueType,
@@ -1958,7 +1957,6 @@ impl BlockRleCompressor {
     }
 }
 
-#[cfg(test)]
 impl BlockCompressor for BlockRleCompressor {
     fn compress(&self, data: DataBlock) -> Result<Option<LanceBuffer>> {
         let DataBlock::FixedWidth(data) = data else {
@@ -1987,7 +1985,6 @@ impl BlockCompressor for BlockRleCompressor {
     }
 }
 
-#[cfg(test)]
 fn try_block_frame(values_payload_bytes: usize, lengths_payload_bytes: usize) -> Result<Vec<u8>> {
     let capacity = (BLOCK_FRAME_BYTES as usize)
         .checked_add(values_payload_bytes)
@@ -2323,7 +2320,6 @@ pub(crate) fn expand_block(
     Ok(fixed_block(value_type, num_values, output))
 }
 
-#[cfg(test)]
 pub(crate) fn materialize_block(
     data: &FixedWidthDataBlock,
     value_type: BlockValueType,

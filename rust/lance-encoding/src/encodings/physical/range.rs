@@ -4,11 +4,9 @@
 //! Metadata-only arithmetic range encoding for unsigned block sequences.
 
 use super::try_vec_with_capacity;
-#[cfg(test)]
-use crate::compression::BlockCompressor;
 use crate::{
     buffer::LanceBuffer,
-    compression::{BlockDecompressor, require_no_block_payload},
+    compression::{BlockCompressor, BlockDecompressor, require_no_block_payload},
     data::{BlockInfo, DataBlock, FixedWidthDataBlock},
 };
 use lance_core::{Error, Result};
@@ -53,7 +51,6 @@ pub(crate) fn checked_range_last(
 }
 
 /// Validates an input block against the selected arithmetic range codec.
-#[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct RangeEncoder {
     bits_per_value: u64,
@@ -61,7 +58,6 @@ pub(crate) struct RangeEncoder {
     step: u64,
 }
 
-#[cfg(test)]
 impl RangeEncoder {
     pub(crate) fn new(bits_per_value: u64, start: u64, step: u64) -> Self {
         Self {
@@ -72,7 +68,6 @@ impl RangeEncoder {
     }
 }
 
-#[cfg(test)]
 impl BlockCompressor for RangeEncoder {
     fn compress(&self, data: DataBlock) -> Result<Option<LanceBuffer>> {
         let DataBlock::FixedWidth(data) = data else {
@@ -200,7 +195,6 @@ pub(crate) fn materialize_validated_range(
     }))
 }
 
-#[cfg(test)]
 fn checked_values<T: arrow_buffer::ArrowNativeType>(
     data: &FixedWidthDataBlock,
 ) -> Result<arrow_buffer::ScalarBuffer<T>> {

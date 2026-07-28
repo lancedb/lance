@@ -75,6 +75,19 @@ impl MiniBlockCompressionContext {
             allow_generic_offsets,
         }
     }
+
+    /// Returns the padded per-chunk header bytes for the supplied value buffers.
+    pub(crate) fn chunk_header_bytes(self, value_buffers: u64) -> u64 {
+        let value_buffer_size_bytes = if self.support_large_chunk { 4 } else { 2 };
+        2_u64
+            .saturating_add(self.common_chunk_buffers.saturating_mul(2))
+            .saturating_add(value_buffers.saturating_mul(value_buffer_size_bytes))
+            .next_multiple_of(8)
+    }
+
+    pub(crate) fn allows_generic_offsets(self) -> bool {
+        self.allow_generic_offsets
+    }
 }
 
 /// Describes the size of a mini-block chunk of data
@@ -154,6 +167,21 @@ mod tests {
     fn test_parse_default() {
         unsafe { std::env::remove_var("LANCE_MINIBLOCK_MAX_VALUES") };
         assert_eq!(parse_max_miniblock_values(), 4096);
+    }
+
+    #[test]
+    fn compression_context_matches_padded_chunk_headers() {
+        let expected = [(0, 8, 16), (1, 8, 16), (2, 16, 16)];
+        for (common_buffers, one_value_buffer, two_value_buffers) in expected {
+            let context = MiniBlockCompressionContext::new(common_buffers, true, true);
+            assert_eq!(context.chunk_header_bytes(1), one_value_buffer);
+            assert_eq!(context.chunk_header_bytes(2), two_value_buffers);
+        }
+
+        let legacy_context = MiniBlockCompressionContext::new(2, false, false);
+        assert_eq!(legacy_context.chunk_header_bytes(1), 8);
+        assert_eq!(legacy_context.chunk_header_bytes(2), 16);
+        assert!(!legacy_context.allows_generic_offsets());
     }
 
     #[test]

@@ -65,20 +65,16 @@ impl BlockValueType {
 mod factory;
 pub(crate) mod fixed;
 
-#[cfg(test)]
-pub(crate) use factory::encode_scalar;
-#[cfg(all(test, feature = "bitpacking"))]
-pub(crate) use factory::out_of_line_payload_bytes;
 pub(crate) use factory::{
-    create_block_decompressor, infer_block_value_type, validate_fixed_payload_len,
+    create_block_decompressor, encode_scalar, infer_block_value_type, validate_fixed_payload_len,
 };
 #[cfg(feature = "bitpacking")]
-pub(crate) use factory::{validate_inline_bitpacking_payload, validate_out_of_line_payload};
-#[cfg(test)]
-pub(crate) use fixed::fixed_from_u64_values;
-#[cfg(any(test, feature = "bitpacking"))]
-pub(crate) use fixed::visit_unsigned_values;
-pub(crate) use fixed::{fixed_block, read_unsigned_values};
+pub(crate) use factory::{
+    out_of_line_payload_bytes, validate_inline_bitpacking_payload, validate_out_of_line_payload,
+};
+pub(crate) use fixed::{
+    fixed_block, fixed_from_u64_values, read_unsigned_values, visit_unsigned_values,
+};
 
 #[cfg(test)]
 mod tests;

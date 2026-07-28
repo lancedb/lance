@@ -474,20 +474,17 @@ impl BlockCompressor for ValueEncoder {
 }
 
 /// Flat fixed-width block compressor used by the generic block selector.
-#[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct FixedWidthBlockCompressor {
     value_type: BlockValueType,
 }
 
-#[cfg(test)]
 impl FixedWidthBlockCompressor {
     pub(crate) fn new(value_type: BlockValueType) -> Self {
         Self { value_type }
     }
 }
 
-#[cfg(test)]
 impl BlockCompressor for FixedWidthBlockCompressor {
     fn compress(&self, data: DataBlock) -> Result<Option<LanceBuffer>> {
         let DataBlock::FixedWidth(data) = data else {

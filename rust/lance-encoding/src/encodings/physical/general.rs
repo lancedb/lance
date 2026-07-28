@@ -3,13 +3,12 @@
 
 use log::trace;
 
-#[cfg(test)]
-use crate::compression::BlockCompressor;
 use crate::{
     Result,
     buffer::LanceBuffer,
     compression::{
-        BlockDecompressor, BlockValueType, MiniBlockDecompressor, require_block_payload,
+        BlockCompressor, BlockDecompressor, BlockValueType, MiniBlockDecompressor,
+        require_block_payload,
     },
     data::DataBlock,
     encodings::{
@@ -22,7 +21,6 @@ use crate::{
 };
 use lance_core::Error;
 
-#[cfg(test)]
 pub(crate) fn compress_block(
     compression: CompressionConfig,
     payload: &[u8],
@@ -45,21 +43,18 @@ pub(crate) fn decompress_block_exact(
 }
 
 /// General-purpose block compressor that owns its child block compressor.
-#[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct GeneralBlockCompressor {
     child: Box<dyn BlockCompressor>,
     compression: CompressionConfig,
 }
 
-#[cfg(test)]
 impl GeneralBlockCompressor {
     pub(crate) fn new(child: Box<dyn BlockCompressor>, compression: CompressionConfig) -> Self {
         Self { child, compression }
     }
 }
 
-#[cfg(test)]
 impl BlockCompressor for GeneralBlockCompressor {
     fn compress(&self, data: DataBlock) -> Result<Option<LanceBuffer>> {
         let payload = self.child.compress(data)?.ok_or_else(|| {

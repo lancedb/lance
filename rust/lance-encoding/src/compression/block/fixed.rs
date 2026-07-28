@@ -16,7 +16,6 @@ pub fn fixed_block(value_type: BlockValueType, num_values: u64, data: LanceBuffe
     })
 }
 
-#[cfg(test)]
 pub fn fixed_from_u64_values(
     values: &[u64],
     value_type: BlockValueType,
@@ -63,7 +62,6 @@ pub fn fixed_from_u64_values(
     })
 }
 
-#[cfg(any(test, feature = "bitpacking"))]
 pub fn visit_unsigned_values(
     block: &FixedWidthDataBlock,
     value_type: BlockValueType,

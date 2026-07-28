@@ -5,25 +5,19 @@
 
 #[cfg(test)]
 use std::cell::Cell;
-#[cfg(test)]
 use std::{collections::BTreeMap, sync::Arc};
 
 use crate::{
     buffer::LanceBuffer,
     compression::{
-        BlockDecompressor, BlockValueType,
-        block::{fixed_block, read_unsigned_values, validate_fixed_payload_len},
+        BlockCompressor, BlockDecompressor, BlockValueType,
+        block::{
+            fixed_block, fixed_from_u64_values, read_unsigned_values, validate_fixed_payload_len,
+            visit_unsigned_values,
+        },
     },
-    data::DataBlock,
+    data::{BlockInfo, DataBlock, FixedWidthDataBlock},
     encodings::physical::try_vec_with_capacity,
-};
-#[cfg(test)]
-use crate::{
-    compression::{
-        BlockCompressor,
-        block::{fixed_from_u64_values, visit_unsigned_values},
-    },
-    data::{BlockInfo, FixedWidthDataBlock},
 };
 use lance_core::{Error, Result};
 
@@ -35,7 +29,6 @@ thread_local! {
 }
 
 /// Dictionary compressor that owns its indices and items compressors.
-#[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct DictionaryBlockCompressor {
     value_type: BlockValueType,
@@ -44,7 +37,6 @@ pub(crate) struct DictionaryBlockCompressor {
     items: Box<dyn BlockCompressor>,
 }
 
-#[cfg(test)]
 impl DictionaryBlockCompressor {
     pub(crate) fn new(
         value_type: BlockValueType,
@@ -61,7 +53,6 @@ impl DictionaryBlockCompressor {
     }
 }
 
-#[cfg(test)]
 impl BlockCompressor for DictionaryBlockCompressor {
     fn compress(&self, data: DataBlock) -> Result<Option<LanceBuffer>> {
         #[cfg(test)]
@@ -313,7 +304,6 @@ fn append_items<T>(
     Ok(())
 }
 
-#[cfg(test)]
 fn try_frame(indices_payload_bytes: usize, items_payload_bytes: usize) -> Result<Vec<u8>> {
     let capacity = (BLOCK_FRAME_BYTES as usize)
         .checked_add(indices_payload_bytes)

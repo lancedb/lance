@@ -3,7 +3,6 @@
 
 //! Fallible construction of concrete generic block decompressors.
 
-#[cfg(test)]
 use bytes::Bytes;
 
 use super::*;
@@ -525,7 +524,6 @@ fn decode_scalar(bytes: &[u8], value_type: BlockValueType, label: &str) -> Resul
     })
 }
 
-#[cfg(test)]
 pub fn encode_scalar(value: u64, value_type: BlockValueType) -> Result<Bytes> {
     if value > value_type.max_value() {
         return Err(Error::invalid_input(format!(
