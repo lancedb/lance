@@ -4909,11 +4909,13 @@ mod tests {
             .unwrap();
 
         let plan = merge_plan_string(&job, &schema, true).await;
-        assert_eq!(
-            plan.contains("IndexedLookup"),
-            expect_probe,
-            "unexpected target scan shape:\n{plan}"
-        );
+        for node in ["IndexedLookup", "DistinctRowAddrs"] {
+            assert_eq!(
+                plan.contains(node),
+                expect_probe,
+                "unexpected target scan shape, looking for {node}:\n{plan}"
+            );
+        }
     }
 
     /// The probe scans the source a second time to collect key values, so a
@@ -5023,10 +5025,9 @@ mod tests {
         );
     }
 
-    /// The probe emits one candidate set per source batch and does not
-    /// de-duplicate across batches, so a target row matched by keys in two
-    /// different batches reaches the sink twice. Source de-duplication is what
-    /// keeps that from producing a duplicate row address.
+    /// The same key in two source batches makes both probes name the same target
+    /// row. Source de-duplication settles which source row wins; the probe's own
+    /// de-duplication is what keeps the target row from being read twice.
     #[tokio::test]
     async fn test_probe_source_duplicates_across_batches() {
         let (ds, _) = partially_indexed_dataset(true).await;
@@ -5065,6 +5066,59 @@ mod tests {
             1,
             "first seen source row wins"
         );
+    }
+
+    /// One source batch per key, which is the shape both probe hazards need.
+    ///
+    /// A materialized source is spread across partitions and the probe reads one
+    /// partition, so the key columns have to be coalesced first — otherwise the
+    /// keys in every other partition go unprobed and their target rows are
+    /// inserted as duplicates instead of updated. And because only `a` is
+    /// indexed, the batches for `(1, 10)` and `(1, 20)` both probe `a IsIn [1]`
+    /// and name each other's target row, so the candidates have to be
+    /// de-duplicated or the merge fails as ambiguous.
+    #[tokio::test]
+    async fn test_probe_multi_partition_source() {
+        let (ds, _) = partially_indexed_dataset(true).await;
+        let job = MergeInsertBuilder::try_new(ds, vec!["a".to_string(), "b".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap();
+
+        let keys = [(1, 10), (1, 20), (2, 10), (2, 20)];
+        let batches = keys
+            .iter()
+            .enumerate()
+            .map(|(idx, (a, b))| {
+                record_batch!(
+                    ("a", Int32, [*a]),
+                    ("b", Int32, [*b]),
+                    ("value", Int32, [900 + idx as i32])
+                )
+                .unwrap()
+            })
+            .collect();
+
+        let (updated, stats) = job.execute_batches(batches).await.unwrap();
+
+        assert_eq!(stats.num_updated_rows, keys.len() as u64);
+        assert_eq!(stats.num_inserted_rows, 0);
+        assert_eq!(updated.count_rows(None).await.unwrap(), keys.len());
+        for (idx, (a, b)) in keys.iter().enumerate() {
+            assert_eq!(
+                updated
+                    .count_rows(Some(format!(
+                        "a = {a} AND b = {b} AND value = {}",
+                        900 + idx
+                    )))
+                    .await
+                    .unwrap(),
+                1,
+                "row ({a}, {b}) from source batch {idx} was not updated"
+            );
+        }
     }
 
     /// Composite-key delete-only merge_insert (`when_matched(Delete)`,

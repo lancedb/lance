@@ -5,27 +5,144 @@
 
 use std::sync::Arc;
 
+use arrow_array::{RecordBatch, UInt64Array, cast::AsArray, types::UInt64Type};
 use arrow_schema::{Schema as ArrowSchema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::{
     catalog::{Session, TableProvider},
     error::DataFusionError,
+    execution::TaskContext,
     logical_expr::{Expr, TableType},
-    physical_plan::{ExecutionPlan, coalesce_partitions::CoalescePartitionsExec, union::UnionExec},
+    physical_expr::{Distribution, EquivalenceProperties},
+    physical_plan::{
+        DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
+        SendableRecordBatchStream,
+        coalesce_partitions::CoalescePartitionsExec,
+        execution_plan::{Boundedness, EmissionType},
+        stream::RecordBatchStreamAdapter,
+        union::UnionExec,
+    },
 };
+use futures::TryStreamExt;
 use lance_arrow::SchemaExt;
 use lance_core::{
     ROW_ADDR_FIELD, ROW_ID_FIELD,
     datatypes::{BlobHandling, OnMissing},
 };
 use lance_table::format::Fragment;
+use roaring::RoaringTreemap;
 
 use crate::Dataset;
 use crate::io::exec::{
     filtered_read::{FilteredReadExec, FilteredReadOptions},
     project,
-    scalar_index::{IndexLookup, MapIndexExec},
+    scalar_index::{INDEX_LOOKUP_SCHEMA, IndexLookup, MapIndexExec},
 };
+
+/// Drops row addresses an earlier batch already emitted, so a probe's candidate
+/// stream is a set.
+///
+/// [`MapIndexExec`] evaluates one query per input batch and emits that batch's
+/// matches, so an over-matching probe can reach the same target row from two
+/// different batches. Reading a target row twice would give one source row two
+/// candidate matches in the join, and the merge rejects that as ambiguous — so
+/// the duplicates have to go before the take.
+#[derive(Debug)]
+struct DistinctRowAddrsExec {
+    input: Arc<dyn ExecutionPlan>,
+    properties: Arc<PlanProperties>,
+}
+
+impl DistinctRowAddrsExec {
+    fn new(input: Arc<dyn ExecutionPlan>) -> Self {
+        let properties = Arc::new(PlanProperties::new(
+            EquivalenceProperties::new(INDEX_LOOKUP_SCHEMA.clone()),
+            Partitioning::RoundRobinBatch(1),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        ));
+        Self { input, properties }
+    }
+
+    fn retain_unseen(seen: &mut RoaringTreemap, batch: &RecordBatch) -> RecordBatch {
+        let addrs = batch.column(0).as_primitive::<UInt64Type>();
+        let unseen: UInt64Array = addrs
+            .values()
+            .iter()
+            .copied()
+            .filter(|addr| seen.insert(*addr))
+            .collect();
+        RecordBatch::try_new(INDEX_LOOKUP_SCHEMA.clone(), vec![Arc::new(unseen)])
+            .expect("a UInt64 column always matches INDEX_LOOKUP_SCHEMA")
+    }
+}
+
+impl DisplayAs for DistinctRowAddrsExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                write!(f, "DistinctRowAddrs")
+            }
+            DisplayFormatType::TreeRender => write!(f, "DistinctRowAddrs"),
+        }
+    }
+}
+
+impl ExecutionPlan for DistinctRowAddrsExec {
+    fn name(&self) -> &str {
+        "DistinctRowAddrsExec"
+    }
+
+    fn schema(&self) -> SchemaRef {
+        INDEX_LOOKUP_SCHEMA.clone()
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+        let [input] = <[_; 1]>::try_from(children).map_err(|children| {
+            DataFusionError::Internal(format!(
+                "DistinctRowAddrsExec requires exactly one child, got {}",
+                children.len()
+            ))
+        })?;
+        Ok(Arc::new(Self::new(input)))
+    }
+
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        // De-duplicating across batches only works if every batch arrives here.
+        vec![Distribution::SinglePartition]
+    }
+
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        vec![false]
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> datafusion::common::Result<SendableRecordBatchStream> {
+        let mut seen = RoaringTreemap::new();
+        let stream = self
+            .input
+            .execute(partition, context)?
+            .map_ok(move |batch| Self::retain_unseen(&mut seen, &batch));
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            INDEX_LOOKUP_SCHEMA.clone(),
+            stream,
+        )))
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
+    }
+}
 
 /// A [`TableProvider`] for the merge-insert target that reaches candidate rows
 /// through scalar indices instead of scanning the whole table.
@@ -39,14 +156,15 @@ use crate::io::exec::{
 /// ```text
 /// Union
 /// ├─ FilteredReadExec              take the projected columns of probed rows
-/// │  └─ CoalescePartitionsExec
+/// │  └─ DistinctRowAddrsExec       one candidate row address at most once
 /// │     └─ MapIndexExec            AND of one IsIn probe per indexed key
-/// │        └─ <source scan #2>     key columns only
+/// │        └─ CoalescePartitionsExec
+/// │           └─ <source scan #2>  key columns only
 /// └─ FilteredReadExec              fragments no index covers
 /// ```
 ///
 /// The probe is allowed to over-match and must not under-match, because the
-/// downstream join is what applies the real key predicate. Two things follow
+/// downstream join is what applies the real key predicate. Three things follow
 /// from that:
 ///
 /// - Only the indexed subset of the merge keys needs to be probed. A composite
@@ -54,6 +172,9 @@ use crate::io::exec::{
 ///   `IsIn` lists do not correlate values across the tuple anyway.
 /// - Fragments that any chosen index does not cover would be invisible to the
 ///   probe, so they are scanned and unioned in.
+/// - Over-matching is only harmless while each candidate row reaches the join
+///   once. Probes are evaluated per source batch, so two batches can name the
+///   same target row and the candidates are de-duplicated before the take.
 ///
 /// The source is scanned a second time here to collect key values. Callers must
 /// only build this over a re-scannable source.
@@ -140,6 +261,7 @@ impl IndexProbeTarget {
             self.lookups.clone(),
             keys,
         ));
+        let probe = Arc::new(DistinctRowAddrsExec::new(probe));
         let take = Arc::new(FilteredReadExec::try_new(
             self.dataset.clone(),
             FilteredReadOptions::new(columns.clone()),

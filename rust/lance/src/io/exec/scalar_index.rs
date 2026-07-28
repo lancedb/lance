@@ -17,6 +17,7 @@ use arrow_schema::{Schema, SchemaRef};
 use async_recursion::async_recursion;
 use async_trait::async_trait;
 use datafusion::{
+    physical_expr::Distribution,
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
         execution_plan::{Boundedness, EmissionType},
@@ -582,6 +583,19 @@ impl ExecutionPlan for MapIndexExec {
 
     fn supports_limit_pushdown(&self) -> bool {
         false
+    }
+
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        // `execute` probes exactly the partition it is asked for, and this node
+        // declares a single output partition, so every input batch has to arrive
+        // on partition 0. Without this the optimizer is free to leave a
+        // multi-partition input in place and the keys in every partition but the
+        // first are never probed.
+        vec![Distribution::SinglePartition]
+    }
+
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        vec![false]
     }
 }
 
