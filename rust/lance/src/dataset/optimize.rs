@@ -1458,8 +1458,11 @@ impl CandidateBin {
             remaining_rows -= *row_count;
 
             // Only split once the current bin is large enough and there is
-            // enough left over to form another worthwhile bin.
-            if current_rows >= min_num_rows && remaining_rows >= min_num_rows {
+            // enough left over to form another worthwhile non-empty bin.
+            if current_rows >= min_num_rows
+                && remaining_rows > 0
+                && remaining_rows >= min_num_rows
+            {
                 split_lengths.push(current_len);
                 current_rows = 0;
                 current_len = 0;
@@ -2368,6 +2371,33 @@ mod tests {
         assert_eq!(split[0].pos_range, 0..2);
         assert_eq!(split[1].pos_range, 2..5);
         assert_eq!(split[2].pos_range, 5..8);
+
+        let zero_min_split_bin = CandidateBin {
+            fragments: std::iter::repeat_n(
+                Fragment {
+                    id: 0,
+                    files: vec![],
+                    overlays: vec![],
+                    deletion_file: None,
+                    row_id_meta: None,
+                    physical_rows: Some(0),
+                    last_updated_at_version_meta: None,
+                    created_at_version_meta: None,
+                },
+                3,
+            )
+            .collect(),
+            pos_range: 0..3,
+            candidacy: std::iter::repeat_n(CompactionCandidacy::CompactItself, 3).collect(),
+            row_counts: vec![100, 200, 300],
+            indices: vec![],
+        };
+        let split = zero_min_split_bin.split_for_size(0);
+        assert_eq!(split.len(), 3);
+        assert!(split.iter().all(|bin| !bin.fragments.is_empty()));
+        assert_eq!(split[0].pos_range, 0..1);
+        assert_eq!(split[1].pos_range, 1..2);
+        assert_eq!(split[2].pos_range, 2..3);
     }
 
     fn sample_data() -> RecordBatch {
