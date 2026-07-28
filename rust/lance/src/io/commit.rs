@@ -99,11 +99,30 @@ pub(crate) async fn read_transaction_file(
 /// be removed by GC.
 async fn cleanup_transaction_file(
     object_store: &ObjectStore,
+    commit_handler: &dyn CommitHandler,
     base_path: &Path,
     transaction_file: &str,
+    inlined: bool,
+    verify_version: Option<u64>,
+    naming_scheme: ManifestNamingScheme,
 ) {
     if transaction_file.is_empty() {
         return;
+    }
+    if !inlined {
+        let Some(version) = verify_version else {
+            return;
+        };
+        match commit_handler
+            .version_exists(base_path, version, &object_store.inner, naming_scheme)
+            .await
+        {
+            // Confirmed the commit did not land: the file is garbage.
+            Ok(false) => {}
+            // Landed (possibly our own lost-ack commit) or unable to confirm:
+            // keep the only durable copy.
+            Ok(true) | Err(_) => return,
+        }
     }
     let path = base_path
         .clone()
@@ -312,11 +331,29 @@ async fn do_commit_new_dataset(
             Ok((manifest, manifest_location))
         }
         Err(CommitError::CommitConflict) => {
-            cleanup_transaction_file(object_store, base_path, &transaction_file).await;
+            cleanup_transaction_file(
+                object_store,
+                commit_handler,
+                base_path,
+                &transaction_file,
+                inline_transaction,
+                None,
+                manifest_naming_scheme,
+            )
+            .await;
             Err(crate::Error::dataset_already_exists(base_path.to_string()))
         }
         Err(CommitError::OtherError(err)) => {
-            cleanup_transaction_file(object_store, base_path, &transaction_file).await;
+            cleanup_transaction_file(
+                object_store,
+                commit_handler,
+                base_path,
+                &transaction_file,
+                inline_transaction,
+                Some(manifest.version),
+                manifest_naming_scheme,
+            )
+            .await;
             Err(err)
         }
     }
@@ -826,6 +863,11 @@ pub(crate) async fn do_commit_detached_transaction(
     let mut inline_tx: Option<lance_table::format::Transaction> =
         inline_transaction.then(|| pb_transaction.into());
 
+    // Set once any attempt hits a commit conflict: the attempted version
+    // exists and may be our own lost-ack commit referencing the shared
+    // transaction file written above.
+    let mut conflict_observed = false;
+
     // We still do a loop since we may have conflicts in the random version we pick
     let mut backoff = Backoff::default();
     while backoff.attempt() < commit_config.num_retries {
@@ -888,12 +930,22 @@ pub(crate) async fn do_commit_detached_transaction(
             Err(CommitError::CommitConflict) => {
                 // We pick a random u64 for the version, so it's possible (though extremely unlikely)
                 // that we have a conflict. In that case, we just try again.
+                conflict_observed = true;
                 inline_tx = inline_transaction.then(|| pb::Transaction::from(transaction).into());
                 tokio::time::sleep(backoff.next_backoff()).await;
             }
             Err(CommitError::OtherError(err)) => {
                 // If other error, return
-                cleanup_transaction_file(object_store, &dataset.base, &transaction_file).await;
+                cleanup_transaction_file(
+                    object_store,
+                    commit_handler,
+                    &dataset.base,
+                    &transaction_file,
+                    inline_transaction,
+                    (!conflict_observed).then_some(random_version),
+                    ManifestNamingScheme::V2,
+                )
+                .await;
                 return Err(err);
             }
         }
@@ -901,7 +953,16 @@ pub(crate) async fn do_commit_detached_transaction(
 
     // This should be extremely unlikely.  There should not be *that* many detached commits.  If
     // this happens then it seems more likely there is a bug in our random u64 generation.
-    cleanup_transaction_file(object_store, &dataset.base, &transaction_file).await;
+    cleanup_transaction_file(
+        object_store,
+        commit_handler,
+        &dataset.base,
+        &transaction_file,
+        inline_transaction,
+        None,
+        ManifestNamingScheme::V2,
+    )
+    .await;
     Err(crate::Error::commit_conflict_source(
         0,
         format!(
@@ -988,8 +1049,13 @@ pub(crate) async fn commit_transaction(
     // We keep pair of (version, transaction). No other transactions to check initially
     let mut other_transactions: Vec<(u64, Arc<Transaction>)>;
     // Track the transaction file written in the current loop iteration so we can
-    // delete it if the commit ultimately fails.
+    // delete it if the commit ultimately fails, whether it was also inlined
+    // (then the file is a redundant copy), and whether any attempt hit a
+    // commit conflict (then the attempted version exists and may be our own
+    // lost-ack commit).
     let mut current_transaction_file = String::new();
+    let mut current_transaction_inlined = true;
+    let mut conflict_observed = false;
 
     while backoff.attempt() < num_attempts {
         // We are pessimistic here and assume there may be other transactions
@@ -1023,6 +1089,7 @@ pub(crate) async fn commit_transaction(
         let (inline_transaction, write_config) =
             inline_transaction_config(&pb_transaction, write_config);
         let write_config = &write_config;
+        current_transaction_inlined = inline_transaction;
 
         current_transaction_file = if !write_config.disable_transaction_file() {
             write_transaction_file(object_store, &dataset.base, &pb_transaction).await?
@@ -1137,6 +1204,7 @@ pub(crate) async fn commit_transaction(
                 return Ok((manifest, manifest_location));
             }
             Err(CommitError::CommitConflict) => {
+                conflict_observed = true;
                 let next_attempt_i = backoff.attempt() + 1;
 
                 if backoff.attempt() == 0 {
@@ -1152,8 +1220,12 @@ pub(crate) async fn commit_transaction(
                     // before the next attempt writes a new one (possibly rebased).
                     cleanup_transaction_file(
                         object_store,
+                        commit_handler,
                         &dataset.base,
                         &current_transaction_file,
+                        inline_transaction,
+                        None,
+                        manifest_naming_scheme,
                     )
                     .await;
                     tokio::time::sleep(backoff.next_backoff()).await;
@@ -1163,14 +1235,31 @@ pub(crate) async fn commit_transaction(
                 }
             }
             Err(CommitError::OtherError(err)) => {
-                cleanup_transaction_file(object_store, &dataset.base, &current_transaction_file)
-                    .await;
+                cleanup_transaction_file(
+                    object_store,
+                    commit_handler,
+                    &dataset.base,
+                    &current_transaction_file,
+                    inline_transaction,
+                    (!conflict_observed).then_some(target_version),
+                    manifest_naming_scheme,
+                )
+                .await;
                 return Err(err);
             }
         }
     }
 
-    cleanup_transaction_file(object_store, &dataset.base, &current_transaction_file).await;
+    cleanup_transaction_file(
+        object_store,
+        commit_handler,
+        &dataset.base,
+        &current_transaction_file,
+        current_transaction_inlined,
+        None,
+        manifest_naming_scheme,
+    )
+    .await;
     Err(crate::Error::commit_conflict_source(
         target_version,
         format!(
