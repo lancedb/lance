@@ -129,7 +129,7 @@ fn schema_fragments_legacy_valid(schema: &Schema, fragments: &[Fragment]) -> Res
 /// survivors did not receive new column bytes; stamping last_updated for those rows would be
 /// incorrect for CDF.
 #[inline]
-pub(crate) fn merge_fragment_physically_rewritten(prev: &Fragment, merged: &Fragment) -> bool {
+pub(super) fn merge_fragment_physically_rewritten(prev: &Fragment, merged: &Fragment) -> bool {
     debug_assert_eq!(prev.id, merged.id);
     if prev.files.len() != merged.files.len() {
         return true;

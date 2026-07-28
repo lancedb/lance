@@ -10,9 +10,7 @@
 
 use crate::format::key_existence::KeyExistenceFilter;
 use crate::format::pb;
-use crate::format::{
-    BasePath, DataFile, Fragment, IndexFile, IndexMetadata, overlay::DataOverlayFile,
-};
+use crate::format::{BasePath, Fragment, IndexFile, IndexMetadata, overlay::DataOverlayFile};
 use crate::system_index::mem_wal::CompactedSsTable;
 use crate::transaction::{
     DataOverlayGroup, DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, Transaction,
@@ -769,6 +767,7 @@ impl From<&Transaction> for crate::format::Transaction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::format::DataFile;
     use crate::format::overlay::OverlayCoverage;
 
     #[test]
