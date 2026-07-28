@@ -1830,6 +1830,46 @@ impl DatasetIndexExt for Dataset {
     async fn optimize_indices(&mut self, options: &OptimizeOptions) -> Result<()> {
         let dataset = Arc::new(self.clone());
         let indices = self.load_indices().await?;
+        let selected_segment_ids = if let Some(segment_ids) = &options.index_segment_ids {
+            if segment_ids.is_empty() {
+                return Err(Error::invalid_input(
+                    "OptimizeIndices: index_segment_ids must not be empty",
+                ));
+            }
+            let Some(index_names) = &options.index_names else {
+                return Err(Error::invalid_input(
+                    "OptimizeIndices: index_segment_ids requires exactly one index name",
+                ));
+            };
+            if index_names.len() != 1 {
+                return Err(Error::invalid_input(
+                    "OptimizeIndices: index_segment_ids requires exactly one index name",
+                ));
+            }
+            if segment_ids.iter().collect::<HashSet<_>>().len() != segment_ids.len() {
+                return Err(Error::invalid_input(
+                    "OptimizeIndices: index_segment_ids must not contain duplicates",
+                ));
+            }
+
+            let index_name = &index_names[0];
+            for segment_id in segment_ids {
+                let Some(index) = indices.iter().find(|index| index.uuid == *segment_id) else {
+                    return Err(Error::invalid_input(format!(
+                        "OptimizeIndices: index segment {segment_id} does not exist"
+                    )));
+                };
+                if &index.name != index_name {
+                    return Err(Error::invalid_input(format!(
+                        "OptimizeIndices: index segment {segment_id} belongs to index '{}' instead of '{index_name}'",
+                        index.name
+                    )));
+                }
+            }
+            Some(segment_ids)
+        } else {
+            None
+        };
 
         let indices_to_optimize = options
             .index_names
@@ -1849,6 +1889,23 @@ impl DatasetIndexExt for Dataset {
         let mut new_indices = vec![];
         let mut removed_indices = vec![];
         for deltas in name_to_indices.values() {
+            let selected_deltas = if let Some(segment_ids) = selected_segment_ids {
+                segment_ids
+                    .iter()
+                    .filter_map(|segment_id| {
+                        deltas
+                            .iter()
+                            .find(|index| index.uuid == *segment_id)
+                            .copied()
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                deltas.clone()
+            };
+            if selected_deltas.is_empty() {
+                continue;
+            }
+
             // Scalar indices have no rebalance concept, so skip them entirely
             // when every fragment is already covered and the caller hasn't
             // asked for retrain or an explicit delta merge. Vector indices
@@ -1862,12 +1919,15 @@ impl DatasetIndexExt for Dataset {
                 continue;
             }
 
-            let Some(res) = merge_indices(dataset.clone(), deltas.as_slice(), options).await?
+            let Some(res) =
+                merge_indices(dataset.clone(), selected_deltas.as_slice(), options).await?
             else {
                 continue;
             };
 
-            let last_idx = deltas.last().expect("Delta indices should not be empty");
+            let last_idx = selected_deltas
+                .last()
+                .ok_or_else(|| Error::internal("Selected index segments should not be empty"))?;
             let new_idx = IndexMetadata {
                 uuid: res.new_uuid,
                 name: last_idx.name.clone(), // Keep the same name

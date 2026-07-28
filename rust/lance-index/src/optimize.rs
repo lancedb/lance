@@ -4,6 +4,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use uuid::Uuid;
+
 use crate::progress::{IndexBuildProgress, noop_progress};
 
 /// Options for optimizing all indices.
@@ -25,6 +27,12 @@ pub struct OptimizeOptions {
 
     /// the index names to optimize. If None, all indices will be optimized.
     pub index_names: Option<Vec<String>>,
+
+    /// Physical index segment IDs to optimize.
+    ///
+    /// This can only be set when exactly one index name is specified. All
+    /// selected segments must belong to that logical index.
+    pub index_segment_ids: Option<Vec<Uuid>>,
 
     /// whether to retrain the whole index. Default: false.
     ///
@@ -55,6 +63,7 @@ impl Default for OptimizeOptions {
         Self {
             num_indices_to_merge: None,
             index_names: None,
+            index_segment_ids: None,
             retrain: false,
             transaction_properties: None,
             progress: noop_progress(),
@@ -99,6 +108,12 @@ impl OptimizeOptions {
 
     pub fn index_names(mut self, names: Vec<String>) -> Self {
         self.index_names = Some(names);
+        self
+    }
+
+    /// Select physical index segments to optimize.
+    pub fn with_index_segment_ids(mut self, segment_ids: Vec<Uuid>) -> Self {
+        self.index_segment_ids = Some(segment_ids);
         self
     }
 

@@ -1788,7 +1788,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_merge_indices_with_unindexed_frags_vector_subset() {
+    async fn test_optimize_indices_with_vector_segment_selection() {
         const DIM: usize = 64;
         const TOTAL: usize = 1000;
 
@@ -1823,7 +1823,120 @@ mod tests {
             .await
             .unwrap();
 
-        let next_batch = RecordBatch::try_new(
+        let make_batch = |start_id: u32| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(
+                        FixedSizeListArray::try_new_from_values(
+                            generate_random_array(TOTAL * DIM),
+                            DIM as i32,
+                        )
+                        .unwrap(),
+                    ),
+                    Arc::new(UInt32Array::from_iter_values(
+                        start_id..start_id + TOTAL as u32,
+                    )),
+                ],
+            )
+            .unwrap()
+        };
+        let next_batch = make_batch(TOTAL as u32);
+        let batches =
+            RecordBatchIterator::new(vec![next_batch].into_iter().map(Ok), schema.clone());
+        dataset.append(batches, None).await.unwrap();
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+
+        let indices_before = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        assert_eq!(indices_before.len(), 2);
+        let selected_uuid = indices_before[0].uuid;
+        let preserved_uuid = indices_before[1].uuid;
+
+        let unindexed_batch = make_batch((TOTAL * 2) as u32);
+        let query = unindexed_batch["vector"].as_fixed_size_list().value(0);
+        let batches = RecordBatchIterator::new(vec![unindexed_batch].into_iter().map(Ok), schema);
+        dataset.append(batches, None).await.unwrap();
+        assert_eq!(
+            dataset
+                .unindexed_fragments("vector_idx")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        dataset
+            .optimize_indices(
+                &OptimizeOptions::merge(1)
+                    .index_names(vec!["vector_idx".to_string()])
+                    .with_index_segment_ids(vec![selected_uuid]),
+            )
+            .await
+            .unwrap();
+
+        let indices_after = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        assert_eq!(indices_after.len(), 2);
+        assert!(
+            indices_after
+                .iter()
+                .all(|index| index.uuid != selected_uuid)
+        );
+        assert!(
+            indices_after
+                .iter()
+                .any(|index| index.uuid == preserved_uuid)
+        );
+        assert!(
+            dataset
+                .unindexed_fragments("vector_idx")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let covered_fragments = indices_after
+            .iter()
+            .flat_map(|index| index.fragment_bitmap.as_ref().unwrap().iter())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            covered_fragments,
+            std::collections::HashSet::from([0, 1, 2])
+        );
+
+        let results = dataset
+            .scan()
+            .nearest("vector", query.as_primitive::<Float32Type>(), 10)
+            .unwrap()
+            .nprobes(2)
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(results.num_rows(), 10);
+    }
+
+    #[tokio::test]
+    async fn test_optimize_indices_rejects_invalid_segment_selection() {
+        const DIM: usize = 64;
+        const TOTAL: usize = 1000;
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    DIM as i32,
+                ),
+                true,
+            ),
+            Field::new("id", DataType::UInt32, false),
+        ]));
+        let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
                 Arc::new(
@@ -1833,34 +1946,27 @@ mod tests {
                     )
                     .unwrap(),
                 ),
-                Arc::new(UInt32Array::from_iter_values(
-                    TOTAL as u32..(TOTAL * 2) as u32,
-                )),
+                Arc::new(UInt32Array::from_iter_values(0..TOTAL as u32)),
             ],
         )
         .unwrap();
-        let batches = RecordBatchIterator::new(vec![next_batch].into_iter().map(Ok), schema);
-        dataset.append(batches, None).await.unwrap();
+        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+        let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+        let index_params = VectorIndexParams::ivf_pq(2, 8, 4, MetricType::L2, 2);
         dataset
-            .optimize_indices(&OptimizeOptions::append())
+            .create_index(&["vector"], IndexType::Vector, None, &index_params, true)
             .await
             .unwrap();
 
-        let indices = dataset.load_indices_by_name("vector_idx").await.unwrap();
-        assert_eq!(indices.len(), 2);
-        let subset = vec![&indices[1]];
-        let merge_result = merge_indices_with_unindexed_frags(
-            Arc::new(dataset),
-            &subset,
-            &[],
-            &OptimizeOptions::merge(1),
-        )
-        .await
-        .unwrap();
-
+        let segment_uuid = dataset.load_indices().await.unwrap()[0].uuid;
+        let error = dataset
+            .optimize_indices(&OptimizeOptions::merge(1).with_index_segment_ids(vec![segment_uuid]))
+            .await
+            .unwrap_err();
         assert!(
-            merge_result.is_some(),
-            "subset merges should respect the caller-provided indices"
+            error
+                .to_string()
+                .contains("index_segment_ids requires exactly one index name")
         );
     }
 
