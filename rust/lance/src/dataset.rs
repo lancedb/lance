@@ -41,8 +41,8 @@ use lance_io::utils::{
 };
 use lance_namespace::LanceNamespace;
 use lance_table::format::{
-    DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, MAGIC, Manifest, RowIdMeta,
-    pb, populate_manifest_schema_dictionaries,
+    DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, MAGIC, Manifest,
+    ManifestBuildConfig, RowIdMeta, pb, populate_manifest_schema_dictionaries,
 };
 use lance_table::io::commit::{
     CommitConfig, CommitError, CommitHandler, CommitLock, ManifestLocation, ManifestNamingScheme,
@@ -3955,6 +3955,21 @@ impl ManifestWriteConfig {
     pub(crate) fn with_transaction_file_disabled(mut self) -> Self {
         self.disable_transaction_file = true;
         self
+    }
+
+    /// Resolve into the config `Transaction::build_manifest` consumes.
+    ///
+    /// The timestamp is resolved here rather than during the build so it goes
+    /// through this crate's mockable `SystemTime`.
+    pub(crate) fn to_build_config(&self) -> ManifestBuildConfig {
+        ManifestBuildConfig {
+            auto_set_feature_flags: self.auto_set_feature_flags,
+            timestamp_nanos: timestamp_to_nanos(self.timestamp),
+            use_stable_row_ids: self.use_stable_row_ids,
+            use_legacy_format: self.use_legacy_format,
+            storage_format: self.storage_format.clone(),
+            disable_transaction_file: self.disable_transaction_file,
+        }
     }
 }
 

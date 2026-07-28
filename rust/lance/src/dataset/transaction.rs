@@ -12,7 +12,6 @@
 //! For more details please refer to the
 //! [Transaction Specification](https://lance.org/format/table/transaction/#transaction-types).
 
-use super::ManifestWriteConfig;
 use super::write::merge_insert::inserted_rows::KeyExistenceFilter;
 use crate::dataset::overlay::collect_overlay_stale_frags;
 use crate::dataset::transaction::UpdateMode::{RewriteColumns, RewriteRows};
@@ -20,7 +19,6 @@ use crate::index::index_results_are_row_addrs;
 use crate::index::mem_wal::{
     load_mem_wal_index_details, new_mem_wal_index_meta, update_mem_wal_index_compacted_sstables,
 };
-use crate::utils::temporal::timestamp_to_nanos;
 use lance_core::datatypes::{
     Field, LANCE_UNENFORCED_CLUSTERING_KEY_POSITION, LANCE_UNENFORCED_PRIMARY_KEY,
     LANCE_UNENFORCED_PRIMARY_KEY_POSITION,
@@ -40,8 +38,8 @@ use lance_table::rowids::read_row_ids;
 use lance_table::{
     format::{
         BasePath, DataFile, DataStorageFormat, Fragment, IndexFile, IndexMetadata, Manifest,
-        RowDatasetVersionMeta, RowDatasetVersionRun, RowDatasetVersionSequence, RowIdMeta,
-        overlay::DataOverlayFile, pb,
+        ManifestBuildConfig, RowDatasetVersionMeta, RowDatasetVersionRun,
+        RowDatasetVersionSequence, RowIdMeta, overlay::DataOverlayFile, pb,
     },
     io::{
         commit::CommitHandler,
@@ -1860,7 +1858,7 @@ impl Transaction {
         commit_handler: &dyn CommitHandler,
         base_path: &Path,
         version: u64,
-        config: &ManifestWriteConfig,
+        config: &ManifestBuildConfig,
         tx_path: &str,
         current_manifest: &Manifest,
     ) -> Result<(Manifest, Vec<IndexMetadata>)> {
@@ -1872,7 +1870,7 @@ impl Transaction {
         // half-set manifest here: the flag reset would quietly drop the lone bit
         // and republish an undefined state as legacy.
         validate_mem_wal_index_catchup_flags(&manifest)?;
-        manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
+        manifest.set_timestamp(config.timestamp_nanos);
         manifest.transaction_file = Some(tx_path.to_string());
         let indices = read_manifest_indexes(object_store, &location, &manifest).await?;
         manifest.max_fragment_id = manifest
@@ -2203,7 +2201,7 @@ impl Transaction {
         current_manifest: Option<&Manifest>,
         current_indices: Vec<IndexMetadata>,
         transaction_file_path: &str,
-        config: &ManifestWriteConfig,
+        config: &ManifestBuildConfig,
     ) -> Result<(Manifest, Vec<IndexMetadata>)> {
         self.build_manifest_with_read_version(
             current_manifest,
@@ -2225,7 +2223,7 @@ impl Transaction {
         current_manifest: Option<&Manifest>,
         current_indices: Vec<IndexMetadata>,
         transaction_file_path: &str,
-        config: &ManifestWriteConfig,
+        config: &ManifestBuildConfig,
         read_version_state: Option<ReadVersionState<'_>>,
     ) -> Result<(Manifest, Vec<IndexMetadata>)> {
         if config.use_stable_row_ids
@@ -3158,7 +3156,7 @@ impl Transaction {
             manifest.writer_feature_flags |= FLAG_MEM_WAL_INDEX_CATCHUP;
         }
 
-        manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
+        manifest.set_timestamp(config.timestamp_nanos);
 
         manifest.update_max_fragment_id();
 
@@ -5086,6 +5084,7 @@ mod tests {
     use uuid::Uuid;
 
     use crate::Dataset;
+    use crate::dataset::ManifestWriteConfig;
     use crate::dataset::write::WriteParams;
     use crate::dataset::{ColumnAlteration, NewColumnTransform};
     use crate::session::Session;
@@ -5698,7 +5697,7 @@ mod tests {
                 Some(&manifest),
                 vec![first_index.clone(), second_index.clone()],
                 "txn",
-                &ManifestWriteConfig::default(),
+                &ManifestWriteConfig::default().to_build_config(),
             )
             .unwrap();
 
@@ -5733,7 +5732,7 @@ mod tests {
                 Some(&manifest),
                 vec![first_index.clone(), second_index.clone()],
                 "txn",
-                &ManifestWriteConfig::default(),
+                &ManifestWriteConfig::default().to_build_config(),
             )
             .unwrap();
 
@@ -5785,7 +5784,7 @@ mod tests {
                 Some(&manifest),
                 vec![],
                 "txn",
-                &ManifestWriteConfig::default(),
+                &ManifestWriteConfig::default().to_build_config(),
             )
             .unwrap();
 
@@ -5821,7 +5820,7 @@ mod tests {
                 Some(&manifest),
                 vec![],
                 "txn",
-                &ManifestWriteConfig::default(),
+                &ManifestWriteConfig::default().to_build_config(),
             )
             .unwrap();
 
@@ -6647,7 +6646,7 @@ mod tests {
                 Some(&manifest),
                 vec![],
                 "txn",
-                &ManifestWriteConfig::default(),
+                &ManifestWriteConfig::default().to_build_config(),
             )
             .unwrap();
 
@@ -6709,7 +6708,7 @@ mod tests {
             Some(&manifest),
             vec![],
             "txn",
-            &ManifestWriteConfig::default(),
+            &ManifestWriteConfig::default().to_build_config(),
         );
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
@@ -6771,7 +6770,7 @@ mod tests {
             Some(&manifest),
             vec![],
             "txn",
-            &ManifestWriteConfig::default(),
+            &ManifestWriteConfig::default().to_build_config(),
         );
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
@@ -6833,7 +6832,7 @@ mod tests {
             Some(&manifest),
             vec![],
             "txn",
-            &ManifestWriteConfig::default(),
+            &ManifestWriteConfig::default().to_build_config(),
         )
         .expect("bitmap at exact physical_rows boundary should succeed");
     }
@@ -7394,7 +7393,7 @@ mod tests {
                 Some(&manifest),
                 vec![],
                 "txn",
-                &ManifestWriteConfig::default(),
+                &ManifestWriteConfig::default().to_build_config(),
             )
             .unwrap();
 
@@ -7480,7 +7479,7 @@ mod tests {
                 Some(&manifest),
                 vec![],
                 "txn",
-                &ManifestWriteConfig::default(),
+                &ManifestWriteConfig::default().to_build_config(),
             )
             .unwrap();
 
@@ -7556,7 +7555,7 @@ mod tests {
                 Some(&manifest),
                 vec![],
                 "txn",
-                &ManifestWriteConfig::default(),
+                &ManifestWriteConfig::default().to_build_config(),
             )
             .unwrap();
 
@@ -7636,7 +7635,7 @@ mod tests {
                 Some(&manifest),
                 vec![],
                 "txn",
-                &ManifestWriteConfig::default(),
+                &ManifestWriteConfig::default().to_build_config(),
             )
             .unwrap();
 
@@ -7705,7 +7704,7 @@ mod tests {
                 Some(&manifest),
                 vec![],
                 "txn",
-                &ManifestWriteConfig::default(),
+                &ManifestWriteConfig::default().to_build_config(),
             )
             .unwrap();
 
@@ -7775,7 +7774,7 @@ mod tests {
                 Some(&manifest),
                 vec![],
                 "txn",
-                &ManifestWriteConfig::default(),
+                &ManifestWriteConfig::default().to_build_config(),
             )
             .unwrap();
 
@@ -7834,7 +7833,7 @@ mod tests {
                 Some(&manifest),
                 vec![],
                 "txn",
-                &ManifestWriteConfig::default(),
+                &ManifestWriteConfig::default().to_build_config(),
             )
             .unwrap();
 
@@ -7893,7 +7892,7 @@ mod tests {
                 Some(&manifest),
                 vec![],
                 "txn",
-                &ManifestWriteConfig::default(),
+                &ManifestWriteConfig::default().to_build_config(),
             )
             .unwrap();
 
@@ -7938,7 +7937,7 @@ mod tests {
                 Some(&manifest),
                 vec![],
                 "txn",
-                &ManifestWriteConfig::default(),
+                &ManifestWriteConfig::default().to_build_config(),
             )
             .unwrap();
 
@@ -7978,7 +7977,7 @@ mod tests {
                 Some(&manifest),
                 vec![],
                 "txn",
-                &ManifestWriteConfig::default(),
+                &ManifestWriteConfig::default().to_build_config(),
             )
             .unwrap();
 
@@ -8023,7 +8022,7 @@ mod tests {
                 Some(&manifest),
                 vec![],
                 "txn",
-                &ManifestWriteConfig::default(),
+                &ManifestWriteConfig::default().to_build_config(),
             )
             .unwrap();
 
@@ -8101,7 +8100,7 @@ mod tests {
                 Some(&manifest),
                 vec![],
                 "txn",
-                &ManifestWriteConfig::default(),
+                &ManifestWriteConfig::default().to_build_config(),
             )
             .unwrap();
 
@@ -8153,7 +8152,7 @@ mod tests {
                 Some(&manifest),
                 vec![],
                 "txn",
-                &ManifestWriteConfig::default(),
+                &ManifestWriteConfig::default().to_build_config(),
             )
             .unwrap();
 
@@ -8217,7 +8216,7 @@ mod tests {
                 Some(&manifest),
                 vec![],
                 "txn",
-                &ManifestWriteConfig::default(),
+                &ManifestWriteConfig::default().to_build_config(),
             )
             .unwrap();
 
@@ -8292,7 +8291,7 @@ mod tests {
                 Some(&manifest),
                 vec![],
                 "txn",
-                &ManifestWriteConfig::default(),
+                &ManifestWriteConfig::default().to_build_config(),
             )
             .unwrap();
 
@@ -8484,7 +8483,7 @@ mod tests {
                 Some(&manifest),
                 vec![],
                 "txn",
-                &ManifestWriteConfig::default(),
+                &ManifestWriteConfig::default().to_build_config(),
             )
             .unwrap();
 
@@ -8561,7 +8560,7 @@ mod tests {
                 Some(&manifest),
                 vec![],
                 "txn",
-                &ManifestWriteConfig::default(),
+                &ManifestWriteConfig::default().to_build_config(),
             )
             .unwrap();
 
@@ -8624,7 +8623,7 @@ mod tests {
             Some(&manifest),
             vec![],
             "txn",
-            &ManifestWriteConfig::default(),
+            &ManifestWriteConfig::default().to_build_config(),
         )
         .map(|(manifest, _)| manifest.fragments[0].clone())
     }
@@ -8819,7 +8818,7 @@ mod tests {
                 Some(&manifest),
                 vec![],
                 "txn",
-                &ManifestWriteConfig::default(),
+                &ManifestWriteConfig::default().to_build_config(),
             )
             .unwrap();
 
@@ -8847,7 +8846,7 @@ mod tests {
                 Some(&manifest),
                 vec![],
                 "txn",
-                &ManifestWriteConfig::default(),
+                &ManifestWriteConfig::default().to_build_config(),
             )
             .unwrap_err();
         assert!(err.to_string().contains("does not exist"), "{err}");
@@ -9528,7 +9527,7 @@ mod tests {
                         Some(&current),
                         vec![mem_wal_index(MemWalIndexDetails::default())],
                         "txn",
-                        &ManifestWriteConfig::default(),
+                        &ManifestWriteConfig::default().to_build_config(),
                     )
                     .unwrap_err();
 
@@ -9549,7 +9548,7 @@ mod tests {
                     Some(&current),
                     vec![mem_wal_index(MemWalIndexDetails::default())],
                     "txn",
-                    &ManifestWriteConfig::default(),
+                    &ManifestWriteConfig::default().to_build_config(),
                 )
                 .unwrap();
 

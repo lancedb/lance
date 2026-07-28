@@ -683,6 +683,32 @@ impl TryFrom<pb::manifest::DataStorageFormat> for DataStorageFormat {
     }
 }
 
+/// Options controlling how a new [`Manifest`] is assembled from a transaction.
+///
+/// The timestamp arrives already resolved to nanoseconds since the Unix epoch.
+/// Callers own the clock so that a caller wanting a mockable one keeps it: the
+/// `lance` crate mocks `SystemTime` under `cfg(test)`, which only takes effect in
+/// that crate.
+#[derive(Debug, Clone)]
+pub struct ManifestBuildConfig {
+    /// Recompute the manifest's feature flags from the fragments and settings
+    /// below. False leaves whatever flags the previous manifest carried.
+    pub auto_set_feature_flags: bool,
+    /// Value for the new manifest's timestamp, in nanoseconds since the Unix epoch.
+    pub timestamp_nanos: u128,
+    /// Request the stable row id feature. The flag is also inherited from the
+    /// previous manifest, so false does not turn it off for a dataset that has it.
+    pub use_stable_row_ids: bool,
+    /// Overwrite only: force the legacy (true) or v2 (false) file format. `None`
+    /// keeps the format the dataset already had.
+    pub use_legacy_format: Option<bool>,
+    /// Overwrite only: force this storage format, taking precedence over
+    /// `use_legacy_format`. `None` keeps the format the dataset already had.
+    pub storage_format: Option<DataStorageFormat>,
+    /// Skip writing a detached transaction file for this commit.
+    pub disable_transaction_file: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VersionPart {
     Major,
