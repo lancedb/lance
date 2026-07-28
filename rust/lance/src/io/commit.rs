@@ -158,23 +158,6 @@ pub(crate) async fn write_transaction_file(
 /// Transactions serialized above this size are not inlined into the manifest.
 pub(crate) const MAX_INLINE_TRANSACTION_BYTES: usize = 64 * 1024;
 
-/// Decide whether `transaction` is small enough to inline into the manifest,
-/// and derive the write config to commit it with: a transaction too large to
-/// inline must be written to the external transaction file unconditionally —
-/// it is then the only durable copy — even if the config asked to skip it.
-fn inline_transaction_config(
-    transaction: &pb::Transaction,
-    write_config: &ManifestWriteConfig,
-) -> (bool, ManifestWriteConfig) {
-    let inline = transaction.encoded_len() <= MAX_INLINE_TRANSACTION_BYTES;
-    let write_config = if inline {
-        write_config.clone()
-    } else {
-        write_config.with_transaction_file_enabled()
-    };
-    (inline, write_config)
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn do_commit_new_dataset(
     object_store: &ObjectStore,
@@ -188,9 +171,7 @@ async fn do_commit_new_dataset(
     store_registry: Arc<ObjectStoreRegistry>,
 ) -> Result<(Manifest, ManifestLocation)> {
     let pb_transaction = pb::Transaction::from(transaction);
-    let (inline_transaction, write_config) =
-        inline_transaction_config(&pb_transaction, write_config);
-    let write_config = &write_config;
+    let inline_transaction = pb_transaction.encoded_len() <= MAX_INLINE_TRANSACTION_BYTES;
 
     let transaction_file = if !write_config.disable_transaction_file() {
         write_transaction_file(object_store, base_path, &pb_transaction).await?
@@ -853,9 +834,7 @@ pub(crate) async fn do_commit_detached_transaction(
     commit_config: &CommitConfig,
 ) -> Result<(Manifest, ManifestLocation)> {
     let pb_transaction = pb::Transaction::from(transaction);
-    let (inline_transaction, write_config) =
-        inline_transaction_config(&pb_transaction, write_config);
-    let write_config = &write_config;
+    let inline_transaction = pb_transaction.encoded_len() <= MAX_INLINE_TRANSACTION_BYTES;
 
     // We don't strictly need a transaction file but we go ahead and create one for
     // record-keeping if nothing else.
@@ -1093,9 +1072,7 @@ pub(crate) async fn commit_transaction(
         // Recomputed every attempt: the rebase above may have rewritten the
         // transaction.
         let pb_transaction = pb::Transaction::from(&transaction);
-        let (inline_transaction, write_config) =
-            inline_transaction_config(&pb_transaction, write_config);
-        let write_config = &write_config;
+        let inline_transaction = pb_transaction.encoded_len() <= MAX_INLINE_TRANSACTION_BYTES;
         current_transaction_inlined = inline_transaction;
 
         current_transaction_file = if !write_config.disable_transaction_file() {

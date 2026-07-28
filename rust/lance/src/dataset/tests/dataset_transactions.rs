@@ -767,10 +767,7 @@ async fn reopen(uri: &str) -> Dataset {
 
 #[tokio::test]
 async fn test_large_transaction_spills_to_external_file() {
-    use crate::dataset::transaction::TransactionBuilder;
-    use crate::io::commit::{MAX_INLINE_TRANSACTION_BYTES, commit_transaction};
-    use lance_table::feature_flags::FLAG_DISABLE_TRANSACTION_FILE;
-    use lance_table::io::commit::CommitConfig;
+    use crate::io::commit::MAX_INLINE_TRANSACTION_BYTES;
 
     let (schema, batch) = spill_test_batch();
     let test_uri = TempStrDir::default();
@@ -790,12 +787,6 @@ async fn test_large_transaction_spills_to_external_file() {
     let ds = reopen(&test_uri).await;
     assert!(ds.manifest.transaction_section.is_none());
     assert!(matches!(ds.manifest.transaction_file.as_deref(), Some(f) if !f.is_empty()));
-    // The spilled file is the only copy, so the "no transaction file" flag must
-    // not be set.
-    assert_eq!(
-        ds.manifest.writer_feature_flags & FLAG_DISABLE_TRANSACTION_FILE,
-        0
-    );
     let tx = ds.read_transaction().await.unwrap().unwrap();
     assert_eq!(
         tx.transaction_properties
@@ -819,67 +810,6 @@ async fn test_large_transaction_spills_to_external_file() {
     .unwrap();
     let ds = reopen(&test_uri).await;
     assert!(ds.manifest.transaction_section.is_some());
-
-    // With the external transaction file disabled, a small transaction is
-    // inline-only and sets the feature flag.
-    let write_config = ManifestWriteConfig {
-        disable_transaction_file: true,
-        ..Default::default()
-    };
-    let tx_small = TransactionBuilder::new(
-        ds.manifest().version,
-        Operation::Append { fragments: vec![] },
-    )
-    .build();
-    let (_, location) = commit_transaction(
-        &ds,
-        ds.object_store.as_ref(),
-        ds.commit_handler.as_ref(),
-        &tx_small,
-        &write_config,
-        &CommitConfig::default(),
-        ds.manifest_location.naming_scheme,
-        None,
-    )
-    .await
-    .unwrap();
-    let ds = ds.checkout_version(location.version).await.unwrap();
-    assert!(ds.manifest.transaction_section.is_some());
-    assert_ne!(
-        ds.manifest.writer_feature_flags & FLAG_DISABLE_TRANSACTION_FILE,
-        0
-    );
-
-    // A large transaction must spill, so the external file is written despite
-    // the config asking to skip it — the file is the only copy — and the flag
-    // must not be set.
-    let tx_large = TransactionBuilder::new(
-        ds.manifest().version,
-        Operation::Append { fragments: vec![] },
-    )
-    .transaction_properties(large_props("payload2"))
-    .build();
-    let (_, location) = commit_transaction(
-        &ds,
-        ds.object_store.as_ref(),
-        ds.commit_handler.as_ref(),
-        &tx_large,
-        &write_config,
-        &CommitConfig::default(),
-        ds.manifest_location.naming_scheme,
-        None,
-    )
-    .await
-    .unwrap();
-    let ds = ds.checkout_version(location.version).await.unwrap();
-    assert!(ds.manifest.transaction_section.is_none());
-    assert!(matches!(ds.manifest.transaction_file.as_deref(), Some(f) if !f.is_empty()));
-    assert_eq!(
-        ds.manifest.writer_feature_flags & FLAG_DISABLE_TRANSACTION_FILE,
-        0
-    );
-    let read_tx = ds.read_transaction().await.unwrap().unwrap();
-    assert_eq!(read_tx, tx_large);
 }
 
 #[tokio::test]

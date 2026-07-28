@@ -3950,7 +3950,7 @@ impl DatasetTakeRows for Dataset {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct ManifestWriteConfig {
     auto_set_feature_flags: bool,              // default true
     timestamp: Option<SystemTime>,             // default None
@@ -3976,13 +3976,6 @@ impl Default for ManifestWriteConfig {
 impl ManifestWriteConfig {
     pub fn disable_transaction_file(&self) -> bool {
         self.disable_transaction_file
-    }
-
-    pub fn with_transaction_file_enabled(&self) -> Self {
-        Self {
-            disable_transaction_file: false,
-            ..self.clone()
-        }
     }
 }
 
