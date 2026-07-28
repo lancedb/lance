@@ -9183,6 +9183,85 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_ngram_contains_untokenizable_needle() {
+        // A needle the tokenizer cannot turn into a trigram must fall back to a
+        // full recheck rather than silently matching nothing.  Byte length is
+        // not a usable proxy for this: "éé" is two characters but four bytes.
+        let unit = ["ééb", "aéé", "abc", "dog", "éab"];
+        let values: Vec<&str> = unit.iter().copied().cycle().take(60).collect();
+        let array = StringArray::from_iter_values(values);
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "text",
+            DataType::Utf8,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(array)]).unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let write_params = WriteParams {
+            max_rows_per_file: 20, // 60 rows -> 3 fragments
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(
+            reader,
+            "memory://test_ngram_contains_utf8",
+            Some(write_params),
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["text"],
+                IndexType::NGram,
+                None,
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        async fn count(dataset: &Dataset, filter: &str) -> usize {
+            let mut scan = dataset.scan();
+            scan.filter(filter).unwrap();
+            let batches = scan
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            batches.iter().map(|b| b.num_rows()).sum()
+        }
+
+        async fn plan_of(dataset: &Dataset, filter: &str) -> String {
+            let mut scan = dataset.scan();
+            scan.filter(filter).unwrap();
+            let plan = scan.create_plan().await.unwrap();
+            format!(
+                "{}",
+                datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
+            )
+        }
+
+        // Each unit value appears 12 times in the 60 rows.
+        // Two characters (four bytes): shorter than a trigram, so the index is
+        // bypassed and "ééb" / "aéé" are still found.
+        assert_eq!(count(&dataset, "contains(text, 'éé')").await, 24);
+        let plan_str = plan_of(&dataset, "contains(text, 'éé')").await;
+        assert!(
+            !plan_str.contains("ScalarIndexQuery"),
+            "expected NO ngram index usage for a two character needle, got plan:\n{plan_str}"
+        );
+
+        // Three characters: long enough to tokenize, so the index is used.
+        assert_eq!(count(&dataset, "contains(text, 'ééb')").await, 12);
+        let plan_str = plan_of(&dataset, "contains(text, 'ééb')").await;
+        assert!(
+            plan_str.contains("ScalarIndexQuery") && plan_str.contains("NGram"),
+            "expected ngram index usage for a three character needle, got plan:\n{plan_str}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_like_prefix_with_btree_index() {
         // Create dataset with string data that has various prefixes
         // Avoid LIKE special characters (%, _) in data to keep tests simple
