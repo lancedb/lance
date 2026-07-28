@@ -30,8 +30,7 @@ use std::any::Any;
 use std::sync::LazyLock;
 
 use arrow_array::{
-    Array, ArrayRef, FixedSizeListArray, RecordBatch, UInt32Array, UInt64Array, cast::AsArray,
-    new_empty_array, new_null_array,
+    ArrayRef, RecordBatch, UInt32Array, UInt64Array, new_empty_array, new_null_array,
 };
 use arrow_schema::{DataType, Field};
 use datafusion::execution::SendableRecordBatchStream;
@@ -184,23 +183,25 @@ impl ZoneMapIndex {
     ) -> Option<(ScalarValue, ScalarValue)> {
         let mut min: Option<&ScalarValue> = None;
         let mut max: Option<&ScalarValue> = None;
-        for zone in segments.into_iter().flat_map(|seg| seg.zones.iter()) {
-            if Self::scalar_is_nan(&zone.max) {
+        for seg in segments.into_iter() {
+            // Nested types have no meaningful scalar range
+            if seg.data_type.is_nested() {
                 return None;
             }
-            // FixedSizeList zones have no meaningful scalar range
-            if matches!(zone.min, ScalarValue::FixedSizeList(_)) {
-                return None;
-            }
-            if Self::scalar_is_finite_bound(&zone.min)
-                && min.is_none_or(|cur| zone.min.partial_cmp(cur).is_some_and(|o| o.is_lt()))
-            {
-                min = Some(&zone.min);
-            }
-            if Self::scalar_is_finite_bound(&zone.max)
-                && max.is_none_or(|cur| zone.max.partial_cmp(cur).is_some_and(|o| o.is_gt()))
-            {
-                max = Some(&zone.max);
+            for zone in seg.zones.iter() {
+                if Self::scalar_is_nan(&zone.max) {
+                    return None;
+                }
+                if Self::scalar_is_finite_bound(&zone.min)
+                    && min.is_none_or(|cur| zone.min.partial_cmp(cur).is_some_and(|o| o.is_lt()))
+                {
+                    min = Some(&zone.min);
+                }
+                if Self::scalar_is_finite_bound(&zone.max)
+                    && max.is_none_or(|cur| zone.max.partial_cmp(cur).is_some_and(|o| o.is_gt()))
+                {
+                    max = Some(&zone.max);
+                }
             }
         }
         Some((min?.clone(), max?.clone()))
@@ -209,54 +210,6 @@ impl ZoneMapIndex {
     /// A scalar usable as a global-range bound: non-null and, for floats, non-NaN.
     fn scalar_is_finite_bound(v: &ScalarValue) -> bool {
         !v.is_null() && !Self::scalar_is_nan(v)
-    }
-
-    /// Per-position equality check for FixedSizeList zone maps.
-    ///
-    /// Returns `false` (prune) when any element of `target_arr` at position j
-    /// falls outside the zone's `[min[j], max[j]]` interval.  Returns `true`
-    /// (keep) conservatively when a position cannot be compared (null or NaN).
-    fn evaluate_fsl_equals(
-        &self,
-        zone: &ZoneMapStatistics,
-        target_arr: &FixedSizeListArray,
-    ) -> Result<bool> {
-        if zone.min.is_null() {
-            // Zone has no non-null lists; a non-null target can never match.
-            return Ok(false);
-        }
-        let (min_values, max_values) = match (&zone.min, &zone.max) {
-            (ScalarValue::FixedSizeList(min_arr), ScalarValue::FixedSizeList(max_arr)) => {
-                (min_arr.values().clone(), max_arr.values().clone())
-            }
-            _ => return Ok(true), // unexpected shape: conservative
-        };
-        let target_values = target_arr.values();
-        let list_size = target_arr.value_length() as usize;
-        if min_values.len() != list_size || max_values.len() != list_size {
-            return Ok(true); // mismatched sizes: conservative
-        }
-        for j in 0..list_size {
-            if target_values.is_null(j) {
-                continue; // null element: can't prune
-            }
-            let target_elem = ScalarValue::try_from_array(target_values, j)?;
-            if Self::scalar_is_nan(&target_elem) {
-                continue; // NaN target: can't prune
-            }
-            let min_elem = ScalarValue::try_from_array(&min_values, j)?;
-            let max_elem = ScalarValue::try_from_array(&max_values, j)?;
-            if min_elem.is_null() || max_elem.is_null() {
-                continue; // no bounds for this position: can't prune
-            }
-            if target_elem.partial_cmp(&min_elem) == Some(std::cmp::Ordering::Less) {
-                return Ok(false);
-            }
-            if target_elem.partial_cmp(&max_elem) == Some(std::cmp::Ordering::Greater) {
-                return Ok(false);
-            }
-        }
-        Ok(true)
     }
 
     /// Evaluates whether a zone could potentially contain values matching the query.
@@ -271,6 +224,29 @@ impl ZoneMapIndex {
     ) -> Result<bool> {
         use std::ops::Bound;
 
+        // For nested types we only track null_count; prune only when certain.
+        if self.data_type.is_nested() {
+            let all_null = zone.null_count as usize == zone.bound.length;
+            return match query {
+                SargableQuery::IsNull() => Ok(zone.null_count > 0),
+                SargableQuery::Equals(target) => {
+                    if target.is_null() {
+                        Ok(zone.null_count > 0)
+                    } else {
+                        Ok(!all_null)
+                    }
+                }
+                SargableQuery::IsIn(values) => {
+                    if values.iter().any(|v| !v.is_null()) {
+                        Ok(!all_null)
+                    } else {
+                        Ok(zone.null_count > 0)
+                    }
+                }
+                _ => Ok(!all_null),
+            };
+        }
+
         match query {
             SargableQuery::IsNull() => {
                 // Zone contains matching values if it has any null values
@@ -279,11 +255,6 @@ impl ZoneMapIndex {
             SargableQuery::Equals(target) => {
                 if target.is_null() {
                     return Ok(zone.null_count > 0);
-                }
-
-                // FixedSizeList: per-position range check
-                if let ScalarValue::FixedSizeList(target_arr) = target {
-                    return self.evaluate_fsl_equals(zone, target_arr);
                 }
 
                 // Handle NaN values - if target is NaN, check nan_count
@@ -305,11 +276,6 @@ impl ZoneMapIndex {
                 Ok(target >= &zone.min && target <= &zone.max)
             }
             SargableQuery::Range(start, end) => {
-                // FixedSizeList columns have no meaningful range ordering
-                if matches!(self.data_type, DataType::FixedSizeList(_, _)) {
-                    return Ok(true);
-                }
-
                 // Zone overlaps with query range if there's any intersection between
                 // the zone's [min, max] and the query's range
                 if !Self::zone_has_finite_min(zone) {
@@ -424,8 +390,6 @@ impl ZoneMapIndex {
                 Ok(values.iter().any(|value| {
                     if value.is_null() {
                         zone.null_count > 0
-                    } else if let ScalarValue::FixedSizeList(arr) = value {
-                        self.evaluate_fsl_equals(zone, arr).unwrap_or(true)
                     } else {
                         match value {
                             ScalarValue::Float16(Some(f)) => {
@@ -468,11 +432,6 @@ impl ZoneMapIndex {
                 "full text search is not supported for zonemap indexes".into(),
             )),
             SargableQuery::LikePrefix(prefix) => {
-                // FixedSizeList columns don't support like-prefix queries
-                if matches!(self.data_type, DataType::FixedSizeList(_, _)) {
-                    return Ok(true);
-                }
-
                 // For prefix matching, a zone can match if:
                 // - zone.max >= prefix (there could be values >= prefix)
                 // - zone.min < next_prefix (there could be values < next_prefix)
@@ -806,7 +765,7 @@ impl ScalarIndex for ZoneMapIndex {
     /// Single-segment `[min, max]` folded from this index's zones; see
     /// [`value_range_over`](Self::value_range_over) for the full contract.
     fn value_range(&self) -> Option<(ScalarValue, ScalarValue)> {
-        if matches!(self.data_type, DataType::FixedSizeList(_, _)) {
+        if self.data_type.is_nested() {
             return None;
         }
         Self::value_range_over([self])
@@ -1072,168 +1031,25 @@ impl ZoneMapIndexBuilder {
     }
 }
 
-/// Returns true when `dt` is a `FixedSizeList` whose item type is not itself nested.
-fn is_fsl_of_primitive(dt: &DataType) -> bool {
-    matches!(dt, DataType::FixedSizeList(field, _) if !field.data_type().is_nested())
-}
-
-/// Accumulates per-position min/max statistics for a FixedSizeList column.
+/// Index-specific processor that computes zone statistics while the trainer
+/// handles chunking and fragment boundaries.
 ///
-/// For each zone, tracks the minimum and maximum value at each list position
-/// independently across all non-null list entries. At query time this enables
-/// pruning: a zone can be skipped when any element of a query list falls
-/// outside the zone's per-position [min, max] interval.
-struct FixedSizeListZoneAccumulator {
-    item_field: Arc<Field>,
-    list_size: i32,
-    data_type: DataType,
-    pos_min: Vec<Option<ScalarValue>>,
-    pos_max: Vec<Option<ScalarValue>>,
-    null_count: u64,
-    nan_count: u64,
-}
-
-impl FixedSizeListZoneAccumulator {
-    fn new(data_type: DataType) -> Result<Self> {
-        let (item_field, list_size) = match &data_type {
-            DataType::FixedSizeList(field, size) => (field.clone(), *size),
-            _ => {
-                return Err(Error::invalid_input(format!(
-                    "FixedSizeListZoneAccumulator requires FixedSizeList type, got {:?}",
-                    data_type
-                )));
-            }
-        };
-        let n = list_size.max(0) as usize;
-        Ok(Self {
-            item_field,
-            list_size,
-            data_type,
-            pos_min: vec![None; n],
-            pos_max: vec![None; n],
-            null_count: 0,
-            nan_count: 0,
-        })
-    }
-
-    fn update(&mut self, array: &ArrayRef) -> Result<()> {
-        let fsl = array.as_fixed_size_list();
-        let n = self.list_size.max(0) as usize;
-        self.null_count += fsl.null_count() as u64;
-
-        for i in 0..fsl.len() {
-            if fsl.is_null(i) {
-                continue;
-            }
-            let items = fsl.value(i);
-            for j in 0..n {
-                if items.is_null(j) {
-                    continue;
-                }
-                let val = ScalarValue::try_from_array(&items, j)
-                    .map_err(|e| Error::invalid_input(format!("{e}")))?;
-                if ZoneMapIndex::scalar_is_nan(&val) {
-                    self.nan_count += 1;
-                    continue;
-                }
-                if self
-                    .pos_min[j]
-                    .as_ref()
-                    .is_none_or(|cur| val.partial_cmp(cur) == Some(std::cmp::Ordering::Less))
-                {
-                    self.pos_min[j] = Some(val.clone());
-                }
-                if self
-                    .pos_max[j]
-                    .as_ref()
-                    .is_none_or(|cur| val.partial_cmp(cur) == Some(std::cmp::Ordering::Greater))
-                {
-                    self.pos_max[j] = Some(val);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn reset(&mut self) {
-        let n = self.list_size.max(0) as usize;
-        self.pos_min = vec![None; n];
-        self.pos_max = vec![None; n];
-        self.null_count = 0;
-        self.nan_count = 0;
-    }
-
-    fn null_count(&self) -> u64 {
-        self.null_count
-    }
-
-    fn nan_count(&self) -> u64 {
-        self.nan_count
-    }
-
-    fn finish_min_scalar(&self) -> Result<ScalarValue> {
-        self.build_fsl_scalar(&self.pos_min)
-    }
-
-    fn finish_max_scalar(&self) -> Result<ScalarValue> {
-        self.build_fsl_scalar(&self.pos_max)
-    }
-
-    fn build_fsl_scalar(&self, pos_values: &[Option<ScalarValue>]) -> Result<ScalarValue> {
-        if pos_values.iter().all(|v| v.is_none()) {
-            return ScalarValue::try_from(&self.data_type)
-                .map_err(|e| Error::invalid_input(format!("{e}")));
-        }
-        let item_type = self.item_field.data_type();
-        let scalars: Vec<ScalarValue> = pos_values
-            .iter()
-            .map(|v| {
-                v.clone().unwrap_or_else(|| {
-                    ScalarValue::try_from(item_type).unwrap_or(ScalarValue::Null)
-                })
-            })
-            .collect();
-        let child_arr = ScalarValue::iter_to_array(scalars)
-            .map_err(|e| Error::invalid_input(format!("{e}")))?;
-        let fsl_arr = Arc::new(FixedSizeListArray::new(
-            self.item_field.clone(),
-            self.list_size,
-            child_arr,
-            None,
-        ));
-        Ok(ScalarValue::FixedSizeList(fsl_arr))
-    }
-}
-
-/// Index-specific processor that computes min/max statistics for each zone while the
-/// trainer takes care of chunking and fragment boundaries.
+/// For non-nested types, tracks min, max, null_count, and nan_count.
+/// For nested types (List, FixedSizeList, Struct, Map, etc.), tracks only
+/// null_count; min and max are stored as typed null values.
+#[derive(Debug)]
 struct ZoneMapProcessor {
     data_type: DataType,
-    accumulator: ZoneMapAccumulator,
-}
-
-/// Holds either scalar or FSL statistics for `ZoneMapProcessor`.
-enum ZoneMapAccumulator {
-    Scalar(StatisticsAccumulator),
-    FixedSizeList(FixedSizeListZoneAccumulator),
-}
-
-impl std::fmt::Debug for ZoneMapProcessor {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ZoneMapProcessor")
-            .field("data_type", &self.data_type)
-            .finish()
-    }
+    statistics: StatisticsAccumulator,
 }
 
 impl ZoneMapProcessor {
     fn new(data_type: DataType) -> Result<Self> {
-        let accumulator = if is_fsl_of_primitive(&data_type) {
-            ZoneMapAccumulator::FixedSizeList(FixedSizeListZoneAccumulator::new(data_type.clone())?)
-        } else {
-            ZoneMapAccumulator::Scalar(StatisticsAccumulator::new(&data_type))
-        };
-        Ok(Self { data_type, accumulator })
+        let statistics = StatisticsAccumulator::new(&data_type);
+        Ok(Self {
+            data_type,
+            statistics,
+        })
     }
 
     fn scalar_value_from_stat(
@@ -1285,53 +1101,46 @@ impl ZoneProcessor for ZoneMapProcessor {
     type ZoneStatistics = ZoneMapStatistics;
 
     fn process_chunk(&mut self, array: &ArrayRef) -> Result<()> {
-        match &mut self.accumulator {
-            ZoneMapAccumulator::Scalar(acc) => acc.update(array)?,
-            ZoneMapAccumulator::FixedSizeList(acc) => acc.update(array)?,
-        }
+        self.statistics.update(array)?;
         Ok(())
     }
 
     fn finish_zone(&mut self, bound: ZoneBound) -> Result<Self::ZoneStatistics> {
-        match &self.accumulator {
-            ZoneMapAccumulator::Scalar(acc) => {
-                let statistics = acc.statistics();
-                let nan_count =
-                    Self::stat_count_to_u32("nan_count", statistics.nan_count.unwrap_or(0))?;
-                Ok(ZoneMapStatistics {
-                    min: Self::scalar_value_from_stat(
-                        statistics.min.as_ref().map(|scalar| scalar.as_array()),
-                        &self.data_type,
-                    )?,
-                    max: Self::max_value_from_stats(
-                        statistics.max.as_ref().map(|scalar| scalar.as_array()),
-                        &self.data_type,
-                        nan_count,
-                    )?,
-                    null_count: Self::stat_count_to_u32("null_count", statistics.null_count)?,
-                    nan_count,
-                    bound,
-                })
-            }
-            ZoneMapAccumulator::FixedSizeList(acc) => {
-                let null_count = Self::stat_count_to_u32("null_count", acc.null_count())?;
-                let nan_count = Self::stat_count_to_u32("nan_count", acc.nan_count())?;
-                Ok(ZoneMapStatistics {
-                    min: acc.finish_min_scalar()?,
-                    max: acc.finish_max_scalar()?,
-                    null_count,
-                    nan_count,
-                    bound,
-                })
-            }
+        let statistics = self.statistics.statistics();
+        let null_count = Self::stat_count_to_u32("null_count", statistics.null_count)?;
+
+        // For nested types, only null_count is meaningful; store null min/max.
+        if self.data_type.is_nested() {
+            return Ok(ZoneMapStatistics {
+                min: ScalarValue::try_from(&self.data_type)
+                    .map_err(|e| Error::invalid_input(format!("{e}")))?,
+                max: ScalarValue::try_from(&self.data_type)
+                    .map_err(|e| Error::invalid_input(format!("{e}")))?,
+                null_count,
+                nan_count: 0,
+                bound,
+            });
         }
+
+        let nan_count = Self::stat_count_to_u32("nan_count", statistics.nan_count.unwrap_or(0))?;
+        Ok(ZoneMapStatistics {
+            min: Self::scalar_value_from_stat(
+                statistics.min.as_ref().map(|scalar| scalar.as_array()),
+                &self.data_type,
+            )?,
+            max: Self::max_value_from_stats(
+                statistics.max.as_ref().map(|scalar| scalar.as_array()),
+                &self.data_type,
+                nan_count,
+            )?,
+            null_count,
+            nan_count,
+            bound,
+        })
     }
 
     fn reset(&mut self) -> Result<()> {
-        match &mut self.accumulator {
-            ZoneMapAccumulator::Scalar(acc) => acc.reset(),
-            ZoneMapAccumulator::FixedSizeList(acc) => acc.reset(),
-        }
+        self.statistics.reset();
         Ok(())
     }
 }
@@ -1363,8 +1172,9 @@ fn default_use_seeds(data_type: &DataType) -> bool {
         // Fixed-width types wider than 8 bytes.
         DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => true,
         DataType::FixedSizeBinary(n) => *n > 8,
-        // FixedSizeList (typically embedding vectors): almost always wider than 8 bytes.
-        DataType::FixedSizeList(_, _) => true,
+        // Nested types (FSL, List, Struct, Map, …): typically wide; even null-only
+        // seeds save more than their tiny serialization cost.
+        _ if data_type.is_nested() => true,
         _ => false,
     }
 }
@@ -1418,12 +1228,6 @@ impl BasicTrainer for ZoneMapIndexPlugin {
         params: &str,
         field: &Field,
     ) -> Result<Box<dyn TrainingRequest>> {
-        if field.data_type().is_nested() && !is_fsl_of_primitive(field.data_type()) {
-            return Err(Error::invalid_input_source(
-                "A zone map index can only be created on a non-nested field.".into(),
-            ));
-        }
-
         let mut params = serde_json::from_str::<ZoneMapIndexBuilderParams>(params)?;
         // Resolve None → type-based default so train_index always sees Some(bool).
         if params.use_seeds.is_none() {
@@ -1521,9 +1325,6 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
         data_type: &DataType,
         index_details: &prost_types::Any,
     ) -> Result<Option<Box<dyn crate::scalar::seed::IndexSeedWriter>>> {
-        if data_type.is_nested() && !is_fsl_of_primitive(data_type) {
-            return Ok(None);
-        }
         let details = index_details.to_msg::<pbold::ZoneMapIndexDetails>().ok();
         let Some(rows_per_zone) = details.as_ref().and_then(|d| d.rows_per_zone) else {
             return Ok(None);
@@ -3852,16 +3653,13 @@ mod tests {
         assert!(result.is_none(), "empty fragment should return None");
     }
 
-    // ───────────────────────────── FixedSizeList tests ─────────────────────────────
+    // ───────────────────────────── Nested type zone map tests ─────────────────────────────
 
     use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array};
 
     /// Build a FixedSizeList<Float32, list_size> zone map from `rows` (each row is a
     /// `Vec<Option<f32>>` of length `list_size`), then load and return the index.
-    async fn train_and_load_fsl(
-        rows: Vec<Vec<Option<f32>>>,
-        list_size: i32,
-    ) -> Arc<ZoneMapIndex> {
+    async fn train_and_load_fsl(rows: Vec<Vec<Option<f32>>>, list_size: i32) -> Arc<ZoneMapIndex> {
         let item_field = Arc::new(Field::new("item", DataType::Float32, true));
         let fsl_type = DataType::FixedSizeList(item_field.clone(), list_size);
         let schema = Arc::new(Schema::new(vec![
@@ -3884,8 +3682,7 @@ mod tests {
         let fsl_arr: ArrayRef = Arc::new(fsl_builder.finish());
         let n = rows.len() as u64;
         let row_addr: ArrayRef = Arc::new(UInt64Array::from_iter_values(0..n));
-        let batch =
-            RecordBatch::try_new(schema.clone(), vec![fsl_arr, row_addr]).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![fsl_arr, row_addr]).unwrap();
 
         let tmpdir = TempObjDir::default();
         let test_store = Arc::new(LanceIndexStore::new(
@@ -3922,12 +3719,11 @@ mod tests {
         SV::FixedSizeList(arr)
     }
 
+    // Zones for nested types have null min/max; all non-null queries are conservative (not pruned)
+    // unless every row in the zone is null.
     #[tokio::test]
-    async fn test_fsl_zonemap_equals_prune() {
-        // Zone 0: rows 0-3, values [[1,2], [3,4], [5,6], [7,8]]
-        // pos0 min=1, max=7; pos1 min=2, max=8
-        // Zone 1: rows 4-7, values [[10,20], [30,40], [50,60], [70,80]]
-        // pos0 min=10, max=70; pos1 min=20, max=80
+    async fn test_fsl_zonemap_conservative_equals() {
+        // Two zones, 4 rows each, no null rows.
         let index = train_and_load_fsl(
             vec![
                 vec![Some(1.0), Some(2.0)],
@@ -3943,33 +3739,41 @@ mod tests {
         )
         .await;
         assert_eq!(index.zones.len(), 2);
+        // min/max are null for nested types
+        assert!(index.zones[0].min.is_null());
+        assert!(index.zones[0].max.is_null());
+        assert_eq!(index.zones[0].null_count, 0);
+        assert_eq!(index.zones[0].nan_count, 0);
 
-        let metrics = crate::metrics::NoOpMetricsCollector;
+        // Non-null Equals: conservative — neither zone is pruned
+        let q = SargableQuery::Equals(fsl_scalar(vec![Some(100.0), Some(200.0)]));
+        assert!(
+            index
+                .evaluate_zone_against_query(&index.zones[0], &q)
+                .unwrap(),
+            "non-null Equals on nested type is conservative"
+        );
+        assert!(
+            index
+                .evaluate_zone_against_query(&index.zones[1], &q)
+                .unwrap(),
+            "non-null Equals on nested type is conservative"
+        );
 
-        // Query [5.0, 6.0]: in zone 0's range, not in zone 1's range
-        let q = SargableQuery::Equals(fsl_scalar(vec![Some(5.0), Some(6.0)]));
-        let result = index.search(&q, &metrics).await.unwrap();
-        // Should not be an exact result (zone map is approximate); check at least zone 1 pruned
-        let zone0 = index
-            .evaluate_zone_against_query(&index.zones[0], &q)
-            .unwrap();
-        let zone1 = index
-            .evaluate_zone_against_query(&index.zones[1], &q)
-            .unwrap();
-        assert!(zone0, "zone 0 should not be pruned");
-        assert!(!zone1, "zone 1 should be pruned: pos0=5 < min=10");
-        drop(result);
-
-        // Query [100.0, 200.0]: outside both zones
-        let q2 = SargableQuery::Equals(fsl_scalar(vec![Some(100.0), Some(200.0)]));
-        let zone0 = index
-            .evaluate_zone_against_query(&index.zones[0], &q2)
-            .unwrap();
-        let zone1 = index
-            .evaluate_zone_against_query(&index.zones[1], &q2)
-            .unwrap();
-        assert!(!zone0, "zone 0 pruned: pos0=100 > max=7");
-        assert!(!zone1, "zone 1 pruned: pos0=100 > max=70");
+        // IsNull: no null rows → both zones pruned
+        let q_null = SargableQuery::IsNull();
+        assert!(
+            !index
+                .evaluate_zone_against_query(&index.zones[0], &q_null)
+                .unwrap(),
+            "IsNull pruned when null_count=0"
+        );
+        assert!(
+            !index
+                .evaluate_zone_against_query(&index.zones[1], &q_null)
+                .unwrap(),
+            "IsNull pruned when null_count=0"
+        );
     }
 
     #[tokio::test]
@@ -3982,8 +3786,7 @@ mod tests {
         ]));
 
         // Build FSL array with some null entries
-        let mut builder =
-            arrow_array::builder::FixedSizeListBuilder::new(Float32Builder::new(), 2);
+        let mut builder = arrow_array::builder::FixedSizeListBuilder::new(Float32Builder::new(), 2);
         // Row 0: null list
         builder.values().append_value(0.0);
         builder.values().append_value(0.0);
@@ -4022,9 +3825,11 @@ mod tests {
 
         // IsNull should match
         let q = SargableQuery::IsNull();
-        assert!(index
-            .evaluate_zone_against_query(&index.zones[0], &q)
-            .unwrap());
+        assert!(
+            index
+                .evaluate_zone_against_query(&index.zones[0], &q)
+                .unwrap()
+        );
 
         // Equals null should match (null_count > 0)
         let null_scalar = SV::FixedSizeList(Arc::new(FixedSizeListArray::new_null(
@@ -4033,16 +3838,16 @@ mod tests {
             1,
         )));
         let q2 = SargableQuery::Equals(null_scalar);
-        assert!(index
-            .evaluate_zone_against_query(&index.zones[0], &q2)
-            .unwrap());
+        assert!(
+            index
+                .evaluate_zone_against_query(&index.zones[0], &q2)
+                .unwrap()
+        );
     }
 
     #[tokio::test]
-    async fn test_fsl_zonemap_is_in() {
-        // Two zones (4 rows each):
-        // zone 0: pos0 in [1,7], pos1 in [2,8]
-        // zone 1: pos0 in [10,70], pos1 in [20,80]
+    async fn test_fsl_zonemap_is_in_conservative() {
+        // Two zones (4 rows each), no null rows.
         let index = train_and_load_fsl(
             vec![
                 vec![Some(1.0), Some(2.0)],
@@ -4059,53 +3864,22 @@ mod tests {
         .await;
         assert_eq!(index.zones.len(), 2);
 
-        // IsIn: one value in zone 0's range, one out of both zones
+        // IsIn with non-null values: conservative — neither zone is pruned
         let q = SargableQuery::IsIn(vec![
-            fsl_scalar(vec![Some(4.0), Some(5.0)]),    // in zone 0
-            fsl_scalar(vec![Some(100.0), Some(200.0)]), // in neither
+            fsl_scalar(vec![Some(4.0), Some(5.0)]),
+            fsl_scalar(vec![Some(100.0), Some(200.0)]),
         ]);
-        let zone0 = index
-            .evaluate_zone_against_query(&index.zones[0], &q)
-            .unwrap();
-        let zone1 = index
-            .evaluate_zone_against_query(&index.zones[1], &q)
-            .unwrap();
-        assert!(zone0, "zone 0 kept because first value is in range");
-        assert!(!zone1, "zone 1 pruned: no candidate fits");
-    }
-
-    #[tokio::test]
-    async fn test_fsl_zonemap_nan_elements() {
-        // Zone: [[1.0, 2.0], [3.0, NaN]]
-        // pos0: min=1, max=3 (all non-NaN)
-        // pos1: min=2, max=2 (only 2.0 is non-NaN)
-        let index = train_and_load_fsl(
-            vec![
-                vec![Some(1.0), Some(2.0)],
-                vec![Some(3.0), Some(f32::NAN)],
-            ],
-            2,
-        )
-        .await;
-        assert_eq!(index.zones.len(), 1);
-        assert!(index.zones[0].nan_count > 0, "NaN should be counted");
-
-        // Query [NaN, 2.0]: pos0=NaN is skipped, pos1=2.0 in [2,2] → not pruned
-        let q_no_prune = SargableQuery::Equals(fsl_scalar(vec![Some(f32::NAN), Some(2.0)]));
         assert!(
             index
-                .evaluate_zone_against_query(&index.zones[0], &q_no_prune)
+                .evaluate_zone_against_query(&index.zones[0], &q)
                 .unwrap(),
-            "NaN at pos0 skips that position; pos1 is in range → not pruned"
+            "IsIn with non-null values is conservative for nested types"
         );
-
-        // Query [2.0, 100.0]: pos1=100 > max=2 → pruned
-        let q_prune = SargableQuery::Equals(fsl_scalar(vec![Some(2.0), Some(100.0)]));
         assert!(
-            !index
-                .evaluate_zone_against_query(&index.zones[0], &q_prune)
+            index
+                .evaluate_zone_against_query(&index.zones[1], &q)
                 .unwrap(),
-            "pos1=100 > max=2 → pruned"
+            "IsIn with non-null values is conservative for nested types"
         );
     }
 
@@ -4127,8 +3901,7 @@ mod tests {
             Field::new(VALUE_COLUMN_NAME, fsl_type.clone(), true),
             Field::new(ROW_ADDR, DataType::UInt64, false),
         ]));
-        let mut builder =
-            arrow_array::builder::FixedSizeListBuilder::new(Float32Builder::new(), 2);
+        let mut builder = arrow_array::builder::FixedSizeListBuilder::new(Float32Builder::new(), 2);
         for _ in 0..2 {
             builder.values().append_value(0.0);
             builder.values().append_value(0.0);
@@ -4161,13 +3934,152 @@ mod tests {
         assert_eq!(index.zones[0].null_count, 2);
         assert!(index.zones[0].min.is_null(), "all-null zone: min is null");
 
-        // A non-null target should be pruned in an all-null zone
+        // When every row is null (null_count == zone length), a non-null query is pruned.
         let q = SargableQuery::Equals(fsl_scalar(vec![Some(1.0), Some(2.0)]));
         assert!(
             !index
                 .evaluate_zone_against_query(&index.zones[0], &q)
                 .unwrap(),
-            "all-null zone should be pruned for non-null target"
+            "all-null zone (null_count == length) is pruned for non-null target"
         );
+
+        // Range and IsIn are also pruned when all rows are null.
+        let q_range = SargableQuery::Range(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded);
+        assert!(
+            !index
+                .evaluate_zone_against_query(&index.zones[0], &q_range)
+                .unwrap(),
+            "all-null zone is pruned for Range query"
+        );
+    }
+
+    /// Build a zone map on a Struct column and verify training succeeds and stats are correct.
+    #[tokio::test]
+    async fn test_struct_zonemap_null_tracking() {
+        use arrow_array::StructArray;
+        use arrow_schema::Fields;
+
+        let item_field = Arc::new(Field::new("x", DataType::Int32, true));
+        let struct_type = DataType::Struct(Fields::from(vec![item_field.clone()]));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(VALUE_COLUMN_NAME, struct_type.clone(), true),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
+        ]));
+
+        // 3 non-null struct rows
+        let x_values: ArrayRef = Arc::new(arrow_array::Int32Array::from(vec![10, 20, 30]));
+        let struct_arr: ArrayRef =
+            Arc::new(StructArray::from(vec![(item_field.clone(), x_values)]));
+        let row_addr: ArrayRef = Arc::new(UInt64Array::from_iter_values(0..3));
+        let batch = RecordBatch::try_new(schema.clone(), vec![struct_arr, row_addr]).unwrap();
+
+        let tmpdir = TempObjDir::default();
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::once(std::future::ready(Ok(batch))),
+        ));
+        ZoneMapIndexPlugin::train_zonemap_index(
+            stream,
+            test_store.as_ref(),
+            Some(ZoneMapIndexBuilderParams::new(10)),
+        )
+        .await
+        .unwrap();
+
+        let index = ZoneMapIndex::load(test_store.clone(), None, &LanceCache::no_cache(), false)
+            .await
+            .unwrap();
+
+        assert_eq!(index.zones.len(), 1);
+        assert_eq!(index.zones[0].null_count, 0, "no null struct rows");
+        assert_eq!(index.zones[0].nan_count, 0);
+        // min/max are typed null ScalarValues (exact representation varies by DataFusion version)
+        // but IsNull correctly returns false and Equals is conservative
+
+        // IsNull: no null rows → zone is pruned
+        assert!(
+            !index
+                .evaluate_zone_against_query(&index.zones[0], &SargableQuery::IsNull())
+                .unwrap()
+        );
+
+        // Non-null Equals: conservative (not pruned) since not all rows are null
+        assert!(
+            index
+                .evaluate_zone_against_query(
+                    &index.zones[0],
+                    &SargableQuery::Equals(SV::Int32(Some(99)))
+                )
+                .unwrap()
+        );
+
+        // value_range: always None for nested types
+        assert_eq!(index.value_range(), None);
+    }
+
+    /// Build a zone map on a List<Int32> column and verify null tracking works.
+    #[tokio::test]
+    async fn test_list_zonemap_null_tracking() {
+        use arrow_array::builder::ListBuilder;
+
+        let item_field = Arc::new(Field::new("item", DataType::Int32, true));
+        let list_type = DataType::List(item_field.clone());
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(VALUE_COLUMN_NAME, list_type.clone(), true),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
+        ]));
+
+        // Build: [null, [1,2], [3]]
+        let mut builder = ListBuilder::new(arrow_array::builder::Int32Builder::new());
+        builder.append_null();
+        builder.values().append_value(1);
+        builder.values().append_value(2);
+        builder.append(true);
+        builder.values().append_value(3);
+        builder.append(true);
+        let list_arr: ArrayRef = Arc::new(builder.finish());
+        let row_addr: ArrayRef = Arc::new(UInt64Array::from_iter_values(0..3));
+        let batch = RecordBatch::try_new(schema.clone(), vec![list_arr, row_addr]).unwrap();
+
+        let tmpdir = TempObjDir::default();
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::once(std::future::ready(Ok(batch))),
+        ));
+        ZoneMapIndexPlugin::train_zonemap_index(
+            stream,
+            test_store.as_ref(),
+            Some(ZoneMapIndexBuilderParams::new(10)),
+        )
+        .await
+        .unwrap();
+
+        let index = ZoneMapIndex::load(test_store.clone(), None, &LanceCache::no_cache(), false)
+            .await
+            .unwrap();
+
+        assert_eq!(index.zones.len(), 1);
+        assert_eq!(index.zones[0].null_count, 1, "one null list row");
+        // min/max are typed null ScalarValues for nested types
+
+        // IsNull search: the null bitmap is populated during training so
+        // the result is an exact set containing just the null row (row address 0).
+        let result = index
+            .search(&SargableQuery::IsNull(), &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let mut exact_nulls = RowAddrTreeMap::new();
+        exact_nulls.insert(0); // only row 0 is null
+        assert_eq!(result, SearchResult::exact(exact_nulls));
     }
 }
