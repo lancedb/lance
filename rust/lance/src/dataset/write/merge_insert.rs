@@ -147,6 +147,7 @@ use tracing::error;
 mod assign_action;
 mod exec;
 mod logical_plan;
+mod probe;
 
 // "update if" expressions typically compare fields from the source table to the target table.
 // These tables have the same schema and so filter expressions need to differentiate.  To do that
@@ -1711,7 +1712,7 @@ impl MergeInsertJob {
         batches: Vec<RecordBatch>,
     ) -> Result<UncommittedMergeInsert> {
         let provider = self.batches_to_provider(batches)?;
-        self.execute_uncommitted_impl(provider).await
+        self.execute_uncommitted_impl(provider, true).await
     }
 
     /// Wrap materialized batches in a multi-partition in-memory [`MemTable`].
@@ -1783,6 +1784,7 @@ impl MergeInsertJob {
         let wrapper = MergeInsertJobWithProvider {
             job: self,
             provider,
+            replayable,
             attempt_count: Arc::new(AtomicU32::new(0)),
         };
 
@@ -1797,7 +1799,7 @@ impl MergeInsertJob {
         source: impl StreamingWriteSource,
     ) -> Result<UncommittedMergeInsert> {
         let stream = source.into_stream();
-        self.execute_uncommitted_impl(one_shot_provider(stream)?)
+        self.execute_uncommitted_impl(one_shot_provider(stream)?, false)
             .await
     }
 
@@ -1816,13 +1818,53 @@ impl MergeInsertJob {
         }
     }
 
-    async fn create_plan(self, provider: Arc<dyn TableProvider>) -> Result<Arc<dyn ExecutionPlan>> {
-        // Goal: we shouldn't manually have to specify which columns to scan.
-        //       DataFusion's optimizer should be able to automatically perform
-        //       projection pushdown for us.
-        // Goal: we shouldn't have to add new branches in this code to handle
-        //       indexed vs non-indexed cases. That should be handled by optimizer rules.
-        let session_ctx = SessionContext::new();
+    /// The scalar-index lookups the target scan should probe instead of scanning
+    /// the whole table, or `None` to scan.
+    ///
+    /// The probe reaches only rows whose keys appear in the source, so it can
+    /// only replace the scan when the merge cannot touch a row the source never
+    /// mentions. It also scans the source a second time to collect key values,
+    /// so the source must be re-scannable.
+    ///
+    /// Probing an indexed subset of a composite key is allowed: the probe
+    /// over-matches and the join applies the real key predicate. Under-matching
+    /// would not be allowed, which is why the caller unions in the fragments no
+    /// chosen index covers.
+    async fn probe_lookups(
+        &self,
+        source_replayable: bool,
+    ) -> Result<Option<Vec<(String, IndexMetadata)>>> {
+        let eligible = source_replayable
+            // Honor an explicit opt-out from consulting an index.
+            && self.params.use_index
+            // Reading rows from a probe's output requires the v2 storage format.
+            && !self.dataset.is_legacy_storage()
+            // Deleting unmatched target rows needs rows the probe never reaches.
+            && matches!(
+                self.params.delete_not_matched_by_source,
+                WhenNotMatchedBySource::Keep
+            );
+        if !eligible {
+            return Ok(None);
+        }
+
+        let indexed = self.indexed_join_keys().await?;
+        if indexed.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(indexed))
+    }
+
+    /// Build the target-side [`TableProvider`], probing a scalar index where that
+    /// is possible and scanning the whole table otherwise.
+    ///
+    /// Both providers report the same schema, so the rest of the plan does not
+    /// change with the choice.
+    async fn target_provider(
+        &self,
+        source: &Arc<dyn TableProvider>,
+        source_replayable: bool,
+    ) -> Result<Arc<dyn TableProvider>> {
         let binary_blob_field_ids = self
             .dataset
             .schema()
@@ -1830,17 +1872,53 @@ impl MergeInsertJob {
             .filter(|field| field.is_blob() && !field.is_blob_v2())
             .map(|field| field.id as u32)
             .collect();
-        let target_provider = Arc::new(
-            crate::datafusion::dataframe::LanceTableProvider::new_with_ordering(
-                self.dataset.clone(),
-                true,
-                true,
-                false,
-            )
-            .with_blob_handling(lance_core::datatypes::BlobHandling::SomeBlobsBinary(
-                binary_blob_field_ids,
+        let blob_handling =
+            lance_core::datatypes::BlobHandling::SomeBlobsBinary(binary_blob_field_ids);
+
+        match self.probe_lookups(source_replayable).await? {
+            Some(indexed) => {
+                let unindexed_fragments = self.unindexed_fragments_for_keys(&indexed).await?;
+                let lookups = indexed
+                    .into_iter()
+                    .map(|(column, index)| IndexLookup::new(column, index.name))
+                    .collect();
+                Ok(Arc::new(probe::IndexProbeTarget::try_new(
+                    self.dataset.clone(),
+                    source.clone(),
+                    lookups,
+                    unindexed_fragments,
+                    blob_handling,
+                )?))
+            }
+            None => Ok(Arc::new(
+                crate::datafusion::dataframe::LanceTableProvider::new_with_ordering(
+                    self.dataset.clone(),
+                    true,
+                    true,
+                    false,
+                )
+                .with_blob_handling(blob_handling),
             )),
-        );
+        }
+    }
+
+    /// Build the physical plan for the merge.
+    ///
+    /// `source_replayable` states whether `provider` can be scanned more than
+    /// once; the index-probe target scan needs a second scan of the source and is
+    /// not used when it cannot have one.
+    async fn create_plan(
+        self,
+        provider: Arc<dyn TableProvider>,
+        source_replayable: bool,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        // Goal: we shouldn't manually have to specify which columns to scan.
+        //       DataFusion's optimizer should be able to automatically perform
+        //       projection pushdown for us.
+        // Goal: we shouldn't have to add new branches in this code to handle
+        //       indexed vs non-indexed cases. That should be handled by optimizer rules.
+        let session_ctx = SessionContext::new();
+        let target_provider = self.target_provider(&provider, source_replayable).await?;
         let scan = session_ctx.read_table(target_provider)?;
         // Wrap column names in double quotes to preserve case (DataFusion lowercases unquoted identifiers)
         let on_cols = self
@@ -1934,13 +2012,14 @@ impl MergeInsertJob {
     async fn execute_uncommitted_v2(
         self,
         provider: Arc<dyn TableProvider>,
+        source_replayable: bool,
     ) -> Result<(
         Transaction,
         MergeStats,
         Option<RowAddrTreeMap>,
         Option<KeyExistenceFilter>,
     )> {
-        let plan = self.create_plan(provider).await?;
+        let plan = self.create_plan(provider, source_replayable).await?;
 
         // Execute the plan
         // Assert that we have exactly one partition since we're designed for single-partition execution
@@ -2126,13 +2205,15 @@ impl MergeInsertJob {
     async fn execute_uncommitted_impl(
         self,
         provider: Arc<dyn TableProvider>,
+        source_replayable: bool,
     ) -> Result<UncommittedMergeInsert> {
         // Check if we can use the fast path
         let can_use_fast_path = self.can_use_create_plan(provider.schema().as_ref()).await?;
 
         if can_use_fast_path {
-            let (transaction, stats, affected_rows, inserted_rows_filter) =
-                self.execute_uncommitted_v2(provider).await?;
+            let (transaction, stats, affected_rows, inserted_rows_filter) = self
+                .execute_uncommitted_v2(provider, source_replayable)
+                .await?;
             return Ok(UncommittedMergeInsert {
                 transaction,
                 affected_rows,
@@ -2461,18 +2542,16 @@ impl MergeInsertJob {
             return Err(Error::not_supported_source("This merge insert configuration does not support explain_plan. Only full-schema merge insert operations without a scalar-index execution path are currently supported.".into()));
         }
 
-        // Create an empty batch with the provided schema to pass to create_plan
+        // An empty batch with the provided schema stands in for the source. It is
+        // wrapped in a re-scannable provider so the plan shown is the one the
+        // execution entry points build; a one-shot source would rule out the
+        // index-probe target scan.
         let empty_batch = RecordBatch::new_empty(Arc::new(schema.clone()));
-        let stream = RecordBatchStreamAdapter::new(
-            Arc::new(schema.clone()),
-            futures::stream::once(async { Ok(empty_batch) }).boxed(),
-        );
+        let provider = self.batches_to_provider(vec![empty_batch])?;
 
         // Clone self since create_plan consumes the job
         let cloned_job = self.clone();
-        let plan = cloned_job
-            .create_plan(one_shot_provider(Box::pin(stream))?)
-            .await?;
+        let plan = cloned_job.create_plan(provider, true).await?;
         let display = DisplayableExecutionPlan::new(plan.as_ref());
 
         Ok(format!("{}", display.indent(verbose)))
@@ -2503,9 +2582,13 @@ impl MergeInsertJob {
             return Err(Error::not_supported_source("This merge insert configuration does not support analyze_plan. Only full-schema merge insert operations without a scalar-index execution path are currently supported.".into()));
         }
 
+        // Build the provider the same way execution does, so the plan analyzed is
+        // the plan that would have run.
+        let (provider, replayable) = self.stream_source_to_provider(source).await?;
+
         // Clone self since create_plan consumes the job
         let cloned_job = self.clone();
-        let plan = cloned_job.create_plan(one_shot_provider(source)?).await?;
+        let plan = cloned_job.create_plan(provider, replayable).await?;
 
         // Use the analyze_plan function from lance_datafusion, but strip out the wrapper lines
         let options = LanceExecutionOptions::default();
@@ -2560,6 +2643,9 @@ pub struct UncommittedMergeInsert {
 struct MergeInsertJobWithProvider {
     job: MergeInsertJob,
     provider: Arc<dyn TableProvider>,
+    /// Whether `provider` can be scanned more than once. False only for a
+    /// one-shot stream that was not spilled, which also disables retries.
+    replayable: bool,
     attempt_count: Arc<AtomicU32>,
 }
 
@@ -2574,7 +2660,7 @@ impl RetryExecutor for MergeInsertJobWithProvider {
         // Re-scan the provider on each retry attempt.
         self.job
             .clone()
-            .execute_uncommitted_impl(self.provider.clone())
+            .execute_uncommitted_impl(self.provider.clone(), self.replayable)
             .await
     }
 
@@ -4738,6 +4824,249 @@ mod tests {
         assert_eq!(updated_ds.count_rows(None).await.unwrap(), 3);
     }
 
+    /// Dataset with a two-column merge key and a scalar index on `a` only, so
+    /// the key is partially indexed and the merge takes the v2 plan path.
+    async fn partially_indexed_dataset(index_on_a: bool) -> (Arc<Dataset>, Arc<Schema>) {
+        let initial = record_batch!(
+            ("a", Int32, [1, 1, 2, 2]),
+            ("b", Int32, [10, 20, 10, 20]),
+            ("value", Int32, [100, 200, 300, 400])
+        )
+        .unwrap();
+        let schema = initial.schema();
+        let mut ds = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(initial.clone())], schema.clone()),
+            "memory://",
+            None,
+        )
+        .await
+        .unwrap();
+        if index_on_a {
+            ds.create_index(
+                &["a"],
+                IndexType::Scalar,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        }
+        (Arc::new(ds), schema)
+    }
+
+    /// Render the merge's physical plan for an empty source of `schema`, stating
+    /// whether the source provider can be scanned more than once.
+    async fn merge_plan_string(
+        job: &MergeInsertJob,
+        schema: &Arc<Schema>,
+        source_replayable: bool,
+    ) -> String {
+        let empty = RecordBatch::new_empty(schema.clone());
+        let provider: Arc<dyn TableProvider> = if source_replayable {
+            Arc::new(MemTable::try_new(schema.clone(), vec![vec![empty]]).unwrap())
+        } else {
+            let stream = RecordBatchStreamAdapter::new(
+                schema.clone(),
+                futures::stream::once(async { Ok(empty) }),
+            );
+            one_shot_provider(Box::pin(stream)).unwrap()
+        };
+        let plan = job
+            .clone()
+            .create_plan(provider, source_replayable)
+            .await
+            .unwrap();
+        format!(
+            "{}",
+            DisplayableExecutionPlan::new(plan.as_ref()).indent(true)
+        )
+    }
+
+    /// The v2 target scan reaches matched rows through a scalar index only when
+    /// doing so cannot miss a row the merge needs. `IndexedLookup` is the probe
+    /// node; its absence means the plan scans the whole target instead.
+    #[rstest::rstest]
+    #[case::partially_indexed(true, true, WhenNotMatchedBySource::Keep, true)]
+    #[case::use_index_disabled(true, false, WhenNotMatchedBySource::Keep, false)]
+    #[case::no_index(false, true, WhenNotMatchedBySource::Keep, false)]
+    #[case::delete_by_source(true, true, WhenNotMatchedBySource::Delete, false)]
+    #[tokio::test]
+    async fn test_probe_plan_shape(
+        #[case] index_on_a: bool,
+        #[case] use_index: bool,
+        #[case] by_source: WhenNotMatchedBySource,
+        #[case] expect_probe: bool,
+    ) {
+        let (ds, schema) = partially_indexed_dataset(index_on_a).await;
+        let job = MergeInsertBuilder::try_new(ds, vec!["a".to_string(), "b".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .when_not_matched_by_source(by_source)
+            .use_index(use_index)
+            .try_build()
+            .unwrap();
+
+        let plan = merge_plan_string(&job, &schema, true).await;
+        assert_eq!(
+            plan.contains("IndexedLookup"),
+            expect_probe,
+            "unexpected target scan shape:\n{plan}"
+        );
+    }
+
+    /// The probe scans the source a second time to collect key values, so a
+    /// source that can only be read once must keep the full-scan hash join.
+    #[tokio::test]
+    async fn test_probe_requires_replayable_source() {
+        let (ds, schema) = partially_indexed_dataset(true).await;
+        let job = MergeInsertBuilder::try_new(ds, vec!["a".to_string(), "b".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap();
+
+        let one_shot = merge_plan_string(&job, &schema, false).await;
+        assert!(
+            !one_shot.contains("IndexedLookup"),
+            "a one-shot source cannot feed the probe:\n{one_shot}"
+        );
+
+        let replayable = merge_plan_string(&job, &schema, true).await;
+        assert!(
+            replayable.contains("IndexedLookup"),
+            "a re-scannable source should reach the probe:\n{replayable}"
+        );
+    }
+
+    /// A full-schema upsert produces its output rows entirely from the source, so
+    /// the probe's take must fetch only the join keys and the row address it needs
+    /// to supersede the old rows. Pinned because widening this read turns a
+    /// cheap keyed take into a full-row one.
+    #[tokio::test]
+    async fn test_probe_take_reads_only_join_keys() {
+        let (ds, schema) = partially_indexed_dataset(true).await;
+        let job = MergeInsertBuilder::try_new(ds, vec!["a".to_string(), "b".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap();
+
+        let plan = merge_plan_string(&job, &schema, true).await;
+        let read = plan
+            .lines()
+            .find(|line| line.trim_start().starts_with("LanceRead:"))
+            .unwrap_or_else(|| panic!("no target read in plan:\n{plan}"));
+        assert!(
+            read.contains("projection=[a, b, _rowaddr]"),
+            "target read should fetch only the keys and row address, got: {read}"
+        );
+    }
+
+    /// Rows in fragments the chosen index does not cover are invisible to the
+    /// probe, so the plan unions in a scan of those fragments. Without it, updates
+    /// to rows appended after the index was built are silently dropped.
+    #[tokio::test]
+    async fn test_probe_unions_unindexed_fragments() {
+        let (ds, schema) = partially_indexed_dataset(true).await;
+        let mut ds = Arc::unwrap_or_clone(ds);
+        let appended = record_batch!(
+            ("a", Int32, [3]),
+            ("b", Int32, [30]),
+            ("value", Int32, [300])
+        )
+        .unwrap();
+        ds.append(
+            RecordBatchIterator::new(vec![Ok(appended.clone())], appended.schema()),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let job = MergeInsertBuilder::try_new(Arc::new(ds), vec!["a".to_string(), "b".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap();
+
+        let plan = merge_plan_string(&job, &schema, true).await;
+        assert!(
+            plan.contains("UnionExec"),
+            "unindexed fragments must be unioned into the target scan:\n{plan}"
+        );
+
+        // One row in an indexed fragment, one in the appended fragment.
+        let source = record_batch!(
+            ("a", Int32, [1, 3]),
+            ("b", Int32, [10, 30]),
+            ("value", Int32, [999, 333])
+        )
+        .unwrap();
+        let (updated, stats) = job.execute_batches(vec![source]).await.unwrap();
+
+        assert_eq!(
+            stats.num_updated_rows, 2,
+            "the row in the unindexed fragment must also be updated"
+        );
+        assert_eq!(stats.num_inserted_rows, 0);
+        assert_eq!(updated.count_rows(None).await.unwrap(), 5);
+        assert_eq!(
+            updated
+                .count_rows(Some("a = 3 AND b = 30 AND value = 333".to_string()))
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    /// The probe emits one candidate set per source batch and does not
+    /// de-duplicate across batches, so a target row matched by keys in two
+    /// different batches reaches the sink twice. Source de-duplication is what
+    /// keeps that from producing a duplicate row address.
+    #[tokio::test]
+    async fn test_probe_source_duplicates_across_batches() {
+        let (ds, _) = partially_indexed_dataset(true).await;
+        let job = MergeInsertBuilder::try_new(ds, vec!["a".to_string(), "b".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .source_dedupe_behavior(SourceDedupeBehavior::FirstSeen)
+            .try_build()
+            .unwrap();
+
+        // (1, 10) twice in separate batches, so the two probes both match it.
+        let first = record_batch!(
+            ("a", Int32, [1]),
+            ("b", Int32, [10]),
+            ("value", Int32, [999])
+        )
+        .unwrap();
+        let second = record_batch!(
+            ("a", Int32, [1]),
+            ("b", Int32, [10]),
+            ("value", Int32, [888])
+        )
+        .unwrap();
+
+        let (updated, stats) = job.execute_batches(vec![first, second]).await.unwrap();
+
+        assert_eq!(stats.num_updated_rows, 1);
+        assert_eq!(stats.num_skipped_duplicates, 1);
+        assert_eq!(updated.count_rows(None).await.unwrap(), 4);
+        assert_eq!(
+            updated
+                .count_rows(Some("a = 1 AND b = 10 AND value = 999".to_string()))
+                .await
+                .unwrap(),
+            1,
+            "first seen source row wins"
+        );
+    }
+
     /// Composite-key delete-only merge_insert (`when_matched(Delete)`,
     /// `when_not_matched_by_source(Keep)`) removes the matched rows for every
     /// combination of which join columns carry a scalar index, including when
@@ -6720,7 +7049,7 @@ mod tests {
         let new_data_stream = reader_to_stream(Box::new(new_data));
 
         let plan = merge_insert_job
-            .create_plan(one_shot_provider(new_data_stream).unwrap())
+            .create_plan(one_shot_provider(new_data_stream).unwrap(), false)
             .await
             .unwrap();
 
@@ -6776,7 +7105,7 @@ mod tests {
 
         // This should use the fast path (execute_uncommitted_v2)
         let plan = merge_insert_job
-            .create_plan(one_shot_provider(new_data_stream).unwrap())
+            .create_plan(one_shot_provider(new_data_stream).unwrap(), false)
             .await
             .unwrap();
 
@@ -6827,7 +7156,7 @@ mod tests {
         let new_data_stream = reader_to_stream(Box::new(new_data_reader));
 
         let plan = merge_insert_job
-            .create_plan(one_shot_provider(new_data_stream).unwrap())
+            .create_plan(one_shot_provider(new_data_stream).unwrap(), false)
             .await
             .unwrap();
 
@@ -6882,7 +7211,7 @@ mod tests {
         // Should reach the v2 fast path (`create_plan` + FullSchemaMergeInsertExec).
         // Dropping to v1 here would return an error from create_plan instead.
         let plan = merge_insert_job
-            .create_plan(one_shot_provider(new_data_stream).unwrap())
+            .create_plan(one_shot_provider(new_data_stream).unwrap(), false)
             .await
             .unwrap();
 
@@ -8013,13 +8342,16 @@ mod tests {
         // Test explain_plan with default schema (None)
         let plan = merge_insert_job.explain_plan(None, false).await.unwrap();
 
-        // Also validate the full string structure with pattern matching
+        // Also validate the full string structure with pattern matching.
+        // `explain_plan` stands the source up as a materialized table, so its
+        // exact row count reaches the optimizer and the join collects the
+        // (smaller) source as its build side — hence source before target.
         let expected_pattern = "\
 MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_not_matched_by_source=Keep...
   CoalescePartitionsExec...
-    HashJoinExec...
-      LanceRead...
-      StreamingTableExec: partition_sizes=1, projection=[id, name]";
+    HashJoinExec: mode=CollectLeft, join_type=Left...
+      DataSourceExec: partitions=1, partition_sizes=[1]
+      LanceRead: uri=data, projection=[id], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=true, full_filter=--, refine_filter=--";
         assert_string_matches(&plan, expected_pattern).unwrap();
 
         // Test with explicit schema
@@ -8059,12 +8391,15 @@ MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, when_n
 
         let plan = merge_insert_job.explain_plan(None, false).await.unwrap();
 
+        // `join_type=Left` with the source on the build side is the swapped form
+        // of `Right` with the target there: either way every source row survives
+        // the join so unmatched ones can be inserted.
         let expected_pattern = "\
 MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_not_matched_by_source=Keep...
   CoalescePartitionsExec...
-    HashJoinExec...join_type=Right...
-      LanceRead...
-      StreamingTableExec: partition_sizes=1, projection=[id, name]";
+    HashJoinExec: mode=CollectLeft, join_type=Left...
+      DataSourceExec: partitions=1, partition_sizes=[1]
+      LanceRead: uri=data, projection=[id], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=true, full_filter=--, refine_filter=--";
         assert_string_matches(&plan, expected_pattern).unwrap();
     }
 
@@ -9820,7 +10155,7 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
             schema.clone(),
         )));
         let plan = plan_job
-            .create_plan(one_shot_provider(plan_stream).unwrap())
+            .create_plan(one_shot_provider(plan_stream).unwrap(), false)
             .await
             .unwrap();
         assert_plan_node_equals(
@@ -9905,7 +10240,7 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
             id_only_schema.clone(),
         )));
         let plan = plan_job
-            .create_plan(one_shot_provider(plan_stream).unwrap())
+            .create_plan(one_shot_provider(plan_stream).unwrap(), false)
             .await
             .unwrap();
         assert_plan_node_equals(
@@ -9990,7 +10325,7 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
             schema.clone(),
         )));
         let plan = plan_job
-            .create_plan(one_shot_provider(plan_stream).unwrap())
+            .create_plan(one_shot_provider(plan_stream).unwrap(), false)
             .await
             .unwrap();
         assert_plan_node_equals(
@@ -10098,7 +10433,7 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
             schema.clone(),
         )));
         let plan = plan_job
-            .create_plan(one_shot_provider(plan_stream).unwrap())
+            .create_plan(one_shot_provider(plan_stream).unwrap(), false)
             .await
             .unwrap();
         assert_plan_node_equals(
@@ -10221,7 +10556,7 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
                 schema.clone(),
             )));
             let plan = job
-                .create_plan(one_shot_provider(plan_stream).unwrap())
+                .create_plan(one_shot_provider(plan_stream).unwrap(), false)
                 .await
                 .unwrap();
 
@@ -11870,7 +12205,7 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
             .unwrap();
 
         // The provider's exact row count reaches the plan's statistics.
-        let plan = job.create_plan(provider).await.unwrap();
+        let plan = job.create_plan(provider, true).await.unwrap();
         let mut row_counts = Vec::new();
         collect_exact_row_counts(&plan, &mut row_counts);
         assert!(
