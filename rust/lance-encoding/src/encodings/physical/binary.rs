@@ -14,12 +14,13 @@ use byteorder::{ByteOrder, LittleEndian};
 use core::panic;
 
 use crate::compression::{
-    BlockCompressor, BlockDecompressor, MiniBlockDecompressor, VariablePerValueDecompressor,
-    require_block_payload,
+    BlockCompressor, BlockDecompressor, BlockValueType, MiniBlockDecompressor,
+    VariablePerValueDecompressor, require_block_payload,
 };
 
 use crate::buffer::LanceBuffer;
-use crate::data::{BlockInfo, DataBlock, VariableWidthBlock};
+use crate::compression::block::{create_block_decompressor, infer_block_value_type};
+use crate::data::{BlockInfo, DataBlock, FixedWidthDataBlock, VariableWidthBlock};
 use crate::encodings::logical::primitive::fullzip::{PerValueCompressor, PerValueDataBlock};
 use crate::encodings::logical::primitive::miniblock::{
     MAX_MINIBLOCK_VALUES, MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressionContext,
@@ -267,13 +268,43 @@ impl MiniBlockCompressor for BinaryMiniBlockEncoder {
 
 #[derive(Debug)]
 pub struct BinaryMiniBlockDecompressor {
-    bits_per_offset: u8,
+    layout: BinaryMiniBlockLayout,
+}
+
+#[derive(Debug)]
+enum BinaryMiniBlockLayout {
+    Legacy {
+        bits_per_offset: u8,
+    },
+    Generic {
+        value_type: BlockValueType,
+        offsets: Box<dyn BlockDecompressor>,
+        offsets_have_payload: bool,
+        validation: OffsetValidation,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OffsetValidation {
+    Endpoints,
+    Full,
+}
+
+fn offset_validation(compression: &Compression) -> OffsetValidation {
+    match compression {
+        Compression::Constant(_) | Compression::Range(_) | Compression::Delta(_) => {
+            OffsetValidation::Endpoints
+        }
+        _ => OffsetValidation::Full,
+    }
 }
 
 impl BinaryMiniBlockDecompressor {
     pub fn new(bits_per_offset: u8) -> Self {
-        assert!(bits_per_offset == 32 || bits_per_offset == 64);
-        Self { bits_per_offset }
+        assert!(matches!(bits_per_offset, 32 | 64));
+        Self {
+            layout: BinaryMiniBlockLayout::Legacy { bits_per_offset },
+        }
     }
 
     pub fn from_variable(variable: &pb21::Variable) -> Result<Self> {
@@ -290,21 +321,36 @@ impl BinaryMiniBlockDecompressor {
             .compression
             .as_ref()
             .ok_or_else(|| Error::invalid_input("Variable offsets are missing compression"))?;
-        match compression {
-            Compression::Flat(flat)
-                if matches!(flat.bits_per_value, 32 | 64) && flat.data.is_none() =>
-            {
-                Ok(Self {
-                    bits_per_offset: flat.bits_per_value as u8,
-                })
+        if let Compression::Flat(flat) = compression {
+            if flat.data.is_some() || !matches!(flat.bits_per_value, 32 | 64) {
+                return Err(Error::invalid_input(format!(
+                    "Legacy Variable offsets require uncompressed 32 or 64-bit Flat encoding, got {} bits",
+                    flat.bits_per_value
+                )));
             }
-            Compression::Flat(flat) => Err(Error::invalid_input(format!(
-                "Variable offsets require uncompressed 32 or 64-bit Flat encoding, got {} bits",
-                flat.bits_per_value
-            ))),
-            other => Err(Error::invalid_input(format!(
-                "Unsupported legacy variable offset compression: {other:?}"
-            ))),
+            Ok(Self {
+                layout: BinaryMiniBlockLayout::Legacy {
+                    bits_per_offset: flat.bits_per_value as u8,
+                },
+            })
+        } else {
+            let value_type = infer_block_value_type(offsets)?;
+            if !matches!(value_type, BlockValueType::UInt32 | BlockValueType::UInt64) {
+                return Err(Error::invalid_input(format!(
+                    "Generic Variable offsets require u32 or u64 output, got {} bits",
+                    value_type.bits_per_value()
+                )));
+            }
+            let validation = offset_validation(compression);
+            let (offsets, offsets_have_payload) = create_block_decompressor(offsets, value_type)?;
+            Ok(Self {
+                layout: BinaryMiniBlockLayout::Generic {
+                    value_type,
+                    offsets,
+                    offsets_have_payload,
+                    validation,
+                },
+            })
         }
     }
 }
@@ -315,53 +361,304 @@ impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
     // it has so assertion can not be done here and the caller of `decompress` must ensure
     // `num_values` <= number of values in the chunk.
     fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
-        assert_eq!(data.len(), 1);
-        let data = data.into_iter().next().unwrap();
-
-        if self.bits_per_offset == 64 {
-            // offset and at least one value
-            assert!(data.len() >= 16);
-
-            let offsets_buffer = data.borrow_to_typed_slice::<u64>();
-            let offsets = offsets_buffer.as_ref();
-
-            let result_offsets = offsets[0..(num_values + 1) as usize]
-                .iter()
-                .map(|offset| offset - offsets[0])
-                .collect::<Vec<u64>>();
-
-            Ok(DataBlock::VariableWidth(VariableWidthBlock {
-                data: LanceBuffer::from(
-                    data[offsets[0] as usize..offsets[num_values as usize] as usize].to_vec(),
-                ),
-                offsets: LanceBuffer::reinterpret_vec(result_offsets),
-                bits_per_offset: 64,
+        match &self.layout {
+            BinaryMiniBlockLayout::Legacy { bits_per_offset } => {
+                decode_legacy_binary_miniblock(data, num_values, *bits_per_offset)
+            }
+            BinaryMiniBlockLayout::Generic {
+                value_type,
+                offsets,
+                offsets_have_payload,
+                validation,
+            } => decode_generic_binary_miniblock(
+                data,
                 num_values,
-                block_info: BlockInfo::new(),
-            }))
-        } else {
-            // offset and at least one value
-            assert!(data.len() >= 8);
+                *value_type,
+                offsets.as_ref(),
+                *offsets_have_payload,
+                *validation,
+            ),
+        }
+    }
+}
 
+fn decode_legacy_binary_miniblock(
+    mut data: Vec<LanceBuffer>,
+    num_values: u64,
+    bits_per_offset: u8,
+) -> Result<DataBlock> {
+    if data.len() != 1 {
+        return Err(Error::invalid_input(format!(
+            "Legacy Variable mini-block requires 1 buffer, got {}",
+            data.len()
+        )));
+    }
+    let data = data.pop().expect("buffer count was checked");
+    let num_offsets = num_values
+        .checked_add(1)
+        .ok_or_else(|| Error::invalid_input("Variable offset count overflows u64"))?;
+    let num_offsets = usize::try_from(num_offsets)
+        .map_err(|_| Error::invalid_input("Variable offset count does not fit usize"))?;
+    match bits_per_offset {
+        32 => {
+            let offset_bytes = num_offsets.checked_mul(4).ok_or_else(|| {
+                Error::invalid_input("Variable offset byte length overflows usize")
+            })?;
+            if data.len() < offset_bytes {
+                return Err(Error::invalid_input(format!(
+                    "Legacy Variable mini-block has {} bytes, shorter than {offset_bytes} offset bytes",
+                    data.len()
+                )));
+            }
             let offsets_buffer = data.borrow_to_typed_slice::<u32>();
-            let offsets = offsets_buffer.as_ref();
-
-            let result_offsets = offsets[0..(num_values + 1) as usize]
-                .iter()
-                .map(|offset| offset - offsets[0])
-                .collect::<Vec<u32>>();
-
+            let offsets = offsets_buffer
+                .get(..num_offsets)
+                .ok_or_else(|| Error::invalid_input("Legacy Variable offsets are truncated"))?;
+            let start = offsets[0];
+            let mut result_offsets = Vec::with_capacity(num_offsets);
+            let mut previous = start;
+            for (index, offset) in offsets.iter().copied().enumerate() {
+                if offset < previous {
+                    return Err(Error::invalid_input(format!(
+                        "Legacy Variable offsets decrease at index {index}"
+                    )));
+                }
+                let relative = offset - start;
+                if relative > i32::MAX as u32 {
+                    return Err(Error::invalid_input(format!(
+                        "Legacy Variable relative offset {relative} exceeds i32::MAX"
+                    )));
+                }
+                result_offsets.push(relative);
+                previous = offset;
+            }
+            let start = usize::try_from(start)
+                .map_err(|_| Error::invalid_input("Variable data start does not fit usize"))?;
+            let end = usize::try_from(*offsets.last().expect("offsets are non-empty"))
+                .map_err(|_| Error::invalid_input("Variable data end does not fit usize"))?;
+            if start < offset_bytes || end < start || end > data.len() {
+                return Err(Error::invalid_input(format!(
+                    "Legacy Variable data range {start}..{end} is invalid for {} bytes",
+                    data.len()
+                )));
+            }
             Ok(DataBlock::VariableWidth(VariableWidthBlock {
-                data: LanceBuffer::from(
-                    data[offsets[0] as usize..offsets[num_values as usize] as usize].to_vec(),
-                ),
+                data: LanceBuffer::from(data[start..end].to_vec()),
                 offsets: LanceBuffer::reinterpret_vec(result_offsets),
-                bits_per_offset: 32,
+                bits_per_offset,
                 num_values,
                 block_info: BlockInfo::new(),
             }))
         }
+        64 => {
+            let offset_bytes = num_offsets.checked_mul(8).ok_or_else(|| {
+                Error::invalid_input("Variable offset byte length overflows usize")
+            })?;
+            if data.len() < offset_bytes {
+                return Err(Error::invalid_input(format!(
+                    "Legacy Variable mini-block has {} bytes, shorter than {offset_bytes} offset bytes",
+                    data.len()
+                )));
+            }
+            let offsets_buffer = data.borrow_to_typed_slice::<u64>();
+            let offsets = offsets_buffer
+                .get(..num_offsets)
+                .ok_or_else(|| Error::invalid_input("Legacy Variable offsets are truncated"))?;
+            let start = offsets[0];
+            let mut result_offsets = Vec::with_capacity(num_offsets);
+            let mut previous = start;
+            for (index, offset) in offsets.iter().copied().enumerate() {
+                if offset < previous {
+                    return Err(Error::invalid_input(format!(
+                        "Legacy Variable offsets decrease at index {index}"
+                    )));
+                }
+                let relative = offset - start;
+                if relative > i64::MAX as u64 {
+                    return Err(Error::invalid_input(format!(
+                        "Legacy Variable relative offset {relative} exceeds i64::MAX"
+                    )));
+                }
+                result_offsets.push(relative);
+                previous = offset;
+            }
+            let start = usize::try_from(start)
+                .map_err(|_| Error::invalid_input("Variable data start does not fit usize"))?;
+            let end = usize::try_from(*offsets.last().expect("offsets are non-empty"))
+                .map_err(|_| Error::invalid_input("Variable data end does not fit usize"))?;
+            if start < offset_bytes || end < start || end > data.len() {
+                return Err(Error::invalid_input(format!(
+                    "Legacy Variable data range {start}..{end} is invalid for {} bytes",
+                    data.len()
+                )));
+            }
+            Ok(DataBlock::VariableWidth(VariableWidthBlock {
+                data: LanceBuffer::from(data[start..end].to_vec()),
+                offsets: LanceBuffer::reinterpret_vec(result_offsets),
+                bits_per_offset,
+                num_values,
+                block_info: BlockInfo::new(),
+            }))
+        }
+        _ => Err(Error::invalid_input(format!(
+            "Legacy Variable offsets require 32 or 64 bits, got {bits_per_offset}"
+        ))),
     }
+}
+
+fn decode_generic_binary_miniblock(
+    mut data: Vec<LanceBuffer>,
+    num_values: u64,
+    value_type: BlockValueType,
+    offsets_decoder: &dyn BlockDecompressor,
+    offsets_have_payload: bool,
+    validation: OffsetValidation,
+) -> Result<DataBlock> {
+    let num_offsets = num_values
+        .checked_add(1)
+        .ok_or_else(|| Error::invalid_input("Variable offset count overflows u64"))?;
+    let expected_buffers = 1 + usize::from(offsets_have_payload);
+    if data.len() != expected_buffers {
+        return Err(Error::invalid_input(format!(
+            "Generic Variable mini-block requires {expected_buffers} buffers, got {}",
+            data.len()
+        )));
+    }
+    let values = data.pop().expect("buffer count was checked");
+    let offset_payload = if offsets_have_payload {
+        Some(data.pop().expect("buffer count was checked"))
+    } else {
+        None
+    };
+    let offsets = offsets_decoder.decompress(offset_payload, num_offsets)?;
+    let DataBlock::FixedWidth(offsets) = offsets else {
+        return Err(Error::invalid_input(
+            "Generic Variable offsets decoded to a non fixed-width block",
+        ));
+    };
+    if offsets.num_values != num_offsets || offsets.bits_per_value != value_type.bits_per_value() {
+        return Err(Error::invalid_input(format!(
+            "Generic Variable offsets decoded {} {}-bit values, expected {num_offsets} {}-bit values",
+            offsets.num_values,
+            offsets.bits_per_value,
+            value_type.bits_per_value()
+        )));
+    }
+    validate_decoded_offsets(&offsets, value_type, values.len(), validation)?;
+    Ok(DataBlock::VariableWidth(VariableWidthBlock {
+        data: values,
+        offsets: offsets.data,
+        bits_per_offset: value_type.bits_per_value() as u8,
+        num_values,
+        block_info: BlockInfo::new(),
+    }))
+}
+
+fn validate_decoded_offsets(
+    offsets: &FixedWidthDataBlock,
+    value_type: BlockValueType,
+    data_len: usize,
+    validation: OffsetValidation,
+) -> Result<()> {
+    let signed_max = match value_type {
+        BlockValueType::UInt32 => i32::MAX as u64,
+        BlockValueType::UInt64 => i64::MAX as u64,
+        _ => {
+            return Err(Error::invalid_input(
+                "Generic Variable offsets require u32 or u64 values",
+            ));
+        }
+    };
+    if validation == OffsetValidation::Endpoints {
+        let (first, last) = match value_type {
+            BlockValueType::UInt32 => {
+                let offsets = offsets.data.borrow_to_typed_slice::<u32>();
+                let first = offsets.first().copied().ok_or_else(|| {
+                    Error::invalid_input("Generic Variable offsets cannot be empty")
+                })?;
+                let last = offsets.last().copied().expect("first offset was present");
+                (u64::from(first), u64::from(last))
+            }
+            BlockValueType::UInt64 => {
+                let offsets = offsets.data.borrow_to_typed_slice::<u64>();
+                let first = offsets.first().copied().ok_or_else(|| {
+                    Error::invalid_input("Generic Variable offsets cannot be empty")
+                })?;
+                let last = offsets.last().copied().expect("first offset was present");
+                (first, last)
+            }
+            _ => unreachable!("generic offset type was validated"),
+        };
+        if first != 0 {
+            return Err(Error::invalid_input(format!(
+                "Generic Variable offsets must start at zero, got {first}"
+            )));
+        }
+        if last > signed_max {
+            return Err(Error::invalid_input(format!(
+                "Generic Variable offset {last} exceeds the Arrow signed offset range"
+            )));
+        }
+        if last != data_len as u64 {
+            return Err(Error::invalid_input(format!(
+                "Generic Variable final offset {last} does not equal {data_len} value bytes"
+            )));
+        }
+        return Ok(());
+    }
+    let mut previous = None;
+    let mut observe = |index: usize, offset: u64| -> Result<()> {
+        if index == 0 && offset != 0 {
+            return Err(Error::invalid_input(format!(
+                "Generic Variable offsets must start at zero, got {offset}"
+            )));
+        }
+        if previous.is_some_and(|previous| offset < previous) {
+            return Err(Error::invalid_input(format!(
+                "Generic Variable offsets decrease at index {index}"
+            )));
+        }
+        if offset > signed_max {
+            return Err(Error::invalid_input(format!(
+                "Generic Variable offset {offset} exceeds the Arrow signed offset range"
+            )));
+        }
+        previous = Some(offset);
+        Ok(())
+    };
+    match value_type {
+        BlockValueType::UInt32 => {
+            for (index, offset) in offsets
+                .data
+                .borrow_to_typed_slice::<u32>()
+                .iter()
+                .copied()
+                .enumerate()
+            {
+                observe(index, u64::from(offset))?;
+            }
+        }
+        BlockValueType::UInt64 => {
+            for (index, offset) in offsets
+                .data
+                .borrow_to_typed_slice::<u64>()
+                .iter()
+                .copied()
+                .enumerate()
+            {
+                observe(index, offset)?;
+            }
+        }
+        _ => unreachable!("generic offset type was validated"),
+    }
+    let final_offset =
+        previous.ok_or_else(|| Error::invalid_input("Generic Variable offsets cannot be empty"))?;
+    if final_offset != data_len as u64 {
+        return Err(Error::invalid_input(format!(
+            "Generic Variable final offset {final_offset} does not equal {data_len} value bytes"
+        )));
+    }
+    Ok(())
 }
 
 /// Most basic encoding for variable-width data which does no compression at all
@@ -547,6 +844,7 @@ impl BlockDecompressor for BinaryBlockDecompressor {
 
 #[cfg(test)]
 mod tests {
+    use super::BinaryMiniBlockDecompressor;
     use arrow_array::{
         ArrayRef, StringArray,
         builder::{LargeStringBuilder, StringBuilder},
@@ -554,9 +852,16 @@ mod tests {
     use arrow_schema::{DataType, Field};
 
     use crate::{
+        buffer::LanceBuffer,
+        compression::MiniBlockDecompressor,
         constants::{
             COMPRESSION_META_KEY, STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY,
             STRUCTURAL_ENCODING_MINIBLOCK,
+        },
+        data::DataBlock,
+        format::{
+            ProtobufUtils21,
+            pb21::{CompressiveEncoding, compressive_encoding::Compression},
         },
         testing::check_specific_random,
     };
@@ -570,6 +875,96 @@ mod tests {
         },
         version::LanceFileVersion,
     };
+
+    fn variable_miniblock_decoder(offsets: CompressiveEncoding) -> BinaryMiniBlockDecompressor {
+        let encoding = ProtobufUtils21::variable(offsets, None);
+        let Compression::Variable(variable) = encoding.compression.as_ref().unwrap() else {
+            unreachable!()
+        };
+        BinaryMiniBlockDecompressor::from_variable(variable).unwrap()
+    }
+
+    #[test]
+    fn generic_range_offsets_decode_without_payload() {
+        let decoder = variable_miniblock_decoder(ProtobufUtils21::range(32, 0, 3));
+        let decoded = decoder
+            .decompress(vec![LanceBuffer::from(b"aaabbbccc".to_vec())], 3)
+            .unwrap();
+        let DataBlock::VariableWidth(decoded) = decoded else {
+            panic!("expected variable-width output");
+        };
+        assert_eq!(
+            decoded.offsets.borrow_to_typed_slice::<u32>().as_ref(),
+            &[0, 3, 6, 9]
+        );
+        assert_eq!(decoded.data.as_ref(), b"aaabbbccc");
+    }
+
+    #[test]
+    fn generic_delta_offsets_decode_with_payload() {
+        let decoder = variable_miniblock_decoder(ProtobufUtils21::delta(
+            32,
+            0,
+            ProtobufUtils21::flat(32, None),
+        ));
+        let decoded = decoder
+            .decompress(
+                vec![
+                    LanceBuffer::reinterpret_vec(vec![2_u32, 0, 3]),
+                    LanceBuffer::from(b"abcde".to_vec()),
+                ],
+                3,
+            )
+            .unwrap();
+        let DataBlock::VariableWidth(decoded) = decoded else {
+            panic!("expected variable-width output");
+        };
+        assert_eq!(
+            decoded.offsets.borrow_to_typed_slice::<u32>().as_ref(),
+            &[0, 2, 2, 5]
+        );
+        assert_eq!(decoded.data.as_ref(), b"abcde");
+    }
+
+    #[test]
+    fn generic_offsets_reject_buffer_count_and_bounds() {
+        let decoder = variable_miniblock_decoder(ProtobufUtils21::range(32, 0, 3));
+        assert!(
+            decoder
+                .decompress(vec![LanceBuffer::empty(), LanceBuffer::empty()], 2)
+                .unwrap_err()
+                .to_string()
+                .contains("requires 1 buffer")
+        );
+
+        let decoder = variable_miniblock_decoder(ProtobufUtils21::range(32, 0, 4));
+        assert!(
+            decoder
+                .decompress(vec![LanceBuffer::from(vec![0; 7])], 2)
+                .unwrap_err()
+                .to_string()
+                .contains("does not equal 7")
+        );
+    }
+
+    #[test]
+    fn legacy_offsets_reject_malformed_buffers() {
+        let decoder = BinaryMiniBlockDecompressor::new(32);
+        assert!(
+            decoder
+                .decompress(Vec::new(), 1)
+                .unwrap_err()
+                .to_string()
+                .contains("requires 1 buffer")
+        );
+        assert!(
+            decoder
+                .decompress(vec![LanceBuffer::from(vec![0; 4])], 1)
+                .unwrap_err()
+                .to_string()
+                .contains("shorter than 8")
+        );
+    }
 
     #[test_log::test(tokio::test)]
     async fn test_utf8_binary() {
@@ -883,9 +1278,7 @@ mod tests {
 
         // Test case 1: u32 offsets
         {
-            let decompressor = BinaryMiniBlockDecompressor {
-                bits_per_offset: 32,
-            };
+            let decompressor = BinaryMiniBlockDecompressor::new(32);
 
             // Create test data with u32 offsets
             // BinaryMiniBlock format: all offsets followed by all string data
@@ -939,9 +1332,7 @@ mod tests {
 
         // Test case 2: u64 offsets
         {
-            let decompressor = BinaryMiniBlockDecompressor {
-                bits_per_offset: 64,
-            };
+            let decompressor = BinaryMiniBlockDecompressor::new(64);
 
             // Create test data with u64 offsets
             let mut test_data = Vec::new();
