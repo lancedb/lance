@@ -4872,6 +4872,7 @@ dependencies = [
  "arrow-array",
  "arrow-schema",
  "arrow-select",
+ "async-recursion",
  "async-trait",
  "bytes",
  "datafusion",
@@ -4885,6 +4886,7 @@ dependencies = [
  "roaring",
  "serde",
  "serde_json",
+ "tracing",
 ]
 
 [[package]]

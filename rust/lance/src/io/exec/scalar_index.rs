@@ -38,7 +38,9 @@ use lance_index::{
     metrics::MetricsCollector,
     scalar::{
         SargableQuery, ScalarIndex,
-        expression::{ScalarIndexExpr, ScalarIndexLoader, ScalarIndexSearch},
+        expression::{
+            ScalarIndexExpr, ScalarIndexExprOptimize, ScalarIndexLoader, ScalarIndexSearch,
+        },
     },
 };
 use lance_select::{

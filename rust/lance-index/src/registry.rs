@@ -3,6 +3,8 @@
 use std::{collections::HashMap, sync::Arc};
 
 use lance_core::{Error, Result};
+use lance_index_core::registry::IndexRegistry;
+use lance_index_core::scalar::registry::ScalarIndexPlugin as CoreScalarIndexPlugin;
 
 #[cfg(feature = "geo")]
 use crate::scalar::rtree::RTreeIndexPlugin;
@@ -87,8 +89,9 @@ impl IndexPluginRegistry {
         registry.add_plugin::<pb::RTreeIndexDetails, RTreeIndexPlugin>();
 
         let registry = Arc::new(registry);
+        let dyn_registry: Arc<dyn IndexRegistry> = registry.clone();
         for plugin in registry.plugins.values() {
-            plugin.attach_registry(registry.clone());
+            plugin.attach_registry(dyn_registry.clone());
         }
 
         registry
@@ -120,6 +123,35 @@ impl IndexPluginRegistry {
         let details_name = details.type_url.split('.').next_back().unwrap();
         let plugin_name = self.get_plugin_name_from_details_name(details_name);
         self.get_plugin_by_name(&plugin_name)
+    }
+}
+
+impl IndexRegistry for IndexPluginRegistry {
+    fn get_plugin_by_name(&self, name: &str) -> Result<&dyn CoreScalarIndexPlugin> {
+        let plugin_name = Self::normalize_plugin_name(name);
+        self.plugins
+            .get(&plugin_name)
+            .map(|plugin| plugin.as_ref() as &dyn CoreScalarIndexPlugin)
+            .ok_or_else(|| {
+                let hint = if plugin_name == "rtree" {
+                    ". The 'rtree' index requires the `geo` feature. \
+                     Rebuild with `--features geo` to enable geospatial support"
+                } else {
+                    ""
+                };
+                Error::invalid_input_source(
+                    format!("No scalar index plugin found for name '{name}'{hint}").into(),
+                )
+            })
+    }
+
+    fn get_plugin_by_details(
+        &self,
+        details: &prost_types::Any,
+    ) -> Result<&dyn CoreScalarIndexPlugin> {
+        let details_name = details.type_url.split('.').next_back().unwrap();
+        let plugin_name = self.get_plugin_name_from_details_name(details_name);
+        IndexRegistry::get_plugin_by_name(self, &plugin_name)
     }
 }
 

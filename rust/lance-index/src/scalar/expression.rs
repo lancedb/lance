@@ -9,160 +9,28 @@ use std::{
 };
 
 use arrow_schema::{DataType, Field};
-use async_recursion::async_recursion;
-use async_trait::async_trait;
 use datafusion_common::ScalarValue;
 use datafusion_expr::{
     Between, BinaryExpr, Expr, Operator, ReturnFieldArgs, ScalarUDF,
     expr::{InList, Like, ScalarFunction},
 };
-use tokio::try_join;
 
 use super::{
-    AnyQuery, BloomFilterQuery, LabelListQuery, MetricsCollector, SargableQuery, ScalarIndex,
-    SearchResult, TextQuery, TokenQuery,
+    BloomFilterQuery, LabelListQuery, SargableQuery, TextQuery, TokenQuery,
 };
 #[cfg(feature = "geo")]
 use super::{GeoQuery, RelationQuery};
 use lance_core::{Error, Result};
 use lance_datafusion::{expr::safe_coerce_scalar, planner::Planner};
-use lance_select::{IndexExprResult, NullableIndexExprResult, NullableRowAddrMask};
 use roaring::RoaringBitmap;
-use tracing::instrument;
+
+// Re-export types that have moved to lance-index-core
+pub use lance_index_core::scalar::{AnyQuery, SearchResult};
+pub use lance_index_core::scalar::expression::{
+    IndexedExpression, ScalarIndexExpr, ScalarIndexLoader, ScalarIndexSearch, ScalarQueryParser,
+};
 
 const MAX_DEPTH: usize = 500;
-
-/// An indexed expression consists of a scalar index query with a post-scan filter
-///
-/// When a user wants to filter the data returned by a scan we may be able to use
-/// one or more scalar indices to reduce the amount of data we load from the disk.
-///
-/// For example, if a user provides the filter "x = 7", and we have a scalar index
-/// on x, then we can possibly identify the exact row that the user desires with our
-/// index.  A full-table scan can then turn into a take operation fetching the rows
-/// desired.  This would create an IndexedExpression with a scalar_query but no
-/// refine.
-///
-/// If the user asked for "type = 'dog' && z = 3" and we had a scalar index on the
-/// "type" column then we could convert this to an indexed scan for "type='dog'"
-/// followed by an in-memory filter for z=3.  This would create an IndexedExpression
-/// with both a scalar_query AND a refine.
-///
-/// Finally, if the user asked for "z = 3" and we do not have a scalar index on the
-/// "z" column then we must fallback to an IndexedExpression with no scalar_query and
-/// only a refine.
-///
-/// Two IndexedExpressions can be AND'd together.  Each part is AND'd together.
-/// Two IndexedExpressions cannot be OR'd together unless both are scalar_query only
-///   or both are refine only
-/// An IndexedExpression cannot be negated if it has both a refine and a scalar_query
-///
-/// When an operation cannot be performed we fallback to the original expression-only
-/// representation
-#[derive(Debug, PartialEq)]
-pub struct IndexedExpression {
-    /// The portion of the query that can be satisfied by scalar indices
-    pub scalar_query: Option<ScalarIndexExpr>,
-    /// The portion of the query that cannot be satisfied by scalar indices
-    pub refine_expr: Option<Expr>,
-}
-
-pub trait ScalarQueryParser: std::fmt::Debug + Send + Sync {
-    /// Visit a between expression
-    ///
-    /// Returns an IndexedExpression if the index can accelerate between expressions
-    fn visit_between(
-        &self,
-        column: &str,
-        low: &Bound<ScalarValue>,
-        high: &Bound<ScalarValue>,
-    ) -> Option<IndexedExpression>;
-    /// Visit an in list expression
-    ///
-    /// Returns an IndexedExpression if the index can accelerate in list expressions
-    fn visit_in_list(&self, column: &str, in_list: &[ScalarValue]) -> Option<IndexedExpression>;
-    /// Visit an is bool expression
-    ///
-    /// Returns an IndexedExpression if the index can accelerate is bool expressions
-    fn visit_is_bool(&self, column: &str, value: bool) -> Option<IndexedExpression>;
-    /// Visit an is null expression
-    ///
-    /// Returns an IndexedExpression if the index can accelerate is null expressions
-    fn visit_is_null(&self, column: &str) -> Option<IndexedExpression>;
-    /// Visit a comparison expression
-    ///
-    /// Returns an IndexedExpression if the index can accelerate comparison expressions
-    fn visit_comparison(
-        &self,
-        column: &str,
-        value: &ScalarValue,
-        op: &Operator,
-    ) -> Option<IndexedExpression>;
-    /// Visit a scalar function expression
-    ///
-    /// Returns an IndexedExpression if the index can accelerate the given scalar function.
-    /// For example, an ngram index can accelerate the contains function.
-    fn visit_scalar_function(
-        &self,
-        column: &str,
-        data_type: &DataType,
-        func: &ScalarUDF,
-        args: &[Expr],
-    ) -> Option<IndexedExpression>;
-
-    /// Visit a LIKE expression
-    ///
-    /// Returns an IndexedExpression if the index can accelerate LIKE expressions.
-    /// For prefix patterns (e.g., "foo%"):
-    /// - ZoneMaps prune zones based on min/max statistics
-    /// - BTrees use range query conversion `[prefix, next_prefix)`
-    ///
-    /// For patterns with wildcards in the middle (e.g., "foo%bar%"), the leading prefix
-    /// can still be used for pruning, with the full pattern as a refine expression.
-    ///
-    /// # Arguments
-    /// * `column` - The column name
-    /// * `like` - The full LIKE expression (for constructing refine_expr if needed)
-    /// * `pattern` - The LIKE pattern as ScalarValue (e.g., "foo%")
-    fn visit_like(
-        &self,
-        _column: &str,
-        _like: &Like,
-        _pattern: &ScalarValue,
-    ) -> Option<IndexedExpression> {
-        None
-    }
-
-    /// Visits a potential reference to a column
-    ///
-    /// This function is a little different from the other visitors.  It is used to test if a potential
-    /// column reference is a reference the index handles.
-    ///
-    /// Most indexes are designed to run on references to the indexed column.  For example, if a query
-    /// is "x = 7" and we have a scalar index on "x" then we apply the index to the "x" column reference.
-    ///
-    /// However, some indexes are designed to run on projections of the indexed column.  For example,
-    /// if a query is "json_extract(json, '$.name') = 'books'" and we have a JSON index on the "json" column
-    /// then we apply the index to the projection of the "json" column.
-    ///
-    /// This function is used to test if a potential column reference is a reference the index handles.
-    /// The default implementation matches column references but this can be overridden by indexes that
-    /// handle projections.
-    ///
-    /// The function is also passed in the data type of the column and should return the data type of the
-    /// reference.  Normally this is the same as the input for a direct column reference and possibly something
-    /// different for a projection.  E.g. a JSON column (LargeBinary) might be projected to a string or float
-    ///
-    /// Note: higher logic in the expression parser already limits references to either Expr::Column or Expr::ScalarFunction
-    /// where the first argument is an Expr::Column.  If your projection doesn't fit that mold then the
-    /// expression parser will need to be modified.
-    fn is_valid_reference(&self, func: &Expr, data_type: &DataType) -> Option<DataType> {
-        match func {
-            Expr::Column(_) => Some(data_type.clone()),
-            _ => None,
-        }
-    }
-}
 
 /// A generic parser that wraps multiple scalar query parsers
 ///
@@ -1236,250 +1104,6 @@ impl ScalarQueryParser for GeoQueryParser {
     }
 }
 
-impl IndexedExpression {
-    /// Create an expression that only does refine
-    fn refine_only(refine_expr: Expr) -> Self {
-        Self {
-            scalar_query: None,
-            refine_expr: Some(refine_expr),
-        }
-    }
-
-    /// Create an expression that is only an index query
-    fn index_query(
-        column: String,
-        index_name: String,
-        index_type: String,
-        query: Arc<dyn AnyQuery>,
-    ) -> Self {
-        Self {
-            scalar_query: Some(ScalarIndexExpr::Query(ScalarIndexSearch {
-                column,
-                index_name,
-                index_type,
-                query,
-                needs_recheck: false,  // Default to false, will be set by parser
-                fragment_bitmap: None, // Filled in by `apply_scalar_indices`
-            })),
-            refine_expr: None,
-        }
-    }
-
-    /// Create an expression that is only an index query with explicit needs_recheck
-    fn index_query_with_recheck(
-        column: String,
-        index_name: String,
-        index_type: String,
-        query: Arc<dyn AnyQuery>,
-        needs_recheck: bool,
-    ) -> Self {
-        Self {
-            scalar_query: Some(ScalarIndexExpr::Query(ScalarIndexSearch {
-                column,
-                index_name,
-                index_type,
-                query,
-                needs_recheck,
-                fragment_bitmap: None, // Filled in by `apply_scalar_indices`
-            })),
-            refine_expr: None,
-        }
-    }
-
-    /// Try and negate the expression
-    ///
-    /// If the expression contains both an index query and a refine expression then it
-    /// cannot be negated today and None will be returned (we give up trying to use indices)
-    fn maybe_not(self) -> Option<Self> {
-        match (self.scalar_query, self.refine_expr) {
-            (Some(_), Some(_)) => None,
-            (Some(scalar_query), None) => {
-                if scalar_query.needs_recheck() {
-                    return None;
-                }
-                Some(Self {
-                    scalar_query: Some(ScalarIndexExpr::Not(Box::new(scalar_query))),
-                    refine_expr: None,
-                })
-            }
-            (None, Some(refine_expr)) => Some(Self {
-                scalar_query: None,
-                refine_expr: Some(Expr::Not(Box::new(refine_expr))),
-            }),
-            (None, None) => panic!("Empty node should not occur"),
-        }
-    }
-
-    /// Perform a logical AND of two indexed expressions
-    ///
-    /// This is straightforward because we can just AND the individual parts
-    /// because (A && B) && (C && D) == (A && C) && (B && D)
-    fn and(self, other: Self) -> Self {
-        let scalar_query = match (self.scalar_query, other.scalar_query) {
-            (Some(scalar_query), Some(other_scalar_query)) => Some(ScalarIndexExpr::And(
-                Box::new(scalar_query),
-                Box::new(other_scalar_query),
-            )),
-            (Some(scalar_query), None) => Some(scalar_query),
-            (None, Some(scalar_query)) => Some(scalar_query),
-            (None, None) => None,
-        };
-        let refine_expr = match (self.refine_expr, other.refine_expr) {
-            (Some(refine_expr), Some(other_refine_expr)) => {
-                Some(refine_expr.and(other_refine_expr))
-            }
-            (Some(refine_expr), None) => Some(refine_expr),
-            (None, Some(refine_expr)) => Some(refine_expr),
-            (None, None) => None,
-        };
-        Self {
-            scalar_query,
-            refine_expr,
-        }
-    }
-
-    /// Try and perform a logical OR of two indexed expressions
-    ///
-    /// This is a bit tricky because something like:
-    ///   (color == 'blue' AND size < 20) OR (color == 'green' AND size < 50)
-    /// is not equivalent to:
-    ///   (color == 'blue' OR color == 'green') AND (size < 20 OR size < 50)
-    fn maybe_or(self, other: Self) -> Option<Self> {
-        // If either expression is missing a scalar_query then we need to load all rows from
-        // the database and so we short-circuit and return None
-        let scalar_query = self.scalar_query?;
-        let other_scalar_query = other.scalar_query?;
-        let scalar_query = Some(ScalarIndexExpr::Or(
-            Box::new(scalar_query),
-            Box::new(other_scalar_query),
-        ));
-
-        let refine_expr = match (self.refine_expr, other.refine_expr) {
-            // TODO
-            //
-            // To handle these cases we need a way of going back from a scalar expression query to a logical DF expression (perhaps
-            // we can store the expression that led to the creation of the query)
-            //
-            // For example, imagine we have something like "(color == 'blue' AND size < 20) OR (color == 'green' AND size < 50)"
-            //
-            // We can do an indexed load of all rows matching "color == 'blue' OR color == 'green'" but then we need to
-            // refine that load with the full original expression which, at the moment, we no longer have.
-            (Some(_), Some(_)) => {
-                return None;
-            }
-            (Some(_), None) => {
-                return None;
-            }
-            (None, Some(_)) => {
-                return None;
-            }
-            (None, None) => None,
-        };
-        Some(Self {
-            scalar_query,
-            refine_expr,
-        })
-    }
-
-    fn refine(self, expr: Expr) -> Self {
-        match self.refine_expr {
-            Some(refine_expr) => Self {
-                scalar_query: self.scalar_query,
-                refine_expr: Some(refine_expr.and(expr)),
-            },
-            None => Self {
-                scalar_query: self.scalar_query,
-                refine_expr: Some(expr),
-            },
-        }
-    }
-}
-
-/// A trait implemented by anything that can load indices by name
-///
-/// This is used during the evaluation of an index expression
-#[async_trait]
-pub trait ScalarIndexLoader: Send + Sync {
-    /// Load the index with the given name
-    async fn load_index(
-        &self,
-        column: &str,
-        index_name: &str,
-        metrics: &dyn MetricsCollector,
-    ) -> Result<Arc<dyn ScalarIndex>>;
-
-    /// Translate an address-domain index result into the row-id domain
-    ///
-    /// Address-domain indices (see [`ScalarIndex::results_are_row_addresses`])
-    /// report matches as physical row addresses. The default returns `result`
-    /// unchanged, which is correct when addresses and row ids coincide (no
-    /// stable row ids). A dataset with stable row ids overrides this to remap
-    /// addresses to stable row ids via its per-fragment row-id sequences.
-    async fn row_addr_result_to_row_ids(
-        &self,
-        result: NullableIndexExprResult,
-    ) -> Result<NullableIndexExprResult> {
-        Ok(result)
-    }
-}
-
-/// This represents a search into a scalar index
-#[derive(Debug, Clone)]
-pub struct ScalarIndexSearch {
-    /// The column to search (redundant, used for debugging messages)
-    pub column: String,
-    /// The name of the index to search
-    pub index_name: String,
-    /// The type of the index being searched (e.g. "BTree", "Bitmap"), used for display purposes
-    pub index_type: String,
-    /// The query to search for
-    pub query: Arc<dyn AnyQuery>,
-    /// If true, the query results are inexact and will need a recheck
-    pub needs_recheck: bool,
-    /// The fragments the underlying index has entries for.
-    ///
-    /// `None` means coverage is unknown (e.g. constructed outside of scanner
-    /// planning, or from a legacy code path). Optimizer rules that need to
-    /// decide whether the index covers the dataset must treat `None` as
-    /// "refuse to use" — the bitmap is the only way to safely answer that
-    /// question synchronously without an async metadata load.
-    pub fragment_bitmap: Option<RoaringBitmap>,
-}
-
-impl PartialEq for ScalarIndexSearch {
-    fn eq(&self, other: &Self) -> bool {
-        // `fragment_bitmap` is metadata derived from the dataset state, not
-        // part of the query identity, so it intentionally does not participate
-        // in equality.
-        self.column == other.column
-            && self.index_name == other.index_name
-            && self.query.as_ref().eq(other.query.as_ref())
-    }
-}
-
-/// This represents a lookup into one or more scalar indices
-///
-/// This is a tree of operations because we may need to logically combine or
-/// modify the results of scalar lookups
-#[derive(Debug, Clone)]
-pub enum ScalarIndexExpr {
-    Not(Box<Self>),
-    And(Box<Self>, Box<Self>),
-    Or(Box<Self>, Box<Self>),
-    Query(ScalarIndexSearch),
-}
-
-impl PartialEq for ScalarIndexExpr {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Not(l0), Self::Not(r0)) => l0 == r0,
-            (Self::And(l0, l1), Self::And(r0, r1)) => l0 == r0 && l1 == r1,
-            (Self::Or(l0, l1), Self::Or(r0, r1)) => l0 == r0 && l1 == r1,
-            (Self::Query(l_search), Self::Query(r_search)) => l_search == r_search,
-            _ => false,
-        }
-    }
-}
 
 /// Conservative grouping key for rewrites targeting the same parsed scalar index.
 /// `index_type` is display metadata, but including it prevents rewrites across
@@ -1574,15 +1198,37 @@ fn range_has_null_bound(lower: &Bound<ScalarValue>, upper: &Bound<ScalarValue>) 
     })
 }
 
-impl ScalarIndexSearch {
+/// Extension trait for optimizer-related helper methods on [`ScalarIndexSearch`].
+///
+/// These methods reference [`SargableQuery`] which lives in `lance-index` (not
+/// `lance-index-core`), so they cannot be inherent methods on `ScalarIndexSearch`
+/// in the core crate.
+trait ScalarIndexSearchExt {
     /// Only SargableQuery participates in these expression-level rewrites.
     /// Other AnyQuery implementations may have different null/range semantics.
+    fn sargable_query(&self) -> Option<&SargableQuery>;
+
+    /// Require a concrete SargableQuery before producing a key so callers do not
+    /// accidentally group unrelated AnyQuery implementations by metadata alone.
+    fn sargable_query_key(&self) -> Option<ScalarIndexQueryKey>;
+
+    /// Only exact SargableQuery values may drive NULL-elimination rewrites.
+    /// Range merging also accepts inexact queries and preserves their recheck.
+    fn exact_sargable_query(&self) -> Option<&SargableQuery>;
+
+    /// Return a scalar-index key only when the query is an exact SargableQuery.
+    fn exact_sargable_query_key(&self) -> Option<ScalarIndexQueryKey>;
+
+    /// A query is null-intolerant if the original predicate cannot match NULL.
+    /// Only exact queries can make `IS NOT NULL` redundant in the index expression.
+    fn is_null_intolerant_sargable_query(&self) -> bool;
+}
+
+impl ScalarIndexSearchExt for ScalarIndexSearch {
     fn sargable_query(&self) -> Option<&SargableQuery> {
         self.query.as_any().downcast_ref::<SargableQuery>()
     }
 
-    /// Require a concrete SargableQuery before producing a key so callers do not
-    /// accidentally group unrelated AnyQuery implementations by metadata alone.
     fn sargable_query_key(&self) -> Option<ScalarIndexQueryKey> {
         self.sargable_query()?;
         Some((
@@ -1592,8 +1238,6 @@ impl ScalarIndexSearch {
         ))
     }
 
-    /// Only exact SargableQuery values may drive NULL-elimination rewrites.
-    /// Range merging also accepts inexact queries and preserves their recheck.
     fn exact_sargable_query(&self) -> Option<&SargableQuery> {
         if self.needs_recheck {
             return None;
@@ -1601,14 +1245,11 @@ impl ScalarIndexSearch {
         self.sargable_query()
     }
 
-    /// Return a scalar-index key only when the query is an exact SargableQuery.
     fn exact_sargable_query_key(&self) -> Option<ScalarIndexQueryKey> {
         self.exact_sargable_query()?;
         self.sargable_query_key()
     }
 
-    /// A query is null-intolerant if the original predicate cannot match NULL.
-    /// Only exact queries can make `IS NOT NULL` redundant in the index expression.
     fn is_null_intolerant_sargable_query(&self) -> bool {
         match self.exact_sargable_query() {
             Some(SargableQuery::Range(lower, upper)) => range_has_non_null_bound(lower, upper),
@@ -1621,7 +1262,12 @@ impl ScalarIndexSearch {
     }
 }
 
-impl ScalarIndexExpr {
+/// Extension trait adding scalar-index optimizer methods to [`ScalarIndexExpr`].
+///
+/// `optimize()` and its helpers reference [`SargableQuery`] which lives in
+/// `lance-index`, so they cannot be inherent methods on `ScalarIndexExpr` in
+/// `lance-index-core`.
+pub trait ScalarIndexExprOptimize: Sized {
     /// Apply scalar-index optimizer rules within each contiguous AND region.
     ///
     /// Range queries for the same parsed scalar index are intersected and retain
@@ -1638,7 +1284,7 @@ impl ScalarIndexExpr {
     ///
     /// ```
     /// # use std::{ops::Bound, sync::Arc};
-    /// # use lance_index::scalar::{SargableQuery, expression::{ScalarIndexExpr, ScalarIndexSearch}};
+    /// # use lance_index::scalar::{SargableQuery, expression::{ScalarIndexExpr, ScalarIndexSearch, ScalarIndexExprOptimize}};
     /// # let range = |lower, upper| ScalarIndexExpr::Query(ScalarIndexSearch {
     /// #     column: "x".into(),
     /// #     index_name: "x_idx".into(),
@@ -1655,331 +1301,218 @@ impl ScalarIndexExpr {
     ///
     /// assert!(matches!(optimized, ScalarIndexExpr::Query(_)));
     /// ```
-    pub fn optimize(self) -> Self {
-        self.optimize_with_context(true)
-    }
+    fn optimize(self) -> Self;
 
-    fn optimize_with_context(self, is_not_null_elidable: bool) -> Self {
-        match self {
-            Self::And(_, _) => self.optimize_and_tree(is_not_null_elidable),
-            Self::Or(lhs, rhs) => Self::Or(
-                Box::new(lhs.optimize_with_context(is_not_null_elidable)),
-                Box::new(rhs.optimize_with_context(is_not_null_elidable)),
-            ),
-            Self::Not(inner) => Self::Not(Box::new(inner.optimize_with_context(false))),
-            other => other,
+    /// Recursively collect all leaf nodes from an AND tree.
+    ///
+    /// OR branches are optimized independently with the current null-elision
+    /// context. NOT branches remain leaves while their children are optimized
+    /// with null elimination disabled.
+    fn collect_and_leaves(self, leaves: &mut Vec<Self>, is_not_null_elidable: bool);
+}
+
+fn optimize_with_context(expr: ScalarIndexExpr, is_not_null_elidable: bool) -> ScalarIndexExpr {
+    match expr {
+        ScalarIndexExpr::And(_, _) => optimize_and_tree(expr, is_not_null_elidable),
+        ScalarIndexExpr::Or(lhs, rhs) => ScalarIndexExpr::Or(
+            Box::new(optimize_with_context(*lhs, is_not_null_elidable)),
+            Box::new(optimize_with_context(*rhs, is_not_null_elidable)),
+        ),
+        ScalarIndexExpr::Not(inner) => {
+            ScalarIndexExpr::Not(Box::new(optimize_with_context(*inner, false)))
         }
+        other => other,
     }
+}
 
-    /// Flatten one contiguous AND region, apply local optimizer rules, and
-    /// rebuild a balanced AND tree.
-    fn optimize_and_tree(self, is_not_null_elidable: bool) -> Self {
-        let mut leaves = Vec::new();
-        self.collect_and_leaves(&mut leaves, is_not_null_elidable);
-        let leaves = Self::optimize_and_leaves(leaves, is_not_null_elidable);
+fn optimize_and_tree(expr: ScalarIndexExpr, is_not_null_elidable: bool) -> ScalarIndexExpr {
+    let mut leaves = Vec::new();
+    collect_and_leaves_impl(expr, &mut leaves, is_not_null_elidable);
+    let leaves = optimize_and_leaves(leaves, is_not_null_elidable);
+    rebuild_and_tree(leaves).expect("AND tree optimization should keep at least one leaf")
+}
 
-        Self::rebuild_and_tree(leaves).expect("AND tree optimization should keep at least one leaf")
-    }
-
-    /// Apply optimizer rules within one AND region only. OR branches have already
-    /// been kept as opaque leaves, so range and null-intolerance rewrites cannot
-    /// cross boolean boundaries.
-    fn optimize_and_leaves(leaves: Vec<Self>, is_not_null_elidable: bool) -> Vec<Self> {
-        let null_intolerant_keys = if !is_not_null_elidable {
+fn optimize_and_leaves(
+    leaves: Vec<ScalarIndexExpr>,
+    is_not_null_elidable: bool,
+) -> Vec<ScalarIndexExpr> {
+    let null_intolerant_keys = if !is_not_null_elidable {
+        HashSet::new()
+    } else {
+        let is_not_null_keys = leaves
+            .iter()
+            .filter_map(is_not_null_query_key)
+            .collect::<HashSet<_>>();
+        if is_not_null_keys.is_empty() {
             HashSet::new()
         } else {
-            let is_not_null_keys = leaves
+            leaves
                 .iter()
-                .filter_map(Self::is_not_null_query_key)
-                .collect::<HashSet<_>>();
-            if is_not_null_keys.is_empty() {
-                HashSet::new()
-            } else {
-                leaves
-                    .iter()
-                    .filter_map(Self::null_intolerant_query_key)
-                    .filter(|key| is_not_null_keys.contains(key))
-                    .collect()
-            }
-        };
+                .filter_map(null_intolerant_query_key)
+                .filter(|key| is_not_null_keys.contains(key))
+                .collect()
+        }
+    };
 
-        let mut optimized = Vec::with_capacity(leaves.len());
-        let mut range_positions = HashMap::new();
+    let mut optimized = Vec::with_capacity(leaves.len());
+    let mut range_positions = HashMap::new();
 
-        for leaf in leaves {
-            if let Some(key) = leaf.is_not_null_query_key()
-                && null_intolerant_keys.contains(&key)
-            {
-                continue;
-            }
+    for leaf in leaves {
+        if let Some(key) = is_not_null_query_key(&leaf)
+            && null_intolerant_keys.contains(&key)
+        {
+            continue;
+        }
 
-            if let Some(key) = leaf.range_query_key() {
-                match range_positions.entry(key) {
-                    Entry::Vacant(entry) => {
-                        entry.insert(optimized.len());
+        if let Some(key) = range_query_key(&leaf) {
+            match range_positions.entry(key) {
+                Entry::Vacant(entry) => {
+                    entry.insert(optimized.len());
+                    optimized.push(leaf);
+                }
+                Entry::Occupied(entry) => {
+                    if !try_merge_range(&mut optimized[*entry.get()], &leaf) {
                         optimized.push(leaf);
                     }
-                    Entry::Occupied(entry) => {
-                        if !optimized[*entry.get()].try_merge_range(&leaf) {
-                            optimized.push(leaf);
-                        }
-                    }
                 }
+            }
+        } else {
+            optimized.push(leaf);
+        }
+    }
+
+    optimized
+}
+
+fn collect_and_leaves_impl(
+    expr: ScalarIndexExpr,
+    leaves: &mut Vec<ScalarIndexExpr>,
+    is_not_null_elidable: bool,
+) {
+    match expr {
+        ScalarIndexExpr::And(lhs, rhs) => {
+            collect_and_leaves_impl(*lhs, leaves, is_not_null_elidable);
+            collect_and_leaves_impl(*rhs, leaves, is_not_null_elidable);
+        }
+        ScalarIndexExpr::Or(lhs, rhs) => {
+            leaves.push(ScalarIndexExpr::Or(
+                Box::new(optimize_with_context(*lhs, is_not_null_elidable)),
+                Box::new(optimize_with_context(*rhs, is_not_null_elidable)),
+            ));
+        }
+        ScalarIndexExpr::Not(inner) => {
+            leaves.push(ScalarIndexExpr::Not(Box::new(optimize_with_context(
+                *inner, false,
+            ))))
+        }
+        other => leaves.push(other),
+    }
+}
+
+fn rebuild_and_tree(leaves: Vec<ScalarIndexExpr>) -> Option<ScalarIndexExpr> {
+    let mut leaves = leaves;
+    if leaves.is_empty() {
+        return None;
+    }
+
+    while leaves.len() > 1 {
+        let mut next = Vec::with_capacity(leaves.len().div_ceil(2));
+        let mut iter = leaves.into_iter();
+        while let Some(lhs) = iter.next() {
+            if let Some(rhs) = iter.next() {
+                next.push(ScalarIndexExpr::And(Box::new(lhs), Box::new(rhs)));
             } else {
-                optimized.push(leaf);
+                next.push(lhs);
             }
         }
-
-        optimized
+        leaves = next;
     }
 
-    /// Recursively collect all leaf nodes from an AND tree. OR branches are
-    /// optimized independently with the current null-elision context. NOT
-    /// branches remain leaves while their children are optimized with null
-    /// elimination disabled.
-    fn collect_and_leaves(self, leaves: &mut Vec<Self>, is_not_null_elidable: bool) {
-        match self {
-            Self::And(lhs, rhs) => {
-                lhs.collect_and_leaves(leaves, is_not_null_elidable);
-                rhs.collect_and_leaves(leaves, is_not_null_elidable);
-            }
-            Self::Or(lhs, rhs) => {
-                leaves.push(Self::Or(
-                    Box::new(lhs.optimize_with_context(is_not_null_elidable)),
-                    Box::new(rhs.optimize_with_context(is_not_null_elidable)),
-                ));
-            }
-            Self::Not(inner) => {
-                leaves.push(Self::Not(Box::new(inner.optimize_with_context(false))))
-            }
-            other => leaves.push(other),
-        }
-    }
+    leaves.pop()
+}
 
-    /// Rebuild as a balanced tree so large planner-generated conjunctions do not
-    /// become deep left-leaning trees after optimization.
-    fn rebuild_and_tree(leaves: Vec<Self>) -> Option<Self> {
-        let mut leaves = leaves;
-        if leaves.is_empty() {
-            return None;
-        }
-
-        while leaves.len() > 1 {
-            let mut next = Vec::with_capacity(leaves.len().div_ceil(2));
-            let mut iter = leaves.into_iter();
-            while let Some(lhs) = iter.next() {
-                if let Some(rhs) = iter.next() {
-                    next.push(Self::And(Box::new(lhs), Box::new(rhs)));
-                } else {
-                    next.push(lhs);
-                }
-            }
-            leaves = next;
-        }
-
-        leaves.pop()
-    }
-
-    /// Detect the scalar-index representation of `col IS NOT NULL`, which is
-    /// stored as `NOT(col IS NULL)`.
-    fn is_not_null_query_key(&self) -> Option<ScalarIndexQueryKey> {
-        match self {
-            Self::Not(inner) => match inner.as_ref() {
-                Self::Query(search)
-                    if matches!(search.sargable_query(), Some(SargableQuery::IsNull())) =>
-                {
-                    search.exact_sargable_query_key()
-                }
-                _ => None,
-            },
-            _ => None,
-        }
-    }
-
-    /// Return the key of a same-column predicate that makes `IS NOT NULL`
-    /// redundant in the same AND region.
-    fn null_intolerant_query_key(&self) -> Option<ScalarIndexQueryKey> {
-        match self {
-            Self::Query(search) if search.is_null_intolerant_sargable_query() => {
+fn is_not_null_query_key(expr: &ScalarIndexExpr) -> Option<ScalarIndexQueryKey> {
+    match expr {
+        ScalarIndexExpr::Not(inner) => match inner.as_ref() {
+            ScalarIndexExpr::Query(search)
+                if matches!(search.sargable_query(), Some(SargableQuery::IsNull())) =>
+            {
                 search.exact_sargable_query_key()
             }
-            Self::Not(inner) => match inner.as_ref() {
-                Self::Query(search)
-                    if matches!(
-                        search.exact_sargable_query(),
-                        Some(SargableQuery::Equals(value)) if !value.is_null()
-                    ) =>
-                {
-                    search.exact_sargable_query_key()
-                }
-                _ => None,
-            },
             _ => None,
-        }
-    }
-
-    /// Return the grouping key for an optimizable range query. Ranges with NULL
-    /// bounds are left unchanged.
-    fn range_query_key(&self) -> Option<ScalarIndexQueryKey> {
-        let Self::Query(search) = self else {
-            return None;
-        };
-        let SargableQuery::Range(lower, upper) = search.sargable_query()? else {
-            return None;
-        };
-        if range_has_null_bound(lower, upper) {
-            return None;
-        }
-        search.sargable_query_key()
-    }
-
-    /// Merge another compatible range into this expression.
-    ///
-    /// The caller must first group both expressions by [`ScalarIndexQueryKey`].
-    /// Different fragment coverage or incomparable bounds leave both predicates
-    /// unchanged. Empty intersections are retained as ranges.
-    fn try_merge_range(&mut self, other: &Self) -> bool {
-        let (Self::Query(search), Self::Query(other_search)) = (self, other) else {
-            return false;
-        };
-        if search.fragment_bitmap != other_search.fragment_bitmap {
-            return false;
-        }
-
-        let (
-            Some(SargableQuery::Range(lower, upper)),
-            Some(SargableQuery::Range(other_lower, other_upper)),
-        ) = (search.sargable_query(), other_search.sargable_query())
-        else {
-            return false;
-        };
-        let Some(lower) = tighter_lower_bound(lower, other_lower) else {
-            return false;
-        };
-        let Some(upper) = tighter_upper_bound(upper, other_upper) else {
-            return false;
-        };
-
-        search.query = Arc::new(SargableQuery::Range(lower, upper));
-        search.needs_recheck |= other_search.needs_recheck;
-        true
+        },
+        _ => None,
     }
 }
 
-impl std::fmt::Display for ScalarIndexExpr {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Not(inner) => write!(f, "NOT({})", inner),
-            Self::And(lhs, rhs) => write!(f, "AND({},{})", lhs, rhs),
-            Self::Or(lhs, rhs) => write!(f, "OR({},{})", lhs, rhs),
-            Self::Query(search) => write!(
-                f,
-                "[{}]@{}({})",
-                search.query.format(&search.column),
-                search.index_name,
-                search.index_type
-            ),
+fn null_intolerant_query_key(expr: &ScalarIndexExpr) -> Option<ScalarIndexQueryKey> {
+    match expr {
+        ScalarIndexExpr::Query(search) if search.is_null_intolerant_sargable_query() => {
+            search.exact_sargable_query_key()
         }
+        ScalarIndexExpr::Not(inner) => match inner.as_ref() {
+            ScalarIndexExpr::Query(search)
+                if matches!(
+                    search.exact_sargable_query(),
+                    Some(SargableQuery::Equals(value)) if !value.is_null()
+                ) =>
+            {
+                search.exact_sargable_query_key()
+            }
+            _ => None,
+        },
+        _ => None,
     }
 }
 
-fn search_result_to_nullable(result: SearchResult) -> NullableIndexExprResult {
-    match result {
-        SearchResult::Exact(mask) => {
-            NullableIndexExprResult::exact(NullableRowAddrMask::AllowList(mask))
-        }
-        SearchResult::AtMost(mask) => {
-            NullableIndexExprResult::at_most(NullableRowAddrMask::AllowList(mask))
-        }
-        SearchResult::AtLeast(mask) => {
-            NullableIndexExprResult::at_least(NullableRowAddrMask::AllowList(mask))
-        }
+fn range_query_key(expr: &ScalarIndexExpr) -> Option<ScalarIndexQueryKey> {
+    let ScalarIndexExpr::Query(search) = expr else {
+        return None;
+    };
+    let SargableQuery::Range(lower, upper) = search.sargable_query()? else {
+        return None;
+    };
+    if range_has_null_bound(lower, upper) {
+        return None;
     }
+    search.sargable_query_key()
 }
 
-impl ScalarIndexExpr {
-    /// Evaluates the scalar index expression
-    ///
-    /// This will result in loading one or more scalar indices and searching them
-    ///
-    /// TODO: We could potentially try and be smarter about reusing loaded indices for
-    /// any situations where the session cache has been disabled.
-    #[async_recursion]
-    pub async fn evaluate_nullable(
-        &self,
-        index_loader: &dyn ScalarIndexLoader,
-        metrics: &dyn MetricsCollector,
-    ) -> Result<NullableIndexExprResult> {
-        match self {
-            Self::Not(inner) => {
-                let result = inner.evaluate_nullable(index_loader, metrics).await?;
-                Ok(!result)
-            }
-            Self::And(lhs, rhs) => {
-                let lhs_result = lhs.evaluate_nullable(index_loader, metrics);
-                let rhs_result = rhs.evaluate_nullable(index_loader, metrics);
-                let (lhs_result, rhs_result) = try_join!(lhs_result, rhs_result)?;
-                Ok(lhs_result & rhs_result)
-            }
-            Self::Or(lhs, rhs) => {
-                let lhs_result = lhs.evaluate_nullable(index_loader, metrics);
-                let rhs_result = rhs.evaluate_nullable(index_loader, metrics);
-                let (lhs_result, rhs_result) = try_join!(lhs_result, rhs_result)?;
-                Ok(lhs_result | rhs_result)
-            }
-            Self::Query(search) => {
-                let index = index_loader
-                    .load_index(&search.column, &search.index_name, metrics)
-                    .await?;
-                let search_result = index.search(search.query.as_ref(), metrics).await?;
-                let result = search_result_to_nullable(search_result);
-                if index.results_are_row_addresses() {
-                    // Translate address-domain results to the row-id domain
-                    // before combining or scanning; otherwise stable-row-id
-                    // datasets silently drop matches (issue #7434).
-                    index_loader.row_addr_result_to_row_ids(result).await
-                } else {
-                    Ok(result)
-                }
-            }
-        }
+fn try_merge_range(this: &mut ScalarIndexExpr, other: &ScalarIndexExpr) -> bool {
+    let (ScalarIndexExpr::Query(search), ScalarIndexExpr::Query(other_search)) = (this, other)
+    else {
+        return false;
+    };
+    if search.fragment_bitmap != other_search.fragment_bitmap {
+        return false;
     }
 
-    #[instrument(level = "debug", skip_all)]
-    pub async fn evaluate(
-        &self,
-        index_loader: &dyn ScalarIndexLoader,
-        metrics: &dyn MetricsCollector,
-    ) -> Result<IndexExprResult> {
-        Ok(self
-            .evaluate_nullable(index_loader, metrics)
-            .await?
-            .drop_nulls())
+    let (
+        Some(SargableQuery::Range(lower, upper)),
+        Some(SargableQuery::Range(other_lower, other_upper)),
+    ) = (search.sargable_query(), other_search.sargable_query())
+    else {
+        return false;
+    };
+    let Some(lower) = tighter_lower_bound(lower, other_lower) else {
+        return false;
+    };
+    let Some(upper) = tighter_upper_bound(upper, other_upper) else {
+        return false;
+    };
+
+    search.query = Arc::new(SargableQuery::Range(lower, upper));
+    search.needs_recheck |= other_search.needs_recheck;
+    true
+}
+
+impl ScalarIndexExprOptimize for ScalarIndexExpr {
+    fn optimize(self) -> Self {
+        optimize_with_context(self, true)
     }
 
-    pub fn to_expr(&self) -> Expr {
-        match self {
-            Self::Not(inner) => Expr::Not(inner.to_expr().into()),
-            Self::And(lhs, rhs) => {
-                let lhs = lhs.to_expr();
-                let rhs = rhs.to_expr();
-                lhs.and(rhs)
-            }
-            Self::Or(lhs, rhs) => {
-                let lhs = lhs.to_expr();
-                let rhs = rhs.to_expr();
-                lhs.or(rhs)
-            }
-            Self::Query(search) => search.query.to_expr(search.column.clone()),
-        }
-    }
-
-    pub fn needs_recheck(&self) -> bool {
-        match self {
-            Self::Not(inner) => inner.needs_recheck(),
-            Self::And(lhs, rhs) | Self::Or(lhs, rhs) => lhs.needs_recheck() || rhs.needs_recheck(),
-            Self::Query(search) => search.needs_recheck,
-        }
+    fn collect_and_leaves(self, leaves: &mut Vec<Self>, is_not_null_elidable: bool) {
+        collect_and_leaves_impl(self, leaves, is_not_null_elidable)
     }
 }
 
@@ -2605,6 +2138,7 @@ mod tests {
     use datafusion_expr::simplify::SimplifyContext;
     use lance_datafusion::exec::{LanceExecutionOptions, get_session_context};
     use lance_select::result::IndexExprResultWireFormat;
+    use lance_select::{IndexExprResult, NullableIndexExprResult, NullableRowAddrMask};
     use roaring::RoaringBitmap;
 
     use crate::scalar::json::{JsonQuery, JsonQueryParser};

@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 use std::convert::TryFrom;
 
 pub mod metrics;
+pub mod progress;
+pub mod registry;
 pub mod scalar;
 
 /// Generic methods common across all types of secondary indices

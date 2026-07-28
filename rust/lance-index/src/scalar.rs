@@ -29,6 +29,17 @@ pub use lance_index_core::scalar::{
     LANCE_SCALAR_INDEX, OldIndexDataFilter, RowIdRemapper, ScalarIndex, ScalarIndexParams,
     SearchResult, TrainingCriteria, TrainingOrdering, UpdateCriteria,
 };
+// Re-exports from moved modules for backwards compatibility
+pub use lance_index_core::progress::{IndexBuildProgress, NoopIndexBuildProgress, noop_progress};
+pub use lance_index_core::registry::IndexRegistry;
+pub use lance_index_core::scalar::expression::{
+    IndexedExpression, ScalarIndexExpr, ScalarIndexLoader, ScalarIndexSearch, ScalarQueryParser,
+};
+pub use lance_index_core::scalar::registry::{
+    BasicTrainer, ScalarIndexCacheKey, ScalarIndexLoad, ScalarIndexPlugin, TrainingRequest,
+    VALUE_COLUMN_NAME, single_flight_open,
+};
+pub use lance_index_core::scalar::seed::{FragmentSeed, IndexSeedWriter, SEED_META_KEY_PREFIX};
 
 pub mod bitmap;
 pub mod bloomfilter;

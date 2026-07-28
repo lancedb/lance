@@ -3,6 +3,10 @@
 
 //! Abstract scalar index traits and types for Lance index plugins
 
+pub mod expression;
+pub mod registry;
+pub mod seed;
+
 use arrow_array::{BooleanArray, RecordBatch, UInt64Array};
 use arrow_schema::Schema;
 use async_trait::async_trait;
