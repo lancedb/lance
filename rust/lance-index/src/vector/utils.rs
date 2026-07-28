@@ -109,6 +109,7 @@ impl SimpleIndex {
             lower_bound: None,
             upper_bound: None,
             dist_q_c: 0.0,
+            use_acorn: false,
         };
         let res = match &self.store {
             SimpleStore::Float(store) => self.index.search_basic(query, 1, &params, None, store)?,

@@ -359,6 +359,7 @@ impl OnlineHnswBuilder {
                 lower_bound: None,
                 upper_bound: None,
                 dist_q_c: 0.0,
+                use_acorn: false,
             },
             dist_calc,
             None,
@@ -430,6 +431,7 @@ impl OnlineHnswBuilder {
             lower_bound: None,
             upper_bound: None,
             dist_q_c: 0.0,
+            use_acorn: false,
         };
         let result = beam_search(
             &bottom,
@@ -662,6 +664,7 @@ mod tests {
                     lower_bound: None,
                     upper_bound: None,
                     dist_q_c: 0.0,
+                    use_acorn: false,
                 },
                 None,
                 &mut visited,

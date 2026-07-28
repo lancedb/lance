@@ -178,6 +178,7 @@ fn inline_transaction_config(
 #[allow(clippy::too_many_arguments)]
 async fn do_commit_new_dataset(
     object_store: &ObjectStore,
+    source_store: Option<&ObjectStore>,
     commit_handler: &dyn CommitHandler,
     base_path: &Path,
     transaction: &Transaction,
@@ -206,15 +207,19 @@ async fn do_commit_new_dataset(
         ..
     } = &transaction.operation
     {
+        // The source manifest must be read through the source store, which may differ
+        // from the destination store when cloning across object stores/accounts. Falls
+        // back to the destination store for same-store clones.
+        let source_store = source_store.unwrap_or(object_store);
         let source_base_path =
             ObjectStore::extract_path_from_uri(store_registry, ref_path.as_str())?;
         let source_manifest_location = commit_handler
-            .resolve_version_location(&source_base_path, *ref_version, &object_store.inner)
+            .resolve_version_location(&source_base_path, *ref_version, &source_store.inner)
             .await?;
         let source_manifest = Dataset::load_manifest(
-            object_store,
+            source_store,
             &source_manifest_location,
-            base_path.to_string().as_str(),
+            ref_path.as_str(),
             &Session::default(),
         )
         .await?;
@@ -235,7 +240,7 @@ async fn do_commit_new_dataset(
             );
 
             let updated_indices = if let Some(index_section_pos) = source_manifest.index_section {
-                let reader = object_store.open(&source_manifest_location.path).await?;
+                let reader = source_store.open(&source_manifest_location.path).await?;
                 let section: pb::IndexSection =
                     lance_io::utils::read_message(reader.as_ref(), index_section_pos).await?;
                 section
@@ -273,7 +278,7 @@ async fn do_commit_new_dataset(
             // Indices: keep metadata but normalize base to local
             let mut updated_indices = Vec::new();
             if let Some(index_section_pos) = source_manifest.index_section {
-                let reader = object_store.open(&source_manifest_location.path).await?;
+                let reader = source_store.open(&source_manifest_location.path).await?;
                 let section: pb::IndexSection =
                     lance_io::utils::read_message(reader.as_ref(), index_section_pos).await?;
                 updated_indices = section
@@ -362,6 +367,7 @@ async fn do_commit_new_dataset(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn commit_new_dataset(
     object_store: &ObjectStore,
+    source_store: Option<&ObjectStore>,
     commit_handler: &dyn CommitHandler,
     base_path: &Path,
     transaction: &Transaction,
@@ -372,6 +378,7 @@ pub(crate) async fn commit_new_dataset(
 ) -> Result<(Manifest, ManifestLocation)> {
     do_commit_new_dataset(
         object_store,
+        source_store,
         commit_handler,
         base_path,
         transaction,

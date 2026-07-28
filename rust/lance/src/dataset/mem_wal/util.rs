@@ -131,7 +131,7 @@ pub fn parse_bit_reversed_filename(filename: &str) -> Option<u64> {
 }
 
 /// Adapt the store params a base dataset was opened with for use on a URI
-/// *derived* from it (a flushed generation under `_mem_wal/`).
+/// *derived* from it (an SSTable under `_mem_wal/`).
 ///
 /// The deprecated `object_store` binding pins a store to one location: given
 /// `Some((store, url))`, both `ObjectStore::from_uri_and_params` and
@@ -178,29 +178,24 @@ pub fn shard_manifest_path(base_path: &Path, shard_id: &Uuid) -> Path {
     shard_base_path(base_path, shard_id).join("manifest")
 }
 
-/// Path to a flushed MemTable directory.
+/// Path to an SSTable directory.
 ///
 /// Returns: `{base_path}/_mem_wal/{shard_id}/{random_hash}_gen_{generation}/`
-pub fn flushed_memtable_path(
-    base_path: &Path,
-    shard_id: &Uuid,
-    random_hash: &str,
-    generation: u64,
-) -> Path {
+pub fn sstable_path(base_path: &Path, shard_id: &Uuid, random_hash: &str, generation: u64) -> Path {
     shard_base_path(base_path, shard_id).join(format!("{}_gen_{}", random_hash, generation))
 }
 
-/// Subdirectory of a flushed generation holding its standalone primary-key
+/// Subdirectory of an SSTable holding its standalone primary-key
 /// dedup index (a sidecar BTree, not registered in the manifest). Both the
 /// flush writer and the block-list probe join this onto the generation path.
 pub const PK_INDEX_DIR: &str = "_pk_index";
 
-/// Path to a flushed generation's standalone primary-key dedup index.
+/// Path to an SSTable's standalone primary-key dedup index.
 pub fn pk_index_path(gen_path: &Path) -> Path {
     gen_path.clone().join(PK_INDEX_DIR)
 }
 
-/// Generate an 8-character random hex string for flushed MemTable directories.
+/// Generate an 8-character random hex string for SSTable directories.
 pub fn generate_random_hash() -> String {
     let bytes: [u8; 4] = rand::random();
     format!(
@@ -309,7 +304,7 @@ mod tests {
         );
 
         assert_eq!(
-            flushed_memtable_path(&base_path, &shard_id, "a1b2c3d4", 5).as_ref(),
+            sstable_path(&base_path, &shard_id, "a1b2c3d4", 5).as_ref(),
             "my/dataset/_mem_wal/550e8400-e29b-41d4-a716-446655440000/a1b2c3d4_gen_5"
         );
 

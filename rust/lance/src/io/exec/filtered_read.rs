@@ -100,6 +100,18 @@ impl EvaluatedIndex {
             applicable_fragments,
         })
     }
+
+    /// Block `rows` (stale overlay row addresses) from the index result so the index never
+    /// emits them. Their fragments stay in the covered set, so non-stale rows keep the index;
+    /// the blocked rows are re-evaluated against their current (overlay-merged) values on a
+    /// separate targeted take path built by the scanner.
+    fn without_rows(mut self, block_list: &RowAddrTreeMap) -> Self {
+        self.index_result.upper =
+            std::mem::take(&mut self.index_result.upper).also_block(block_list.clone());
+        self.index_result.lower =
+            std::mem::take(&mut self.index_result.lower).also_block(block_list.clone());
+        self
+    }
 }
 
 /// A fragment along with ranges of row offsets to read
@@ -462,27 +474,19 @@ impl std::fmt::Debug for FilteredReadStream {
 
 impl FilteredReadStream {
     /// Create a new FilteredReadStream from a pre-computed internal plan.
-    /// A `None` scheduler or fragments is created/loaded here; the
-    /// row-stream path injects its per-query shared ones and a per-batch
-    /// priority offset.
+    /// Fragment handles are constructed I/O-free from the manifest
+    /// descriptors, only for the fragments the plan selects. A `None`
+    /// scheduler is created here; the row-stream path injects its per-query
+    /// shared one and a per-batch priority offset.
     #[instrument(name = "init_filtered_read_stream", skip_all)]
-    async fn try_new(
+    fn try_new(
         dataset: Arc<Dataset>,
         options: FilteredReadOptions,
         global_metrics: Arc<FilteredReadGlobalMetrics>,
         plan: FilteredReadInternalPlan,
         scan_scheduler: Option<Arc<ScanScheduler>>,
-        loaded_fragments: Option<&[LoadedFragment]>,
         priority_offset: Option<u32>,
-    ) -> DataFusionResult<Self> {
-        let freshly_loaded_fragments;
-        let loaded_fragments = match loaded_fragments {
-            Some(fragments) => fragments,
-            None => {
-                freshly_loaded_fragments = Self::load_all_fragments(&dataset, &options).await?;
-                &freshly_loaded_fragments
-            }
-        };
+    ) -> Self {
         let scan_scheduler =
             scan_scheduler.unwrap_or_else(|| Self::make_scan_scheduler(&dataset, &options));
         let threading_mode = options.threading_mode;
@@ -493,9 +497,14 @@ impl FilteredReadStream {
             .unwrap_or_else(|| (*DEFAULT_FRAGMENT_READAHEAD).unwrap_or(io_parallelism * 2))
             .max(1);
 
+        let fragment_descriptors = options
+            .fragments
+            .clone()
+            .unwrap_or_else(|| dataset.fragments().clone());
+
         log::debug!(
             "Filtered read on {} fragments with frag_readahead={} and io_parallelism={}",
-            loaded_fragments.len(),
+            fragment_descriptors.len(),
             fragment_readahead,
             io_parallelism
         );
@@ -508,7 +517,7 @@ impl FilteredReadStream {
         // Convert plan to scoped fragments for I/O
         let mut scoped_fragments = Self::plan_to_scoped_fragments(
             &plan,
-            loaded_fragments,
+            &fragment_descriptors,
             &dataset,
             &options,
             scan_scheduler.clone(),
@@ -554,7 +563,7 @@ impl FilteredReadStream {
                         (fragments, rows)
                     }
                 });
-        Ok(Self {
+        Self {
             output_schema,
             task_stream: Arc::new(AsyncMutex::new(task_stream)),
             scan_scheduler,
@@ -564,7 +573,7 @@ impl FilteredReadStream {
             scan_range_after_filter,
             touched_fragments,
             planned_rows,
-        })
+        }
     }
 
     /// Drain the entire read into batches (used by the row-stream path,
@@ -820,10 +829,13 @@ impl FilteredReadStream {
         }
     }
 
+    /// Handles are constructed here, I/O-free, only for the fragments the
+    /// plan selects; priority is the fragment's position in the candidate
+    /// list so a sparse plan keeps the original I/O order.
     fn plan_to_scoped_fragments(
         plan: &FilteredReadInternalPlan,
-        fragments: &[LoadedFragment],
-        dataset: &Dataset,
+        fragments: &[Fragment],
+        dataset: &Arc<Dataset>,
         options: &FilteredReadOptions,
         scan_scheduler: Arc<ScanScheduler>,
     ) -> Vec<ScopedFragmentRead> {
@@ -839,7 +851,7 @@ impl FilteredReadStream {
         let mut scoped_fragments = Vec::new();
 
         for (priority, fragment) in fragments.iter().enumerate() {
-            let fragment_id = fragment.fragment.id() as u32;
+            let fragment_id = fragment.id as u32;
 
             // Check if this fragment is in the plan
             if let Some(ranges) = plan.rows.get(&fragment_id) {
@@ -851,7 +863,7 @@ impl FilteredReadStream {
                 let filter = plan.filters.get(&fragment_id).map(|f| (**f).clone());
 
                 scoped_fragments.push(ScopedFragmentRead {
-                    fragment: fragment.fragment.clone(),
+                    fragment: Arc::new(FileFragment::new(dataset.clone(), fragment.clone())),
                     ranges: ranges.clone(),
                     projection: projection.clone(),
                     with_deleted_rows: options.with_deleted_rows,
@@ -1505,6 +1517,12 @@ pub struct FilteredReadOptions {
     pub io_buffer_size_bytes: Option<u64>,
     /// If true, skip fragments that are not covered by the scalar index result.
     pub only_indexed_fragments: bool,
+    /// Row addresses whose index entries may be stale because an overlay committed after the
+    /// index was built touches an indexed field. They are blocked from the index result so the
+    /// index never emits them; the scanner re-evaluates just these rows against their current
+    /// (overlay-merged) values on a targeted take path. Their fragments stay in the covered set,
+    /// so non-stale rows keep the index. `None` on the common no-overlay fast path.
+    pub overlay_block: Option<RowAddrMask>,
 }
 
 impl FilteredReadOptions {
@@ -1534,10 +1552,18 @@ impl FilteredReadOptions {
             full_filter: None,
             io_buffer_size_bytes: None,
             only_indexed_fragments: false,
+            overlay_block: None,
             threading_mode: FilteredReadThreadingMode::OnePartitionMultipleThreads(
                 get_num_compute_intensive_cpus(),
             ),
         }
+    }
+
+    /// Block the given stale overlay row addresses (see the `overlay_block` field) from the
+    /// scalar index result so the index never emits them.
+    pub fn with_overlay_block(mut self, block: RowAddrMask) -> Self {
+        self.overlay_block = Some(block);
+        self
     }
 
     /// Include deleted rows in the scan
@@ -2117,9 +2143,15 @@ impl FilteredReadExec {
                     let index_search_result = index_search.next().await.ok_or_else(|| {
                         Error::internal("Index search did not yield any results".to_string())
                     })??;
-                    evaluated_index = Some(Arc::new(EvaluatedIndex::try_from_arrow(
-                        &index_search_result,
-                    )?));
+                    let mut idx = EvaluatedIndex::try_from_arrow(&index_search_result)?;
+                    // `overlay_block` is always constructed as a block list (see
+                    // `Scanner::stale_rows_block_mask`), so `block_list()` is always `Some`.
+                    if let Some(block_list) =
+                        options.overlay_block.as_ref().and_then(|b| b.block_list())
+                    {
+                        idx = idx.without_rows(block_list);
+                    }
+                    evaluated_index = Some(Arc::new(idx));
                 }
 
                 // Load fragments to compute the plan
@@ -2145,7 +2177,9 @@ impl FilteredReadExec {
                     .try_collect::<Vec<_>>()
                     .await?;
 
-                // Plan the scan
+                // Plan the scan; the metadata loaded here drops when planning
+                // finishes — stream construction rebuilds I/O-free handles
+                // from the manifest descriptors
                 Ok(FilteredReadStream::plan_scan(
                     &loaded_fragments,
                     &evaluated_index,
@@ -2226,10 +2260,7 @@ impl FilteredReadExec {
                     plan.clone(),
                     None,
                     None,
-                    None,
-                )
-                .await
-                .map_err(|e| DataFusionError::External(e.into()))?;
+                );
                 let first_stream = new_running_stream.get_stream(&metrics, partition);
                 *running_stream = Some(new_running_stream);
                 first_stream
@@ -2551,20 +2582,18 @@ impl RowStreamRead {
         internal_plan: FilteredReadInternalPlan,
         batch_index: u32,
     ) -> DataFusionResult<RecordBatch> {
-        let fragments = &self.load_fragments().await?.fragments;
+        let fragment_count = self.load_fragments().await?.fragments.len();
         // I/O priority: earlier batches strictly first (output emits in batch
         // order), fragments keep dataset order within a batch
-        let priority_offset = batch_index.saturating_mul(fragments.len() as u32);
+        let priority_offset = batch_index.saturating_mul(fragment_count as u32);
         let read = FilteredReadStream::try_new(
             self.dataset.clone(),
             self.source.read_options.clone(),
             self.global_metrics.clone(),
             internal_plan,
             Some(self.scan_scheduler.clone()),
-            Some(fragments),
             Some(priority_offset),
-        )
-        .await?;
+        );
         let decode_parallelism = match self.source.read_options.threading_mode {
             FilteredReadThreadingMode::OnePartitionMultipleThreads(n) => n,
             FilteredReadThreadingMode::MultiplePartitions(n) => n,
@@ -5067,6 +5096,38 @@ mod tests {
                 .try_collect::<Vec<_>>()
                 .await
                 .unwrap()
+        }
+
+        /// A sparse plan constructs fragment handles only for the fragments
+        /// it selects, keeping their candidate-list position as priority —
+        /// no metadata is loaded or retained for unselected fragments
+        #[tokio::test]
+        async fn sparse_plan_scopes_only_selected_fragments() {
+            let fixture = take_fixture(false).await;
+            let dataset = &fixture.dataset;
+            let descriptors = dataset.fragments().clone();
+            assert_eq!(descriptors.len(), 3);
+
+            let mut rows = BTreeMap::new();
+            rows.insert(2u32, vec![0u64..5]);
+            let plan = FilteredReadInternalPlan {
+                rows,
+                filters: HashMap::new(),
+                scan_range_after_filter: None,
+            };
+            let options = FilteredReadOptions::basic_full_read(dataset);
+            let scheduler = FilteredReadStream::make_scan_scheduler(dataset, &options);
+
+            let scoped = FilteredReadStream::plan_to_scoped_fragments(
+                &plan,
+                &descriptors,
+                dataset,
+                &options,
+                scheduler,
+            );
+            assert_eq!(scoped.len(), 1);
+            assert_eq!(scoped[0].fragment.id(), 2);
+            assert_eq!(scoped[0].priority, 2);
         }
 
         /// Output preserves the input's row order, duplicates, and payload

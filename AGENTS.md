@@ -4,32 +4,6 @@ Lance is a modern columnar data format optimized for ML workflows and datasets, 
 
 Also see directory-specific guidelines: [rust/](rust/AGENTS.md) | [python/](python/AGENTS.md) | [java/](java/AGENTS.md) | [protos/](protos/AGENTS.md) | [docs/src/format/](docs/src/format/AGENTS.md)
 
-## Architecture
-
-Rust workspace with Python and Java bindings:
-
-- `rust/lance/` - Main library implementing the columnar format
-- `rust/lance-core/` - Core types, traits, and utilities
-- `rust/lance-arrow/` - Apache Arrow integration layer
-- `rust/lance-encoding/` - Data encoding and compression algorithms
-- `rust/lance-file/` - File format reading/writing
-- `rust/lance-index/` - Vector and scalar indexing
-- `rust/lance-io/` - I/O operations and object store integration
-- `rust/lance-linalg/` - Linear algebra for vector search
-- `rust/lance-table/` - Table format and operations
-- `rust/lance-geo/` - Geospatial data support
-- `rust/lance-datagen/` - Data generation for tests and benchmarks
-- `rust/lance-namespace/` / `rust/lance-namespace-impls/` - Namespace/catalog interfaces
-- `rust/lance-test-macros/` / `rust/lance-testing/` - Test infrastructure
-- `rust/lance-tools/` - CLI and developer tooling
-- `rust/examples/` - Sample binaries and demonstrations
-- `rust/compression/bitpacking/` / `rust/compression/fsst/` - Compression codecs
-- `rust/lance-datafusion/` - DataFusion integration (built separately)
-- `python/` - Python bindings (PyO3/maturin)
-- `java/` - Java bindings (JNI)
-
-Key technical traits: async-first (tokio), Arrow-native, versioned writes with manifest tracking, custom ML-optimized encodings, unified object store interface (local/S3/Azure/GCS).
-
 ## File Format Stability and Compatibility
 
 - Treat every file format marked stable as a durable compatibility contract. All changes to a stable format must preserve both backward and forward compatibility.

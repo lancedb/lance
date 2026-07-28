@@ -377,6 +377,7 @@ struct MutableBatch<F: FnOnce(Response) + Send> {
     num_bytes: u64,
     priority: u128,
     num_reqs: usize,
+    num_delivered: usize,
     err: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
     // When true, report 0 bytes consumed so the backpressure budget is unaffected
     bypass_backpressure: bool,
@@ -400,6 +401,7 @@ impl<F: FnOnce(Response) + Send> MutableBatch<F> {
             num_bytes: 0,
             priority,
             num_reqs,
+            num_delivered: 0,
             err: None,
             bypass_backpressure,
             io_queue,
@@ -413,9 +415,16 @@ impl<F: FnOnce(Response) + Send> MutableBatch<F> {
 // data.
 impl<F: FnOnce(Response) + Send> Drop for MutableBatch<F> {
     fn drop(&mut self) {
-        // If we have an error, return that.  Otherwise return the data
-        let result = if self.err.is_some() {
-            Err(Error::wrapped(self.err.take().unwrap()))
+        // If we have an error, return that. Otherwise return the data, as long as the I/O requests have been processed.
+        let result = if let Some(err) = self.err.take() {
+            Err(Error::wrapped(err))
+        } else if self.num_delivered < self.data_buffers.len() {
+            // This usually happens on tokio runtime shutdown
+            Err(Error::io(format!(
+                "I/O request was dropped before completion ({} of {} reads delivered)",
+                self.num_delivered,
+                self.data_buffers.len()
+            )))
         } else {
             let mut data = Vec::new();
             std::mem::swap(&mut data, &mut self.data_buffers);
@@ -453,6 +462,7 @@ impl<F: FnOnce(Response) + Send> DataSink for MutableBatch<F> {
     // Called by worker tasks to add data to the MutableBatch
     fn deliver_data(&mut self, data: DataChunk) {
         self.num_bytes += data.num_bytes;
+        self.num_delivered += 1;
         match data.data {
             Ok(data_bytes) => {
                 self.data_buffers[data.task_idx] = data_bytes;
@@ -1416,6 +1426,29 @@ mod tests {
             .collect();
 
         assert_eq!(order, vec![(5, true), (20, true), (1, false), (10, false)]);
+    }
+
+    #[test]
+    fn test_batch_with_undelivered_slot_is_error() {
+        let response = Arc::new(Mutex::new(None));
+        let response_clone = response.clone();
+        let io_queue = Arc::new(IoQueue::new(1, 1024, IoStats::new()));
+        let batch = MutableBatch::new(
+            move |rsp| *response_clone.lock().unwrap() = Some(rsp),
+            2, // num_data_buffers
+            0, // priority
+            2, // num_reqs
+            false,
+            io_queue,
+        );
+        drop(batch);
+
+        let mut rsp = response.lock().unwrap().take().unwrap();
+        let data = rsp.data.take().unwrap();
+        assert!(
+            data.is_err(),
+            "undelivered slot must yield an error, got {data:?}",
+        );
     }
 
     #[tokio::test]

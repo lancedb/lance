@@ -344,6 +344,7 @@ mod tests {
                     }
                 }
                 crate::format::pb21::page_layout::Layout::BlobLayout(_) => {}
+                crate::format::pb21::page_layout::Layout::SparseLayout(_) => {}
             }
         }
 

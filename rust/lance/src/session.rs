@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use lance_core::cache::{CacheBackend, CacheKeyIterator, LanceCache};
+use lance_core::cache::{CacheBackend, CacheKeyIterator, LanceCache, QuickCacheBackend};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 use lance_index::IndexType;
@@ -95,8 +95,10 @@ impl Session {
     ///
     /// Parameters:
     ///
-    /// - ***index_cache_size***: the size of the index cache.
-    /// - ***metadata_cache_size***: the size of the metadata cache.
+    /// - ***index_cache_size***: the size of the index cache, backed by
+    ///   [`QuickCacheBackend`].
+    /// - ***metadata_cache_size***: the size of the metadata cache, backed by
+    ///   [`QuickCacheBackend`].
     /// - ***store_registry***: the object store registry to use when opening
     ///   datasets. This determines which schemes are available, and also allows
     ///   re-using object stores.
@@ -106,8 +108,12 @@ impl Session {
         store_registry: Arc<ObjectStoreRegistry>,
     ) -> Self {
         Self {
-            index_cache: GlobalIndexCache(LanceCache::with_capacity(index_cache_size)),
-            metadata_cache: GlobalMetadataCache(LanceCache::with_capacity(metadata_cache_size)),
+            index_cache: GlobalIndexCache(LanceCache::with_backend(Arc::new(
+                QuickCacheBackend::with_capacity(index_cache_size),
+            ))),
+            metadata_cache: GlobalMetadataCache(LanceCache::with_backend(Arc::new(
+                QuickCacheBackend::with_capacity(metadata_cache_size),
+            ))),
             index_extensions: HashMap::new(),
             store_registry,
             spill_store: Arc::new(LocalSpillStore::default()),
@@ -117,7 +123,7 @@ impl Session {
     /// Create a session with a custom index cache backend.
     ///
     /// The provided backend will be used for caching index data. The metadata
-    /// cache will use the default Moka-based backend with the given capacity.
+    /// cache uses a [`QuickCacheBackend`] with the given capacity.
     pub fn with_index_cache_backend(
         index_cache_backend: Arc<dyn CacheBackend>,
         metadata_cache_size: usize,
@@ -125,7 +131,9 @@ impl Session {
     ) -> Self {
         Self {
             index_cache: GlobalIndexCache(LanceCache::with_backend(index_cache_backend)),
-            metadata_cache: GlobalMetadataCache(LanceCache::with_capacity(metadata_cache_size)),
+            metadata_cache: GlobalMetadataCache(LanceCache::with_backend(Arc::new(
+                QuickCacheBackend::with_capacity(metadata_cache_size),
+            ))),
             index_extensions: HashMap::new(),
             store_registry,
             spill_store: Arc::new(LocalSpillStore::default()),
