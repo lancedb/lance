@@ -2501,10 +2501,17 @@ impl ShardWriter {
         }
     }
 
-    /// Seal the active memtable so it's queued for L0 flush. No-op when
-    /// the active memtable is empty. Errors in WAL-only mode or if this
-    /// writer has been fenced by a successor. Pair with
-    /// [`Self::wait_for_flush_drain`] to wait for the queued flush.
+    /// Seal the active memtable so it's queued for L0 flush. `None` when
+    /// the active memtable was empty (a no-op seal). Errors in WAL-only
+    /// mode or if this writer has been fenced by a successor.
+    ///
+    /// The returned [`SealedGeneration`] is what makes a *bounded* wait
+    /// possible: a caller that needs "everything written before my seal is
+    /// in L0" can wait on this one generation
+    /// (`ShardManifest::current_generation` exceeding it) instead of
+    /// [`Self::wait_for_flush_drain`], which loops until the frozen set is
+    /// empty and therefore also waits on every memtable frozen *while it
+    /// waits*. Under sustained writes that set may never empty.
     ///
     /// Beyond test setup where deterministic flush points are required,
     /// this is the primary lever for callers that need to drive flushes
@@ -2514,7 +2521,7 @@ impl ShardWriter {
     /// the next epoch starts with no replayable entries from the old
     /// layout.
     #[instrument(name = "sw_force_seal_active", level = "info", skip_all, fields(shard_id = %self.config.shard_id, epoch = self.epoch))]
-    pub async fn force_seal_active(&self) -> Result<()> {
+    pub async fn force_seal_active(&self) -> Result<Option<SealedGeneration>> {
         match &self.mode {
             WriterMode::MemTable {
                 state,
@@ -2525,10 +2532,14 @@ impl ShardWriter {
                 self.wal_flusher.check_poisoned()?;
                 let mut state = state.write().await;
                 if state.memtable.batch_count() == 0 {
-                    return Ok(());
+                    return Ok(None);
                 }
+                let sealed = SealedGeneration {
+                    generation: state.memtable.generation(),
+                    rows: state.memtable.row_count(),
+                };
                 writer_state.freeze_memtable(&mut state)?;
-                Ok(())
+                Ok(Some(sealed))
             }
             WriterMode::WalOnly { .. } => Err(Error::invalid_input(
                 "force_seal_active not available in WAL-only mode (no MemTable)",
@@ -2833,6 +2844,17 @@ pub struct MemTableStats {
 pub struct WalStats {
     /// Next WAL entry position to be used.
     pub next_wal_entry_position: u64,
+}
+
+/// What one [`ShardWriter::force_seal_active`] call sealed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SealedGeneration {
+    /// Generation number of the memtable that was frozen. The shard
+    /// manifest covers it once `current_generation` exceeds it — that is
+    /// the predicate a bounded post-seal wait should use.
+    pub generation: u64,
+    /// Rows the sealed memtable held.
+    pub rows: usize,
 }
 
 /// The oldest store that still owes the WAL an append, or `None` when everything
