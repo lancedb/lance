@@ -3,7 +3,10 @@
 
 //! Fixtures shared between the tests of several submodules.
 
-use crate::format::{DataStorageFormat, Fragment, IndexMetadata, Manifest, ManifestBuildConfig};
+use crate::format::overlay::{DataOverlayFile, OverlayCoverage};
+use crate::format::{
+    DataFile, DataStorageFormat, Fragment, IndexMetadata, Manifest, ManifestBuildConfig,
+};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use chrono::Utc;
 use lance_core::datatypes::Schema as LanceSchema;
@@ -49,5 +52,13 @@ pub fn sample_index_metadata(name: &str) -> IndexMetadata {
         created_at: Some(Utc::now()),
         base_id: None,
         files: None,
+    }
+}
+
+pub fn overlay_with_field(field: i32, committed_version: u64) -> DataOverlayFile {
+    DataOverlayFile {
+        data_file: DataFile::new_legacy_from_fields("o.lance", vec![field], None),
+        coverage: OverlayCoverage::dense(roaring::RoaringBitmap::from_iter([0u32])),
+        committed_version,
     }
 }
