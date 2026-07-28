@@ -156,7 +156,7 @@ pub(crate) async fn write_transaction_file(
 }
 
 /// Transactions serialized above this size are not inlined into the manifest.
-pub(crate) const MAX_INLINE_TRANSACTION_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_INLINE_TRANSACTION_BYTES: usize = 20 * 1024 * 1024;
 
 #[allow(clippy::too_many_arguments)]
 async fn do_commit_new_dataset(
