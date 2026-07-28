@@ -700,7 +700,8 @@ pub struct InvertedIndex {
     pub(crate) partitions: Vec<Arc<InvertedPartition>>,
     corpus_stats: Arc<OnceCell<(u64, usize)>>,
     prewarm_state: Arc<Mutex<InvertedPrewarmState>>,
-    /// One-way publication: document projections never leave memory after loading.
+    /// Optimistic fast-path hint. Cache eviction can make it stale; the
+    /// resident resolver clears it when a weak projection upgrade misses.
     document_projections_resident: Arc<AtomicBool>,
     // Fragments which are contained in the index, but no longer in the dataset.
     // These should be pruned at search time since we don't prune them at update time.
@@ -1291,12 +1292,7 @@ impl InvertedIndex {
         if self.document_projections_resident.load(Ordering::Acquire) {
             return true;
         }
-        let resident = self.partitions.iter().all(|partition| {
-            partition
-                .docs
-                .modern()
-                .is_some_and(|documents| documents.projection_loaded())
-        });
+        let resident = self.document_projections_resident_now();
         if resident {
             self.document_projections_resident
                 .store(true, Ordering::Release);
@@ -1304,12 +1300,26 @@ impl InvertedIndex {
         resident
     }
 
+    fn document_projections_resident_now(&self) -> bool {
+        self.partitions.iter().all(|partition| {
+            partition
+                .docs
+                .modern()
+                .is_some_and(|documents| documents.projection_resident())
+        })
+    }
+
     async fn bm25_search_modern_resident(
         &self,
         request: ModernSearchRequest<'_>,
     ) -> Result<(Vec<u64>, Vec<f32>)> {
         let ranked = self.bm25_search_modern_candidates(request).await?;
-        self.resolve_resident_modern_candidates(ranked)
+        if let Some(result) = self.resolve_resident_modern_candidates(&ranked)? {
+            return Ok(result);
+        }
+        self.document_projections_resident
+            .store(false, Ordering::Release);
+        self.resolve_deferred_modern_candidates(ranked).await
     }
 
     async fn bm25_search_modern_deferred(
@@ -1524,33 +1534,44 @@ impl InvertedIndex {
 
     fn resolve_resident_modern_candidates(
         &self,
-        ranked: Vec<Reverse<ScoredPartitionDoc>>,
-    ) -> Result<(Vec<u64>, Vec<f32>)> {
-        let mut addresses = Vec::with_capacity(ranked.len());
-        let mut scores = Vec::with_capacity(ranked.len());
-        for Reverse(candidate) in ranked {
+        ranked: &[Reverse<ScoredPartitionDoc>],
+    ) -> Result<Option<(Vec<u64>, Vec<f32>)>> {
+        let mut addresses = vec![0; ranked.len()];
+        let mut by_partition = BTreeMap::<usize, Vec<(usize, DocId)>>::new();
+        for (rank, Reverse(candidate)) in ranked.iter().enumerate() {
             let partition_ordinal = candidate.document.partition_ordinal();
             let doc_id = candidate.document.doc_id;
+            by_partition
+                .entry(partition_ordinal)
+                .or_default()
+                .push((rank, doc_id));
+        }
+        for (partition_ordinal, entries) in by_partition {
             let documents = self
                 .partitions
                 .get(partition_ordinal)
                 .and_then(|partition| partition.docs.modern())
                 .ok_or_else(|| {
                     Error::internal(format!(
-                        "resident FTS candidate DocId {} references missing modern partition ordinal {partition_ordinal}",
-                        doc_id.get()
+                        "resident FTS candidates reference missing modern partition ordinal {partition_ordinal}"
                     ))
                 })?;
-            let address = documents.cached_row_address(doc_id)?.ok_or_else(|| {
-                Error::internal(format!(
-                    "resident FTS candidate DocId {} in partition ordinal {partition_ordinal} lost its cached address projection",
-                    doc_id.get()
-                ))
-            })?;
-            addresses.push(address.into());
-            scores.push(candidate.score.0);
+            let doc_ids = entries
+                .iter()
+                .map(|(_, doc_id)| *doc_id)
+                .collect::<Vec<_>>();
+            let Some(resolved) = documents.cached_row_addresses(&doc_ids)? else {
+                return Ok(None);
+            };
+            for ((rank, _), address) in entries.into_iter().zip(resolved) {
+                addresses[rank] = address;
+            }
         }
-        Ok((addresses, scores))
+        let scores = ranked
+            .iter()
+            .map(|Reverse(candidate)| candidate.score.0)
+            .collect();
+        Ok(Some((addresses, scores)))
     }
 
     async fn resolve_deferred_modern_candidates(
@@ -2010,12 +2031,19 @@ fn prewarm_chunk_ranges(
 impl InvertedIndex {
     pub async fn prewarm_with_options(&self, options: &FtsPrewarmOptions) -> Result<()> {
         let mut state = self.prewarm_state.lock().await;
-        if state.satisfies(options.with_position) {
+        if state.satisfies(options.with_position)
+            && (self.is_legacy() || self.document_projections_resident_now())
+        {
             return Ok(());
         }
-        self.prewarm_query_state(options.with_position).await?;
+        let with_position = options.with_position || state.positions_ready;
+        state.query_ready = false;
+        state.positions_ready = false;
+        self.document_projections_resident
+            .store(false, Ordering::Release);
+        self.prewarm_query_state(with_position).await?;
         state.query_ready = true;
-        state.positions_ready |= options.with_position;
+        state.positions_ready = with_position;
         Ok(())
     }
 
@@ -8188,7 +8216,7 @@ mod tests {
     use crate::scalar::inverted::document_tokenizer::DocType;
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use futures::stream;
-    use lance_core::cache::LanceCache;
+    use lance_core::cache::{LanceCache, QuickCacheBackend};
     use lance_core::utils::tempfile::TempObjDir;
     use lance_io::object_store::ObjectStore;
 
@@ -10655,7 +10683,9 @@ mod tests {
             .unwrap();
         writer.finish_with_metadata(metadata).await.unwrap();
 
-        let cache = Arc::new(LanceCache::with_capacity(4096));
+        let cache = Arc::new(LanceCache::with_backend(Arc::new(
+            QuickCacheBackend::with_capacity(4096),
+        )));
         let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
             .await
             .unwrap();
@@ -10703,6 +10733,31 @@ mod tests {
                 CompressedPositionStorage::LegacyPerDoc(_)
             ),
             "positions should be stored in the dedicated position cache"
+        );
+
+        drop(positions);
+        drop(group);
+        cache.clear().await;
+        assert!(
+            inverted_list
+                .index_cache
+                .get_with_key(&PositionKey { token_id: 0 })
+                .await
+                .is_none()
+        );
+
+        index
+            .prewarm_with_options(&FtsPrewarmOptions::default())
+            .await
+            .unwrap();
+        assert!(index.prewarm_state.lock().await.satisfies(true));
+        assert!(
+            inverted_list
+                .index_cache
+                .get_with_key(&PositionKey { token_id: 0 })
+                .await
+                .is_some(),
+            "re-prewarm after eviction must preserve the strongest requested mode"
         );
     }
 
@@ -10979,7 +11034,7 @@ mod tests {
     async fn load_global_scoring_test_index(
         first_partition_has_impacts: bool,
         second_partition_has_impacts: bool,
-    ) -> (TempObjDir, Arc<InvertedIndex>) {
+    ) -> (TempObjDir, Arc<LanceCache>, Arc<InvertedIndex>) {
         let tmpdir = TempObjDir::default();
         let store = Arc::new(LanceIndexStore::new(
             ObjectStore::local().into(),
@@ -11028,9 +11083,13 @@ mod tests {
         }
 
         write_test_metadata(&store, vec![0, 1], InvertedIndexParams::default()).await;
-        let cache = LanceCache::with_capacity(4096);
-        let index = InvertedIndex::load(store, None, &cache).await.unwrap();
-        (tmpdir, index)
+        let cache = Arc::new(LanceCache::with_backend(Arc::new(
+            QuickCacheBackend::with_capacity(4096),
+        )));
+        let index = InvertedIndex::load(store, None, cache.as_ref())
+            .await
+            .unwrap();
+        (tmpdir, cache, index)
     }
 
     #[tokio::test]
@@ -11102,7 +11161,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_prewarmed_modern_search_uses_resident_address_projection() {
-        let (_tmpdir, index) = load_global_scoring_test_index(true, true).await;
+        let (_tmpdir, cache, index) = load_global_scoring_test_index(true, true).await;
         let tokens = Arc::new(Tokens::new(vec!["alpha".to_owned()], DocType::Text));
         let params = Arc::new(FtsSearchParams::new().with_limit(Some(2)));
 
@@ -11159,8 +11218,8 @@ mod tests {
 
         let resident = index
             .bm25_search(
-                tokens,
-                params,
+                tokens.clone(),
+                params.clone(),
                 Operator::Or,
                 Arc::new(NoFilter),
                 Arc::new(NoOpMetricsCollector),
@@ -11172,11 +11231,66 @@ mod tests {
         assert_eq!(resident.0.len(), 2);
         assert!(resident.0.contains(&100));
         assert!(resident.0.contains(&200));
+
+        cache.clear().await;
+        assert!(index.document_projections_resident.load(Ordering::Acquire));
+        assert_eq!(cache.size().await, 0);
+        let resident_address_owners = index
+            .partitions
+            .iter()
+            .map(|partition| {
+                partition
+                    .docs
+                    .modern()
+                    .unwrap()
+                    .address_buffer_handle()
+                    .strong_count()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(resident_address_owners, vec![0, 0]);
+        assert!(
+            index
+                .partitions
+                .iter()
+                .all(|partition| { !partition.docs.modern().unwrap().projection_resident() })
+        );
+
+        let after_eviction = index
+            .bm25_search(
+                tokens.clone(),
+                params.clone(),
+                Operator::Or,
+                Arc::new(NoFilter),
+                Arc::new(NoOpMetricsCollector),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(after_eviction, deferred);
+        assert!(!index.document_projections_resident.load(Ordering::Acquire));
+
+        cache.clear().await;
+        index.prewarm_with_options(&prewarm_options).await.unwrap();
+        assert!(index.document_projections_resident_now());
+        assert!(index.document_projections_resident.load(Ordering::Acquire));
+
+        let re_prewarms_after_eviction = index
+            .bm25_search(
+                tokens,
+                params,
+                Operator::Or,
+                Arc::new(NoFilter),
+                Arc::new(NoOpMetricsCollector),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(re_prewarms_after_eviction, deferred);
     }
 
     #[tokio::test]
     async fn test_resident_modern_search_loads_partition_stats_without_global_stats() {
-        let (_tmpdir, index) = load_global_scoring_test_index(true, false).await;
+        let (_tmpdir, _cache, index) = load_global_scoring_test_index(true, false).await;
         assert!(index.corpus_stats.get().is_none());
         assert!(
             index
@@ -11186,7 +11300,13 @@ mod tests {
         );
 
         for partition in &index.partitions {
-            partition.docs.modern().unwrap().projection().await.unwrap();
+            partition
+                .docs
+                .modern()
+                .unwrap()
+                .address_projection()
+                .await
+                .unwrap();
         }
         assert!(index.has_resident_document_projections());
 
@@ -11263,7 +11383,7 @@ mod tests {
         // Partition 0 wins under its local corpus statistics but loses under
         // the global statistics. If its local score escapes into the shared
         // floor, partition 1 will incorrectly prune the real global winner.
-        let (_tmpdir, index) = load_global_scoring_test_index(true, true).await;
+        let (_tmpdir, _cache, index) = load_global_scoring_test_index(true, true).await;
         let first_partition = index
             .partitions
             .iter()
@@ -11360,7 +11480,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_mixed_impact_and_legacy_partitions_use_global_final_scores() {
-        let (_tmpdir, index) = load_global_scoring_test_index(true, false).await;
+        let (_tmpdir, _cache, index) = load_global_scoring_test_index(true, false).await;
 
         let impact_partition = index
             .partitions
@@ -11421,7 +11541,7 @@ mod tests {
     async fn test_two_legacy_partitions_keep_private_thresholds() {
         // Legacy BM25 scores use partition-local statistics, so sharing one
         // pruning floor across partitions can discard the global winner.
-        let (_tmpdir, index) = load_global_scoring_test_index(false, false).await;
+        let (_tmpdir, _cache, index) = load_global_scoring_test_index(false, false).await;
         for partition in index.partitions.iter() {
             let posting = partition
                 .inverted_list

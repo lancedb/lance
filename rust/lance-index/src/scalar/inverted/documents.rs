@@ -8,8 +8,9 @@
 //! never has to infer which value a numeric slot represents.
 
 use std::borrow::Cow;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 
+use arc_swap::ArcSwapWeak;
 use arrow::buffer::ScalarBuffer;
 use arrow_array::{Array, RecordBatch, UInt32Array, UInt64Array};
 use lance_core::cache::{CacheKey, WeakLanceCache};
@@ -56,9 +57,9 @@ pub(super) struct PartitionStats {
 
 /// One partition's immutable `DocId -> row address` column.
 ///
-/// Cold top-k resolution borrows the independently weighed cache entry without
-/// retaining another owned copy. Explicit prewarm shares its buffer with the
-/// resident address projection so prewarmed queries stay synchronous.
+/// The independently weighed cache entry is the only long-lived owner. The
+/// address projection keeps a weak handle and query-local guards upgrade it,
+/// so cache eviction releases the column once in-flight queries finish.
 #[derive(Debug)]
 pub(super) struct CachedDocRowIds {
     pub(crate) row_ids: Arc<UInt64Array>,
@@ -192,22 +193,15 @@ impl DocLengths {
 
 #[derive(Debug)]
 enum AddressValues {
-    Shared(ScalarBuffer<u64>),
-    Owned(Vec<u64>),
+    Shared { len: usize },
+    Owned(Arc<Vec<u64>>),
 }
 
 impl AddressValues {
     fn len(&self) -> usize {
         match self {
-            Self::Shared(values) => values.len(),
+            Self::Shared { len } => *len,
             Self::Owned(values) => values.len(),
-        }
-    }
-
-    fn get(&self, index: usize) -> u64 {
-        match self {
-            Self::Shared(values) => values[index],
-            Self::Owned(values) => values[index],
         }
     }
 }
@@ -215,7 +209,7 @@ impl AddressValues {
 impl DeepSizeOf for AddressValues {
     fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         match self {
-            Self::Shared(values) => values.deep_size_of_children(context),
+            Self::Shared { .. } => 0,
             Self::Owned(values) => values.deep_size_of_children(context),
         }
     }
@@ -243,25 +237,26 @@ impl DeepSizeOf for AddressDocIdLookup {
 }
 
 impl AddressDocIdLookup {
-    fn build(projection: &VersionAddressProjection) -> Self {
-        if projection.live_docs.is_none()
-            && (1..projection.addresses.len())
-                .all(|index| projection.addresses.get(index - 1) <= projection.addresses.get(index))
+    fn build(projection: &ResidentAddressProjection) -> Self {
+        if projection.projection.live_docs.is_none()
+            && (1..projection.len()).all(|index| {
+                projection.stored_address(index - 1) <= projection.stored_address(index)
+            })
         {
             return Self::Identity;
         }
 
-        let mut doc_ids = match projection.live_docs.as_ref() {
+        let mut doc_ids = match projection.projection.live_docs.as_ref() {
             Some(live_docs) => live_docs.iter().collect::<Vec<_>>(),
-            None => (0..projection.addresses.len() as u32).collect::<Vec<_>>(),
+            None => (0..projection.len() as u32).collect::<Vec<_>>(),
         };
-        doc_ids.sort_unstable_by_key(|&doc_id| projection.addresses.get(doc_id as usize));
+        doc_ids.sort_unstable_by_key(|&doc_id| projection.stored_address(doc_id as usize));
         Self::Sorted(doc_ids.into_boxed_slice())
     }
 
-    fn len(&self, projection: &VersionAddressProjection) -> usize {
+    fn len(&self, projection: &ResidentAddressProjection) -> usize {
         match self {
-            Self::Identity => projection.addresses.len(),
+            Self::Identity => projection.len(),
             Self::Sorted(doc_ids) => doc_ids.len(),
         }
     }
@@ -273,13 +268,13 @@ impl AddressDocIdLookup {
         }
     }
 
-    fn address_at(&self, projection: &VersionAddressProjection, position: usize) -> u64 {
-        projection.addresses.get(self.doc_id_at(position) as usize)
+    fn address_at(&self, projection: &ResidentAddressProjection, position: usize) -> u64 {
+        projection.stored_address(self.doc_id_at(position) as usize)
     }
 
     fn partition_point(
         &self,
-        projection: &VersionAddressProjection,
+        projection: &ResidentAddressProjection,
         mut predicate: impl FnMut(u64) -> bool,
     ) -> usize {
         let mut left = 0;
@@ -297,7 +292,7 @@ impl AddressDocIdLookup {
 
     fn insert_address_range(
         &self,
-        projection: &VersionAddressProjection,
+        projection: &ResidentAddressProjection,
         start: u64,
         end: u64,
         selected: &mut RoaringBitmap,
@@ -311,7 +306,7 @@ impl AddressDocIdLookup {
 
     fn matching_doc_ids(
         &self,
-        projection: &VersionAddressProjection,
+        projection: &ResidentAddressProjection,
         addresses: &RowAddrTreeMap,
     ) -> RoaringBitmap {
         let mut selected = RoaringBitmap::new();
@@ -338,7 +333,7 @@ impl AddressDocIdLookup {
 
     fn visibility(
         &self,
-        projection: &VersionAddressProjection,
+        projection: &ResidentAddressProjection,
         mask: &RowAddrMask,
     ) -> DocVisibility {
         match mask {
@@ -363,6 +358,20 @@ pub(super) struct VersionAddressProjection {
     /// slot but are absent from this bitmap.
     live_docs: Option<RoaringBitmap>,
     doc_ids_by_address: OnceCell<Arc<AddressDocIdLookup>>,
+}
+
+/// A query-scoped projection guard. Shared addresses remain alive only while
+/// this guard or their independently weighed cache entry owns the Arrow column.
+#[derive(Debug, Clone)]
+pub(super) struct ResidentAddressProjection {
+    projection: Arc<VersionAddressProjection>,
+    addresses: ResidentAddressValues,
+}
+
+#[derive(Debug, Clone)]
+enum ResidentAddressValues {
+    Shared(Arc<UInt64Array>),
+    Owned(Arc<Vec<u64>>),
 }
 
 impl DeepSizeOf for VersionAddressProjection {
@@ -403,7 +412,7 @@ impl VersionAddressProjection {
 
         let Some(remapper) = remapper else {
             return Ok(Self {
-                addresses: AddressValues::Shared(raw.values().clone()),
+                addresses: AddressValues::Shared { len: raw.len() },
                 live_docs: None,
                 doc_ids_by_address: OnceCell::new(),
             });
@@ -425,32 +434,68 @@ impl VersionAddressProjection {
             }
         }
         Ok(Self {
-            addresses: AddressValues::Owned(addresses),
+            addresses: AddressValues::Owned(Arc::new(addresses)),
             live_docs: Some(live_docs),
             doc_ids_by_address: OnceCell::new(),
         })
     }
 
+    fn resident(
+        self: &Arc<Self>,
+        shared_addresses: Option<Arc<UInt64Array>>,
+    ) -> Option<ResidentAddressProjection> {
+        match &self.addresses {
+            AddressValues::Shared { len } => {
+                let shared_addresses = shared_addresses?;
+                debug_assert_eq!(shared_addresses.len(), *len);
+                Some(ResidentAddressProjection {
+                    projection: self.clone(),
+                    addresses: ResidentAddressValues::Shared(shared_addresses),
+                })
+            }
+            AddressValues::Owned(values) => Some(ResidentAddressProjection {
+                projection: self.clone(),
+                addresses: ResidentAddressValues::Owned(values.clone()),
+            }),
+        }
+    }
+}
+
+impl ResidentAddressProjection {
+    fn len(&self) -> usize {
+        self.projection.addresses.len()
+    }
+
+    fn stored_address(&self, index: usize) -> u64 {
+        match &self.addresses {
+            ResidentAddressValues::Shared(values) => values.value(index),
+            ResidentAddressValues::Owned(values) => values[index],
+        }
+    }
+
     fn address(&self, doc_id: DocId) -> Option<u64> {
         if self
+            .projection
             .live_docs
             .as_ref()
             .is_some_and(|live| !live.contains(doc_id.get()))
         {
             None
         } else {
-            Some(self.addresses.get(doc_id.as_usize()))
+            Some(self.stored_address(doc_id.as_usize()))
         }
     }
 
     fn live_doc_ids(&self) -> RoaringBitmap {
-        self.live_docs
+        self.projection
+            .live_docs
             .clone()
-            .unwrap_or_else(|| (0..self.addresses.len() as u32).collect())
+            .unwrap_or_else(|| (0..self.len() as u32).collect())
     }
 
-    async fn doc_ids_by_address(self: &Arc<Self>) -> Result<Arc<AddressDocIdLookup>> {
-        self.doc_ids_by_address
+    async fn doc_ids_by_address(&self) -> Result<Arc<AddressDocIdLookup>> {
+        self.projection
+            .doc_ids_by_address
             .get_or_try_init(|| {
                 let projection = self.clone();
                 async move {
@@ -462,12 +507,9 @@ impl VersionAddressProjection {
             .cloned()
     }
 
-    async fn materialize_visibility(
-        self: &Arc<Self>,
-        mask: Arc<RowAddrMask>,
-    ) -> Result<DocVisibility> {
+    async fn materialize_visibility(self, mask: Arc<RowAddrMask>) -> Result<DocVisibility> {
         let lookup = self.doc_ids_by_address().await?;
-        let projection = self.clone();
+        let projection = self;
         spawn_cpu(move || Result::Ok(lookup.visibility(&projection, &mask))).await
     }
 }
@@ -478,7 +520,7 @@ pub(super) enum DocVisibility {
     All,
     Selected(RoaringBitmap),
     Filtered {
-        projection: Arc<VersionAddressProjection>,
+        projection: ResidentAddressProjection,
         mask: Arc<RowAddrMask>,
     },
 }
@@ -531,6 +573,7 @@ pub(super) struct PartitionDocuments {
     remapper: Option<Arc<dyn RowIdRemapper>>,
     lengths: OnceCell<Arc<DocLengths>>,
     projection: OnceCell<Arc<VersionAddressProjection>>,
+    shared_addresses: ArcSwapWeak<UInt64Array>,
     prewarm_complete: OnceCell<()>,
 }
 
@@ -683,6 +726,7 @@ impl PartitionDocuments {
             remapper,
             lengths: OnceCell::new(),
             projection: OnceCell::new(),
+            shared_addresses: ArcSwapWeak::from(Weak::new()),
             prewarm_complete: OnceCell::new(),
         })
     }
@@ -696,8 +740,18 @@ impl PartitionDocuments {
         self.lengths.initialized()
     }
 
+    #[cfg(test)]
     pub(crate) fn projection_loaded(&self) -> bool {
         self.projection.initialized()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn address_buffer_handle(&self) -> Weak<UInt64Array> {
+        self.shared_addresses.load_full()
+    }
+
+    pub(crate) fn projection_resident(&self) -> bool {
+        self.resident_address_projection().is_some()
     }
 
     pub(crate) fn query_ready(&self) -> bool {
@@ -710,6 +764,7 @@ impl PartitionDocuments {
                 .projection
                 .get()
                 .is_some_and(|projection| projection.doc_ids_by_address.initialized())
+            && self.projection_resident()
     }
 
     async fn reader(&self) -> Result<Arc<dyn IndexReader>> {
@@ -751,7 +806,9 @@ impl PartitionDocuments {
                 },
             )
             .await?;
-        Ok(cached.row_ids.clone())
+        let row_ids = cached.row_ids.clone();
+        self.shared_addresses.store(Arc::downgrade(&row_ids));
+        Ok(row_ids)
     }
 
     fn lengths_from_batch(&self, batch: &RecordBatch) -> Result<Arc<DocLengths>> {
@@ -809,11 +866,25 @@ impl PartitionDocuments {
         self.lengths.get().cloned()
     }
 
-    pub(crate) async fn projection(&self) -> Result<Arc<VersionAddressProjection>> {
-        self.projection
+    fn resident_address_projection(&self) -> Option<ResidentAddressProjection> {
+        let projection = self.projection.get()?.clone();
+        let shared_addresses = match &projection.addresses {
+            AddressValues::Shared { .. } => self.shared_addresses.load().upgrade(),
+            AddressValues::Owned(_) => None,
+        };
+        projection.resident(shared_addresses)
+    }
+
+    pub(crate) async fn address_projection(&self) -> Result<ResidentAddressProjection> {
+        if let Some(projection) = self.resident_address_projection() {
+            return Ok(projection);
+        }
+
+        let row_ids = self.row_ids_column().await?;
+        let projection = self
+            .projection
             .get_or_try_init(|| async {
-                let row_ids = self.row_ids_column().await?;
-                Ok(Arc::new(VersionAddressProjection::try_new(
+                Result::Ok(Arc::new(VersionAddressProjection::try_new(
                     row_ids.as_ref(),
                     self.num_docs,
                     self.remapper.as_deref(),
@@ -821,7 +892,13 @@ impl PartitionDocuments {
                 )?))
             })
             .await
-            .cloned()
+            .cloned()?;
+        projection.resident(Some(row_ids)).ok_or_else(|| {
+            Error::internal(format!(
+                "address projection for {} could not bind its cache-managed ROW_ID column",
+                self.path
+            ))
+        })
     }
 
     pub(crate) async fn visibility(
@@ -833,7 +910,7 @@ impl PartitionDocuments {
             return Ok(visibility);
         }
 
-        let projection = self.projection().await?;
+        let projection = self.address_projection().await?;
         if mask.is_select_all() {
             return Ok(DocVisibility::Selected(projection.live_doc_ids()));
         }
@@ -857,7 +934,7 @@ impl PartitionDocuments {
             return Some(DocVisibility::All);
         }
 
-        let projection = self.projection.get()?.clone();
+        let projection = self.resident_address_projection()?;
         if mask.is_select_all() {
             return Some(DocVisibility::Selected(projection.live_doc_ids()));
         }
@@ -873,6 +950,23 @@ impl PartitionDocuments {
         if doc_ids.is_empty() {
             return Ok(Vec::new());
         }
+        self.validate_doc_ids(doc_ids)?;
+        if let Some(projection) = self.resident_address_projection() {
+            return self.resolve_projected_addresses(&projection, doc_ids);
+        }
+        if self.remapper.is_some() {
+            let projection = self.address_projection().await?;
+            return self.resolve_projected_addresses(&projection, doc_ids);
+        }
+
+        let row_ids = self.row_ids_column().await?;
+        Ok(doc_ids
+            .iter()
+            .map(|doc_id| row_ids.value(doc_id.as_usize()))
+            .collect())
+    }
+
+    fn validate_doc_ids(&self, doc_ids: &[DocId]) -> Result<()> {
         for doc_id in doc_ids {
             if doc_id.as_usize() >= self.num_docs {
                 return Err(corrupt_docs(
@@ -885,39 +979,36 @@ impl PartitionDocuments {
                 ));
             }
         }
-        if let Some(projection) = self.projection.get() {
-            return doc_ids
-                .iter()
-                .map(|&doc_id| {
-                    projection.address(doc_id).ok_or_else(|| {
-                        corrupt_docs(
-                            &self.path,
-                            format!("candidate DocId {} is not live", doc_id.get()),
-                        )
-                    })
-                })
-                .collect();
-        }
-        if self.remapper.is_some() {
-            let projection = self.projection().await?;
-            return doc_ids
-                .iter()
-                .map(|&doc_id| {
-                    projection.address(doc_id).ok_or_else(|| {
-                        corrupt_docs(
-                            &self.path,
-                            format!("candidate DocId {} is not live", doc_id.get()),
-                        )
-                    })
-                })
-                .collect();
-        }
+        Ok(())
+    }
 
-        let row_ids = self.row_ids_column().await?;
-        Ok(doc_ids
+    fn resolve_projected_addresses(
+        &self,
+        projection: &ResidentAddressProjection,
+        doc_ids: &[DocId],
+    ) -> Result<Vec<u64>> {
+        doc_ids
             .iter()
-            .map(|doc_id| row_ids.value(doc_id.as_usize()))
-            .collect())
+            .map(|&doc_id| {
+                projection.address(doc_id).ok_or_else(|| {
+                    corrupt_docs(
+                        &self.path,
+                        format!("candidate DocId {} is not live", doc_id.get()),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    /// Resolve addresses synchronously when the cache-managed projection buffer
+    /// is resident. The returned `None` asks the caller to use the async reload path.
+    pub(crate) fn cached_row_addresses(&self, doc_ids: &[DocId]) -> Result<Option<Vec<u64>>> {
+        self.validate_doc_ids(doc_ids)?;
+        let Some(projection) = self.resident_address_projection() else {
+            return Ok(None);
+        };
+        self.resolve_projected_addresses(&projection, doc_ids)
+            .map(Some)
     }
 
     /// Estimated Arrow payload retained while loading this partition's cached
@@ -925,7 +1016,7 @@ impl PartitionDocuments {
     /// The estimate is used to cap cross-partition read concurrency; a single
     /// oversized partition is still allowed to make progress.
     pub(crate) fn estimated_address_read_bytes(&self, doc_ids: &[DocId]) -> usize {
-        if doc_ids.is_empty() || self.projection.initialized() {
+        if doc_ids.is_empty() || self.projection_resident() {
             return 0;
         }
         self.num_docs.saturating_mul(std::mem::size_of::<u64>())
@@ -934,33 +1025,6 @@ impl PartitionDocuments {
     /// Materialize the build-side table for rewrite/update operations.
     pub(crate) async fn load_build_docset(&self) -> Result<DocSet> {
         DocSet::load(self.reader().await?, false, self.remapper.clone()).await
-    }
-
-    /// Resolve one DocId synchronously when its current-version projection is resident.
-    pub(crate) fn cached_row_address(&self, doc_id: DocId) -> Result<Option<RowAddress>> {
-        let Some(projection) = self.projection.get() else {
-            return Ok(None);
-        };
-        if doc_id.as_usize() >= self.num_docs {
-            return Err(corrupt_docs(
-                &self.path,
-                format!(
-                    "candidate DocId {} is outside [0, {})",
-                    doc_id.get(),
-                    self.num_docs
-                ),
-            ));
-        }
-        projection
-            .address(doc_id)
-            .map(RowAddress::new_from_u64)
-            .map(Some)
-            .ok_or_else(|| {
-                corrupt_docs(
-                    &self.path,
-                    format!("candidate DocId {} is not live", doc_id.get()),
-                )
-            })
     }
 
     pub(crate) async fn prewarm(&self) -> Result<()> {
@@ -986,14 +1050,18 @@ impl PartitionDocuments {
                         self.remapper.as_deref(),
                         &self.path,
                     )?);
+                    let cached_row_ids = Arc::new(CachedDocRowIds {
+                        row_ids: row_ids.clone(),
+                    });
                     self.index_cache
                         .insert_with_key(
                             &DocRowIdsKey {
                                 partition_id: self.partition_id,
                             },
-                            Arc::new(CachedDocRowIds { row_ids }),
+                            cached_row_ids,
                         )
                         .await;
+                    self.shared_addresses.store(Arc::downgrade(&row_ids));
 
                     // A concurrent single-column request may win either OnceCell.
                     // Awaiting the accessors below joins that initialization without
@@ -1008,10 +1076,16 @@ impl PartitionDocuments {
                     Result::Ok(())
                 })
                 .await?;
-                self.projection().await?.doc_ids_by_address().await?;
+                self.address_projection()
+                    .await?
+                    .doc_ids_by_address()
+                    .await?;
                 Result::Ok(())
             })
             .await?;
+        if !self.projection_resident() {
+            self.address_projection().await?;
+        }
         Ok(())
     }
 }
@@ -1074,7 +1148,7 @@ mod tests {
     use arrow_array::{ArrayRef, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use async_trait::async_trait;
-    use lance_core::cache::LanceCache;
+    use lance_core::cache::{LanceCache, QuickCacheBackend};
     use lance_core::utils::tempfile::TempObjDir;
     use lance_io::object_store::ObjectStore;
     use lance_select::RowAddrTreeMap;
@@ -1289,6 +1363,21 @@ mod tests {
     fn test_store() -> (TempObjDir, Arc<LanceIndexStore>, Arc<LanceCache>) {
         let directory = TempObjDir::default();
         let cache = Arc::new(LanceCache::with_capacity(1024 * 1024));
+        test_store_with_cache(directory, cache)
+    }
+
+    fn eviction_test_store() -> (TempObjDir, Arc<LanceIndexStore>, Arc<LanceCache>) {
+        let directory = TempObjDir::default();
+        let cache = Arc::new(LanceCache::with_backend(Arc::new(
+            QuickCacheBackend::with_capacity(1024 * 1024),
+        )));
+        test_store_with_cache(directory, cache)
+    }
+
+    fn test_store_with_cache(
+        directory: TempObjDir,
+        cache: Arc<LanceCache>,
+    ) -> (TempObjDir, Arc<LanceIndexStore>, Arc<LanceCache>) {
         let store = Arc::new(LanceIndexStore::new(
             ObjectStore::local().into(),
             directory.clone(),
@@ -1433,11 +1522,12 @@ mod tests {
 
     #[test]
     fn live_documents_use_doc_ids() {
-        let projection = VersionAddressProjection {
-            addresses: AddressValues::Owned(vec![10, 20, 30]),
+        let projection = Arc::new(VersionAddressProjection {
+            addresses: AddressValues::Owned(Arc::new(vec![10, 20, 30])),
             live_docs: Some(RoaringBitmap::from_iter([0, 2])),
             doc_ids_by_address: OnceCell::new(),
-        };
+        });
+        let projection = projection.resident(None).unwrap();
         let selected = projection.live_doc_ids();
         assert_eq!(selected.iter().collect::<Vec<_>>(), vec![0, 2]);
     }
@@ -1452,6 +1542,7 @@ mod tests {
             VersionAddressProjection::try_new(&raw, 4, Some(&remapper), "docs")
                 .expect("valid projection"),
         );
+        let projection = projection.resident(None).unwrap();
 
         assert_eq!(projection.address(DocId::new(0)), Some(100));
         assert_eq!(projection.address(DocId::new(1)), None);
@@ -1465,6 +1556,7 @@ mod tests {
             100, 40,
         ])));
         let DocVisibility::Selected(selected) = projection
+            .clone()
             .materialize_visibility(allowed)
             .await
             .expect("valid allow-list")
@@ -1479,6 +1571,7 @@ mod tests {
             .expect("cached address lookup");
         let blocked = Arc::new(RowAddrMask::from_block(RowAddrTreeMap::from_iter([300])));
         let DocVisibility::Selected(selected) = projection
+            .clone()
             .materialize_visibility(blocked)
             .await
             .expect("valid block-list")
@@ -1499,15 +1592,16 @@ mod tests {
             u64::from(RowAddress::new_from_parts(fragment_id, row_offset))
         };
         let projection = Arc::new(VersionAddressProjection {
-            addresses: AddressValues::Owned(vec![
+            addresses: AddressValues::Owned(Arc::new(vec![
                 row_address(2, 5),
                 row_address(1, 2),
                 row_address(1, 2),
                 row_address(1, 4),
-            ]),
+            ])),
             live_docs: None,
             doc_ids_by_address: OnceCell::new(),
         });
+        let projection = projection.resident(None).unwrap();
 
         let allowed = Arc::new(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter([
             row_address(1, 2),
@@ -1515,6 +1609,7 @@ mod tests {
             row_address(1, 4),
         ])));
         let DocVisibility::Selected(selected) = projection
+            .clone()
             .materialize_visibility(allowed)
             .await
             .expect("valid allow-list")
@@ -1538,12 +1633,13 @@ mod tests {
     #[test]
     fn lazy_visibility_projects_only_candidate_doc_ids() {
         let projection = Arc::new(VersionAddressProjection {
-            addresses: AddressValues::Owned(vec![10, 20, 30]),
+            addresses: AddressValues::Owned(Arc::new(vec![10, 20, 30])),
             live_docs: Some(RoaringBitmap::from_iter([0, 2])),
             doc_ids_by_address: OnceCell::new(),
         });
+        let resident = projection.resident(None).unwrap();
         let visibility = DocVisibility::Filtered {
-            projection: projection.clone(),
+            projection: resident,
             mask: Arc::new(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter([
                 20, 30,
             ]))),
@@ -1667,10 +1763,16 @@ mod tests {
             .into_iter()
             .collect::<Result<Vec<_>>>()
             .unwrap();
-        let projection = documents.projection().await.unwrap();
+        let projection = documents.address_projection().await.unwrap();
         let first_lookup = projection.doc_ids_by_address().await.unwrap();
         documents.prewarm().await.unwrap();
-        let second_lookup = projection.doc_ids_by_address().await.unwrap();
+        let second_lookup = documents
+            .address_projection()
+            .await
+            .unwrap()
+            .doc_ids_by_address()
+            .await
+            .unwrap();
 
         assert!(documents.lengths_loaded());
         assert!(documents.projection_loaded());
@@ -1686,8 +1788,8 @@ mod tests {
         ));
         assert!(Arc::ptr_eq(&first_lookup, &second_lookup));
         assert_eq!(
-            documents.cached_row_address(DocId::new(1)).unwrap(),
-            Some(RowAddress::new_from_u64(20))
+            documents.cached_row_addresses(&[DocId::new(1)]).unwrap(),
+            Some(vec![20])
         );
         assert_eq!(counts.open_calls.load(Ordering::Relaxed), 2);
         assert_eq!(counts.range_calls.load(Ordering::Relaxed), 1);
@@ -1699,6 +1801,83 @@ mod tests {
                 .await
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn filtered_visibility_releases_addresses_after_cache_eviction() {
+        let (_directory, store, cache) = eviction_test_store();
+        let path = "docs.lance";
+        write_documents(
+            store.as_ref(),
+            path,
+            UInt64Array::from(vec![10, 20, 30]),
+            UInt32Array::from(vec![2, 3, 5]),
+            Some("10"),
+        )
+        .await;
+        let (counting, counts) = counted_store(store, path);
+        let documents = open_documents(counting, path, cache.as_ref(), None)
+            .await
+            .unwrap();
+        let mask = Arc::new(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter([20])));
+
+        let visibility = documents.visibility(mask.clone(), false).await.unwrap();
+        assert!(!visibility.selected(DocId::new(0)));
+        assert!(visibility.selected(DocId::new(1)));
+        assert!(!visibility.selected(DocId::new(2)));
+
+        let weak_addresses = documents.address_buffer_handle();
+
+        cache.clear().await;
+        assert!(weak_addresses.upgrade().is_some());
+        assert!(documents.projection_resident());
+
+        drop(visibility);
+        assert!(weak_addresses.upgrade().is_none());
+        assert!(!documents.projection_resident());
+
+        let reloaded = documents.visibility(mask, false).await.unwrap();
+        assert!(reloaded.selected(DocId::new(1)));
+        assert_eq!(counts.address_rows.load(Ordering::Relaxed), 6);
+    }
+
+    #[tokio::test]
+    async fn prewarm_reloads_addresses_after_cache_eviction() {
+        let (_directory, store, cache) = eviction_test_store();
+        let path = "docs.lance";
+        write_documents(
+            store.as_ref(),
+            path,
+            UInt64Array::from(vec![10, 20, 30]),
+            UInt32Array::from(vec![2, 3, 5]),
+            Some("10"),
+        )
+        .await;
+        let (counting, counts) = counted_store(store, path);
+        let documents = open_documents(counting, path, cache.as_ref(), None)
+            .await
+            .unwrap();
+
+        documents.prewarm().await.unwrap();
+        assert!(documents.query_ready());
+        let weak_addresses = documents.address_buffer_handle();
+
+        cache.clear().await;
+        assert!(weak_addresses.upgrade().is_none());
+        assert!(documents.projection_loaded());
+        assert!(!documents.projection_resident());
+        assert!(!documents.query_ready());
+
+        documents.prewarm().await.unwrap();
+        assert!(documents.query_ready());
+        assert_eq!(
+            documents
+                .cached_row_addresses(&[DocId::new(2), DocId::new(0)])
+                .unwrap(),
+            Some(vec![30, 10])
+        );
+        assert_eq!(counts.length_rows.load(Ordering::Relaxed), 3);
+        assert_eq!(counts.address_rows.load(Ordering::Relaxed), 6);
     }
 
     #[tokio::test]
