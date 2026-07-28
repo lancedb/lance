@@ -2077,6 +2077,12 @@ mod tests {
         );
         let merged = merge(&all_valid_left, &all_null_right);
         assert_eq!(merged.null_count(), 0);
+
+        // An explicit all-valid buffer has the same semantics as a missing buffer.
+        let all_valid: arrow_buffer::NullBuffer = vec![true, true].into();
+        let partial: arrow_buffer::NullBuffer = vec![true, false].into();
+        assert!(merge_struct_validity(Some(&all_valid), Some(&partial)).is_none());
+        assert!(merge_struct_validity(Some(&partial), Some(&all_valid)).is_none());
     }
 
     #[test]
