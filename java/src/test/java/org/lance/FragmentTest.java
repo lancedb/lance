@@ -151,6 +151,64 @@ public class FragmentTest {
   }
 
   @Test
+  void testWriteFragmentWithSession(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("fragment_with_session").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+        Session session = Session.builder().build()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+
+      long sizeBefore = session.sizeBytes();
+      try (VectorSchemaRoot root = VectorSchemaRoot.create(testDataset.getSchema(), allocator)) {
+        root.allocateNew();
+        VarCharVector nameVector = (VarCharVector) root.getVector("name");
+        IntVector idVector = (IntVector) root.getVector("id");
+        nameVector.setSafe(0, "Person 1".getBytes(StandardCharsets.UTF_8));
+        idVector.setSafe(0, 1);
+        root.setRowCount(1);
+
+        // First append in APPEND mode without an explicit schema: the
+        // manifest load for schema inference populates the shared session's
+        // metadata cache.
+        List<FragmentMetadata> firstFragments =
+            appendWithSession(datasetPath, allocator, root, session);
+        assertEquals(1, firstFragments.size());
+        assertEquals(1, firstFragments.get(0).getPhysicalRows());
+        assertTrue(session.sizeBytes() > sizeBefore);
+        long hitsAfterFirst = session.metadataCacheStats().getHits();
+
+        // Second append through the same session: schema inference reads the
+        // manifest cached by the first write, so cache hits must increase.
+        List<FragmentMetadata> secondFragments =
+            appendWithSession(datasetPath, allocator, root, session);
+        assertEquals(1, secondFragments.size());
+        assertEquals(1, secondFragments.get(0).getPhysicalRows());
+        assertTrue(session.metadataCacheStats().getHits() > hitsAfterFirst);
+
+        // A closed session has a zero native handle and degrades to "no
+        // session", matching Dataset's behavior for closed sessions.
+        Session closedSession = Session.builder().build();
+        closedSession.close();
+        List<FragmentMetadata> fragmentsWithClosedSession =
+            appendWithSession(datasetPath, allocator, root, closedSession);
+        assertEquals(1, fragmentsWithClosedSession.size());
+      }
+    }
+  }
+
+  private static List<FragmentMetadata> appendWithSession(
+      String datasetPath, RootAllocator allocator, VectorSchemaRoot root, Session session) {
+    return Fragment.write()
+        .datasetUri(datasetPath)
+        .allocator(allocator)
+        .data(root)
+        .mode(WriteParams.WriteMode.APPEND)
+        .session(session)
+        .execute();
+  }
+
+  @Test
   void commitWithoutVersion(@TempDir Path tempDir) {
     String datasetPath = tempDir.resolve("commit_without_version").toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {

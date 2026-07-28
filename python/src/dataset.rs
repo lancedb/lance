@@ -4710,6 +4710,9 @@ pub fn get_write_params(
         if let Some(progress) = get_dict_opt::<Py<PyAny>>(options, "progress")? {
             p.progress = Arc::new(PyWriteProgress::new(progress.into_py_any(options.py())?));
         }
+        if let Some(session) = get_dict_opt::<Session>(options, "session")? {
+            p.session = Some(session.inner.clone());
+        }
 
         let storage_options = get_dict_opt::<HashMap<String, String>>(options, "storage_options")?;
 

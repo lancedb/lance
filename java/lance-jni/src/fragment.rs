@@ -29,6 +29,7 @@ use std::sync::Arc;
 use crate::blocking_dataset::extract_namespace_info;
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
+use crate::session::session_from_handle;
 use crate::traits::{FromJObjectWithEnv, IntoJava, JLance, export_vec, import_vec};
 use crate::utils::extract_storage_options;
 use crate::{
@@ -109,6 +110,7 @@ pub extern "system" fn Java_org_lance_Fragment_createWithFfiArray<'local>(
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
     blob_pack_file_size_threshold: JObject,     // Optional<Long>
     schema_addr: jlong,
+    session_handle: jlong, // Session handle, 0 means no session
 ) -> JObject<'local> {
     ok_or_throw_with_return!(
         env,
@@ -132,6 +134,7 @@ pub extern "system" fn Java_org_lance_Fragment_createWithFfiArray<'local>(
             allow_external_blob_outside_bases,
             blob_pack_file_size_threshold,
             schema_addr,
+            session_handle,
         ),
         JObject::default()
     )
@@ -158,6 +161,7 @@ fn inner_create_with_ffi_array<'local>(
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
     blob_pack_file_size_threshold: JObject,     // Optional<Long>
     schema_addr: jlong,
+    session_handle: jlong, // Session handle, 0 means no session
 ) -> Result<JObject<'local>> {
     let c_array_ptr = arrow_array_addr as *mut FFI_ArrowArray;
     let c_schema_ptr = arrow_schema_addr as *mut FFI_ArrowSchema;
@@ -190,6 +194,7 @@ fn inner_create_with_ffi_array<'local>(
         allow_external_blob_outside_bases,
         blob_pack_file_size_threshold,
         schema_addr,
+        session_handle,
         reader,
     )
 }
@@ -215,6 +220,7 @@ pub extern "system" fn Java_org_lance_Fragment_createWithFfiStream<'a>(
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
     blob_pack_file_size_threshold: JObject,     // Optional<Long>
     schema_addr: jlong,
+    session_handle: jlong, // Session handle, 0 means no session
 ) -> JObject<'a> {
     ok_or_throw_with_return!(
         env,
@@ -237,6 +243,7 @@ pub extern "system" fn Java_org_lance_Fragment_createWithFfiStream<'a>(
             allow_external_blob_outside_bases,
             blob_pack_file_size_threshold,
             schema_addr,
+            session_handle,
         ),
         JObject::null()
     )
@@ -262,6 +269,7 @@ fn inner_create_with_ffi_stream<'local>(
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
     blob_pack_file_size_threshold: JObject,     // Optional<Long>
     schema_addr: jlong,
+    session_handle: jlong, // Session handle, 0 means no session
 ) -> Result<JObject<'local>> {
     let stream_ptr = arrow_array_stream_addr as *mut FFI_ArrowArrayStream;
     let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }?;
@@ -284,6 +292,7 @@ fn inner_create_with_ffi_stream<'local>(
         allow_external_blob_outside_bases,
         blob_pack_file_size_threshold,
         schema_addr,
+        session_handle,
         reader,
     )
 }
@@ -307,6 +316,7 @@ fn create_fragment<'a>(
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
     blob_pack_file_size_threshold: JObject,     // Optional<Long>
     schema_addr: jlong,
+    session_handle: jlong, // Session handle, 0 means no session
     source: impl StreamingWriteSource,
 ) -> Result<JObject<'a>> {
     let path_str = dataset_uri.extract(env)?;
@@ -327,6 +337,8 @@ fn create_fragment<'a>(
         &allow_external_blob_outside_bases,
         &blob_pack_file_size_threshold,
     )?;
+
+    write_params.session = session_from_handle(session_handle);
 
     // Set up storage options provider if namespace is provided
     let namespace_info = extract_namespace_info(env, &namespace_obj, &table_id_obj)?;
