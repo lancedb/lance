@@ -12,10 +12,25 @@
 //! For more details please refer to the
 //! [Transaction Specification](https://lance.org/format/table/transaction/#transaction-types).
 
-use super::write::merge_insert::inserted_rows::KeyExistenceFilter;
-use crate::dataset::overlay::collect_overlay_stale_frags;
-use crate::dataset::transaction::UpdateMode::{RewriteColumns, RewriteRows};
-use crate::index::mem_wal::update_mem_wal_index_compacted_sstables;
+use crate::feature_flags::{FLAG_STABLE_ROW_IDS, apply_feature_flags};
+use crate::format::key_existence::KeyExistenceFilter;
+use crate::format::overlay::staleness::collect_overlay_stale_frags;
+use crate::format::{
+    BasePath, DataFile, DataStorageFormat, Fragment, IndexFile, IndexMetadata, Manifest,
+    ManifestBuildConfig, RowDatasetVersionMeta, RowDatasetVersionRun, RowDatasetVersionSequence,
+    RowIdMeta, overlay::DataOverlayFile, pb,
+};
+use crate::io::{
+    commit::CommitHandler,
+    manifest::{read_manifest, read_manifest_indexes},
+};
+use crate::rowids::{
+    RowIdSequence, read_row_ids, segment::U64Segment, version::build_version_meta, write_row_ids,
+};
+use crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
+use crate::system_index::is_system_index;
+use crate::system_index::mem_wal::{CompactedSsTable, update_mem_wal_index_compacted_sstables};
+use crate::transaction::UpdateMode::{RewriteColumns, RewriteRows};
 use lance_core::datatypes::{
     LANCE_UNENFORCED_CLUSTERING_KEY_POSITION, LANCE_UNENFORCED_PRIMARY_KEY,
     LANCE_UNENFORCED_PRIMARY_KEY_POSITION,
@@ -23,23 +38,7 @@ use lance_core::datatypes::{
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result, datatypes::Schema};
 use lance_file::{datatypes::Fields, version::LanceFileVersion};
-use lance_index::mem_wal::CompactedSsTable;
-use lance_index::{frag_reuse::FRAG_REUSE_INDEX_NAME, is_system_index};
 use lance_io::object_store::ObjectStore;
-use lance_table::feature_flags::{FLAG_STABLE_ROW_IDS, apply_feature_flags};
-use lance_table::rowids::read_row_ids;
-use lance_table::{
-    format::{
-        BasePath, DataFile, DataStorageFormat, Fragment, IndexFile, IndexMetadata, Manifest,
-        ManifestBuildConfig, RowDatasetVersionMeta, RowDatasetVersionRun,
-        RowDatasetVersionSequence, RowIdMeta, overlay::DataOverlayFile, pb,
-    },
-    io::{
-        commit::CommitHandler,
-        manifest::{read_manifest, read_manifest_indexes},
-    },
-    rowids::{RowIdSequence, segment::U64Segment, version::build_version_meta, write_row_ids},
-};
 use object_store::path::Path;
 use roaring::RoaringBitmap;
 use std::cmp::Ordering;
@@ -524,7 +523,7 @@ impl std::fmt::Display for Operation {
     }
 }
 
-impl From<&Transaction> for lance_table::format::Transaction {
+impl From<&Transaction> for crate::format::Transaction {
     fn from(value: &Transaction) -> Self {
         let pb_transaction: pb::Transaction = value.into();
         Self {
@@ -1455,7 +1454,7 @@ impl Operation {
         }
     }
 
-    pub(crate) fn modifies_same_metadata(&self, other: &Self) -> bool {
+    pub fn modifies_same_metadata(&self, other: &Self) -> bool {
         match (self, other) {
             (
                 Self::UpdateConfig {
@@ -1512,7 +1511,7 @@ impl Operation {
     }
 
     /// Check whether another operation upserts a key that is referenced by another operation
-    pub(crate) fn upsert_key_conflict(&self, other: &Self) -> bool {
+    pub fn upsert_key_conflict(&self, other: &Self) -> bool {
         let self_upsert_keys = self.get_upsert_config_keys();
         let other_upsert_keys = other.get_upsert_config_keys();
 
@@ -1756,7 +1755,7 @@ impl Transaction {
         }
     }
 
-    pub(crate) async fn restore_old_manifest(
+    pub async fn restore_old_manifest(
         object_store: &ObjectStore,
         commit_handler: &dyn CommitHandler,
         base_path: &Path,
@@ -1781,7 +1780,7 @@ impl Transaction {
     /// Create a new manifest from the current manifest and the transaction.
     ///
     /// `current_manifest` should only be None if the dataset does not yet exist.
-    pub(crate) fn build_manifest(
+    pub fn build_manifest(
         &self,
         current_manifest: Option<&Manifest>,
         current_indices: Vec<IndexMetadata>,
@@ -1953,7 +1952,7 @@ impl Transaction {
                             // supersede them.
                             updated.overlays = f.overlays.clone();
                             if matches!(update_mode, Some(RewriteColumns)) {
-                                lance_table::format::overlay::tombstone_overlay_fields(
+                                crate::format::overlay::tombstone_overlay_fields(
                                     &mut updated.overlays,
                                     fields_modified,
                                 );
@@ -1995,7 +1994,7 @@ impl Transaction {
                             continue;
                         }
                         let offsets: Vec<usize> = bitmap.iter().map(|o| o as usize).collect();
-                        lance_table::rowids::version::refresh_row_latest_update_meta_for_partial_frag_rewrite_cols(
+                        crate::rowids::version::refresh_row_latest_update_meta_for_partial_frag_rewrite_cols(
                             fragment,
                             &offsets,
                             new_version,
@@ -2168,7 +2167,7 @@ impl Transaction {
                         match prev_by_id.get(&fragment.id) {
                             Some(prev) => {
                                 if merge_fragment_physically_rewritten(prev, fragment) {
-                                    lance_table::rowids::version::refresh_row_latest_update_meta_for_full_frag_rewrite_cols(
+                                    crate::rowids::version::refresh_row_latest_update_meta_for_full_frag_rewrite_cols(
                                         fragment,
                                         new_version,
                                     )?;
@@ -2178,7 +2177,7 @@ impl Transaction {
                                 // Brand-new fragment ID not present in the previous manifest.
                                 // Set both last_updated and created version meta, consistent
                                 // with Append/Overwrite for genuinely new fragments.
-                                lance_table::rowids::version::refresh_row_latest_update_meta_for_full_frag_rewrite_cols(
+                                crate::rowids::version::refresh_row_latest_update_meta_for_full_frag_rewrite_cols(
                                     fragment,
                                     new_version,
                                 )?;
@@ -2325,7 +2324,7 @@ impl Transaction {
                     // New base values for these fields supersede any overlay
                     // still shadowing them; tombstone the overlaid fields so the
                     // replacement is not silently masked.
-                    lance_table::format::overlay::tombstone_overlay_fields(
+                    crate::format::overlay::tombstone_overlay_fields(
                         &mut new_frag.overlays,
                         &replaced_fields,
                     );
@@ -2433,7 +2432,7 @@ impl Transaction {
         // that assembled a fragment's overlays out of order.
         for fragment in &final_fragments {
             if !fragment.overlays.is_empty() {
-                lance_table::format::overlay::verify_overlays_newest_last(&fragment.overlays)?;
+                crate::format::overlay::verify_overlays_newest_last(&fragment.overlays)?;
             }
         }
 
@@ -2474,7 +2473,7 @@ impl Transaction {
         manifest.tag.clone_from(&self.tag);
 
         if config.auto_set_feature_flags {
-            // Internal operations (e.g. CreateIndex) use ManifestWriteConfig::default()
+            // Internal operations (e.g. CreateIndex) build with the default config,
             // which has use_stable_row_ids = false. Without inheriting from the previous
             // manifest, apply_feature_flags would clear FLAG_STABLE_ROW_IDS.
             let inherited = current_manifest
@@ -4112,22 +4111,35 @@ fn merge_fragments_valid(manifest: &Manifest, new_fragments: &[Fragment]) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::format::overlay::OverlayCoverage;
+    use crate::format::{
+        RowDatasetVersionMeta, RowDatasetVersionRun, RowDatasetVersionSequence, RowIdMeta,
+    };
+    use crate::rowids::segment::U64Segment;
+    use crate::rowids::write_row_ids;
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use chrono::Utc;
     use lance_core::datatypes::Schema as LanceSchema;
     use lance_file::version::LanceFileVersion;
     use lance_io::utils::CachedFileSize;
-    use lance_table::format::overlay::OverlayCoverage;
-    use lance_table::format::{
-        RowDatasetVersionMeta, RowDatasetVersionRun, RowDatasetVersionSequence, RowIdMeta,
-    };
-    use lance_table::rowids::segment::U64Segment;
-    use lance_table::rowids::write_row_ids;
     use std::collections::HashMap;
     use std::sync::Arc;
     use uuid::Uuid;
 
-    use crate::dataset::ManifestWriteConfig;
+    /// The build config that `lance`'s `ManifestWriteConfig::default()` resolves to.
+    fn default_build_config() -> ManifestBuildConfig {
+        ManifestBuildConfig {
+            auto_set_feature_flags: true,
+            timestamp_nanos: std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            use_stable_row_ids: false,
+            use_legacy_format: None,
+            storage_format: None,
+            disable_transaction_file: false,
+        }
+    }
 
     fn sample_manifest() -> Manifest {
         let schema = ArrowSchema::new(vec![ArrowField::new("id", DataType::Int32, false)]);
@@ -4304,7 +4316,7 @@ mod tests {
                 Some(&manifest),
                 vec![first_index.clone(), second_index.clone()],
                 "txn",
-                &ManifestWriteConfig::default().to_build_config(),
+                &default_build_config(),
             )
             .unwrap();
 
@@ -4339,7 +4351,7 @@ mod tests {
                 Some(&manifest),
                 vec![first_index.clone(), second_index.clone()],
                 "txn",
-                &ManifestWriteConfig::default().to_build_config(),
+                &default_build_config(),
             )
             .unwrap();
 
@@ -4729,7 +4741,7 @@ mod tests {
 
     #[test]
     fn test_retain_indices_keeps_system_indices() {
-        use lance_index::mem_wal::MEM_WAL_INDEX_NAME;
+        use crate::system_index::mem_wal::MEM_WAL_INDEX_NAME;
 
         let schema = create_test_schema(&[1, 2]);
         let fragments = vec![Fragment::new(1)];
@@ -5150,12 +5162,7 @@ mod tests {
         );
 
         let (out, _) = tx
-            .build_manifest(
-                Some(&manifest),
-                vec![],
-                "txn",
-                &ManifestWriteConfig::default().to_build_config(),
-            )
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
             .unwrap();
 
         assert!(
@@ -5288,8 +5295,8 @@ mod tests {
 
     #[test]
     fn merge_build_manifest_refreshes_last_updated_when_data_files_change_stable_row_ids() {
+        use crate::feature_flags::FLAG_STABLE_ROW_IDS;
         use lance_file::version::LanceFileVersion;
-        use lance_table::feature_flags::FLAG_STABLE_ROW_IDS;
 
         let (major, minor) = LanceFileVersion::Stable.to_numbers();
         let mk_file = |path: &str| DataFile::new(path, vec![0], vec![0], major, minor, None, None);
@@ -5335,12 +5342,7 @@ mod tests {
         );
 
         let (out, _) = tx
-            .build_manifest(
-                Some(&manifest),
-                vec![],
-                "txn",
-                &ManifestWriteConfig::default().to_build_config(),
-            )
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
             .unwrap();
 
         assert_eq!(out.version, 2);
@@ -5357,9 +5359,9 @@ mod tests {
 
     #[test]
     fn merge_build_manifest_skips_refresh_when_carry_forward_stable_row_ids() {
+        use crate::feature_flags::FLAG_STABLE_ROW_IDS;
+        use crate::rowids::version::{RowDatasetVersionMeta, RowDatasetVersionSequence};
         use lance_file::version::LanceFileVersion;
-        use lance_table::feature_flags::FLAG_STABLE_ROW_IDS;
-        use lance_table::rowids::version::{RowDatasetVersionMeta, RowDatasetVersionSequence};
 
         let (major, minor) = LanceFileVersion::Stable.to_numbers();
         let data_file = DataFile::new("same.lance", vec![0], vec![0], major, minor, None, None);
@@ -5414,12 +5416,7 @@ mod tests {
         );
 
         let (out, _) = tx
-            .build_manifest(
-                Some(&manifest),
-                vec![],
-                "txn",
-                &ManifestWriteConfig::default().to_build_config(),
-            )
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
             .unwrap();
 
         let seq = out.fragments[0]
@@ -5434,8 +5431,8 @@ mod tests {
 
     #[test]
     fn merge_build_manifest_no_last_updated_refresh_without_stable_row_ids() {
+        use crate::feature_flags::FLAG_STABLE_ROW_IDS;
         use lance_file::version::LanceFileVersion;
-        use lance_table::feature_flags::FLAG_STABLE_ROW_IDS;
 
         let (major, minor) = LanceFileVersion::Stable.to_numbers();
         let mk_file = |path: &str| DataFile::new(path, vec![0], vec![0], major, minor, None, None);
@@ -5481,12 +5478,7 @@ mod tests {
         );
 
         let (out, _) = tx
-            .build_manifest(
-                Some(&manifest),
-                vec![],
-                "txn",
-                &ManifestWriteConfig::default().to_build_config(),
-            )
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
             .unwrap();
 
         assert!(
@@ -5497,8 +5489,8 @@ mod tests {
 
     #[test]
     fn merge_build_manifest_sets_both_version_meta_for_new_fragment_id_stable_row_ids() {
+        use crate::feature_flags::FLAG_STABLE_ROW_IDS;
         use lance_file::version::LanceFileVersion;
-        use lance_table::feature_flags::FLAG_STABLE_ROW_IDS;
 
         let (major, minor) = LanceFileVersion::Stable.to_numbers();
         let mk_file = |path: &str| DataFile::new(path, vec![0], vec![0], major, minor, None, None);
@@ -5552,12 +5544,7 @@ mod tests {
         );
 
         let (out, _) = tx
-            .build_manifest(
-                Some(&manifest),
-                vec![],
-                "txn",
-                &ManifestWriteConfig::default().to_build_config(),
-            )
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
             .unwrap();
 
         assert_eq!(out.version, 2);
@@ -5621,12 +5608,7 @@ mod tests {
 
         let manifest = make_stable_row_id_manifest(vec![existing_fragment]);
         let (result, _) = update_txn(vec![new_fragment])
-            .build_manifest(
-                Some(&manifest),
-                vec![],
-                "txn",
-                &ManifestWriteConfig::default().to_build_config(),
-            )
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
             .unwrap();
 
         assert_eq!(created_at_versions(&result, 10), vec![5, 5]);
@@ -5691,12 +5673,7 @@ mod tests {
         };
 
         let (result, _) = update_txn(vec![new_fragment])
-            .build_manifest(
-                Some(&manifest),
-                vec![],
-                "txn",
-                &ManifestWriteConfig::default().to_build_config(),
-            )
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
             .unwrap();
 
         // Row 11 came from frag_a (offset 1, version 2), row 20 came from frag_b (offset 0, version 3)
@@ -5750,12 +5727,7 @@ mod tests {
         // update_txn uses read_version 4 → new_version is 5
         let manifest = make_stable_row_id_manifest(vec![existing_fragment]);
         let (result, _) = update_txn(vec![new_fragment])
-            .build_manifest(
-                Some(&manifest),
-                vec![],
-                "txn",
-                &ManifestWriteConfig::default().to_build_config(),
-            )
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
             .unwrap();
 
         // Row 10 (UPDATE branch): created_at copied from source (version 5).
@@ -5809,12 +5781,7 @@ mod tests {
         // update_txn uses read_version 4 → new_version is 5
         let manifest = make_stable_row_id_manifest(vec![existing_fragment]);
         let (result, _) = update_txn(vec![new_fragment])
-            .build_manifest(
-                Some(&manifest),
-                vec![],
-                "txn",
-                &ManifestWriteConfig::default().to_build_config(),
-            )
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
             .unwrap();
 
         // UPDATE branch rows (10, 11): created_at preserved from source (version 3).
@@ -5854,12 +5821,7 @@ mod tests {
 
         let manifest = make_stable_row_id_manifest(vec![existing_fragment]);
         let (result, _) = update_txn(vec![new_fragment])
-            .build_manifest(
-                Some(&manifest),
-                vec![],
-                "txn",
-                &ManifestWriteConfig::default().to_build_config(),
-            )
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
             .unwrap();
 
         // Row 50 is found in source but source has no created_at_version_meta → default 1
@@ -5894,12 +5856,7 @@ mod tests {
 
         let manifest = make_stable_row_id_manifest(vec![existing_fragment]);
         let (result, _) = update_txn(vec![new_fragment])
-            .build_manifest(
-                Some(&manifest),
-                vec![],
-                "txn",
-                &ManifestWriteConfig::default().to_build_config(),
-            )
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
             .unwrap();
 
         // Fragment starts with no row_id_meta → assign_row_ids gives it fresh IDs →
@@ -5939,12 +5896,7 @@ mod tests {
 
         let manifest = make_stable_row_id_manifest(vec![existing_fragment]);
         let (result, _) = update_txn(vec![new_fragment])
-            .build_manifest(
-                Some(&manifest),
-                vec![],
-                "txn",
-                &ManifestWriteConfig::default().to_build_config(),
-            )
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
             .unwrap();
 
         // Corrupt metadata causes decode to fail → falls back to UNKNOWN_CREATED_AT_VERSION (1)
@@ -6017,12 +5969,7 @@ mod tests {
 
         let manifest = make_stable_row_id_manifest(vec![in_range_frag, out_of_range_frag]);
         let (result, _) = update_txn(vec![new_frag])
-            .build_manifest(
-                Some(&manifest),
-                vec![],
-                "txn",
-                &ManifestWriteConfig::default().to_build_config(),
-            )
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
             .unwrap();
 
         // Both rows originate from the in-range fragment (version 5).
@@ -6069,12 +6016,7 @@ mod tests {
 
         let manifest = make_stable_row_id_manifest(vec![existing]);
         let (result, _) = update_txn(vec![new_frag])
-            .build_manifest(
-                Some(&manifest),
-                vec![],
-                "txn",
-                &ManifestWriteConfig::default().to_build_config(),
-            )
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
             .unwrap();
 
         // Boundary IDs must be found and resolved correctly
@@ -6133,12 +6075,7 @@ mod tests {
 
         let manifest = make_stable_row_id_manifest(vec![src_frag]);
         let (result, _) = update_txn(vec![new_frag])
-            .build_manifest(
-                Some(&manifest),
-                vec![],
-                "txn",
-                &ManifestWriteConfig::default().to_build_config(),
-            )
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
             .unwrap();
 
         let versions = created_at_versions(&result, 10);
@@ -6208,12 +6145,7 @@ mod tests {
         };
 
         let (result, _) = update_txn(vec![new_frag])
-            .build_manifest(
-                Some(&manifest),
-                vec![],
-                "txn",
-                &ManifestWriteConfig::default().to_build_config(),
-            )
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
             .unwrap();
 
         // Row 12 → frag A offset 2 → version 2; row 20 → frag B offset 0 → version 8
@@ -6374,7 +6306,7 @@ mod tests {
         let mut manifest = Manifest::new(
             LanceSchema::try_from(&schema).unwrap(),
             Arc::new(vec![frag0, frag1, frag2]),
-            lance_table::format::DataStorageFormat::new(LanceFileVersion::V2_0),
+            crate::format::DataStorageFormat::new(LanceFileVersion::V2_0),
             HashMap::new(),
         );
         // The pre-existing overlays were committed at v3, so the current
@@ -6400,12 +6332,7 @@ mod tests {
         );
 
         let (result, _) = txn
-            .build_manifest(
-                Some(&manifest),
-                vec![],
-                "txn",
-                &ManifestWriteConfig::default().to_build_config(),
-            )
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
             .unwrap();
 
         let frag = |id: u64| {
@@ -6460,7 +6387,7 @@ mod tests {
         let manifest = Manifest::new(
             LanceSchema::try_from(&schema).unwrap(),
             Arc::new(vec![fragment]),
-            lance_table::format::DataStorageFormat::new(LanceFileVersion::V2_0),
+            crate::format::DataStorageFormat::new(LanceFileVersion::V2_0),
             HashMap::new(),
         );
 
@@ -6476,12 +6403,7 @@ mod tests {
         );
 
         let (result, _) = txn
-            .build_manifest(
-                Some(&manifest),
-                vec![],
-                "txn",
-                &ManifestWriteConfig::default().to_build_config(),
-            )
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
             .unwrap();
 
         let frag = &result.fragments[0];
@@ -6516,12 +6438,7 @@ mod tests {
         );
 
         let (result, _) = txn
-            .build_manifest(
-                Some(&manifest),
-                vec![],
-                "txn",
-                &ManifestWriteConfig::default().to_build_config(),
-            )
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
             .unwrap();
 
         let overlays = &result.fragments[0].overlays;
@@ -6544,12 +6461,7 @@ mod tests {
             None,
         );
         let err = txn
-            .build_manifest(
-                Some(&manifest),
-                vec![],
-                "txn",
-                &ManifestWriteConfig::default().to_build_config(),
-            )
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
             .unwrap_err();
         assert!(err.to_string().contains("does not exist"), "{err}");
     }

@@ -9,7 +9,6 @@
 
 pub(crate) use lance_table::system_index::mem_wal::{
     load_mem_wal_index_details, new_mem_wal_index_meta, open_mem_wal_index,
-    update_mem_wal_index_compacted_sstables,
 };
 
 #[cfg(test)]
@@ -17,6 +16,7 @@ mod tests {
     use super::*;
 
     use lance_index::mem_wal::{CompactedSsTable, MEM_WAL_INDEX_NAME, MemWalIndexDetails};
+    use lance_table::system_index::mem_wal::update_mem_wal_index_compacted_sstables;
     use std::sync::Arc;
     use uuid::Uuid;
 

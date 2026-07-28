@@ -90,7 +90,28 @@ mod schema_evolution;
 pub mod sql;
 pub mod statistics;
 mod take;
-pub mod transaction;
+/// Transaction definitions for updating datasets
+///
+/// Prior to creating a new manifest, a transaction must be created representing
+/// the changes being made to the dataset. By representing them as incremental
+/// changes, we can detect whether concurrent operations are compatible with
+/// one another. We can also rebuild manifests when retrying committing a
+/// manifest.
+///
+/// The definitions live in [`lance_table::transaction`]: building a manifest from
+/// a transaction reads and writes only table metadata, so it belongs at the table
+/// layer. This module re-exports them at the path callers have always used.
+///
+/// For more details please refer to the
+/// [Transaction Specification](https://lance.org/format/table/transaction/#transaction-types).
+pub mod transaction {
+    pub use lance_table::transaction::{
+        DataOverlayGroup, DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex,
+        Transaction, TransactionBuilder, UpdateMap, UpdateMapEntry, UpdateMode,
+        UpdatedFragmentOffsets, translate_config_updates, translate_schema_metadata_updates,
+        validate_operation,
+    };
+}
 pub mod udtf;
 pub mod updater;
 mod utils;
