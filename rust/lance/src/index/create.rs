@@ -2389,6 +2389,8 @@ mod tests {
             .await
             .unwrap();
 
+        let version_before_optimize = dataset.version().version;
+        let segments_before_optimize = dataset.load_indices_by_name("vector_idx").await.unwrap();
         let err = dataset
             .optimize_indices(&OptimizeOptions::merge(2))
             .await
@@ -2397,6 +2399,116 @@ mod tests {
             err.to_string()
                 .contains("vector index segments do not share IVF centroids"),
             "unexpected error: {err}"
+        );
+        assert_eq!(dataset.version().version, version_before_optimize);
+        assert_eq!(
+            dataset.load_indices_by_name("vector_idx").await.unwrap(),
+            segments_before_optimize,
+            "an incompatible merge must not partially commit index metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_vector_optimize_only_validates_requested_compatible_suffix() {
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+        let mut dataset = write_vector_fragment_dataset(&dataset_uri).await;
+        let fragments = dataset.get_fragments();
+        assert!(fragments.len() >= 4);
+        let tail_start = fragments.len() - 2;
+
+        let mut independent_ivf = IvfBuildParams::new(2);
+        independent_ivf.max_iters = 7;
+        let independent_params =
+            VectorIndexParams::with_ivf_flat_params(DistanceType::L2, independent_ivf);
+        let independent_segment = CreateIndexBuilder::new(
+            &mut dataset,
+            &["vector"],
+            IndexType::Vector,
+            &independent_params,
+        )
+        .name("vector_idx".to_string())
+        .fragments(
+            fragments[..tail_start]
+                .iter()
+                .map(|fragment| fragment.id() as u32)
+                .collect(),
+        )
+        .execute_uncommitted()
+        .await
+        .unwrap();
+
+        let mut shared_ivf = prepare_vector_ivf(&dataset, "vector").await;
+        shared_ivf.max_iters = 13;
+        let shared_params = VectorIndexParams::with_ivf_flat_params(DistanceType::L2, shared_ivf);
+        let mut compatible_tail = Vec::new();
+        for fragment in fragments.iter().skip(tail_start) {
+            compatible_tail.push(
+                CreateIndexBuilder::new(
+                    &mut dataset,
+                    &["vector"],
+                    IndexType::Vector,
+                    &shared_params,
+                )
+                .name("vector_idx".to_string())
+                .fragments(vec![fragment.id() as u32])
+                .execute_uncommitted()
+                .await
+                .unwrap(),
+            );
+        }
+
+        let independent_uuid = independent_segment.uuid;
+        let tail_uuids = compatible_tail
+            .iter()
+            .map(|segment| segment.uuid)
+            .collect::<Vec<_>>();
+        let expected_merged_fragments = compatible_tail
+            .iter()
+            .flat_map(|segment| segment.fragment_bitmap.as_ref().unwrap().iter())
+            .collect::<RoaringBitmap>();
+        let expected_merged_details = compatible_tail.last().unwrap().index_details.clone();
+        assert_ne!(
+            independent_segment.index_details, expected_merged_details,
+            "test setup must distinguish base and suffix metadata"
+        );
+        let mut segments = vec![independent_segment];
+        segments.extend(compatible_tail);
+        dataset
+            .commit_existing_index_segments("vector_idx", "vector", segments)
+            .await
+            .unwrap();
+
+        dataset
+            .optimize_indices(&OptimizeOptions::merge(2))
+            .await
+            .unwrap();
+
+        let optimized = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        assert_eq!(optimized.len(), 2);
+        assert!(
+            optimized
+                .iter()
+                .any(|segment| segment.uuid == independent_uuid),
+            "the incompatible base segment must not participate in the requested suffix merge"
+        );
+        assert!(
+            tail_uuids
+                .iter()
+                .all(|uuid| optimized.iter().all(|segment| segment.uuid != *uuid)),
+            "both compatible suffix segments must be replaced"
+        );
+        let merged = optimized
+            .iter()
+            .find(|segment| segment.uuid != independent_uuid)
+            .unwrap();
+        assert_eq!(
+            merged.fragment_bitmap.as_ref().unwrap(),
+            &expected_merged_fragments
+        );
+        assert_eq!(
+            merged.index_details, expected_merged_details,
+            "merged metadata must come from the selected suffix, not an incompatible base segment"
         );
     }
 

@@ -4,7 +4,7 @@
 //! IVF - Inverted File index.
 
 use super::{
-    LogicalIvfView,
+    LogicalIvfView, derive_hnsw_params,
     pq::{PQIndex, build_pq_model},
     utils::{filter_finite_training_data, maybe_sample_training_data},
 };
@@ -503,11 +503,11 @@ pub(crate) async fn optimize_vector_indices(
             "optimizing vector index: no existing index found".to_string(),
         ));
     }
+    validate_shared_vector_model(&existing_indices, "optimizing vector index")?;
 
     // try cast to v1 IVFIndex,
     // fallback to v2 IVFIndex if it's not v1 IVFIndex
     if !existing_indices[0].as_any().is::<IVFIndex>() {
-        validate_shared_vector_model(&existing_indices, "optimizing vector index")?;
         return optimize_vector_indices_v2(
             &dataset,
             unindexed,
@@ -740,7 +740,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                     index_dir,
                     distance_type,
                     shuffler,
-                    HnswBuildParams::default(),
+                    derive_hnsw_params(existing_indices[0].as_ref()),
                     frag_reuse_index,
                     options.clone(),
                 )?
@@ -758,7 +758,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                     index_dir,
                     distance_type,
                     shuffler,
-                    HnswBuildParams::default(),
+                    derive_hnsw_params(existing_indices[0].as_ref()),
                     frag_reuse_index,
                     options.clone(),
                 )?
@@ -779,7 +779,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 index_dir,
                 distance_type,
                 shuffler,
-                HnswBuildParams::default(),
+                derive_hnsw_params(existing_indices[0].as_ref()),
                 frag_reuse_index,
                 options.clone(),
             )?
@@ -799,7 +799,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 index_dir,
                 distance_type,
                 shuffler,
-                HnswBuildParams::default(),
+                derive_hnsw_params(existing_indices[0].as_ref()),
                 frag_reuse_index,
                 options.clone(),
             )?
