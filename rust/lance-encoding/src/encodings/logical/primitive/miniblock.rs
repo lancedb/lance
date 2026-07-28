@@ -54,6 +54,29 @@ pub struct MiniBlockCompressed {
     pub num_values: u64,
 }
 
+/// Per-page framing details that can affect a mini-block compressor's choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MiniBlockCompressionContext {
+    common_chunk_buffers: u64,
+    support_large_chunk: bool,
+    allow_generic_offsets: bool,
+}
+
+impl MiniBlockCompressionContext {
+    /// Creates the framing context supplied by the owning mini-block page.
+    pub fn new(
+        common_chunk_buffers: u64,
+        support_large_chunk: bool,
+        allow_generic_offsets: bool,
+    ) -> Self {
+        Self {
+            common_chunk_buffers,
+            support_large_chunk,
+            allow_generic_offsets,
+        }
+    }
+}
+
 /// Describes the size of a mini-block chunk of data
 ///
 /// Mini-block chunks are designed to be small (just a few disk sectors)
@@ -113,7 +136,11 @@ pub trait MiniBlockCompressor: std::fmt::Debug + Send + Sync {
     ///
     /// This method also returns a description of the encoding applied that will be
     /// used at decode time to read the data.
-    fn compress(&self, page: DataBlock) -> Result<(MiniBlockCompressed, CompressiveEncoding)>;
+    fn compress(
+        &self,
+        page: DataBlock,
+        context: MiniBlockCompressionContext,
+    ) -> Result<(MiniBlockCompressed, CompressiveEncoding)>;
 }
 
 #[cfg(test)]

@@ -9,7 +9,9 @@ use crate::{
     compression::MiniBlockDecompressor,
     data::DataBlock,
     encodings::{
-        logical::primitive::miniblock::{MiniBlockCompressed, MiniBlockCompressor},
+        logical::primitive::miniblock::{
+            MiniBlockCompressed, MiniBlockCompressionContext, MiniBlockCompressor,
+        },
         physical::block::{CompressionConfig, GeneralBufferCompressor},
     },
     format::{ProtobufUtils21, pb21::CompressiveEncoding},
@@ -35,9 +37,13 @@ const MIN_BUFFER_SIZE_FOR_COMPRESSION: usize = 4 * 1024;
 use super::super::logical::primitive::miniblock::MiniBlockChunk;
 
 impl MiniBlockCompressor for GeneralMiniBlockCompressor {
-    fn compress(&self, page: DataBlock) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
+    fn compress(
+        &self,
+        page: DataBlock,
+        context: MiniBlockCompressionContext,
+    ) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
         // First, compress with the inner compressor
-        let (inner_compressed, inner_encoding) = self.inner.compress(page)?;
+        let (inner_compressed, inner_encoding) = self.inner.compress(page, context)?;
 
         // Return the original encoding without compression if there's no data or
         // the first buffer is not large enough
@@ -146,6 +152,10 @@ mod tests {
     use crate::format::pb21::compressive_encoding::Compression;
     use arrow_array::{Float64Array, Int32Array};
 
+    fn miniblock_context() -> MiniBlockCompressionContext {
+        MiniBlockCompressionContext::new(0, true, true)
+    }
+
     #[derive(Debug)]
     struct TestCase {
         name: &'static str,
@@ -249,7 +259,9 @@ mod tests {
             GeneralMiniBlockCompressor::new(test_case.inner_encoder, test_case.compression);
 
         // Compress the data
-        let (compressed, encoding) = compressor.compress(test_case.data).unwrap();
+        let (compressed, encoding) = compressor
+            .compress(test_case.data, miniblock_context())
+            .unwrap();
 
         // Check if compression was applied as expected
         match &encoding.compression {
@@ -461,7 +473,7 @@ mod tests {
         let compressor = GeneralMiniBlockCompressor::new(inner, compression);
 
         // Compress the data
-        let (compressed, encoding) = compressor.compress(block).unwrap();
+        let (compressed, encoding) = compressor.compress(block, miniblock_context()).unwrap();
 
         // Should get GeneralMiniBlock encoding since buffer is 4KB
         match &encoding.compression {
@@ -503,7 +515,7 @@ mod tests {
             },
         );
 
-        let (compressed, _) = compressor.compress(data).unwrap();
+        let (compressed, _) = compressor.compress(data, miniblock_context()).unwrap();
         // RLE produces 2 buffers, but only the first one is compressed
         assert_eq!(compressed.data.len(), 2);
     }
@@ -539,7 +551,9 @@ mod tests {
             },
         );
 
-        let (_compressed, encoding) = compressor.compress(test_32.data).unwrap();
+        let (_compressed, encoding) = compressor
+            .compress(test_32.data, miniblock_context())
+            .unwrap();
 
         // Verify the encoding structure
         match &encoding.compression {
@@ -596,7 +610,9 @@ mod tests {
             },
         );
 
-        let (_compressed_64, encoding_64) = compressor_64.compress(block_64).unwrap();
+        let (_compressed_64, encoding_64) = compressor_64
+            .compress(block_64, miniblock_context())
+            .unwrap();
 
         // Verify the encoding structure for 64-bit
         match &encoding_64.compression {
@@ -650,7 +666,7 @@ mod tests {
             },
         );
 
-        let result = compressor.compress(empty_block);
+        let result = compressor.compress(empty_block, miniblock_context());
         match result {
             Ok((compressed, _)) => {
                 assert_eq!(compressed.num_values, 0);

@@ -28,7 +28,7 @@ use crate::compression::{BlockCompressor, BlockDecompressor, MiniBlockDecompress
 use crate::data::BlockInfo;
 use crate::data::{DataBlock, FixedWidthDataBlock};
 use crate::encodings::logical::primitive::miniblock::{
-    MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressor,
+    MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressionContext, MiniBlockCompressor,
 };
 use crate::format::pb21::CompressiveEncoding;
 use crate::format::{ProtobufUtils21, pb21};
@@ -215,7 +215,11 @@ impl InlineBitpacking {
 }
 
 impl MiniBlockCompressor for InlineBitpacking {
-    fn compress(&self, chunk: DataBlock) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
+    fn compress(
+        &self,
+        chunk: DataBlock,
+        _context: MiniBlockCompressionContext,
+    ) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
         match chunk {
             DataBlock::FixedWidth(fixed_width) => Ok(self.chunk_data(fixed_width)),
             _ => Err(Error::invalid_input_source(
