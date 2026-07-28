@@ -18,8 +18,8 @@ pub use fragment::*;
 pub use index::{IndexFile, IndexMetadata, index_metadata_codec, list_index_files_with_sizes};
 
 pub use manifest::{
-    BasePath, DETACHED_VERSION_MASK, DataStorageFormat, Manifest, SelfDescribingFileReader,
-    WriterVersion, is_detached_version,
+    BasePath, DETACHED_VERSION_MASK, DataStorageFormat, Manifest, ManifestBuildConfig,
+    SelfDescribingFileReader, WriterVersion, is_detached_version,
 };
 pub use transaction::Transaction;
 

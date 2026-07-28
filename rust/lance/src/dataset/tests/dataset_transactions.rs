@@ -391,7 +391,7 @@ async fn test_inline_transaction() {
             Some(ds.manifest.as_ref()),
             ds.load_indices().await.unwrap().as_ref().clone(),
             &tx_file,
-            &ManifestWriteConfig::default(),
+            &ManifestWriteConfig::default().to_build_config(),
         )
         .unwrap();
     let location = write_manifest_file(

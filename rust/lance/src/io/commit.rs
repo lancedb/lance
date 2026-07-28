@@ -250,8 +250,12 @@ async fn do_commit_new_dataset(
             (new_manifest, updated_indices)
         }
     } else {
-        let (manifest, indices) =
-            transaction.build_manifest(None, vec![], &transaction_file, write_config)?;
+        let (manifest, indices) = transaction.build_manifest(
+            None,
+            vec![],
+            &transaction_file,
+            &write_config.to_build_config(),
+        )?;
         (manifest, indices)
     };
 
@@ -811,7 +815,7 @@ pub(crate) async fn do_commit_detached_transaction(
                     commit_handler,
                     &dataset.base,
                     version,
-                    write_config,
+                    &write_config.to_build_config(),
                     &transaction_file,
                     &dataset.manifest,
                 )
@@ -821,7 +825,7 @@ pub(crate) async fn do_commit_detached_transaction(
                 Some(dataset.manifest.as_ref()),
                 dataset.load_indices().await?.as_ref().clone(),
                 &transaction_file,
-                write_config,
+                &write_config.to_build_config(),
             )?,
         };
 
@@ -1009,7 +1013,7 @@ pub(crate) async fn commit_transaction(
                     commit_handler,
                     &dataset.base,
                     version,
-                    write_config,
+                    &write_config.to_build_config(),
                     transaction_file,
                     &dataset.manifest,
                 )
@@ -1019,7 +1023,7 @@ pub(crate) async fn commit_transaction(
                 Some(dataset.manifest.as_ref()),
                 dataset.load_indices().await?.as_ref().clone(),
                 transaction_file,
-                write_config,
+                &write_config.to_build_config(),
             )?,
         };
 
