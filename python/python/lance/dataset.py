@@ -748,23 +748,22 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         reader = _coerce_reader(data_obj, schema)
         return super(MergeInsertBuilder, self).analyze_plan(reader)
 
-    def mark_generations_as_merged(
-        self, generations: "List[mem_wal.MergedGeneration]"
+    def mark_sstables_as_compacted(
+        self, sstables: "List[mem_wal.CompactedSsTable]"
     ) -> "MergeInsertBuilder":
-        """Mark MemWAL generations as merged into the base table.
+        """Mark MemWAL SSTables as compacted into the base table.
 
-        Call this before executing the merge_insert when the source data
-        includes rows from MemWAL flushed generations.
+        Call this before executing merge_insert when it compacts MemWAL SSTables.
 
         Parameters
         ----------
-        generations : list of MergedGeneration
-            Generations to mark as merged.
+        sstables : list of CompactedSsTable
+            SSTables to mark as compacted.
         """
-        from .mem_wal import _to_raw_merged_generations
+        from .mem_wal import _to_raw_compacted_sstables
 
-        raw_gens = _to_raw_merged_generations(generations)
-        super(MergeInsertBuilder, self).mark_generations_as_merged(raw_gens)
+        raw_sstables = _to_raw_compacted_sstables(sstables)
+        super(MergeInsertBuilder, self).mark_sstables_as_compacted(raw_sstables)
         return self
 
 
@@ -2175,7 +2174,7 @@ class LanceDataset(pa.dataset.Dataset):
         ids: Optional[Union[List[int], pa.Array]] = None,
         addresses: Optional[Union[List[int], pa.Array]] = None,
         indices: Optional[Union[List[int], pa.Array]] = None,
-    ) -> List[BlobFile]:
+    ) -> List[Optional[BlobFile]]:
         """
         Select blobs by row IDs.
 
@@ -2202,7 +2201,9 @@ class LanceDataset(pa.dataset.Dataset):
 
         Returns
         -------
-        blob_files : List[BlobFile]
+        blob_files : List[Optional[BlobFile]]
+            One element per selected row. Null blob values return ``None``;
+            valid empty blobs return a ``BlobFile`` with size zero.
         """
         selection_kind, selection_values = _resolve_blob_selection(
             ids, addresses, indices
@@ -2218,7 +2219,10 @@ class LanceDataset(pa.dataset.Dataset):
             lance_blob_files = self._ds.take_blobs_by_indices(
                 selection_values, blob_column
             )
-        return [BlobFile(lance_blob_file) for lance_blob_file in lance_blob_files]
+        return [
+            BlobFile(lance_blob_file) if lance_blob_file is not None else None
+            for lance_blob_file in lance_blob_files
+        ]
 
     def read_blobs(
         self,
@@ -2229,7 +2233,7 @@ class LanceDataset(pa.dataset.Dataset):
         *,
         io_buffer_size: Optional[int] = None,
         preserve_order: Optional[bool] = None,
-    ) -> List[Tuple[int, bytes]]:
+    ) -> List[Tuple[int, Optional[bytes]]]:
         """
         Read blobs directly into memory using Lance's planned blob reader.
 
@@ -2257,8 +2261,9 @@ class LanceDataset(pa.dataset.Dataset):
 
         Returns
         -------
-        blobs : List[Tuple[int, bytes]]
-            A list of ``(row_address, blob_bytes)`` pairs.
+        blobs : List[Tuple[int, Optional[bytes]]]
+            One ``(row_address, blob_bytes)`` pair per selected row. Null blob
+            values return ``None``; valid empty blobs return ``b""``.
         """
         selection_kind, selection_values = _resolve_blob_selection(
             ids, addresses, indices
@@ -2284,7 +2289,7 @@ class LanceDataset(pa.dataset.Dataset):
         selector: Literal["ids", "addresses", "indices"],
         io_buffer_size: Optional[int] = None,
         preserve_order: Optional[bool] = None,
-    ) -> List[Tuple[int, int, bytes]]:
+    ) -> List[Tuple[int, int, Optional[bytes]]]:
         """
         Read row-specific blob-local byte ranges with one planned API call.
 
@@ -2295,9 +2300,13 @@ class LanceDataset(pa.dataset.Dataset):
         request coalescing, and bounded I/O scheduling all happen in Rust; this
         method does not use a Python thread pool.
 
-        Null blob requests produce no result. Empty ranges on non-null blobs
-        return empty bytes without issuing payload I/O. By default results
-        preserve the input order among non-null requests.
+        Every request produces one result. Requests on null blobs return ``None``,
+        including when the requested range is empty. Empty ranges on non-null
+        blobs return empty bytes without issuing payload I/O. For every request,
+        offset plus length must fit in an unsigned 64-bit integer. Ranges on
+        non-null blobs must not extend beyond the logical blob size. Blob-local
+        bounds are not evaluated for null values because they have no logical
+        payload length. By default results preserve the input request order.
 
         Parameters
         ----------
@@ -2327,8 +2336,8 @@ class LanceDataset(pa.dataset.Dataset):
 
         Returns
         -------
-        results : List[Tuple[int, int, bytes]]
-            ``(request_index, row_address, data)`` for each non-null request.
+        results : List[Tuple[int, int, Optional[bytes]]]
+            One ``(request_index, row_address, data)`` tuple per request.
             The Python list retains all returned payload bytes in memory; peak
             result memory is therefore proportional to their total logical size.
         """
@@ -3307,6 +3316,8 @@ class LanceDataset(pa.dataset.Dataset):
             "BITMAP",
             "INVERTED",
             "FTS",
+            "NGRAM",
+            "RTREE",
             "ZONEMAP",
             "BLOOMFILTER",
         }
@@ -3319,6 +3330,8 @@ class LanceDataset(pa.dataset.Dataset):
         return cls._normalized_index_type(index_type) in {
             "BTREE",
             "BITMAP",
+            "NGRAM",
+            "RTREE",
             "ZONEMAP",
             "BLOOMFILTER",
         }
@@ -4286,8 +4299,9 @@ class LanceDataset(pa.dataset.Dataset):
         Create one segment without publishing it and return its metadata.
 
         This is the public distributed-build API for vector, BTREE scalar,
-        canonical bitmap scalar, INVERTED scalar, ZONEMAP scalar, and
-        BLOOMFILTER scalar index construction. Unlike
+        canonical bitmap scalar, INVERTED scalar, NGRAM scalar, RTREE scalar,
+        ZONEMAP scalar,
+        and BLOOMFILTER scalar index construction. Unlike
         :meth:`create_index`, this method does not publish the index into the
         dataset manifest. Instead, it writes one segment under
         ``_indices/<segment_uuid>/`` and returns the resulting
@@ -4303,8 +4317,10 @@ class LanceDataset(pa.dataset.Dataset):
         4. commit the final segment list with
            :meth:`commit_existing_index_segments`
 
-        BTREE, BITMAP, INVERTED, ZONEMAP, and BLOOMFILTER segments may
+        BTREE, BITMAP, INVERTED, NGRAM, RTREE, ZONEMAP, and BLOOMFILTER segments may
         be merged with :meth:`merge_existing_index_segments` before commit.
+        NGRAM segments built before a deferred compaction must be merged before
+        commit so their postings can be rebuilt against current row addresses.
         Parameters are the same as :meth:`create_index`, with one additional
         requirement:
 

@@ -14,32 +14,43 @@
 package org.lance.memwal;
 
 import com.google.common.base.MoreObjects;
+import com.google.common.base.Preconditions;
 
-/** A flushed MemWAL generation and the storage path of its Lance files. */
-public class FlushedGeneration {
+/**
+ * Points to an SSTable compacted into the base table.
+ *
+ * <p>Pass a list of these to {@link org.lance.merge.MergeInsertParams#markSstablesAsCompacted} so
+ * Lance can record compaction progress.
+ */
+public class CompactedSsTable {
+  private final String shardId;
   private final long generation;
-  private final String path;
 
-  public FlushedGeneration(long generation, String path) {
+  /**
+   * @param shardId UUID string for the write shard
+   * @param generation generation number from {@link ShardSnapshot#sstables()}
+   */
+  public CompactedSsTable(String shardId, long generation) {
+    Preconditions.checkNotNull(shardId, "shardId must not be null");
+    this.shardId = shardId;
     this.generation = generation;
-    this.path = path;
   }
 
-  /** The generation number of this flushed MemTable. */
-  public long generation() {
+  /** UUID string for the write shard. */
+  public String getShardId() {
+    return shardId;
+  }
+
+  /** The compacted SSTable's generation number. */
+  public long getGeneration() {
     return generation;
-  }
-
-  /** The storage path of the flushed Lance files. */
-  public String path() {
-    return path;
   }
 
   @Override
   public String toString() {
     return MoreObjects.toStringHelper(this)
+        .add("shardId", shardId)
         .add("generation", generation)
-        .add("path", path)
         .toString();
   }
 }

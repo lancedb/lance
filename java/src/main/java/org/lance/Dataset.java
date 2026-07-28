@@ -1621,11 +1621,27 @@ public class Dataset implements Closeable {
   private native List<BlobFile> nativeTakeBlobsByIndices(List<Long> rowIndices, String column);
 
   /**
-   * Open blob files for given row ids on a blob column. Names and semantics align with Rust/Python.
+   * Open {@link BlobFile} handles for given row IDs on a blob column. Names and semantics align
+   * with Rust/Python.
    *
-   * @param rowIds stable row ids (row addresses)
+   * <p>Pass logical row IDs read from {@code _rowid}, not physical row addresses from {@code
+   * _rowaddr}.
+   *
+   * <pre>{@code
+   * long rowId = 42L; // Example value from the _rowid column.
+   * List<BlobFile> blobs = dataset.takeBlobs(List.of(rowId), "images");
+   * for (BlobFile blob : blobs) {
+   *   if (blob != null) {
+   *     try (BlobFile file = blob) {
+   *       byte[] data = file.read();
+   *     }
+   *   }
+   * }
+   * }</pre>
+   *
+   * @param rowIds logical row IDs from the {@code _rowid} column
    * @param column blob column name
-   * @return list of BlobFile objects
+   * @return one {@link BlobFile} per row ID; null blob values are represented by null elements
    */
   public List<BlobFile> takeBlobs(List<Long> rowIds, String column) {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
@@ -1639,11 +1655,22 @@ public class Dataset implements Closeable {
   }
 
   /**
-   * Open blob files for given row indices on a blob column.
+   * Open {@link BlobFile} handles for given row indices on a blob column.
+   *
+   * <pre>{@code
+   * List<BlobFile> blobs = dataset.takeBlobsByIndices(List.of(0L), "images");
+   * for (BlobFile blob : blobs) {
+   *   if (blob != null) {
+   *     try (BlobFile file = blob) {
+   *       byte[] data = file.read();
+   *     }
+   *   }
+   * }
+   * }</pre>
    *
    * @param rowIndices row offsets within dataset
    * @param column blob column name
-   * @return list of BlobFile objects
+   * @return one {@link BlobFile} per row index; null blob values are represented by null elements
    */
   public List<BlobFile> takeBlobsByIndices(List<Long> rowIndices, String column) {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {

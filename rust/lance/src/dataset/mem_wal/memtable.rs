@@ -630,7 +630,7 @@ impl MemTable {
     ///
     /// This is used when flushing MemTable to persistent storage to ensure
     /// the flushed data is ordered from newest to oldest. This enables more
-    /// efficient K-way merge during LSM scan because flushed generations
+    /// efficient K-way merge during LSM scan because SSTables
     /// will be pre-sorted in the order needed for deduplication.
     ///
     /// The total number of rows in the MemTable is also returned to allow

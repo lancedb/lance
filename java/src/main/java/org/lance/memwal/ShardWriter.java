@@ -151,9 +151,8 @@ public class ShardWriter implements Closeable {
   /**
    * Create an LSM scanner that includes this writer's active MemTable.
    *
-   * <p>The scanner covers the base table, the given flushed generations, and the current active
-   * MemTable, providing read-your-writes consistency. This writer's own shard is included
-   * automatically.
+   * <p>The scanner covers the base table, the given SSTables, and the current active MemTable,
+   * providing read-your-writes consistency. This writer's own shard is included automatically.
    *
    * @param shardSnapshots snapshots of other shards to include
    * @return an LSM scanner

@@ -65,6 +65,7 @@ pub fn overlay_exclusion_offsets(
     overlays: &[DataOverlayFile],
     indexed_field_ids: &[i32],
     index_version: u64,
+    schema: &Schema,
 ) -> Result<RoaringBitmap> {
     let mut excluded = RoaringBitmap::new();
     for overlay in overlays {
@@ -72,7 +73,21 @@ pub fn overlay_exclusion_offsets(
             continue;
         }
         for (field_pos, field_id) in overlay.data_file.fields.iter().enumerate() {
-            if indexed_field_ids.contains(field_id) {
+            let overlay_ancestry = schema.field_ancestry_by_id(*field_id);
+            let affects_index = indexed_field_ids.iter().any(|indexed_field_id| {
+                indexed_field_id == field_id
+                    || overlay_ancestry.as_ref().is_some_and(|ancestry| {
+                        ancestry
+                            .iter()
+                            .any(|ancestor| ancestor.id == *indexed_field_id)
+                    })
+                    || schema
+                        .field_ancestry_by_id(*indexed_field_id)
+                        .is_some_and(|ancestry| {
+                            ancestry.iter().any(|ancestor| ancestor.id == *field_id)
+                        })
+            });
+            if affects_index {
                 excluded |= &*overlay.coverage_for_field(field_pos)?;
             }
         }
@@ -87,6 +102,7 @@ fn stale_offsets_for_fragment(
     fragment: &Fragment,
     fields: &[i32],
     index_version: u64,
+    schema: &Schema,
 ) -> Result<RoaringBitmap> {
     if fragment
         .overlays
@@ -95,7 +111,7 @@ fn stale_offsets_for_fragment(
     {
         return Ok(RoaringBitmap::new());
     }
-    overlay_exclusion_offsets(&fragment.overlays, fields, index_version)
+    overlay_exclusion_offsets(&fragment.overlays, fields, index_version, schema)
 }
 
 // A missing `fragment_bitmap` means the index predates fragment-bitmap tracking; treat it as
@@ -120,23 +136,20 @@ pub fn overlaid_fragments(fragments: &[Fragment]) -> HashMap<u32, &Fragment> {
 /// stale because an overlay committed after the segment was built touches a field the segment
 /// indexes. Field-aware and version-gated via [`overlay_exclusion_offsets`].
 ///
-/// `indexed_field_ids` are the physical ids written to overlay files. They may
-/// include descendants of the logical field ids stored in `segment`.
-///
 /// `overlaid_frags` holds only the fragments that actually carry overlays (rare), so the loop is
 /// `O(overlaid_frags)` rather than `O(fragments the segment covers)`.
 pub fn collect_overlay_stale_frags(
     segment: &IndexMetadata,
-    indexed_field_ids: &[i32],
     overlaid_frags: &HashMap<u32, &Fragment>,
     stale: &mut RoaringBitmap,
+    schema: &Schema,
 ) -> Result<()> {
     let coverage = segment.fragment_bitmap.as_ref();
     for (&frag_id, fragment) in overlaid_frags {
         if stale.contains(frag_id) || !covers_fragment(coverage, frag_id) {
             continue;
         }
-        if !stale_offsets_for_fragment(fragment, indexed_field_ids, segment.dataset_version)?
+        if !stale_offsets_for_fragment(fragment, &segment.fields, segment.dataset_version, schema)?
             .is_empty()
         {
             stale.insert(frag_id);
@@ -156,6 +169,7 @@ pub fn collect_overlay_stale_rows_for_segment(
     segment: &IndexMetadata,
     overlaid_frags: &HashMap<u32, &Fragment>,
     stale: &mut HashMap<u32, RoaringBitmap>,
+    schema: &Schema,
 ) -> Result<()> {
     let coverage = segment.fragment_bitmap.as_ref();
     for (&frag_id, fragment) in overlaid_frags {
@@ -163,7 +177,7 @@ pub fn collect_overlay_stale_rows_for_segment(
             continue;
         }
         let excluded =
-            stale_offsets_for_fragment(fragment, &segment.fields, segment.dataset_version)?;
+            stale_offsets_for_fragment(fragment, &segment.fields, segment.dataset_version, schema)?;
         if !excluded.is_empty() {
             *stale.entry(frag_id).or_default() |= &excluded;
         }
@@ -892,6 +906,19 @@ mod tests {
         RoaringBitmap::from_iter(offsets)
     }
 
+    fn flat_test_schema() -> Schema {
+        use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+
+        let mut schema = Schema::try_from(&ArrowSchema::new(
+            (0..5)
+                .map(|id| ArrowField::new(format!("field_{id}"), DataType::Int32, true))
+                .collect::<Vec<_>>(),
+        ))
+        .unwrap();
+        schema.set_field_id(None);
+        schema
+    }
+
     /// Physical offsets for a contiguous range `[start, start + len)`.
     fn offsets(start: u32, len: usize) -> Vec<u32> {
         (start..start + len as u32).collect()
@@ -1100,7 +1127,8 @@ mod tests {
             DataType::Struct(outer_fields),
             true,
         )]);
-        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let mut schema = Schema::try_from(&arrow_schema).unwrap();
+        schema.set_field_id(None);
         let middle = StructArray::from(vec![
             (
                 Arc::new(ArrowField::new("a", DataType::Int32, true)),
@@ -1200,17 +1228,18 @@ mod tests {
 
     #[test]
     fn test_exclusion_offsets_version_gate() {
+        let schema = flat_test_schema();
         // index built at version 5; only overlays committed > 5 are excluded.
         let overlays = vec![
             dense_overlay(vec![3], [0, 1], 4),
             dense_overlay(vec![3], [2, 7], 6),
         ];
-        let excluded = overlay_exclusion_offsets(&overlays, &[3], 5).unwrap();
+        let excluded = overlay_exclusion_offsets(&overlays, &[3], 5, &schema).unwrap();
         assert_eq!(excluded, bitmap([2, 7]));
         // An overlay exactly at the index version is already incorporated.
         let overlays = vec![dense_overlay(vec![3], [9], 5)];
         assert!(
-            overlay_exclusion_offsets(&overlays, &[3], 5)
+            overlay_exclusion_offsets(&overlays, &[3], 5, &schema)
                 .unwrap()
                 .is_empty()
         );
@@ -1218,23 +1247,51 @@ mod tests {
 
     #[test]
     fn test_exclusion_offsets_is_field_aware() {
+        let schema = flat_test_schema();
         // An overlay touching only an unrelated field excludes nothing.
         let overlays = vec![dense_overlay(vec![2], [0, 1, 2], 9)];
         assert!(
-            overlay_exclusion_offsets(&overlays, &[3], 1)
+            overlay_exclusion_offsets(&overlays, &[3], 1, &schema)
                 .unwrap()
                 .is_empty()
         );
         // The union spans only the indexed fields the overlay actually carries.
         let overlays = vec![dense_overlay(vec![2, 3], [4], 9)];
         assert_eq!(
-            overlay_exclusion_offsets(&overlays, &[3], 1).unwrap(),
+            overlay_exclusion_offsets(&overlays, &[3], 1, &schema).unwrap(),
             bitmap([4])
         );
     }
 
     #[test]
+    fn test_exclusion_offsets_matches_nested_fields() {
+        let (schema, _) = nested_struct();
+        let outer = &schema.fields[0];
+        let middle = &outer.children[0];
+        let a = &middle.children[0];
+        let b = &middle.children[1];
+
+        let overlays = vec![dense_overlay(vec![a.id], [1], 9)];
+        assert_eq!(
+            overlay_exclusion_offsets(&overlays, &[outer.id], 1, &schema).unwrap(),
+            bitmap([1])
+        );
+        assert!(
+            overlay_exclusion_offsets(&overlays, &[b.id], 1, &schema)
+                .unwrap()
+                .is_empty()
+        );
+
+        let overlays = vec![dense_overlay(vec![middle.id], [2], 9)];
+        assert_eq!(
+            overlay_exclusion_offsets(&overlays, &[a.id], 1, &schema).unwrap(),
+            bitmap([2])
+        );
+    }
+
+    #[test]
     fn test_exclusion_offsets_sparse_per_field() {
+        let schema = flat_test_schema();
         // Sparse overlay: field 2 covers {2,3}, field 4 covers {1}.
         let overlay = DataOverlayFile {
             data_file: DataFile::new_legacy_from_fields("o.lance", vec![2, 4], None),
@@ -1244,23 +1301,24 @@ mod tests {
         let overlays = vec![overlay];
         // Only the bitmap for the indexed field (4) contributes.
         assert_eq!(
-            overlay_exclusion_offsets(&overlays, &[4], 1).unwrap(),
+            overlay_exclusion_offsets(&overlays, &[4], 1, &schema).unwrap(),
             bitmap([1])
         );
         assert_eq!(
-            overlay_exclusion_offsets(&overlays, &[2], 1).unwrap(),
+            overlay_exclusion_offsets(&overlays, &[2], 1, &schema).unwrap(),
             bitmap([2, 3])
         );
     }
 
     #[test]
     fn test_exclusion_offsets_unions_multiple_overlays() {
+        let schema = flat_test_schema();
         let overlays = vec![
             dense_overlay(vec![3], [1], 6),
             dense_overlay(vec![3], [4, 5], 7),
         ];
         assert_eq!(
-            overlay_exclusion_offsets(&overlays, &[3], 1).unwrap(),
+            overlay_exclusion_offsets(&overlays, &[3], 1, &schema).unwrap(),
             bitmap([1, 4, 5])
         );
     }
@@ -1294,13 +1352,14 @@ mod tests {
 
     #[test]
     fn test_collect_frags_missing_bitmap_covers_all() {
+        let schema = flat_test_schema();
         // A segment with no fragment_bitmap (legacy index predating bitmap tracking) must treat
         // every overlaid fragment as covered so stale rows can't leak past the index unmasked.
         let fragment = fragment_with_overlay(3, dense_overlay(vec![3], [1, 2], 9));
         let overlaid: HashMap<u32, &Fragment> = HashMap::from([(3u32, &fragment)]);
 
         let mut stale = RoaringBitmap::new();
-        collect_overlay_stale_frags(&segment(vec![3], 1, None), &[3], &overlaid, &mut stale)
+        collect_overlay_stale_frags(&segment(vec![3], 1, None), &overlaid, &mut stale, &schema)
             .unwrap();
         assert_eq!(stale, bitmap([3]), "missing bitmap must cover fragment 3");
 
@@ -1308,9 +1367,9 @@ mod tests {
         let mut stale = RoaringBitmap::new();
         collect_overlay_stale_frags(
             &segment(vec![3], 1, Some(bitmap([0]))),
-            &[3],
             &overlaid,
             &mut stale,
+            &schema,
         )
         .unwrap();
         assert!(
@@ -1322,9 +1381,9 @@ mod tests {
         let mut stale = RoaringBitmap::new();
         collect_overlay_stale_frags(
             &segment(vec![3], 1, Some(bitmap([3]))),
-            &[3],
             &overlaid,
             &mut stale,
+            &schema,
         )
         .unwrap();
         assert_eq!(stale, bitmap([3]));
@@ -1332,13 +1391,19 @@ mod tests {
 
     #[test]
     fn test_collect_rows_missing_bitmap_covers_all() {
+        let schema = flat_test_schema();
         // Same covers-all guarantee at row-level granularity.
         let fragment = fragment_with_overlay(3, dense_overlay(vec![3], [1, 2], 9));
         let overlaid: HashMap<u32, &Fragment> = HashMap::from([(3u32, &fragment)]);
 
         let mut stale = HashMap::new();
-        collect_overlay_stale_rows_for_segment(&segment(vec![3], 1, None), &overlaid, &mut stale)
-            .unwrap();
+        collect_overlay_stale_rows_for_segment(
+            &segment(vec![3], 1, None),
+            &overlaid,
+            &mut stale,
+            &schema,
+        )
+        .unwrap();
         assert_eq!(
             stale.get(&3),
             Some(&bitmap([1, 2])),
@@ -1351,6 +1416,7 @@ mod tests {
             &segment(vec![3], 1, Some(bitmap([0]))),
             &overlaid,
             &mut stale,
+            &schema,
         )
         .unwrap();
         assert!(

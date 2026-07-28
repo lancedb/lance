@@ -52,7 +52,7 @@ use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 /// Column name for the mem_wal tombstone (delete sentinel) marker.
 ///
 /// `_tombstone` is a *physical* column present only in mem_wal memtables and
-/// flushed generations — it is deliberately kept out of the base table (hard
+/// SSTables — it is deliberately kept out of the base table (hard
 /// delete), so it is **not** a virtual [`is_system_column`](lance_core::is_system_column).
 /// A row with `_tombstone = true` is a delete sentinel: the newest value for
 /// its primary key, carrying null in every non-PK column, that wins

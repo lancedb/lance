@@ -15,6 +15,8 @@ use arrow_array::types::Int32Type;
 use arrow_array::{ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, StringArray};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance_index::IndexType;
+use lance_index::optimize::OptimizeOptions;
+use lance_index::scalar::BuiltinIndexType;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::ScalarIndexParams;
 use lance_index::scalar::inverted::query::{FtsQuery, MatchQuery, PhraseQuery};
@@ -29,10 +31,11 @@ use rstest::rstest;
 use lance_file::writer::{FileWriter, FileWriterOptions};
 
 use crate::Dataset;
+use crate::dataset::optimize::{CompactionOptions, compact_files, remapping};
 use crate::dataset::transaction::{DataOverlayGroup, Operation};
 use crate::dataset::{WriteDestination, WriteParams};
-use crate::index::DatasetIndexExt;
 use crate::index::vector::VectorIndexParams;
+use crate::index::{CreateIndexBuilder, DatasetIndexExt};
 
 /// Two-fragment Int32 dataset: `id` (field 0) = 0..12 and `age` (field 1) = id * 10,
 /// six rows per file (fragments 0 and 1). In-memory store so overlay files can be written
@@ -419,6 +422,55 @@ async fn test_overlay_multi_fragment(#[values(false, true)] stable_row_ids: bool
     assert_eq!(ids_matching(&dataset, "age = 30").await, vec![3]);
 }
 
+/// A deletion below an overlaid row must not corrupt the physical-offset → stable-row-id
+/// translation used to build the overlay block mask.
+///
+/// Under stable row ids the stale-row block/take set is computed by mapping each stale
+/// *physical offset* to its stable row id via the fragment's `RowIdSequence`. The sequence
+/// keeps one entry per physical row (deleted rows are tracked separately by the deletion
+/// vector, not compacted out), so the correct mapping is `sequence.get(offset)`. A regression
+/// that instead advanced a `sequence.iter()` cursor only for non-deleted offsets desynced the
+/// cursor after any deletion at an offset *below* the stale one, blocking/taking the wrong row
+/// id: the stale index hit then leaked and the new value was never surfaced.
+///
+/// Setup (stable row ids): fragment 1 holds ids 6..12 at offsets 0..6. Delete id=6 (offset 0),
+/// then overlay offset 2 (id=8, age 80 → 999). The deletion at offset 0 sits below the stale
+/// offset 2, so a cursor-based translation would map offset 2 to id=7 instead of id=8.
+///
+/// Parametrized over `stable_row_ids`: only the stable-row-id path translates offsets to row
+/// ids, so the bug is specific to it; the non-stable case (addresses are row ids) is a control.
+#[rstest]
+#[tokio::test]
+async fn test_btree_overlay_stale_row_with_prior_deletion(
+    #[values(false, true)] stable_row_ids: bool,
+) {
+    let mut dataset = create_base_dataset_with(stable_row_ids).await;
+    build_age_index(&mut dataset).await;
+
+    // Delete id=6 (fragment 1, offset 0) — a deletion hole below the row the overlay marks stale.
+    dataset.delete("id = 6").await.unwrap();
+
+    // Fragment 1, offset 2 is id=8 (age 80). The overlay (committed after the index) → age 999.
+    let dataset = commit_overlay(
+        dataset,
+        "age_overlay_del",
+        1,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([2])),
+        vec![i32_array([Some(999)])],
+    )
+    .await;
+
+    // Stale-drop: id=8's old age=80 index entry must not be returned.
+    assert_eq!(ids_matching(&dataset, "age = 80").await, Vec::<i32>::new());
+    // New-match: id=8's current age=999 is found by re-evaluating the stale row.
+    assert_eq!(ids_matching(&dataset, "age = 999").await, vec![8]);
+    // A non-stale row in the same deletion-bearing fragment is still served by the index.
+    assert_eq!(ids_matching(&dataset, "age = 70").await, vec![7]);
+    // The deleted row is gone.
+    assert_eq!(ids_matching(&dataset, "age = 60").await, Vec::<i32>::new());
+}
+
 const VEC_DIM: i32 = 8;
 
 fn vec_query() -> Vec<f32> {
@@ -602,6 +654,72 @@ async fn test_overlay_stale_with_compound_index_expression() {
     assert_eq!(ids_matching(&dataset, "id = 2").await, vec![2]);
 }
 
+/// A `RewriteRows` update (under stable row ids) that touches only a *non-indexed* column moves
+/// the matched rows to a new fragment and, because the scalar index's field was not modified,
+/// extends that index's fragment coverage onto the new fragment
+/// (`register_pure_rewrite_rows_update_frags_in_indices`) so its existing entries are reused.
+///
+/// That reuse is unsound when a moved row carried a data overlay on the *indexed* field: the
+/// update materializes the overlay's current value into the new fragment, but the reused index
+/// entry still holds the stale pre-overlay value, and the new fragment (now marked covered) no
+/// longer falls to the flat path that previously served the correct value via overlay masking.
+///
+/// Here `age` is indexed and overlaid (id=1: age 10 -> 999); the update sets the non-indexed
+/// `id` column on that row. After it, `age = 10` must stay dropped and `age = 999` must still
+/// find the row — otherwise the stale index entry has resurfaced.
+#[tokio::test]
+async fn test_update_nonindexed_column_preserves_overlay_masking() {
+    use crate::dataset::UpdateBuilder;
+
+    let mut dataset = create_base_dataset_with(true).await;
+    build_age_index(&mut dataset).await;
+
+    // Overlay fragment 0, offset 1 (id=1): age 10 -> 999, committed after the index.
+    let dataset = commit_overlay(
+        dataset,
+        "age_update",
+        0,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+        vec![i32_array([Some(999)])],
+    )
+    .await;
+
+    // Masking works before the update.
+    assert_eq!(ids_matching(&dataset, "age = 10").await, Vec::<i32>::new());
+    assert_eq!(ids_matching(&dataset, "age = 999").await, vec![1]);
+
+    // Update only the non-indexed `id` column of the overlaid row. This is a rewrite-rows move:
+    // the row (with age materialized to 999) is written to a new fragment and deleted from
+    // fragment 0, keeping its stable row id.
+    let dataset = UpdateBuilder::new(Arc::new(dataset))
+        .update_where("id = 1")
+        .unwrap()
+        .set("id", "100")
+        .unwrap()
+        .build()
+        .unwrap()
+        .execute()
+        .await
+        .unwrap()
+        .new_dataset;
+
+    // Still masked: the stale age=10 entry must stay dropped and the overlaid age=999 value must
+    // still be found (now on the moved row, whose id is 100).
+    assert_eq!(
+        ids_matching(&dataset, "age = 10").await,
+        Vec::<i32>::new(),
+        "stale index entry age=10 resurfaced after updating a non-indexed column"
+    );
+    assert_eq!(
+        ids_matching(&dataset, "age = 999").await,
+        vec![100],
+        "overlaid value age=999 lost after updating a non-indexed column"
+    );
+    // A row untouched by the overlay is unaffected.
+    assert_eq!(ids_matching(&dataset, "age = 20").await, vec![2]);
+}
+
 /// Text dataset: two fragments, 6 rows each. Schema: id (Int32), text (Utf8).
 /// Texts are unique tokens so each row can be identified by its term.
 async fn create_text_dataset() -> Dataset {
@@ -689,6 +807,162 @@ async fn fts_ids(dataset: &Dataset, query: FullTextSearchQuery) -> Vec<i32> {
 
 async fn fts_ids_matching(dataset: &Dataset, term: &str) -> Vec<i32> {
     fts_ids(dataset, FullTextSearchQuery::new(term.to_owned())).await
+}
+
+#[tokio::test]
+async fn test_ngram_optimize_preserves_overlay_staleness() {
+    let mut dataset = create_text_dataset().await;
+    let params = ScalarIndexParams::for_builtin(BuiltinIndexType::NGram);
+    let fragment_ids = dataset
+        .get_fragments()
+        .into_iter()
+        .map(|fragment| fragment.id() as u32)
+        .collect::<Vec<_>>();
+    let mut segments = Vec::with_capacity(fragment_ids.len());
+    for fragment_id in fragment_ids {
+        segments.push(
+            CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::NGram, &params)
+                .name("text_ngram".to_string())
+                .fragments(vec![fragment_id])
+                .execute_uncommitted()
+                .await
+                .unwrap(),
+        );
+    }
+    let source_version = segments[0].dataset_version;
+    dataset
+        .commit_existing_index_segments("text_ngram", "text", segments)
+        .await
+        .unwrap();
+
+    let mut dataset = commit_overlay(
+        dataset,
+        "ngram_text_overlay",
+        0,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+        vec![Arc::new(StringArray::from(vec![Some("cherry mango")]))],
+    )
+    .await;
+    dataset
+        .optimize_indices(&OptimizeOptions::merge(2))
+        .await
+        .unwrap();
+
+    let committed = dataset.load_indices_by_name("text_ngram").await.unwrap();
+    assert_eq!(committed.len(), 1);
+    assert_eq!(committed[0].dataset_version, source_version);
+    assert_eq!(
+        ids_matching(&dataset, "contains(text, 'apple')").await,
+        vec![0]
+    );
+    assert_eq!(
+        ids_matching(&dataset, "contains(text, 'mango')").await,
+        vec![1, 6]
+    );
+}
+
+#[tokio::test]
+async fn test_btree_physical_merge_preserves_overlay_staleness() {
+    let mut dataset = create_base_dataset().await;
+    let params = ScalarIndexParams::default();
+    let mut segments = Vec::new();
+    for fragment in dataset.get_fragments() {
+        segments.push(
+            CreateIndexBuilder::new(&mut dataset, &["age"], IndexType::BTree, &params)
+                .name("age_btree".to_string())
+                .fragments(vec![fragment.id() as u32])
+                .execute_uncommitted()
+                .await
+                .unwrap(),
+        );
+    }
+    let source_version = segments[0].dataset_version;
+    let mut dataset = commit_overlay(
+        dataset,
+        "btree_before_merge",
+        0,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+        vec![i32_array([Some(999)])],
+    )
+    .await;
+
+    let merged = dataset
+        .merge_existing_index_segments(segments)
+        .await
+        .unwrap();
+    assert_eq!(merged.dataset_version, source_version);
+    dataset
+        .commit_existing_index_segments("age_btree", "age", vec![merged])
+        .await
+        .unwrap();
+
+    assert_eq!(ids_matching(&dataset, "age = 10").await, Vec::<i32>::new());
+    assert_eq!(ids_matching(&dataset, "age = 999").await, vec![1]);
+}
+
+#[tokio::test]
+async fn test_ngram_remap_excludes_newer_overlay_fragments() {
+    let mut dataset = create_text_dataset().await;
+    let params = ScalarIndexParams::for_builtin(BuiltinIndexType::NGram);
+    dataset
+        .create_index(
+            &["text"],
+            IndexType::NGram,
+            Some("text_ngram".to_string()),
+            &params,
+            false,
+        )
+        .await
+        .unwrap();
+    let source_version =
+        dataset.load_indices_by_name("text_ngram").await.unwrap()[0].dataset_version;
+
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            target_rows_per_fragment: 12,
+            defer_index_remap: true,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    let compacted_fragment_id = dataset.get_fragments()[0].id();
+    let mut dataset = commit_overlay(
+        dataset,
+        "ngram_after_compaction",
+        compacted_fragment_id as u64,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+        vec![Arc::new(StringArray::from(vec![Some("cherry mango")]))],
+    )
+    .await;
+
+    remapping::remap_column_index(&mut dataset, &["text"], Some("text_ngram".to_string()))
+        .await
+        .unwrap();
+
+    let committed = dataset.load_indices_by_name("text_ngram").await.unwrap();
+    assert_eq!(committed.len(), 1);
+    assert!(committed[0].dataset_version > source_version);
+    assert!(
+        !committed[0]
+            .fragment_bitmap
+            .as_ref()
+            .unwrap()
+            .contains(compacted_fragment_id as u32)
+    );
+    assert_eq!(
+        ids_matching(&dataset, "contains(text, 'apple')").await,
+        vec![0]
+    );
+    assert_eq!(
+        ids_matching(&dataset, "contains(text, 'mango')").await,
+        vec![1, 6]
+    );
 }
 
 async fn fts_phrase_ids_matching(dataset: &Dataset, phrase: &str) -> Vec<i32> {

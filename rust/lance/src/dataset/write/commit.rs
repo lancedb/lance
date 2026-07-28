@@ -985,7 +985,7 @@ mod tests {
                 new_fragments: vec![],
                 removed_fragment_ids: vec![],
                 fields_modified: vec![],
-                merged_generations: Vec::new(),
+                compacted_sstables: Vec::new(),
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
                 inserted_rows_filter: None,

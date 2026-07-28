@@ -971,32 +971,13 @@ impl CompactionPlan {
 
 /// Classification for one blob v2 row during compaction.
 ///
-/// - `Null`: NULL row or Inline blob with position=0 and size=0.
+/// - `Null`: NULL row.
 /// - `External`: External blob referenced by URI.
 /// - `DataBlob`: Inline/Packed/Dedicated blob stored in Lance files.
 enum RowClass {
     Null,
     External,
     DataBlob,
-}
-
-/// Check if a row is a null Inline blob.
-///
-/// This matches `BlobV2StructuralEncoder`'s behavior of encoding null rows as
-/// Inline with position=0 and size=0, and `collect_blob_entries_v2`'s behavior
-/// of skipping them.
-fn is_inline_null_blob(
-    kind: BlobKind,
-    position_col: &arrow::array::UInt64Array,
-    size_col: &arrow::array::UInt64Array,
-    index: usize,
-) -> bool {
-    if kind != BlobKind::Inline {
-        return false;
-    }
-    let position_is_empty = position_col.is_null(index) || position_col.value(index) == 0;
-    let size_is_empty = size_col.is_null(index) || size_col.value(index) == 0;
-    position_is_empty && size_is_empty
 }
 
 /// Column views for the 5 fields in a blob v2 descriptor struct.
@@ -1095,8 +1076,6 @@ fn classify_rows(
             })?;
             if kind == BlobKind::External {
                 row_classes.push(RowClass::External);
-            } else if is_inline_null_blob(kind, descriptor.position_col, descriptor.size_col, i) {
-                row_classes.push(RowClass::Null);
             } else {
                 row_classes.push(RowClass::DataBlob);
                 blob_read_addrs.push(row_addrs.value(i));
@@ -1172,7 +1151,13 @@ async fn build_user_view_struct(
                 }
             }
             RowClass::DataBlob => {
-                let data = blob_files[blob_file_idx].read().await?;
+                let blob_file = blob_files[blob_file_idx].as_ref().ok_or_else(|| {
+                    Error::internal(format!(
+                        "Non-null blob row {} in column '{}' resolved to null",
+                        i, column_name
+                    ))
+                })?;
+                let data = blob_file.read().await?;
                 blob_file_idx += 1;
                 data_builder.append_value(data.as_ref());
                 uri_builder.append_null();
@@ -1194,10 +1179,11 @@ async fn build_user_view_struct(
     )?)
 }
 
-async fn transform_blob_v2_batch(
+pub(crate) async fn transform_blob_v2_batch(
     dataset: &Arc<Dataset>,
     schema: &lance_core::datatypes::Schema,
     batch: RecordBatch,
+    keep_row_addr: bool,
 ) -> Result<RecordBatch> {
     let row_addr_idx = batch
         .schema()
@@ -1221,7 +1207,7 @@ async fn transform_blob_v2_batch(
 
     let batch_schema = batch.schema();
     for (col_idx, field) in batch_schema.fields().iter().enumerate() {
-        if field.name() == lance_core::ROW_ADDR {
+        if field.name() == lance_core::ROW_ADDR && !keep_row_addr {
             continue;
         }
 
@@ -1245,6 +1231,15 @@ async fn transform_blob_v2_batch(
                     batch.column(col_idx).data_type()
                 ))
             })?;
+
+        // Merge-insert may supply a blob v2 value directly from the source.
+        // Those values are already in the writer's user view and do not refer
+        // to a row in the target dataset, unlike descriptor values from scans.
+        if struct_arr.column_by_name("kind").is_none() {
+            new_columns.push(batch.column(col_idx).clone());
+            new_fields.push(field.clone());
+            continue;
+        }
 
         let column_name = field.name();
         let descriptor = BlobV2Descriptor::try_from_struct(struct_arr, column_name)?;
@@ -1665,7 +1660,7 @@ async fn rewrite_files(
                 let schema = dataset_schema.clone();
                 async move {
                     let batch = batch_result?;
-                    transform_blob_v2_batch(&dataset, &schema, batch)
+                    transform_blob_v2_batch(&dataset, &schema, batch, false)
                         .await
                         .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))
                 }
@@ -2599,7 +2594,7 @@ mod tests {
             .unwrap();
         assert_eq!(blobs.len(), expected_payload.len());
         for (blob, expected) in blobs.iter().zip(expected_payload.iter()) {
-            let bytes = blob.read().await.unwrap();
+            let bytes = blob.as_ref().unwrap().read().await.unwrap();
             assert_eq!(bytes.as_ref(), expected.as_slice());
         }
     }
@@ -7238,14 +7233,128 @@ mod tests {
             let row_id = row_ids.value(i);
             let id = ids.value(i);
             let blobs = dataset.take_blobs(&[row_id], column).await.unwrap();
-            if blobs.is_empty() {
-                result.push((id, None));
-            } else {
-                let data = blobs[0].read().await.unwrap();
-                result.push((id, Some(data.to_vec())));
+            match blobs.into_iter().next().flatten() {
+                Some(blob) => {
+                    let data = blob.read().await.unwrap();
+                    result.push((id, Some(data.to_vec())));
+                }
+                None => result.push((id, None)),
             }
         }
         result
+    }
+
+    fn mixed_blob_values() -> Vec<(i32, Option<Vec<u8>>)> {
+        vec![
+            (0, Some(vec![b'0'; 80])),
+            (1, None),
+            (2, Some(Vec::new())),
+            (3, Some(vec![b'3'; 80])),
+            (4, Some(vec![b'4'; 80])),
+            (5, Some(vec![b'5'; 80])),
+        ]
+    }
+
+    async fn assert_compaction_preserves_blob_values(
+        mut dataset: Dataset,
+        expected: &[(i32, Option<Vec<u8>>)],
+    ) {
+        assert_eq!(dataset.get_fragments().len(), 3);
+
+        let mut before = read_blob_bytes_by_index(&Arc::new(dataset.clone()), "blob").await;
+        before.sort_by_key(|(id, _)| *id);
+        assert_eq!(before, expected);
+
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 1024 * 1024,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(dataset.get_fragments().len(), 1);
+
+        let mut after = read_blob_bytes_by_index(&Arc::new(dataset), "blob").await;
+        after.sort_by_key(|(id, _)| *id);
+        assert_eq!(after, expected);
+    }
+
+    #[tokio::test]
+    async fn test_compact_blob_v1_preserves_null_empty_and_payload_order() {
+        let test_dir = TempStrDir::default();
+        let expected = mixed_blob_values();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("blob", DataType::LargeBinary, true)
+                .with_metadata([(BLOB_META_KEY.to_string(), "true".to_string())].into()),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..expected.len() as i32)),
+                Arc::new(LargeBinaryArray::from_iter(
+                    expected.iter().map(|(_, value)| value.as_deref()),
+                )),
+            ],
+        )
+        .unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &test_dir,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_0),
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_compaction_preserves_blob_values(dataset, &expected).await;
+    }
+
+    #[tokio::test]
+    async fn test_compact_blob_v2_preserves_null_empty_and_payload_order() {
+        use crate::BlobArrayBuilder;
+
+        let test_dir = TempStrDir::default();
+        let expected = mixed_blob_values();
+        let mut blob_builder = BlobArrayBuilder::new(expected.len());
+        for (_, value) in &expected {
+            match value {
+                Some(value) => blob_builder.push_bytes(value).unwrap(),
+                None => blob_builder.push_null().unwrap(),
+            }
+        }
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            crate::blob_field("blob", true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..expected.len() as i32)),
+                blob_builder.finish().unwrap(),
+            ],
+        )
+        .unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &test_dir,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_compaction_preserves_blob_values(dataset, &expected).await;
     }
 
     #[tokio::test]

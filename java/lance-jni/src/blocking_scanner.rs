@@ -662,7 +662,7 @@ fn inner_count_rows(env: &mut JNIEnv, j_scanner: JObject) -> Result<u64> {
 }
 
 const SCAN_STATS_CLASS: &str = "org/lance/ipc/ScanStats";
-const SCAN_STATS_CONSTRUCTOR_SIG: &str = "(JJJJJJLjava/util/Map;Ljava/util/Map;)V";
+const SCAN_STATS_CONSTRUCTOR_SIG: &str = "(JJJJJJJJLjava/util/Map;Ljava/util/Map;)V";
 
 fn export_usize_map<'a>(env: &mut JNIEnv<'a>, map: &HashMap<String, usize>) -> Result<JObject<'a>> {
     let hash_map = env.new_object("java/util/HashMap", "()V", &[])?;
@@ -694,6 +694,8 @@ impl IntoJava for &ExecutionSummaryCounts {
                 JValueGen::Long(self.indices_loaded as i64),
                 JValueGen::Long(self.parts_loaded as i64),
                 JValueGen::Long(self.index_comparisons as i64),
+                JValueGen::Long(self.index_cache_hits() as i64),
+                JValueGen::Long(self.index_cache_misses() as i64),
                 JValueGen::Object(&all_counts),
                 JValueGen::Object(&all_times),
             ],
