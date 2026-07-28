@@ -13,7 +13,9 @@ use crate::{
     encodings::physical::{
         block::{CompressionConfig, CompressionScheme},
         constant::ConstantBlockDecompressor,
+        delta::DeltaDecompressor,
         general::GenericGeneralBlockDecompressor,
+        range::RangeDecompressor,
         rle::{BlockRleDecompressor, BlockRunCount, MetadataRunLengths},
         value::FixedWidthBlockDecompressor,
     },
@@ -198,6 +200,65 @@ fn create_inner(
                 false,
             ))
         }
+        Compression::Range(range) => {
+            validate_declared_bits(range.uncompressed_bits_per_value, expected_type, "Range")?;
+            if !matches!(
+                expected_type,
+                BlockValueType::UInt32 | BlockValueType::UInt64
+            ) {
+                return Err(Error::invalid_input(format!(
+                    "Range only supports 32 or 64-bit values, got {expected_bits}"
+                )));
+            }
+            if range.start > expected_type.max_value() {
+                return Err(Error::invalid_input(format!(
+                    "Range start {} exceeds the {expected_bits}-bit value range",
+                    range.start
+                )));
+            }
+            if range.step == 0 {
+                return Err(Error::invalid_input("Range step must be positive"));
+            }
+            Ok((
+                Box::new(RangeDecompressor::new(
+                    expected_bits,
+                    range.start,
+                    range.step,
+                )),
+                false,
+            ))
+        }
+        Compression::Delta(delta) => {
+            if position != Position::Root {
+                return Err(Error::invalid_input(
+                    "Delta is not supported as a block codec child",
+                ));
+            }
+            validate_declared_bits(delta.uncompressed_bits_per_value, expected_type, "Delta")?;
+            if !matches!(
+                expected_type,
+                BlockValueType::UInt32 | BlockValueType::UInt64
+            ) {
+                return Err(Error::invalid_input(format!(
+                    "Delta only supports 32 or 64-bit values, got {expected_bits}"
+                )));
+            }
+            if delta.base > expected_type.max_value() {
+                return Err(Error::invalid_input(format!(
+                    "Delta base {} exceeds the {expected_bits}-bit value range",
+                    delta.base
+                )));
+            }
+            let child = delta.deltas.as_deref().ok_or_else(|| {
+                Error::invalid_input("Delta is missing its deltas child encoding")
+            })?;
+            let (child, child_has_payload) =
+                create_inner(child, expected_type, Position::Child, false)?;
+            Ok((
+                Box::new(DeltaDecompressor::new(expected_bits, delta.base, child)),
+                child_has_payload,
+            ))
+        }
         Compression::InlineBitpacking(bitpacking) => {
             validate_declared_bits(
                 bitpacking.uncompressed_bits_per_value,
@@ -332,6 +393,17 @@ fn create_inner(
                     )?;
                     Some(MetadataRunLengths::Constant(value))
                 }
+                Some(Compression::Range(range)) => {
+                    validate_declared_bits(
+                        range.uncompressed_bits_per_value,
+                        run_length_type,
+                        "RLE run lengths Range",
+                    )?;
+                    Some(MetadataRunLengths::Range {
+                        start: range.start,
+                        step: range.step,
+                    })
+                }
                 _ => None,
             };
             let run_count = if let Some(metadata) = metadata_run_lengths {
@@ -444,6 +516,11 @@ fn validate_compression_config(
     Ok(CompressionConfig::new(scheme, compression.level))
 }
 
+/// Infers the unsigned fixed-width result of a bounded block descriptor.
+pub fn infer_block_value_type(encoding: &CompressiveEncoding) -> Result<BlockValueType> {
+    infer_inner(encoding, Position::Root)
+}
+
 fn infer_inner(encoding: &CompressiveEncoding, position: Position) -> Result<BlockValueType> {
     let compression = encoding
         .compression
@@ -464,6 +541,10 @@ fn infer_inner(encoding: &CompressiveEncoding, position: Position) -> Result<Blo
         }
         Compression::OutOfLineBitpacking(bitpacking) => {
             BlockValueType::from_bits(bitpacking.uncompressed_bits_per_value)
+        }
+        Compression::Range(range) => BlockValueType::from_bits(range.uncompressed_bits_per_value),
+        Compression::Delta(delta) if position == Position::Root => {
+            BlockValueType::from_bits(delta.uncompressed_bits_per_value)
         }
         Compression::General(general) if position == Position::Root => infer_inner(
             general
@@ -500,6 +581,8 @@ fn compression_name(compression: &Compression) -> &'static str {
         Compression::FixedSizeList(_) => "fixed-size list",
         Compression::PackedStruct(_) => "packed struct",
         Compression::VariablePackedStruct(_) => "variable packed struct",
+        Compression::Range(_) => "range",
+        Compression::Delta(_) => "delta",
     }
 }
 
@@ -529,5 +612,20 @@ mod tests {
         let flat = crate::format::ProtobufUtils21::flat(32, None);
         let error = create_block_decompressor(&flat, BlockValueType::UInt64).unwrap_err();
         assert!(error.to_string().contains("expected 64"));
+    }
+
+    #[test]
+    fn validates_range_cardinality_when_decoding() {
+        let encoding = crate::format::ProtobufUtils21::range(32, u32::MAX as u64, 1);
+        let (decoder, has_payload) =
+            create_block_decompressor(&encoding, BlockValueType::UInt32).unwrap();
+        assert!(!has_payload);
+        let error = decoder.decompress(None, 2).unwrap_err();
+        assert!(error.to_string().contains("exceeds u32::MAX"));
+    }
+
+    #[test]
+    fn range_helper_rejects_overflow() {
+        assert!(crate::encodings::physical::range::checked_range_last(64, u64::MAX, 1, 2).is_err());
     }
 }

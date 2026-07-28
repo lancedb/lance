@@ -51,7 +51,6 @@ impl BlockValueType {
         (self.bits_per_value() / 8) as usize
     }
 
-    #[cfg(test)]
     pub(crate) fn max_value(self) -> u64 {
         match self {
             Self::UInt8 => u8::MAX as u64,
@@ -67,7 +66,9 @@ pub(crate) mod fixed;
 
 #[cfg(test)]
 pub(crate) use factory::encode_scalar;
-pub(crate) use factory::{create_block_decompressor, validate_fixed_payload_len};
+pub(crate) use factory::{
+    create_block_decompressor, infer_block_value_type, validate_fixed_payload_len,
+};
 #[cfg(feature = "bitpacking")]
 pub(crate) use factory::{validate_inline_bitpacking_payload, validate_out_of_line_payload};
 #[cfg(test)]

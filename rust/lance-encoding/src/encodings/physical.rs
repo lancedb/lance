@@ -9,9 +9,11 @@ pub mod bitpacking;
 pub mod block;
 pub mod byte_stream_split;
 pub mod constant;
+pub mod delta;
 pub mod fsst;
 pub mod general;
 pub mod packed;
+pub mod range;
 pub mod rle;
 pub mod value;
 

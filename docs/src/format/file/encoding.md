@@ -585,6 +585,8 @@ on a per-value basis. We use ☑️ to mark a technique that is applied on a per
 | Flat            | ✅ (2.1)              | ✅ (2.1)                 | ✅ (2.1)                   |
 | Variable        | ✅ (2.1)              | ✅ (2.1)                 | ✅ (2.1)                   |
 | Constant        | ✅ (2.1)              | ❓                       | ❓                         |
+| Range           | ✅ (2.3)              | ❌                       | ❓                         |
+| Delta           | ✅ (2.3)              | ❌                       | ❓                         |
 | Bitpacking      | ✅ (2.1)              | ❓                       | ✅ (2.1)                   |
 | Fsst            | ❓                    | ✅ (2.1)                 | ✅ (2.1)                   |
 | Rle             | ✅ (2.2)              | ❌                       | ✅ (2.1)                   |
@@ -593,6 +595,28 @@ on a per-value basis. We use ☑️ to mark a technique that is applied on a per
 
 In the following sections we will describe each technique in a bit more detail and explain how it is utilized
 in various contexts.
+
+### Generic Block Sequences
+
+Starting in Lance 2.3, block compression can describe unsigned `u32` and `u64` sequences with a bounded,
+zero-or-one-payload codec tree. The containing layout supplies the value type and cardinality.
+
+`Range` is metadata-only. It stores the unsigned width, first value, and positive step. The value at index `i`
+is `start + step * i`; readers reject cardinalities below two, overflow, and widths other than 32 or 64 bits.
+
+```protobuf
+%%% proto.message.Range %%%
+```
+
+`Delta` stores the first value inline. Its child describes the `n - 1` non-negative adjacent differences and
+determines whether the Delta tree has a payload. Zero differences are valid. Readers reconstruct the sequence
+with checked prefix sums.
+
+```protobuf
+%%% proto.message.Delta %%%
+```
+
+Lance 2.0 through 2.2 writers do not emit either encoding.
 
 ### Flat
 

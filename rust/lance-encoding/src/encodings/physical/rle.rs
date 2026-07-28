@@ -2006,6 +2006,7 @@ fn try_block_frame(values_payload_bytes: usize, lengths_payload_bytes: usize) ->
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum MetadataRunLengths {
     Constant(u64),
+    Range { start: u64, step: u64 },
 }
 
 impl MetadataRunLengths {
@@ -2027,6 +2028,39 @@ impl MetadataRunLengths {
                     ));
                 }
                 Ok(run_count)
+            }
+            Self::Range { start, step } => {
+                if start == 0 {
+                    return Err(Error::invalid_input("RLE run lengths must be positive"));
+                }
+                if step == 0 {
+                    return Err(Error::invalid_input(
+                        "RLE run lengths Range step must be positive",
+                    ));
+                }
+                let target = u128::from(num_values);
+                let mut low = 1_u64;
+                let mut high = num_values;
+                while low <= high {
+                    let run_count = low + (high - low) / 2;
+                    let count = u128::from(run_count);
+                    let factor = u128::from(start).checked_mul(2).and_then(|twice_start| {
+                        u128::from(run_count - 1)
+                            .checked_mul(u128::from(step))
+                            .and_then(|tail| twice_start.checked_add(tail))
+                    });
+                    let sum = factor
+                        .and_then(|factor| count.checked_mul(factor))
+                        .map(|sum| sum / 2);
+                    match sum.map(|sum| sum.cmp(&target)) {
+                        Some(std::cmp::Ordering::Equal) => return Ok(run_count),
+                        Some(std::cmp::Ordering::Less) => low = run_count + 1,
+                        Some(std::cmp::Ordering::Greater) | None => high = run_count - 1,
+                    }
+                }
+                Err(Error::invalid_input(format!(
+                    "RLE run length range start={start} step={step} does not sum to {num_values}"
+                )))
             }
         }
     }

@@ -1209,6 +1209,11 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
             Compression::OutOfLineBitpacking(_) => Err(Error::not_supported_source(
                 "this runtime was not built with bitpacking support".into(),
             )),
+            Compression::Range(_) | Compression::Delta(_) => {
+                let value_type = block::infer_block_value_type(description)?;
+                block::create_block_decompressor(description, value_type)
+                    .map(|(decompressor, _)| decompressor)
+            }
             Compression::Rle(rle) => Ok(Box::new(create_rle_decompressor(rle, self)?)),
             Compression::Variable(variable) => {
                 let offsets = variable.offsets.as_deref().ok_or_else(|| {
@@ -1443,6 +1448,8 @@ fn compression_name(compression: &Compression) -> &'static str {
         Compression::FixedSizeList(_) => "fixed-size list",
         Compression::VariablePackedStruct(_) => "variable packed struct",
         Compression::Rle(_) => "rle",
+        Compression::Range(_) => "range",
+        Compression::Delta(_) => "delta",
     }
 }
 

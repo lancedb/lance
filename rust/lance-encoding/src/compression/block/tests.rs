@@ -8,7 +8,7 @@ use crate::{
     compression::BlockCompressor,
     data::{BlockInfo, DataBlock, FixedWidthDataBlock},
     encodings::physical::{
-        constant::ConstantBlockCompressor, rle::BlockRleCompressor,
+        constant::ConstantBlockCompressor, range::RangeEncoder, rle::BlockRleCompressor,
         value::FixedWidthBlockCompressor,
     },
     format::{ProtobufUtils21, pb21::CompressiveEncoding},
@@ -28,6 +28,13 @@ fn decoded_u64(block: DataBlock) -> Vec<u64> {
         panic!("expected fixed-width output");
     };
     block.data.borrow_to_typed_slice::<u64>().to_vec()
+}
+
+fn decoded_u32(block: DataBlock) -> Vec<u32> {
+    let DataBlock::FixedWidth(block) = block else {
+        panic!("expected fixed-width output");
+    };
+    block.data.borrow_to_typed_slice::<u32>().to_vec()
 }
 
 #[test]
@@ -72,6 +79,12 @@ fn metadata_compressors_validate_and_decode() {
             Some(7),
         )),
         ProtobufUtils21::constant(Some(7_u64.to_le_bytes().to_vec().into())),
+    );
+    let values = (0..32_u64).map(|value| 5 + value * 3).collect::<Vec<_>>();
+    round_trip_u64(
+        &values,
+        Box::new(RangeEncoder::new(64, 5, 3)),
+        ProtobufUtils21::range(64, 5, 3),
     );
 }
 
@@ -218,6 +231,40 @@ fn constant_cardinality_contract_is_checked_at_decode() {
 }
 
 #[test]
+fn range_checks_cardinality_and_overflow() {
+    let (decoder, has_payload) =
+        create_block_decompressor(&ProtobufUtils21::range(32, 3, 5), BlockValueType::UInt32)
+            .unwrap();
+    assert!(!has_payload);
+    assert_eq!(
+        decoded_u32(decoder.decompress(None, 4).unwrap()),
+        vec![3, 8, 13, 18]
+    );
+    assert!(decoder.decompress(None, 1).is_err());
+
+    let (overflowing, has_payload) = create_block_decompressor(
+        &ProtobufUtils21::range(32, u32::MAX as u64, 1),
+        BlockValueType::UInt32,
+    )
+    .unwrap();
+    assert!(!has_payload);
+    assert!(overflowing.decompress(None, 2).is_err());
+}
+
+#[test]
+fn delta_checks_prefix_sum_overflow() {
+    let encoding = ProtobufUtils21::delta(
+        64,
+        u64::MAX,
+        ProtobufUtils21::constant(Some(1_u64.to_le_bytes().to_vec().into())),
+    );
+    let (decoder, has_payload) =
+        create_block_decompressor(&encoding, BlockValueType::UInt64).unwrap();
+    assert!(!has_payload);
+    assert!(decoder.decompress(None, 2).is_err());
+}
+
+#[test]
 fn metadata_only_rle_round_trip() {
     let encoding = ProtobufUtils21::rle(
         ProtobufUtils21::constant(Some(10_u64.to_le_bytes().to_vec().into())),
@@ -231,6 +278,22 @@ fn metadata_only_rle_round_trip() {
         vec![10; 6]
     );
     assert!(decoder.decompress(None, 5).is_err());
+}
+
+#[test]
+fn metadata_range_rle_round_trip() {
+    let encoding = ProtobufUtils21::rle(
+        ProtobufUtils21::range(64, 10, 1),
+        ProtobufUtils21::range(32, 1, 1),
+    );
+    let (decoder, has_payload) =
+        create_block_decompressor(&encoding, BlockValueType::UInt64).unwrap();
+    assert!(!has_payload);
+    assert_eq!(
+        decoded_u64(decoder.decompress(None, 6).unwrap()),
+        vec![10, 11, 11, 12, 12, 12]
+    );
+    assert!(decoder.decompress(None, 7).is_err());
 }
 
 #[test]
