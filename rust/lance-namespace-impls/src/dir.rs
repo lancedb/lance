@@ -929,7 +929,6 @@ struct ExistingTableVersionResolve<'a> {
     final_path: &'a Path,
     version: u64,
     table_uri: &'a str,
-    request_e_tag: Option<&'a str>,
     final_meta: &'a ObjectMeta,
     request_manifest_size: Option<i64>,
 }
@@ -1645,22 +1644,18 @@ impl DirectoryNamespace {
 
     /// Whether the staging blob matches the already-published version blob.
     ///
-    /// Used for idempotent retries of `create_table_version`: after a successful
-    /// Create materialize the final object's e_tag may differ from the staging
-    /// e_tag, so content equality is the durable identity check.
+    /// Used for idempotent retries of `create_table_version`. Object-store
+    /// `e_tag` is opaque metadata (not a validated content hash) and may also
+    /// change across Create/rename materialize, so it is never used for
+    /// identity. Size mismatch is a cheap negative check; byte equality is the
+    /// durable success condition.
     async fn staging_matches_final_manifest(
         &self,
         staging_path: &Path,
         final_path: &Path,
-        request_e_tag: Option<&str>,
         final_meta: &ObjectMeta,
         request_manifest_size: Option<i64>,
     ) -> Result<bool> {
-        if let (Some(req_tag), Some(exist_tag)) = (request_e_tag, final_meta.e_tag.as_deref())
-            && req_tag == exist_tag
-        {
-            return Ok(true);
-        }
         if let Some(size) = request_manifest_size
             && size != final_meta.size as i64
         {
@@ -1723,7 +1718,6 @@ impl DirectoryNamespace {
             .staging_matches_final_manifest(
                 args.staging_path,
                 args.final_path,
-                args.request_e_tag,
                 args.final_meta,
                 args.request_manifest_size,
             )
@@ -3886,7 +3880,6 @@ impl LanceNamespace for DirectoryNamespace {
                         final_path: &final_path,
                         version,
                         table_uri: &table_uri,
-                        request_e_tag: request.e_tag.as_deref(),
                         final_meta: &existing_meta,
                         request_manifest_size: request.manifest_size,
                     })
@@ -3939,7 +3932,6 @@ impl LanceNamespace for DirectoryNamespace {
                         final_path: &final_path,
                         version,
                         table_uri: &table_uri,
-                        request_e_tag: request.e_tag.as_deref(),
                         final_meta: &existing_meta,
                         request_manifest_size: request.manifest_size,
                     })
