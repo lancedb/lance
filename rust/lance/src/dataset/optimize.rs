@@ -2594,6 +2594,93 @@ mod tests {
         assert_eq!(plan.tasks().len(), 0);
     }
 
+    /// Compaction is a read→write roundtrip and the decoder materializes the
+    /// children of null structs as nulls.  A dataset containing null structs
+    /// with non-nullable children (e.g. GeoArrow point columns, where the
+    /// children must be non-nullable and validity is carried by the struct)
+    /// must therefore stay compactable.
+    ///
+    /// Reproduces <https://github.com/lance-format/lance/issues/7826>
+    ///
+    /// 2.1+ only: the 2.0 encoding does not store struct validity, so masked
+    /// child nulls stay rejected at write time there.
+    #[tokio::test]
+    async fn test_compact_null_structs_with_non_nullable_children() {
+        let data_storage_version = LanceFileVersion::V2_1;
+        use arrow_array::{Float64Array, StructArray, cast::AsArray};
+        use arrow_buffer::NullBuffer;
+        use arrow_schema::Fields;
+
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+
+        let child_fields = Fields::from(vec![
+            Field::new("x", DataType::Float64, false),
+            Field::new("y", DataType::Float64, false),
+        ]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("position", DataType::Struct(child_fields.clone()), true),
+        ]));
+
+        // Every third row is a null struct; the children physically hold 0.0
+        // fillers at those slots ("validity-first" layout).
+        let num_rows = 100_usize;
+        let ids = Int64Array::from_iter_values(0..num_rows as i64);
+        let is_valid = |i: usize| !i.is_multiple_of(3);
+        let xs = Float64Array::from_iter_values(
+            (0..num_rows).map(|i| if is_valid(i) { i as f64 } else { 0.0 }),
+        );
+        let ys = Float64Array::from_iter_values(
+            (0..num_rows).map(|i| if is_valid(i) { i as f64 * 10.0 } else { 0.0 }),
+        );
+        let position = StructArray::try_new(
+            child_fields,
+            vec![Arc::new(xs) as ArrayRef, Arc::new(ys) as ArrayRef],
+            Some(NullBuffer::from_iter((0..num_rows).map(is_valid))),
+        )
+        .unwrap();
+        let data = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(ids) as ArrayRef, Arc::new(position) as ArrayRef],
+        )
+        .unwrap();
+
+        let reader = RecordBatchIterator::new(vec![Ok(data)], schema.clone());
+        let write_params = WriteParams {
+            max_rows_per_file: 25,
+            data_storage_version: Some(data_storage_version),
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(reader, test_uri, Some(write_params))
+            .await
+            .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 4);
+
+        let metrics = compact_files(&mut dataset, CompactionOptions::default(), None)
+            .await
+            .unwrap();
+        assert_eq!(metrics.fragments_removed, 4);
+        assert_eq!(metrics.fragments_added, 1);
+
+        // The rewritten data is intact: null structs stay null and valid rows
+        // keep their values.
+        let batch = dataset.scan().try_into_batch().await.unwrap();
+        assert_eq!(batch.num_rows(), num_rows);
+        let ids = batch.column_by_name("id").unwrap();
+        let ids = ids.as_primitive::<Int64Type>();
+        let position = batch.column_by_name("position").unwrap().as_struct();
+        let xs = position.column(0).as_primitive::<Float64Type>();
+        let ys = position.column(1).as_primitive::<Float64Type>();
+        for row in 0..num_rows {
+            let i = ids.value(row) as usize;
+            assert_eq!(position.is_valid(row), is_valid(i));
+            if is_valid(i) {
+                assert_eq!((xs.value(row), ys.value(row)), (i as f64, i as f64 * 10.0));
+            }
+        }
+    }
+
     #[tokio::test]
     async fn test_compact_blob_columns() {
         let test_dir = TempStrDir::default();

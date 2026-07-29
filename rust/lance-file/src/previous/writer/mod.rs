@@ -11,7 +11,6 @@ use arrow_array::cast::{as_large_list_array, as_list_array, as_struct_array};
 use arrow_array::types::{Int32Type, Int64Type};
 use arrow_array::{Array, ArrayRef, RecordBatch, StructArray};
 use arrow_buffer::ArrowNativeType;
-use arrow_data::ArrayData;
 use arrow_schema::DataType;
 use async_recursion::async_recursion;
 use async_trait::async_trait;
@@ -140,24 +139,11 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
         &self.schema
     }
 
-    fn verify_field_nullability(arr: &ArrayData, field: &Field) -> Result<()> {
-        if !field.nullable && arr.null_count() > 0 {
-            return Err(Error::invalid_input(format!(
-                "The field `{}` contained null values even though the field is marked non-null in the schema",
-                field.name
-            )));
-        }
-
-        for (child_field, child_arr) in field.children.iter().zip(arr.child_data()) {
-            Self::verify_field_nullability(child_arr, child_field)?;
-        }
-
-        Ok(())
-    }
-
     fn verify_nullability_constraints(&self, batch: &RecordBatch) -> Result<()> {
         for (col, field) in batch.columns().iter().zip(self.schema.fields.iter()) {
-            Self::verify_field_nullability(&col.to_data(), field)?;
+            // The legacy format does not encode struct validity, so masked
+            // child nulls cannot roundtrip and stay rejected.
+            crate::writer::verify_field_nullability(col.as_ref(), field, None, false)?;
         }
         Ok(())
     }
