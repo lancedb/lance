@@ -2576,3 +2576,329 @@ async fn test_open_dataset_non_not_found_error_is_not_masked() {
         err,
     );
 }
+
+// ── Incremental format upgrade tests ─────────────────────────────────────
+
+#[lance_test_macros::test(tokio::test)]
+async fn test_append_upgrades_format_version() {
+    let test_uri = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "x",
+        DataType::Int32,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+    )
+    .unwrap();
+
+    let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone());
+    let ds = Dataset::write(
+        reader,
+        &test_uri,
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_1),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        ds.manifest
+            .data_storage_format
+            .lance_file_version()
+            .unwrap(),
+        LanceFileVersion::V2_1
+    );
+
+    let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone());
+    let ds = Dataset::write(
+        reader,
+        &test_uri,
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        ds.manifest
+            .data_storage_format
+            .lance_file_version()
+            .unwrap(),
+        LanceFileVersion::V2_2,
+        "Manifest should be upgraded to v2.2 after appending v2.2 fragments"
+    );
+    assert_eq!(ds.count_rows(None).await.unwrap(), 6);
+}
+
+#[lance_test_macros::test(tokio::test)]
+async fn test_append_without_version_inherits_manifest() {
+    let test_uri = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "x",
+        DataType::Int32,
+        false,
+    )]));
+    let batch =
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1, 2]))]).unwrap();
+
+    let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone());
+    Dataset::write(
+        reader,
+        &test_uri,
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone());
+    let ds = Dataset::write(
+        reader,
+        &test_uri,
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        ds.manifest
+            .data_storage_format
+            .lance_file_version()
+            .unwrap(),
+        LanceFileVersion::V2_2,
+        "Manifest should remain v2.2 when appending without explicit version"
+    );
+    assert_eq!(ds.count_rows(None).await.unwrap(), 4);
+}
+
+#[lance_test_macros::test(tokio::test)]
+async fn test_append_ignores_lower_format_version() {
+    let test_uri = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "x",
+        DataType::Int32,
+        false,
+    )]));
+    let batch =
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1]))]).unwrap();
+
+    let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone());
+    Dataset::write(
+        reader,
+        &test_uri,
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone());
+    let ds = Dataset::write(
+        reader,
+        &test_uri,
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            data_storage_version: Some(LanceFileVersion::V2_1),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        ds.manifest
+            .data_storage_format
+            .lance_file_version()
+            .unwrap(),
+        LanceFileVersion::V2_2,
+        "Manifest should remain at v2.2 — downgrade requests are ignored"
+    );
+    assert_eq!(ds.count_rows(None).await.unwrap(), 2);
+}
+
+#[lance_test_macros::test(tokio::test)]
+async fn test_overwrite_changes_format_version() {
+    let test_uri = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "x",
+        DataType::Int32,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+    )
+    .unwrap();
+
+    let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone());
+    Dataset::write(
+        reader,
+        &test_uri,
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_1),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone());
+    let ds = Dataset::write(
+        reader,
+        &test_uri,
+        Some(WriteParams {
+            mode: Overwrite,
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        ds.manifest
+            .data_storage_format
+            .lance_file_version()
+            .unwrap(),
+        LanceFileVersion::V2_2
+    );
+    assert_eq!(ds.count_rows(None).await.unwrap(), 3);
+}
+
+#[lance_test_macros::test(tokio::test)]
+async fn test_mixed_version_fragments_readable() {
+    let test_uri = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "x",
+        DataType::Int32,
+        false,
+    )]));
+
+    let batch_v21 = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![10, 20]))],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch_v21)], schema.clone());
+    Dataset::write(
+        reader,
+        &test_uri,
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_1),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let batch_v22 = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![30, 40]))],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch_v22)], schema.clone());
+    let ds = Dataset::write(
+        reader,
+        &test_uri,
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let batches: Vec<RecordBatch> = ds
+        .scan()
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let combined = concat_batches(&schema, &batches).unwrap();
+    let values = combined
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    let mut actual: Vec<i32> = values.iter().map(|v| v.unwrap()).collect();
+    actual.sort();
+    assert_eq!(actual, vec![10, 20, 30, 40]);
+}
+
+#[lance_test_macros::test(tokio::test)]
+async fn test_delete_on_mixed_version_table() {
+    let test_uri = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "x",
+        DataType::Int32,
+        false,
+    )]));
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+    Dataset::write(
+        reader,
+        &test_uri,
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_1),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let batch =
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![4, 5]))]).unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+    let ds = Dataset::write(
+        reader,
+        &test_uri,
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ds.count_rows(None).await.unwrap(), 5);
+
+    let mut ds = Dataset::open(&test_uri).await.unwrap();
+    ds.delete("x = 2 OR x = 4").await.unwrap();
+
+    let ds = Dataset::open(&test_uri).await.unwrap();
+    assert_eq!(ds.count_rows(None).await.unwrap(), 3);
+    let batches: Vec<RecordBatch> = ds
+        .scan()
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let combined = concat_batches(&schema, &batches).unwrap();
+    let values = combined
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    let mut actual: Vec<i32> = values.iter().map(|v| v.unwrap()).collect();
+    actual.sort();
+    assert_eq!(actual, vec![1, 3, 5]);
+}

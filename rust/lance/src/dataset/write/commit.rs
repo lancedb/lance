@@ -362,7 +362,9 @@ impl<'a> CommitBuilder<'a> {
         } else {
             self.use_stable_row_ids.unwrap_or(false)
         };
-        // Validate storage format matches existing dataset
+        // Validate storage format against existing dataset.
+        // Overwrite can set any version. Other operations (Append, Update, etc.)
+        // may upgrade to a higher version but cannot downgrade.
         if let Some(ds) = dest.dataset()
             && let Some(storage_format) = self.storage_format
         {
@@ -370,11 +372,15 @@ impl<'a> CommitBuilder<'a> {
             if ds.manifest.data_storage_format != passed_storage_format
                 && !matches!(transaction.operation, Operation::Overwrite { .. })
             {
-                return Err(Error::invalid_input_source(format!(
-                    "Storage format mismatch. Existing dataset uses {:?}, but new data uses {:?}",
-                    ds.manifest.data_storage_format,
-                    passed_storage_format
-                ).into()));
+                let existing_version = ds.manifest.data_storage_format.lance_file_version()?;
+                if storage_format <= existing_version {
+                    return Err(Error::invalid_input_source(format!(
+                        "Storage format mismatch. Existing dataset uses {:?}, but requested {:?}. \
+                         Only forward upgrades are permitted for non-overwrite operations.",
+                        ds.manifest.data_storage_format,
+                        passed_storage_format
+                    ).into()));
+                }
             }
         }
 

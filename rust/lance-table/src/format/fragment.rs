@@ -669,6 +669,27 @@ impl Fragment {
         }
         Ok(Some(file_version))
     }
+
+    /// Returns the maximum file version across all data files in the given fragments.
+    ///
+    /// Returns `None` if there are no data files.
+    pub fn max_file_version(fragments: &[Self]) -> Result<Option<LanceFileVersion>> {
+        let mut max_version: Option<LanceFileVersion> = None;
+        for frag in fragments {
+            for file in &frag.files {
+                let v = LanceFileVersion::try_from_major_minor(
+                    file.file_major_version,
+                    file.file_minor_version,
+                )?;
+                max_version = Some(match max_version {
+                    Some(current) if v > current => v,
+                    Some(current) => current,
+                    None => v,
+                });
+            }
+        }
+        Ok(max_version)
+    }
 }
 
 impl TryFrom<pb::DataFragment> for Fragment {

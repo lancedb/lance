@@ -422,9 +422,12 @@ impl<'a> InsertBuilder<'a> {
                 })?
             }
             (_, WriteDestination::Dataset(dataset)) => {
-                // If appending to an existing dataset, always use the dataset version
                 let m = dataset.manifest.as_ref();
-                m.data_storage_format.lance_file_version()?
+                let existing = m.data_storage_format.lance_file_version()?;
+                match params.data_storage_version {
+                    Some(requested) if requested > existing => requested,
+                    _ => existing,
+                }
             }
             // Otherwise (no existing dataset) fallback to the default if the user didn't specify
             (_, WriteDestination::Uri(_)) => params.storage_version_or_default(),

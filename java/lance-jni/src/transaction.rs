@@ -596,12 +596,13 @@ pub(crate) fn convert_to_java_schema<'local>(
 
 fn parse_storage_format(name: &str) -> Result<LanceFileVersion> {
     match name.to_lowercase().as_str() {
-        "legacy" => Ok(LanceFileVersion::Legacy),
-        "v2_0" | "v2.0" => Ok(LanceFileVersion::V2_0),
+        "legacy" | "0.1" => Ok(LanceFileVersion::Legacy),
+        "v2_0" | "v2.0" | "2.0" => Ok(LanceFileVersion::V2_0),
         "stable" => Ok(LanceFileVersion::Stable),
-        "v2_1" | "v2.1" => Ok(LanceFileVersion::V2_1),
+        "v2_1" | "v2.1" | "2.1" => Ok(LanceFileVersion::V2_1),
         "next" => Ok(LanceFileVersion::Next),
-        "v2_2" | "v2.2" => Ok(LanceFileVersion::V2_2),
+        "v2_2" | "v2.2" | "2.2" => Ok(LanceFileVersion::V2_2),
+        "v2_3" | "v2.3" | "2.3" => Ok(LanceFileVersion::V2_3),
         _ => Err(Error::input_error(format!(
             "Unknown storage format: {}",
             name

@@ -394,14 +394,15 @@ fn check_storage_version(manifest: &mut Manifest) -> Result<()> {
                     manifest.data_storage_format = DataStorageFormat::new(actual_file_version);
                 }
     } else {
-        // Otherwise, if we are on 2.0 or greater, we should ensure that the file versions
-        // match the data storage version.  This is a sanity assertion to prevent data corruption.
-        if let Some(actual_file_version) = Fragment::try_infer_version(&manifest.fragments)?
-            && actual_file_version != data_storage_version
+        // For v2.0+: verify that no fragment contains files encoded at a version
+        // higher than the manifest's declared data_storage_format. Mixed versions
+        // at or below the manifest version are valid (incremental format upgrade).
+        if let Some(max_file_version) = Fragment::max_file_version(&manifest.fragments)?
+            && max_file_version > data_storage_version
         {
             return Err(Error::internal(format!(
                 "The operation added files with version {}.  However, the data storage version is {}.",
-                actual_file_version, data_storage_version
+                max_file_version, data_storage_version
             )));
         }
     }

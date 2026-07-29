@@ -2452,13 +2452,27 @@ impl Transaction {
             let mut prev_manifest =
                 Manifest::new_from_previous(current_manifest, schema, Arc::new(final_fragments));
 
-            if let (Some(user_requested_version), Operation::Overwrite { .. }) =
-                (user_requested_version, &self.operation)
-            {
-                // If this is an overwrite operation and the user has requested a specific version
-                // then overwrite with that version.  Otherwise, if the user didn't request a specific
-                // version, then overwrite with whatever version we had before.
-                prev_manifest.data_storage_format = DataStorageFormat::new(user_requested_version);
+            if let Some(user_requested_version) = user_requested_version {
+                let existing_version = prev_manifest.data_storage_format.lance_file_version()?;
+                match &self.operation {
+                    Operation::Overwrite { .. } => {
+                        // Overwrite always applies the requested version.
+                        prev_manifest.data_storage_format =
+                            DataStorageFormat::new(user_requested_version);
+                    }
+                    _ => {
+                        // For all other operations (Append, Update, etc.): allow
+                        // upgrading the manifest to a higher format version. This
+                        // enables incremental format adoption — new fragments use
+                        // the newer encoding while existing fragments remain at
+                        // their original version. The reader dispatches per-file
+                        // based on DataFile.file_major_version/file_minor_version.
+                        if user_requested_version > existing_version {
+                            prev_manifest.data_storage_format =
+                                DataStorageFormat::new(user_requested_version);
+                        }
+                    }
+                }
             }
 
             prev_manifest

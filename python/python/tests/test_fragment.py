@@ -321,10 +321,11 @@ def test_mixed_fragment_versions(tmp_path):
         lance.LanceFragment.create(ds.uri, data, data_storage_version="stable")
     )
 
-    # Attempt to commit
+    # Commit succeeds — mixed fragment versions are permitted when the manifest
+    # version is >= all fragment versions (incremental format upgrade).
     operation = lance.LanceOperation.Overwrite(ds.schema, fragments)
-    with pytest.raises(OSError, match="All data files must have the same version"):
-        lance.LanceDataset.commit(ds.uri, operation)
+    ds = lance.LanceDataset.commit(ds.uri, operation)
+    assert ds.count_rows() == 1600
 
 
 def test_create_from_file(tmp_path):
