@@ -1,0 +1,88 @@
+/*
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.lance.otel;
+
+import org.lance.Dataset;
+import org.lance.TestUtils;
+
+import io.opentelemetry.sdk.metrics.SdkMeterProvider;
+import io.opentelemetry.sdk.metrics.data.MetricData;
+import io.opentelemetry.sdk.testing.exporter.InMemoryMetricReader;
+import org.apache.arrow.memory.RootAllocator;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+
+import java.nio.file.Path;
+import java.util.Collection;
+import java.util.Map;
+import java.util.Set;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+public class LanceMetricsTest {
+  private static final String REQUESTS = "lance_object_store_requests_total";
+  private static final String DURATION = "lance_object_store_request_duration_seconds";
+  private static final String RETRYABLE = "lance_object_store_retryable_responses_total";
+  private static final String IN_FLIGHT = "lance_object_store_in_flight_requests";
+
+  @Test
+  void testInstrumentLanceMetricsExportsObjectStoreMetrics(@TempDir Path tempDir) {
+    InMemoryMetricReader reader = InMemoryMetricReader.create();
+    SdkMeterProvider provider = SdkMeterProvider.builder().registerMetricReader(reader).build();
+
+    try {
+      assertTrue(LanceMetrics.instrument(provider));
+
+      Map<String, MetricDescription> catalog =
+          LanceMetrics.catalog().stream()
+              .collect(Collectors.toMap(MetricDescription::getName, Function.identity()));
+      assertTrue(catalog.containsKey(REQUESTS));
+      assertEquals("histogram", catalog.get(DURATION).getKind());
+      assertEquals("counter", catalog.get(RETRYABLE).getKind());
+      assertEquals("gauge", catalog.get(IN_FLIGHT).getKind());
+
+      try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+        String datasetPath = tempDir.resolve("otel_metrics.lance").toString();
+        TestUtils.SimpleTestDataset testDataset =
+            new TestUtils.SimpleTestDataset(allocator, datasetPath);
+        try (Dataset dataset = testDataset.createEmptyDataset()) {
+          assertEquals(0, dataset.countRows());
+        }
+      }
+
+      MetricPoint requests =
+          LanceMetrics.snapshot().stream()
+              .filter(point -> REQUESTS.equals(point.getName()))
+              .findFirst()
+              .orElseThrow(() -> new AssertionError("expected object store request metric"));
+      assertNotNull(requests.getValue());
+      assertTrue(requests.getValue() > 0);
+      assertTrue(requests.getAttributes().containsKey("operation"));
+      assertTrue(requests.getAttributes().containsKey("base"));
+
+      Collection<MetricData> metrics = reader.collectAllMetrics();
+      Set<String> names = metrics.stream().map(MetricData::getName).collect(Collectors.toSet());
+      assertTrue(names.contains(REQUESTS));
+      assertTrue(names.contains(DURATION + "_bucket"));
+      assertTrue(names.contains(DURATION + "_count"));
+      assertTrue(names.contains(DURATION + "_sum"));
+    } finally {
+      provider.close();
+    }
+  }
+}

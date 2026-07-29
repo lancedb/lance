@@ -55,6 +55,7 @@ mod mem_wal;
 mod merge_insert;
 mod namespace;
 mod optimize;
+mod otel;
 mod schema;
 mod session;
 mod sql;
