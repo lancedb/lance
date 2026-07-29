@@ -20,6 +20,7 @@ import io.opentelemetry.sdk.metrics.SdkMeterProvider;
 import io.opentelemetry.sdk.metrics.data.MetricData;
 import io.opentelemetry.sdk.testing.exporter.InMemoryMetricReader;
 import org.apache.arrow.memory.RootAllocator;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -40,6 +41,11 @@ public class LanceMetricsTest {
   private static final String RETRYABLE = "lance_object_store_retryable_responses_total";
   private static final String IN_FLIGHT = "lance_object_store_in_flight_requests";
 
+  @AfterEach
+  void closeLanceMetrics() {
+    LanceMetrics.close();
+  }
+
   @Test
   void testInstrumentLanceMetricsExportsObjectStoreMetrics(@TempDir Path tempDir) {
     InMemoryMetricReader reader = InMemoryMetricReader.create();
@@ -56,14 +62,7 @@ public class LanceMetricsTest {
       assertEquals("counter", catalog.get(RETRYABLE).getKind());
       assertEquals("gauge", catalog.get(IN_FLIGHT).getKind());
 
-      try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
-        String datasetPath = tempDir.resolve("otel_metrics.lance").toString();
-        TestUtils.SimpleTestDataset testDataset =
-            new TestUtils.SimpleTestDataset(allocator, datasetPath);
-        try (Dataset dataset = testDataset.createEmptyDataset()) {
-          assertEquals(0, dataset.countRows());
-        }
-      }
+      generateObjectStoreMetrics(tempDir.resolve("otel_metrics.lance"));
 
       MetricPoint requests =
           LanceMetrics.snapshot().stream()
@@ -84,5 +83,42 @@ public class LanceMetricsTest {
     } finally {
       provider.close();
     }
+  }
+
+  @Test
+  void testInstrumentReRegistersWithNewProvider(@TempDir Path tempDir) {
+    InMemoryMetricReader firstReader = InMemoryMetricReader.create();
+    InMemoryMetricReader secondReader = InMemoryMetricReader.create();
+    SdkMeterProvider firstProvider =
+        SdkMeterProvider.builder().registerMetricReader(firstReader).build();
+    SdkMeterProvider secondProvider =
+        SdkMeterProvider.builder().registerMetricReader(secondReader).build();
+
+    try {
+      assertTrue(LanceMetrics.instrument(firstProvider));
+      generateObjectStoreMetrics(tempDir.resolve("first_provider.lance"));
+      assertTrue(metricNames(firstReader).contains(REQUESTS));
+
+      assertTrue(LanceMetrics.instrument(secondProvider));
+      assertTrue(metricNames(secondReader).contains(REQUESTS));
+    } finally {
+      firstProvider.close();
+      secondProvider.close();
+    }
+  }
+
+  private static void generateObjectStoreMetrics(Path datasetPath) {
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath.toString());
+      try (Dataset dataset = testDataset.createEmptyDataset()) {
+        assertEquals(0, dataset.countRows());
+      }
+    }
+  }
+
+  private static Set<String> metricNames(InMemoryMetricReader reader) {
+    Collection<MetricData> metrics = reader.collectAllMetrics();
+    return metrics.stream().map(MetricData::getName).collect(Collectors.toSet());
   }
 }

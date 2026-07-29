@@ -18,12 +18,15 @@ import org.lance.JniLoader;
 import io.opentelemetry.api.GlobalOpenTelemetry;
 import io.opentelemetry.api.common.Attributes;
 import io.opentelemetry.api.common.AttributesBuilder;
+import io.opentelemetry.api.metrics.BatchCallback;
 import io.opentelemetry.api.metrics.Meter;
 import io.opentelemetry.api.metrics.MeterProvider;
 import io.opentelemetry.api.metrics.ObservableDoubleMeasurement;
+import io.opentelemetry.api.metrics.ObservableMeasurement;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -35,6 +38,7 @@ public final class LanceMetrics {
   private static final String METER_NAME = "lance";
   private static final List<AutoCloseable> INSTRUMENTS = new ArrayList<>();
   private static boolean instrumented;
+  private static MeterProvider instrumentedProvider;
 
   private LanceMetrics() {}
 
@@ -53,7 +57,9 @@ public final class LanceMetrics {
    *
    * <p>This installs a process-global Rust metrics recorder. If a different Rust metrics recorder
    * is already installed, this returns false and does not create instruments. Repeated successful
-   * calls are safe and return true without creating duplicate instruments.
+   * calls with the same provider are safe and return true without creating duplicate instruments.
+   * Calls with a different provider close the existing instruments and register new callbacks on
+   * the supplied provider.
    *
    * @param meterProvider the OpenTelemetry meter provider that owns the instruments
    * @return true if the recorder is installed and instruments are registered, false otherwise
@@ -71,61 +77,88 @@ public final class LanceMetrics {
     }
 
     if (instrumented) {
-      return true;
+      if (instrumentedProvider == meterProvider) {
+        return true;
+      }
+      closeInstruments();
     }
 
     Meter meter = meterProvider.meterBuilder(METER_NAME).build();
+    Map<String, RegisteredMetric> registeredMetrics = new HashMap<>();
+    List<ObservableMeasurement> measurements = new ArrayList<>();
+
     for (MetricDescription desc : catalog()) {
       String unit = desc.getUnit() == null ? "" : desc.getUnit();
       String description = desc.getDescription();
       switch (desc.getKind()) {
         case "counter":
-          INSTRUMENTS.add(
+          ObservableDoubleMeasurement counter =
               meter
                   .counterBuilder(desc.getName())
                   .ofDoubles()
                   .setUnit(unit)
                   .setDescription(description)
-                  .buildWithCallback(measurement -> recordScalar(desc.getName(), measurement)));
+                  .buildObserver();
+          registeredMetrics.put(desc.getName(), RegisteredMetric.scalar(counter));
+          measurements.add(counter);
           break;
         case "gauge":
-          INSTRUMENTS.add(
+          ObservableDoubleMeasurement gauge =
               meter
                   .gaugeBuilder(desc.getName())
                   .setUnit(unit)
                   .setDescription(description)
-                  .buildWithCallback(measurement -> recordScalar(desc.getName(), measurement)));
+                  .buildObserver();
+          registeredMetrics.put(desc.getName(), RegisteredMetric.scalar(gauge));
+          measurements.add(gauge);
           break;
         case "histogram":
-          INSTRUMENTS.add(
+          ObservableDoubleMeasurement buckets =
               meter
                   .counterBuilder(desc.getName() + "_bucket")
                   .ofDoubles()
                   .setDescription(description + " (cumulative buckets)")
-                  .buildWithCallback(measurement -> recordBuckets(desc.getName(), measurement)));
-          INSTRUMENTS.add(
+                  .buildObserver();
+          ObservableDoubleMeasurement count =
               meter
                   .counterBuilder(desc.getName() + "_count")
                   .ofDoubles()
                   .setDescription(description + " (count)")
-                  .buildWithCallback(
-                      measurement -> recordField(desc.getName(), "count", measurement)));
-          INSTRUMENTS.add(
+                  .buildObserver();
+          ObservableDoubleMeasurement sum =
               meter
                   .counterBuilder(desc.getName() + "_sum")
                   .ofDoubles()
                   .setUnit(unit)
                   .setDescription(description + " (sum)")
-                  .buildWithCallback(
-                      measurement -> recordField(desc.getName(), "sum", measurement)));
+                  .buildObserver();
+          registeredMetrics.put(desc.getName(), RegisteredMetric.histogram(buckets, count, sum));
+          measurements.add(buckets);
+          measurements.add(count);
+          measurements.add(sum);
           break;
         default:
           throw new IllegalStateException("Unknown Lance metric kind: " + desc.getKind());
       }
     }
 
+    if (!measurements.isEmpty()) {
+      ObservableMeasurement first = measurements.get(0);
+      ObservableMeasurement[] rest =
+          measurements.subList(1, measurements.size()).toArray(new ObservableMeasurement[0]);
+      BatchCallback callback =
+          meter.batchCallback(() -> recordSnapshot(registeredMetrics), first, rest);
+      INSTRUMENTS.add(callback);
+    }
+
     instrumented = true;
+    instrumentedProvider = meterProvider;
     return true;
+  }
+
+  /** Close registered OpenTelemetry callbacks. Rust metric state remains process-global. */
+  public static synchronized void close() {
+    closeInstruments();
   }
 
   /** Return the catalog of Lance metrics described by the native recorder. */
@@ -140,60 +173,87 @@ public final class LanceMetrics {
     return Collections.unmodifiableList(snapshotLanceMetricsNative());
   }
 
-  private static void recordScalar(String metricName, ObservableDoubleMeasurement measurement) {
+  private static void recordSnapshot(Map<String, RegisteredMetric> registeredMetrics) {
     for (MetricPoint point : snapshot()) {
-      if (metricName.equals(point.getName()) && point.getValue() != null) {
-        measurement.record(point.getValue(), attributes(point.getAttributes()));
-      }
-    }
-  }
-
-  private static void recordBuckets(String metricName, ObservableDoubleMeasurement measurement) {
-    for (MetricPoint point : snapshot()) {
-      if (!metricName.equals(point.getName()) || point.getBuckets() == null) {
+      RegisteredMetric metric = registeredMetrics.get(point.getName());
+      if (metric == null) {
         continue;
       }
-      for (MetricBucket bucket : point.getBuckets()) {
-        AttributesBuilder attributes = Attributes.builder();
-        for (Map.Entry<String, String> entry : point.getAttributes().entrySet()) {
-          attributes.put(entry.getKey(), entry.getValue());
-        }
-        attributes.put("le", bucket.getLe());
-        measurement.record(bucket.getCumulativeCount(), attributes.build());
-      }
+      metric.record(point);
     }
   }
 
-  private static void recordField(
-      String metricName, String fieldName, ObservableDoubleMeasurement measurement) {
-    for (MetricPoint point : snapshot()) {
-      if (!metricName.equals(point.getName())) {
-        continue;
-      }
-      Double value = fieldValue(point, fieldName);
-      if (value != null) {
-        measurement.record(value, attributes(point.getAttributes()));
+  private static void closeInstruments() {
+    for (AutoCloseable instrument : INSTRUMENTS) {
+      try {
+        instrument.close();
+      } catch (Exception e) {
+        LOGGER.warning("Failed to close Lance OpenTelemetry instrument: " + e.getMessage());
       }
     }
+    INSTRUMENTS.clear();
+    instrumented = false;
+    instrumentedProvider = null;
   }
 
-  private static Double fieldValue(MetricPoint point, String fieldName) {
-    switch (fieldName) {
-      case "count":
-        return point.getCount() == null ? null : point.getCount().doubleValue();
-      case "sum":
-        return point.getSum();
-      default:
-        throw new IllegalArgumentException("Unknown Lance metric field: " + fieldName);
-    }
-  }
-
-  private static Attributes attributes(Map<String, String> values) {
+  private static AttributesBuilder attributesBuilder(Map<String, String> values) {
     AttributesBuilder builder = Attributes.builder();
     for (Map.Entry<String, String> entry : values.entrySet()) {
       builder.put(entry.getKey(), entry.getValue());
     }
-    return builder.build();
+    return builder;
+  }
+
+  private static Attributes attributes(Map<String, String> values) {
+    return attributesBuilder(values).build();
+  }
+
+  private static final class RegisteredMetric {
+    private final ObservableDoubleMeasurement scalar;
+    private final ObservableDoubleMeasurement buckets;
+    private final ObservableDoubleMeasurement count;
+    private final ObservableDoubleMeasurement sum;
+
+    private RegisteredMetric(
+        ObservableDoubleMeasurement scalar,
+        ObservableDoubleMeasurement buckets,
+        ObservableDoubleMeasurement count,
+        ObservableDoubleMeasurement sum) {
+      this.scalar = scalar;
+      this.buckets = buckets;
+      this.count = count;
+      this.sum = sum;
+    }
+
+    private static RegisteredMetric scalar(ObservableDoubleMeasurement measurement) {
+      return new RegisteredMetric(measurement, null, null, null);
+    }
+
+    private static RegisteredMetric histogram(
+        ObservableDoubleMeasurement buckets,
+        ObservableDoubleMeasurement count,
+        ObservableDoubleMeasurement sum) {
+      return new RegisteredMetric(null, buckets, count, sum);
+    }
+
+    private void record(MetricPoint point) {
+      if (scalar != null && point.getValue() != null) {
+        scalar.record(point.getValue(), attributes(point.getAttributes()));
+      }
+      if (buckets != null && point.getBuckets() != null) {
+        for (MetricBucket bucket : point.getBuckets()) {
+          AttributesBuilder attributes = attributesBuilder(point.getAttributes());
+          attributes.put("le", bucket.getLe());
+          buckets.record(bucket.getCumulativeCount(), attributes.build());
+        }
+      }
+      if (count != null && point.getCount() != null) {
+        count.record(point.getCount().doubleValue(), attributes(point.getAttributes()));
+      }
+      if (sum != null && point.getSum() != null) {
+        sum.record(point.getSum(), attributes(point.getAttributes()));
+      }
+    }
   }
 
   private static native boolean registerLanceMetricsRecorderNative();

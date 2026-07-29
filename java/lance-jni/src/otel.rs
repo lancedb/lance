@@ -405,6 +405,8 @@ fn attributes_to_java<'local>(
             "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
             &[JValue::Object(&java_key), JValue::Object(&java_value)],
         )?;
+        env.delete_local_ref(java_key)?;
+        env.delete_local_ref(java_value)?;
     }
     Ok(java_map)
 }
@@ -425,6 +427,8 @@ fn buckets_to_java<'local>(
             &[JValue::Object(&le), JValue::Long(*cumulative_count as i64)],
         )?;
         add_to_list(env, &list, &bucket)?;
+        env.delete_local_ref(le)?;
+        env.delete_local_ref(bucket)?;
     }
     Ok(list)
 }
@@ -514,8 +518,10 @@ fn snapshot_lance_metrics_native<'local>(env: &mut JNIEnv<'local>) -> Result<JOb
     let list = object_list(env)?;
     if let Some(registry) = REGISTRY.get() {
         for point in collect_points(registry) {
-            let item = metric_point_to_java(env, point)?;
-            add_to_list(env, &list, &item)?;
+            env.with_local_frame(64, |env| {
+                let item = metric_point_to_java(env, point)?;
+                add_to_list(env, &list, &item)
+            })?;
         }
     }
     Ok(list)
