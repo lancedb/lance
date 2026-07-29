@@ -3268,6 +3268,18 @@ mod tests {
     }
 
     #[test]
+    fn test_fn_gen_propagates_array_data_build_error() {
+        // FnGen constructors are internal. Use an incompatible declared type to
+        // verify that ArrayDataBuilder validation failures are propagated.
+        let mut generator = FnGen::<i32, Int32Array, _>::new_unknown_size(DataType::Utf8, |_| 0, 1);
+
+        assert!(matches!(
+            generator.generate_default(RowCount::from(1)),
+            Err(ArrowError::InvalidArgumentError(_))
+        ));
+    }
+
+    #[test]
     fn test_step() {
         let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(DEFAULT_SEED.0);
         let mut genn = array::step::<Int32Type>();
