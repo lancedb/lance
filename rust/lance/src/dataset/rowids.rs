@@ -18,25 +18,24 @@ pub async fn load_row_id_sequence(
     dataset: &Dataset,
     fragment: &Fragment,
 ) -> Result<Arc<RowIdSequence>> {
-    // Virtual path to prevent collisions in the cache.
-    match &fragment.row_id_meta {
-        None => Err(Error::internal("Missing row id meta")),
-        Some(RowIdMeta::Inline(data)) => {
+    let Some(row_id_meta) = &fragment.row_id_meta else {
+        return Err(Error::internal("Missing row id meta"));
+    };
+    let key = RowIdSequenceKey {
+        fragment_id: fragment.id,
+        row_id_meta,
+    };
+    match row_id_meta {
+        RowIdMeta::Inline(data) => {
             let data = data.clone();
-            let key = RowIdSequenceKey {
-                fragment_id: fragment.id,
-            };
             dataset
                 .metadata_cache
                 .get_or_insert_with_key(key, || async move { read_row_ids(&data) })
                 .await
         }
-        Some(RowIdMeta::External(file_slice)) => {
+        RowIdMeta::External(file_slice) => {
             let file_slice = file_slice.clone();
             let dataset_clone = dataset.clone();
-            let key = RowIdSequenceKey {
-                fragment_id: fragment.id,
-            };
             dataset
                 .metadata_cache
                 .get_or_insert_with_key(key, || async move {
@@ -424,6 +423,69 @@ mod test {
         let index = get_row_id_index(&dataset).await.unwrap().unwrap();
         assert!(index.get(0).is_none());
         assert!(index.get(num_rows).is_some());
+    }
+
+    #[tokio::test]
+    async fn test_row_ids_overwrite_with_shared_session() {
+        // Regression test for https://github.com/lance-format/lance/issues/8075:
+        // overwrite restarts fragment ids at 0, so a cache entry keyed only on the
+        // fragment id serves the previous generation's sequence to every reader.
+        let temp_dir = lance_core::utils::tempfile::TempStrDir::default();
+        let tmp_path = &temp_dir;
+        // The shared session is what carries the cache entry across the overwrite.
+        let write_params = WriteParams {
+            enable_stable_row_ids: true,
+            session: Some(Arc::new(crate::session::Session::default())),
+            ..Default::default()
+        };
+
+        let write = |values: Range<i32>, mode: WriteMode| {
+            let batch = sequence_batch(values);
+            let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+            let params = WriteParams {
+                mode,
+                ..write_params.clone()
+            };
+            async move {
+                Dataset::write(reader, tmp_path, Some(params))
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // Generation 1: fragment 0 holds ids 0..100. `count_rows` with a filter goes
+        // through the per-fragment sequences, warming `row_id_sequence/0`.
+        let dataset = write(0..100, WriteMode::Create).await;
+        assert_eq!(
+            dataset.count_rows(Some("id >= 0".into())).await.unwrap(),
+            100
+        );
+
+        // Generation 2: a brand new fragment 0 holding 60 rows with ids 100..160.
+        let dataset = write(0..60, WriteMode::Overwrite).await;
+        let sequence = load_row_id_sequence(&dataset, &dataset.manifest.fragments[0])
+            .await
+            .unwrap();
+        assert_eq!(
+            sequence.iter().collect::<Vec<_>>(),
+            (100..160).collect::<Vec<u64>>()
+        );
+
+        // Compaction rechunks the sequences of the fragments it merges, so a stale
+        // sequence there corrupts the ids of every surviving row.
+        let mut dataset = write(0..100, WriteMode::Append).await;
+        compact(&mut dataset, 1024).await;
+
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 160);
+        let mut scan = dataset.scan();
+        scan.with_row_id();
+        let result = scan.try_into_batch().await.unwrap();
+        let mut ids = result[ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .to_vec();
+        ids.sort_unstable();
+        assert_eq!(ids, (100..260).collect::<Vec<u64>>());
     }
 
     #[tokio::test]

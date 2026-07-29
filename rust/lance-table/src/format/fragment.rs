@@ -446,7 +446,7 @@ impl TryFrom<pb::DeletionFile> for DeletionFile {
 }
 
 /// A reference to a part of a file.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, DeepSizeOf)]
 pub struct ExternalFile {
     pub path: String,
     pub offset: u64,
@@ -454,7 +454,7 @@ pub struct ExternalFile {
 }
 
 /// Metadata about location of the row id sequence.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, DeepSizeOf)]
 pub enum RowIdMeta {
     Inline(Vec<u8>),
     External(ExternalFile),

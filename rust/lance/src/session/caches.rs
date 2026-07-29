@@ -10,6 +10,8 @@
 //!     │    │
 //!     └────┴──► FileMetadataCache (prefixed by file path)
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::{borrow::Cow, ops::Deref};
 
 use lance_core::deepsize::{Context, DeepSizeOf};
@@ -19,7 +21,7 @@ use lance_core::{
 };
 use lance_select::RowAddrMask;
 use lance_table::{
-    format::{DeletionFile, DeletionFileType, Manifest},
+    format::{DeletionFile, DeletionFileType, Manifest, RowIdMeta},
     rowids::{RowIdIndex, RowIdSequence},
 };
 use object_store::path::Path;
@@ -221,25 +223,48 @@ impl CacheKey for RowIdIndexKey {
 }
 
 #[derive(Debug)]
-pub struct RowIdSequenceKey {
+pub struct RowIdSequenceKey<'a> {
     pub fragment_id: u64,
+    /// Identifies which generation of the fragment the sequence belongs to.
+    /// `WriteMode::Overwrite` restarts fragment ids at 0, so a key carrying only
+    /// the fragment id would serve a previous generation's sequence for a reused
+    /// id.
+    pub row_id_meta: &'a RowIdMeta,
 }
 
-impl CacheKey for RowIdSequenceKey {
+impl CacheKey for RowIdSequenceKey<'_> {
     type ValueType = RowIdSequence;
     fn key(&self) -> Cow<'_, str> {
-        Cow::Owned(format!("row_id_sequence/{}", self.fragment_id))
+        let mut hasher = DefaultHasher::new();
+        self.row_id_meta.hash(&mut hasher);
+        Cow::Owned(format!(
+            "row_id_sequence/{}/{:x}",
+            self.fragment_id,
+            hasher.finish()
+        ))
     }
     fn type_name() -> &'static str {
         "RowIdSequence"
     }
 
     fn schema() -> CacheKeySchema {
-        CacheKeySchema::new("lance.dataset.row-id-sequence-key", 1)
+        CacheKeySchema::new("lance.dataset.row-id-sequence-key", 2)
     }
 
     fn write_key(&self, builder: &mut KeyBuilder) {
         builder.write_u64(self.fragment_id);
+        match self.row_id_meta {
+            RowIdMeta::Inline(data) => {
+                builder.write_variant(0);
+                builder.write_bytes(data);
+            }
+            RowIdMeta::External(file) => {
+                builder.write_variant(1);
+                builder.write_str(&file.path);
+                builder.write_u64(file.offset);
+                builder.write_u64(file.size);
+            }
+        }
     }
 }
 
@@ -254,6 +279,8 @@ impl DSMetadataCache {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+
+    use lance_table::rowids::write_row_ids;
 
     use super::*;
 
@@ -289,6 +316,43 @@ mod tests {
                 })
                 .await
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn row_id_sequence_key_separates_fragment_generations() {
+        // Overwrite restarts fragment ids at 0, so the same id must not resolve
+        // to a previous generation's sequence.
+        let cache = LanceCache::with_capacity(4096);
+        let first_generation = RowIdMeta::Inline(write_row_ids(&(0..100).into()));
+        cache
+            .insert_with_key(
+                &RowIdSequenceKey {
+                    fragment_id: 0,
+                    row_id_meta: &first_generation,
+                },
+                Arc::new(RowIdSequence::from(0..100)),
+            )
+            .await;
+
+        let second_generation = RowIdMeta::Inline(write_row_ids(&(100..160).into()));
+        assert!(
+            cache
+                .get_with_key(&RowIdSequenceKey {
+                    fragment_id: 0,
+                    row_id_meta: &second_generation,
+                })
+                .await
+                .is_none()
+        );
+        assert!(
+            cache
+                .get_with_key(&RowIdSequenceKey {
+                    fragment_id: 0,
+                    row_id_meta: &first_generation,
+                })
+                .await
+                .is_some()
         );
     }
 }
