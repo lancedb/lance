@@ -137,13 +137,17 @@ impl FieldEncoder for BlobStructuralEncoder {
         let def = repdef.definition_levels.as_ref();
         let def_meaning: Arc<[DefinitionInterpretation]> = repdef.def_meaning.into();
 
-        match self.def_meaning.as_ref() {
-            None => {
-                self.def_meaning = Some(def_meaning.clone());
-            }
-            Some(existing) => {
-                debug_assert_eq!(existing, &def_meaning);
-            }
+        // A page can span several batches. `add_validity_bitmap` reports
+        // all-valid for a null-free batch, so a null-free first batch would pin
+        // the column all-valid and later nulls would decode as empty. Adopt the
+        // nullable interpretation once any batch has a null; never downgrade.
+        let batch_has_nulls = def_meaning.iter().any(|level| !level.is_all_valid());
+        let adopt_def_meaning = match self.def_meaning.as_ref() {
+            None => true,
+            Some(existing) => batch_has_nulls && existing.iter().all(|level| level.is_all_valid()),
+        };
+        if adopt_def_meaning {
+            self.def_meaning = Some(def_meaning);
         }
 
         // Collect positions and sizes
@@ -200,7 +204,10 @@ impl FieldEncoder for BlobStructuralEncoder {
             num_rows,
         )?;
 
-        Ok(Self::wrap_tasks(encode_tasks, def_meaning))
+        // A page here may include rows buffered from an earlier batch, so wrap
+        // with the column's locked-in def meaning, not just this batch's.
+        let effective_def_meaning = self.def_meaning.clone().expect("def_meaning is set above");
+        Ok(Self::wrap_tasks(encode_tasks, effective_def_meaning))
     }
 
     fn flush(&mut self, external_buffers: &mut OutOfLineBuffers) -> Result<Vec<EncodeTask>> {
@@ -554,6 +561,29 @@ mod tests {
         ]));
 
         check_round_trip_encoding_of_data(vec![array], &TestCases::default(), blob_metadata).await;
+    }
+
+    #[tokio::test]
+    async fn test_blob_round_trip_null_in_later_batch() {
+        // Each array is a separate `maybe_encode` batch. A null-free first batch
+        // used to pin the column all-valid, so a later null decoded as empty.
+        let blob_metadata =
+            HashMap::from([(lance_arrow::BLOB_META_KEY.to_string(), "true".to_string())]);
+
+        let val: &[u8] = &vec![7u8; 4096];
+        let empty: &[u8] = &[];
+
+        // first batch: no nulls at all; later batches introduce nulls / empties
+        let batch1 = Arc::new(LargeBinaryArray::from(vec![Some(val), Some(empty)]));
+        let batch2 = Arc::new(LargeBinaryArray::from(vec![None, Some(val)]));
+        let batch3 = Arc::new(LargeBinaryArray::from(vec![Some(empty), None]));
+
+        check_round_trip_encoding_of_data(
+            vec![batch1, batch2, batch3],
+            &TestCases::default().with_max_file_version(LanceFileVersion::V2_1),
+            blob_metadata,
+        )
+        .await;
     }
 
     #[tokio::test]
