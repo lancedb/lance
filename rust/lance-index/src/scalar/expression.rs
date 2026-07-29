@@ -274,6 +274,10 @@ pub struct SargableQueryParser {
     index_name: String,
     index_type: String,
     needs_recheck: bool,
+    /// Whether IS NULL queries need post-filter rechecking. May be false even
+    /// when `needs_recheck` is true for indexes that track exact null positions
+    /// (e.g. zone maps with a null bitmap).
+    is_null_needs_recheck: bool,
     supports_like_prefix: bool,
 }
 
@@ -283,6 +287,7 @@ impl SargableQueryParser {
             index_name,
             index_type,
             needs_recheck,
+            is_null_needs_recheck: needs_recheck,
             supports_like_prefix: true,
         }
     }
@@ -292,6 +297,14 @@ impl SargableQueryParser {
     /// ordinary filtering instead of failing at search time.
     pub fn without_like_prefix(mut self) -> Self {
         self.supports_like_prefix = false;
+        self
+    }
+
+    /// Mark IS NULL as exact so that IS NOT NULL can be served by the index
+    /// without a post-filter. Use this when the index tracks null row addresses
+    /// precisely (e.g. a zone map with a null bitmap).
+    pub fn with_exact_null_tracking(mut self) -> Self {
+        self.is_null_needs_recheck = false;
         self
     }
 }
@@ -362,7 +375,7 @@ impl ScalarQueryParser for SargableQueryParser {
             self.index_name.clone(),
             self.index_type.clone(),
             Arc::new(SargableQuery::IsNull()),
-            self.needs_recheck,
+            self.is_null_needs_recheck,
         ))
     }
 

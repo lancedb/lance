@@ -1150,6 +1150,7 @@ fn make_zone_map_index_details(rows_per_zone: u64, use_seeds: bool) -> prost_typ
     prost_types::Any::from_msg(&pbold::ZoneMapIndexDetails {
         rows_per_zone: Some(rows_per_zone),
         use_seeds: Some(use_seeds),
+        has_null_bitmap: Some(true),
     })
     .unwrap()
 }
@@ -1284,13 +1285,20 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
     fn new_query_parser(
         &self,
         index_name: String,
-        _index_details: &prost_types::Any,
+        index_details: &prost_types::Any,
     ) -> Option<Box<dyn ScalarQueryParser>> {
-        Some(Box::new(SargableQueryParser::new(
-            index_name,
-            self.name().to_string(),
-            true,
-        )))
+        let has_null_bitmap = index_details
+            .to_msg::<pbold::ZoneMapIndexDetails>()
+            .ok()
+            .and_then(|d| d.has_null_bitmap)
+            .unwrap_or(false);
+        let parser = SargableQueryParser::new(index_name, self.name().to_string(), true);
+        let parser = if has_null_bitmap {
+            parser.with_exact_null_tracking()
+        } else {
+            parser
+        };
+        Some(Box::new(parser))
     }
 
     async fn load_index(

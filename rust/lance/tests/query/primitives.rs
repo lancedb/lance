@@ -10,7 +10,7 @@ use arrow_array::{
 };
 use arrow_schema::DataType;
 use lance::Dataset;
-use lance::dataset::WriteParams;
+use lance::dataset::{InsertBuilder, WriteParams};
 use lance::dataset::optimize::{CompactionOptions, compact_files};
 
 use lance::index::DatasetIndexExt;
@@ -516,4 +516,89 @@ async fn test_filtered_scan_after_compact_with_srid() {
         "Expected 90 rows (100 written - 10 deleted) but got {}",
         results.num_rows()
     );
+}
+
+/// Verifies that a zone map index on a string column is used (ScalarIndexQuery
+/// in the plan) for both IS NULL and IS NOT NULL predicate filters.
+///
+/// IS NOT NULL must not silently fall back to a full scan when a zone map
+/// index exists — both predicates should leverage the index.
+#[tokio::test]
+async fn test_zone_map_null_index_used() {
+    // 6 non-null strings and 4 null values across 10 rows.
+    let string_values = vec![
+        Some("alpha"),
+        None,
+        Some("beta"),
+        Some("gamma"),
+        None,
+        Some("delta"),
+        None,
+        Some("epsilon"),
+        Some("zeta"),
+        None,
+    ];
+    let value_array = Arc::new(StringArray::from(string_values)) as ArrayRef;
+    let id_array = Arc::new(Int32Array::from((0..10).collect::<Vec<i32>>())) as ArrayRef;
+    let batch =
+        RecordBatch::try_from_iter(vec![("id", id_array), ("value", value_array)]).unwrap();
+
+    let mut ds = InsertBuilder::new("memory://")
+        .execute(vec![batch])
+        .await
+        .unwrap();
+
+    ds.create_index(
+        &["value"],
+        IndexType::ZoneMap,
+        None,
+        &lance_index::scalar::ScalarIndexParams::default(),
+        true,
+    )
+    .await
+    .unwrap();
+
+    // IS NULL: the zone map index must appear in the plan.
+    let plan = ds
+        .scan()
+        .filter("value IS NULL")
+        .unwrap()
+        .explain_plan(false)
+        .await
+        .unwrap();
+    assert!(
+        plan.contains("ScalarIndexQuery"),
+        "IS NULL should use zone map index, got plan:\n{}",
+        plan
+    );
+    let null_batch = ds
+        .scan()
+        .filter("value IS NULL")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(null_batch.num_rows(), 4);
+
+    // IS NOT NULL: the zone map index must also appear in the plan.
+    let plan = ds
+        .scan()
+        .filter("value IS NOT NULL")
+        .unwrap()
+        .explain_plan(false)
+        .await
+        .unwrap();
+    assert!(
+        plan.contains("ScalarIndexQuery"),
+        "IS NOT NULL should use zone map index, got plan:\n{}",
+        plan
+    );
+    let non_null_batch = ds
+        .scan()
+        .filter("value IS NOT NULL")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(non_null_batch.num_rows(), 6);
 }
