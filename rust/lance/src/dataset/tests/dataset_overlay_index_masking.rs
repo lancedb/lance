@@ -105,13 +105,13 @@ async fn commit_overlay(
     let obj_writer = dataset.object_store.create(&path).await.unwrap();
     let mut writer =
         FileWriter::try_new(obj_writer, overlay_schema, FileWriterOptions::default()).unwrap();
-    let (major, minor) = writer.version().to_numbers();
+    let file_version = writer.version().into();
     for (i, array) in columns.into_iter().enumerate() {
         writer.write_column(i, array).await.unwrap();
     }
     let summary = writer.finish().await.unwrap();
 
-    let mut data_file = DataFile::new_unstarted(filename, major, minor);
+    let mut data_file = DataFile::new_unstarted(filename, file_version);
     data_file.fields = writer
         .field_id_to_column_indices()
         .iter()

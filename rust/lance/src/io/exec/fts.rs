@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -311,6 +312,15 @@ fn document_key_scores_batch(
             .map(|(key, score)| ScoredDoc::with_doc_index(key.row_id, key.doc_index, score))
             .collect(),
     )
+}
+
+fn compare_scored_rows(
+    (left_row_id, left_score): &(u64, f32),
+    (right_row_id, right_score): &(u64, f32),
+) -> Ordering {
+    right_score
+        .total_cmp(left_score)
+        .then_with(|| left_row_id.cmp(right_row_id))
 }
 
 /// Fall back to the default simple tokenizer when no on-disk FTS segment exists.
@@ -2432,7 +2442,7 @@ impl ExecutionPlan for BoostQueryExec {
 
             let documents = res
                 .into_iter()
-                .sorted_unstable_by(|(_, a), (_, b)| b.total_cmp(a))
+                .sorted_unstable_by(compare_scored_rows)
                 .take(params.limit.unwrap_or(usize::MAX))
                 .collect::<Vec<_>>();
             metrics.baseline_metrics.record_output(documents.len());
@@ -2775,7 +2785,7 @@ impl ExecutionPlan for BooleanQueryExec {
             let _timer = elapsed_time.timer();
             let documents = res
                 .into_iter()
-                .sorted_unstable_by(|(_, a), (_, b)| b.total_cmp(a))
+                .sorted_unstable_by(compare_scored_rows)
                 .take(params.limit.unwrap_or(usize::MAX))
                 .collect::<Vec<_>>();
             metrics.baseline_metrics.record_output(documents.len());

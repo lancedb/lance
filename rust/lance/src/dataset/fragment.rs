@@ -28,7 +28,11 @@ use lance_core::datatypes::{OnMissing, OnTypeMismatch, SchemaCompareOptions};
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
-use lance_core::{Error, Result, cache::CacheKey, datatypes::Schema};
+use lance_core::{
+    Error, Result,
+    cache::{CacheKey, CacheKeySchema, KeyBuilder},
+    datatypes::Schema,
+};
 use lance_core::{
     ROW_ADDR, ROW_ADDR_FIELD, ROW_CREATED_AT_VERSION_FIELD, ROW_ID, ROW_ID_FIELD,
     ROW_LAST_UPDATED_AT_VERSION_FIELD,
@@ -41,7 +45,7 @@ use lance_file::previous::reader::{
 use lance_file::reader::{
     CachedFileMetadata, FileMetadataIndex, FileReaderOptions, ProjectedFileReader, ReaderProjection,
 };
-use lance_file::version::LanceFileVersion;
+use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use lance_file::{LanceEncodingsIo, determine_file_version};
 use lance_io::ReadBatchParams;
 use lance_io::scheduler::{FileScheduler, ScanScheduler, SchedulerConfig};
@@ -838,7 +842,7 @@ impl FileFragment {
                 filename,
                 dataset.schema().field_ids(),
                 column_indices,
-                &file_version,
+                ConcreteFileVersion::from(file_version),
                 None,
             );
             Ok(frag)
@@ -1126,10 +1130,7 @@ impl FileFragment {
                             }
                         }),
                 ));
-                let file_version = LanceFileVersion::try_from_major_minor(
-                    data_file.file_major_version,
-                    data_file.file_minor_version,
-                )?;
+                let file_version: LanceFileVersion = data_file.file_version()?.into();
                 let reader_projection = ReaderProjection::from_field_ids(
                     file_version,
                     schema_per_file.as_ref(),
@@ -2194,6 +2195,12 @@ impl CacheKey for FileMetadataCacheKey {
     fn type_name() -> &'static str {
         "FileMetadata"
     }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.dataset.fragment-file-metadata-key", 1)
+    }
+
+    fn write_key(&self, _builder: &mut KeyBuilder) {}
 }
 
 #[derive(Debug, Clone)]
@@ -2209,6 +2216,12 @@ impl CacheKey for FileMetadataIndexCacheKey {
     fn type_name() -> &'static str {
         "FileMetadataIndex"
     }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.dataset.fragment-file-metadata-index-key", 1)
+    }
+
+    fn write_key(&self, _builder: &mut KeyBuilder) {}
 }
 
 impl From<FileFragment> for Fragment {
@@ -3134,7 +3147,7 @@ mod tests {
     use lance_core::ROW_ID;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::{RowCount, array, gen_batch};
-    use lance_file::version::LanceFileVersion;
+    use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
     use lance_file::writer::FileWriterOptions;
     use lance_io::{assert_io_eq, assert_io_lt, object_store::ObjectStore};
     use pretty_assertions::assert_eq;
@@ -3228,7 +3241,7 @@ mod tests {
         };
         use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
         use lance_core::datatypes::Schema;
-        use lance_file::version::LanceFileVersion;
+        use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
         use lance_file::writer::{FileWriter, FileWriterOptions};
         use lance_io::utils::CachedFileSize;
         use lance_table::format::DataFile;
@@ -3307,13 +3320,13 @@ mod tests {
                 },
             )
             .unwrap();
-            let (major, minor) = writer.version().to_numbers();
+            let file_version = ConcreteFileVersion::from(writer.version());
             for (column_index, array) in columns.into_iter().enumerate() {
                 writer.write_column(column_index, array).await.unwrap();
             }
             let summary = writer.finish().await.unwrap();
 
-            let mut data_file = DataFile::new_unstarted(filename, major, minor);
+            let mut data_file = DataFile::new_unstarted(filename, file_version);
             data_file.fields = writer
                 .field_id_to_column_indices()
                 .iter()
@@ -5924,7 +5937,7 @@ mod tests {
             Fragment::try_infer_version(std::slice::from_ref(&frag))
                 .unwrap()
                 .unwrap(),
-            LanceFileVersion::Stable.resolve()
+            ConcreteFileVersion::from(LanceFileVersion::Stable)
         );
 
         let op = Operation::Append {

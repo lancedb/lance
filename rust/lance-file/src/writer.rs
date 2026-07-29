@@ -21,7 +21,6 @@ use lance_encoding::encoder::{
     FieldEncodingStrategy, OutOfLineBuffers, default_encoding_strategy,
 };
 use lance_encoding::repdef::RepDefBuilder;
-use lance_encoding::version::LanceFileVersion;
 use lance_io::object_store::ObjectStore;
 use lance_io::traits::Writer;
 use log::{debug, warn};
@@ -37,6 +36,7 @@ use crate::format::MAGIC;
 use crate::format::pb;
 use crate::format::pbfile;
 use crate::format::pbfile::DirectEncoding;
+use crate::version::{ConcreteFileVersion, LanceFileVersion};
 
 /// Pages buffers are aligned to 64 bytes
 pub(crate) const PAGE_BUFFER_ALIGNMENT: usize = 64;
@@ -867,17 +867,13 @@ impl FileWriter {
         Ok(())
     }
 
-    /// Converts self.version (which is a mix of "software version" and
-    /// "format version" into a format version)
-    fn version_to_numbers(&self) -> (u16, u16) {
-        let version = self.options.format_version.unwrap_or_default();
-        match version.resolve() {
-            LanceFileVersion::V2_0 => (0, 3),
-            LanceFileVersion::V2_1 => (2, 1),
-            LanceFileVersion::V2_2 => (2, 2),
-            LanceFileVersion::V2_3 => (2, 3),
-            _ => panic!("Unsupported version: {}", version),
+    fn standard_footer_numbers(&self) -> (u16, u16) {
+        let version = self.version();
+        let exact_version = ConcreteFileVersion::from(version);
+        if exact_version == crate::version::ConcreteFileVersion::V1 {
+            panic!("Unsupported version: {}", version);
         }
+        exact_version.to_standard_footer_numbers()
     }
 
     /// Finishes writing the file
@@ -931,7 +927,7 @@ impl FileWriter {
             self.writer.write_u64_le(gbo_len).await?;
         }
 
-        let (major, minor) = self.version_to_numbers();
+        let (major, minor) = self.standard_footer_numbers();
         // 7. write the footer
         self.writer.write_u64_le(column_metadata_start).await?;
         self.writer.write_u64_le(cmo_table_start).await?;
@@ -1069,7 +1065,7 @@ fn concat_lance_footer(
         data.put_u64_le(gbo_len);
     }
 
-    let (major, minor) = version.to_numbers();
+    let (major, minor) = ConcreteFileVersion::from(version).to_embedded_footer_numbers();
 
     // write the footer
     data.put_u64_le(col_metadata_start);
@@ -1077,8 +1073,8 @@ fn concat_lance_footer(
     data.put_u64_le(gbo_table_start);
     data.put_u32_le(num_global_buffers);
     data.put_u32_le(batch.page_table.len() as u32);
-    data.put_u16_le(major as u16);
-    data.put_u16_le(minor as u16);
+    data.put_u16_le(major);
+    data.put_u16_le(minor);
     data.put(MAGIC.as_slice());
 
     Ok(data.freeze())

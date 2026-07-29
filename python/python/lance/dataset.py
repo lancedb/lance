@@ -239,14 +239,6 @@ def _is_null_blob_description(description: Any) -> bool:
         return False
     if description.keys() == {"position", "size"}:
         return description["position"] == 1 and description["size"] == 0
-    if description.keys() == {"kind", "position", "size", "blob_id", "blob_uri"}:
-        return (
-            description["kind"] == 0
-            and description["position"] == 0
-            and description["size"] == 0
-            and description["blob_id"] == 0
-            and description["blob_uri"] == ""
-        )
     return False
 
 
@@ -3256,8 +3248,12 @@ class LanceDataset(pa.dataset.Dataset):
                         ", float, bool, str, large_str, fixed-size-binary, or temporal",
                     )
             elif index_type == "LABEL_LIST":
-                if not pa.types.is_list(field_type):
-                    raise TypeError(f"LABEL_LIST index column {column} must be a list")
+                if not (
+                    pa.types.is_list(field_type) or pa.types.is_large_list(field_type)
+                ):
+                    raise TypeError(
+                        f"LABEL_LIST index column {column} must be a list or large list"
+                    )
             elif index_type == "NGRAM":
                 if not pa.types.is_string(field_type) and not pa.types.is_large_string(
                     field_type
@@ -3320,6 +3316,7 @@ class LanceDataset(pa.dataset.Dataset):
             "RTREE",
             "ZONEMAP",
             "BLOOMFILTER",
+            "LABEL_LIST",
         }
 
     @classmethod
@@ -3334,6 +3331,7 @@ class LanceDataset(pa.dataset.Dataset):
             "RTREE",
             "ZONEMAP",
             "BLOOMFILTER",
+            "LABEL_LIST",
         }
 
     def create_scalar_index(
@@ -4300,10 +4298,9 @@ class LanceDataset(pa.dataset.Dataset):
 
         This is the public distributed-build API for vector, BTREE scalar,
         canonical bitmap scalar, INVERTED scalar, NGRAM scalar, RTREE scalar,
-        ZONEMAP scalar,
-        and BLOOMFILTER scalar index construction. Unlike
-        :meth:`create_index`, this method does not publish the index into the
-        dataset manifest. Instead, it writes one segment under
+        ZONEMAP scalar, BLOOMFILTER scalar, and LABEL_LIST scalar index construction.
+        Unlike :meth:`create_index`, this method does not publish the index into
+        the dataset manifest. Instead, it writes one segment under
         ``_indices/<segment_uuid>/`` and returns the resulting
         :class:`Index` metadata.
 
@@ -4317,10 +4314,11 @@ class LanceDataset(pa.dataset.Dataset):
         4. commit the final segment list with
            :meth:`commit_existing_index_segments`
 
-        BTREE, BITMAP, INVERTED, NGRAM, RTREE, ZONEMAP, and BLOOMFILTER segments may
-        be merged with :meth:`merge_existing_index_segments` before commit.
-        NGRAM segments built before a deferred compaction must be merged before
-        commit so their postings can be rebuilt against current row addresses.
+        BTREE, BITMAP, INVERTED, NGRAM, RTREE, ZONEMAP, BLOOMFILTER, and
+        LABEL_LIST segments may be merged with
+        :meth:`merge_existing_index_segments` before commit. NGRAM segments
+        built before a deferred compaction must be merged before commit so
+        their postings can be rebuilt against current row addresses.
         Parameters are the same as :meth:`create_index`, with one additional
         requirement:
 

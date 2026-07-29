@@ -63,8 +63,8 @@ use lance_core::deepsize::DeepSizeOf;
 use lance_core::{
     Error, ROW_ID, Result,
     cache::{
-        CacheCodec, CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheKey, LanceCache,
-        WeakLanceCache,
+        CacheCodec, CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheKey, CacheKeySchema,
+        KeyBuilder, LanceCache, WeakLanceCache,
     },
     error::LanceOptionExt,
     utils::{
@@ -1365,6 +1365,14 @@ impl CacheKey for BTreePageKey {
         "BTreePage"
     }
 
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.scalar.btree-page-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_u32(self.page_number);
+    }
+
     fn codec() -> Option<CacheCodec> {
         // Pages are cached as `FlatIndex` values (see `ValueType` above).
         Some(CacheCodec::from_impl::<FlatIndex>())
@@ -1489,6 +1497,14 @@ impl CacheKey for BTreeIndexStateKey {
 
     fn type_name() -> &'static str {
         "BTreeIndexState"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.scalar.btree-index-state-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_variant(0);
     }
 
     fn codec() -> Option<CacheCodec> {
