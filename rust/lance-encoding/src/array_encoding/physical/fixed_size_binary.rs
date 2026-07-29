@@ -4,6 +4,7 @@
 use std::sync::Arc;
 
 use arrow_buffer::ScalarBuffer;
+#[cfg(test)]
 use arrow_schema::DataType;
 use futures::{FutureExt, future::BoxFuture};
 use lance_core::Result;
@@ -11,8 +12,12 @@ use lance_core::Result;
 use crate::{
     EncodingsIo,
     buffer::LanceBuffer,
-    data::{BlockInfo, DataBlock, FixedWidthDataBlock, VariableWidthBlock},
+    data::{BlockInfo, DataBlock, VariableWidthBlock},
     decoder::{PageScheduler, PrimitivePageDecoder},
+};
+#[cfg(test)]
+use crate::{
+    data::FixedWidthDataBlock,
     encoder::{ArrayEncoder, EncodedArray},
     format::ProtobufUtils,
 };
@@ -117,13 +122,15 @@ impl PrimitivePageDecoder for FixedSizeBinaryDecoder {
 }
 
 #[derive(Debug)]
-pub struct FixedSizeBinaryEncoder {
+#[cfg(test)]
+struct FixedSizeBinaryEncoder {
     bytes_encoder: Box<dyn ArrayEncoder>,
     byte_width: usize,
 }
 
+#[cfg(test)]
 impl FixedSizeBinaryEncoder {
-    pub fn new(bytes_encoder: Box<dyn ArrayEncoder>, byte_width: usize) -> Self {
+    fn new(bytes_encoder: Box<dyn ArrayEncoder>, byte_width: usize) -> Self {
         Self {
             bytes_encoder,
             byte_width,
@@ -131,6 +138,7 @@ impl FixedSizeBinaryEncoder {
     }
 }
 
+#[cfg(test)]
 impl ArrayEncoder for FixedSizeBinaryEncoder {
     fn encode(
         &self,
@@ -173,9 +181,14 @@ mod tests {
     use arrow_data::ArrayData;
     use arrow_schema::{DataType, Field};
 
-    use crate::array_encoding::physical::fixed_size_binary::FixedSizeBinaryDecoder;
+    use crate::array_encoding::physical::{
+        basic::BasicEncoder,
+        fixed_size_binary::{FixedSizeBinaryDecoder, FixedSizeBinaryEncoder},
+    };
     use crate::data::{DataBlock, FixedWidthDataBlock};
     use crate::decoder::PrimitivePageDecoder;
+    use crate::encoder::ArrayEncoder;
+    use crate::encodings::physical::value::ValueEncoder;
     use crate::testing::{TestCases, check_basic_random, check_round_trip_encoding_of_data};
 
     #[test_log::test(tokio::test)]
@@ -201,6 +214,29 @@ mod tests {
     async fn test_fixed_size_large_utf8() {
         let field = Field::new("", DataType::LargeUtf8, true);
         check_basic_random(field).await;
+    }
+
+    #[test]
+    fn test_fixed_size_binary_encoder() {
+        let array = Arc::new(StringArray::from(vec!["aaa", "bbb"])) as ArrayRef;
+        let encoder = FixedSizeBinaryEncoder::new(
+            Box::new(BasicEncoder::new(Box::new(ValueEncoder::default()))),
+            3,
+        );
+        let mut buffer_index = 0;
+
+        let encoded = encoder
+            .encode(
+                DataBlock::from_array(array),
+                &DataType::Utf8,
+                &mut buffer_index,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            encoded.encoding.array_encoding,
+            Some(crate::format::pb::array_encoding::ArrayEncoding::FixedSizeBinary(_))
+        ));
     }
 
     #[test_log::test(tokio::test)]

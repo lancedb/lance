@@ -1222,7 +1222,7 @@ impl FileReader {
                 let num_rows = page.length;
                 let encoding = match file_version {
                     LanceFileVersion::V2_0 => {
-                        PageEncoding::Array(Self::fetch_encoding::<pbenc::ArrayEncoding>(
+                        PageEncoding::Legacy(Self::fetch_encoding::<pbenc::ArrayEncoding>(
                             page.encoding.as_ref().ok_or_else(|| {
                                 Error::invalid_input_source(
                                     format!(

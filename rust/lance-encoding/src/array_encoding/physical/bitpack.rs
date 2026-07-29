@@ -3,27 +3,37 @@
 
 use std::sync::Arc;
 
+#[cfg(test)]
 use arrow_array::types::{
     Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
 };
+#[cfg(test)]
 use arrow_array::{Array, ArrayRef, ArrowPrimitiveType, PrimitiveArray, cast::AsArray};
+#[cfg(test)]
 use arrow_buffer::ArrowNativeType;
 use arrow_buffer::bit_util::ceil;
+#[cfg(test)]
 use arrow_schema::DataType;
 use bytes::Bytes;
 use futures::future::{BoxFuture, FutureExt};
 use log::trace;
+#[cfg(test)]
 use num_traits::{AsPrimitive, PrimInt};
 
+#[cfg(test)]
 use lance_arrow::DataTypeExt;
 use lance_bitpacking::BitPacking;
 use lance_core::{Error, Result};
 
 use crate::buffer::LanceBuffer;
 use crate::data::BlockInfo;
-use crate::data::{DataBlock, FixedWidthDataBlock, NullableDataBlock};
+#[cfg(test)]
+use crate::data::NullableDataBlock;
+use crate::data::{DataBlock, FixedWidthDataBlock};
 use crate::decoder::{PageScheduler, PrimitivePageDecoder};
+#[cfg(test)]
 use crate::encoder::{ArrayEncoder, EncodedArray};
+#[cfg(test)]
 use crate::format::ProtobufUtils;
 use bytemuck::cast_slice;
 
@@ -33,7 +43,8 @@ const ELEMS_PER_CHUNK: u64 = 1 << LOG_ELEMS_PER_CHUNK;
 // Compute the compressed_bit_width for a given array of integers
 // todo: compute all statistics before encoding
 // todo: see how to use rust macro to rewrite this function
-pub fn compute_compressed_bit_width_for_non_neg(arrays: &[ArrayRef]) -> u64 {
+#[cfg(test)]
+fn compute_compressed_bit_width_for_non_neg(arrays: &[ArrayRef]) -> u64 {
     debug_assert!(!arrays.is_empty());
 
     let res;
@@ -202,6 +213,7 @@ pub fn compute_compressed_bit_width_for_non_neg(arrays: &[ArrayRef]) -> u64 {
 // data_type can be  one of u8, u16, u32, or u64.
 // buffer_index is a mutable borrow of u32, indicating the buffer index of the output EncodedArray.
 // It outputs an fastlanes bitpacked EncodedArray
+#[cfg(test)]
 macro_rules! encode_fixed_width {
     ($self:expr, $unpacked:expr, $data_type:ty, $buffer_index:expr) => {{
         let num_chunks = $unpacked.num_values.div_ceil(ELEMS_PER_CHUNK);
@@ -272,20 +284,21 @@ macro_rules! encode_fixed_width {
 }
 
 #[derive(Debug)]
-pub struct BitpackedForNonNegArrayEncoder {
-    pub compressed_bit_width: usize,
-    pub original_data_type: DataType,
+#[cfg(test)]
+struct BitpackedForNonNegArrayEncoder {
+    compressed_bit_width: usize,
 }
 
+#[cfg(test)]
 impl BitpackedForNonNegArrayEncoder {
-    pub fn new(compressed_bit_width: usize, data_type: DataType) -> Self {
+    fn new(compressed_bit_width: usize) -> Self {
         Self {
             compressed_bit_width,
-            original_data_type: data_type,
         }
     }
 }
 
+#[cfg(test)]
 impl ArrayEncoder for BitpackedForNonNegArrayEncoder {
     fn encode(
         &self,
@@ -590,15 +603,17 @@ fn bitpacked_for_non_neg_decode(
 }
 
 #[derive(Debug)]
-pub struct BitpackParams {
-    pub num_bits: u64,
+#[cfg(test)]
+struct BitpackParams {
+    num_bits: u64,
 
-    pub signed: bool,
+    signed: bool,
 }
 
 // Compute the number of bits to use for each item, if this array can be encoded using
 // bitpacking encoding. Returns `None` if the type or array data is not supported.
-pub fn bitpack_params(arr: &dyn Array) -> Option<BitpackParams> {
+#[cfg(test)]
+fn bitpack_params(arr: &dyn Array) -> Option<BitpackParams> {
     match arr.data_type() {
         DataType::UInt8 => bitpack_params_for_type::<UInt8Type>(arr.as_primitive()),
         DataType::UInt16 => bitpack_params_for_type::<UInt16Type>(arr.as_primitive()),
@@ -615,6 +630,7 @@ pub fn bitpack_params(arr: &dyn Array) -> Option<BitpackParams> {
 
 // Compute the number bits to use for bitpacking generically.
 // returns None if the array is empty or all nulls
+#[cfg(test)]
 fn bitpack_params_for_type<T>(arr: &PrimitiveArray<T>) -> Option<BitpackParams>
 where
     T: ArrowPrimitiveType,
@@ -637,6 +653,7 @@ where
 /// an array of signed values. It includes all the significant bits for
 /// the value + plus 1 bit to represent the sign. If there are no negative values
 /// then it will not add a signed bit
+#[cfg(test)]
 fn bitpack_params_for_signed_type<T>(arr: &PrimitiveArray<T>) -> Option<BitpackParams>
 where
     T: ArrowPrimitiveType,
@@ -674,13 +691,15 @@ where
     })
 }
 #[derive(Debug)]
-pub struct BitpackedArrayEncoder {
+#[cfg(test)]
+struct BitpackedArrayEncoder {
     num_bits: u64,
     signed_type: bool,
 }
 
+#[cfg(test)]
 impl BitpackedArrayEncoder {
-    pub fn new(num_bits: u64, signed_type: bool) -> Self {
+    fn new(num_bits: u64, signed_type: bool) -> Self {
         Self {
             num_bits,
             signed_type,
@@ -688,6 +707,7 @@ impl BitpackedArrayEncoder {
     }
 }
 
+#[cfg(test)]
 impl ArrayEncoder for BitpackedArrayEncoder {
     fn encode(
         &self,
@@ -741,6 +761,7 @@ impl ArrayEncoder for BitpackedArrayEncoder {
     }
 }
 
+#[cfg(test)]
 fn pack_bits(
     src: &LanceBuffer,
     num_bits: u64,
@@ -1166,6 +1187,28 @@ pub mod test {
     use rand::distr::Uniform;
 
     #[test]
+    fn test_bitpacked_for_non_negative_encoder() {
+        let array = Arc::new(UInt16Array::from(vec![0, 1, 7, 255])) as ArrayRef;
+        let compressed_bit_width =
+            compute_compressed_bit_width_for_non_neg(std::slice::from_ref(&array));
+        let encoder = BitpackedForNonNegArrayEncoder::new(compressed_bit_width as usize);
+        let mut buffer_index = 0;
+
+        let encoded = encoder
+            .encode(
+                DataBlock::from_array(array),
+                &DataType::UInt16,
+                &mut buffer_index,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            encoded.encoding.array_encoding,
+            Some(pb::array_encoding::ArrayEncoding::BitpackedForNonNeg(_))
+        ));
+    }
+
+    #[test]
     fn test_bitpack_params() {
         fn gen_array(generator: Box<dyn ArrayGenerator>) -> ArrayRef {
             gen_batch()
@@ -1368,10 +1411,7 @@ pub mod test {
         for (data_type, arr, bits_per_value) in test_cases {
             let mut buffed_index = 1;
             let params = bitpack_params(arr.as_ref()).unwrap();
-            let encoder = BitpackedArrayEncoder {
-                num_bits: params.num_bits,
-                signed_type: params.signed,
-            };
+            let encoder = BitpackedArrayEncoder::new(params.num_bits, params.signed);
             let data = DataBlock::from_array(arr);
             let result = encoder.encode(data, &data_type, &mut buffed_index).unwrap();
 

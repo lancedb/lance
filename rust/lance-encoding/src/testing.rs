@@ -1027,7 +1027,7 @@ fn verify_page_encoding(
                 return Ok(());
             }
         }
-        PageEncoding::Array(_) => {
+        PageEncoding::Legacy(_) => {
             // We don't need to care about the v2.0 array encoding.
         }
     }

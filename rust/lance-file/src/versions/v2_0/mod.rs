@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use lance_encoding::{array_encoding::ArrayFieldEncodingStrategy, encoder::FieldEncodingStrategy};
+use lance_encoding::encoder::{ArrayFieldEncodingStrategy, FieldEncodingStrategy};
 
 /// Compose the v2.0 field encoding mechanisms.
 pub fn encoding_strategy() -> Arc<dyn FieldEncodingStrategy> {
