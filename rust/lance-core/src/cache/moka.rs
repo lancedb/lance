@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -115,6 +116,23 @@ impl CacheBackend for MokaCacheBackend {
         let prefix = prefix.to_owned();
         self.cache
             .invalidate_entries_if(move |key, _value| key.starts_with(&prefix))
+            .expect("Cache configured correctly");
+    }
+
+    async fn invalidate_key_prefixes(&self, prefix: &str, key_prefixes: &[String]) {
+        let prefix = prefix.to_owned();
+        // Exact matches (e.g. a manifest with no e-tag) check this set
+        // directly; matches with a suffix (e.g. "manifest/5/{e_tag}") check
+        // against the `/`-suffixed forms below. Both are precomputed once
+        // here rather than per entry.
+        let exact: HashSet<String> = key_prefixes.iter().cloned().collect();
+        let with_slash: Vec<String> = key_prefixes.iter().map(|kp| format!("{kp}/")).collect();
+        self.cache
+            .invalidate_entries_if(move |key, _value| {
+                key.prefix() == prefix
+                    && (exact.contains(key.key())
+                        || with_slash.iter().any(|p| key.key().starts_with(p)))
+            })
             .expect("Cache configured correctly");
     }
 

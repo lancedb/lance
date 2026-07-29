@@ -116,6 +116,54 @@ pub trait CacheBackend: Send + Sync + std::fmt::Debug {
     /// Remove all entries whose prefix starts with the given string.
     async fn invalidate_prefix(&self, prefix: &str);
 
+    /// Remove all entries within `prefix` whose `key` equals `key_prefix` or
+    /// starts with `key_prefix` followed by `/`.
+    ///
+    /// Unlike [`invalidate_prefix`](Self::invalidate_prefix), which matches
+    /// against an entry's namespace [`prefix`](InternalCacheKey::prefix)
+    /// (e.g. a dataset URI), this matches against the per-entry
+    /// [`key`](InternalCacheKey::key) (e.g. a version number or fragment id).
+    /// This lets callers evict every cached entry associated with one
+    /// version/fragment (a manifest, its transaction, its row address mask,
+    /// etc.) without needing to know every optional suffix (e-tag, filter
+    /// hash) a given key type may carry.
+    ///
+    /// The `/` boundary check prevents `key_prefix = "5"` from also matching
+    /// `"50"` or `"500"`.
+    ///
+    /// Backends that cannot support this cheaply may leave it as a no-op;
+    /// doing so only means those entries are evicted later by the normal
+    /// capacity-based eviction policy instead of immediately.
+    ///
+    /// Defaults to a single-element call to
+    /// [`invalidate_key_prefixes`](Self::invalidate_key_prefixes). Overriding
+    /// [`invalidate_key_prefixes`](Self::invalidate_key_prefixes) is
+    /// therefore the one to implement: it gives you both methods for free.
+    /// Overriding only this method does *not* work the other way around --
+    /// [`invalidate_key_prefixes`](Self::invalidate_key_prefixes)'s own
+    /// default (a no-op) is unaffected, so any caller that invokes it
+    /// directly (as [`LanceCache::invalidate_key_prefixes`](super::LanceCache::invalidate_key_prefixes)
+    /// does) would silently evict nothing.
+    async fn invalidate_key_prefix(&self, prefix: &str, key_prefix: &str) {
+        self.invalidate_key_prefixes(prefix, std::slice::from_ref(&key_prefix.to_owned()))
+            .await;
+    }
+
+    /// Like [`invalidate_key_prefix`](Self::invalidate_key_prefix), but
+    /// removes entries matching *any* of `key_prefixes` in a single pass
+    /// over the cache, instead of one pass per prefix.
+    ///
+    /// Prefer this over calling [`invalidate_key_prefix`](Self::invalidate_key_prefix)
+    /// in a loop when invalidating many keys at once (e.g. several dataset
+    /// versions' worth of cache entries after a cleanup run) — each call to
+    /// either method registers its own scan over the backend's entries, so
+    /// batching avoids `O(prefixes)` scans.
+    ///
+    /// Backends that cannot support this cheaply may leave it as a no-op;
+    /// doing so only means those entries are evicted later by the normal
+    /// capacity-based eviction policy instead of immediately.
+    async fn invalidate_key_prefixes(&self, _prefix: &str, _key_prefixes: &[String]) {}
+
     /// Remove all entries.
     async fn clear(&self);
 
