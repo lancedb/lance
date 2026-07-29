@@ -4,7 +4,7 @@
 //! IVF - Inverted File index.
 
 use super::{
-    LogicalIvfView,
+    LogicalIvfView, derive_hnsw_params,
     pq::{PQIndex, build_pq_model},
     utils::{filter_finite_training_data, maybe_sample_training_data},
 };
@@ -322,7 +322,7 @@ fn candidate_is_better(
     }
 }
 
-fn index_type_for_segmented_optimize(index: &dyn VectorIndex) -> Result<IndexType> {
+pub(crate) fn index_type_for_segmented_optimize(index: &dyn VectorIndex) -> Result<IndexType> {
     let (sub_index_type, quantization_type) = index.sub_index_type();
     IndexType::try_from(index_type_string(sub_index_type, quantization_type).as_str())
 }
@@ -386,17 +386,45 @@ pub(crate) fn select_segment_for_single_rebalance(
     Ok(selected.map(|candidate| candidate.segment_id))
 }
 
-fn validate_shared_vector_model(indices: &[Arc<dyn VectorIndex>], operation: &str) -> Result<()> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VectorSegmentCompatibility {
+    SharedModel,
+    QueryCompatibleModelsDiffer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VectorModelMismatch {
+    StorageFormat,
+    IvfCentroids,
+    QuantizerMetadata,
+}
+
+fn vector_index_dimension(index: &dyn VectorIndex) -> usize {
+    let ivf_dimension = index.ivf_model().dimension();
+    if ivf_dimension != 0 {
+        return ivf_dimension;
+    }
+
+    match index.quantizer() {
+        Quantizer::Flat(quantizer) => quantizer.metadata(None).dim,
+        Quantizer::FlatBin(quantizer) => quantizer.metadata(None).dim,
+        Quantizer::Product(quantizer) => quantizer.dimension,
+        Quantizer::Scalar(quantizer) => quantizer.metadata(None).dim,
+        Quantizer::Rabit(quantizer) => quantizer.metadata(None).rotated_dim(),
+    }
+}
+
+fn validate_vector_query_compatibility(
+    indices: &[Arc<dyn VectorIndex>],
+    operation: &str,
+) -> Result<()> {
     let Some(first) = indices.first() else {
         return Ok(());
     };
-    if indices.len() == 1 {
-        return Ok(());
-    }
 
     let first_metric = first.metric_type();
+    let first_dimension = vector_index_dimension(first.as_ref());
     let first_index_type = first.sub_index_type();
-    let first_centroids = first.ivf_model().centroids_array();
     let first_quantizer = first.quantizer();
     let first_quantizer_type = first_quantizer.quantization_type();
 
@@ -408,6 +436,12 @@ fn validate_shared_vector_model(indices: &[Arc<dyn VectorIndex>], operation: &st
                 first_metric
             )));
         }
+        let dimension = vector_index_dimension(index.as_ref());
+        if dimension != first_dimension {
+            return Err(Error::index(format!(
+                "{operation}: vector index segment {idx} has dimension {dimension}, expected {first_dimension}"
+            )));
+        }
         let index_type = index.sub_index_type();
         if std::mem::discriminant(&index_type.0) != std::mem::discriminant(&first_index_type.0)
             || index_type.1 != first_index_type.1
@@ -416,19 +450,6 @@ fn validate_shared_vector_model(indices: &[Arc<dyn VectorIndex>], operation: &st
                 "{operation}: vector index segment {idx} has type {:?}, expected {:?}",
                 index_type, first_index_type
             )));
-        }
-        match (first_centroids, index.ivf_model().centroids_array()) {
-            (Some(expected), Some(actual)) if expected.to_data() != actual.to_data() => {
-                return Err(Error::index(format!(
-                    "{operation}: vector index segments do not share IVF centroids"
-                )));
-            }
-            (Some(_), None) | (None, Some(_)) => {
-                return Err(Error::index(format!(
-                    "{operation}: vector index segments do not share IVF centroids"
-                )));
-            }
-            _ => {}
         }
 
         let quantizer = index.quantizer();
@@ -439,14 +460,65 @@ fn validate_shared_vector_model(indices: &[Arc<dyn VectorIndex>], operation: &st
                 first_quantizer_type
             )));
         }
-        if !shared_quantizer_model(&first_quantizer, &quantizer) {
-            return Err(Error::index(format!(
-                "{operation}: vector index segments do not share quantizer metadata"
-            )));
-        }
     }
 
     Ok(())
+}
+
+fn vector_model_mismatch(indices: &[Arc<dyn VectorIndex>]) -> Option<VectorModelMismatch> {
+    let first = indices.first()?;
+    let first_centroids = first.ivf_model().centroids_array();
+    let first_quantizer = first.quantizer();
+
+    for index in indices.iter().skip(1) {
+        if first.as_any().type_id() != index.as_any().type_id() {
+            return Some(VectorModelMismatch::StorageFormat);
+        }
+        match (first_centroids, index.ivf_model().centroids_array()) {
+            (Some(expected), Some(actual)) if expected.to_data() != actual.to_data() => {
+                return Some(VectorModelMismatch::IvfCentroids);
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                return Some(VectorModelMismatch::IvfCentroids);
+            }
+            _ => {}
+        }
+
+        if !shared_quantizer_model(&first_quantizer, &index.quantizer()) {
+            return Some(VectorModelMismatch::QuantizerMetadata);
+        }
+    }
+
+    None
+}
+
+pub(crate) fn vector_segment_compatibility(
+    logical_index: &LogicalIvfView<'_>,
+    operation: &str,
+) -> Result<VectorSegmentCompatibility> {
+    let indices = logical_index.indices().cloned().collect::<Vec<_>>();
+    validate_vector_query_compatibility(&indices, operation)?;
+    Ok(if vector_model_mismatch(&indices).is_none() {
+        VectorSegmentCompatibility::SharedModel
+    } else {
+        VectorSegmentCompatibility::QueryCompatibleModelsDiffer
+    })
+}
+
+fn validate_shared_vector_model(indices: &[Arc<dyn VectorIndex>], operation: &str) -> Result<()> {
+    validate_vector_query_compatibility(indices, operation)?;
+    match vector_model_mismatch(indices) {
+        Some(VectorModelMismatch::StorageFormat) => Err(Error::index(format!(
+            "{operation}: vector index segments do not share a storage format"
+        ))),
+        Some(VectorModelMismatch::IvfCentroids) => Err(Error::index(format!(
+            "{operation}: vector index segments do not share IVF centroids"
+        ))),
+        Some(VectorModelMismatch::QuantizerMetadata) => Err(Error::index(format!(
+            "{operation}: vector index segments do not share quantizer metadata"
+        ))),
+        None => Ok(()),
+    }
 }
 
 fn shared_quantizer_model(left: &Quantizer, right: &Quantizer) -> bool {
@@ -503,11 +575,11 @@ pub(crate) async fn optimize_vector_indices(
             "optimizing vector index: no existing index found".to_string(),
         ));
     }
+    validate_shared_vector_model(&existing_indices, "optimizing vector index")?;
 
     // try cast to v1 IVFIndex,
     // fallback to v2 IVFIndex if it's not v1 IVFIndex
     if !existing_indices[0].as_any().is::<IVFIndex>() {
-        validate_shared_vector_model(&existing_indices, "optimizing vector index")?;
         return optimize_vector_indices_v2(
             &dataset,
             unindexed,
@@ -740,7 +812,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                     index_dir,
                     distance_type,
                     shuffler,
-                    HnswBuildParams::default(),
+                    derive_hnsw_params(existing_indices[0].as_ref()),
                     frag_reuse_index,
                     options.clone(),
                 )?
@@ -758,7 +830,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                     index_dir,
                     distance_type,
                     shuffler,
-                    HnswBuildParams::default(),
+                    derive_hnsw_params(existing_indices[0].as_ref()),
                     frag_reuse_index,
                     options.clone(),
                 )?
@@ -779,7 +851,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 index_dir,
                 distance_type,
                 shuffler,
-                HnswBuildParams::default(),
+                derive_hnsw_params(existing_indices[0].as_ref()),
                 frag_reuse_index,
                 options.clone(),
             )?
@@ -799,7 +871,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 index_dir,
                 distance_type,
                 shuffler,
-                HnswBuildParams::default(),
+                derive_hnsw_params(existing_indices[0].as_ref()),
                 frag_reuse_index,
                 options.clone(),
             )?
