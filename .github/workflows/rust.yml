@@ -152,57 +152,6 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
-  # Temporary same-archive control for verifying that profile sharding preserves
-  # the Codecov report. Remove after the coverage artifacts are compared.
-  linux-coverage-unsharded:
-    needs: linux-coverage-build
-    runs-on: "ubuntu-24.04-8x"
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Setup rust toolchain
-        run: |
-          # Temporary mitigation for https://github.com/rust-lang/rust/issues/159261.
-          rustup toolchain install nightly-2026-07-13 --component llvm-tools-preview
-          rustup default nightly-2026-07-13
-      - name: Install dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y libssl-dev
-      - name: Start DynamoDB and S3
-        run: docker compose -f docker-compose.yml up -d --wait
-      - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # cargo-llvm-cov
-        with:
-          tool: cargo-llvm-cov
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # nextest
-        with:
-          tool: nextest
-      - name: Download coverage tests
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: rust-coverage-tests
-          path: coverage-artifacts
-      - name: Run coverage tests
-        run: |
-          cargo +nightly-2026-07-13 llvm-cov nextest \
-            --no-report \
-            --archive-file coverage-artifacts/rust-coverage-tests.tar.zst
-      - name: Generate coverage report
-        run: |
-          cargo +nightly-2026-07-13 llvm-cov report \
-            --nextest-archive-file coverage-artifacts/rust-coverage-tests.tar.zst \
-            --codecov \
-            --output-path coverage.codecov
-      - name: Upload coverage artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: rust-coverage-unsharded-codecov
-          path: coverage.codecov
-          retention-days: 1
-          if-no-files-found: error
-
   linux-coverage-test:
     needs: linux-coverage-build
     runs-on: "ubuntu-24.04-8x"
