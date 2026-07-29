@@ -657,8 +657,11 @@ mod tests {
     use arrow::datatypes::Float32Type;
     use arrow_array::RecordBatchIterator;
     use arrow_schema::{Field, Schema};
-    use lance_core::utils::tempfile::TempStrDir;
+    use lance_core::utils::tempfile::{TempObjFile, TempStrDir};
+    use lance_io::object_store::ObjectStore;
+    use lance_io::traits::Writer;
     use lance_linalg::kernels::normalize_fsl;
+    use tokio::io::AsyncWriteExt;
 
     use crate::index::vector::ivf::build_ivf_model;
     use lance_index::metrics::NoOpMetricsCollector;
@@ -670,6 +673,27 @@ mod tests {
     };
 
     const DIM: usize = 128;
+
+    #[tokio::test]
+    async fn legacy_index_values_are_read_from_the_requested_offset() {
+        let path = TempObjFile::default();
+        let object_store = ObjectStore::local();
+        let mut writer = object_store.create(&path).await.unwrap();
+        writer.write_all(&[0xFF]).await.unwrap();
+        writer.write_all(&11_u64.to_le_bytes()).await.unwrap();
+        writer.write_all(&12_u64.to_le_bytes()).await.unwrap();
+        Writer::shutdown(writer.as_mut()).await.unwrap();
+
+        let reader = object_store.open(&path).await.unwrap();
+        let values = read_legacy_index_values(reader.as_ref(), &DataType::UInt64, 1, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            values.as_primitive::<UInt64Type>(),
+            &UInt64Array::from_iter_values([11, 12])
+        );
+    }
+
     async fn generate_dataset(
         test_uri: &str,
         range: Range<f32>,
