@@ -200,8 +200,9 @@ public class CommitBuilder {
    * Set the storage format to use for the dataset.
    *
    * <p>This is only needed when creating a new empty table. If any data files are passed, the
-   * storage format will be inferred from the data files. Valid values: "legacy", "v2_0", "stable",
-   * "v2_1", "next", "v2_2".
+   * storage format will be inferred from the data files. Valid values include the canonical numeric
+   * forms ("2.0", "2.1", "2.2", "2.3"), prefixed aliases ("v2_0", "v2.0", "v2_1", "v2.1", etc.),
+   * and selectors ("legacy", "stable", "next"). Parsing is case-insensitive.
    *
    * @param storageFormat the storage format name
    * @return this builder instance

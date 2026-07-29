@@ -595,18 +595,8 @@ pub(crate) fn convert_to_java_schema<'local>(
 }
 
 fn parse_storage_format(name: &str) -> Result<LanceFileVersion> {
-    match name.to_lowercase().as_str() {
-        "legacy" => Ok(LanceFileVersion::Legacy),
-        "v2_0" | "v2.0" => Ok(LanceFileVersion::V2_0),
-        "stable" => Ok(LanceFileVersion::Stable),
-        "v2_1" | "v2.1" => Ok(LanceFileVersion::V2_1),
-        "next" => Ok(LanceFileVersion::Next),
-        "v2_2" | "v2.2" => Ok(LanceFileVersion::V2_2),
-        _ => Err(Error::input_error(format!(
-            "Unknown storage format: {}",
-            name
-        ))),
-    }
+    name.parse::<LanceFileVersion>()
+        .map_err(|_| Error::input_error(format!("Unknown storage format: {}", name)))
 }
 
 /// Translate the Java `commitTimeoutNanos` sentinel into an
@@ -1835,5 +1825,72 @@ mod tests {
             schema.metadata,
             HashMap::from([("new_schema_k".to_string(), "new_schema_v".to_string())])
         );
+    }
+
+    #[test]
+    fn test_parse_storage_format_canonical_forms() {
+        let cases = [
+            ("2.0", LanceFileVersion::V2_0),
+            ("2.1", LanceFileVersion::V2_1),
+            ("2.2", LanceFileVersion::V2_2),
+            ("2.3", LanceFileVersion::V2_3),
+            ("0.1", LanceFileVersion::Legacy),
+            ("legacy", LanceFileVersion::Legacy),
+            ("stable", LanceFileVersion::Stable),
+            ("next", LanceFileVersion::Next),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                parse_storage_format(input).unwrap(),
+                expected,
+                "parse_storage_format({:?}) failed",
+                input
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_storage_format_prefixed_aliases() {
+        let cases = [
+            ("v2_0", LanceFileVersion::V2_0),
+            ("v2.0", LanceFileVersion::V2_0),
+            ("v2_1", LanceFileVersion::V2_1),
+            ("v2.1", LanceFileVersion::V2_1),
+            ("v2_2", LanceFileVersion::V2_2),
+            ("v2.2", LanceFileVersion::V2_2),
+            ("v2_3", LanceFileVersion::V2_3),
+            ("v2.3", LanceFileVersion::V2_3),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                parse_storage_format(input).unwrap(),
+                expected,
+                "parse_storage_format({:?}) failed",
+                input
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_storage_format_case_insensitive() {
+        assert_eq!(
+            parse_storage_format("LEGACY").unwrap(),
+            LanceFileVersion::Legacy
+        );
+        assert_eq!(
+            parse_storage_format("Stable").unwrap(),
+            LanceFileVersion::Stable
+        );
+        assert_eq!(
+            parse_storage_format("V2_1").unwrap(),
+            LanceFileVersion::V2_1
+        );
+    }
+
+    #[test]
+    fn test_parse_storage_format_rejects_invalid() {
+        assert!(parse_storage_format("v3.0").is_err());
+        assert!(parse_storage_format("").is_err());
+        assert!(parse_storage_format("foo").is_err());
     }
 }
