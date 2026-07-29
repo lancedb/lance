@@ -103,8 +103,15 @@ jobs:
           command: check
 
   linux-build:
+    name: Linux coverage (${{ matrix.profile }})
     runs-on: "ubuntu-24.04-8x"
     timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        profile:
+          - ci
+          - ci-test
     env:
       # Need up-to-date compilers for kernels
       CC: clang
@@ -120,6 +127,8 @@ jobs:
           rustup default nightly-2026-07-13
       - uses: rui314/setup-mold@725a8794d15fc7563f59595bd9556495c0564878 # v1
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          key: llvm-cov-${{ matrix.profile }}
       - name: Install dependencies
         run: |
           sudo apt update
@@ -131,8 +140,15 @@ jobs:
       - name: Run tests
         run: |
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc -e slow_tests | sort | uniq | paste -s -d "," -`
-          cargo +nightly-2026-07-13 llvm-cov --profile ci --locked --workspace --codecov --output-path coverage.codecov --features ${ALL_FEATURES}
+          cargo +nightly-2026-07-13 llvm-cov --profile ${{ matrix.profile }} --locked --workspace --codecov --output-path coverage.codecov --features ${ALL_FEATURES}
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: rust-coverage-${{ matrix.profile }}
+          path: coverage.codecov
+          retention-days: 1
       - name: Upload coverage to Codecov
+        if: matrix.profile == 'ci-test'
         uses: codecov/codecov-action@b9fd7d16f6d7d1b5d2bec1a2887e65ceed900238 # v4
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
