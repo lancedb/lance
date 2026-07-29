@@ -20,7 +20,8 @@ use datafusion::physical_plan::{SendableRecordBatchStream, stream::RecordBatchSt
 use datafusion_common::ScalarValue;
 use futures::{StreamExt, TryStream, TryStreamExt, stream::BoxStream};
 use lance_core::cache::{
-    CacheCodec, CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheKey, LanceCache,
+    CacheCodec, CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheKey, CacheKeySchema,
+    KeyBuilder, LanceCache,
 };
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::error::LanceOptionExt;
@@ -662,6 +663,14 @@ impl CacheKey for LabelListIndexStateKey {
 
     fn type_name() -> &'static str {
         "LabelListIndexState"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.scalar.label-list-index-state-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_variant(0);
     }
 
     fn codec() -> Option<CacheCodec> {

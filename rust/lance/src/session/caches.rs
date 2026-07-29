@@ -14,12 +14,12 @@ use std::{borrow::Cow, ops::Deref};
 
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::{
-    cache::{CacheKey, LanceCache},
+    cache::{CacheKey, CacheKeySchema, KeyBuilder, LanceCache},
     utils::deletion::DeletionVector,
 };
 use lance_select::RowAddrMask;
 use lance_table::{
-    format::{DeletionFile, Manifest},
+    format::{DeletionFile, DeletionFileType, Manifest},
     rowids::{RowIdIndex, RowIdSequence},
 };
 use object_store::path::Path;
@@ -80,6 +80,20 @@ impl CacheKey for ManifestKey<'_> {
     fn type_name() -> &'static str {
         "Manifest"
     }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.dataset.manifest-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_u64(self.version);
+        if let Some(e_tag) = self.e_tag {
+            builder.write_some();
+            builder.write_str(e_tag);
+        } else {
+            builder.write_none();
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -94,6 +108,14 @@ impl CacheKey for TransactionKey {
     }
     fn type_name() -> &'static str {
         "Transaction"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.dataset.transaction-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_u64(self.version);
     }
 }
 
@@ -117,6 +139,26 @@ impl CacheKey for DeletionFileKey<'_> {
     fn type_name() -> &'static str {
         "DeletionVector"
     }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.dataset.deletion-file-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_u64(self.fragment_id);
+        builder.write_u64(self.deletion_file.read_version);
+        builder.write_u64(self.deletion_file.id);
+        builder.write_variant(match &self.deletion_file.file_type {
+            DeletionFileType::Array => 0,
+            DeletionFileType::Bitmap => 1,
+        });
+        if let Some(base_id) = self.deletion_file.base_id {
+            builder.write_some();
+            builder.write_u32(base_id);
+        } else {
+            builder.write_none();
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -139,6 +181,20 @@ impl CacheKey for RowAddrMaskKey {
     fn type_name() -> &'static str {
         "RowAddrMask"
     }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.dataset.row-address-mask-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_u64(self.version);
+        if let Some(restrict_hash) = self.restrict_hash {
+            builder.write_some();
+            builder.write_u64(restrict_hash);
+        } else {
+            builder.write_none();
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -153,6 +209,14 @@ impl CacheKey for RowIdIndexKey {
     }
     fn type_name() -> &'static str {
         "RowIdIndex"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.dataset.row-id-index-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_u64(self.version);
     }
 }
 
@@ -169,6 +233,14 @@ impl CacheKey for RowIdSequenceKey {
     fn type_name() -> &'static str {
         "RowIdSequence"
     }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.dataset.row-id-sequence-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_u64(self.fragment_id);
+    }
 }
 
 impl DSMetadataCache {
@@ -176,5 +248,47 @@ impl DSMetadataCache {
     /// This is used by file readers and other components that need file-level caching.
     pub(crate) fn file_metadata_cache(&self, prefix: &Path) -> LanceCache {
         self.0.with_key_prefix(prefix.as_ref())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn deletion_file_key_separates_storage_bases() {
+        let cache = LanceCache::with_capacity(4096);
+        let deletion_file = DeletionFile {
+            read_version: 3,
+            id: 4,
+            file_type: DeletionFileType::Bitmap,
+            num_deleted_rows: Some(1),
+            base_id: None,
+        };
+        cache
+            .insert_with_key(
+                &DeletionFileKey {
+                    fragment_id: 2,
+                    deletion_file: &deletion_file,
+                },
+                Arc::new(DeletionVector::NoDeletions),
+            )
+            .await;
+
+        let deletion_file_on_other_base = DeletionFile {
+            base_id: Some(7),
+            ..deletion_file
+        };
+        assert!(
+            cache
+                .get_with_key(&DeletionFileKey {
+                    fragment_id: 2,
+                    deletion_file: &deletion_file_on_other_base,
+                })
+                .await
+                .is_none()
+        );
     }
 }
