@@ -26,7 +26,7 @@ use std::time::Instant;
 
 use conflict_resolver::TransactionRebase;
 use lance_core::utils::backoff::{Backoff, SlotBackoff};
-use lance_file::version::{LanceFileFormat, LanceFileVersion};
+use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_io::utils::CachedFileSize;
 use lance_select::RowAddrTreeMap;
@@ -376,7 +376,7 @@ async fn migrate_manifest(
 
 fn check_storage_version(manifest: &mut Manifest) -> Result<()> {
     let data_storage_version = manifest.data_storage_format.lance_file_format();
-    if data_storage_version == LanceFileFormat::V1 {
+    if data_storage_version == ConcreteFileVersion::V1 {
         // Due to bugs in 0.16 it is possible the dataset's data storage version does not
         // match the file version.  As a result, we need to check and see if they are out
         // of sync.
@@ -385,7 +385,7 @@ fn check_storage_version(manifest: &mut Manifest) -> Result<()> {
                 "The dataset contains a mixture of file versions.  You will need to rollback to an earlier version: {}",
                 e
             )))?
-                && actual_file_version != LanceFileFormat::V1 {
+                && actual_file_version != ConcreteFileVersion::V1 {
                     log::warn!(
                         "Data storage version {} is less than the actual file version {}.  This has been automatically updated.",
                         data_storage_version,
@@ -1154,7 +1154,7 @@ mod tests {
     use lance_core::datatypes::{Field, Schema};
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::{BatchCount, RowCount, array, gen_batch};
-    use lance_file::version::LanceFileFormat;
+    use lance_file::version::ConcreteFileVersion;
     use lance_index::IndexType;
     use lance_linalg::distance::MetricType;
     use lance_table::format::{DataFile, DataStorageFormat};
@@ -1861,7 +1861,7 @@ mod tests {
         Manifest::new(
             schema,
             Arc::new(vec![fragment]),
-            DataStorageFormat::new(LanceFileFormat::from(data_storage_version)),
+            DataStorageFormat::new(ConcreteFileVersion::from(data_storage_version)),
             HashMap::new(),
         )
     }
@@ -1887,7 +1887,7 @@ mod tests {
             "data.lance",
             vec![0, 1],
             vec![0, 1],
-            LanceFileFormat::V2_1,
+            ConcreteFileVersion::V2_1,
             None,
             None,
         );
@@ -1922,7 +1922,7 @@ mod tests {
             "data.lance",
             vec![0, 1],
             vec![0, 1],
-            LanceFileFormat::V2_1,
+            ConcreteFileVersion::V2_1,
             None,
             None,
         );
@@ -1957,7 +1957,7 @@ mod tests {
             "data.lance",
             vec![0, 1],
             vec![-1, 0],
-            LanceFileFormat::V2_1,
+            ConcreteFileVersion::V2_1,
             None,
             None,
         );
@@ -1989,7 +1989,7 @@ mod tests {
             "data.lance",
             vec![0, 1],
             vec![0, 1],
-            LanceFileFormat::V2_1,
+            ConcreteFileVersion::V2_1,
             None,
             None,
         );
@@ -2017,7 +2017,7 @@ mod tests {
             "data.lance",
             vec![0, 1],
             vec![0, 1],
-            LanceFileFormat::V2_0,
+            ConcreteFileVersion::V2_0,
             None,
             None,
         );
@@ -2041,7 +2041,7 @@ mod tests {
             "data.lance",
             vec![0],
             vec![0, 1],
-            LanceFileFormat::V2_1,
+            ConcreteFileVersion::V2_1,
             None,
             None,
         );
@@ -2068,7 +2068,7 @@ mod tests {
             "data.lance",
             vec![0, 99],
             vec![0, 1],
-            LanceFileFormat::V2_1,
+            ConcreteFileVersion::V2_1,
             None,
             None,
         );
@@ -2097,7 +2097,7 @@ mod tests {
             "data.lance",
             vec![0, 1],
             vec![-1, -1],
-            LanceFileFormat::V2_1,
+            ConcreteFileVersion::V2_1,
             None,
             None,
         );

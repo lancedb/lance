@@ -6,7 +6,7 @@ use futures::StreamExt;
 use lance_core::datatypes::{OnMissing, OnTypeMismatch};
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::{Error, Result, datatypes::Schema};
-use lance_file::version::LanceFileFormat;
+use lance_file::version::ConcreteFileVersion;
 use lance_table::format::{DataFile, Fragment};
 use lance_table::utils::stream::ReadBatchFutStream;
 
@@ -237,7 +237,7 @@ impl Updater {
             path,
             vec![],
             vec![],
-            LanceFileFormat::V1,
+            ConcreteFileVersion::V1,
             None,
             base_id,
         ));

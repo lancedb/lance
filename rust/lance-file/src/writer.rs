@@ -36,7 +36,7 @@ use crate::format::MAGIC;
 use crate::format::pb;
 use crate::format::pbfile;
 use crate::format::pbfile::DirectEncoding;
-use crate::version::{LanceFileFormat, LanceFileVersion};
+use crate::version::{ConcreteFileVersion, LanceFileVersion};
 
 /// Pages buffers are aligned to 64 bytes
 pub(crate) const PAGE_BUFFER_ALIGNMENT: usize = 64;
@@ -869,8 +869,8 @@ impl FileWriter {
 
     fn standard_footer_numbers(&self) -> (u16, u16) {
         let version = self.version();
-        let exact_version = LanceFileFormat::from(version);
-        if exact_version == crate::version::LanceFileFormat::V1 {
+        let exact_version = ConcreteFileVersion::from(version);
+        if exact_version == crate::version::ConcreteFileVersion::V1 {
             panic!("Unsupported version: {}", version);
         }
         exact_version.to_standard_footer_numbers()
@@ -1065,7 +1065,7 @@ fn concat_lance_footer(
         data.put_u64_le(gbo_len);
     }
 
-    let (major, minor) = LanceFileFormat::from(version).to_embedded_footer_numbers();
+    let (major, minor) = ConcreteFileVersion::from(version).to_embedded_footer_numbers();
 
     // write the footer
     data.put_u64_le(col_metadata_start);

@@ -6,7 +6,7 @@ use byteorder::{ByteOrder, LittleEndian};
 use bytes::{Bytes, BytesMut};
 use lance_arrow::DataTypeExt;
 use lance_file::{
-    previous::writer::ManifestProvider as PreviousManifestProvider, version::LanceFileFormat,
+    previous::writer::ManifestProvider as PreviousManifestProvider, version::ConcreteFileVersion,
 };
 use object_store::ObjectStoreExt;
 use object_store::path::Path;
@@ -245,7 +245,7 @@ impl PreviousManifestProvider for ManifestDescribing {
         let mut manifest = Manifest::new(
             schema.clone(),
             Arc::new(vec![]),
-            DataStorageFormat::new(LanceFileFormat::V1),
+            DataStorageFormat::new(ConcreteFileVersion::V1),
             HashMap::new(),
         );
         let pos = do_write_manifest(object_writer, &mut manifest, None, None).await?;
