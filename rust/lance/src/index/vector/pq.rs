@@ -13,6 +13,7 @@ use arrow_array::types::UInt64Type;
 use arrow_array::{
     Array, FixedSizeListArray, RecordBatch, UInt8Array, UInt64Array,
     cast::{AsArray, as_primitive_array},
+    new_empty_array,
 };
 use arrow_array::{ArrayRef, Float32Array, UInt32Array};
 use arrow_ord::sort::sort_to_indices;
@@ -80,6 +81,10 @@ async fn read_legacy_index_values(
     offset: usize,
     length: usize,
 ) -> Result<ArrayRef> {
+    if length == 0 {
+        return Ok(new_empty_array(data_type));
+    }
+
     let byte_length = length
         .checked_mul(data_type.byte_width())
         .ok_or_else(|| Error::index("legacy IVF page byte length overflow".to_string()))?;
@@ -674,6 +679,7 @@ mod tests {
     use lance_io::object_store::ObjectStore;
     use lance_io::traits::Writer;
     use lance_linalg::kernels::normalize_fsl;
+    use object_store::path::Path;
     use tokio::io::AsyncWriteExt;
 
     use crate::index::vector::ivf::build_ivf_model;
@@ -686,6 +692,26 @@ mod tests {
     };
 
     const DIM: usize = 128;
+
+    #[tokio::test]
+    async fn empty_legacy_ivf_pq_partition_does_not_read_object_store() {
+        let object_store = ObjectStore::memory();
+        let reader = object_store
+            .open(&Path::from("missing-index"))
+            .await
+            .unwrap();
+        let codebook_values = Float32Array::from_iter_values((0..256).map(|value| value as f32));
+        let codebook = FixedSizeListArray::try_new_from_values(codebook_values, 1).unwrap();
+        let index = PQIndex::new(
+            ProductQuantizer::new(1, 8, 1, codebook, DistanceType::L2),
+            MetricType::L2,
+            None,
+        );
+
+        let loaded = index.load(reader.into(), 1, 0).await.unwrap();
+
+        assert_eq!(loaded.num_rows(), 0);
+    }
 
     #[tokio::test]
     async fn legacy_index_values_are_read_from_the_requested_offset() {
