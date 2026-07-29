@@ -1176,7 +1176,6 @@ mod tests {
             metadata: lance_index::vector::flat::index::FlatMetadata { dim: 2 },
             sub_index_type: SubIndexType::Flat,
             quantization_type: QuantizationType::Flat,
-            cache_key_prefix: "prefix/".to_string(),
             index_file_size: 1024,
             aux_file_size: 512,
             rq_search_cache: empty_rabit_search_cache_cell(),

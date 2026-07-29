@@ -21,7 +21,7 @@ use arrow_select::concat::{self, concat_batches};
 use async_recursion::async_recursion;
 use futures::{Future, FutureExt, StreamExt, TryStreamExt, stream};
 use lance_arrow::*;
-use lance_core::cache::{CacheKey, LanceCache};
+use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder, LanceCache};
 use lance_core::datatypes::{Field, Schema};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
@@ -83,7 +83,23 @@ impl<'a, T> StringCacheKey<'a, T> {
     }
 }
 
-impl<T: 'static> CacheKey for StringCacheKey<'_, T> {
+trait StableStringCacheValue: 'static {
+    const STABLE_TYPE_ID: &'static str;
+}
+
+impl StableStringCacheValue for Metadata {
+    const STABLE_TYPE_ID: &'static str = "lance.file.previous.Metadata";
+}
+
+impl StableStringCacheValue for PageTable {
+    const STABLE_TYPE_ID: &'static str = "lance.file.previous.PageTable";
+}
+
+impl StableStringCacheValue for Option<PageTable> {
+    const STABLE_TYPE_ID: &'static str = "lance.file.previous.OptionalPageTable";
+}
+
+impl<T: StableStringCacheValue> CacheKey for StringCacheKey<'_, T> {
     type ValueType = T;
 
     fn key(&self) -> Cow<'_, str> {
@@ -91,10 +107,21 @@ impl<T: 'static> CacheKey for StringCacheKey<'_, T> {
     }
 
     fn type_name() -> &'static str {
-        // This is a private, crate-internal key that is only instantiated with
-        // a single concrete T within one build, so std::any::type_name is fine
-        // here — there is no cross-crate collision risk.
+        // Keep the legacy diagnostic name for compatibility. `stable_type_id`
+        // provides the compiler-independent identity used by physical keys.
         std::any::type_name::<T>()
+    }
+
+    fn stable_type_id() -> &'static str {
+        T::STABLE_TYPE_ID
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.file.previous.string-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_str(self.key);
     }
 }
 
@@ -244,7 +271,7 @@ impl FileReader {
     }
 
     /// Load some metadata about the fragment from the cache, if there is one.
-    async fn load_from_cache<T: DeepSizeOf + Send + Sync + 'static, F, Fut>(
+    async fn load_from_cache<T: DeepSizeOf + Send + Sync + StableStringCacheValue, F, Fut>(
         cache: Option<&LanceCache>,
         key: String,
         loader: F,
@@ -799,6 +826,34 @@ mod tests {
     use arrow_array::{BooleanArray, Int32Array};
     use arrow_schema::{Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema};
     use lance_io::object_store::ObjectStoreParams;
+
+    #[test]
+    fn string_cache_key_discriminators_are_stable_and_type_scoped() {
+        assert_eq!(
+            [
+                <StringCacheKey<'static, Metadata> as CacheKey>::stable_type_id(),
+                <StringCacheKey<'static, PageTable> as CacheKey>::stable_type_id(),
+                <StringCacheKey<'static, Option<PageTable>> as CacheKey>::stable_type_id(),
+            ],
+            [
+                "lance.file.previous.Metadata",
+                "lance.file.previous.PageTable",
+                "lance.file.previous.OptionalPageTable",
+            ]
+        );
+        assert_eq!(
+            [
+                <StringCacheKey<'static, Metadata> as CacheKey>::type_name(),
+                <StringCacheKey<'static, PageTable> as CacheKey>::type_name(),
+                <StringCacheKey<'static, Option<PageTable>> as CacheKey>::type_name(),
+            ],
+            [
+                std::any::type_name::<Metadata>(),
+                std::any::type_name::<PageTable>(),
+                std::any::type_name::<Option<PageTable>>(),
+            ]
+        );
+    }
 
     #[tokio::test]
     async fn test_take() {

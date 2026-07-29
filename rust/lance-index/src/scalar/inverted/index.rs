@@ -41,7 +41,9 @@ use fst::{Automaton, IntoStreamer, Streamer};
 use futures::{FutureExt, Stream, StreamExt, TryStreamExt, stream};
 use itertools::{Either, Itertools};
 use lance_arrow::{RecordBatchExt, iter_str_array};
-use lance_core::cache::{CacheCodec, CacheKey, LanceCache, WeakLanceCache};
+use lance_core::cache::{
+    CacheCodec, CacheKey, CacheKeySchema, KeyBuilder, LanceCache, WeakLanceCache,
+};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::error::{DataFusionResult, LanceOptionExt};
 use lance_core::utils::address::RowAddress;
@@ -4721,6 +4723,14 @@ impl CacheKey for PostingListKey {
         "PostingList"
     }
 
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.scalar.inverted.posting-list-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_u32(self.token_id);
+    }
+
     fn codec() -> Option<CacheCodec> {
         Some(CacheCodec::from_impl::<PostingList>())
     }
@@ -4745,6 +4755,15 @@ impl CacheKey for PostingListGroupKey {
 
     fn type_name() -> &'static str {
         "PostingListGroup"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.scalar.inverted.posting-list-group-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_u32(self.start);
+        builder.write_u32(self.end);
     }
 
     fn codec() -> Option<CacheCodec> {
@@ -4773,6 +4792,23 @@ impl<K: CacheKey> CacheKey for ImpactAwareCacheKey<K> {
 
     fn type_name() -> &'static str {
         K::type_name()
+    }
+
+    fn stable_type_id() -> &'static str {
+        K::stable_type_id()
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.scalar.inverted.impact-aware-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        let inner_schema = K::schema();
+        builder.write_str(K::stable_type_id());
+        builder.write_str(inner_schema.id());
+        builder.write_u32(inner_schema.version());
+        builder.write_variant(if self.has_impacts { 1 } else { 0 });
+        self.inner.write_key(builder);
     }
 
     fn codec() -> Option<CacheCodec> {
@@ -4819,6 +4855,14 @@ impl CacheKey for PostingMetadataKey {
     fn type_name() -> &'static str {
         "PostingMetadata"
     }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.scalar.inverted.posting-metadata-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_u32(self.token_id);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -4835,6 +4879,14 @@ impl CacheKey for PositionKey {
 
     fn type_name() -> &'static str {
         "Position"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.scalar.inverted.position-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_u32(self.token_id);
     }
 
     fn codec() -> Option<CacheCodec> {
