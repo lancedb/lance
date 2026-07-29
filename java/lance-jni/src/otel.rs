@@ -508,8 +508,10 @@ fn lance_metrics_catalog_native<'local>(env: &mut JNIEnv<'local>) -> Result<JObj
     let catalog = CATALOG.lock().unwrap();
     let list = object_list(env)?;
     for (name, desc) in catalog.iter() {
-        let item = metric_description_to_java(env, name, desc)?;
-        add_to_list(env, &list, &item)?;
+        env.with_local_frame(16, |env| {
+            let item = metric_description_to_java(env, name, desc)?;
+            add_to_list(env, &list, &item)
+        })?;
     }
     Ok(list)
 }
