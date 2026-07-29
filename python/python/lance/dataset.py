@@ -3306,21 +3306,6 @@ class LanceDataset(pa.dataset.Dataset):
                         f"BTREE/BITMAP index column {column} must be int",
                         ", float, bool, str, large_str, fixed-size-binary, or temporal",
                     )
-            elif index_type == "ZONEMAP":
-                if (
-                    not pa.types.is_integer(field_type)
-                    and not pa.types.is_floating(field_type)
-                    and not pa.types.is_boolean(field_type)
-                    and not pa.types.is_string(field_type)
-                    and not pa.types.is_large_string(field_type)
-                    and not pa.types.is_temporal(field_type)
-                    and not pa.types.is_fixed_size_binary(field_type)
-                    and not pa.types.is_nested(field_type)
-                ):
-                    raise TypeError(
-                        f"ZONEMAP index column {column} must be int, float, bool, "
-                        "str, large_str, fixed-size-binary, temporal, or nested type",
-                    )
             elif index_type == "LABEL_LIST":
                 if not (
                     pa.types.is_list(field_type) or pa.types.is_large_list(field_type)
@@ -3508,7 +3493,7 @@ class LanceDataset(pa.dataset.Dataset):
         ----------
         column : str
             The column to be indexed.  Must be a boolean, integer, float,
-            string, or nested (e.g. FixedSizeList) column when using ZONEMAP.
+            or string column.
         index_type : str
             The type of the index.  One of ``"BTREE"``, ``"BITMAP"``,
             ``"LABEL_LIST"``, ``"NGRAM"``, ``"ZONEMAP"``, ``"INVERTED"``,
