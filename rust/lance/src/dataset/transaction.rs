@@ -16,6 +16,7 @@ use super::ManifestWriteConfig;
 use super::write::merge_insert::inserted_rows::KeyExistenceFilter;
 use crate::dataset::overlay::collect_overlay_stale_frags;
 use crate::dataset::transaction::UpdateMode::{RewriteColumns, RewriteRows};
+use crate::index::index_results_are_row_addrs;
 use crate::index::mem_wal::update_mem_wal_index_compacted_sstables;
 use crate::utils::temporal::timestamp_to_nanos;
 use lance_core::datatypes::{
@@ -2122,9 +2123,21 @@ impl Transaction {
                     // We can re-use indices, but need to rewrite the fragment bitmaps
                     debug_assert!(rewritten_indices.is_empty());
                     for index in final_indices.iter_mut() {
+                        let results_are_row_addrs = index_results_are_row_addrs(index);
                         if let Some(fragment_bitmap) = &mut index.fragment_bitmap {
-                            *fragment_bitmap =
-                                Self::recalculate_fragment_bitmap(fragment_bitmap, groups)?;
+                            *fragment_bitmap = if results_are_row_addrs {
+                                // Stable row ids survive a rewrite, so a row-id-domain index
+                                // can simply follow its data to the new fragments. An
+                                // address-domain index cannot: its stored addresses point into
+                                // the fragments the rewrite dropped. Claiming coverage of the
+                                // new fragments would make it answer queries with addresses
+                                // that no longer resolve, so drop the rewritten fragments from
+                                // its coverage instead and let the scanner fall back to a full
+                                // scan for them.
+                                Self::drop_rewritten_fragments(fragment_bitmap, groups)
+                            } else {
+                                Self::recalculate_fragment_bitmap(fragment_bitmap, groups)?
+                            };
                         }
                     }
                 } else {
@@ -3021,6 +3034,18 @@ impl Transaction {
             }
         }
         Ok(new_bitmap)
+    }
+
+    /// Coverage of an index that a rewrite invalidates: the rewritten fragments are
+    /// removed and the fragments they became are *not* added.
+    fn drop_rewritten_fragments(old: &RoaringBitmap, groups: &[RewriteGroup]) -> RoaringBitmap {
+        let mut new_bitmap = old.clone();
+        for group in groups {
+            for old_fragment in &group.old_fragments {
+                new_bitmap.remove(old_fragment.id as u32);
+            }
+        }
+        new_bitmap
     }
 
     fn handle_rewrite_indices(
