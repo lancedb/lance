@@ -184,7 +184,7 @@ impl ZoneMapIndex {
         let mut min: Option<&ScalarValue> = None;
         let mut max: Option<&ScalarValue> = None;
         for seg in segments.into_iter() {
-            // Nested types have no meaningful scalar range
+            // Nested types have no meaningful ordering
             if seg.data_type.is_nested() {
                 return None;
             }
@@ -253,6 +253,8 @@ impl ZoneMapIndex {
                 Ok(zone.null_count > 0)
             }
             SargableQuery::Equals(target) => {
+                // Zone contains matching values if target falls within [min, max] range
+                // Handle null values - if target is null, check null_count
                 if target.is_null() {
                     return Ok(zone.null_count > 0);
                 }
@@ -765,6 +767,7 @@ impl ScalarIndex for ZoneMapIndex {
     /// Single-segment `[min, max]` folded from this index's zones; see
     /// [`value_range_over`](Self::value_range_over) for the full contract.
     fn value_range(&self) -> Option<(ScalarValue, ScalarValue)> {
+        // We don't record min/max for nested types
         if self.data_type.is_nested() {
             return None;
         }
@@ -1172,8 +1175,7 @@ fn default_use_seeds(data_type: &DataType) -> bool {
         // Fixed-width types wider than 8 bytes.
         DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => true,
         DataType::FixedSizeBinary(n) => *n > 8,
-        // Nested types (FSL, List, Struct, Map, …): typically wide; even null-only
-        // seeds save more than their tiny serialization cost.
+        // Nested types (FSL, List, Struct, Map, …): typically wide.
         _ if data_type.is_nested() => true,
         _ => false,
     }
