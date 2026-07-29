@@ -5,7 +5,10 @@ use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::any::Any;
 use std::sync::Arc;
 
-use arrow::compute::concat;
+use arrow::{
+    array::{ArrayData, make_array},
+    compute::concat,
+};
 use arrow_array::types::UInt64Type;
 use arrow_array::{
     Array, FixedSizeListArray, RecordBatch, UInt8Array, UInt64Array,
@@ -18,7 +21,7 @@ use arrow_select::take::take;
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use lance_arrow::{DataTypeExt, FixedSizeListArrayExt, array_from_fixed_width_bytes};
+use lance_arrow::{BufferExt, DataTypeExt, FixedSizeListArrayExt};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::spawn_cpu;
@@ -84,7 +87,17 @@ async fn read_legacy_index_values(
         .checked_add(byte_length)
         .ok_or_else(|| Error::index("legacy IVF page offset overflow".to_string()))?;
     let bytes = reader.get_range(offset..end).await?;
-    Ok(array_from_fixed_width_bytes(data_type, bytes, length, 0)?)
+    let buffer = if bytes.len() < byte_length {
+        arrow_buffer::Buffer::copy_bytes_bytes(bytes, byte_length)
+    } else {
+        arrow_buffer::Buffer::from_bytes_bytes(bytes, data_type.byte_width() as u64)
+    };
+    let data = ArrayData::builder(data_type.clone())
+        .len(length)
+        .null_count(0)
+        .add_buffer(buffer)
+        .build()?;
+    Ok(make_array(data))
 }
 
 impl DeepSizeOf for PQIndex {

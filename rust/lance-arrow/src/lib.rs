@@ -21,13 +21,13 @@ use std::{collections::HashMap, ptr::NonNull};
 use arrow_array::{
     Array, ArrayRef, ArrowNumericType, FixedSizeBinaryArray, FixedSizeListArray, GenericListArray,
     LargeListArray, ListArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, StructArray,
-    UInt8Array, UInt32Array, cast::AsArray, make_array,
+    UInt8Array, UInt32Array, cast::AsArray,
 };
 use arrow_array::{
     Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, new_null_array,
 };
-use arrow_buffer::{Buffer, MutableBuffer};
-use arrow_data::{ArrayDataBuilder, BufferSpec, layout};
+use arrow_buffer::MutableBuffer;
+use arrow_data::ArrayDataBuilder;
 use arrow_schema::{ArrowError, DataType, Field, Fields, IntervalUnit, Schema, SortOptions};
 use arrow_select::{interleave::interleave, take::take};
 use rand::prelude::*;
@@ -69,48 +69,6 @@ pub const BLOB_PACK_FILE_SIZE_THRESHOLD_META_KEY: &str =
     "lance-encoding:blob-pack-file-size-threshold";
 
 type Result<T> = std::result::Result<T, ArrowError>;
-
-/// Build a null-free Arrow array over a fixed-width byte buffer.
-///
-/// The input is reused without copying when its alignment and size satisfy the
-/// Arrow layout. Otherwise, an aligned buffer is allocated and the missing
-/// trailing bytes are zero-filled.
-pub fn array_from_fixed_width_bytes(
-    data_type: &DataType,
-    bytes: bytes::Bytes,
-    len: usize,
-    offset: usize,
-) -> Result<ArrayRef> {
-    let layout = layout(data_type);
-    if layout.buffers.len() != 1 {
-        return Err(ArrowError::InvalidArgumentError(format!(
-            "expected a data type with one fixed-width buffer, found {data_type}"
-        )));
-    }
-
-    let buffer = if let BufferSpec::FixedWidth {
-        byte_width,
-        alignment,
-    } = &layout.buffers[0]
-    {
-        let min_buffer_size = (len + offset).saturating_mul(*byte_width);
-        if bytes.len() < min_buffer_size {
-            Buffer::copy_bytes_bytes(bytes, min_buffer_size)
-        } else {
-            Buffer::from_bytes_bytes(bytes, *alignment as u64)
-        }
-    } else {
-        Buffer::from_slice_ref(bytes)
-    };
-
-    let data = ArrayDataBuilder::new(data_type.clone())
-        .len(len)
-        .offset(offset)
-        .null_count(0)
-        .add_buffer(buffer)
-        .build()?;
-    Ok(make_array(data))
-}
 
 pub trait DataTypeExt {
     /// Returns true if the data type is binary-like, such as Utf8, Binary, or the large and/or view variants.
@@ -1605,21 +1563,6 @@ mod tests {
     use arrow_array::{Float32Array, Int32Array, NullArray, StructArray};
     use arrow_array::{ListArray, StringArray, new_empty_array, new_null_array};
     use arrow_buffer::OffsetBuffer;
-
-    #[test]
-    fn fixed_width_bytes_zero_pads_short_input() {
-        let bytes = bytes::Bytes::copy_from_slice(&42_i32.to_le_bytes());
-        let array = array_from_fixed_width_bytes(&DataType::Int32, bytes, 2, 0).unwrap();
-        let array = array.as_any().downcast_ref::<Int32Array>().unwrap();
-        assert_eq!(array.values(), &[42, 0]);
-    }
-
-    #[test]
-    fn fixed_width_bytes_rejects_variable_width_type() {
-        let error =
-            array_from_fixed_width_bytes(&DataType::Utf8, bytes::Bytes::new(), 0, 0).unwrap_err();
-        assert!(error.to_string().contains("one fixed-width buffer"));
-    }
 
     #[test]
     fn test_convert_to_floating_point_preserves_inner_nulls() {
