@@ -1398,11 +1398,258 @@ fn metric_value(metrics: &datafusion::physical_plan::metrics::MetricsSet, name: 
         .unwrap_or(0)
 }
 
+fn map_filtering_read<T>(
+    plan: &dyn ExecutionPlan,
+    map: &impl Fn(&FilteredReadExec) -> T,
+) -> Option<T> {
+    if let Some(filtered_read) = plan.downcast_ref::<FilteredReadExec>()
+        && filtered_read.row_stream_input().is_none()
+        && (filtered_read.options().full_filter.is_some()
+            || filtered_read.options().refine_filter.is_some())
+    {
+        return Some(map(filtered_read));
+    }
+    for child in plan.children() {
+        if let Some(value) = map_filtering_read(child.as_ref(), map) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+async fn run_filtered_pipeline_case(
+    config: &Config,
+    io_buffer_gib: Option<u64>,
+    scheduler_diagnostics: &SchedulerDiagnosticsCollector,
+) -> Result<CaseStats> {
+    scheduler_diagnostics.clear();
+    let dataset = Arc::new(
+        DatasetBuilder::from_uri(&config.uri)
+            .with_version(config.dataset_version)
+            .load()
+            .await?,
+    );
+    let planned_fragments = dataset.fragments().len();
+    let planned_rows = dataset
+        .fragments()
+        .iter()
+        .map(|fragment| {
+            fragment
+                .num_rows()
+                .map(|rows| rows as u64)
+                .ok_or_else(|| format!("fragment {} is missing num_rows", fragment.id))
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .sum::<u64>();
+
+    let threading_mode = match config.filtered_read_mode {
+        FilteredReadMode::OnePartitionOrdered | FilteredReadMode::OnePartitionUnordered => {
+            FilteredReadThreadingMode::OnePartitionMultipleThreads(config.filtered_read_parallelism)
+        }
+        FilteredReadMode::MultiplePartitions => {
+            FilteredReadThreadingMode::MultiplePartitions(config.filtered_read_parallelism)
+        }
+    };
+    let benchmark_options = FilteredReadBenchmarkOptions {
+        preserve_task_order: !matches!(
+            config.filtered_read_mode,
+            FilteredReadMode::OnePartitionUnordered
+        ),
+        partition_decode_readahead: config.partition_decode_readahead,
+    };
+
+    let stats_holder = ExecutionStatsHolder::default();
+    let mut scanner = dataset.scan();
+    if let Some(columns) = config.columns.as_ref() {
+        scanner.project(columns)?;
+    }
+    scanner.filter(
+        config
+            .filter
+            .as_deref()
+            .ok_or("filtered pipeline requires --filter")?,
+    )?;
+    scanner
+        .batch_size(config.batch_size as usize)
+        .batch_readahead(config.filtered_read_parallelism)
+        .fragment_readahead(config.fragment_concurrency)
+        .target_parallelism(config.filtered_read_parallelism)
+        .scan_in_order(false)
+        .scan_stats_callback(stats_holder.get_setter())
+        .with_filtered_read_benchmark_options(threading_mode, benchmark_options);
+    let limit_rows = i64::try_from(config.limit_rows)
+        .map_err(|_| "--limit-rows is too large for scanner limit")?;
+    scanner.limit(Some(limit_rows), None)?;
+    if let Some(file_reader_options) = file_reader_options(config) {
+        scanner.with_file_reader_options(file_reader_options);
+    }
+    if let Some(batch_size_bytes) = config.batch_size_bytes {
+        scanner.batch_size_bytes(batch_size_bytes);
+    }
+    if let Some(io_buffer_gib) = io_buffer_gib {
+        scanner.io_buffer_size(io_buffer_gib * GIB);
+    }
+
+    let source_plan = scanner.create_plan().await?;
+    let source_partitions = map_filtering_read(source_plan.as_ref(), &|filtered_read| {
+        filtered_read
+            .properties()
+            .output_partitioning()
+            .partition_count()
+    })
+    .ok_or("scanner plan did not contain a filtering FilteredReadExec")?;
+    let expected_partitions = match config.filtered_read_mode {
+        FilteredReadMode::OnePartitionOrdered | FilteredReadMode::OnePartitionUnordered => 1,
+        FilteredReadMode::MultiplePartitions => config.filtered_read_parallelism,
+    };
+    if source_partitions != expected_partitions {
+        return Err(format!(
+            "filtering read produced {source_partitions} partitions, expected {expected_partitions}"
+        )
+        .into());
+    }
+
+    let plan_text = displayable(source_plan.as_ref()).indent(true).to_string();
+    let mut plan_hasher = DefaultHasher::new();
+    plan_text.hash(&mut plan_hasher);
+    let plan_hash = format!("{:016x}", plan_hasher.finish());
+
+    let counters = Arc::new(SharedCounters::default());
+    let cpu_before = read_cpu_sample();
+    let started = Instant::now();
+    let mut stream = execute_stream(source_plan.clone(), Arc::new(TaskContext::default()))?;
+    let mut rows = 0u64;
+    let mut batches = 0u64;
+    let mut arrow_bytes = 0u64;
+    let mut samples = Vec::new();
+    let mut sample_interval = tokio::time::interval(Duration::from_millis(config.sample_ms));
+    sample_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_sample = LastSample {
+        elapsed: Duration::default(),
+        scheduler_stats: ScanStats::default(),
+        rows: 0,
+        batches: 0,
+        arrow_bytes: 0,
+    };
+    loop {
+        tokio::select! {
+            maybe_batch = stream.next() => {
+                let Some(batch) = maybe_batch else {
+                    break;
+                };
+                let batch = batch?;
+                let batch_bytes = if config.skip_batch_byte_accounting {
+                    0
+                } else {
+                    batch.get_array_memory_size() as u64
+                };
+                rows += batch.num_rows() as u64;
+                batches += 1;
+                arrow_bytes += batch_bytes;
+                counters.batches_completed.fetch_add(1, Ordering::Relaxed);
+                counters
+                    .rows_completed
+                    .fetch_add(batch.num_rows() as u64, Ordering::Relaxed);
+                counters.arrow_bytes.fetch_add(batch_bytes, Ordering::Relaxed);
+            }
+            _ = sample_interval.tick() => {
+                samples.push(sample_json(
+                    started,
+                    counters.as_ref(),
+                    scheduler_diagnostics.snapshot(io_buffer_gib),
+                    0,
+                    0,
+                    &mut last_sample,
+                ));
+            }
+        }
+    }
+    drop(stream);
+
+    if rows != config.limit_rows {
+        return Err(format!(
+            "filtered topology scan returned {rows} rows, expected limit {}",
+            config.limit_rows
+        )
+        .into());
+    }
+
+    let elapsed = started.elapsed();
+    let metrics = map_filtering_read(source_plan.as_ref(), &|filtered_read| {
+        filtered_read.metrics()
+    })
+    .flatten()
+    .ok_or("filtering FilteredReadExec did not expose execution metrics")?;
+    let fallback_scheduler_stats = ScanStats {
+        iops: metric_value(&metrics, "iops"),
+        requests: metric_value(&metrics, "requests"),
+        bytes_read: metric_value(&metrics, "bytes_read"),
+    };
+    let scheduler_stats = stats_holder
+        .consume()
+        .map(|summary| scan_stats_from_execution_summary(&summary))
+        .unwrap_or(fallback_scheduler_stats);
+    let task_wait_ns = metric_value(&metrics, "task_wait_time");
+    let elapsed_compute_ns = metrics.elapsed_compute().unwrap_or(0) as u64;
+    let execution_metrics = metrics.iter().map(ToString::to_string).collect::<Vec<_>>();
+
+    let mut final_diagnostics = scheduler_diagnostics.snapshot(io_buffer_gib);
+    final_diagnostics.stats = scheduler_stats;
+    let cpu_after = read_cpu_sample();
+    samples.push(sample_json(
+        started,
+        counters.as_ref(),
+        final_diagnostics,
+        0,
+        0,
+        &mut last_sample,
+    ));
+
+    Ok(CaseStats {
+        rows,
+        batches,
+        arrow_bytes,
+        planned_fragments,
+        planned_rows,
+        elapsed,
+        producer_finished_at: Some(elapsed),
+        peak_decode_in_flight: 0,
+        cpu_avg: cpu_before.zip(cpu_after).and_then(|(before, after)| {
+            let total = after.total.checked_sub(before.total)?;
+            let idle = after.idle.checked_sub(before.idle)?;
+            if total == 0 {
+                return None;
+            }
+            Some((total - idle) as f64 / total as f64 * 100.0)
+        }),
+        scheduler_diagnostics: final_diagnostics,
+        counters,
+        samples,
+        execution_metadata: Some(json!({
+            "full_scanner_pipeline": true,
+            "filtered_read_mode": config.filtered_read_mode.name(),
+            "filtered_read_parallelism": config.filtered_read_parallelism,
+            "partition_decode_readahead": config.partition_decode_readahead,
+            "filtering_source_partitions": source_partitions,
+            "plan": plan_text,
+            "plan_hash": plan_hash,
+            "task_wait_seconds_total": task_wait_ns as f64 / 1_000_000_000.0,
+            "elapsed_compute_seconds_total": elapsed_compute_ns as f64 / 1_000_000_000.0,
+            "metrics": execution_metrics,
+        })),
+    })
+}
+
 async fn run_filtered_read_case(
     config: &Config,
     io_buffer_gib: Option<u64>,
     scheduler_diagnostics: &SchedulerDiagnosticsCollector,
 ) -> Result<CaseStats> {
+    if config.filter.is_some() {
+        return run_filtered_pipeline_case(config, io_buffer_gib, scheduler_diagnostics).await;
+    }
+
     scheduler_diagnostics.clear();
     let dataset = Arc::new(
         DatasetBuilder::from_uri(&config.uri)

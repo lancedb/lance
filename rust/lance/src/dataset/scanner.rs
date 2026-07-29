@@ -96,7 +96,7 @@ use crate::index::vector::utils::{
     default_distance_type_for, get_vector_dim, get_vector_type, validate_distance_type_for,
 };
 use crate::io::exec::filtered_read::{
-    FilteredReadExec, FilteredReadOptions, FilteredReadThreadingMode,
+    FilteredReadBenchmarkOptions, FilteredReadExec, FilteredReadOptions, FilteredReadThreadingMode,
 };
 use crate::io::exec::fts::{
     BoostQueryExec, FlatMatchFilterExec, FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec,
@@ -846,6 +846,10 @@ pub struct Scanner {
     /// Defaults to `get_num_compute_intensive_cpus()`.
     target_parallelism: Option<usize>,
 
+    /// Experimental filtered-read controls used only by the topology benchmark.
+    filtered_read_benchmark_options:
+        Option<(FilteredReadThreadingMode, FilteredReadBenchmarkOptions)>,
+
     // Legacy fields to help migrate some old projection behavior to new behavior
     //
     // There are two behaviors we are moving away from:
@@ -1071,6 +1075,7 @@ impl Scanner {
             autoproject_scoring_columns: true,
             relational_algebra_version: LANCE_RELATIONAL_ALGEBRA_VERSION,
             target_parallelism: None,
+            filtered_read_benchmark_options: None,
         };
         scanner.apply_blob_handling();
         scanner
@@ -1405,6 +1410,17 @@ impl Scanner {
     /// partitions to use. Set to 1 in tests that assert specific plan shapes.
     pub fn target_parallelism(&mut self, n: usize) -> &mut Self {
         self.target_parallelism = Some(n);
+        self
+    }
+
+    /// Override filtered-read execution controls for topology benchmarks.
+    #[doc(hidden)]
+    pub fn with_filtered_read_benchmark_options(
+        &mut self,
+        threading_mode: FilteredReadThreadingMode,
+        benchmark_options: FilteredReadBenchmarkOptions,
+    ) -> &mut Self {
+        self.filtered_read_benchmark_options = Some((threading_mode, benchmark_options));
         self
     }
 
@@ -2935,6 +2951,11 @@ impl Scanner {
         read_options = read_options.with_threading_mode(
             FilteredReadThreadingMode::OnePartitionMultipleThreads(self.batch_readahead),
         );
+        if let Some((threading_mode, benchmark_options)) = self.filtered_read_benchmark_options {
+            read_options = read_options
+                .with_threading_mode(threading_mode)
+                .with_benchmark_options(benchmark_options);
+        }
 
         if let Some(file_reader_options) = self.resolved_file_reader_options() {
             read_options = read_options.with_file_reader_options(file_reader_options);
