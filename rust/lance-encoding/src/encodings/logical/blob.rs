@@ -561,9 +561,7 @@ mod tests {
 
         check_round_trip_encoding_of_data(
             vec![all_valid, with_null, all_valid_again],
-            &TestCases::default()
-                .with_min_file_version(LanceFileVersion::V2_1)
-                .with_max_file_version(LanceFileVersion::V2_1),
+            &TestCases::default().with_encoding(TestEncoding::StructuralU16),
             blob_metadata,
         )
         .await;
