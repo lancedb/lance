@@ -1355,9 +1355,10 @@ impl InvertedIndex {
 
     fn document_projections_resident_now(&self) -> bool {
         self.partitions.iter().all(|partition| {
-            partition.docs.modern().is_some_and(|documents| {
-                documents.coordinate_rank() == 0 && documents.projection_resident()
-            })
+            partition
+                .docs
+                .modern()
+                .is_some_and(|documents| documents.projection_resident())
         })
     }
 

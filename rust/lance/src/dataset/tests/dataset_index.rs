@@ -37,7 +37,7 @@ use lance_file::version::LanceFileVersion;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::inverted::{
-    InvertedListFormatVersion, SCORE_COL,
+    DocumentGranularity, InvertedListFormatVersion, SCORE_COL,
     query::{BooleanQuery, BoostQuery, MatchQuery, Occur, Operator, PhraseQuery},
     tokenizer::InvertedIndexParams,
 };
@@ -885,10 +885,11 @@ async fn create_fragmented_fts_index(dataset: &mut Dataset, column: &str) {
         .await
         .unwrap();
 
-    let segments = crate::index::scalar::inverted::load_segments(dataset, column)
-        .await
-        .unwrap()
-        .unwrap();
+    let segments =
+        crate::index::scalar::inverted::load_segments(dataset, column, DocumentGranularity::Row)
+            .await
+            .unwrap()
+            .unwrap();
     assert_eq!(segments.len(), fragment_ids.len());
 }
 

@@ -256,7 +256,7 @@ fn scored_documents_batch(schema: SchemaRef, documents: Vec<ScoredDoc>) -> Resul
     Ok(RecordBatch::try_new(schema, columns)?)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct DocumentKey {
     row_id: u64,
     doc_index: Vec<u32>,
@@ -314,13 +314,13 @@ fn document_key_scores_batch(
     )
 }
 
-fn compare_scored_rows(
-    (left_row_id, left_score): &(u64, f32),
-    (right_row_id, right_score): &(u64, f32),
+fn compare_scored_documents(
+    (left_key, left_score): &(DocumentKey, f32),
+    (right_key, right_score): &(DocumentKey, f32),
 ) -> Ordering {
     right_score
         .total_cmp(left_score)
-        .then_with(|| left_row_id.cmp(right_row_id))
+        .then_with(|| left_key.cmp(right_key))
 }
 
 /// Fall back to the default simple tokenizer when no on-disk FTS segment exists.
@@ -2442,7 +2442,7 @@ impl ExecutionPlan for BoostQueryExec {
 
             let documents = res
                 .into_iter()
-                .sorted_unstable_by(compare_scored_rows)
+                .sorted_unstable_by(compare_scored_documents)
                 .take(params.limit.unwrap_or(usize::MAX))
                 .collect::<Vec<_>>();
             metrics.baseline_metrics.record_output(documents.len());
@@ -2785,7 +2785,7 @@ impl ExecutionPlan for BooleanQueryExec {
             let _timer = elapsed_time.timer();
             let documents = res
                 .into_iter()
-                .sorted_unstable_by(compare_scored_rows)
+                .sorted_unstable_by(compare_scored_documents)
                 .take(params.limit.unwrap_or(usize::MAX))
                 .collect::<Vec<_>>();
             metrics.baseline_metrics.record_output(documents.len());
