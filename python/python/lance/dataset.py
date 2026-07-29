@@ -5513,9 +5513,7 @@ class SqlQueryBuilder:
 
     def blob_handling(
         self,
-        blob_handling: Literal[
-            "all_binary", "blobs_descriptions", "all_descriptions"
-        ],
+        blob_handling: Literal["all_binary", "blobs_descriptions", "all_descriptions"],
     ) -> "SqlQueryBuilder":
         """
         Control how blob columns are returned by this SQL query.
