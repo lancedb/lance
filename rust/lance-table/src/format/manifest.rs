@@ -4,9 +4,11 @@
 use async_trait::async_trait;
 use chrono::prelude::*;
 use lance_core::deepsize::DeepSizeOf;
-use lance_file::datatypes::{Fields, FieldsWithMeta, populate_schema_dictionary};
-use lance_file::previous::reader::FileReader as PreviousFileReader;
+use lance_file::datatypes::{Fields, FieldsWithMeta};
 use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
+use lance_file::versions::v1::{
+    encoding::populate_schema_dictionaries, reader::FileReader as V1FileReader,
+};
 use lance_io::traits::{ProtoStruct, Reader};
 use object_store::path::Path;
 use prost::Message;
@@ -552,6 +554,40 @@ impl Manifest {
     }
 }
 
+/// Populate dictionary values stored outside a V1 manifest.
+///
+/// Other exact file versions store their schema dictionaries inline, so this
+/// is a no-op for those manifests.
+///
+/// # Examples
+///
+/// ```
+/// # use lance_core::Result;
+/// # use lance_io::traits::Reader;
+/// # use lance_table::format::{Manifest, populate_manifest_schema_dictionaries};
+/// # async fn hydrate_v1_manifest(
+/// #     manifest: &mut Manifest,
+/// #     reader: &dyn Reader,
+/// # ) -> Result<()> {
+/// populate_manifest_schema_dictionaries(manifest, reader).await
+/// # }
+/// ```
+pub async fn populate_manifest_schema_dictionaries(
+    manifest: &mut Manifest,
+    reader: &dyn Reader,
+) -> Result<()> {
+    match manifest.data_storage_format.version {
+        ConcreteFileVersion::V1 => {
+            populate_schema_dictionaries(&mut manifest.schema, reader).await?;
+        }
+        ConcreteFileVersion::V2_0
+        | ConcreteFileVersion::V2_1
+        | ConcreteFileVersion::V2_2
+        | ConcreteFileVersion::V2_3 => {}
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct BasePath {
     pub id: u32,
@@ -1040,7 +1076,7 @@ pub trait SelfDescribingFileReader {
 }
 
 #[async_trait]
-impl SelfDescribingFileReader for PreviousFileReader {
+impl SelfDescribingFileReader for V1FileReader {
     async fn try_new_self_described_from_reader(
         reader: Arc<dyn Reader>,
         cache: Option<&LanceCache>,
@@ -1051,9 +1087,7 @@ impl SelfDescribingFileReader for PreviousFileReader {
             reader.path(),
         )))?;
         let mut manifest: Manifest = read_struct(reader.as_ref(), manifest_position).await?;
-        if manifest.should_use_legacy_format() {
-            populate_schema_dictionary(&mut manifest.schema, reader.as_ref()).await?;
-        }
+        populate_manifest_schema_dictionaries(&mut manifest, reader.as_ref()).await?;
         let schema = manifest.schema;
         let max_field_id = schema.max_field_id().unwrap_or_default();
         Self::try_new_from_reader(

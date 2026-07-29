@@ -6,14 +6,10 @@
 //! Plain encoding works with fixed stride types, i.e., `boolean`, `i8...i64`, `f16...f64`,
 //! it stores the array directly in the file. It offers O(1) read access.
 
-use std::ops::{Range, RangeFrom, RangeFull, RangeTo};
+use std::ops::Range;
 use std::slice::from_raw_parts;
 use std::sync::Arc;
 
-use crate::{
-    ReadBatchParams,
-    traits::{Reader, Writer},
-};
 use arrow_arith::numeric::sub;
 use arrow_array::{
     Array, ArrayRef, BooleanArray, FixedSizeBinaryArray, FixedSizeListArray, UInt8Array,
@@ -24,14 +20,14 @@ use arrow_data::{ArrayDataBuilder, BufferSpec, layout};
 use arrow_schema::{DataType, Field};
 use arrow_select::{concat::concat, take::take};
 use async_recursion::async_recursion;
-use async_trait::async_trait;
-use bytes::Bytes;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use lance_arrow::*;
 use lance_core::{Error, Result};
+use lance_io::{
+    ReadBatchParams,
+    traits::{Reader, Writer},
+};
 use tokio::io::AsyncWriteExt;
-
-use crate::encodings::{AsyncIndex, Decoder};
 
 /// Encoder for plain encoding.
 ///
@@ -175,49 +171,41 @@ fn get_byte_range(data_type: &DataType, row_range: Range<usize>) -> Range<usize>
     }
 }
 
-pub fn bytes_to_array(
+fn bytes_to_array(
     data_type: &DataType,
-    bytes: Bytes,
+    bytes: bytes::Bytes,
     len: usize,
     offset: usize,
 ) -> Result<ArrayRef> {
     let layout = layout(data_type);
-
     if layout.buffers.len() != 1 {
         return Err(Error::internal(format!(
-            "Can only convert datatypes that require one buffer, found {:?}",
-            data_type
+            "v1 plain encoding requires one value buffer, found {data_type}"
         )));
     }
 
-    let buf: Buffer = if let BufferSpec::FixedWidth {
+    let buffer = if let BufferSpec::FixedWidth {
         byte_width,
         alignment,
     } = &layout.buffers[0]
     {
-        // this code is taken from
-        // https://github.com/apache/arrow-rs/blob/master/arrow-data/src/data.rs#L748-L768
-        let len_plus_offset = len + offset;
-        let min_buffer_size = len_plus_offset.saturating_mul(*byte_width);
-
-        // alignment or size isn't right -- just make a copy
+        let min_buffer_size = (len + offset).saturating_mul(*byte_width);
         if bytes.len() < min_buffer_size {
             Buffer::copy_bytes_bytes(bytes, min_buffer_size)
         } else {
             Buffer::from_bytes_bytes(bytes, *alignment as u64)
         }
     } else {
-        // cases we don't handle, just copy
         Buffer::from_slice_ref(bytes)
     };
 
-    let array_data = ArrayDataBuilder::new(data_type.clone())
+    let data = ArrayDataBuilder::new(data_type.clone())
         .len(len)
         .offset(offset)
         .null_count(0)
-        .add_buffer(buf)
+        .add_buffer(buffer)
         .build()?;
-    Ok(make_array(array_data))
+    Ok(make_array(data))
 }
 
 impl<'a> PlainDecoder<'a> {
@@ -383,13 +371,12 @@ fn make_chunked_requests(
     chunked_ranges
 }
 
-#[async_trait]
-impl Decoder for PlainDecoder<'_> {
-    async fn decode(&self) -> Result<ArrayRef> {
+impl PlainDecoder<'_> {
+    pub async fn decode(&self) -> Result<ArrayRef> {
         self.get(0..self.length).await
     }
 
-    async fn take(&self, indices: &UInt32Array) -> Result<ArrayRef> {
+    pub async fn take(&self, indices: &UInt32Array) -> Result<ArrayRef> {
         if indices.is_empty() {
             return Ok(new_empty_array(self.data_type));
         }
@@ -419,23 +406,9 @@ impl Decoder for PlainDecoder<'_> {
         let references = arrays.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
         Ok(concat(&references)?)
     }
-}
 
-#[async_trait]
-impl AsyncIndex<usize> for PlainDecoder<'_> {
-    // TODO: should this return a Scalar value?
-    type Output = Result<ArrayRef>;
-
-    async fn get(&self, index: usize) -> Self::Output {
-        self.get(index..index + 1).await
-    }
-}
-
-#[async_trait]
-impl AsyncIndex<Range<usize>> for PlainDecoder<'_> {
-    type Output = Result<ArrayRef>;
-
-    async fn get(&self, index: Range<usize>) -> Self::Output {
+    #[async_recursion]
+    async fn decode_range(&self, index: Range<usize>) -> Result<ArrayRef> {
         if index.is_empty() {
             return Ok(new_empty_array(self.data_type));
         }
@@ -451,47 +424,16 @@ impl AsyncIndex<Range<usize>> for PlainDecoder<'_> {
             _ => self.decode_primitive(index.start, index.end).await,
         }
     }
-}
 
-#[async_trait]
-impl AsyncIndex<RangeFrom<usize>> for PlainDecoder<'_> {
-    type Output = Result<ArrayRef>;
-
-    async fn get(&self, index: RangeFrom<usize>) -> Self::Output {
-        self.get(index.start..self.length).await
-    }
-}
-
-#[async_trait]
-impl AsyncIndex<RangeTo<usize>> for PlainDecoder<'_> {
-    type Output = Result<ArrayRef>;
-
-    async fn get(&self, index: RangeTo<usize>) -> Self::Output {
-        self.get(0..index.end).await
-    }
-}
-
-#[async_trait]
-impl AsyncIndex<RangeFull> for PlainDecoder<'_> {
-    type Output = Result<ArrayRef>;
-
-    async fn get(&self, _: RangeFull) -> Self::Output {
-        self.get(0..self.length).await
-    }
-}
-
-#[async_trait]
-impl AsyncIndex<ReadBatchParams> for PlainDecoder<'_> {
-    type Output = Result<ArrayRef>;
-
-    async fn get(&self, params: ReadBatchParams) -> Self::Output {
-        match params {
-            ReadBatchParams::Range(r) => self.get(r).await,
-            // Ranges not supported in v1 files
-            ReadBatchParams::Ranges(_) => unimplemented!(),
-            ReadBatchParams::RangeFull => self.get(..).await,
-            ReadBatchParams::RangeTo(r) => self.get(r).await,
-            ReadBatchParams::RangeFrom(r) => self.get(r).await,
+    pub async fn get(&self, params: impl Into<ReadBatchParams>) -> Result<ArrayRef> {
+        match params.into() {
+            ReadBatchParams::Range(range) => self.decode_range(range).await,
+            ReadBatchParams::Ranges(_) => Err(Error::invalid_input(
+                "multiple ranges are not supported by v1 plain encoding",
+            )),
+            ReadBatchParams::RangeFull => self.decode_range(0..self.length).await,
+            ReadBatchParams::RangeTo(range) => self.decode_range(0..range.end).await,
+            ReadBatchParams::RangeFrom(range) => self.decode_range(range.start..self.length).await,
             ReadBatchParams::Indices(indices) => self.take(&indices).await,
         }
     }
@@ -502,11 +444,14 @@ mod tests {
     use std::ops::Deref;
 
     use arrow_array::*;
+    use arrow_buffer::Buffer;
+    use arrow_data::ArrayDataBuilder;
+    use bytes::Bytes;
     use lance_core::utils::tempfile::TempStdFile;
+    use lance_io::local::LocalObjectReader;
     use rand::prelude::*;
 
     use super::*;
-    use crate::local::LocalObjectReader;
 
     #[tokio::test]
     async fn test_encode_decode_primitive_array() {
@@ -682,7 +627,7 @@ mod tests {
     }
 
     async fn make_array_(data_type: &DataType, buffer: &Buffer) -> ArrayRef {
-        make_array(
+        arrow_array::make_array(
             ArrayDataBuilder::new(data_type.clone())
                 .len(126)
                 .add_buffer(buffer.clone())

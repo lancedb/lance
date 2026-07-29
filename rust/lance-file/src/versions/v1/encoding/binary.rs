@@ -5,7 +5,7 @@
 //!
 
 use std::marker::PhantomData;
-use std::ops::{Range, RangeFrom, RangeFull, RangeTo};
+use std::ops::Range;
 use std::sync::Arc;
 
 use arrow_arith::numeric::sub;
@@ -23,16 +23,17 @@ use arrow_buffer::{ArrowNativeType, Buffer, MutableBuffer, ScalarBuffer, bit_uti
 use arrow_cast::cast::cast;
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::DataType;
-use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
 use lance_arrow::BufferExt;
 use tokio::io::AsyncWriteExt;
 
-use super::ReadBatchParams;
-use super::{AsyncIndex, Decoder, Encoder, plain::PlainDecoder};
-use crate::traits::{Reader, Writer};
+use super::plain::PlainDecoder;
 use lance_core::Result;
+use lance_io::{
+    ReadBatchParams,
+    traits::{Reader, Writer},
+};
 
 /// Encoder for Var-binary encoding.
 pub struct BinaryEncoder<'a> {
@@ -87,9 +88,8 @@ impl<'a> BinaryEncoder<'a> {
     }
 }
 
-#[async_trait]
-impl Encoder for BinaryEncoder<'_> {
-    async fn encode(&mut self, arrs: &[&dyn Array]) -> Result<usize> {
+impl BinaryEncoder<'_> {
+    pub async fn encode(&mut self, arrs: &[&dyn Array]) -> Result<usize> {
         assert!(!arrs.is_empty());
         let data_type = arrs[0].data_type();
         match data_type {
@@ -97,12 +97,10 @@ impl Encoder for BinaryEncoder<'_> {
             DataType::Binary => self.encode_typed_arr::<BinaryType>(arrs).await,
             DataType::LargeUtf8 => self.encode_typed_arr::<LargeUtf8Type>(arrs).await,
             DataType::LargeBinary => self.encode_typed_arr::<LargeBinaryType>(arrs).await,
-            _ => {
-                return Err(lance_core::Error::invalid_input(format!(
-                    "Unsupported data type for binary encoding: {}",
-                    data_type
-                )));
-            }
+            _ => Err(lance_core::Error::invalid_input(format!(
+                "Unsupported data type for binary encoding: {}",
+                data_type
+            ))),
         }
     }
 }
@@ -134,7 +132,8 @@ impl<'a, T: ByteArrayType> BinaryDecoder<'a, T> {
     /// ```rust
     /// use arrow_array::types::Utf8Type;
     /// use object_store::path::Path;
-    /// use lance_io::{local::LocalObjectReader, encodings::binary::BinaryDecoder, traits::Reader};
+    /// use lance_file::versions::v1::encoding::binary::BinaryDecoder;
+    /// use lance_io::{local::LocalObjectReader, traits::Reader};
     ///
     /// async {
     ///     let reader = LocalObjectReader::open_local_path("/tmp/foo.lance", 2048, None).await.unwrap();
@@ -285,16 +284,15 @@ fn plan_take_chunks(
     Ok(chunks)
 }
 
-#[async_trait]
-impl<T: ByteArrayType> Decoder for BinaryDecoder<'_, T> {
-    async fn decode(&self) -> Result<ArrayRef> {
+impl<T: ByteArrayType> BinaryDecoder<'_, T> {
+    pub async fn decode(&self) -> Result<ArrayRef> {
         self.get(..).await
     }
 
     /// Take the values at the given indices.
     ///
     /// This function assumes indices are sorted.
-    async fn take(&self, indices: &UInt32Array) -> Result<ArrayRef> {
+    pub async fn take(&self, indices: &UInt32Array) -> Result<ArrayRef> {
         if indices.is_empty() {
             return Ok(new_empty_array(&T::DATA_TYPE));
         }
@@ -393,64 +391,17 @@ impl<T: ByteArrayType> Decoder for BinaryDecoder<'_, T> {
     }
 }
 
-#[async_trait]
-impl<T: ByteArrayType> AsyncIndex<usize> for BinaryDecoder<'_, T> {
-    type Output = Result<ArrayRef>;
-
-    async fn get(&self, index: usize) -> Self::Output {
-        self.get(index..index + 1).await
-    }
-}
-
-#[async_trait]
-impl<T: ByteArrayType> AsyncIndex<RangeFrom<usize>> for BinaryDecoder<'_, T> {
-    type Output = Result<ArrayRef>;
-
-    async fn get(&self, index: RangeFrom<usize>) -> Self::Output {
-        self.get(index.start..self.length).await
-    }
-}
-
-#[async_trait]
-impl<T: ByteArrayType> AsyncIndex<RangeTo<usize>> for BinaryDecoder<'_, T> {
-    type Output = Result<ArrayRef>;
-
-    async fn get(&self, index: RangeTo<usize>) -> Self::Output {
-        self.get(0..index.end).await
-    }
-}
-
-#[async_trait]
-impl<T: ByteArrayType> AsyncIndex<RangeFull> for BinaryDecoder<'_, T> {
-    type Output = Result<ArrayRef>;
-
-    async fn get(&self, _: RangeFull) -> Self::Output {
-        self.get(0..self.length).await
-    }
-}
-
-#[async_trait]
-impl<T: ByteArrayType> AsyncIndex<ReadBatchParams> for BinaryDecoder<'_, T> {
-    type Output = Result<ArrayRef>;
-
-    async fn get(&self, params: ReadBatchParams) -> Self::Output {
-        match params {
-            ReadBatchParams::Range(r) => self.get(r).await,
-            // Ranges not supported in v1 files
-            ReadBatchParams::Ranges(_) => unimplemented!(),
-            ReadBatchParams::RangeFull => self.get(..).await,
-            ReadBatchParams::RangeTo(r) => self.get(r).await,
-            ReadBatchParams::RangeFrom(r) => self.get(r).await,
-            ReadBatchParams::Indices(indices) => self.take(&indices).await,
+impl<T: ByteArrayType> BinaryDecoder<'_, T> {
+    async fn decode_range(&self, index: Range<usize>) -> Result<ArrayRef> {
+        if index.end > self.length {
+            return Err(lance_core::Error::invalid_input(format!(
+                "v1 binary row range {}..{} exceeds length {}",
+                index.start, index.end, self.length
+            )));
         }
-    }
-}
-
-#[async_trait]
-impl<T: ByteArrayType> AsyncIndex<Range<usize>> for BinaryDecoder<'_, T> {
-    type Output = Result<ArrayRef>;
-
-    async fn get(&self, index: Range<usize>) -> Self::Output {
+        if index.is_empty() {
+            return Ok(new_empty_array(&T::DATA_TYPE));
+        }
         let position_decoder = PlainDecoder::new(
             self.reader,
             &DataType::Int64,
@@ -461,6 +412,19 @@ impl<T: ByteArrayType> AsyncIndex<Range<usize>> for BinaryDecoder<'_, T> {
         let int64_positions: &Int64Array = as_primitive_array(&positions);
 
         self.get_range(int64_positions, 0..index.len()).await
+    }
+
+    pub async fn get(&self, params: impl Into<ReadBatchParams>) -> Result<ArrayRef> {
+        match params.into() {
+            ReadBatchParams::Range(range) => self.decode_range(range).await,
+            ReadBatchParams::Ranges(_) => Err(lance_core::Error::invalid_input(
+                "multiple ranges are not supported by v1 binary encoding",
+            )),
+            ReadBatchParams::RangeFull => self.decode_range(0..self.length).await,
+            ReadBatchParams::RangeTo(range) => self.decode_range(0..range.end).await,
+            ReadBatchParams::RangeFrom(range) => self.decode_range(range.start..self.length).await,
+            ReadBatchParams::Indices(indices) => self.take(&indices).await,
+        }
     }
 }
 
@@ -474,7 +438,7 @@ mod tests {
     use arrow_select::concat::concat;
     use lance_core::utils::tempfile::TempStdFile;
 
-    use crate::local::LocalObjectReader;
+    use lance_io::local::LocalObjectReader;
 
     async fn write_test_data<O: OffsetSizeTrait>(
         path: impl AsRef<std::path::Path>,
