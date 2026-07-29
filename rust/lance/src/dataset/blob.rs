@@ -4432,6 +4432,67 @@ mod tests {
         }
     }
 
+    /// The blob encoder derives each page's definition interpretation from the validity
+    /// bitmap of the batch it saw, so a write whose batches disagree about nullability
+    /// used to panic in debug builds and drop the nulls in release builds
+    /// (https://github.com/lance-format/lance/issues/8077).  Batch boundaries are not
+    /// under the caller's control during compaction or merge_insert, so a null must
+    /// survive in either order.
+    #[rstest]
+    #[tokio::test]
+    async fn test_write_blob_batches_with_mixed_nullability(
+        #[values(false, true)] nulls_first: bool,
+    ) {
+        let test_dir = TempStrDir::default();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("blob", DataType::LargeBinary, true).with_metadata(HashMap::from([(
+                BLOB_META_KEY.to_string(),
+                "true".to_string(),
+            )])),
+        ]));
+        let batch = |values: Vec<Option<&[u8]>>| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(LargeBinaryArray::from(values))],
+            )
+            .unwrap()
+        };
+
+        let all_valid = batch(vec![Some(b"a".as_slice()), Some(b"".as_slice())]);
+        let with_null = batch(vec![Some(b"c".as_slice()), None]);
+        let (batches, expected) = if nulls_first {
+            (
+                vec![with_null, all_valid],
+                vec![Some(b"c".as_slice()), None, Some(b"a"), Some(b"")],
+            )
+        } else {
+            (
+                vec![all_valid, with_null],
+                vec![Some(b"a".as_slice()), Some(b""), Some(b"c"), None],
+            )
+        };
+
+        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+        let dataset = Arc::new(Dataset::write(reader, &test_dir, None).await.unwrap());
+
+        let blobs = dataset
+            .take_blobs_by_indices(&[0, 1, 2, 3], "blob")
+            .await
+            .unwrap();
+        assert_eq!(blobs.len(), expected.len());
+        for (idx, expected) in expected.into_iter().enumerate() {
+            match (&blobs[idx], expected) {
+                (Some(blob), Some(expected)) => {
+                    assert_eq!(blob.read().await.unwrap().as_ref(), expected, "row {idx}");
+                }
+                (None, None) => {}
+                (actual, expected) => {
+                    panic!("row {idx}: expected {expected:?}, got {}", actual.is_some());
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     pub async fn test_take_blob_id_not_exist() {
         let fixture = BlobTestFixture::new().await;
