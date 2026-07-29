@@ -352,6 +352,8 @@ struct FilteredReadStream {
     active_partitions_counter: Arc<AtomicUsize>,
     /// The threading mode for the scan
     threading_mode: FilteredReadThreadingMode,
+    /// Experimental benchmark-only execution controls.
+    benchmark_options: FilteredReadBenchmarkOptions,
     /// Range to apply to the result stream if not already pushed down in planning phase
     scan_range_after_filter: Option<Range<u64>>,
     /// Fragments planned non-empty, and their total planned rows; the output
@@ -530,22 +532,29 @@ impl FilteredReadStream {
 
         let global_metrics_clone = global_metrics.clone();
 
-        let fragment_streams = futures::stream::iter(scoped_fragments)
-            .map({
-                let scan_range_after_filter = scan_range_after_filter.clone();
-                move |scoped_fragment| {
-                    let metrics = global_metrics_clone.clone();
-                    let limit = scan_range_after_filter.as_ref().map(|r| r.end);
-                    let dataset = dataset.clone();
-                    SpawnedTask::spawn(
-                        Self::read_fragment(dataset, scoped_fragment, metrics, limit)
-                            .in_current_span(),
-                    )
-                    .map(|thread_result| thread_result.unwrap())
-                }
-            })
-            .buffered(fragment_readahead);
-        let task_stream = fragment_streams.try_flatten().boxed();
+        let fragment_tasks = futures::stream::iter(scoped_fragments).map({
+            let scan_range_after_filter = scan_range_after_filter.clone();
+            move |scoped_fragment| {
+                let metrics = global_metrics_clone.clone();
+                let limit = scan_range_after_filter.as_ref().map(|r| r.end);
+                let dataset = dataset.clone();
+                SpawnedTask::spawn(
+                    Self::read_fragment(dataset, scoped_fragment, metrics, limit).in_current_span(),
+                )
+                .map(|thread_result| thread_result.unwrap())
+            }
+        });
+        let task_stream = if options.benchmark_options.preserve_task_order {
+            fragment_tasks
+                .buffered(fragment_readahead)
+                .try_flatten()
+                .boxed()
+        } else {
+            fragment_tasks
+                .buffer_unordered(fragment_readahead)
+                .try_flatten_unordered(Some(fragment_readahead))
+                .boxed()
+        };
 
         // A batch never spans fragments, so a plan touching many fragments
         // with few rows each emits one tiny batch per fragment. Fragments
@@ -570,6 +579,7 @@ impl FilteredReadStream {
             metrics: global_metrics,
             active_partitions_counter: Arc::new(AtomicUsize::new(0)),
             threading_mode,
+            benchmark_options: options.benchmark_options,
             scan_range_after_filter,
             touched_fragments,
             planned_rows,
@@ -1153,12 +1163,72 @@ impl FilteredReadStream {
         match self.threading_mode {
             FilteredReadThreadingMode::OnePartitionMultipleThreads(num_threads) => {
                 assert_eq!(partition, 0);
+                if self.benchmark_options.preserve_task_order {
+                    let output_schema = self.output_schema.clone();
+                    let task_stream = self.task_stream.clone();
+                    let partition_metrics_clone = partition_metrics.clone();
+                    let futures_stream = futures::stream::try_unfold(task_stream, {
+                        move |task_stream| {
+                            let partition_metrics = partition_metrics_clone.clone();
+                            async move {
+                                // There is no compute we can meaningfully measure here.  The actual work is
+                                // done by spawned background threads.
+                                let _timer =
+                                    partition_metrics.baseline_metrics.elapsed_compute().timer();
+                                let _task_wait_timer = partition_metrics.task_wait_time.timer();
+                                let maybe_task =
+                                    task_stream.lock().await.next().await.transpose()?;
+                                Result::Ok(maybe_task.map(|task| (task, task_stream)))
+                            }
+                        }
+                    });
+                    let partition_metrics_clone = partition_metrics.clone();
+                    let base_batch_stream = futures_stream
+                        .try_buffered(num_threads)
+                        .try_filter_map(move |batch| {
+                            std::future::ready(Ok(if batch.num_rows() == 0 {
+                                None
+                            } else {
+                                Some(batch)
+                            }))
+                        });
+
+                    let batch_stream = if let Some(ref range) = self.scan_range_after_filter {
+                        Self::apply_hard_range(base_batch_stream, range.clone()).boxed()
+                    } else {
+                        // Need to box here otherwise the if/else returns incompatible types
+                        base_batch_stream.boxed()
+                    };
+
+                    // Clone so the finally handler can record a final snapshot even when
+                    // no output batches were produced (inspect_ok never fires in that case).
+                    let global_metrics_final = global_metrics.clone();
+                    let scan_scheduler_final = scan_scheduler.clone();
+                    let batch_stream = batch_stream
+                        .inspect_ok(move |batch| {
+                            partition_metrics_clone
+                                .baseline_metrics
+                                .record_output(batch.num_rows());
+                            global_metrics.io_metrics.record(&scan_scheduler);
+                        })
+                        .finally(move || {
+                            global_metrics_final
+                                .io_metrics
+                                .record(&scan_scheduler_final);
+                            partition_metrics.baseline_metrics.done();
+                        })
+                        .map_err(|e: lance_core::Error| DataFusionError::External(e.into()))
+                        .boxed();
+
+                    return Box::pin(RecordBatchStreamAdapter::new(output_schema, batch_stream));
+                }
+
                 let output_schema = self.output_schema.clone();
                 let task_stream = self.task_stream.clone();
-                let partition_metrics_clone = partition_metrics.clone();
+                let partition_metrics_for_tasks = partition_metrics.clone();
                 let futures_stream = futures::stream::try_unfold(task_stream, {
                     move |task_stream| {
-                        let partition_metrics = partition_metrics_clone.clone();
+                        let partition_metrics = partition_metrics_for_tasks.clone();
                         async move {
                             // There is no compute we can meaningfully measure here.  The actual work is
                             // done by spawned background threads.
@@ -1170,17 +1240,15 @@ impl FilteredReadStream {
                         }
                     }
                 });
-                let partition_metrics_clone = partition_metrics.clone();
-                let base_batch_stream =
-                    futures_stream
-                        .try_buffered(num_threads)
-                        .try_filter_map(move |batch| {
-                            std::future::ready(Ok(if batch.num_rows() == 0 {
-                                None
-                            } else {
-                                Some(batch)
-                            }))
-                        });
+                let base_batch_stream = futures_stream
+                    .try_buffer_unordered(num_threads)
+                    .try_filter_map(move |batch| {
+                        std::future::ready(Ok(if batch.num_rows() == 0 {
+                            None
+                        } else {
+                            Some(batch)
+                        }))
+                    });
 
                 let batch_stream = if let Some(ref range) = self.scan_range_after_filter {
                     Self::apply_hard_range(base_batch_stream, range.clone()).boxed()
@@ -1193,9 +1261,10 @@ impl FilteredReadStream {
                 // no output batches were produced (inspect_ok never fires in that case).
                 let global_metrics_final = global_metrics.clone();
                 let scan_scheduler_final = scan_scheduler.clone();
+                let partition_metrics_for_batches = partition_metrics.clone();
                 let batch_stream = batch_stream
                     .inspect_ok(move |batch| {
-                        partition_metrics_clone
+                        partition_metrics_for_batches
                             .baseline_metrics
                             .record_output(batch.num_rows());
                         global_metrics.io_metrics.record(&scan_scheduler);
@@ -1213,53 +1282,96 @@ impl FilteredReadStream {
             }
             FilteredReadThreadingMode::MultiplePartitions(num_partitions) => {
                 assert!(partition < num_partitions);
+                if self.benchmark_options.partition_decode_readahead == 1 {
+                    let output_schema = self.output_schema.clone();
+                    let task_stream = self.task_stream.clone();
+                    let global_metrics_clone = global_metrics.clone();
+                    let scan_scheduler_clone = scan_scheduler.clone();
+                    let batch_stream = futures::stream::try_unfold(task_stream, {
+                        move |task_stream| {
+                            let partition_metrics = partition_metrics.clone();
+                            let global_metrics = global_metrics_clone.clone();
+                            let scan_scheduler = scan_scheduler_clone.clone();
+                            async move {
+                                // This isn't quite right.  It's counting I/O time in addition to
+                                // compute time.
+                                //
+                                // TODO: Modify the "read task" concept to have a way of marking when
+                                // the 'wait' portion of the task is complete.
+                                let _timer =
+                                    partition_metrics.baseline_metrics.elapsed_compute().timer();
+                                let maybe_task = {
+                                    let _task_wait_timer = partition_metrics.task_wait_time.timer();
+                                    task_stream.lock().await.next().await
+                                };
+                                if let Some(task) = maybe_task {
+                                    let task = task?;
+                                    let batch = task.await?;
+                                    partition_metrics
+                                        .baseline_metrics
+                                        .record_output(batch.num_rows());
+
+                                    global_metrics.io_metrics.record(&scan_scheduler);
+
+                                    Ok(Some((batch, task_stream)))
+                                } else {
+                                    partition_metrics.baseline_metrics.done();
+                                    Ok(None)
+                                }
+                            }
+                            .instrument(tracing::debug_span!("filtered_read_task"))
+                        }
+                    })
+                    .try_filter_map(move |batch| {
+                        std::future::ready(Ok(if batch.num_rows() == 0 {
+                            None
+                        } else {
+                            Some(batch)
+                        }))
+                    })
+                    .map_err(|e: lance_core::Error| DataFusionError::External(e.into()));
+                    return Box::pin(RecordBatchStreamAdapter::new(output_schema, batch_stream));
+                }
+
                 let output_schema = self.output_schema.clone();
                 let task_stream = self.task_stream.clone();
-                let global_metrics_clone = global_metrics.clone();
-                let scan_scheduler_clone = scan_scheduler.clone();
-                let batch_stream = futures::stream::try_unfold(task_stream, {
+                let partition_metrics_for_tasks = partition_metrics.clone();
+                let futures_stream = futures::stream::try_unfold(task_stream, {
                     move |task_stream| {
-                        let partition_metrics = partition_metrics.clone();
-                        let global_metrics = global_metrics_clone.clone();
-                        let scan_scheduler = scan_scheduler_clone.clone();
+                        let partition_metrics = partition_metrics_for_tasks.clone();
                         async move {
-                            // This isn't quite right.  It's counting I/O time in addition to
-                            // compute time.
-                            //
-                            // TODO: Modify the "read task" concept to have a way of marking when
-                            // the 'wait' portion of the task is complete.
-                            let _timer =
-                                partition_metrics.baseline_metrics.elapsed_compute().timer();
-                            let maybe_task = {
-                                let _task_wait_timer = partition_metrics.task_wait_time.timer();
-                                task_stream.lock().await.next().await
-                            };
-                            if let Some(task) = maybe_task {
-                                let task = task?;
-                                let batch = task.await?;
-                                partition_metrics
-                                    .baseline_metrics
-                                    .record_output(batch.num_rows());
-
-                                global_metrics.io_metrics.record(&scan_scheduler);
-
-                                Ok(Some((batch, task_stream)))
-                            } else {
-                                partition_metrics.baseline_metrics.done();
-                                Ok(None)
-                            }
+                            let _task_wait_timer = partition_metrics.task_wait_time.timer();
+                            let maybe_task = task_stream.lock().await.next().await.transpose()?;
+                            Result::Ok(maybe_task.map(|task| (task, task_stream)))
                         }
                         .instrument(tracing::debug_span!("filtered_read_task"))
                     }
-                })
-                .try_filter_map(move |batch| {
-                    std::future::ready(Ok(if batch.num_rows() == 0 {
-                        None
-                    } else {
-                        Some(batch)
-                    }))
-                })
-                .map_err(|e: lance_core::Error| DataFusionError::External(e.into()));
+                });
+                let partition_metrics_for_batches = partition_metrics.clone();
+                let global_metrics_final = global_metrics.clone();
+                let scan_scheduler_final = scan_scheduler.clone();
+                let batch_stream = futures_stream
+                    .try_buffered(self.benchmark_options.partition_decode_readahead)
+                    .try_filter_map(move |batch| {
+                        std::future::ready(Ok(if batch.num_rows() == 0 {
+                            None
+                        } else {
+                            Some(batch)
+                        }))
+                    })
+                    .inspect_ok(move |batch| {
+                        partition_metrics_for_batches
+                            .baseline_metrics
+                            .record_output(batch.num_rows());
+                        global_metrics.io_metrics.record(&scan_scheduler);
+                    })
+                    .finally(move || {
+                        global_metrics_final
+                            .io_metrics
+                            .record(&scan_scheduler_final);
+                        partition_metrics.baseline_metrics.done();
+                    })
+                    .map_err(|e: lance_core::Error| DataFusionError::External(e.into()));
                 Box::pin(RecordBatchStreamAdapter::new(output_schema, batch_stream))
             }
         }
@@ -1485,6 +1597,27 @@ impl FilteredReadStream {
     }
 }
 
+/// Experimental controls used only by the filtered-read topology benchmark.
+///
+/// These controls are intentionally omitted from plan serialization. They exist
+/// only on the benchmark branch so competing execution shapes can run in one
+/// binary without changing production defaults.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FilteredReadBenchmarkOptions {
+    pub preserve_task_order: bool,
+    pub partition_decode_readahead: usize,
+}
+
+impl Default for FilteredReadBenchmarkOptions {
+    fn default() -> Self {
+        Self {
+            preserve_task_order: true,
+            partition_decode_readahead: 1,
+        }
+    }
+}
+
 /// Options for a filtered read.
 #[derive(Debug, Clone)]
 pub struct FilteredReadOptions {
@@ -1513,6 +1646,9 @@ pub struct FilteredReadOptions {
     pub full_filter: Option<Expr>,
     /// The threading mode to use for the scan
     pub threading_mode: FilteredReadThreadingMode,
+    /// Experimental benchmark-only execution controls.
+    #[doc(hidden)]
+    pub benchmark_options: FilteredReadBenchmarkOptions,
     /// The size of the I/O buffer to use for the scan
     pub io_buffer_size_bytes: Option<u64>,
     /// If true, skip fragments that are not covered by the scalar index result.
@@ -1556,6 +1692,7 @@ impl FilteredReadOptions {
             threading_mode: FilteredReadThreadingMode::OnePartitionMultipleThreads(
                 get_num_compute_intensive_cpus(),
             ),
+            benchmark_options: FilteredReadBenchmarkOptions::default(),
         }
     }
 
@@ -1729,6 +1866,16 @@ impl FilteredReadOptions {
     /// [`FilteredReadExec::try_new`].
     pub fn with_threading_mode(mut self, threading_mode: FilteredReadThreadingMode) -> Self {
         self.threading_mode = threading_mode;
+        self
+    }
+
+    /// Set execution controls for the filtered-read topology benchmark.
+    #[doc(hidden)]
+    pub fn with_benchmark_options(
+        mut self,
+        benchmark_options: FilteredReadBenchmarkOptions,
+    ) -> Self {
+        self.benchmark_options = benchmark_options;
         self
     }
 }
@@ -2039,6 +2186,12 @@ impl FilteredReadExec {
                 ));
             }
             _ => {}
+        }
+        if options.benchmark_options.partition_decode_readahead == 0 {
+            return Err(Error::invalid_input_source(
+                "FilteredReadBenchmarkOptions::partition_decode_readahead must be greater than 0, got 0"
+                    .into(),
+            ));
         }
 
         if options.scan_range_after_filter.is_some() {
@@ -3676,6 +3829,63 @@ mod tests {
             panic!("Expected an InvalidInput error when given an empty projection");
         };
         assert!(source.to_string().contains("no columns were selected"));
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_benchmark_topology_modes_preserve_rows() {
+        let fixture = TestFixture::new().await;
+        let projection = fixture
+            .dataset
+            .empty_projection()
+            .union_column("fully_indexed", OnMissing::Error)
+            .unwrap();
+        let cases = [
+            (
+                FilteredReadThreadingMode::OnePartitionMultipleThreads(4),
+                FilteredReadBenchmarkOptions::default(),
+            ),
+            (
+                FilteredReadThreadingMode::OnePartitionMultipleThreads(4),
+                FilteredReadBenchmarkOptions {
+                    preserve_task_order: false,
+                    partition_decode_readahead: 1,
+                },
+            ),
+            (
+                FilteredReadThreadingMode::MultiplePartitions(4),
+                FilteredReadBenchmarkOptions::default(),
+            ),
+            (
+                FilteredReadThreadingMode::MultiplePartitions(4),
+                FilteredReadBenchmarkOptions {
+                    preserve_task_order: true,
+                    partition_decode_readahead: 2,
+                },
+            ),
+        ];
+
+        for (threading_mode, benchmark_options) in cases {
+            let options = FilteredReadOptions::new(projection.clone())
+                .with_threading_mode(threading_mode)
+                .with_benchmark_options(benchmark_options);
+            let plan: Arc<dyn ExecutionPlan> = Arc::new(fixture.make_plan(options).await);
+            let mut stream =
+                datafusion::physical_plan::execute_stream(plan, Arc::new(TaskContext::default()))
+                    .unwrap();
+            let mut values = Vec::new();
+            while let Some(batch) = stream.try_next().await.unwrap() {
+                values.extend_from_slice(
+                    batch["fully_indexed"].as_primitive::<UInt32Type>().values(),
+                );
+            }
+            values.sort_unstable();
+
+            assert_eq!(
+                values,
+                (0..100).chain(250..400).collect::<Vec<u32>>(),
+                "threading_mode={threading_mode:?}, benchmark_options={benchmark_options:?}"
+            );
+        }
     }
 
     #[test_log::test(tokio::test)]

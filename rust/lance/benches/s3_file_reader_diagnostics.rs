@@ -4,9 +4,10 @@
 #![allow(clippy::print_stdout)]
 #![recursion_limit = "256"]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, hash_map::DefaultHasher};
 use std::env;
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::hint::black_box;
 use std::ops::Range;
 use std::sync::{
@@ -16,6 +17,8 @@ use std::sync::{
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arrow_array::RecordBatch;
+use datafusion::execution::TaskContext;
+use datafusion::physical_plan::{ExecutionPlan, displayable, execute_stream};
 use futures::future::BoxFuture;
 use futures::stream::{FuturesOrdered, FuturesUnordered};
 use futures::{FutureExt, StreamExt, TryStreamExt};
@@ -23,6 +26,9 @@ use lance::dataset::ProjectionRequest;
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::fragment::{FileFragment, FragReadConfig};
 use lance::dataset::scanner::{ExecutionStatsCallback, ExecutionSummaryCounts};
+use lance::io::exec::filtered_read::{
+    FilteredReadBenchmarkOptions, FilteredReadExec, FilteredReadOptions, FilteredReadThreadingMode,
+};
 use lance_core::datatypes::Schema;
 use lance_encoding::decoder::PageEncoding;
 use lance_encoding::format::pb21;
@@ -82,6 +88,7 @@ struct Config {
     uri: String,
     dataset_version: u64,
     columns: Option<Vec<String>>,
+    filter: Option<String>,
     limit_rows: u64,
     target_bytes: Option<u64>,
     raw_range_size_bytes: u64,
@@ -97,6 +104,9 @@ struct Config {
     read_chunk_size: Option<u64>,
     fragment_concurrency: usize,
     batch_concurrency: usize,
+    filtered_read_mode: FilteredReadMode,
+    filtered_read_parallelism: usize,
+    partition_decode_readahead: usize,
     sample_ms: u64,
     out_dir: String,
     case_name: String,
@@ -109,8 +119,16 @@ struct Config {
 enum Backend {
     FileReader,
     Scanner,
+    FilteredRead,
     SchedulerRaw,
     DatasetTake,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum FilteredReadMode {
+    OnePartitionOrdered,
+    OnePartitionUnordered,
+    MultiplePartitions,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -167,6 +185,7 @@ impl Backend {
         match self {
             Self::FileReader => "lance-file-reader",
             Self::Scanner => "lance-scanner",
+            Self::FilteredRead => "lance-filtered-read",
             Self::SchedulerRaw => "lance-scheduler-raw",
             Self::DatasetTake => "lance-dataset-take",
         }
@@ -176,8 +195,19 @@ impl Backend {
         match self {
             Self::FileReader => "file-reader",
             Self::Scanner => "scanner",
+            Self::FilteredRead => "filtered-read",
             Self::SchedulerRaw => "scheduler",
             Self::DatasetTake => "dataset-take",
+        }
+    }
+}
+
+impl FilteredReadMode {
+    fn name(self) -> &'static str {
+        match self {
+            Self::OnePartitionOrdered => "one-partition-ordered",
+            Self::OnePartitionUnordered => "one-partition-unordered",
+            Self::MultiplePartitions => "multiple-partitions",
         }
     }
 }
@@ -219,6 +249,7 @@ struct CaseStats {
     scheduler_diagnostics: SchedulerDiagnostics,
     counters: Arc<SharedCounters>,
     samples: Vec<Value>,
+    execution_metadata: Option<Value>,
 }
 
 #[derive(Debug)]
@@ -232,8 +263,8 @@ struct LastSample {
 
 fn usage() -> &'static str {
     "usage: s3_file_reader_diagnostics --uri <s3-dataset-uri> \
-     [--backend <file-reader|scanner|scheduler-raw>] \
-     [--dataset-version <n>] [--columns <all|col[,col...]>] \
+     [--backend <file-reader|scanner|filtered-read|scheduler-raw>] \
+     [--dataset-version <n>] [--columns <all|col[,col...]>] [--filter <expr>] \
      [--limit-rows <n>] [--target-bytes <n>] [--raw-range-size-bytes <n>] \
      [--raw-range-mode <file-sequential|metadata-pages|metadata-pages-round-robin>] \
      [--raw-column-indices <all|n[,n...]>] \
@@ -244,6 +275,8 @@ fn usage() -> &'static str {
      [--batch-size <n>] [--batch-size-bytes <n>] [--read-chunk-size <n>] \
      [--skip-batch-byte-accounting] \
      [--fragment-concurrency <n>] [--batch-concurrency <n>] \
+     [--filtered-read-mode <one-partition-ordered|one-partition-unordered|multiple-partitions>] \
+     [--filtered-read-parallelism <n>] [--partition-decode-readahead <n>] \
      [--sample-ms <n>] [--out-dir <path>] [--case <name>] \
      [--detach-fragment-streams] [--drop-read-tasks] [--describe-layout]"
 }
@@ -253,6 +286,7 @@ fn parse_args() -> Result<Config> {
     let mut uri = None;
     let mut dataset_version = 1u64;
     let mut columns = Some(vec!["vector".to_string()]);
+    let mut filter = None;
     let mut limit_rows = 67_108_864u64;
     let mut target_bytes = None;
     let mut raw_range_size_bytes = 16 * 1024 * 1024;
@@ -268,6 +302,9 @@ fn parse_args() -> Result<Config> {
     let mut read_chunk_size = None;
     let mut fragment_concurrency = 256usize;
     let mut batch_concurrency = 256usize;
+    let mut filtered_read_mode = FilteredReadMode::OnePartitionOrdered;
+    let mut filtered_read_parallelism = 64usize;
+    let mut partition_decode_readahead = 1usize;
     let mut sample_ms = 1000u64;
     let mut out_dir = "/tmp/lance-s3-bottleneck-results".to_string();
     let mut case_name = "lance-file-reader-diagnostics".to_string();
@@ -293,6 +330,12 @@ fn parse_args() -> Result<Config> {
                     .next()
                     .ok_or_else(|| format!("missing value for --columns. {}", usage()))?;
                 columns = parse_columns(&value)?;
+            }
+            "--filter" => {
+                filter = Some(
+                    args.next()
+                        .ok_or_else(|| format!("missing value for --filter. {}", usage()))?,
+                );
             }
             "--limit-rows" => {
                 limit_rows = parse_required_value(&mut args, "--limit-rows")?;
@@ -353,6 +396,20 @@ fn parse_args() -> Result<Config> {
             }
             "--batch-concurrency" => {
                 batch_concurrency = parse_required_value(&mut args, "--batch-concurrency")?;
+            }
+            "--filtered-read-mode" => {
+                let value = args.next().ok_or_else(|| {
+                    format!("missing value for --filtered-read-mode. {}", usage())
+                })?;
+                filtered_read_mode = parse_filtered_read_mode(&value)?;
+            }
+            "--filtered-read-parallelism" => {
+                filtered_read_parallelism =
+                    parse_required_value(&mut args, "--filtered-read-parallelism")?;
+            }
+            "--partition-decode-readahead" => {
+                partition_decode_readahead =
+                    parse_required_value(&mut args, "--partition-decode-readahead")?;
             }
             "--sample-ms" => {
                 sample_ms = parse_required_value(&mut args, "--sample-ms")?;
@@ -423,12 +480,27 @@ fn parse_args() -> Result<Config> {
     if sample_ms == 0 {
         return Err("--sample-ms must be greater than zero".into());
     }
+    if filtered_read_parallelism == 0 {
+        return Err("--filtered-read-parallelism must be greater than zero".into());
+    }
+    if partition_decode_readahead == 0 {
+        return Err("--partition-decode-readahead must be greater than zero".into());
+    }
+    if !matches!(filtered_read_mode, FilteredReadMode::MultiplePartitions)
+        && partition_decode_readahead != 1
+    {
+        return Err("--partition-decode-readahead only applies to multiple-partitions mode".into());
+    }
+    if filter.is_some() && !matches!(backend, Backend::Scanner | Backend::FilteredRead) {
+        return Err("--filter only applies to scanner or filtered-read backends".into());
+    }
 
     Ok(Config {
         backend,
         uri,
         dataset_version,
         columns,
+        filter,
         limit_rows,
         target_bytes,
         raw_range_size_bytes,
@@ -444,6 +516,9 @@ fn parse_args() -> Result<Config> {
         read_chunk_size,
         fragment_concurrency,
         batch_concurrency,
+        filtered_read_mode,
+        filtered_read_parallelism,
+        partition_decode_readahead,
         sample_ms,
         out_dir,
         case_name,
@@ -457,10 +532,25 @@ fn parse_backend(value: &str) -> Result<Backend> {
     match value {
         "file-reader" | "lance-file-reader" => Ok(Backend::FileReader),
         "scanner" | "lance-scanner" => Ok(Backend::Scanner),
+        "filtered-read" | "lance-filtered-read" => Ok(Backend::FilteredRead),
         "scheduler-raw" | "lance-scheduler-raw" => Ok(Backend::SchedulerRaw),
         "dataset-take" | "take" | "lance-dataset-take" => Ok(Backend::DatasetTake),
         other => Err(format!(
-            "invalid --backend value {other}; expected file-reader, scanner, scheduler-raw, or dataset-take"
+            "invalid --backend value {other}; expected file-reader, scanner, filtered-read, scheduler-raw, or dataset-take"
+        )
+        .into()),
+    }
+}
+
+fn parse_filtered_read_mode(value: &str) -> Result<FilteredReadMode> {
+    match value {
+        "one-partition-ordered" | "1p-ordered" => Ok(FilteredReadMode::OnePartitionOrdered),
+        "one-partition-unordered" | "1p-unordered" => {
+            Ok(FilteredReadMode::OnePartitionUnordered)
+        }
+        "multiple-partitions" | "np" => Ok(FilteredReadMode::MultiplePartitions),
+        other => Err(format!(
+            "invalid --filtered-read-mode value {other}; expected one-partition-ordered, one-partition-unordered, or multiple-partitions"
         )
         .into()),
     }
@@ -1161,6 +1251,9 @@ async fn run_scanner_case(
     if let Some(columns) = config.columns.as_ref() {
         scanner.project(columns)?;
     }
+    if let Some(filter) = config.filter.as_deref() {
+        scanner.filter(filter)?;
+    }
     scanner
         .batch_size(config.batch_size as usize)
         .scan_in_order(false)
@@ -1272,6 +1365,265 @@ async fn run_scanner_case(
         scheduler_diagnostics: final_diagnostics,
         counters,
         samples,
+        execution_metadata: None,
+    })
+}
+
+struct FilteredReadPlanInput {
+    options: FilteredReadOptions,
+    index_input: Option<Arc<dyn ExecutionPlan>>,
+    has_row_stream_input: bool,
+}
+
+fn find_filtered_read(plan: &dyn ExecutionPlan) -> Option<FilteredReadPlanInput> {
+    if let Some(filtered_read) = plan.downcast_ref::<FilteredReadExec>() {
+        return Some(FilteredReadPlanInput {
+            options: filtered_read.options().clone(),
+            index_input: filtered_read.index_input().cloned(),
+            has_row_stream_input: filtered_read.row_stream_input().is_some(),
+        });
+    }
+    for child in plan.children() {
+        if let Some(filtered_read) = find_filtered_read(child.as_ref()) {
+            return Some(filtered_read);
+        }
+    }
+    None
+}
+
+fn metric_value(metrics: &datafusion::physical_plan::metrics::MetricsSet, name: &str) -> u64 {
+    metrics
+        .sum_by_name(name)
+        .map(|value| value.as_usize() as u64)
+        .unwrap_or(0)
+}
+
+async fn run_filtered_read_case(
+    config: &Config,
+    io_buffer_gib: Option<u64>,
+    scheduler_diagnostics: &SchedulerDiagnosticsCollector,
+) -> Result<CaseStats> {
+    scheduler_diagnostics.clear();
+    let dataset = Arc::new(
+        DatasetBuilder::from_uri(&config.uri)
+            .with_version(config.dataset_version)
+            .load()
+            .await?,
+    );
+
+    let mut remaining_rows = config.limit_rows;
+    let mut planned_fragments = 0usize;
+    let mut planned_rows = 0u64;
+    for fragment in dataset.fragments().iter() {
+        if remaining_rows == 0 {
+            break;
+        }
+        let fragment_rows = fragment
+            .num_rows()
+            .ok_or_else(|| format!("fragment {} is missing num_rows", fragment.id))?
+            as u64;
+        let rows = fragment_rows.min(remaining_rows);
+        planned_fragments += 1;
+        planned_rows += rows;
+        remaining_rows -= rows;
+    }
+    if planned_fragments == 0 {
+        return Err("no fragments selected".into());
+    }
+
+    let mut scanner = dataset.scan();
+    if let Some(columns) = config.columns.as_ref() {
+        scanner.project(columns)?;
+    }
+    if let Some(filter) = config.filter.as_deref() {
+        scanner.filter(filter)?;
+    }
+    scanner
+        .batch_size(config.batch_size as usize)
+        .batch_readahead(config.filtered_read_parallelism)
+        .fragment_readahead(config.fragment_concurrency)
+        .scan_in_order(false);
+    if let Some(file_reader_options) = file_reader_options(config) {
+        scanner.with_file_reader_options(file_reader_options);
+    }
+    if let Some(batch_size_bytes) = config.batch_size_bytes {
+        scanner.batch_size_bytes(batch_size_bytes);
+    }
+    if let Some(io_buffer_gib) = io_buffer_gib {
+        scanner.io_buffer_size(io_buffer_gib * GIB);
+    }
+
+    let scanner_plan = scanner.create_plan().await?;
+    let plan_input = find_filtered_read(scanner_plan.as_ref())
+        .ok_or("scanner plan did not contain FilteredReadExec")?;
+    if plan_input.has_row_stream_input {
+        return Err("topology benchmark does not support row-stream filtered reads".into());
+    }
+    let mut options = plan_input.options;
+
+    let threading_mode = match config.filtered_read_mode {
+        FilteredReadMode::OnePartitionOrdered | FilteredReadMode::OnePartitionUnordered => {
+            FilteredReadThreadingMode::OnePartitionMultipleThreads(config.filtered_read_parallelism)
+        }
+        FilteredReadMode::MultiplePartitions => {
+            FilteredReadThreadingMode::MultiplePartitions(config.filtered_read_parallelism)
+        }
+    };
+    let benchmark_options = FilteredReadBenchmarkOptions {
+        preserve_task_order: !matches!(
+            config.filtered_read_mode,
+            FilteredReadMode::OnePartitionUnordered
+        ),
+        partition_decode_readahead: config.partition_decode_readahead,
+    };
+    options.scan_range_before_filter = None;
+    options.scan_range_after_filter = None;
+    options = options
+        .with_scan_range_before_filter(0..planned_rows)?
+        .with_threading_mode(threading_mode)
+        .with_benchmark_options(benchmark_options);
+
+    let filtered_read = Arc::new(FilteredReadExec::try_new(
+        dataset,
+        options,
+        plan_input.index_input,
+    )?);
+    let source_partitions = filtered_read
+        .properties()
+        .output_partitioning()
+        .partition_count();
+    let expected_partitions = match config.filtered_read_mode {
+        FilteredReadMode::OnePartitionOrdered | FilteredReadMode::OnePartitionUnordered => 1,
+        FilteredReadMode::MultiplePartitions => config.filtered_read_parallelism,
+    };
+    if source_partitions != expected_partitions {
+        return Err(format!(
+            "filtered read produced {source_partitions} partitions, expected {expected_partitions}"
+        )
+        .into());
+    }
+
+    let source_plan: Arc<dyn ExecutionPlan> = filtered_read.clone();
+    let plan_text = displayable(source_plan.as_ref()).indent(true).to_string();
+    let mut plan_hasher = DefaultHasher::new();
+    plan_text.hash(&mut plan_hasher);
+    let plan_hash = format!("{:016x}", plan_hasher.finish());
+
+    let counters = Arc::new(SharedCounters::default());
+    let cpu_before = read_cpu_sample();
+    let started = Instant::now();
+    let mut stream = execute_stream(source_plan, Arc::new(TaskContext::default()))?;
+    let mut rows = 0u64;
+    let mut batches = 0u64;
+    let mut arrow_bytes = 0u64;
+    let mut samples = Vec::new();
+    let mut sample_interval = tokio::time::interval(Duration::from_millis(config.sample_ms));
+    sample_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_sample = LastSample {
+        elapsed: Duration::default(),
+        scheduler_stats: ScanStats::default(),
+        rows: 0,
+        batches: 0,
+        arrow_bytes: 0,
+    };
+    loop {
+        tokio::select! {
+            maybe_batch = stream.next() => {
+                let Some(batch) = maybe_batch else {
+                    break;
+                };
+                let batch = batch?;
+                let batch_bytes = if config.skip_batch_byte_accounting {
+                    0
+                } else {
+                    batch.get_array_memory_size() as u64
+                };
+                rows += batch.num_rows() as u64;
+                batches += 1;
+                arrow_bytes += batch_bytes;
+                counters.batches_completed.fetch_add(1, Ordering::Relaxed);
+                counters
+                    .rows_completed
+                    .fetch_add(batch.num_rows() as u64, Ordering::Relaxed);
+                counters.arrow_bytes.fetch_add(batch_bytes, Ordering::Relaxed);
+            }
+            _ = sample_interval.tick() => {
+                samples.push(sample_json(
+                    started,
+                    counters.as_ref(),
+                    scheduler_diagnostics.snapshot(io_buffer_gib),
+                    0,
+                    0,
+                    &mut last_sample,
+                ));
+            }
+        }
+    }
+    drop(stream);
+
+    if config.filter.is_none() && rows != planned_rows {
+        return Err(format!(
+            "unfiltered topology scan returned {rows} rows, expected {planned_rows}"
+        )
+        .into());
+    }
+
+    let elapsed = started.elapsed();
+    let metrics = filtered_read
+        .metrics()
+        .ok_or("FilteredReadExec did not expose execution metrics")?;
+    let scheduler_stats = ScanStats {
+        iops: metric_value(&metrics, "iops"),
+        requests: metric_value(&metrics, "requests"),
+        bytes_read: metric_value(&metrics, "bytes_read"),
+    };
+    let task_wait_ns = metric_value(&metrics, "task_wait_time");
+    let elapsed_compute_ns = metrics.elapsed_compute().unwrap_or(0) as u64;
+    let execution_metrics = metrics.iter().map(ToString::to_string).collect::<Vec<_>>();
+
+    let mut final_diagnostics = scheduler_diagnostics.snapshot(io_buffer_gib);
+    final_diagnostics.stats = scheduler_stats;
+    let cpu_after = read_cpu_sample();
+    samples.push(sample_json(
+        started,
+        counters.as_ref(),
+        final_diagnostics,
+        0,
+        0,
+        &mut last_sample,
+    ));
+
+    Ok(CaseStats {
+        rows,
+        batches,
+        arrow_bytes,
+        planned_fragments,
+        planned_rows,
+        elapsed,
+        producer_finished_at: Some(elapsed),
+        peak_decode_in_flight: 0,
+        cpu_avg: cpu_before.zip(cpu_after).and_then(|(before, after)| {
+            let total = after.total.checked_sub(before.total)?;
+            let idle = after.idle.checked_sub(before.idle)?;
+            if total == 0 {
+                return None;
+            }
+            Some((total - idle) as f64 / total as f64 * 100.0)
+        }),
+        scheduler_diagnostics: final_diagnostics,
+        counters,
+        samples,
+        execution_metadata: Some(json!({
+            "filtered_read_mode": config.filtered_read_mode.name(),
+            "filtered_read_parallelism": config.filtered_read_parallelism,
+            "partition_decode_readahead": config.partition_decode_readahead,
+            "source_partitions": source_partitions,
+            "plan": plan_text,
+            "plan_hash": plan_hash,
+            "task_wait_seconds_total": task_wait_ns as f64 / 1_000_000_000.0,
+            "elapsed_compute_seconds_total": elapsed_compute_ns as f64 / 1_000_000_000.0,
+            "metrics": execution_metrics,
+        })),
     })
 }
 
@@ -1369,6 +1721,7 @@ async fn run_dataset_take_case(
         scheduler_diagnostics: scheduler_diagnostics.snapshot(None),
         counters,
         samples: Vec::new(),
+        execution_metadata: None,
     })
 }
 
@@ -1809,6 +2162,7 @@ async fn run_scheduler_raw_case(
         scheduler_diagnostics: final_diagnostics,
         counters,
         samples,
+        execution_metadata: None,
     })
 }
 
@@ -2134,6 +2488,7 @@ async fn run_case(
         scheduler_diagnostics: final_diagnostics,
         counters,
         samples,
+        execution_metadata: None,
     })
 }
 
@@ -2205,7 +2560,7 @@ async fn main() -> Result<()> {
 
     for io_buffer_gib in &config.io_buffer_gib {
         println!(
-            "running case={} backend={} projection={} limit_rows={} io_buffer_gib={} batch_size={} fragment_concurrency={} batch_concurrency={} sample_ms={}",
+            "running case={} backend={} projection={} limit_rows={} io_buffer_gib={} batch_size={} fragment_concurrency={} batch_concurrency={} filtered_read_mode={} filtered_read_parallelism={} partition_decode_readahead={} sample_ms={}",
             config.case_name,
             config.backend.name(),
             projection,
@@ -2216,6 +2571,9 @@ async fn main() -> Result<()> {
             config.batch_size,
             config.fragment_concurrency,
             config.batch_concurrency,
+            config.filtered_read_mode.name(),
+            config.filtered_read_parallelism,
+            config.partition_decode_readahead,
             config.sample_ms
         );
         let stats = match config.backend {
@@ -2224,6 +2582,9 @@ async fn main() -> Result<()> {
             }
             Backend::Scanner => {
                 run_scanner_case(&config, *io_buffer_gib, &scheduler_diagnostics).await?
+            }
+            Backend::FilteredRead => {
+                run_filtered_read_case(&config, *io_buffer_gib, &scheduler_diagnostics).await?
             }
             Backend::SchedulerRaw => {
                 run_scheduler_raw_case(&config, *io_buffer_gib, &scheduler_diagnostics).await?
@@ -2267,6 +2628,7 @@ async fn main() -> Result<()> {
             "dataset_version": config.dataset_version,
             "lance_commit": commit,
             "projection": projection,
+            "filter": config.filter.as_deref(),
             "limit_rows": config.limit_rows,
             "target_bytes": config.target_bytes,
             "raw_range_size_bytes": config.raw_range_size_bytes,
@@ -2286,6 +2648,9 @@ async fn main() -> Result<()> {
             "read_chunk_size": config.read_chunk_size,
             "fragment_concurrency": config.fragment_concurrency,
             "batch_concurrency": config.batch_concurrency,
+            "filtered_read_mode": config.filtered_read_mode.name(),
+            "filtered_read_parallelism": config.filtered_read_parallelism,
+            "partition_decode_readahead": config.partition_decode_readahead,
             "detach_fragment_streams": config.detach_fragment_streams,
             "drop_read_tasks": config.drop_read_tasks,
             "sample_ms": config.sample_ms,
@@ -2323,6 +2688,7 @@ async fn main() -> Result<()> {
             "raw_reassemble_seconds_total": ns_to_seconds(counters.raw_reassemble_ns.load(Ordering::Relaxed)),
             "cpu_avg": stats.cpu_avg,
             "samples": stats.samples,
+            "execution_metadata": stats.execution_metadata,
         });
         println!(
             "case={} backend={} projection={} io_buffer_gib={} elapsed={:.3}s logical_gbps={:.2} physical_gbps={:.2} rows={} batches={} scheduler_bytes_read={} scheduler_iops={} scheduler_requests={} active_iops={} pending_iops={} cpu_avg={}",
