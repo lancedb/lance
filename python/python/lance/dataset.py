@@ -239,14 +239,6 @@ def _is_null_blob_description(description: Any) -> bool:
         return False
     if description.keys() == {"position", "size"}:
         return description["position"] == 1 and description["size"] == 0
-    if description.keys() == {"kind", "position", "size", "blob_id", "blob_uri"}:
-        return (
-            description["kind"] == 0
-            and description["position"] == 0
-            and description["size"] == 0
-            and description["blob_id"] == 0
-            and description["blob_uri"] == ""
-        )
     return False
 
 
