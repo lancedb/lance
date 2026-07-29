@@ -6,7 +6,7 @@ use chrono::prelude::*;
 use lance_core::deepsize::DeepSizeOf;
 use lance_file::datatypes::{Fields, FieldsWithMeta, populate_schema_dictionary};
 use lance_file::previous::reader::FileReader as PreviousFileReader;
-use lance_file::version::{LEGACY_FORMAT_VERSION, LanceFileVersion};
+use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use lance_io::traits::{ProtoStruct, Reader};
 use object_store::path::Path;
 use prost::Message;
@@ -502,7 +502,7 @@ impl Manifest {
     }
 
     pub fn should_use_legacy_format(&self) -> bool {
-        self.data_storage_format.version == LEGACY_FORMAT_VERSION
+        self.data_storage_format.version == ConcreteFileVersion::V1
     }
 
     /// Get the summary information of a manifest.
@@ -606,36 +606,44 @@ pub struct WriterVersion {
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct DataStorageFormat {
     pub file_format: String,
-    pub version: String,
+    pub version: ConcreteFileVersion,
 }
 
 const LANCE_FORMAT_NAME: &str = "lance";
 
 impl DataStorageFormat {
-    pub fn new(version: LanceFileVersion) -> Self {
+    pub fn new(version: ConcreteFileVersion) -> Self {
         Self {
             file_format: LANCE_FORMAT_NAME.to_string(),
-            version: version.resolve().to_string(),
+            version,
         }
     }
 
+    /// Return the exact file format version persisted by this manifest.
+    pub fn lance_file_format(&self) -> ConcreteFileVersion {
+        self.version
+    }
+
+    // Retained until all selector-based execution APIs migrate to exact versions.
     pub fn lance_file_version(&self) -> Result<LanceFileVersion> {
-        self.version.parse::<LanceFileVersion>()
+        Ok(self.version.into())
     }
 }
 
 impl Default for DataStorageFormat {
     fn default() -> Self {
-        Self::new(LanceFileVersion::default())
+        Self::new(ConcreteFileVersion::from(LanceFileVersion::Stable))
     }
 }
 
-impl From<pb::manifest::DataStorageFormat> for DataStorageFormat {
-    fn from(pb: pb::manifest::DataStorageFormat) -> Self {
-        Self {
+impl TryFrom<pb::manifest::DataStorageFormat> for DataStorageFormat {
+    type Error = Error;
+
+    fn try_from(pb: pb::manifest::DataStorageFormat) -> Result<Self> {
+        Ok(Self {
             file_format: pb.file_format,
-            version: pb.version,
-        }
+            version: ConcreteFileVersion::from_manifest_string(&pb.version)?,
+        })
     }
 }
 
@@ -891,13 +899,13 @@ impl TryFrom<pb::Manifest> for Manifest {
                 } else {
                     // No fragments to inspect, best we can do is look at writer flags
                     if has_deprecated_v2_feature_flag(p.writer_feature_flags) {
-                        DataStorageFormat::new(LanceFileVersion::Stable)
+                        DataStorageFormat::new(ConcreteFileVersion::from(LanceFileVersion::Stable))
                     } else {
-                        DataStorageFormat::new(LanceFileVersion::Legacy)
+                        DataStorageFormat::new(ConcreteFileVersion::V1)
                     }
                 }
             }
-            Some(format) => DataStorageFormat::from(format),
+            Some(format) => DataStorageFormat::try_from(format)?,
         };
 
         let schema = Schema::try_from(fields_with_meta)?;
@@ -980,7 +988,11 @@ impl From<&Manifest> for pb::Manifest {
             next_row_id: m.next_row_id,
             data_format: Some(pb::manifest::DataStorageFormat {
                 file_format: m.data_storage_format.file_format.clone(),
-                version: m.data_storage_format.version.clone(),
+                version: m
+                    .data_storage_format
+                    .version
+                    .to_manifest_string()
+                    .to_string(),
             }),
             config: m.config.clone(),
             base_paths: m
@@ -1060,6 +1072,7 @@ impl SelfDescribingFileReader for PreviousFileReader {
 
 #[cfg(test)]
 mod tests {
+    use crate::feature_flags::FLAG_USE_V2_FORMAT_DEPRECATED;
     use crate::format::{DataFile, DeletionFile, DeletionFileType};
     use std::num::NonZero;
 
@@ -1067,6 +1080,101 @@ mod tests {
 
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
     use lance_core::datatypes::Field;
+
+    #[test]
+    fn old_empty_manifest_recovers_v1_or_current_stable() {
+        let old_manifest = pb::Manifest {
+            data_format: None,
+            ..Default::default()
+        };
+        let recovered_v1 = Manifest::try_from(old_manifest.clone()).unwrap();
+        assert_eq!(
+            recovered_v1.data_storage_format.lance_file_format(),
+            ConcreteFileVersion::V1
+        );
+
+        let recovered_stable = Manifest::try_from(pb::Manifest {
+            writer_feature_flags: FLAG_USE_V2_FORMAT_DEPRECATED,
+            ..old_manifest
+        })
+        .unwrap();
+        assert_eq!(
+            recovered_stable.data_storage_format.lance_file_format(),
+            ConcreteFileVersion::from(LanceFileVersion::Stable)
+        );
+    }
+
+    #[test]
+    fn manifest_persistence_rejects_selectors_and_public_aliases() {
+        for version in ["stable", "next", "legacy", "0.3"] {
+            let manifest = pb::Manifest {
+                data_format: Some(pb::manifest::DataStorageFormat {
+                    file_format: LANCE_FORMAT_NAME.to_string(),
+                    version: version.to_string(),
+                }),
+                ..Default::default()
+            };
+            assert!(Manifest::try_from(manifest).is_err(), "accepted {version}");
+        }
+    }
+
+    #[test]
+    fn manifest_codec_writes_canonical_exact_string() {
+        let manifest = Manifest::new(
+            Schema::default(),
+            Arc::new(Vec::new()),
+            DataStorageFormat::new(ConcreteFileVersion::V2_0),
+            HashMap::new(),
+        );
+        let encoded = pb::Manifest::from(&manifest);
+        assert_eq!(encoded.data_format.unwrap().version, "2.0");
+    }
+
+    #[test]
+    fn missing_format_infers_exact_version_and_rejects_mixed_files() {
+        let v2_0 = Fragment::new(0).with_file(
+            "v2_0.lance",
+            vec![0],
+            vec![0],
+            ConcreteFileVersion::V2_0,
+            None,
+        );
+        let manifest = Manifest::new(
+            Schema::default(),
+            Arc::new(vec![v2_0.clone()]),
+            DataStorageFormat::new(ConcreteFileVersion::V1),
+            HashMap::new(),
+        );
+        let mut encoded = pb::Manifest::from(&manifest);
+        encoded.data_format = None;
+        let recovered = Manifest::try_from(encoded).unwrap();
+        assert_eq!(
+            recovered.data_storage_format.lance_file_format(),
+            ConcreteFileVersion::V2_0
+        );
+
+        let v2_1 = Fragment::new(1).with_file(
+            "v2_1.lance",
+            vec![0],
+            vec![0],
+            ConcreteFileVersion::V2_1,
+            None,
+        );
+        let mixed_manifest = Manifest::new(
+            Schema::default(),
+            Arc::new(vec![v2_0, v2_1]),
+            DataStorageFormat::new(ConcreteFileVersion::V2_0),
+            HashMap::new(),
+        );
+        let mut encoded = pb::Manifest::from(&mixed_manifest);
+        encoded.data_format = None;
+        let error = Manifest::try_from(encoded).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("All data files must have the same version")
+        );
+    }
 
     #[test]
     fn test_writer_version() {
@@ -1450,14 +1558,13 @@ mod tests {
         assert_eq!(real_data_summary.total_data_file_rows, 425);
         assert_eq!(real_data_summary.total_deletion_files, 0);
 
-        let file_version = LanceFileVersion::default();
         // Step 4: write deletion files and verify summary
         let mut fragment_with_deletion = Fragment::new(0)
             .with_file(
                 "data_with_deletion.lance",
                 vec![0, 1],
                 vec![0, 1],
-                &file_version,
+                ConcreteFileVersion::from(LanceFileVersion::Stable),
                 NonZero::new(1000),
             )
             .with_physical_rows(50);

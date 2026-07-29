@@ -29,7 +29,7 @@ use lance_core::utils::tracing::{
 use lance_datafusion::projection::ProjectionPlan;
 use lance_file::datatypes::populate_schema_dictionary;
 use lance_file::reader::{FileReader, FileReaderOptions};
-use lance_file::version::LanceFileVersion;
+use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use lance_index::{IndexType, progress::IndexBuildProgress};
 use lance_io::object_store::{
     ChainedWrappingObjectStore, LanceNamespaceStorageOptionsProvider, ObjectStore,
@@ -2230,10 +2230,11 @@ impl Dataset {
             .await?;
         let file_metadata = FileReader::read_all_metadata(&file).await?;
 
-        let file_version = LanceFileVersion::try_from_major_minor(
-            file_metadata.major_version as u32,
-            file_metadata.minor_version as u32,
+        let lance_file_format = ConcreteFileVersion::from_footer_numbers(
+            file_metadata.major_version,
+            file_metadata.minor_version,
         )?;
+        let file_version: LanceFileVersion = lance_file_format.into();
 
         let is_structural = file_version >= LanceFileVersion::V2_1;
         let physical_columns = file_metadata.column_metadatas.len();
@@ -2451,8 +2452,7 @@ impl Dataset {
             path,
             fields,
             column_indices,
-            file_metadata.major_version as u32,
-            file_metadata.minor_version as u32,
+            lance_file_format,
             file_size_nz,
             base_id,
         ))

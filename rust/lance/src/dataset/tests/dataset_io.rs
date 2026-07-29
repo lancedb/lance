@@ -35,7 +35,7 @@ use lance_arrow::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY};
 use lance_core::utils::tempfile::{TempStdDir, TempStrDir};
 use lance_datagen::{BatchCount, RowCount, array, gen_batch};
 use lance_file::{
-    version::LanceFileVersion,
+    version::{ConcreteFileVersion, LanceFileVersion},
     writer::{FileWriter, FileWriterOptions},
 };
 use lance_io::assert_io_eq;
@@ -1002,7 +1002,11 @@ async fn test_write_params(
 #[rstest]
 #[tokio::test]
 async fn test_write_manifest(
-    #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+    #[values(
+        LanceFileVersion::Legacy,
+        LanceFileVersion::Stable,
+        LanceFileVersion::Next
+    )]
     data_storage_version: LanceFileVersion,
 ) {
     use lance_table::feature_flags::FLAG_UNKNOWN;
@@ -1051,8 +1055,12 @@ async fn test_write_manifest(
 
     assert_eq!(
         manifest.data_storage_format,
-        DataStorageFormat::new(data_storage_version)
+        DataStorageFormat::new(ConcreteFileVersion::from(data_storage_version))
     );
+    assert!(!matches!(
+        manifest.data_storage_format.version.to_manifest_string(),
+        "stable" | "next"
+    ));
     assert_eq!(manifest.reader_feature_flags, 0);
 
     // Create one with deletions
