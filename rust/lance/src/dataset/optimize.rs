@@ -103,13 +103,15 @@ use crate::io::commit::{commit_transaction, migrate_fragments};
 use arrow::array::AsArray;
 use arrow::datatypes::{UInt8Type, UInt32Type, UInt64Type};
 use arrow_array::Array;
+use arrow_array::ArrayRef;
 use arrow_array::RecordBatch;
 use arrow_array::StructArray;
 use arrow_array::builder::{LargeBinaryBuilder, PrimitiveBuilder, StringBuilder};
 use arrow_buffer::NullBuffer;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use futures::{StreamExt, TryStreamExt};
+use futures::future::BoxFuture;
+use futures::{FutureExt, StreamExt, TryStreamExt};
 use lance_core::Error;
 use lance_core::datatypes::{BlobHandling, BlobKind};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
@@ -1176,6 +1178,167 @@ async fn build_user_view_struct(
     )?)
 }
 
+/// Returns true when `field` itself or any of its descendants is a blob v2 field.
+fn contains_blob_v2(field: &lance_core::datatypes::Field) -> bool {
+    field.is_blob_v2() || field.children.iter().any(contains_blob_v2)
+}
+
+/// The Arrow field that [`transform_blob_v2_column`] produces for `arrow_field`.
+///
+/// Blob v2 descriptor structs become the writer's user view; enclosing structs are
+/// rebuilt around their transformed children.
+fn transformed_blob_v2_field(
+    lance_field: &lance_core::datatypes::Field,
+    arrow_field: &Arc<arrow_schema::Field>,
+) -> Arc<arrow_schema::Field> {
+    if lance_field.is_blob_v2() {
+        let logical_field = arrow_schema::Field::from(lance_field);
+        return Arc::new(
+            arrow_schema::Field::new(
+                arrow_field.name(),
+                lance_core::datatypes::BLOB_V2_USER_TYPE.clone(),
+                arrow_field.is_nullable(),
+            )
+            .with_metadata(logical_field.metadata().clone()),
+        );
+    }
+
+    let arrow_schema::DataType::Struct(children) = arrow_field.data_type() else {
+        return arrow_field.clone();
+    };
+
+    let new_children = children
+        .iter()
+        .map(|child| match lance_field.child(child.name()) {
+            Some(child_lance_field) if contains_blob_v2(child_lance_field) => {
+                transformed_blob_v2_field(child_lance_field, child)
+            }
+            _ => child.clone(),
+        })
+        .collect::<Vec<_>>();
+    Arc::new(
+        arrow_schema::Field::new(
+            arrow_field.name(),
+            arrow_schema::DataType::Struct(new_children.into()),
+            arrow_field.is_nullable(),
+        )
+        .with_metadata(arrow_field.metadata().clone()),
+    )
+}
+
+/// Rewrite a blob v2 descriptor column, or a struct containing one, into the
+/// writer's user view. `column_path` is the dotted path to `array` in the dataset
+/// schema, which is how blob payloads are addressed when they are read back.
+fn transform_blob_v2_column<'a>(
+    dataset: &'a Arc<Dataset>,
+    lance_field: &'a lance_core::datatypes::Field,
+    arrow_field: &'a Arc<arrow_schema::Field>,
+    array: ArrayRef,
+    row_addrs: &'a arrow::array::UInt64Array,
+    column_path: String,
+) -> BoxFuture<'a, Result<(ArrayRef, Arc<arrow_schema::Field>)>> {
+    async move {
+        // Blob payloads are addressed by row address, so a blob v2 leaf can only be
+        // reached through struct children, where there is still one value per row.
+        let Some(struct_arr) = array.as_any().downcast_ref::<StructArray>() else {
+            return Err(Error::not_supported(format!(
+                "Compacting a blob v2 column nested under '{}' of type {}; \
+                 only struct nesting is supported",
+                column_path,
+                array.data_type()
+            )));
+        };
+
+        if !lance_field.is_blob_v2() {
+            let mut new_children = Vec::with_capacity(struct_arr.num_columns());
+            let mut new_child_fields = Vec::with_capacity(struct_arr.num_columns());
+            for (child_idx, child_field) in struct_arr.fields().iter().enumerate() {
+                let child_array = struct_arr.column(child_idx).clone();
+                match lance_field.child(child_field.name()) {
+                    Some(child_lance_field) if contains_blob_v2(child_lance_field) => {
+                        let (new_child, new_child_field) = transform_blob_v2_column(
+                            dataset,
+                            child_lance_field,
+                            child_field,
+                            child_array,
+                            row_addrs,
+                            format!("{column_path}.{}", child_field.name()),
+                        )
+                        .await?;
+                        new_children.push(new_child);
+                        new_child_fields.push(new_child_field);
+                    }
+                    _ => {
+                        new_children.push(child_array);
+                        new_child_fields.push(child_field.clone());
+                    }
+                }
+            }
+            let new_struct = StructArray::try_new(
+                new_child_fields.clone().into(),
+                new_children,
+                struct_arr.nulls().cloned(),
+            )?;
+            let new_field = Arc::new(
+                arrow_schema::Field::new(
+                    arrow_field.name(),
+                    arrow_schema::DataType::Struct(new_child_fields.into()),
+                    arrow_field.is_nullable(),
+                )
+                .with_metadata(arrow_field.metadata().clone()),
+            );
+            return Ok((Arc::new(new_struct) as ArrayRef, new_field));
+        }
+
+        // Merge-insert may supply a blob v2 value directly from the source.
+        // Those values are already in the writer's user view and do not refer
+        // to a row in the target dataset, unlike descriptor values from scans.
+        if struct_arr.column_by_name("kind").is_none() {
+            return Ok((array.clone(), arrow_field.clone()));
+        }
+
+        let descriptor = BlobV2Descriptor::try_from_struct(struct_arr, &column_path)?;
+        let classification = classify_rows(struct_arr, &descriptor, row_addrs, &column_path)?;
+        let new_struct = build_user_view_struct(
+            dataset,
+            &descriptor,
+            &classification,
+            &column_path,
+            struct_arr.len(),
+            struct_arr.nulls().cloned(),
+        )
+        .await?;
+
+        Ok((
+            Arc::new(new_struct) as ArrayRef,
+            transformed_blob_v2_field(lance_field, arrow_field),
+        ))
+    }
+    .boxed()
+}
+
+/// The Arrow schema that [`transform_blob_v2_batch`] produces for `read_schema`.
+pub(crate) fn transformed_blob_v2_schema(
+    read_schema: &arrow_schema::Schema,
+    dataset_schema: &lance_core::datatypes::Schema,
+) -> Arc<arrow_schema::Schema> {
+    let fields = read_schema
+        .fields()
+        .iter()
+        .filter(|field| field.name() != lance_core::ROW_ADDR)
+        .map(|field| match dataset_schema.field(field.name()) {
+            Some(lance_field) if contains_blob_v2(lance_field) => {
+                transformed_blob_v2_field(lance_field, field)
+            }
+            _ => field.clone(),
+        })
+        .collect::<Vec<_>>();
+    Arc::new(arrow_schema::Schema::new_with_metadata(
+        fields,
+        read_schema.metadata().clone(),
+    ))
+}
+
 pub(crate) async fn transform_blob_v2_batch(
     dataset: &Arc<Dataset>,
     schema: &lance_core::datatypes::Schema,
@@ -1208,73 +1371,30 @@ pub(crate) async fn transform_blob_v2_batch(
             continue;
         }
 
-        let lance_field = schema.field(field.name());
-        let is_blob_v2 = lance_field.is_some_and(|f| f.is_blob_v2());
-
-        if !is_blob_v2 {
-            new_columns.push(batch.column(col_idx).clone());
-            new_fields.push(field.clone());
-            continue;
+        let column = batch.column(col_idx).clone();
+        match schema.field(field.name()) {
+            Some(lance_field) if contains_blob_v2(lance_field) => {
+                let (new_column, new_field) = transform_blob_v2_column(
+                    dataset,
+                    lance_field,
+                    field,
+                    column,
+                    row_addrs,
+                    field.name().clone(),
+                )
+                .await?;
+                new_columns.push(new_column);
+                new_fields.push(new_field);
+            }
+            _ => {
+                new_columns.push(column);
+                new_fields.push(field.clone());
+            }
         }
-
-        let struct_arr = batch
-            .column(col_idx)
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .ok_or_else(|| {
-                Error::internal(format!(
-                    "Blob v2 column '{}' expected StructArray, got {:?}",
-                    field.name(),
-                    batch.column(col_idx).data_type()
-                ))
-            })?;
-
-        // Merge-insert may supply a blob v2 value directly from the source.
-        // Those values are already in the writer's user view and do not refer
-        // to a row in the target dataset, unlike descriptor values from scans.
-        if struct_arr.column_by_name("kind").is_none() {
-            new_columns.push(batch.column(col_idx).clone());
-            new_fields.push(field.clone());
-            continue;
-        }
-
-        let column_name = field.name();
-        let descriptor = BlobV2Descriptor::try_from_struct(struct_arr, column_name)?;
-        let classification = classify_rows(struct_arr, &descriptor, row_addrs, column_name)?;
-        let num_rows = struct_arr.len();
-
-        let new_struct = build_user_view_struct(
-            dataset,
-            &descriptor,
-            &classification,
-            column_name,
-            num_rows,
-            struct_arr.nulls().cloned(),
-        )
-        .await?;
-
-        new_columns.push(Arc::new(new_struct));
-        let logical_field = arrow_schema::Field::from(lance_field.ok_or_else(|| {
-            Error::internal(format!(
-                "Blob v2 column '{}' missing from dataset schema during compaction",
-                field.name()
-            ))
-        })?);
-        new_fields.push(Arc::new(
-            arrow_schema::Field::new(
-                field.name(),
-                lance_core::datatypes::BLOB_V2_USER_TYPE.clone(),
-                field.is_nullable(),
-            )
-            .with_metadata(logical_field.metadata().clone()),
-        ));
     }
 
     let new_schema = Arc::new(arrow_schema::Schema::new_with_metadata(
-        new_fields
-            .iter()
-            .map(|f| f.as_ref().clone())
-            .collect::<Vec<_>>(),
+        new_fields,
         batch_schema.metadata().clone(),
     ));
 
@@ -1684,35 +1804,7 @@ async fn rewrite_files(
                         .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))
                 }
             });
-            let transformed_schema = {
-                let mut fields: Vec<Arc<arrow_schema::Field>> = Vec::new();
-                for field in schema.fields().iter() {
-                    if field.name() == lance_core::ROW_ADDR {
-                        continue;
-                    }
-                    let lance_field = dataset.schema().field(field.name());
-                    if let Some(lance_field) = lance_field.filter(|f| f.is_blob_v2()) {
-                        let logical_field = arrow_schema::Field::from(lance_field);
-                        fields.push(Arc::new(
-                            arrow_schema::Field::new(
-                                field.name(),
-                                lance_core::datatypes::BLOB_V2_USER_TYPE.clone(),
-                                field.is_nullable(),
-                            )
-                            .with_metadata(logical_field.metadata().clone()),
-                        ));
-                    } else {
-                        fields.push(field.clone());
-                    }
-                }
-                Arc::new(arrow_schema::Schema::new_with_metadata(
-                    fields
-                        .iter()
-                        .map(|f| f.as_ref().clone())
-                        .collect::<Vec<_>>(),
-                    schema.metadata().clone(),
-                ))
-            };
+            let transformed_schema = transformed_blob_v2_schema(&schema, dataset.schema());
             reader = Some(Box::pin(RecordBatchStreamAdapter::new(
                 transformed_schema,
                 transformed,
@@ -7935,6 +8027,184 @@ mod tests {
                 (1, None),
                 (2, Some(b"thumb-2".to_vec()))
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_compact_blob_v2_struct_nested_column() {
+        use crate::BlobArrayBuilder;
+        use arrow_array::StringArray;
+        use lance_core::utils::tempfile::TempDir;
+
+        let test_dir = TempDir::default();
+
+        let expected: Vec<(i32, Option<Vec<u8>>)> = vec![
+            (0, Some(b"payload-0".to_vec())),
+            (1, Some(Vec::new())),
+            (2, None),
+            (3, Some(b"payload-3".to_vec())),
+        ];
+
+        let mut blob_builder = BlobArrayBuilder::new(expected.len());
+        for (_, value) in &expected {
+            match value {
+                Some(value) => blob_builder.push_bytes(value).unwrap(),
+                None => blob_builder.push_null().unwrap(),
+            }
+        }
+
+        let payload_field = crate::blob_field("payload", true);
+        let asset_fields = vec![Field::new("mime", DataType::Utf8, true), payload_field];
+        let asset_array: ArrayRef = Arc::new(
+            StructArray::try_new(
+                asset_fields.clone().into(),
+                vec![
+                    Arc::new(StringArray::from(vec!["image/png"; expected.len()])) as ArrayRef,
+                    blob_builder.finish().unwrap(),
+                ],
+                None,
+            )
+            .unwrap(),
+        );
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("asset", DataType::Struct(asset_fields.into()), true),
+        ]));
+        let id_array: ArrayRef = Arc::new(Int32Array::from_iter_values(0..expected.len() as i32));
+        let batch = RecordBatch::try_new(schema.clone(), vec![id_array, asset_array]).unwrap();
+        let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+
+        let mut dataset = Dataset::write(
+            reader,
+            &test_dir.path_str(),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        dataset.delete("id = 1").await.unwrap();
+
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 1024 * 1024,
+                materialize_deletions_threshold: 0.0,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 1);
+
+        let dataset = Arc::new(dataset);
+        let batch = dataset
+            .scan()
+            .project(&["id", "asset"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_primitive::<Int32Type>();
+        assert_eq!(ids.values(), &[0, 2, 3]);
+
+        let mime = batch
+            .column_by_name("asset")
+            .unwrap()
+            .as_struct()
+            .column_by_name("mime")
+            .unwrap()
+            .as_string::<i32>();
+        assert!((0..mime.len()).all(|i| mime.value(i) == "image/png"));
+
+        let blobs = dataset
+            .take_blobs_by_indices(&[0, 1, 2], "asset.payload")
+            .await
+            .unwrap();
+        let mut actual = Vec::with_capacity(blobs.len());
+        for blob in blobs {
+            match blob {
+                Some(blob) => actual.push(Some(blob.read().await.unwrap().to_vec())),
+                None => actual.push(None),
+            }
+        }
+        assert_eq!(
+            actual,
+            vec![
+                Some(b"payload-0".to_vec()),
+                None,
+                Some(b"payload-3".to_vec())
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_compact_blob_v2_list_nested_column_is_not_supported() {
+        use crate::BlobArrayBuilder;
+        use lance_core::utils::tempfile::TempDir;
+
+        let test_dir = TempDir::default();
+
+        let mut blob_builder = BlobArrayBuilder::new(2);
+        blob_builder.push_bytes(b"payload-0").unwrap();
+        blob_builder.push_bytes(b"payload-1").unwrap();
+        let item_field = Arc::new(crate::blob_field("item", true));
+        let blobs_array: ArrayRef = Arc::new(
+            arrow_array::ListArray::try_new(
+                item_field.clone(),
+                arrow_buffer::OffsetBuffer::new(arrow_buffer::ScalarBuffer::from(vec![0i32, 1, 2])),
+                blob_builder.finish().unwrap(),
+                None,
+            )
+            .unwrap(),
+        );
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("blobs", DataType::List(item_field), true),
+        ]));
+        let id_array: ArrayRef = Arc::new(Int32Array::from(vec![0, 1]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![id_array, blobs_array]).unwrap();
+        let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+
+        let mut dataset = Dataset::write(
+            reader,
+            &test_dir.path_str(),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                max_rows_per_file: 1,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let err = compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 1024 * 1024,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::NotSupported { .. }),
+            "expected NotSupported, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("only struct nesting is supported"),
+            "unexpected error message: {err}"
         );
     }
 
