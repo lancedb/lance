@@ -99,18 +99,45 @@ pub(crate) async fn read_transaction_file(
 /// be removed by GC.
 async fn cleanup_transaction_file(
     object_store: &ObjectStore,
+    base_path: &Path,
+    transaction_file: &str,
+) {
+    if transaction_file.is_empty() {
+        return;
+    }
+    let path = base_path
+        .clone()
+        .join(TRANSACTIONS_DIR)
+        .join(transaction_file);
+    if let Err(e) = object_store.delete(&path).await {
+        log::warn!(
+            "Failed to clean up orphaned transaction file '{}': {}",
+            transaction_file,
+            e
+        );
+    }
+}
+
+/// Handle the external transaction file after a manifest commit error.
+///
+/// If there is no inline copy, delete the file only when the target manifest is
+/// confirmed absent. A present manifest may be our own lost-ack commit, while a
+/// failed existence check leaves the commit outcome unknown.
+#[allow(clippy::too_many_arguments)]
+async fn handle_transaction_file_after_manifest_commit_error(
+    object_store: &ObjectStore,
     commit_handler: &dyn CommitHandler,
     base_path: &Path,
     transaction_file: &str,
-    inlined: bool,
-    verify_version: Option<u64>,
+    inline_transaction: bool,
+    version_to_verify: Option<u64>,
     naming_scheme: ManifestNamingScheme,
 ) {
     if transaction_file.is_empty() {
         return;
     }
-    if !inlined {
-        let Some(version) = verify_version else {
+    if !inline_transaction {
+        let Some(version) = version_to_verify else {
             return;
         };
         match commit_handler
@@ -124,17 +151,7 @@ async fn cleanup_transaction_file(
             Ok(true) | Err(_) => return,
         }
     }
-    let path = base_path
-        .clone()
-        .join(TRANSACTIONS_DIR)
-        .join(transaction_file);
-    if let Err(e) = object_store.delete(&path).await {
-        log::warn!(
-            "Failed to clean up orphaned transaction file '{}': {}",
-            transaction_file,
-            e
-        );
-    }
+    cleanup_transaction_file(object_store, base_path, transaction_file).await;
 }
 
 /// Write a transaction to a file and return the relative path.
@@ -322,7 +339,7 @@ async fn do_commit_new_dataset(
             Ok((manifest, manifest_location))
         }
         Err(CommitError::CommitConflict) => {
-            cleanup_transaction_file(
+            handle_transaction_file_after_manifest_commit_error(
                 object_store,
                 commit_handler,
                 base_path,
@@ -335,7 +352,7 @@ async fn do_commit_new_dataset(
             Err(crate::Error::dataset_already_exists(base_path.to_string()))
         }
         Err(CommitError::OtherError(err)) => {
-            cleanup_transaction_file(
+            handle_transaction_file_after_manifest_commit_error(
                 object_store,
                 commit_handler,
                 base_path,
@@ -927,7 +944,7 @@ pub(crate) async fn do_commit_detached_transaction(
             }
             Err(CommitError::OtherError(err)) => {
                 // If other error, return
-                cleanup_transaction_file(
+                handle_transaction_file_after_manifest_commit_error(
                     object_store,
                     commit_handler,
                     &dataset.base,
@@ -944,7 +961,7 @@ pub(crate) async fn do_commit_detached_transaction(
 
     // This should be extremely unlikely.  There should not be *that* many detached commits.  If
     // this happens then it seems more likely there is a bug in our random u64 generation.
-    cleanup_transaction_file(
+    handle_transaction_file_after_manifest_commit_error(
         object_store,
         commit_handler,
         &dataset.base,
@@ -1207,7 +1224,7 @@ pub(crate) async fn commit_transaction(
                 if next_attempt_i < num_attempts {
                     // The transaction file from this attempt is now stale; clean it up
                     // before the next attempt writes a new one (possibly rebased).
-                    cleanup_transaction_file(
+                    handle_transaction_file_after_manifest_commit_error(
                         object_store,
                         commit_handler,
                         &dataset.base,
@@ -1224,7 +1241,7 @@ pub(crate) async fn commit_transaction(
                 }
             }
             Err(CommitError::OtherError(err)) => {
-                cleanup_transaction_file(
+                handle_transaction_file_after_manifest_commit_error(
                     object_store,
                     commit_handler,
                     &dataset.base,
@@ -1239,7 +1256,7 @@ pub(crate) async fn commit_transaction(
         }
     }
 
-    cleanup_transaction_file(
+    handle_transaction_file_after_manifest_commit_error(
         object_store,
         commit_handler,
         &dataset.base,
