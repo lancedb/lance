@@ -2741,7 +2741,7 @@ impl Transaction {
 
     /// If an operation modifies one or more fields in a fragment then we need to remove
     /// that fragment from any indices that cover one of the modified fields.
-    fn prune_updated_fields_from_indices(
+    pub(crate) fn prune_updated_fields_from_indices(
         indices: &mut [IndexMetadata],
         updated_fragments: &[Fragment],
         fields_modified: &[u32],

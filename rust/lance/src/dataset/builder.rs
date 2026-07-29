@@ -19,7 +19,7 @@ use lance_io::object_store::{
 use lance_namespace::LanceNamespace;
 use lance_namespace::models::DescribeTableRequest;
 use lance_table::{
-    format::{Manifest, populate_manifest_schema_dictionary},
+    format::{Manifest, populate_manifest_schema_dictionaries},
     io::commit::external_manifest::ExternalManifestCommitHandler,
     io::commit::{CommitHandler, commit_handler_from_url},
 };
@@ -839,7 +839,7 @@ impl DatasetBuilder {
                 .await?;
             if manifest.schema.has_dictionary_types() {
                 let reader = object_store.open(&location.path).await?;
-                populate_manifest_schema_dictionary(&mut manifest, reader.as_ref()).await?;
+                populate_manifest_schema_dictionaries(&mut manifest, reader.as_ref()).await?;
             }
             (Arc::new(manifest), location)
         } else {

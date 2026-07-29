@@ -28,7 +28,11 @@ use lance_core::datatypes::{OnMissing, OnTypeMismatch, SchemaCompareOptions};
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
-use lance_core::{Error, Result, cache::CacheKey, datatypes::Schema};
+use lance_core::{
+    Error, Result,
+    cache::{CacheKey, CacheKeySchema, KeyBuilder},
+    datatypes::Schema,
+};
 use lance_core::{
     ROW_ADDR, ROW_ADDR_FIELD, ROW_CREATED_AT_VERSION_FIELD, ROW_ID, ROW_ID_FIELD,
     ROW_LAST_UPDATED_AT_VERSION_FIELD,
@@ -39,9 +43,7 @@ use lance_file::reader::{
     CachedFileMetadata, FileMetadataIndex, FileReaderOptions, ProjectedFileReader, ReaderProjection,
 };
 use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
-use lance_file::versions::v1::reader::{
-    FileReader as V1FileReader, read_batch as previous_read_batch,
-};
+use lance_file::versions::v1::reader::{FileReader as V1FileReader, read_batch as v1_read_batch};
 use lance_file::{LanceEncodingsIo, determine_file_version};
 use lance_io::ReadBatchParams;
 use lance_io::scheduler::{FileScheduler, ScanScheduler, SchedulerConfig};
@@ -175,7 +177,7 @@ fn ranges_to_tasks(
             let reader = reader.clone();
             let projection = projection.clone();
             let task = tokio::task::spawn(async move {
-                previous_read_batch(
+                v1_read_batch(
                     &reader,
                     &ReadBatchParams::Range(range.clone()),
                     &projection,
@@ -2191,6 +2193,12 @@ impl CacheKey for FileMetadataCacheKey {
     fn type_name() -> &'static str {
         "FileMetadata"
     }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.dataset.fragment-file-metadata-key", 1)
+    }
+
+    fn write_key(&self, _builder: &mut KeyBuilder) {}
 }
 
 #[derive(Debug, Clone)]
@@ -2206,6 +2214,12 @@ impl CacheKey for FileMetadataIndexCacheKey {
     fn type_name() -> &'static str {
         "FileMetadataIndex"
     }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.dataset.fragment-file-metadata-index-key", 1)
+    }
+
+    fn write_key(&self, _builder: &mut KeyBuilder) {}
 }
 
 impl From<FileFragment> for Fragment {
