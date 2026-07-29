@@ -10,6 +10,12 @@ use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FtsSearchParams {
+    /// Controls result completeness for each recursively planned FTS node.
+    ///
+    /// `Some(k)` permits bounded top-k execution, while `None` requires complete
+    /// results so an outer compound query can combine every candidate exactly.
+    /// Future competitive-score pruning must use a separate planning contract
+    /// instead of inferring a bound from the ambient scanner limit.
     pub limit: Option<usize>,
     pub wand_factor: f32,
     pub fuzziness: Option<u32>,
