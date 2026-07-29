@@ -182,6 +182,29 @@ def test_scan_blob_as_binary(tmp_path):
     assert tbl.column("blobs").to_pylist() == values
 
 
+def test_sql_blob_as_binary(tmp_path):
+    values = [b"foo", b"bar", b"baz"]
+    table = pa.table(
+        [pa.array(values, pa.large_binary())],
+        schema=pa.schema(
+            [
+                pa.field(
+                    "blobs", pa.large_binary(), metadata={"lance-encoding:blob": "true"}
+                )
+            ]
+        ),
+    )
+    ds = lance.write_dataset(table, tmp_path / "test_ds")
+
+    batches = (
+        ds.sql("SELECT blobs FROM dataset")
+        .blob_handling("all_binary")
+        .build()
+        .to_batch_records()
+    )
+    assert pa.Table.from_batches(batches).column("blobs").to_pylist() == values
+
+
 def test_v2_0_blob_descriptor_projection_and_reads(tmp_path):
     values = [b"abc", b"defgh", b"ijklmnop"]
     blob_field = pa.field(
