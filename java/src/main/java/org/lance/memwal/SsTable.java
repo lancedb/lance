@@ -14,43 +14,32 @@
 package org.lance.memwal;
 
 import com.google.common.base.MoreObjects;
-import com.google.common.base.Preconditions;
 
-/**
- * Identifies a flushed MemWAL generation that has been merged into the base table.
- *
- * <p>Pass a list of these to {@link org.lance.merge.MergeInsertParams#markGenerationsAsMerged} so
- * Lance knows which generations are now part of the base table.
- */
-public class MergedGeneration {
-  private final String shardId;
+/** An SSTable and the storage path of its Lance files. */
+public class SsTable {
   private final long generation;
+  private final String path;
 
-  /**
-   * @param shardId UUID string for the write shard
-   * @param generation generation number from {@link ShardSnapshot#flushedGenerations()}
-   */
-  public MergedGeneration(String shardId, long generation) {
-    Preconditions.checkNotNull(shardId, "shardId must not be null");
-    this.shardId = shardId;
+  public SsTable(long generation, String path) {
     this.generation = generation;
+    this.path = path;
   }
 
-  /** UUID string for the write shard. */
-  public String shardId() {
-    return shardId;
-  }
-
-  /** The merged generation number. */
+  /** The generation number of this SSTable. */
   public long generation() {
     return generation;
+  }
+
+  /** The storage path of the SSTable Lance files. */
+  public String path() {
+    return path;
   }
 
   @Override
   public String toString() {
     return MoreObjects.toStringHelper(this)
-        .add("shardId", shardId)
         .add("generation", generation)
+        .add("path", path)
         .toString();
   }
 }

@@ -30,12 +30,12 @@ pub const ROW_ADDRESS_COLUMN: &str = "_rowaddr";
 /// ExecutionPlan node that scans all visible batches from a MemTable.
 ///
 /// This node implements visibility filtering, returning only batches
-/// where `batch_position <= max_visible_batch_position`.
+/// where `batch_position <= visible_count`.
 ///
 /// Supports filter pushdown for efficient predicate evaluation during scan.
 pub struct MemTableScanExec {
     batch_store: Arc<BatchStore>,
-    max_visible_batch_position: usize,
+    visible_count: usize,
     projection: Option<Vec<usize>>,
     output_schema: SchemaRef,
     /// Schema of the source data (before projection), used for filter evaluation.
@@ -55,10 +55,7 @@ pub struct MemTableScanExec {
 impl Debug for MemTableScanExec {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MemTableScanExec")
-            .field(
-                "max_visible_batch_position",
-                &self.max_visible_batch_position,
-            )
+            .field("visible_count", &self.visible_count)
             .field("projection", &self.projection)
             .field("with_row_id", &self.with_row_id)
             .field("with_row_address", &self.with_row_address)
@@ -73,20 +70,20 @@ impl MemTableScanExec {
     /// # Arguments
     ///
     /// * `batch_store` - Lock-free batch store containing data
-    /// * `max_visible_batch_position` - Maximum batch position visible (inclusive)
+    /// * `visible_count` - Maximum batch position visible (inclusive)
     /// * `projection` - Optional column indices to project
     /// * `output_schema` - Schema after projection (should include _rowid/_rowaddr if requested)
     /// * `with_row_id` - Whether to include _rowid column (row position)
     pub fn new(
         batch_store: Arc<BatchStore>,
-        max_visible_batch_position: usize,
+        visible_count: usize,
         projection: Option<Vec<usize>>,
         output_schema: SchemaRef,
         with_row_id: bool,
     ) -> Self {
         Self::with_filter(
             batch_store,
-            max_visible_batch_position,
+            visible_count,
             projection,
             output_schema.clone(),
             output_schema,
@@ -102,7 +99,7 @@ impl MemTableScanExec {
     /// # Arguments
     ///
     /// * `batch_store` - Lock-free batch store containing data
-    /// * `max_visible_batch_position` - Maximum batch position visible (inclusive)
+    /// * `visible_count` - Maximum batch position visible (inclusive)
     /// * `projection` - Optional column indices to project
     /// * `output_schema` - Schema after projection (should include _rowid/_rowaddr if requested)
     /// * `source_schema` - Schema of source data (before projection), used for filter evaluation
@@ -113,7 +110,7 @@ impl MemTableScanExec {
     #[allow(clippy::too_many_arguments)]
     pub fn with_filter(
         batch_store: Arc<BatchStore>,
-        max_visible_batch_position: usize,
+        visible_count: usize,
         projection: Option<Vec<usize>>,
         output_schema: SchemaRef,
         source_schema: SchemaRef,
@@ -131,7 +128,7 @@ impl MemTableScanExec {
 
         Self {
             batch_store,
-            max_visible_batch_position,
+            visible_count,
             projection,
             output_schema,
             source_schema,
@@ -221,7 +218,7 @@ impl ExecutionPlan for MemTableScanExec {
         // Get visible batches with their row offsets
         let batches_with_offsets = self
             .batch_store
-            .visible_batches_with_offsets(self.max_visible_batch_position);
+            .visible_batches_with_offsets(self.visible_count);
 
         let projection = self.projection.clone();
         let schema = self.output_schema.clone();
@@ -394,7 +391,7 @@ mod tests {
         batch_store.append(batch).unwrap();
 
         // Batch is at position 0, max_visible=0 means position 0 is visible
-        let exec = MemTableScanExec::new(batch_store, 0, None, schema, false);
+        let exec = MemTableScanExec::new(batch_store, 1, None, schema, false);
 
         let ctx = Arc::new(TaskContext::default());
         let stream = exec.execute(0, ctx).unwrap();
@@ -420,8 +417,8 @@ mod tests {
             .append(create_test_batch(&schema, 20, 10))
             .unwrap();
 
-        // max_visible_batch_position=1 means positions 0 and 1 are visible (2 batches)
-        let exec = MemTableScanExec::new(batch_store.clone(), 1, None, schema.clone(), false);
+        // visible_count=1 means positions 0 and 1 are visible (2 batches)
+        let exec = MemTableScanExec::new(batch_store.clone(), 2, None, schema.clone(), false);
         let ctx = Arc::new(TaskContext::default());
         let stream = exec.execute(0, ctx).unwrap();
         let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
@@ -442,7 +439,7 @@ mod tests {
         // Project only "id" column (index 0)
         let projected_schema =
             Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
-        let exec = MemTableScanExec::new(batch_store, 0, Some(vec![0]), projected_schema, false);
+        let exec = MemTableScanExec::new(batch_store, 1, Some(vec![0]), projected_schema, false);
 
         let ctx = Arc::new(TaskContext::default());
         let stream = exec.execute(0, ctx).unwrap();
@@ -459,7 +456,7 @@ mod tests {
         let batch_store = Arc::new(BatchStore::with_capacity(100));
 
         // Empty store with max_visible=0 should return no batches
-        let exec = MemTableScanExec::new(batch_store, 0, None, schema, false);
+        let exec = MemTableScanExec::new(batch_store, 1, None, schema, false);
 
         let ctx = Arc::new(TaskContext::default());
         let stream = exec.execute(0, ctx).unwrap();
@@ -481,7 +478,7 @@ mod tests {
             .unwrap();
 
         // max_visible=1 means positions 0 and 1 are visible
-        let exec = MemTableScanExec::new(batch_store, 1, None, schema, false);
+        let exec = MemTableScanExec::new(batch_store, 2, None, schema, false);
 
         let stats = exec.partition_statistics(None).unwrap();
         // Statistics are Absent to avoid DataFusion analysis bugs
@@ -508,7 +505,7 @@ mod tests {
             Field::new("_rowid", DataType::UInt64, true),
         ]));
 
-        let exec = MemTableScanExec::new(batch_store, 1, None, schema_with_rowid, true);
+        let exec = MemTableScanExec::new(batch_store, 2, None, schema_with_rowid, true);
 
         let ctx = Arc::new(TaskContext::default());
         let stream = exec.execute(0, ctx).unwrap();

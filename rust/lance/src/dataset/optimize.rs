@@ -88,7 +88,7 @@ use std::ops::{AddAssign, Range};
 use std::sync::Arc;
 
 use super::fragment::FileFragment;
-use super::index::DatasetIndexRemapperOptions;
+use super::index::{DatasetIndexRemapperOptions, load_indices_for_remapping};
 use super::rowids::load_row_id_sequences;
 use super::transaction::{
     Operation, RewriteGroup, RewrittenIndex, Transaction, TransactionBuilder,
@@ -971,32 +971,13 @@ impl CompactionPlan {
 
 /// Classification for one blob v2 row during compaction.
 ///
-/// - `Null`: NULL row or Inline blob with position=0 and size=0.
+/// - `Null`: NULL row.
 /// - `External`: External blob referenced by URI.
 /// - `DataBlob`: Inline/Packed/Dedicated blob stored in Lance files.
 enum RowClass {
     Null,
     External,
     DataBlob,
-}
-
-/// Check if a row is a null Inline blob.
-///
-/// This matches `BlobV2StructuralEncoder`'s behavior of encoding null rows as
-/// Inline with position=0 and size=0, and `collect_blob_entries_v2`'s behavior
-/// of skipping them.
-fn is_inline_null_blob(
-    kind: BlobKind,
-    position_col: &arrow::array::UInt64Array,
-    size_col: &arrow::array::UInt64Array,
-    index: usize,
-) -> bool {
-    if kind != BlobKind::Inline {
-        return false;
-    }
-    let position_is_empty = position_col.is_null(index) || position_col.value(index) == 0;
-    let size_is_empty = size_col.is_null(index) || size_col.value(index) == 0;
-    position_is_empty && size_is_empty
 }
 
 /// Column views for the 5 fields in a blob v2 descriptor struct.
@@ -1095,8 +1076,6 @@ fn classify_rows(
             })?;
             if kind == BlobKind::External {
                 row_classes.push(RowClass::External);
-            } else if is_inline_null_blob(kind, descriptor.position_col, descriptor.size_col, i) {
-                row_classes.push(RowClass::Null);
             } else {
                 row_classes.push(RowClass::DataBlob);
                 blob_read_addrs.push(row_addrs.value(i));
@@ -1172,7 +1151,13 @@ async fn build_user_view_struct(
                 }
             }
             RowClass::DataBlob => {
-                let data = blob_files[blob_file_idx].read().await?;
+                let blob_file = blob_files[blob_file_idx].as_ref().ok_or_else(|| {
+                    Error::internal(format!(
+                        "Non-null blob row {} in column '{}' resolved to null",
+                        i, column_name
+                    ))
+                })?;
+                let data = blob_file.read().await?;
                 blob_file_idx += 1;
                 data_builder.append_value(data.as_ref());
                 uri_builder.append_null();
@@ -1194,10 +1179,11 @@ async fn build_user_view_struct(
     )?)
 }
 
-async fn transform_blob_v2_batch(
+pub(crate) async fn transform_blob_v2_batch(
     dataset: &Arc<Dataset>,
     schema: &lance_core::datatypes::Schema,
     batch: RecordBatch,
+    keep_row_addr: bool,
 ) -> Result<RecordBatch> {
     let row_addr_idx = batch
         .schema()
@@ -1221,7 +1207,7 @@ async fn transform_blob_v2_batch(
 
     let batch_schema = batch.schema();
     for (col_idx, field) in batch_schema.fields().iter().enumerate() {
-        if field.name() == lance_core::ROW_ADDR {
+        if field.name() == lance_core::ROW_ADDR && !keep_row_addr {
             continue;
         }
 
@@ -1245,6 +1231,15 @@ async fn transform_blob_v2_batch(
                     batch.column(col_idx).data_type()
                 ))
             })?;
+
+        // Merge-insert may supply a blob v2 value directly from the source.
+        // Those values are already in the writer's user view and do not refer
+        // to a row in the target dataset, unlike descriptor values from scans.
+        if struct_arr.column_by_name("kind").is_none() {
+            new_columns.push(batch.column(col_idx).clone());
+            new_fields.push(field.clone());
+            continue;
+        }
 
         let column_name = field.name();
         let descriptor = BlobV2Descriptor::try_from_struct(struct_arr, column_name)?;
@@ -1450,35 +1445,57 @@ impl CandidateBin {
     }
 
     /// Split into one or more bins with at least `min_num_rows` in them.
-    fn split_for_size(mut self, min_num_rows: usize) -> Vec<Self> {
-        let mut bins = Vec::new();
+    fn split_for_size(self, min_num_rows: usize) -> Vec<Self> {
+        let total_rows = self.row_counts.iter().sum::<usize>();
+        let mut remaining_rows = total_rows;
+        let mut current_rows = 0;
+        let mut current_len = 0;
+        let mut split_lengths = Vec::new();
 
-        loop {
-            let mut bin_len = 0;
-            let mut bin_row_count = 0;
-            while bin_row_count < min_num_rows && bin_len < self.row_counts.len() {
-                bin_row_count += self.row_counts[bin_len];
-                bin_len += 1;
-            }
+        for row_count in &self.row_counts {
+            current_rows += *row_count;
+            current_len += 1;
+            remaining_rows -= *row_count;
 
-            // If there's enough remaining to make another worthwhile bin, then
-            // push what we have as a bin.
-            if self.row_counts[bin_len..].iter().sum::<usize>() >= min_num_rows {
-                bins.push(Self {
-                    fragments: self.fragments.drain(0..bin_len).collect(),
-                    pos_range: self.pos_range.start..(self.pos_range.start + bin_len),
-                    candidacy: self.candidacy.drain(0..bin_len).collect(),
-                    row_counts: self.row_counts.drain(0..bin_len).collect(),
-                    // By the time we are splitting for size we are done considering indices
-                    indices: Vec::new(),
-                });
-                self.pos_range.start += bin_len;
-            } else {
-                // Otherwise, just push the remaining fragments into the last bin
-                bins.push(self);
-                break;
+            // Only split once the current bin is large enough and there is
+            // enough left over to form another worthwhile non-empty bin.
+            if current_rows >= min_num_rows && remaining_rows > 0 && remaining_rows >= min_num_rows
+            {
+                split_lengths.push(current_len);
+                current_rows = 0;
+                current_len = 0;
             }
         }
+
+        if split_lengths.is_empty() {
+            return vec![self];
+        }
+
+        let mut bins = Vec::with_capacity(split_lengths.len() + 1);
+        let mut fragments = self.fragments.into_iter();
+        let mut candidacy = self.candidacy.into_iter();
+        let mut row_counts = self.row_counts.into_iter();
+        let mut pos_start = self.pos_range.start;
+
+        for bin_len in split_lengths {
+            bins.push(Self {
+                fragments: fragments.by_ref().take(bin_len).collect(),
+                pos_range: pos_start..(pos_start + bin_len),
+                candidacy: candidacy.by_ref().take(bin_len).collect(),
+                row_counts: row_counts.by_ref().take(bin_len).collect(),
+                // By the time we are splitting for size we are done considering indices
+                indices: Vec::new(),
+            });
+            pos_start += bin_len;
+        }
+
+        bins.push(Self {
+            fragments: fragments.collect(),
+            pos_range: pos_start..self.pos_range.end,
+            candidacy: candidacy.collect(),
+            row_counts: row_counts.collect(),
+            indices: self.indices,
+        });
 
         bins
     }
@@ -1608,8 +1625,13 @@ async fn rewrite_files(
         .iter()
         .map(|f| f.physical_rows.unwrap() as u64)
         .sum::<u64>();
-    // If we aren't using stable row ids, then we need to remap indices.
-    let needs_remapping = !dataset.manifest.uses_stable_row_ids();
+    // Capturing row addresses is only useful if something will consume them:
+    // an index to remap now, or a deferred remap through the FRI.
+    let capture_row_addrs = !dataset.manifest.uses_stable_row_ids()
+        && (options.defer_index_remap
+            || load_indices_for_remapping(dataset.as_ref())
+                .await?
+                .is_some());
     let mut new_fragments: Vec<Fragment>;
     let task_id = uuid::Uuid::new_v4();
     log::info!(
@@ -1635,7 +1657,7 @@ async fn rewrite_files(
             options.batch_size,
             options.io_buffer_size,
             true,
-            needs_remapping,
+            capture_row_addrs,
         )
         .await?;
         row_ids_rx = rx_initial;
@@ -1660,7 +1682,7 @@ async fn rewrite_files(
                 let schema = dataset_schema.clone();
                 async move {
                     let batch = batch_result?;
-                    transform_blob_v2_batch(&dataset, &schema, batch)
+                    transform_blob_v2_batch(&dataset, &schema, batch, false)
                         .await
                         .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))
                 }
@@ -1739,7 +1761,7 @@ async fn rewrite_files(
             ));
         }
 
-        if needs_remapping {
+        if capture_row_addrs {
             let (tx, rx) = std::sync::mpsc::channel();
             let mut addrs = RoaringTreemap::new();
             for frag in &fragments {
@@ -2009,8 +2031,17 @@ pub async fn commit_compaction(
         return Ok(CompactionMetrics::default());
     }
 
-    // If we aren't using stable row ids, then we need to remap indices.
-    let needs_remapping = !dataset.manifest.uses_stable_row_ids() && !options.defer_index_remap;
+    let has_address_style = completed_tasks.iter().any(|t| t.row_addrs.is_some());
+    // Address-style results require immediate index remapping unless it is deferred.
+    let needs_remapping =
+        !dataset.manifest.uses_stable_row_ids() && !options.defer_index_remap && has_address_style;
+
+    // Confirm there is a remapper before materializing the potentially very large row address map.
+    let index_remapper = if needs_remapping {
+        remap_options.create_remapper(dataset).await?
+    } else {
+        None
+    };
 
     // Determine the earliest version at which compaction tasks were planned/executed.
     //
@@ -2034,7 +2065,6 @@ pub async fn commit_compaction(
     let mut completed_tasks = completed_tasks;
 
     // Single reserve_fragment_ids for all address-style tasks
-    let has_address_style = completed_tasks.iter().any(|t| t.row_addrs.is_some());
     if has_address_style {
         let frags: Vec<&mut Fragment> = completed_tasks
             .iter_mut()
@@ -2084,7 +2114,7 @@ pub async fn commit_compaction(
             new_fragments: task.new_fragments.clone(),
         };
 
-        if needs_remapping {
+        if index_remapper.is_some() {
             if let Some(row_addrs_bytes) = task.row_addrs {
                 let row_addrs =
                     RoaringTreemap::deserialize_from(&mut Cursor::new(&row_addrs_bytes))?;
@@ -2151,8 +2181,7 @@ pub async fn commit_compaction(
         rewrite_groups.push(rewrite_group);
     }
 
-    let rewritten_indices = if needs_remapping {
-        let index_remapper = remap_options.create_remapper(dataset)?;
+    let rewritten_indices = if let Some(index_remapper) = index_remapper {
         let affected_ids = rewrite_groups
             .iter()
             .flat_map(|group| group.old_fragments.iter().map(|frag| frag.id))
@@ -2340,6 +2369,33 @@ mod tests {
         assert_eq!(split[0].pos_range, 0..2);
         assert_eq!(split[1].pos_range, 2..5);
         assert_eq!(split[2].pos_range, 5..8);
+
+        let zero_min_split_bin = CandidateBin {
+            fragments: std::iter::repeat_n(
+                Fragment {
+                    id: 0,
+                    files: vec![],
+                    overlays: vec![],
+                    deletion_file: None,
+                    row_id_meta: None,
+                    physical_rows: Some(0),
+                    last_updated_at_version_meta: None,
+                    created_at_version_meta: None,
+                },
+                3,
+            )
+            .collect(),
+            pos_range: 0..3,
+            candidacy: std::iter::repeat_n(CompactionCandidacy::CompactItself, 3).collect(),
+            row_counts: vec![100, 200, 300],
+            indices: vec![],
+        };
+        let split = zero_min_split_bin.split_for_size(0);
+        assert_eq!(split.len(), 3);
+        assert!(split.iter().all(|bin| !bin.fragments.is_empty()));
+        assert_eq!(split[0].pos_range, 0..1);
+        assert_eq!(split[1].pos_range, 1..2);
+        assert_eq!(split[2].pos_range, 2..3);
     }
 
     fn sample_data() -> RecordBatch {
@@ -2448,9 +2504,10 @@ mod tests {
         }
     }
 
+    #[async_trait]
     impl IndexRemapperOptions for MockIndexRemapper {
-        fn create_remapper(&self, _: &Dataset) -> Result<Box<dyn IndexRemapper>> {
-            Ok(Box::new(self.clone()))
+        async fn create_remapper(&self, _: &Dataset) -> Result<Option<Box<dyn IndexRemapper>>> {
+            Ok(Some(Box::new(self.clone())))
         }
     }
 
@@ -2586,7 +2643,7 @@ mod tests {
             .unwrap();
         assert_eq!(blobs.len(), expected_payload.len());
         for (blob, expected) in blobs.iter().zip(expected_payload.iter()) {
-            let bytes = blob.read().await.unwrap();
+            let bytes = blob.as_ref().unwrap().read().await.unwrap();
             assert_eq!(bytes.as_ref(), expected.as_slice());
         }
     }
@@ -2979,9 +3036,70 @@ mod tests {
         }
     }
 
+    #[async_trait]
     impl IndexRemapperOptions for IgnoreRemap {
-        fn create_remapper(&self, _: &Dataset) -> Result<Box<dyn IndexRemapper>> {
-            Ok(Box::new(Self {}))
+        async fn create_remapper(&self, _: &Dataset) -> Result<Option<Box<dyn IndexRemapper>>> {
+            Ok(None)
+        }
+    }
+
+    #[rstest]
+    #[case::without_index(false)]
+    #[case::with_index(true)]
+    #[tokio::test]
+    async fn test_row_addrs_only_used_with_remappable_index(#[case] has_index: bool) {
+        let data = sample_data();
+        let reader = RecordBatchIterator::new(vec![Ok(data.slice(0, 9_000))], data.schema());
+        let mut dataset = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 3_000,
+                data_storage_version: Some(LanceFileVersion::Legacy),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        if has_index {
+            create_scalar_index(&mut dataset, "a", false).await;
+        }
+
+        let options = CompactionOptions {
+            target_rows_per_fragment: 9_000,
+            ..Default::default()
+        };
+        let plan = plan_compaction(&dataset, &options).await.unwrap();
+        assert_eq!(plan.tasks().len(), 1);
+
+        let mut result = rewrite_files(Cow::Borrowed(&dataset), plan.tasks()[0].clone(), &options)
+            .await
+            .unwrap();
+        assert_eq!(result.row_addrs.is_some(), has_index);
+
+        if has_index {
+            let row_addrs_bytes = result
+                .row_addrs
+                .as_ref()
+                .expect("indexed compaction should capture row addresses");
+            let row_addrs =
+                RoaringTreemap::deserialize_from(&mut Cursor::new(row_addrs_bytes)).unwrap();
+            assert_eq!(row_addrs.len(), 9_000);
+        } else {
+            // Simulate a stale worker result that captured row addresses before the
+            // dataset no longer needed a remapper. Invalid bytes ensure the commit
+            // does not attempt to deserialize or materialize the unused map.
+            result.row_addrs = Some(b"not a roaring treemap".to_vec());
+            commit_compaction(
+                &mut dataset,
+                vec![result],
+                Arc::new(DatasetIndexRemapperOptions::default()),
+                &options,
+            )
+            .await
+            .unwrap();
+            assert_eq!(dataset.get_fragments().len(), 1);
         }
     }
 
@@ -3322,17 +3440,10 @@ mod tests {
         dataset.delete("i < 500").await.unwrap();
         dataset2.delete("i < 500").await.unwrap();
 
-        // Create a scalar index to check this is not touched
-        dataset
-            .create_index(
-                &["i"],
-                IndexType::Scalar,
-                Some("scalar".into()),
-                &ScalarIndexParams::default(),
-                false,
-            )
-            .await
-            .unwrap();
+        // Create the same scalar index on both datasets so deferred and immediate
+        // remapping are compared under the same conditions.
+        create_scalar_index(&mut dataset, "i", false).await;
+        create_scalar_index(&mut dataset2, "i", false).await;
 
         // Verify the initial state - no fragment reuse index should exist
         let initial_indices = dataset.load_indices().await.unwrap();
@@ -7171,14 +7282,128 @@ mod tests {
             let row_id = row_ids.value(i);
             let id = ids.value(i);
             let blobs = dataset.take_blobs(&[row_id], column).await.unwrap();
-            if blobs.is_empty() {
-                result.push((id, None));
-            } else {
-                let data = blobs[0].read().await.unwrap();
-                result.push((id, Some(data.to_vec())));
+            match blobs.into_iter().next().flatten() {
+                Some(blob) => {
+                    let data = blob.read().await.unwrap();
+                    result.push((id, Some(data.to_vec())));
+                }
+                None => result.push((id, None)),
             }
         }
         result
+    }
+
+    fn mixed_blob_values() -> Vec<(i32, Option<Vec<u8>>)> {
+        vec![
+            (0, Some(vec![b'0'; 80])),
+            (1, None),
+            (2, Some(Vec::new())),
+            (3, Some(vec![b'3'; 80])),
+            (4, Some(vec![b'4'; 80])),
+            (5, Some(vec![b'5'; 80])),
+        ]
+    }
+
+    async fn assert_compaction_preserves_blob_values(
+        mut dataset: Dataset,
+        expected: &[(i32, Option<Vec<u8>>)],
+    ) {
+        assert_eq!(dataset.get_fragments().len(), 3);
+
+        let mut before = read_blob_bytes_by_index(&Arc::new(dataset.clone()), "blob").await;
+        before.sort_by_key(|(id, _)| *id);
+        assert_eq!(before, expected);
+
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 1024 * 1024,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(dataset.get_fragments().len(), 1);
+
+        let mut after = read_blob_bytes_by_index(&Arc::new(dataset), "blob").await;
+        after.sort_by_key(|(id, _)| *id);
+        assert_eq!(after, expected);
+    }
+
+    #[tokio::test]
+    async fn test_compact_blob_v1_preserves_null_empty_and_payload_order() {
+        let test_dir = TempStrDir::default();
+        let expected = mixed_blob_values();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("blob", DataType::LargeBinary, true)
+                .with_metadata([(BLOB_META_KEY.to_string(), "true".to_string())].into()),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..expected.len() as i32)),
+                Arc::new(LargeBinaryArray::from_iter(
+                    expected.iter().map(|(_, value)| value.as_deref()),
+                )),
+            ],
+        )
+        .unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &test_dir,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_0),
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_compaction_preserves_blob_values(dataset, &expected).await;
+    }
+
+    #[tokio::test]
+    async fn test_compact_blob_v2_preserves_null_empty_and_payload_order() {
+        use crate::BlobArrayBuilder;
+
+        let test_dir = TempStrDir::default();
+        let expected = mixed_blob_values();
+        let mut blob_builder = BlobArrayBuilder::new(expected.len());
+        for (_, value) in &expected {
+            match value {
+                Some(value) => blob_builder.push_bytes(value).unwrap(),
+                None => blob_builder.push_null().unwrap(),
+            }
+        }
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            crate::blob_field("blob", true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..expected.len() as i32)),
+                blob_builder.finish().unwrap(),
+            ],
+        )
+        .unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &test_dir,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_compaction_preserves_blob_values(dataset, &expected).await;
     }
 
     #[tokio::test]

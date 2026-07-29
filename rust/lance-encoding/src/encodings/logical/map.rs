@@ -223,7 +223,8 @@ impl StructuralDecodeArrayTask for StructuralMapDecodeTask {
             .clone();
 
         // Build the MapArray from offsets, entries, validity, and keys_sorted
-        let map_array = MapArray::new(entries_field, offsets, entries, validity, keys_sorted);
+        let map_array = MapArray::try_new(entries_field, offsets, entries, validity, keys_sorted)
+            .map_err(|error| Error::invalid_input_source(error.to_string().into()))?;
 
         Ok(DecodedArray {
             array: Arc::new(map_array),
@@ -244,13 +245,21 @@ mod tests {
     use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, Fields};
 
+    use crate::decoder::{DecodedArray, StructuralDecodeArrayTask};
     use crate::encoder::{ColumnIndexSequence, EncodingOptions, default_encoding_strategy};
+    use crate::encodings::logical::primitive::sparse::{
+        SparseCountSet, SparsePositionSet, SparseStructuralLayerPlan, SparseStructuralPlan,
+        SparseValidityMeaning, SparseValiditySet,
+    };
+    use crate::repdef::{CompositeRepDefUnraveler, RepDefUnraveler};
     use crate::{
         testing::{TestCases, check_round_trip_encoding_of_data},
         version::LanceFileVersion,
     };
     use arrow_schema::Field as ArrowField;
     use lance_core::datatypes::Field as LanceField;
+
+    use super::StructuralMapDecodeTask;
 
     fn make_map_type(key_type: DataType, value_type: DataType) -> DataType {
         // Note: Arrow MapBuilder uses "keys" and "values" as field names (plural)
@@ -263,6 +272,70 @@ mod tests {
             false,
         );
         DataType::Map(Arc::new(entries), false)
+    }
+
+    #[derive(Debug)]
+    struct StaticMapEntriesTask {
+        entries: StructArray,
+        repdef: CompositeRepDefUnraveler,
+    }
+
+    impl StructuralDecodeArrayTask for StaticMapEntriesTask {
+        fn decode(self: Box<Self>) -> lance_core::Result<DecodedArray> {
+            let Self { entries, repdef } = *self;
+            Ok(DecodedArray {
+                array: Arc::new(entries),
+                repdef,
+                data_size: 0,
+            })
+        }
+    }
+
+    #[test]
+    fn malformed_sparse_map_entries_return_invalid_input() {
+        let entry_fields = Fields::from(vec![
+            Field::new("keys", DataType::Int32, false),
+            Field::new("values", DataType::Int32, true),
+        ]);
+        let entries = StructArray::try_new(
+            entry_fields.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(Int32Array::from(vec![2])),
+            ],
+            Some(NullBuffer::from(vec![false])),
+        )
+        .unwrap();
+        let validity = SparseValiditySet {
+            meaning: SparseValidityMeaning::NullPositions,
+            positions: SparsePositionSet::Empty,
+        };
+        let plan = SparseStructuralPlan {
+            layers: vec![SparseStructuralLayerPlan::List {
+                num_slots: 1,
+                num_child_slots: 1,
+                non_empty_positions: SparsePositionSet::All { len: 1 },
+                counts: SparseCountSet::Constant { value: 1, len: 1 },
+                validity,
+            }],
+            num_items: 1,
+            num_visible_items: 1,
+        };
+        let child_task = StaticMapEntriesTask {
+            entries,
+            repdef: CompositeRepDefUnraveler::new(vec![RepDefUnraveler::new_sparse(plan)]),
+        };
+        let map_type = DataType::Map(
+            Arc::new(Field::new("entries", DataType::Struct(entry_fields), false)),
+            false,
+        );
+
+        let Err(err) =
+            Box::new(StructuralMapDecodeTask::new(Box::new(child_task), map_type)).decode()
+        else {
+            panic!("expected malformed map entries to be rejected");
+        };
+        assert!(matches!(err, lance_core::Error::InvalidInput { .. }));
     }
 
     #[test_log::test(tokio::test)]

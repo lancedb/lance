@@ -1200,7 +1200,12 @@ impl InnerBuilder {
         let batch = docs.to_batch()?;
         let mut writer = store.new_index_file(path, batch.schema()).await?;
         writer.write_record_batch(batch).await?;
-        writer.finish().await
+        writer
+            .finish_with_metadata(HashMap::from([(
+                super::documents::TOTAL_TOKENS_KEY.to_owned(),
+                docs.total_tokens_num().to_string(),
+            )]))
+            .await
     }
 }
 
@@ -1820,16 +1825,16 @@ pub(crate) fn inverted_list_schema_for_version_with_block_size_and_impacts(
         InvertedListFormatVersion::V1 => {
             inverted_list_schema_v1(with_position, block_size, with_impacts)
         }
-        InvertedListFormatVersion::V2
-        | InvertedListFormatVersion::V3
-        | InvertedListFormatVersion::V4 => inverted_list_schema_with_tail_codec_and_position_codec(
-            with_position,
-            format_version,
-            PostingTailCodec::VarintDelta,
-            Some(PositionStreamCodec::PackedDelta),
-            block_size,
-            with_impacts,
-        ),
+        InvertedListFormatVersion::V2 | InvertedListFormatVersion::V3 => {
+            inverted_list_schema_with_tail_codec_and_position_codec(
+                with_position,
+                format_version,
+                PostingTailCodec::VarintDelta,
+                Some(PositionStreamCodec::PackedDelta),
+                block_size,
+                with_impacts,
+            )
+        }
     }
 }
 
@@ -2927,7 +2932,7 @@ mod tests {
         assert_eq!(written_partitions, remapped_partitions);
         assert_eq!(
             parse_format_version_from_metadata(metadata)?,
-            InvertedListFormatVersion::V4
+            InvertedListFormatVersion::V2
         );
 
         for (new_id, old_id) in expected_partitions.iter().enumerate() {
@@ -3452,6 +3457,39 @@ mod tests {
         assert_eq!(builder.posting_tail_codec, PostingTailCodec::VarintDelta);
     }
 
+    #[test]
+    fn test_v3_128_reuses_v2_physical_layout() {
+        for with_position in [false, true] {
+            for with_impacts in [false, true] {
+                let v2 = inverted_list_schema_for_version_with_block_size_and_impacts(
+                    with_position,
+                    InvertedListFormatVersion::V2,
+                    LEGACY_BLOCK_SIZE,
+                    with_impacts,
+                );
+                let v3 = inverted_list_schema_for_version_with_block_size_and_impacts(
+                    with_position,
+                    InvertedListFormatVersion::V3,
+                    LEGACY_BLOCK_SIZE,
+                    with_impacts,
+                );
+
+                assert_eq!(v2.fields(), v3.fields());
+                let mut v2_metadata = v2.metadata.clone();
+                let mut v3_metadata = v3.metadata.clone();
+                assert_eq!(
+                    v2_metadata.remove(FTS_FORMAT_VERSION_KEY).as_deref(),
+                    Some("2")
+                );
+                assert_eq!(
+                    v3_metadata.remove(FTS_FORMAT_VERSION_KEY).as_deref(),
+                    Some("3")
+                );
+                assert_eq!(v2_metadata, v3_metadata);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn test_inverted_index_without_positions_tracks_frequency() -> Result<()> {
         let index_dir = TempDir::default();
@@ -3532,8 +3570,9 @@ mod tests {
             .await?;
 
         let index = InvertedIndex::load(store, None, &LanceCache::no_cache()).await?;
-        let (total_tokens, num_docs, token_docs) =
-            index.bm25_stats_for_terms(&["hello".to_string()]).await?;
+        let (total_tokens, num_docs, token_docs) = index
+            .bm25_stats_for_terms(&["hello".to_string()], None)
+            .await?;
         assert_eq!(total_tokens, 1);
         assert_eq!(num_docs, 1);
         assert_eq!(token_docs, vec![1]);

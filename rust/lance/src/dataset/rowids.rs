@@ -6,6 +6,7 @@ use crate::session::caches::{RowIdIndexKey, RowIdSequenceKey};
 use crate::{Error, Result};
 use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::utils::deletion::DeletionVector;
+use lance_select::{RowAddrSelection, RowAddrTreeMap};
 use lance_table::{
     format::{Fragment, RowIdMeta},
     rowids::{FragmentRowIdIndex, RowIdIndex, RowIdSequence, read_row_ids},
@@ -85,6 +86,65 @@ pub async fn get_row_id_index(
     } else {
         Ok(None)
     }
+}
+
+/// Map a set of physical row addresses to their stable row ids
+///
+/// A fragment's [`RowIdSequence`] holds one id per physical row in offset order;
+/// deletions are tracked by the deletion vector and do not compact the sequence,
+/// so a physical offset indexes the sequence directly (see [`RowIdIndex`], which
+/// maps ids to `start_address + position` and filters deletions separately).
+/// Addresses that point at deleted rows have no live counterpart and are dropped,
+/// which is correct: those rows are not part of the answer.
+pub(crate) async fn translate_addr_treemap_to_row_ids(
+    dataset: &Dataset,
+    addrs: &RowAddrTreeMap,
+) -> Result<RowAddrTreeMap> {
+    let mut row_ids = RowAddrTreeMap::new();
+    for (fragment_id, selection) in addrs.iter() {
+        let file_fragment = dataset.get_fragment(*fragment_id as usize).ok_or_else(|| {
+            Error::internal(format!(
+                "fragment {fragment_id} referenced by an address-domain index result \
+                 was not found in the dataset"
+            ))
+        })?;
+        let sequence = load_row_id_sequence(dataset, file_fragment.metadata()).await?;
+
+        match selection {
+            RowAddrSelection::Full => {
+                // The whole fragment is selected: every live row's id qualifies.
+                row_ids |= RowAddrTreeMap::from(sequence.as_ref());
+            }
+            RowAddrSelection::Partial(offsets) => {
+                let deletion_vector = file_fragment.get_deletion_vector().await?;
+                for physical_offset in offsets.iter() {
+                    // A deletion does not compact the row id sequence; the deleted row keeps
+                    // its slot (the deletion vector tracks it separately). So a physical offset
+                    // is a direct index into the sequence, regardless of any deletions below it.
+                    // A stale offset that points at a deleted row has no live counterpart and is
+                    // not part of any answer, so it contributes no id to the block/take set.
+                    let deleted = deletion_vector
+                        .as_ref()
+                        .is_some_and(|dv| dv.contains(physical_offset));
+                    if deleted {
+                        continue;
+                    }
+                    // A selected offset with no sequence entry points past the fragment's rows.
+                    // Silently dropping it would let a stale index result escape masking, so
+                    // treat the mismatch as corruption.
+                    let id = sequence.get(physical_offset as usize).ok_or_else(|| {
+                        Error::internal(format!(
+                            "fragment_id={fragment_id} row-id sequence has no entry at \
+                             physical_offset={physical_offset} (sequence len={})",
+                            sequence.len()
+                        ))
+                    })?;
+                    row_ids.insert(id);
+                }
+            }
+        }
+    }
+    Ok(row_ids)
 }
 
 /// Resolve row addresses to row ids, positionally: `addr = (fragment << 32) | offset`
@@ -552,6 +612,53 @@ mod test {
         assert_eq!(index.get(3), Some(RowAddress::new_from_parts(1, 0)));
         // there is no new row id
         assert_eq!(index.get(5), None);
+    }
+
+    /// 100 sequential rows across 4 fragments with every third row deleted.
+    async fn deleted_thirds_dataset(enable_stable_row_ids: bool) -> Dataset {
+        let batch = sequence_batch(0..100);
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let write_params = WriteParams {
+            enable_stable_row_ids,
+            max_rows_per_file: 25,
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(reader, "memory://", Some(write_params))
+            .await
+            .unwrap();
+        dataset.delete("id % 3 = 0").await.unwrap();
+        dataset
+    }
+
+    #[rstest::rstest]
+    #[case::interleaved((0..100).collect(), (0..100).filter(|id| id % 3 != 0).collect())]
+    #[case::all_deleted(vec![0, 3, 9], vec![])]
+    #[case::all_live(vec![1, 2, 50, 98], vec![1, 2, 50, 98])]
+    #[tokio::test]
+    async fn test_filter_deleted_ids_with_stable_row_ids(
+        #[case] ids: Vec<u64>,
+        #[case] expected: Vec<u64>,
+    ) {
+        // Regression test for https://github.com/lance-format/lance/issues/7701:
+        // filter_deleted_ids must return exactly the live ids, in order.
+        // Sequential inserts, so stable row id == id column value.
+        let dataset = deleted_thirds_dataset(true).await;
+        assert_eq!(dataset.filter_deleted_ids(&ids).await.unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn test_filter_deleted_ids_without_stable_row_ids() {
+        // Non-stable: ids are row addresses; only deleted rows drop out.
+        let dataset = deleted_thirds_dataset(false).await;
+
+        // Row addresses: fragment (id / 25) << 32 | offset (id % 25).
+        let addr = |id: u64| (id / 25) << 32 | (id % 25);
+        let ids = (0..100).map(addr).collect::<Vec<u64>>();
+        let expected = (0..100)
+            .filter(|id| id % 3 != 0)
+            .map(addr)
+            .collect::<Vec<u64>>();
+        assert_eq!(dataset.filter_deleted_ids(&ids).await.unwrap(), expected);
     }
 
     fn build_rowid_to_i_map(row_ids: &UInt64Array, i_array: &Int32Array) -> HashMap<u64, i32> {

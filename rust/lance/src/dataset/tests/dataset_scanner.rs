@@ -11,11 +11,11 @@ use lance_arrow::{ARROW_EXT_NAME_KEY, FixedSizeListArrayExt};
 
 use crate::index::DatasetIndexExt;
 use arrow::compute::concat_batches;
-use arrow_array::UInt64Array;
 use arrow_array::cast::AsArray;
 use arrow_array::{Array, FixedSizeListArray, ListArray, StructArray};
 use arrow_array::{Float32Array, Int32Array, RecordBatch, RecordBatchIterator, StringArray};
-use arrow_buffer::{OffsetBuffer, ScalarBuffer};
+use arrow_array::{Int64Array, UInt64Array};
+use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema, SchemaRef};
 use futures::TryStreamExt;
 use lance_arrow::SchemaExt;
@@ -34,6 +34,7 @@ use lance_linalg::distance::MetricType;
 use uuid::Uuid;
 
 use crate::Dataset;
+use crate::dataset::NewColumnTransform;
 use crate::dataset::scanner::{DatasetRecordBatchStream, QueryFilter};
 use crate::dataset::write::WriteParams;
 use lance_index::scalar::inverted::query::FtsQuery;
@@ -41,6 +42,146 @@ use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::pq::PQBuildParams;
 use lance_index::vector::{DEFAULT_QUERY_PARALLELISM, Query};
 use pretty_assertions::assert_eq;
+
+/// A null struct must not read back as a valid struct with null children.
+///
+/// A scan merges the per-column batches with `lance_arrow::merge`, which used to read an all-null
+/// validity buffer as "this side carries no validity" and drop it. A filter that selects only null
+/// rows leaves exactly that shape, so the scan reported those rows as valid while `IS NULL`
+/// counted them as null. The dataset is created empty and then appended to because that is the
+/// path this was found on, and the version is pinned because 2.0 does not encode struct validity.
+#[tokio::test]
+async fn test_filtered_scan_preserves_nullable_struct_validity() {
+    let struct_fields = Fields::from(vec![
+        ArrowField::new("a", DataType::Int64, true),
+        ArrowField::new("b", DataType::Utf8, true),
+    ]);
+    let item_field = Arc::new(ArrowField::new(
+        "item",
+        DataType::Struct(struct_fields.clone()),
+        true,
+    ));
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::UInt64, false),
+        ArrowField::new("s", DataType::Struct(struct_fields.clone()), true),
+        ArrowField::new("l", DataType::List(item_field.clone()), true),
+    ]));
+
+    let empty = RecordBatch::new_empty(schema.clone());
+    let reader = RecordBatchIterator::new([Ok(empty)], schema.clone());
+    let mut dataset = Dataset::write(
+        reader,
+        "memory://",
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_1),
+            ..WriteParams::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    // Rows 100 and 177 are null in both nested columns while their children still carry values,
+    // so losing the top-level validity turns them into valid values instead of null ones.
+    let validity = NullBuffer::from(vec![false, true, false]);
+    let structs = StructArray::new(
+        struct_fields.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![Some(10), Some(11), Some(12)])),
+            Arc::new(StringArray::from(vec![Some("x"), Some("y"), Some("z")])),
+        ],
+        Some(validity.clone()),
+    );
+    let items = StructArray::new(
+        struct_fields.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![Some(20), Some(21), Some(22)])),
+            Arc::new(StringArray::from(vec![Some("p"), Some("q"), Some("r")])),
+        ],
+        None,
+    );
+    let lists = ListArray::new(
+        item_field,
+        OffsetBuffer::new(ScalarBuffer::from(vec![0, 1, 2, 3])),
+        Arc::new(items),
+        Some(validity),
+    );
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt64Array::from(vec![100, 116, 177])),
+            Arc::new(structs),
+            Arc::new(lists),
+        ],
+    )
+    .unwrap();
+    dataset
+        .append(
+            Box::new(RecordBatchIterator::new([Ok(batch)], schema)),
+            None,
+        )
+        .await
+        .unwrap();
+
+    for (id, expected_is_null) in [(100, true), (116, false), (177, true)] {
+        let mut scan = dataset.scan();
+        scan.filter(&format!("id = {id}")).unwrap();
+        let batch = scan.try_into_batch().await.unwrap();
+        let structs = batch["s"].as_struct();
+        assert_eq!(structs.is_null(0), expected_is_null, "s, row id {id}");
+        // A null struct masks its children, so both levels have to agree.
+        assert_eq!(
+            structs.column(0).is_null(0),
+            expected_is_null,
+            "s.a, row id {id}"
+        );
+        assert_eq!(
+            batch["l"].as_list::<i32>().is_null(0),
+            expected_is_null,
+            "l, row id {id}"
+        );
+    }
+
+    assert_eq!(
+        dataset
+            .count_rows(Some("s IS NULL".to_owned()))
+            .await
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        dataset
+            .count_rows(Some("l IS NULL".to_owned()))
+            .await
+            .unwrap(),
+        2
+    );
+
+    // A struct column added as all-nulls reaches the same merge through schema evolution, where
+    // every row is null and there is no other side to recover the validity from.
+    dataset
+        .add_columns(
+            NewColumnTransform::AllNulls(Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "t",
+                DataType::Struct(struct_fields),
+                true,
+            )]))),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let mut scan = dataset.scan();
+    scan.filter("id = 116").unwrap();
+    let batch = scan.try_into_batch().await.unwrap();
+    assert!(batch["t"].as_struct().is_null(0));
+    assert_eq!(
+        dataset
+            .count_rows(Some("t IS NULL".to_owned()))
+            .await
+            .unwrap(),
+        3
+    );
+}
 
 #[tokio::test]
 async fn test_scan_wide_fixed_size_list_at_batch_boundary() {

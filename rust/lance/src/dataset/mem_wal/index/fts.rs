@@ -1142,13 +1142,20 @@ impl FtsMemIndex {
     fn insert_batch(&self, batch: &RecordBatch, row_offset: u64) -> Result<()> {
         let st = self.state.load_full();
 
+        // A missing column is a config error, not an empty document: silently
+        // appending an empty batch would leave the index empty forever while the
+        // shard reported healthy. BTree and HNSW both reject this; so do we.
+        // `validate_index_configs` catches it at open, so reaching here means a
+        // batch got past the memtable's schema-equality gate.
         let Some(col_idx) = batch
             .schema()
             .column_with_name(&self.column_name)
             .map(|(idx, _)| idx)
         else {
-            // A missing column has no searchable documents.
-            return Ok(());
+            return Err(Error::invalid_input(format!(
+                "FTS index column '{}' is not in the inserted batch schema",
+                self.column_name
+            )));
         };
 
         let column = batch.column(col_idx);
