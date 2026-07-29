@@ -10,8 +10,8 @@ use arrow_array::{
 };
 use arrow_schema::DataType;
 use lance::Dataset;
-use lance::dataset::{InsertBuilder, WriteParams};
 use lance::dataset::optimize::{CompactionOptions, compact_files};
+use lance::dataset::{InsertBuilder, WriteParams};
 
 use lance::index::DatasetIndexExt;
 use lance_datagen::{ArrayGeneratorExt, RowCount, array, gen_batch};
@@ -540,8 +540,7 @@ async fn test_zone_map_null_index_used() {
     ];
     let value_array = Arc::new(StringArray::from(string_values)) as ArrayRef;
     let id_array = Arc::new(Int32Array::from((0..10).collect::<Vec<i32>>())) as ArrayRef;
-    let batch =
-        RecordBatch::try_from_iter(vec![("id", id_array), ("value", value_array)]).unwrap();
+    let batch = RecordBatch::try_from_iter(vec![("id", id_array), ("value", value_array)]).unwrap();
 
     let mut ds = InsertBuilder::new("memory://")
         .execute(vec![batch])
