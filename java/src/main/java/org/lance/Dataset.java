@@ -1168,8 +1168,7 @@ public class Dataset implements Closeable {
       Optional<Integer> batchReadHead,
       IndexBuildProgress progress) {
     Preconditions.checkNotNull(progress, "progress cannot be null");
-    innerMergeIndexMetadataWithProgress(
-        indexUUID, indexType.getValue(), batchReadHead, progress);
+    innerMergeIndexMetadataWithProgress(indexUUID, indexType.getValue(), batchReadHead, progress);
   }
 
   private native void innerMergeIndexMetadataWithProgress(

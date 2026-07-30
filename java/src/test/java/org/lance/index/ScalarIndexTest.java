@@ -66,12 +66,7 @@ public class ScalarIndexTest {
     @Override
     public void stageStart(String stage, Optional<Long> total, String unit) {
       events.add(
-          "start:"
-              + stage
-              + ":"
-              + total.map(String::valueOf).orElse("unknown")
-              + ":"
-              + unit);
+          "start:" + stage + ":" + total.map(String::valueOf).orElse("unknown") + ":" + unit);
     }
 
     @Override
@@ -91,8 +86,7 @@ public class ScalarIndexTest {
     }
   }
 
-  private static final class FailingProgressIndexBuildProgress
-      implements IndexBuildProgress {
+  private static final class FailingProgressIndexBuildProgress implements IndexBuildProgress {
     private final RecordingIndexBuildProgress recorder = new RecordingIndexBuildProgress();
 
     @Override
@@ -112,8 +106,7 @@ public class ScalarIndexTest {
     }
   }
 
-  private static final class FailingCompleteIndexBuildProgress
-      implements IndexBuildProgress {
+  private static final class FailingCompleteIndexBuildProgress implements IndexBuildProgress {
     private final RecordingIndexBuildProgress recorder = new RecordingIndexBuildProgress();
 
     @Override
@@ -437,10 +430,7 @@ public class ScalarIndexTest {
         dataset.mergeIndexMetadata(indexUuid, IndexType.INVERTED, Optional.empty(), progress);
 
         assertTrue(
-            progress
-                .recorder
-                .snapshot()
-                .contains("complete:write_merged_metadata"),
+            progress.recorder.snapshot().contains("complete:write_merged_metadata"),
             "Expected merge to continue after stageComplete callback failures");
       }
     }
@@ -453,13 +443,11 @@ public class ScalarIndexTest {
             "{\"base_tokenizer\":\"simple\",\"language\":\"English\","
                 + "\"max_token_length\":40,\"lower_case\":true,\"stem\":false,"
                 + "\"remove_stop_words\":false}");
-    IndexParams indexParams =
-        IndexParams.builder().setScalarIndexParams(scalarParams).build();
+    IndexParams indexParams = IndexParams.builder().setScalarIndexParams(scalarParams).build();
     String indexUuid = UUID.randomUUID().toString();
     for (Fragment fragment : dataset.getFragments()) {
       dataset.createIndex(
-          IndexOptions.builder(
-                  Collections.singletonList("name"), IndexType.INVERTED, indexParams)
+          IndexOptions.builder(Collections.singletonList("name"), IndexType.INVERTED, indexParams)
               .replace(true)
               .withIndexName("inverted_progress_idx")
               .withIndexUUID(indexUuid)
