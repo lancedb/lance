@@ -5061,7 +5061,10 @@ mod tests {
         let fragment_id = db.get_fragments()[0].id() as u64;
         let field_id = db.schema().field("indexable").unwrap().id;
         let overlay_name = format!("{}.lance", Uuid::new_v4());
-        let mut data_file = DataFile::new_unstarted(overlay_name.clone(), 2, 0);
+        let mut data_file = DataFile::new_unstarted(
+            overlay_name.clone(),
+            lance_file::version::ConcreteFileVersion::V2_0,
+        );
         data_file.fields = vec![field_id].into();
         data_file.column_indices = vec![0].into();
 
