@@ -1476,13 +1476,6 @@ mod tests {
         strategy.create_block_compressor(field, data).unwrap()
     }
 
-    fn miniblock_context()
-    -> crate::encodings::logical::primitive::miniblock::MiniBlockCompressionContext {
-        crate::encodings::logical::primitive::miniblock::MiniBlockCompressionContext::new(
-            0, true, true,
-        )
-    }
-
     fn create_fixed_width_block_with_stats(
         bits_per_value: u64,
         num_values: u64,
