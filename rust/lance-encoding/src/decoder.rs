@@ -881,15 +881,16 @@ impl CoreFieldDecoderStrategy {
                         array_encoding: Some(pb::array_encoding::ArrayEncoding::List(..))
                     }
                 ) {
-                    let list_type = if matches!(data_type, DataType::Utf8 | DataType::Binary) {
-                        DataType::List(Arc::new(ArrowField::new("item", DataType::UInt8, false)))
-                    } else {
-                        DataType::LargeList(Arc::new(ArrowField::new(
-                            "item",
-                            DataType::UInt8,
-                            false,
-                        )))
-                    };
+                    // Always use LargeList (i64 offsets) internally to avoid
+                    // "Offset overflow" errors when a single batch exceeds 2GB
+                    // of variable-length data.  The BinaryArrayDecoder will
+                    // downcast back to i32 offsets when the target type is
+                    // Utf8 / Binary and the data fits.
+                    let list_type = DataType::LargeList(Arc::new(ArrowField::new(
+                        "item",
+                        DataType::UInt8,
+                        false,
+                    )));
                     let list_field = Field::try_from(ArrowField::new(
                         field.name.clone(),
                         list_type,

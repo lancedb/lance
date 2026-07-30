@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use arrow_array::{
-    Array, ArrayRef, GenericByteArray, GenericListArray,
+    Array, ArrayRef, GenericByteArray, GenericListArray, OffsetSizeTrait,
     cast::AsArray,
     types::{BinaryType, ByteArrayType, LargeBinaryType, LargeUtf8Type, UInt8Type, Utf8Type},
 };
@@ -152,7 +152,10 @@ pub struct BinaryArrayDecoder {
 }
 
 impl BinaryArrayDecoder {
-    fn from_list_array<T: ByteArrayType>(array: &GenericListArray<T::Offset>) -> ArrayRef {
+    fn from_list_array<T: ByteArrayType>(array: &GenericListArray<T::Offset>) -> ArrayRef
+    where
+        T::Offset: OffsetSizeTrait,
+    {
         let values = array
             .values()
             .as_primitive::<UInt8Type>()
@@ -166,6 +169,42 @@ impl BinaryArrayDecoder {
             array.nulls().cloned(),
         ))
     }
+
+    /// Convert a LargeList (i64 offsets) array to a small-offset byte array (Utf8 / Binary).
+    /// Returns an error if the data exceeds the i32 offset limit.
+    fn from_large_list_to_small<T: ByteArrayType<Offset = i32>>(
+        array: &GenericListArray<i64>,
+    ) -> Result<ArrayRef> {
+        let values = array
+            .values()
+            .as_primitive::<UInt8Type>()
+            .values()
+            .inner()
+            .clone();
+        let large_offsets = array.offsets();
+
+        // Check if the offsets fit in i32
+        let last_offset = large_offsets[large_offsets.len() - 1];
+        if last_offset <= i32::MAX as i64 {
+            // Safe to downcast to i32 offsets
+            let small: Vec<i32> = large_offsets.iter().map(|&o| o as i32).collect();
+            let offsets = arrow_buffer::OffsetBuffer::new(arrow_buffer::ScalarBuffer::from(small));
+            Ok(Arc::new(GenericByteArray::<T>::new(
+                offsets,
+                values,
+                array.nulls().cloned(),
+            )))
+        } else {
+            // Data exceeds 2GB -- cannot fit in i32 offsets.
+            // This should not happen in practice because the batch-size feedback
+            // loop limits batch sizes, but if it does we return a clear error.
+            Err(lance_core::Error::invalid_input(format!(
+                "A single batch of variable-length data exceeded 2 GiB ({} bytes). \
+                 Use LargeUtf8 / LargeBinary in your schema, or reduce the batch size.",
+                last_offset
+            )))
+        }
+    }
 }
 
 impl DecodeArrayTask for BinaryArrayDecoder {
@@ -173,14 +212,121 @@ impl DecodeArrayTask for BinaryArrayDecoder {
         let data_type = self.data_type;
         let (arr, _) = self.inner.decode()?;
         let result = match data_type {
-            DataType::Binary => Self::from_list_array::<BinaryType>(arr.as_list::<i32>()),
+            DataType::Binary => {
+                // Internal representation is always LargeList (i64 offsets) now
+                if arr.data_type()
+                    == &DataType::LargeList(Arc::new(arrow_schema::Field::new(
+                        "item",
+                        DataType::UInt8,
+                        false,
+                    )))
+                {
+                    Self::from_large_list_to_small::<BinaryType>(arr.as_list::<i64>())?
+                } else {
+                    Self::from_list_array::<BinaryType>(arr.as_list::<i32>())
+                }
+            }
             DataType::LargeBinary => Self::from_list_array::<LargeBinaryType>(arr.as_list::<i64>()),
-            DataType::Utf8 => Self::from_list_array::<Utf8Type>(arr.as_list::<i32>()),
+            DataType::Utf8 => {
+                if arr.data_type()
+                    == &DataType::LargeList(Arc::new(arrow_schema::Field::new(
+                        "item",
+                        DataType::UInt8,
+                        false,
+                    )))
+                {
+                    Self::from_large_list_to_small::<Utf8Type>(arr.as_list::<i64>())?
+                } else {
+                    Self::from_list_array::<Utf8Type>(arr.as_list::<i32>())
+                }
+            }
             DataType::LargeUtf8 => Self::from_list_array::<LargeUtf8Type>(arr.as_list::<i64>()),
-            _ => panic!("Binary decoder does not support this data type"),
+            _ => {
+                return Err(lance_core::Error::internal(
+                    "Binary decoder does not support this data type",
+                ));
+            }
         };
         // data_size is only tracked in the v2.1 structural decode path; the legacy
         // v2.0 path does not need it so we return 0.
         Ok((result, 0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::builder::LargeListBuilder;
+    use arrow_array::builder::PrimitiveBuilder;
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::UInt8Type;
+    use arrow_buffer::Buffer;
+    use arrow_data::ArrayData;
+
+    #[test]
+    fn test_from_large_list_to_small() {
+        // Create a small LargeList array (i64 offsets) to test downcasting
+        let values_builder = PrimitiveBuilder::<UInt8Type>::new();
+        let mut builder = LargeListBuilder::new(values_builder);
+
+        // Add "hello"
+        builder.values().append_slice(b"hello");
+        builder.append(true);
+
+        // Add "world"
+        builder.values().append_slice(b"world");
+        builder.append(true);
+
+        let large_list_array = builder.finish();
+
+        // Convert to small StringArray
+        let result =
+            BinaryArrayDecoder::from_large_list_to_small::<Utf8Type>(&large_list_array).unwrap();
+
+        assert_eq!(result.data_type(), &DataType::Utf8);
+        let string_array = result.as_string::<i32>();
+        assert_eq!(string_array.len(), 2);
+        assert_eq!(string_array.value(0), "hello");
+        assert_eq!(string_array.value(1), "world");
+    }
+
+    #[test]
+    fn test_from_large_list_to_small_overflow() {
+        // We can manually craft an array with a fake offset that exceeds i32::MAX
+        // to test the 2GB limit check without allocating 2GB of memory.
+        // Create offsets that exceed i32::MAX
+        let offsets = Buffer::from_slice_ref([0_i64, (i32::MAX as i64) + 10]);
+
+        // Field for LargeList
+        let field = Arc::new(arrow_schema::Field::new("item", DataType::UInt8, true));
+
+        // SAFETY: The deliberately oversized offset is invalid for the one-byte child array.
+        // This lets the test exercise BinaryArrayDecoder's overflow guard without allocating
+        // more than 2 GiB of child values.
+        let values_data = unsafe {
+            ArrayData::builder(DataType::UInt8)
+                .len(1)
+                .add_buffer(Buffer::from_slice_ref([0_u8]))
+                .build_unchecked()
+        };
+
+        // SAFETY: This intentionally constructs an invalid LargeList array with offsets beyond
+        // the child value length so the helper can reject the i64-to-i32 downcast before building
+        // a Binary / Utf8 array.
+        let list_data = unsafe {
+            ArrayData::builder(DataType::LargeList(field))
+                .len(1)
+                .add_buffer(offsets)
+                .add_child_data(values_data)
+                .build_unchecked()
+        };
+        let large_list_array = GenericListArray::<i64>::from(list_data);
+
+        let result = BinaryArrayDecoder::from_large_list_to_small::<Utf8Type>(&large_list_array);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, lance_core::Error::InvalidInput { .. }));
+        assert!(err.to_string().contains("exceeded 2 GiB"));
     }
 }
