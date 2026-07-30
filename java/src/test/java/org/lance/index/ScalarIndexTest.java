@@ -398,9 +398,9 @@ public class ScalarIndexTest {
       try (Dataset dataset = testDataset.write(2, 10)) {
         String indexUuid = createDistributedInvertedIndex(dataset);
 
-        Exception failure =
+        RuntimeException failure =
             Assertions.assertThrows(
-                Exception.class,
+                RuntimeException.class,
                 () ->
                     dataset.mergeIndexMetadata(
                         indexUuid,
@@ -408,10 +408,15 @@ public class ScalarIndexTest {
                         Optional.empty(),
                         new FailingProgressIndexBuildProgress()));
 
+        assertFalse(
+            failure instanceof IllegalArgumentException,
+            "Progress callback failures should not be reported as invalid input: " + failure);
         assertTrue(
             causeChainContains(failure, "stageProgress")
-                && causeChainContains(failure, "read_partition_metadata"),
-            "Expected progress callback context, got: " + failure);
+                && causeChainContains(failure, "read_partition_metadata")
+                && causeChainContains(failure, "java.lang.IllegalStateException")
+                && causeChainContains(failure, "progress callback failure"),
+            "Expected callback context and original Java exception details, got: " + failure);
       }
     }
   }
