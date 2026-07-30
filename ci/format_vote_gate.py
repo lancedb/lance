@@ -8,30 +8,45 @@ and publishes the `format-spec-vote` commit status, which blocks merging until:
   * 3 PMC members have approved the PR (excluding the author), counted only on
     the head commit so new pushes invalidate stale approvals;
   * no PMC member has an outstanding "Request changes" review (a veto); and
-  * the 1-week voting period (from when `format-change` was first applied) has
-    elapsed.
+  * the 72-hour voting period has elapsed. The clock starts once the PR is both
+    labeled and out of draft, and pauses over weekends.
 
 A PMC member can waive a trivial edit by applying the `format-waived` label.
 Non-format PRs get a passing status immediately and are otherwise left alone.
+Drafts get a blocking status but no comment: the vote has not opened yet.
 
-The vote-counting rules are pure functions (`tally_reviews`, `decide_verdict`)
-unit tested in `test_format_vote_gate.py`; `main` wires them to the GitHub API.
+The vote-counting and deadline rules are pure functions (`tally_reviews`,
+`decide_verdict`, `vote_opened_at`, `weekday_deadline`) unit tested in
+`test_format_vote_gate.py`; `main` wires them to the GitHub API.
 """
 
 import json
 import os
+from collections import namedtuple
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 STATUS_CONTEXT = "format-spec-vote"
 FORMAT_LABEL = "format-change"
 WAIVED_LABEL = "format-waived"
 COMMENT_MARKER = "<!-- format-spec-vote-status -->"
 REQUIRED_APPROVALS = 3
-PERIOD_DAYS = 7
+PERIOD_HOURS = 72
 VOTING_URL = "https://lance.org/community/voting/"
+
+# The weekend boundary is fixed in UTC rather than a local zone: it has no DST
+# transitions to reason about, and no PMC member's timezone gets to define when
+# everyone else's clock pauses. Deadlines are *displayed* in UTC and Pacific.
+WEEKEND_TZ = timezone.utc
+DISPLAY_TZ = ZoneInfo("America/Los_Angeles")
+
+# datetime.weekday() numbers Monday 0 .. Sunday 6, so the weekend is >= 5.
+_SATURDAY = 5
 
 # Review states that express a stance; COMMENTED/PENDING are ignored.
 _STANCE_STATES = ("APPROVED", "CHANGES_REQUESTED", "DISMISSED")
+
+TimelineFacts = namedtuple("TimelineFacts", "labeled_at waived ready_at")
 
 
 def tally_reviews(reviews, head_sha, author, is_pmc):
@@ -72,8 +87,63 @@ def decide_verdict(veto_count, approval_count, period_elapsed, required):
     return "pass"
 
 
+def vote_opened_at(labeled_at, ready_at):
+    """When the voting period starts, or None if it hasn't.
+
+    A vote opens only once the proposal is both identified as a format change
+    and offered for review, so the clock starts at the later of the two. A draft
+    is still being drafted; time spent there shouldn't count toward the period.
+    """
+    if labeled_at is None or ready_at is None:
+        return None
+    return max(labeled_at, ready_at)
+
+
+def _start_of_day(dt):
+    return dt.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+# Advance to Monday 00:00 if `dt` lands on a weekend; otherwise leave it alone.
+def _skip_weekend(dt):
+    while dt.weekday() >= _SATURDAY:
+        dt = _start_of_day(dt) + timedelta(days=1)
+    return dt
+
+
+# Saturday 00:00 following `dt`, which must already be a weekday.
+def _next_weekend(dt):
+    return _start_of_day(dt) + timedelta(days=_SATURDAY - dt.weekday())
+
+
+def weekday_deadline(start, hours):
+    """When `hours` of non-weekend time have elapsed after `start`.
+
+    Weekends don't count toward the voting period, so a proposal opened on a
+    Friday afternoon doesn't burn most of its period while nobody is reading it.
+    Both `start` and the result are aware datetimes; the arithmetic happens in
+    `WEEKEND_TZ`, which decides where each weekend begins and ends.
+    """
+    cursor = _skip_weekend(start.astimezone(WEEKEND_TZ))
+    remaining = timedelta(hours=hours)
+    while True:
+        until_weekend = _next_weekend(cursor) - cursor
+        if remaining <= until_weekend:
+            return cursor + remaining
+        remaining -= until_weekend
+        cursor = _skip_weekend(_next_weekend(cursor))
+
+
 def _fmt_list(logins):
     return ", ".join(f"@{login}" for login in logins) if logins else "none"
+
+
+# Renders as `Wed 2026-08-05 17:00 UTC (10:00 PDT)` — the PMC spans both zones.
+# The Pacific weekday is spelled out only when the deadline falls on a different
+# day there, which is the case that actually trips people up.
+def _fmt_deadline(dt):
+    local = dt.astimezone(DISPLAY_TZ)
+    local_day = "" if local.date() == dt.date() else f"{local:%a }"
+    return f"{dt:%a %Y-%m-%d %H:%M} UTC ({local_day}{local:%H:%M %Z})"
 
 
 def _as_utc(dt):
@@ -90,7 +160,8 @@ def _build_comment(headline, approval_cell, vetoes, period_cell):
             "This PR modifies the Lance format specification, so it requires "
             f"**{REQUIRED_APPROVALS} binding +1 votes from PMC members** "
             "(excluding the proposer) and a minimum "
-            f"**{PERIOD_DAYS}-day** voting period before it can merge. "
+            f"**{PERIOD_HOURS}-hour** voting period, weekends excluded, before "
+            "it can merge. "
             "Vote by approving this PR (+1) or requesting changes (−1, a veto). "
             f"See the [voting process]({VOTING_URL}).",
             "",
@@ -143,26 +214,25 @@ class Gate:
                 return
         issue.create_comment(body)
 
-    def label_facts(self, issue):
-        """When `format-change` was first applied, and whether a PMC waived."""
-        first_added = None
+    def timeline_facts(self, issue):
+        """Read the vote-clock inputs off the PR timeline in one pass."""
+        labeled_at = None
         waived_by_pmc = False
+        ready_at = None
         for event in issue.get_events():
-            if event.event not in ("labeled", "unlabeled") or event.label is None:
-                continue
-            name = event.label.name
             actor = event.actor.login if event.actor else None
-            if (
-                name == FORMAT_LABEL
-                and event.event == "labeled"
-                and first_added is None
-            ):
-                first_added = _as_utc(event.created_at)
-            elif (
-                name == WAIVED_LABEL and event.event == "labeled" and self.is_pmc(actor)
-            ):
+            # A PR converted back to draft and re-opened for review restarts the
+            # clock, so the *last* ready_for_review wins.
+            if event.event == "ready_for_review":
+                ready_at = _as_utc(event.created_at)
+                continue
+            if event.event != "labeled" or event.label is None:
+                continue
+            if event.label.name == FORMAT_LABEL and labeled_at is None:
+                labeled_at = _as_utc(event.created_at)
+            elif event.label.name == WAIVED_LABEL and self.is_pmc(actor):
                 waived_by_pmc = True
-        return first_added, waived_by_pmc
+        return TimelineFacts(labeled_at, waived_by_pmc, ready_at)
 
     def evaluate(self, number):
         pr = self.repo.get_pull(number)
@@ -181,13 +251,24 @@ class Gate:
             return
 
         issue = self.repo.get_issue(number)
-        first_added, waived = self.label_facts(issue)
+        facts = self.timeline_facts(issue)
 
-        if WAIVED_LABEL in labels and waived:
+        if WAIVED_LABEL in labels and facts.waived:
             self.set_status(
                 head_sha, "success", "Format-spec vote waived by a PMC member."
             )
             print(f"PR #{number}: vote waived.")
+            return
+
+        # Stay quiet on drafts: the proposal isn't up for a vote yet, so there is
+        # nothing for the PMC to act on and no deadline to announce.
+        if pr.draft:
+            self.set_status(
+                head_sha,
+                "failure",
+                "Draft; voting period starts when marked ready for review.",
+            )
+            print(f"PR #{number}: draft, vote not open.")
             return
 
         reviews = [
@@ -203,14 +284,18 @@ class Gate:
         )
 
         now = datetime.now(timezone.utc)
-        vote_start = first_added or now
-        period_ends = vote_start + timedelta(days=PERIOD_DAYS)
+        # `pr.created_at` covers a PR opened ready for review, which never emits a
+        # ready_for_review event.
+        opened_at = vote_opened_at(
+            facts.labeled_at, facts.ready_at or _as_utc(pr.created_at)
+        )
+        period_ends = weekday_deadline(opened_at or now, PERIOD_HOURS)
         period_elapsed = now >= period_ends
         verdict = decide_verdict(
             len(vetoes), len(approvals), period_elapsed, REQUIRED_APPROVALS
         )
 
-        end_date = period_ends.date().isoformat()
+        deadline = _fmt_deadline(period_ends)
         if verdict == "veto":
             state, summary = "failure", f"Vetoed by {len(vetoes)} PMC member(s)."
             headline = f"❌ Blocked — vetoed by {_fmt_list(vetoes)}"
@@ -221,21 +306,18 @@ class Gate:
             )
             headline = f"❌ Blocked — {len(approvals)} of {REQUIRED_APPROVALS} required approvals"
         elif verdict == "waiting_period":
-            state, summary = "failure", f"Approved; voting period ends {end_date}."
+            state, summary = "failure", f"Approved; voting period ends {deadline}."
             headline = (
                 f"⏳ Approvals met ({len(approvals)}/{REQUIRED_APPROVALS}); "
-                f"voting period ends {end_date}"
+                f"voting period ends {deadline}"
             )
         else:
             state = "success"
             summary = f"Passed — {len(approvals)} PMC approvals, period elapsed."
             headline = f"✅ Vote passed — {len(approvals)} PMC approvals, voting period elapsed"
 
-        days_left = max(0, -(-(period_ends - now).days))  # ceil of day difference
         period_cell = (
-            f"elapsed (ended {end_date})"
-            if period_elapsed
-            else f"ends {end_date} ({days_left} day(s) left)"
+            f"elapsed — ended {deadline}" if period_elapsed else f"ends {deadline}"
         )
         approval_cell = (
             f"{_fmt_list(approvals)} ({len(approvals)}/{REQUIRED_APPROVALS})"

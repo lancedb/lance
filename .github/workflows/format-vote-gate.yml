@@ -6,7 +6,9 @@ name: Format spec vote gate
 # the format spec (`protos/**/*.proto`, `docs/src/format/**`); this gate reads
 # that label and blocks merging until the PR has 3 binding +1 votes from PMC
 # members (PR approvals, excluding the author), has no outstanding veto (a PMC
-# "Request changes" review), and the 1-week voting period has elapsed.
+# "Request changes" review), and the 72-hour voting period has elapsed. That
+# period starts once the PR is labeled and ready for review, and pauses over
+# weekends.
 #
 # The gate publishes its verdict as the `format-spec-vote` commit status on the
 # PR head. To make it a merge blocker, an org admin must add `format-spec-vote`
@@ -23,14 +25,24 @@ name: Format spec vote gate
 
 on:
   pull_request_target:
-    types: [opened, reopened, synchronize, labeled, unlabeled]
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - labeled
+      - unlabeled
+      # The voting clock starts when a PR leaves draft, so both draft
+      # transitions have to re-evaluate the gate.
+      - ready_for_review
+      - converted_to_draft
   pull_request_review:
     types: [submitted, edited, dismissed]
   schedule:
     # Re-evaluate open format-change PRs so the voting-period clock is re-checked
-    # even when no PR event fires (e.g. the 1-week period elapses days after the
-    # third approval lands).
-    - cron: "0 */8 * * *"
+    # even when no PR event fires (the period routinely elapses days after the
+    # third approval lands). Hourly, because the gate publishes an exact deadline
+    # and should flip within an hour of it.
+    - cron: "0 * * * *"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
