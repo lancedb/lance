@@ -110,6 +110,48 @@ The following keys can be used as both environment variables or keys in the
 | `aws_sse_kms_key_id`                                                | The KMS key ID to use for server-side encryption. If set, `aws_server_side_encryption` must be `"aws:kms"` or `"aws:kms:dsse"`.                  |
 | `aws_sse_bucket_key_enabled`                                        | Whether to use bucket keys for server-side encryption.                                                                                           |
 
+### Credential provider selection
+
+Lance resolves S3 credentials in the following order of precedence:
+
+1. An explicit credential provider passed via the SDK (`aws_credentials` / `storage_options_accessor`).
+2. Static access keys (`aws_access_key_id` + `aws_secret_access_key` in `storage_options` or environment variables).
+3. IRSA (IAM Roles for Service Accounts / web identity token), if `aws_web_identity_token_file` and `aws_role_arn` are set.
+4. ECS container credentials, if `aws_container_credentials_full_uri` or `aws_container_credentials_relative_uri` is set.
+5. The default AWS credential provider chain (environment variables, shared credentials file, instance metadata, etc.).
+
+The following `storage_options` keys explicitly select a credential provider:
+
+| Key | Description |
+|-----|-------------|
+| `aws_web_identity_token_file` | Path to the web identity token file for IRSA authentication. Must be set together with `aws_role_arn`. |
+| `aws_role_arn` | IAM role ARN to assume for IRSA authentication. Must be set together with `aws_web_identity_token_file`. |
+| `aws_role_session_name` | Session name used when assuming the IAM role. Optional; defaults to `"lance-session"`. |
+| `aws_container_credentials_full_uri` | Full URI for the ECS/Pod Identity container credential endpoint (e.g. `http://169.254.170.2/credentials`). Takes precedence over the relative URI form. |
+| `aws_container_credentials_relative_uri` | Relative URI appended to `http://169.254.170.2` to form the container credential endpoint. |
+| `aws_container_authorization_token_file` | Path to a file containing an authorization token sent as the `Authorization` header when fetching ECS credentials. Optional. |
+
+#### Suppressing environment-variable credential keys
+
+Lance merges the process environment into `storage_options` at startup (env vars that are not already set). If your environment contains IRSA variables (`AWS_WEB_IDENTITY_TOKEN_FILE`, `AWS_ROLE_ARN`) but you want a specific dataset to use ECS credentials instead, set the unwanted keys to the empty string in `storage_options`. An empty string blocks the env-var injection for that key and is then filtered out before reaching the credential logic, so only your explicit non-empty options are used.
+
+```python
+import lance
+
+# The pod has AWS_WEB_IDENTITY_TOKEN_FILE / AWS_ROLE_ARN in its environment
+# (default IRSA), but this dataset should use ECS credentials instead.
+ds = lance.dataset(
+    "s3://bucket/path",
+    storage_options={
+        # Suppress IRSA env vars for this dataset
+        "aws_web_identity_token_file": "",
+        "aws_role_arn": "",
+        # Use ECS container credentials instead
+        "aws_container_credentials_full_uri": "http://169.254.170.2/my-credentials",
+    }
+)
+```
+
 ### S3-compatible stores
 
 Lance can also connect to S3-compatible stores, such as MinIO. To do so, you must

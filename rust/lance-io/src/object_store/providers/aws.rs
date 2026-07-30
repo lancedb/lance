@@ -283,18 +283,22 @@ pub async fn build_aws_credential(
             .unwrap_or(DEFAULT_REGION.to_string())
     };
 
-    let storage_options_credentials = storage_options.and_then(extract_static_s3_credentials);
+    // If the user supplied their own credential provider that takes top priority
+    if let Some(creds) = credentials {
+        return Ok((creds, region));
+    }
 
-    // Explicit aws_credentials takes precedence over dynamic credentials.
-    if credentials.is_none()
-        && let Some(dynamic_creds) = build_dynamic_credential_provider::<ObjectStoreAwsCredential>(
-            storage_options_accessor.clone(),
-        )
-        .await?
+    // Otherwise, if the user provided a storage_options_accessor, try and use that
+    if let Some(dynamic_creds) = build_dynamic_credential_provider::<ObjectStoreAwsCredential>(
+        storage_options_accessor.clone(),
+    )
+    .await?
     {
         return Ok((dynamic_creds, region));
     }
 
+    // If the user provided a storage_options_accessor, then it must not have matched AWS.
+    // Log a message and ignore it.
     if storage_options_accessor
         .as_ref()
         .is_some_and(|a| a.has_provider())
@@ -305,57 +309,51 @@ pub async fn build_aws_credential(
         );
     }
 
-    if let Some(creds) = credentials {
-        return Ok((creds, region));
-    }
+    if let Some(opts) = storage_options {
+        // Check for static credentials (access key & secret)
+        if let Some(creds) = extract_static_s3_credentials(opts) {
+            return Ok((Arc::new(creds), region));
+        }
 
-    if let Some(creds) = storage_options_credentials {
-        return Ok((Arc::new(creds), region));
-    }
-
-    // Check for explicitly provided IRSA (web identity token) credentials.
-    // with_env_s3() does not inject credential-selection keys, so these are
-    // only present when the user explicitly provided them.
-    if let Some(opts) = storage_options
-        && let (Some(token_file), Some(role_arn)) = (
+        // Check for explicitly provided IRSA (web identity token) credentials.
+        if let (Some(token_file), Some(role_arn)) = (
             opts.get(&AmazonS3ConfigKey::WebIdentityTokenFile),
             opts.get(&AmazonS3ConfigKey::RoleArn),
-        )
-    {
-        let session_name = opts.get(&AmazonS3ConfigKey::RoleSessionName).cloned();
-        let provider = build_irsa_provider(token_file, role_arn, session_name);
-        return Ok((
-            Arc::new(AwsCredentialAdapter::new(
-                Arc::new(provider),
-                credentials_refresh_offset,
-            )),
-            region,
-        ));
-    }
+        ) {
+            let session_name = opts.get(&AmazonS3ConfigKey::RoleSessionName).cloned();
+            let provider = build_irsa_provider(token_file, role_arn, session_name);
+            return Ok((
+                Arc::new(AwsCredentialAdapter::new(
+                    Arc::new(provider),
+                    credentials_refresh_offset,
+                )),
+                region,
+            ));
+        }
 
-    // Check for explicitly provided ECS container credentials.
-    if let Some(opts) = storage_options
-        && (opts.contains_key(&AmazonS3ConfigKey::ContainerCredentialsFullUri)
-            || opts.contains_key(&AmazonS3ConfigKey::ContainerCredentialsRelativeUri))
-    {
-        let full_uri = opts
-            .get(&AmazonS3ConfigKey::ContainerCredentialsFullUri)
-            .cloned();
-        let relative_uri = opts
-            .get(&AmazonS3ConfigKey::ContainerCredentialsRelativeUri)
-            .cloned();
-        let auth_token_file = opts
-            .get(&AmazonS3ConfigKey::ContainerAuthorizationTokenFile)
-            .cloned();
+        // Check for explicitly provided ECS container credentials.
+        if opts.contains_key(&AmazonS3ConfigKey::ContainerCredentialsFullUri)
+            || opts.contains_key(&AmazonS3ConfigKey::ContainerCredentialsRelativeUri)
+        {
+            let full_uri = opts
+                .get(&AmazonS3ConfigKey::ContainerCredentialsFullUri)
+                .cloned();
+            let relative_uri = opts
+                .get(&AmazonS3ConfigKey::ContainerCredentialsRelativeUri)
+                .cloned();
+            let auth_token_file = opts
+                .get(&AmazonS3ConfigKey::ContainerAuthorizationTokenFile)
+                .cloned();
 
-        let provider = EcsCredentialProvider::new(full_uri, relative_uri, auth_token_file)?;
-        return Ok((
-            Arc::new(AwsCredentialAdapter::new(
-                Arc::new(provider),
-                credentials_refresh_offset,
-            )),
-            region,
-        ));
+            let provider = EcsCredentialProvider::new(full_uri, relative_uri, auth_token_file)?;
+            return Ok((
+                Arc::new(AwsCredentialAdapter::new(
+                    Arc::new(provider),
+                    credentials_refresh_offset,
+                )),
+                region,
+            ));
+        }
     }
 
     let credentials_provider = DefaultCredentialsChain::builder().build().await;
@@ -598,31 +596,16 @@ impl CredentialProvider for AwsCredentialAdapter {
     }
 }
 
-/// Credential-selection keys that must not be injected from the environment into
-/// storage options.  These keys exist solely to tell our credential-provider logic
-/// which AWS auth method to use; the underlying SDK providers (DefaultCredentialsChain,
-/// WebIdentityTokenCredentialsProvider, EcsCredentialsProvider) already read the
-/// corresponding env vars from the process environment directly.  Injecting them via
-/// with_env_s3() would make it impossible to distinguish "user explicitly chose IRSA"
-/// from "IRSA env vars happened to be present when the user wanted ECS", because both
-/// would appear identically in the merged storage-options map.
-const CREDENTIAL_SELECTION_KEYS: &[AmazonS3ConfigKey] = &[
-    AmazonS3ConfigKey::WebIdentityTokenFile,
-    AmazonS3ConfigKey::RoleArn,
-    AmazonS3ConfigKey::RoleSessionName,
-    AmazonS3ConfigKey::ContainerCredentialsRelativeUri,
-    AmazonS3ConfigKey::ContainerCredentialsFullUri,
-    AmazonS3ConfigKey::ContainerAuthorizationTokenFile,
-];
-
 impl StorageOptions {
-    /// Add values from the environment to storage options
+    /// Add values from the environment to storage options.
+    ///
+    /// Only adds keys that are not already present, so explicitly-set options
+    /// (including empty-string sentinels) always take precedence over env vars.
     pub fn with_env_s3(&mut self) {
         for (os_key, os_value) in std::env::vars_os() {
             if let (Some(key), Some(value)) = (os_key.to_str(), os_value.to_str())
                 && let Ok(config_key) = AmazonS3ConfigKey::from_str(&key.to_ascii_lowercase())
                 && !self.0.contains_key(config_key.as_ref())
-                && !CREDENTIAL_SELECTION_KEYS.contains(&config_key)
             {
                 self.0
                     .insert(config_key.as_ref().to_string(), value.to_string());
@@ -630,11 +613,19 @@ impl StorageOptions {
         }
     }
 
-    /// Subset of options relevant for s3 storage
+    /// Subset of options relevant for s3 storage.
+    ///
+    /// Empty-string values are excluded: setting a key to `""` is the way to
+    /// suppress an env-var-injected value (the empty string blocks injection via
+    /// `with_env_s3`, and this filter ensures it doesn't reach the builder or
+    /// credential logic either).
     pub fn as_s3_options(&self) -> HashMap<AmazonS3ConfigKey, String> {
         self.0
             .iter()
             .filter_map(|(key, value)| {
+                if value.is_empty() {
+                    return None;
+                }
                 let s3_key = AmazonS3ConfigKey::from_str(&key.to_ascii_lowercase()).ok()?;
                 Some((s3_key, value.clone()))
             })
@@ -1462,78 +1453,80 @@ mod tests {
         assert_eq!(cred.secret_key, "SECRET");
     }
 
-    // Test that with_env_s3() does NOT inject credential-selection keys from the environment.
-    // These keys are excluded so that a user setting ECS credentials isn't accidentally
-    // overridden by IRSA env vars that happen to be present in the process environment.
-    #[test]
-    fn test_with_env_s3_does_not_inject_credential_selection_keys() {
-        // Temporarily set env vars for all credential-selection keys
-        let test_vars = [
-            ("AWS_WEB_IDENTITY_TOKEN_FILE", "/tmp/token"),
-            ("AWS_ROLE_ARN", "arn:aws:iam::123:role/Role"),
-            ("AWS_ROLE_SESSION_NAME", "test-session"),
-            ("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "/creds"),
-            (
-                "AWS_CONTAINER_CREDENTIALS_FULL_URI",
-                "http://127.0.0.1/creds",
-            ),
-            ("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE", "/tmp/token-file"),
-        ];
+    // Test that setting credential-selection keys to "" in storage options blocks env-var
+    // injection and that the empty sentinels are stripped by as_s3_options(), so the credential
+    // logic sees only the explicitly-set non-empty keys (ECS URI in this case, not IRSA).
+    #[tokio::test]
+    async fn test_empty_string_masks_env_credential_keys() {
+        use tempfile::NamedTempFile;
 
-        // Save original values and set test values
-        let original: Vec<_> = test_vars
-            .iter()
-            .map(|(k, _)| (*k, std::env::var(k).ok()))
-            .collect();
-        // SAFETY: test-only; no other threads read these vars during this test.
+        // Simulate: IRSA env vars are present in the process env (e.g., pod has IRSA by default)
+        // SAFETY: test-only env mutation; no other threads touch these vars.
         unsafe {
-            for (k, v) in &test_vars {
-                std::env::set_var(k, v);
-            }
+            std::env::set_var("AWS_WEB_IDENTITY_TOKEN_FILE", "/tmp/irsa-token");
+            std::env::set_var("AWS_ROLE_ARN", "arn:aws:iam::123:role/IrsaRole");
         }
 
-        let mut opts = StorageOptions::new(HashMap::new());
-        opts.with_env_s3();
+        // User explicitly wants ECS, not IRSA — set IRSA keys to "" to block injection
+        let ecs_token_file = NamedTempFile::new().unwrap();
+        let user_opts = HashMap::from([
+            (
+                "aws_container_credentials_full_uri".to_string(),
+                "http://169.254.170.2/credentials".to_string(),
+            ),
+            (
+                "aws_web_identity_token_file".to_string(),
+                "".to_string(), // block IRSA env var
+            ),
+            (
+                "aws_role_arn".to_string(),
+                "".to_string(), // block IRSA env var
+            ),
+            (
+                "aws_container_authorization_token_file".to_string(),
+                ecs_token_file.path().to_str().unwrap().to_string(),
+            ),
+        ]);
 
-        // Restore original env
+        let mut storage_options = StorageOptions::new(user_opts);
+        storage_options.with_env_s3();
+        let s3_opts = storage_options.as_s3_options();
+
+        // Restore env
         // SAFETY: test-only; restoring env vars set above.
         unsafe {
-            for (k, orig) in &original {
-                match orig {
-                    Some(v) => std::env::set_var(k, v),
-                    None => std::env::remove_var(k),
-                }
-            }
+            std::env::remove_var("AWS_WEB_IDENTITY_TOKEN_FILE");
+            std::env::remove_var("AWS_ROLE_ARN");
         }
 
-        // None of the credential-selection keys should have been injected
+        // IRSA keys must be absent — empty sentinels were stripped by as_s3_options()
         assert!(
-            !opts.0.contains_key("aws_web_identity_token_file"),
-            "web identity token file should not be injected"
+            !s3_opts.contains_key(&AmazonS3ConfigKey::WebIdentityTokenFile),
+            "IRSA token file should be absent after empty-string masking"
         );
         assert!(
-            !opts.0.contains_key("aws_role_arn"),
-            "role ARN should not be injected"
+            !s3_opts.contains_key(&AmazonS3ConfigKey::RoleArn),
+            "IRSA role ARN should be absent after empty-string masking"
         );
+        // ECS URI must be present
         assert!(
-            !opts.0.contains_key("aws_role_session_name"),
-            "role session name should not be injected"
+            s3_opts.contains_key(&AmazonS3ConfigKey::ContainerCredentialsFullUri),
+            "ECS full URI should be present"
         );
+
+        // build_aws_credential should select ECS, not IRSA
+        let result = build_aws_credential(
+            Duration::from_secs(300),
+            None,
+            Some(&s3_opts),
+            Some("us-east-1".to_string()),
+            None,
+        )
+        .await;
         assert!(
-            !opts
-                .0
-                .contains_key("aws_container_credentials_relative_uri"),
-            "container relative URI should not be injected"
-        );
-        assert!(
-            !opts.0.contains_key("aws_container_credentials_full_uri"),
-            "container full URI should not be injected"
-        );
-        assert!(
-            !opts
-                .0
-                .contains_key("aws_container_authorization_token_file"),
-            "container auth token file should not be injected"
+            result.is_ok(),
+            "ECS provider should be selected and built without error: {:?}",
+            result.err()
         );
     }
 }
