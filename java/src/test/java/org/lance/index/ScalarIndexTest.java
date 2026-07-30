@@ -165,6 +165,7 @@ public class ScalarIndexTest {
       assertTrue(dataset.version() > 0);
       assertTrue(dataset.countRows() > 0);
       assertFalse(dataset.getFragments().isEmpty());
+      assertFalse(dataset.memWalIndexDetails().isPresent());
       reentries.incrementAndGet();
     }
   }

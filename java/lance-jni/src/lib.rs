@@ -92,6 +92,9 @@ pub static RT: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
 /// already inside `RT.block_on`. Calling `Runtime::block_on` again panics with
 /// "Cannot start a runtime from within a runtime". When a Tokio handle is already
 /// available, use `block_in_place` + `Handle::block_on` instead.
+///
+/// JNI entry points should use this helper instead of calling `RT.block_on`
+/// directly so they remain safe when invoked from a callback.
 pub fn block_on<F: std::future::Future>(future: F) -> F::Output {
     match tokio::runtime::Handle::try_current() {
         Ok(handle) => tokio::task::block_in_place(|| handle.block_on(future)),
