@@ -11,7 +11,6 @@ use crate::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 use crate::{Dataset, Error, Result, session::Session};
 use futures::FutureExt;
 use lance_core::utils::tracing::{DATASET_LOADING_EVENT, TRACE_DATASET_EVENTS};
-use lance_file::datatypes::populate_schema_dictionary;
 use lance_file::reader::FileReaderOptions;
 use lance_io::object_store::{
     DEFAULT_CLOUD_IO_PARALLELISM, LanceNamespaceStorageOptionsProvider, ObjectStore,
@@ -20,7 +19,7 @@ use lance_io::object_store::{
 use lance_namespace::LanceNamespace;
 use lance_namespace::models::DescribeTableRequest;
 use lance_table::{
-    format::Manifest,
+    format::{Manifest, populate_manifest_schema_dictionaries},
     io::commit::external_manifest::ExternalManifestCommitHandler,
     io::commit::{CommitHandler, commit_handler_from_url},
 };
@@ -838,9 +837,9 @@ impl DatasetBuilder {
             let location = commit_handler
                 .resolve_version_location(&base_path, manifest.version, &object_store.inner)
                 .await?;
-            if manifest.schema.has_dictionary_types() && manifest.should_use_legacy_format() {
+            if manifest.schema.has_dictionary_types() {
                 let reader = object_store.open(&location.path).await?;
-                populate_schema_dictionary(&mut manifest.schema, reader.as_ref()).await?;
+                populate_manifest_schema_dictionaries(&mut manifest, reader.as_ref()).await?;
             }
             (Arc::new(manifest), location)
         } else {

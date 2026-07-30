@@ -478,6 +478,14 @@ pub struct TakeBuilder {
     row_addrs: Option<Vec<u64>>,
     projection: Arc<ProjectionPlan>,
     with_row_address: bool,
+    missing_row_policy: MissingRowPolicy,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum MissingRowPolicy {
+    #[default]
+    Ignore,
+    Error,
 }
 
 impl TakeBuilder {
@@ -493,6 +501,7 @@ impl TakeBuilder {
             projection: Arc::new(projection.into_projection_plan(dataset.clone())?),
             dataset,
             with_row_address: false,
+            missing_row_policy: MissingRowPolicy::default(),
         })
     }
 
@@ -508,12 +517,18 @@ impl TakeBuilder {
             projection,
             dataset,
             with_row_address: false,
+            missing_row_policy: MissingRowPolicy::default(),
         })
     }
 
     /// Adds row addresses to the output
     pub fn with_row_address(mut self, with_row_address: bool) -> Self {
         self.with_row_address = with_row_address;
+        self
+    }
+
+    pub(super) fn with_missing_row_policy(mut self, policy: MissingRowPolicy) -> Self {
+        self.missing_row_policy = policy;
         self
     }
 
@@ -537,8 +552,20 @@ impl TakeBuilder {
                 .as_ref()
                 .expect("row_ids must be set if row_addrs is not");
             let addrs = if let Some(row_id_index) = get_row_id_index(&self.dataset).await? {
-                row_id_index
-                    .get_many(row_ids)
+                let resolved = row_id_index.get_many(row_ids);
+                if self.missing_row_policy == MissingRowPolicy::Error
+                    && let Some(first_missing_index) =
+                        resolved.iter().position(|address| address.is_none())
+                {
+                    let missing_count = resolved.iter().filter(|address| address.is_none()).count();
+                    return Err(Error::invalid_input(format!(
+                        "Could not resolve all requested row IDs: requested {}, resolved {}; first missing row ID {} was deleted or not found",
+                        row_ids.len(),
+                        row_ids.len() - missing_count,
+                        row_ids[first_missing_index]
+                    )));
+                }
+                resolved
                     .into_iter()
                     .filter_map(|opt| opt.map(|address| address.into()))
                     .collect::<Vec<_>>()

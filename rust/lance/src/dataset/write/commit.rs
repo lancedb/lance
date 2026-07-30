@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use lance_file::version::LanceFileVersion;
+use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_select::RowAddrTreeMap;
 use lance_table::{
@@ -43,6 +43,7 @@ pub struct CommitBuilder<'a> {
     commit_handler: Option<Arc<dyn CommitHandler>>,
     store_params: Option<ObjectStoreParams>,
     object_store: Option<Arc<ObjectStore>>,
+    source_store: Option<Arc<ObjectStore>>,
     session: Option<Arc<Session>>,
     detached: bool,
     commit_config: CommitConfig,
@@ -64,6 +65,7 @@ impl<'a> CommitBuilder<'a> {
             commit_handler: None,
             store_params: None,
             object_store: None,
+            source_store: None,
             session: None,
             detached: false,
             commit_config: Default::default(),
@@ -100,6 +102,18 @@ impl<'a> CommitBuilder<'a> {
     /// Pass an object store to use.
     pub fn with_object_store(mut self, object_store: Arc<ObjectStore>) -> Self {
         self.object_store = Some(object_store);
+        self
+    }
+
+    /// Pass the object store of the dataset being cloned from.
+    ///
+    /// Only used by `Operation::Clone`: the source manifest is read through this store
+    /// while the new dataset is written through the destination store. This lets a clone
+    /// cross object stores/accounts (e.g. between two Azure accounts), where the source
+    /// is not reachable with the destination's credentials. Defaults to the destination
+    /// store when not set, preserving same-store behavior.
+    pub fn with_source_store(mut self, source_store: Arc<ObjectStore>) -> Self {
+        self.source_store = Some(source_store);
         self
     }
 
@@ -241,6 +255,9 @@ impl<'a> CommitBuilder<'a> {
             .or_else(|| self.dest.dataset().map(|ds| ds.session.clone()))
             .unwrap_or_default();
 
+        // Store used to read the source manifest for a clone (see with_source_store).
+        let source_store = self.source_store.clone();
+
         let (object_store, base_path, commit_handler) = match &self.dest {
             WriteDestination::Dataset(dataset) => (
                 dataset.object_store.clone(),
@@ -349,7 +366,8 @@ impl<'a> CommitBuilder<'a> {
         if let Some(ds) = dest.dataset()
             && let Some(storage_format) = self.storage_format
         {
-            let passed_storage_format = DataStorageFormat::new(storage_format);
+            let passed_storage_format =
+                DataStorageFormat::new(ConcreteFileVersion::from(storage_format));
             if ds.manifest.data_storage_format != passed_storage_format
                 && !matches!(transaction.operation, Operation::Overwrite { .. })
             {
@@ -363,7 +381,10 @@ impl<'a> CommitBuilder<'a> {
 
         let manifest_config = ManifestWriteConfig {
             use_stable_row_ids,
-            storage_format: self.storage_format.map(DataStorageFormat::new),
+            storage_format: self
+                .storage_format
+                .map(ConcreteFileVersion::from)
+                .map(DataStorageFormat::new),
             ..Default::default()
         };
 
@@ -404,6 +425,7 @@ impl<'a> CommitBuilder<'a> {
         } else {
             commit_new_dataset(
                 object_store.as_ref(),
+                source_store.as_deref(),
                 commit_handler.as_ref(),
                 &base_path,
                 &transaction,
@@ -537,7 +559,8 @@ mod tests {
     use super::*;
 
     fn sample_fragment() -> Fragment {
-        let (major_version, minor_version) = LanceFileVersion::Stable.to_numbers();
+        let (major_version, minor_version) =
+            ConcreteFileVersion::from(LanceFileVersion::Stable).to_data_file_numbers();
         Fragment {
             id: 0,
             files: vec![DataFile {
@@ -549,6 +572,7 @@ mod tests {
                 file_size_bytes: CachedFileSize::new(100),
                 base_id: None,
             }],
+            overlays: vec![],
             deletion_file: None,
             row_id_meta: None,
             physical_rows: Some(10),
@@ -966,7 +990,7 @@ mod tests {
                 new_fragments: vec![],
                 removed_fragment_ids: vec![],
                 fields_modified: vec![],
-                merged_generations: Vec::new(),
+                compacted_sstables: Vec::new(),
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
                 inserted_rows_filter: None,

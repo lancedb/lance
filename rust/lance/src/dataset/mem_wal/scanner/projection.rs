@@ -6,8 +6,8 @@
 //!
 //! `MemTableScanner::project()` only special-cases `_rowid`; passing other
 //! system columns through it errors. And cross-LSM values for system
-//! columns aren't comparable (a `_rowid` of 5 in the base and in a flushed
-//! memtable refer to different rows).
+//! columns aren't comparable (a `_rowid` of 5 in the base and in an
+//! SSTable refer to different rows).
 //!
 //! - [`build_scanner_projection`] — strips system / `_distance` cols, appends PKs.
 //! - [`canonical_output_schema`] — final schema honoring user order; system

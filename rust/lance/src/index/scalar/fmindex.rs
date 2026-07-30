@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use lance_index::scalar::index_files_to_table;
 use lance_table::format::IndexMetadata;
 use roaring::RoaringBitmap;
 use std::sync::Arc;
@@ -76,7 +77,7 @@ pub(in crate::index) async fn merge_segments(
             index_version: created_index.index_version as i32,
             created_at: Some(chrono::Utc::now()),
             base_id: None,
-            files: Some(created_index.files),
+            files: Some(index_files_to_table(created_index.files)),
             ..segments[0].clone()
         });
     }
@@ -111,7 +112,7 @@ pub(in crate::index) async fn merge_segments(
         index_version: created_index.index_version as i32,
         created_at: Some(chrono::Utc::now()),
         base_id: None,
-        files: Some(created_index.files),
+        files: Some(index_files_to_table(created_index.files)),
         ..segments[0].clone()
     })
 }

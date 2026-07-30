@@ -22,6 +22,7 @@ use crate::dataset::fragment::write::FragmentCreateBuilder;
 use crate::dataset::transaction::Operation;
 
 mod failing_store;
+pub mod serializing_cache;
 mod throttle_store;
 
 pub use failing_store::FailingProxyStore;
@@ -243,6 +244,7 @@ impl TestDatasetGenerator {
         Fragment {
             id: 0,
             files,
+            overlays: vec![],
             deletion_file: None,
             row_id_meta: None,
             physical_rows: Some(batch.num_rows()),

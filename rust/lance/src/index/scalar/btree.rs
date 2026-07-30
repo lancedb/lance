@@ -15,7 +15,7 @@ use lance_index::pbold::BTreeIndexDetails;
 use lance_index::scalar::btree::BTreeIndex;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::registry::VALUE_COLUMN_NAME;
-use lance_index::scalar::{CreatedIndex, OldIndexDataFilter};
+use lance_index::scalar::{CreatedIndex, OldIndexDataFilter, index_files_to_table};
 use lance_table::format::IndexMetadata;
 use uuid::Uuid;
 
@@ -161,6 +161,6 @@ pub(crate) async fn merge_segments(
         index_version: created_index.index_version as i32,
         created_at: Some(chrono::Utc::now()),
         base_id: None,
-        files: Some(created_index.files),
+        files: Some(index_files_to_table(created_index.files)),
     })
 }

@@ -137,14 +137,18 @@ impl FieldEncoder for BlobStructuralEncoder {
         let def = repdef.definition_levels.as_ref();
         let def_meaning: Arc<[DefinitionInterpretation]> = repdef.def_meaning.into();
 
-        match self.def_meaning.as_ref() {
-            None => {
-                self.def_meaning = Some(def_meaning.clone());
+        // A blob page stores one definition interpretation for all of its rows.
+        // The descriptor encoder can buffer multiple input arrays, so finish the
+        // pending page before a later array changes from all-valid to nullable (or
+        // vice versa).
+        let mut encode_tasks = match self.def_meaning.as_ref() {
+            Some(existing) if existing != &def_meaning => {
+                let existing = existing.clone();
+                Self::wrap_tasks(self.descriptor_encoder.flush(external_buffers)?, existing)
             }
-            Some(existing) => {
-                debug_assert_eq!(existing, &def_meaning);
-            }
-        }
+            _ => Vec::new(),
+        };
+        self.def_meaning = Some(def_meaning.clone());
 
         // Collect positions and sizes
         let mut positions = Vec::with_capacity(binary_array.len());
@@ -192,15 +196,16 @@ impl FieldEncoder for BlobStructuralEncoder {
         ));
 
         // Delegate to descriptor encoder
-        let encode_tasks = self.descriptor_encoder.maybe_encode(
+        let descriptor_tasks = self.descriptor_encoder.maybe_encode(
             descriptor_array,
             external_buffers,
             RepDefBuilder::default(),
             row_number,
             num_rows,
         )?;
+        encode_tasks.extend(Self::wrap_tasks(descriptor_tasks, def_meaning));
 
-        Ok(Self::wrap_tasks(encode_tasks, def_meaning))
+        Ok(encode_tasks)
     }
 
     fn flush(&mut self, external_buffers: &mut OutOfLineBuffers) -> Result<Vec<EncodeTask>> {
@@ -267,16 +272,11 @@ impl FieldEncoder for BlobV2StructuralEncoder {
         &mut self,
         array: ArrayRef,
         external_buffers: &mut OutOfLineBuffers,
-        mut repdef: RepDefBuilder,
+        repdef: RepDefBuilder,
         row_number: u64,
         num_rows: u64,
     ) -> Result<Vec<EncodeTask>> {
         let struct_arr = array.as_struct();
-        if let Some(validity) = struct_arr.nulls() {
-            repdef.add_validity_bitmap(validity.clone());
-        } else {
-            repdef.add_no_null(struct_arr.len());
-        }
 
         let kind_col = struct_arr
             .column_by_name("kind")
@@ -403,7 +403,7 @@ impl FieldEncoder for BlobV2StructuralEncoder {
         let descriptor_array = Arc::new(StructArray::try_new(
             BLOB_V2_DESC_FIELDS.clone(),
             children,
-            None,
+            struct_arr.nulls().cloned(),
         )?) as ArrayRef;
 
         self.descriptor_encoder.maybe_encode(
@@ -559,6 +559,28 @@ mod tests {
         ]));
 
         check_round_trip_encoding_of_data(vec![array], &TestCases::default(), blob_metadata).await;
+    }
+
+    #[tokio::test]
+    async fn test_blob_round_trip_varying_chunk_nullability() {
+        let blob_metadata =
+            HashMap::from([(lance_arrow::BLOB_META_KEY.to_string(), "true".to_string())]);
+        let all_valid = Arc::new(LargeBinaryArray::from(vec![Some(b"first".as_ref())]));
+        let with_null = Arc::new(LargeBinaryArray::from(vec![
+            Some(b"second".as_ref()),
+            None,
+            Some(b"".as_ref()),
+        ]));
+        let all_valid_again = Arc::new(LargeBinaryArray::from(vec![Some(b"last".as_ref())]));
+
+        check_round_trip_encoding_of_data(
+            vec![all_valid, with_null, all_valid_again],
+            &TestCases::default()
+                .with_min_file_version(LanceFileVersion::V2_1)
+                .with_max_file_version(LanceFileVersion::V2_1),
+            blob_metadata,
+        )
+        .await;
     }
 
     #[tokio::test]

@@ -4,7 +4,7 @@
 //! IVF - Inverted File index.
 
 use super::{
-    LogicalIvfView,
+    LogicalIvfView, derive_hnsw_params,
     pq::{PQIndex, build_pq_model},
     utils::{filter_finite_training_data, maybe_sample_training_data},
 };
@@ -19,7 +19,11 @@ use crate::index::vector::open_index_file;
 use crate::index::vector::utils::{get_vector_dim, get_vector_type};
 use crate::{
     dataset::Dataset,
-    index::{INDEX_FILE_NAME, pb, prefilter::PreFilter, vector::ivf::io::write_pq_partitions},
+    index::{
+        INDEX_FILE_NAME, pb,
+        prefilter::PreFilter,
+        vector::ivf::io::{write_pq_partition_payload, write_pq_partitions},
+    },
 };
 use crate::{dataset::builder::DatasetBuilder, index::vector::IndexFileVersion};
 use arrow::array::ArrayData;
@@ -47,7 +51,7 @@ use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::{
     Error, ROW_ID_FIELD, Result,
-    cache::{LanceCache, UnsizedCacheKey, WeakLanceCache},
+    cache::{CacheKeySchema, KeyBuilder, LanceCache, UnsizedCacheKey, WeakLanceCache},
     traits::DatasetTakeRows,
     utils::parse::parse_env_as_bool,
     utils::tracing::{IO_TYPE_LOAD_VECTOR_PART, TRACE_IO_EVENTS},
@@ -55,10 +59,8 @@ use lance_core::{
 use lance_encoding::decoder::FilterExpression;
 use lance_file::{
     format::MAGIC,
-    previous::writer::{
-        FileWriter as PreviousFileWriter, FileWriterOptions as PreviousFileWriterOptions,
-    },
     reader::{FileReader as V2Reader, FileReaderOptions as V2ReaderOptions},
+    versions::v1::writer::{FileWriter as V1FileWriter, FileWriterOptions as V1FileWriterOptions},
     writer::{FileWriter as V2Writer, FileWriterOptions as V2WriterOptions},
 };
 use lance_index::metrics::MetricsCollector;
@@ -102,7 +104,6 @@ use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
 use lance_io::{
     ReadBatchParams,
-    encodings::plain::PlainEncoder,
     local::to_local_path,
     object_store::ObjectStore,
     stream::RecordBatchStream,
@@ -156,6 +157,14 @@ impl UnsizedCacheKey for LegacyIVFPartitionKey {
 
     fn type_name() -> &'static str {
         "LegacyIVFPartition"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.index.legacy-ivf-partition-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_u64(self.partition_id as u64);
     }
 }
 
@@ -322,7 +331,7 @@ fn candidate_is_better(
     }
 }
 
-fn index_type_for_segmented_optimize(index: &dyn VectorIndex) -> Result<IndexType> {
+pub(crate) fn index_type_for_segmented_optimize(index: &dyn VectorIndex) -> Result<IndexType> {
     let (sub_index_type, quantization_type) = index.sub_index_type();
     IndexType::try_from(index_type_string(sub_index_type, quantization_type).as_str())
 }
@@ -386,6 +395,178 @@ pub(crate) fn select_segment_for_single_rebalance(
     Ok(selected.map(|candidate| candidate.segment_id))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VectorSegmentCompatibility {
+    SharedModel,
+    QueryCompatibleModelsDiffer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VectorModelMismatch {
+    StorageFormat,
+    IvfCentroids,
+    QuantizerMetadata,
+}
+
+fn vector_index_dimension(index: &dyn VectorIndex) -> usize {
+    let ivf_dimension = index.ivf_model().dimension();
+    if ivf_dimension != 0 {
+        return ivf_dimension;
+    }
+
+    match index.quantizer() {
+        Quantizer::Flat(quantizer) => quantizer.metadata(None).dim,
+        Quantizer::FlatBin(quantizer) => quantizer.metadata(None).dim,
+        Quantizer::Product(quantizer) => quantizer.dimension,
+        Quantizer::Scalar(quantizer) => quantizer.metadata(None).dim,
+        Quantizer::Rabit(quantizer) => quantizer.metadata(None).rotated_dim(),
+    }
+}
+
+fn validate_vector_query_compatibility(
+    indices: &[Arc<dyn VectorIndex>],
+    operation: &str,
+) -> Result<()> {
+    let Some(first) = indices.first() else {
+        return Ok(());
+    };
+
+    let first_metric = first.metric_type();
+    let first_dimension = vector_index_dimension(first.as_ref());
+    let first_index_type = first.sub_index_type();
+    let first_quantizer = first.quantizer();
+    let first_quantizer_type = first_quantizer.quantization_type();
+
+    for (idx, index) in indices.iter().enumerate().skip(1) {
+        if index.metric_type() != first_metric {
+            return Err(Error::index(format!(
+                "{operation}: vector index segment {idx} has metric {:?}, expected {:?}",
+                index.metric_type(),
+                first_metric
+            )));
+        }
+        let dimension = vector_index_dimension(index.as_ref());
+        if dimension != first_dimension {
+            return Err(Error::index(format!(
+                "{operation}: vector index segment {idx} has dimension {dimension}, expected {first_dimension}"
+            )));
+        }
+        let index_type = index.sub_index_type();
+        if std::mem::discriminant(&index_type.0) != std::mem::discriminant(&first_index_type.0)
+            || index_type.1 != first_index_type.1
+        {
+            return Err(Error::index(format!(
+                "{operation}: vector index segment {idx} has type {:?}, expected {:?}",
+                index_type, first_index_type
+            )));
+        }
+
+        let quantizer = index.quantizer();
+        if quantizer.quantization_type() != first_quantizer_type {
+            return Err(Error::index(format!(
+                "{operation}: vector index segment {idx} has quantizer {:?}, expected {:?}",
+                quantizer.quantization_type(),
+                first_quantizer_type
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn vector_model_mismatch(indices: &[Arc<dyn VectorIndex>]) -> Option<VectorModelMismatch> {
+    let first = indices.first()?;
+    let first_centroids = first.ivf_model().centroids_array();
+    let first_quantizer = first.quantizer();
+
+    for index in indices.iter().skip(1) {
+        if first.as_any().type_id() != index.as_any().type_id() {
+            return Some(VectorModelMismatch::StorageFormat);
+        }
+        match (first_centroids, index.ivf_model().centroids_array()) {
+            (Some(expected), Some(actual)) if expected.to_data() != actual.to_data() => {
+                return Some(VectorModelMismatch::IvfCentroids);
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                return Some(VectorModelMismatch::IvfCentroids);
+            }
+            _ => {}
+        }
+
+        if !shared_quantizer_model(&first_quantizer, &index.quantizer()) {
+            return Some(VectorModelMismatch::QuantizerMetadata);
+        }
+    }
+
+    None
+}
+
+pub(crate) fn vector_segment_compatibility(
+    logical_index: &LogicalIvfView<'_>,
+    operation: &str,
+) -> Result<VectorSegmentCompatibility> {
+    let indices = logical_index.indices().cloned().collect::<Vec<_>>();
+    validate_vector_query_compatibility(&indices, operation)?;
+    Ok(if vector_model_mismatch(&indices).is_none() {
+        VectorSegmentCompatibility::SharedModel
+    } else {
+        VectorSegmentCompatibility::QueryCompatibleModelsDiffer
+    })
+}
+
+fn validate_shared_vector_model(indices: &[Arc<dyn VectorIndex>], operation: &str) -> Result<()> {
+    validate_vector_query_compatibility(indices, operation)?;
+    match vector_model_mismatch(indices) {
+        Some(VectorModelMismatch::StorageFormat) => Err(Error::index(format!(
+            "{operation}: vector index segments do not share a storage format"
+        ))),
+        Some(VectorModelMismatch::IvfCentroids) => Err(Error::index(format!(
+            "{operation}: vector index segments do not share IVF centroids"
+        ))),
+        Some(VectorModelMismatch::QuantizerMetadata) => Err(Error::index(format!(
+            "{operation}: vector index segments do not share quantizer metadata"
+        ))),
+        None => Ok(()),
+    }
+}
+
+fn shared_quantizer_model(left: &Quantizer, right: &Quantizer) -> bool {
+    match (left, right) {
+        (Quantizer::Flat(left), Quantizer::Flat(right)) => {
+            left.metadata(None).dim == right.metadata(None).dim
+        }
+        (Quantizer::FlatBin(left), Quantizer::FlatBin(right)) => {
+            left.metadata(None).dim == right.metadata(None).dim
+        }
+        (Quantizer::Product(left), Quantizer::Product(right)) => {
+            left.num_sub_vectors == right.num_sub_vectors
+                && left.num_bits == right.num_bits
+                && left.dimension == right.dimension
+                && left.distance_type == right.distance_type
+                && left.codebook.to_data() == right.codebook.to_data()
+        }
+        (Quantizer::Scalar(left), Quantizer::Scalar(right)) => {
+            left.metadata(None) == right.metadata(None)
+        }
+        (Quantizer::Rabit(left), Quantizer::Rabit(right)) => {
+            let left = left.metadata(None);
+            let right = right.metadata(None);
+            left.rotation_type == right.rotation_type
+                && left.code_dim == right.code_dim
+                && left.num_bits == right.num_bits
+                && left.packed == right.packed
+                && left.query_estimator == right.query_estimator
+                && left.fast_rotation_signs == right.fast_rotation_signs
+                && match (&left.rotate_mat, &right.rotate_mat) {
+                    (Some(left), Some(right)) => left.to_data() == right.to_data(),
+                    (None, None) => true,
+                    _ => false,
+                }
+        }
+        _ => false,
+    }
+}
+
 // TODO: move to `lance-index` crate.
 ///
 /// Returns (new_uuid, num_indices_merged, files)
@@ -403,6 +584,7 @@ pub(crate) async fn optimize_vector_indices(
             "optimizing vector index: no existing index found".to_string(),
         ));
     }
+    validate_shared_vector_model(&existing_indices, "optimizing vector index")?;
 
     // try cast to v1 IVFIndex,
     // fallback to v2 IVFIndex if it's not v1 IVFIndex
@@ -639,7 +821,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                     index_dir,
                     distance_type,
                     shuffler,
-                    HnswBuildParams::default(),
+                    derive_hnsw_params(existing_indices[0].as_ref()),
                     frag_reuse_index,
                     options.clone(),
                 )?
@@ -657,7 +839,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                     index_dir,
                     distance_type,
                     shuffler,
-                    HnswBuildParams::default(),
+                    derive_hnsw_params(existing_indices[0].as_ref()),
                     frag_reuse_index,
                     options.clone(),
                 )?
@@ -678,7 +860,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 index_dir,
                 distance_type,
                 shuffler,
-                HnswBuildParams::default(),
+                derive_hnsw_params(existing_indices[0].as_ref()),
                 frag_reuse_index,
                 options.clone(),
             )?
@@ -698,7 +880,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 index_dir,
                 distance_type,
                 shuffler,
-                HnswBuildParams::default(),
+                derive_hnsw_params(existing_indices[0].as_ref()),
                 frag_reuse_index,
                 options.clone(),
             )?
@@ -870,11 +1052,8 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
 
     // Prepare the HNSW writer
     let schema = lance_core::datatypes::Schema::try_from(HNSW::schema().as_ref())?;
-    let mut writer = PreviousFileWriter::with_object_writer(
-        writer,
-        schema,
-        &PreviousFileWriterOptions::default(),
-    )?;
+    let mut writer =
+        V1FileWriter::with_object_writer(writer, schema, &V1FileWriterOptions::default())?;
     writer.add_metadata(
         INDEX_METADATA_SCHEMA_KEY,
         json!(IndexMetadata {
@@ -898,11 +1077,8 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
         ),
     ]);
     let schema = lance_core::datatypes::Schema::try_from(&schema)?;
-    let mut aux_writer = PreviousFileWriter::with_object_writer(
-        aux_writer,
-        schema,
-        &PreviousFileWriterOptions::default(),
-    )?;
+    let mut aux_writer =
+        V1FileWriter::with_object_writer(aux_writer, schema, &V1FileWriterOptions::default())?;
     aux_writer.add_metadata(
         INDEX_METADATA_SCHEMA_KEY,
         json!(IndexMetadata {
@@ -1744,8 +1920,12 @@ impl RemapPageTask {
             page.pq.code_dim(),
             page.row_ids.as_ref().unwrap().len(),
         );
-        PlainEncoder::write(writer, &[&original_pq]).await?;
-        PlainEncoder::write(writer, &[page.row_ids.as_ref().unwrap().as_ref()]).await?;
+        write_pq_partition_payload(
+            writer,
+            &[&original_pq],
+            &[page.row_ids.as_ref().unwrap().as_ref()],
+        )
+        .await?;
         Ok(())
     }
 }
@@ -2064,11 +2244,8 @@ async fn write_ivf_hnsw_file(
     let writer = object_store.create(&path).await?;
 
     let schema = lance_core::datatypes::Schema::try_from(HNSW::schema().as_ref())?;
-    let mut writer = PreviousFileWriter::with_object_writer(
-        writer,
-        schema,
-        &PreviousFileWriterOptions::default(),
-    )?;
+    let mut writer =
+        V1FileWriter::with_object_writer(writer, schema, &V1FileWriterOptions::default())?;
     writer.add_metadata(
         INDEX_METADATA_SCHEMA_KEY,
         json!(IndexMetadata {
@@ -2096,11 +2273,8 @@ async fn write_ivf_hnsw_file(
         ),
     ]);
     let schema = lance_core::datatypes::Schema::try_from(&schema)?;
-    let mut aux_writer = PreviousFileWriter::with_object_writer(
-        aux_writer,
-        schema,
-        &PreviousFileWriterOptions::default(),
-    )?;
+    let mut aux_writer =
+        V1FileWriter::with_object_writer(aux_writer, schema, &V1FileWriterOptions::default())?;
     aux_writer.add_metadata(
         INDEX_METADATA_SCHEMA_KEY,
         json!(IndexMetadata {
@@ -4583,6 +4757,41 @@ mod tests {
     use crate::utils::test::copy_test_data_to_tmp;
 
     const DIM: usize = 32;
+
+    #[test]
+    fn test_shared_quantizer_model_compares_skipped_payloads() {
+        let codebook = |offset| {
+            let values = Float32Array::from_iter_values((0..32).map(|v| v as f32 + offset));
+            FixedSizeListArray::try_new_from_values(values, 2).unwrap()
+        };
+        let pq1 = Quantizer::Product(ProductQuantizer::new(
+            1,
+            4,
+            2,
+            codebook(0.0),
+            DistanceType::L2,
+        ));
+        let pq2 = Quantizer::Product(ProductQuantizer::new(
+            1,
+            4,
+            2,
+            codebook(100.0),
+            DistanceType::L2,
+        ));
+        assert!(!shared_quantizer_model(&pq1, &pq2));
+
+        let rq1 = Quantizer::Rabit(RabitQuantizer::new_with_rotation::<Float32Type>(
+            1,
+            8,
+            lance_index::vector::bq::RQRotationType::Matrix,
+        ));
+        let rq2 = Quantizer::Rabit(RabitQuantizer::new_with_rotation::<Float32Type>(
+            1,
+            8,
+            lance_index::vector::bq::RQRotationType::Matrix,
+        ));
+        assert!(!shared_quantizer_model(&rq1, &rq2));
+    }
 
     async fn compute_test_ivf_loss(dataset: &Dataset, column: &str, ivf: &IvfModel) -> f64 {
         let centroids = ivf

@@ -164,6 +164,9 @@ fn remap_expr_references(expr: &mut Expression, mapping: &HashMap<usize, usize>)
         RexType::WindowFunction(_) | RexType::Subquery(_) => Err(Error::invalid_input(
             "Window functions or subqueries not allowed in filter expression",
         )),
+        RexType::Lambda(_) | RexType::LambdaInvocation(_) => Err(Error::invalid_input(
+            "Lambda expressions not allowed in filter expression",
+        )),
         // Pass through operators, nested children may have field references
         RexType::ScalarFunction(func) => {
             #[allow(deprecated)]
@@ -551,7 +554,7 @@ mod tests {
         },
         expression_reference::ExprType,
         extensions::{
-            SimpleExtensionDeclaration, SimpleExtensionUri, SimpleExtensionUrn,
+            SimpleExtensionDeclaration, SimpleExtensionUrn,
             simple_extension_declaration::{ExtensionFunction, MappingType},
         },
         function_argument::ArgType,
@@ -576,13 +579,6 @@ mod tests {
                 git_hash: "".to_string(),
                 producer: "unit-test".to_string(),
             }),
-            #[expect(deprecated)]
-            extension_uris: vec![
-                SimpleExtensionUri {
-                    extension_uri_anchor: 1,
-                    uri: "https://github.com/substrait-io/substrait/blob/main/extensions/functions_comparison.yaml".to_string(),
-                }
-            ],
             extension_urns: vec![
                 SimpleExtensionUrn {
                     extension_urn_anchor: 1,
@@ -592,8 +588,6 @@ mod tests {
             extensions: vec![
                 SimpleExtensionDeclaration {
                     mapping_type: Some(MappingType::ExtensionFunction(ExtensionFunction {
-                        #[expect(deprecated)]
-                        extension_uri_reference: 1,
                         extension_urn_reference: 1,
                         function_anchor: 1,
                         name: "lt".to_string(),
@@ -881,9 +875,7 @@ mod tests {
     fn agg_extension(anchor: u32, name: &str) -> SimpleExtensionDeclaration {
         SimpleExtensionDeclaration {
             mapping_type: Some(MappingType::ExtensionFunction(ExtensionFunction {
-                #[allow(deprecated)]
-                extension_uri_reference: 1,
-                extension_urn_reference: 0,
+                extension_urn_reference: 1,
                 function_anchor: anchor,
                 name: name.to_string(),
             })),
@@ -919,10 +911,9 @@ mod tests {
                 git_hash: String::new(),
                 producer: "lance-test".to_string(),
             }),
-            #[allow(deprecated)]
-            extension_uris: vec![SimpleExtensionUri {
-                extension_uri_anchor: 1,
-                uri: "https://github.com/substrait-io/substrait/blob/main/extensions/functions_aggregate_generic.yaml".to_string(),
+            extension_urns: vec![SimpleExtensionUrn {
+                extension_urn_anchor: 1,
+                urn: "https://github.com/substrait-io/substrait/blob/main/extensions/functions_aggregate_generic.yaml".to_string(),
             }],
             extensions,
             relations: vec![PlanRel {
@@ -935,7 +926,6 @@ mod tests {
             }],
             advanced_extensions: None,
             expected_type_urls: vec![],
-            extension_urns: vec![],
             parameter_bindings: vec![],
             type_aliases: vec![],
         };

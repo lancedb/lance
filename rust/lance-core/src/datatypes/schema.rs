@@ -762,11 +762,65 @@ impl Schema {
 
     /// Returns the properly formatted path from root to the field.
     /// Field names containing dots are quoted (e.g., struct.`field.with.dot`)
+    ///
+    /// The result is suitable for SQL parsing. For a human-readable path
+    /// (e.g. for display in index metadata), use [`Self::field_path_minimal`].
     pub fn field_path(&self, field_id: i32) -> Result<String> {
         self.field_ancestry_by_id(field_id)
             .map(|ancestry| {
                 let field_refs: Vec<&str> = ancestry.iter().map(|f| f.name.as_str()).collect();
                 format_field_path(&field_refs)
+            })
+            .ok_or_else(|| {
+                Error::index(format!("Could not find field ancestry for id {}", field_id))
+            })
+    }
+
+    /// Returns the path from root to the field using *minimal* quoting.
+    ///
+    /// A segment is wrapped in backticks only when it contains a character that
+    /// [`parse_field_path`] treats specially (a `.` separator or a `` ` `` quote);
+    /// any other character — including hyphens — is left bare. Unlike
+    /// [`Self::field_path`] (which quotes for SQL-expression safety and so wraps
+    /// e.g. `my-col` in backticks), the result here is both human-readable and
+    /// round-trips back through `parse_field_path`, so it is safe to feed into
+    /// field-path APIs such as `drop_columns` / `update_field_metadata`.
+    ///
+    /// This is what should be exposed as the column name in index metadata.
+    ///
+    /// ```
+    /// use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema};
+    /// use lance_core::datatypes::{parse_field_path, Schema};
+    ///
+    /// let arrow = ArrowSchema::new(vec![
+    ///     Field::new("my-col", DataType::Int32, false),
+    ///     Field::new(
+    ///         "parent",
+    ///         DataType::Struct(Fields::from(vec![Field::new("child.x", DataType::Int32, true)])),
+    ///         true,
+    ///     ),
+    /// ]);
+    /// let schema = Schema::try_from(&arrow).unwrap();
+    ///
+    /// // A hyphen is not special to `parse_field_path`, so it is left bare
+    /// // (unlike `field_path`, which would quote it as `` `my-col` ``).
+    /// let hyphen_id = schema.field("my-col").unwrap().id;
+    /// assert_eq!(schema.field_path_minimal(hyphen_id).unwrap(), "my-col");
+    ///
+    /// // A `.` in a segment forces quoting so the path still round-trips.
+    /// let dotted_id = schema.field("parent").unwrap().children[0].id;
+    /// let path = schema.field_path_minimal(dotted_id).unwrap();
+    /// assert_eq!(path, "parent.`child.x`");
+    /// assert_eq!(
+    ///     parse_field_path(&path).unwrap(),
+    ///     vec!["parent".to_string(), "child.x".to_string()],
+    /// );
+    /// ```
+    pub fn field_path_minimal(&self, field_id: i32) -> Result<String> {
+        self.field_ancestry_by_id(field_id)
+            .map(|ancestry| {
+                let field_refs: Vec<&str> = ancestry.iter().map(|f| f.name.as_str()).collect();
+                format_field_path_minimal(&field_refs)
             })
             .ok_or_else(|| {
                 Error::index(format!("Could not find field ancestry for id {}", field_id))
@@ -1071,6 +1125,17 @@ pub enum BlobHandling {
 }
 
 impl BlobHandling {
+    fn should_load_binary(&self, field: &Field) -> bool {
+        if !field.is_blob() {
+            return false;
+        }
+        match self {
+            Self::AllBinary => true,
+            Self::SomeBlobsBinary(set) | Self::SomeBinary(set) => set.contains(&(field.id as u32)),
+            Self::BlobsDescriptions | Self::AllDescriptions => false,
+        }
+    }
+
     fn should_unload(&self, field: &Field) -> bool {
         // Blob v2 columns are Structs, so we need to treat any blob-marked field as unloadable
         // even if the physical data type is not binary-like.
@@ -1095,10 +1160,25 @@ impl BlobHandling {
         self.should_unload(field)
     }
 
+    /// Apply this blob handling policy to a projected field tree.
+    ///
+    /// Blob descriptor modes convert blob leaves to descriptor views. Binary
+    /// modes convert selected blob leaves to `LargeBinary`. Non-blob nested
+    /// fields are preserved while their children are handled recursively.
     pub fn unload_if_needed(&self, mut field: Field) -> Field {
+        if self.should_load_binary(&field) {
+            field.binary_blob_mut();
+            return field;
+        }
         if self.should_unload(&field) {
             field.unloaded_mut();
+            return field;
         }
+        field.children = field
+            .children
+            .into_iter()
+            .map(|child| self.unload_if_needed(child))
+            .collect();
         field
     }
 }
@@ -1595,6 +1675,50 @@ pub fn format_field_path(fields: &[&str]) -> String {
             let needs_quoting = field.chars().any(|c| !c.is_alphanumeric() && c != '_');
             if needs_quoting {
                 // Escape backticks by doubling them (PostgreSQL style)
+                let escaped = field.replace('`', "``");
+                format!("`{}`", escaped)
+            } else {
+                field.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+/// Like [`format_field_path`], but quotes a segment only when strictly required
+/// for the result to round-trip back through [`parse_field_path`].
+///
+/// `parse_field_path` only treats `.` (segment separator) and `` ` `` (quote)
+/// specially, so those are the only characters that force quoting here. Notably
+/// a hyphen does NOT force quoting (`my-col` stays `my-col`), unlike
+/// `format_field_path` which quotes any non-identifier character for
+/// SQL-expression safety. Use this for human-readable, round-trippable paths
+/// (e.g. column names in index metadata); use `format_field_path` when the
+/// result will be embedded in a SQL expression.
+///
+/// ```
+/// use lance_core::datatypes::{format_field_path_minimal, parse_field_path};
+///
+/// // Plain identifiers and hyphenated names are left bare.
+/// assert_eq!(format_field_path_minimal(&["parent", "my-col"]), "parent.my-col");
+/// // A `.` in a segment forces quoting.
+/// assert_eq!(format_field_path_minimal(&["parent", "child.x"]), "parent.`child.x`");
+/// // Embedded backticks are escaped by doubling them.
+/// assert_eq!(format_field_path_minimal(&["child`x"]), "`child``x`");
+///
+/// // Whatever it produces round-trips back through `parse_field_path`.
+/// for segments in [vec!["parent", "my-col"], vec!["parent", "child.x"], vec!["child`x"]] {
+///     let path = format_field_path_minimal(&segments);
+///     assert_eq!(parse_field_path(&path).unwrap(), segments);
+/// }
+/// ```
+pub fn format_field_path_minimal(fields: &[&str]) -> String {
+    fields
+        .iter()
+        .map(|field| {
+            let needs_quoting = field.contains('.') || field.contains('`');
+            if needs_quoting {
+                // Escape embedded backticks by doubling them, matching parse_field_path.
                 let escaped = field.replace('`', "``");
                 format!("`{}`", escaped)
             } else {
@@ -2775,6 +2899,77 @@ mod tests {
         assert!(paths.contains(&"id".to_string()));
         assert!(paths.contains(&"vector".to_string()));
         assert!(paths.contains(&"name".to_string()));
+    }
+
+    #[test]
+    fn test_field_path_minimal() {
+        // A struct child whose own NAME contains a dot is the case that makes
+        // "just strip all backticks" wrong: it must stay quoted to round-trip.
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("mycol", ArrowDataType::Int32, false),
+            ArrowField::new("my_col", ArrowDataType::Int32, false),
+            ArrowField::new("my-col", ArrowDataType::Int32, false),
+            ArrowField::new(
+                "parent",
+                ArrowDataType::Struct(ArrowFields::from(vec![
+                    ArrowField::new("child-field", ArrowDataType::Int32, true),
+                    ArrowField::new("child.x", ArrowDataType::Int32, true),
+                    ArrowField::new("child`x", ArrowDataType::Int32, true),
+                ])),
+                true,
+            ),
+        ]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let id_of = |path: &str| schema.field(path).unwrap().id;
+        let child_id = |name: &str| {
+            schema
+                .field("parent")
+                .unwrap()
+                .children
+                .iter()
+                .find(|c| c.name == name)
+                .unwrap()
+                .id
+        };
+
+        // Plain identifiers: unchanged by either method.
+        assert_eq!(schema.field_path_minimal(id_of("mycol")).unwrap(), "mycol");
+        assert_eq!(
+            schema.field_path_minimal(id_of("my_col")).unwrap(),
+            "my_col"
+        );
+
+        // Hyphen is NOT special to parse_field_path, so minimal quoting leaves it
+        // bare (field_path would quote it for SQL safety).
+        assert_eq!(schema.field_path(id_of("my-col")).unwrap(), "`my-col`");
+        assert_eq!(
+            schema.field_path_minimal(id_of("my-col")).unwrap(),
+            "my-col"
+        );
+
+        // Nested hyphenated leaf: bare under minimal quoting.
+        assert_eq!(
+            schema.field_path_minimal(child_id("child-field")).unwrap(),
+            "parent.child-field"
+        );
+
+        // Nested leaf whose NAME contains a dot: MUST stay quoted so it
+        // round-trips through parse_field_path (this is the regression guard).
+        let dotted = schema.field_path_minimal(child_id("child.x")).unwrap();
+        assert_eq!(dotted, "parent.`child.x`");
+        assert_eq!(
+            parse_field_path(&dotted).unwrap(),
+            vec!["parent".to_string(), "child.x".to_string()]
+        );
+
+        // Nested leaf whose NAME contains a backtick: it must be quoted AND the
+        // backtick doubled so it round-trips through parse_field_path.
+        let backticked = schema.field_path_minimal(child_id("child`x")).unwrap();
+        assert_eq!(backticked, "parent.`child``x`");
+        assert_eq!(
+            parse_field_path(&backticked).unwrap(),
+            vec!["parent".to_string(), "child`x".to_string()]
+        );
     }
 
     #[test]

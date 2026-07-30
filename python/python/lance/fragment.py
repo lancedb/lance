@@ -45,6 +45,7 @@ if TYPE_CHECKING:
         ColumnOrdering,
         DatasetBasePath,
         LanceDataset,
+        LanceOperation,
         LanceScanner,
         ReaderLike,
         Transaction,
@@ -78,6 +79,11 @@ class FragmentMetadata:
         The row created at version metadata, if any.
     last_updated_at_version_meta : Optional[RowDatasetVersionMeta]
         The row last updated at version metadata, if any.
+    overlays : List[LanceOperation.DataOverlayFile]
+        The data overlay files layered over this fragment's base data, if any.
+        Overlays are created via :class:`LanceOperation.DataOverlay`; they are
+        carried here so they survive operations that round-trip fragment
+        metadata (e.g. a manual ``Delete``, ``Update``, or ``Merge`` commit).
     """
 
     id: int
@@ -87,6 +93,7 @@ class FragmentMetadata:
     row_id_meta: Optional[RowIdMeta] = None
     created_at_version_meta: Optional[RowDatasetVersionMeta] = None
     last_updated_at_version_meta: Optional[RowDatasetVersionMeta] = None
+    overlays: List["LanceOperation.DataOverlayFile"] = field(default_factory=list)
 
     @property
     def num_deletions(self) -> int:
@@ -110,12 +117,25 @@ class FragmentMetadata:
 
     def to_json(self) -> dict:
         """Get this as a simple JSON-serializable dictionary."""
-        files = [asdict(f) for f in self.files]
-        for f in files:
-            f["path"] = f.pop("_path")
+
+        def _data_file_to_json(f: DataFile) -> dict:
+            d = asdict(f)
+            d["path"] = d.pop("_path")
+            return d
+
+        files = [_data_file_to_json(f) for f in self.files]
+        overlays = [
+            dict(
+                data_file=_data_file_to_json(o.data_file),
+                offsets=o.offsets,
+                committed_version=o.committed_version,
+            )
+            for o in self.overlays
+        ]
         return dict(
             id=self.id,
             files=files,
+            overlays=overlays,
             physical_rows=self.physical_rows,
             deletion_file=(
                 self.deletion_file.asdict() if self.deletion_file is not None else None
@@ -159,6 +179,20 @@ class FragmentMetadata:
                 json.dumps(last_updated_at_version_meta)
             )
 
+        overlays = []
+        overlays_json = json_data.get("overlays")
+        if overlays_json:
+            from .dataset import LanceOperation
+
+            overlays = [
+                LanceOperation.DataOverlayFile(
+                    data_file=DataFile(**o["data_file"]),
+                    offsets=o["offsets"],
+                    committed_version=o.get("committed_version"),
+                )
+                for o in overlays_json
+            ]
+
         return FragmentMetadata(
             id=json_data["id"],
             files=[DataFile(**f) for f in json_data["files"]],
@@ -167,6 +201,7 @@ class FragmentMetadata:
             row_id_meta=row_id_meta,
             created_at_version_meta=created_at_version_meta,
             last_updated_at_version_meta=last_updated_at_version_meta,
+            overlays=overlays,
         )
 
 

@@ -69,6 +69,83 @@ def test_blob_compaction(tmp_path: Path):
     assert contents == blobs
 
 
+@pytest.mark.parametrize("storage_version", ["2.0", "2.1", "2.2"])
+def test_blob_compaction_preserves_null_empty_and_read_parity(
+    tmp_path: Path, storage_version: str
+):
+    base_dir = tmp_path / f"blob_dataset_{storage_version}"
+    if storage_version == "2.2":
+        blob_field = lance.blob_field("blob")
+    else:
+        blob_field = pa.field(
+            "blob",
+            pa.large_binary(),
+            metadata={"lance-encoding:blob": "true"},
+        )
+    schema = pa.schema([pa.field("id", pa.int64()), blob_field])
+
+    def make_blob_array(values):
+        if storage_version == "2.2":
+            return lance.blob_array(values)
+        return pa.array(values, type=pa.large_binary())
+
+    for index, (ids, values) in enumerate(
+        [
+            ([1, 2], [b"P1", None]),
+            ([3, 4, 5], [b"P3", None, b""]),
+        ]
+    ):
+        lance.write_dataset(
+            pa.Table.from_arrays(
+                [
+                    pa.array(ids, type=pa.int64()),
+                    make_blob_array(values),
+                ],
+                schema=schema,
+            ),
+            base_dir,
+            mode="create" if index == 0 else "append",
+            data_storage_version=storage_version,
+        )
+
+    dataset = lance.dataset(base_dir)
+    dataset.delete("id = 2")
+    dataset.optimize.compact_files(num_threads=1)
+
+    expected = {1: b"P1", 3: b"P3", 4: None, 5: b""}
+    binary_table = dataset.to_table(columns=["id", "blob"], blob_handling="all_binary")
+    scan_values = dict(
+        zip(
+            binary_table.column("id").to_pylist(),
+            binary_table.column("blob").to_pylist(),
+        )
+    )
+
+    ids = dataset.to_table(columns=["id"]).column("id").to_pylist()
+    blob_files = dataset.take_blobs("blob", indices=range(len(ids)))
+    take_values = {
+        row_id: None if blob_file is None else blob_file.readall()
+        for row_id, blob_file in zip(ids, blob_files)
+    }
+
+    assert take_values == expected
+    assert scan_values == take_values
+
+    descriptor_table = dataset.to_table(columns=["id", "blob"])
+    descriptions = dict(
+        zip(
+            descriptor_table.column("id").to_pylist(),
+            descriptor_table.column("blob").to_pylist(),
+        )
+    )
+    if storage_version == "2.0":
+        assert descriptions[4] == {"position": 1, "size": 0}
+    else:
+        assert descriptions[4] is None
+    assert descriptions[5] is not None
+    assert descriptions[5]["size"] == 0
+
+
 def test_optimize_max_bytes(tmp_path: Path):
     base_dir = tmp_path / "dataset"
     arr = pa.array(range(4 * 1024 * 1024))
@@ -590,6 +667,10 @@ def test_remap_row_addrs(tmp_path: Path):
 
     before = ds.scanner(columns=["id"], with_row_address=True).to_table()
     old = dict(zip(before["id"].to_pylist(), before["_rowaddr"].to_pylist()))
+
+    # A deferred-remap compaction records a fragment-reuse index only when it
+    # rewrites data an index covers, so index a column first.
+    ds.create_scalar_index("id", "BTREE")
 
     ds.optimize.compact_files(
         target_rows_per_fragment=1_000, defer_index_remap=True, num_threads=1

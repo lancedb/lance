@@ -9,6 +9,7 @@ import json
 import operator
 import os
 import random
+import re
 import time
 import uuid
 import warnings
@@ -44,6 +45,9 @@ from .blob import BlobFile
 from .dependencies import (
     _check_for_numpy,
     _check_for_torch,
+    _is_pydantic_base_model_class,
+    _validate_pydantic_list,
+    model_to_dict,
     torch,
 )
 from .dependencies import numpy as np
@@ -71,11 +75,15 @@ from .lance import (
 from .lance import __version__ as __version__
 from .lance import _Session as Session
 from .query import FullTextQuery
-from .types import _coerce_reader
+from .types import _coerce_reader, _is_materialized
 from .udf import BatchUDF, normalize_transform
 from .udf import BatchUDFCheckpoint as BatchUDFCheckpoint
 from .udf import batch_udf as batch_udf
-from .util import _target_partition_size_to_num_partitions, td_to_micros
+from .util import (
+    _normalize_index_segment_ids,
+    _target_partition_size_to_num_partitions,
+    td_to_micros,
+)
 
 if TYPE_CHECKING:
     from pyarrow._compute import Expression
@@ -235,14 +243,6 @@ def _is_null_blob_description(description: Any) -> bool:
         return False
     if description.keys() == {"position", "size"}:
         return description["position"] == 1 and description["size"] == 0
-    if description.keys() == {"kind", "position", "size", "blob_id", "blob_uri"}:
-        return (
-            description["kind"] == 0
-            and description["position"] == 0
-            and description["size"] == 0
-            and description["blob_id"] == 0
-            and description["blob_uri"] == ""
-        )
     return False
 
 
@@ -393,6 +393,12 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         """
         reader = _coerce_reader(data_obj, schema)
 
+        # Materialized sources are wrapped in an in-memory table so retries never
+        # spill and the source's statistics can drive the join; everything else is
+        # treated as a one-shot stream.
+        if _is_materialized(data_obj):
+            return super(MergeInsertBuilder, self).execute_batches(reader)
+
         return super(MergeInsertBuilder, self).execute(reader)
 
     def execute_uncommitted(
@@ -416,6 +422,9 @@ class MergeInsertBuilder(_MergeInsertBuilder):
             source is some kind of generator.
         """
         reader = _coerce_reader(data_obj, schema)
+
+        if _is_materialized(data_obj):
+            return super(MergeInsertBuilder, self).execute_uncommitted_batches(reader)
 
         return super(MergeInsertBuilder, self).execute_uncommitted(reader)
 
@@ -735,23 +744,22 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         reader = _coerce_reader(data_obj, schema)
         return super(MergeInsertBuilder, self).analyze_plan(reader)
 
-    def mark_generations_as_merged(
-        self, generations: "List[mem_wal.MergedGeneration]"
+    def mark_sstables_as_compacted(
+        self, sstables: "List[mem_wal.CompactedSsTable]"
     ) -> "MergeInsertBuilder":
-        """Mark MemWAL generations as merged into the base table.
+        """Mark MemWAL SSTables as compacted into the base table.
 
-        Call this before executing the merge_insert when the source data
-        includes rows from MemWAL flushed generations.
+        Call this before executing merge_insert when it compacts MemWAL SSTables.
 
         Parameters
         ----------
-        generations : list of MergedGeneration
-            Generations to mark as merged.
+        sstables : list of CompactedSsTable
+            SSTables to mark as compacted.
         """
-        from .mem_wal import _to_raw_merged_generations
+        from .mem_wal import _to_raw_compacted_sstables
 
-        raw_gens = _to_raw_merged_generations(generations)
-        super(MergeInsertBuilder, self).mark_generations_as_merged(raw_gens)
+        raw_sstables = _to_raw_compacted_sstables(sstables)
+        super(MergeInsertBuilder, self).mark_sstables_as_compacted(raw_sstables)
         return self
 
 
@@ -841,6 +849,55 @@ class LanceDataset(pa.dataset.Dataset):
             read_params=read_params,
             base_store_params=base_store_params,
         )
+
+    @classmethod
+    def from_pydantic_model(
+        cls,
+        model_class,
+        data,
+        uri: Optional[Union[str, Path]] = None,
+        mode: str = "create",
+        **kwargs,
+    ) -> "LanceDataset":
+        """Create a LanceDataset from a Pydantic model class and a list of instances.
+
+        The table name is inferred from the model class name converted to snake_case.
+        The schema is inferred from the model class's field annotations, not from
+        the data, so optional fields are typed correctly even if every value in a
+        given batch happens to be None.
+
+        Parameters
+        ----------
+        model_class : type
+            A Pydantic BaseModel subclass.
+        data : list
+            A list of Pydantic model instances.
+        uri : str or Path, optional
+            The URI to write the dataset to. If not provided, the model class name
+            converted to snake_case is used as the path.
+        mode : str, optional
+            The write mode. One of "create", "overwrite", or "append".
+        **kwargs
+            Additional arguments passed to write_dataset().
+        """
+        if not _is_pydantic_base_model_class(model_class):
+            raise TypeError(
+                f"`model_class` must be a Pydantic BaseModel subclass, "
+                f"got {model_class!r}"
+            )
+        _validate_pydantic_list(data, model_class)
+        if not data:
+            raise ValueError(
+                "`data` must be a non-empty list of Pydantic model instances."
+            )
+        if uri is None:
+            uri = re.sub(r"(?<!^)(?=[A-Z])", "_", model_class.__name__).lower()
+        from .pydantic import pydantic_to_schema
+
+        dicts = [model_to_dict(item) for item in data]
+        schema = pydantic_to_schema(model_class)
+        table = pa.Table.from_pylist(dicts, schema=schema)
+        return write_dataset(table, uri, mode=mode, **kwargs)
 
     def __reduce__(self):
         return type(self).__deserialize__, (
@@ -2162,7 +2219,7 @@ class LanceDataset(pa.dataset.Dataset):
         ids: Optional[Union[List[int], pa.Array]] = None,
         addresses: Optional[Union[List[int], pa.Array]] = None,
         indices: Optional[Union[List[int], pa.Array]] = None,
-    ) -> List[BlobFile]:
+    ) -> List[Optional[BlobFile]]:
         """
         Select blobs by row IDs.
 
@@ -2189,7 +2246,9 @@ class LanceDataset(pa.dataset.Dataset):
 
         Returns
         -------
-        blob_files : List[BlobFile]
+        blob_files : List[Optional[BlobFile]]
+            One element per selected row. Null blob values return ``None``;
+            valid empty blobs return a ``BlobFile`` with size zero.
         """
         selection_kind, selection_values = _resolve_blob_selection(
             ids, addresses, indices
@@ -2205,7 +2264,10 @@ class LanceDataset(pa.dataset.Dataset):
             lance_blob_files = self._ds.take_blobs_by_indices(
                 selection_values, blob_column
             )
-        return [BlobFile(lance_blob_file) for lance_blob_file in lance_blob_files]
+        return [
+            BlobFile(lance_blob_file) if lance_blob_file is not None else None
+            for lance_blob_file in lance_blob_files
+        ]
 
     def read_blobs(
         self,
@@ -2216,7 +2278,7 @@ class LanceDataset(pa.dataset.Dataset):
         *,
         io_buffer_size: Optional[int] = None,
         preserve_order: Optional[bool] = None,
-    ) -> List[Tuple[int, bytes]]:
+    ) -> List[Tuple[int, Optional[bytes]]]:
         """
         Read blobs directly into memory using Lance's planned blob reader.
 
@@ -2244,8 +2306,9 @@ class LanceDataset(pa.dataset.Dataset):
 
         Returns
         -------
-        blobs : List[Tuple[int, bytes]]
-            A list of ``(row_address, blob_bytes)`` pairs.
+        blobs : List[Tuple[int, Optional[bytes]]]
+            One ``(row_address, blob_bytes)`` pair per selected row. Null blob
+            values return ``None``; valid empty blobs return ``b""``.
         """
         selection_kind, selection_values = _resolve_blob_selection(
             ids, addresses, indices
@@ -2262,6 +2325,74 @@ class LanceDataset(pa.dataset.Dataset):
                 selection_values, blob_column, **kwargs
             )
         return self._ds.read_blobs_by_indices(selection_values, blob_column, **kwargs)
+
+    def read_blob_ranges(
+        self,
+        blob_column: str,
+        requests: Sequence[Tuple[int, int, int]],
+        *,
+        selector: Literal["ids", "addresses", "indices"],
+        io_buffer_size: Optional[int] = None,
+        preserve_order: Optional[bool] = None,
+    ) -> List[Tuple[int, int, Optional[bytes]]]:
+        """
+        Read row-specific blob-local byte ranges with one planned API call.
+
+        Each request is a ``(row, offset, length)`` tuple. ``selector`` defines
+        whether every ``row`` value is interpreted as a stable row ID, physical
+        row address, or dataset index. Repeat a row value to read multiple ranges
+        from the same blob. Planning, range validation, physical-source grouping,
+        request coalescing, and bounded I/O scheduling all happen in Rust; this
+        method does not use a Python thread pool.
+
+        Every request produces one result. Requests on null blobs return ``None``,
+        including when the requested range is empty. Empty ranges on non-null
+        blobs return empty bytes without issuing payload I/O. For every request,
+        offset plus length must fit in an unsigned 64-bit integer. Ranges on
+        non-null blobs must not extend beyond the logical blob size. Blob-local
+        bounds are not evaluated for null values because they have no logical
+        payload length. By default results preserve the input request order.
+
+        Parameters
+        ----------
+        blob_column : str
+            The name of the blob column to read.
+        requests : Sequence[Tuple[int, int, int]]
+            Complete ``(row, offset, length)`` requests.
+        selector : {"ids", "addresses", "indices"}
+            Interpretation of every request's ``row`` value.
+        io_buffer_size : int, optional
+            Override the scheduler I/O buffer size used while materializing ranges.
+        preserve_order : bool, optional
+            If True, returned results follow request order. If False,
+            ``request_index`` still identifies every result.
+
+        Examples
+        --------
+        Read two disjoint ranges from the same row index:
+
+        .. code-block:: python
+
+            dataset.read_blob_ranges(
+                "images",
+                requests=[(7, 0, 1024), (7, 4096, 1024)],
+                selector="indices",
+            )
+
+        Returns
+        -------
+        results : List[Tuple[int, int, Optional[bytes]]]
+            One ``(request_index, row_address, data)`` tuple per request.
+            The Python list retains all returned payload bytes in memory; peak
+            result memory is therefore proportional to their total logical size.
+        """
+        return self._ds.read_blob_ranges(
+            list(requests),
+            blob_column,
+            selector,
+            io_buffer_size=io_buffer_size,
+            preserve_order=preserve_order,
+        )
 
     def head(self, num_rows, **kwargs):
         """
@@ -3166,8 +3297,12 @@ class LanceDataset(pa.dataset.Dataset):
                         ", float, bool, str, large_str, fixed-size-binary, or temporal",
                     )
             elif index_type == "LABEL_LIST":
-                if not pa.types.is_list(field_type):
-                    raise TypeError(f"LABEL_LIST index column {column} must be a list")
+                if not (
+                    pa.types.is_list(field_type) or pa.types.is_large_list(field_type)
+                ):
+                    raise TypeError(
+                        f"LABEL_LIST index column {column} must be a list or large list"
+                    )
             elif index_type == "NGRAM":
                 if not pa.types.is_string(field_type) and not pa.types.is_large_string(
                     field_type
@@ -3221,7 +3356,11 @@ class LanceDataset(pa.dataset.Dataset):
             "BITMAP",
             "INVERTED",
             "FTS",
+            "NGRAM",
+            "RTREE",
             "ZONEMAP",
+            "BLOOMFILTER",
+            "LABEL_LIST",
         }
 
     @classmethod
@@ -3232,7 +3371,11 @@ class LanceDataset(pa.dataset.Dataset):
         return cls._normalized_index_type(index_type) in {
             "BTREE",
             "BITMAP",
+            "NGRAM",
+            "RTREE",
             "ZONEMAP",
+            "BLOOMFILTER",
+            "LABEL_LIST",
         }
 
     def create_scalar_index(
@@ -3366,8 +3509,10 @@ class LanceDataset(pa.dataset.Dataset):
         format_version: int or str, optional
             This is for the ``INVERTED`` / ``FTS`` index. Explicit on-disk FTS
             format version to write when creating a new index. Accepts ``1``,
-            ``2``, ``"v1"``, or ``"v2"``. If unset, Lance chooses the current
-            default format.
+            ``2``, ``3``, ``"v1"``, ``"v2"``, or ``"v3"``.
+            If unset, Lance uses ``LANCE_FTS_FORMAT_VERSION`` when present and
+            otherwise writes v2 for text analysis with ``block_size=128`` and
+            v3 for code analysis or ``block_size=256``.
 
         with_position: bool, default False
             This is for the ``INVERTED`` index. If True, the index will store the
@@ -3375,6 +3520,12 @@ class LanceDataset(pa.dataset.Dataset):
             query. This will significantly increase the index size.
             It won't impact the performance of non-phrase queries even if it is set to
             True.
+        block_size: int, default 128
+            This is for the ``INVERTED`` index. Number of documents per compressed
+            posting block. Must be one of ``128`` or ``256``.
+            ``block_size=256`` is experimental and may introduce breaking changes.
+            Use ``128`` when stable compatibility with the legacy posting layout is
+            required.
         memory_limit: int, optional
             This is for the ``INVERTED`` index. Total build-time memory limit in MiB.
             If set, Lance divides this budget evenly across the workers. If unset,
@@ -4180,10 +4331,10 @@ class LanceDataset(pa.dataset.Dataset):
         Create one segment without publishing it and return its metadata.
 
         This is the public distributed-build API for vector, BTREE scalar,
-        canonical bitmap scalar, INVERTED scalar, and ZONEMAP scalar index
-        construction. Unlike
-        :meth:`create_index`, this method does not publish the index into the
-        dataset manifest. Instead, it writes one segment under
+        canonical bitmap scalar, INVERTED scalar, NGRAM scalar, RTREE scalar,
+        ZONEMAP scalar, BLOOMFILTER scalar, and LABEL_LIST scalar index construction.
+        Unlike :meth:`create_index`, this method does not publish the index into
+        the dataset manifest. Instead, it writes one segment under
         ``_indices/<segment_uuid>/`` and returns the resulting
         :class:`Index` metadata.
 
@@ -4197,8 +4348,11 @@ class LanceDataset(pa.dataset.Dataset):
         4. commit the final segment list with
            :meth:`commit_existing_index_segments`
 
-        BTREE, BITMAP, INVERTED, and ZONEMAP segments may
-        be merged with :meth:`merge_existing_index_segments` before commit.
+        BTREE, BITMAP, INVERTED, NGRAM, RTREE, ZONEMAP, BLOOMFILTER, and
+        LABEL_LIST segments may be merged with
+        :meth:`merge_existing_index_segments` before commit. NGRAM segments
+        built before a deferred compaction must be merged before commit so
+        their postings can be rebuilt against current row addresses.
         Parameters are the same as :meth:`create_index`, with one additional
         requirement:
 
@@ -4324,20 +4478,10 @@ class LanceDataset(pa.dataset.Dataset):
             named logical index. Use :meth:`describe_indices` to inspect logical
             indices and obtain segment UUIDs from ``IndexDescription.segments``.
         """
-        if index_segments is not None:
-            segment_ids = []
-            for segment_id in index_segments:
-                if isinstance(segment_id, (str, uuid.UUID)):
-                    segment_ids.append(str(segment_id))
-                else:
-                    raise TypeError(
-                        "index_segments must be an iterable of str or uuid.UUID. "
-                        f"Got {type(segment_id)} instead."
-                    )
-            index_segments = segment_ids
-
         return self._ds.prewarm_index(
-            name, with_position=with_position, index_segments=index_segments
+            name,
+            with_position=with_position,
+            index_segments=_normalize_index_segment_ids(index_segments),
         )
 
     def merge_index_metadata(
@@ -5084,7 +5228,6 @@ class LanceDataset(pa.dataset.Dataset):
         identity_column: Optional[str] = None,
         unsharded: bool = False,
         durable_write: Optional[bool] = None,
-        sync_indexed_write: Optional[bool] = None,
         max_wal_buffer_size: Optional[int] = None,
         max_wal_flush_interval_ms: Optional[int] = None,
         max_memtable_size: Optional[int] = None,
@@ -5092,8 +5235,6 @@ class LanceDataset(pa.dataset.Dataset):
         max_memtable_batches: Optional[int] = None,
         max_unflushed_memtable_bytes: Optional[int] = None,
         manifest_scan_batch_size: Optional[int] = None,
-        async_index_buffer_rows: Optional[int] = None,
-        async_index_interval_ms: Optional[int] = None,
         backpressure_log_interval_ms: Optional[int] = None,
         stats_log_interval_ms: Optional[int] = None,
         hnsw_params: Optional[Dict[str, Dict[str, int]]] = None,
@@ -5154,7 +5295,6 @@ class LanceDataset(pa.dataset.Dataset):
             identity_column=identity_column,
             unsharded=unsharded,
             durable_write=durable_write,
-            sync_indexed_write=sync_indexed_write,
             max_wal_buffer_size=max_wal_buffer_size,
             max_wal_flush_interval_ms=max_wal_flush_interval_ms,
             max_memtable_size=max_memtable_size,
@@ -5162,8 +5302,6 @@ class LanceDataset(pa.dataset.Dataset):
             max_memtable_batches=max_memtable_batches,
             max_unflushed_memtable_bytes=max_unflushed_memtable_bytes,
             manifest_scan_batch_size=manifest_scan_batch_size,
-            async_index_buffer_rows=async_index_buffer_rows,
-            async_index_interval_ms=async_index_interval_ms,
             backpressure_log_interval_ms=backpressure_log_interval_ms,
             stats_log_interval_ms=stats_log_interval_ms,
             hnsw_params=hnsw_params,
@@ -5186,7 +5324,6 @@ class LanceDataset(pa.dataset.Dataset):
         shard_id: str,
         *,
         durable_write: Optional[bool] = None,
-        sync_indexed_write: Optional[bool] = None,
         max_wal_buffer_size: Optional[int] = None,
         max_wal_flush_interval_ms: Optional[int] = None,
         max_memtable_size: Optional[int] = None,
@@ -5194,8 +5331,6 @@ class LanceDataset(pa.dataset.Dataset):
         max_memtable_batches: Optional[int] = None,
         max_unflushed_memtable_bytes: Optional[int] = None,
         manifest_scan_batch_size: Optional[int] = None,
-        async_index_buffer_rows: Optional[int] = None,
-        async_index_interval_ms: Optional[int] = None,
         backpressure_log_interval_ms: Optional[int] = None,
         stats_log_interval_ms: Optional[int] = None,
         hnsw_params: Optional[Dict[str, Dict[str, int]]] = None,
@@ -5213,8 +5348,6 @@ class LanceDataset(pa.dataset.Dataset):
             ``str(uuid.uuid4())``).
         durable_write : bool, optional
             Whether to fsync WAL writes (default: ``True``).
-        sync_indexed_write : bool, optional
-            Whether index updates are synchronous (default: ``True``).
         max_wal_buffer_size : int, optional
             Maximum WAL buffer size in bytes (default: 10 MB).
         max_wal_flush_interval_ms : int, optional
@@ -5229,10 +5362,6 @@ class LanceDataset(pa.dataset.Dataset):
             Maximum unflushed bytes before backpressure (default: 1 GB).
         manifest_scan_batch_size : int, optional
             Batch size for manifest scans (default: 2).
-        async_index_buffer_rows : int, optional
-            Buffer rows for async index updates (default: 10 000).
-        async_index_interval_ms : int, optional
-            Interval for async index updates in milliseconds (default: 1000).
         backpressure_log_interval_ms : int, optional
             Interval for backpressure log messages in milliseconds
             (default: 30 000).
@@ -5280,7 +5409,6 @@ class LanceDataset(pa.dataset.Dataset):
             name: val
             for name, val in [
                 ("durable_write", durable_write),
-                ("sync_indexed_write", sync_indexed_write),
                 ("max_wal_buffer_size", max_wal_buffer_size),
                 ("max_wal_flush_interval_ms", max_wal_flush_interval_ms),
                 ("max_memtable_size", max_memtable_size),
@@ -5288,8 +5416,6 @@ class LanceDataset(pa.dataset.Dataset):
                 ("max_memtable_batches", max_memtable_batches),
                 ("max_unflushed_memtable_bytes", max_unflushed_memtable_bytes),
                 ("manifest_scan_batch_size", manifest_scan_batch_size),
-                ("async_index_buffer_rows", async_index_buffer_rows),
-                ("async_index_interval_ms", async_index_interval_ms),
                 ("backpressure_log_interval_ms", backpressure_log_interval_ms),
                 ("stats_log_interval_ms", stats_log_interval_ms),
                 ("hnsw_params", hnsw_params),
@@ -5990,6 +6116,76 @@ class LanceOperation:
         replacements: List[LanceOperation.DataReplacementGroup]
 
     @dataclass
+    class DataOverlayFile:
+        """
+        An overlay file supplying new values for a subset of
+        ``(physical offset, field)`` cells of a fragment, resolved on read and
+        layered over the base data without rewriting the base files.
+
+        The overlay is dense or sparse depending on the shape of ``offsets``:
+        pass a flat ``List[int]`` for a dense overlay (one offset list shared by
+        every field in ``data_file``) or a ``List[List[int]]`` for a sparse
+        overlay (one offset list per field, in the order of the file's fields).
+        Offsets are **physical** row offsets (positions in the base files,
+        counting deleted rows), like deletion vectors.
+
+        Attributes
+        ----------
+        data_file : DataFile
+            The Lance data file storing the overlay's new cell values — one
+            value column per covered field. The value at each covered offset is
+            stored at the rank (0-based count of covered offsets below it) of
+            that offset in the field's coverage.
+        offsets : Union[List[int], List[List[int]]]
+            The covered physical row offsets. A flat list is dense coverage
+            (shared by every field); a list of per-field lists is sparse
+            coverage (in field order). Each list must be strictly ascending
+            with no duplicates, since the Nth offset maps to the Nth value row
+            in ``data_file``; a non-ascending list raises ``ValueError``.
+        committed_version : Optional[int]
+            The dataset version at which this overlay became effective. Leave as
+            ``None`` when creating an overlay to commit — the commit stamps it.
+            It is populated when reading an existing fragment's overlays so they
+            round-trip through :class:`FragmentMetadata`.
+        """
+
+        data_file: DataFile
+        offsets: Union[List[int], List[List[int]]]
+        committed_version: Optional[int] = None
+
+    @dataclass
+    class DataOverlayGroup:
+        """
+        Overlay files to append to a single fragment.
+
+        Attributes
+        ----------
+        fragment_id : int
+            The id of the fragment the overlays apply to.
+        overlays : List[LanceOperation.DataOverlayFile]
+            The overlay files to append, ordered oldest-first (a later entry is
+            newer and wins where coverage overlaps).
+        """
+
+        fragment_id: int
+        overlays: List[LanceOperation.DataOverlayFile]
+
+    @dataclass
+    class DataOverlay(BaseOperation):
+        """
+        Operation that appends data overlay files to fragments.
+
+        Overlays are appended to each fragment's existing overlays (overlays
+        written by concurrent commits are preserved) and resolved on read
+        over the base data without rewriting it.
+
+        If multiple groups target the same data then the values in the
+        latest group take precedence.
+        """
+
+        groups: List[LanceOperation.DataOverlayGroup]
+
+    @dataclass
     class Project(BaseOperation):
         """
         Operation that project columns.
@@ -6209,10 +6405,12 @@ class ScannerBuilder:
 
     def batch_readahead(self, nbatches: Optional[int] = None) -> ScannerBuilder:
         """
-        This parameter is ignored when reading v2 files
+        Set the maximum number of batches to decode concurrently.
+
+        This parameter must be greater than zero.
         """
-        if nbatches is not None and int(nbatches) < 0:
-            raise ValueError("batch_readahead must be non-negative")
+        if nbatches is not None and int(nbatches) <= 0:
+            raise ValueError("batch_readahead must be greater than 0")
         self._batch_readahead = nbatches
         return self
 
@@ -6421,19 +6619,7 @@ class ScannerBuilder:
     def with_index_segments(
         self, index_segments: Optional[Iterable[Union[str, uuid.UUID]]]
     ) -> ScannerBuilder:
-        if index_segments is not None:
-            segment_ids = []
-            for segment_id in index_segments:
-                if isinstance(segment_id, (str, uuid.UUID)):
-                    segment_ids.append(str(segment_id))
-                else:
-                    raise TypeError(
-                        "index_segments must be an iterable of str or uuid.UUID. "
-                        f"Got {type(segment_id)} instead."
-                    )
-            index_segments = segment_ids
-
-        self._index_segments = index_segments
+        self._index_segments = _normalize_index_segment_ids(index_segments)
         return self
 
     def nearest(

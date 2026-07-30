@@ -8,8 +8,8 @@ use arrow_array::{RecordBatch, RecordBatchIterator};
 use datafusion::execution::SendableRecordBatchStream;
 use humantime::format_duration;
 use lance_core::datatypes::{NullabilityComparison, Schema, SchemaCompareOptions};
+use lance_core::is_system_column;
 use lance_core::utils::tracing::{DATASET_WRITING_EVENT, TRACE_DATASET_EVENTS};
-use lance_core::{ROW_ADDR, ROW_ID, ROW_OFFSET};
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_file::version::LanceFileVersion;
 use lance_io::object_store::ObjectStore;
@@ -328,9 +328,12 @@ impl<'a> InsertBuilder<'a> {
             normalized_data_schema.check_compatible(dataset.schema(), &schema_cmp_opts)?;
         }
 
-        // Make sure we aren't using any reserved column names
+        // The system columns (`_rowid`, `_rowaddr`, `_rowoffset`, and the row-version
+        // columns) are virtual: they're injected into scan results at read time and
+        // never stored. A stored column sharing one of these names would collide with
+        // the system column on read, so reject it at write time.
         for field in data_schema.fields.iter() {
-            if field.name == ROW_ID || field.name == ROW_ADDR || field.name == ROW_OFFSET {
+            if is_system_column(&field.name) {
                 return Err(Error::invalid_input_source(
                     format!(
                         "The column {} is a reserved name and cannot be used in a Lance dataset",
@@ -503,6 +506,38 @@ mod test {
                 .await
                 .unwrap(),
             1
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::row_id("_rowid")]
+    #[case::row_addr("_rowaddr")]
+    #[case::row_offset("_rowoffset")]
+    #[case::row_created_at_version("_row_created_at_version")]
+    #[case::row_last_updated_at_version("_row_last_updated_at_version")]
+    #[tokio::test]
+    async fn rejects_reserved_system_column_names(#[case] reserved_name: &str) {
+        // Every system column name must be rejected on write. The row-version
+        // columns (`_row_created_at_version`, `_row_last_updated_at_version`) are
+        // computed at read time and appended by `Projection::to_schema`; a user
+        // data column sharing one of those names would otherwise pass ingest and
+        // later collide with the appended field.
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            reserved_name,
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1]))])
+            .unwrap();
+
+        let result = InsertBuilder::new("memory://")
+            .execute_stream(RecordBatchIterator::new(vec![Ok(batch)], schema.clone()))
+            .await;
+
+        let err = result.expect_err("writing a reserved system column name should fail");
+        assert!(
+            err.to_string().contains("reserved name"),
+            "unexpected error for {reserved_name}: {err}"
         );
     }
 

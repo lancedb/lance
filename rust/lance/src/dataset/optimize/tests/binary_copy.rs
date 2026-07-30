@@ -685,7 +685,8 @@ async fn test_can_use_binary_copy_version_mismatch() {
     );
 
     // Simulate mixed file versions by marking the second fragment as v2.1.
-    let (v21_major, v21_minor) = LanceFileVersion::V2_1.to_numbers();
+    let (v21_major, v21_minor) =
+        lance_file::version::ConcreteFileVersion::V2_1.to_data_file_numbers();
     for file in &mut frags[1].files {
         file.file_major_version = v21_major;
         file.file_minor_version = v21_minor;

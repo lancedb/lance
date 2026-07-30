@@ -58,6 +58,31 @@ fn encode_jsonb(json_str: &str) -> Result<Expr> {
     Ok(Expr::Literal(ScalarValue::LargeBinary(Some(bytes)), None))
 }
 
+// The escape in `LIKE/ILIKE ... ESCAPE '<char>'` must be exactly one character.
+// Reject empty or multi-character escape strings rather than silently treating
+// them as "no escape" or truncating to the first character.
+fn parse_like_escape_char(escape_char: &Option<ValueWithSpan>) -> Result<Option<char>> {
+    let Some(value) = escape_char else {
+        return Ok(None);
+    };
+    let ValueWithSpan {
+        value: Value::SingleQuotedString(escape),
+        ..
+    } = value
+    else {
+        return Err(Error::invalid_input(format!(
+            "Invalid escape character in LIKE expression. Expected a single character wrapped with single quotes, got {value}"
+        )));
+    };
+    let mut chars = escape.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) => Ok(Some(c)),
+        _ => Err(Error::invalid_input(format!(
+            "Invalid escape character in LIKE expression. Expected a single character, got '{escape}'"
+        ))),
+    }
+}
+
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 struct CastListF16Udf {
     signature: Signature,
@@ -72,10 +97,6 @@ impl CastListF16Udf {
 }
 
 impl ScalarUDFImpl for CastListF16Udf {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "_cast_list_f16"
     }
@@ -197,6 +218,13 @@ impl ContextProvider for LanceContextProvider {
         self.state.window_functions().get(name).cloned()
     }
 
+    fn get_higher_order_meta(
+        &self,
+        name: &str,
+    ) -> Option<Arc<datafusion::logical_expr::HigherOrderUDF>> {
+        self.state.higher_order_functions().get(name).cloned()
+    }
+
     fn get_function_meta(&self, f: &str) -> Option<Arc<ScalarUDF>> {
         match f {
             // TODO: cast should go thru CAST syntax instead of UDF
@@ -225,6 +253,14 @@ impl ContextProvider for LanceContextProvider {
 
     fn udwf_names(&self) -> Vec<String> {
         self.state.window_functions().keys().cloned().collect()
+    }
+
+    fn higher_order_function_names(&self) -> Vec<String> {
+        self.state
+            .higher_order_functions()
+            .keys()
+            .cloned()
+            .collect()
     }
 
     fn get_expr_planners(&self) -> &[Arc<dyn ExprPlanner>] {
@@ -747,10 +783,10 @@ impl Planner {
                 data_type, value, ..
             }) => {
                 let value = value.clone().into_string().expect_ok()?;
-                Ok(Expr::Cast(datafusion::logical_expr::Cast {
-                    expr: Box::new(Expr::Literal(ScalarValue::Utf8(Some(value)), None)),
-                    data_type: self.parse_type(data_type)?,
-                }))
+                Ok(Expr::Cast(datafusion::logical_expr::Cast::new(
+                    Box::new(Expr::Literal(ScalarValue::Utf8(Some(value)), None)),
+                    self.parse_type(data_type)?,
+                )))
             }
             SQLExpr::IsFalse(expr) => Ok(Expr::IsFalse(Box::new(self.parse_sql_expr(expr)?))),
             SQLExpr::IsNotFalse(expr) => Ok(Expr::IsNotFalse(Box::new(self.parse_sql_expr(expr)?))),
@@ -782,16 +818,7 @@ impl Planner {
                 *negated,
                 Box::new(self.parse_sql_expr(expr)?),
                 Box::new(self.parse_sql_expr(pattern)?),
-                match escape_char {
-                    Some(Value::SingleQuotedString(char)) => char.chars().next(),
-                    Some(value) => {
-                        return Err(Error::invalid_input(format!(
-                            "Invalid escape character in LIKE expression. Expected a single character wrapped with single quotes, got {}",
-                            value
-                        )));
-                    }
-                    None => None,
-                },
+                parse_like_escape_char(escape_char)?,
                 true,
             ))),
             SQLExpr::Like {
@@ -804,16 +831,7 @@ impl Planner {
                 *negated,
                 Box::new(self.parse_sql_expr(expr)?),
                 Box::new(self.parse_sql_expr(pattern)?),
-                match escape_char {
-                    Some(Value::SingleQuotedString(char)) => char.chars().next(),
-                    Some(value) => {
-                        return Err(Error::invalid_input(format!(
-                            "Invalid escape character in LIKE expression. Expected a single character wrapped with single quotes, got {}",
-                            value
-                        )));
-                    }
-                    None => None,
-                },
+                parse_like_escape_char(escape_char)?,
                 false,
             ))),
             // JSONB cast: CAST('...' AS JSONB) or '...'::jsonb
@@ -838,15 +856,15 @@ impl Planner {
             } => match kind {
                 datafusion::sql::sqlparser::ast::CastKind::TryCast
                 | datafusion::sql::sqlparser::ast::CastKind::SafeCast => {
-                    Ok(Expr::TryCast(datafusion::logical_expr::TryCast {
-                        expr: Box::new(self.parse_sql_expr(expr)?),
-                        data_type: self.parse_type(data_type)?,
-                    }))
+                    Ok(Expr::TryCast(datafusion::logical_expr::TryCast::new(
+                        Box::new(self.parse_sql_expr(expr)?),
+                        self.parse_type(data_type)?,
+                    )))
                 }
-                _ => Ok(Expr::Cast(datafusion::logical_expr::Cast {
-                    expr: Box::new(self.parse_sql_expr(expr)?),
-                    data_type: self.parse_type(data_type)?,
-                })),
+                _ => Ok(Expr::Cast(datafusion::logical_expr::Cast::new(
+                    Box::new(self.parse_sql_expr(expr)?),
+                    self.parse_type(data_type)?,
+                ))),
             },
             SQLExpr::JsonAccess { .. } => Err(Error::invalid_input("JSON access is not supported")),
             SQLExpr::CompoundFieldAccess { root, access_chain } => {
@@ -991,9 +1009,10 @@ impl Planner {
 
         // DataFusion needs the coerce and simplify passes to be applied before
         // expressions can be handled by the physical planner.
-        let simplify_context = SimplifyContext::default()
+        let simplify_context = SimplifyContext::builder()
             .with_schema(df_schema.clone())
-            .with_query_execution_start_time(Some(Utc::now()));
+            .with_query_execution_start_time(Some(Utc::now()))
+            .build();
         let simplifier =
             datafusion::optimizer::simplify_expressions::ExprSimplifier::new(simplify_context);
 
@@ -1080,7 +1099,6 @@ impl TreeNodeVisitor<'_> for ColumnCapturingVisitor {
 
 #[cfg(test)]
 mod tests {
-    use std::any::Any;
 
     use crate::logical_expr::ExprExt;
 
@@ -1200,10 +1218,6 @@ mod tests {
     }
 
     impl ScalarUDFImpl for StrictFloat64Udf {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
         fn name(&self) -> &str {
             "strict_float64"
         }
@@ -1450,6 +1464,36 @@ mod tests {
     }
 
     #[test]
+    fn test_like_escape_char() {
+        let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, true)]));
+        let planner = Planner::new(schema);
+
+        // A valid single-character escape is captured for both LIKE and ILIKE.
+        for filter in ["s LIKE 'a!%' ESCAPE '!'", "s ILIKE 'a!%' ESCAPE '!'"] {
+            match planner.parse_filter(filter).unwrap() {
+                Expr::Like(like) => assert_eq!(like.escape_char, Some('!'), "{filter}"),
+                other => panic!("expected a LIKE expression for `{filter}`, got {other:?}"),
+            }
+        }
+
+        // Empty and multi-character escapes are rejected rather than silently
+        // dropped or truncated to the first character.
+        for filter in [
+            "s LIKE 'x' ESCAPE ''",
+            "s LIKE 'x' ESCAPE 'ab'",
+            "s ILIKE 'x' ESCAPE ''",
+            "s ILIKE 'x' ESCAPE 'ab'",
+        ] {
+            let err = planner.parse_filter(filter).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("Invalid escape character in LIKE expression"),
+                "unexpected error for `{filter}`: {err}"
+            );
+        }
+    }
+
+    #[test]
     fn test_sql_is_in() {
         let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, true)]));
 
@@ -1605,7 +1649,7 @@ mod tests {
 
             match expr {
                 Expr::BinaryExpr(BinaryExpr { right, .. }) => match right.as_ref() {
-                    Expr::Cast(Cast { expr, data_type }) => {
+                    Expr::Cast(Cast { expr, field }) => {
                         match expr.as_ref() {
                             Expr::Literal(ScalarValue::Utf8(Some(value_str)), _) => {
                                 assert_eq!(value_str, expected_value_str);
@@ -1615,7 +1659,7 @@ mod tests {
                             }
                             _ => panic!("Expected cast to be applied to literal"),
                         }
-                        assert_eq!(data_type, expected_data_type);
+                        assert_eq!(field.data_type(), expected_data_type);
                     }
                     _ => panic!("Expected right to be a cast"),
                 },
@@ -1656,14 +1700,14 @@ mod tests {
 
             match expr {
                 Expr::BinaryExpr(BinaryExpr { right, .. }) => match right.as_ref() {
-                    Expr::Cast(Cast { expr, data_type }) => {
+                    Expr::Cast(Cast { expr, field }) => {
                         match expr.as_ref() {
                             Expr::Literal(ScalarValue::Utf8(Some(value_str)), _) => {
                                 assert_eq!(value_str, expected_value_str);
                             }
                             _ => panic!("Expected cast to be applied to literal"),
                         }
-                        assert_eq!(data_type, expected_data_type);
+                        assert_eq!(field.data_type(), expected_data_type);
                     }
                     _ => panic!("Expected right to be a cast"),
                 },

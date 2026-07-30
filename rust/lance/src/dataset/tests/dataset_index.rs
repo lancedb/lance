@@ -19,11 +19,11 @@ use crate::index::DatasetIndexExt;
 use arrow::array::{AsArray, GenericListBuilder, GenericStringBuilder};
 use arrow::datatypes::UInt64Type;
 use arrow_array::RecordBatch;
-use arrow_array::{Array, GenericStringArray, StructArray, UInt64Array};
+use arrow_array::{Array, GenericStringArray, LargeListArray, ListArray, StructArray, UInt64Array};
 use arrow_array::{
     ArrayRef, Float32Array, Int32Array, RecordBatchIterator, StringArray,
     builder::StringDictionaryBuilder,
-    types::{Float32Type, Int32Type},
+    types::{Float32Type, Int32Type, Int64Type},
 };
 use arrow_schema::{
     DataType, Field as ArrowField, Field, Fields as ArrowFields, Schema as ArrowSchema,
@@ -37,8 +37,8 @@ use lance_file::version::LanceFileVersion;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::inverted::{
-    InvertedListFormatVersion,
-    query::{BooleanQuery, MatchQuery, Occur, Operator, PhraseQuery},
+    InvertedListFormatVersion, SCORE_COL,
+    query::{BooleanQuery, BoostQuery, MatchQuery, Occur, Operator, PhraseQuery},
     tokenizer::InvertedIndexParams,
 };
 use lance_index::{FtsPrewarmOptions, PrewarmOptions};
@@ -861,6 +861,167 @@ async fn test_fts_on_multiple_columns() {
         .await
         .unwrap();
     assert_eq!(results.num_rows(), 1);
+}
+
+async fn create_fragmented_fts_index(dataset: &mut Dataset, column: &str) {
+    let index_name = format!("{column}_idx");
+    let columns = [column];
+    let params = InvertedIndexParams::default();
+    let fragment_ids = dataset
+        .get_fragments()
+        .iter()
+        .map(|fragment| fragment.id() as u32)
+        .collect::<Vec<_>>();
+    let mut segments = Vec::with_capacity(fragment_ids.len());
+    for fragment_id in &fragment_ids {
+        let mut builder = dataset
+            .create_index_builder(&columns, IndexType::Inverted, &params)
+            .name(index_name.clone())
+            .fragments(vec![*fragment_id]);
+        segments.push(builder.execute_uncommitted().await.unwrap());
+    }
+    dataset
+        .commit_existing_index_segments(&index_name, column, segments)
+        .await
+        .unwrap();
+
+    let segments = crate::index::scalar::inverted::load_segments(dataset, column)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(segments.len(), fragment_ids.len());
+}
+
+fn compound_multimatch_query() -> FtsQuery {
+    MultiMatchQuery::try_new(
+        "common".to_owned(),
+        vec!["title".to_owned(), "body".to_owned()],
+    )
+    .unwrap()
+    .try_with_boosts(vec![10.0, 1.0])
+    .unwrap()
+    .into()
+}
+
+fn compound_match_query(term: &str, column: &str, boost: f32) -> FtsQuery {
+    MatchQuery::new(term.to_owned())
+        .with_column(Some(column.to_owned()))
+        .with_boost(boost)
+        .into()
+}
+
+async fn compound_fts_results(
+    dataset: &Dataset,
+    query: FtsQuery,
+    limit: Option<i64>,
+) -> Vec<(u64, f32)> {
+    let mut scan = dataset.scan();
+    scan.with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap();
+    if let Some(limit) = limit {
+        scan.limit(Some(limit), None).unwrap();
+    }
+    let batch = scan.try_into_batch().await.unwrap();
+    let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().values();
+    let scores = batch[SCORE_COL].as_primitive::<Float32Type>().values();
+    row_ids
+        .iter()
+        .copied()
+        .zip(scores.iter().copied())
+        .collect()
+}
+
+async fn assert_compound_fts_top_k(dataset: &Dataset, query: FtsQuery, limit: usize) {
+    let exhaustive = compound_fts_results(dataset, query.clone(), None).await;
+    assert!(
+        exhaustive.len() > limit,
+        "the exhaustive result must contain candidates beyond k"
+    );
+    let limited = compound_fts_results(dataset, query, Some(limit as i64)).await;
+    assert_eq!(limited, exhaustive[..limit]);
+}
+
+#[tokio::test]
+async fn test_nested_multimatch_limit_propagation() {
+    let batch = arrow_array::record_batch!(
+        (
+            "title",
+            Utf8,
+            [
+                "common",
+                "common filler filler filler filler filler filler filler",
+                "irrelevant",
+                "common tie",
+                "common tie",
+                "irrelevant"
+            ]
+        ),
+        (
+            "body",
+            Utf8,
+            [
+                "penalty",
+                "special",
+                "common",
+                "neutral",
+                "neutral",
+                "common filler filler filler penalty"
+            ]
+        )
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 3);
+    create_fragmented_fts_index(&mut dataset, "title").await;
+    create_fragmented_fts_index(&mut dataset, "body").await;
+
+    let must_query: FtsQuery = BooleanQuery::new([
+        (Occur::Must, compound_multimatch_query()),
+        (
+            Occur::Should,
+            compound_match_query("special", "body", 100.0),
+        ),
+    ])
+    .into();
+    let must_results = compound_fts_results(&dataset, must_query.clone(), None).await;
+    assert!(
+        must_results
+            .windows(2)
+            .any(|rows| rows[0].1 == rows[1].1 && rows[0].0 < rows[1].0),
+        "the exhaustive result should include a deterministic score tie"
+    );
+    assert_compound_fts_top_k(&dataset, must_query, 2).await;
+
+    let should_query: FtsQuery = BooleanQuery::new([
+        (Occur::Should, compound_multimatch_query()),
+        (
+            Occur::Should,
+            compound_match_query("special", "body", 100.0),
+        ),
+    ])
+    .into();
+    assert_compound_fts_top_k(&dataset, should_query, 2).await;
+
+    let boost_query: FtsQuery = BoostQuery::new(
+        compound_multimatch_query(),
+        compound_match_query("penalty", "body", 100.0),
+        Some(1.0),
+    )
+    .into();
+    assert_compound_fts_top_k(&dataset, boost_query, 2).await;
+
+    assert_compound_fts_top_k(&dataset, compound_multimatch_query(), 1).await;
 }
 
 fn nested_fts_batch(
@@ -2472,124 +2633,6 @@ async fn test_prewarm_index_with_position_validation() {
     );
 }
 
-/// Cache backend that exercises the serialization codec on every insert and
-/// returns deserialized entries on every get. Items without a codec fall
-/// through to an in-memory passthrough so that non-FTS cache traffic still
-/// works during the test.
-///
-/// Mirrors the helper in `rust/lance/src/index/vector/ivf/v2.rs` tests; if a
-/// third user appears, lift this into a shared test utility.
-mod fts_serializing_backend {
-    use std::collections::HashMap;
-    use std::pin::Pin;
-
-    use futures::Future;
-    use lance_core::Result;
-    use lance_core::cache::{
-        CacheBackend, CacheCodec, CacheEntry, InternalCacheKey, MokaCacheBackend,
-    };
-
-    type SerializedEntry = (bytes::Bytes, CacheCodec, usize);
-
-    #[derive(Debug)]
-    pub struct SerializingBackend {
-        serialized: tokio::sync::Mutex<HashMap<InternalCacheKey, SerializedEntry>>,
-        passthrough: MokaCacheBackend,
-    }
-
-    impl SerializingBackend {
-        pub fn new() -> Self {
-            Self {
-                serialized: tokio::sync::Mutex::new(HashMap::new()),
-                passthrough: MokaCacheBackend::with_capacity(256 * 1024 * 1024),
-            }
-        }
-
-        pub async fn serialized_entry_count(&self) -> usize {
-            self.serialized.lock().await.len()
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl CacheBackend for SerializingBackend {
-        async fn get(
-            &self,
-            key: &InternalCacheKey,
-            codec: Option<CacheCodec>,
-        ) -> Option<CacheEntry> {
-            let guard = self.serialized.lock().await;
-            if let Some((bytes, stored_codec, _)) = guard.get(key) {
-                return stored_codec.deserialize(&bytes.clone()).hit();
-            }
-            drop(guard);
-            self.passthrough.get(key, codec).await
-        }
-
-        async fn insert(
-            &self,
-            key: &InternalCacheKey,
-            entry: CacheEntry,
-            size_bytes: usize,
-            codec: Option<CacheCodec>,
-        ) {
-            if let Some(codec) = codec {
-                let mut bytes = Vec::new();
-                codec
-                    .serialize(&entry, &mut bytes)
-                    .expect("serialization should succeed");
-                self.serialized
-                    .lock()
-                    .await
-                    .insert(key.clone(), (bytes::Bytes::from(bytes), codec, size_bytes));
-            } else {
-                self.passthrough.insert(key, entry, size_bytes, None).await;
-            }
-        }
-
-        async fn get_or_insert<'a>(
-            &self,
-            key: &InternalCacheKey,
-            loader: Pin<Box<dyn Future<Output = Result<(CacheEntry, usize)>> + Send + 'a>>,
-            codec: Option<CacheCodec>,
-        ) -> Result<(CacheEntry, bool)> {
-            if let Some(entry) = self.get(key, codec).await {
-                return Ok((entry, true));
-            }
-            let (entry, size) = loader.await?;
-            self.insert(key, entry.clone(), size, codec).await;
-            Ok((entry, false))
-        }
-
-        async fn invalidate_prefix(&self, prefix: &str) {
-            self.serialized
-                .lock()
-                .await
-                .retain(|k, _| !k.starts_with(prefix));
-            self.passthrough.invalidate_prefix(prefix).await;
-        }
-
-        async fn clear(&self) {
-            self.serialized.lock().await.clear();
-            self.passthrough.clear().await;
-        }
-
-        async fn num_entries(&self) -> usize {
-            self.serialized.lock().await.len() + self.passthrough.num_entries().await
-        }
-
-        async fn size_bytes(&self) -> usize {
-            let serialized: usize = self
-                .serialized
-                .lock()
-                .await
-                .values()
-                .map(|(_, _, s)| *s)
-                .sum();
-            serialized + self.passthrough.size_bytes().await
-        }
-    }
-}
-
 /// Validates the OSS-741 contract: after FTS prewarm through a serializing
 /// cache backend, FTS queries serve results without any further IO. The
 /// serializing backend forces every cache hit through the new
@@ -2600,7 +2643,7 @@ mod fts_serializing_backend {
 async fn test_fts_prewarm_with_serializing_backend_serves_query_with_no_io() {
     use lance_io::assert_io_eq;
 
-    use fts_serializing_backend::SerializingBackend;
+    use crate::utils::test::serializing_cache::SerializingCacheBackend;
 
     let tmpdir = TempStrDir::default();
     let uri = tmpdir.to_owned();
@@ -2639,7 +2682,7 @@ async fn test_fts_prewarm_with_serializing_backend_serves_query_with_no_io() {
     // Re-open the dataset on a session whose cache backend serializes every
     // entry through its codec. Set a generous capacity so nothing is evicted
     // before we query.
-    let backend = Arc::new(SerializingBackend::new());
+    let backend = Arc::new(SerializingCacheBackend::new());
     let session = Arc::new(Session::with_index_cache_backend(
         backend.clone(),
         128 * 1024 * 1024,
@@ -2718,7 +2761,7 @@ async fn test_fts_prewarm_with_serializing_backend_serves_query_with_no_io() {
 async fn test_btree_prewarm_with_serializing_backend_serves_query_with_no_io() {
     use lance_io::assert_io_eq;
 
-    use fts_serializing_backend::SerializingBackend;
+    use crate::utils::test::serializing_cache::SerializingCacheBackend;
 
     let tmpdir = TempStrDir::default();
     let uri = tmpdir.to_owned();
@@ -2754,7 +2797,7 @@ async fn test_btree_prewarm_with_serializing_backend_serves_query_with_no_io() {
 
     // Re-open on a session whose cache backend serializes every entry through
     // its codec, with a generous capacity so nothing is evicted before we query.
-    let backend = Arc::new(SerializingBackend::new());
+    let backend = Arc::new(SerializingCacheBackend::new());
     let session = Arc::new(Session::with_index_cache_backend(
         backend.clone(),
         128 * 1024 * 1024,
@@ -2781,9 +2824,32 @@ async fn test_btree_prewarm_with_serializing_backend_serves_query_with_no_io() {
          but the serializing store was empty"
     );
 
-    // After prewarm, an indexed-filter query must reconstruct the index and
-    // every page it touches from the cache, deserializing via the codec, with
-    // no disk IO. Project only `_rowid` so the scan does not read a data column.
+    drop(dataset);
+    let backend = Arc::new(backend.restart());
+    assert_eq!(
+        backend.l1_entry_count().await,
+        0,
+        "restarting must discard the in-memory L1"
+    );
+    assert_eq!(
+        backend.serialized_entry_count().await,
+        serialized_after_prewarm,
+        "restarting must retain only the serialized entries"
+    );
+    let session = Arc::new(Session::with_index_cache_backend(
+        backend,
+        128 * 1024 * 1024,
+        Arc::new(lance_io::object_store::ObjectStoreRegistry::default()),
+    ));
+    let dataset = DatasetBuilder::from_uri(&uri)
+        .with_session(session)
+        .load()
+        .await
+        .unwrap();
+
+    // After recreating the backend, an indexed-filter query must reconstruct
+    // the index and every page it touches from serialized bytes, with no disk
+    // IO. Project only `_rowid` so the scan does not read a data column.
     dataset.object_store.as_ref().io_stats_incremental();
 
     let result = dataset
@@ -2821,7 +2887,7 @@ async fn test_btree_prewarm_with_serializing_backend_serves_query_with_no_io() {
 async fn test_bitmap_prewarm_with_serializing_backend_serves_query_with_no_io() {
     use lance_io::assert_io_eq;
 
-    use fts_serializing_backend::SerializingBackend;
+    use crate::utils::test::serializing_cache::SerializingCacheBackend;
 
     let tmpdir = TempStrDir::default();
     let uri = tmpdir.to_owned();
@@ -2855,7 +2921,7 @@ async fn test_bitmap_prewarm_with_serializing_backend_serves_query_with_no_io() 
         .await
         .unwrap();
 
-    let backend = Arc::new(SerializingBackend::new());
+    let backend = Arc::new(SerializingCacheBackend::new());
     let session = Arc::new(Session::with_index_cache_backend(
         backend.clone(),
         128 * 1024 * 1024,
@@ -2904,6 +2970,95 @@ async fn test_bitmap_prewarm_with_serializing_backend_serves_query_with_no_io() 
     );
 }
 
+#[rstest]
+#[case::list(false)]
+#[case::large_list(true)]
+#[tokio::test]
+async fn test_label_list_index_types(#[case] large_list: bool) {
+    let test_uri = TempStrDir::default();
+    let label_values = vec![
+        Some(vec![Some(1), Some(2)]),
+        Some(vec![Some(2)]),
+        Some(vec![Some(1)]),
+        Some(vec![Some(3)]),
+    ];
+    let labels: ArrayRef = if large_list {
+        Arc::new(LargeListArray::from_iter_primitive::<Int64Type, _, _>(
+            label_values,
+        ))
+    } else {
+        Arc::new(ListArray::from_iter_primitive::<Int64Type, _, _>(
+            label_values,
+        ))
+    };
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new("labels", labels.data_type().clone(), true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![0, 1, 2, 3])), labels],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let mut dataset = Dataset::write(reader, &test_uri, None).await.unwrap();
+
+    let expected = dataset
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .filter("array_has_any(labels, [1])")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let expected_ids = expected
+        .column(0)
+        .as_primitive::<Int32Type>()
+        .values()
+        .to_vec();
+    assert_eq!(expected_ids, vec![0, 2]);
+
+    dataset
+        .create_index(
+            &["labels"],
+            IndexType::LabelList,
+            Some("labels_idx".to_owned()),
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let result = dataset
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .filter("array_has_any(labels, [1])")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let result_ids = result
+        .column(0)
+        .as_primitive::<Int32Type>()
+        .values()
+        .to_vec();
+    assert_eq!(result_ids, expected_ids);
+
+    let plan = dataset
+        .scan()
+        .filter("array_has_any(labels, [1])")
+        .unwrap()
+        .explain_plan(false)
+        .await
+        .unwrap();
+    assert!(
+        plan.contains("ScalarIndexQuery") && plan.contains("LabelList"),
+        "Expected LabelList scalar index query in plan: {plan}"
+    );
+}
+
 /// LabelList analogue: after prewarming, an `array_has_any` query against a
 /// `LabelList` index serves results without any further IO. Exercises the
 /// `LabelListIndexState` codec (which embeds the inner bitmap state and the
@@ -2912,7 +3067,7 @@ async fn test_bitmap_prewarm_with_serializing_backend_serves_query_with_no_io() 
 async fn test_label_list_prewarm_with_serializing_backend_serves_query_with_no_io() {
     use lance_io::assert_io_eq;
 
-    use fts_serializing_backend::SerializingBackend;
+    use crate::utils::test::serializing_cache::SerializingCacheBackend;
 
     let tmpdir = TempStrDir::default();
     let uri = tmpdir.to_owned();
@@ -2956,7 +3111,7 @@ async fn test_label_list_prewarm_with_serializing_backend_serves_query_with_no_i
         "test dataset must contain at least one row whose labels include 3"
     );
 
-    let backend = Arc::new(SerializingBackend::new());
+    let backend = Arc::new(SerializingCacheBackend::new());
     let session = Arc::new(Session::with_index_cache_backend(
         backend.clone(),
         128 * 1024 * 1024,
@@ -4112,4 +4267,51 @@ async fn test_manifest_read_recovers_from_stale_size() {
         .expect("read_manifest_indexes should recover from a stale manifest size");
     assert_eq!(indices.len(), 1);
     assert_eq!(indices[0].name, "id_idx");
+}
+
+/// `load_segment_params` must match the fully opened segment's params,
+/// including `custom_stop_words` — the field `InvertedIndexDetails` loses.
+#[tokio::test]
+async fn test_load_segment_params_full_fidelity() {
+    use crate::index::DatasetIndexInternalExt;
+    use lance_index::metrics::NoOpMetricsCollector;
+    use lance_index::scalar::inverted::InvertedIndex;
+
+    let batch = RecordBatch::try_new(
+        arrow_schema::Schema::new(vec![Field::new("text", DataType::Utf8, false)]).into(),
+        vec![Arc::new(StringArray::from(vec![
+            "the quick brown fox",
+            "lazy dogs sleep",
+        ]))],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let stream = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    let mut dataset = Dataset::write(stream, "memory://test/segment_params", None)
+        .await
+        .unwrap();
+
+    let params = InvertedIndexParams::default().custom_stop_words(Some(vec!["quick".to_string()]));
+    dataset
+        .create_index(&["text"], IndexType::Inverted, None, &params, true)
+        .await
+        .unwrap();
+
+    let segments = crate::index::scalar::load_segments(&dataset, "text")
+        .await
+        .unwrap()
+        .expect("FTS index segments");
+    let read = crate::index::scalar::load_segment_params(&dataset, &segments[0])
+        .await
+        .unwrap();
+
+    let generic = dataset
+        .open_generic_index("text", &segments[0].uuid, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    let opened = generic
+        .as_any()
+        .downcast_ref::<InvertedIndex>()
+        .expect("inverted index");
+    assert_eq!(&read, opened.params());
 }
