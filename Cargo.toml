@@ -185,6 +185,7 @@ prost = "0.14.1"
 prost-build = "0.14.1"
 prost-types = "0.14.1"
 rand = { version = "0.9.1", features = ["small_rng"] }
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
 rand_distr = { version = "0.5.1" }
 rand_xoshiro = "0.7.0"
 rangemap = { version = "1.0" }

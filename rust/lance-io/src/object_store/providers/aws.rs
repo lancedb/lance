@@ -14,6 +14,7 @@ use object_store_opendal::OpendalStore;
 use opendal::{Operator, services::S3};
 
 use aws_config::default_provider::credentials::DefaultCredentialsChain;
+use aws_config::web_identity_token::{StaticConfiguration, WebIdentityTokenCredentialsProvider};
 use aws_credential_types::provider::ProvideCredentials;
 use object_store::{
     ClientOptions, CredentialProvider, Result as ObjectStoreResult, RetryConfig,
@@ -23,6 +24,7 @@ use object_store::{
         AwsCredentialProvider,
     },
 };
+use serde::Deserialize;
 use tokio::sync::RwLock;
 use url::Url;
 
@@ -247,7 +249,11 @@ async fn resolve_s3_region(
 /// 2. An explicit `credentials` provider
 /// 3. Explicit credentials in storage_options (as in `aws_access_key_id`,
 ///    `aws_secret_access_key`, `aws_session_token`)
-/// 4. The default credential provider chain from AWS SDK.
+/// 4. IRSA (web identity token) if `storage_options` contains both
+///    `aws_web_identity_token_file` and `aws_role_arn`
+/// 5. ECS container credentials if `storage_options` contains
+///    `aws_container_credentials_full_uri` or `aws_container_credentials_relative_uri`
+/// 6. The default credential provider chain from AWS SDK.
 ///
 /// # Storage Options Accessor
 ///
@@ -299,21 +305,193 @@ pub async fn build_aws_credential(
         );
     }
 
-    // Fall back to existing logic for static credentials
     if let Some(creds) = credentials {
-        Ok((creds, region))
-    } else if let Some(creds) = storage_options_credentials {
-        Ok((Arc::new(creds), region))
-    } else {
-        let credentials_provider = DefaultCredentialsChain::builder().build().await;
+        return Ok((creds, region));
+    }
 
-        Ok((
+    if let Some(creds) = storage_options_credentials {
+        return Ok((Arc::new(creds), region));
+    }
+
+    // Check for explicitly provided IRSA (web identity token) credentials.
+    // with_env_s3() does not inject credential-selection keys, so these are
+    // only present when the user explicitly provided them.
+    if let Some(opts) = storage_options
+        && let (Some(token_file), Some(role_arn)) = (
+            opts.get(&AmazonS3ConfigKey::WebIdentityTokenFile),
+            opts.get(&AmazonS3ConfigKey::RoleArn),
+        )
+    {
+        let session_name = opts.get(&AmazonS3ConfigKey::RoleSessionName).cloned();
+        let provider = build_irsa_provider(token_file, role_arn, session_name);
+        return Ok((
             Arc::new(AwsCredentialAdapter::new(
-                Arc::new(credentials_provider),
+                Arc::new(provider),
                 credentials_refresh_offset,
             )),
             region,
+        ));
+    }
+
+    // Check for explicitly provided ECS container credentials.
+    if let Some(opts) = storage_options
+        && (opts.contains_key(&AmazonS3ConfigKey::ContainerCredentialsFullUri)
+            || opts.contains_key(&AmazonS3ConfigKey::ContainerCredentialsRelativeUri))
+    {
+        let full_uri = opts
+            .get(&AmazonS3ConfigKey::ContainerCredentialsFullUri)
+            .cloned();
+        let relative_uri = opts
+            .get(&AmazonS3ConfigKey::ContainerCredentialsRelativeUri)
+            .cloned();
+        let auth_token_file = opts
+            .get(&AmazonS3ConfigKey::ContainerAuthorizationTokenFile)
+            .cloned();
+
+        let provider = EcsCredentialProvider::new(full_uri, relative_uri, auth_token_file)?;
+        return Ok((
+            Arc::new(AwsCredentialAdapter::new(
+                Arc::new(provider),
+                credentials_refresh_offset,
+            )),
+            region,
+        ));
+    }
+
+    let credentials_provider = DefaultCredentialsChain::builder().build().await;
+    Ok((
+        Arc::new(AwsCredentialAdapter::new(
+            Arc::new(credentials_provider),
+            credentials_refresh_offset,
+        )),
+        region,
+    ))
+}
+
+/// Build an IRSA (web identity token) credentials provider from explicit configuration.
+fn build_irsa_provider(
+    token_file: &str,
+    role_arn: &str,
+    session_name: Option<String>,
+) -> WebIdentityTokenCredentialsProvider {
+    use std::path::PathBuf;
+    let session_name = session_name.unwrap_or_else(|| "lance-session".to_string());
+    WebIdentityTokenCredentialsProvider::builder()
+        .static_configuration(StaticConfiguration {
+            web_identity_token_file: PathBuf::from(token_file),
+            role_arn: role_arn.to_string(),
+            session_name,
+        })
+        .build()
+}
+
+/// Custom ECS/Pod identity credential provider that fetches credentials from a
+/// container credential endpoint. Used when explicit URI storage options are set.
+#[derive(Debug)]
+struct EcsCredentialProvider {
+    uri: String,
+    auth_token_file: Option<String>,
+}
+
+impl EcsCredentialProvider {
+    fn new(
+        full_uri: Option<String>,
+        relative_uri: Option<String>,
+        auth_token_file: Option<String>,
+    ) -> Result<Self> {
+        const ECS_CONTAINER_HOST: &str = "http://169.254.170.2";
+        let uri = if let Some(full_uri) = full_uri {
+            full_uri
+        } else if let Some(relative_uri) = relative_uri {
+            format!("{}{}", ECS_CONTAINER_HOST, relative_uri)
+        } else {
+            return Err(Error::invalid_input(
+                "ECS credential provider requires at least one of \
+                 aws_container_credentials_full_uri or aws_container_credentials_relative_uri",
+            ));
+        };
+        Ok(Self {
+            uri,
+            auth_token_file,
+        })
+    }
+
+    async fn fetch(&self) -> aws_credential_types::provider::Result {
+        use aws_credential_types::provider::error::CredentialsError;
+
+        #[derive(Deserialize)]
+        struct EcsCredentialResponse {
+            #[serde(rename = "AccessKeyId")]
+            access_key_id: String,
+            #[serde(rename = "SecretAccessKey")]
+            secret_access_key: String,
+            #[serde(rename = "Token")]
+            token: Option<String>,
+            #[serde(rename = "Expiration")]
+            expiration: Option<String>,
+        }
+
+        let token = if let Some(file) = &self.auth_token_file {
+            Some(
+                tokio::fs::read_to_string(file)
+                    .await
+                    .map_err(|e| {
+                        CredentialsError::provider_error(format!(
+                            "Failed to read ECS auth token file '{}': {}",
+                            file, e
+                        ))
+                    })?
+                    .trim()
+                    .to_string(),
+            )
+        } else {
+            None
+        };
+
+        let client = reqwest::Client::new();
+        let mut request = client.get(&self.uri);
+        if let Some(token) = token {
+            request = request.header("Authorization", token);
+        }
+
+        let response = request.send().await.map_err(|e| {
+            CredentialsError::provider_error(format!(
+                "Failed to fetch ECS credentials from '{}': {}",
+                self.uri, e
+            ))
+        })?;
+
+        let creds: EcsCredentialResponse = response.json().await.map_err(|e| {
+            CredentialsError::provider_error(format!(
+                "Failed to parse ECS credentials response from '{}': {}",
+                self.uri, e
+            ))
+        })?;
+
+        let expiry = creds.expiration.and_then(|e| {
+            chrono::DateTime::parse_from_rfc3339(&e)
+                .ok()
+                .map(std::time::SystemTime::from)
+        });
+
+        Ok(aws_credential_types::Credentials::new(
+            creds.access_key_id,
+            creds.secret_access_key,
+            creds.token,
+            expiry,
+            "EcsCredentialProvider",
         ))
+    }
+}
+
+impl ProvideCredentials for EcsCredentialProvider {
+    fn provide_credentials<'a>(
+        &'a self,
+    ) -> aws_credential_types::provider::future::ProvideCredentials<'a>
+    where
+        Self: 'a,
+    {
+        aws_credential_types::provider::future::ProvideCredentials::new(self.fetch())
     }
 }
 
@@ -420,6 +598,23 @@ impl CredentialProvider for AwsCredentialAdapter {
     }
 }
 
+/// Credential-selection keys that must not be injected from the environment into
+/// storage options.  These keys exist solely to tell our credential-provider logic
+/// which AWS auth method to use; the underlying SDK providers (DefaultCredentialsChain,
+/// WebIdentityTokenCredentialsProvider, EcsCredentialsProvider) already read the
+/// corresponding env vars from the process environment directly.  Injecting them via
+/// with_env_s3() would make it impossible to distinguish "user explicitly chose IRSA"
+/// from "IRSA env vars happened to be present when the user wanted ECS", because both
+/// would appear identically in the merged storage-options map.
+const CREDENTIAL_SELECTION_KEYS: &[AmazonS3ConfigKey] = &[
+    AmazonS3ConfigKey::WebIdentityTokenFile,
+    AmazonS3ConfigKey::RoleArn,
+    AmazonS3ConfigKey::RoleSessionName,
+    AmazonS3ConfigKey::ContainerCredentialsRelativeUri,
+    AmazonS3ConfigKey::ContainerCredentialsFullUri,
+    AmazonS3ConfigKey::ContainerAuthorizationTokenFile,
+];
+
 impl StorageOptions {
     /// Add values from the environment to storage options
     pub fn with_env_s3(&mut self) {
@@ -427,6 +622,7 @@ impl StorageOptions {
             if let (Some(key), Some(value)) = (os_key.to_str(), os_value.to_str())
                 && let Ok(config_key) = AmazonS3ConfigKey::from_str(&key.to_ascii_lowercase())
                 && !self.0.contains_key(config_key.as_ref())
+                && !CREDENTIAL_SELECTION_KEYS.contains(&config_key)
             {
                 self.0
                     .insert(config_key.as_ref().to_string(), value.to_string());
@@ -1128,5 +1324,216 @@ mod tests {
 
         // Storage options provider should have been called once
         assert_eq!(mock_storage_provider.get_call_count().await, 1);
+    }
+
+    // Test that explicitly providing IRSA keys selects the IRSA provider.
+    // Provider construction succeeds immediately; the STS credential fetch happens lazily.
+    #[tokio::test]
+    async fn test_irsa_selected_when_explicit_keys_provided() {
+        use tempfile::NamedTempFile;
+        let token_file = NamedTempFile::new().unwrap();
+        let token_path = token_file.path().to_str().unwrap().to_string();
+
+        let opts = HashMap::from([
+            (AmazonS3ConfigKey::WebIdentityTokenFile, token_path),
+            (
+                AmazonS3ConfigKey::RoleArn,
+                "arn:aws:iam::123456789012:role/TestRole".to_string(),
+            ),
+        ]);
+
+        let result = build_aws_credential(
+            Duration::from_secs(300),
+            None,
+            Some(&opts),
+            Some("us-east-1".to_string()),
+            None,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "IRSA provider should be built without error: {:?}",
+            result.err()
+        );
+    }
+
+    // Test that IRSA is NOT selected when the keys are absent (e.g., only present as env
+    // vars, which with_env_s3() no longer injects for credential-selection keys).
+    #[tokio::test]
+    async fn test_irsa_not_selected_when_keys_absent() {
+        let opts: HashMap<AmazonS3ConfigKey, String> = HashMap::new();
+
+        let result = build_aws_credential(
+            Duration::from_secs(300),
+            None,
+            Some(&opts),
+            Some("us-east-1".to_string()),
+            None,
+        )
+        .await;
+        // Falls through to DefaultCredentialsChain without error
+        assert!(result.is_ok());
+    }
+
+    // Test that ECS provider is selected when an explicit URI is provided.
+    #[tokio::test]
+    async fn test_ecs_selected_when_explicit_uri_provided() {
+        let opts = HashMap::from([(
+            AmazonS3ConfigKey::ContainerCredentialsFullUri,
+            "http://169.254.170.2/credentials".to_string(),
+        )]);
+
+        let result = build_aws_credential(
+            Duration::from_secs(300),
+            None,
+            Some(&opts),
+            Some("us-east-1".to_string()),
+            None,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "ECS provider should be built without error: {:?}",
+            result.err()
+        );
+    }
+
+    // Test that IRSA takes precedence over ECS when both are explicitly provided.
+    #[tokio::test]
+    async fn test_irsa_takes_precedence_over_ecs() {
+        use tempfile::NamedTempFile;
+        let token_file = NamedTempFile::new().unwrap();
+        let token_path = token_file.path().to_str().unwrap().to_string();
+
+        let opts = HashMap::from([
+            (AmazonS3ConfigKey::WebIdentityTokenFile, token_path),
+            (
+                AmazonS3ConfigKey::RoleArn,
+                "arn:aws:iam::123456789012:role/TestRole".to_string(),
+            ),
+            (
+                AmazonS3ConfigKey::ContainerCredentialsFullUri,
+                "http://169.254.170.2/credentials".to_string(),
+            ),
+        ]);
+
+        // Both IRSA and ECS set — IRSA should win (checked first in precedence order)
+        let result = build_aws_credential(
+            Duration::from_secs(300),
+            None,
+            Some(&opts),
+            Some("us-east-1".to_string()),
+            None,
+        )
+        .await;
+        assert!(result.is_ok());
+    }
+
+    // Test that static access keys take precedence over IRSA.
+    #[tokio::test]
+    async fn test_static_keys_take_precedence_over_irsa() {
+        use tempfile::NamedTempFile;
+        let token_file = NamedTempFile::new().unwrap();
+        let token_path = token_file.path().to_str().unwrap().to_string();
+
+        let opts = HashMap::from([
+            (AmazonS3ConfigKey::AccessKeyId, "AKID".to_string()),
+            (AmazonS3ConfigKey::SecretAccessKey, "SECRET".to_string()),
+            (AmazonS3ConfigKey::WebIdentityTokenFile, token_path),
+            (
+                AmazonS3ConfigKey::RoleArn,
+                "arn:aws:iam::123456789012:role/TestRole".to_string(),
+            ),
+        ]);
+
+        let (provider, _region) = build_aws_credential(
+            Duration::from_secs(300),
+            None,
+            Some(&opts),
+            Some("us-east-1".to_string()),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Static creds should be used — key_id will be "AKID"
+        let cred = provider.get_credential().await.unwrap();
+        assert_eq!(cred.key_id, "AKID");
+        assert_eq!(cred.secret_key, "SECRET");
+    }
+
+    // Test that with_env_s3() does NOT inject credential-selection keys from the environment.
+    // These keys are excluded so that a user setting ECS credentials isn't accidentally
+    // overridden by IRSA env vars that happen to be present in the process environment.
+    #[test]
+    fn test_with_env_s3_does_not_inject_credential_selection_keys() {
+        // Temporarily set env vars for all credential-selection keys
+        let test_vars = [
+            ("AWS_WEB_IDENTITY_TOKEN_FILE", "/tmp/token"),
+            ("AWS_ROLE_ARN", "arn:aws:iam::123:role/Role"),
+            ("AWS_ROLE_SESSION_NAME", "test-session"),
+            ("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "/creds"),
+            (
+                "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+                "http://127.0.0.1/creds",
+            ),
+            ("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE", "/tmp/token-file"),
+        ];
+
+        // Save original values and set test values
+        let original: Vec<_> = test_vars
+            .iter()
+            .map(|(k, _)| (*k, std::env::var(k).ok()))
+            .collect();
+        // SAFETY: test-only; no other threads read these vars during this test.
+        unsafe {
+            for (k, v) in &test_vars {
+                std::env::set_var(k, v);
+            }
+        }
+
+        let mut opts = StorageOptions::new(HashMap::new());
+        opts.with_env_s3();
+
+        // Restore original env
+        // SAFETY: test-only; restoring env vars set above.
+        unsafe {
+            for (k, orig) in &original {
+                match orig {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+
+        // None of the credential-selection keys should have been injected
+        assert!(
+            !opts.0.contains_key("aws_web_identity_token_file"),
+            "web identity token file should not be injected"
+        );
+        assert!(
+            !opts.0.contains_key("aws_role_arn"),
+            "role ARN should not be injected"
+        );
+        assert!(
+            !opts.0.contains_key("aws_role_session_name"),
+            "role session name should not be injected"
+        );
+        assert!(
+            !opts
+                .0
+                .contains_key("aws_container_credentials_relative_uri"),
+            "container relative URI should not be injected"
+        );
+        assert!(
+            !opts.0.contains_key("aws_container_credentials_full_uri"),
+            "container full URI should not be injected"
+        );
+        assert!(
+            !opts
+                .0
+                .contains_key("aws_container_authorization_token_file"),
+            "container auth token file should not be injected"
+        );
     }
 }
