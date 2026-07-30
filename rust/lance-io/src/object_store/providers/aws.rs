@@ -385,6 +385,10 @@ fn build_irsa_provider(
 
 /// Custom ECS/Pod identity credential provider that fetches credentials from a
 /// container credential endpoint. Used when explicit URI storage options are set.
+///
+/// We cannot use aws_config::ecs::EcsCredentialProvider because it does not offer
+/// any way to set the variables programmatically.  It _always_ pulls them from
+/// environment variables.
 #[derive(Debug)]
 struct EcsCredentialProvider {
     uri: String,
