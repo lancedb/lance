@@ -788,7 +788,6 @@ mod tests {
             FnArrayGeneratorProvider, TestCases, check_basic_random,
             check_round_trip_encoding_generated, check_round_trip_encoding_of_data,
         },
-        version::LanceFileVersion,
     };
 
     use super::ValueEncoder;
@@ -842,7 +841,7 @@ mod tests {
             .with_indices(vec![0, 1, 2])
             .with_indices(vec![1])
             .with_indices(vec![2])
-            .with_min_file_version(LanceFileVersion::V2_1);
+            .with_structural_encodings();
 
         check_round_trip_encoding_of_data(vec![items], &test_cases, HashMap::default()).await;
     }
@@ -853,7 +852,7 @@ mod tests {
             (0..5000).map(|i| if i % 2 == 0 { Some(i) } else { None }),
         ));
 
-        let test_cases = TestCases::default().with_min_file_version(LanceFileVersion::V2_1);
+        let test_cases = TestCases::default().with_structural_encodings();
 
         check_round_trip_encoding_of_data(vec![items], &test_cases, HashMap::default()).await;
     }
@@ -885,7 +884,7 @@ mod tests {
 
     #[test_log::test(tokio::test)]
     async fn test_decimal128_dictionary_encoding() {
-        let test_cases = TestCases::default().with_min_file_version(LanceFileVersion::V2_1);
+        let test_cases = TestCases::default().with_structural_encodings();
         let decimals: Vec<i32> = (0..100).collect();
         let repeated_strings: Vec<_> = decimals
             .iter()
@@ -931,7 +930,7 @@ mod tests {
                 let test_cases = TestCases::default()
                     .with_page_sizes(vec![1000, 2000, 3000, 60000])
                     .with_batch_size(batch_size)
-                    .with_min_file_version(LanceFileVersion::V2_1);
+                    .with_structural_encodings();
 
                 check_round_trip_encoding_of_data(data.clone(), &test_cases, HashMap::new()).await;
             }
@@ -1101,7 +1100,7 @@ mod tests {
         let list_array =
             FixedSizeListArray::new(items_field, 2, items, Some(NullBuffer::new(list_nulls)));
 
-        let test_cases = TestCases::default().with_min_file_version(LanceFileVersion::V2_1);
+        let test_cases = TestCases::default().with_structural_encodings();
 
         check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases, HashMap::new())
             .await;
@@ -1119,7 +1118,7 @@ mod tests {
         let list_arr = ListArray::new(list_field, OffsetBuffer::new(offsets), Arc::new(fsl), None);
 
         let test_cases = TestCases::default()
-            .with_min_file_version(LanceFileVersion::V2_1)
+            .with_structural_encodings()
             .with_batch_size(1);
 
         check_round_trip_encoding_of_data(vec![Arc::new(list_arr)], &test_cases, HashMap::new())
@@ -1227,7 +1226,7 @@ mod tests {
 
         let test_cases = TestCases::default()
             .with_expected_encoding("flat")
-            .with_min_file_version(LanceFileVersion::V2_1);
+            .with_structural_encodings();
 
         // Test both explicit configuration and automatic fallback scenarios
         // 1. Test explicit "none" compression to force flat encoding

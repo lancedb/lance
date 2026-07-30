@@ -19,6 +19,8 @@ use crate::{
     statistics::ComputeStat,
 };
 
+use super::super::MiniblockChunkSize;
+
 use super::{
     SparseCountSet, SparsePositionSet, SparseStructuralLayerPlan, SparseStructuralPlan,
     SparseValidityMeaning, SparseValiditySet,
@@ -439,7 +441,7 @@ fn with_explicit_value_counts(
 
 fn serialize_value_chunks(
     compressed: SparseMiniBlockCompressed,
-    support_large_chunk: bool,
+    miniblock_chunk_size: MiniblockChunkSize,
 ) -> Result<SerializedValuePage> {
     let bytes_data = compressed.data.iter().map(LanceBuffer::len).sum::<usize>();
     let num_buffers = compressed.data.len();
@@ -458,7 +460,7 @@ fn serialize_value_chunks(
         let chunk_start = data_buffer.len();
         debug_assert_eq!(chunk_start % MINIBLOCK_ALIGNMENT, 0);
         data_buffer.extend_from_slice(&0_u16.to_le_bytes());
-        if support_large_chunk {
+        if miniblock_chunk_size == MiniblockChunkSize::U32 {
             for buffer_size in &chunk.buffer_sizes {
                 data_buffer.extend_from_slice(&buffer_size.to_le_bytes());
             }
@@ -541,7 +543,7 @@ pub fn prepare_values(
     field: &Field,
     compression_strategy: &dyn CompressionStrategy,
     data: DataBlock,
-    support_large_chunk: bool,
+    miniblock_chunk_size: MiniblockChunkSize,
 ) -> Result<PreparedSparseValues> {
     match &data {
         DataBlock::AllNull(_) => {
@@ -564,10 +566,13 @@ pub fn prepare_values(
 
     let num_values = data.num_values();
     let compressor = compression_strategy.create_miniblock_compressor(field, &data)?;
+    let support_large_chunk = miniblock_chunk_size == MiniblockChunkSize::U32;
     let compression_context = MiniBlockCompressionContext::new(0, support_large_chunk, false);
     let (compressed, value_compression) = compressor.compress(compression_context, data)?;
-    let values =
-        serialize_value_chunks(with_explicit_value_counts(compressed)?, support_large_chunk)?;
+    let values = serialize_value_chunks(
+        with_explicit_value_counts(compressed)?,
+        miniblock_chunk_size,
+    )?;
     Ok(PreparedSparseValues {
         num_values,
         value_compression,
@@ -827,7 +832,7 @@ pub(in crate::encodings::logical::primitive) fn encode_page(
     plan: SparseStructuralPlan,
     row_number: u64,
     num_rows: u64,
-    support_large_chunk: bool,
+    miniblock_chunk_size: MiniblockChunkSize,
 ) -> Result<EncodedPage> {
     let PreparedSparseValues {
         num_values,
@@ -835,7 +840,7 @@ pub(in crate::encodings::logical::primitive) fn encode_page(
         values,
     } = match values {
         SparseValueInput::Unprepared(data) => {
-            prepare_values(field, compression_strategy, data, support_large_chunk)?
+            prepare_values(field, compression_strategy, data, miniblock_chunk_size)?
         }
         SparseValueInput::Prepared(prepared) => prepared,
     };
@@ -853,7 +858,7 @@ pub(in crate::encodings::logical::primitive) fn encode_page(
                 num_buffers: values.num_buffers,
                 num_items: plan.num_items,
                 num_visible_items: plan.num_visible_items,
-                has_large_chunk: support_large_chunk,
+                has_large_chunk: miniblock_chunk_size == MiniblockChunkSize::U32,
                 structural_layers: structural.layers,
             },
         )),
@@ -893,10 +898,11 @@ mod tests {
         data::FixedSizeListBlock,
         encoder::{
             ColumnIndexSequence, EncodingOptions, FieldEncoder, MIN_PAGE_BUFFER_ALIGNMENT,
-            OutOfLineBuffers, default_encoding_strategy,
+            OutOfLineBuffers,
         },
-        testing::{TestCases, check_round_trip_encoding_of_data},
-        version::LanceFileVersion,
+        testing::{
+            TestCases, TestEncoding, check_round_trip_encoding_of_data, test_encoding_strategy,
+        },
     };
 
     use super::*;
@@ -1198,19 +1204,18 @@ mod tests {
 
     fn create_encoder(
         array: &ArrayRef,
-        version: LanceFileVersion,
+        version: TestEncoding,
         metadata: HashMap<String, String>,
     ) -> Result<Box<dyn FieldEncoder>> {
         let arrow_field =
             ArrowField::new("values", array.data_type().clone(), true).with_metadata(metadata);
         let field = Field::try_from(&arrow_field)?;
-        let strategy = default_encoding_strategy(version);
+        let strategy = test_encoding_strategy(version);
         let options = EncodingOptions {
             cache_bytes_per_column: 1,
-            version,
             ..Default::default()
         };
-        strategy.create_field_encoder(
+        crate::testing::create_test_field_encoder(
             strategy.as_ref(),
             &field,
             &mut ColumnIndexSequence::default(),
@@ -1220,7 +1225,7 @@ mod tests {
 
     async fn encode_pages(
         array: ArrayRef,
-        version: LanceFileVersion,
+        version: TestEncoding,
         metadata: HashMap<String, String>,
     ) -> Result<Vec<EncodedPage>> {
         encode_chunks(vec![array], version, metadata).await
@@ -1228,7 +1233,7 @@ mod tests {
 
     async fn encode_chunks(
         arrays: Vec<ArrayRef>,
-        version: LanceFileVersion,
+        version: TestEncoding,
         metadata: HashMap<String, String>,
     ) -> Result<Vec<EncodedPage>> {
         let first = arrays
@@ -1476,9 +1481,13 @@ mod tests {
             None,
             Some(40),
         ])) as ArrayRef;
-        let pages = encode_pages(array.clone(), LanceFileVersion::V2_3, sparse_metadata())
-            .await
-            .unwrap();
+        let pages = encode_pages(
+            array.clone(),
+            TestEncoding::StructuralSparse,
+            sparse_metadata(),
+        )
+        .await
+        .unwrap();
         assert_eq!(pages.len(), 1);
         let sparse = sparse_layout(&pages[0]);
         assert_eq!(sparse.num_items, 6);
@@ -1499,8 +1508,7 @@ mod tests {
         ));
 
         let cases = TestCases::default()
-            .with_min_file_version(LanceFileVersion::V2_3)
-            .with_max_file_version(LanceFileVersion::V2_3)
+            .with_encoding(TestEncoding::StructuralSparse)
             .with_page_sizes(vec![1])
             .with_range(1..5)
             .with_indices(vec![0, 2, 5]);
@@ -1510,9 +1518,13 @@ mod tests {
     #[tokio::test]
     async fn test_explicit_sparse_nullable_struct_roundtrip() {
         let array = nullable_struct();
-        let pages = encode_pages(array.clone(), LanceFileVersion::V2_3, sparse_metadata())
-            .await
-            .unwrap();
+        let pages = encode_pages(
+            array.clone(),
+            TestEncoding::StructuralSparse,
+            sparse_metadata(),
+        )
+        .await
+        .unwrap();
         assert_eq!(pages.len(), 1);
         let sparse = sparse_layout(&pages[0]);
         assert_eq!(sparse.structural_layers.len(), 2);
@@ -1537,8 +1549,7 @@ mod tests {
         ));
 
         let cases = TestCases::default()
-            .with_min_file_version(LanceFileVersion::V2_3)
-            .with_max_file_version(LanceFileVersion::V2_3)
+            .with_encoding(TestEncoding::StructuralSparse)
             .with_page_sizes(vec![1])
             .with_range(1..5)
             .with_indices(vec![0, 2, 4]);
@@ -1565,9 +1576,13 @@ mod tests {
             ],
             Some(null_buffer([true, false, true, true, false])),
         )) as ArrayRef;
-        let pages = encode_pages(array.clone(), LanceFileVersion::V2_3, sparse_metadata())
-            .await
-            .unwrap();
+        let pages = encode_pages(
+            array.clone(),
+            TestEncoding::StructuralSparse,
+            sparse_metadata(),
+        )
+        .await
+        .unwrap();
         assert!(pages.iter().any(|page| matches!(
             page_layout(page),
             pb21::page_layout::Layout::ConstantLayout(_)
@@ -1578,8 +1593,7 @@ mod tests {
         )));
 
         let cases = TestCases::default()
-            .with_min_file_version(LanceFileVersion::V2_3)
-            .with_max_file_version(LanceFileVersion::V2_3)
+            .with_encoding(TestEncoding::StructuralSparse)
             .with_page_sizes(vec![1])
             .with_range(1..5)
             .with_indices(vec![0, 2, 4]);
@@ -1607,7 +1621,7 @@ mod tests {
 
         let null_positions = encode_pages(
             mostly_valid.clone(),
-            LanceFileVersion::V2_3,
+            TestEncoding::StructuralSparse,
             sparse_metadata(),
         )
         .await
@@ -1624,7 +1638,7 @@ mod tests {
 
         let valid_positions = encode_pages(
             mostly_null.clone(),
-            LanceFileVersion::V2_3,
+            TestEncoding::StructuralSparse,
             sparse_metadata(),
         )
         .await
@@ -1640,8 +1654,7 @@ mod tests {
         );
 
         let cases = TestCases::default()
-            .with_min_file_version(LanceFileVersion::V2_3)
-            .with_max_file_version(LanceFileVersion::V2_3)
+            .with_encoding(TestEncoding::StructuralSparse)
             .with_page_sizes(vec![1])
             .with_range(1..5)
             .with_indices(vec![0, 2, 5]);
@@ -1654,9 +1667,13 @@ mod tests {
     async fn test_explicit_sparse_nested_page_boundaries_range_and_take() {
         let nested = deeply_nested();
         let chunks = vec![nested.slice(0, 2), nested.slice(2, 3)];
-        let pages = encode_chunks(chunks.clone(), LanceFileVersion::V2_3, sparse_metadata())
-            .await
-            .unwrap();
+        let pages = encode_chunks(
+            chunks.clone(),
+            TestEncoding::StructuralSparse,
+            sparse_metadata(),
+        )
+        .await
+        .unwrap();
         assert!(pages.len() >= 2, "expected multiple sparse pages");
         let sparse = pages
             .iter()
@@ -1683,8 +1700,7 @@ mod tests {
         }));
 
         let cases = TestCases::default()
-            .with_min_file_version(LanceFileVersion::V2_3)
-            .with_max_file_version(LanceFileVersion::V2_3)
+            .with_encoding(TestEncoding::StructuralSparse)
             .with_page_sizes(vec![1])
             .with_batch_size(2)
             .with_range(1..5)
@@ -1705,8 +1721,7 @@ mod tests {
             Some(vec![false, true, true, true, true]),
         );
         let cases = TestCases::default()
-            .with_min_file_version(LanceFileVersion::V2_3)
-            .with_max_file_version(LanceFileVersion::V2_3)
+            .with_encoding(TestEncoding::StructuralSparse)
             .with_page_sizes(vec![1])
             .with_range(0..5)
             .with_range(1..4)
@@ -1714,9 +1729,13 @@ mod tests {
             .with_indices(vec![2, 3]);
 
         for array in [list, large_list] {
-            let pages = encode_pages(array.clone(), LanceFileVersion::V2_3, sparse_metadata())
-                .await
-                .unwrap();
+            let pages = encode_pages(
+                array.clone(),
+                TestEncoding::StructuralSparse,
+                sparse_metadata(),
+            )
+            .await
+            .unwrap();
             assert!(pages.iter().map(sparse_layout).all(|layout| {
                 layout.structural_layers.iter().any(|layer| {
                     matches!(
@@ -1732,9 +1751,13 @@ mod tests {
     #[tokio::test]
     async fn test_explicit_sparse_map_and_fixed_size_list_roundtrip() {
         let map = map_i32();
-        let map_pages = encode_pages(map.clone(), LanceFileVersion::V2_3, sparse_metadata())
-            .await
-            .unwrap();
+        let map_pages = encode_pages(
+            map.clone(),
+            TestEncoding::StructuralSparse,
+            sparse_metadata(),
+        )
+        .await
+        .unwrap();
         assert!(map_pages.iter().map(sparse_layout).any(|layout| {
             layout.structural_layers.iter().any(|layer| {
                 matches!(
@@ -1744,17 +1767,20 @@ mod tests {
             })
         }));
         let map_cases = TestCases::default()
-            .with_min_file_version(LanceFileVersion::V2_3)
-            .with_max_file_version(LanceFileVersion::V2_3)
+            .with_encoding(TestEncoding::StructuralSparse)
             .with_page_sizes(vec![1])
             .with_range(1..4)
             .with_indices(vec![0, 2, 3]);
         check_round_trip_encoding_of_data(vec![map], &map_cases, sparse_metadata()).await;
 
         let fsl = fixed_size_list_struct();
-        let fsl_pages = encode_pages(fsl.clone(), LanceFileVersion::V2_3, sparse_metadata())
-            .await
-            .unwrap();
+        let fsl_pages = encode_pages(
+            fsl.clone(),
+            TestEncoding::StructuralSparse,
+            sparse_metadata(),
+        )
+        .await
+        .unwrap();
         for page in &fsl_pages {
             let layout = sparse_layout(page);
             let outer_slots = layer_num_slots(layout.structural_layers.first().unwrap());
@@ -1772,8 +1798,7 @@ mod tests {
                 .any(|layer| fixed_size_list_dimension(layer) == Some(2))
         }));
         let fsl_cases = TestCases::default()
-            .with_min_file_version(LanceFileVersion::V2_3)
-            .with_max_file_version(LanceFileVersion::V2_3)
+            .with_encoding(TestEncoding::StructuralSparse)
             .with_page_sizes(vec![1])
             .with_range(1..6)
             .with_indices(vec![0, 3, 5]);
@@ -1783,9 +1808,13 @@ mod tests {
     #[tokio::test]
     async fn test_explicit_sparse_list_fixed_size_list_struct_roundtrip() {
         let array = list_fixed_size_list_struct();
-        let pages = encode_pages(array.clone(), LanceFileVersion::V2_3, sparse_metadata())
-            .await
-            .unwrap();
+        let pages = encode_pages(
+            array.clone(),
+            TestEncoding::StructuralSparse,
+            sparse_metadata(),
+        )
+        .await
+        .unwrap();
         assert!(pages.iter().map(sparse_layout).any(|layout| {
             let kinds = layout
                 .structural_layers
@@ -1805,8 +1834,7 @@ mod tests {
         }
 
         let cases = TestCases::default()
-            .with_min_file_version(LanceFileVersion::V2_3)
-            .with_max_file_version(LanceFileVersion::V2_3)
+            .with_encoding(TestEncoding::StructuralSparse)
             .with_page_sizes(vec![1])
             .with_range(1..4)
             .with_indices(vec![0, 2, 3])
@@ -1817,9 +1845,13 @@ mod tests {
     #[tokio::test]
     async fn test_explicit_sparse_serializes_semantic_list_forms() {
         let all_array = list_i32(vec![0, 2, 4, 6], None);
-        let all = encode_pages(all_array.clone(), LanceFileVersion::V2_3, sparse_metadata())
-            .await
-            .unwrap();
+        let all = encode_pages(
+            all_array.clone(),
+            TestEncoding::StructuralSparse,
+            sparse_metadata(),
+        )
+        .await
+        .unwrap();
         let all_layer = list_layer(sparse_layout(&all[0]));
         assert!(matches!(
             all_layer.non_empty_positions.as_ref().unwrap().positions,
@@ -1836,7 +1868,7 @@ mod tests {
         let range_array = list_i32(vec![0, 2, 4, 4, 4], None);
         let range = encode_pages(
             range_array.clone(),
-            LanceFileVersion::V2_3,
+            TestEncoding::StructuralSparse,
             sparse_metadata(),
         )
         .await
@@ -1862,7 +1894,7 @@ mod tests {
         let explicit_array = list_i32(vec![0, 1, 1, 4, 4, 6], None);
         let explicit = encode_pages(
             explicit_array.clone(),
-            LanceFileVersion::V2_3,
+            TestEncoding::StructuralSparse,
             sparse_metadata(),
         )
         .await
@@ -1883,8 +1915,7 @@ mod tests {
         assert_eq!(explicit[0].data.len(), 4);
 
         let cases = TestCases::default()
-            .with_min_file_version(LanceFileVersion::V2_3)
-            .with_max_file_version(LanceFileVersion::V2_3)
+            .with_encoding(TestEncoding::StructuralSparse)
             .with_page_sizes(vec![1])
             .with_range(1..3)
             .with_indices(vec![0, 2]);
@@ -1897,7 +1928,7 @@ mod tests {
     async fn test_constant_layout_boundary_is_explicit() {
         let structural_only = encode_pages(
             list_i32(vec![0, 0, 0, 0], None),
-            LanceFileVersion::V2_3,
+            TestEncoding::StructuralSparse,
             sparse_metadata(),
         )
         .await
@@ -1908,28 +1939,33 @@ mod tests {
         ));
 
         let empty_struct = Arc::new(StructArray::new_empty_fields(3, None)) as ArrayRef;
-        let empty_struct_pages =
-            encode_pages(empty_struct, LanceFileVersion::V2_3, sparse_metadata())
-                .await
-                .unwrap();
+        let empty_struct_pages = encode_pages(
+            empty_struct,
+            TestEncoding::StructuralSparse,
+            sparse_metadata(),
+        )
+        .await
+        .unwrap();
         assert!(matches!(
             page_layout(&empty_struct_pages[0]),
             pb21::page_layout::Layout::ConstantLayout(_)
         ));
 
         let all_null = Arc::new(Int32Array::from(vec![None, None, None])) as ArrayRef;
-        let all_null_pages = encode_pages(all_null, LanceFileVersion::V2_3, sparse_metadata())
-            .await
-            .unwrap();
+        let all_null_pages =
+            encode_pages(all_null, TestEncoding::StructuralSparse, sparse_metadata())
+                .await
+                .unwrap();
         assert!(matches!(
             page_layout(&all_null_pages[0]),
             pb21::page_layout::Layout::ConstantLayout(_)
         ));
 
         let constant = Arc::new(Int32Array::from(vec![7, 7, 7])) as ArrayRef;
-        let constant_pages = encode_pages(constant, LanceFileVersion::V2_3, sparse_metadata())
-            .await
-            .unwrap();
+        let constant_pages =
+            encode_pages(constant, TestEncoding::StructuralSparse, sparse_metadata())
+                .await
+                .unwrap();
         assert!(matches!(
             page_layout(&constant_pages[0]),
             pb21::page_layout::Layout::SparseLayout(_)
@@ -1939,12 +1975,12 @@ mod tests {
     #[tokio::test]
     async fn test_default_and_explicit_dense_layouts_are_unchanged() {
         let array = Arc::new(Int32Array::from_iter_values(0..16)) as ArrayRef;
-        let v2_2_default = encode_pages(array.clone(), LanceFileVersion::V2_2, HashMap::new())
+        let v2_2_default = encode_pages(array.clone(), TestEncoding::StructuralU32, HashMap::new())
             .await
             .unwrap();
         let v2_2_miniblock = encode_pages(
             array.clone(),
-            LanceFileVersion::V2_2,
+            TestEncoding::StructuralU32,
             structural_metadata(STRUCTURAL_ENCODING_MINIBLOCK),
         )
         .await
@@ -1959,9 +1995,13 @@ mod tests {
             assert_eq!(default.data, explicit.data);
         }
 
-        let v2_3_default = encode_pages(array.clone(), LanceFileVersion::V2_3, HashMap::new())
-            .await
-            .unwrap();
+        let v2_3_default = encode_pages(
+            array.clone(),
+            TestEncoding::StructuralSparse,
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
         assert!(matches!(
             page_layout(&v2_3_default[0]),
             pb21::page_layout::Layout::MiniBlockLayout(_)
@@ -1969,7 +2009,7 @@ mod tests {
 
         let v2_3_miniblock = encode_pages(
             array.clone(),
-            LanceFileVersion::V2_3,
+            TestEncoding::StructuralSparse,
             structural_metadata(STRUCTURAL_ENCODING_MINIBLOCK),
         )
         .await
@@ -1981,7 +2021,7 @@ mod tests {
 
         let v2_3_fullzip = encode_pages(
             array.clone(),
-            LanceFileVersion::V2_3,
+            TestEncoding::StructuralSparse,
             structural_metadata(STRUCTURAL_ENCODING_FULLZIP),
         )
         .await
@@ -1991,7 +2031,7 @@ mod tests {
             pb21::page_layout::Layout::FullZipLayout(_)
         ));
 
-        let v2_3_sparse = encode_pages(array, LanceFileVersion::V2_3, sparse_metadata())
+        let v2_3_sparse = encode_pages(array, TestEncoding::StructuralSparse, sparse_metadata())
             .await
             .unwrap();
         assert!(matches!(
@@ -2007,7 +2047,7 @@ mod tests {
 
         let within_budget = encode_pages(
             sparse_i32_list(4_096, 1_024),
-            LanceFileVersion::V2_3,
+            TestEncoding::StructuralSparse,
             HashMap::new(),
         )
         .await
@@ -2018,9 +2058,13 @@ mod tests {
             pb21::page_layout::Layout::MiniBlockLayout(_)
         ));
 
-        let automatic = encode_pages(array.clone(), LanceFileVersion::V2_3, HashMap::new())
-            .await
-            .unwrap();
+        let automatic = encode_pages(
+            array.clone(),
+            TestEncoding::StructuralSparse,
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
         assert_eq!(automatic.len(), 1);
         assert!(matches!(
             page_layout(&automatic[0]),
@@ -2029,7 +2073,7 @@ mod tests {
 
         let miniblock = encode_pages(
             array.clone(),
-            LanceFileVersion::V2_3,
+            TestEncoding::StructuralSparse,
             structural_metadata(STRUCTURAL_ENCODING_MINIBLOCK),
         )
         .await
@@ -2042,7 +2086,7 @@ mod tests {
 
         let fullzip = encode_pages(
             array.clone(),
-            LanceFileVersion::V2_3,
+            TestEncoding::StructuralSparse,
             structural_metadata(STRUCTURAL_ENCODING_FULLZIP),
         )
         .await
@@ -2053,21 +2097,25 @@ mod tests {
             pb21::page_layout::Layout::FullZipLayout(_)
         )));
 
-        let sparse = encode_pages(array.clone(), LanceFileVersion::V2_3, sparse_metadata())
-            .await
-            .unwrap();
+        let sparse = encode_pages(
+            array.clone(),
+            TestEncoding::StructuralSparse,
+            sparse_metadata(),
+        )
+        .await
+        .unwrap();
         assert_eq!(sparse.len(), 1);
         assert!(matches!(
             page_layout(&sparse[0]),
             pb21::page_layout::Layout::SparseLayout(_)
         ));
 
-        let v2_2_default = encode_pages(array.clone(), LanceFileVersion::V2_2, HashMap::new())
+        let v2_2_default = encode_pages(array.clone(), TestEncoding::StructuralU32, HashMap::new())
             .await
             .unwrap();
         let v2_2_miniblock = encode_pages(
             array.clone(),
-            LanceFileVersion::V2_2,
+            TestEncoding::StructuralU32,
             structural_metadata(STRUCTURAL_ENCODING_MINIBLOCK),
         )
         .await
@@ -2079,8 +2127,7 @@ mod tests {
         }
 
         let cases = TestCases::default()
-            .with_min_file_version(LanceFileVersion::V2_3)
-            .with_max_file_version(LanceFileVersion::V2_3)
+            .with_encoding(TestEncoding::StructuralSparse)
             .with_page_sizes(vec![1024 * 1024])
             .with_batch_size(NUM_ROWS as u32)
             .with_range(1_999..2_002)
@@ -2095,16 +2142,20 @@ mod tests {
             Arc::new(ArrowField::new("item", DataType::Int32, true)),
         );
 
-        let automatic = encode_pages(array.clone(), LanceFileVersion::V2_3, HashMap::new())
-            .await
-            .unwrap();
+        let automatic = encode_pages(
+            array.clone(),
+            TestEncoding::StructuralSparse,
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
         assert_eq!(automatic.len(), 1);
         assert!(matches!(
             page_layout(&automatic[0]),
             pb21::page_layout::Layout::SparseLayout(_)
         ));
 
-        let v2_2 = encode_pages(array.clone(), LanceFileVersion::V2_2, HashMap::new())
+        let v2_2 = encode_pages(array.clone(), TestEncoding::StructuralU32, HashMap::new())
             .await
             .unwrap();
         assert_eq!(v2_2.len(), 1);
@@ -2115,7 +2166,7 @@ mod tests {
 
         let miniblock_error = encode_pages(
             array.clone(),
-            LanceFileVersion::V2_3,
+            TestEncoding::StructuralSparse,
             structural_metadata(STRUCTURAL_ENCODING_MINIBLOCK),
         )
         .await
@@ -2128,7 +2179,7 @@ mod tests {
 
         let fullzip = encode_pages(
             array.clone(),
-            LanceFileVersion::V2_3,
+            TestEncoding::StructuralSparse,
             structural_metadata(STRUCTURAL_ENCODING_FULLZIP),
         )
         .await
@@ -2138,18 +2189,20 @@ mod tests {
             pb21::page_layout::Layout::FullZipLayout(_)
         ));
 
-        let explicit_sparse =
-            encode_pages(array.clone(), LanceFileVersion::V2_3, sparse_metadata())
-                .await
-                .unwrap();
+        let explicit_sparse = encode_pages(
+            array.clone(),
+            TestEncoding::StructuralSparse,
+            sparse_metadata(),
+        )
+        .await
+        .unwrap();
         assert!(matches!(
             page_layout(&explicit_sparse[0]),
             pb21::page_layout::Layout::SparseLayout(_)
         ));
 
         let cases = TestCases::default()
-            .with_min_file_version(LanceFileVersion::V2_3)
-            .with_max_file_version(LanceFileVersion::V2_3)
+            .with_encoding(TestEncoding::StructuralSparse)
             .with_range(0..1)
             .with_indices(vec![0]);
         check_round_trip_encoding_of_data(vec![array], &cases, HashMap::new()).await;
@@ -2164,7 +2217,7 @@ mod tests {
         let dictionary_array = sparse_list_values(NUM_ROWS, 2_000, dictionary, dictionary_field);
         let dictionary_pages = encode_pages(
             dictionary_array.clone(),
-            LanceFileVersion::V2_3,
+            TestEncoding::StructuralSparse,
             HashMap::new(),
         )
         .await
@@ -2177,10 +2230,13 @@ mod tests {
 
         let (packed_values, packed_field) = variable_packed_struct_values(num_values);
         let packed_array = sparse_list_values(NUM_ROWS, 2_000, packed_values, packed_field);
-        let packed_pages =
-            encode_pages(packed_array.clone(), LanceFileVersion::V2_3, HashMap::new())
-                .await
-                .unwrap();
+        let packed_pages = encode_pages(
+            packed_array.clone(),
+            TestEncoding::StructuralSparse,
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
         assert!(packed_pages.len() > 1);
         assert!(packed_pages.iter().all(|page| matches!(
             page_layout(page),
@@ -2191,7 +2247,7 @@ mod tests {
         let unsplittable_packed = unsplittable_nested_list(packed_values, packed_field);
         let packed_fallback = encode_pages(
             unsplittable_packed.clone(),
-            LanceFileVersion::V2_3,
+            TestEncoding::StructuralSparse,
             HashMap::new(),
         )
         .await
@@ -2206,14 +2262,14 @@ mod tests {
         let unsplittable_dictionary = unsplittable_nested_list(dictionary, dictionary_field);
         let v2_2_error = encode_pages(
             unsplittable_dictionary.clone(),
-            LanceFileVersion::V2_2,
+            TestEncoding::StructuralU32,
             HashMap::new(),
         )
         .await
         .unwrap_err();
         let v2_3_error = encode_pages(
             unsplittable_dictionary,
-            LanceFileVersion::V2_3,
+            TestEncoding::StructuralSparse,
             HashMap::new(),
         )
         .await
@@ -2226,23 +2282,20 @@ mod tests {
         );
 
         let cases = TestCases::default()
-            .with_min_file_version(LanceFileVersion::V2_3)
-            .with_max_file_version(LanceFileVersion::V2_3)
+            .with_encoding(TestEncoding::StructuralSparse)
             .with_page_sizes(vec![1024 * 1024])
             .with_batch_size(NUM_ROWS as u32)
             .with_range(1_999..2_002)
             .with_indices(vec![0, 2_000, NUM_ROWS as u64 - 1]);
         check_round_trip_encoding_of_data(vec![dictionary_array], &cases, HashMap::new()).await;
         let packed_cases = TestCases::default()
-            .with_min_file_version(LanceFileVersion::V2_3)
-            .with_max_file_version(LanceFileVersion::V2_3)
+            .with_encoding(TestEncoding::StructuralSparse)
             .with_page_sizes(vec![1024 * 1024])
             .with_batch_size(NUM_ROWS as u32);
         check_round_trip_encoding_of_data(vec![packed_array], &packed_cases, HashMap::new()).await;
 
         let single_row_cases = TestCases::default()
-            .with_min_file_version(LanceFileVersion::V2_3)
-            .with_max_file_version(LanceFileVersion::V2_3)
+            .with_encoding(TestEncoding::StructuralSparse)
             .with_page_sizes(vec![1024 * 1024])
             .with_range(0..1)
             .with_indices(vec![0]);
@@ -2284,12 +2337,16 @@ mod tests {
             let item_field = Arc::new(ArrowField::new("item", values.data_type().clone(), true));
             let array = unsplittable_nested_list(values, item_field);
 
-            let v2_2 = encode_pages(array.clone(), LanceFileVersion::V2_2, HashMap::new())
+            let v2_2 = encode_pages(array.clone(), TestEncoding::StructuralU32, HashMap::new())
                 .await
                 .unwrap();
-            let v2_3 = encode_pages(array.clone(), LanceFileVersion::V2_3, HashMap::new())
-                .await
-                .unwrap();
+            let v2_3 = encode_pages(
+                array.clone(),
+                TestEncoding::StructuralSparse,
+                HashMap::new(),
+            )
+            .await
+            .unwrap();
             for pages in [&v2_2, &v2_3] {
                 assert_eq!(pages.len(), 1, "unexpected {label} page count");
                 assert!(
@@ -2301,18 +2358,20 @@ mod tests {
                 );
             }
 
-            let explicit_error =
-                encode_pages(array.clone(), LanceFileVersion::V2_3, sparse_metadata())
-                    .await
-                    .unwrap_err();
+            let explicit_error = encode_pages(
+                array.clone(),
+                TestEncoding::StructuralSparse,
+                sparse_metadata(),
+            )
+            .await
+            .unwrap_err();
             assert!(
                 explicit_error.to_string().contains("too wide"),
                 "explicit sparse should preserve the {label} value error: {explicit_error}"
             );
 
             let cases = TestCases::default()
-                .with_min_file_version(LanceFileVersion::V2_2)
-                .with_max_file_version(LanceFileVersion::V2_3)
+                .with_u32_structural_encodings()
                 .with_range(0..1)
                 .with_indices(vec![0]);
             check_round_trip_encoding_of_data(vec![array], &cases, HashMap::new()).await;
@@ -2322,25 +2381,28 @@ mod tests {
     #[test]
     fn test_explicit_sparse_rejects_lance_2_2() {
         let array = Arc::new(Int32Array::from(vec![Some(1), None])) as ArrayRef;
-        let Err(error) = create_encoder(&array, LanceFileVersion::V2_2, sparse_metadata()) else {
+        let Err(error) = create_encoder(&array, TestEncoding::StructuralU32, sparse_metadata())
+        else {
             panic!("expected Lance 2.2 to reject explicit sparse encoding");
         };
         assert!(
             error
                 .to_string()
-                .contains("requires Lance file format 2.3+")
+                .contains("not enabled by the selected file format")
         );
 
         let structural_only = list_i32(vec![0, 0, 0], None);
-        let Err(error) =
-            create_encoder(&structural_only, LanceFileVersion::V2_2, sparse_metadata())
-        else {
+        let Err(error) = create_encoder(
+            &structural_only,
+            TestEncoding::StructuralU32,
+            sparse_metadata(),
+        ) else {
             panic!("expected Lance 2.2 structural-only input to reject explicit sparse encoding");
         };
         assert!(
             error
                 .to_string()
-                .contains("requires Lance file format 2.3+")
+                .contains("not enabled by the selected file format")
         );
     }
 }

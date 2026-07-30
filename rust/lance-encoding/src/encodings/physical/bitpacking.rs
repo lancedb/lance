@@ -622,7 +622,6 @@ mod test {
         compression::{BlockDecompressor, MiniBlockDecompressor},
         data::{BlockInfo, DataBlock, FixedWidthDataBlock},
         testing::{TestCases, check_round_trip_encoding_of_data},
-        version::LanceFileVersion,
     };
 
     #[rstest]
@@ -738,7 +737,7 @@ mod test {
 
     #[test_log::test(tokio::test)]
     async fn test_miniblock_bitpack() {
-        let test_cases = TestCases::default().with_min_file_version(LanceFileVersion::V2_1);
+        let test_cases = TestCases::default().with_structural_encodings();
 
         let arrays = vec![
             Arc::new(Int8Array::from(vec![100; 1024])) as Arc<dyn Array>,
@@ -777,7 +776,7 @@ mod test {
         // Test bitpacking encoding verification with varied small values that should trigger bitpacking
         let test_cases = TestCases::default()
             .with_expected_encoding("inline_bitpacking")
-            .with_min_file_version(LanceFileVersion::V2_1);
+            .with_structural_encodings();
 
         // Generate data with varied small values to avoid RLE
         // Mix different values but keep them small to trigger bitpacking
@@ -801,7 +800,7 @@ mod test {
 
         let test_cases = TestCases::default()
             .with_expected_encoding("inline_bitpacking")
-            .with_min_file_version(LanceFileVersion::V2_1);
+            .with_structural_encodings();
 
         // Build 2048 values: first 1024 all zeros (bit_width=0),
         // next 1024 small varied values to avoid RLE and trigger bitpacking.

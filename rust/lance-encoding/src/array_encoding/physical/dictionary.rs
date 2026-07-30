@@ -16,18 +16,18 @@ use lance_arrow::DataTypeExt;
 use lance_core::{Error, Result};
 use std::collections::HashMap;
 
+use crate::array_encoding::logical::primitive::PrimitiveFieldDecoder;
 use crate::buffer::LanceBuffer;
 use crate::data::{
     BlockInfo, DataBlock, DictionaryDataBlock, FixedWidthDataBlock, NullableDataBlock,
     VariableWidthBlock,
 };
+use crate::decoder::LogicalPageDecoder;
 use crate::format::ProtobufUtils;
-use crate::previous::decoder::LogicalPageDecoder;
-use crate::previous::encodings::logical::primitive::PrimitiveFieldDecoder;
 use crate::{
     EncodingsIo,
     decoder::{PageScheduler, PrimitivePageDecoder},
-    previous::encoder::{ArrayEncoder, EncodedArray},
+    encoder::{ArrayEncoder, EncodedArray},
 };
 
 #[derive(Debug)]

@@ -19,7 +19,7 @@ use crate::{
         DecodeArrayTask, FilterExpression, MessageType, NextDecodeTask, PriorityRange,
         ScheduledScanLine, SchedulerContext,
     },
-    previous::decoder::{DecoderReady, FieldScheduler, LogicalPageDecoder, SchedulingJob},
+    decoder::{DecoderReady, FieldScheduler, LogicalPageDecoder, SchedulingJob},
 };
 
 /// Wraps a varbin scheduler and uses a BinaryPageDecoder to cast
@@ -41,7 +41,7 @@ impl SchedulingJob for BinarySchedulingJob<'_> {
             .decoders
             .into_iter()
             .map(|message| {
-                let decoder = message.into_legacy();
+                let decoder = message.into_array();
                 MessageType::DecoderReady(DecoderReady {
                     path: decoder.path,
                     decoder: Box::new(BinaryPageDecoder {
@@ -179,7 +179,7 @@ impl DecodeArrayTask for BinaryArrayDecoder {
             DataType::LargeUtf8 => Self::from_list_array::<LargeUtf8Type>(arr.as_list::<i64>()),
             _ => panic!("Binary decoder does not support this data type"),
         };
-        // data_size is only tracked in the v2.1 structural decode path; the legacy
+        // data_size is only tracked in the v2.1 structural decode path; the v2.0 array
         // v2.0 path does not need it so we return 0.
         Ok((result, 0))
     }

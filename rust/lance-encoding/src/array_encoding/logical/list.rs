@@ -22,19 +22,19 @@ use tokio::task::JoinHandle;
 
 use crate::{
     EncodingsIo,
+    array_encoding::logical::r#struct::{SimpleStructDecoder, SimpleStructScheduler},
     buffer::LanceBuffer,
     data::{BlockInfo, DataBlock, FixedWidthDataBlock},
     decoder::{
-        DecodeArrayTask, DecodeBatchScheduler, FilterExpression, ListPriorityRange, MessageType,
-        NextDecodeTask, PageEncoding, PriorityRange, ScheduledScanLine, SchedulerContext,
+        DecodeArrayTask, DecodeBatchScheduler, FieldScheduler, FilterExpression, ListPriorityRange,
+        LogicalPageDecoder, MessageType, NextDecodeTask, PageEncoding, PriorityRange,
+        ScheduledScanLine, SchedulerContext, SchedulingJob,
     },
-    encoder::{EncodeTask, EncodedColumn, EncodedPage, FieldEncoder, OutOfLineBuffers},
+    encoder::{
+        ArrayEncoder, EncodeTask, EncodedArray, EncodedColumn, EncodedPage, FieldEncoder,
+        OutOfLineBuffers,
+    },
     format::pb,
-    previous::{
-        decoder::{FieldScheduler, LogicalPageDecoder, SchedulingJob},
-        encoder::{ArrayEncoder, EncodedArray},
-        encodings::logical::r#struct::{SimpleStructDecoder, SimpleStructScheduler},
-    },
     repdef::RepDefBuilder,
     utils::accumulation::AccumulationQueue,
 };
@@ -397,7 +397,7 @@ async fn indirect_schedule_task(
 
     for message in indirect_messages {
         for decoder in message.decoders {
-            let decoder = decoder.into_legacy();
+            let decoder = decoder.into_array();
             if !decoder.path.is_empty() {
                 root_decoder.accept_child(decoder)?;
             }
@@ -467,7 +467,7 @@ impl SchedulingJob for ListFieldSchedulingJob<'_> {
             .into_iter()
             .next()
             .unwrap()
-            .into_legacy()
+            .into_array()
             .decoder;
 
         let items_scheduler = self.scheduler.items_scheduler.clone();
@@ -690,7 +690,7 @@ impl DecodeArrayTask for ListDecodeTask {
             }
             _ => panic!("ListDecodeTask with data type that is not i32 or i64"),
         };
-        // data_size is only tracked in the v2.1 structural decode path; the legacy
+        // data_size is only tracked in the v2.1 structural decode path; the v2.0 array
         // v2.0 path does not need it so we return 0.
         Ok((array, 0))
     }
@@ -961,7 +961,7 @@ impl ListOffsetsEncoder {
                 description: PageEncoding::Legacy(description),
                 num_rows,
                 column_idx,
-                row_number: 0, // Legacy encoders do not use
+                row_number: 0, // V2.0 encoders do not use
             })
         })
         .map(|res_res| res_res.unwrap())

@@ -5,16 +5,16 @@ use arrow_schema::DataType;
 use lance_arrow::DataTypeExt;
 
 use crate::{
-    buffer::LanceBuffer,
-    decoder::{PageBuffers, PageScheduler},
-    encodings::physical::block::{CompressionConfig, CompressionScheme},
-    format::pb::{self, PackedStruct},
-    previous::encodings::physical::{
+    array_encoding::physical::{
         basic::BasicPageScheduler, binary::BinaryPageScheduler, bitmap::DenseBitmapScheduler,
         dictionary::DictionaryPageScheduler, fixed_size_list::FixedListScheduler,
         fsst::FsstPageScheduler, packed_struct::PackedStructPageScheduler,
         value::ValuePageScheduler,
     },
+    buffer::LanceBuffer,
+    decoder::{PageBuffers, PageScheduler},
+    encodings::physical::block::{CompressionConfig, CompressionScheme},
+    format::pb::{self, PackedStruct},
 };
 
 pub mod basic;
@@ -293,9 +293,9 @@ pub fn decoder_from_array_encoding(
 
 #[cfg(test)]
 mod tests {
+    use crate::array_encoding::physical::get_buffer_decoder;
     use crate::decoder::{ColumnBuffers, FileBuffers, PageBuffers};
     use crate::format::pb;
-    use crate::previous::encodings::physical::get_buffer_decoder;
 
     #[test]
     fn test_get_buffer_decoder_for_compressed_buffer() {
