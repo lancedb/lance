@@ -5412,6 +5412,7 @@ impl PrimitiveStructuralEncoder {
         let compressor = compression_strategy.create_miniblock_compressor(field, &data)?;
         let common_chunk_buffers =
             u64::from(repdef.rep_slicer().is_some()) + u64::from(repdef.def_slicer().is_some());
+        let support_large_chunk = miniblock_chunk_size == MiniblockChunkSize::U32;
         let compression_context =
             MiniBlockCompressionContext::new(common_chunk_buffers, support_large_chunk, true);
         let (compressed_data, value_encoding) = compressor.compress(compression_context, data)?;
