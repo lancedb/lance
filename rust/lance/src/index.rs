@@ -64,7 +64,8 @@ use serde_json::json;
 use tracing::{info, instrument, warn};
 use uuid::Uuid;
 use vector::details::{
-    derive_vector_index_type, infer_missing_vector_details, vector_details_as_json,
+    derive_vector_index_type, infer_missing_vector_details, needs_vector_details_inference,
+    vector_details_as_json,
 };
 pub(crate) use vector::details::{vector_index_details, vector_index_details_default};
 use vector::ivf::v2::{IVFIndex, IvfStateEntryBox};
@@ -1505,14 +1506,24 @@ impl DatasetIndexExt for Dataset {
         // Infer details for legacy vector indices (once per index name, concurrently).
         // This may run on indices that were opportunistically cached during Dataset::open
         // before the full Dataset was available for inference.
+        // Only legacy vector indices missing details need inference; checking the
+        // predicate first avoids deep-cloning and deep-comparing the whole index
+        // metadata list (including per-index fragment bitmaps) on every call —
+        // this path runs per segment per query on the FTS read path.
         {
-            let mut updated = indices.as_ref().clone();
-            infer_missing_vector_details(self, &mut updated).await;
-            if updated != *indices {
-                indices = Arc::new(updated);
-                self.index_cache
-                    .insert_with_key(&metadata_key, indices.clone())
-                    .await;
+            let schema = self.schema();
+            if indices
+                .iter()
+                .any(|idx| needs_vector_details_inference(idx, schema))
+            {
+                let mut updated = indices.as_ref().clone();
+                infer_missing_vector_details(self, &mut updated).await;
+                if updated != *indices {
+                    indices = Arc::new(updated);
+                    self.index_cache
+                        .insert_with_key(&metadata_key, indices.clone())
+                        .await;
+                }
             }
         }
 
