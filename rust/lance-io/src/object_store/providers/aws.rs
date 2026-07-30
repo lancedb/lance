@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
+use std::{collections::{HashMap, HashSet}, str::FromStr, sync::Arc, time::Duration};
 
 #[cfg(test)]
 use mock_instant::thread_local::{SystemTime, UNIX_EPOCH};
@@ -53,6 +53,7 @@ impl AwsStoreProvider {
             retry_timeout: Duration::from_secs(storage_options.client_retry_timeout()),
         };
 
+        let masked_env_vars = storage_options.masked_env_vars();
         let mut s3_storage_options = storage_options.as_s3_options();
         let region = resolve_s3_region(base_path, &s3_storage_options).await?;
 
@@ -65,6 +66,7 @@ impl AwsStoreProvider {
             Some(&s3_storage_options),
             region,
             accessor,
+            &masked_env_vars,
         )
         .await?;
 
@@ -241,6 +243,65 @@ async fn resolve_s3_region(
     }
 }
 
+/// Build the default AWS credentials chain, skipping providers whose required
+/// environment variables are masked (set to empty string in storage options).
+///
+/// This mirrors the `DefaultCredentialsChain` resolution order but conditionally
+/// excludes providers based on the masked env var set.
+async fn build_credentials_chain_with_masks(
+    region: Option<String>,
+    masked: &HashSet<String>,
+) -> impl ProvideCredentials + 'static {
+    use aws_config::{
+        Region,
+        ecs::EcsCredentialsProvider,
+        environment::credentials::EnvironmentVariableCredentialsProvider,
+        imds::credentials::ImdsCredentialsProvider,
+        meta::credentials::CredentialsProviderChain,
+        profile::ProfileFileCredentialsProvider,
+        provider_config::ProviderConfig,
+        web_identity_token::WebIdentityTokenCredentialsProvider,
+    };
+
+    let conf = ProviderConfig::default()
+        .with_region(region.map(Region::new));
+
+    let env_masked =
+        masked.contains("AWS_ACCESS_KEY_ID") || masked.contains("AWS_SECRET_ACCESS_KEY");
+    let web_identity_masked = masked.contains("AWS_WEB_IDENTITY_TOKEN_FILE");
+    let ecs_masked = masked.contains("AWS_CONTAINER_CREDENTIALS_FULL_URI")
+        || masked.contains("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI");
+
+    let profile_provider = ProfileFileCredentialsProvider::builder()
+        .configure(&conf)
+        .build();
+
+    let mut chain = if !env_masked {
+        CredentialsProviderChain::first_try(
+            "Environment",
+            EnvironmentVariableCredentialsProvider::new(),
+        )
+        .or_else("Profile", profile_provider)
+    } else {
+        CredentialsProviderChain::first_try("Profile", profile_provider)
+    };
+
+    if !web_identity_masked {
+        let provider = WebIdentityTokenCredentialsProvider::builder()
+            .configure(&conf)
+            .build();
+        chain = chain.or_else("WebIdentityToken", provider);
+    }
+
+    if !ecs_masked {
+        let provider = EcsCredentialsProvider::builder().configure(&conf).build();
+        chain = chain.or_else("EcsContainer", provider);
+    }
+
+    let imds_provider = ImdsCredentialsProvider::builder().configure(&conf).build();
+    chain.or_else("Ec2InstanceMetadata", imds_provider)
+}
+
 /// Build AWS credentials
 ///
 /// This resolves credentials from the following sources in order:
@@ -257,12 +318,21 @@ async fn resolve_s3_region(
 /// before expiration.
 ///
 /// `credentials_refresh_offset` is the amount of time before expiry to refresh credentials.
+///
+/// # Masked Environment Variables
+///
+/// When `masked_env_vars` is non-empty, any env var name listed there (uppercase)
+/// is excluded from the default credential chain. A storage option set to an empty
+/// string masks the environment variable with the same name (case-insensitive). For
+/// example, setting `AWS_WEB_IDENTITY_TOKEN_FILE = ""` prevents IRSA from being
+/// used, allowing pod-based (ECS) credentials to take effect instead.
 pub async fn build_aws_credential(
     credentials_refresh_offset: Duration,
     credentials: Option<AwsCredentialProvider>,
     storage_options: Option<&HashMap<AmazonS3ConfigKey, String>>,
     region: Option<String>,
     storage_options_accessor: Option<Arc<StorageOptionsAccessor>>,
+    masked_env_vars: &HashSet<String>,
 ) -> Result<(AwsCredentialProvider, String)> {
     use aws_config::meta::region::RegionProviderChain;
     const DEFAULT_REGION: &str = "us-west-2";
@@ -306,13 +376,16 @@ pub async fn build_aws_credential(
     } else if let Some(creds) = storage_options_credentials {
         Ok((Arc::new(creds), region))
     } else {
-        let credentials_provider = DefaultCredentialsChain::builder().build().await;
+        let inner: Arc<dyn ProvideCredentials> = if masked_env_vars.is_empty() {
+            Arc::new(DefaultCredentialsChain::builder().build().await)
+        } else {
+            Arc::new(
+                build_credentials_chain_with_masks(Some(region.clone()), masked_env_vars).await,
+            )
+        };
 
         Ok((
-            Arc::new(AwsCredentialAdapter::new(
-                Arc::new(credentials_provider),
-                credentials_refresh_offset,
-            )),
+            Arc::new(AwsCredentialAdapter::new(inner, credentials_refresh_offset)),
             region,
         ))
     }
@@ -423,6 +496,11 @@ impl CredentialProvider for AwsCredentialAdapter {
 
 impl StorageOptions {
     /// Add values from the environment to storage options
+    ///
+    /// Environment variables are only added when the corresponding key is not
+    /// already present in the storage options. This means that a user-provided
+    /// storage option — including an empty string used to mask the env var —
+    /// always takes precedence over the process environment.
     pub fn with_env_s3(&mut self) {
         for (os_key, os_value) in std::env::vars_os() {
             if let (Some(key), Some(value)) = (os_key.to_str(), os_value.to_str())
@@ -436,15 +514,21 @@ impl StorageOptions {
     }
 
     /// Subset of options relevant for s3 storage
+    ///
+    /// Keys set to an empty string are excluded: they are masks that prevent the
+    /// corresponding environment variable from being used, not actual values to
+    /// pass to the S3 builder.
     pub fn as_s3_options(&self) -> HashMap<AmazonS3ConfigKey, String> {
         self.0
             .iter()
+            .filter(|(_, value)| !value.is_empty())
             .filter_map(|(key, value)| {
                 let s3_key = AmazonS3ConfigKey::from_str(&key.to_ascii_lowercase()).ok()?;
                 Some((s3_key, value.clone()))
             })
             .collect()
     }
+
 }
 
 impl ObjectStoreParams {
@@ -1044,6 +1128,7 @@ mod tests {
             None, // no storage_options
             Some("us-west-2".to_string()),
             Some(accessor),
+            &Default::default(),
         )
         .await
         .unwrap();
@@ -1107,6 +1192,7 @@ mod tests {
             None, // no storage_options
             Some("us-west-2".to_string()),
             Some(accessor),
+            &Default::default(),
         )
         .await
         .unwrap();
@@ -1129,5 +1215,36 @@ mod tests {
 
         // Storage options provider should have been called once
         assert_eq!(mock_storage_provider.get_call_count().await, 1);
+    }
+
+    #[test]
+    fn test_masked_env_vars_extracted_from_storage_options() {
+        let options = StorageOptions(HashMap::from([
+            ("AWS_WEB_IDENTITY_TOKEN_FILE".to_string(), "".to_string()),
+            ("aws_role_arn".to_string(), "".to_string()),
+            ("aws_region".to_string(), "us-east-1".to_string()),
+            ("aws_access_key_id".to_string(), "AKID".to_string()),
+        ]));
+
+        let masked = options.masked_env_vars();
+        assert!(masked.contains("AWS_WEB_IDENTITY_TOKEN_FILE"));
+        assert!(masked.contains("AWS_ROLE_ARN"));
+        assert!(!masked.contains("AWS_REGION"));
+        assert!(!masked.contains("AWS_ACCESS_KEY_ID"));
+        assert_eq!(masked.len(), 2);
+    }
+
+    #[test]
+    fn test_masked_env_vars_excluded_from_s3_options() {
+        // Empty-string values should not appear in S3 options (they mask env vars,
+        // not values to pass to the S3 builder).
+        let options = StorageOptions(HashMap::from([
+            ("aws_region".to_string(), "".to_string()),
+            ("aws_access_key_id".to_string(), "AKID".to_string()),
+        ]));
+
+        let s3_opts = options.as_s3_options();
+        assert!(!s3_opts.contains_key(&AmazonS3ConfigKey::Region));
+        assert!(s3_opts.contains_key(&AmazonS3ConfigKey::AccessKeyId));
     }
 }

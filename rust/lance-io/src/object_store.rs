@@ -1071,6 +1071,22 @@ impl StorageOptions {
         self.0.get(key)
     }
 
+    /// Returns the set of environment variable names (uppercase) that are masked.
+    ///
+    /// A storage option set to an empty string masks the environment variable with
+    /// the same name (case-insensitive). Masked env vars are excluded from the AWS
+    /// credential provider chain so that a lower-priority auth method can be used.
+    ///
+    /// For example, setting `AWS_WEB_IDENTITY_TOKEN_FILE = ""` prevents IRSA from
+    /// being selected, allowing pod-based (ECS) credentials to take effect instead.
+    pub fn masked_env_vars(&self) -> std::collections::HashSet<String> {
+        self.0
+            .iter()
+            .filter(|(_, v)| v.is_empty())
+            .map(|(k, _)| k.to_ascii_uppercase())
+            .collect()
+    }
+
     /// Build [`ClientOptions`] with default headers extracted from `headers.*` keys.
     ///
     /// Keys prefixed with `headers.` are parsed into HTTP headers. For example,
