@@ -4,8 +4,6 @@
 use std::sync::Arc;
 
 use arrow_buffer::ScalarBuffer;
-#[cfg(test)]
-use arrow_schema::DataType;
 use futures::{FutureExt, future::BoxFuture};
 use lance_core::Result;
 
@@ -14,12 +12,6 @@ use crate::{
     buffer::LanceBuffer,
     data::{BlockInfo, DataBlock, VariableWidthBlock},
     decoder::{PageScheduler, PrimitivePageDecoder},
-};
-#[cfg(test)]
-use crate::{
-    data::FixedWidthDataBlock,
-    encoder::{ArrayEncoder, EncodedArray},
-    format::ProtobufUtils,
 };
 
 /// A scheduler for fixed size binary data
@@ -121,54 +113,6 @@ impl PrimitivePageDecoder for FixedSizeBinaryDecoder {
     }
 }
 
-#[derive(Debug)]
-#[cfg(test)]
-struct FixedSizeBinaryEncoder {
-    bytes_encoder: Box<dyn ArrayEncoder>,
-    byte_width: usize,
-}
-
-#[cfg(test)]
-impl FixedSizeBinaryEncoder {
-    fn new(bytes_encoder: Box<dyn ArrayEncoder>, byte_width: usize) -> Self {
-        Self {
-            bytes_encoder,
-            byte_width,
-        }
-    }
-}
-
-#[cfg(test)]
-impl ArrayEncoder for FixedSizeBinaryEncoder {
-    fn encode(
-        &self,
-        data: DataBlock,
-        _data_type: &DataType,
-        buffer_index: &mut u32,
-    ) -> Result<EncodedArray> {
-        let bytes_data = data.as_variable_width().unwrap();
-        let fixed_data = DataBlock::FixedWidth(FixedWidthDataBlock {
-            bits_per_value: 8 * self.byte_width as u64,
-            data: bytes_data.data,
-            num_values: bytes_data.num_values,
-            block_info: BlockInfo::new(),
-        });
-
-        let encoded_data = self.bytes_encoder.encode(
-            fixed_data,
-            &DataType::FixedSizeBinary(self.byte_width as i32),
-            buffer_index,
-        )?;
-        let encoding =
-            ProtobufUtils::fixed_size_binary(encoded_data.encoding, self.byte_width as u32);
-
-        Ok(EncodedArray {
-            data: encoded_data.data,
-            encoding,
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::{collections::HashMap, sync::Arc};
@@ -181,14 +125,9 @@ mod tests {
     use arrow_data::ArrayData;
     use arrow_schema::{DataType, Field};
 
-    use crate::array_encoding::physical::{
-        basic::BasicEncoder,
-        fixed_size_binary::{FixedSizeBinaryDecoder, FixedSizeBinaryEncoder},
-    };
+    use crate::array_encoding::physical::fixed_size_binary::FixedSizeBinaryDecoder;
     use crate::data::{DataBlock, FixedWidthDataBlock};
     use crate::decoder::PrimitivePageDecoder;
-    use crate::encoder::ArrayEncoder;
-    use crate::encodings::physical::value::ValueEncoder;
     use crate::testing::{TestCases, check_basic_random, check_round_trip_encoding_of_data};
 
     #[test_log::test(tokio::test)]
@@ -214,29 +153,6 @@ mod tests {
     async fn test_fixed_size_large_utf8() {
         let field = Field::new("", DataType::LargeUtf8, true);
         check_basic_random(field).await;
-    }
-
-    #[test]
-    fn test_fixed_size_binary_encoder() {
-        let array = Arc::new(StringArray::from(vec!["aaa", "bbb"])) as ArrayRef;
-        let encoder = FixedSizeBinaryEncoder::new(
-            Box::new(BasicEncoder::new(Box::new(ValueEncoder::default()))),
-            3,
-        );
-        let mut buffer_index = 0;
-
-        let encoded = encoder
-            .encode(
-                DataBlock::from_array(array),
-                &DataType::Utf8,
-                &mut buffer_index,
-            )
-            .unwrap();
-
-        assert!(matches!(
-            encoded.encoding.array_encoding,
-            Some(crate::format::pb::array_encoding::ArrayEncoding::FixedSizeBinary(_))
-        ));
     }
 
     #[test_log::test(tokio::test)]
