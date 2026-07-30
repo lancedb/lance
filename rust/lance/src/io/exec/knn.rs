@@ -870,6 +870,7 @@ impl ExecutionPlan for KNNVectorDistanceExec {
         partition: usize,
         context: Arc<datafusion::execution::context::TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
+        let target_partitions = context.session_config().target_partitions();
         let input_stream = self.input.execute(partition, context)?;
         if self.is_batch {
             let stream = stream::once(Self::execute_batch(
@@ -933,7 +934,11 @@ impl ExecutionPlan for KNNVectorDistanceExec {
                         .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
                 }
             })
-            .buffer_unordered(get_num_compute_intensive_cpus());
+            .buffer_unordered(
+                get_num_compute_intensive_cpus()
+                    .min(target_partitions)
+                    .max(1),
+            );
 
         let stream = stream.map(move |batch| {
             let poll = baseline.record_poll(std::task::Poll::Ready(Some(batch)));
@@ -3124,6 +3129,64 @@ mod tests {
         let indices = sort_to_indices(distances, None, Some(10)).unwrap();
         let expected = take_record_batch(&all_with_distances, &indices).unwrap();
         assert_eq!(expected, results[0]);
+    }
+
+    /// Verify that KNNVectorDistanceExec with target_partitions=1 produces the same
+    /// row count as the default context. Regression guard for the parallelism cap.
+    #[tokio::test]
+    async fn test_knn_vector_distance_respects_target_partitions() {
+        use arrow_array::UInt64Array;
+        use datafusion::execution::context::{SessionConfig, TaskContext};
+
+        let dim: usize = 16;
+        let n_batches = 10;
+        let batch_size = 50;
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new(ROW_ID, DataType::UInt64, false),
+            ArrowField::new(
+                "vector",
+                DataType::FixedSizeList(
+                    Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                    dim as i32,
+                ),
+                true,
+            ),
+        ]));
+
+        let batches: Vec<RecordBatch> = (0..n_batches)
+            .map(|i| {
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(UInt64Array::from_iter_values(
+                            ((i * batch_size) as u64)..((i + 1) as u64 * batch_size as u64),
+                        )),
+                        Arc::new(
+                            FixedSizeListArray::try_new_from_values(
+                                generate_random_array(dim * batch_size),
+                                dim as i32,
+                            )
+                            .unwrap(),
+                        ),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect();
+
+        let input: Arc<dyn ExecutionPlan> = Arc::new(TestingExec::new(batches));
+        let query_vec = Arc::new(generate_random_array(dim)) as ArrayRef;
+        let exec =
+            KNNVectorDistanceExec::try_new(input, "vector", query_vec, DistanceType::L2).unwrap();
+
+        let low_ctx = Arc::new(
+            TaskContext::default()
+                .with_session_config(SessionConfig::default().with_target_partitions(1)),
+        );
+        let stream = exec.execute(0, low_ctx).unwrap();
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, n_batches * batch_size);
     }
 
     #[test]
