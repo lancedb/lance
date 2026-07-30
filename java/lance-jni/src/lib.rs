@@ -51,6 +51,7 @@ mod file_reader;
 mod file_writer;
 mod fragment;
 mod index;
+mod index_progress;
 mod mem_wal;
 mod merge_insert;
 mod namespace;

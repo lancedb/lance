@@ -3,6 +3,7 @@
 
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
+use crate::index_progress::JavaIndexBuildProgress;
 use crate::namespace::{
     BlockingDirectoryNamespace, BlockingRestNamespace, create_java_lance_namespace,
 };
@@ -1115,13 +1116,12 @@ fn inner_merge_index_metadata(
     index_type_code_jobj: jint,
     batch_readhead_jobj: JObject, // Optional<Integer>
 ) -> Result<()> {
-    let index_uuid_str = index_uuid.extract(env)?;
-    let index_uuid = Uuid::parse_str(&index_uuid_str)
-        .map_err(|e| Error::input_error(format!("Invalid UUID string for index_uuid: {e}")))?;
-    let index_type = IndexType::try_from(index_type_code_jobj)?;
-    let batch_readhead = env
-        .get_int_opt(&batch_readhead_jobj)?
-        .map(|val| val as usize);
+    let (index_uuid, index_type, batch_readhead) = parse_merge_index_metadata_args(
+        env,
+        index_uuid,
+        index_type_code_jobj,
+        batch_readhead_jobj,
+    )?;
 
     let dataset_guard =
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
@@ -1133,6 +1133,72 @@ fn inner_merge_index_metadata(
             .await
     })?;
     Ok(())
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_innerMergeIndexMetadataWithProgress<'local>(
+    mut env: JNIEnv<'local>,
+    java_dataset: JObject,
+    index_uuid: JString,
+    index_type_code_jobj: jint,
+    batch_readhead_jobj: JObject,
+    progress_jobj: JObject,
+) {
+    ok_or_throw_without_return!(
+        env,
+        inner_merge_index_metadata_with_progress(
+            &mut env,
+            java_dataset,
+            index_uuid,
+            index_type_code_jobj,
+            batch_readhead_jobj,
+            progress_jobj,
+        )
+    );
+}
+
+fn inner_merge_index_metadata_with_progress(
+    env: &mut JNIEnv,
+    java_dataset: JObject,
+    index_uuid: JString,
+    index_type_code_jobj: jint,
+    batch_readhead_jobj: JObject,
+    progress_jobj: JObject,
+) -> Result<()> {
+    let (index_uuid, index_type, batch_readhead) = parse_merge_index_metadata_args(
+        env,
+        index_uuid,
+        index_type_code_jobj,
+        batch_readhead_jobj,
+    )?;
+    let progress = Arc::new(JavaIndexBuildProgress::new(env, &progress_jobj)?);
+
+    let dataset_guard =
+        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+
+    RT.block_on(async {
+        dataset_guard
+            .inner
+            .merge_index_metadata(&index_uuid, index_type, batch_readhead, progress)
+            .await
+    })?;
+    Ok(())
+}
+
+fn parse_merge_index_metadata_args(
+    env: &mut JNIEnv,
+    index_uuid: JString,
+    index_type_code_jobj: jint,
+    batch_readhead_jobj: JObject,
+) -> Result<(Uuid, IndexType, Option<usize>)> {
+    let index_uuid_str = index_uuid.extract(env)?;
+    let index_uuid = Uuid::parse_str(&index_uuid_str)
+        .map_err(|e| Error::input_error(format!("Invalid UUID string for index_uuid: {e}")))?;
+    let index_type = IndexType::try_from(index_type_code_jobj)?;
+    let batch_readhead = env
+        .get_int_opt(&batch_readhead_jobj)?
+        .map(|val| val as usize);
+    Ok((index_uuid, index_type, batch_readhead))
 }
 
 #[unsafe(no_mangle)]

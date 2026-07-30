@@ -19,6 +19,7 @@ import org.lance.cleanup.RemovalStats;
 import org.lance.compaction.CompactionOptions;
 import org.lance.delta.DatasetDelta;
 import org.lance.index.Index;
+import org.lance.index.IndexBuildProgress;
 import org.lance.index.IndexCriteria;
 import org.lance.index.IndexDescription;
 import org.lance.index.IndexOptions;
@@ -1152,6 +1153,30 @@ public class Dataset implements Closeable {
 
   private native void innerMergeIndexMetadata(
       String indexUUID, int indexType, Optional<Integer> batchReadHead);
+
+  /**
+   * Merge distributed index metadata while reporting stage-level progress.
+   *
+   * @param indexUUID shared UUID used by the distributed index parts
+   * @param indexType type of index metadata to merge
+   * @param batchReadHead optional limit for metadata read concurrency
+   * @param progress thread-safe progress callback
+   */
+  public void mergeIndexMetadata(
+      String indexUUID,
+      IndexType indexType,
+      Optional<Integer> batchReadHead,
+      IndexBuildProgress progress) {
+    Preconditions.checkNotNull(progress, "progress cannot be null");
+    innerMergeIndexMetadataWithProgress(
+        indexUUID, indexType.getValue(), batchReadHead, progress);
+  }
+
+  private native void innerMergeIndexMetadataWithProgress(
+      String indexUUID,
+      int indexType,
+      Optional<Integer> batchReadHead,
+      IndexBuildProgress progress);
 
   /** Merge one caller-defined group of existing uncommitted vector index segments. */
   public Index mergeExistingIndexSegments(List<Index> segments) {
