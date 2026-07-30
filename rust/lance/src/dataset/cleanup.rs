@@ -57,6 +57,7 @@ use lance_table::{
         deletion::deletion_file_path,
         manifest::{read_manifest, read_manifest_indexes},
     },
+    rowids::version::RowDatasetVersionMeta,
 };
 use object_store::ObjectMeta;
 use object_store::path::Path;
@@ -85,8 +86,8 @@ struct ReferencedFiles {
 ///
 /// **Experimental.** This API is intended for external orphan-cleanup drivers
 /// and may change. It is only defined for datasets without branches, detached
-/// versions, external (multi-base) fragments, or external row-id files;
-/// [`Dataset::referenced_files`] errors otherwise.
+/// versions, external (multi-base) fragments, external row-id files, or external
+/// row-version metadata; [`Dataset::referenced_files`] errors otherwise.
 ///
 /// # How to use it safely
 ///
@@ -100,8 +101,13 @@ struct ReferencedFiles {
 /// before its commit lands is referenced by no present manifest yet).
 ///
 /// Never treat these as orphan candidates — this set does not describe them:
-/// `_refs/` (tags/branches), staging manifests (`_versions/.tmp*`), and the
-/// version-hint file.
+/// `_refs/` (tags/branches), staging manifests (`_versions/.tmp*`), the
+/// version-hint file, and `_mem_wal/` (MemWAL entries, SSTables, and PK-index
+/// sidecars, which are live data enumerated nowhere in this set).
+///
+/// Directory-marker objects (zero-byte keys like `data/{key}/` or
+/// `_indices/{uuid}/` that some tools create) are not referenced either — they
+/// name a directory, not a file this set tracks.
 ///
 /// [`is_referenced`](Self::is_referenced) already encapsulates the blob v2
 /// sidecar rule (a sidecar `data/{key}/{blob_id}.blob` is referenced iff its
@@ -125,21 +131,24 @@ impl ReferencedFileSet {
     /// on a worker after distributing [`exact_paths`](Self::exact_paths) and
     /// [`index_prefixes`](Self::index_prefixes) from the driver.
     pub fn new(exact_paths: Vec<String>, index_prefixes: Vec<String>) -> Self {
-        // Normalize both sides through the same `object_store::path::Path` form
-        // that `is_referenced` applies to its query, so a caller that
-        // reconstructs the set with a directory-style trailing slash (e.g.
-        // `_indices/{uuid}/`) or a leading slash still matches — an asymmetry
-        // here would silently flip a live file to unreferenced.
+        // Normalize only path *shape* (leading/trailing delimiters, empty
+        // segments) — never percent-encoding. `Path::from` would percent-encode
+        // `%` itself (it is in object_store's INVALID set), so applying it to a
+        // string that is already in canonical form re-encodes it: `%25` becomes
+        // `%2525`. That is not idempotent, and both the producer's keys and the
+        // paths a caller lists from storage are already in canonical form, so
+        // re-encoding either side silently turns a live file into a
+        // false negative and the caller deletes it.
         let mut index_prefixes: Vec<String> = index_prefixes
             .into_iter()
-            .map(|p| Path::from(p.as_str()).to_string())
+            .map(|p| normalize_path_shape(&p))
             .collect();
         index_prefixes.sort_unstable();
         index_prefixes.dedup();
         Self {
             exact: exact_paths
                 .into_iter()
-                .map(|p| Path::from(p.as_str()).to_string())
+                .map(|p| normalize_path_shape(&p))
                 .collect(),
             index_prefixes,
         }
@@ -153,18 +162,18 @@ impl ReferencedFileSet {
     /// returns `false` for — within a managed subtree and past an age threshold —
     /// is an orphan.
     ///
-    /// The path is normalized to [`object_store::path::Path`] form before
-    /// matching, so a caller that lists with a leading/trailing slash still
-    /// matches; a false negative here would delete a live file.
+    /// Leading/trailing slashes and empty path segments are normalized away, and
+    /// a percent-decoded spelling of a stored *exact* key is also accepted, so a
+    /// caller whose lister reports either form still matches. (Index prefixes are
+    /// `_indices/{uuid}` — hyphenated hex, so both spellings coincide.) Matching
+    /// errs toward "referenced": a false negative here would delete a live file.
     pub fn is_referenced(&self, root_relative_path: &str) -> bool {
-        // Normalize to the same `object_store::path::Path` form the producer
-        // stored keys in (strips leading/trailing delimiters, collapses empty
-        // segments), so path-shape differences can't turn a live file into a
-        // false negative (which the caller would delete).
-        let normalized = Path::from(root_relative_path).to_string();
+        // Normalize path shape only (see `new`): percent-encoding is left alone
+        // so that a path listed from storage matches the key as stored.
+        let normalized = normalize_path_shape(root_relative_path);
         let path = normalized.as_str();
 
-        if self.exact.contains(path) {
+        if self.contains_exact(path) {
             return true;
         }
         // Index artifact: any file under a referenced `_indices/{uuid}/`.
@@ -191,9 +200,40 @@ impl ReferencedFileSet {
             if segments.next().is_some() {
                 return true;
             }
-            return self.exact.contains(&format!("data/{key}.lance"));
+            return self.contains_exact(&format!("data/{key}.lance"));
         }
         false
+    }
+
+    /// Exact-set membership, accepting either the stored spelling of a path or a
+    /// percent-decoded one. Keys are stored in object-store canonical (encoded)
+    /// form; a caller that hands back a decoded path would otherwise miss, and a
+    /// miss deletes a live file. Extra matches only ever over-retain.
+    fn contains_exact(&self, path: &str) -> bool {
+        if self.exact.contains(path) {
+            return true;
+        }
+        // Only a path that `Path::from` would rewrite can have a second
+        // spelling. Skip the re-encode (two allocations plus a byte scan) for
+        // the ordinary case: this API's caller scans every listed object, and
+        // Lance-generated names are alphanumeric plus `.`, `-`, `_`. The test is
+        // an allowlist, so an unfamiliar byte falls through to the retry rather
+        // than silently skipping it.
+        let is_already_canonical = path.split('/').all(|segment| {
+            // `Path::from` rewrites a bare `.`/`..` segment to `%2E`/`%2E%2E`.
+            segment != "."
+                && segment != ".."
+                && segment
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+        });
+        if is_already_canonical {
+            return false;
+        }
+        // Re-encode a possibly-decoded caller path and retry. `Path::from`
+        // percent-encodes per segment, which is exactly the producer's spelling.
+        let reencoded = Path::from(path).to_string();
+        reencoded != path && self.exact.contains(&reencoded)
     }
 
     /// Root-relative exact-match paths (data/deletion/transaction/manifest),
@@ -210,6 +250,24 @@ impl ReferencedFileSet {
     pub fn index_prefixes(&self) -> &[String] {
         &self.index_prefixes
     }
+}
+
+/// Normalize a root-relative path's *shape* only: drop leading/trailing
+/// delimiters and empty segments (`a//b` → `a/b`), leaving every byte otherwise
+/// untouched.
+///
+/// Deliberately not [`object_store::path::Path::from`], which percent-encodes
+/// `%` and so is not idempotent: keys are already stored in canonical form, and
+/// re-encoding one side of a comparison would turn a live file into a false
+/// negative that the caller then deletes.
+fn normalize_path_shape(path: &str) -> String {
+    if !path.starts_with('/') && !path.ends_with('/') && !path.contains("//") {
+        return path.to_string();
+    }
+    path.split('/')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// Whether `path` lies strictly inside the directory `prefix` (i.e. `prefix/…`).
@@ -1509,9 +1567,9 @@ pub async fn cleanup_old_versions(
 /// # Safety scope
 ///
 /// The returned set is only complete for datasets **without branches, detached
-/// versions, external (multi-base) fragments, or external row-id files**; this
-/// returns an error if any of those is present, rather than silently returning an
-/// incomplete set a caller could act on:
+/// versions, external (multi-base) fragments, external row-id files, or external
+/// row-version metadata**; this returns an error if any of those is present,
+/// rather than silently returning an incomplete set a caller could act on:
 ///
 /// * Branch lineage files (referenced across `base_id`/`base_paths`) are not
 ///   traced, so a child branch's files could be reported as orphans.
@@ -1521,6 +1579,9 @@ pub async fn cleanup_old_versions(
 ///   they neither protect nor match files in another base.
 /// * External row-id files are a referenced artifact this set does not enumerate
 ///   (matching `collect_paths`, which also rejects them).
+/// * External row-version metadata (`created_at`/`last_updated_at`) is likewise a
+///   root-relative referenced file this set does not enumerate, so a driver would
+///   list it and see it as unreferenced.
 ///
 /// See [`ReferencedFileSet`] for how to interpret the result, including the
 /// blob v2 sidecar rule.
@@ -1604,6 +1665,29 @@ pub async fn referenced_files(dataset: &Dataset) -> Result<ReferencedFileSet> {
                             .into(),
                         ));
                     }
+                    // Same for external row-version metadata: a root-relative
+                    // referenced file this set does not enumerate, so a driver
+                    // would list it and see it as unreferenced. Refuse rather
+                    // than under-report.
+                    for (field, meta) in [
+                        ("created_at_version_meta", &fragment.created_at_version_meta),
+                        (
+                            "last_updated_at_version_meta",
+                            &fragment.last_updated_at_version_meta,
+                        ),
+                    ] {
+                        if let Some(RowDatasetVersionMeta::External(external_file)) = meta {
+                            return Err(Error::not_supported_source(
+                                format!(
+                                    "referenced_files is not supported on datasets with external \
+                                     row-version metadata ({field}, e.g. {}): the file is \
+                                     referenced but not enumerated",
+                                    external_file.path
+                                )
+                                .into(),
+                            ));
+                        }
+                    }
                     // Base data files and data-overlay files share the
                     // `data/{key}.lance` namespace; both must be kept.
                     let data_files = fragment
@@ -1650,6 +1734,18 @@ pub async fn referenced_files(dataset: &Dataset) -> Result<ReferencedFileSet> {
                 let (exact_paths, index_uuids) = &mut *guard;
                 exact_paths.extend(local_exact);
                 for index in &indexes {
+                    // An external-base index resolves outside this root, so its
+                    // uuid would become a phantom local `_indices/` prefix. Same
+                    // per-fragment reasoning as data and deletion files above:
+                    // the top-level `base_paths` guard only sees the latest
+                    // manifest, so re-check here across all present versions.
+                    if index.base_id.is_some() {
+                        return Err(Error::not_supported_source(
+                            "referenced_files is not supported on datasets with external \
+                             base indices: the index lives outside this dataset's root"
+                                .into(),
+                        ));
+                    }
                     index_uuids.insert(index.uuid.to_string());
                 }
                 Ok(())
@@ -4911,6 +5007,29 @@ mod tests {
         );
         assert!(reshaped.is_referenced("data/keep.lance"));
         assert!(reshaped.is_referenced("_indices/abc/index.idx"));
+
+        // Empty segments are normalized away too, so a caller that joins a
+        // prefix that already ends in `/` still matches.
+        assert!(set.is_referenced("data//keep.lance"));
+
+        // Percent-encoding must survive the distribute/reconstruct round trip.
+        // `Path::from` percent-encodes `%` itself, so normalizing with it would
+        // turn `%25` into `%2525` on every hop and a live object would look
+        // unreferenced to the worker that lists it.
+        let producer = ReferencedFileSet::new(vec!["data/live%25name.lance".to_string()], vec![]);
+        assert!(producer.is_referenced("data/live%25name.lance"));
+        let worker =
+            ReferencedFileSet::new(producer.exact_paths(), producer.index_prefixes().to_vec());
+        assert!(
+            worker.is_referenced("data/live%25name.lance"),
+            "worker-side reconstruction must match the producer's keys verbatim"
+        );
+        assert_eq!(producer, worker);
+        // The sidecar rule must survive the same round trip.
+        assert!(worker.is_referenced("data/live%25name/00000001.blob"));
+        // A caller whose lister reports the decoded spelling still matches:
+        // extra matches only over-retain, while a miss would delete a live file.
+        assert!(worker.is_referenced("data/live%name.lance"));
     }
 
     #[tokio::test]
@@ -5140,6 +5259,61 @@ mod tests {
         assert!(
             err.to_string().contains("row-id"),
             "error should mention external row-id files, got {err}"
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::created_at("created_at_version_meta")]
+    #[case::last_updated_at("last_updated_at_version_meta")]
+    #[tokio::test]
+    async fn referenced_files_rejects_external_row_version_metadata(#[case] field: &str) {
+        use lance_table::format::ExternalFile;
+        use lance_table::rowids::version::RowDatasetVersionMeta;
+
+        // External row-version metadata lives under the managed `data/` prefix, so
+        // a cleanup driver would list it and see it as unreferenced. Since this
+        // set does not enumerate it, the producer must refuse.
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        let db = fixture.open().await.unwrap();
+
+        let mut fragments: Vec<_> = db
+            .get_fragments()
+            .iter()
+            .map(|f| f.metadata().clone())
+            .collect();
+        let external = Some(RowDatasetVersionMeta::External(ExternalFile {
+            path: "data/external.versions".to_string(),
+            offset: 0,
+            size: 16,
+        }));
+        match field {
+            "created_at_version_meta" => fragments[0].created_at_version_meta = external,
+            _ => fragments[0].last_updated_at_version_meta = external,
+        }
+        let transaction = Transaction::new(
+            db.manifest.version,
+            Operation::Overwrite {
+                fragments,
+                schema: db.schema().clone(),
+                config_upsert_values: None,
+                initial_bases: None,
+            },
+            None,
+        );
+        let mut db = db;
+        db.apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+
+        let err = db.referenced_files().await.unwrap_err();
+        assert!(
+            matches!(err, Error::NotSupported { .. }),
+            "expected NotSupported for external row-version metadata, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains(field),
+            "error should name the offending field, got {err}"
         );
     }
 }

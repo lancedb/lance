@@ -1498,8 +1498,8 @@ impl Dataset {
     /// latest), so a file referenced only by an older-but-present version is kept.
     ///
     /// Returns an error for datasets with branches, detached versions, external
-    /// (multi-base) fragments, or external row-id files, whose files this set cannot
-    /// fully represent.
+    /// (multi-base) fragments, external row-id files, or external row-version
+    /// metadata, whose files this set cannot fully represent.
     ///
     /// ```
     /// # use lance::{Dataset, Result};
