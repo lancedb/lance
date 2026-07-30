@@ -299,10 +299,6 @@ async fn do_take_rows(
                 .or_insert_with(|| vec![offset]);
         });
 
-        // Only construct FileFragment handles for the fragments actually addressed
-        // by this take: get_fragments() clones every fragment descriptor, which is
-        // O(dataset fragments) per call and dominates take cost on datasets with
-        // many fragments.
         let addressed_ids: Vec<u32> = row_addrs_per_fragment.keys().copied().collect();
         let fragments = builder
             .dataset
