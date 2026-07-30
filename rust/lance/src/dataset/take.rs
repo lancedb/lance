@@ -308,57 +308,103 @@ async fn do_take_rows(
             Some((f, row_offset))
         });
 
+        // Spawn each per-fragment take onto its own task: `buffered` alone only
+        // interleaves the futures on the polling task, so the CPU-bound decode
+        // of every fragment would run serially on one thread.
         let mut batches = futures::stream::iter(fragment_and_indices)
             .map(|(fragment, indices)| {
-                do_take(
+                let physical_schema = physical_schema.clone();
+                tokio::task::spawn(do_take(
                     fragment,
                     indices,
-                    physical_schema.clone(),
+                    physical_schema,
                     with_row_id_in_projection,
                     true,
                     with_row_created_at_version_in_projection,
                     with_row_last_updated_at_version_in_projection,
-                )
+                ))
             })
             .buffered(builder.dataset.object_store.io_parallelism())
+            .map(|join_result| {
+                join_result.map_err(|e| Error::internal(format!("take task panicked: {e}")))?
+            })
             .try_collect::<Vec<_>>()
             .await?;
-        let one_batch = if batches.len() > 1 {
-            concat_batches(&batches[0].schema(), &batches)?
+        // Merge and reorder in one pass: concat + take each copy the full
+        // payload. Struct columns keep the concat path because
+        // arrow_select::take mishandles empty structs (see take_struct_array).
+        let has_struct = batches
+            .first()
+            .map(|b| {
+                b.schema()
+                    .fields()
+                    .iter()
+                    .any(|f| matches!(f.data_type(), arrow_schema::DataType::Struct(_)))
+            })
+            .unwrap_or(false);
+        if !has_struct && batches.len() > 1 {
+            let mut addr_to_pos: HashMap<u64, (usize, usize)> = HashMap::new();
+            for (batch_idx, batch) in batches.iter().enumerate() {
+                let addrs = batch
+                    .column_by_name(ROW_ADDR)
+                    .ok_or_else(|| Error::internal("_rowaddr column not found"))?
+                    .as_primitive::<UInt64Type>()
+                    .values();
+                for (row_idx, addr) in addrs.iter().enumerate() {
+                    addr_to_pos.insert(*addr, (batch_idx, row_idx));
+                }
+            }
+            let indices: Vec<(usize, usize)> = row_addrs
+                .iter()
+                .filter_map(|o| addr_to_pos.get(o).copied())
+                .collect();
+            let schema = batches[0].schema();
+            let columns = (0..schema.fields().len())
+                .map(|col_idx| {
+                    let arrays: Vec<&dyn Array> =
+                        batches.iter().map(|b| b.column(col_idx).as_ref()).collect();
+                    Ok(arrow_select::interleave::interleave(&arrays, &indices)?)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(RecordBatch::try_new(schema, columns)?)
         } else {
-            batches.pop().unwrap()
-        };
-        // Note: one_batch may contains fewer rows than the number of requested
-        // row ids because some rows may have been deleted. Because of this, we
-        // get the results with row ids so that we can re-order the results
-        // to match the requested order.
+            let one_batch = if batches.len() > 1 {
+                concat_batches(&batches[0].schema(), &batches)?
+            } else {
+                batches.pop().unwrap()
+            };
+            // Note: one_batch may contains fewer rows than the number of requested
+            // row ids because some rows may have been deleted. Because of this, we
+            // get the results with row ids so that we can re-order the results
+            // to match the requested order.
 
-        let returned_row_addr = one_batch
-            .column_by_name(ROW_ADDR)
-            .ok_or_else(|| Error::internal("_rowaddr column not found"))?
-            .as_primitive::<UInt64Type>()
-            .values();
+            let returned_row_addr = one_batch
+                .column_by_name(ROW_ADDR)
+                .ok_or_else(|| Error::internal("_rowaddr column not found"))?
+                .as_primitive::<UInt64Type>()
+                .values();
 
-        let addr_to_pos: HashMap<u64, u64> = returned_row_addr
-            .iter()
-            .enumerate()
-            .map(|(i, addr)| (*addr, i as u64))
-            .collect();
-        let remapping_index: UInt64Array = row_addrs
-            .iter()
-            .filter_map(|o| addr_to_pos.get(o).copied())
-            .collect();
+            let addr_to_pos: HashMap<u64, u64> = returned_row_addr
+                .iter()
+                .enumerate()
+                .map(|(i, addr)| (*addr, i as u64))
+                .collect();
+            let remapping_index: UInt64Array = row_addrs
+                .iter()
+                .filter_map(|o| addr_to_pos.get(o).copied())
+                .collect();
 
-        // remapping_index may be greater than the number of rows in one_batch
-        // if there are duplicates in the requested row ids. This is expected.
-        debug_assert!(remapping_index.len() >= one_batch.num_rows());
+            // remapping_index may be greater than the number of rows in one_batch
+            // if there are duplicates in the requested row ids. This is expected.
+            debug_assert!(remapping_index.len() >= one_batch.num_rows());
 
-        // There's a bug in arrow_select::take::take, that it doesn't handle empty struct correctly,
-        // so we need to handle it manually here.
-        // TODO: remove this once the bug is fixed.
-        let struct_arr: StructArray = one_batch.into();
-        let reordered = take_struct_array(&struct_arr, &remapping_index)?;
-        Ok(reordered.into())
+            // There's a bug in arrow_select::take::take, that it doesn't handle empty struct correctly,
+            // so we need to handle it manually here.
+            // TODO: remove this once the bug is fixed.
+            let struct_arr: StructArray = one_batch.into();
+            let reordered = take_struct_array(&struct_arr, &remapping_index)?;
+            Ok(reordered.into())
+        }
     }?;
 
     if builder.with_row_address || projection.must_add_row_offset {
