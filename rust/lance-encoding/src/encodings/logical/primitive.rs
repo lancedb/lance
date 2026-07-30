@@ -28,7 +28,6 @@ use arrow_array::{
     Array, ArrayRef, PrimitiveArray, cast::AsArray, make_array, new_null_array, types::UInt64Type,
 };
 use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder, NullBuffer, ScalarBuffer};
-use arrow_data::ArrayData;
 use arrow_schema::{DataType, Field as ArrowField};
 use bytes::Bytes;
 use futures::{FutureExt, TryStreamExt, future::BoxFuture, stream::FuturesOrdered};
@@ -6633,26 +6632,27 @@ impl PrimitiveStructuralEncoder {
             }
             // Repdef already records nullness. Give empty dictionaries an encodable placeholder
             // instead of retaining validity or exposing key 0 into an empty values array.
-            if array
-                .as_any_dictionary_opt()
-                .is_some_and(|dictionary| dictionary.values().is_empty())
+            if let Some(dictionary) = array.as_any_dictionary_opt()
+                && dictionary.values().is_empty()
             {
-                let DataType::Dictionary(key_type, value_type) = array.data_type() else {
-                    unreachable!("dictionary array must have a dictionary data type")
-                };
-                let zeroed = |data_type: &DataType, len: usize| -> Result<ArrayData> {
-                    Ok(new_null_array(data_type, len)
+                let zeroed = |data_type: &DataType, len: usize| {
+                    new_null_array(data_type, len)
                         .to_data()
                         .into_builder()
                         .nulls(None)
-                        .build()?)
+                        .build()
                 };
-                let rebuilt = zeroed(key_type, array.len())?
-                    .into_builder()
-                    .data_type(array.data_type().clone())
-                    .child_data(vec![zeroed(value_type, 1)?])
-                    .build()?;
-                return Ok(make_array(rebuilt));
+                return zeroed(dictionary.keys().data_type(), array.len())
+                    .and_then(|keys| {
+                        zeroed(dictionary.values().data_type(), 1).and_then(|value| {
+                            keys.into_builder()
+                                .data_type(array.data_type().clone())
+                                .child_data(vec![value])
+                                .build()
+                        })
+                    })
+                    .map(make_array)
+                    .map_err(Into::into);
             }
             let data_no_nulls = array.to_data().into_builder().nulls(None).build()?;
             Ok(make_array(data_no_nulls))
@@ -7057,8 +7057,11 @@ mod tests {
     use crate::testing::TestEncoding;
     use crate::testing::{TestCases, check_round_trip_encoding_of_data};
     use arrow_array::{
-        Array, ArrayRef, FixedSizeListArray, Float32Array, Int8Array, StringArray, UInt8Array,
+        Array, ArrayRef, DictionaryArray, FixedSizeListArray, Float32Array, Int8Array,
+        PrimitiveArray, StringArray, UInt8Array,
+        builder::StringDictionaryBuilder,
         make_array, new_null_array,
+        types::{ArrowDictionaryKeyType, Int8Type, Int32Type},
     };
     use arrow_buffer::ScalarBuffer;
     use arrow_schema::{DataType, Field as ArrowField};
@@ -7094,27 +7097,46 @@ mod tests {
             .await;
     }
 
-    #[tokio::test]
-    async fn test_mixed_valued_and_all_null_dictionary_round_trip() {
-        use arrow_array::builder::StringDictionaryBuilder;
-        use arrow_array::types::Int32Type;
-
-        let mut valued = StringDictionaryBuilder::<Int32Type>::new();
+    fn valued_dictionary<K: ArrowDictionaryKeyType>() -> ArrayRef {
+        let mut valued = StringDictionaryBuilder::<K>::new();
         valued.append_value("a");
         for _ in 0..7 {
             valued.append_null();
         }
-        let valued = Arc::new(valued.finish()) as ArrayRef;
+        Arc::new(valued.finish())
+    }
 
+    fn mixed_empty_dictionary_values() -> Vec<ArrayRef> {
         let data_type = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
-        let all_null = new_null_array(&data_type, 8);
+        vec![
+            valued_dictionary::<Int32Type>(),
+            new_null_array(&data_type, 8),
+        ]
+    }
 
-        check_round_trip_encoding_of_data(
-            vec![valued, all_null],
-            &TestCases::default(),
-            HashMap::new(),
-        )
-        .await;
+    fn mixed_null_dictionary_values() -> Vec<ArrayRef> {
+        let keys = PrimitiveArray::<Int32Type>::from(vec![0; 8]);
+        let values = Arc::new(StringArray::from(vec![None::<&str>]));
+        let all_null = Arc::new(DictionaryArray::<Int32Type>::try_new(keys, values).unwrap());
+        vec![valued_dictionary::<Int32Type>(), all_null]
+    }
+
+    fn mixed_sliced_int8_dictionary() -> Vec<ArrayRef> {
+        let data_type = DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8));
+        let all_null = new_null_array(&data_type, 10).slice(1, 8);
+        vec![valued_dictionary::<Int8Type>(), all_null]
+    }
+
+    #[rstest::rstest]
+    #[case::empty_values(mixed_empty_dictionary_values())]
+    #[case::null_values(mixed_null_dictionary_values())]
+    #[case::sliced_int8(mixed_sliced_int8_dictionary())]
+    #[tokio::test]
+    async fn test_mixed_valued_and_all_null_dictionary_round_trip(
+        #[case] dictionaries: Vec<ArrayRef>,
+    ) {
+        check_round_trip_encoding_of_data(dictionaries, &TestCases::default(), HashMap::new())
+            .await;
     }
 
     #[test]
