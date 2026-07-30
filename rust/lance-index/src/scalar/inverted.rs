@@ -3,6 +3,7 @@
 
 pub mod builder;
 mod cache_codec;
+mod compound;
 mod documents;
 mod encoding;
 mod impact;
@@ -21,6 +22,7 @@ use std::sync::Arc;
 use arrow_schema::{DataType, Field};
 use async_trait::async_trait;
 pub use builder::InvertedIndexBuilder;
+pub use compound::compound_search;
 use datafusion::execution::SendableRecordBatchStream;
 pub use index::*;
 use lance_core::{Result, cache::LanceCache};
