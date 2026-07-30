@@ -40,6 +40,7 @@ import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.ByteArrayInputStream;
@@ -52,6 +53,8 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -123,6 +126,46 @@ public class ScalarIndexTest {
     public void stageComplete(String stage) {
       recorder.stageComplete(stage);
       throw new IllegalStateException("complete callback failure");
+    }
+  }
+
+  /**
+   * Progress callback that re-enters the same Dataset via JNI. Without releasing the native field
+   * lock before merge starts, these calls would deadlock.
+   */
+  private static final class ReentrantDatasetIndexBuildProgress implements IndexBuildProgress {
+    private final Dataset dataset;
+    private final RecordingIndexBuildProgress recorder = new RecordingIndexBuildProgress();
+    private final AtomicInteger reentries = new AtomicInteger();
+
+    private ReentrantDatasetIndexBuildProgress(Dataset dataset) {
+      this.dataset = dataset;
+    }
+
+    @Override
+    public void stageStart(String stage, Optional<Long> total, String unit) {
+      recorder.stageStart(stage, total, unit);
+      touchDataset();
+    }
+
+    @Override
+    public void stageProgress(String stage, long completed) {
+      recorder.stageProgress(stage, completed);
+      touchDataset();
+    }
+
+    @Override
+    public void stageComplete(String stage) {
+      recorder.stageComplete(stage);
+      touchDataset();
+    }
+
+    private void touchDataset() {
+      assertNotNull(dataset.uri());
+      assertTrue(dataset.version() > 0);
+      assertTrue(dataset.countRows() > 0);
+      assertFalse(dataset.getFragments().isEmpty());
+      reentries.incrementAndGet();
     }
   }
 
@@ -432,6 +475,34 @@ public class ScalarIndexTest {
         assertTrue(
             progress.recorder.snapshot().contains("complete:write_merged_metadata"),
             "Expected merge to continue after stageComplete callback failures");
+      }
+    }
+  }
+
+  @Test
+  @Timeout(value = 60, unit = TimeUnit.SECONDS)
+  public void testMergeInvertedIndexMetadataAllowsReentrantDatasetAccess(@TempDir Path tempDir)
+      throws Exception {
+    String datasetPath = tempDir.resolve("inverted_merge_reentrant_dataset").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      testDataset.write(1, 10).close();
+      try (Dataset dataset = testDataset.write(2, 10)) {
+        String indexUuid = createDistributedInvertedIndex(dataset);
+        ReentrantDatasetIndexBuildProgress progress =
+            new ReentrantDatasetIndexBuildProgress(dataset);
+
+        dataset.mergeIndexMetadata(indexUuid, IndexType.INVERTED, Optional.empty(), progress);
+
+        assertTrue(
+            progress.reentries.get() > 0,
+            "Expected progress callbacks to re-enter Dataset JNI methods");
+        assertTrue(
+            progress.recorder.snapshot().contains("complete:write_merged_metadata"),
+            "Expected merge to finish after re-entrant Dataset access, got: "
+                + progress.recorder.snapshot());
       }
     }
   }

@@ -1123,12 +1123,17 @@ fn inner_merge_index_metadata(
         batch_readhead_jobj,
     )?;
 
-    let dataset_guard =
-        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+    // Clone the inner Dataset out of the `get_rust_field` guard and drop the
+    // guard before the long-lived merge. Otherwise nested JNI callbacks that
+    // touch the same Dataset would deadlock on the native field mutex.
+    let inner_dataset = unsafe {
+        let dataset_guard =
+            env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET)?;
+        dataset_guard.inner.clone()
+    };
 
     RT.block_on(async {
-        dataset_guard
-            .inner
+        inner_dataset
             .merge_index_metadata(&index_uuid, index_type, batch_readhead, noop_progress())
             .await
     })?;
@@ -1173,12 +1178,18 @@ fn inner_merge_index_metadata_with_progress(
     )?;
     let progress = Arc::new(JavaIndexBuildProgress::new(env, &progress_jobj)?);
 
-    let dataset_guard =
-        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+    // Clone the inner Dataset out of the `get_rust_field` guard and drop the
+    // guard before the long-lived merge. Progress callbacks are allowed to
+    // re-enter Dataset JNI methods; holding the guard across those callbacks
+    // would deadlock on the native field mutex (see update.rs).
+    let inner_dataset = unsafe {
+        let dataset_guard =
+            env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET)?;
+        dataset_guard.inner.clone()
+    };
 
     RT.block_on(async {
-        dataset_guard
-            .inner
+        inner_dataset
             .merge_index_metadata(&index_uuid, index_type, batch_readhead, progress)
             .await
     })?;
