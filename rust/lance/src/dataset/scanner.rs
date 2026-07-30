@@ -3591,12 +3591,12 @@ impl Scanner {
         // phrase queries already do not search — overlaid fragments are simply dropped from the
         // phrase result; new phrase matches there surface once compaction folds the overlay into
         // the base. This removes stale hits without introducing wrong ones.
-        let target_fragments = self
+        let target_fragments: &[Fragment] = self
             .fragments
-            .clone()
-            .unwrap_or_else(|| self.dataset.fragments().to_vec());
+            .as_deref()
+            .unwrap_or_else(|| self.dataset.fragments());
         let (_flat_frag_ids, fresh_segments) = self
-            .fts_stale_frags_and_fresh_segments(&column, &target_fragments)
+            .fts_stale_frags_and_fresh_segments(&column, target_fragments)
             .await?;
 
         let exec: Arc<dyn ExecutionPlan> = match fresh_segments {
@@ -3641,10 +3641,10 @@ impl Scanner {
             .await?;
 
         // Get target fragments
-        let target_fragments = self
+        let target_fragments: &[Fragment] = self
             .fragments
-            .clone()
-            .unwrap_or_else(|| self.dataset.fragments().to_vec());
+            .as_deref()
+            .unwrap_or_else(|| self.dataset.fragments());
 
         let (match_plan, flat_match_plan) = match &index {
             Some(index) => {
@@ -3655,7 +3655,7 @@ impl Scanner {
                 // Fragments whose FTS index entries may be stale due to a newer data overlay.
                 // These are excluded from the indexed path and re-evaluated on the flat path.
                 let (stale_flat_frag_ids, fresh_segments) = self
-                    .fts_stale_frags_and_fresh_segments(&column, &target_fragments)
+                    .fts_stale_frags_and_fresh_segments(&column, target_fragments)
                     .await?;
 
                 // Fragments that need flat evaluation: unindexed + stale (deduplicated).
@@ -3718,7 +3718,7 @@ impl Scanner {
                 }
                 // No index: flat search all target fragments
                 let flat_match_plan = self
-                    .plan_flat_match_query(target_fragments.clone(), query, params, filter_plan)
+                    .plan_flat_match_query(target_fragments.to_vec(), query, params, filter_plan)
                     .await?;
                 (None, Some(flat_match_plan))
             }
