@@ -93,6 +93,7 @@ pub fn schema_with_tombstone(base: &ArrowSchema) -> Arc<ArrowSchema> {
 }
 
 pub use api::{DatasetMemWalExt, InitializeMemWalBuilder};
+pub use index::is_maintainable_index_type;
 pub use manifest::ShardManifestStore;
 pub use memtable::scanner::MemTableScanner;
 pub use scanner::{LsmDataSource, LsmGeneration, LsmScanner, ShardSnapshot};

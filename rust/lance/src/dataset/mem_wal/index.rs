@@ -415,6 +415,16 @@ impl MemIndexConfig {
     }
 }
 
+/// Whether the MemWAL can maintain an index of this protobuf type on a
+/// memtable.
+///
+/// Opening a shard writer rejects any maintained index outside this set, which
+/// makes the table unwritable, so callers choosing what to maintain filter on
+/// this first rather than discovering the problem at claim time.
+pub fn is_maintainable_index_type(type_url: &str) -> bool {
+    MemIndexConfig::detect_index_type(type_url).is_ok()
+}
+
 /// Registry managing all in-memory indexes for a MemTable.
 ///
 /// Indexes are keyed by index name. Each index stores its field_id for
@@ -1176,6 +1186,28 @@ mod tests {
     use rstest::rstest;
     use std::sync::Arc;
     use uuid::Uuid;
+
+    /// The maintainable-type predicate must agree with the check a shard
+    /// writer makes when it opens, since callers use it to keep an
+    /// unmaintainable index out of `maintained_indexes` — where it would
+    /// instead fail every memtable claim and leave the table unwritable.
+    #[rstest]
+    #[case::btree("/lance.index.pb.BTreeIndexDetails", true)]
+    #[case::fts("/lance.index.pb.InvertedIndexDetails", true)]
+    #[case::vector("/lance.index.pb.VectorIndexDetails", true)]
+    #[case::bitmap("/lance.index.pb.BitmapIndexDetails", false)]
+    #[case::label_list("/lance.index.pb.LabelListIndexDetails", false)]
+    #[case::absent("", false)]
+    fn maintainable_index_types_match_writer_support(
+        #[case] type_url: &str,
+        #[case] maintainable: bool,
+    ) {
+        assert_eq!(is_maintainable_index_type(type_url), maintainable);
+        assert_eq!(
+            MemIndexConfig::detect_index_type(type_url).is_ok(),
+            maintainable
+        );
+    }
 
     /// Check if an index type is supported and log warning if not.
     fn check_index_type_supported(index_type: &str) -> bool {
