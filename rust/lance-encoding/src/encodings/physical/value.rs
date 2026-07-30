@@ -519,8 +519,8 @@ impl BlockCompressor for FixedWidthBlockCompressor {
 impl MiniBlockCompressor for ValueEncoder {
     fn compress(
         &self,
-        chunk: DataBlock,
         _context: MiniBlockCompressionContext,
+        chunk: DataBlock,
     ) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
         match chunk {
             DataBlock::FixedWidth(fixed_width) => {
@@ -883,7 +883,7 @@ mod tests {
         MiniBlockCompressed,
         crate::format::pb21::CompressiveEncoding,
     )> {
-        compressor.compress(data, MiniBlockCompressionContext::new(0, true, true))
+        compressor.compress(MiniBlockCompressionContext::new(0, true, true), data)
     }
 
     const PRIMITIVE_TYPES: &[DataType] = &[

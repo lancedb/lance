@@ -5,13 +5,13 @@ use arrow_array::builder::Int64Builder;
 use arrow_array::{Array, Int64Array};
 use arrow_schema::DataType;
 use lance_core::deepsize::DeepSizeOf;
-use lance_io::encodings::Decoder;
-use lance_io::encodings::plain::PlainDecoder;
 use std::collections::BTreeMap;
 use tokio::io::AsyncWriteExt;
 
 use lance_core::{Error, Result};
 use lance_io::traits::{Reader, Writer};
+
+use super::encoding::plain::PlainDecoder;
 
 #[derive(Clone, Debug, PartialEq, DeepSizeOf)]
 pub struct PageInfo {

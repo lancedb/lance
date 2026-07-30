@@ -8,8 +8,8 @@ use lance_core::Error;
 use lance_core::datatypes::Schema;
 use lance_datafusion::chunker::{break_stream, chunk_stream};
 use lance_datafusion::utils::StreamingWriteSource;
-use lance_file::previous::writer::FileWriter as PreviousFileWriter;
-use lance_file::version::LanceFileVersion;
+use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
+use lance_file::versions::v1::writer::FileWriter as V1FileWriter;
 use lance_file::writer::FileWriterOptions;
 use lance_io::object_store::ObjectStore;
 use lance_io::utils::CachedFileSize;
@@ -156,9 +156,8 @@ impl<'a> FragmentCreateBuilder<'a> {
             },
         )?;
 
-        let (major, minor) = writer.version().to_numbers();
-
-        let data_file = DataFile::new_unstarted(filename, major, minor);
+        let data_file =
+            DataFile::new_unstarted(filename, ConcreteFileVersion::from(writer.version()));
         fragment.files.push(data_file);
 
         progress.begin(&fragment).await?;
@@ -283,7 +282,7 @@ impl<'a> FragmentCreateBuilder<'a> {
         let filename = format!("{}.lance", generate_random_filename());
         let mut fragment = Fragment::with_file_legacy(id, &filename, &schema, None);
         let full_path = base_path.clone().join(DATA_DIR).join(filename.clone());
-        let mut writer = PreviousFileWriter::<ManifestDescribing>::try_new(
+        let mut writer = V1FileWriter::<ManifestDescribing>::try_new(
             &object_store,
             &full_path,
             schema,
@@ -693,7 +692,8 @@ mod tests {
 
         assert!(!fragment.files.is_empty());
         fragment.files.iter().for_each(|f| {
-            let (major_version, minor_version) = file_version.to_numbers();
+            let (major_version, minor_version) =
+                ConcreteFileVersion::from(file_version).to_data_file_numbers();
             assert_eq!(f.file_major_version, major_version);
             assert_eq!(f.file_minor_version, minor_version);
         })
@@ -725,7 +725,8 @@ mod tests {
 
         assert!(!fragment.is_empty());
         fragment[0].files.iter().for_each(|f| {
-            let (major_version, minor_version) = file_version.to_numbers();
+            let (major_version, minor_version) =
+                ConcreteFileVersion::from(file_version).to_data_file_numbers();
             assert_eq!(f.file_major_version, major_version);
             assert_eq!(f.file_minor_version, minor_version);
         })

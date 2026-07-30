@@ -75,8 +75,8 @@ pub struct PackedStructFixedWidthMiniBlockEncoder {}
 impl MiniBlockCompressor for PackedStructFixedWidthMiniBlockEncoder {
     fn compress(
         &self,
-        data: DataBlock,
         context: MiniBlockCompressionContext,
+        data: DataBlock,
     ) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
         match data {
             DataBlock::Struct(struct_data_block) => {
@@ -88,7 +88,7 @@ impl MiniBlockCompressor for PackedStructFixedWidthMiniBlockEncoder {
                 // store and transformed fixed-width data block.
                 let value_miniblock_compressor = Box::new(ValueEncoder::default()) as Box<dyn MiniBlockCompressor>;
                 let (value_miniblock_compressed, value_array_encoding) =
-                value_miniblock_compressor.compress(data_block, context)?;
+                value_miniblock_compressor.compress(context, data_block)?;
 
                 Ok((
                     value_miniblock_compressed,

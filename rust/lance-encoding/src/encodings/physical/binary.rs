@@ -249,8 +249,8 @@ impl BinaryMiniBlockEncoder {
 impl MiniBlockCompressor for BinaryMiniBlockEncoder {
     fn compress(
         &self,
-        data: DataBlock,
         _context: MiniBlockCompressionContext,
+        data: DataBlock,
     ) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
         match data {
             DataBlock::VariableWidth(variable_width) => Ok(self.chunk_data(variable_width)),

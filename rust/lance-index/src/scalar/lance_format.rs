@@ -13,8 +13,8 @@ use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result, cache::LanceCache};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_encoding::version::LanceFileVersion;
-use lance_file::previous::reader::FileReader as PreviousFileReader;
 use lance_file::reader::{FileReader as CurrentFileReader, FileReaderOptions, ReaderProjection};
+use lance_file::versions::v1::reader::FileReader as V1FileReader;
 use lance_file::writer as current_writer;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
@@ -167,11 +167,11 @@ impl IndexWriter for LanceIndexWriter {
     }
 }
 
-/// Newtype wrapper to allow implementing IndexReader for PreviousFileReader (a foreign type)
-struct PreviousIndexReader(PreviousFileReader);
+/// Newtype wrapper to allow implementing IndexReader for V1FileReader (a foreign type)
+struct V1IndexReader(V1FileReader);
 
 #[async_trait]
-impl IndexReader for PreviousIndexReader {
+impl IndexReader for V1IndexReader {
     async fn read_record_batch(&self, offset: u64, _batch_size: u64) -> Result<RecordBatch> {
         self.0
             .read_batch(offset as i32, ReadBatchParams::RangeFull, self.0.schema())
@@ -199,7 +199,7 @@ impl IndexReader for PreviousIndexReader {
     }
 
     fn schema(&self) -> &lance_core::datatypes::Schema {
-        PreviousFileReader::schema(&self.0)
+        V1FileReader::schema(&self.0)
     }
 }
 
@@ -457,13 +457,13 @@ impl IndexStore for LanceIndexStore {
                 // If the error is a version conflict we can try to read the file with v1 reader
                 if let Error::VersionConflict { .. } = e {
                     let path = self.index_file_path(name)?;
-                    let file_reader = PreviousFileReader::try_new_self_described(
+                    let file_reader = V1FileReader::try_new_self_described(
                         &self.object_store,
                         &path,
                         Some(&self.metadata_cache),
                     )
                     .await?;
-                    Ok(Arc::new(PreviousIndexReader(file_reader)))
+                    Ok(Arc::new(V1IndexReader(file_reader)))
                 } else {
                     Err(e)
                 }
@@ -608,6 +608,15 @@ mod tests {
             }
             fn type_name() -> &'static str {
                 "Vec<u8>"
+            }
+            fn stable_type_id() -> &'static str {
+                "lance.scalar.lance-format.Blob"
+            }
+            fn schema() -> lance_core::cache::CacheKeySchema {
+                lance_core::cache::CacheKeySchema::new("lance.scalar.lance-format.blob-key", 1)
+            }
+            fn write_key(&self, builder: &mut lance_core::cache::KeyBuilder) {
+                builder.write_variant(0);
             }
         }
 

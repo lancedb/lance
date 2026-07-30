@@ -18,10 +18,10 @@ use lance_core::utils::tracing::{AUDIT_MODE_CREATE, AUDIT_TYPE_DATA, TRACE_FILE_
 use lance_core::{Error, Result, datatypes::Schema};
 use lance_datafusion::chunker::{break_stream, chunk_stream};
 use lance_datafusion::utils::StreamingWriteSource;
-use lance_file::previous::writer::{
-    FileWriter as PreviousFileWriter, ManifestProvider as PreviousManifestProvider,
+use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
+use lance_file::versions::v1::writer::{
+    FileWriter as V1FileWriter, ManifestProvider as V1ManifestProvider,
 };
-use lance_file::version::LanceFileVersion;
 use lance_file::writer::{self as current_writer, FileWriterOptions};
 use lance_io::object_store::{
     ObjectStore, ObjectStoreParams, ObjectStoreRegistry, parse_base_scoped_key,
@@ -1471,9 +1471,9 @@ pub trait GenericWriter: Send {
 
 struct V1WriterAdapter<M>
 where
-    M: PreviousManifestProvider + Send + Sync,
+    M: V1ManifestProvider + Send + Sync,
 {
-    writer: PreviousFileWriter<M>,
+    writer: V1FileWriter<M>,
     path: String,
     base_id: Option<u32>,
 }
@@ -1481,7 +1481,7 @@ where
 #[async_trait::async_trait]
 impl<M> GenericWriter for V1WriterAdapter<M>
 where
-    M: PreviousManifestProvider + Send + Sync,
+    M: V1ManifestProvider + Send + Sync,
 {
     async fn write(&mut self, batches: &[RecordBatch]) -> Result<()> {
         self.writer.write(batches).await
@@ -1550,14 +1550,13 @@ impl GenericWriter for V2WriterAdapter {
             .iter()
             .map(|(_, column_index)| *column_index as i32)
             .collect::<Vec<_>>();
-        let (major, minor) = self.writer.version().to_numbers();
+        let file_version = ConcreteFileVersion::from(self.writer.version());
         let write_summary = self.writer.finish().await?;
         let data_file = DataFile::new(
             std::mem::take(&mut self.path),
             field_ids,
             column_indices,
-            major,
-            minor,
+            file_version,
             NonZero::new(write_summary.size_bytes),
             self.base_id,
         );
@@ -1668,7 +1667,7 @@ async fn open_writer_with_options(
 
     let writer = if storage_version == LanceFileVersion::Legacy {
         Box::new(V1WriterAdapter {
-            writer: PreviousFileWriter::<ManifestDescribing>::try_new(
+            writer: V1FileWriter::<ManifestDescribing>::try_new(
                 object_store,
                 &full_path,
                 schema.clone(),
@@ -1890,7 +1889,8 @@ mod tests {
     use datafusion_physical_plan::RecordBatchStream;
     use futures::TryStreamExt;
     use lance_datagen::{BatchCount, RowCount, array, gen_batch};
-    use lance_file::previous::reader::FileReader as PreviousFileReader;
+    use lance_file::version::ConcreteFileVersion;
+    use lance_file::versions::v1::reader::FileReader as V1FileReader;
     use lance_io::object_store::StorageOptionsAccessor;
     use lance_io::traits::Reader;
     use lance_table::format::BasePath;
@@ -2220,7 +2220,7 @@ mod tests {
             LanceFileVersion::Next,
         ];
         for version in versions {
-            let (major, minor) = version.to_numbers();
+            let (major, minor) = ConcreteFileVersion::from(version).to_data_file_numbers();
             let write_params = WriteParams {
                 data_storage_version: Some(version),
                 // This parameter should be ignored
@@ -2333,7 +2333,7 @@ mod tests {
             .join(DATA_DIR)
             .join(fragment.files[0].path.as_str());
         let file_reader: Arc<dyn Reader> = object_store.open(&path).await.unwrap().into();
-        let reader = PreviousFileReader::try_new_from_reader(
+        let reader = V1FileReader::try_new_from_reader(
             &path,
             file_reader,
             None,
@@ -3983,9 +3983,10 @@ mod tests {
         // Sanity check: file is on disk.
         assert_eq!(count_data_files(test_uri), 1);
 
-        let mut external_file = DataFile::new_unstarted("external.lance", 2, 1);
+        let mut external_file =
+            DataFile::new_unstarted("external.lance", ConcreteFileVersion::V2_1);
         external_file.base_id = Some(42);
-        let local_file = DataFile::new_unstarted(local_filename, 2, 1);
+        let local_file = DataFile::new_unstarted(local_filename, ConcreteFileVersion::V2_1);
         let fragments = vec![Fragment {
             id: 0,
             files: vec![external_file, local_file],
@@ -4061,11 +4062,11 @@ mod tests {
         assert_eq!(count_data_files(base1_dir.as_str()), 1);
         assert_eq!(count_plain_files(base2_dir.as_str()), 1);
 
-        let mut base1_file = DataFile::new_unstarted("one.lance", 2, 1);
+        let mut base1_file = DataFile::new_unstarted("one.lance", ConcreteFileVersion::V2_1);
         base1_file.base_id = Some(1);
-        let mut base2_file = DataFile::new_unstarted("two.lance", 2, 1);
+        let mut base2_file = DataFile::new_unstarted("two.lance", ConcreteFileVersion::V2_1);
         base2_file.base_id = Some(2);
-        let mut unknown_file = DataFile::new_unstarted("unknown.lance", 2, 1);
+        let mut unknown_file = DataFile::new_unstarted("unknown.lance", ConcreteFileVersion::V2_1);
         unknown_file.base_id = Some(42);
         let fragments = vec![Fragment {
             id: 0,

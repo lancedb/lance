@@ -26,7 +26,7 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::stream;
 use lance_core::utils::tempfile::TempStdDir;
-use lance_file::previous::reader::FileReader as PreviousFileReader;
+use lance_file::versions::v1::reader::FileReader as V1FileReader;
 use lance_index::frag_reuse::FragReuseIndex;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
@@ -1711,7 +1711,7 @@ pub(crate) async fn open_vector_index_v2(
     dataset: Arc<Dataset>,
     column: &str,
     uuid: &Uuid,
-    reader: PreviousFileReader,
+    reader: V1FileReader,
     frag_reuse_index: Option<Arc<FragReuseIndex>>,
 ) -> Result<Arc<dyn VectorIndex>> {
     let index_metadata = reader
@@ -2029,7 +2029,7 @@ fn derive_rabit_params(rabit_quantizer: &RabitQuantizer) -> RQBuildParams {
 /// Extract HNSW build parameters from the source vector index statistics.
 /// Returns default parameters if extraction fails.
 /// TODO: support consistently deriving all the original parameters
-fn derive_hnsw_params(source_index: &dyn VectorIndex) -> HnswBuildParams {
+pub(crate) fn derive_hnsw_params(source_index: &dyn VectorIndex) -> HnswBuildParams {
     let default_params = HnswBuildParams {
         max_level: 4,
         m: 20,
@@ -2062,16 +2062,122 @@ fn derive_hnsw_params(source_index: &dyn VectorIndex) -> HnswBuildParams {
             .and_then(|v| v.as_u64())
             .map(|v| v as usize)
             .unwrap_or(100);
+        let prefetch_distance = params
+            .get("prefetch_distance")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
 
         return HnswBuildParams {
             max_level,
             m,
             ef_construction,
-            prefetch_distance: None,
+            prefetch_distance,
         };
     }
 
     default_params
+}
+
+fn vector_index_type(index: &dyn VectorIndex) -> IndexType {
+    match index.sub_index_type() {
+        (SubIndexType::Flat, QuantizationType::Flat | QuantizationType::FlatBin) => {
+            IndexType::IvfFlat
+        }
+        (SubIndexType::Flat, QuantizationType::Product) => IndexType::IvfPq,
+        (SubIndexType::Flat, QuantizationType::Scalar) => IndexType::IvfSq,
+        (SubIndexType::Flat, QuantizationType::Rabit) => IndexType::IvfRq,
+        (SubIndexType::Hnsw, QuantizationType::Flat | QuantizationType::FlatBin) => {
+            IndexType::IvfHnswFlat
+        }
+        (SubIndexType::Hnsw, QuantizationType::Product) => IndexType::IvfHnswPq,
+        (SubIndexType::Hnsw, QuantizationType::Scalar) => IndexType::IvfHnswSq,
+        (SubIndexType::Hnsw, QuantizationType::Rabit) => IndexType::Vector,
+    }
+}
+
+/// Derive structural build parameters for a new, independently trained segment.
+///
+/// Learned IVF centroids, quantizer codebooks, and rotations are deliberately
+/// omitted so the new segment is valid for its own fragment set.
+pub(crate) fn fresh_vector_segment_params(
+    metadata: &IndexMetadata,
+    index: &dyn VectorIndex,
+) -> Result<VectorIndexParams> {
+    if let Some(params) = metadata
+        .index_details
+        .as_deref()
+        .and_then(details::vector_params_from_details)
+        && params.metric_type == index.metric_type()
+        && params.index_type() == vector_index_type(index)
+    {
+        return Ok(params);
+    }
+
+    let mut ivf_params = derive_ivf_params(index.ivf_model());
+    ivf_params.centroids = None;
+    #[allow(deprecated)]
+    {
+        ivf_params.retrain = false;
+    }
+
+    let metric_type = index.metric_type();
+    let quantizer = index.quantizer();
+    Ok(match index.sub_index_type() {
+        (SubIndexType::Flat, QuantizationType::Flat | QuantizationType::FlatBin) => {
+            VectorIndexParams::with_ivf_flat_params(metric_type, ivf_params)
+        }
+        (SubIndexType::Flat, QuantizationType::Product) => {
+            let quantizer: ProductQuantizer = quantizer.try_into()?;
+            let mut pq_params = derive_pq_params(&quantizer);
+            pq_params.codebook = None;
+            VectorIndexParams::with_ivf_pq_params(metric_type, ivf_params, pq_params)
+        }
+        (SubIndexType::Flat, QuantizationType::Scalar) => {
+            let quantizer: ScalarQuantizer = quantizer.try_into()?;
+            VectorIndexParams::with_ivf_sq_params(
+                metric_type,
+                ivf_params,
+                derive_sq_params(&quantizer),
+            )
+        }
+        (SubIndexType::Flat, QuantizationType::Rabit) => {
+            let quantizer: RabitQuantizer = quantizer.try_into()?;
+            VectorIndexParams::with_ivf_rq_params(
+                metric_type,
+                ivf_params,
+                derive_rabit_params(&quantizer),
+            )
+        }
+        (SubIndexType::Hnsw, QuantizationType::Flat | QuantizationType::FlatBin) => {
+            VectorIndexParams::ivf_hnsw(metric_type, ivf_params, derive_hnsw_params(index))
+        }
+        (SubIndexType::Hnsw, QuantizationType::Product) => {
+            let quantizer: ProductQuantizer = quantizer.try_into()?;
+            let mut pq_params = derive_pq_params(&quantizer);
+            pq_params.codebook = None;
+            VectorIndexParams::with_ivf_hnsw_pq_params(
+                metric_type,
+                ivf_params,
+                derive_hnsw_params(index),
+                pq_params,
+            )
+        }
+        (SubIndexType::Hnsw, QuantizationType::Scalar) => {
+            let quantizer: ScalarQuantizer = quantizer.try_into()?;
+            VectorIndexParams::with_ivf_hnsw_sq_params(
+                metric_type,
+                ivf_params,
+                derive_hnsw_params(index),
+                derive_sq_params(&quantizer),
+            )
+        }
+        (SubIndexType::Hnsw, QuantizationType::Rabit) => {
+            return Err(Error::index(
+                "Cannot build a fresh IVF_HNSW_RQ segment: this index type is unsupported"
+                    .to_string(),
+            ));
+        }
+    })
 }
 
 #[cfg(test)]

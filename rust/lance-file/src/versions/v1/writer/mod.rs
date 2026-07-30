@@ -18,17 +18,18 @@ use async_trait::async_trait;
 use lance_arrow::*;
 use lance_core::datatypes::{Encoding, Field, NullabilityComparison, Schema, SchemaCompareOptions};
 use lance_core::{Error, Result};
-use lance_io::encodings::{
-    Encoder, binary::BinaryEncoder, dictionary::DictionaryEncoder, plain::PlainEncoder,
-};
 use lance_io::object_store::ObjectStore;
 use lance_io::traits::{WriteExt, Writer};
 use object_store::path::Path;
 use tokio::io::AsyncWriteExt;
 
 use crate::format::{MAGIC, MAJOR_VERSION, MINOR_VERSION};
-use crate::previous::format::metadata::{Metadata, StatisticsMetadata};
-use crate::previous::page_table::{PageInfo, PageTable};
+use crate::versions::v1::encoding::{
+    binary::BinaryEncoder, dictionary::DictionaryEncoder, plain::PlainEncoder,
+    write_schema_dictionaries,
+};
+use crate::versions::v1::format::metadata::{Metadata, StatisticsMetadata};
+use crate::versions::v1::page_table::{PageInfo, PageTable};
 use crate::writer::FileWriteSummary;
 
 /// The file format currently includes a "manifest" where it stores the schema for
@@ -623,53 +624,6 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
         }
     }
 
-    /// Writes the dictionaries (using plain/binary encoding) into the file
-    ///
-    /// The offsets and lengths of the written buffers are stored in the given
-    /// schema so that the dictionaries can be loaded in the future.
-    async fn write_dictionaries(writer: &mut dyn Writer, schema: &mut Schema) -> Result<()> {
-        // Write dictionary values.
-        let max_field_id = schema.max_field_id().unwrap_or(-1);
-        for field_id in 0..max_field_id + 1 {
-            if let Some(field) = schema.mut_field_by_id(field_id)
-                && field.data_type().is_dictionary()
-            {
-                let dict_info = field.dictionary.as_mut().ok_or_else(|| {
-                    // and wrap it in here.
-                    Error::io(format!("Lance field {} misses dictionary info", field.name))
-                })?;
-
-                let value_arr = dict_info.values.as_ref().ok_or_else(|| {
-                    Error::invalid_input(format!(
-                        "Lance field {} is dictionary type, but misses the dictionary value array",
-                        field.name
-                    ))
-                })?;
-
-                let data_type = value_arr.data_type();
-                let pos = match data_type {
-                    dt if dt.is_numeric() => {
-                        let mut encoder = PlainEncoder::new(writer, dt);
-                        encoder.encode(&[value_arr]).await?
-                    }
-                    dt if dt.is_binary_like() => {
-                        let mut encoder = BinaryEncoder::new(writer);
-                        encoder.encode(&[value_arr]).await?
-                    }
-                    _ => {
-                        return Err(Error::schema(format!(
-                            "Does not support {} as dictionary value type",
-                            value_arr.data_type()
-                        )));
-                    }
-                };
-                dict_info.offset = pos;
-                dict_info.length = value_arr.len();
-            }
-        }
-        Ok(())
-    }
-
     async fn write_footer(&mut self) -> Result<()> {
         // Step 1. Write page table.
         let field_id_offset = *self.schema.field_ids().iter().min().unwrap();
@@ -683,7 +637,7 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
         self.metadata.stats_metadata = self.write_statistics().await?;
 
         // Step 3. Write manifest and dictionary values.
-        Self::write_dictionaries(self.object_writer.as_mut(), &mut self.schema).await?;
+        write_schema_dictionaries(self.object_writer.as_mut(), &mut self.schema).await?;
         let pos = M::store_schema(self.object_writer.as_mut(), &self.schema).await?;
 
         // Step 4. Write metadata.
@@ -756,7 +710,7 @@ mod tests {
     };
     use arrow_select::concat::concat_batches;
 
-    use crate::previous::reader::FileReader;
+    use crate::versions::v1::reader::FileReader;
 
     #[tokio::test]
     async fn test_write_file() {

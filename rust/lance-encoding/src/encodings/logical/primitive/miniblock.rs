@@ -138,8 +138,8 @@ pub trait MiniBlockCompressor: std::fmt::Debug + Send + Sync {
     /// used at decode time to read the data.
     fn compress(
         &self,
-        page: DataBlock,
         context: MiniBlockCompressionContext,
+        page: DataBlock,
     ) -> Result<(MiniBlockCompressed, CompressiveEncoding)>;
 }
 

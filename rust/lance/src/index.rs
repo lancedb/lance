@@ -12,17 +12,17 @@ use std::time::Instant;
 use arrow_schema::DataType;
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
-use futures::FutureExt;
+use futures::{FutureExt, StreamExt, TryStreamExt};
 use itertools::Itertools;
-use lance_core::cache::CacheKey;
+use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder};
 use lance_core::datatypes::Field;
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::utils::parse::parse_env_as_bool;
 use lance_core::utils::tracing::{
     IO_TYPE_OPEN_FRAG_REUSE, IO_TYPE_OPEN_MEM_WAL, IO_TYPE_OPEN_VECTOR, TRACE_IO_EVENTS,
 };
-use lance_file::previous::reader::FileReader as PreviousFileReader;
 use lance_file::reader::FileReaderOptions;
+use lance_file::versions::v1::reader::FileReader as V1FileReader;
 use lance_index::INDEX_METADATA_SCHEMA_KEY;
 pub use lance_index::IndexParams;
 use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragReuseIndex, FragReuseIndexHandle};
@@ -92,7 +92,7 @@ use crate::index::mem_wal::open_mem_wal_index;
 pub use crate::index::prefilter::{FilterLoader, PreFilter};
 use crate::index::scalar::{IndexDetails, fetch_index_details, load_training_data};
 pub use crate::index::vector::{LogicalIvfView, LogicalVectorIndex};
-use crate::session::index_caches::{FragReuseIndexKey, IndexMetadataKey};
+use crate::session::index_caches::{FragReuseIndexKey, IndexMetadataKey, write_index_identity};
 use crate::{Error, Result, dataset::Dataset};
 pub use create::CreateIndexBuilder;
 pub use lance_index::IndexDescription;
@@ -278,8 +278,7 @@ pub(crate) async fn build_index_metadata_from_segments(
 
     prune_stale_segment_coverage(dataset, field_id, &mut segments, false, false).await?;
 
-    let mut new_indices = Vec::with_capacity(segments.len());
-    for segment in segments {
+    let new_indices = futures::stream::iter(segments.into_iter().map(|segment| async move {
         let (uuid, fragment_bitmap, fields, index_details, index_version, dataset_version) =
             segment.into_parts();
         let is_inverted_index = index_details.type_url.ends_with("InvertedIndexDetails");
@@ -299,12 +298,12 @@ pub(crate) async fn build_index_metadata_from_segments(
             crate::index::scalar::inverted::finalize_segment_files_if_needed(dataset, &metadata)
                 .await?;
         }
-        let index_dir = dataset.indices_dir().clone().join(uuid.to_string());
+        let index_dir = dataset.indices_dir().join(uuid.to_string());
         let mut files = list_index_files_with_sizes(&dataset.object_store, &index_dir).await?;
         if is_inverted_index {
             retain_committed_inverted_files(&mut files);
         }
-        new_indices.push(IndexMetadata {
+        Ok::<_, Error>(IndexMetadata {
             uuid,
             name: index_name.to_string(),
             fields,
@@ -315,8 +314,11 @@ pub(crate) async fn build_index_metadata_from_segments(
             created_at: Some(chrono::Utc::now()),
             base_id: None,
             files: Some(files),
-        });
-    }
+        })
+    }))
+    .buffered(dataset.object_store.io_parallelism())
+    .try_collect::<Vec<_>>()
+    .await?;
 
     Ok(new_indices)
 }
@@ -686,6 +688,14 @@ impl CacheKey for LegacyVectorIndexCacheKey<'_> {
     fn type_name() -> &'static str {
         "LegacyVectorIndex"
     }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.index.legacy-vector-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        write_index_identity(builder, self.uuid, self.fri_uuid);
+    }
 }
 
 /// Sized cache key for `IvfIndexState`.
@@ -718,6 +728,14 @@ impl CacheKey for IvfIndexStateCacheKey<'_> {
         } else {
             self.uuid.to_string().into()
         }
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.index.ivf-state-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        write_index_identity(builder, self.uuid, self.fri_uuid);
     }
 
     fn codec() -> Option<lance_core::cache::CacheCodec> {
@@ -756,6 +774,14 @@ impl CacheKey for FragReuseIndexCacheKey<'_> {
     fn type_name() -> &'static str {
         "FragReuseIndex"
     }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.index.fragment-reuse-cache-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        write_index_identity(builder, self.uuid, self.fri_uuid);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -783,6 +809,14 @@ impl CacheKey for MemWalCacheKey<'_> {
 
     fn type_name() -> &'static str {
         "MemWalIndex"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.index.mem-wal-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        write_index_identity(builder, self.uuid, self.fri_uuid);
     }
 }
 
@@ -2366,7 +2400,7 @@ impl DatasetIndexInternalExt for Dataset {
         let state_key = IvfIndexStateCacheKey::new(uuid, frag_reuse_uuid.as_ref());
         if let Some(entry) = self.index_cache.get_with_key(&state_key).await {
             log::debug!("Found IvfIndexState in cache uuid: {}", uuid);
-            let partition_cache = self.index_cache.with_key_prefix(&state_key.key());
+            let partition_cache = self.index_cache.for_index(uuid, frag_reuse_uuid.as_ref());
             let frag_reuse_index = self.open_frag_reuse_index(metrics).await?;
             return entry
                 .0
@@ -2405,7 +2439,7 @@ impl DatasetIndexInternalExt for Dataset {
         let (major_version, minor_version) = read_version(&tailing_bytes)?;
 
         // Namespace the index cache by the UUID of the index.
-        let index_cache = self.index_cache.with_key_prefix(&cache_key.key());
+        let index_cache = self.index_cache.for_index(uuid, frag_reuse_uuid.as_ref());
 
         // Extract the cacheable state before type-erasing to Arc<dyn VectorIndex>.
         fn wrap_ivf<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
@@ -2445,7 +2479,7 @@ impl DatasetIndexInternalExt for Dataset {
 
             (0, 2) => {
                 info!(target: TRACE_IO_EVENTS, index_uuid=%uuid, r#type=IO_TYPE_OPEN_VECTOR, version="0.2", index_type="IVF_PQ");
-                let reader = PreviousFileReader::try_new_self_described_from_reader(
+                let reader = V1FileReader::try_new_self_described_from_reader(
                     reader.clone(),
                     Some(&self.metadata_cache.file_metadata_cache(&index_file)),
                 )

@@ -578,7 +578,7 @@ impl<'a> TransactionRebase<'a> {
             new_indices,
             removed_indices,
             ..
-        } = &self.transaction.operation
+        } = &mut self.transaction.operation
         {
             match &other_transaction.operation {
                 Operation::Append { .. }
@@ -625,7 +625,19 @@ impl<'a> TransactionRebase<'a> {
                 }
                 // Although some of the rows we indexed may have been deleted / moved,
                 // row ids are still valid, so we allow this optimistically.
-                Operation::Delete { .. } | Operation::Update { .. } => Ok(()),
+                Operation::Delete { .. } => Ok(()),
+                Operation::Update {
+                    updated_fragments,
+                    fields_modified,
+                    ..
+                } => {
+                    Transaction::prune_updated_fields_from_indices(
+                        new_indices,
+                        updated_fragments,
+                        fields_modified,
+                    );
+                    Ok(())
+                }
                 // Merge, reserve, and project don't change row ids, so this should be fine.
                 Operation::Merge { .. } => Ok(()),
                 Operation::ReserveFragments { .. } => Ok(()),
@@ -2138,7 +2150,7 @@ mod tests {
     use arrow_array::{Int32Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use lance_core::Error;
-    use lance_file::version::LanceFileVersion;
+    use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
     use lance_io::assert_io_eq;
     use uuid::Uuid;
 
@@ -2358,7 +2370,7 @@ mod tests {
                 "path1",
                 vec![0],
                 vec![0],
-                &LanceFileVersion::Stable,
+                ConcreteFileVersion::from(LanceFileVersion::Stable),
                 NonZero::new(10),
             )
             .with_physical_rows(3);
@@ -2501,7 +2513,7 @@ mod tests {
                 "path1",
                 vec![0],
                 vec![0],
-                &LanceFileVersion::Stable,
+                ConcreteFileVersion::from(LanceFileVersion::Stable),
                 NonZero::new(10),
             )
             .with_physical_rows(3);
@@ -3506,7 +3518,7 @@ mod tests {
                 "moved.lance",
                 vec![0],
                 vec![0],
-                &LanceFileVersion::Stable,
+                ConcreteFileVersion::from(LanceFileVersion::Stable),
                 NonZero::new(10),
             )
             .with_physical_rows(1);
@@ -3567,6 +3579,68 @@ mod tests {
                 "overlay disjoint from the moved row should succeed, got {res:?}"
             );
         }
+    }
+
+    #[rstest::rstest]
+    #[test]
+    #[case::indexed_field_updated(0, vec![0])]
+    #[case::other_field_updated(1, vec![0, 1])]
+    fn test_create_index_rebase_prunes_updated_field_coverage(
+        #[case] field_modified: u32,
+        #[case] expected_fragment_ids: Vec<u32>,
+    ) {
+        let index = IndexMetadata {
+            uuid: Uuid::new_v4(),
+            name: "test".to_string(),
+            fields: vec![0],
+            dataset_version: 1,
+            fragment_bitmap: Some(RoaringBitmap::from_iter([0, 1])),
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+        let mut rebase = TransactionRebase {
+            transaction: Transaction::new(
+                1,
+                Operation::CreateIndex {
+                    new_indices: vec![index],
+                    removed_indices: vec![],
+                },
+                None,
+            ),
+            initial_fragments: HashMap::new(),
+            modified_fragment_ids: HashSet::new(),
+            affected_rows: None,
+            conflicting_frag_reuse_indices: Vec::new(),
+            conflicting_mem_wal_compacted_sstables: Vec::new(),
+        };
+        let update = Transaction::new(
+            1,
+            Operation::Update {
+                updated_fragments: vec![Fragment::new(1)],
+                removed_fragment_ids: vec![],
+                new_fragments: vec![],
+                fields_modified: vec![field_modified],
+                compacted_sstables: Vec::new(),
+                fields_for_preserving_frag_bitmap: vec![],
+                update_mode: Some(UpdateMode::RewriteColumns),
+                inserted_rows_filter: None,
+                updated_fragment_offsets: None,
+            },
+            None,
+        );
+
+        rebase.check_txn(&update, 2).unwrap();
+
+        let Operation::CreateIndex { new_indices, .. } = &rebase.transaction.operation else {
+            panic!("expected CreateIndex operation");
+        };
+        assert_eq!(
+            new_indices[0].fragment_bitmap.as_ref().unwrap(),
+            &RoaringBitmap::from_iter(expected_fragment_ids)
+        );
     }
 
     #[test]

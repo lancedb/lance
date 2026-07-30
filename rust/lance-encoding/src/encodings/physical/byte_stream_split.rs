@@ -109,8 +109,8 @@ impl ByteStreamSplitEncoder {
 impl MiniBlockCompressor for ByteStreamSplitEncoder {
     fn compress(
         &self,
-        page: DataBlock,
         _context: MiniBlockCompressionContext,
+        page: DataBlock,
     ) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
         match page {
             DataBlock::FixedWidth(data) => {
@@ -350,7 +350,7 @@ mod tests {
 
         // Compress
         let (compressed, _encoding) = encoder
-            .compress(data_block, MiniBlockCompressionContext::new(0, true, true))
+            .compress(MiniBlockCompressionContext::new(0, true, true), data_block)
             .unwrap();
 
         // Decompress
@@ -398,7 +398,7 @@ mod tests {
 
         // Compress
         let (compressed, _encoding) = encoder
-            .compress(data_block, MiniBlockCompressionContext::new(0, true, true))
+            .compress(MiniBlockCompressionContext::new(0, true, true), data_block)
             .unwrap();
 
         // Decompress
@@ -433,7 +433,7 @@ mod tests {
 
         // Compress empty data
         let (compressed, _encoding) = encoder
-            .compress(data_block, MiniBlockCompressionContext::new(0, true, true))
+            .compress(MiniBlockCompressionContext::new(0, true, true), data_block)
             .unwrap();
 
         // Decompress empty data

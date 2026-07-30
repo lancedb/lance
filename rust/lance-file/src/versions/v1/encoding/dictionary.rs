@@ -14,18 +14,14 @@ use arrow_array::types::{
 };
 use arrow_array::{Array, ArrayRef, DictionaryArray, PrimitiveArray, UInt32Array};
 use arrow_schema::DataType;
-use async_trait::async_trait;
 
-use crate::{
+use lance_core::{Error, Result};
+use lance_io::{
     ReadBatchParams,
     traits::{Reader, Writer},
 };
-use lance_core::{Error, Result};
 
-use super::AsyncIndex;
-use super::plain::PlainEncoder;
-use crate::encodings::plain::PlainDecoder;
-use crate::encodings::{Decoder, Encoder};
+use super::plain::{PlainDecoder, PlainEncoder};
 
 /// Encoder for Dictionary encoding.
 pub struct DictionaryEncoder<'a> {
@@ -60,9 +56,8 @@ impl<'a> DictionaryEncoder<'a> {
     }
 }
 
-#[async_trait]
-impl Encoder for DictionaryEncoder<'_> {
-    async fn encode(&mut self, array: &[&dyn Array]) -> Result<usize> {
+impl DictionaryEncoder<'_> {
+    pub async fn encode(&mut self, array: &[&dyn Array]) -> Result<usize> {
         use DataType::*;
 
         match self.key_type {
@@ -165,36 +160,17 @@ impl<'a> DictionaryDecoder<'a> {
     }
 }
 
-#[async_trait]
-impl Decoder for DictionaryDecoder<'_> {
-    async fn decode(&self) -> Result<ArrayRef> {
+impl DictionaryDecoder<'_> {
+    pub async fn decode(&self) -> Result<ArrayRef> {
         self.decode_impl(..).await
     }
 
-    async fn take(&self, indices: &UInt32Array) -> Result<ArrayRef> {
+    pub async fn take(&self, indices: &UInt32Array) -> Result<ArrayRef> {
         self.decode_impl(indices.clone()).await
     }
-}
 
-#[async_trait]
-impl AsyncIndex<usize> for DictionaryDecoder<'_> {
-    type Output = Result<ArrayRef>;
-
-    async fn get(&self, _index: usize) -> Self::Output {
-        Err(Error::not_supported_source(
-            "DictionaryDecoder does not support get()"
-                .to_string()
-                .into(),
-        ))
-    }
-}
-
-#[async_trait]
-impl AsyncIndex<ReadBatchParams> for DictionaryDecoder<'_> {
-    type Output = Result<ArrayRef>;
-
-    async fn get(&self, params: ReadBatchParams) -> Self::Output {
-        self.decode_impl(params.clone()).await
+    pub async fn get(&self, params: impl Into<ReadBatchParams>) -> Result<ArrayRef> {
+        self.decode_impl(params).await
     }
 }
 
@@ -202,10 +178,10 @@ impl AsyncIndex<ReadBatchParams> for DictionaryDecoder<'_> {
 mod tests {
     use super::*;
 
-    use crate::local::LocalObjectReader;
     use arrow_array::StringArray;
     use arrow_buffer::ArrowNativeType;
     use lance_core::utils::tempfile::TempStdFile;
+    use lance_io::local::LocalObjectReader;
     use tokio::io::AsyncWriteExt;
 
     async fn test_dict_decoder_for_type<T: ArrowDictionaryKeyType>() {

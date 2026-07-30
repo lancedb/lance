@@ -1049,8 +1049,8 @@ impl RleChildCandidate {
 impl MiniBlockCompressor for RleEncoder {
     fn compress(
         &self,
-        data: DataBlock,
         _context: MiniBlockCompressionContext,
+        data: DataBlock,
     ) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
         match data {
             DataBlock::FixedWidth(fixed_width) => {
@@ -2351,6 +2351,13 @@ mod tests {
     use arrow_array::Int32Array;
     use rstest::rstest;
 
+    fn compress_miniblock(
+        compressor: &dyn MiniBlockCompressor,
+        data: DataBlock,
+    ) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
+        compressor.compress(MiniBlockCompressionContext::new(0, true, true), data)
+    }
+
     fn expand_u16_runs(runs: &RleRuns) -> Vec<u16> {
         let mut expanded = Vec::with_capacity(runs.num_values());
         for (value, length) in runs.iter() {
@@ -2532,13 +2539,6 @@ mod tests {
             "no two adjacent values are equal"
         );
         assert_eq!(expand_u16_runs(&runs), alternating);
-    }
-
-    fn compress_miniblock(
-        compressor: &dyn MiniBlockCompressor,
-        data: DataBlock,
-    ) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
-        compressor.compress(data, MiniBlockCompressionContext::new(0, true, true))
     }
 
     #[test]

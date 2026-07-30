@@ -1451,10 +1451,15 @@ mod tests {
     use super::*;
     use crate::buffer::LanceBuffer;
     use crate::data::{BlockInfo, DataBlock, FixedWidthDataBlock};
+    use crate::encodings::logical::primitive::miniblock::MiniBlockCompressionContext;
     use crate::statistics::ComputeStat;
     use crate::testing::extract_array_encoding_chain;
     use arrow_schema::{DataType, Field as ArrowField};
     use std::collections::HashMap;
+
+    fn miniblock_context() -> MiniBlockCompressionContext {
+        MiniBlockCompressionContext::new(0, true, true)
+    }
 
     fn create_test_field(name: &str, data_type: DataType) -> Field {
         let arrow_field = ArrowField::new(name, data_type, true);
@@ -1860,14 +1865,14 @@ mod tests {
             .create_miniblock_compressor(&field, &fixed_data)
             .unwrap();
         let (_block, encoding) = compressor
-            .compress(fixed_data.clone(), miniblock_context())
+            .compress(miniblock_context(), fixed_data.clone())
             .unwrap();
         check_uncompressed_encoding(&encoding, false);
         let compressor = strategy
             .create_miniblock_compressor(&field, &variable_data)
             .unwrap();
         let (_block, encoding) = compressor
-            .compress(variable_data.clone(), miniblock_context())
+            .compress(miniblock_context(), variable_data.clone())
             .unwrap();
         check_uncompressed_encoding(&encoding, true);
 
@@ -1899,7 +1904,7 @@ mod tests {
             .create_miniblock_compressor(&field, &fixed_data)
             .unwrap();
         let (_block, encoding) = compressor
-            .compress(fixed_data.clone(), miniblock_context())
+            .compress(miniblock_context(), fixed_data.clone())
             .unwrap();
         check_uncompressed_encoding(&encoding, false);
 
@@ -1907,7 +1912,7 @@ mod tests {
             .create_miniblock_compressor(&field, &variable_data)
             .unwrap();
         let (_block, encoding) = compressor
-            .compress(variable_data.clone(), miniblock_context())
+            .compress(miniblock_context(), variable_data.clone())
             .unwrap();
         check_uncompressed_encoding(&encoding, true);
 
@@ -2205,7 +2210,7 @@ mod tests {
 
         let strategy = DefaultCompressionStrategy::new().with_version(LanceFileVersion::V2_3);
         let compressor = strategy.create_miniblock_compressor(&field, &data).unwrap();
-        let (_compressed, encoding) = compressor.compress(data, miniblock_context()).unwrap();
+        let (_compressed, encoding) = compressor.compress(miniblock_context(), data).unwrap();
         assert_eq!(rle_run_length_bits(&encoding), 16);
     }
 
@@ -2230,7 +2235,7 @@ mod tests {
 
             let strategy = DefaultCompressionStrategy::new().with_version(version);
             let compressor = strategy.create_miniblock_compressor(&field, &data).unwrap();
-            let (_compressed, encoding) = compressor.compress(data, miniblock_context()).unwrap();
+            let (_compressed, encoding) = compressor.compress(miniblock_context(), data).unwrap();
             assert_eq!(rle_run_length_bits(&encoding), 8, "version={version}");
         }
     }
@@ -2258,7 +2263,7 @@ mod tests {
         let debug_str = format!("{compressor:?}");
         assert!(debug_str.contains("RleEncoder"));
 
-        let (_compressed, encoding) = compressor.compress(data, miniblock_context()).unwrap();
+        let (_compressed, encoding) = compressor.compress(miniblock_context(), data).unwrap();
         assert_eq!(rle_run_length_bits(&encoding), 16);
     }
 
@@ -2281,7 +2286,7 @@ mod tests {
 
         let strategy = DefaultCompressionStrategy::new().with_version(LanceFileVersion::V2_3);
         let compressor = strategy.create_miniblock_compressor(&field, &data).unwrap();
-        let (_compressed, encoding) = compressor.compress(data, miniblock_context()).unwrap();
+        let (_compressed, encoding) = compressor.compress(miniblock_context(), data).unwrap();
         assert_eq!(rle_run_length_bits(&encoding), 16);
     }
 
@@ -2304,7 +2309,7 @@ mod tests {
 
         let strategy = DefaultCompressionStrategy::new().with_version(LanceFileVersion::V2_3);
         let compressor = strategy.create_miniblock_compressor(&field, &data).unwrap();
-        let (_compressed, encoding) = compressor.compress(data, miniblock_context()).unwrap();
+        let (_compressed, encoding) = compressor.compress(miniblock_context(), data).unwrap();
         assert_eq!(rle_run_length_bits(&encoding), 8);
     }
 
@@ -2341,7 +2346,7 @@ mod tests {
             let data = DataBlock::FixedWidth(data);
 
             let compressor = strategy.create_miniblock_compressor(&field, &data).unwrap();
-            let (_compressed, encoding) = compressor.compress(data, miniblock_context()).unwrap();
+            let (_compressed, encoding) = compressor.compress(miniblock_context(), data).unwrap();
             let rle = expect_rle_encoding(&encoding);
 
             assert!(
@@ -2389,7 +2394,7 @@ mod tests {
         let debug_str = format!("{compressor:?}");
         assert!(debug_str.contains("RleEncoder"));
 
-        let (_compressed, encoding) = compressor.compress(data, miniblock_context()).unwrap();
+        let (_compressed, encoding) = compressor.compress(miniblock_context(), data).unwrap();
         let Compression::Rle(rle) = encoding.compression.as_ref().unwrap() else {
             panic!("expected RLE encoding");
         };
@@ -2439,7 +2444,7 @@ mod tests {
             "expected RLE to beat inline bitpacking after child selection, got: {debug_str}"
         );
 
-        let (_compressed, encoding) = compressor.compress(data, miniblock_context()).unwrap();
+        let (_compressed, encoding) = compressor.compress(miniblock_context(), data).unwrap();
         let rle = expect_rle_encoding(&encoding);
         assert!(matches!(
             rle.values.as_ref().unwrap().compression.as_ref().unwrap(),
