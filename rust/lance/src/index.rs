@@ -1506,10 +1506,6 @@ impl DatasetIndexExt for Dataset {
         // Infer details for legacy vector indices (once per index name, concurrently).
         // This may run on indices that were opportunistically cached during Dataset::open
         // before the full Dataset was available for inference.
-        // Only legacy vector indices missing details need inference; checking the
-        // predicate first avoids deep-cloning and deep-comparing the whole index
-        // metadata list (including per-index fragment bitmaps) on every call —
-        // this path runs per segment per query on the FTS read path.
         {
             let schema = self.schema();
             if indices
