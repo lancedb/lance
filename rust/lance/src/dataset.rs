@@ -43,7 +43,7 @@ use lance_io::utils::{
 use lance_namespace::LanceNamespace;
 use lance_table::format::{
     DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, MAGIC, Manifest, RowIdMeta,
-    pb, populate_manifest_schema_dictionary,
+    pb, populate_manifest_schema_dictionaries,
 };
 use lance_table::io::commit::{
     CommitConfig, CommitError, CommitHandler, CommitLock, ManifestLocation, ManifestNamingScheme,
@@ -772,7 +772,7 @@ impl Dataset {
                 .await;
         }
 
-        populate_manifest_schema_dictionary(&mut manifest, object_reader.as_ref()).await?;
+        populate_manifest_schema_dictionaries(&mut manifest, object_reader.as_ref()).await?;
 
         Ok(manifest)
     }
@@ -1185,7 +1185,7 @@ impl Dataset {
             } else {
                 self.object_store.open(&location.path).await?
             };
-            populate_manifest_schema_dictionary(&mut manifest, reader.as_ref()).await?;
+            populate_manifest_schema_dictionaries(&mut manifest, reader.as_ref()).await?;
         }
         let manifest_arc = Arc::new(manifest);
         self.metadata_cache

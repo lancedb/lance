@@ -8,7 +8,7 @@ use futures::{FutureExt, TryFutureExt, future::BoxFuture};
 
 use lance_core::Result;
 
-pub mod array_encoding;
+mod array_encoding;
 pub mod buffer;
 pub mod compression;
 pub mod compression_config;

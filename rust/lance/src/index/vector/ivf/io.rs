@@ -68,28 +68,30 @@ async fn write_primitive_values<T: ArrowPrimitiveType>(
 
 async fn write_pq_codes(writer: &mut dyn Writer, arrays: &[&dyn Array]) -> Result<()> {
     for array in arrays {
-        let codes = array
-            .as_any()
-            .downcast_ref::<FixedSizeListArray>()
-            .ok_or_else(|| {
-                Error::index(format!(
-                    "legacy IVF PQ codes must be FixedSizeList, found {}",
-                    array.data_type()
-                ))
-            })?;
-        let value_offset = codes.value_offset(0) as usize;
-        let value_len = codes.len() * codes.value_length() as usize;
-        let values = codes.values().slice(value_offset, value_len);
-        let values = values
-            .as_any()
-            .downcast_ref::<PrimitiveArray<UInt8Type>>()
-            .ok_or_else(|| {
-                Error::index(format!(
-                    "legacy IVF PQ code values must be UInt8, found {}",
-                    values.data_type()
-                ))
-            })?;
-        write_primitive_values(writer, values).await?;
+        // Loaded legacy partitions expose transposed codes as flat UInt8 arrays,
+        // while newly shuffled partitions supply FixedSizeList<UInt8>.
+        if let Some(values) = array.as_any().downcast_ref::<PrimitiveArray<UInt8Type>>() {
+            write_primitive_values(writer, values).await?;
+        } else if let Some(codes) = array.as_any().downcast_ref::<FixedSizeListArray>() {
+            let value_offset = codes.value_offset(0) as usize;
+            let value_len = codes.len() * codes.value_length() as usize;
+            let values = codes.values().slice(value_offset, value_len);
+            let values = values
+                .as_any()
+                .downcast_ref::<PrimitiveArray<UInt8Type>>()
+                .ok_or_else(|| {
+                    Error::index(format!(
+                        "legacy IVF PQ code values must be UInt8, found {}",
+                        values.data_type()
+                    ))
+                })?;
+            write_primitive_values(writer, values).await?;
+        } else {
+            return Err(Error::index(format!(
+                "legacy IVF PQ codes must be UInt8 or FixedSizeList<UInt8>, found {}",
+                array.data_type()
+            )));
+        }
     }
     Ok(())
 }
@@ -691,25 +693,28 @@ mod tests {
         let codes =
             FixedSizeListArray::try_new_from_values(UInt8Array::from_iter_values(0..6), 2).unwrap();
         let codes = codes.slice(1, 2);
+        let flat_codes = UInt8Array::from_iter_values(6..9).slice(1, 2);
         let row_ids = UInt64Array::from_iter_values([10, 11, 12]).slice(1, 2);
+        let flat_row_id = UInt64Array::from_iter_values([13]);
 
         let path = TempObjFile::default();
         let object_store = ObjectStore::local();
         let mut writer = object_store.create(&path).await.unwrap();
         write_pq_partition_payload(
             writer.as_mut(),
-            &[&codes as &dyn Array],
-            &[&row_ids as &dyn Array],
+            &[&codes as &dyn Array, &flat_codes as &dyn Array],
+            &[&row_ids as &dyn Array, &flat_row_id as &dyn Array],
         )
         .await
         .unwrap();
         Writer::shutdown(&mut writer).await.unwrap();
 
         let reader = object_store.open(&path).await.unwrap();
-        let bytes = reader.get_range(0..20).await.unwrap();
-        let mut expected = vec![2, 3, 4, 5];
+        let bytes = reader.get_range(0..30).await.unwrap();
+        let mut expected = vec![2, 3, 4, 5, 7, 8];
         expected.extend_from_slice(&11_u64.to_le_bytes());
         expected.extend_from_slice(&12_u64.to_le_bytes());
+        expected.extend_from_slice(&13_u64.to_le_bytes());
         assert_eq!(bytes.as_ref(), expected);
     }
 

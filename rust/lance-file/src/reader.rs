@@ -32,7 +32,7 @@ use prost::{Message, Name};
 
 use lance_core::{
     Error, Result,
-    cache::{CacheKey, LanceCache},
+    cache::{CacheKey, CacheKeySchema, KeyBuilder, LanceCache},
     datatypes::{Field, Schema},
 };
 use lance_encoding::format::pb as pbenc;
@@ -226,6 +226,14 @@ impl CacheKey for ColumnMetadataCacheKey {
 
     fn type_name() -> &'static str {
         "ColumnMetadata"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.file.column-metadata-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_u32(self.column_index);
     }
 }
 
@@ -1214,7 +1222,7 @@ impl FileReader {
                 let num_rows = page.length;
                 let encoding = match file_version {
                     LanceFileVersion::V2_0 => {
-                        PageEncoding::Array(Self::fetch_encoding::<pbenc::ArrayEncoding>(
+                        PageEncoding::Legacy(Self::fetch_encoding::<pbenc::ArrayEncoding>(
                             page.encoding.as_ref().ok_or_else(|| {
                                 Error::invalid_input_source(
                                     format!(
