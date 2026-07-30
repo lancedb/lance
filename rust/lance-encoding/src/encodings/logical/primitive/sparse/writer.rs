@@ -24,7 +24,8 @@ use super::{
     SparseValidityMeaning, SparseValiditySet,
 };
 use crate::encodings::logical::primitive::{
-    FILL_BYTE, MINIBLOCK_ALIGNMENT, miniblock::MiniBlockCompressed,
+    FILL_BYTE, MINIBLOCK_ALIGNMENT,
+    miniblock::{MiniBlockCompressed, MiniBlockCompressionContext},
 };
 
 #[derive(Clone, Copy, Default)]
@@ -563,7 +564,8 @@ pub fn prepare_values(
 
     let num_values = data.num_values();
     let compressor = compression_strategy.create_miniblock_compressor(field, &data)?;
-    let (compressed, value_compression) = compressor.compress(data)?;
+    let compression_context = MiniBlockCompressionContext::new(0, support_large_chunk, false);
+    let (compressed, value_compression) = compressor.compress(compression_context, data)?;
     let values =
         serialize_value_chunks(with_explicit_value_counts(compressed)?, support_large_chunk)?;
     Ok(PreparedSparseValues {

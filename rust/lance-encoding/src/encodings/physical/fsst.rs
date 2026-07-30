@@ -23,7 +23,7 @@ use crate::{
     data::{BlockInfo, DataBlock, VariableWidthBlock},
     encodings::logical::primitive::{
         fullzip::{PerValueCompressor, PerValueDataBlock},
-        miniblock::{MiniBlockCompressed, MiniBlockCompressor},
+        miniblock::{MiniBlockCompressed, MiniBlockCompressionContext, MiniBlockCompressor},
     },
     format::{
         ProtobufUtils21,
@@ -138,7 +138,11 @@ impl FsstMiniBlockEncoder {
 }
 
 impl MiniBlockCompressor for FsstMiniBlockEncoder {
-    fn compress(&self, data: DataBlock) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
+    fn compress(
+        &self,
+        context: MiniBlockCompressionContext,
+        data: DataBlock,
+    ) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
         let compressed = FsstCompressed::fsst_compress(data)?;
 
         let data_block = DataBlock::VariableWidth(compressed.data);
@@ -148,7 +152,7 @@ impl MiniBlockCompressor for FsstMiniBlockEncoder {
             as Box<dyn MiniBlockCompressor>;
 
         let (binary_miniblock_compressed, binary_array_encoding) =
-            binary_compressor.compress(data_block)?;
+            binary_compressor.compress(context, data_block)?;
 
         Ok((
             binary_miniblock_compressed,

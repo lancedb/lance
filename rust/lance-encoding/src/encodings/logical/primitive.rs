@@ -55,7 +55,7 @@ use crate::{
     encodings::logical::primitive::fullzip::PerValueDataBlock,
 };
 use crate::{
-    encodings::logical::primitive::miniblock::MiniBlockCompressed,
+    encodings::logical::primitive::miniblock::{MiniBlockCompressed, MiniBlockCompressionContext},
     statistics::{ComputeStat, GetStat, Stat},
 };
 use crate::{
@@ -5291,7 +5291,11 @@ impl PrimitiveStructuralEncoder {
         let num_items = data.num_values();
 
         let compressor = compression_strategy.create_miniblock_compressor(field, &data)?;
-        let (compressed_data, value_encoding) = compressor.compress(data)?;
+        let common_chunk_buffers =
+            u64::from(repdef.rep_slicer().is_some()) + u64::from(repdef.def_slicer().is_some());
+        let compression_context =
+            MiniBlockCompressionContext::new(common_chunk_buffers, support_large_chunk, true);
+        let (compressed_data, value_encoding) = compressor.compress(compression_context, data)?;
 
         let max_rep = repdef.def_meaning.iter().filter(|l| l.is_list()).count() as u16;
 
