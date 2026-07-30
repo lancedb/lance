@@ -1038,8 +1038,8 @@ impl RleChildCandidate {
 impl MiniBlockCompressor for RleEncoder {
     fn compress(
         &self,
-        data: DataBlock,
         _context: MiniBlockCompressionContext,
+        data: DataBlock,
     ) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
         match data {
             DataBlock::FixedWidth(fixed_width) => {
@@ -1861,7 +1861,7 @@ mod tests {
         compressor: &dyn MiniBlockCompressor,
         data: DataBlock,
     ) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
-        compressor.compress(data, MiniBlockCompressionContext::new(0, true, true))
+        compressor.compress(MiniBlockCompressionContext::new(0, true, true), data)
     }
 
     fn expand_u16_runs(runs: &RleRuns) -> Vec<u16> {

@@ -217,8 +217,8 @@ impl InlineBitpacking {
 impl MiniBlockCompressor for InlineBitpacking {
     fn compress(
         &self,
-        chunk: DataBlock,
         _context: MiniBlockCompressionContext,
+        chunk: DataBlock,
     ) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
         match chunk {
             DataBlock::FixedWidth(fixed_width) => Ok(self.chunk_data(fixed_width)),

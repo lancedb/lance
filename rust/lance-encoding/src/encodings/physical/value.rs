@@ -473,8 +473,8 @@ impl BlockCompressor for ValueEncoder {
 impl MiniBlockCompressor for ValueEncoder {
     fn compress(
         &self,
-        chunk: DataBlock,
         _context: MiniBlockCompressionContext,
+        chunk: DataBlock,
     ) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
         match chunk {
             DataBlock::FixedWidth(fixed_width) => {
@@ -978,7 +978,7 @@ mod tests {
 
         let encoder = ValueEncoder::default();
         let (data, compression) =
-            MiniBlockCompressor::compress(&encoder, starting_data, miniblock_context()).unwrap();
+            MiniBlockCompressor::compress(&encoder, miniblock_context(), starting_data).unwrap();
 
         assert_eq!(data.num_values, 3);
         assert_eq!(data.data.len(), 3);
@@ -1039,7 +1039,7 @@ mod tests {
         let starting_data = DataBlock::from_array(array);
 
         let encoder = ValueEncoder::default();
-        let result = MiniBlockCompressor::compress(&encoder, starting_data, miniblock_context());
+        let result = MiniBlockCompressor::compress(&encoder, miniblock_context(), starting_data);
 
         let err = result.expect_err("wide values should not be encodable as miniblock");
         assert!(
@@ -1152,7 +1152,7 @@ mod tests {
 
         let encoder = ValueEncoder::default();
         let (data, compression) =
-            MiniBlockCompressor::compress(&encoder, starting_data, miniblock_context()).unwrap();
+            MiniBlockCompressor::compress(&encoder, miniblock_context(), starting_data).unwrap();
 
         let Compression::FixedSizeList(fsl) = compression.compression.unwrap() else {
             panic!()

@@ -39,11 +39,11 @@ use super::super::logical::primitive::miniblock::MiniBlockChunk;
 impl MiniBlockCompressor for GeneralMiniBlockCompressor {
     fn compress(
         &self,
-        page: DataBlock,
         context: MiniBlockCompressionContext,
+        page: DataBlock,
     ) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
         // First, compress with the inner compressor
-        let (inner_compressed, inner_encoding) = self.inner.compress(page, context)?;
+        let (inner_compressed, inner_encoding) = self.inner.compress(context, page)?;
 
         // Return the original encoding without compression if there's no data or
         // the first buffer is not large enough
@@ -260,7 +260,7 @@ mod tests {
 
         // Compress the data
         let (compressed, encoding) = compressor
-            .compress(test_case.data, miniblock_context())
+            .compress(miniblock_context(), test_case.data)
             .unwrap();
 
         // Check if compression was applied as expected
@@ -473,7 +473,7 @@ mod tests {
         let compressor = GeneralMiniBlockCompressor::new(inner, compression);
 
         // Compress the data
-        let (compressed, encoding) = compressor.compress(block, miniblock_context()).unwrap();
+        let (compressed, encoding) = compressor.compress(miniblock_context(), block).unwrap();
 
         // Should get GeneralMiniBlock encoding since buffer is 4KB
         match &encoding.compression {
@@ -515,7 +515,7 @@ mod tests {
             },
         );
 
-        let (compressed, _) = compressor.compress(data, miniblock_context()).unwrap();
+        let (compressed, _) = compressor.compress(miniblock_context(), data).unwrap();
         // RLE produces 2 buffers, but only the first one is compressed
         assert_eq!(compressed.data.len(), 2);
     }
@@ -552,7 +552,7 @@ mod tests {
         );
 
         let (_compressed, encoding) = compressor
-            .compress(test_32.data, miniblock_context())
+            .compress(miniblock_context(), test_32.data)
             .unwrap();
 
         // Verify the encoding structure
@@ -611,7 +611,7 @@ mod tests {
         );
 
         let (_compressed_64, encoding_64) = compressor_64
-            .compress(block_64, miniblock_context())
+            .compress(miniblock_context(), block_64)
             .unwrap();
 
         // Verify the encoding structure for 64-bit
@@ -666,7 +666,7 @@ mod tests {
             },
         );
 
-        let result = compressor.compress(empty_block, miniblock_context());
+        let result = compressor.compress(miniblock_context(), empty_block);
         match result {
             Ok((compressed, _)) => {
                 assert_eq!(compressed.num_values, 0);

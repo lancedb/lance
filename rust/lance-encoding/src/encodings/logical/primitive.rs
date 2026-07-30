@@ -5286,7 +5286,7 @@ impl PrimitiveStructuralEncoder {
             u64::from(repdef.rep_slicer().is_some()) + u64::from(repdef.def_slicer().is_some());
         let compression_context =
             MiniBlockCompressionContext::new(common_chunk_buffers, support_large_chunk, true);
-        let (compressed_data, value_encoding) = compressor.compress(data, compression_context)?;
+        let (compressed_data, value_encoding) = compressor.compress(compression_context, data)?;
 
         let max_rep = repdef.def_meaning.iter().filter(|l| l.is_list()).count() as u16;
 

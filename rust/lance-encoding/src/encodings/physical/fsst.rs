@@ -140,8 +140,8 @@ impl FsstMiniBlockEncoder {
 impl MiniBlockCompressor for FsstMiniBlockEncoder {
     fn compress(
         &self,
-        data: DataBlock,
         context: MiniBlockCompressionContext,
+        data: DataBlock,
     ) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
         let compressed = FsstCompressed::fsst_compress(data)?;
 
@@ -152,7 +152,7 @@ impl MiniBlockCompressor for FsstMiniBlockEncoder {
             as Box<dyn MiniBlockCompressor>;
 
         let (binary_miniblock_compressed, binary_array_encoding) =
-            binary_compressor.compress(data_block, context)?;
+            binary_compressor.compress(context, data_block)?;
 
         Ok((
             binary_miniblock_compressed,
