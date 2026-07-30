@@ -179,7 +179,9 @@ fn supports_compound_scorer(query: &FtsQuery) -> bool {
                         .chain(&query.must_not)
                         .all(supports_shape)
             }
-            FtsQuery::Boost(_) => false,
+            FtsQuery::Boost(query) => {
+                supports_shape(&query.positive) && supports_shape(&query.negative)
+            }
         }
     }
 
@@ -208,26 +210,27 @@ fn contains_phrase_query(query: &FtsQuery) -> bool {
 }
 
 fn validate_fts_query_contract(query: &FtsQuery) -> Result<()> {
-    fn validate_multiplier(value: f32) -> Result<()> {
+    fn validate_multiplier(name: &str, value: f32) -> Result<()> {
         if value.is_finite() && value >= 0.0 {
             Ok(())
         } else {
             Err(Error::invalid_input(format!(
-                "MatchQuery boost must be finite and non-negative, got {value}"
+                "{name} must be finite and non-negative, got {value}"
             )))
         }
     }
 
     match query {
-        FtsQuery::Match(query) => validate_multiplier(query.boost),
+        FtsQuery::Match(query) => validate_multiplier("MatchQuery boost", query.boost),
         FtsQuery::Phrase(_) => Ok(()),
         FtsQuery::Boost(query) => {
+            validate_multiplier("BoostQuery negative_boost", query.negative_boost)?;
             validate_fts_query_contract(&query.positive)?;
             validate_fts_query_contract(&query.negative)
         }
         FtsQuery::MultiMatch(query) => {
             for match_query in &query.match_queries {
-                validate_multiplier(match_query.boost)?;
+                validate_multiplier("MultiMatchQuery boost", match_query.boost)?;
             }
             Ok(())
         }
@@ -6023,7 +6026,7 @@ mod test {
     use lance_file::version::LanceFileVersion;
     use lance_index::optimize::OptimizeOptions;
     use lance_index::scalar::inverted::query::{
-        BooleanQuery, FtsQuery, MatchQuery, Occur, PhraseQuery,
+        BooleanQuery, BoostQuery, FtsQuery, MatchQuery, Occur, PhraseQuery,
     };
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::ivf::IvfBuildParams;
@@ -6059,6 +6062,15 @@ mod test {
         let error = validate_fts_query_contract(&empty_boolean).unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }));
         assert!(error.to_string().contains("at least one should/must query"));
+
+        let infinite_boost = FtsQuery::Boost(BoostQuery::new(
+            MatchQuery::new("hello".to_string()).into(),
+            MatchQuery::new("world".to_string()).into(),
+            Some(f32::INFINITY),
+        ));
+        let error = validate_fts_query_contract(&infinite_boost).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("BoostQuery negative_boost"));
     }
 
     #[test]
