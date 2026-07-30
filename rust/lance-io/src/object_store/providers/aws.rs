@@ -1,7 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{collections::{HashMap, HashSet}, str::FromStr, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    str::FromStr,
+    sync::Arc,
+    time::Duration,
+};
 
 #[cfg(test)]
 use mock_instant::thread_local::{SystemTime, UNIX_EPOCH};
@@ -253,18 +258,14 @@ async fn build_credentials_chain_with_masks(
     masked: &HashSet<String>,
 ) -> impl ProvideCredentials + 'static {
     use aws_config::{
-        Region,
-        ecs::EcsCredentialsProvider,
+        Region, ecs::EcsCredentialsProvider,
         environment::credentials::EnvironmentVariableCredentialsProvider,
-        imds::credentials::ImdsCredentialsProvider,
-        meta::credentials::CredentialsProviderChain,
-        profile::ProfileFileCredentialsProvider,
-        provider_config::ProviderConfig,
+        imds::credentials::ImdsCredentialsProvider, meta::credentials::CredentialsProviderChain,
+        profile::ProfileFileCredentialsProvider, provider_config::ProviderConfig,
         web_identity_token::WebIdentityTokenCredentialsProvider,
     };
 
-    let conf = ProviderConfig::default()
-        .with_region(region.map(Region::new));
+    let conf = ProviderConfig::default().with_region(region.map(Region::new));
 
     let env_masked =
         masked.contains("AWS_ACCESS_KEY_ID") || masked.contains("AWS_SECRET_ACCESS_KEY");
@@ -528,7 +529,6 @@ impl StorageOptions {
             })
             .collect()
     }
-
 }
 
 impl ObjectStoreParams {
