@@ -1446,6 +1446,11 @@ impl Transaction {
                         "the unenforced primary key is a reserved key and cannot be set to an invalid value",
                     ));
                 }
+                if writes_primary_key {
+                    // Installing by field metadata skips the Arrow-schema
+                    // conversion that would otherwise validate the key.
+                    manifest.schema.verify_primary_key()?;
+                }
                 let clustering_key_after: Vec<i32> = manifest
                     .schema
                     .unenforced_clustering_key()

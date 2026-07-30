@@ -10789,4 +10789,42 @@ mod shard_writer_tests {
 
         writer.close().await.unwrap();
     }
+
+    /// The other paths now prevent a nullable key, so this forges one to stand
+    /// in for a table written before they were closed.
+    #[tokio::test]
+    async fn test_initialize_mem_wal_rejects_a_nullable_primary_key() {
+        let vector_dim = 128;
+        let schema = create_append_only_schema(vector_dim);
+        let uri = format!("memory://test_mem_wal_nullable_pk_{}", Uuid::new_v4());
+
+        let initial_batch = create_test_batch(&schema, 0, 100, vector_dim);
+        let batches = RecordBatchIterator::new([Ok(initial_batch)], schema.clone());
+        let mut dataset = Dataset::write(batches, &uri, Some(WriteParams::default()))
+            .await
+            .expect("Failed to create dataset");
+
+        {
+            let manifest = Arc::make_mut(&mut dataset.manifest);
+            let id_field = manifest
+                .schema
+                .fields
+                .iter_mut()
+                .find(|field| field.name == "id")
+                .expect("schema has an id column");
+            id_field.unenforced_primary_key_position = Some(1);
+            id_field.nullable = true;
+        }
+
+        let err = dataset
+            .initialize_mem_wal()
+            .unsharded()
+            .execute()
+            .await
+            .expect_err("MemWAL must not enable on a nullable primary key");
+        assert!(
+            err.to_string().contains("must not be nullable"),
+            "unexpected error: {err}"
+        );
+    }
 }

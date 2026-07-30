@@ -790,6 +790,7 @@ pub(super) async fn alter_columns(
     }
 
     new_schema.validate()?;
+    new_schema.verify_primary_key()?;
 
     // If any column being cast has an attached index, fail fast. Cast operations
     // rewrite the underlying column data and silently invalidate any index on the
@@ -4100,5 +4101,53 @@ mod test {
         .with_metadata(packed_meta);
         let field4 = ArrowField::new("test", DataType::Struct(vec![conflict_field].into()), false);
         assert!(check_field_conflict(&field1, &field4, &ConcreteFileVersion::V2_2).is_err());
+    }
+
+    /// Table creation rejects a nullable primary key; altering one afterwards
+    /// reached the same state without passing that check.
+    #[tokio::test]
+    async fn test_alter_columns_cannot_make_a_primary_key_nullable() -> Result<()> {
+        let pk = ArrowField::new("id", DataType::Int32, false).with_metadata(
+            [(
+                "lance-schema:unenforced-primary-key:position".to_string(),
+                "1".to_string(),
+            )]
+            .into(),
+        );
+        let schema = Arc::new(ArrowSchema::new(vec![
+            pk,
+            ArrowField::new("value", DataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int32Array::from(vec![10, 20])),
+            ],
+        )?;
+        let test_dir = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &test_dir,
+            None,
+        )
+        .await?;
+
+        let err = dataset
+            .alter_columns(&[ColumnAlteration::new("id".into()).set_nullable(true)])
+            .await
+            .expect_err("making a primary key nullable must be rejected");
+        assert!(
+            err.to_string().contains("must not be nullable"),
+            "unexpected error: {err}"
+        );
+
+        // Specific to the key: other columns may still be altered.
+        dataset
+            .alter_columns(&[ColumnAlteration::new("value".into()).rename("val".into())])
+            .await?;
+        assert!(!dataset.schema().unenforced_primary_key()[0].nullable);
+
+        Ok(())
     }
 }

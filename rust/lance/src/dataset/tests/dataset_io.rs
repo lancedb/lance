@@ -3378,3 +3378,65 @@ async fn test_validate_dataset_root_for_drop_allows_missing_path() {
         .await
         .unwrap();
 }
+
+/// Restore and clone rebuild a manifest from a stored one, never passing
+/// through the Arrow-schema conversion that validates a primary key. Both write
+/// through `write_manifest_file`, so the invariant is enforced there — a schema
+/// that reached a manifest before the write paths were validated cannot be
+/// carried forward into a new version.
+#[tokio::test]
+async fn write_manifest_file_rejects_a_nullable_primary_key() {
+    use lance_core::utils::tempfile::TempStrDir;
+
+    let test_dir = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "id",
+        DataType::Int32,
+        false,
+    )]));
+    let batch =
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1, 2]))]).unwrap();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        &test_dir,
+        None,
+    )
+    .await
+    .unwrap();
+
+    // Stand in for a manifest stored before the write paths were validated.
+    let mut manifest = dataset.manifest.as_ref().clone();
+    let id_field = manifest
+        .schema
+        .fields
+        .iter_mut()
+        .find(|field| field.name == "id")
+        .expect("schema has an id column");
+    id_field.unenforced_primary_key_position = Some(1);
+    id_field.nullable = true;
+    manifest.version += 1;
+
+    let err = write_manifest_file(
+        dataset.object_store.as_ref(),
+        dataset.commit_handler.as_ref(),
+        &dataset.base,
+        &mut manifest,
+        None,
+        &ManifestWriteConfig {
+            auto_set_feature_flags: false,
+            timestamp: None,
+            use_stable_row_ids: false,
+            use_legacy_format: None,
+            storage_format: None,
+            disable_transaction_file: false,
+        },
+        dataset.manifest_location.naming_scheme,
+        None,
+    )
+    .await
+    .expect_err("a nullable primary key must not reach a manifest");
+    assert!(
+        format!("{err:?}").contains("must not be nullable"),
+        "unexpected error: {err:?}"
+    );
+}

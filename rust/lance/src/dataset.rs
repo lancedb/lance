@@ -4082,6 +4082,15 @@ pub(crate) async fn write_manifest_file(
     transaction: Option<lance_table::format::Transaction>,
 ) -> std::result::Result<ManifestLocation, CommitError> {
     validate_paired_feature_flags(manifest)?;
+    // Every manifest write funnels through here, including restore and clone,
+    // which rebuild a manifest from a stored one rather than from an Arrow
+    // schema. Checking here is what makes the invariant hold for a schema that
+    // never passed through that conversion.
+    manifest
+        .schema
+        .verify_primary_key()
+        .map_err(CommitError::OtherError)?;
+
     if config.auto_set_feature_flags {
         // build_manifest may have already set FLAG_STABLE_ROW_IDS on the manifest.
         // Preserve it here so this second apply_feature_flags call does not clear it
