@@ -2855,13 +2855,13 @@ mod tests {
             .full_text_search(FullTextSearchQuery::new_query(query.into()))
             .unwrap();
         let analysis = scanner.analyze_plan().await.unwrap();
-        let boolean_line = analysis
+        let compound_line = analysis
             .lines()
-            .find(|line| line.contains("BooleanQuery"))
+            .find(|line| line.contains("CompoundFtsScorer"))
             .unwrap();
         assert!(
-            boolean_line.contains(&format!("{PARTITIONS_SEARCHED_METRIC}={expected_total}")),
-            "BooleanQuery metrics missing partitions_searched: {boolean_line}"
+            compound_line.contains(&format!("{PARTITIONS_SEARCHED_METRIC}={expected_total}")),
+            "compound FTS scorer metrics missing partitions_searched: {compound_line}"
         );
     }
 

@@ -17,7 +17,9 @@ use super::{
     document_tokenizer::{DocType, JsonTokenizer, LanceTokenizer},
     documents::{DocId, DocLengths, DocVisibility},
     index::{DocSet, InvertedPartition},
-    query::{FtsQuery, FtsSearchParams, MatchQuery, Operator, Tokens, collect_query_tokens},
+    query::{
+        FtsQuery, FtsSearchParams, MatchQuery, Operator, PhraseQuery, Tokens, collect_query_tokens,
+    },
     scorer::MemBM25Scorer,
     tokenizer::document_tokenizer::TextTokenizer,
     wand::{
@@ -92,6 +94,27 @@ impl ScoreBounds {
         Self {
             lower: next_down(self.lower * factor),
             upper: next_up(self.upper * factor),
+        }
+    }
+
+    fn include_zero(self) -> Self {
+        Self {
+            lower: self.lower.min(0.0),
+            upper: self.upper.max(0.0),
+        }
+    }
+
+    fn add(self, other: Self) -> Self {
+        if !self.lower.is_finite()
+            || !self.upper.is_finite()
+            || !other.lower.is_finite()
+            || !other.upper.is_finite()
+        {
+            return Self::UNBOUNDED;
+        }
+        Self {
+            lower: next_down(self.lower + other.lower),
+            upper: next_up(self.upper + other.upper),
         }
     }
 }
@@ -171,8 +194,16 @@ type BoxScorer<'a> = Box<dyn ComposableScorer + 'a>;
 
 #[derive(Debug, Clone)]
 enum CompoundScorerPlan {
-    Leaf { index: usize, boost: f32 },
+    Leaf {
+        index: usize,
+        boost: f32,
+    },
     MultiMatch(Vec<Self>),
+    Boolean {
+        should: Vec<Self>,
+        must: Vec<Self>,
+        must_not: Vec<Self>,
+    },
 }
 
 impl CompoundScorerPlan {
@@ -186,6 +217,11 @@ impl CompoundScorerPlan {
                     boost: query.boost,
                 })
             }
+            FtsQuery::Phrase(_) => {
+                let index = *num_leaves;
+                *num_leaves += 1;
+                Ok(Self::Leaf { index, boost: 1.0 })
+            }
             FtsQuery::MultiMatch(query) => Ok(Self::MultiMatch(
                 query
                     .match_queries
@@ -193,8 +229,25 @@ impl CompoundScorerPlan {
                     .map(|query| Self::from_query(&FtsQuery::Match(query.clone()), num_leaves))
                     .collect::<Result<Vec<_>>>()?,
             )),
-            _ => Err(Error::not_supported(
-                "posting-backed compound FTS currently supports MultiMatch queries only",
+            FtsQuery::Boolean(query) => Ok(Self::Boolean {
+                should: query
+                    .should
+                    .iter()
+                    .map(|query| Self::from_query(query, num_leaves))
+                    .collect::<Result<Vec<_>>>()?,
+                must: query
+                    .must
+                    .iter()
+                    .map(|query| Self::from_query(query, num_leaves))
+                    .collect::<Result<Vec<_>>>()?,
+                must_not: query
+                    .must_not
+                    .iter()
+                    .map(|query| Self::from_query(query, num_leaves))
+                    .collect::<Result<Vec<_>>>()?,
+            }),
+            FtsQuery::Boost(_) => Err(Error::not_supported(
+                "posting-backed compound FTS does not support BoostQuery yet",
             )),
         }
     }
@@ -214,6 +267,24 @@ impl CompoundScorerPlan {
             }
             Self::MultiMatch(children) => Ok(Box::new(DisjunctionScorer::try_new(
                 children
+                    .iter()
+                    .map(|child| child.build(leaves))
+                    .collect::<Result<Vec<_>>>()?,
+                DisjunctionScore::Max,
+            )?)),
+            Self::Boolean {
+                should,
+                must,
+                must_not,
+            } => Ok(Box::new(BooleanScorer::try_new(
+                should
+                    .iter()
+                    .map(|child| child.build(leaves))
+                    .collect::<Result<Vec<_>>>()?,
+                must.iter()
+                    .map(|child| child.build(leaves))
+                    .collect::<Result<Vec<_>>>()?,
+                must_not
                     .iter()
                     .map(|child| child.build(leaves))
                     .collect::<Result<Vec<_>>>()?,
@@ -263,7 +334,11 @@ impl<D: WandDocuments + Sync> ComposableScorer for WandCursor<'_, D> {
     }
 
     fn matches(&mut self) -> Result<bool> {
-        Ok(true)
+        self.matches()
+    }
+
+    fn match_cost(&self) -> Option<f32> {
+        self.match_cost()
     }
 }
 
@@ -661,6 +736,12 @@ impl TopKCollector<u64> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(super) enum DisjunctionScore {
+    Sum,
+    Max,
+}
+
 struct EmptyScorer;
 
 impl ComposableScorer for EmptyScorer {
@@ -768,9 +849,10 @@ impl ComposableScorer for ScaleScorer<'_> {
     }
 }
 
-/// Union scorer used for MultiMatch DisMax.
+/// Union scorer used for Boolean SHOULD sums and MultiMatch DisMax.
 pub(super) struct DisjunctionScorer<'a> {
     children: Vec<BoxScorer<'a>>,
+    mode: DisjunctionScore,
     current: Option<u64>,
     confirmed_doc: Option<u64>,
     confirmed: Vec<bool>,
@@ -778,7 +860,7 @@ pub(super) struct DisjunctionScorer<'a> {
 }
 
 impl<'a> DisjunctionScorer<'a> {
-    pub(super) fn try_new(children: Vec<BoxScorer<'a>>) -> Result<Self> {
+    pub(super) fn try_new(children: Vec<BoxScorer<'a>>, mode: DisjunctionScore) -> Result<Self> {
         if children.is_empty() {
             return Err(Error::internal(
                 "FTS disjunction scorer requires at least one child",
@@ -787,6 +869,7 @@ impl<'a> DisjunctionScorer<'a> {
         let confirmed = vec![false; children.len()];
         Ok(Self {
             children,
+            mode,
             current: None,
             confirmed_doc: None,
             confirmed,
@@ -875,13 +958,19 @@ impl ComposableScorer for DisjunctionScorer<'_> {
                 "FTS disjunction score requested for an unconfirmed document",
             ));
         }
-        let mut score = f32::NEG_INFINITY;
+        let mut score = match self.mode {
+            DisjunctionScore::Sum => 0.0_f32,
+            DisjunctionScore::Max => f32::NEG_INFINITY,
+        };
         for (matched, child) in self.confirmed.iter().zip(&mut self.children) {
             if !matched {
                 continue;
             }
             let child_score = child.score()?;
-            score = score.max(child_score);
+            score = match self.mode {
+                DisjunctionScore::Sum => score + child_score,
+                DisjunctionScore::Max => score.max(child_score),
+            };
         }
         checked_score(score, "FTS disjunction")
     }
@@ -897,9 +986,12 @@ impl ComposableScorer for DisjunctionScorer<'_> {
     }
 
     fn score_bounds(&mut self, up_to: u64) -> Result<ScoreBounds> {
-        let mut bounds = ScoreBounds {
-            lower: f32::INFINITY,
-            upper: f32::NEG_INFINITY,
+        let mut bounds = match self.mode {
+            DisjunctionScore::Sum => ScoreBounds::ZERO,
+            DisjunctionScore::Max => ScoreBounds {
+                lower: f32::INFINITY,
+                upper: f32::NEG_INFINITY,
+            },
         };
         for child in &mut self.children {
             let child_bounds = if child.doc().is_some_and(|doc| doc <= up_to) {
@@ -907,9 +999,12 @@ impl ComposableScorer for DisjunctionScorer<'_> {
             } else {
                 ScoreBounds::ZERO
             };
-            bounds = ScoreBounds {
-                lower: bounds.lower.min(child_bounds.lower),
-                upper: bounds.upper.max(child_bounds.upper),
+            bounds = match self.mode {
+                DisjunctionScore::Sum => bounds.add(child_bounds.include_zero()),
+                DisjunctionScore::Max => ScoreBounds {
+                    lower: bounds.lower.min(child_bounds.lower),
+                    upper: bounds.upper.max(child_bounds.upper),
+                },
             };
         }
         if bounds.lower == f32::INFINITY {
@@ -929,8 +1024,13 @@ impl ComposableScorer for DisjunctionScorer<'_> {
             return Ok(());
         }
         self.min_competitive_score = min_score;
-        for child in &mut self.children {
-            child.set_min_competitive_score(min_score)?;
+        // A child below a DisMax threshold cannot affect a competitive max.
+        // Sum scorers need sibling-global bounds before translating the floor,
+        // so they keep it at this node and prune from their combined block bound.
+        if matches!(self.mode, DisjunctionScore::Max) {
+            for child in &mut self.children {
+                child.set_min_competitive_score(min_score)?;
+            }
         }
         Ok(())
     }
@@ -947,21 +1047,325 @@ impl ComposableScorer for DisjunctionScorer<'_> {
     }
 }
 
+/// Intersection scorer preserving the existing Boolean MUST score contract:
+/// all children filter membership, while the first MUST child supplies score.
+pub(super) struct RequiredConjunctionScorer<'a> {
+    children: Vec<BoxScorer<'a>>,
+    current: Option<u64>,
+    confirmed_doc: Option<u64>,
+    confirmed: bool,
+}
+
+impl<'a> RequiredConjunctionScorer<'a> {
+    pub(super) fn try_new(children: Vec<BoxScorer<'a>>) -> Result<Self> {
+        if children.is_empty() {
+            return Err(Error::internal(
+                "FTS conjunction scorer requires at least one child",
+            ));
+        }
+        Ok(Self {
+            children,
+            current: None,
+            confirmed_doc: None,
+            confirmed: false,
+        })
+    }
+
+    fn align(&mut self, target: u64) -> Result<Option<u64>> {
+        let mut target = target;
+        loop {
+            for child in &mut self.children {
+                if child.doc().is_none_or(|doc| doc < target) {
+                    let Some(doc) = child.advance(target)? else {
+                        self.current = None;
+                        return Ok(None);
+                    };
+                    target = target.max(doc);
+                }
+            }
+            let min_doc = self.children.iter().filter_map(|child| child.doc()).min();
+            let max_doc = self.children.iter().filter_map(|child| child.doc()).max();
+            if min_doc == max_doc {
+                self.current = min_doc;
+                self.confirmed_doc = None;
+                self.confirmed = false;
+                return Ok(self.current);
+            }
+            target = max_doc.ok_or_else(|| {
+                Error::internal("FTS conjunction lost a child while aligning scorers")
+            })?;
+        }
+    }
+
+    fn ensure_confirmed(&mut self) -> Result<bool> {
+        let Some(current) = self.current else {
+            return Ok(false);
+        };
+        if self.confirmed_doc == Some(current) {
+            return Ok(self.confirmed);
+        }
+        self.confirmed = true;
+        for child in &mut self.children {
+            if !child.matches()? {
+                self.confirmed = false;
+            }
+        }
+        self.confirmed_doc = Some(current);
+        Ok(self.confirmed)
+    }
+}
+
+impl ComposableScorer for RequiredConjunctionScorer<'_> {
+    fn doc(&self) -> Option<u64> {
+        self.current
+    }
+
+    fn document_key(&self) -> Option<u64> {
+        self.children.first().and_then(|child| child.document_key())
+    }
+
+    fn next(&mut self) -> Result<Option<u64>> {
+        let target = match self.current {
+            None => 0,
+            Some(u64::MAX) => return Ok(None),
+            Some(current) => current + 1,
+        };
+        self.align(target)
+    }
+
+    fn advance(&mut self, target: u64) -> Result<Option<u64>> {
+        if self.current.is_some_and(|current| current >= target) {
+            return Ok(self.current);
+        }
+        self.align(target)
+    }
+
+    fn cost(&self) -> usize {
+        self.children
+            .iter()
+            .map(|child| child.cost())
+            .min()
+            .unwrap_or(0)
+    }
+
+    fn score(&mut self) -> Result<f32> {
+        if !self.ensure_confirmed()? {
+            return Err(Error::internal(
+                "FTS conjunction score requested for an unconfirmed document",
+            ));
+        }
+        self.children[0].score()
+    }
+
+    fn advance_shallow(&mut self, target: u64) -> Result<u64> {
+        let mut up_to = u64::MAX;
+        for child in &mut self.children {
+            let child_target = child.doc().map_or(target, |doc| target.max(doc));
+            up_to = up_to.min(child.advance_shallow(child_target)?);
+        }
+        Ok(up_to)
+    }
+
+    fn score_bounds(&mut self, up_to: u64) -> Result<ScoreBounds> {
+        self.children[0].score_bounds(up_to)
+    }
+
+    fn set_min_competitive_score(&mut self, min_score: f32) -> Result<()> {
+        // Only the first MUST child contributes score. The remaining children
+        // are exact membership filters and must never be score-pruned.
+        self.children[0].set_min_competitive_score(min_score)
+    }
+
+    fn matches(&mut self) -> Result<bool> {
+        self.ensure_confirmed()
+    }
+
+    fn match_cost(&self) -> Option<f32> {
+        self.children
+            .iter()
+            .filter_map(|child| child.match_cost())
+            .reduce(|left, right| left + right)
+    }
+}
+
+/// Boolean scorer preserving the current membership and score semantics.
+pub(super) struct BooleanScorer<'a> {
+    driver: BoxScorer<'a>,
+    optional: Option<BoxScorer<'a>>,
+    prohibited: Option<BoxScorer<'a>>,
+    current: Option<u64>,
+    optional_matches: bool,
+}
+
+impl<'a> BooleanScorer<'a> {
+    pub(super) fn try_new(
+        should: Vec<BoxScorer<'a>>,
+        must: Vec<BoxScorer<'a>>,
+        must_not: Vec<BoxScorer<'a>>,
+    ) -> Result<Self> {
+        let mut optional = if should.is_empty() {
+            None
+        } else {
+            Some(
+                Box::new(DisjunctionScorer::try_new(should, DisjunctionScore::Sum)?)
+                    as BoxScorer<'a>,
+            )
+        };
+        let driver = if must.is_empty() {
+            optional.take().ok_or_else(|| {
+                Error::invalid_input("boolean query must have at least one should/must query")
+            })?
+        } else {
+            Box::new(RequiredConjunctionScorer::try_new(must)?) as BoxScorer<'a>
+        };
+        let prohibited = if must_not.is_empty() {
+            None
+        } else {
+            Some(
+                Box::new(DisjunctionScorer::try_new(must_not, DisjunctionScore::Max)?)
+                    as BoxScorer<'a>,
+            )
+        };
+        Ok(Self {
+            driver,
+            optional,
+            prohibited,
+            current: None,
+            optional_matches: false,
+        })
+    }
+
+    fn accept_driver_doc(&mut self) -> Result<bool> {
+        let Some(current) = self.driver.doc() else {
+            return Ok(false);
+        };
+        if !self.driver.matches()? {
+            return Ok(false);
+        }
+        if let Some(prohibited) = &mut self.prohibited
+            && prohibited.advance(current)? == Some(current)
+            && prohibited.matches()?
+        {
+            return Ok(false);
+        }
+        self.optional_matches = if let Some(optional) = &mut self.optional {
+            optional.advance(current)? == Some(current) && optional.matches()?
+        } else {
+            false
+        };
+        self.current = Some(current);
+        Ok(true)
+    }
+
+    fn next_accepted(&mut self, target: Option<u64>) -> Result<Option<u64>> {
+        let mut doc = match target {
+            Some(target) => self.driver.advance(target)?,
+            None => self.driver.next()?,
+        };
+        while doc.is_some() {
+            if self.accept_driver_doc()? {
+                return Ok(self.current);
+            }
+            doc = self.driver.next()?;
+        }
+        self.current = None;
+        self.optional_matches = false;
+        Ok(None)
+    }
+}
+
+impl ComposableScorer for BooleanScorer<'_> {
+    fn doc(&self) -> Option<u64> {
+        self.current
+    }
+
+    fn document_key(&self) -> Option<u64> {
+        self.driver.document_key()
+    }
+
+    fn next(&mut self) -> Result<Option<u64>> {
+        self.next_accepted(None)
+    }
+
+    fn advance(&mut self, target: u64) -> Result<Option<u64>> {
+        if self.current.is_some_and(|current| current >= target) {
+            return Ok(self.current);
+        }
+        self.next_accepted(Some(target))
+    }
+
+    fn cost(&self) -> usize {
+        self.driver.cost()
+    }
+
+    fn score(&mut self) -> Result<f32> {
+        if self.current.is_none() {
+            return Err(Error::internal(
+                "Boolean FTS scorer is not positioned on a document",
+            ));
+        }
+        let mut score = self.driver.score()?;
+        if self.optional_matches
+            && let Some(optional) = &mut self.optional
+        {
+            score += optional.score()?;
+        }
+        checked_score(score, "BooleanQuery scorer")
+    }
+
+    fn advance_shallow(&mut self, target: u64) -> Result<u64> {
+        let mut up_to = self.driver.advance_shallow(target)?;
+        if let Some(optional) = &mut self.optional
+            && let Some(doc) = optional.doc()
+        {
+            up_to = up_to.min(optional.advance_shallow(target.max(doc))?);
+        }
+        Ok(up_to)
+    }
+
+    fn score_bounds(&mut self, up_to: u64) -> Result<ScoreBounds> {
+        let mut bounds = self.driver.score_bounds(up_to)?;
+        if let Some(optional) = &mut self.optional
+            && optional.doc().is_some_and(|doc| doc <= up_to)
+        {
+            bounds = bounds.add(optional.score_bounds(up_to)?.include_zero());
+        }
+        Ok(bounds)
+    }
+
+    fn set_min_competitive_score(&mut self, min_score: f32) -> Result<()> {
+        // When SHOULD is also present, a global sibling bound is required to
+        // translate the parent threshold safely. The combined block bound still
+        // prunes at this node. Without SHOULD, driver score is the full score.
+        if self.optional.is_none() {
+            self.driver.set_min_competitive_score(min_score)?;
+        }
+        Ok(())
+    }
+
+    fn matches(&mut self) -> Result<bool> {
+        Ok(self.current.is_some())
+    }
+}
+
 #[derive(Clone)]
 enum LeafQuery {
     Match(MatchQuery),
+    Phrase(PhraseQuery),
 }
 
 impl LeafQuery {
     fn terms(&self) -> &str {
         match self {
             Self::Match(query) => &query.terms,
+            Self::Phrase(query) => &query.terms,
         }
     }
 
     fn operator(&self) -> Operator {
         match self {
             Self::Match(query) => query.operator,
+            Self::Phrase(_) => Operator::And,
         }
     }
 
@@ -974,22 +1378,38 @@ impl LeafQuery {
                 .with_fuzziness(query.fuzziness)
                 .with_max_expansions(query.max_expansions)
                 .with_prefix_length(query.prefix_length),
+            Self::Phrase(query) => params
+                .clone()
+                .with_limit(None)
+                .with_phrase_slop(Some(query.slop)),
         }
     }
 }
 
-fn collect_leaf_queries(query: &FtsQuery) -> Result<Vec<LeafQuery>> {
+fn collect_leaf_queries(query: &FtsQuery, leaves: &mut Vec<LeafQuery>) -> Result<()> {
     match query {
-        FtsQuery::MultiMatch(query) => Ok(query
-            .match_queries
-            .iter()
-            .cloned()
-            .map(LeafQuery::Match)
-            .collect()),
-        _ => Err(Error::not_supported(
-            "posting-backed compound FTS currently supports MultiMatch queries only",
-        )),
+        FtsQuery::Match(query) => leaves.push(LeafQuery::Match(query.clone())),
+        FtsQuery::Phrase(query) => leaves.push(LeafQuery::Phrase(query.clone())),
+        FtsQuery::MultiMatch(query) => {
+            leaves.extend(query.match_queries.iter().cloned().map(LeafQuery::Match));
+        }
+        FtsQuery::Boolean(query) => {
+            for child in query
+                .should
+                .iter()
+                .chain(&query.must)
+                .chain(&query.must_not)
+            {
+                collect_leaf_queries(child, leaves)?;
+            }
+        }
+        FtsQuery::Boost(_) => {
+            return Err(Error::not_supported(
+                "posting-backed compound FTS does not support BoostQuery yet",
+            ));
+        }
     }
+    Ok(())
 }
 
 struct PreparedLeaf {
@@ -1048,7 +1468,8 @@ async fn prepare_compound_query(
     let first_index = indices
         .first()
         .ok_or_else(|| Error::invalid_input("compound FTS requires at least one index segment"))?;
-    let leaf_queries = collect_leaf_queries(query)?;
+    let mut leaf_queries = Vec::new();
+    collect_leaf_queries(query, &mut leaf_queries)?;
     let mut num_plan_leaves = 0;
     let plan = CompoundScorerPlan::from_query(query, &mut num_plan_leaves)?;
     if num_plan_leaves != leaf_queries.len() {
@@ -1521,11 +1942,33 @@ mod tests {
     }
 
     #[test]
-    fn dismax_preserves_exact_scores_and_order() {
-        let mut dismax = DisjunctionScorer::try_new(vec![
-            materialized(&[(1, 2.0), (3, 3.0)]),
-            materialized(&[(1, 4.0), (2, 4.0)]),
-        ])
+    fn boolean_and_dismax_preserve_exact_scores_and_order() {
+        let must = vec![
+            materialized(&[(1, 3.0), (2, 2.0), (3, 1.0)]),
+            materialized(&[(1, 30.0), (3, 10.0)]),
+        ];
+        let should = vec![
+            materialized(&[(1, 0.5), (3, 4.0)]),
+            materialized(&[(3, 2.0)]),
+        ];
+        let must_not = vec![materialized(&[(1, 9.0)])];
+        let mut boolean = BooleanScorer::try_new(should, must, must_not).unwrap();
+        let results = TopKCollector::new(10).collect(&mut boolean).unwrap();
+        assert_eq!(
+            results,
+            vec![ScoredRow {
+                row_id: 3,
+                score: 7.0
+            }]
+        );
+
+        let mut dismax = DisjunctionScorer::try_new(
+            vec![
+                materialized(&[(1, 2.0), (3, 3.0)]),
+                materialized(&[(1, 4.0), (2, 4.0)]),
+            ],
+            DisjunctionScore::Max,
+        )
         .unwrap();
         let results = TopKCollector::new(2).collect(&mut dismax).unwrap();
         assert_eq!(results, rows(&[(1, 4.0), (2, 4.0)]));

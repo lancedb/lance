@@ -167,7 +167,23 @@ fn collect_all_fts_columns(query: &FtsQuery, columns: &mut HashSet<String>) {
 }
 
 fn supports_compound_scorer(query: &FtsQuery) -> bool {
-    if !matches!(query, FtsQuery::MultiMatch(_)) {
+    fn supports_shape(query: &FtsQuery) -> bool {
+        match query {
+            FtsQuery::Match(_) | FtsQuery::Phrase(_) | FtsQuery::MultiMatch(_) => true,
+            FtsQuery::Boolean(query) => {
+                (!query.should.is_empty() || !query.must.is_empty())
+                    && query
+                        .should
+                        .iter()
+                        .chain(&query.must)
+                        .chain(&query.must_not)
+                        .all(supports_shape)
+            }
+            FtsQuery::Boost(_) => false,
+        }
+    }
+
+    if matches!(query, FtsQuery::Match(_) | FtsQuery::Phrase(_)) || !supports_shape(query) {
         return false;
     }
     let mut columns = HashSet::new();
@@ -175,7 +191,23 @@ fn supports_compound_scorer(query: &FtsQuery) -> bool {
     columns.len() == 1
 }
 
-fn validate_fts_match_boosts(query: &FtsQuery) -> Result<()> {
+fn contains_phrase_query(query: &FtsQuery) -> bool {
+    match query {
+        FtsQuery::Phrase(_) => true,
+        FtsQuery::Match(_) | FtsQuery::MultiMatch(_) => false,
+        FtsQuery::Boost(query) => {
+            contains_phrase_query(&query.positive) || contains_phrase_query(&query.negative)
+        }
+        FtsQuery::Boolean(query) => query
+            .should
+            .iter()
+            .chain(&query.must)
+            .chain(&query.must_not)
+            .any(contains_phrase_query),
+    }
+}
+
+fn validate_fts_query_contract(query: &FtsQuery) -> Result<()> {
     fn validate_multiplier(value: f32) -> Result<()> {
         if value.is_finite() && value >= 0.0 {
             Ok(())
@@ -190,8 +222,8 @@ fn validate_fts_match_boosts(query: &FtsQuery) -> Result<()> {
         FtsQuery::Match(query) => validate_multiplier(query.boost),
         FtsQuery::Phrase(_) => Ok(()),
         FtsQuery::Boost(query) => {
-            validate_fts_match_boosts(&query.positive)?;
-            validate_fts_match_boosts(&query.negative)
+            validate_fts_query_contract(&query.positive)?;
+            validate_fts_query_contract(&query.negative)
         }
         FtsQuery::MultiMatch(query) => {
             for match_query in &query.match_queries {
@@ -200,13 +232,18 @@ fn validate_fts_match_boosts(query: &FtsQuery) -> Result<()> {
             Ok(())
         }
         FtsQuery::Boolean(query) => {
+            if query.should.is_empty() && query.must.is_empty() {
+                return Err(Error::invalid_input(
+                    "boolean query must have at least one should/must query",
+                ));
+            }
             for child in query
                 .should
                 .iter()
                 .chain(&query.must)
                 .chain(&query.must_not)
             {
-                validate_fts_match_boosts(child)?;
+                validate_fts_query_contract(child)?;
             }
             Ok(())
         }
@@ -3454,7 +3491,7 @@ impl Scanner {
         } else {
             query.query.clone()
         };
-        validate_fts_match_boosts(&query)?;
+        validate_fts_query_contract(&query)?;
 
         // TODO: Could maybe walk the query here to find all the indices that will be
         // involved in the query to calculate a more accuarate required_fragments than
@@ -3522,6 +3559,15 @@ impl Scanner {
                     Error::invalid_input(format!("No Inverted index found for column {column}"))
                 })?,
         };
+        if contains_phrase_query(query) {
+            let details = load_segment_details(&self.dataset, &column, &segments).await?;
+            if !details.with_position {
+                return Err(Error::invalid_input(
+                    "position is not found but required for phrase queries, try recreating the index with position"
+                        .to_string(),
+                ));
+            }
+        }
         Ok(Some(Arc::new(CompoundQueryExec::new_with_segments(
             self.dataset.clone(),
             query.clone(),
@@ -5976,7 +6022,9 @@ mod test {
     };
     use lance_file::version::LanceFileVersion;
     use lance_index::optimize::OptimizeOptions;
-    use lance_index::scalar::inverted::query::{FtsQuery, MatchQuery, PhraseQuery};
+    use lance_index::scalar::inverted::query::{
+        BooleanQuery, FtsQuery, MatchQuery, Occur, PhraseQuery,
+    };
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::pq::PQBuildParams;
@@ -6001,11 +6049,16 @@ mod test {
     };
 
     #[test]
-    fn test_fts_match_boosts_reject_invalid_values() {
+    fn test_fts_query_contract_rejects_invalid_values() {
         let negative_match = FtsQuery::Match(MatchQuery::new("hello".to_string()).with_boost(-1.0));
-        let error = validate_fts_match_boosts(&negative_match).unwrap_err();
+        let error = validate_fts_query_contract(&negative_match).unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }));
         assert!(error.to_string().contains("finite and non-negative"));
+
+        let empty_boolean = FtsQuery::Boolean(BooleanQuery::new(Vec::<(Occur, FtsQuery)>::new()));
+        let error = validate_fts_query_contract(&empty_boolean).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("at least one should/must query"));
     }
 
     #[test]
