@@ -864,6 +864,14 @@ async fn test_fts_on_multiple_columns() {
 }
 
 async fn create_fragmented_fts_index(dataset: &mut Dataset, column: &str) {
+    create_fragmented_fts_index_with_order(dataset, column, false).await;
+}
+
+async fn create_fragmented_fts_index_with_order(
+    dataset: &mut Dataset,
+    column: &str,
+    reverse_segments: bool,
+) {
     let index_name = format!("{column}_idx");
     let columns = [column];
     let params = InvertedIndexParams::default();
@@ -879,6 +887,9 @@ async fn create_fragmented_fts_index(dataset: &mut Dataset, column: &str) {
             .name(index_name.clone())
             .fragments(vec![*fragment_id]);
         segments.push(builder.execute_uncommitted().await.unwrap());
+    }
+    if reverse_segments {
+        segments.reverse();
     }
     dataset
         .commit_existing_index_segments(&index_name, column, segments)
@@ -1087,6 +1098,33 @@ async fn test_same_column_multimatch_uses_compound_scorer() {
         plan.contains("CompoundFtsScorer"),
         "bounded same-column MultiMatch should use posting-backed scorers:\n{plan}"
     );
+}
+
+#[tokio::test]
+async fn test_compound_tie_uses_resolved_row_id() {
+    let batch =
+        arrow_array::record_batch!(("text", Utf8, ["common", "common", "common", "common"]))
+            .unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 1,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    create_fragmented_fts_index_with_order(&mut dataset, "text", true).await;
+
+    let query: FtsQuery = MultiMatchQuery::try_new(
+        "common".to_owned(),
+        vec!["text".to_owned(), "text".to_owned()],
+    )
+    .unwrap()
+    .into();
+    assert_compound_fts_top_k(&dataset, query, 1).await;
 }
 
 fn nested_fts_batch(

@@ -503,11 +503,12 @@ fn compare_scored_rows<K: Ord>(left: &ScoredRow<K>, right: &ScoredRow<K>) -> Ord
         .then_with(|| left.row_id.cmp(&right.row_id))
 }
 
-fn is_better<K: Ord>(candidate: ScoredRow<K>, current: ScoredRow<K>) -> bool {
-    compare_scored_rows(&candidate, &current) == Ordering::Less
-}
-
 /// The sole owner of top-k state for a compound scorer tree.
+///
+/// The heap retains every candidate tied at the kth score. Some document keys
+/// are only resolvable to row ids asynchronously, so equal-score candidates
+/// cannot be trimmed by their temporary keys without changing the final
+/// row-id tie-break.
 pub(super) struct TopKCollector<K = u64> {
     limit: usize,
     heap: BinaryHeap<HeapRow<K>>,
@@ -536,18 +537,47 @@ impl<K: Copy + Ord> TopKCollector<K> {
         }
         if self.heap.len() < self.limit {
             self.heap.push(HeapRow(row));
-        } else if self
-            .heap
-            .peek()
-            .is_some_and(|worst| is_better(row, worst.0))
-        {
-            self.heap.pop();
-            self.heap.push(HeapRow(row));
+        } else {
+            let floor = self
+                .heap
+                .peek()
+                .expect("a full top-k heap is non-empty")
+                .0
+                .score;
+            match row.score.total_cmp(&floor) {
+                Ordering::Less => {}
+                Ordering::Equal => self.heap.push(HeapRow(row)),
+                Ordering::Greater => {
+                    self.heap.push(HeapRow(row));
+                    self.prune_obsolete_score_floors();
+                }
+            }
         }
-        if self.heap.len() == self.limit
+        if self.heap.len() >= self.limit
             && let Some(worst) = self.heap.peek()
         {
             self.competitive_score.raise(worst.0.score);
+        }
+    }
+
+    fn prune_obsolete_score_floors(&mut self) {
+        while self.heap.len() > self.limit {
+            let floor = self
+                .heap
+                .peek()
+                .expect("a non-empty top-k heap has a score floor")
+                .0
+                .score;
+            let floor_count = self
+                .heap
+                .iter()
+                .filter(|row| row.0.score.total_cmp(&floor) == Ordering::Equal)
+                .count();
+            if self.heap.len() - floor_count < self.limit {
+                break;
+            }
+            self.heap
+                .retain(|row| row.0.score.total_cmp(&floor) != Ordering::Equal);
         }
     }
 
@@ -608,9 +638,17 @@ impl<K: Copy + Ord> TopKCollector<K> {
         Ok(())
     }
 
-    pub(super) fn into_rows(self) -> Vec<ScoredRow<K>> {
+    fn into_score_floor_rows(self) -> Vec<ScoredRow<K>> {
         let mut rows = self.heap.into_iter().map(|row| row.0).collect::<Vec<_>>();
         rows.sort_unstable_by(compare_scored_rows);
+        rows
+    }
+
+    #[cfg(test)]
+    fn into_rows(self) -> Vec<ScoredRow<K>> {
+        let limit = self.limit;
+        let mut rows = self.into_score_floor_rows();
+        rows.truncate(limit);
         rows
     }
 }
@@ -1259,6 +1297,7 @@ fn collect_loaded_partitions(
 async fn resolve_compound_rows(
     indices: &[Arc<InvertedIndex>],
     rows: Vec<ScoredRow<CompoundDocument>>,
+    limit: usize,
 ) -> Result<Vec<ScoredRow>> {
     let mut resolved = vec![None; rows.len()];
     let mut modern = BTreeMap::<(usize, usize), Vec<(usize, DocId)>>::new();
@@ -1308,6 +1347,7 @@ async fn resolve_compound_rows(
         })
         .collect::<Result<Vec<_>>>()?;
     rows.sort_unstable_by(compare_scored_rows);
+    rows.truncate(limit);
     Ok(rows)
 }
 
@@ -1315,8 +1355,9 @@ async fn resolve_compound_rows(
 ///
 /// The caller must provide all committed index segments for the column and a
 /// ready prefilter. One collector owns the global top-k heap and propagates its
-/// score floor through every partition-local scorer tree. Only its final
-/// bounded candidates are resolved to row addresses and returned.
+/// score floor through every partition-local scorer tree. Its score-bounded
+/// candidates, including every kth-score tie, are resolved to row addresses
+/// before the final row-id tie-break is applied.
 pub async fn compound_search(
     indices: &[Arc<InvertedIndex>],
     query: &FtsQuery,
@@ -1372,7 +1413,7 @@ pub async fn compound_search(
         .await?;
     }
 
-    let rows = resolve_compound_rows(indices, collector.into_rows()).await?;
+    let rows = resolve_compound_rows(indices, collector.into_score_floor_rows(), limit).await?;
     Ok(rows.into_iter().map(|row| (row.row_id, row.score)).unzip())
 }
 
