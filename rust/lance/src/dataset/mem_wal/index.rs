@@ -1227,7 +1227,6 @@ mod tests {
     use super::*;
     use arrow_array::{Int32Array, StringArray};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
-    use log::warn;
     use rstest::rstest;
     use std::sync::Arc;
     use uuid::Uuid;
@@ -1281,23 +1280,6 @@ mod tests {
             MemIndexKind::ALL.len(),
             "two kinds share a details suffix, so one can never be resolved",
         );
-    }
-
-    /// Check if an index type is supported and log warning if not.
-    fn check_index_type_supported(index_type: &str) -> bool {
-        match index_type.to_lowercase().as_str() {
-            "btree" | "scalar" => true,
-            "hnsw" | "vector" => true,
-            "fts" | "inverted" | "fulltext" => true,
-            _ => {
-                warn!(
-                    "Index type '{}' is not supported for MemWAL. \
-                     Supported types: btree, hnsw, fts. Skipping.",
-                    index_type
-                );
-                false
-            }
-        }
     }
 
     fn create_test_schema() -> Arc<ArrowSchema> {
@@ -1650,18 +1632,6 @@ mod tests {
 
         let fts = registry.get_fts("desc_idx").unwrap();
         assert_eq!(fts.doc_count(), 3);
-    }
-
-    #[test]
-    fn test_check_index_type_supported() {
-        assert!(check_index_type_supported("btree"));
-        assert!(check_index_type_supported("BTree"));
-        assert!(check_index_type_supported("hnsw"));
-        assert!(check_index_type_supported("vector"));
-        assert!(check_index_type_supported("fts"));
-        assert!(check_index_type_supported("inverted"));
-
-        assert!(!check_index_type_supported("unknown"));
     }
 
     #[test]
