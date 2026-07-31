@@ -37,6 +37,24 @@ def test_dataset_optimize(tmp_path: Path):
     assert dataset.version == 3
 
 
+def test_compact_files_max_source_fragments(tmp_path: Path):
+    dataset = lance.write_dataset(
+        pa.table({"a": range(1000)}),
+        tmp_path / "dataset",
+        max_rows_per_file=100,
+    )
+    assert len(dataset.get_fragments()) == 10
+
+    metrics = dataset.optimize.compact_files(
+        target_rows_per_fragment=250,
+        max_source_fragments=4,
+        num_threads=1,
+    )
+
+    assert 0 < metrics.fragments_removed <= 4
+    assert 1 < len(dataset.get_fragments()) < 10
+
+
 def test_blob_compaction(tmp_path: Path):
     base_dir = tmp_path / "blob_dataset"
     blob_field = pa.field(
