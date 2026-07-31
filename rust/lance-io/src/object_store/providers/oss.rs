@@ -12,7 +12,7 @@ use url::Url;
 use crate::object_store::dynamic_opendal::DynamicOpenDalStore;
 use crate::object_store::{
     DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
-    ObjectStoreParams, ObjectStoreProvider, StorageOptions,
+    ObjectStoreParams, ObjectStoreProvider, StorageOptions, opendal_list::OpendalDirLister,
 };
 use lance_core::error::{Error, Result};
 
@@ -93,12 +93,12 @@ impl OssStoreProvider {
         Ok(config_map)
     }
 
-    fn build_oss_store(config_map: HashMap<String, String>) -> Result<OpendalStore> {
+    fn build_oss_operator(config_map: HashMap<String, String>) -> Result<Operator> {
         let operator = Operator::from_iter::<Oss>(config_map)
             .map_err(|e| Error::invalid_input(format!("Failed to create OSS operator: {:?}", e)))?
             .finish();
 
-        Ok(OpendalStore::new(operator))
+        Ok(operator)
     }
 }
 
@@ -111,23 +111,30 @@ impl ObjectStoreProvider for OssStoreProvider {
         let base_options = Self::base_oss_options(&base_path, &storage_options)?;
         let accessor = params.get_accessor();
 
-        let inner: Arc<dyn OSObjectStore> =
-            if let Some(accessor) = accessor.filter(|a| a.has_provider()) {
-                Arc::new(
-                    DynamicOpenDalStore::new(
-                        format!("oss:{}", base_path),
-                        base_options,
-                        accessor,
-                        Self::normalize_oss_config,
-                        Self::build_oss_store,
-                    )
-                    .with_protected_keys(["bucket", "root"]),
+        let (inner, paginated_lister): (Arc<dyn OSObjectStore>, _) = if let Some(accessor) =
+            accessor.filter(|a| a.has_provider())
+        {
+            let store = Arc::new(
+                DynamicOpenDalStore::new(
+                    format!("oss:{}", base_path),
+                    base_options,
+                    accessor,
+                    Self::normalize_oss_config,
+                    Self::build_oss_operator,
                 )
-            } else {
-                Arc::new(Self::build_oss_store(Self::normalize_oss_config(
-                    &base_options,
-                )?)?)
-            };
+                .with_protected_keys(["bucket", "root"]),
+            );
+            (
+                store.clone(),
+                Some(OpendalDirLister::for_dynamic_store(store)),
+            )
+        } else {
+            let operator = Self::build_oss_operator(Self::normalize_oss_config(&base_options)?)?;
+            (
+                Arc::new(OpendalStore::new(operator.clone())),
+                OpendalDirLister::for_operator(operator),
+            )
+        };
 
         let mut url = base_path;
         if !url.path().ends_with('/') {
@@ -145,6 +152,7 @@ impl ObjectStoreProvider for OssStoreProvider {
             download_retry_count: storage_options.download_retry_count(),
             io_tracker: Default::default(),
             store_prefix: self.calculate_object_store_prefix(&url, params.storage_options())?,
+            paginated_lister,
         })
     }
 }
@@ -273,7 +281,7 @@ mod tests {
             base_options,
             accessor,
             OssStoreProvider::normalize_oss_config,
-            OssStoreProvider::build_oss_store,
+            OssStoreProvider::build_oss_operator,
         );
 
         let current_store = store

@@ -15,18 +15,22 @@ use object_store::{
     RenameOptions,
 };
 use object_store_opendal::OpendalStore;
+use opendal::Operator;
 use tokio::sync::RwLock;
 
 use crate::object_store::StorageOptionsAccessor;
 use lance_core::Result;
 
 type NormalizeConfigFn = fn(&HashMap<String, String>) -> Result<HashMap<String, String>>;
-type BuildStoreFn = fn(HashMap<String, String>) -> Result<OpendalStore>;
+type BuildOperatorFn = fn(HashMap<String, String>) -> Result<Operator>;
 
 #[derive(Debug, Clone)]
 struct CachedOpenDalStore {
     config: HashMap<String, String>,
     store: Arc<OpendalStore>,
+    /// The operator the store was built from, kept so that APIs OpenDAL exposes only on
+    /// [`Operator`] (paginated listing) stay reachable after the store is type-erased.
+    operator: Operator,
 }
 
 #[derive(Clone)]
@@ -35,7 +39,7 @@ pub(in crate::object_store) struct DynamicOpenDalStore {
     base_options: Arc<HashMap<String, String>>,
     accessor: Arc<StorageOptionsAccessor>,
     normalize_config: NormalizeConfigFn,
-    build_store: BuildStoreFn,
+    build_operator: BuildOperatorFn,
     protected_keys: Vec<&'static str>,
     cache: Arc<RwLock<Option<CachedOpenDalStore>>>,
 }
@@ -55,14 +59,14 @@ impl DynamicOpenDalStore {
         base_options: HashMap<String, String>,
         accessor: Arc<StorageOptionsAccessor>,
         normalize_config: NormalizeConfigFn,
-        build_store: BuildStoreFn,
+        build_operator: BuildOperatorFn,
     ) -> Self {
         Self {
             name: name.into(),
             base_options: Arc::new(base_options),
             accessor,
             normalize_config,
-            build_store,
+            build_operator,
             protected_keys: Vec::new(),
             cache: Arc::new(RwLock::new(None)),
         }
@@ -89,6 +93,14 @@ impl DynamicOpenDalStore {
     }
 
     pub(in crate::object_store) async fn current_store(&self) -> Result<Arc<OpendalStore>> {
+        Ok(self.current().await?.0)
+    }
+
+    pub(in crate::object_store) async fn current_operator(&self) -> Result<Operator> {
+        Ok(self.current().await?.1)
+    }
+
+    async fn current(&self) -> Result<(Arc<OpendalStore>, Operator)> {
         let merged_options = self.merge_options(self.accessor.get_storage_options().await?.0);
         let config = (self.normalize_config)(&merged_options)?;
 
@@ -100,23 +112,25 @@ impl DynamicOpenDalStore {
             if let Some(cached) = cache.as_ref()
                 && cached.config == config
             {
-                return Ok(cached.store.clone());
+                return Ok((cached.store.clone(), cached.operator.clone()));
             }
         }
 
-        let store = Arc::new((self.build_store)(config.clone())?);
+        let operator = (self.build_operator)(config.clone())?;
+        let store = Arc::new(OpendalStore::new(operator.clone()));
         let mut cache = self.cache.write().await;
         if let Some(cached) = cache.as_ref()
             && cached.config == config
         {
-            return Ok(cached.store.clone());
+            return Ok((cached.store.clone(), cached.operator.clone()));
         }
 
         *cache = Some(CachedOpenDalStore {
             config,
             store: store.clone(),
+            operator: operator.clone(),
         });
-        Ok(store)
+        Ok((store, operator))
     }
 
     fn map_store_error(&self, error: lance_core::Error) -> object_store::Error {
@@ -278,7 +292,7 @@ mod tests {
                         "Failed to create memory operator: {e:?}"
                     ))
                 })?;
-                Ok(OpendalStore::new(operator.finish()))
+                Ok(operator.finish())
             },
         );
 
@@ -316,7 +330,7 @@ mod tests {
                         "Failed to create memory operator: {e:?}"
                     ))
                 })?;
-                Ok(OpendalStore::new(operator.finish()))
+                Ok(operator.finish())
             },
         )
         .with_protected_keys(["bucket", "root"]);
