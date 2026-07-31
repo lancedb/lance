@@ -8399,7 +8399,7 @@ mod tests {
     // overlay files into a fresh fragment with the overlays (and deletions)
     // materialized into the base data.
     use arrow_array::record_batch;
-    use lance_file::writer::{FileWriter, FileWriterOptions};
+    use lance_file::writer::FileWriterOptions;
     use lance_io::utils::CachedFileSize;
     use lance_table::format::DataFile;
     use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
@@ -8451,16 +8451,14 @@ mod tests {
         let filename = format!("{}.lance", Uuid::new_v4());
         let path = dataset.base.clone().join(DATA_DIR).join(filename.as_str());
         let obj_writer = dataset.object_store.create(&path).await.unwrap();
-        let mut writer = FileWriter::try_new(
+        let file_version = lance_file::version::ConcreteFileVersion::from(LanceFileVersion::Stable);
+        let mut writer = lance_file::versions::create_writer(
+            file_version,
             obj_writer,
             overlay_schema,
-            FileWriterOptions {
-                format_version: Some(LanceFileVersion::Stable),
-                ..Default::default()
-            },
+            FileWriterOptions::default(),
         )
         .unwrap();
-        let file_version = lance_file::version::ConcreteFileVersion::from(writer.version());
         for (column_index, array) in columns.into_iter().enumerate() {
             writer.write_column(column_index, array).await.unwrap();
         }

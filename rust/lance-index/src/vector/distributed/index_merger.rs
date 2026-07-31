@@ -41,6 +41,8 @@ use bytes::Bytes;
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_encoding::version::LanceFileVersion;
 use lance_file::reader::{FileReader as V2Reader, FileReaderOptions as V2ReaderOptions};
+use lance_file::version::ConcreteFileVersion;
+use lance_file::versions;
 use lance_file::writer::{FileWriter as V2Writer, FileWriter, FileWriterOptions};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
@@ -263,13 +265,11 @@ pub async fn init_writer_for_flat(
         ),
     ]);
     let writer = object_store.create(aux_out).await?;
-    let mut w = FileWriter::try_new(
+    let mut w = versions::create_writer(
+        ConcreteFileVersion::from(format_version),
         writer,
         LanceSchema::try_from(&arrow_schema)?,
-        FileWriterOptions {
-            format_version: Some(format_version),
-            ..Default::default()
-        },
+        FileWriterOptions::default(),
     )?;
     let meta_json = serde_json::to_string(&FlatMetadata { dim: d0 })?;
     init_writer_for_storage(&mut w, dt, &meta_json, "")?;
@@ -304,13 +304,11 @@ pub async fn init_writer_for_pq(
         ),
     ]);
     let writer = object_store.create(aux_out).await?;
-    let mut w = FileWriter::try_new(
+    let mut w = versions::create_writer(
+        ConcreteFileVersion::from(format_version),
         writer,
         LanceSchema::try_from(&arrow_schema)?,
-        FileWriterOptions {
-            format_version: Some(format_version),
-            ..Default::default()
-        },
+        FileWriterOptions::default(),
     )?;
     let mut pm_init = pm.clone();
     let cb = pm_init
@@ -347,13 +345,11 @@ pub async fn init_writer_for_sq(
         ),
     ]);
     let writer = object_store.create(aux_out).await?;
-    let mut w = FileWriter::try_new(
+    let mut w = versions::create_writer(
+        ConcreteFileVersion::from(format_version),
         writer,
         LanceSchema::try_from(&arrow_schema)?,
-        FileWriterOptions {
-            format_version: Some(format_version),
-            ..Default::default()
-        },
+        FileWriterOptions::default(),
     )?;
     let meta_json = serde_json::to_string(sq_meta)?;
     init_writer_for_storage(&mut w, dt, &meta_json, SQ_METADATA_KEY)?;
@@ -384,13 +380,11 @@ pub async fn init_writer_for_rq(
     }
     let arrow_schema = ArrowSchema::new(fields);
     let writer = object_store.create(aux_out).await?;
-    let mut w = FileWriter::try_new(
+    let mut w = versions::create_writer(
+        ConcreteFileVersion::from(format_version),
         writer,
         LanceSchema::try_from(&arrow_schema)?,
-        FileWriterOptions {
-            format_version: Some(format_version),
-            ..Default::default()
-        },
+        FileWriterOptions::default(),
     )?;
 
     let mut rq_meta_init = rq_meta.clone();
@@ -1670,7 +1664,7 @@ mod tests {
         ]);
 
         let writer = store.create(aux_path).await?;
-        let mut v2w = V2Writer::try_new(
+        let mut v2w = versions::v2_1::create_writer(
             writer,
             lance_core::datatypes::Schema::try_from(&arrow_schema)?,
             V2WriterOptions::default(),
@@ -1740,7 +1734,7 @@ mod tests {
         ]);
 
         let writer = store.create(aux_path).await?;
-        let mut v2w = V2Writer::try_new(
+        let mut v2w = versions::v2_1::create_writer(
             writer,
             lance_core::datatypes::Schema::try_from(&arrow_schema)?,
             V2WriterOptions::default(),
@@ -2096,7 +2090,7 @@ mod tests {
         ]);
 
         let writer = store.create(aux_path).await?;
-        let mut v2w = V2Writer::try_new(
+        let mut v2w = versions::v2_1::create_writer(
             writer,
             lance_core::datatypes::Schema::try_from(&arrow_schema)?,
             V2WriterOptions::default(),
@@ -2208,7 +2202,7 @@ mod tests {
         let arrow_schema = ArrowSchema::new(fields);
 
         let writer = store.create(aux_path).await?;
-        let mut v2w = V2Writer::try_new(
+        let mut v2w = versions::v2_1::create_writer(
             writer,
             lance_core::datatypes::Schema::try_from(&arrow_schema)?,
             V2WriterOptions::default(),
