@@ -914,16 +914,21 @@ impl CommitHandler for AmbiguousCommitHandler {
         if self.fail_resolve.load(Ordering::SeqCst) {
             return Err(lance_core::Error::io("simulated verification outage"));
         }
-        if self
-            .resolve_not_found_remaining
-            .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                remaining.checked_sub(1)
-            })
-            .is_ok()
-        {
-            return Err(lance_core::Error::not_found(
-                "simulated temporarily invisible manifest",
-            ));
+        let mut remaining = self.resolve_not_found_remaining.load(Ordering::SeqCst);
+        while remaining > 0 {
+            match self.resolve_not_found_remaining.compare_exchange_weak(
+                remaining,
+                remaining - 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    return Err(lance_core::Error::not_found(
+                        "simulated temporarily invisible manifest",
+                    ));
+                }
+                Err(actual) => remaining = actual,
+            }
         }
         ConditionalPutCommitHandler
             .resolve_version_location(base_path, version, object_store)
