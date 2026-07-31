@@ -13,7 +13,7 @@ use arrow_array::{Array, ArrayRef, Float32Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, ROW_ID_FIELD, Result};
-use lance_file::previous::reader::FileReader as PreviousFileReader;
+use lance_file::versions::v1::reader::FileReader as V1FileReader;
 use lance_linalg::distance::DistanceType;
 use serde::{Deserialize, Serialize};
 
@@ -329,7 +329,7 @@ pub struct FlatMetadata {
 
 #[async_trait::async_trait]
 impl QuantizerMetadata for FlatMetadata {
-    async fn load(_: &PreviousFileReader) -> Result<Self> {
+    async fn load(_: &V1FileReader) -> Result<Self> {
         unimplemented!("Flat will be used in new index builder which doesn't require this")
     }
 }

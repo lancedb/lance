@@ -1304,6 +1304,36 @@ public class Dataset implements Closeable {
   private native List<FragmentMetadata> getFragmentsNative();
 
   /**
+   * Get per-fragment statistics for all fragments in this dataset version.
+   *
+   * <p>Unlike {@link #getFragments()}, this is a metadata-only bulk operation: no per-fragment Java
+   * objects are materialized, making it suitable for planning over datasets with a very large
+   * number of fragments. Row counts match {@link FragmentMetadata#getNumRows()} (physical rows
+   * minus deleted rows).
+   *
+   * @return per-fragment statistics as parallel arrays, in manifest order
+   */
+  public FragmentStatistics getFragmentStatistics() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      // Flattened as [id0, rowCount0, dataFileNum0, id1, ...] to keep the JNI surface primitive
+      long[] flat = nativeGetFragmentStatistics();
+      int count = flat.length / 3;
+      int[] ids = new int[count];
+      long[] rowCounts = new long[count];
+      int[] dataFileNums = new int[count];
+      for (int i = 0; i < count; i++) {
+        ids[i] = (int) flat[3 * i];
+        rowCounts[i] = flat[3 * i + 1];
+        dataFileNums[i] = (int) flat[3 * i + 2];
+      }
+      return new FragmentStatistics(ids, rowCounts, dataFileNums);
+    }
+  }
+
+  private native long[] nativeGetFragmentStatistics();
+
+  /**
    * Gets the arrow schema of the dataset.
    *
    * @return the arrow schema

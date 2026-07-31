@@ -441,6 +441,18 @@ impl Error {
         CorruptFileSnafu { path }.into_error(message.into().into())
     }
 
+    /// Reports a corrupt file when the caller only has a logical/section name
+    /// rather than the real file path (for example, a decoder that validates an
+    /// in-memory buffer and does not know where it came from).
+    ///
+    /// `name` is carried in the `path` field of the resulting [`Error::CorruptFile`]
+    /// variant and is NOT a filesystem path; callers that have the real path should
+    /// use [`Self::corrupt_file`] instead.
+    #[track_caller]
+    pub fn corrupt_file_named(name: &str, message: impl Into<String>) -> Self {
+        Self::corrupt_file(object_store::path::Path::from(name), message)
+    }
+
     #[track_caller]
     pub fn invalid_input(message: impl Into<String>) -> Self {
         InvalidInputSnafu.into_error(message.into().into())

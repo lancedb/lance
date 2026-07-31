@@ -55,13 +55,14 @@ use crate::{
     encodings::logical::primitive::fullzip::PerValueDataBlock,
 };
 use crate::{
-    encodings::logical::primitive::miniblock::MiniBlockCompressed,
+    encodings::logical::primitive::miniblock::{MiniBlockCompressed, MiniBlockCompressionContext},
     statistics::{ComputeStat, GetStat, Stat},
 };
 use crate::{
     repdef::{
         CompositeRepDefUnraveler, ControlWordIterator, ControlWordParser, DefinitionInterpretation,
-        MiniBlockRepDefBudget, RepDefSlicer, SerializedRepDefs, build_control_word_iterator,
+        MiniBlockRepDefBudget, NormalizedStructuralPlan, RepDefSlicer, SerializedRepDefs,
+        build_control_word_iterator,
     },
     utils::accumulation::AccumulationQueue,
 };
@@ -73,7 +74,6 @@ use crate::constants::{
     DICT_VALUES_COMPRESSION_LEVEL_ENV_VAR, DICT_VALUES_COMPRESSION_LEVEL_META_KEY,
     DICT_VALUES_COMPRESSION_META_KEY,
 };
-use crate::version::LanceFileVersion;
 use crate::{
     EncodingsIo,
     buffer::LanceBuffer,
@@ -4432,19 +4432,125 @@ const MINIBLOCK_ALIGNMENT: usize = 8;
 /// TODO: We should concatenate metadata buffers from all pages into a single buffer
 /// at (roughly) the end of the file so there is, at most, one read per column of
 /// metadata per file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MiniblockChunkSize {
+    U16,
+    U32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComplexNullEncoding {
+    RawLevels,
+    CompressedLevels,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FixedWidthDictionaryEncoding {
+    Exclude64Bit,
+    Include64Bit,
+}
+
+trait PrimitivePageEncodingBehavior: Send + Sync + Debug {
+    fn validate_field(&self, _field: &Field, _metadata: &HashMap<String, String>) -> Result<()> {
+        Ok(())
+    }
+
+    fn try_plan_pages(
+        &self,
+        _ctx: &PrimitivePlanContext<'_>,
+        _arrays: &[ArrayRef],
+        _normalized: &NormalizedStructuralPlan,
+        _row_number: u64,
+        _num_rows: u64,
+        _num_values: u64,
+    ) -> Result<Option<Vec<PrimitivePageData>>> {
+        Ok(None)
+    }
+
+    fn try_encode_page(
+        &self,
+        _ctx: &PrimitiveEncodeContext,
+        page: PrimitivePageData,
+    ) -> Result<PrimitiveEncodeAttempt> {
+        Ok(PrimitiveEncodeAttempt::Unhandled(page))
+    }
+}
+
+/// One executable primitive-page behavior selected by an exact file
+/// composition.
+#[derive(Debug, Clone)]
+pub struct PrimitivePageEncoding {
+    behavior: Arc<dyn PrimitivePageEncodingBehavior>,
+}
+
+impl PrimitivePageEncoding {
+    /// Reject an explicit request for sparse structural encoding.
+    pub fn reject_sparse() -> Self {
+        Self {
+            behavior: Arc::new(RejectSparsePrimitiveEncoding),
+        }
+    }
+
+    /// Encode constant non-null values as a constant page when applicable.
+    pub fn constant() -> Self {
+        Self {
+            behavior: Arc::new(ConstantPrimitiveEncoding),
+        }
+    }
+
+    /// Plan and encode sparse structural pages when applicable.
+    pub fn sparse(compression: Arc<dyn CompressionStrategy>) -> Self {
+        Self {
+            behavior: Arc::new(SparsePrimitiveEncoding { compression }),
+        }
+    }
+
+    /// Encode dense pages with the original u16 miniblock grammar.
+    pub fn dense_u16(compression: Arc<dyn CompressionStrategy>) -> Self {
+        Self {
+            behavior: Arc::new(DenseU16PrimitiveEncoding { compression }),
+        }
+    }
+
+    /// Encode dense pages with the u32 miniblock grammar.
+    pub fn dense_u32(compression: Arc<dyn CompressionStrategy>) -> Self {
+        Self {
+            behavior: Arc::new(DenseU32PrimitiveEncoding { compression }),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RejectSparsePrimitiveEncoding;
+
+#[derive(Debug)]
+struct ConstantPrimitiveEncoding;
+
+#[derive(Debug)]
+struct SparsePrimitiveEncoding {
+    compression: Arc<dyn CompressionStrategy>,
+}
+
+#[derive(Debug)]
+struct DenseU16PrimitiveEncoding {
+    compression: Arc<dyn CompressionStrategy>,
+}
+
+#[derive(Debug)]
+struct DenseU32PrimitiveEncoding {
+    compression: Arc<dyn CompressionStrategy>,
+}
+
 pub struct PrimitiveStructuralEncoder {
     // Accumulates arrays until we have enough data to justify a disk page
     accumulation_queue: AccumulationQueue,
 
     keep_original_array: bool,
-    support_large_chunk: bool,
     accumulated_repdefs: Vec<RepDefBuilder>,
-    // The compression strategy we will use to compress the data
-    compression_strategy: Arc<dyn CompressionStrategy>,
+    page_encodings: Arc<[PrimitivePageEncoding]>,
     column_index: u32,
     field: Field,
     encoding_metadata: Arc<HashMap<String, String>>,
-    version: LanceFileVersion,
 }
 
 struct CompressedLevelsChunk {
@@ -4493,6 +4599,17 @@ struct PrimitivePageData {
     num_rows: u64,
 }
 
+struct PrimitivePlanContext<'a> {
+    column_idx: u32,
+    field: &'a Field,
+    encoding_metadata: &'a HashMap<String, String>,
+}
+
+enum PrimitiveEncodeAttempt {
+    Encoded(EncodedPage),
+    Unhandled(PrimitivePageData),
+}
+
 // Immutable encoder state shared by per-page encode tasks.
 //
 // Cloning this only clones Arc-backed configuration and field metadata.  Page data
@@ -4501,42 +4618,24 @@ struct PrimitivePageData {
 struct PrimitiveEncodeContext {
     // Column being encoded.
     column_idx: u32,
-    // Logical field metadata for compression/layout selection.
     field: Field,
-    // Compression strategy shared across pages.
-    compression_strategy: Arc<dyn CompressionStrategy>,
-    // Field-level encoding metadata such as structural encoding overrides.
     encoding_metadata: Arc<HashMap<String, String>>,
-    // Whether miniblock chunks may use the v2.2 large-chunk metadata.
-    support_large_chunk: bool,
-    // Lance file version selected by the writer.
-    version: LanceFileVersion,
-    // True when the only rep/def information is simple nullable validity.
     is_simple_validity: bool,
-    // True when the field has any non-empty rep/def information.
     has_repdef_info: bool,
 }
 
 impl PrimitiveStructuralEncoder {
     pub fn try_new(
         options: &EncodingOptions,
-        compression_strategy: Arc<dyn CompressionStrategy>,
+        page_encodings: Arc<[PrimitivePageEncoding]>,
         column_index: u32,
         field: Field,
         encoding_metadata: Arc<HashMap<String, String>>,
     ) -> Result<Self> {
-        let requests_sparse = encoding_metadata
-            .get(STRUCTURAL_ENCODING_META_KEY)
-            .is_some_and(|requested| requested.eq_ignore_ascii_case(STRUCTURAL_ENCODING_SPARSE));
-        if requests_sparse && options.version.resolve() < LanceFileVersion::V2_3 {
-            return Err(Error::invalid_input_source(
-                format!(
-                    "Field '{}' requests sparse structural encoding, which requires Lance file format 2.3+; current version is {}",
-                    field.name,
-                    options.version.resolve()
-                )
-                .into(),
-            ));
+        for page_encoding in page_encodings.iter() {
+            page_encoding
+                .behavior
+                .validate_field(&field, &encoding_metadata)?;
         }
         Ok(Self {
             accumulation_queue: AccumulationQueue::new(
@@ -4544,15 +4643,33 @@ impl PrimitiveStructuralEncoder {
                 column_index,
                 options.keep_original_array,
             ),
-            support_large_chunk: options.support_large_chunk(),
             keep_original_array: options.keep_original_array,
             accumulated_repdefs: Vec::new(),
             column_index,
-            compression_strategy,
+            page_encodings,
             field,
             encoding_metadata,
-            version: options.version,
         })
+    }
+
+    fn encode_page(
+        page_encodings: &[PrimitivePageEncoding],
+        ctx: &PrimitiveEncodeContext,
+        mut page: PrimitivePageData,
+    ) -> Result<EncodedPage> {
+        for page_encoding in page_encodings {
+            match page_encoding.behavior.try_encode_page(ctx, page)? {
+                PrimitiveEncodeAttempt::Encoded(page) => return Ok(page),
+                PrimitiveEncodeAttempt::Unhandled(unhandled) => page = unhandled,
+            }
+        }
+        Err(Error::invalid_input_source(
+            format!(
+                "No primitive page encoding atom supports field '{}'",
+                ctx.field.name
+            )
+            .into(),
+        ))
     }
 
     // TODO: This is a heuristic we may need to tune at some point
@@ -4649,7 +4766,7 @@ impl PrimitiveStructuralEncoder {
         miniblocks: MiniBlockCompressed,
         rep: Option<Vec<CompressedLevelsChunk>>,
         def: Option<Vec<CompressedLevelsChunk>>,
-        support_large_chunk: bool,
+        miniblock_chunk_size: MiniblockChunkSize,
     ) -> Result<SerializedMiniBlockPage> {
         let bytes_rep = rep
             .as_ref()
@@ -4670,7 +4787,10 @@ impl PrimitiveStructuralEncoder {
         // 2 bytes for the length of each buffer and up to 7 bytes of padding per buffer
         let max_extra = 9 * num_buffers;
         let mut data_buffer = Vec::with_capacity(bytes_rep + bytes_def + bytes_data + max_extra);
-        let chunk_size_bytes = if support_large_chunk { 4 } else { 2 };
+        let chunk_size_bytes = match miniblock_chunk_size {
+            MiniblockChunkSize::U16 => 2,
+            MiniblockChunkSize::U32 => 4,
+        };
         let mut meta_buffer = Vec::with_capacity(miniblocks.chunks.len() * chunk_size_bytes);
 
         let mut rep_iter = rep.map(|r| r.into_iter());
@@ -4712,7 +4832,7 @@ impl PrimitiveStructuralEncoder {
                 data_buffer.extend_from_slice(&bytes_def.to_le_bytes());
             }
 
-            if support_large_chunk {
+            if miniblock_chunk_size == MiniblockChunkSize::U32 {
                 for &buffer_size in &chunk.buffer_sizes {
                     data_buffer.extend_from_slice(&buffer_size.to_le_bytes());
                 }
@@ -4757,10 +4877,9 @@ impl PrimitiveStructuralEncoder {
             }
 
             let chunk_bytes = data_buffer.len() - start_pos;
-            let max_chunk_size = if support_large_chunk {
-                1_u64 << 31 // 28 bits of 8-byte words in u32 metadata
-            } else {
-                32 * 1024 // 32KiB limit with u16 metadata
+            let max_chunk_size = match miniblock_chunk_size {
+                MiniblockChunkSize::U16 => 32 * 1024,
+                MiniblockChunkSize::U32 => 1_u64 << 31,
             };
             if chunk_bytes == 0 || chunk_bytes as u64 > max_chunk_size {
                 return Err(Error::internal(format!(
@@ -4787,7 +4906,7 @@ impl PrimitiveStructuralEncoder {
             let divided_bytes_minus_one = (divided_bytes - 1) as u64;
 
             let metadata = (divided_bytes_minus_one << 4) | chunk.log_num_values as u64;
-            if support_large_chunk {
+            if miniblock_chunk_size == MiniblockChunkSize::U32 {
                 meta_buffer.extend_from_slice(&(metadata as u32).to_le_bytes());
             } else {
                 meta_buffer.extend_from_slice(&(metadata as u16).to_le_bytes());
@@ -4983,10 +5102,10 @@ impl PrimitiveStructuralEncoder {
         repdef: crate::repdef::SerializedRepDefs,
         row_number: u64,
         num_rows: u64,
-        version: LanceFileVersion,
+        complex_null_encoding: ComplexNullEncoding,
         compression_strategy: &dyn CompressionStrategy,
     ) -> Result<EncodedPage> {
-        if version.resolve() < LanceFileVersion::V2_2 {
+        if complex_null_encoding == ComplexNullEncoding::RawLevels {
             let rep_bytes = if let Some(rep) = repdef.repetition_levels.as_ref() {
                 LanceBuffer::reinterpret_slice(rep.clone())
             } else {
@@ -5280,7 +5399,7 @@ impl PrimitiveStructuralEncoder {
         row_number: u64,
         dictionary_data: Option<DataBlock>,
         num_rows: u64,
-        support_large_chunk: bool,
+        miniblock_chunk_size: MiniblockChunkSize,
     ) -> Result<EncodedPage> {
         if let DataBlock::AllNull(_null_block) = data {
             // We should not be using mini-block for all-null.  There are other structural
@@ -5291,7 +5410,12 @@ impl PrimitiveStructuralEncoder {
         let num_items = data.num_values();
 
         let compressor = compression_strategy.create_miniblock_compressor(field, &data)?;
-        let (compressed_data, value_encoding) = compressor.compress(data)?;
+        let common_chunk_buffers =
+            u64::from(repdef.rep_slicer().is_some()) + u64::from(repdef.def_slicer().is_some());
+        let support_large_chunk = miniblock_chunk_size == MiniblockChunkSize::U32;
+        let compression_context =
+            MiniBlockCompressionContext::new(common_chunk_buffers, support_large_chunk, true);
+        let (compressed_data, value_encoding) = compressor.compress(compression_context, data)?;
 
         let max_rep = repdef.def_meaning.iter().filter(|l| l.is_list()).count() as u16;
 
@@ -5340,7 +5464,8 @@ impl PrimitiveStructuralEncoder {
             .map(|cd| std::mem::take(&mut cd.data));
 
         let serialized =
-            Self::serialize_miniblocks(compressed_data, rep_data, def_data, support_large_chunk)?;
+            Self::serialize_miniblocks(compressed_data, rep_data, def_data, miniblock_chunk_size)?;
+        let has_large_chunk = miniblock_chunk_size == MiniblockChunkSize::U32;
 
         // Metadata, Data, Dictionary, (maybe) Repetition Index
         let mut data = Vec::with_capacity(4);
@@ -5369,7 +5494,7 @@ impl PrimitiveStructuralEncoder {
                 Some((dictionary_encoding, num_dictionary_items)),
                 &repdef.def_meaning,
                 num_items,
-                support_large_chunk,
+                has_large_chunk,
             );
             Ok(EncodedPage {
                 num_rows,
@@ -5388,7 +5513,7 @@ impl PrimitiveStructuralEncoder {
                 None,
                 &repdef.def_meaning,
                 num_items,
-                support_large_chunk,
+                has_large_chunk,
             );
 
             if let Some(rep_index) = rep_index {
@@ -5720,7 +5845,7 @@ impl PrimitiveStructuralEncoder {
     fn should_dictionary_encode(
         data_block: &DataBlock,
         field: &Field,
-        version: LanceFileVersion,
+        fixed_width_dictionary_encoding: FixedWidthDictionaryEncoding,
     ) -> Option<DictEncodingBudget> {
         const DEFAULT_SAMPLE_SIZE: usize = 4096;
         const DEFAULT_SAMPLE_UNIQUE_RATIO: f64 = 0.98;
@@ -5729,7 +5854,9 @@ impl PrimitiveStructuralEncoder {
         // estimating the size for other types.
         match data_block {
             DataBlock::FixedWidth(fixed) => {
-                if fixed.bits_per_value == 64 && version < LanceFileVersion::V2_2 {
+                if fixed.bits_per_value == 64
+                    && fixed_width_dictionary_encoding == FixedWidthDictionaryEncoding::Exclude64Bit
+                {
                     return None;
                 }
                 if fixed.bits_per_value != 64 && fixed.bits_per_value != 128 {
@@ -6048,14 +6175,18 @@ impl PrimitiveStructuralEncoder {
         Ok(pages)
     }
 
-    fn encode_page(ctx: PrimitiveEncodeContext, page: PrimitivePageData) -> Result<EncodedPage> {
+    fn encode_dense_page(
+        ctx: PrimitiveEncodeContext,
+        page: PrimitivePageData,
+        compression_strategy: Arc<dyn CompressionStrategy>,
+        miniblock_chunk_size: MiniblockChunkSize,
+        complex_null_encoding: ComplexNullEncoding,
+        fixed_width_dictionary_encoding: FixedWidthDictionaryEncoding,
+    ) -> Result<EncodedPage> {
         let PrimitiveEncodeContext {
             column_idx,
             field,
-            compression_strategy,
             encoding_metadata,
-            support_large_chunk,
-            version,
             is_simple_validity,
             has_repdef_info,
         } = ctx;
@@ -6072,33 +6203,8 @@ impl PrimitiveStructuralEncoder {
                 repdef,
                 single_row_miniblock_repdef_levels,
             } => (repdef, single_row_miniblock_repdef_levels),
-            PrimitivePageStructure::Sparse {
-                plan,
-                prepared_values,
-            } => {
-                log::debug!(
-                    "Encoding column {} with {} visible items ({} rows) using sparse layout",
-                    column_idx,
-                    num_values,
-                    num_rows
-                );
-                return sparse::writer::encode_page(
-                    column_idx,
-                    &field,
-                    compression_strategy.as_ref(),
-                    prepared_values.map_or_else(
-                        || {
-                            sparse::writer::SparseValueInput::Unprepared(DataBlock::from_arrays(
-                                &arrays, num_values,
-                            ))
-                        },
-                        sparse::writer::SparseValueInput::Prepared,
-                    ),
-                    plan,
-                    row_number,
-                    num_rows,
-                    support_large_chunk,
-                );
+            PrimitivePageStructure::Sparse { .. } => {
+                unreachable!("dense atom received sparse page")
             }
         };
 
@@ -6116,7 +6222,7 @@ impl PrimitiveStructuralEncoder {
                 repdef,
                 row_number,
                 num_rows,
-                version,
+                complex_null_encoding,
                 compression_strategy.as_ref(),
             );
         }
@@ -6148,7 +6254,7 @@ impl PrimitiveStructuralEncoder {
                     repdef,
                     row_number,
                     num_rows,
-                    version,
+                    complex_null_encoding,
                     compression_strategy.as_ref(),
                 )
             };
@@ -6166,20 +6272,6 @@ impl PrimitiveStructuralEncoder {
         }
 
         let data_block = DataBlock::from_arrays(&arrays, num_values);
-
-        if version.resolve() >= LanceFileVersion::V2_2
-            && let Some(scalar) = Self::find_constant_scalar(&arrays, leaf_validity.as_ref())?
-        {
-            log::debug!(
-                "Encoding column {} with {} items ({} rows) using constant layout",
-                column_idx,
-                num_values,
-                num_rows
-            );
-            return constant::encode_constant_page(
-                column_idx, scalar, repdef, row_number, num_rows,
-            );
-        }
 
         if let Some(num_levels) = single_row_miniblock_repdef_levels {
             let requested_encoding = encoding_metadata
@@ -6329,24 +6421,29 @@ impl PrimitiveStructuralEncoder {
                 row_number,
                 Some(dictionary_data_block),
                 num_rows,
-                support_large_chunk,
+                miniblock_chunk_size,
             );
         }
 
         // Try dictionary encoding first if applicable. If encoding aborts, fall back to the
         // preferred structural encoding.
-        let dict_result = Self::should_dictionary_encode(&data_block, &field, version).and_then(|budget| {
-                log::debug!(
-                    "Encoding column {} with {} items using dictionary encoding (mini-block layout)",
-                    column_idx,
-                    num_values
-                );
-                dict::dictionary_encode(
-                    &data_block,
-                    budget.max_dict_entries,
-                    budget.max_encoded_size,
-                )
-            });
+        let dict_result = Self::should_dictionary_encode(
+            &data_block,
+            &field,
+            fixed_width_dictionary_encoding,
+        )
+        .and_then(|budget| {
+            log::debug!(
+                "Encoding column {} with {} items using dictionary encoding (mini-block layout)",
+                column_idx,
+                num_values
+            );
+            dict::dictionary_encode(
+                &data_block,
+                budget.max_dict_entries,
+                budget.max_encoded_size,
+            )
+        });
 
         if let Some((indices_data_block, dictionary_data_block)) = dict_result {
             Self::encode_miniblock(
@@ -6358,7 +6455,7 @@ impl PrimitiveStructuralEncoder {
                 row_number,
                 Some(dictionary_data_block),
                 num_rows,
-                support_large_chunk,
+                miniblock_chunk_size,
             )
         } else if Self::prefers_miniblock(&data_block, encoding_metadata.as_ref()) {
             log::debug!(
@@ -6375,7 +6472,7 @@ impl PrimitiveStructuralEncoder {
                 row_number,
                 None,
                 num_rows,
-                support_large_chunk,
+                miniblock_chunk_size,
             )
         } else if Self::prefers_fullzip(encoding_metadata.as_ref()) {
             log::debug!(
@@ -6409,96 +6506,48 @@ impl PrimitiveStructuralEncoder {
         let is_simple_validity = repdefs.iter().all(|rd| rd.is_simple_validity());
         let has_repdef_info = repdefs.iter().any(|rd| !rd.is_empty());
         let normalized = RepDefBuilder::normalize(repdefs);
-        let requested_encoding = self.encoding_metadata.get(STRUCTURAL_ENCODING_META_KEY);
-        let requests_sparse = requested_encoding
-            .is_some_and(|requested| requested.eq_ignore_ascii_case(STRUCTURAL_ENCODING_SPARSE));
-        let sparse_plan = requests_sparse
-            .then(|| sparse::writer::plan(&normalized, num_values))
-            .transpose()?;
-        let pages = if let Some(plan) = sparse_plan
-            && !sparse::writer::uses_constant_layout(&plan, &self.field)
-        {
-            vec![PrimitivePageData {
-                arrays,
-                structure: PrimitivePageStructure::Sparse {
-                    plan,
-                    prepared_values: None,
-                },
+        let plan_ctx = PrimitivePlanContext {
+            column_idx: self.column_index,
+            field: &self.field,
+            encoding_metadata: &self.encoding_metadata,
+        };
+        let mut pages = None;
+        for page_encoding in self.page_encodings.iter() {
+            if let Some(planned) = page_encoding.behavior.try_plan_pages(
+                &plan_ctx,
+                &arrays,
+                &normalized,
                 row_number,
                 num_rows,
-            }]
-        } else {
-            let (repdef, miniblock_repdef_budget) = normalized
-                .serialize_with_miniblock_repdef_budget(
-                    miniblock::max_repdef_levels_per_chunk,
-                    num_rows,
-                    num_values,
-                )?;
-            let automatic_sparse = layout::select_automatic_sparse(
-                self.version.resolve(),
-                requested_encoding.map(String::as_str),
-                &miniblock_repdef_budget,
-                || {
-                    let data = DataBlock::from_arrays(&arrays, num_values);
-                    if !sparse::writer::supports_value_block(&data) {
-                        return Ok(None);
-                    }
-                    let prepared_values = match sparse::writer::prepare_values(
-                        &self.field,
-                        self.compression_strategy.as_ref(),
-                        data,
-                        self.support_large_chunk,
-                    ) {
-                        Ok(prepared_values) => prepared_values,
-                        Err(error) => {
-                            debug!(
-                                "Keeping column {} on its dense structural path because sparse value preparation is unavailable: {}",
-                                self.column_index, error
-                            );
-                            return Ok(None);
-                        }
-                    };
-                    let plan = sparse::writer::plan(&normalized, num_values)?;
-                    if sparse::writer::uses_constant_layout(&plan, &self.field) {
-                        return Ok(None);
-                    }
-                    Ok(Some((plan, prepared_values)))
-                },
-            )?;
-            match automatic_sparse {
-                Some((plan, prepared_values)) => vec![PrimitivePageData {
-                    arrays,
-                    structure: PrimitivePageStructure::Sparse {
-                        plan,
-                        prepared_values: Some(prepared_values),
-                    },
-                    row_number,
-                    num_rows,
-                }],
-                None => Self::split_pages_for_miniblock_repdef_budget(
-                    arrays,
-                    repdef,
-                    miniblock_repdef_budget,
-                    row_number,
-                    num_rows,
-                )?,
+                num_values,
+            )? {
+                pages = Some(planned);
+                break;
             }
-        };
+        }
+        let pages = pages.ok_or_else(|| {
+            Error::invalid_input_source(
+                format!(
+                    "No primitive page planner supports field '{}'",
+                    self.field.name
+                )
+                .into(),
+            )
+        })?;
 
         let mut tasks = Vec::with_capacity(pages.len());
         let ctx = PrimitiveEncodeContext {
             column_idx: self.column_index,
             field: self.field.clone(),
-            compression_strategy: self.compression_strategy.clone(),
             encoding_metadata: self.encoding_metadata.clone(),
-            support_large_chunk: self.support_large_chunk,
-            version: self.version,
             is_simple_validity,
             has_repdef_info,
         };
         for page in pages {
             let ctx = ctx.clone();
-            let task = spawn_cpu(move || Self::encode_page(ctx, page)).boxed();
+            let page_encodings = self.page_encodings.clone();
+            let task =
+                spawn_cpu(move || Self::encode_page(page_encodings.as_ref(), &ctx, page)).boxed();
             tasks.push(task);
         }
         Ok(tasks)
@@ -6547,6 +6596,291 @@ impl PrimitiveStructuralEncoder {
             // with a rep/def value for every single item in the vector.
             _ => Self::extract_validity_buf(array, repdef, keep_original_array),
         }
+    }
+}
+
+impl PrimitivePageEncodingBehavior for RejectSparsePrimitiveEncoding {
+    fn validate_field(&self, field: &Field, metadata: &HashMap<String, String>) -> Result<()> {
+        if metadata
+            .get(STRUCTURAL_ENCODING_META_KEY)
+            .is_some_and(|requested| requested.eq_ignore_ascii_case(STRUCTURAL_ENCODING_SPARSE))
+        {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "Field '{}' requests sparse structural encoding, which is not enabled by the selected file format",
+                    field.name
+                )
+                .into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn plan_dense_primitive_pages(
+    arrays: &[ArrayRef],
+    normalized: &NormalizedStructuralPlan,
+    row_number: u64,
+    num_rows: u64,
+    num_values: u64,
+) -> Result<Vec<PrimitivePageData>> {
+    let (repdef, miniblock_repdef_budget) = normalized.serialize_with_miniblock_repdef_budget(
+        miniblock::max_repdef_levels_per_chunk,
+        num_rows,
+        num_values,
+    )?;
+    PrimitiveStructuralEncoder::split_pages_for_miniblock_repdef_budget(
+        arrays.to_vec(),
+        repdef,
+        miniblock_repdef_budget,
+        row_number,
+        num_rows,
+    )
+}
+
+impl PrimitivePageEncodingBehavior for DenseU16PrimitiveEncoding {
+    fn try_plan_pages(
+        &self,
+        _ctx: &PrimitivePlanContext<'_>,
+        arrays: &[ArrayRef],
+        normalized: &NormalizedStructuralPlan,
+        row_number: u64,
+        num_rows: u64,
+        num_values: u64,
+    ) -> Result<Option<Vec<PrimitivePageData>>> {
+        Ok(Some(plan_dense_primitive_pages(
+            arrays, normalized, row_number, num_rows, num_values,
+        )?))
+    }
+
+    fn try_encode_page(
+        &self,
+        ctx: &PrimitiveEncodeContext,
+        page: PrimitivePageData,
+    ) -> Result<PrimitiveEncodeAttempt> {
+        if !matches!(&page.structure, PrimitivePageStructure::Dense { .. }) {
+            return Ok(PrimitiveEncodeAttempt::Unhandled(page));
+        }
+        Ok(PrimitiveEncodeAttempt::Encoded(
+            PrimitiveStructuralEncoder::encode_dense_page(
+                ctx.clone(),
+                page,
+                self.compression.clone(),
+                MiniblockChunkSize::U16,
+                ComplexNullEncoding::RawLevels,
+                FixedWidthDictionaryEncoding::Exclude64Bit,
+            )?,
+        ))
+    }
+}
+
+impl PrimitivePageEncodingBehavior for DenseU32PrimitiveEncoding {
+    fn try_plan_pages(
+        &self,
+        _ctx: &PrimitivePlanContext<'_>,
+        arrays: &[ArrayRef],
+        normalized: &NormalizedStructuralPlan,
+        row_number: u64,
+        num_rows: u64,
+        num_values: u64,
+    ) -> Result<Option<Vec<PrimitivePageData>>> {
+        Ok(Some(plan_dense_primitive_pages(
+            arrays, normalized, row_number, num_rows, num_values,
+        )?))
+    }
+
+    fn try_encode_page(
+        &self,
+        ctx: &PrimitiveEncodeContext,
+        page: PrimitivePageData,
+    ) -> Result<PrimitiveEncodeAttempt> {
+        if !matches!(&page.structure, PrimitivePageStructure::Dense { .. }) {
+            return Ok(PrimitiveEncodeAttempt::Unhandled(page));
+        }
+        Ok(PrimitiveEncodeAttempt::Encoded(
+            PrimitiveStructuralEncoder::encode_dense_page(
+                ctx.clone(),
+                page,
+                self.compression.clone(),
+                MiniblockChunkSize::U32,
+                ComplexNullEncoding::CompressedLevels,
+                FixedWidthDictionaryEncoding::Include64Bit,
+            )?,
+        ))
+    }
+}
+
+impl PrimitivePageEncodingBehavior for SparsePrimitiveEncoding {
+    fn try_plan_pages(
+        &self,
+        ctx: &PrimitivePlanContext<'_>,
+        arrays: &[ArrayRef],
+        normalized: &NormalizedStructuralPlan,
+        row_number: u64,
+        num_rows: u64,
+        num_values: u64,
+    ) -> Result<Option<Vec<PrimitivePageData>>> {
+        let requested_encoding = ctx.encoding_metadata.get(STRUCTURAL_ENCODING_META_KEY);
+        let requests_sparse = requested_encoding
+            .is_some_and(|requested| requested.eq_ignore_ascii_case(STRUCTURAL_ENCODING_SPARSE));
+        if requests_sparse {
+            let plan = sparse::writer::plan(normalized, num_values)?;
+            if sparse::writer::uses_constant_layout(&plan, ctx.field) {
+                return Ok(None);
+            }
+            return Ok(Some(vec![PrimitivePageData {
+                arrays: arrays.to_vec(),
+                structure: PrimitivePageStructure::Sparse {
+                    plan,
+                    prepared_values: None,
+                },
+                row_number,
+                num_rows,
+            }]));
+        }
+
+        let (_, miniblock_repdef_budget) = normalized.serialize_with_miniblock_repdef_budget(
+            miniblock::max_repdef_levels_per_chunk,
+            num_rows,
+            num_values,
+        )?;
+        let automatic_sparse = layout::select_automatic_sparse(
+            requested_encoding.map(String::as_str),
+            &miniblock_repdef_budget,
+            || {
+                let data = DataBlock::from_arrays(arrays, num_values);
+                if !sparse::writer::supports_value_block(&data) {
+                    return Ok(None);
+                }
+                let prepared_values = match sparse::writer::prepare_values(
+                    ctx.field,
+                    self.compression.as_ref(),
+                    data,
+                    MiniblockChunkSize::U32,
+                ) {
+                    Ok(prepared_values) => prepared_values,
+                    Err(error) => {
+                        debug!(
+                            "Keeping column {} on its dense structural path because sparse value preparation is unavailable: {}",
+                            ctx.column_idx, error
+                        );
+                        return Ok(None);
+                    }
+                };
+                let plan = sparse::writer::plan(normalized, num_values)?;
+                if sparse::writer::uses_constant_layout(&plan, ctx.field) {
+                    return Ok(None);
+                }
+                Ok(Some((plan, prepared_values)))
+            },
+        )?;
+        Ok(automatic_sparse.map(|(plan, prepared_values)| {
+            vec![PrimitivePageData {
+                arrays: arrays.to_vec(),
+                structure: PrimitivePageStructure::Sparse {
+                    plan,
+                    prepared_values: Some(prepared_values),
+                },
+                row_number,
+                num_rows,
+            }]
+        }))
+    }
+
+    fn try_encode_page(
+        &self,
+        ctx: &PrimitiveEncodeContext,
+        page: PrimitivePageData,
+    ) -> Result<PrimitiveEncodeAttempt> {
+        if !matches!(&page.structure, PrimitivePageStructure::Sparse { .. }) {
+            return Ok(PrimitiveEncodeAttempt::Unhandled(page));
+        }
+        let PrimitivePageData {
+            arrays,
+            structure:
+                PrimitivePageStructure::Sparse {
+                    plan,
+                    prepared_values,
+                },
+            row_number,
+            num_rows,
+        } = page
+        else {
+            unreachable!()
+        };
+        let num_values = arrays.iter().map(|array| array.len() as u64).sum();
+        log::debug!(
+            "Encoding column {} with {} visible items ({} rows) using sparse layout",
+            ctx.column_idx,
+            num_values,
+            num_rows
+        );
+        Ok(PrimitiveEncodeAttempt::Encoded(
+            sparse::writer::encode_page(
+                ctx.column_idx,
+                &ctx.field,
+                self.compression.as_ref(),
+                prepared_values.map_or_else(
+                    || {
+                        sparse::writer::SparseValueInput::Unprepared(DataBlock::from_arrays(
+                            &arrays, num_values,
+                        ))
+                    },
+                    sparse::writer::SparseValueInput::Prepared,
+                ),
+                plan,
+                row_number,
+                num_rows,
+                MiniblockChunkSize::U32,
+            )?,
+        ))
+    }
+}
+
+impl PrimitivePageEncodingBehavior for ConstantPrimitiveEncoding {
+    fn try_encode_page(
+        &self,
+        ctx: &PrimitiveEncodeContext,
+        page: PrimitivePageData,
+    ) -> Result<PrimitiveEncodeAttempt> {
+        let PrimitivePageStructure::Dense { repdef, .. } = &page.structure else {
+            return Ok(PrimitiveEncodeAttempt::Unhandled(page));
+        };
+        let num_values: u64 = page.arrays.iter().map(|array| array.len() as u64).sum();
+        if num_values == 0 {
+            return Ok(PrimitiveEncodeAttempt::Unhandled(page));
+        }
+        let leaf_validity = PrimitiveStructuralEncoder::leaf_validity(repdef, num_values as usize)?;
+        if leaf_validity
+            .as_ref()
+            .is_some_and(|validity| validity.count_set_bits() == 0)
+            || matches!(ctx.field.data_type(), DataType::Struct(fields) if fields.is_empty())
+        {
+            return Ok(PrimitiveEncodeAttempt::Unhandled(page));
+        }
+        let Some(scalar) =
+            PrimitiveStructuralEncoder::find_constant_scalar(&page.arrays, leaf_validity.as_ref())?
+        else {
+            return Ok(PrimitiveEncodeAttempt::Unhandled(page));
+        };
+        let PrimitivePageData {
+            structure: PrimitivePageStructure::Dense { repdef, .. },
+            row_number,
+            num_rows,
+            ..
+        } = page
+        else {
+            unreachable!()
+        };
+        log::debug!(
+            "Encoding column {} with {} items ({} rows) using constant layout",
+            ctx.column_idx,
+            num_values,
+            num_rows
+        );
+        Ok(PrimitiveEncodeAttempt::Encoded(
+            constant::encode_constant_page(ctx.column_idx, scalar, repdef, row_number, num_rows)?,
+        ))
     }
 }
 
@@ -6600,11 +6934,12 @@ impl FieldEncoder for PrimitiveStructuralEncoder {
 mod tests {
     use super::{
         ChunkInstructions, DataBlock, DecodeMiniBlockTask, FixedPerValueDecompressor,
-        FixedWidthDataBlock, FullZipCacheableState, FullZipDecodeDetails, FullZipReadSource,
-        FullZipRepIndexDetails, FullZipScheduler, LazyLevels, LevelCodec, LevelCursor, LevelPlan,
-        MiniBlockChunk, MiniBlockChunkIndex, MiniBlockCompressed, PerValueDecompressor,
-        PreambleAction, RunEndsBuilder, RunPosition, RunStorage, StructuralPageScheduler,
-        VariableFullZipDecoder, dense_levels_from_block, validate_complex_all_null_levels,
+        FixedWidthDataBlock, FixedWidthDictionaryEncoding, FullZipCacheableState,
+        FullZipDecodeDetails, FullZipReadSource, FullZipRepIndexDetails, FullZipScheduler,
+        LazyLevels, LevelCodec, LevelCursor, LevelPlan, MiniBlockChunk, MiniBlockChunkIndex,
+        MiniBlockCompressed, MiniblockChunkSize, PerValueDecompressor, PreambleAction,
+        RunEndsBuilder, RunPosition, RunStorage, StructuralPageScheduler, VariableFullZipDecoder,
+        dense_levels_from_block, validate_complex_all_null_levels,
     };
     use crate::buffer::LanceBuffer;
     use crate::compression::{BlockCompressor, DefaultDecompressionStrategy};
@@ -6623,8 +6958,8 @@ mod tests {
     use crate::format::pb21;
     use crate::format::pb21::compressive_encoding::Compression;
     use crate::repdef::build_control_word_iterator;
+    use crate::testing::TestEncoding;
     use crate::testing::{TestCases, check_round_trip_encoding_of_data};
-    use crate::version::LanceFileVersion;
     use arrow_array::{ArrayRef, Int8Array, StringArray};
     use arrow_buffer::ScalarBuffer;
     use arrow_schema::{DataType, Field as ArrowField};
@@ -7943,7 +8278,7 @@ mod tests {
         );
 
         let test_cases = TestCases::default()
-            .with_min_file_version(LanceFileVersion::V2_1)
+            .with_structural_encodings()
             .with_batch_size(100)
             .with_range(0..num_rows.min(500) as u64)
             .with_indices(vec![0, num_rows as u64 / 2, (num_rows - 1) as u64]);
@@ -7954,7 +8289,7 @@ mod tests {
     async fn test_minichunk_size_helper(
         string_data: Vec<Option<String>>,
         minichunk_size: u64,
-        file_version: LanceFileVersion,
+        encodings: &[TestEncoding],
     ) {
         use crate::constants::MINICHUNK_SIZE_META_KEY;
         use crate::testing::{TestCases, check_round_trip_encoding_of_data};
@@ -7974,7 +8309,7 @@ mod tests {
         );
 
         let test_cases = TestCases::default()
-            .with_min_file_version(file_version)
+            .with_encodings(encodings.iter().copied())
             .with_batch_size(1000);
 
         check_round_trip_encoding_of_data(vec![string_array], &test_cases, metadata).await;
@@ -7988,7 +8323,16 @@ mod tests {
             string_data.push(Some(format!("test_string_{}", i).repeat(50)));
         }
         // configure minichunk size to 64 bytes (smaller than the default 4kb) for Lance 2.1
-        test_minichunk_size_helper(string_data, 64, LanceFileVersion::V2_1).await;
+        test_minichunk_size_helper(
+            string_data,
+            64,
+            &[
+                TestEncoding::StructuralU16,
+                TestEncoding::StructuralU32,
+                TestEncoding::StructuralSparse,
+            ],
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -7999,7 +8343,12 @@ mod tests {
         for i in 0..10000 {
             string_data.push(Some(format!("test_string_{}", i).repeat(50)));
         }
-        test_minichunk_size_helper(string_data, 128 * 1024, LanceFileVersion::V2_2).await;
+        test_minichunk_size_helper(
+            string_data,
+            128 * 1024,
+            &[TestEncoding::StructuralU32, TestEncoding::StructuralSparse],
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -8009,7 +8358,12 @@ mod tests {
         for i in 0..10000 {
             string_data.push(Some(format!("t_{}", i)));
         }
-        test_minichunk_size_helper(string_data, 128 * 1024, LanceFileVersion::V2_2).await;
+        test_minichunk_size_helper(
+            string_data,
+            128 * 1024,
+            &[TestEncoding::StructuralU32, TestEncoding::StructuralSparse],
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -8036,7 +8390,7 @@ mod tests {
 
         // Configure test to use V2_2 and verify encoding
         let test_cases = TestCases::default()
-            .with_min_file_version(LanceFileVersion::V2_2)
+            .with_u32_structural_encodings()
             .with_verify_encoding(Arc::new(|cols: &[crate::encoder::EncodedColumn], _| {
                 assert_eq!(cols.len(), 1);
                 let col = &cols[0];
@@ -8106,7 +8460,7 @@ mod tests {
         )
         .with_metadata(metadata);
 
-        encode_first_page(field, dict_array, LanceFileVersion::V2_2).await
+        encode_first_page(field, dict_array, TestEncoding::StructuralU32).await
     }
 
     async fn encode_auto_fixed_dict_page(
@@ -8136,7 +8490,7 @@ mod tests {
         let field = arrow_schema::Field::new("fixed_col", DataType::Decimal128(38, 0), false)
             .with_metadata(field_metadata);
 
-        encode_first_page(field, decimal, LanceFileVersion::V2_2).await
+        encode_first_page(field, decimal, TestEncoding::StructuralU32).await
     }
 
     #[tokio::test]
@@ -8263,7 +8617,6 @@ mod tests {
     async fn test_dictionary_encode_int64() {
         use crate::constants::{DICT_SIZE_RATIO_META_KEY, STRUCTURAL_ENCODING_META_KEY};
         use crate::testing::{TestCases, check_round_trip_encoding_of_data};
-        use crate::version::LanceFileVersion;
         use arrow_array::{ArrayRef, Int64Array};
         use std::collections::HashMap;
         use std::sync::Arc;
@@ -8286,7 +8639,7 @@ mod tests {
         metadata.insert(DICT_SIZE_RATIO_META_KEY.to_string(), "0.99".to_string());
 
         let test_cases = TestCases::default()
-            .with_min_file_version(LanceFileVersion::V2_2)
+            .with_u32_structural_encodings()
             .with_batch_size(1000)
             .with_range(0..1000)
             .with_indices(vec![0, 1, 10, 999])
@@ -8299,7 +8652,6 @@ mod tests {
     async fn test_dictionary_encode_float64() {
         use crate::constants::{DICT_SIZE_RATIO_META_KEY, STRUCTURAL_ENCODING_META_KEY};
         use crate::testing::{TestCases, check_round_trip_encoding_of_data};
-        use crate::version::LanceFileVersion;
         use arrow_array::{ArrayRef, Float64Array};
         use std::collections::HashMap;
         use std::sync::Arc;
@@ -8322,7 +8674,7 @@ mod tests {
         metadata.insert(DICT_SIZE_RATIO_META_KEY.to_string(), "0.99".to_string());
 
         let test_cases = TestCases::default()
-            .with_min_file_version(LanceFileVersion::V2_2)
+            .with_u32_structural_encodings()
             .with_batch_size(1000)
             .with_range(0..1000)
             .with_indices(vec![0, 1, 10, 999])
@@ -8457,7 +8809,7 @@ mod tests {
         let result = PrimitiveStructuralEncoder::should_dictionary_encode(
             &block,
             &field,
-            LanceFileVersion::V2_1,
+            FixedWidthDictionaryEncoding::Exclude64Bit,
         );
 
         assert!(
@@ -8504,7 +8856,7 @@ mod tests {
         let result = PrimitiveStructuralEncoder::should_dictionary_encode(
             &block,
             &field,
-            LanceFileVersion::V2_2,
+            FixedWidthDictionaryEncoding::Include64Bit,
         );
 
         assert!(
@@ -8531,7 +8883,7 @@ mod tests {
         let result = PrimitiveStructuralEncoder::should_dictionary_encode(
             &block,
             &field,
-            LanceFileVersion::V2_2,
+            FixedWidthDictionaryEncoding::Include64Bit,
         );
 
         assert!(
@@ -8549,7 +8901,7 @@ mod tests {
         let field = arrow_schema::Field::new("test", DataType::Utf8, false).with_metadata(metadata);
         let array = create_sorted_string_array(200_000, 8_000);
 
-        let page = encode_first_page(field, array, LanceFileVersion::V2_2).await;
+        let page = encode_first_page(field, array, TestEncoding::StructuralU32).await;
         let _ = dictionary_encoding_from_page(&page);
     }
 
@@ -8569,7 +8921,7 @@ mod tests {
         let result = PrimitiveStructuralEncoder::should_dictionary_encode(
             &block,
             &field,
-            LanceFileVersion::V2_1,
+            FixedWidthDictionaryEncoding::Exclude64Bit,
         );
 
         assert!(
@@ -8595,7 +8947,7 @@ mod tests {
         let result = PrimitiveStructuralEncoder::should_dictionary_encode(
             &block,
             &field,
-            LanceFileVersion::V2_1,
+            FixedWidthDictionaryEncoding::Exclude64Bit,
         );
 
         assert!(
@@ -8621,9 +8973,13 @@ mod tests {
             num_values: 32_769,
         };
 
-        let serialized =
-            PrimitiveStructuralEncoder::serialize_miniblocks(miniblocks, None, None, false)
-                .unwrap();
+        let serialized = PrimitiveStructuralEncoder::serialize_miniblocks(
+            miniblocks,
+            None,
+            None,
+            MiniblockChunkSize::U16,
+        )
+        .unwrap();
 
         let chunk_metadata = serialized.metadata.borrow_to_typed_slice::<u16>();
         assert_eq!(chunk_metadata.len(), 2);
@@ -8637,33 +8993,33 @@ mod tests {
     async fn encode_first_page(
         field: arrow_schema::Field,
         array: ArrayRef,
-        version: LanceFileVersion,
+        version: TestEncoding,
     ) -> crate::encoder::EncodedPage {
-        use crate::encoder::{
-            ColumnIndexSequence, EncodingOptions, MIN_PAGE_BUFFER_ALIGNMENT, OutOfLineBuffers,
-            default_encoding_strategy,
-        };
         use crate::repdef::RepDefBuilder;
+        use crate::{
+            encoder::{
+                ColumnIndexSequence, EncodingOptions, MIN_PAGE_BUFFER_ALIGNMENT, OutOfLineBuffers,
+            },
+            testing::{create_test_field_encoder, test_encoding_strategy},
+        };
 
         let lance_field = lance_core::datatypes::Field::try_from(&field).unwrap();
-        let encoding_strategy = default_encoding_strategy(version);
+        let encoding_strategy = test_encoding_strategy(version);
         let mut column_index_seq = ColumnIndexSequence::default();
         let encoding_options = EncodingOptions {
             cache_bytes_per_column: 1,
             max_page_bytes: 32 * 1024 * 1024,
             keep_original_array: true,
             buffer_alignment: MIN_PAGE_BUFFER_ALIGNMENT,
-            version,
         };
 
-        let mut encoder = encoding_strategy
-            .create_field_encoder(
-                encoding_strategy.as_ref(),
-                &lance_field,
-                &mut column_index_seq,
-                &encoding_options,
-            )
-            .unwrap();
+        let mut encoder = create_test_field_encoder(
+            encoding_strategy.as_ref(),
+            &lance_field,
+            &mut column_index_seq,
+            &encoding_options,
+        )
+        .unwrap();
 
         let mut external_buffers = OutOfLineBuffers::new(0, MIN_PAGE_BUFFER_ALIGNMENT);
         let repdef = RepDefBuilder::default();
@@ -8694,7 +9050,7 @@ mod tests {
             .unwrap(),
         );
         let field = arrow_schema::Field::new("c", DataType::FixedSizeBinary(33), true);
-        let page = encode_first_page(field, arr.clone(), LanceFileVersion::V2_2).await;
+        let page = encode_first_page(field, arr.clone(), TestEncoding::StructuralU32).await;
 
         let PageEncoding::Structural(layout) = &page.description else {
             panic!("Expected structural encoding");
@@ -8706,8 +9062,7 @@ mod tests {
         assert_eq!(page.data.len(), 1);
 
         let test_cases = TestCases::default()
-            .with_min_file_version(LanceFileVersion::V2_2)
-            .with_max_file_version(LanceFileVersion::V2_2)
+            .with_encoding(TestEncoding::StructuralU32)
             .with_page_sizes(vec![4096]);
         check_round_trip_encoding_of_data(vec![arr], &test_cases, HashMap::new()).await;
     }
@@ -8720,7 +9075,7 @@ mod tests {
             std::iter::repeat_n("hello", 512),
         ));
         let field = arrow_schema::Field::new("c", DataType::Utf8, true);
-        let page = encode_first_page(field, arr.clone(), LanceFileVersion::V2_2).await;
+        let page = encode_first_page(field, arr.clone(), TestEncoding::StructuralU32).await;
 
         let PageEncoding::Structural(layout) = &page.description else {
             panic!("Expected structural encoding");
@@ -8732,8 +9087,7 @@ mod tests {
         assert_eq!(page.data.len(), 1);
 
         let test_cases = TestCases::default()
-            .with_min_file_version(LanceFileVersion::V2_2)
-            .with_max_file_version(LanceFileVersion::V2_2)
+            .with_encoding(TestEncoding::StructuralU32)
             .with_page_sizes(vec![4096]);
         check_round_trip_encoding_of_data(vec![arr], &test_cases, HashMap::new()).await;
     }
@@ -8750,7 +9104,7 @@ mod tests {
             Some(7),
         ]));
         let field = arrow_schema::Field::new("c", DataType::Int32, true);
-        let page = encode_first_page(field, arr.clone(), LanceFileVersion::V2_2).await;
+        let page = encode_first_page(field, arr.clone(), TestEncoding::StructuralU32).await;
 
         let PageEncoding::Structural(layout) = &page.description else {
             panic!("Expected structural encoding");
@@ -8762,8 +9116,7 @@ mod tests {
         assert_eq!(page.data.len(), 2);
 
         let test_cases = TestCases::default()
-            .with_min_file_version(LanceFileVersion::V2_2)
-            .with_max_file_version(LanceFileVersion::V2_2)
+            .with_encoding(TestEncoding::StructuralU32)
             .with_page_sizes(vec![4096]);
         check_round_trip_encoding_of_data(vec![arr], &test_cases, HashMap::new()).await;
     }
@@ -8796,7 +9149,7 @@ mod tests {
             ))),
             true,
         );
-        let page = encode_first_page(field, arr.clone(), LanceFileVersion::V2_2).await;
+        let page = encode_first_page(field, arr.clone(), TestEncoding::StructuralU32).await;
 
         let PageEncoding::Structural(layout) = &page.description else {
             panic!("Expected structural encoding");
@@ -8808,8 +9161,7 @@ mod tests {
         assert_eq!(page.data.len(), 2);
 
         let test_cases = TestCases::default()
-            .with_min_file_version(LanceFileVersion::V2_2)
-            .with_max_file_version(LanceFileVersion::V2_2)
+            .with_encoding(TestEncoding::StructuralU32)
             .with_page_sizes(vec![4096]);
         check_round_trip_encoding_of_data(vec![arr], &test_cases, HashMap::new()).await;
     }
@@ -8835,7 +9187,7 @@ mod tests {
             ),
             true,
         );
-        let page = encode_first_page(field, arr.clone(), LanceFileVersion::V2_2).await;
+        let page = encode_first_page(field, arr.clone(), TestEncoding::StructuralU32).await;
 
         if let PageEncoding::Structural(layout) = &page.description {
             assert!(
@@ -8845,8 +9197,7 @@ mod tests {
         }
 
         let test_cases = TestCases::default()
-            .with_min_file_version(LanceFileVersion::V2_2)
-            .with_max_file_version(LanceFileVersion::V2_2)
+            .with_encoding(TestEncoding::StructuralU32)
             .with_page_sizes(vec![4096]);
         check_round_trip_encoding_of_data(vec![arr], &test_cases, HashMap::new()).await;
     }
@@ -8857,7 +9208,7 @@ mod tests {
 
         let arr: ArrayRef = Arc::new(arrow_array::Int32Array::from(vec![7; 1024]));
         let field = arrow_schema::Field::new("c", DataType::Int32, true);
-        let page = encode_first_page(field, arr.clone(), LanceFileVersion::V2_1).await;
+        let page = encode_first_page(field, arr.clone(), TestEncoding::StructuralU16).await;
 
         let PageEncoding::Structural(layout) = &page.description else {
             return;
@@ -8868,8 +9219,7 @@ mod tests {
         );
 
         let test_cases = TestCases::default()
-            .with_min_file_version(LanceFileVersion::V2_1)
-            .with_max_file_version(LanceFileVersion::V2_1)
+            .with_encoding(TestEncoding::StructuralU16)
             .with_page_sizes(vec![4096]);
         check_round_trip_encoding_of_data(vec![arr], &test_cases, HashMap::new()).await;
     }
@@ -8880,7 +9230,7 @@ mod tests {
 
         let arr: ArrayRef = Arc::new(arrow_array::Int32Array::from(vec![None, None, None]));
         let field = arrow_schema::Field::new("c", DataType::Int32, true);
-        let page = encode_first_page(field, arr.clone(), LanceFileVersion::V2_2).await;
+        let page = encode_first_page(field, arr.clone(), TestEncoding::StructuralU32).await;
 
         let PageEncoding::Structural(layout) = &page.description else {
             panic!("Expected structural encoding");
@@ -8892,26 +9242,26 @@ mod tests {
         assert_eq!(page.data.len(), 0);
 
         let test_cases = TestCases::default()
-            .with_min_file_version(LanceFileVersion::V2_2)
-            .with_max_file_version(LanceFileVersion::V2_2)
+            .with_encoding(TestEncoding::StructuralU32)
             .with_page_sizes(vec![4096]);
         check_round_trip_encoding_of_data(vec![arr], &test_cases, HashMap::new()).await;
     }
 
     #[test]
     fn test_encode_decode_complex_all_null_vals_roundtrip() {
-        use crate::compression::{
-            DecompressionStrategy, DefaultCompressionStrategy, DefaultDecompressionStrategy,
-        };
+        use crate::compression::{DecompressionStrategy, DefaultDecompressionStrategy};
 
         let values: Arc<[u16]> = Arc::from((0..2048).map(|i| (i % 5) as u16).collect::<Vec<u16>>());
 
-        let compression_strategy = DefaultCompressionStrategy::default();
+        let compression_strategy = crate::testing::test_compression_strategy(
+            TestEncoding::StructuralU16,
+            crate::compression_config::CompressionParams::default(),
+        );
         let decompression_strategy = DefaultDecompressionStrategy::default();
 
         let (compressed_buf, encoding) = PrimitiveStructuralEncoder::encode_complex_all_null_vals(
             &values,
-            &compression_strategy,
+            compression_strategy.as_ref(),
         )
         .unwrap();
 
@@ -8947,7 +9297,8 @@ mod tests {
             true,
         );
 
-        let page_v21 = encode_first_page(field.clone(), arr.clone(), LanceFileVersion::V2_1).await;
+        let page_v21 =
+            encode_first_page(field.clone(), arr.clone(), TestEncoding::StructuralU16).await;
         let PageEncoding::Structural(layout_v21) = &page_v21.description else {
             panic!("Expected structural encoding");
         };
@@ -8959,7 +9310,7 @@ mod tests {
         assert_eq!(layout_v21.num_rep_values, 0);
         assert_eq!(layout_v21.num_def_values, 0);
 
-        let page_v22 = encode_first_page(field, arr, LanceFileVersion::V2_2).await;
+        let page_v22 = encode_first_page(field, arr, TestEncoding::StructuralU32).await;
         let PageEncoding::Structural(layout_v22) = &page_v22.description else {
             panic!("Expected structural encoding");
         };
@@ -8978,7 +9329,7 @@ mod tests {
             (0..1000).map(|i| if i % 2 == 0 { None } else { Some(vec![]) }),
         );
 
-        let test_cases = TestCases::default().with_min_file_version(LanceFileVersion::V2_2);
+        let test_cases = TestCases::default().with_u32_structural_encodings();
         check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases, HashMap::new())
             .await;
     }
@@ -8993,7 +9344,7 @@ mod tests {
             (0..5000).map(|_| None::<Vec<Option<i32>>>),
         );
 
-        let test_cases = TestCases::default().with_min_file_version(LanceFileVersion::V2_2);
+        let test_cases = TestCases::default().with_u32_structural_encodings();
         check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases, HashMap::new())
             .await;
     }
@@ -9501,7 +9852,7 @@ mod tests {
         }
         let list_array = Arc::new(list_builder.finish());
 
-        let test_cases = TestCases::default().with_min_file_version(LanceFileVersion::V2_1);
+        let test_cases = TestCases::default().with_structural_encodings();
         check_round_trip_encoding_of_data(vec![list_array], &test_cases, HashMap::new()).await;
     }
 }

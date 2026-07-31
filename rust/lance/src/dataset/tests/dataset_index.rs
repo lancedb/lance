@@ -37,8 +37,8 @@ use lance_file::version::LanceFileVersion;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::inverted::{
-    InvertedListFormatVersion,
-    query::{BooleanQuery, MatchQuery, Occur, Operator, PhraseQuery},
+    InvertedListFormatVersion, SCORE_COL,
+    query::{BooleanQuery, BoostQuery, MatchQuery, Occur, Operator, PhraseQuery},
     tokenizer::InvertedIndexParams,
 };
 use lance_index::{FtsPrewarmOptions, PrewarmOptions};
@@ -861,6 +861,307 @@ async fn test_fts_on_multiple_columns() {
         .await
         .unwrap();
     assert_eq!(results.num_rows(), 1);
+}
+
+async fn create_fragmented_fts_index(dataset: &mut Dataset, column: &str, with_position: bool) {
+    create_fragmented_fts_index_with_order(dataset, column, with_position, false).await;
+}
+
+async fn create_fragmented_fts_index_with_order(
+    dataset: &mut Dataset,
+    column: &str,
+    with_position: bool,
+    reverse_segments: bool,
+) {
+    let index_name = format!("{column}_idx");
+    let columns = [column];
+    let params = InvertedIndexParams::default().with_position(with_position);
+    let fragment_ids = dataset
+        .get_fragments()
+        .iter()
+        .map(|fragment| fragment.id() as u32)
+        .collect::<Vec<_>>();
+    let mut segments = Vec::with_capacity(fragment_ids.len());
+    for fragment_id in &fragment_ids {
+        let mut builder = dataset
+            .create_index_builder(&columns, IndexType::Inverted, &params)
+            .name(index_name.clone())
+            .fragments(vec![*fragment_id]);
+        segments.push(builder.execute_uncommitted().await.unwrap());
+    }
+    if reverse_segments {
+        segments.reverse();
+    }
+    dataset
+        .commit_existing_index_segments(&index_name, column, segments)
+        .await
+        .unwrap();
+
+    let segments = crate::index::scalar::inverted::load_segments(dataset, column)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(segments.len(), fragment_ids.len());
+}
+
+fn compound_multimatch_query() -> FtsQuery {
+    MultiMatchQuery::try_new(
+        "common".to_owned(),
+        vec!["title".to_owned(), "body".to_owned()],
+    )
+    .unwrap()
+    .try_with_boosts(vec![10.0, 1.0])
+    .unwrap()
+    .into()
+}
+
+fn compound_match_query(term: &str, column: &str, boost: f32) -> FtsQuery {
+    MatchQuery::new(term.to_owned())
+        .with_column(Some(column.to_owned()))
+        .with_boost(boost)
+        .into()
+}
+
+async fn compound_fts_results(
+    dataset: &Dataset,
+    query: FtsQuery,
+    limit: Option<i64>,
+) -> Vec<(u64, f32)> {
+    let mut scan = dataset.scan();
+    scan.with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap();
+    if let Some(limit) = limit {
+        scan.limit(Some(limit), None).unwrap();
+    }
+    let batch = scan.try_into_batch().await.unwrap();
+    let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().values();
+    let scores = batch[SCORE_COL].as_primitive::<Float32Type>().values();
+    row_ids
+        .iter()
+        .copied()
+        .zip(scores.iter().copied())
+        .collect()
+}
+
+async fn assert_compound_fts_top_k(dataset: &Dataset, query: FtsQuery, limit: usize) {
+    let exhaustive = compound_fts_results(dataset, query.clone(), None).await;
+    assert!(
+        exhaustive.len() > limit,
+        "the exhaustive result must contain candidates beyond k"
+    );
+    let limited = compound_fts_results(dataset, query, Some(limit as i64)).await;
+    assert_eq!(limited, exhaustive[..limit]);
+}
+
+#[tokio::test]
+async fn test_nested_multimatch_limit_propagation() {
+    let batch = arrow_array::record_batch!(
+        (
+            "title",
+            Utf8,
+            [
+                "common",
+                "common filler filler filler filler filler filler filler",
+                "irrelevant",
+                "common tie",
+                "common tie",
+                "irrelevant"
+            ]
+        ),
+        (
+            "body",
+            Utf8,
+            [
+                "penalty",
+                "special",
+                "common",
+                "neutral",
+                "neutral",
+                "common filler filler filler penalty"
+            ]
+        )
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 3);
+    create_fragmented_fts_index(&mut dataset, "title", false).await;
+    create_fragmented_fts_index(&mut dataset, "body", false).await;
+
+    let must_query: FtsQuery = BooleanQuery::new([
+        (Occur::Must, compound_multimatch_query()),
+        (
+            Occur::Should,
+            compound_match_query("special", "body", 100.0),
+        ),
+    ])
+    .into();
+    let must_results = compound_fts_results(&dataset, must_query.clone(), None).await;
+    assert!(
+        must_results
+            .windows(2)
+            .any(|rows| rows[0].1 == rows[1].1 && rows[0].0 < rows[1].0),
+        "the exhaustive result should include a deterministic score tie"
+    );
+    assert_compound_fts_top_k(&dataset, must_query, 2).await;
+
+    let should_query: FtsQuery = BooleanQuery::new([
+        (Occur::Should, compound_multimatch_query()),
+        (
+            Occur::Should,
+            compound_match_query("special", "body", 100.0),
+        ),
+    ])
+    .into();
+    assert_compound_fts_top_k(&dataset, should_query.clone(), 2).await;
+    let mut fallback_scanner = dataset.scan();
+    fallback_scanner
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(should_query))
+        .unwrap();
+    fallback_scanner.limit(Some(2), None).unwrap();
+    let fallback_plan = fallback_scanner.explain_plan(false).await.unwrap();
+    assert!(
+        fallback_plan.contains("BooleanQuery"),
+        "cross-column compound FTS should retain its exact fallback:\n{fallback_plan}"
+    );
+    assert!(
+        !fallback_plan.contains("CompoundFtsScorer"),
+        "cross-column compound FTS is not yet supported by the scorer tree:\n{fallback_plan}"
+    );
+
+    let boost_query: FtsQuery = BoostQuery::new(
+        compound_multimatch_query(),
+        compound_match_query("penalty", "body", 100.0),
+        Some(1.0),
+    )
+    .into();
+    assert_compound_fts_top_k(&dataset, boost_query, 2).await;
+
+    assert_compound_fts_top_k(&dataset, compound_multimatch_query(), 1).await;
+}
+
+#[tokio::test]
+async fn test_same_column_compound_scorer_is_exact_and_bounded() {
+    let batch = arrow_array::record_batch!((
+        "text",
+        Utf8,
+        [
+            "common",
+            "common filler filler filler",
+            "irrelevant",
+            "common tie",
+            "common tie",
+            "common filler"
+        ]
+    ))
+    .unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    create_fragmented_fts_index(&mut dataset, "text", true).await;
+
+    let match_query = |term: &str| {
+        MatchQuery::new(term.to_owned())
+            .with_column(Some("text".to_owned()))
+            .into()
+    };
+    let query: FtsQuery = BooleanQuery::new([
+        (Occur::Must, match_query("common")),
+        (Occur::Should, match_query("tie")),
+        (
+            Occur::Should,
+            PhraseQuery::new("common tie".to_owned())
+                .with_column(Some("text".to_owned()))
+                .into(),
+        ),
+        (Occur::MustNot, match_query("irrelevant")),
+    ])
+    .into();
+
+    assert_compound_fts_top_k(&dataset, query.clone(), 2).await;
+
+    let mut scanner = dataset.scan();
+    scanner
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap();
+    scanner.limit(Some(2), None).unwrap();
+    let plan = scanner.explain_plan(false).await.unwrap();
+    assert!(
+        plan.contains("CompoundFtsScorer"),
+        "same-column compound FTS should use the scorer tree:\n{plan}"
+    );
+    assert!(
+        !plan.contains("HashJoinExec"),
+        "same-column compound FTS should not materialize intermediate joins:\n{plan}"
+    );
+
+    let same_column_multimatch: FtsQuery = MultiMatchQuery::try_new(
+        "common".to_owned(),
+        vec!["text".to_owned(), "text".to_owned()],
+    )
+    .unwrap()
+    .try_with_boosts(vec![1.0, 0.5])
+    .unwrap()
+    .into();
+    assert_compound_fts_top_k(&dataset, same_column_multimatch.clone(), 2).await;
+    let mut scanner = dataset.scan();
+    scanner
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(same_column_multimatch))
+        .unwrap();
+    scanner.limit(Some(2), None).unwrap();
+    let plan = scanner.explain_plan(false).await.unwrap();
+    assert!(
+        plan.contains("CompoundFtsScorer"),
+        "bounded same-column MultiMatch should use posting-backed scorers:\n{plan}"
+    );
+}
+
+#[tokio::test]
+async fn test_compound_tie_uses_resolved_row_id() {
+    let batch =
+        arrow_array::record_batch!(("text", Utf8, ["common", "common", "common", "common"]))
+            .unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 1,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    create_fragmented_fts_index_with_order(&mut dataset, "text", false, true).await;
+
+    let query: FtsQuery = MultiMatchQuery::try_new(
+        "common".to_owned(),
+        vec!["text".to_owned(), "text".to_owned()],
+    )
+    .unwrap()
+    .into();
+    assert_compound_fts_top_k(&dataset, query, 1).await;
 }
 
 fn nested_fts_batch(
