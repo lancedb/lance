@@ -340,7 +340,7 @@ impl BlockCompressor for InlineBitpacking {
             max_value = max_value.max(value);
             Ok(())
         })?;
-        let compressed_bit_width = u64::from(u64::BITS - max_value.leading_zeros()).max(1);
+        let compressed_bit_width = u64::from(u64::BITS - max_value.leading_zeros());
         fixed_width.block_info.0.write().unwrap().insert(
             Stat::BitWidth,
             std::sync::Arc::new(UInt64Array::from(vec![compressed_bit_width])),
@@ -762,6 +762,30 @@ mod test {
         assert_eq!(
             decoded.data.borrow_to_typed_view::<u32>().as_ref(),
             &[0, 1, 7]
+        );
+    }
+
+    #[test]
+    fn test_inline_block_bitpacking_preserves_zero_bit_width() {
+        let codec = InlineBitpacking::new(8);
+        let input = DataBlock::FixedWidth(FixedWidthDataBlock {
+            data: LanceBuffer::reinterpret_vec(vec![0_u8; ELEMS_PER_CHUNK as usize]),
+            bits_per_value: 8,
+            num_values: ELEMS_PER_CHUNK,
+            block_info: BlockInfo::new(),
+        });
+
+        let payload = BlockCompressor::compress(&codec, input).unwrap().unwrap();
+        assert_eq!(payload.as_ref(), &[0]);
+
+        let decoded =
+            BlockDecompressor::decompress(&codec, Some(payload), ELEMS_PER_CHUNK).unwrap();
+        let DataBlock::FixedWidth(decoded) = decoded else {
+            panic!("Expected FixedWidth block");
+        };
+        assert_eq!(
+            decoded.data.borrow_to_typed_view::<u8>().as_ref(),
+            vec![0; ELEMS_PER_CHUNK as usize]
         );
     }
 
