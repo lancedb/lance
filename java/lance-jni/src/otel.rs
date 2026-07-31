@@ -15,10 +15,8 @@ use jni::JNIEnv;
 use jni::objects::{JClass, JObject, JValue};
 use jni::sys::{jboolean, jobject};
 use metrics::atomics::AtomicU64;
-use metrics::{
-    Counter, CounterFn, Gauge, GaugeFn, Histogram, Key, KeyName, Metadata, Recorder, SharedString,
-    Unit,
-};
+use metrics::{Counter, Gauge, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit};
+use metrics_util::registry::{Registry, Storage};
 
 use crate::error::Result;
 
@@ -55,7 +53,7 @@ static CATALOG: LazyLock<Mutex<HashMap<String, MetricDescription>>> =
 static HISTOGRAM_BOUNDS: LazyLock<RwLock<HashMap<String, Arc<[f64]>>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
-static REGISTRY: OnceLock<Arc<LanceRegistry>> = OnceLock::new();
+static REGISTRY: OnceLock<Arc<Registry<Key, LanceStorage>>> = OnceLock::new();
 
 fn bounds_for(name: &str) -> Arc<[f64]> {
     HISTOGRAM_BOUNDS
@@ -64,17 +62,6 @@ fn bounds_for(name: &str) -> Arc<[f64]> {
         .get(name)
         .cloned()
         .unwrap_or_else(|| Arc::from(DEFAULT_BOUNDS))
-}
-
-fn atomic_add_f64(cell: &AtomicU64, value: f64) {
-    let mut current = cell.load(Ordering::Relaxed);
-    loop {
-        let updated = (f64::from_bits(current) + value).to_bits();
-        match cell.compare_exchange_weak(current, updated, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => break,
-            Err(actual) => current = actual,
-        }
-    }
 }
 
 struct BucketedHistogram {
@@ -94,6 +81,22 @@ impl BucketedHistogram {
             counts,
             count: AtomicU64::new(0),
             sum_bits: AtomicU64::new(0),
+        }
+    }
+
+    fn add_to_sum(&self, value: f64) {
+        let mut current = self.sum_bits.load(Ordering::Relaxed);
+        loop {
+            let updated = (f64::from_bits(current) + value).to_bits();
+            match self.sum_bits.compare_exchange_weak(
+                current,
+                updated,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
         }
     }
 
@@ -119,111 +122,32 @@ impl metrics::HistogramFn for BucketedHistogram {
         let idx = self.bounds.partition_point(|&bound| bound < value);
         self.counts[idx].fetch_add(1, Ordering::Relaxed);
         self.count.fetch_add(1, Ordering::Relaxed);
-        atomic_add_f64(&self.sum_bits, value);
+        self.add_to_sum(value);
     }
 }
 
-struct AtomicCounter {
-    value: AtomicU64,
-}
+struct LanceStorage;
 
-impl AtomicCounter {
-    fn new() -> Self {
-        Self {
-            value: AtomicU64::new(0),
-        }
-    }
-}
+impl Storage<Key> for LanceStorage {
+    type Counter = Arc<AtomicU64>;
+    type Gauge = Arc<AtomicU64>;
+    type Histogram = Arc<BucketedHistogram>;
 
-impl CounterFn for AtomicCounter {
-    fn increment(&self, value: u64) {
-        self.value.fetch_add(value, Ordering::Relaxed);
+    fn counter(&self, _key: &Key) -> Self::Counter {
+        Arc::new(AtomicU64::new(0))
     }
 
-    fn absolute(&self, value: u64) {
-        let mut current = self.value.load(Ordering::Relaxed);
-        while current < value {
-            match self.value.compare_exchange_weak(
-                current,
-                value,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(actual) => current = actual,
-            }
-        }
-    }
-}
-
-struct AtomicGauge {
-    value_bits: AtomicU64,
-}
-
-impl AtomicGauge {
-    fn new() -> Self {
-        Self {
-            value_bits: AtomicU64::new(0),
-        }
+    fn gauge(&self, _key: &Key) -> Self::Gauge {
+        Arc::new(AtomicU64::new(0))
     }
 
-    fn add(&self, value: f64) {
-        atomic_add_f64(&self.value_bits, value);
-    }
-}
-
-impl GaugeFn for AtomicGauge {
-    fn increment(&self, value: f64) {
-        self.add(value);
-    }
-
-    fn decrement(&self, value: f64) {
-        self.add(-value);
-    }
-
-    fn set(&self, value: f64) {
-        self.value_bits.store(value.to_bits(), Ordering::Relaxed);
-    }
-}
-
-#[derive(Default)]
-struct LanceRegistry {
-    counters: Mutex<HashMap<Key, Arc<AtomicCounter>>>,
-    gauges: Mutex<HashMap<Key, Arc<AtomicGauge>>>,
-    histograms: Mutex<HashMap<Key, Arc<BucketedHistogram>>>,
-}
-
-impl LanceRegistry {
-    fn counter(&self, key: &Key) -> Arc<AtomicCounter> {
-        self.counters
-            .lock()
-            .unwrap()
-            .entry(key.clone())
-            .or_insert_with(|| Arc::new(AtomicCounter::new()))
-            .clone()
-    }
-
-    fn gauge(&self, key: &Key) -> Arc<AtomicGauge> {
-        self.gauges
-            .lock()
-            .unwrap()
-            .entry(key.clone())
-            .or_insert_with(|| Arc::new(AtomicGauge::new()))
-            .clone()
-    }
-
-    fn histogram(&self, key: &Key) -> Arc<BucketedHistogram> {
-        self.histograms
-            .lock()
-            .unwrap()
-            .entry(key.clone())
-            .or_insert_with(|| Arc::new(BucketedHistogram::new(bounds_for(key.name()))))
-            .clone()
+    fn histogram(&self, key: &Key) -> Self::Histogram {
+        Arc::new(BucketedHistogram::new(bounds_for(key.name())))
     }
 }
 
 struct LanceRecorder {
-    registry: Arc<LanceRegistry>,
+    registry: Arc<Registry<Key, LanceStorage>>,
 }
 
 impl LanceRecorder {
@@ -259,15 +183,18 @@ impl Recorder for LanceRecorder {
     }
 
     fn register_counter(&self, key: &Key, _metadata: &Metadata<'_>) -> Counter {
-        Counter::from_arc(self.registry.counter(key))
+        self.registry
+            .get_or_create_counter(key, |counter| Counter::from_arc(counter.clone()))
     }
 
     fn register_gauge(&self, key: &Key, _metadata: &Metadata<'_>) -> Gauge {
-        Gauge::from_arc(self.registry.gauge(key))
+        self.registry
+            .get_or_create_gauge(key, |gauge| Gauge::from_arc(gauge.clone()))
     }
 
     fn register_histogram(&self, key: &Key, _metadata: &Metadata<'_>) -> Histogram {
-        Histogram::from_arc(self.registry.histogram(key))
+        self.registry
+            .get_or_create_histogram(key, |histogram| Histogram::from_arc(histogram.clone()))
     }
 }
 
@@ -304,29 +231,29 @@ fn labels(key: &Key) -> HashMap<String, String> {
         .collect()
 }
 
-fn collect_points(registry: &LanceRegistry) -> Vec<MetricPoint> {
+fn collect_points(registry: &Registry<Key, LanceStorage>) -> Vec<MetricPoint> {
     let mut points = Vec::new();
-    for (key, handle) in registry.counters.lock().unwrap().iter() {
+    for (key, handle) in registry.get_counter_handles() {
         points.push(MetricPoint {
             name: key.name().to_string(),
             kind: "counter",
-            attributes: labels(key),
-            value: MetricValue::Scalar(handle.value.load(Ordering::Relaxed) as f64),
+            attributes: labels(&key),
+            value: MetricValue::Scalar(handle.load(Ordering::Relaxed) as f64),
         });
     }
-    for (key, handle) in registry.gauges.lock().unwrap().iter() {
+    for (key, handle) in registry.get_gauge_handles() {
         points.push(MetricPoint {
             name: key.name().to_string(),
             kind: "gauge",
-            attributes: labels(key),
-            value: MetricValue::Scalar(f64::from_bits(handle.value_bits.load(Ordering::Relaxed))),
+            attributes: labels(&key),
+            value: MetricValue::Scalar(f64::from_bits(handle.load(Ordering::Relaxed))),
         });
     }
-    for (key, handle) in registry.histograms.lock().unwrap().iter() {
+    for (key, handle) in registry.get_histogram_handles() {
         points.push(MetricPoint {
             name: key.name().to_string(),
             kind: "histogram",
-            attributes: labels(key),
+            attributes: labels(&key),
             value: handle.snapshot(),
         });
     }
@@ -337,7 +264,7 @@ fn register_lance_metrics_recorder() -> bool {
     if REGISTRY.get().is_some() {
         return true;
     }
-    let registry = Arc::new(LanceRegistry::default());
+    let registry = Arc::new(Registry::new(LanceStorage));
     let recorder = LanceRecorder {
         registry: registry.clone(),
     };
@@ -548,7 +475,7 @@ pub extern "system" fn Java_org_lance_otel_LanceMetrics_snapshotLanceMetricsNati
 #[cfg(test)]
 mod tests {
     use super::*;
-    use metrics::{GaugeFn, HistogramFn};
+    use metrics::HistogramFn;
 
     fn bucket_count(buckets: &[(String, u64)], le: &str) -> u64 {
         buckets
@@ -586,12 +513,29 @@ mod tests {
     }
 
     #[test]
-    fn test_atomic_gauge_adds_and_subtracts_values() {
-        let gauge = AtomicGauge::new();
+    fn test_registry_aggregates_counters_and_gauges() {
+        let registry = Arc::new(Registry::new(LanceStorage));
+        let recorder = LanceRecorder {
+            registry: registry.clone(),
+        };
+        metrics::with_local_recorder(&recorder, || {
+            metrics::counter!("test_counter", "operation" => "get").increment(2);
+            metrics::counter!("test_counter", "operation" => "get").increment(3);
+            metrics::gauge!("test_gauge", "operation" => "get").increment(3.5);
+            metrics::gauge!("test_gauge", "operation" => "get").decrement(1.25);
+        });
 
-        gauge.increment(3.5);
-        gauge.decrement(1.25);
+        let points = collect_points(&registry);
+        let counter = points
+            .iter()
+            .find(|point| point.name == "test_counter")
+            .expect("counter recorded");
+        let gauge = points
+            .iter()
+            .find(|point| point.name == "test_gauge")
+            .expect("gauge recorded");
 
-        assert!((f64::from_bits(gauge.value_bits.load(Ordering::Relaxed)) - 2.25).abs() < 1e-9);
+        assert!(matches!(counter.value, MetricValue::Scalar(value) if value == 5.0));
+        assert!(matches!(gauge.value, MetricValue::Scalar(value) if (value - 2.25).abs() < 1e-9));
     }
 }

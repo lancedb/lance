@@ -53,6 +53,7 @@ serde_json = { version = "1" }
 bytes = "1.11"
 log = "0.4"
 metrics = "0.24"
+metrics-util = { version = "0.19", default-features = false, features = ["registry"] }
 env_logger = "0.11.7"
 uuid = { version = "1.17.0", features = ["v4"] }
 prost = "0.14.1"
