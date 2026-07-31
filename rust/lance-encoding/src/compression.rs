@@ -212,6 +212,9 @@ fn rle_beats_raw_and_bitpacking(
     encoded_bytes: u128,
     raw_bytes: u128,
 ) -> bool {
+    #[cfg(not(feature = "bitpacking"))]
+    let _ = data;
+
     if encoded_bytes >= raw_bytes {
         return false;
     }
@@ -1467,7 +1470,7 @@ mod tests {
     }
 
     fn selected_block_codec(
-        strategy: &dyn CompressionStrategy,
+        strategy: &Arc<dyn CompressionStrategy>,
         field: &Field,
         data: &DataBlock,
     ) -> (Box<dyn BlockCompressor>, CompressiveEncoding) {

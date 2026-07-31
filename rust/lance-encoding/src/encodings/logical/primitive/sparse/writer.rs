@@ -1575,9 +1575,13 @@ mod tests {
                 )),
             );
         let metadata = sparse_metadata();
-        let pages = encode_pages(array.clone(), LanceFileVersion::V2_3, metadata.clone())
-            .await
-            .unwrap();
+        let pages = encode_pages(
+            array.clone(),
+            TestEncoding::StructuralSparse,
+            metadata.clone(),
+        )
+        .await
+        .unwrap();
         assert_eq!(pages.len(), 1);
         let sparse = sparse_layout(&pages[0]);
         assert_eq!(sparse.num_buffers, 1);
@@ -1604,8 +1608,7 @@ mod tests {
         ));
 
         let cases = TestCases::default()
-            .with_min_file_version(LanceFileVersion::V2_3)
-            .with_max_file_version(LanceFileVersion::V2_3)
+            .with_encoding(TestEncoding::StructuralSparse)
             .with_page_sizes(vec![1])
             .with_range(1..17)
             .with_indices(vec![0, 7, (num_values * 2 - 1) as u64]);

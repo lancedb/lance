@@ -5,7 +5,7 @@ use arrow_schema::{DataType, Field as ArrowField};
 use lance_core::{Result, datatypes::Field};
 use lance_encoding::{
     buffer::LanceBuffer,
-    compression::{BlockCompressor, CompressionStrategy, DefaultCompressionStrategy},
+    compression::{BlockCompressor, CompressionStrategy},
     data::{BlockInfo, DataBlock, FixedWidthDataBlock},
     encodings::logical::primitive::{fullzip::PerValueCompressor, miniblock::MiniBlockCompressor},
     format::ProtobufUtils21,
@@ -23,10 +23,8 @@ impl BlockCompressor for IdentityBlockCompressor {
     }
 }
 
-#[derive(Debug, Default)]
-struct CustomCompressionStrategy {
-    fallback: DefaultCompressionStrategy,
-}
+#[derive(Debug)]
+struct CustomCompressionStrategy;
 
 impl CompressionStrategy for CustomCompressionStrategy {
     fn create_block_compressor(
@@ -48,18 +46,18 @@ impl CompressionStrategy for CustomCompressionStrategy {
 
     fn create_per_value(
         &self,
-        field: &Field,
-        data: &DataBlock,
+        _field: &Field,
+        _data: &DataBlock,
     ) -> Result<Box<dyn PerValueCompressor>> {
-        self.fallback.create_per_value(field, data)
+        unreachable!("test only exercises block compression")
     }
 
     fn create_miniblock_compressor(
         &self,
-        field: &Field,
-        data: &DataBlock,
+        _field: &Field,
+        _data: &DataBlock,
     ) -> Result<Box<dyn MiniBlockCompressor>> {
-        self.fallback.create_miniblock_compressor(field, data)
+        unreachable!("test only exercises block compression")
     }
 }
 
@@ -73,7 +71,7 @@ fn public_strategy_returns_the_frozen_block_compressor() {
         num_values: values.len() as u64,
         block_info: BlockInfo::default(),
     });
-    let strategy: Box<dyn CompressionStrategy> = Box::new(CustomCompressionStrategy::default());
+    let strategy: Box<dyn CompressionStrategy> = Box::new(CustomCompressionStrategy);
 
     let (compressor, _) = strategy.create_block_compressor(&field, &data).unwrap();
     let payload = compressor.compress(data).unwrap().unwrap();
