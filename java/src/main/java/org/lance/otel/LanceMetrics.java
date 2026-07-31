@@ -87,7 +87,7 @@ public final class LanceMetrics {
     Map<String, RegisteredMetric> registeredMetrics = new HashMap<>();
     List<ObservableMeasurement> measurements = new ArrayList<>();
 
-    for (MetricDescription desc : catalog()) {
+    for (MetricDescription desc : supportedMetrics(catalog())) {
       String unit = desc.getUnit() == null ? "" : desc.getUnit();
       String description = desc.getDescription();
       switch (desc.getKind()) {
@@ -138,7 +138,9 @@ public final class LanceMetrics {
           measurements.add(sum);
           break;
         default:
-          throw new IllegalStateException("Unknown Lance metric kind: " + desc.getKind());
+          LOGGER.warning(
+              "Skipping Lance metric " + desc.getName() + " with unknown kind: " + desc.getKind());
+          continue;
       }
     }
 
@@ -171,6 +173,23 @@ public final class LanceMetrics {
   public static List<MetricPoint> snapshot() {
     JniLoader.ensureLoaded();
     return Collections.unmodifiableList(snapshotLanceMetricsNative());
+  }
+
+  static List<MetricDescription> supportedMetrics(List<MetricDescription> catalog) {
+    List<MetricDescription> supported = new ArrayList<>();
+    for (MetricDescription desc : catalog) {
+      switch (desc.getKind()) {
+        case "counter":
+        case "gauge":
+        case "histogram":
+          supported.add(desc);
+          break;
+        default:
+          LOGGER.warning(
+              "Skipping Lance metric " + desc.getName() + " with unknown kind: " + desc.getKind());
+      }
+    }
+    return supported;
   }
 
   private static void recordSnapshot(Map<String, RegisteredMetric> registeredMetrics) {

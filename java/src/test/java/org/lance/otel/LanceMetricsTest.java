@@ -16,7 +16,10 @@ package org.lance.otel;
 import org.lance.Dataset;
 import org.lance.TestUtils;
 
+import io.opentelemetry.api.common.AttributeKey;
+import io.opentelemetry.api.common.Attributes;
 import io.opentelemetry.sdk.metrics.SdkMeterProvider;
+import io.opentelemetry.sdk.metrics.data.DoublePointData;
 import io.opentelemetry.sdk.metrics.data.MetricData;
 import io.opentelemetry.sdk.testing.exporter.InMemoryMetricReader;
 import org.apache.arrow.memory.RootAllocator;
@@ -25,13 +28,17 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
+import java.util.Arrays;
 import java.util.Collection;
+import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -75,11 +82,39 @@ public class LanceMetricsTest {
       assertTrue(requests.getAttributes().containsKey("base"));
 
       Collection<MetricData> metrics = reader.collectAllMetrics();
-      Set<String> names = metrics.stream().map(MetricData::getName).collect(Collectors.toSet());
+      Map<String, MetricData> metricsByName =
+          metrics.stream().collect(Collectors.toMap(MetricData::getName, Function.identity()));
+      Set<String> names = metricsByName.keySet();
       assertTrue(names.contains(REQUESTS));
       assertTrue(names.contains(DURATION + "_bucket"));
       assertTrue(names.contains(DURATION + "_count"));
       assertTrue(names.contains(DURATION + "_sum"));
+
+      Collection<DoublePointData> bucketPoints =
+          metricsByName.get(DURATION + "_bucket").getDoubleSumData().getPoints();
+      Collection<DoublePointData> countPoints =
+          metricsByName.get(DURATION + "_count").getDoubleSumData().getPoints();
+      Collection<DoublePointData> sumPoints =
+          metricsByName.get(DURATION + "_sum").getDoubleSumData().getPoints();
+
+      assertFalse(bucketPoints.isEmpty());
+      assertTrue(
+          bucketPoints.stream()
+              .allMatch(point -> point.getAttributes().get(AttributeKey.stringKey("le")) != null));
+
+      Map<Attributes, Double> countsByAttributes =
+          countPoints.stream()
+              .collect(Collectors.toMap(DoublePointData::getAttributes, DoublePointData::getValue));
+      Map<Attributes, Double> infiniteBucketsByAttributes = new HashMap<>();
+      for (DoublePointData bucketPoint : bucketPoints) {
+        if ("+Inf".equals(bucketPoint.getAttributes().get(AttributeKey.stringKey("le")))) {
+          Attributes attributes =
+              bucketPoint.getAttributes().toBuilder().remove(AttributeKey.stringKey("le")).build();
+          infiniteBucketsByAttributes.put(attributes, bucketPoint.getValue());
+        }
+      }
+      assertEquals(countsByAttributes, infiniteBucketsByAttributes);
+      assertTrue(sumPoints.stream().anyMatch(point -> point.getValue() > 0));
     } finally {
       provider.close();
     }
@@ -101,10 +136,23 @@ public class LanceMetricsTest {
 
       assertTrue(LanceMetrics.instrument(secondProvider));
       assertTrue(metricNames(secondReader).contains(REQUESTS));
+      assertFalse(metricNames(firstReader).contains(REQUESTS));
     } finally {
       firstProvider.close();
       secondProvider.close();
     }
+  }
+
+  @Test
+  void testSupportedMetricsSkipsUnknownKinds() {
+    MetricDescription counter = new MetricDescription("counter", "counter", null, "counter");
+    MetricDescription unknown = new MetricDescription("unknown", "summary", null, "unknown");
+
+    List<MetricDescription> supported =
+        LanceMetrics.supportedMetrics(Arrays.asList(counter, unknown));
+
+    assertEquals(1, supported.size());
+    assertEquals("counter", supported.get(0).getName());
   }
 
   private static void generateObjectStoreMetrics(Path datasetPath) {

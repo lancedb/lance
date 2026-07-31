@@ -66,6 +66,17 @@ fn bounds_for(name: &str) -> Arc<[f64]> {
         .unwrap_or_else(|| Arc::from(DEFAULT_BOUNDS))
 }
 
+fn atomic_add_f64(cell: &AtomicU64, value: f64) {
+    let mut current = cell.load(Ordering::Relaxed);
+    loop {
+        let updated = (f64::from_bits(current) + value).to_bits();
+        match cell.compare_exchange_weak(current, updated, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
 struct BucketedHistogram {
     bounds: Arc<[f64]>,
     counts: Box<[AtomicU64]>,
@@ -75,10 +86,9 @@ struct BucketedHistogram {
 
 impl BucketedHistogram {
     fn new(bounds: Arc<[f64]>) -> Self {
-        let counts = (0..bounds.len() + 1)
+        let counts = (0..=bounds.len())
             .map(|_| AtomicU64::new(0))
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
+            .collect::<Box<[_]>>();
         Self {
             bounds,
             counts,
@@ -87,28 +97,12 @@ impl BucketedHistogram {
         }
     }
 
-    fn add_to_sum(&self, value: f64) {
-        let mut current = self.sum_bits.load(Ordering::Relaxed);
-        loop {
-            let updated = (f64::from_bits(current) + value).to_bits();
-            match self.sum_bits.compare_exchange_weak(
-                current,
-                updated,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(actual) => current = actual,
-            }
-        }
-    }
-
     fn snapshot(&self) -> MetricValue {
         let mut cumulative = 0u64;
         let mut buckets = Vec::with_capacity(self.bounds.len() + 1);
         for (i, bound) in self.bounds.iter().enumerate() {
             cumulative += self.counts[i].load(Ordering::Relaxed);
-            buckets.push((format!("{}", bound), cumulative));
+            buckets.push((bound.to_string(), cumulative));
         }
         cumulative += self.counts[self.bounds.len()].load(Ordering::Relaxed);
         buckets.push(("+Inf".to_string(), cumulative));
@@ -125,7 +119,7 @@ impl metrics::HistogramFn for BucketedHistogram {
         let idx = self.bounds.partition_point(|&bound| bound < value);
         self.counts[idx].fetch_add(1, Ordering::Relaxed);
         self.count.fetch_add(1, Ordering::Relaxed);
-        self.add_to_sum(value);
+        atomic_add_f64(&self.sum_bits, value);
     }
 }
 
@@ -174,19 +168,7 @@ impl AtomicGauge {
     }
 
     fn add(&self, value: f64) {
-        let mut current = self.value_bits.load(Ordering::Relaxed);
-        loop {
-            let updated = (f64::from_bits(current) + value).to_bits();
-            match self.value_bits.compare_exchange_weak(
-                current,
-                updated,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(actual) => current = actual,
-            }
-        }
+        atomic_add_f64(&self.value_bits, value);
     }
 }
 
@@ -561,4 +543,55 @@ pub extern "system" fn Java_org_lance_otel_LanceMetrics_snapshotLanceMetricsNati
         std::ptr::null_mut()
     )
     .into_raw()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use metrics::{GaugeFn, HistogramFn};
+
+    fn bucket_count(buckets: &[(String, u64)], le: &str) -> u64 {
+        buckets
+            .iter()
+            .find(|(bound, _)| bound == le)
+            .map(|(_, count)| *count)
+            .unwrap_or_else(|| panic!("no bucket with le={le}"))
+    }
+
+    #[test]
+    fn test_bucketed_histogram_records_cumulative_buckets() {
+        let histogram = BucketedHistogram::new(Arc::from([0.1f64, 1.0, 10.0].as_slice()));
+        histogram.record(0.05);
+        histogram.record(0.1);
+        histogram.record(0.5);
+        histogram.record(1.0);
+        histogram.record(5.0);
+        histogram.record(50.0);
+
+        let MetricValue::Histogram {
+            buckets,
+            count,
+            sum,
+        } = histogram.snapshot()
+        else {
+            panic!("expected histogram");
+        };
+
+        assert_eq!(bucket_count(&buckets, "0.1"), 2);
+        assert_eq!(bucket_count(&buckets, "1"), 4);
+        assert_eq!(bucket_count(&buckets, "10"), 5);
+        assert_eq!(bucket_count(&buckets, "+Inf"), 6);
+        assert_eq!(bucket_count(&buckets, "+Inf"), count);
+        assert!((sum - 56.65).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_atomic_gauge_adds_and_subtracts_values() {
+        let gauge = AtomicGauge::new();
+
+        gauge.increment(3.5);
+        gauge.decrement(1.25);
+
+        assert!((f64::from_bits(gauge.value_bits.load(Ordering::Relaxed)) - 2.25).abs() < 1e-9);
+    }
 }
