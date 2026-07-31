@@ -10,7 +10,7 @@ use url::Url;
 
 use crate::object_store::{
     DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
-    ObjectStoreParams, ObjectStoreProvider, StorageOptions,
+    ObjectStoreParams, ObjectStoreProvider, StorageOptions, opendal_list::OpendalDirLister,
 };
 use lance_core::error::{Error, Result};
 
@@ -178,7 +178,7 @@ impl ObjectStoreProvider for GooseFsStoreProvider {
             .finish();
 
         // Wrap as object_store::ObjectStore via OpendalStore bridge
-        let opendal_store = Arc::new(OpendalStore::new(operator));
+        let opendal_store = Arc::new(OpendalStore::new(operator.clone()));
 
         Ok(ObjectStore {
             scheme: "goosefs".to_string(),
@@ -192,6 +192,7 @@ impl ObjectStoreProvider for GooseFsStoreProvider {
             io_tracker: Default::default(),
             store_prefix: self
                 .calculate_object_store_prefix(&base_path, params.storage_options())?,
+            paginated_lister: OpendalDirLister::for_operator(operator),
         })
     }
 

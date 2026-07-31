@@ -14,7 +14,7 @@ use opendal::{Operator, services::Azblob, services::Azdls};
 
 use object_store::{
     RetryConfig,
-    azure::{AzureConfigKey, AzureCredential, MicrosoftAzureBuilder},
+    azure::{AzureConfigKey, AzureCredential, MicrosoftAzure, MicrosoftAzureBuilder},
 };
 use url::Url;
 
@@ -22,7 +22,9 @@ use crate::object_store::{
     DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
     ObjectStoreParams, ObjectStoreProvider, StorageOptions, StorageOptionsAccessor,
     dynamic_credentials::build_dynamic_credential_provider,
-    throttle::{AimdThrottleConfig, AimdThrottledStore},
+    opendal_list::OpendalDirLister,
+    read_dir::NativeDirLister,
+    throttle::{AimdThrottleConfig, with_throttling},
 };
 use lance_core::error::{Error, Result};
 
@@ -155,21 +157,12 @@ impl AzureBlobStoreProvider {
         }
     }
 
-    async fn build_opendal_azure_store(
-        &self,
-        base_path: &Url,
-        storage_options: &StorageOptions,
-    ) -> Result<Arc<dyn OSObjectStore>> {
-        let operator = Self::build_opendal_operator(base_path, storage_options)?;
-        Ok(Arc::new(OpendalStore::new(operator)))
-    }
-
     async fn build_microsoft_azure_store(
         &self,
         base_path: &Url,
         storage_options: &StorageOptions,
         accessor: Option<Arc<StorageOptionsAccessor>>,
-    ) -> Result<Arc<dyn OSObjectStore>> {
+    ) -> Result<Arc<MicrosoftAzure>> {
         // Use a low retry count since the AIMD throttle layer handles
         // throttle recovery with its own retry loop.
         let retry_config = RetryConfig {
@@ -201,7 +194,7 @@ impl AzureBlobStoreProvider {
             );
         }
 
-        Ok(Arc::new(builder.build()?) as Arc<dyn OSObjectStore>)
+        Ok(Arc::new(builder.build()?))
     }
 
     fn calculate_object_store_prefix_with_env(
@@ -266,21 +259,23 @@ impl ObjectStoreProvider for AzureBlobStoreProvider {
 
         let accessor = params.get_accessor();
 
-        let inner: Arc<dyn OSObjectStore> = if use_opendal {
+        let (inner, paginated_lister) = if use_opendal {
             // OpenDAL Azure intentionally uses static/environment-backed configuration only.
             // Namespace-vended dynamic credentials are supported on the native object_store path.
-            self.build_opendal_azure_store(&base_path, &storage_options)
-                .await?
+            let operator = Self::build_opendal_operator(&base_path, &storage_options)?;
+            (
+                Arc::new(OpendalStore::new(operator.clone())) as Arc<dyn OSObjectStore>,
+                OpendalDirLister::for_operator(operator),
+            )
         } else {
-            self.build_microsoft_azure_store(&base_path, &storage_options, accessor)
-                .await?
+            let store = self
+                .build_microsoft_azure_store(&base_path, &storage_options, accessor)
+                .await?;
+            let paginated_lister = Some(NativeDirLister::for_store(store.clone()));
+            (store as Arc<dyn OSObjectStore>, paginated_lister)
         };
         let throttle_config = AimdThrottleConfig::from_storage_options(params.storage_options())?;
-        let inner = if throttle_config.is_disabled() {
-            inner
-        } else {
-            Arc::new(AimdThrottledStore::new(inner, throttle_config)?) as Arc<dyn OSObjectStore>
-        };
+        let (inner, paginated_lister) = with_throttling(throttle_config, inner, paginated_lister)?;
 
         Ok(ObjectStore {
             inner,
@@ -294,6 +289,7 @@ impl ObjectStoreProvider for AzureBlobStoreProvider {
             io_tracker: Default::default(),
             store_prefix: self
                 .calculate_object_store_prefix(&base_path, params.storage_options())?,
+            paginated_lister,
         })
     }
 
