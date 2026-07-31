@@ -1106,10 +1106,8 @@ impl MemTableFlusher {
         );
         index_writer.finish().await?;
 
-        // Pack the details the same way index creation does. Hand-building the
-        // `Any` here produced a `type.googleapis.com/` type url, which no other
-        // writer in lance emits; readers match on the message-name suffix, so
-        // it worked, but it made memwal-flushed indexes the odd ones out.
+        // Packed the same way index creation does; hand-building the `Any` here
+        // produced a `type.googleapis.com/` url no other writer in lance emits.
         let index_details = Some(Arc::new(vector_index_details_default()));
         let index_meta = IndexMetadata {
             uuid: index_uuid,

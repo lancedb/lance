@@ -662,10 +662,9 @@ impl DatasetMemWalExt for Dataset {
             let kind = MemIndexKind::from_type_url(type_url)
                 .ok_or_else(|| unsupported_index_type(type_url))?;
 
-            // Exhaustive on purpose: a new `MemIndexKind` has to be built here,
-            // or callers filtering on `is_maintainable_index_type` would admit
-            // an index this writer cannot open — failing every memtable claim
-            // and leaving the table unwritable.
+            // Exhaustive: a new kind must be built here, or callers filtering on
+            // `is_maintainable_index_type` would admit an index this writer
+            // cannot open, failing every memtable claim.
             match kind {
                 MemIndexKind::BTree => {
                     index_configs.push(MemIndexConfig::btree_from_metadata(

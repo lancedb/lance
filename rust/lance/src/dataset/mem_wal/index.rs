@@ -259,18 +259,12 @@ fn is_encodable_pk_type(data_type: &DataType) -> bool {
     )
 }
 
-/// The index kinds a MemTable can maintain.
+/// The index kinds a MemTable can maintain — the registry of MemWAL index
+/// support. Data-free because indexes are identified by type url before any
+/// [`MemIndexConfig`] exists.
 ///
-/// This is the registry of MemWAL index support, and it is deliberately
-/// data-free: base-table indexes are identified by protobuf type url before
-/// any [`MemIndexConfig`] exists, so the lookup key cannot be the config enum
-/// itself.
-///
-/// Adding memtable support for an index type means adding a variant here. The
-/// compiler then requires the rest: [`details_suffix`](Self::details_suffix)
-/// must name the type url that identifies it, `MemIndexConfig::kind` must map
-/// its config, and `Dataset::mem_wal_writer` must build it. Each of those
-/// matches exhaustively, so none can be skipped.
+/// Adding a variant is a compile error in [`details_suffix`](Self::details_suffix),
+/// `MemIndexConfig::kind`, and `Dataset::mem_wal_writer` until each handles it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MemIndexKind {
     /// BTree index for scalar fields (point lookups, range queries).
@@ -282,19 +276,15 @@ pub enum MemIndexKind {
 }
 
 impl MemIndexKind {
-    /// Every maintainable kind. Only used to drive
-    /// [`from_type_url`](Self::from_type_url); a kind missing from this list is
-    /// simply never detected, so it goes unmaintained rather than reaching a
-    /// memtable that cannot build it.
+    /// Every maintainable kind. A kind missing here is never detected, so it
+    /// goes unmaintained rather than reaching a memtable that cannot build it.
     pub const ALL: &'static [Self] = &[Self::BTree, Self::Hnsw, Self::Fts];
 
-    /// Suffix of the protobuf details message identifying this kind on a base
-    /// table index.
+    /// Suffix of the protobuf details message identifying this kind.
     ///
-    /// A suffix rather than a whole type url on purpose: the prefix varies
-    /// across dataset versions (`/lance.table.`, `/lance.index.pb.`, and the
-    /// `type.googleapis.com/` form MemWAL flush once wrote), and every form
-    /// has to keep resolving.
+    /// Only the suffix: the prefix varies by dataset version
+    /// (`/lance.table.`, `/lance.index.pb.`, and the `type.googleapis.com/`
+    /// form MemWAL flush once wrote), and all must resolve.
     pub const fn details_suffix(self) -> &'static str {
         match self {
             Self::BTree => "BTreeIndexDetails",
@@ -313,10 +303,9 @@ impl MemIndexKind {
     }
 }
 
-/// Configuration for an index in MemWAL.
+/// Configuration for an index in MemWAL. Pairs 1:1 with [`MemIndexKind`] via
+/// [`kind`](Self::kind).
 ///
-/// Each variant contains all the configuration needed for that index type,
-/// and pairs 1:1 with a [`MemIndexKind`] via [`kind`](Self::kind).
 /// `Hnsw` is boxed because `HnswBuildParams` is small but the variant may
 /// grow with future config (e.g. shard-specific tuning).
 #[derive(Debug, Clone)]
@@ -330,10 +319,8 @@ pub enum MemIndexConfig {
 }
 
 impl MemIndexConfig {
-    /// The kind of index this config builds.
-    ///
-    /// The link that makes [`MemIndexKind`] the single registry: a new config
-    /// variant fails to compile here until it declares its kind.
+    /// The kind this config builds. Links the config enum to the registry, so
+    /// a new variant must declare its kind.
     pub const fn kind(&self) -> MemIndexKind {
         match self {
             Self::BTree(_) => MemIndexKind::BTree,
@@ -481,18 +468,16 @@ impl MemIndexConfig {
     }
 }
 
-/// Whether the MemWAL can maintain an index of this protobuf type on a
-/// memtable.
+/// Whether the MemWAL can maintain an index of this protobuf type.
 ///
-/// Opening a shard writer rejects any maintained index outside this set, which
-/// makes the table unwritable, so callers choosing what to maintain filter on
-/// this first rather than discovering the problem at claim time.
+/// Opening a shard writer rejects anything outside this set, which makes the
+/// table unwritable — so filter on this before committing a maintained set,
+/// not at claim time.
 pub fn is_maintainable_index_type(type_url: &str) -> bool {
     MemIndexKind::from_type_url(type_url).is_some()
 }
 
-/// The error for a base-table index no memtable can maintain, shared by the
-/// detection and writer paths so they report the same thing.
+/// Shared by the detection and writer paths so both report the same thing.
 pub(crate) fn unsupported_index_type(type_url: &str) -> Error {
     Error::invalid_input(format!(
         "Unsupported index type for MemWAL: {}. Supported: BTree, Inverted, Vector",
@@ -1262,23 +1247,16 @@ mod tests {
     use std::sync::Arc;
     use uuid::Uuid;
 
-    /// Type urls resolve to the kind a memtable will actually build, and
-    /// anything else resolves to nothing — callers use this to keep an
-    /// unmaintainable index out of `maintained_indexes`, where it would
-    /// otherwise fail every memtable claim and leave the table unwritable.
-    ///
-    /// Matching is on the message-name suffix, not the whole url, because the
-    /// prefix varies with how and when the index was written: `Any::from_msg`
-    /// emits the package (`/lance.table.`, `/lance.index.pb.`), while MemWAL
-    /// flush used to hand-write a `type.googleapis.com/` url, so existing
-    /// datasets still carry that form.
+    /// Matching is on the message-name suffix, not the whole url: `Any::from_msg`
+    /// emits the package (`/lance.table.`, `/lance.index.pb.`), while MemWAL flush
+    /// used to hand-write a `type.googleapis.com/` url that existing datasets
+    /// still carry.
     #[rstest]
     #[case::btree("/lance.table.BTreeIndexDetails", Some(MemIndexKind::BTree))]
     #[case::fts("/lance.table.InvertedIndexDetails", Some(MemIndexKind::Fts))]
     #[case::fts_legacy("/lance.index.pb.InvertedIndexDetails", Some(MemIndexKind::Fts))]
     #[case::vector("/lance.index.pb.VectorIndexDetails", Some(MemIndexKind::Hnsw))]
-    // Written by MemWAL flush before it switched to `Any::from_msg`; flushed
-    // generations in existing datasets still have it.
+    // What MemWAL flush wrote before it switched to `Any::from_msg`.
     #[case::vector_legacy_flush(
         "type.googleapis.com/lance.index.VectorIndexDetails",
         Some(MemIndexKind::Hnsw)
@@ -1299,8 +1277,7 @@ mod tests {
         assert_eq!(is_maintainable_index_type(type_url), expected.is_some());
     }
 
-    /// `MemIndexKind::ALL` is hand-maintained, so a kind left out of it would
-    /// silently stop resolving. Every kind reachable from a config must appear.
+    /// `ALL` is hand-maintained, so a kind left out of it stops resolving.
     #[test]
     fn every_kind_is_registered_and_uniquely_identified() {
         for kind in MemIndexKind::ALL {
