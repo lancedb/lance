@@ -330,7 +330,22 @@ fn validate_range(offset: u64, size: u64, object_size: u64, label: &str) -> Resu
     Ok(())
 }
 
-fn validate_prepared_blob_value_array(field: &Field, array: &ArrayRef) -> Result<()> {
+/// Payload bytes observed while validating a prepared blob v2 array.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct PreparedBlobTally {
+    /// Total bytes of inline payloads. The encoder stores these out-of-line in
+    /// the data file being written, so they count as bytes stored by that file.
+    pub inline_bytes: u64,
+    /// Whether any packed or dedicated rows were present. Their payloads live
+    /// in sidecar files this writer did not produce, so their sizes cannot be
+    /// attributed to the file being written.
+    pub has_sidecar_references: bool,
+}
+
+fn validate_prepared_blob_value_array(
+    field: &Field,
+    array: &ArrayRef,
+) -> Result<PreparedBlobTally> {
     if !is_prepared_blob_v2_field(field) {
         return Err(blob_v2_shape_error(field));
     }
@@ -364,6 +379,7 @@ fn validate_prepared_blob_value_array(field: &Field, array: &ArrayRef) -> Result
         .ok_or_else(|| Error::invalid_input("Prepared blob struct missing `position` field"))?
         .as_primitive::<UInt64Type>();
 
+    let mut tally = PreparedBlobTally::default();
     for row in 0..struct_arr.len() {
         if struct_arr.is_null(row) {
             continue;
@@ -381,6 +397,7 @@ fn validate_prepared_blob_value_array(field: &Field, array: &ArrayRef) -> Result
                         "Prepared inline blob row {row} must set `data`"
                     )));
                 }
+                tally.inline_bytes += data_col.value_length(row) as u64;
             }
             BlobKind::Packed => {
                 if blob_id_col.is_null(row)
@@ -399,6 +416,7 @@ fn validate_prepared_blob_value_array(field: &Field, array: &ArrayRef) -> Result
                         "Prepared packed blob row {row} range overflows u64: offset={offset}, size={size}"
                     ))
                 })?;
+                tally.has_sidecar_references = true;
             }
             BlobKind::Dedicated => {
                 if blob_id_col.is_null(row) || blob_size_col.is_null(row) {
@@ -407,6 +425,7 @@ fn validate_prepared_blob_value_array(field: &Field, array: &ArrayRef) -> Result
                     )));
                 }
                 validate_blob_id(blob_id_col.value(row))?;
+                tally.has_sidecar_references = true;
             }
             BlobKind::External => {
                 if uri_col.is_null(row) || uri_col.value(row).is_empty() {
@@ -433,11 +452,17 @@ fn validate_prepared_blob_value_array(field: &Field, array: &ArrayRef) -> Result
         }
     }
 
-    Ok(())
+    Ok(tally)
 }
 
 /// Validate a writer-side prepared blob v2 array before it reaches the encoder.
-pub(crate) fn validate_prepared_blob_array(field: &Field, array: &ArrayRef) -> Result<()> {
+///
+/// Returns the payload byte tally observed during validation so writers can
+/// record blob storage sizes without a second pass over the array.
+pub(crate) fn validate_prepared_blob_array(
+    field: &Field,
+    array: &ArrayRef,
+) -> Result<PreparedBlobTally> {
     validate_prepared_blob_value_array(field, array)
 }
 

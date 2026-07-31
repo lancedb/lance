@@ -12,7 +12,7 @@ use lance_arrow::{
     BLOB_V2_EXT_NAME,
 };
 use lance_core::datatypes::{
-    Field as LanceField, NullabilityComparison, OnMissing, OnTypeMismatch, SchemaCompareOptions,
+    NullabilityComparison, OnMissing, OnTypeMismatch, SchemaCompareOptions,
 };
 use lance_core::utils::tracing::{AUDIT_MODE_CREATE, AUDIT_TYPE_DATA, TRACE_FILE_AUDIT};
 use lance_core::{Error, Result, datatypes::Schema};
@@ -40,9 +40,9 @@ use tracing::{info, instrument};
 use crate::Dataset;
 use crate::blob::normalize_prepared_blob_schema;
 use crate::dataset::blob::{
-    BlobPreprocessor, ExternalBaseCandidate, ExternalBaseResolver, accumulate_blob_payload_bytes,
+    BlobPreprocessor, ExternalBaseCandidate, ExternalBaseResolver,
     blob_dedicated_threshold_from_metadata, blob_inline_threshold_from_metadata,
-    blob_pack_file_threshold_from_metadata, field_contains_blob_v2, preprocess_blob_batches,
+    blob_pack_file_threshold_from_metadata, preprocess_blob_batches,
 };
 use crate::index::DatasetIndexExt;
 use crate::index::scalar::{IndexDetails, fetch_index_details};
@@ -1511,24 +1511,6 @@ struct V2WriterAdapter {
     path: String,
     base_id: Option<u32>,
     preprocessor: Option<BlobPreprocessor>,
-    /// Top-level schema fields that are, or contain, blob v2 fields. Empty
-    /// when the file stores no blob v2 data.
-    blob_fields: Vec<LanceField>,
-    /// Blob v2 payload bytes written so far, keyed by blob field id. Recorded
-    /// in the resulting [`DataFile`] so statistics can report blob storage
-    /// sizes without extra IO.
-    blob_bytes: HashMap<i32, u64>,
-}
-
-impl V2WriterAdapter {
-    fn tally_blob_bytes(&mut self, batch: &RecordBatch) -> Result<()> {
-        for field in &self.blob_fields {
-            if let Some(column) = batch.column_by_name(&field.name) {
-                accumulate_blob_payload_bytes(field, column, &mut self.blob_bytes)?;
-            }
-        }
-        Ok(())
-    }
 }
 
 #[async_trait::async_trait]
@@ -1537,7 +1519,6 @@ impl GenericWriter for V2WriterAdapter {
         if let Some(pre) = self.preprocessor.as_mut() {
             let processed = preprocess_blob_batches(batches, pre).await?;
             for batch in processed {
-                self.tally_blob_bytes(&batch)?;
                 self.writer.write_batch(&batch).await?;
             }
         } else {
@@ -1571,13 +1552,15 @@ impl GenericWriter for V2WriterAdapter {
             .collect::<Vec<_>>();
         let file_version = ConcreteFileVersion::from(self.writer.version());
         let write_summary = self.writer.finish().await?;
-        let blob_bytes = if self.blob_bytes.is_empty() {
-            Vec::new()
-        } else {
-            field_ids
+        // Record the preprocessor's blob payload tally, aligned to `fields`.
+        // Left empty ("not recorded") when the schema has no blob v2 fields or
+        // when the preprocessor could not attribute every payload byte.
+        let blob_bytes = match self.preprocessor.as_ref().and_then(|pre| pre.blob_bytes()) {
+            Some(tally) if !tally.is_empty() => field_ids
                 .iter()
-                .map(|field_id| self.blob_bytes.get(field_id).copied().unwrap_or(0))
-                .collect()
+                .map(|field_id| tally.get(field_id).copied().unwrap_or(0))
+                .collect(),
+            _ => Vec::new(),
         };
         let data_file = DataFile::new(
             std::mem::take(&mut self.path),
@@ -1732,23 +1715,11 @@ async fn open_writer_with_options(
         } else {
             None
         };
-        let blob_fields = if enable_blob_v2 {
-            schema
-                .fields
-                .iter()
-                .filter(|field| field_contains_blob_v2(field))
-                .cloned()
-                .collect()
-        } else {
-            Vec::new()
-        };
         let writer_adapter = V2WriterAdapter {
             writer: file_writer,
             path: filename,
             base_id,
             preprocessor,
-            blob_fields,
-            blob_bytes: HashMap::new(),
         };
         Box::new(writer_adapter) as Box<dyn GenericWriter>
     };

@@ -225,6 +225,10 @@ class DataFile:
         The minor version of the data storage format.
     file_size_bytes : Optional[int]
         The size of the data file in bytes, if available.
+    blob_bytes : List[int]
+        The blob payload bytes stored by this data file, one entry per entry
+        in `fields` (0 for non-blob fields). Empty if blob payload sizes were
+        not recorded.
     """
 
     _path: str
@@ -234,6 +238,7 @@ class DataFile:
     file_minor_version: int = 0
     file_size_bytes: Optional[int] = None
     base_id: Optional[int] = None
+    blob_bytes: List[int] = field(default_factory=list)
 
     def __init__(
         self,
@@ -244,6 +249,7 @@ class DataFile:
         file_minor_version: int = 0,
         file_size_bytes: Optional[int] = None,
         base_id: Optional[int] = None,
+        blob_bytes: List[int] = None,
     ):
         # TODO: only we eliminate the path method, we can remove this
         self._path = path
@@ -253,6 +259,7 @@ class DataFile:
         self.file_minor_version = file_minor_version
         self.file_size_bytes = file_size_bytes
         self.base_id = base_id
+        self.blob_bytes = blob_bytes or []
 
     def __repr__(self):
         # pretend we have a 'path' attribute

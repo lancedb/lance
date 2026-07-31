@@ -576,7 +576,7 @@ fn inner_encode_row_ids(env: &mut JNIEnv, row_ids: &JLongArray) -> Result<String
 
 const DATA_FILE_CLASS: &str = "org/lance/fragment/DataFile";
 const DATA_FILE_CONSTRUCTOR_SIG: &str =
-    "(Ljava/lang/String;[I[IIILjava/lang/Long;Ljava/lang/Integer;)V";
+    "(Ljava/lang/String;[I[IIILjava/lang/Long;Ljava/lang/Integer;[J)V";
 const DELETE_FILE_CLASS: &str = "org/lance/fragment/DeletionFile";
 const DELETE_FILE_CONSTRUCTOR_SIG: &str =
     "(JJLjava/lang/Long;Lorg/lance/fragment/DeletionFileType;Ljava/lang/Integer;)V";
@@ -635,6 +635,13 @@ impl IntoJava for &DataFile {
             None => JObject::null(),
         };
         let base_id = convert_to_java_integer(env, self.base_id)?;
+        let blob_bytes = JLance(
+            self.blob_bytes
+                .iter()
+                .map(|v| *v as i64)
+                .collect::<Vec<i64>>(),
+        )
+        .into_java(env)?;
         Ok(env.new_object(
             DATA_FILE_CLASS,
             DATA_FILE_CONSTRUCTOR_SIG,
@@ -646,6 +653,7 @@ impl IntoJava for &DataFile {
                 JValueGen::Int(self.file_minor_version as i32),
                 JValueGen::Object(&file_size_bytes),
                 JValueGen::Object(&base_id),
+                JValueGen::Object(&blob_bytes),
             ],
         )?)
     }
@@ -904,6 +912,12 @@ impl FromJObjectWithEnv<DataFile> for JObject<'_> {
         let file_size_bytes =
             file_size_bytes.map_or(Default::default(), |r| CachedFileSize::new(r as u64));
         let base_id = get_base_id(env, self)?;
+        let blob_bytes_obj = env.call_method(self, "getBlobBytes", "()[J", &[])?.l()?;
+        let blob_bytes: Vec<u64> = if blob_bytes_obj.is_null() {
+            Vec::new()
+        } else {
+            JLongArray::from(blob_bytes_obj).extract_object(env)?
+        };
         Ok(DataFile {
             path,
             fields: fields.into(),
@@ -912,6 +926,7 @@ impl FromJObjectWithEnv<DataFile> for JObject<'_> {
             file_minor_version,
             file_size_bytes,
             base_id,
+            blob_bytes: Arc::from(blob_bytes),
         })
     }
 }

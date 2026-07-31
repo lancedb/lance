@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::num::NonZero;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use lance_core::Error;
 use lance_core::deepsize::DeepSizeOf;
@@ -109,8 +109,22 @@ impl<'de> Deserialize<'de> for DataFile {
             file_minor_version: helper.file_minor_version,
             file_size_bytes: helper.file_size_bytes,
             base_id: helper.base_id,
-            blob_bytes: Arc::from(helper.blob_bytes),
+            blob_bytes: blob_bytes_arc(helper.blob_bytes),
         })
+    }
+}
+
+/// Shared allocation for the common "blob payload sizes not recorded" case, so
+/// the many empty tallies across a manifest don't each allocate.
+static EMPTY_BLOB_BYTES: LazyLock<Arc<[u64]>> = LazyLock::new(|| Arc::from([]));
+
+/// Convert a blob byte tally to `Arc<[u64]>`, collapsing the common empty case
+/// to a single shared allocation.
+fn blob_bytes_arc(blob_bytes: Vec<u64>) -> Arc<[u64]> {
+    if blob_bytes.is_empty() {
+        EMPTY_BLOB_BYTES.clone()
+    } else {
+        Arc::from(blob_bytes)
     }
 }
 
@@ -133,7 +147,7 @@ impl DataFile {
             file_minor_version,
             file_size_bytes: file_size_bytes.into(),
             base_id,
-            blob_bytes: Arc::from([]),
+            blob_bytes: EMPTY_BLOB_BYTES.clone(),
         }
     }
 
@@ -141,7 +155,7 @@ impl DataFile {
     /// (or don't call) when sizes are unknown; when non-empty, `blob_bytes`
     /// must have one entry per entry in `fields`.
     pub fn with_blob_bytes(mut self, blob_bytes: Vec<u64>) -> Self {
-        self.blob_bytes = Arc::from(blob_bytes);
+        self.blob_bytes = blob_bytes_arc(blob_bytes);
         self
     }
 
@@ -156,7 +170,7 @@ impl DataFile {
             file_minor_version,
             file_size_bytes: Default::default(),
             base_id: None,
-            blob_bytes: Arc::from([]),
+            blob_bytes: EMPTY_BLOB_BYTES.clone(),
         }
     }
 
@@ -259,7 +273,7 @@ impl TryFrom<pb::DataFile> for DataFile {
             file_minor_version: proto.file_minor_version,
             file_size_bytes: CachedFileSize::new(proto.file_size_bytes),
             base_id: proto.base_id,
-            blob_bytes: Arc::from(proto.blob_bytes),
+            blob_bytes: blob_bytes_arc(proto.blob_bytes),
         })
     }
 }
@@ -279,9 +293,6 @@ pub struct DataFileFieldInterner {
     fields: InternCache<i32>,
     column_indices: InternCache<i32>,
     inline_bytes: InternCache<u8>,
-    // Non-empty blob byte tallies rarely repeat across files, but the common
-    // empty case collapses to a single shared allocation.
-    blob_bytes: InternCache<u64>,
 }
 
 /// A cache that uses linear scan for small sizes and HashMap for large.
@@ -384,7 +395,10 @@ impl DataFileFieldInterner {
             file_minor_version: proto.file_minor_version,
             file_size_bytes: CachedFileSize::new(proto.file_size_bytes),
             base_id: proto.base_id,
-            blob_bytes: self.blob_bytes.intern(proto.blob_bytes),
+            // Non-empty blob byte tallies rarely repeat across files, so they
+            // are not worth interning; the common empty case already collapses
+            // to a single shared allocation.
+            blob_bytes: blob_bytes_arc(proto.blob_bytes),
         })
     }
 
@@ -1045,7 +1059,13 @@ mod tests {
 
         // A recorded tally must line up with `fields` entry for entry.
         let misaligned = data_file.with_blob_bytes(vec![42]);
-        assert!(misaligned.validate(&base_path).is_err());
+        let err = misaligned.validate(&base_path).unwrap_err();
+        assert!(matches!(err, Error::CorruptFile { .. }), "{err}");
+        assert!(
+            err.to_string()
+                .contains("1 blob_bytes entries for 3 fields"),
+            "{err}"
+        );
     }
 
     #[test]

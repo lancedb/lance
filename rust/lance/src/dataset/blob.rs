@@ -285,6 +285,19 @@ pub struct BlobPreprocessor {
     /// this write job only; it is not persisted into the dataset schema.
     pack_file_size_override: Option<usize>,
     field_processors: Vec<BlobPreprocessField>,
+    /// Blob v2 payload bytes stored so far by the data file being written,
+    /// keyed by blob field id: payloads this preprocessor routed to inline,
+    /// packed, or dedicated storage, plus inline payloads of user-supplied
+    /// prepared descriptors (which the encoder stores out-of-line in the same
+    /// file). Recorded in the resulting [`DataFile`](lance_table::format::DataFile)
+    /// so statistics can report blob storage sizes without extra IO.
+    blob_bytes: HashMap<i32, u64>,
+    /// False when the file stores blob payload bytes this preprocessor cannot
+    /// attribute: blob fields nested under wrappers it does not traverse
+    /// (e.g. FixedSizeList or Map), or user-supplied packed/dedicated
+    /// descriptors whose sidecars it did not write. When false the tally must
+    /// not be recorded — an unknown tally (empty) beats a wrong one.
+    is_tally_complete: bool,
     external_base_resolver: Option<Arc<ExternalBaseResolver>>,
     allow_external_blob_outside_bases: bool,
     external_blob_mode: ExternalBlobMode,
@@ -314,13 +327,23 @@ struct BlobPreprocessField {
     kind: BlobPreprocessFieldKind,
 }
 
+/// Per-field settings for ingesting a logical blob v2 column.
+#[derive(Clone, Debug)]
+struct BlobV2FieldConfig {
+    field_id: i32,
+    inline_threshold: usize,
+    dedicated_threshold: usize,
+    pack_file_threshold: usize,
+    writer_metadata: HashMap<String, String>,
+}
+
 #[derive(Clone, Debug)]
 enum BlobPreprocessFieldKind {
-    BlobV2 {
-        inline_threshold: usize,
-        dedicated_threshold: usize,
-        pack_file_threshold: usize,
-        writer_metadata: HashMap<String, String>,
+    BlobV2(BlobV2FieldConfig),
+    /// Already-prepared descriptors: validated and tallied, then passed
+    /// through unchanged.
+    PreparedBlobV2 {
+        field_id: i32,
     },
     Struct {
         children: Vec<BlobPreprocessField>,
@@ -332,11 +355,24 @@ enum BlobPreprocessFieldKind {
 }
 
 impl BlobPreprocessField {
-    fn new(field: &ArrowField) -> Result<Self> {
+    /// Classify `field` (paired with its Lance schema counterpart, which
+    /// carries the field id used for blob byte tallies).
+    ///
+    /// Sets `has_unreachable_blob` when a blob v2 field is nested under a
+    /// wrapper this preprocessor does not traverse (e.g. FixedSizeList or
+    /// Map): the file may store blob payload bytes the tally cannot see, so
+    /// no tally must be recorded for it.
+    fn new(
+        field: &ArrowField,
+        lance_field: &LanceField,
+        has_unreachable_blob: &mut bool,
+    ) -> Result<Self> {
         if field.is_blob_v2() {
             if is_prepared_blob_v2_field(field) {
                 return Ok(Self {
-                    kind: BlobPreprocessFieldKind::Passthrough,
+                    kind: BlobPreprocessFieldKind::PreparedBlobV2 {
+                        field_id: lance_field.id,
+                    },
                 });
             }
             if !is_logical_blob_v2_field(field) {
@@ -349,7 +385,8 @@ impl BlobPreprocessField {
                 )));
             }
             return Ok(Self {
-                kind: BlobPreprocessFieldKind::BlobV2 {
+                kind: BlobPreprocessFieldKind::BlobV2(BlobV2FieldConfig {
+                    field_id: lance_field.id,
                     inline_threshold: blob_inline_threshold_from_metadata(
                         field.metadata(),
                         field.name(),
@@ -363,24 +400,34 @@ impl BlobPreprocessField {
                         field.name(),
                     )?,
                     writer_metadata: field.metadata().clone(),
-                },
+                }),
             });
         }
 
-        if let ArrowDataType::Struct(children) = field.data_type() {
+        if let ArrowDataType::Struct(children) = field.data_type()
+            && children.len() == lance_field.children.len()
+        {
             let children = children
                 .iter()
-                .map(|child| Self::new(child.as_ref()))
+                .zip(lance_field.children.iter())
+                .map(|(child, lance_child)| {
+                    Self::new(child.as_ref(), lance_child, has_unreachable_blob)
+                })
                 .collect::<Result<Vec<_>>>()?;
             if children.iter().any(|child| child.requires_preprocessing()) {
                 return Ok(Self {
                     kind: BlobPreprocessFieldKind::Struct { children },
                 });
             }
+            return Ok(Self {
+                kind: BlobPreprocessFieldKind::Passthrough,
+            });
         }
 
-        if let ArrowDataType::List(child) | ArrowDataType::LargeList(child) = field.data_type() {
-            let child = Self::new(child.as_ref())?;
+        if let ArrowDataType::List(child) | ArrowDataType::LargeList(child) = field.data_type()
+            && let Some(lance_child) = lance_field.children.first()
+        {
+            let child = Self::new(child.as_ref(), lance_child, has_unreachable_blob)?;
             if child.requires_preprocessing() {
                 return Ok(Self {
                     kind: BlobPreprocessFieldKind::List {
@@ -388,8 +435,16 @@ impl BlobPreprocessField {
                     },
                 });
             }
+            return Ok(Self {
+                kind: BlobPreprocessFieldKind::Passthrough,
+            });
         }
 
+        // Any other wrapper (FixedSizeList, Map, ...) is not traversed; if a
+        // blob v2 field hides below it, its payload bytes cannot be tallied.
+        if field_contains_blob_v2(lance_field) {
+            *has_unreachable_blob = true;
+        }
         Ok(Self {
             kind: BlobPreprocessFieldKind::Passthrough,
         })
@@ -397,6 +452,21 @@ impl BlobPreprocessField {
 
     fn requires_preprocessing(&self) -> bool {
         !matches!(self.kind, BlobPreprocessFieldKind::Passthrough)
+    }
+
+    /// Collect the ids of blob v2 fields this processor will tally.
+    fn collect_blob_field_ids(&self, ids: &mut Vec<i32>) {
+        match &self.kind {
+            BlobPreprocessFieldKind::BlobV2(BlobV2FieldConfig { field_id, .. })
+            | BlobPreprocessFieldKind::PreparedBlobV2 { field_id } => ids.push(*field_id),
+            BlobPreprocessFieldKind::Struct { children } => {
+                for child in children {
+                    child.collect_blob_field_ids(ids);
+                }
+            }
+            BlobPreprocessFieldKind::List { child } => child.collect_blob_field_ids(ids),
+            BlobPreprocessFieldKind::Passthrough => {}
+        }
     }
 }
 
@@ -465,11 +535,30 @@ impl BlobPreprocessor {
     ) -> Result<Self> {
         let pack_writer = RollingPackedBlobWriter::new();
         let arrow_schema = arrow_schema::Schema::from(schema);
+        if arrow_schema.fields().len() != schema.fields.len() {
+            return Err(Error::internal(format!(
+                "Arrow schema has {} fields but Lance schema has {}",
+                arrow_schema.fields().len(),
+                schema.fields.len()
+            )));
+        }
+        let mut has_unreachable_blob = false;
         let field_processors = arrow_schema
             .fields()
             .iter()
-            .map(|field| BlobPreprocessField::new(field.as_ref()))
+            .zip(schema.fields.iter())
+            .map(|(field, lance_field)| {
+                BlobPreprocessField::new(field.as_ref(), lance_field, &mut has_unreachable_blob)
+            })
             .collect::<Result<Vec<_>>>()?;
+        // Start every reachable blob field at zero so a file whose blobs are
+        // all null or external still records a known-zero tally rather than
+        // "not recorded".
+        let mut blob_field_ids = Vec::new();
+        for processor in &field_processors {
+            processor.collect_blob_field_ids(&mut blob_field_ids);
+        }
+        let blob_bytes = blob_field_ids.into_iter().map(|id| (id, 0)).collect();
         Ok(Self {
             object_store,
             data_dir,
@@ -478,6 +567,8 @@ impl BlobPreprocessor {
             pack_writer,
             pack_file_size_override,
             field_processors,
+            blob_bytes,
+            is_tally_complete: !has_unreachable_blob,
             external_base_resolver,
             allow_external_blob_outside_bases,
             external_blob_mode,
@@ -648,28 +739,46 @@ impl BlobPreprocessor {
         field: &'a Arc<ArrowField>,
     ) -> BoxFuture<'a, Result<(ArrayRef, Arc<ArrowField>)>> {
         async move {
+            // The batch shape wins over the schema classification: on append
+            // the writer schema is the dataset's logical blob schema, yet a
+            // batch may still carry already-prepared descriptors that must be
+            // passed through untouched, not re-ingested as logical blobs.
             if is_prepared_blob_v2_field(field.as_ref()) {
-                validate_prepared_blob_array(field.as_ref(), &array)?;
+                let tally = validate_prepared_blob_array(field.as_ref(), &array)?;
+                match &processor.kind {
+                    BlobPreprocessFieldKind::BlobV2(BlobV2FieldConfig { field_id, .. })
+                    | BlobPreprocessFieldKind::PreparedBlobV2 { field_id } => {
+                        // Inline payloads of prepared descriptors are stored
+                        // out-of-line in this file by the encoder; packed and
+                        // dedicated descriptors reference sidecars this
+                        // writer did not produce, so the tally cannot vouch
+                        // for them.
+                        *self.blob_bytes.entry(*field_id).or_insert(0) += tally.inline_bytes;
+                        if tally.has_sidecar_references {
+                            self.is_tally_complete = false;
+                        }
+                    }
+                    _ => {
+                        // No blob field id to attribute these payloads to.
+                        self.is_tally_complete = false;
+                    }
+                }
                 return Ok((array, field.clone()));
             }
 
             match &processor.kind {
                 BlobPreprocessFieldKind::Passthrough => Ok((array, field.clone())),
-                BlobPreprocessFieldKind::BlobV2 {
-                    inline_threshold,
-                    dedicated_threshold,
-                    pack_file_threshold,
-                    writer_metadata,
-                } => {
-                    self.preprocess_blob_array(
-                        array,
-                        field.as_ref(),
-                        *inline_threshold,
-                        *dedicated_threshold,
-                        *pack_file_threshold,
-                        writer_metadata,
-                    )
-                    .await
+                BlobPreprocessFieldKind::PreparedBlobV2 { .. } => {
+                    // Classified prepared but the batch is not in prepared
+                    // shape: pass through unchanged (matching pre-tally
+                    // behavior) and leave the tally unrecorded rather than
+                    // guessing.
+                    self.is_tally_complete = false;
+                    Ok((array, field.clone()))
+                }
+                BlobPreprocessFieldKind::BlobV2(config) => {
+                    self.preprocess_blob_array(array, field.as_ref(), config)
+                        .await
                 }
                 BlobPreprocessFieldKind::Struct { children } => {
                     self.preprocess_struct_array(array, field.as_ref(), children)
@@ -821,11 +930,15 @@ impl BlobPreprocessor {
         &mut self,
         array: ArrayRef,
         field: &ArrowField,
-        inline_threshold: usize,
-        dedicated_threshold: usize,
-        pack_file_threshold: usize,
-        writer_metadata: &HashMap<String, String>,
+        config: &BlobV2FieldConfig,
     ) -> Result<(ArrayRef, Arc<ArrowField>)> {
+        let &BlobV2FieldConfig {
+            field_id,
+            inline_threshold,
+            dedicated_threshold,
+            pack_file_threshold,
+            ref writer_metadata,
+        } = config;
         let struct_arr = array
             .as_any()
             .downcast_ref::<StructArray>()
@@ -847,6 +960,9 @@ impl BlobPreprocessor {
             .map(|col| col.as_primitive::<UInt64Type>());
 
         let mut blob_writer = self.blob_writer_with_metadata(field, writer_metadata.clone());
+        // Payload bytes routed to storage owned by the file being written
+        // (inline, packed, or dedicated); external references are excluded.
+        let mut stored_bytes: u64 = 0;
 
         for i in 0..struct_arr.len() {
             if struct_arr.is_null(i) {
@@ -876,6 +992,7 @@ impl BlobPreprocessor {
                 )
                 .await?;
                 blob_writer.push(value)?;
+                stored_bytes += data_len as u64;
                 continue;
             }
 
@@ -887,6 +1004,7 @@ impl BlobPreprocessor {
                     )
                     .await?;
                 blob_writer.push(value)?;
+                stored_bytes += data_len as u64;
                 continue;
             }
 
@@ -921,6 +1039,7 @@ impl BlobPreprocessor {
                         )
                         .await?;
                         blob_writer.push(value)?;
+                        stored_bytes += data_len;
                         continue;
                     }
 
@@ -929,10 +1048,12 @@ impl BlobPreprocessor {
                             .write_packed(pack_file_threshold, BlobWriteSource::External(&source))
                             .await?;
                         blob_writer.push(value)?;
+                        stored_bytes += data_len;
                         continue;
                     }
 
                     let data = source.read_all().await?;
+                    stored_bytes += data.len() as u64;
                     blob_writer.push_inline(data)?;
                     continue;
                 }
@@ -961,11 +1082,13 @@ impl BlobPreprocessor {
 
             if has_data {
                 blob_writer.push_inline(Bytes::copy_from_slice(data_col.value(i)))?;
+                stored_bytes += data_len as u64;
             } else {
                 blob_writer.push_null()?;
             }
         }
 
+        *self.blob_bytes.entry(field_id).or_insert(0) += stored_bytes;
         let column = blob_writer.finish()?;
         let (field, array) = column.into_parts();
         Ok((array, Arc::new(field)))
@@ -973,6 +1096,18 @@ impl BlobPreprocessor {
 
     pub(crate) async fn finish(&mut self) -> Result<()> {
         self.pack_writer.finish().await
+    }
+
+    /// Blob v2 payload bytes stored by the data file being written, keyed by
+    /// blob field id (zero entries for blob fields whose payloads were all
+    /// null or external).
+    ///
+    /// Returns `None` when the file may store blob payload bytes this
+    /// preprocessor could not attribute (see `is_tally_complete`); no tally
+    /// should be recorded in that case. Empty when the schema has no
+    /// (reachable) blob v2 fields.
+    pub(super) fn blob_bytes(&self) -> Option<&HashMap<i32, u64>> {
+        self.is_tally_complete.then_some(&self.blob_bytes)
     }
 }
 
@@ -988,90 +1123,8 @@ pub async fn preprocess_blob_batches(
 }
 
 /// Returns true when `field` is, or contains, a blob v2 field.
-pub(super) fn field_contains_blob_v2(field: &LanceField) -> bool {
+fn field_contains_blob_v2(field: &LanceField) -> bool {
     field.is_blob_v2() || field.children.iter().any(field_contains_blob_v2)
-}
-
-/// Accumulate the blob v2 payload bytes carried by `array` into `tally`,
-/// keyed by the owning blob field's id.
-///
-/// `array` must hold prepared blob descriptors (the shape the encoder sees on
-/// the write path): inline rows carry their payload in the `data` child while
-/// packed and dedicated rows record their payload length in `blob_size`.
-/// External rows reference storage Lance does not own and are not counted.
-pub(super) fn accumulate_blob_payload_bytes(
-    field: &LanceField,
-    array: &dyn Array,
-    tally: &mut HashMap<i32, u64>,
-) -> Result<()> {
-    if field.is_blob_v2() {
-        let missing_child = |child: &str| {
-            Error::invalid_input(format!(
-                "Blob v2 field '{}' reached the writer without a prepared descriptor \
-                 '{}' child (array type {:?})",
-                field.name,
-                child,
-                array.data_type(),
-            ))
-        };
-        let structs = array.as_struct_opt().ok_or_else(|| missing_child("kind"))?;
-        let kinds = structs
-            .column_by_name("kind")
-            .and_then(|c| c.as_primitive_opt::<UInt8Type>())
-            .ok_or_else(|| missing_child("kind"))?;
-        let sizes = structs
-            .column_by_name("blob_size")
-            .and_then(|c| c.as_primitive_opt::<UInt64Type>())
-            .ok_or_else(|| missing_child("blob_size"))?;
-        let data = structs
-            .column_by_name("data")
-            .and_then(|c| c.as_binary_opt::<i64>())
-            .ok_or_else(|| missing_child("data"))?;
-        let mut total: u64 = 0;
-        for i in 0..structs.len() {
-            if structs.is_null(i) || kinds.is_null(i) {
-                continue;
-            }
-            match BlobKind::try_from(kinds.value(i))? {
-                BlobKind::Inline => {
-                    if data.is_valid(i) {
-                        total += data.value_length(i) as u64;
-                    }
-                }
-                BlobKind::Packed | BlobKind::Dedicated => {
-                    if sizes.is_valid(i) {
-                        total += sizes.value(i);
-                    }
-                }
-                BlobKind::External => {}
-            }
-        }
-        *tally.entry(field.id).or_insert(0) += total;
-        return Ok(());
-    }
-
-    match array.data_type() {
-        ArrowDataType::Struct(_) => {
-            let structs = array.as_struct();
-            for child in &field.children {
-                if let Some(child_array) = structs.column_by_name(&child.name) {
-                    accumulate_blob_payload_bytes(child, child_array, tally)?;
-                }
-            }
-        }
-        ArrowDataType::List(_) => {
-            if let Some(child) = field.children.first() {
-                accumulate_blob_payload_bytes(child, array.as_list::<i32>().values(), tally)?;
-            }
-        }
-        ArrowDataType::LargeList(_) => {
-            if let Some(child) = field.children.first() {
-                accumulate_blob_payload_bytes(child, array.as_list::<i64>().values(), tally)?;
-            }
-        }
-        _ => {}
-    }
-    Ok(())
 }
 
 /// Mutable state for a [`BlobFile`] cursor.
@@ -5230,6 +5283,193 @@ mod tests {
             blobs[1].as_ref().unwrap().read().await.unwrap().as_ref(),
             b"append"
         );
+
+        // Both write paths must record the inline payload bytes in the
+        // manifest: the logical write stored b"initial" (7 bytes) and the
+        // prepared append stored b"append" (6 bytes) out-of-line in their
+        // respective data files.
+        let blob_field_id = dataset.schema().field("blob").unwrap().id;
+        let fragments = dataset.fragments();
+        for (fragment, expected) in fragments.iter().zip([7u64, 6u64]) {
+            assert_eq!(recorded_blob_bytes(fragment, blob_field_id), Some(expected));
+        }
+    }
+
+    /// The blob payload bytes recorded for `field_id` in the fragment's sole
+    /// data file, or `None` when no tally was recorded.
+    fn recorded_blob_bytes(fragment: &lance_table::format::Fragment, field_id: i32) -> Option<u64> {
+        assert_eq!(fragment.files.len(), 1);
+        let file = &fragment.files[0];
+        if file.blob_bytes.is_empty() {
+            return None;
+        }
+        assert_eq!(file.blob_bytes.len(), file.fields.len());
+        Some(
+            file.fields
+                .iter()
+                .zip(file.blob_bytes.iter())
+                .filter(|(id, _)| **id == field_id)
+                .map(|(_, bytes)| *bytes)
+                .sum(),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_prepared_sidecar_descriptors_leave_blob_bytes_unrecorded() {
+        // Packed/dedicated prepared descriptors reference sidecar files this
+        // write does not produce, so the writer cannot vouch for their sizes:
+        // the tally must be left unrecorded (empty), not recorded as wrong.
+        let test_dir = TempStrDir::default();
+        let logical_schema = Arc::new(Schema::new(vec![blob_field("blob", true)]));
+        let mut initial_builder = BlobArrayBuilder::new(1);
+        initial_builder.push_bytes(b"initial").unwrap();
+        let initial_batch = RecordBatch::try_new(
+            logical_schema.clone(),
+            vec![initial_builder.finish().unwrap()],
+        )
+        .unwrap();
+        let dataset = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new(vec![Ok(initial_batch)], logical_schema.clone()),
+                &test_dir,
+                Some(WriteParams {
+                    data_storage_version: Some(LanceFileVersion::V2_2),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+
+        let sidecar_owner_path = dataset.data_dir().join("pre-written.lance");
+        let mut blob_writer = BlobDescriptorArrayBuilder::new("blob");
+        let mut packed =
+            PackedBlobWriter::try_new(dataset.object_store.as_ref().clone(), sidecar_owner_path, 1)
+                .await
+                .unwrap();
+        packed.write_blob(b"packed-elsewhere").await.unwrap();
+        blob_writer.extend(packed.finish().await.unwrap()).unwrap();
+        let (prepared_field, prepared_array) = blob_writer.finish().unwrap().into_parts();
+        let append_schema = Arc::new(Schema::new(vec![prepared_field]));
+        let append_batch =
+            RecordBatch::try_new(append_schema.clone(), vec![prepared_array]).unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(append_batch)], append_schema),
+            dataset,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let blob_field_id = dataset.schema().field("blob").unwrap().id;
+        let fragments = dataset.fragments();
+        assert_eq!(recorded_blob_bytes(&fragments[0], blob_field_id), Some(7));
+        assert_eq!(recorded_blob_bytes(&fragments[1], blob_field_id), None);
+    }
+
+    #[tokio::test]
+    async fn test_blob_field_under_untraversed_wrapper_leaves_blob_bytes_unrecorded() {
+        // A blob v2 field nested under a wrapper the preprocessor does not
+        // traverse (FixedSizeList here) stores payload bytes the tally cannot
+        // see. The whole file's tally must be left unrecorded — recording a
+        // definite 0 for the wrapped field (while the sibling blob records
+        // bytes) would silently understate storage forever.
+        let test_dir = TempStrDir::default();
+        let mut wrapped_builder = BlobDescriptorArrayBuilder::new("item");
+        wrapped_builder
+            .push_inline(Bytes::from_static(b"wrapped!"))
+            .unwrap();
+        let (wrapped_field, wrapped_array) = wrapped_builder.finish().unwrap().into_parts();
+        let fsl = arrow_array::FixedSizeListArray::try_new(
+            Arc::new(wrapped_field),
+            1,
+            wrapped_array,
+            None,
+        )
+        .unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("wrapped", fsl.data_type().clone(), false),
+            blob_field("blob", true),
+        ]));
+        let mut blobs = BlobArrayBuilder::new(1);
+        blobs.push_bytes(b"top-level-payload").unwrap();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(fsl) as ArrayRef, blobs.finish().unwrap()],
+        )
+        .unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &test_dir,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let blob_field_id = dataset.schema().field("blob").unwrap().id;
+        let fragments = dataset.fragments();
+        assert_eq!(recorded_blob_bytes(&fragments[0], blob_field_id), None);
+    }
+
+    #[tokio::test]
+    async fn test_sliced_list_of_prepared_blobs_tallies_only_own_rows() {
+        // The write pipeline zero-copy slices batches to honor
+        // max_rows_per_file; each slice of a list column still exposes the
+        // full values buffer. The tally must count each file's own rows only,
+        // not the whole buffer once per file.
+        let test_dir = TempStrDir::default();
+        let mut item_builder = BlobDescriptorArrayBuilder::new("item");
+        item_builder
+            .push_inline(Bytes::from(vec![1u8; 10]))
+            .unwrap();
+        item_builder
+            .push_inline(Bytes::from(vec![2u8; 20]))
+            .unwrap();
+        let (item_field, item_array) = item_builder.finish().unwrap().into_parts();
+        let list = arrow_array::ListArray::try_new(
+            Arc::new(item_field),
+            arrow_buffer::OffsetBuffer::from_lengths([1, 1]),
+            item_array,
+            None,
+        )
+        .unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "blobs",
+            list.data_type().clone(),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(list) as ArrayRef]).unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &test_dir,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                max_rows_per_file: 1,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let blob_field_id = dataset
+            .schema()
+            .field("blobs")
+            .unwrap()
+            .children
+            .first()
+            .unwrap()
+            .id;
+        let fragments = dataset.fragments();
+        assert_eq!(fragments.len(), 2);
+        assert_eq!(recorded_blob_bytes(&fragments[0], blob_field_id), Some(10));
+        assert_eq!(recorded_blob_bytes(&fragments[1], blob_field_id), Some(20));
     }
 
     #[tokio::test]
@@ -5307,6 +5547,30 @@ mod tests {
             .create_data_file(&data_file_name, None)
             .await
             .unwrap();
+        // The replacement file owns the packed sidecar holding
+        // b"nested-replacement"; record its tally and check it survives the
+        // commit (the old file's tally must not linger on the new path).
+        let blob_field_id = dataset
+            .schema()
+            .field("info")
+            .unwrap()
+            .children
+            .iter()
+            .find(|child| child.name == "blob")
+            .unwrap()
+            .id;
+        let replacement_tally = data_file
+            .fields
+            .iter()
+            .map(|id| {
+                if *id == blob_field_id {
+                    b"nested-replacement".len() as u64
+                } else {
+                    0
+                }
+            })
+            .collect::<Vec<_>>();
+        let data_file = data_file.with_blob_bytes(replacement_tally.clone());
         let transaction = Transaction {
             read_version: dataset.manifest.version,
             uuid: Uuid::new_v4().hyphenated().to_string(),
@@ -5321,6 +5585,16 @@ mod tests {
                 .execute(transaction)
                 .await
                 .unwrap(),
+        );
+
+        let replaced_file = dataset.fragments()[0]
+            .files
+            .iter()
+            .find(|file| file.path == data_file_name)
+            .expect("replacement data file should be in the fragment");
+        assert_eq!(
+            replaced_file.blob_bytes.as_ref(),
+            replacement_tally.as_slice()
         );
 
         let blobs = dataset

@@ -2305,6 +2305,10 @@ impl Transaction {
                             file.path = new_file.path.clone();
                             file.file_size_bytes = new_file.file_size_bytes.clone();
                             file.base_id = new_file.base_id;
+                            // Carry the replacement file's blob tally (possibly
+                            // empty = unknown); the old file's tally describes
+                            // payloads that no longer back this path.
+                            file.blob_bytes = new_file.blob_bytes.clone();
                         }
                         columns_covered.extend(file.fields.iter());
                     }

@@ -894,6 +894,12 @@ impl FromPyObject<'_, '_> for PyLance<DataFile> {
         let file_size_bytes = CachedFileSize::new(file_size_bytes.unwrap_or(0));
         let fields: Vec<i32> = ob.getattr("fields")?.extract()?;
         let column_indices: Vec<i32> = ob.getattr("column_indices")?.extract()?;
+        // Older DataFile objects may not have a blob_bytes attribute; treat
+        // that the same as "blob payload sizes not recorded" (empty).
+        let blob_bytes: Vec<u64> = ob
+            .getattr("blob_bytes")
+            .and_then(|v| v.extract())
+            .unwrap_or_default();
         Ok(Self(DataFile {
             path: ob.getattr("path")?.extract()?,
             fields: fields.into(),
@@ -902,6 +908,7 @@ impl FromPyObject<'_, '_> for PyLance<DataFile> {
             file_minor_version: ob.getattr("file_minor_version")?.extract()?,
             file_size_bytes,
             base_id: ob.getattr("base_id")?.extract()?,
+            blob_bytes: Arc::from(blob_bytes),
         }))
     }
 }
@@ -926,6 +933,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&DataFile> {
             self.0.file_minor_version,
             file_size_bytes,
             self.0.base_id,
+            self.0.blob_bytes.to_vec(),
         ))
     }
 }
