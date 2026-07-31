@@ -5,9 +5,9 @@ use arrow_schema::DataType;
 
 use crate::{
     data::{BlockInfo, DataBlock, OpaqueBlock},
+    encoder::{ArrayEncoder, EncodedArray},
     encodings::physical::block::{CompressedBufferEncoder, CompressionConfig, CompressionScheme},
     format::ProtobufUtils,
-    previous::encoder::{ArrayEncoder, EncodedArray},
 };
 
 use lance_core::Result;

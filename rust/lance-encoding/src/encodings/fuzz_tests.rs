@@ -16,7 +16,6 @@ use arrow_schema::{DataType, Field};
 use proptest::prelude::*;
 
 use crate::testing::{TestCases, check_round_trip_encoding_of_data};
-use crate::version::LanceFileVersion;
 use lance_core::Result;
 use lance_datagen::{ArrayGenerator, ByteCount, Dimension, RowCount, Seed, array, gen_batch};
 
@@ -280,7 +279,7 @@ proptest! {
             }
 
             let test_cases = TestCases::default()
-                .with_min_file_version(LanceFileVersion::V2_1)
+                .with_structural_encodings()
                 .with_batch_size(100)
                 .with_range(0..num_rows.min(500) as u64)
                 .with_indices(vec![0, num_rows as u64 / 2, (num_rows - 1) as u64]);
@@ -301,7 +300,7 @@ async fn test_edge_cases_single_value() {
     let single_int32 = Arc::new(Int32Array::from(vec![42])) as Arc<dyn Array>;
     let single_string = Arc::new(StringArray::from(vec!["test"])) as Arc<dyn Array>;
 
-    let test_cases = TestCases::default().with_min_file_version(LanceFileVersion::V2_1);
+    let test_cases = TestCases::default().with_structural_encodings();
 
     check_round_trip_encoding_of_data(vec![single_int32], &test_cases, HashMap::new()).await;
 
@@ -317,7 +316,7 @@ async fn test_edge_cases_all_nulls() {
         vec![None, None, None] as Vec<Option<&str>>
     )) as Arc<dyn Array>;
 
-    let test_cases = TestCases::default().with_min_file_version(LanceFileVersion::V2_1);
+    let test_cases = TestCases::default().with_structural_encodings();
 
     check_round_trip_encoding_of_data(vec![all_nulls_int32], &test_cases, HashMap::new()).await;
 
@@ -347,7 +346,7 @@ proptest! {
             let list_array = Arc::new(list_builder.finish()) as Arc<dyn Array>;
 
             let test_cases = TestCases::default()
-                .with_min_file_version(LanceFileVersion::V2_1)
+                .with_structural_encodings()
                 .with_range(0..list_sizes.len().min(50) as u64);
 
             check_round_trip_encoding_of_data(
@@ -381,7 +380,7 @@ proptest! {
                 .expect("Failed to generate test data");
 
             let test_cases = TestCases::default()
-                .with_min_file_version(LanceFileVersion::V2_1);
+                .with_structural_encodings();
 
             check_round_trip_encoding_of_data(
                 vec![test_data],
@@ -424,7 +423,7 @@ async fn test_list_dict_empty_batch() {
     let list_array = Arc::new(list_builder.finish());
 
     let test_cases = TestCases::default()
-        .with_min_file_version(LanceFileVersion::V2_1)
+        .with_structural_encodings()
         // Read only the empty/null lists (rows 50-99)
         // This batch will have 0 underlying values
         .with_range(50..100);
@@ -539,7 +538,7 @@ async fn test_all_valid_combinations() {
         let test_data =
             generate_test_data_for_config(&config, 100, 42).expect("Failed to generate test data");
 
-        let test_cases = TestCases::default().with_min_file_version(LanceFileVersion::V2_1);
+        let test_cases = TestCases::default().with_structural_encodings();
 
         check_round_trip_encoding_of_data(vec![test_data], &test_cases, HashMap::new()).await;
     }

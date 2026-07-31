@@ -18,7 +18,7 @@ use crate::format::ProtobufUtils;
 use crate::{
     EncodingsIo,
     decoder::{PageScheduler, PrimitivePageDecoder},
-    previous::encoder::{ArrayEncoder, EncodedArray},
+    encoder::{ArrayEncoder, EncodedArray},
 };
 
 use lance_core::{Error, Result};

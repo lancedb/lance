@@ -15,10 +15,8 @@ use bytes::Bytes;
 use futures::TryStreamExt;
 use lance_core::cache::LanceCache;
 use lance_core::datatypes::Schema as LanceSchema;
-use lance_encoding::decoder::{DecoderPlugins, FilterExpression, decode_batch};
-use lance_encoding::encoder::{
-    EncodedBatch, EncodingOptions, default_encoding_strategy, encode_batch,
-};
+use lance_encoding::decoder::{DecoderPlugins, EncodedBatchLayout, FilterExpression, decode_batch};
+use lance_encoding::encoder::{EncodedBatch, EncodingOptions, encode_batch};
 use lance_io::ReadBatchParams;
 use lance_io::traits::Writer;
 use lance_io::utils::CachedFileSize;
@@ -27,7 +25,7 @@ use tokio::io::AsyncWriteExt;
 
 use crate::reader::{EncodedBatchReaderExt, FileReader, FileReaderOptions};
 use crate::testing::FsFixture;
-use crate::version::ConcreteFileVersion;
+use crate::version::{ConcreteFileVersion, LanceFileVersion};
 use crate::versions::v1::reader::FileReader as V1Reader;
 use crate::versions::v1::writer::{
     FileWriter as V1Writer, FileWriterOptions as V1WriterOptions, NotSelfDescribing,
@@ -264,15 +262,14 @@ async fn write_current_fixture(
 }
 
 async fn write_v2_0_embedded_fixtures(batch: &RecordBatch, schema: &LanceSchema) -> (Bytes, Bytes) {
-    let version = ConcreteFileVersion::V2_0.into();
+    let version = LanceFileVersion::from(ConcreteFileVersion::V2_0);
     let options = EncodingOptions {
         cache_bytes_per_column: 1,
         max_page_bytes: 1024,
         keep_original_array: true,
         buffer_alignment: 64,
-        version,
     };
-    let encoding_strategy = default_encoding_strategy(version);
+    let encoding_strategy = crate::versions::v2_0::encoding_strategy();
     let encoded_batch = encode_batch(
         batch,
         Arc::new(schema.clone()),
@@ -394,7 +391,7 @@ async fn v2_0_embedded_writer_and_reader_are_wire_compatible() {
     assert_eq!(footer_version(expected_self_described), expected_footer);
     assert_eq!(footer_version(expected_mini), expected_footer);
 
-    let version = ConcreteFileVersion::V2_0.into();
+    let version = LanceFileVersion::from(ConcreteFileVersion::V2_0);
     let self_described =
         EncodedBatch::try_from_self_described_lance(Bytes::from_static(expected_self_described))
             .unwrap();
@@ -403,7 +400,7 @@ async fn v2_0_embedded_writer_and_reader_are_wire_compatible() {
         &FilterExpression::no_filter(),
         Arc::<DecoderPlugins>::default(),
         false,
-        version,
+        EncodedBatchLayout::Array,
         None,
     )
     .await
@@ -418,7 +415,7 @@ async fn v2_0_embedded_writer_and_reader_are_wire_compatible() {
         &FilterExpression::no_filter(),
         Arc::<DecoderPlugins>::default(),
         false,
-        version,
+        EncodedBatchLayout::Array,
         None,
     )
     .await

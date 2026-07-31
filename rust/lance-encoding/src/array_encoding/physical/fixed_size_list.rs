@@ -12,8 +12,8 @@ use crate::{
     EncodingsIo,
     data::{DataBlock, FixedSizeListBlock},
     decoder::{PageScheduler, PrimitivePageDecoder},
+    encoder::{ArrayEncoder, EncodedArray},
     format::ProtobufUtils,
-    previous::encoder::{ArrayEncoder, EncodedArray},
 };
 
 /// A scheduler for fixed size lists of primitive values
@@ -138,10 +138,7 @@ mod tests {
     use arrow_schema::{DataType, Field};
     use lance_datagen::{ArrayGeneratorExt, RowCount, array, gen_array};
 
-    use crate::{
-        testing::{TestCases, check_basic_random, check_round_trip_encoding_of_data},
-        version::LanceFileVersion,
-    };
+    use crate::testing::{TestCases, check_basic_random, check_round_trip_encoding_of_data};
 
     const PRIMITIVE_TYPES: &[DataType] = &[DataType::Int8, DataType::Float32, DataType::Float64];
 
@@ -182,7 +179,7 @@ mod tests {
             .with_indices(vec![0, 1, 2])
             .with_indices(vec![1])
             .with_indices(vec![2])
-            .with_min_file_version(LanceFileVersion::V2_1);
+            .with_structural_encodings();
 
         check_round_trip_encoding_of_data(vec![list], &test_cases, HashMap::default()).await;
     }
@@ -209,7 +206,7 @@ mod tests {
             .with_indices(vec![0, 1, 2])
             .with_indices(vec![1])
             .with_indices(vec![2])
-            .with_min_file_version(LanceFileVersion::V2_1);
+            .with_structural_encodings();
 
         check_round_trip_encoding_of_data(vec![list], &test_cases, HashMap::default()).await;
     }
@@ -260,7 +257,7 @@ mod tests {
             .with_range(1..3)
             .with_indices(vec![0, 1, 2])
             .with_indices(vec![2])
-            .with_min_file_version(LanceFileVersion::V2_1);
+            .with_structural_encodings();
 
         check_round_trip_encoding_of_data(vec![outer_list], &test_cases, HashMap::default()).await;
     }

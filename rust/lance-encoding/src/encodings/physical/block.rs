@@ -46,8 +46,19 @@ pub struct CompressionConfig {
 }
 
 impl CompressionConfig {
-    pub(crate) fn new(scheme: CompressionScheme, level: Option<i32>) -> Self {
+    /// Create a compression configuration for an encoding mechanism.
+    pub fn new(scheme: CompressionScheme, level: Option<i32>) -> Self {
         Self { scheme, level }
+    }
+
+    /// Return the selected compression scheme.
+    pub fn scheme(&self) -> CompressionScheme {
+        self.scheme
+    }
+
+    /// Return the optional compression level.
+    pub fn level(&self) -> Option<i32> {
+        self.level
     }
 }
 
@@ -1019,7 +1030,6 @@ mod tests {
             },
             encodings::physical::block::lz4::Lz4BufferCompressor,
             testing::{FnArrayGeneratorProvider, TestCases, check_round_trip_encoding_generated},
-            version::LanceFileVersion,
         };
 
         #[test]
@@ -1089,7 +1099,7 @@ mod tests {
                     // Need to use large pages as small pages might be too small to compress
                     .with_page_sizes(vec![1024 * 1024])
                     .with_expected_encoding("zstd")
-                    .with_min_file_version(LanceFileVersion::V2_1);
+                    .with_structural_encodings();
 
                 // Can't use the default random provider because random data isn't compressible
                 // and we will fallback to uncompressed encoding

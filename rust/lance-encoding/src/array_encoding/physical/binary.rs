@@ -12,17 +12,17 @@ use futures::TryFutureExt;
 
 use futures::{FutureExt, future::BoxFuture};
 
+use crate::array_encoding::logical::primitive::PrimitiveFieldDecoder;
 use crate::buffer::LanceBuffer;
 use crate::data::{
     BlockInfo, DataBlock, FixedWidthDataBlock, NullableDataBlock, VariableWidthBlock,
 };
+use crate::decoder::LogicalPageDecoder;
+use crate::encoder::{ArrayEncoder, EncodedArray};
 use crate::encodings::physical::block::{
     BufferCompressor, CompressionConfig, GeneralBufferCompressor,
 };
 use crate::format::ProtobufUtils;
-use crate::previous::decoder::LogicalPageDecoder;
-use crate::previous::encoder::{ArrayEncoder, EncodedArray};
-use crate::previous::encodings::logical::primitive::PrimitiveFieldDecoder;
 use crate::{
     EncodingsIo,
     decoder::{PageScheduler, PrimitivePageDecoder},

@@ -131,9 +131,9 @@ mod tests {
     use bytes::Bytes;
     use std::{collections::HashMap, sync::Arc};
 
+    use crate::array_encoding::physical::bitmap::BitmapData;
     use crate::data::{DataBlock, FixedWidthDataBlock};
     use crate::decoder::PrimitivePageDecoder;
-    use crate::previous::encodings::physical::bitmap::BitmapData;
     use crate::testing::{TestCases, check_basic_random, check_round_trip_encoding_of_data};
 
     use super::BitmapDecoder;
