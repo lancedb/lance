@@ -1304,6 +1304,36 @@ public class Dataset implements Closeable {
   private native List<FragmentMetadata> getFragmentsNative();
 
   /**
+   * Get per-fragment statistics for all fragments in this dataset version.
+   *
+   * <p>Unlike {@link #getFragments()}, this is a metadata-only bulk operation: no per-fragment Java
+   * objects are materialized, making it suitable for planning over datasets with a very large
+   * number of fragments. Row counts match {@link FragmentMetadata#getNumRows()} (physical rows
+   * minus deleted rows).
+   *
+   * @return per-fragment statistics as parallel arrays, in manifest order
+   */
+  public FragmentStatistics getFragmentStatistics() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      // Flattened as [id0, rowCount0, dataFileNum0, id1, ...] to keep the JNI surface primitive
+      long[] flat = nativeGetFragmentStatistics();
+      int count = flat.length / 3;
+      int[] ids = new int[count];
+      long[] rowCounts = new long[count];
+      int[] dataFileNums = new int[count];
+      for (int i = 0; i < count; i++) {
+        ids[i] = (int) flat[3 * i];
+        rowCounts[i] = flat[3 * i + 1];
+        dataFileNums[i] = (int) flat[3 * i + 2];
+      }
+      return new FragmentStatistics(ids, rowCounts, dataFileNums);
+    }
+  }
+
+  private native long[] nativeGetFragmentStatistics();
+
+  /**
    * Gets the arrow schema of the dataset.
    *
    * @return the arrow schema
@@ -1621,11 +1651,27 @@ public class Dataset implements Closeable {
   private native List<BlobFile> nativeTakeBlobsByIndices(List<Long> rowIndices, String column);
 
   /**
-   * Open blob files for given row ids on a blob column. Names and semantics align with Rust/Python.
+   * Open {@link BlobFile} handles for given row IDs on a blob column. Names and semantics align
+   * with Rust/Python.
    *
-   * @param rowIds stable row ids (row addresses)
+   * <p>Pass logical row IDs read from {@code _rowid}, not physical row addresses from {@code
+   * _rowaddr}.
+   *
+   * <pre>{@code
+   * long rowId = 42L; // Example value from the _rowid column.
+   * List<BlobFile> blobs = dataset.takeBlobs(List.of(rowId), "images");
+   * for (BlobFile blob : blobs) {
+   *   if (blob != null) {
+   *     try (BlobFile file = blob) {
+   *       byte[] data = file.read();
+   *     }
+   *   }
+   * }
+   * }</pre>
+   *
+   * @param rowIds logical row IDs from the {@code _rowid} column
    * @param column blob column name
-   * @return list of BlobFile objects
+   * @return one {@link BlobFile} per row ID; null blob values are represented by null elements
    */
   public List<BlobFile> takeBlobs(List<Long> rowIds, String column) {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
@@ -1639,11 +1685,22 @@ public class Dataset implements Closeable {
   }
 
   /**
-   * Open blob files for given row indices on a blob column.
+   * Open {@link BlobFile} handles for given row indices on a blob column.
+   *
+   * <pre>{@code
+   * List<BlobFile> blobs = dataset.takeBlobsByIndices(List.of(0L), "images");
+   * for (BlobFile blob : blobs) {
+   *   if (blob != null) {
+   *     try (BlobFile file = blob) {
+   *       byte[] data = file.read();
+   *     }
+   *   }
+   * }
+   * }</pre>
    *
    * @param rowIndices row offsets within dataset
    * @param column blob column name
-   * @return list of BlobFile objects
+   * @return one {@link BlobFile} per row index; null blob values are represented by null elements
    */
   public List<BlobFile> takeBlobsByIndices(List<Long> rowIndices, String column) {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {

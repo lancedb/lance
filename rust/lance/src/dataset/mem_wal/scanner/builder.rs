@@ -25,12 +25,14 @@ use uuid::Uuid;
 
 use super::collector::{InMemoryMemTableRef, InMemoryMemTables, LsmDataSourceCollector};
 use super::data_source::{FreshTierWatermark, ShardSnapshot};
-use super::flushed_cache::{DatasetCache, GenerationWarmer};
 use super::planner::LsmScanPlanner;
 use super::point_lookup::LsmPointLookupPlanner;
 use super::projection::validate_projection_names;
+use super::sstable_cache::{DatasetCache, SsTableWarmer};
 use crate::dataset::Dataset;
+use crate::dataset::mem_wal::util::derived_store_params;
 use crate::session::Session;
+use lance_io::object_store::ObjectStoreParams;
 
 /// Vector (KNN) search state, set by [`LsmScanner::nearest`] and friends. Mirrors
 /// the subset of `lance::dataset::scanner::Query` the LSM vector planner honors.
@@ -90,7 +92,7 @@ fn extract_pk_point_keys(filter: &Expr, pk_col: &str) -> Option<Vec<ScalarValue>
 }
 
 /// Either a base Lance table, or an explicit base path used to resolve
-/// flushed-generation directories when no base dataset is configured.
+/// SSTable directories when no base dataset is configured.
 enum BaseSource {
     Table(Arc<Dataset>),
     PathOnly(String),
@@ -150,12 +152,12 @@ fn key_to_fsl(key: &dyn Array, dim: i32) -> Result<FixedSizeListArray> {
     Ok(builder.finish())
 }
 
-/// Scanner for LSM tree data spanning base table, flushed MemTables, and active MemTable.
+/// Scanner for LSM tree data spanning base table, SSTables, and active MemTable.
 ///
 /// This scanner provides a unified interface for querying data across multiple
 /// LSM tree levels:
-/// - Base table (merged data, generation = 0)
-/// - Flushed MemTables (persisted but not yet merged, generation = 1, 2, ...)
+/// - Base table (compacted data, generation = 0)
+/// - SSTables (persisted but not yet compacted, generation = 1, 2, ...)
 /// - Active MemTable (in-memory buffer, highest generation)
 ///
 /// The scanner automatically handles deduplication by primary key, keeping
@@ -206,15 +208,17 @@ pub struct LsmScanner {
     // Primary key columns (required for deduplication)
     pk_columns: Vec<String>,
 
-    /// Session threaded into flushed-generation opens so the first open of
-    /// each generation populates the shared index / file-metadata caches.
-    /// Defaults to the base table's session when one is present.
+    /// Session for opening SSTables (shares the base's caches).
+    /// Defaults to the base table's session.
     session: Option<Arc<Session>>,
-    /// Cache of opened flushed-generation datasets. When set, repeated
+    /// Store params for opening SSTables, reusing the base dataset's
+    /// store. Defaults to the base table's params.
+    store_params: Option<ObjectStoreParams>,
+    /// Cache of opened SSTable datasets. When set, repeated
     /// queries against the same generation skip the manifest read entirely.
-    flushed_cache: Option<Arc<dyn DatasetCache>>,
-    /// Optional warmer fired on first open of a flushed generation.
-    warmer: Option<Arc<dyn GenerationWarmer>>,
+    sstable_cache: Option<Arc<dyn DatasetCache>>,
+    /// Optional warmer fired on first open of an SSTable.
+    warmer: Option<Arc<dyn SsTableWarmer>>,
     /// Over-fetch multiple for block-listed sources in search plans
     /// (see [`super::LsmFtsSearchPlanner::with_overfetch_factor`]).
     overfetch_factor: Option<f64>,
@@ -225,7 +229,7 @@ impl LsmScanner {
     ///
     /// # Arguments
     ///
-    /// * `base_table` - The base Lance table (merged data)
+    /// * `base_table` - The base Lance table (compacted data)
     /// * `shard_snapshots` - Snapshots of shard states from MemWAL index
     /// * `pk_columns` - Primary key column names for deduplication
     pub fn new(
@@ -239,6 +243,10 @@ impl LsmScanner {
         // the shared index / metadata caches without extra wiring. An
         // explicit `with_session` still overrides this.
         let session = Some(base_table.session());
+        // The scanner only ever opens SSTables with these — the base
+        // table is already open and handed in — so they must not carry a
+        // path-bound store binding.
+        let store_params = base_table.store_params().map(derived_store_params);
         Self {
             base: BaseSource::Table(base_table),
             schema: Arc::new(arrow_schema),
@@ -254,25 +262,26 @@ impl LsmScanner {
             with_memtable_gen: false,
             pk_columns,
             session,
-            flushed_cache: None,
+            store_params,
+            sstable_cache: None,
             warmer: None,
             overfetch_factor: None,
         }
     }
 
     /// Create a scanner that reads only the fresh tier (active memtable and
-    /// flushed generations) without including a base Lance table.
+    /// SSTables) without including a base Lance table.
     ///
     /// This is useful when the caller owns the base read path separately and
-    /// only needs the WAL's contribution: active memtable ∪ L0 flushed
-    /// generations. Deduplication semantics are unchanged — newer generations
+    /// only needs the WAL's contribution: active memtable ∪ L0 SSTables.
+    /// Deduplication semantics are unchanged — newer generations
     /// still win on PK conflicts.
     ///
     /// # Arguments
     ///
     /// * `schema` - Schema used for projection, filter parsing, and empty plans.
-    ///   Should match the schema flushed generations were written with.
-    /// * `base_path` - Table-root URI used to resolve relative flushed paths.
+    ///   Should match the schema SSTables were written with.
+    /// * `base_path` - Table-root URI used to resolve relative SSTable paths.
     /// * `shard_snapshots` - Snapshots of shard states from MemWAL index.
     /// * `pk_columns` - Primary key column names for deduplication.
     pub fn without_base_table(
@@ -296,7 +305,8 @@ impl LsmScanner {
             with_memtable_gen: false,
             pk_columns,
             session: None,
-            flushed_cache: None,
+            store_params: None,
+            sstable_cache: None,
             warmer: None,
             overfetch_factor: None,
         }
@@ -331,33 +341,40 @@ impl LsmScanner {
         self
     }
 
-    /// Thread an existing session into flushed-generation opens.
-    ///
-    /// The first open of each flushed generation then populates the shared
-    /// index / file-metadata caches, so later queries skip re-decoding them.
-    /// When a base table is configured this defaults to its session; call
-    /// this to override (e.g. on a fresh-tier-only scanner that owns its own
-    /// long-lived session).
+    /// Set the session used to open SSTables. Defaults to the base
+    /// table's; set explicitly on a fresh-tier-only scanner (no base table).
     pub fn with_session(mut self, session: Arc<Session>) -> Self {
         self.session = Some(session);
         self
     }
 
-    /// Inject a cache of opened flushed-generation datasets.
+    /// Set the store params used to open SSTables. Defaults to the
+    /// base table's; set explicitly on a fresh-tier-only scanner (no base table).
+    ///
+    /// Pass the params the *base* was opened with. As in [`Self::new`], they are
+    /// adapted for generation URIs: a path-bound `object_store` binding would
+    /// redirect every generation open at the base table itself, so it is dropped
+    /// while storage options, wrapper, and credentials carry over.
+    pub fn with_store_params(mut self, store_params: ObjectStoreParams) -> Self {
+        self.store_params = Some(derived_store_params(&store_params));
+        self
+    }
+
+    /// Inject a cache of opened SSTable datasets.
     ///
     /// With a cache, repeated queries against the same generation become a
     /// pure `Arc::clone` with no manifest read or object-store I/O. The cache
     /// is owned and sized by the caller (any [`DatasetCache`] impl, e.g.
-    /// [`FlushedMemTableCache`](super::FlushedMemTableCache)); not set by
+    /// [`SsTableCache`](super::SsTableCache)); not set by
     /// default, so behavior is unchanged unless opted in.
-    pub fn with_flushed_cache(mut self, cache: Arc<dyn DatasetCache>) -> Self {
-        self.flushed_cache = Some(cache);
+    pub fn with_sstable_cache(mut self, cache: Arc<dyn DatasetCache>) -> Self {
+        self.sstable_cache = Some(cache);
         self
     }
 
-    /// Inject the warmer fired on first open of a flushed generation. Not set by
+    /// Inject the warmer fired on first open of an SSTable. Not set by
     /// default, so behavior is unchanged unless opted in.
-    pub fn with_warmer(mut self, warmer: Arc<dyn GenerationWarmer>) -> Self {
+    pub fn with_warmer(mut self, warmer: Arc<dyn SsTableWarmer>) -> Self {
         self.warmer = Some(warmer);
         self
     }
@@ -419,7 +436,7 @@ impl LsmScanner {
     }
 
     /// Find the `k` nearest neighbors of `key` in `column`. Routes `create_plan`
-    /// through the LSM vector planner (base ∪ flushed ∪ in-memory). Mirrors
+    /// through the LSM vector planner (base ∪ SSTables ∪ in-memory). Mirrors
     /// [`crate::dataset::scanner::Scanner::nearest`]; the LSM path supports a
     /// single Float32 query vector. When combined with an offset, the LSM path
     /// fetches `k + offset` per source before applying the final page. Tune with
@@ -537,7 +554,7 @@ impl LsmScanner {
         Arc::new(GlobalLimitExec::new(plan, skip, self.limit))
     }
 
-    /// Vector (KNN) search across base ∪ flushed ∪ in-memory, via the LSM vector
+    /// Vector (KNN) search across base ∪ SSTables ∪ in-memory, via the LSM vector
     /// planner. Honors the builder filter as a prefilter.
     async fn plan_vector(&self) -> Result<Arc<dyn ExecutionPlan>> {
         let nearest = self
@@ -564,8 +581,11 @@ impl LsmScanner {
         if let Some(session) = &self.session {
             planner = planner.with_session(session.clone());
         }
-        if let Some(cache) = &self.flushed_cache {
-            planner = planner.with_flushed_cache(cache.clone());
+        if let Some(store_params) = &self.store_params {
+            planner = planner.with_store_params(store_params.clone());
+        }
+        if let Some(cache) = &self.sstable_cache {
+            planner = planner.with_sstable_cache(cache.clone());
         }
         if let Some(warmer) = &self.warmer {
             planner = planner.with_warmer(warmer.clone());
@@ -588,7 +608,7 @@ impl LsmScanner {
         Ok(self.apply_limit_offset(plan))
     }
 
-    /// Full-text search across base ∪ flushed ∪ in-memory, via the LSM FTS
+    /// Full-text search across base ∪ SSTables ∪ in-memory, via the LSM FTS
     /// planner. Query/scanner limits bound per-source fetches when present;
     /// otherwise the search remains unbounded and any offset is applied above.
     async fn plan_fts(&self) -> Result<Arc<dyn ExecutionPlan>> {
@@ -640,8 +660,11 @@ impl LsmScanner {
         if let Some(session) = &self.session {
             planner = planner.with_session(session.clone());
         }
-        if let Some(cache) = &self.flushed_cache {
-            planner = planner.with_flushed_cache(cache.clone());
+        if let Some(store_params) = &self.store_params {
+            planner = planner.with_store_params(store_params.clone());
+        }
+        if let Some(cache) = &self.sstable_cache {
+            planner = planner.with_sstable_cache(cache.clone());
         }
         if let Some(warmer) = &self.warmer {
             planner = planner.with_warmer(warmer.clone());
@@ -660,7 +683,7 @@ impl LsmScanner {
         Ok(self.apply_limit_offset(plan))
     }
 
-    /// Plain (filter / projection / limit) scan over base ∪ flushed ∪ in-memory.
+    /// Plain (filter / projection / limit) scan over base ∪ SSTables ∪ in-memory.
     async fn plan_scan(&self) -> Result<Arc<dyn ExecutionPlan>> {
         let collector = self.build_collector();
         let base_schema = self.schema();
@@ -685,8 +708,11 @@ impl LsmScanner {
             if let Some(session) = &self.session {
                 planner = planner.with_session(session.clone());
             }
-            if let Some(cache) = &self.flushed_cache {
-                planner = planner.with_flushed_cache(cache.clone());
+            if let Some(store_params) = &self.store_params {
+                planner = planner.with_store_params(store_params.clone());
+            }
+            if let Some(cache) = &self.sstable_cache {
+                planner = planner.with_sstable_cache(cache.clone());
             }
             if let Some(warmer) = &self.warmer {
                 planner = planner.with_warmer(warmer.clone());
@@ -704,14 +730,14 @@ impl LsmScanner {
         if let Some(session) = &self.session {
             planner = planner.with_session(session.clone());
         }
-        if let Some(cache) = &self.flushed_cache {
-            planner = planner.with_flushed_cache(cache.clone());
+        if let Some(store_params) = &self.store_params {
+            planner = planner.with_store_params(store_params.clone());
+        }
+        if let Some(cache) = &self.sstable_cache {
+            planner = planner.with_sstable_cache(cache.clone());
         }
         if let Some(warmer) = &self.warmer {
             planner = planner.with_warmer(warmer.clone());
-        }
-        if let Some(factor) = self.overfetch_factor {
-            planner = planner.with_overfetch_factor(factor);
         }
 
         planner
@@ -727,7 +753,7 @@ impl LsmScanner {
     }
 
     /// Find rows matching a full-text query. Routes `create_plan` through the
-    /// LSM FTS planner (base ∪ flushed ∪ in-memory), local-scored by BM25 and
+    /// LSM FTS planner (base ∪ SSTables ∪ in-memory), local-scored by BM25 and
     /// merged by `_score` DESC. Mirrors
     /// [`crate::dataset::scanner::Scanner::full_text_search`]: the searched
     /// column(s) come from the query (set via `FullTextSearchQuery::with_column`);
@@ -778,7 +804,7 @@ impl LsmScanner {
     }
 
     /// Test which `pks` have been (re)written in the WAL fresh tier — the active
-    /// and frozen memtables and flushed generations this scanner spans — i.e.
+    /// and frozen memtables and SSTables this scanner spans — i.e.
     /// are shadowed above the base table. `pks` is a batch whose columns include
     /// the primary-key columns; the returned `Vec<bool>` is aligned with its
     /// rows. Hashing matches the scanner's internal dedup, so the caller never
@@ -802,7 +828,8 @@ impl LsmScanner {
         let memberships = super::block_list::fresh_tier_block_list(
             &sources,
             self.session.as_ref(),
-            self.flushed_cache.as_ref(),
+            self.store_params.as_ref(),
+            self.sstable_cache.as_ref(),
             watermarks,
         )
         .await?;
@@ -915,13 +942,13 @@ mod tests {
         let snapshot = ShardSnapshot::new(shard_id)
             .with_spec_id(1)
             .with_current_generation(5)
-            .with_flushed_generation(1, "path/gen_1".to_string())
-            .with_flushed_generation(2, "path/gen_2".to_string());
+            .with_sstable(1, "path/gen_1".to_string())
+            .with_sstable(2, "path/gen_2".to_string());
 
         assert_eq!(snapshot.shard_id, shard_id);
         assert_eq!(snapshot.spec_id, 1);
         assert_eq!(snapshot.current_generation, 5);
-        assert_eq!(snapshot.flushed_generations.len(), 2);
+        assert_eq!(snapshot.sstables.len(), 2);
     }
 
     #[test]
@@ -973,44 +1000,69 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_overfetch_factor_is_rejected() {
-        let shard = Uuid::new_v4();
-        let scanner = LsmScanner::without_base_table(
+    async fn overfetch_factor_only_applies_to_searches() {
+        // Plain scans refill exactly via LocalLimitExec, so overfetch_factor is
+        // search-only and must not affect scan planning.
+        let scan = LsmScanner::without_base_table(
             pk_schema(),
-            "memory://t",
+            "memory://scan",
             vec![],
             vec!["id".to_string()],
         )
-        .with_in_memory_memtables(
-            shard,
-            InMemoryMemTables {
-                active: mk_pk_memtable(&[1, 2], 2),
-                frozen: vec![],
-            },
-        )
-        .with_overfetch_factor(0.5);
+        .with_overfetch_factor(0.5)
+        .try_into_batch()
+        .await
+        .unwrap();
+        assert_eq!(scan.num_rows(), 0);
 
-        let Err(err) = scanner.try_into_stream().await else {
-            panic!("invalid overfetch factor should fail planning");
+        let vector_schema = pk_schema_with(arrow_schema::Field::new(
+            "vector",
+            DataType::FixedSizeList(
+                Arc::new(arrow_schema::Field::new("item", DataType::Float32, true)),
+                4,
+            ),
+            false,
+        ));
+        let vector_search = LsmScanner::without_base_table(
+            vector_schema,
+            "memory://vector",
+            vec![],
+            vec!["id".to_string()],
+        )
+        .nearest(
+            "vector",
+            &arrow_array::Float32Array::from(vec![0.0f32, 0.0, 0.0, 0.0]),
+            1,
+        )
+        .unwrap()
+        .with_overfetch_factor(0.5);
+        let Err(err) = vector_search.try_into_stream().await else {
+            panic!("invalid overfetch factor should fail vector search planning");
         };
         assert!(
             err.to_string().contains("overfetch_factor"),
             "unexpected error for invalid overfetch factor: {err}"
         );
 
-        let empty_scanner = LsmScanner::without_base_table(
-            pk_schema(),
-            "memory://empty",
+        let fts_search = LsmScanner::without_base_table(
+            pk_schema_with(arrow_schema::Field::new("text", DataType::Utf8, true)),
+            "memory://fts",
             vec![],
             vec!["id".to_string()],
         )
+        .full_text_search(
+            FullTextSearchQuery::new("lance".to_string())
+                .with_column("text".to_string())
+                .unwrap(),
+        )
+        .unwrap()
         .with_overfetch_factor(0.5);
-        let Err(err) = empty_scanner.try_into_stream().await else {
-            panic!("invalid overfetch factor should fail even when there are no sources");
+        let Err(err) = fts_search.try_into_stream().await else {
+            panic!("invalid overfetch factor should fail full-text search planning");
         };
         assert!(
             err.to_string().contains("overfetch_factor"),
-            "unexpected error for invalid empty-source overfetch factor: {err}"
+            "unexpected error for invalid overfetch factor: {err}"
         );
     }
 

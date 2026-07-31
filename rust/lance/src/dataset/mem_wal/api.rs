@@ -14,7 +14,6 @@ use async_trait::async_trait;
 use lance_core::{Error, Result};
 use lance_index::mem_wal::{MEM_WAL_INDEX_NAME, MemWalIndexDetails, ShardingField, ShardingSpec};
 use lance_index::vector::hnsw::builder::HnswBuildParams;
-use lance_io::object_store::ObjectStore;
 use uuid::Uuid;
 
 use crate::Dataset;
@@ -25,8 +24,9 @@ use crate::index::DatasetIndexInternalExt;
 use crate::index::mem_wal::{load_mem_wal_index_details, new_mem_wal_index_meta};
 
 use super::ShardWriterConfig;
-use super::scanner::flushed_cache::open_flushed_dataset;
+use super::scanner::sstable_cache::open_sstable;
 use super::scanner::{DatasetCache, ShardSnapshot};
+use super::util::derived_store_params;
 use super::write::MemIndexConfig;
 use super::write::ShardWriter;
 
@@ -393,10 +393,6 @@ fn writer_config_to_defaults(config: &ShardWriterConfig) -> HashMap<String, Stri
             config.durable_write.to_string(),
         ),
         (
-            "sync_indexed_write".to_string(),
-            config.sync_indexed_write.to_string(),
-        ),
-        (
             "max_wal_buffer_size".to_string(),
             config.max_wal_buffer_size.to_string(),
         ),
@@ -431,14 +427,6 @@ fn writer_config_to_defaults(config: &ShardWriterConfig) -> HashMap<String, Stri
         (
             "backpressure_log_interval_ms".to_string(),
             config.backpressure_log_interval.as_millis().to_string(),
-        ),
-        (
-            "async_index_buffer_rows".to_string(),
-            config.async_index_buffer_rows.to_string(),
-        ),
-        (
-            "async_index_interval_ms".to_string(),
-            config.async_index_interval.as_millis().to_string(),
         ),
         (
             "enable_memtable".to_string(),
@@ -491,10 +479,10 @@ pub trait DatasetMemWalExt {
         Ok(Vec::new())
     }
 
-    /// Prewarm the flushed generations of the given MemWAL shards into this
+    /// Prewarm the SSTables of the given MemWAL shards into this
     /// dataset's session caches.
     ///
-    /// For every flushed generation in `snapshots`, opens the generation's
+    /// For every SSTable in `snapshots`, opens the generation's
     /// on-disk dataset (populating the session's metadata/index caches, and the
     /// optional `cache` of opened `Arc<Dataset>`s) and prewarms each of its
     /// indexes. Opens run concurrently.
@@ -597,7 +585,9 @@ impl DatasetMemWalExt for Dataset {
         cache: Option<&Arc<dyn DatasetCache>>,
     ) -> Result<()> {
         let session = self.session();
-        // Resolve flushed paths exactly as the LSM collector does, so the
+        // Every open below targets a generation URI, never the base's own.
+        let store_params = self.store_params().map(derived_store_params);
+        // Resolve SSTable paths exactly as the LSM collector does, so the
         // session/cache entries we warm key-match the paths later lookups open.
         let base_path = self.uri().trim_end_matches('/').to_string();
         let opens = snapshots
@@ -606,11 +596,13 @@ impl DatasetMemWalExt for Dataset {
                 let shard_id = snapshot.shard_id;
                 let base_path = &base_path;
                 let session = &session;
-                snapshot.flushed_generations.iter().map(move |flushed| {
-                    let path = format!("{}/_mem_wal/{}/{}", base_path, shard_id, flushed.path);
+                let store_params = &store_params;
+                snapshot.sstables.iter().map(move |sstable| {
+                    let path = format!("{}/_mem_wal/{}/{}", base_path, shard_id, sstable.path);
                     async move {
                         let dataset =
-                            open_flushed_dataset(&path, Some(session), cache, None).await?;
+                            open_sstable(&path, Some(session), store_params.as_ref(), cache, None)
+                                .await?;
                         prewarm_all_indexes(&dataset).await
                     }
                 })
@@ -700,9 +692,17 @@ impl DatasetMemWalExt for Dataset {
         // Set shard_id in config
         config.shard_id = shard_id;
 
-        // Get object store and base path
+        // Inject the dataset's store params + session so the flusher opens the
+        // base + generations with the same store the base was resolved with.
+        config.store_params = self.store_params().cloned();
+        config.session = Some(self.session());
+
+        // Reuse the dataset's own object store + base path; `ObjectStore::from_uri`
+        // would discard the store params the dataset was opened with, signing WAL
+        // writes with the ambient identity. Mirrors `list_mem_wal_latest_shard_ids`.
         let base_uri = self.uri();
-        let (store, base_path) = ObjectStore::from_uri(base_uri).await?;
+        let store = self.object_store(None).await?;
+        let base_path = self.branch_location().path;
 
         // Create ShardWriter
         ShardWriter::open(
@@ -771,7 +771,7 @@ async fn load_vector_index_config(
 
 #[cfg(test)]
 mod tests {
-    use super::super::scanner::FlushedMemTableCache;
+    use super::super::scanner::SsTableCache;
     use super::*;
 
     use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator};
@@ -802,9 +802,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_prewarm_mem_wal_opens_and_warms_indexes() {
-        // `prewarm_mem_wal` opens each flushed generation (into the base
+        // `prewarm_mem_wal` opens each SSTable (into the base
         // dataset's session + the supplied cache) and warms its indexes. We
-        // place a flushed-generation dataset with a BTree index at the
+        // place an SSTable dataset with a BTree index at the
         // canonical `{base}/_mem_wal/{shard}/{folder}` path, prewarm it via a
         // snapshot, and assert the generation is cached and its index loadable.
         let tmp = tempfile::tempdir().unwrap();
@@ -817,7 +817,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Flushed generation with a BTree index on `id`.
+        // SSTable with a BTree index on `id`.
         let shard_id = Uuid::new_v4();
         let folder = "deadbeef_gen_1";
         let gen_uri = format!("{}/_mem_wal/{}/{}", base_uri, shard_id, folder);
@@ -839,9 +839,9 @@ mod tests {
 
         let snapshot = ShardSnapshot::new(shard_id)
             .with_current_generation(2)
-            .with_flushed_generation(1, folder.to_string());
+            .with_sstable(1, folder.to_string());
 
-        let cache: Arc<dyn DatasetCache> = Arc::new(FlushedMemTableCache::new(4));
+        let cache: Arc<dyn DatasetCache> = Arc::new(SsTableCache::new(4));
         base.prewarm_mem_wal(std::slice::from_ref(&snapshot), Some(&cache))
             .await
             .expect("prewarm must open the generation and warm its index");
@@ -849,7 +849,7 @@ mod tests {
         // The generation is resident in the cache (same session), with its
         // index loadable — a later lookup that opens this path is a pure hit.
         let warmed = cache
-            .get_or_open(&gen_uri, Some(base.session()))
+            .get_or_open(&gen_uri, Some(base.session()), base.store_params().cloned())
             .await
             .unwrap();
         assert_eq!(warmed.load_indices().await.unwrap().len(), 1);
@@ -857,7 +857,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_prewarm_mem_wal_empty_is_noop() {
-        // No snapshots / no flushed generations: prewarm is a clean no-op.
+        // No snapshots / no SSTables: prewarm is a clean no-op.
         let tmp = tempfile::tempdir().unwrap();
         let base_uri = format!("{}/base", tmp.path().to_str().unwrap());
         let schema = id_v_schema();

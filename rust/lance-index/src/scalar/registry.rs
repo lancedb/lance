@@ -4,13 +4,13 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use arrow_schema::Field;
+use arrow_schema::{DataType, Field};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use futures::future::BoxFuture;
 use lance_core::{
     Result,
-    cache::{CacheKey, LanceCache, UnsizedCacheKey},
+    cache::{CacheKey, CacheKeySchema, KeyBuilder, LanceCache, UnsizedCacheKey},
     deepsize::DeepSizeOf,
 };
 
@@ -18,45 +18,10 @@ use crate::progress::IndexBuildProgress;
 use crate::registry::IndexPluginRegistry;
 use crate::scalar::RowIdRemapper;
 use crate::scalar::{CreatedIndex, IndexStore, ScalarIndex, expression::ScalarQueryParser};
+// Re-export training types that were previously defined here
+pub use crate::scalar::{TrainingCriteria, TrainingOrdering};
 
 pub const VALUE_COLUMN_NAME: &str = "value";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TrainingOrdering {
-    /// The input will arrive sorted by the value column in ascending order
-    Values,
-    /// The input will arrive sorted by the address column in ascending order
-    Addresses,
-    /// The input will arrive in an arbitrary order
-    None,
-}
-
-#[derive(Debug, Clone)]
-pub struct TrainingCriteria {
-    pub ordering: TrainingOrdering,
-    pub needs_row_ids: bool,
-    pub needs_row_addrs: bool,
-}
-
-impl TrainingCriteria {
-    pub fn new(ordering: TrainingOrdering) -> Self {
-        Self {
-            ordering,
-            needs_row_ids: false,
-            needs_row_addrs: false,
-        }
-    }
-
-    pub fn with_row_id(mut self) -> Self {
-        self.needs_row_ids = true;
-        self
-    }
-
-    pub fn with_row_addr(mut self) -> Self {
-        self.needs_row_addrs = true;
-        self
-    }
-}
 
 /// A trait object for plugin-specific training parameters and data requirements.
 ///
@@ -278,6 +243,55 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
         // Return an empty JSON object as the default implementation
         Ok(serde_json::json!({}))
     }
+
+    /// Optionally create a seed writer for the given column.
+    ///
+    /// A seed writer observes column values during data file writes, accumulates
+    /// compact statistics in memory, and serializes them as a global buffer
+    /// embedded in the data file footer. The buffer is later harvested during
+    /// index updates to skip a full column scan.
+    ///
+    /// All parameters needed to construct the writer must be derivable from
+    /// `index_details` — this method must not perform any I/O. Return `Ok(None)`
+    /// if this index type does not support seed writing.
+    async fn create_seed_writer(
+        &self,
+        _field_path: &str,
+        _data_type: &DataType,
+        _index_details: &prost_types::Any,
+    ) -> Result<Option<Box<dyn super::seed::IndexSeedWriter>>> {
+        Ok(None)
+    }
+
+    /// Returns true if this index type may have seed buffers embedded in data
+    /// files for the given index configuration.
+    ///
+    /// When false the caller can skip opening data files to look for seeds
+    /// entirely, avoiding I/O for index types or configurations that never
+    /// write seeds.
+    fn might_use_seeds(&self, _index_details: &prost_types::Any) -> bool {
+        false
+    }
+
+    /// Attempt to update `reference_index` using pre-harvested `seeds` instead
+    /// of re-scanning column data.
+    ///
+    /// Each [`FragmentSeed`](super::seed::FragmentSeed) carries the raw bytes
+    /// written by the corresponding [`IndexSeedWriter`](super::seed::IndexSeedWriter)
+    /// and the original `metadata_value` stored in the data file, which the plugin
+    /// can use for compatibility validation (e.g. confirming `rows_per_zone`).
+    ///
+    /// Return `Ok(Some(created))` if the seed-based update succeeded, or
+    /// `Ok(None)` to signal that the caller should fall back to a full column scan.
+    async fn update_from_seeds(
+        &self,
+        _seeds: Vec<super::seed::FragmentSeed>,
+        _reference_index: Arc<dyn ScalarIndex>,
+        _index_details: &prost_types::Any,
+        _dest_store: &dyn IndexStore,
+    ) -> Result<Option<CreatedIndex>> {
+        Ok(None)
+    }
 }
 
 /// A boxed, `Send` future performing the storage-level load of a scalar index
@@ -341,5 +355,13 @@ impl UnsizedCacheKey for ScalarIndexCacheKey {
 
     fn type_name() -> &'static str {
         "ScalarIndex"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.scalar.registry.scalar-index-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_variant(0);
     }
 }

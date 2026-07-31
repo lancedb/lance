@@ -134,6 +134,8 @@ public class ScanOptions {
     Preconditions.checkArgument(
         !(filter.isPresent() && substraitFilter.isPresent()),
         "cannot set both substrait filter and string filter");
+    Preconditions.checkArgument(
+        batchReadahead > 0, "batchReadahead must be greater than 0, got %s", batchReadahead);
     this.fragmentIds = fragmentIds;
     this.batchSize = batchSize;
     this.columns = columns;

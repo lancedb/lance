@@ -146,7 +146,7 @@ impl ShardManifestStore {
             replay_after_wal_entry_position: 0,
             wal_entry_position_last_seen: 0,
             current_generation: 1,
-            flushed_generations: vec![],
+            sstables: vec![],
             status: ShardStatus::Active,
         };
 
@@ -462,7 +462,7 @@ impl ShardManifestStore {
                     replay_after_wal_entry_position: 0,
                     wal_entry_position_last_seen: 0,
                     current_generation: 1,
-                    flushed_generations: vec![],
+                    sstables: vec![],
                     status: ShardStatus::Active,
                 }
             };
@@ -619,7 +619,7 @@ mod tests {
             replay_after_wal_entry_position: 0,
             wal_entry_position_last_seen: 0,
             current_generation: 1,
-            flushed_generations: vec![],
+            sstables: vec![],
             status: ShardStatus::Active,
         }
     }

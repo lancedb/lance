@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use arrow::compute::cast;
+use arrow::{
+    array::{ArrayData, make_array},
+    buffer::Buffer,
+    compute::cast,
+};
 use arrow_array::types::{Float16Type, Float32Type, Float64Type};
 use arrow_array::{Array, ArrayRef, BooleanArray, FixedSizeListArray, cast::AsArray};
 use arrow_schema::{DataType, Field};
-use lance_arrow::FixedSizeListArrayExt;
+use lance_arrow::{BufferExt, DataTypeExt, FixedSizeListArrayExt};
 use lance_core::{Error, Result};
-use lance_io::encodings::plain::bytes_to_array;
 use lance_linalg::distance::DistanceType;
 use prost::bytes;
 use std::sync::LazyLock;
@@ -109,6 +112,7 @@ impl SimpleIndex {
             lower_bound: None,
             upper_bound: None,
             dist_q_c: 0.0,
+            use_acorn: false,
         };
         let res = match &self.store {
             SimpleStore::Float(store) => self.index.search_basic(query, 1, &params, None, store)?,
@@ -212,23 +216,40 @@ impl TryFrom<&pb::Tensor> for FixedSizeListArray {
         }
         let dim = tensor.shape[1] as usize;
         let num_rows = tensor.shape[0] as usize;
-
-        let data = bytes::Bytes::from(tensor.data.clone());
-        let flat_array = bytes_to_array(
-            &DataType::from(pb::tensor::DataType::try_from(tensor.data_type).unwrap()),
-            data,
-            dim * num_rows,
-            0,
-        )?;
-
-        if flat_array.len() != dim * num_rows {
+        let num_values = dim.checked_mul(num_rows).ok_or_else(|| {
+            Error::index(format!(
+                "Tensor shape {:?} exceeds the supported size",
+                tensor.shape
+            ))
+        })?;
+        let data_type = DataType::from(pb::tensor::DataType::try_from(tensor.data_type).unwrap());
+        let expected_data_len =
+            num_values
+                .checked_mul(data_type.byte_width())
+                .ok_or_else(|| {
+                    Error::index(format!(
+                        "Tensor shape {:?} exceeds the supported byte length",
+                        tensor.shape
+                    ))
+                })?;
+        if tensor.data.len() != expected_data_len {
             return Err(Error::index(format!(
-                "Tensor shape {:?} does not match to data len: {}",
+                "Tensor shape {:?} with data type {data_type} requires {expected_data_len} bytes, got {}",
                 tensor.shape,
-                flat_array.len()
+                tensor.data.len()
             )));
         }
 
+        let buffer = Buffer::from_bytes_bytes(
+            bytes::Bytes::from(tensor.data.clone()),
+            data_type.byte_width() as u64,
+        );
+        let data = ArrayData::builder(data_type)
+            .len(num_values)
+            .null_count(0)
+            .add_buffer(buffer)
+            .build()?;
+        let flat_array = make_array(data);
         let field = Field::new("item", flat_array.data_type().clone(), true);
         Ok(Self::try_new(
             Arc::new(field),
@@ -277,6 +298,7 @@ mod tests {
     use half::f16;
     use lance_arrow::FixedSizeListArrayExt;
     use num_traits::identities::Zero;
+    use rayon::ThreadPoolBuilder;
 
     use arrow::compute::cast;
     use rstest::rstest;
@@ -307,7 +329,8 @@ mod tests {
         (0..100).flat_map(|i| std::iter::repeat_n(i as f32, 16)).collect::<Vec<_>>(),
     )) as ArrayRef, 42.0f32)]
     fn test_simple_index_nearest_centroid(#[case] centroids: ArrayRef, #[case] query_val: f32) {
-        let index = build_index(centroids, 16);
+        let thread_pool = ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+        let index = thread_pool.install(|| build_index(centroids, 16));
         let query: ArrayRef = Arc::new(Float32Array::from(vec![query_val; 16]));
         let (id, dist) = index.search(query).unwrap();
         assert_eq!(id, 42);
@@ -351,6 +374,8 @@ mod tests {
         assert_eq!(tensor.data_type, pb::tensor::DataType::Float16 as i32);
         assert_eq!(tensor.shape, vec![4, 5]);
         assert_eq!(tensor.data.len(), 20 * 2);
+        let decoded = FixedSizeListArray::try_from(&tensor).unwrap();
+        assert_eq!(decoded.values().to_data(), fsl.values().to_data());
 
         let fsl =
             FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0; 20]), 5).unwrap();
@@ -358,6 +383,8 @@ mod tests {
         assert_eq!(tensor.data_type, pb::tensor::DataType::Float32 as i32);
         assert_eq!(tensor.shape, vec![4, 5]);
         assert_eq!(tensor.data.len(), 20 * 4);
+        let decoded = FixedSizeListArray::try_from(&tensor).unwrap();
+        assert_eq!(decoded.values().to_data(), fsl.values().to_data());
 
         let fsl =
             FixedSizeListArray::try_new_from_values(Float64Array::from(vec![0.0; 20]), 5).unwrap();
@@ -365,5 +392,21 @@ mod tests {
         assert_eq!(tensor.data_type, pb::tensor::DataType::Float64 as i32);
         assert_eq!(tensor.shape, vec![4, 5]);
         assert_eq!(tensor.data.len(), 20 * 8);
+        let decoded = FixedSizeListArray::try_from(&tensor).unwrap();
+        assert_eq!(decoded.values().to_data(), fsl.values().to_data());
+    }
+
+    #[rstest]
+    #[case::too_short(vec![0; 7])]
+    #[case::too_long(vec![0; 9])]
+    fn test_tensor_to_fsl_rejects_invalid_data_length(#[case] data: Vec<u8>) {
+        let tensor = pb::Tensor {
+            data_type: pb::tensor::DataType::Uint32 as i32,
+            shape: vec![1, 2],
+            data,
+        };
+
+        let error = FixedSizeListArray::try_from(&tensor).unwrap_err();
+        assert!(error.to_string().contains("requires 8 bytes"));
     }
 }

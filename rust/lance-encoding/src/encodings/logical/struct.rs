@@ -368,26 +368,57 @@ impl StructuralDecodeArrayTask for RepDefStructDecodeTask {
             .map(|task| task.decode())
             .collect::<Result<Vec<_>>>()?;
         let mut children = Vec::with_capacity(arrays.len());
+        let mut repdefs = Vec::with_capacity(arrays.len());
         let mut data_size = 0u64;
         let mut arrays_iter = arrays.into_iter();
-        let first_array = arrays_iter.next().unwrap();
+        let first_array = arrays_iter.next().ok_or_else(|| {
+            Error::internal("Struct decoder unexpectedly has no child arrays".to_string())
+        })?;
         let length = first_array.array.len();
 
         // The repdef should be identical across all children at this point
-        let mut repdef = first_array.repdef;
+        repdefs.push(first_array.repdef);
         data_size += first_array.data_size;
         children.push(first_array.array);
 
         for array in arrays_iter {
-            debug_assert_eq!(length, array.array.len());
+            if length != array.array.len() {
+                return Err(Error::invalid_input_source(
+                    format!(
+                        "Struct child array length {} does not match sibling length {}",
+                        array.array.len(),
+                        length
+                    )
+                    .into(),
+                ));
+            }
             data_size += array.data_size;
             children.push(array.array);
+            repdefs.push(array.repdef);
+        }
+
+        // Dense rep/def state can retain child-specific repetition information after a child
+        // decoder finishes, so comparing dense siblings is not meaningful. If any child carries
+        // sparse state, keep a sparse child as the canonical structural plan and compare it with
+        // every other sparse sibling so sparse metadata is never silently discarded.
+        let primary_repdef = repdefs
+            .iter()
+            .position(CompositeRepDefUnraveler::has_sparse)
+            .unwrap_or(0);
+        let mut repdef = repdefs.swap_remove(primary_repdef);
+        if repdef.has_sparse() {
+            for sibling in repdefs {
+                if sibling.has_sparse() {
+                    repdef.add_compatibility_check(sibling);
+                }
+            }
         }
 
         let validity = if self.is_root {
+            repdef.ensure_exhausted()?;
             None
         } else {
-            repdef.unravel_validity(length)
+            repdef.unravel_validity(length)?
         };
 
         let array = StructArray::try_new(self.child_fields, children, validity)
@@ -601,10 +632,7 @@ mod tests {
     use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, Fields};
 
-    use crate::{
-        testing::{TestCases, check_basic_random, check_round_trip_encoding_of_data},
-        version::LanceFileVersion,
-    };
+    use crate::testing::{TestCases, check_basic_random, check_round_trip_encoding_of_data};
 
     #[test_log::test(tokio::test)]
     async fn test_simple_struct() {
@@ -663,7 +691,7 @@ mod tests {
             Some(rows_validity),
         );
 
-        let test_cases = TestCases::default().with_min_file_version(LanceFileVersion::V2_1);
+        let test_cases = TestCases::default().with_structural_encodings();
 
         check_round_trip_encoding_of_data(vec![Arc::new(rows)], &test_cases, HashMap::new()).await;
     }
@@ -693,7 +721,7 @@ mod tests {
         );
         check_round_trip_encoding_of_data(
             vec![Arc::new(struct_array)],
-            &TestCases::default().with_min_file_version(LanceFileVersion::V2_1),
+            &TestCases::default().with_structural_encodings(),
             HashMap::new(),
         )
         .await;
@@ -724,7 +752,7 @@ mod tests {
         );
         check_round_trip_encoding_of_data(
             vec![Arc::new(struct_array)],
-            &TestCases::default().with_min_file_version(LanceFileVersion::V2_1),
+            &TestCases::default().with_structural_encodings(),
             HashMap::new(),
         )
         .await;
@@ -803,7 +831,7 @@ mod tests {
 
         check_round_trip_encoding_of_data(
             vec![Arc::new(list_array)],
-            &TestCases::default().with_min_file_version(LanceFileVersion::V2_2),
+            &TestCases::default().with_u32_structural_encodings(),
             HashMap::new(),
         )
         .await;
@@ -837,7 +865,7 @@ mod tests {
                 .with_range(1..2)
                 .with_indices(vec![0])
                 .with_indices(vec![1])
-                .with_min_file_version(LanceFileVersion::V2_1),
+                .with_structural_encodings(),
             HashMap::new(),
         )
         .await;
@@ -885,7 +913,7 @@ mod tests {
 
         check_round_trip_encoding_of_data(
             vec![Arc::new(row_array)],
-            &TestCases::default().with_min_file_version(LanceFileVersion::V2_1),
+            &TestCases::default().with_structural_encodings(),
             HashMap::new(),
         )
         .await;

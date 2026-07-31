@@ -12,9 +12,10 @@ categories.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-arc-swap.workspace = true
+arc-swap = { workspace = true, features = ["weak"] }
 arrow.workspace = true
 arrow-array.workspace = true
+arrow-ipc.workspace = true
 arrow-ord.workspace = true
 arrow-schema.workspace = true
 arrow-select.workspace = true
@@ -39,6 +40,7 @@ jsonb.workspace = true
 lance-arrow.workspace = true
 lance-arrow-stats.workspace = true
 lance-core.workspace = true
+lance-index-core.workspace = true
 lance-datafusion.workspace = true
 lance-encoding.workspace = true
 lance-file.workspace = true

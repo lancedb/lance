@@ -9,6 +9,7 @@ BLOOMFILTER, JSON, FTS) created with one version of Lance can be read
 and written by other versions.
 """
 
+import os
 import shutil
 from pathlib import Path
 
@@ -320,9 +321,12 @@ class FtsIndex(UpgradeDowngradeTest):
             max_rows_per_file=100,
             data_storage_version=safe_data_storage_version(self.compat_version),
         )
-        dataset.create_scalar_index(
-            "text", "INVERTED", with_position=True, format_version=1
-        )
+        kwargs = {"with_position": True}
+        # Downgrade reads use older wheels, so current-created FTS indexes must
+        # stay on the legacy posting block layout.
+        if os.environ.get("LANCE_COMPAT_FTS_LEGACY_BLOCK_SIZE") == "1":
+            kwargs["block_size"] = 128
+        dataset.create_scalar_index("text", "INVERTED", format_version=1, **kwargs)
 
     def check_read(self):
         """Verify FTS index can be queried."""
@@ -350,6 +354,16 @@ class FtsIndex(UpgradeDowngradeTest):
 
     def skip_downgrade(self, version: str) -> bool:
         return version.startswith("0.")
+
+    def current_env(self, method_name: str) -> dict[str, str]:
+        if method_name == "create":
+            return {
+                "LANCE_COMPAT_FTS_LEGACY_BLOCK_SIZE": "1",
+                "LANCE_FTS_FORMAT_VERSION": "1",
+            }
+        if method_name == "check_write":
+            return {"LANCE_FTS_FORMAT_VERSION": "2"}
+        return {}
 
     def compat_env(self, version: str, method_name: str) -> dict[str, str]:
         if method_name in {"create", "check_write"}:

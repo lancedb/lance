@@ -3,6 +3,7 @@
 
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::scalar::bitmap::BitmapIndex;
+use lance_index::scalar::index_files_to_table;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_table::format::IndexMetadata;
 use roaring::RoaringBitmap;
@@ -70,7 +71,7 @@ pub(in crate::index) async fn merge_segments(
         index_version: created_index.index_version as i32,
         created_at: Some(chrono::Utc::now()),
         base_id: None,
-        files: Some(created_index.files),
+        files: Some(index_files_to_table(created_index.files)),
         ..segments[0].clone()
     })
 }
