@@ -471,8 +471,8 @@ fn rescore_partition_candidates<C>(
 }
 
 #[derive(Debug)]
-struct LoadedPostings {
-    postings: Vec<PostingIterator>,
+pub(super) struct LoadedPostings {
+    pub(super) postings: Vec<PostingIterator>,
     grouped_expansions: Vec<GroupedExpansionTerms>,
     impact_safe: bool,
     exact_scoring_required: bool,
@@ -1175,6 +1175,7 @@ impl InvertedIndex {
                                     operator,
                                     impact_scorer.as_ref(),
                                     metrics.as_ref(),
+                                    false,
                                 )
                                 .await?;
                             if postings.is_empty() {
@@ -1401,6 +1402,7 @@ impl InvertedIndex {
                                     operator,
                                     impact_scorer.as_ref(),
                                     metrics.as_ref(),
+                                    false,
                                 )
                                 .await?;
                             if postings.is_empty() {
@@ -2696,14 +2698,20 @@ impl InvertedPartition {
     // search the documents that contain the query
     // return the doc info and the doc length
     // ref: https://en.wikipedia.org/wiki/Okapi_BM25
+    //
+    // `force_global_scorer` is used by compound search, where leaf scores and
+    // bounds must share corpus-level statistics before the global collector
+    // can safely propagate its threshold. Old posting formats without impacts
+    // fall back to a scorer-derived global upper bound in that mode.
     #[instrument(level = "debug", skip_all)]
-    async fn load_posting_lists(
+    pub(super) async fn load_posting_lists(
         &self,
         tokens: &Tokens,
         params: &FtsSearchParams,
         operator: Operator,
         impact_scorer: &MemBM25Scorer,
         metrics: &dyn MetricsCollector,
+        force_global_scorer: bool,
     ) -> Result<LoadedPostings> {
         let is_phrase_query = params.phrase_slop.is_some();
         let is_and_query = operator == Operator::And;
@@ -2783,13 +2791,15 @@ impl InvertedPartition {
                 postings: loaded_postings
                     .into_iter()
                     .map(|(token_id, token, position, posting)| {
-                        let needs_scorer_upper_bound =
-                            exact_scoring_required && !posting.has_impacts();
-                        let query_weight = if impact_safe || exact_scoring_required {
-                            impact_scorer.query_weight(&token)
-                        } else {
-                            idf(posting.len(), num_docs)
-                        };
+                        let needs_scorer_upper_bound = (exact_scoring_required
+                            || force_global_scorer)
+                            && !posting.has_impacts();
+                        let query_weight =
+                            if impact_safe || exact_scoring_required || force_global_scorer {
+                                impact_scorer.query_weight(&token)
+                            } else {
+                                idf(posting.len(), num_docs)
+                            };
                         let posting = PostingIterator::with_query_weight(
                             token,
                             token_id,
@@ -11406,6 +11416,7 @@ mod tests {
                 Operator::Or,
                 scorer.as_ref(),
                 &NoOpMetricsCollector,
+                false,
             )
             .await
             .unwrap();

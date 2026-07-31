@@ -99,7 +99,8 @@ use crate::io::exec::filtered_read::{
     FilteredReadExec, FilteredReadOptions, FilteredReadThreadingMode,
 };
 use crate::io::exec::fts::{
-    BoostQueryExec, FlatMatchFilterExec, FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec,
+    BoostQueryExec, CompoundQueryExec, FlatMatchFilterExec, FlatMatchQueryExec, MatchQueryExec,
+    PhraseQueryExec,
 };
 use crate::io::exec::knn::MultivectorScoringExec;
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
@@ -128,6 +129,89 @@ use lance_datafusion::substrait::parse_substrait;
 /// Rows per output batch when neither the scan options nor
 /// `LANCE_DEFAULT_BATCH_SIZE` specify one.
 pub const BATCH_SIZE_FALLBACK: usize = 8192;
+
+fn collect_all_fts_columns(query: &FtsQuery, columns: &mut HashSet<String>) {
+    match query {
+        FtsQuery::Match(query) => {
+            if let Some(column) = &query.column {
+                columns.insert(column.clone());
+            }
+        }
+        FtsQuery::Phrase(query) => {
+            if let Some(column) = &query.column {
+                columns.insert(column.clone());
+            }
+        }
+        FtsQuery::Boost(query) => {
+            collect_all_fts_columns(&query.positive, columns);
+            collect_all_fts_columns(&query.negative, columns);
+        }
+        FtsQuery::MultiMatch(query) => {
+            for match_query in &query.match_queries {
+                if let Some(column) = &match_query.column {
+                    columns.insert(column.clone());
+                }
+            }
+        }
+        FtsQuery::Boolean(query) => {
+            for child in query
+                .should
+                .iter()
+                .chain(&query.must)
+                .chain(&query.must_not)
+            {
+                collect_all_fts_columns(child, columns);
+            }
+        }
+    }
+}
+
+fn supports_compound_scorer(query: &FtsQuery) -> bool {
+    if !matches!(query, FtsQuery::MultiMatch(_)) {
+        return false;
+    }
+    let mut columns = HashSet::new();
+    collect_all_fts_columns(query, &mut columns);
+    columns.len() == 1
+}
+
+fn validate_fts_match_boosts(query: &FtsQuery) -> Result<()> {
+    fn validate_multiplier(value: f32) -> Result<()> {
+        if value.is_finite() && value >= 0.0 {
+            Ok(())
+        } else {
+            Err(Error::invalid_input(format!(
+                "MatchQuery boost must be finite and non-negative, got {value}"
+            )))
+        }
+    }
+
+    match query {
+        FtsQuery::Match(query) => validate_multiplier(query.boost),
+        FtsQuery::Phrase(_) => Ok(()),
+        FtsQuery::Boost(query) => {
+            validate_fts_match_boosts(&query.positive)?;
+            validate_fts_match_boosts(&query.negative)
+        }
+        FtsQuery::MultiMatch(query) => {
+            for match_query in &query.match_queries {
+                validate_multiplier(match_query.boost)?;
+            }
+            Ok(())
+        }
+        FtsQuery::Boolean(query) => {
+            for child in query
+                .should
+                .iter()
+                .chain(&query.must)
+                .chain(&query.must_not)
+            {
+                validate_fts_match_boosts(child)?;
+            }
+            Ok(())
+        }
+    }
+}
 
 /// Parse an environment variable as a specific type, logging a warning on parse failure.
 fn parse_env_var<T: std::str::FromStr>(env_var_name: &str, default_val: &str) -> Option<T>
@@ -3370,6 +3454,7 @@ impl Scanner {
         } else {
             query.query.clone()
         };
+        validate_fts_match_boosts(&query)?;
 
         // TODO: Could maybe walk the query here to find all the indices that will be
         // involved in the query to calculate a more accuarate required_fragments than
@@ -3390,6 +3475,62 @@ impl Scanner {
         Ok(fts_exec)
     }
 
+    async fn plan_compound_scorer(
+        &self,
+        query: &FtsQuery,
+        params: &FtsSearchParams,
+        prefilter_source: &PreFilterSource,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        let mut columns = HashSet::new();
+        collect_all_fts_columns(query, &mut columns);
+        let Some(column) = columns.into_iter().next() else {
+            return Ok(None);
+        };
+
+        let index = self
+            .dataset
+            .load_scalar_index(IndexCriteria::default().for_column(&column).supports_fts())
+            .await?;
+        let Some(index) = index else {
+            return Ok(None);
+        };
+        let target_fragments = self
+            .fragments
+            .clone()
+            .unwrap_or_else(|| self.dataset.fragments().to_vec());
+        if !self
+            .retain_target_fragments(self.dataset.unindexed_fragments(&index.name).await?)
+            .is_empty()
+        {
+            // Flat and posting-backed leaves do not share a document domain.
+            // Preserve the exact DataFusion fallback until flat leaves expose
+            // the same candidate protocol.
+            return Ok(None);
+        }
+        let (stale_fragments, fresh_segments) = self
+            .fts_stale_frags_and_fresh_segments(&column, &target_fragments)
+            .await?;
+        if !stale_fragments.is_empty() {
+            return Ok(None);
+        }
+
+        let segments = match fresh_segments {
+            Some(segments) => segments,
+            None => load_segments(&self.dataset, &column)
+                .await?
+                .ok_or_else(|| {
+                    Error::invalid_input(format!("No Inverted index found for column {column}"))
+                })?,
+        };
+        Ok(Some(Arc::new(CompoundQueryExec::new_with_segments(
+            self.dataset.clone(),
+            query.clone(),
+            params.clone(),
+            prefilter_source.clone(),
+            segments,
+        ))))
+    }
+
     async fn plan_fts(
         &self,
         query: &FtsQuery,
@@ -3397,6 +3538,17 @@ impl Scanner {
         filter_plan: &ExprFilterPlan,
         prefilter_source: &PreFilterSource,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        if supports_compound_scorer(query)
+            && let Some(plan) = self
+                .plan_compound_scorer(query, params, prefilter_source)
+                .await?
+        {
+            return Ok(plan);
+        }
+
+        // Cross-column, flat, and overlay-backed compound queries retain the
+        // exact DataFusion fallback because their leaves do not share one
+        // posting document domain.
         let plan: Arc<dyn ExecutionPlan> = match query {
             FtsQuery::Match(query) => {
                 self.plan_match_query(query, params, filter_plan, prefilter_source)
@@ -5824,7 +5976,7 @@ mod test {
     };
     use lance_file::version::LanceFileVersion;
     use lance_index::optimize::OptimizeOptions;
-    use lance_index::scalar::inverted::query::{MatchQuery, PhraseQuery};
+    use lance_index::scalar::inverted::query::{FtsQuery, MatchQuery, PhraseQuery};
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::pq::PQBuildParams;
@@ -5847,6 +5999,14 @@ mod test {
     use crate::utils::test::{
         DatagenExt, FragmentCount, FragmentRowCount, ThrottledStoreWrapper, assert_plan_node_equals,
     };
+
+    #[test]
+    fn test_fts_match_boosts_reject_invalid_values() {
+        let negative_match = FtsQuery::Match(MatchQuery::new("hello".to_string()).with_boost(-1.0));
+        let error = validate_fts_match_boosts(&negative_match).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("finite and non-negative"));
+    }
 
     #[test]
     fn test_env_var_parsing() {
