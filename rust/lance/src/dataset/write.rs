@@ -14,8 +14,6 @@ use lance_arrow::{
 use lance_core::datatypes::{
     NullabilityComparison, OnMissing, OnTypeMismatch, SchemaCompareOptions,
 };
-use lance_core::error::LanceOptionExt;
-use lance_core::utils::tempfile::TempDir;
 use lance_core::utils::tracing::{
     AUDIT_MODE_CREATE, AUDIT_MODE_DELETE, AUDIT_TYPE_DATA, TRACE_FILE_AUDIT,
 };

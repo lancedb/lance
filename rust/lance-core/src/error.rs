@@ -91,6 +91,41 @@ impl fmt::Display for FieldNotFoundError {
 
 impl std::error::Error for FieldNotFoundError {}
 
+/// A manifest commit returned an error and its final outcome could not be
+/// determined safely.
+///
+/// This is wrapped in [`Error::Wrapped`] so Lance can expose a structured
+/// source without adding a variant to the exhaustive public [`Error`] enum.
+#[derive(Debug)]
+pub struct CommitStatusUnknownError {
+    version: u64,
+    source: BoxedError,
+}
+
+impl CommitStatusUnknownError {
+    /// Return the manifest version whose commit outcome is unknown.
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+}
+
+impl std::fmt::Display for CommitStatusUnknownError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Commit result for version {} is unknown: the commit may or may not have been \
+             applied; check the table state before retrying: {}",
+            self.version, self.source
+        )
+    }
+}
+
+impl std::error::Error for CommitStatusUnknownError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
 /// Allocates error on the heap and then places `e` into it.
 #[inline]
 pub fn box_error(e: impl std::error::Error + Send + Sync + 'static) -> BoxedError {
@@ -191,18 +226,6 @@ pub enum Error {
     },
     #[snafu(display("Retryable commit conflict for version {version}: {source}, {location}"))]
     RetryableCommitConflict {
-        version: u64,
-        source: BoxedError,
-        #[snafu(implicit)]
-        location: Location,
-        #[snafu(implicit)]
-        backtrace: MaybeBacktrace,
-    },
-    #[snafu(display(
-        "Commit result for version {version} is unknown: the commit may or may not have \
-         been applied; check the table state before retrying: {source}, {location}"
-    ))]
-    CommitStatusUnknown {
         version: u64,
         source: BoxedError,
         #[snafu(implicit)]
@@ -405,7 +428,6 @@ impl Error {
             | Self::CommitConflict { backtrace, .. }
             | Self::IncompatibleTransaction { backtrace, .. }
             | Self::RetryableCommitConflict { backtrace, .. }
-            | Self::CommitStatusUnknown { backtrace, .. }
             | Self::TooMuchWriteContention { backtrace, .. }
             | Self::Internal { backtrace, .. }
             | Self::PrerequisiteFailed { backtrace, .. }
@@ -549,6 +571,11 @@ impl Error {
     pub fn is_not_found(&self) -> bool {
         match self {
             Self::NotFound { .. } => true,
+            Self::Wrapped { error, .. }
+                if error.downcast_ref::<CommitStatusUnknownError>().is_some() =>
+            {
+                false
+            }
             Self::IO { source, .. } | Self::Wrapped { error: source, .. } => {
                 error_source_is_not_found(source.as_ref())
             }
@@ -689,7 +716,17 @@ impl Error {
 
     #[track_caller]
     pub fn commit_status_unknown_source(version: u64, source: BoxedError) -> Self {
-        CommitStatusUnknownSnafu { version }.into_error(source)
+        Self::wrapped(box_error(CommitStatusUnknownError { version, source }))
+    }
+
+    /// Return whether this error represents a commit whose final outcome could
+    /// not be determined safely.
+    pub fn is_commit_status_unknown(&self) -> bool {
+        matches!(
+            self,
+            Self::Wrapped { error, .. }
+                if error.downcast_ref::<CommitStatusUnknownError>().is_some()
+        )
     }
 
     #[track_caller]
@@ -1170,6 +1207,25 @@ mod test {
         let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "missing");
         let converted: Error = io_err.into();
         assert!(matches!(converted, Error::IO { .. }));
+    }
+
+    #[test]
+    fn test_commit_status_unknown_is_structured_without_masking_as_not_found() {
+        let error = Error::commit_status_unknown_source(
+            42,
+            box_error(Error::not_found("temporarily invisible manifest")),
+        );
+
+        assert!(error.is_commit_status_unknown());
+        assert!(!error.is_not_found());
+        assert!(error.to_string().contains("version 42 is unknown"));
+        let Error::Wrapped { error, .. } = error else {
+            panic!("commit-status-unknown must use the semver-compatible wrapper")
+        };
+        let status = error
+            .downcast_ref::<CommitStatusUnknownError>()
+            .expect("wrapper must retain the typed commit status");
+        assert_eq!(status.version(), 42);
     }
 
     #[test]

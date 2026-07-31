@@ -3974,6 +3974,12 @@ impl ManifestWriteConfig {
     pub fn disable_transaction_file(&self) -> bool {
         self.disable_transaction_file
     }
+
+    #[cfg(test)]
+    pub(crate) fn with_transaction_file_disabled(mut self) -> Self {
+        self.disable_transaction_file = true;
+        self
+    }
 }
 
 /// Commit a manifest file and create a copy at the latest manifest path.

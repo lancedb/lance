@@ -4368,6 +4368,7 @@ def test_custom_commit_lock(tmp_path: Path):
         lance.write_dataset(
             pa.table({"a": range(100)}), tmp_path / "test2", commit_lock=commit_lock
         )
+    assert lance.dataset(tmp_path / "test2").count_rows() == 100
 
     @contextlib.contextmanager
     def commit_lock(_version: int):
