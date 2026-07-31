@@ -67,7 +67,7 @@ fn column_info_to_metadata(column: &ColumnInfo) -> Result<pbfile::ColumnMetadata
         .iter()
         .map(|page| {
             let encoding = match &page.encoding {
-                PageEncoding::Array(encoding) => Any::from_msg(encoding)?.encode_to_vec(),
+                PageEncoding::Legacy(encoding) => Any::from_msg(encoding)?.encode_to_vec(),
                 PageEncoding::Structural(encoding) => Any::from_msg(encoding)?.encode_to_vec(),
             };
             let (buffer_offsets, buffer_sizes) =

@@ -12,9 +12,9 @@ use std::time::Instant;
 use arrow_schema::DataType;
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
-use futures::FutureExt;
+use futures::{FutureExt, StreamExt, TryStreamExt};
 use itertools::Itertools;
-use lance_core::cache::CacheKey;
+use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder};
 use lance_core::datatypes::Field;
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::utils::parse::parse_env_as_bool;
@@ -92,7 +92,7 @@ use crate::index::mem_wal::open_mem_wal_index;
 pub use crate::index::prefilter::{FilterLoader, PreFilter};
 use crate::index::scalar::{IndexDetails, fetch_index_details, load_training_data};
 pub use crate::index::vector::{LogicalIvfView, LogicalVectorIndex};
-use crate::session::index_caches::{FragReuseIndexKey, IndexMetadataKey};
+use crate::session::index_caches::{FragReuseIndexKey, IndexMetadataKey, write_index_identity};
 use crate::{Error, Result, dataset::Dataset};
 pub use create::CreateIndexBuilder;
 pub use lance_index::IndexDescription;
@@ -278,8 +278,7 @@ pub(crate) async fn build_index_metadata_from_segments(
 
     prune_stale_segment_coverage(dataset, field_id, &mut segments, false, false).await?;
 
-    let mut new_indices = Vec::with_capacity(segments.len());
-    for segment in segments {
+    let new_indices = futures::stream::iter(segments.into_iter().map(|segment| async move {
         let (uuid, fragment_bitmap, fields, index_details, index_version, dataset_version) =
             segment.into_parts();
         let is_inverted_index = index_details.type_url.ends_with("InvertedIndexDetails");
@@ -299,12 +298,12 @@ pub(crate) async fn build_index_metadata_from_segments(
             crate::index::scalar::inverted::finalize_segment_files_if_needed(dataset, &metadata)
                 .await?;
         }
-        let index_dir = dataset.indices_dir().clone().join(uuid.to_string());
+        let index_dir = dataset.indices_dir().join(uuid.to_string());
         let mut files = list_index_files_with_sizes(&dataset.object_store, &index_dir).await?;
         if is_inverted_index {
             retain_committed_inverted_files(&mut files);
         }
-        new_indices.push(IndexMetadata {
+        Ok::<_, Error>(IndexMetadata {
             uuid,
             name: index_name.to_string(),
             fields,
@@ -315,8 +314,11 @@ pub(crate) async fn build_index_metadata_from_segments(
             created_at: Some(chrono::Utc::now()),
             base_id: None,
             files: Some(files),
-        });
-    }
+        })
+    }))
+    .buffered(dataset.object_store.io_parallelism())
+    .try_collect::<Vec<_>>()
+    .await?;
 
     Ok(new_indices)
 }
@@ -686,6 +688,14 @@ impl CacheKey for LegacyVectorIndexCacheKey<'_> {
     fn type_name() -> &'static str {
         "LegacyVectorIndex"
     }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.index.legacy-vector-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        write_index_identity(builder, self.uuid, self.fri_uuid);
+    }
 }
 
 /// Sized cache key for `IvfIndexState`.
@@ -693,6 +703,11 @@ impl CacheKey for LegacyVectorIndexCacheKey<'_> {
 /// Used for v0.3+ indices that support serialization. This key has a codec,
 /// so custom cache backends can serialize the state to disk/Redis/etc.
 /// Legacy indices use `LegacyVectorIndexCacheKey` instead (in-memory only).
+///
+/// Note: legacy entries hold live readers bound to the object store that
+/// opened them, so they are only valid for credential setups that refresh
+/// internally (e.g. a credentials provider). Deployments that pass fresh
+/// static credentials per dataset open should use v0.3+ index formats.
 #[derive(Debug, Clone)]
 pub(crate) struct IvfIndexStateCacheKey<'a> {
     uuid: &'a Uuid,
@@ -718,6 +733,14 @@ impl CacheKey for IvfIndexStateCacheKey<'_> {
         } else {
             self.uuid.to_string().into()
         }
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.index.ivf-state-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        write_index_identity(builder, self.uuid, self.fri_uuid);
     }
 
     fn codec() -> Option<lance_core::cache::CacheCodec> {
@@ -756,6 +779,14 @@ impl CacheKey for FragReuseIndexCacheKey<'_> {
     fn type_name() -> &'static str {
         "FragReuseIndex"
     }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.index.fragment-reuse-cache-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        write_index_identity(builder, self.uuid, self.fri_uuid);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -783,6 +814,14 @@ impl CacheKey for MemWalCacheKey<'_> {
 
     fn type_name() -> &'static str {
         "MemWalIndex"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.index.mem-wal-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        write_index_identity(builder, self.uuid, self.fri_uuid);
     }
 }
 
@@ -2366,7 +2405,7 @@ impl DatasetIndexInternalExt for Dataset {
         let state_key = IvfIndexStateCacheKey::new(uuid, frag_reuse_uuid.as_ref());
         if let Some(entry) = self.index_cache.get_with_key(&state_key).await {
             log::debug!("Found IvfIndexState in cache uuid: {}", uuid);
-            let partition_cache = self.index_cache.with_key_prefix(&state_key.key());
+            let partition_cache = self.index_cache.for_index(uuid, frag_reuse_uuid.as_ref());
             let frag_reuse_index = self.open_frag_reuse_index(metrics).await?;
             return entry
                 .0
@@ -2404,8 +2443,10 @@ impl DatasetIndexInternalExt for Dataset {
         let tailing_bytes = read_last_block(reader.as_ref()).await?;
         let (major_version, minor_version) = read_version(&tailing_bytes)?;
 
-        // Namespace the index cache by the UUID of the index.
-        let index_cache = self.index_cache.with_key_prefix(&cache_key.key());
+        // Namespace the index cache by the UUID of the index. v2+ partition
+        // entries are store-free and remain reusable across object-store
+        // generations alongside their serializable state.
+        let index_cache = self.index_cache.for_index(uuid, frag_reuse_uuid.as_ref());
 
         // Extract the cacheable state before type-erasing to Arc<dyn VectorIndex>.
         fn wrap_ivf<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
@@ -2463,8 +2504,8 @@ impl DatasetIndexInternalExt for Dataset {
 
             (0, 3) | (2, _) => {
                 let scheduler = ScanScheduler::new(
-                    self.object_store.clone(),
-                    SchedulerConfig::max_bandwidth(&self.object_store),
+                    object_store.clone(),
+                    SchedulerConfig::max_bandwidth(&object_store),
                 );
                 let cached_size = file_sizes
                     .get(INDEX_FILE_NAME)
@@ -2498,7 +2539,7 @@ impl DatasetIndexInternalExt for Dataset {
                     "IVF_FLAT" => match element_type {
                         DataType::Float16 | DataType::Float32 | DataType::Float64 => {
                             let ivf = IVFIndex::<FlatIndex, FlatQuantizer>::try_new(
-                                self.object_store.clone(),
+                                object_store.clone(),
                                 index_dir,
                                 uuid.to_owned(),
                                 frag_reuse_index,
@@ -2511,7 +2552,7 @@ impl DatasetIndexInternalExt for Dataset {
                         }
                         DataType::UInt8 => {
                             let ivf = IVFIndex::<FlatIndex, FlatBinQuantizer>::try_new(
-                                self.object_store.clone(),
+                                object_store.clone(),
                                 index_dir,
                                 uuid.to_owned(),
                                 frag_reuse_index,
@@ -2530,7 +2571,7 @@ impl DatasetIndexInternalExt for Dataset {
 
                     "IVF_PQ" => {
                         let ivf = IVFIndex::<FlatIndex, ProductQuantizer>::try_new(
-                            self.object_store.clone(),
+                            object_store.clone(),
                             index_dir,
                             uuid.to_owned(),
                             frag_reuse_index,
@@ -2544,7 +2585,7 @@ impl DatasetIndexInternalExt for Dataset {
 
                     "IVF_SQ" => {
                         let ivf = IVFIndex::<FlatIndex, ScalarQuantizer>::try_new(
-                            self.object_store.clone(),
+                            object_store.clone(),
                             index_dir,
                             uuid.to_owned(),
                             frag_reuse_index,
@@ -2558,8 +2599,8 @@ impl DatasetIndexInternalExt for Dataset {
 
                     "IVF_RQ" => {
                         let ivf = IVFIndex::<FlatIndex, RabitQuantizer>::try_new(
-                            self.object_store.clone(),
-                            self.indices_dir(),
+                            object_store.clone(),
+                            index_dir,
                             uuid.to_owned(),
                             frag_reuse_index,
                             self.metadata_cache.as_ref(),
@@ -2573,7 +2614,7 @@ impl DatasetIndexInternalExt for Dataset {
                     "IVF_HNSW_FLAT" => match element_type {
                         DataType::UInt8 => {
                             let ivf = IVFIndex::<HNSW, FlatBinQuantizer>::try_new(
-                                self.object_store.clone(),
+                                object_store.clone(),
                                 index_dir,
                                 uuid.to_owned(),
                                 frag_reuse_index,
@@ -2586,7 +2627,7 @@ impl DatasetIndexInternalExt for Dataset {
                         }
                         _ => {
                             let ivf = IVFIndex::<HNSW, FlatQuantizer>::try_new(
-                                self.object_store.clone(),
+                                object_store.clone(),
                                 index_dir,
                                 uuid.to_owned(),
                                 frag_reuse_index,
@@ -2601,7 +2642,7 @@ impl DatasetIndexInternalExt for Dataset {
 
                     "IVF_HNSW_SQ" => {
                         let ivf = IVFIndex::<HNSW, ScalarQuantizer>::try_new(
-                            self.object_store.clone(),
+                            object_store.clone(),
                             index_dir,
                             uuid.to_owned(),
                             frag_reuse_index,
@@ -2615,7 +2656,7 @@ impl DatasetIndexInternalExt for Dataset {
 
                     "IVF_HNSW_PQ" => {
                         let ivf = IVFIndex::<HNSW, ProductQuantizer>::try_new(
-                            self.object_store.clone(),
+                            object_store.clone(),
                             index_dir,
                             uuid.to_owned(),
                             frag_reuse_index,
@@ -2650,7 +2691,6 @@ impl DatasetIndexInternalExt for Dataset {
             io_stats.add_scan_stats(&open_stats);
         }
         if let Some(ivf_entry) = ivf_entry {
-            let state_key = IvfIndexStateCacheKey::new(uuid, frag_reuse_uuid.as_ref());
             self.index_cache
                 .insert_with_key(&state_key, Arc::new(ivf_entry))
                 .await;

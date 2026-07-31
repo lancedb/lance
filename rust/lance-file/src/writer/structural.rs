@@ -210,7 +210,7 @@ impl StructuralFileSink {
             self.write_aligned_buffer(&buffer).await?;
         }
         let encoded_encoding = match encoded_page.description {
-            PageEncoding::Array(array_encoding) => Any::from_msg(&array_encoding)?.encode_to_vec(),
+            PageEncoding::Legacy(array_encoding) => Any::from_msg(&array_encoding)?.encode_to_vec(),
             PageEncoding::Structural(page_layout) => Any::from_msg(&page_layout)?.encode_to_vec(),
         };
         let page = pbfile::column_metadata::Page {
@@ -772,7 +772,7 @@ pub fn encode_batch_body(batch: &EncodedBatch, write_schema: bool) -> Result<Enc
             .iter()
             .map(|page_info| {
                 let encoded_encoding = match &page_info.encoding {
-                    PageEncoding::Array(array_encoding) => {
+                    PageEncoding::Legacy(array_encoding) => {
                         Any::from_msg(array_encoding)?.encode_to_vec()
                     }
                     PageEncoding::Structural(page_layout) => {

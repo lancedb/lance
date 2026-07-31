@@ -7,10 +7,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use lance_core::{Result, datatypes::Schema};
-use lance_encoding::{
-    array_encoding::ArrayFieldEncodingStrategy,
-    encoder::{EncodedBatch, FieldEncodingStrategy},
-};
+use lance_encoding::encoder::{ArrayFieldEncodingStrategy, EncodedBatch, FieldEncodingStrategy};
 use lance_io::traits::Writer as ObjectWriter;
 
 use crate::writer::FileWriterOptions;

@@ -11,19 +11,21 @@ use arrow_array::{
     Array, ArrayRef, Int32Array, LargeBinaryArray, ListArray, RecordBatch, StringArray,
 };
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+use bytes::Bytes;
 use futures::TryStreamExt;
 use lance_core::cache::LanceCache;
 use lance_core::datatypes::Schema as LanceSchema;
-use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
+use lance_encoding::decoder::{DecoderPlugins, EncodedBatchLayout, FilterExpression, decode_batch};
+use lance_encoding::encoder::{EncodedBatch, EncodingOptions, encode_batch};
 use lance_io::ReadBatchParams;
 use lance_io::traits::Writer;
 use lance_io::utils::CachedFileSize;
 use rstest::rstest;
 use tokio::io::AsyncWriteExt;
 
-use crate::reader::{FileReader, FileReaderOptions};
+use crate::reader::{EncodedBatchReaderExt, FileReader, FileReaderOptions};
 use crate::testing::FsFixture;
-use crate::version::ConcreteFileVersion;
+use crate::version::{ConcreteFileVersion, LanceFileVersion};
 use crate::versions;
 use crate::versions::v1::reader::FileReader as V1Reader;
 use crate::versions::v1::writer::{
@@ -95,6 +97,43 @@ fn compatibility_fixture_batch() -> RecordBatch {
     RecordBatch::try_new(schema, vec![ids, names, items, categories, blobs]).unwrap()
 }
 
+fn v1_reader_expected_batch(batch: &RecordBatch) -> RecordBatch {
+    // The V1 reader historically materializes null lists as empty, null child integers as zero,
+    // and null dictionary keys as the first dictionary value.
+    let items = Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(
+        (0..batch.num_rows() as i32).map(|index| {
+            Some(if index % 11 == 0 {
+                Vec::new()
+            } else {
+                vec![
+                    Some(index),
+                    Some(if index % 5 == 0 { 0 } else { index * 2 }),
+                    Some(index * 3),
+                ]
+            })
+        }),
+    )) as ArrayRef;
+    let mut categories = StringDictionaryBuilder::<Int8Type>::new();
+    for index in 0..batch.num_rows() {
+        categories
+            .append(if index % 13 == 0 {
+                "green"
+            } else {
+                match index % 3 {
+                    0 => "red",
+                    1 => "green",
+                    _ => "blue",
+                }
+            })
+            .unwrap();
+    }
+    let categories = Arc::new(categories.finish()) as ArrayRef;
+    let mut columns = batch.columns().to_vec();
+    columns[2] = items;
+    columns[3] = categories;
+    RecordBatch::try_new(batch.schema(), columns).unwrap()
+}
+
 fn stable_fixture(version: ConcreteFileVersion) -> &'static [u8] {
     match version {
         ConcreteFileVersion::V1 => include_bytes!("../test_data/exact_versions/v1.lance"),
@@ -133,6 +172,44 @@ fn assert_blob_column_eq(actual: &dyn Array, expected: &dyn Array) {
     }
 }
 
+fn assert_record_batch_eq(actual: &RecordBatch, expected: &RecordBatch) {
+    assert_eq!(actual.schema_ref(), expected.schema_ref());
+    assert_eq!(actual.num_rows(), expected.num_rows());
+    assert_eq!(actual.num_columns(), expected.num_columns());
+
+    for column_index in 0..actual.num_columns() {
+        if expected.schema().field(column_index).name() == "blob" {
+            assert_blob_column_eq(
+                actual.column(column_index).as_ref(),
+                expected.column(column_index).as_ref(),
+            );
+        } else if actual.column(column_index).to_data() != expected.column(column_index).to_data() {
+            let row_index = (0..actual.num_rows())
+                .find(|row_index| {
+                    actual.column(column_index).slice(*row_index, 1).to_data()
+                        != expected.column(column_index).slice(*row_index, 1).to_data()
+                })
+                .unwrap();
+            panic!(
+                "column {} ({}) differs at row {}: actual={:?}, expected={:?}",
+                column_index,
+                expected.schema().field(column_index).name(),
+                row_index,
+                actual.column(column_index).slice(row_index, 1),
+                expected.column(column_index).slice(row_index, 1)
+            );
+        }
+    }
+}
+
+fn footer_version(bytes: &[u8]) -> (u16, u16) {
+    let version_start = bytes.len() - 8;
+    (
+        u16::from_le_bytes([bytes[version_start], bytes[version_start + 1]]),
+        u16::from_le_bytes([bytes[version_start + 2], bytes[version_start + 3]]),
+    )
+}
+
 fn assert_wire_bytes_equal(actual: &[u8], expected: &[u8]) {
     if let Some(offset) = actual
         .iter()
@@ -165,7 +242,9 @@ async fn write_current_fixture(
         ..Default::default()
     };
     let summary = match version {
-        ConcreteFileVersion::V1 => unreachable!("v1 uses its manifest-backed writer"),
+        ConcreteFileVersion::V1 => {
+            unreachable!("legacy fixtures use the legacy writer")
+        }
         ConcreteFileVersion::V2_0 => {
             let mut writer =
                 versions::v2_0::create_writer(object_writer, schema.clone(), options).unwrap();
@@ -211,6 +290,29 @@ async fn write_current_fixture(
         .await
         .unwrap()
         .to_vec()
+}
+
+async fn write_v2_0_embedded_fixtures(batch: &RecordBatch, schema: &LanceSchema) -> (Bytes, Bytes) {
+    let options = EncodingOptions {
+        cache_bytes_per_column: 1,
+        max_page_bytes: 1024,
+        keep_original_array: true,
+        buffer_alignment: 64,
+    };
+    let encoding_strategy = crate::versions::v2_0::encoding_strategy();
+    let encoded_batch = encode_batch(
+        batch,
+        Arc::new(schema.clone()),
+        encoding_strategy.as_ref(),
+        &options,
+    )
+    .await
+    .unwrap();
+
+    (
+        versions::v2_0::encode_self_described_batch(&encoded_batch).unwrap(),
+        versions::v2_0::encode_mini_batch(&encoded_batch).unwrap(),
+    )
 }
 
 async fn assert_current_reader_roundtrip(
@@ -271,7 +373,7 @@ async fn assert_current_reader_roundtrip(
     let mut row_offset = 0;
     for actual in &batches {
         let expected = expected.slice(row_offset, actual.num_rows());
-        assert_blob_column_eq(actual.column(4).as_ref(), expected.column(4).as_ref());
+        assert_record_batch_eq(actual, &expected);
         row_offset += actual.num_rows();
     }
     assert_eq!(row_offset, expected.num_rows());
@@ -292,7 +394,63 @@ async fn stable_current_writer_and_reader_are_wire_compatible(
     let actual = write_current_fixture(version, &batch, &schema).await;
     let expected = stable_fixture(version);
     assert_wire_bytes_equal(&actual, expected);
+    assert_eq!(
+        footer_version(expected),
+        version.to_standard_footer_numbers()
+    );
     assert_current_reader_roundtrip(expected, version, &batch).await;
+}
+
+#[tokio::test]
+async fn v2_0_embedded_writer_and_reader_are_wire_compatible() {
+    let batch = compatibility_fixture_batch()
+        .project(&[0, 1])
+        .unwrap()
+        .slice(0, 257);
+    let mut schema = LanceSchema::try_from(batch.schema().as_ref()).unwrap();
+    schema.set_dictionary(&batch).unwrap();
+
+    let (actual_self_described, actual_mini) = write_v2_0_embedded_fixtures(&batch, &schema).await;
+    let expected_self_described =
+        include_bytes!("../test_data/exact_versions/v2_0_self_described.lance");
+    let expected_mini = include_bytes!("../test_data/exact_versions/v2_0_mini.lance");
+    assert_wire_bytes_equal(&actual_self_described, expected_self_described);
+    assert_wire_bytes_equal(&actual_mini, expected_mini);
+
+    let expected_footer = ConcreteFileVersion::V2_0.to_embedded_footer_numbers();
+    assert_eq!(footer_version(expected_self_described), expected_footer);
+    assert_eq!(footer_version(expected_mini), expected_footer);
+
+    let version = LanceFileVersion::from(ConcreteFileVersion::V2_0);
+    let self_described =
+        EncodedBatch::try_from_self_described_lance(Bytes::from_static(expected_self_described))
+            .unwrap();
+    let decoded = decode_batch(
+        &self_described,
+        &FilterExpression::no_filter(),
+        Arc::<DecoderPlugins>::default(),
+        false,
+        EncodedBatchLayout::Array,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_record_batch_eq(&decoded, &batch);
+
+    let mini =
+        EncodedBatch::try_from_mini_lance(Bytes::from_static(expected_mini), &schema, version)
+            .unwrap();
+    let decoded = decode_batch(
+        &mini,
+        &FilterExpression::no_filter(),
+        Arc::<DecoderPlugins>::default(),
+        false,
+        EncodedBatchLayout::Array,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_record_batch_eq(&decoded, &batch);
 }
 
 #[tokio::test]
@@ -305,8 +463,8 @@ async fn v2_3_output_is_deterministic_within_the_current_revision() {
     let second = write_current_fixture(ConcreteFileVersion::V2_3, &batch, &schema).await;
     assert_eq!(first, second);
     assert_eq!(
-        &first[first.len() - 8..],
-        &[2, 0, 3, 0, b'L', b'A', b'N', b'C']
+        footer_version(&first),
+        ConcreteFileVersion::V2_3.to_standard_footer_numbers()
     );
     assert_current_reader_roundtrip(&first, ConcreteFileVersion::V2_3, &batch).await;
 }
@@ -342,6 +500,10 @@ async fn v1_writer_and_reader_are_wire_compatible() {
         .await
         .unwrap();
     assert_wire_bytes_equal(actual.as_ref(), expected);
+    assert_eq!(
+        footer_version(expected),
+        ConcreteFileVersion::V1.to_standard_footer_numbers()
+    );
 
     let fixture_fs = FsFixture::default();
     let mut fixture_writer = fixture_fs
@@ -363,8 +525,5 @@ async fn v1_writer_and_reader_are_wire_compatible() {
         .await
         .unwrap();
     assert_eq!(reader.num_batches(), 5);
-    assert_eq!(actual_batch.num_rows(), batch.num_rows());
-    assert_eq!(actual_batch.column(0).to_data(), batch.column(0).to_data());
-    assert_eq!(actual_batch.column(1).to_data(), batch.column(1).to_data());
-    assert_blob_column_eq(actual_batch.column(4).as_ref(), batch.column(4).as_ref());
+    assert_record_batch_eq(&actual_batch, &v1_reader_expected_batch(&batch));
 }

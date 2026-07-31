@@ -33,7 +33,7 @@ use itertools::Itertools;
 use lance_arrow::DataTypeExt;
 use lance_arrow::deepcopy::deep_copy_nulls;
 use lance_core::{
-    cache::{CacheKey, Context, DeepSizeOf},
+    cache::{CacheKey, CacheKeySchema, Context, DeepSizeOf, KeyBuilder},
     error::{Error, LanceOptionExt},
     utils::bit::pad_bytes,
 };
@@ -55,7 +55,7 @@ use crate::{
     encodings::logical::primitive::fullzip::PerValueDataBlock,
 };
 use crate::{
-    encodings::logical::primitive::miniblock::MiniBlockCompressed,
+    encodings::logical::primitive::miniblock::{MiniBlockCompressed, MiniBlockCompressionContext},
     statistics::{ComputeStat, GetStat, Stat},
 };
 use crate::{
@@ -4177,6 +4177,15 @@ impl CacheKey for FieldDataCacheKey {
     fn type_name() -> &'static str {
         "FieldData"
     }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.encoding.logical.primitive.field-data-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_u32(self.column_index);
+        builder.write_str(&self.view_tag);
+    }
 }
 
 impl StructuralFieldScheduler for StructuralPrimitiveFieldScheduler {
@@ -5401,7 +5410,12 @@ impl PrimitiveStructuralEncoder {
         let num_items = data.num_values();
 
         let compressor = compression_strategy.create_miniblock_compressor(field, &data)?;
-        let (compressed_data, value_encoding) = compressor.compress(data)?;
+        let common_chunk_buffers =
+            u64::from(repdef.rep_slicer().is_some()) + u64::from(repdef.def_slicer().is_some());
+        let support_large_chunk = miniblock_chunk_size == MiniblockChunkSize::U32;
+        let compression_context =
+            MiniBlockCompressionContext::new(common_chunk_buffers, support_large_chunk, true);
+        let (compressed_data, value_encoding) = compressor.compress(compression_context, data)?;
 
         let max_rep = repdef.def_meaning.iter().filter(|l| l.is_list()).count() as u16;
 

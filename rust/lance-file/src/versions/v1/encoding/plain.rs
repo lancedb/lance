@@ -13,9 +13,10 @@ use std::sync::Arc;
 use arrow_arith::numeric::sub;
 use arrow_array::{
     Array, ArrayRef, BooleanArray, FixedSizeBinaryArray, FixedSizeListArray, UInt8Array,
-    UInt32Array, builder::BooleanBuilder, cast::AsArray, new_empty_array,
+    UInt32Array, builder::BooleanBuilder, cast::AsArray, make_array, new_empty_array,
 };
-use arrow_buffer::bit_util;
+use arrow_buffer::{Buffer, bit_util};
+use arrow_data::{ArrayDataBuilder, BufferSpec, layout};
 use arrow_schema::{DataType, Field};
 use arrow_select::{concat::concat, take::take};
 use async_recursion::async_recursion;
@@ -170,6 +171,43 @@ fn get_byte_range(data_type: &DataType, row_range: Range<usize>) -> Range<usize>
     }
 }
 
+fn bytes_to_array(
+    data_type: &DataType,
+    bytes: bytes::Bytes,
+    len: usize,
+    offset: usize,
+) -> Result<ArrayRef> {
+    let layout = layout(data_type);
+    if layout.buffers.len() != 1 {
+        return Err(Error::internal(format!(
+            "v1 plain encoding requires one value buffer, found {data_type}"
+        )));
+    }
+
+    let buffer = if let BufferSpec::FixedWidth {
+        byte_width,
+        alignment,
+    } = &layout.buffers[0]
+    {
+        let min_buffer_size = (len + offset).saturating_mul(*byte_width);
+        if bytes.len() < min_buffer_size {
+            Buffer::copy_bytes_bytes(bytes, min_buffer_size)
+        } else {
+            Buffer::from_bytes_bytes(bytes, *alignment as u64)
+        }
+    } else {
+        Buffer::from_slice_ref(bytes)
+    };
+
+    let data = ArrayDataBuilder::new(data_type.clone())
+        .len(len)
+        .offset(offset)
+        .null_count(0)
+        .add_buffer(buffer)
+        .build()?;
+    Ok(make_array(data))
+}
+
 impl<'a> PlainDecoder<'a> {
     pub fn new(
         reader: &'a dyn Reader,
@@ -208,12 +246,7 @@ impl<'a> PlainDecoder<'a> {
         } else {
             0
         };
-        Ok(array_from_fixed_width_bytes(
-            self.data_type,
-            data,
-            end - start,
-            offset,
-        )?)
+        bytes_to_array(self.data_type, data, end - start, offset)
     }
 
     async fn decode_fixed_size_list(
@@ -540,9 +573,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_array_from_fixed_width_bytes_padding() {
+    async fn test_bytes_to_array_padding() {
         let bytes = Bytes::from_static(&[0x01, 0x00, 0x02, 0x00, 0x03]);
-        let arr = array_from_fixed_width_bytes(&DataType::UInt16, bytes, 3, 0).unwrap();
+        let arr = bytes_to_array(&DataType::UInt16, bytes, 3, 0).unwrap();
 
         let expected = UInt16Array::from(vec![1, 2, 3]);
         assert_eq!(arr.as_ref(), &expected);

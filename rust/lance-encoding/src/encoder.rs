@@ -29,6 +29,8 @@ use crate::{
     format::pb,
 };
 
+pub use crate::array_encoding::ArrayFieldEncodingStrategy;
+
 pub mod structural;
 
 /// The minimum alignment for a page buffer.  Writers must respect this.
