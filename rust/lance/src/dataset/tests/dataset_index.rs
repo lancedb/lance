@@ -863,18 +863,19 @@ async fn test_fts_on_multiple_columns() {
     assert_eq!(results.num_rows(), 1);
 }
 
-async fn create_fragmented_fts_index(dataset: &mut Dataset, column: &str) {
-    create_fragmented_fts_index_with_order(dataset, column, false).await;
+async fn create_fragmented_fts_index(dataset: &mut Dataset, column: &str, with_position: bool) {
+    create_fragmented_fts_index_with_order(dataset, column, with_position, false).await;
 }
 
 async fn create_fragmented_fts_index_with_order(
     dataset: &mut Dataset,
     column: &str,
+    with_position: bool,
     reverse_segments: bool,
 ) {
     let index_name = format!("{column}_idx");
     let columns = [column];
-    let params = InvertedIndexParams::default();
+    let params = InvertedIndexParams::default().with_position(with_position);
     let fragment_ids = dataset
         .get_fragments()
         .iter()
@@ -994,8 +995,8 @@ async fn test_nested_multimatch_limit_propagation() {
     .await
     .unwrap();
     assert_eq!(dataset.get_fragments().len(), 3);
-    create_fragmented_fts_index(&mut dataset, "title").await;
-    create_fragmented_fts_index(&mut dataset, "body").await;
+    create_fragmented_fts_index(&mut dataset, "title", false).await;
+    create_fragmented_fts_index(&mut dataset, "body", false).await;
 
     let must_query: FtsQuery = BooleanQuery::new([
         (Occur::Must, compound_multimatch_query()),
@@ -1051,7 +1052,7 @@ async fn test_nested_multimatch_limit_propagation() {
 }
 
 #[tokio::test]
-async fn test_same_column_multimatch_uses_compound_scorer() {
+async fn test_same_column_compound_scorer_is_exact_and_bounded() {
     let batch = arrow_array::record_batch!((
         "text",
         Utf8,
@@ -1076,7 +1077,43 @@ async fn test_same_column_multimatch_uses_compound_scorer() {
     )
     .await
     .unwrap();
-    create_fragmented_fts_index(&mut dataset, "text").await;
+    create_fragmented_fts_index(&mut dataset, "text", true).await;
+
+    let match_query = |term: &str| {
+        MatchQuery::new(term.to_owned())
+            .with_column(Some("text".to_owned()))
+            .into()
+    };
+    let query: FtsQuery = BooleanQuery::new([
+        (Occur::Must, match_query("common")),
+        (Occur::Should, match_query("tie")),
+        (
+            Occur::Should,
+            PhraseQuery::new("common tie".to_owned())
+                .with_column(Some("text".to_owned()))
+                .into(),
+        ),
+        (Occur::MustNot, match_query("irrelevant")),
+    ])
+    .into();
+
+    assert_compound_fts_top_k(&dataset, query.clone(), 2).await;
+
+    let mut scanner = dataset.scan();
+    scanner
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap();
+    scanner.limit(Some(2), None).unwrap();
+    let plan = scanner.explain_plan(false).await.unwrap();
+    assert!(
+        plan.contains("CompoundFtsScorer"),
+        "same-column compound FTS should use the scorer tree:\n{plan}"
+    );
+    assert!(
+        !plan.contains("HashJoinExec"),
+        "same-column compound FTS should not materialize intermediate joins:\n{plan}"
+    );
 
     let same_column_multimatch: FtsQuery = MultiMatchQuery::try_new(
         "common".to_owned(),
@@ -1116,7 +1153,7 @@ async fn test_compound_tie_uses_resolved_row_id() {
     )
     .await
     .unwrap();
-    create_fragmented_fts_index_with_order(&mut dataset, "text", true).await;
+    create_fragmented_fts_index_with_order(&mut dataset, "text", false, true).await;
 
     let query: FtsQuery = MultiMatchQuery::try_new(
         "common".to_owned(),

@@ -4368,11 +4368,13 @@ impl<'a> PositionCursor<'a> {
 /// which owns the only competitive score for the whole scorer tree.
 pub(super) struct WandCursor<'a, D: WandDocuments> {
     wand: Wand<'a, Arc<MemBM25Scorer>, D>,
+    phrase_slop: Option<u32>,
     wand_factor: f32,
     cost: usize,
     current_doc: Option<DocInfo>,
     current_document_key: Option<u64>,
     current_score: f32,
+    confirmation: Option<bool>,
     shallow: Option<(u64, u64, f32)>,
     comparisons: usize,
     metrics_recorded: bool,
@@ -4400,11 +4402,13 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
         .unwrap_or_default();
         Self {
             wand: Wand::new(operator, postings.into_iter(), documents, scorer),
+            phrase_slop: params.phrase_slop,
             wand_factor: params.wand_factor,
             cost,
             current_doc: None,
             current_document_key: None,
             current_score: 0.0,
+            confirmation: None,
             shallow: None,
             comparisons: 0,
             metrics_recorded: false,
@@ -4424,6 +4428,7 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
         self.current_doc = None;
         self.current_document_key = None;
         self.current_score = 0.0;
+        self.confirmation = None;
         self.shallow = None;
     }
 
@@ -4460,6 +4465,7 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
             self.current_doc = Some(doc);
             self.current_document_key = Some(document_key);
             self.current_score = score;
+            self.confirmation = self.phrase_slop.is_none().then_some(true);
             self.shallow = None;
             return Ok(Some(doc_id));
         }
@@ -4492,6 +4498,25 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
         self.current_doc
             .map(|_| self.current_score)
             .ok_or_else(|| Error::internal("posting FTS scorer is not positioned on a document"))
+    }
+
+    pub(super) fn matches(&mut self) -> Result<bool> {
+        let Some(_) = self.current_doc else {
+            return Ok(false);
+        };
+        if let Some(confirmed) = self.confirmation {
+            return Ok(confirmed);
+        }
+        let phrase_slop = self.phrase_slop.ok_or_else(|| {
+            Error::internal("posting FTS scorer requires phrase slop for position confirmation")
+        })?;
+        let confirmed = self.wand.check_positions(phrase_slop as i32)?;
+        self.confirmation = Some(confirmed);
+        Ok(confirmed)
+    }
+
+    pub(super) fn match_cost(&self) -> Option<f32> {
+        self.phrase_slop.map(|_| self.wand.num_terms.max(1) as f32)
     }
 
     pub(super) fn advance_shallow(&mut self, target: u64) -> Result<u64> {
