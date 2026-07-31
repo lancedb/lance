@@ -417,21 +417,6 @@ impl MemIndexConfig {
         ))
     }
 
-    /// Detect index type from protobuf type_url.
-    #[deprecated(
-        since = "10.0.1",
-        note = "use `MemIndexKind::from_type_url`, which returns a kind the \
-                memtable is known to be able to build"
-    )]
-    pub fn detect_index_type(type_url: &str) -> Result<&'static str> {
-        match MemIndexKind::from_type_url(type_url) {
-            Some(MemIndexKind::BTree) => Ok("btree"),
-            Some(MemIndexKind::Fts) => Ok("fts"),
-            Some(MemIndexKind::Hnsw) => Ok("vector"),
-            None => Err(unsupported_index_type(type_url)),
-        }
-    }
-
     fn fts_format_version_from_metadata(
         index_meta: &IndexMetadata,
     ) -> Result<InvertedListFormatVersion> {
