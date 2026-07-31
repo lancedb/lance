@@ -413,4 +413,47 @@ public class FragmentTest {
       }
     }
   }
+
+  @Test
+  void testFragmentStatistics(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("fragment_statistics").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+
+      // Two fragments with different row counts
+      FragmentMetadata frag1 = testDataset.createNewFragment(21);
+      FragmentMetadata frag2 = testDataset.createNewFragment(9);
+      FragmentOperation.Append appendOp = new FragmentOperation.Append(Arrays.asList(frag1, frag2));
+      try (Dataset dataset = Dataset.commit(allocator, datasetPath, appendOp, Optional.of(1L))) {
+        List<Fragment> fragments = dataset.getFragments();
+        FragmentStatistics stats = dataset.getFragmentStatistics();
+        assertEquals(fragments.size(), stats.size());
+
+        // Parity with getFragments across all three arrays
+        assertArrayEquals(fragments.stream().mapToInt(Fragment::getId).toArray(), stats.getIds());
+        assertArrayEquals(
+            fragments.stream().mapToLong(f -> f.metadata().getNumRows()).toArray(),
+            stats.getRowCounts());
+        assertArrayEquals(
+            fragments.stream().mapToInt(f -> f.metadata().getFiles().size()).toArray(),
+            stats.getDataFileNums());
+
+        assertEquals(30, Arrays.stream(stats.getRowCounts()).sum());
+      }
+    }
+  }
+
+  @Test
+  void testFragmentStatisticsOnEmptyDataset(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("fragment_statistics_empty").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      try (Dataset dataset = testDataset.createEmptyDataset()) {
+        assertEquals(0, dataset.getFragmentStatistics().size());
+      }
+    }
+  }
 }
