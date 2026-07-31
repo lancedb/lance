@@ -12208,15 +12208,11 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
-      BoostQuery: negative_boost=1
-        MatchQuery: column=s, query=[hello]
-        MatchQuery: column=s, query=[world]"#
+      CompoundFtsScorer: query=Boosting(positive=Match(MatchQuery { column: Some("s"), terms: "hello", ... }), negative=Match(MatchQuery { column: Some("s"), terms: "world", ... }), negative_boost=1)"#
         } else {
             r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   LanceRead: uri=..., projection=[s], source=stream(_rowid)
-    BoostQuery: negative_boost=1
-      MatchQuery: column=s, query=[hello]
-      MatchQuery: column=s, query=[world]"#
+    CompoundFtsScorer: query=Boosting(positive=Match(MatchQuery { column: Some("s"), terms: "hello", ... }), negative=Match(MatchQuery { column: Some("s"), terms: "world", ... }), negative_boost=1)"#
         };
         assert_plan_equals(
             &dataset.dataset,
