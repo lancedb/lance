@@ -57,7 +57,6 @@ def make_base_dataset(
     num_rows: int,
     rows_per_file: int,
     dtype: str,
-    version: str,
     embedding_dim: int = EMBEDDING_DIM,
 ) -> lance.LanceDataset:
     """Create a base dataset with an ``id`` column and a ``val`` column.
@@ -77,12 +76,7 @@ def make_base_dataset(
     reader = rand_batches(
         schema, num_batches=num_rows // rows_per_file, rows_per_batch=rows_per_file
     )
-    return lance.write_dataset(
-        reader,
-        base_path,
-        max_rows_per_file=rows_per_file,
-        data_storage_version=version,
-    )
+    return lance.write_dataset(reader, base_path, max_rows_per_file=rows_per_file)
 
 
 def coverage_offsets(num_rows: int, fraction: float, pattern: str) -> List[int]:

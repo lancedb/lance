@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
-"""Benchmark #1: impact of overlay files on manifest size.
+"""Impact of overlay files on manifest size.
 
 Each committed overlay adds a ``DataOverlayFile`` entry (a value-file pointer
 plus a serialized coverage bitmap) to every overlaid fragment's metadata in the
@@ -20,22 +20,22 @@ NUM_ROWS = 1_000_000
 # Single fragment so every overlay lands on the same fragment's metadata.
 ROWS_PER_FILE = NUM_ROWS
 
+# Strided 10% coverage is the worst case for bitmap size, so manifest growth is
+# measured at its upper bound rather than swept across coverage shapes.
+COVERAGE_FRACTION = 0.1
+COVERAGE_PATTERN = "stride"
 
-@pytest.mark.parametrize("num_overlays", [0, 1, 4, 16, 64])
-@pytest.mark.parametrize(
-    "fraction,pattern",
-    [(0.01, "contiguous"), (0.01, "stride"), (0.1, "stride")],
-    ids=["1pct-contiguous", "1pct-stride", "10pct-stride"],
-)
-def test_overlay_manifest_size(
-    tmp_path, record_property, num_overlays, fraction, pattern
-):
+
+@pytest.mark.parametrize("num_overlays", [0, 4, 64])
+def test_overlay_manifest_size(tmp_path, record_property, num_overlays):
     base = str(tmp_path / "ds")
-    ds = make_base_dataset(base, NUM_ROWS, ROWS_PER_FILE, "int32", "2.1")
+    ds = make_base_dataset(base, NUM_ROWS, ROWS_PER_FILE, "int32")
     base_bytes = manifest_size(ds)
 
     if num_overlays:
-        ds = commit_overlay_layers(ds, num_overlays, fraction, pattern, "int32")
+        ds = commit_overlay_layers(
+            ds, num_overlays, COVERAGE_FRACTION, COVERAGE_PATTERN, "int32"
+        )
 
     total = manifest_size(ds)
     growth = total - base_bytes
