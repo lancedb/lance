@@ -29,7 +29,7 @@
     <properties>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <arrow.version>18.3.0</arrow.version>
-        <opentelemetry.version>1.30.0</opentelemetry.version>
+        <opentelemetry.version>1.64.0</opentelemetry.version>
         <substrait.version>0.28.1</substrait.version>
         <spotless.skip>false</spotless.skip>
         <spotless.version>2.43.0</spotless.version>
