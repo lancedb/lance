@@ -60,7 +60,7 @@ use {
     self::external_manifest::{ExternalManifestCommitHandler, ExternalManifestStore},
     aws_credential_types::provider::ProvideCredentials,
     aws_credential_types::provider::error::CredentialsError,
-    lance_io::object_store::{StorageOptions, providers::aws::{AwsProviderScheme, build_aws_credential}},
+    lance_io::object_store::{StorageOptions, providers::aws::build_aws_credential},
     object_store::aws::AmazonS3ConfigKey,
     object_store::aws::AwsCredentialProvider,
     std::borrow::Cow,

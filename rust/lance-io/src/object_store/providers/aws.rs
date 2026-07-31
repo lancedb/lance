@@ -385,7 +385,6 @@ pub async fn build_aws_credential(
     ))
 }
 
-
 fn extract_static_s3_credentials(
     options: &HashMap<AmazonS3ConfigKey, String>,
 ) -> Option<StaticCredentialProvider<ObjectStoreAwsCredential>> {
