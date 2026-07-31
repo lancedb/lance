@@ -21,7 +21,8 @@ use crate::buffer::LanceBuffer;
 use crate::data::{BlockInfo, DataBlock, VariableWidthBlock};
 use crate::encodings::logical::primitive::fullzip::{PerValueCompressor, PerValueDataBlock};
 use crate::encodings::logical::primitive::miniblock::{
-    MAX_MINIBLOCK_VALUES, MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressor,
+    MAX_MINIBLOCK_VALUES, MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressionContext,
+    MiniBlockCompressor,
 };
 use crate::format::pb21::CompressiveEncoding;
 use crate::format::pb21::compressive_encoding::Compression;
@@ -245,7 +246,11 @@ impl BinaryMiniBlockEncoder {
 }
 
 impl MiniBlockCompressor for BinaryMiniBlockEncoder {
-    fn compress(&self, data: DataBlock) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
+    fn compress(
+        &self,
+        _context: MiniBlockCompressionContext,
+        data: DataBlock,
+    ) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
         match data {
             DataBlock::VariableWidth(variable_width) => Ok(self.chunk_data(variable_width)),
             _ => Err(Error::invalid_input_source(

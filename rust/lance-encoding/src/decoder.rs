@@ -357,31 +357,31 @@ fn inline_scheduling_threshold() -> u64 {
 /// and 2.1+ decoders can always assume this is pb::PageLayout
 #[derive(Debug, Clone)]
 pub enum PageEncoding {
-    Array(pb::ArrayEncoding),
+    Legacy(pb::ArrayEncoding),
     Structural(pb21::PageLayout),
 }
 
 impl DeepSizeOf for PageEncoding {
     fn deep_size_of_children(&self, _context: &mut Context) -> usize {
         match self {
-            Self::Array(encoding) => encoding.encoded_len() * 4,
+            Self::Legacy(encoding) => encoding.encoded_len() * 4,
             Self::Structural(encoding) => encoding.encoded_len() * 4,
         }
     }
 }
 
 impl PageEncoding {
-    pub fn as_array(&self) -> &pb::ArrayEncoding {
+    pub fn as_legacy(&self) -> &pb::ArrayEncoding {
         match self {
-            Self::Array(enc) => enc,
-            Self::Structural(_) => panic!("Expected an array encoding"),
+            Self::Legacy(enc) => enc,
+            Self::Structural(_) => panic!("Expected a legacy encoding"),
         }
     }
 
     pub fn as_structural(&self) -> &pb21::PageLayout {
         match self {
             Self::Structural(enc) => enc,
-            Self::Array(_) => panic!("Expected a structural encoding"),
+            Self::Legacy(_) => panic!("Expected a structural encoding"),
         }
     }
 
@@ -708,7 +708,7 @@ impl CoreFieldDecoderStrategy {
             return Err(Error::invalid_input_source(format!("Due to schema we expected a struct column but we received a column with {} pages and right now we only support struct columns with 1 page", column_info.page_infos.len()).into()));
         }
         let encoding = &column_info.page_infos[0].encoding;
-        match encoding.as_array().array_encoding.as_ref().unwrap() {
+        match encoding.as_legacy().array_encoding.as_ref().unwrap() {
             pb::array_encoding::ArrayEncoding::Struct(_) => Ok(()),
             _ => Err(Error::invalid_input_source(format!("Expected a struct encoding because we have a struct field in the schema but got the encoding {:?}", encoding).into())),
         }
@@ -717,7 +717,7 @@ impl CoreFieldDecoderStrategy {
     fn check_packed_struct(column_info: &ColumnInfo) -> bool {
         let encoding = &column_info.page_infos[0].encoding;
         matches!(
-            encoding.as_array().array_encoding.as_ref().unwrap(),
+            encoding.as_legacy().array_encoding.as_ref().unwrap(),
             pb::array_encoding::ArrayEncoding::PackedStruct(_)
         )
     }
@@ -743,11 +743,11 @@ impl CoreFieldDecoderStrategy {
             .filter(|offsets_page| offsets_page.num_rows > 0)
             .map(|offsets_page| {
                 if let Some(pb::array_encoding::ArrayEncoding::List(list_encoding)) =
-                    &offsets_page.encoding.as_array().array_encoding
+                    &offsets_page.encoding.as_legacy().array_encoding
                 {
                     let inner = PageInfo {
                         buffer_offsets_and_sizes: offsets_page.buffer_offsets_and_sizes.clone(),
-                        encoding: PageEncoding::Array(
+                        encoding: PageEncoding::Legacy(
                             list_encoding.offsets.as_ref().unwrap().as_ref().clone(),
                         ),
                         num_rows: offsets_page.num_rows,
@@ -937,7 +937,7 @@ impl CoreFieldDecoderStrategy {
             }
             if let Some(page_info) = column_info.page_infos.first() {
                 if matches!(
-                    page_info.encoding.as_array(),
+                    page_info.encoding.as_legacy(),
                     pb::ArrayEncoding {
                         array_encoding: Some(pb::array_encoding::ArrayEncoding::List(..))
                     }
@@ -1064,7 +1064,7 @@ fn root_column(num_rows: u64) -> ColumnInfo {
             } else {
                 u64::MAX
             },
-            encoding: PageEncoding::Array(pb::ArrayEncoding {
+            encoding: PageEncoding::Legacy(pb::ArrayEncoding {
                 array_encoding: Some(pb::array_encoding::ArrayEncoding::Struct(
                     pb::SimpleStruct {},
                 )),

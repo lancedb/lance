@@ -9,6 +9,7 @@ import json
 import operator
 import os
 import random
+import re
 import time
 import uuid
 import warnings
@@ -44,6 +45,9 @@ from .blob import BlobFile
 from .dependencies import (
     _check_for_numpy,
     _check_for_torch,
+    _is_pydantic_base_model_class,
+    _validate_pydantic_list,
+    model_to_dict,
     torch,
 )
 from .dependencies import numpy as np
@@ -239,14 +243,6 @@ def _is_null_blob_description(description: Any) -> bool:
         return False
     if description.keys() == {"position", "size"}:
         return description["position"] == 1 and description["size"] == 0
-    if description.keys() == {"kind", "position", "size", "blob_id", "blob_uri"}:
-        return (
-            description["kind"] == 0
-            and description["position"] == 0
-            and description["size"] == 0
-            and description["blob_id"] == 0
-            and description["blob_uri"] == ""
-        )
     return False
 
 
@@ -853,6 +849,55 @@ class LanceDataset(pa.dataset.Dataset):
             read_params=read_params,
             base_store_params=base_store_params,
         )
+
+    @classmethod
+    def from_pydantic_model(
+        cls,
+        model_class,
+        data,
+        uri: Optional[Union[str, Path]] = None,
+        mode: str = "create",
+        **kwargs,
+    ) -> "LanceDataset":
+        """Create a LanceDataset from a Pydantic model class and a list of instances.
+
+        The table name is inferred from the model class name converted to snake_case.
+        The schema is inferred from the model class's field annotations, not from
+        the data, so optional fields are typed correctly even if every value in a
+        given batch happens to be None.
+
+        Parameters
+        ----------
+        model_class : type
+            A Pydantic BaseModel subclass.
+        data : list
+            A list of Pydantic model instances.
+        uri : str or Path, optional
+            The URI to write the dataset to. If not provided, the model class name
+            converted to snake_case is used as the path.
+        mode : str, optional
+            The write mode. One of "create", "overwrite", or "append".
+        **kwargs
+            Additional arguments passed to write_dataset().
+        """
+        if not _is_pydantic_base_model_class(model_class):
+            raise TypeError(
+                f"`model_class` must be a Pydantic BaseModel subclass, "
+                f"got {model_class!r}"
+            )
+        _validate_pydantic_list(data, model_class)
+        if not data:
+            raise ValueError(
+                "`data` must be a non-empty list of Pydantic model instances."
+            )
+        if uri is None:
+            uri = re.sub(r"(?<!^)(?=[A-Z])", "_", model_class.__name__).lower()
+        from .pydantic import pydantic_to_schema
+
+        dicts = [model_to_dict(item) for item in data]
+        schema = pydantic_to_schema(model_class)
+        table = pa.Table.from_pylist(dicts, schema=schema)
+        return write_dataset(table, uri, mode=mode, **kwargs)
 
     def __reduce__(self):
         return type(self).__deserialize__, (
@@ -3252,8 +3297,12 @@ class LanceDataset(pa.dataset.Dataset):
                         ", float, bool, str, large_str, fixed-size-binary, or temporal",
                     )
             elif index_type == "LABEL_LIST":
-                if not pa.types.is_list(field_type):
-                    raise TypeError(f"LABEL_LIST index column {column} must be a list")
+                if not (
+                    pa.types.is_list(field_type) or pa.types.is_large_list(field_type)
+                ):
+                    raise TypeError(
+                        f"LABEL_LIST index column {column} must be a list or large list"
+                    )
             elif index_type == "NGRAM":
                 if not pa.types.is_string(field_type) and not pa.types.is_large_string(
                     field_type
@@ -3311,6 +3360,7 @@ class LanceDataset(pa.dataset.Dataset):
             "RTREE",
             "ZONEMAP",
             "BLOOMFILTER",
+            "LABEL_LIST",
         }
 
     @classmethod
@@ -3325,6 +3375,7 @@ class LanceDataset(pa.dataset.Dataset):
             "RTREE",
             "ZONEMAP",
             "BLOOMFILTER",
+            "LABEL_LIST",
         }
 
     def create_scalar_index(
@@ -4281,10 +4332,9 @@ class LanceDataset(pa.dataset.Dataset):
 
         This is the public distributed-build API for vector, BTREE scalar,
         canonical bitmap scalar, INVERTED scalar, NGRAM scalar, RTREE scalar,
-        ZONEMAP scalar,
-        and BLOOMFILTER scalar index construction. Unlike
-        :meth:`create_index`, this method does not publish the index into the
-        dataset manifest. Instead, it writes one segment under
+        ZONEMAP scalar, BLOOMFILTER scalar, and LABEL_LIST scalar index construction.
+        Unlike :meth:`create_index`, this method does not publish the index into
+        the dataset manifest. Instead, it writes one segment under
         ``_indices/<segment_uuid>/`` and returns the resulting
         :class:`Index` metadata.
 
@@ -4298,10 +4348,11 @@ class LanceDataset(pa.dataset.Dataset):
         4. commit the final segment list with
            :meth:`commit_existing_index_segments`
 
-        BTREE, BITMAP, INVERTED, NGRAM, RTREE, ZONEMAP, and BLOOMFILTER segments may
-        be merged with :meth:`merge_existing_index_segments` before commit.
-        NGRAM segments built before a deferred compaction must be merged before
-        commit so their postings can be rebuilt against current row addresses.
+        BTREE, BITMAP, INVERTED, NGRAM, RTREE, ZONEMAP, BLOOMFILTER, and
+        LABEL_LIST segments may be merged with
+        :meth:`merge_existing_index_segments` before commit. NGRAM segments
+        built before a deferred compaction must be merged before commit so
+        their postings can be rebuilt against current row addresses.
         Parameters are the same as :meth:`create_index`, with one additional
         requirement:
 
@@ -6991,6 +7042,7 @@ class DatasetOptimizer:
             Literal["reencode", "try_binary_copy", "force_binary_copy"]
         ] = None,
         binary_copy_read_batch_bytes: Optional[int] = None,
+        max_source_fragments: Optional[int] = None,
     ) -> CompactionMetrics:
         """Compacts small files in the dataset, reducing total number of files.
 
@@ -7021,7 +7073,8 @@ class DatasetOptimizer:
         ``lance.compaction.defer_index_remap``,
         ``lance.compaction.batch_size``,
         ``lance.compaction.compaction_mode``,
-        ``lance.compaction.binary_copy_read_batch_bytes``.
+        ``lance.compaction.binary_copy_read_batch_bytes``,
+        ``lance.compaction.max_source_fragments``.
 
         Parameters
         ----------
@@ -7074,6 +7127,12 @@ class DatasetOptimizer:
             The batch size in bytes for reading during binary copy operations.
             Controls how much data is read at once when performing binary copy.
             Defaults to 16MB.
+        max_source_fragments: int, optional
+            Maximum number of source fragments to compact in a single run.
+            Compaction tasks are included until adding the next task would
+            exceed this limit, allowing compaction to proceed incrementally.
+            Fragments are processed oldest first. If not specified, uses the
+            manifest config value, or applies no limit.
 
         Returns
         -------
@@ -7097,6 +7156,7 @@ class DatasetOptimizer:
                 batch_size=batch_size,
                 compaction_mode=compaction_mode,
                 binary_copy_read_batch_bytes=binary_copy_read_batch_bytes,
+                max_source_fragments=max_source_fragments,
             ).items()
             if v is not None
         }

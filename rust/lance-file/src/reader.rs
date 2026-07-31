@@ -32,7 +32,7 @@ use prost::Message;
 
 use lance_core::{
     Error, Result,
-    cache::{CacheKey, LanceCache},
+    cache::{CacheKey, CacheKeySchema, KeyBuilder, LanceCache},
     datatypes::{Field, Schema},
 };
 use lance_encoding::format::pb as pbenc;
@@ -231,6 +231,14 @@ impl CacheKey for ColumnMetadataCacheKey {
 
     fn type_name() -> &'static str {
         "ColumnMetadata"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.file.column-metadata-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_u32(self.column_index);
     }
 }
 
@@ -2367,6 +2375,14 @@ mod tests {
     use crate::writer::FileWriterOptions;
     use lance_encoding::decoder::DecoderConfig;
 
+    fn footer_version(bytes: &[u8]) -> (u16, u16) {
+        let version_start = bytes.len() - 8;
+        (
+            u16::from_le_bytes([bytes[version_start], bytes[version_start + 1]]),
+            u16::from_le_bytes([bytes[version_start + 2], bytes[version_start + 3]]),
+        )
+    }
+
     #[tokio::test]
     async fn sparse_file_writer_reader_scan_range_and_take_roundtrip() {
         let fs = FsFixture::default();
@@ -2736,7 +2752,7 @@ mod tests {
             buffer_alignment: 64,
         };
 
-        let encoding_strategy = lance_encoding::array_encoding::ArrayFieldEncodingStrategy::new();
+        let encoding_strategy = crate::versions::v2_0::encoding_strategy();
 
         let encoded_batch = encode_batch(
             &data,

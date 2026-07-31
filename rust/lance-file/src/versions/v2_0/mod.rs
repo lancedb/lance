@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
 //! Lance v2.0 file composition.
 
 use std::{collections::BTreeMap, sync::Arc};
@@ -7,7 +10,10 @@ use lance_core::{
     Result,
     datatypes::{Field, Schema},
 };
-use lance_encoding::{decoder::PageInfo, encoder::EncodedBatch};
+use lance_encoding::{
+    decoder::PageInfo,
+    encoder::{ArrayFieldEncodingStrategy, EncodedBatch, FieldEncodingStrategy},
+};
 use lance_io::traits::Writer as ObjectWriter;
 
 use crate::{reader::ReadProjection, writer::FileWriterOptions};
@@ -123,6 +129,11 @@ pub(super) fn finalize_external_metadata_column(
         pages[0].priority = 0;
         pages.truncate(1);
     }
+}
+
+/// Compose the v2.0 field encoding mechanisms.
+pub fn encoding_strategy() -> Arc<dyn FieldEncodingStrategy> {
+    Arc::new(ArrayFieldEncodingStrategy::new())
 }
 
 /// Create a v2.0 writer with an explicit schema.
