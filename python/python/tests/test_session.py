@@ -49,7 +49,7 @@ def test_cache_backend_uri_config():
 def test_cache_backend_dict_config():
     session = lance.Session(
         index_cache_backend={
-            "kind": "moka",
+            "kind": "MOKA",
             "options": {"capacity": "1048576"},
         },
     )
@@ -76,3 +76,13 @@ def test_cache_backend_rejects_unknown_dict_key():
                 "capacity": "1048576",
             },
         )
+
+
+def test_cache_backend_rejects_moka_without_capacity():
+    with pytest.raises(ValueError, match="capacity is required"):
+        lance.Session(index_cache_backend="moka://")
+
+
+def test_cache_backend_rejects_moka_empty_capacity():
+    with pytest.raises(ValueError, match="capacity must not be empty"):
+        lance.Session(index_cache_backend="moka://?capacity=")

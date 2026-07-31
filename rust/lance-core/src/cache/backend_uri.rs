@@ -38,7 +38,7 @@
 use std::sync::Arc;
 
 use super::backend::CacheBackend;
-use super::registry::{BackendConfig, build_from_config};
+use super::registry::{BackendConfig, build_from_config, normalize_backend_kind};
 use crate::{Error, Result};
 
 /// Parse `uri` into a [`BackendConfig`] and build the backend registered
@@ -60,7 +60,7 @@ pub fn parse_backend_uri(uri: &str) -> Result<BackendConfig> {
     let (scheme, rest) = split_scheme(uri)?;
     let (path, query) = split_path_query(rest);
 
-    let mut config = BackendConfig::new(scheme);
+    let mut config = BackendConfig::new(&scheme)?;
 
     let normalized_path = normalize_path(path);
     if !normalized_path.is_empty() {
@@ -108,31 +108,9 @@ fn split_scheme(uri: &str) -> Result<(String, &str)> {
         Error::invalid_input(format!("cache backend uri {:?} is missing ':'", uri))
     })?;
     let scheme = &uri[..colon];
-    validate_scheme(scheme, uri)?;
-    Ok((scheme.to_ascii_lowercase(), &uri[colon + 1..]))
-}
-
-fn validate_scheme(scheme: &str, uri: &str) -> Result<()> {
-    let mut chars = scheme.chars();
-    match chars.next() {
-        Some(c) if c.is_ascii_alphabetic() => {}
-        _ => {
-            return Err(Error::invalid_input(format!(
-                "cache backend uri {:?}: scheme must start with an ASCII letter",
-                uri
-            )));
-        }
-    }
-    for c in chars {
-        let ok = c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.');
-        if !ok {
-            return Err(Error::invalid_input(format!(
-                "cache backend uri {:?}: invalid character {:?} in scheme",
-                uri, c
-            )));
-        }
-    }
-    Ok(())
+    let scheme = normalize_backend_kind(scheme)
+        .map_err(|err| Error::invalid_input(format!("cache backend uri {:?}: {}", uri, err)))?;
+    Ok((scheme, &uri[colon + 1..]))
 }
 
 fn split_path_query(rest: &str) -> (&str, Option<&str>) {

@@ -51,6 +51,7 @@ fn entry_weight(key: &InternalCacheKey, size_bytes: usize, weight_unit: usize) -
 /// via moka's built-in `optionally_get_with`.
 pub struct MokaCacheBackend {
     cache: moka::future::Cache<InternalCacheKey, MokaCacheEntry>,
+    capacity: usize,
     weight_unit: usize,
 }
 
@@ -72,14 +73,24 @@ impl MokaCacheBackend {
                 entry_weight(key, entry.size_bytes, weight_unit)
             })
             .build();
-        Self { cache, weight_unit }
+        Self {
+            cache,
+            capacity,
+            weight_unit,
+        }
     }
 
     pub fn no_cache() -> Self {
         Self {
             cache: moka::future::Cache::new(0),
+            capacity: 0,
             weight_unit: 1,
         }
+    }
+
+    /// Configured weighted capacity in bytes.
+    pub fn capacity(&self) -> usize {
+        self.capacity
     }
 
     fn weighted_size_bytes(&self) -> usize {
@@ -211,24 +222,28 @@ pub const MOKA_BACKEND_KIND: &str = "moka";
 ///
 /// Recognized options:
 ///   * `capacity` — total weighted capacity in bytes (`usize`).
-///     A missing or empty value defaults to 0, i.e. a disabled cache.
+///     This must be present and non-empty.
 ///
 /// Unknown options are rejected so typos surface immediately instead of
 /// silently falling through to the default capacity.
-pub(super) fn build_moka(config: &super::registry::BackendConfig) -> Result<Arc<dyn CacheBackend>> {
-    let mut capacity: usize = 0;
+pub(super) fn build_moka_backend(
+    config: &super::registry::BackendConfig,
+) -> Result<MokaCacheBackend> {
+    let mut capacity: Option<usize> = None;
     for (key, value) in &config.options {
         match key.as_str() {
             "capacity" => {
                 if value.is_empty() {
-                    capacity = 0;
+                    return Err(crate::Error::invalid_input(
+                        "moka cache backend: capacity must not be empty",
+                    ));
                 } else {
-                    capacity = value.parse::<usize>().map_err(|err| {
+                    capacity = Some(value.parse::<usize>().map_err(|err| {
                         crate::Error::invalid_input(format!(
                             "moka cache backend: cannot parse capacity {:?}: {}",
                             value, err
                         ))
-                    })?;
+                    })?);
                 }
             }
             other => {
@@ -239,34 +254,50 @@ pub(super) fn build_moka(config: &super::registry::BackendConfig) -> Result<Arc<
             }
         }
     }
-    Ok(Arc::new(MokaCacheBackend::with_capacity(capacity)))
+    let capacity = capacity.ok_or_else(|| {
+        crate::Error::invalid_input(
+            "moka cache backend: capacity is required; use moka://?capacity=<bytes>",
+        )
+    })?;
+    Ok(MokaCacheBackend::with_capacity(capacity))
+}
+
+pub(super) fn build_moka(config: &super::registry::BackendConfig) -> Result<Arc<dyn CacheBackend>> {
+    Ok(Arc::new(build_moka_backend(config)?))
 }
 
 #[cfg(test)]
 mod moka_registry_tests {
-    use super::super::backend_uri::build_from_uri;
+    use super::super::backend_uri::{build_from_uri, parse_backend_uri};
     use super::super::registry::{BackendConfig, build_from_config, registry_test_lock};
+    use super::*;
 
     #[test]
     fn test_moka_builds_from_config() {
         let _lock = registry_test_lock();
-        let cfg = BackendConfig::new("moka").with_option("capacity", "1048576");
-        // Any Arc<dyn CacheBackend> we can construct is a pass; we're
-        // checking that "moka" is discoverable in the registry without
-        // the caller having to register it manually.
+        let cfg = BackendConfig::new("moka")
+            .unwrap()
+            .with_option("capacity", "1048576");
+        let backend = build_moka_backend(&cfg).unwrap();
+        assert_eq!(backend.capacity(), 1048576);
         let _backend = build_from_config(&cfg).unwrap();
     }
 
     #[test]
     fn test_moka_builds_from_uri() {
         let _lock = registry_test_lock();
+        let cfg = parse_backend_uri("moka://?capacity=1048576").unwrap();
+        let backend = build_moka_backend(&cfg).unwrap();
+        assert_eq!(backend.capacity(), 1048576);
         let _backend = build_from_uri("moka://?capacity=1048576").unwrap();
     }
 
     #[test]
     fn test_moka_rejects_unknown_option() {
         let _lock = registry_test_lock();
-        let cfg = BackendConfig::new("moka").with_option("mystery", "1");
+        let cfg = BackendConfig::new("moka")
+            .unwrap()
+            .with_option("mystery", "1");
         let err = build_from_config(&cfg).unwrap_err();
         assert!(err.to_string().contains("unknown option"));
     }
@@ -274,8 +305,28 @@ mod moka_registry_tests {
     #[test]
     fn test_moka_rejects_bad_capacity() {
         let _lock = registry_test_lock();
-        let cfg = BackendConfig::new("moka").with_option("capacity", "not-a-number");
+        let cfg = BackendConfig::new("moka")
+            .unwrap()
+            .with_option("capacity", "not-a-number");
         let err = build_from_config(&cfg).unwrap_err();
         assert!(err.to_string().contains("cannot parse capacity"));
+    }
+
+    #[test]
+    fn test_moka_rejects_missing_capacity() {
+        let _lock = registry_test_lock();
+        let cfg = BackendConfig::new("moka").unwrap();
+        let err = build_from_config(&cfg).unwrap_err();
+        assert!(err.to_string().contains("capacity is required"));
+    }
+
+    #[test]
+    fn test_moka_rejects_empty_capacity() {
+        let _lock = registry_test_lock();
+        let cfg = BackendConfig::new("moka")
+            .unwrap()
+            .with_option("capacity", "");
+        let err = build_from_config(&cfg).unwrap_err();
+        assert!(err.to_string().contains("capacity must not be empty"));
     }
 }

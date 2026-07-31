@@ -8,9 +8,8 @@ use pyo3::exceptions::PyValueError;
 use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods, PyString};
 use pyo3::{Bound, PyAny, PyResult, pyclass, pymethods};
 
-use lance::dataset::{DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
-use lance::session::Session as LanceSession;
-use lance_core::cache::{BackendConfig, CacheBackend, build_from_config, build_from_uri};
+use lance::session::{CacheSpec, Session as LanceSession};
+use lance_core::cache::{BackendConfig, build_from_config, build_from_uri};
 
 use crate::rt;
 
@@ -65,33 +64,34 @@ impl Session {
 /// backend were provided for the same cache. Rather than silently letting
 /// one override the other (Proposal §7), this is rejected up-front so the
 /// operator gets an actionable error.
-fn resolve_backend(
+fn resolve_cache_spec(
     backend_field: &str,
     backend: Option<&Bound<'_, PyAny>>,
     size_field: &str,
-    size_field_set: bool,
-) -> PyResult<Option<Arc<dyn CacheBackend>>> {
-    let Some(value) = backend else {
-        return Ok(None);
-    };
-    if size_field_set {
+    size: Option<usize>,
+) -> PyResult<CacheSpec> {
+    if backend.is_some() && size.is_some() {
         return Err(PyValueError::new_err(format!(
             "{} and {} are mutually exclusive; set one or the other",
             size_field, backend_field,
         )));
     }
 
+    let Some(value) = backend else {
+        return Ok(size.map(CacheSpec::Size).unwrap_or(CacheSpec::Default));
+    };
+
     if value.cast::<PyString>().is_ok() {
         let uri: String = value.extract()?;
         return build_from_uri(&uri)
-            .map(Some)
+            .map(CacheSpec::Backend)
             .map_err(|e| PyValueError::new_err(format!("{}: {}", backend_field, e)));
     }
 
     if let Ok(dict) = value.cast::<PyDict>() {
         let cfg = backend_config_from_dict(backend_field, dict)?;
         return build_from_config(&cfg)
-            .map(Some)
+            .map(CacheSpec::Backend)
             .map_err(|e| PyValueError::new_err(format!("{}: {}", backend_field, e)));
     }
 
@@ -154,7 +154,10 @@ fn backend_config_from_dict(field: &str, dict: &Bound<'_, PyDict>) -> PyResult<B
         }
     }
 
-    Ok(BackendConfig { kind, options })
+    let mut config = BackendConfig::new(&kind)
+        .map_err(|e| PyValueError::new_err(format!("{}: {}", field, e)))?;
+    config.options = options;
+    Ok(config)
 }
 
 #[pymethods]
@@ -172,26 +175,21 @@ impl Session {
         index_cache_backend: Option<Bound<'_, PyAny>>,
         metadata_cache_backend: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
-        let index_backend = resolve_backend(
+        let index_cache = resolve_cache_spec(
             "index_cache_backend",
             index_cache_backend.as_ref(),
             "index_cache_size_bytes",
-            index_cache_size_bytes.is_some(),
+            index_cache_size_bytes,
         )?;
-        let metadata_backend = resolve_backend(
+        let metadata_cache = resolve_cache_spec(
             "metadata_cache_backend",
             metadata_cache_backend.as_ref(),
             "metadata_cache_size_bytes",
-            metadata_cache_size_bytes.is_some(),
+            metadata_cache_size_bytes,
         )?;
 
-        let session = LanceSession::with_cache_backends(
-            index_backend,
-            metadata_backend,
-            index_cache_size_bytes.unwrap_or(DEFAULT_INDEX_CACHE_SIZE),
-            metadata_cache_size_bytes.unwrap_or(DEFAULT_METADATA_CACHE_SIZE),
-            Default::default(),
-        );
+        let session =
+            LanceSession::with_cache_backends(index_cache, metadata_cache, Default::default());
         Ok(Self {
             inner: Arc::new(session),
         })

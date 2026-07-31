@@ -35,11 +35,11 @@ pub struct BackendConfig {
 
 impl BackendConfig {
     /// Build a config with no options.
-    pub fn new(kind: impl Into<String>) -> Self {
-        Self {
-            kind: kind.into(),
+    pub fn new(kind: impl AsRef<str>) -> Result<Self> {
+        Ok(Self {
+            kind: normalize_backend_kind(kind.as_ref())?,
             options: HashMap::new(),
-        }
+        })
     }
 
     /// Insert a single option and return `self`, enabling chaining.
@@ -47,6 +47,34 @@ impl BackendConfig {
         self.options.insert(key.into(), value.into());
         self
     }
+}
+
+/// Normalize and validate a cache backend kind.
+///
+/// Backend kinds share the same syntax as URI schemes. They are matched
+/// case-insensitively and stored as lowercase ASCII so registry lookups,
+/// config dictionaries, and URI parsing all address the same key.
+pub fn normalize_backend_kind(kind: &str) -> Result<String> {
+    let mut chars = kind.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() => {}
+        _ => {
+            return Err(Error::invalid_input(format!(
+                "cache backend kind {:?}: must start with an ASCII letter",
+                kind
+            )));
+        }
+    }
+    for c in chars {
+        let ok = c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.');
+        if !ok {
+            return Err(Error::invalid_input(format!(
+                "cache backend kind {:?}: invalid character {:?}",
+                kind, c
+            )));
+        }
+    }
+    Ok(kind.to_ascii_lowercase())
 }
 
 /// Constructor signature for a cache backend.
@@ -75,11 +103,10 @@ fn registry_lock_for_test() -> MutexGuard<'static, HashMap<String, BackendBuildF
 
 /// Register a constructor for a cache backend under `kind`.
 ///
-/// Returns `Err` if `kind` is already registered or reserved by a built-in
-/// backend. This is intentional: duplicate registration (e.g. two crates or a
-/// dynamic plugin claiming the same identifier) is a configuration bug that
-/// should surface immediately rather than silently overriding an existing
-/// implementation.
+/// Returns `Err` if a non-built-in `kind` is already registered. Built-in
+/// backends may be replaced so callers can mask a built-in implementation
+/// (for example, a patched `"moka"` backend) without changing URI/config
+/// strings elsewhere.
 ///
 /// Typical usage from a backend crate:
 ///
@@ -89,18 +116,13 @@ fn registry_lock_for_test() -> MutexGuard<'static, HashMap<String, BackendBuildF
 /// }
 /// ```
 pub fn register_backend(kind: &str, build: BackendBuildFn) -> Result<()> {
-    if builtin_backend(kind).is_some() {
-        return Err(Error::invalid_input(format!(
-            "cache backend kind {:?} is reserved for a built-in backend",
-            kind
-        )));
-    }
-    insert_backend(kind, build)
+    let kind = normalize_backend_kind(kind)?;
+    insert_backend(&kind, build, builtin_backend(&kind).is_some())
 }
 
-fn insert_backend(kind: &str, build: BackendBuildFn) -> Result<()> {
+fn insert_backend(kind: &str, build: BackendBuildFn, allow_replace: bool) -> Result<()> {
     let mut map = registry_lock()?;
-    if map.contains_key(kind) {
+    if map.contains_key(kind) && !allow_replace {
         return Err(Error::invalid_input(format!(
             "cache backend {:?} is already registered",
             kind
@@ -122,15 +144,20 @@ fn builtin_backend(kind: &str) -> Option<BackendBuildFn> {
 /// Returns `Err` if no backend has been registered under that identifier.
 pub fn build_from_config(config: &BackendConfig) -> Result<Arc<dyn CacheBackend>> {
     ensure_builtin_backends()?;
+    let kind = normalize_backend_kind(&config.kind)?;
+    let config = BackendConfig {
+        kind: kind.clone(),
+        options: config.options.clone(),
+    };
     let build = {
         let map = registry_lock()?;
-        map.get(&config.kind).copied()
+        map.get(&kind).copied()
     };
     match build {
-        Some(build) => build(config),
+        Some(build) => build(&config),
         None => Err(Error::invalid_input(format!(
             "unknown cache backend kind: {:?}",
-            config.kind
+            kind
         ))),
     }
 }
@@ -261,7 +288,7 @@ mod tests {
     fn test_register_and_build() {
         let _guard = RegistryGuard::new();
         register_backend("null", build_null).unwrap();
-        let backend = build_from_config(&BackendConfig::new("null")).unwrap();
+        let backend = build_from_config(&BackendConfig::new("null").unwrap()).unwrap();
         // Backend is opaque; we just check that the constructor ran and
         // gave us an Arc<dyn CacheBackend>.
         assert_eq!(Arc::strong_count(&backend), 1);
@@ -276,17 +303,49 @@ mod tests {
     }
 
     #[test]
-    fn test_builtin_kind_is_reserved() {
+    fn test_builtin_kind_can_be_overridden() {
         let _guard = RegistryGuard::new();
-        let err = register_backend("moka", build_null).unwrap_err();
-        assert!(err.to_string().contains("reserved"));
+        register_backend("moka", build_null).unwrap();
+        let backend = build_from_config(&BackendConfig::new("moka").unwrap()).unwrap();
+        assert_eq!(Arc::strong_count(&backend), 1);
     }
 
     #[test]
     fn test_unknown_kind_errors() {
         let _guard = RegistryGuard::new();
-        let err = build_from_config(&BackendConfig::new("missing")).unwrap_err();
+        let err = build_from_config(&BackendConfig::new("missing").unwrap()).unwrap_err();
         assert!(err.to_string().contains("unknown cache backend kind"));
+    }
+
+    #[test]
+    fn test_backend_kind_is_normalized() {
+        let _guard = RegistryGuard::new();
+        register_backend("Echo.Backend", build_null).unwrap();
+        let backend = build_from_config(&BackendConfig::new("echo.backend").unwrap()).unwrap();
+        assert_eq!(Arc::strong_count(&backend), 1);
+    }
+
+    #[test]
+    fn test_config_lookup_normalizes_direct_config() {
+        let _guard = RegistryGuard::new();
+        fn build_echo(cfg: &BackendConfig) -> Result<Arc<dyn CacheBackend>> {
+            assert_eq!(cfg.kind, "echo.backend");
+            Ok(Arc::new(NullBackend))
+        }
+        register_backend("echo.backend", build_echo).unwrap();
+        let cfg = BackendConfig {
+            kind: "ECHO.Backend".to_string(),
+            options: HashMap::new(),
+        };
+        build_from_config(&cfg).unwrap();
+    }
+
+    #[test]
+    fn test_invalid_backend_kind_errors() {
+        let err = register_backend("not a scheme", build_null).unwrap_err();
+        assert!(err.to_string().contains("invalid character"));
+        let err = BackendConfig::new("1moka").unwrap_err();
+        assert!(err.to_string().contains("must start with an ASCII letter"));
     }
 
     #[test]
@@ -297,7 +356,9 @@ mod tests {
             Ok(Arc::new(NullBackend))
         }
         register_backend("echo", build_echo).unwrap();
-        let cfg = BackendConfig::new("echo").with_option("capacity", "42");
+        let cfg = BackendConfig::new("echo")
+            .unwrap()
+            .with_option("capacity", "42");
         build_from_config(&cfg).unwrap();
     }
 }
