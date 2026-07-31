@@ -24,6 +24,7 @@ use crate::index::DatasetIndexInternalExt;
 use crate::index::mem_wal::{load_mem_wal_index_details, new_mem_wal_index_meta};
 
 use super::ShardWriterConfig;
+use super::index::{MemIndexKind, unsupported_index_type};
 use super::scanner::sstable_cache::open_sstable;
 use super::scanner::{DatasetCache, ShardSnapshot};
 use super::util::derived_store_params;
@@ -651,40 +652,39 @@ impl DatasetMemWalExt for Dataset {
                     ))
                 })?;
 
-            // Detect index type and create appropriate config
+            // Detect index kind and create appropriate config
             let type_url = index_meta
                 .index_details
                 .as_ref()
                 .map(|d| d.type_url.as_str())
                 .unwrap_or("");
 
-            let index_type = MemIndexConfig::detect_index_type(type_url)?;
+            let kind = MemIndexKind::from_type_url(type_url)
+                .ok_or_else(|| unsupported_index_type(type_url))?;
 
-            match index_type {
-                "btree" => {
+            // Exhaustive on purpose: a new `MemIndexKind` has to be built here,
+            // or callers filtering on `is_maintainable_index_type` would admit
+            // an index this writer cannot open — failing every memtable claim
+            // and leaving the table unwritable.
+            match kind {
+                MemIndexKind::BTree => {
                     index_configs.push(MemIndexConfig::btree_from_metadata(
                         &index_meta,
                         self.schema(),
                     )?);
                 }
-                "fts" => {
+                MemIndexKind::Fts => {
                     index_configs.push(MemIndexConfig::fts_from_metadata(
                         &index_meta,
                         self.schema(),
                     )?);
                 }
-                "vector" => {
+                MemIndexKind::Hnsw => {
                     let hnsw_params = config.hnsw_params.get(index_name).cloned();
                     let vector_config =
                         load_vector_index_config(self, index_name, &index_meta, hnsw_params)
                             .await?;
                     index_configs.push(vector_config);
-                }
-                _ => {
-                    return Err(Error::invalid_input(format!(
-                        "Unknown index type: {}",
-                        index_type
-                    )));
                 }
             };
         }
