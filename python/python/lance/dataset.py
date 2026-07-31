@@ -7042,6 +7042,7 @@ class DatasetOptimizer:
             Literal["reencode", "try_binary_copy", "force_binary_copy"]
         ] = None,
         binary_copy_read_batch_bytes: Optional[int] = None,
+        max_source_fragments: Optional[int] = None,
     ) -> CompactionMetrics:
         """Compacts small files in the dataset, reducing total number of files.
 
@@ -7072,7 +7073,8 @@ class DatasetOptimizer:
         ``lance.compaction.defer_index_remap``,
         ``lance.compaction.batch_size``,
         ``lance.compaction.compaction_mode``,
-        ``lance.compaction.binary_copy_read_batch_bytes``.
+        ``lance.compaction.binary_copy_read_batch_bytes``,
+        ``lance.compaction.max_source_fragments``.
 
         Parameters
         ----------
@@ -7125,6 +7127,12 @@ class DatasetOptimizer:
             The batch size in bytes for reading during binary copy operations.
             Controls how much data is read at once when performing binary copy.
             Defaults to 16MB.
+        max_source_fragments: int, optional
+            Maximum number of source fragments to compact in a single run.
+            Compaction tasks are included until adding the next task would
+            exceed this limit, allowing compaction to proceed incrementally.
+            Fragments are processed oldest first. If not specified, uses the
+            manifest config value, or applies no limit.
 
         Returns
         -------
@@ -7148,6 +7156,7 @@ class DatasetOptimizer:
                 batch_size=batch_size,
                 compaction_mode=compaction_mode,
                 binary_copy_read_batch_bytes=binary_copy_read_batch_bytes,
+                max_source_fragments=max_source_fragments,
             ).items()
             if v is not None
         }
