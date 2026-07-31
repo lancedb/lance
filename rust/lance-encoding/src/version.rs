@@ -101,13 +101,16 @@ impl FromStr for LanceFileVersion {
 
     fn from_str(value: &str) -> Result<Self> {
         match value.to_lowercase().as_str() {
-            LEGACY_FORMAT_VERSION | "legacy" => Ok(Self::Legacy),
-            V2_FORMAT_2_0 | "v2_0" | "v2.0" | "0.3" => Ok(Self::V2_0),
-            V2_FORMAT_2_1 | "v2_1" | "v2.1" => Ok(Self::V2_1),
-            V2_FORMAT_2_2 | "v2_2" | "v2.2" => Ok(Self::V2_2),
-            V2_FORMAT_2_3 | "v2_3" | "v2.3" => Ok(Self::V2_3),
+            LEGACY_FORMAT_VERSION => Ok(Self::Legacy),
+            V2_FORMAT_2_0 => Ok(Self::V2_0),
+            V2_FORMAT_2_1 => Ok(Self::V2_1),
+            V2_FORMAT_2_2 => Ok(Self::V2_2),
+            V2_FORMAT_2_3 => Ok(Self::V2_3),
             "stable" => Ok(Self::Stable),
+            "legacy" => Ok(Self::Legacy),
             "next" => Ok(Self::Next),
+            // Version 0.3 is an alias of 2.0
+            "0.3" => Ok(Self::V2_0),
             _ => Err(Error::invalid_input_source(
                 format!("Unknown Lance storage version: {}", value).into(),
             )),

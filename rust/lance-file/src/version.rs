@@ -207,30 +207,16 @@ mod tests {
             ("0.1", LanceFileVersion::Legacy),
             ("legacy", LanceFileVersion::Legacy),
             ("2.0", LanceFileVersion::V2_0),
-            ("v2_0", LanceFileVersion::V2_0),
-            ("v2.0", LanceFileVersion::V2_0),
             ("0.3", LanceFileVersion::V2_0),
             ("2.1", LanceFileVersion::V2_1),
-            ("v2_1", LanceFileVersion::V2_1),
-            ("v2.1", LanceFileVersion::V2_1),
             ("stable", LanceFileVersion::Stable),
             ("2.2", LanceFileVersion::V2_2),
-            ("v2_2", LanceFileVersion::V2_2),
-            ("v2.2", LanceFileVersion::V2_2),
             ("next", LanceFileVersion::Next),
             ("2.3", LanceFileVersion::V2_3),
-            ("v2_3", LanceFileVersion::V2_3),
-            ("v2.3", LanceFileVersion::V2_3),
         ];
 
         for (value, expected) in cases {
-            assert_eq!(
-                LanceFileVersion::from_str(value).unwrap(),
-                expected,
-                "from_str({:?}) should return {:?}",
-                value,
-                expected
-            );
+            assert_eq!(LanceFileVersion::from_str(value).unwrap(), expected);
         }
     }
 
