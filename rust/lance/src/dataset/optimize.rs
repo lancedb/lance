@@ -113,7 +113,10 @@ use futures::{StreamExt, TryStreamExt};
 use lance_core::Error;
 use lance_core::datatypes::{BlobHandling, BlobKind};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
-use lance_core::utils::tracing::{DATASET_COMPACTING_EVENT, TRACE_DATASET_EVENTS};
+use lance_core::utils::tracing::{
+    AUDIT_MODE_DELETE, AUDIT_TYPE_INDEX, DATASET_COMPACTING_EVENT, TRACE_DATASET_EVENTS,
+    TRACE_FILE_AUDIT,
+};
 use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragReuseGroup};
 use lance_index::is_system_index;
 use lance_table::format::{Fragment, RowIdMeta};
@@ -2232,6 +2235,17 @@ pub async fn commit_compaction(
         .flat_map(|g| g.new_fragments.iter().cloned())
         .collect();
 
+    // Collect the index ids for the same reason, before they move into the
+    // transaction. `RemapResult::Keep` reports an index it did not rewrite as
+    // `new_id == old_id`; that directory belongs to the committed manifest, so
+    // only differing ids are ours to delete.
+    let new_index_ids: Vec<uuid::Uuid> = rewritten_indices
+        .iter()
+        .filter(|rewritten| rewritten.new_id != rewritten.old_id)
+        .map(|rewritten| rewritten.new_id)
+        .chain(frag_reuse_index.as_ref().map(|index| index.uuid))
+        .collect();
+
     let transaction = TransactionBuilder::new(
         // Use the version at which the compaction tasks were *planned*, not the
         // version of the dataset handle passed to this function.  In distributed
@@ -2261,10 +2275,39 @@ pub async fn commit_compaction(
             &all_new_fragments,
         )
         .await;
+        cleanup_index_dirs(dataset, &new_index_ids).await;
         return Err(e);
     }
 
     Ok(metrics)
+}
+
+/// Removes index directories left behind by a transaction that failed to commit.
+///
+/// Callers must only pass ids no manifest references. That holds for ids minted
+/// by the failed transaction, since they are only discoverable through the
+/// manifest it never published — with the same caveat as
+/// [`cleanup_data_fragments`](super::cleanup_data_fragments): a commit handler
+/// can fail after the manifest reached its final path, so `Err` is strong but
+/// not absolute evidence.
+///
+/// Errors are logged, not returned: the commit error is what the caller needs,
+/// and a directory left behind only costs space until the next cleanup.
+async fn cleanup_index_dirs(dataset: &Dataset, index_ids: &[uuid::Uuid]) {
+    for id in index_ids {
+        let dir = dataset.indices_dir().join(id.to_string());
+        match dataset.object_store.remove_dir_all(dir.clone()).await {
+            Ok(()) => {
+                info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE, r#type=AUDIT_TYPE_INDEX, path = dir.to_string());
+            }
+            // A fragment-reuse index that inlines its details writes no
+            // directory, so a missing one is expected rather than a problem.
+            Err(err) if err.is_not_found() => {}
+            Err(err) => {
+                log::warn!("Failed to clean up orphaned index directory {dir}: {err}");
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2417,6 +2460,42 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    /// Reports a fixed remap result for any row map, for tests that care about
+    /// the returned ids rather than the address mapping.
+    #[derive(Debug, Clone)]
+    struct FixedRemap {
+        answer: Vec<RemappedIndex>,
+    }
+
+    #[async_trait]
+    impl IndexRemapper for FixedRemap {
+        async fn remap_indices(&self, _: RowAddrRemap, _: &[u64]) -> Result<Vec<RemappedIndex>> {
+            Ok(self.answer.clone())
+        }
+    }
+
+    #[async_trait]
+    impl IndexRemapperOptions for FixedRemap {
+        async fn create_remapper(&self, _: &Dataset) -> Result<Option<Box<dyn IndexRemapper>>> {
+            Ok(Some(Box::new(self.clone())))
+        }
+    }
+
+    /// Only `old_id`/`new_id` are read by the cleanup path, and the failing
+    /// commit never serializes the rest.
+    fn mock_remapped_index(old_id: Uuid, new_id: Uuid) -> RemappedIndex {
+        RemappedIndex {
+            old_id,
+            new_id,
+            index_details: prost_types::Any {
+                type_url: String::new(),
+                value: Vec::new(),
+            },
+            index_version: 0,
+            files: None,
+        }
     }
 
     #[derive(Debug, Default, Clone, PartialEq)]
@@ -7092,6 +7171,20 @@ mod tests {
         count_all_files_in(&data_dir).unwrap_or(0)
     }
 
+    /// Names of the `_indices/{uuid}/` directories on disk. A set rather than a
+    /// count, so deleting the wrong directory cannot pass.
+    fn index_dirs_in(base_dir: &str) -> HashSet<String> {
+        let indices_dir = std::path::Path::new(base_dir).join("_indices");
+        let Ok(entries) = std::fs::read_dir(&indices_dir) else {
+            return HashSet::new();
+        };
+        entries
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().is_dir())
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .collect()
+    }
+
     /// Site 2 in PR #6320: when `commit_compaction` fails to apply the commit
     /// after `rewrite_files` has already written new data files, those files
     /// must be cleaned up. We force the commit failure by injecting an error on
@@ -7169,6 +7262,302 @@ mod tests {
             count_data_files_in(test_uri),
             baseline_files,
             "Compaction data files should be cleaned up when commit fails"
+        );
+    }
+
+    /// A failed commit must also reclaim the `_indices/{uuid}/` directory
+    /// `remap_indices` wrote. Needs address-style row ids and an existing index,
+    /// otherwise `needs_remapping` is false and no directory is written — the
+    /// data-file test above takes that shortcut deliberately.
+    #[tokio::test]
+    async fn test_commit_compaction_cleans_up_indices_on_commit_failure() {
+        use crate::dataset::builder::DatasetBuilder;
+        use crate::utils::test::FailingProxyStore;
+        use lance_io::object_store::ObjectStoreParams;
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        // Prefix `/` so Windows drive letters (e.g. `C:`) don't get parsed as
+        // the URL authority.
+        let path_prefix = if test_uri.starts_with('/') { "" } else { "/" };
+        let routed_uri = format!("file-object-store://{path_prefix}{test_uri}");
+
+        let data = sample_data();
+        let reader = RecordBatchIterator::new(vec![Ok(data.slice(0, 200))], data.schema());
+        let mut dataset = Dataset::write(
+            reader,
+            &routed_uri,
+            Some(WriteParams {
+                max_rows_per_file: 100,
+                // Address-style row ids force index remapping.
+                enable_stable_row_ids: false,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Index before wrapping the store: `create_index` commits its own
+        // transaction, which would consume the injected failure counter.
+        create_scalar_index(&mut dataset, "a", false).await;
+        let index_dirs_before = index_dirs_in(test_uri);
+        // Guards the assertion below against passing on an empty directory.
+        assert_eq!(
+            index_dirs_before.len(),
+            1,
+            "expected the committed index directory to exist before compaction"
+        );
+
+        let failing = Arc::new(FailingProxyStore::new());
+        // Let the `reserve_fragment_ids` transaction through; fail `apply_commit`.
+        failing.fail_after_n("put", "_transactions", 1, "injected commit failure");
+        failing.fail_after_n(
+            "put_multipart",
+            "_transactions",
+            1,
+            "injected commit failure",
+        );
+
+        let mut dataset = DatasetBuilder::from_uri(&routed_uri)
+            .with_read_params(crate::dataset::ReadParams {
+                store_options: Some(ObjectStoreParams {
+                    object_store_wrapper: Some(failing.clone()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .load()
+            .await
+            .unwrap();
+
+        let options = CompactionOptions {
+            target_rows_per_fragment: 1000,
+            ..Default::default()
+        };
+        let err = compact_files(&mut dataset, options, None)
+            .await
+            .expect_err("Compaction should fail when transaction commit fails");
+        // Pin the failure to the injected error: failing earlier than
+        // `apply_commit` would leave this test green but vacuous.
+        assert!(
+            err.to_string().contains("injected commit failure"),
+            "expected the injected commit failure, got {err}"
+        );
+
+        assert_eq!(
+            index_dirs_in(test_uri),
+            index_dirs_before,
+            "Only the index directory written by the failed commit should be removed"
+        );
+
+        // Deleting the live directory instead of the orphan keeps the set size
+        // right but breaks every query that scans the index.
+        let dataset = DatasetBuilder::from_uri(&routed_uri).load().await.unwrap();
+        dataset
+            .scan()
+            .project(&["a"])
+            .unwrap()
+            .filter("a >= 0")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .expect("index should still be usable after the failed compaction");
+    }
+
+    /// An index reported as `RemapResult::Keep` comes back with
+    /// `new_id == old_id` and points at the directory the committed manifest
+    /// still uses, so the `new_id != old_id` filter must exclude it. Reaching
+    /// that arm for real needs a fully-deleted fragment bitmap; a stub remapper
+    /// reports both shapes directly.
+    #[tokio::test]
+    async fn test_commit_compaction_keeps_index_dirs_it_did_not_write() {
+        use crate::dataset::builder::DatasetBuilder;
+        use crate::utils::test::FailingProxyStore;
+        use lance_io::object_store::ObjectStoreParams;
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let path_prefix = if test_uri.starts_with('/') { "" } else { "/" };
+        let routed_uri = format!("file-object-store://{path_prefix}{test_uri}");
+
+        let data = sample_data();
+        let reader = RecordBatchIterator::new(vec![Ok(data.slice(0, 200))], data.schema());
+        let mut dataset = Dataset::write(
+            reader,
+            &routed_uri,
+            Some(WriteParams {
+                max_rows_per_file: 100,
+                enable_stable_row_ids: false,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Compaction only reaches a remapper when an index exists. Neither stub
+        // entry reports this index, so its directory also checks that cleanup
+        // touches only reported ids.
+        create_scalar_index(&mut dataset, "a", false).await;
+
+        // `kept_id` mimics an index left alone; `rewritten_id` one that was
+        // rewritten.
+        let kept_id = Uuid::new_v4();
+        let rewritten_old_id = Uuid::new_v4();
+        let rewritten_id = Uuid::new_v4();
+        for id in [kept_id, rewritten_id] {
+            let marker = dataset.indices_dir().join(id.to_string()).join("index.idx");
+            dataset
+                .object_store
+                .put(&marker, b"placeholder index file")
+                .await
+                .unwrap();
+        }
+
+        // `MockIndexRemapper` asserts on the exact row map, which is irrelevant
+        // here.
+        let mock_remapper = Arc::new(FixedRemap {
+            answer: vec![
+                mock_remapped_index(kept_id, kept_id),
+                mock_remapped_index(rewritten_old_id, rewritten_id),
+            ],
+        });
+
+        let failing = Arc::new(FailingProxyStore::new());
+        failing.fail_after_n("put", "_transactions", 1, "injected commit failure");
+        failing.fail_after_n(
+            "put_multipart",
+            "_transactions",
+            1,
+            "injected commit failure",
+        );
+
+        let mut dataset = DatasetBuilder::from_uri(&routed_uri)
+            .with_read_params(crate::dataset::ReadParams {
+                store_options: Some(ObjectStoreParams {
+                    object_store_wrapper: Some(failing.clone()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .load()
+            .await
+            .unwrap();
+
+        let options = CompactionOptions {
+            target_rows_per_fragment: 1000,
+            ..Default::default()
+        };
+        let err = compact_files(&mut dataset, options, Some(mock_remapper))
+            .await
+            .expect_err("Compaction should fail when transaction commit fails");
+        assert!(
+            err.to_string().contains("injected commit failure"),
+            "expected the injected commit failure, got {err}"
+        );
+
+        let dirs = index_dirs_in(test_uri);
+        assert!(
+            dirs.contains(&kept_id.to_string()),
+            "an index reported as kept (new_id == old_id) is still live and must not be deleted"
+        );
+        assert!(
+            !dirs.contains(&rewritten_id.to_string()),
+            "the directory this transaction wrote must be cleaned up"
+        );
+    }
+
+    /// The fragment-reuse arm: under `defer_index_remap`, details larger than the
+    /// inline threshold get their own `_indices/{uuid}/` directory before the
+    /// commit. These are the orphans #7207 reports from deferred-remap
+    /// deployments.
+    #[tokio::test]
+    async fn test_commit_compaction_cleans_up_frag_reuse_index_on_commit_failure() {
+        use crate::dataset::builder::DatasetBuilder;
+        use crate::utils::test::FailingProxyStore;
+        use lance_io::object_store::ObjectStoreParams;
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let path_prefix = if test_uri.starts_with('/') { "" } else { "/" };
+        let routed_uri = format!("file-object-store://{path_prefix}{test_uri}");
+
+        // Enough fragments to push FragReuseIndexDetails past the inline
+        // threshold, as in `test_defer_index_remap_large_external_file`.
+        let num_fragments = 150usize;
+        let rows_per_fragment = 1000usize;
+        let total_rows = num_fragments * rows_per_fragment;
+        let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, false)]));
+
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(
+                vec![Ok(RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(Int32Array::from_iter_values(0..total_rows as i32)) as ArrayRef],
+                )
+                .unwrap())],
+                schema.clone(),
+            ),
+            &routed_uri,
+            Some(WriteParams {
+                max_rows_per_file: rows_per_fragment,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // An FRI is only built when compaction touches indexed data.
+        create_scalar_index(&mut dataset, "i", false).await;
+        dataset.delete("i % 1000 = 0").await.unwrap();
+
+        let index_dirs_before = index_dirs_in(test_uri);
+        assert_eq!(
+            index_dirs_before.len(),
+            1,
+            "expected only the scalar index directory before compaction"
+        );
+
+        let failing = Arc::new(FailingProxyStore::new());
+        // Let the fragment-id reservation write through; fail `apply_commit`.
+        failing.fail_after_n("put", "_transactions", 1, "injected commit failure");
+        failing.fail_after_n(
+            "put_multipart",
+            "_transactions",
+            1,
+            "injected commit failure",
+        );
+
+        let mut dataset = DatasetBuilder::from_uri(&routed_uri)
+            .with_read_params(crate::dataset::ReadParams {
+                store_options: Some(ObjectStoreParams {
+                    object_store_wrapper: Some(failing.clone()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .load()
+            .await
+            .unwrap();
+
+        let err = compact_files(
+            &mut dataset,
+            CompactionOptions {
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect_err("Compaction should fail when transaction commit fails");
+        assert!(
+            err.to_string().contains("injected commit failure"),
+            "expected the injected commit failure, got {err}"
+        );
+
+        assert_eq!(
+            index_dirs_in(test_uri),
+            index_dirs_before,
+            "The fragment-reuse index directory written by the failed commit should be removed"
         );
     }
 
