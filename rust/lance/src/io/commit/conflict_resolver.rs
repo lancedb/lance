@@ -750,7 +750,14 @@ impl<'a> TransactionRebase<'a> {
                         Err(self.incompatible_conflict_err(other_transaction, other_version))
                     }
                 }
-                Operation::Overwrite { .. } | Operation::Restore { .. } => {
+                // An overwrite replaces every fragment, so none of this
+                // index's fragment coverage still exists. Retry lets the
+                // caller decide to rebuild against the new data, mirroring
+                // how concurrent overwrites are handled against each other.
+                Operation::Overwrite { .. } => {
+                    Err(self.retryable_conflict_err(other_transaction, other_version))
+                }
+                Operation::Restore { .. } => {
                     Err(self.incompatible_conflict_err(other_transaction, other_version))
                 }
             }
@@ -2812,16 +2819,19 @@ mod tests {
                     removed_indices: vec![index0],
                 },
                 // Conflicts with row-id-changing operations and same-name CreateIndex.
+                // A concurrent overwrite is retryable, not incompatible: it
+                // replaces every fragment, so retry lets the caller rebuild
+                // the index against the new data instead of failing outright.
                 [
-                    Compatible,    // append
-                    Retryable,     // create index
-                    Compatible,    // delete
-                    Compatible,    // merge
-                    NotCompatible, // overwrite
-                    Retryable,     // rewrite
-                    Compatible,    // reserve
-                    Compatible,    // update
-                    Compatible,    // update config
+                    Compatible, // append
+                    Retryable,  // create index
+                    Compatible, // delete
+                    Compatible, // merge
+                    Retryable,  // overwrite
+                    Retryable,  // rewrite
+                    Compatible, // reserve
+                    Compatible, // update
+                    Compatible, // update config
                 ],
             ),
             (

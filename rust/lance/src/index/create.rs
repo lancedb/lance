@@ -1137,6 +1137,51 @@ mod tests {
         assert_ne!(latest_indices[0].uuid, original.uuid);
     }
 
+    #[tokio::test]
+    async fn test_concurrent_create_index_vs_overwrite_returns_retryable_conflict() {
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+        let reader = gen_batch()
+            .col("a", lance_datagen::array::step::<Int32Type>())
+            .into_reader_rows(
+                lance_datagen::RowCount::from(100),
+                lance_datagen::BatchCount::from(1),
+            );
+        let dataset = Dataset::write(reader, &dataset_uri, None).await.unwrap();
+
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree);
+        let read_version = dataset.manifest.version;
+        let mut index_reader = dataset.checkout_version(read_version).await.unwrap();
+
+        // A concurrent overwrite commits before the CreateIndex started below,
+        // replacing every fragment the in-flight index was built against.
+        let overwrite_data = gen_batch()
+            .col("a", lance_datagen::array::step::<Int32Type>())
+            .into_reader_rows(
+                lance_datagen::RowCount::from(50),
+                lance_datagen::BatchCount::from(1),
+            );
+        Dataset::write(
+            overwrite_data,
+            &dataset_uri,
+            Some(WriteParams {
+                mode: WriteMode::Overwrite,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let result = CreateIndexBuilder::new(&mut index_reader, &["a"], IndexType::BTree, &params)
+            .name("a_idx".to_string())
+            .execute()
+            .await;
+        assert!(
+            matches!(result, Err(Error::RetryableCommitConflict { .. })),
+            "create_index racing a concurrent overwrite should be retryable, got {result:?}"
+        );
+    }
+
     // Helper function to create test data with text field suitable for inverted index
     fn create_text_batch(start: i32, end: i32) -> RecordBatch {
         let schema = Arc::new(ArrowSchema::new(vec![
