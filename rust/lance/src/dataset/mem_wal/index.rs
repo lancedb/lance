@@ -415,32 +415,6 @@ impl MemIndexConfig {
     }
 }
 
-/// Which kind of in-memory index an [`MemIndexDescriptor`] names.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum MemIndexKind {
-    BTree,
-    Hnsw,
-    Fts,
-}
-
-impl MemIndexKind {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::BTree => "btree",
-            Self::Hnsw => "hnsw",
-            Self::Fts => "fts",
-        }
-    }
-}
-
-/// One in-memory index, as reported by [`IndexStore::describe`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MemIndexDescriptor {
-    pub name: String,
-    pub kind: MemIndexKind,
-    pub column: String,
-}
-
 /// Registry managing all in-memory indexes for a MemTable.
 ///
 /// Indexes are keyed by index name. Each index stores its field_id for
@@ -1155,41 +1129,21 @@ impl IndexStore {
         self.btree_indexes.is_empty() && self.hnsw_indexes.is_empty() && self.fts_indexes.is_empty()
     }
 
-    /// Describe every index this memtable carries, for diagnostics.
+    /// Name every index this memtable carries, for diagnostics.
     ///
     /// Answers "is my fresh-tier vector search brute-force" — an absent
-    /// HNSW entry is the whole explanation, and there is no other way to
-    /// see it from outside. Ordered by kind then name so repeated calls
-    /// compare cleanly; `HashMap` iteration order alone would not.
-    pub fn describe(&self) -> Vec<MemIndexDescriptor> {
-        let mut out: Vec<MemIndexDescriptor> = self
+    /// name is the whole explanation, and there is no other way to see it
+    /// from outside. Sorted so repeated calls compare cleanly; `HashMap`
+    /// iteration order alone would not.
+    pub fn index_names(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
             .btree_indexes
-            .iter()
-            .map(|(name, idx)| MemIndexDescriptor {
-                name: name.clone(),
-                kind: MemIndexKind::BTree,
-                column: idx.column_name().to_string(),
-            })
-            .chain(
-                self.hnsw_indexes
-                    .iter()
-                    .map(|(name, idx)| MemIndexDescriptor {
-                        name: name.clone(),
-                        kind: MemIndexKind::Hnsw,
-                        column: idx.column_name().to_string(),
-                    }),
-            )
-            .chain(
-                self.fts_indexes
-                    .iter()
-                    .map(|(name, idx)| MemIndexDescriptor {
-                        name: name.clone(),
-                        kind: MemIndexKind::Fts,
-                        column: idx.column_name().to_string(),
-                    }),
-            )
+            .keys()
+            .chain(self.hnsw_indexes.keys())
+            .chain(self.fts_indexes.keys())
+            .cloned()
             .collect();
-        out.sort_by(|a, b| (a.kind, &a.name).cmp(&(b.kind, &b.name)));
+        out.sort();
         out
     }
 
