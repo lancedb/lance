@@ -3,13 +3,21 @@
 
 //! Lance v2.3 encoding composition.
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
-use lance_core::{Error, Result, datatypes::Field};
+use bytes::Bytes;
+use lance_core::{
+    Error, Result,
+    datatypes::{Field, Schema},
+};
 use lance_encoding::{
     compression_config::CompressionParams,
     encoder::{
-        ColumnIndexSequence, FieldEncoder, FieldEncodingContext, FieldEncodingStrategy,
+        ColumnIndexSequence, EncodedBatch, FieldEncoder, FieldEncodingContext,
+        FieldEncodingStrategy,
         structural::{
             PrimitiveFieldEncoding, PrimitivePageEncoding, try_create_binary_blob, try_create_list,
             try_create_map, try_create_struct, try_create_structural_blob,
@@ -17,8 +25,16 @@ use lance_encoding::{
         },
     },
 };
+use lance_io::traits::Writer as ObjectWriter;
+
+use crate::writer::FileWriterOptions;
 
 mod compression;
+mod writer;
+
+pub use writer::Writer;
+
+static WARNED_ON_UNSTABLE_FORMAT: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug)]
 struct FieldStrategy {
@@ -89,4 +105,65 @@ pub fn encoding_strategy(params: CompressionParams) -> Arc<dyn FieldEncodingStra
             PrimitivePageEncoding::dense_u32(compression),
         ]),
     })
+}
+
+fn warn_unstable_format() {
+    if WARNED_ON_UNSTABLE_FORMAT
+        .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+    {
+        log::warn!(
+            "You have requested an unstable format version.  Files written with this format version may not be readable in the future!  This is a development feature and should only be used for experimentation and never for production data."
+        );
+    }
+}
+
+/// Create a v2.3 writer with an explicit schema.
+pub fn create_writer(
+    object_writer: Box<dyn ObjectWriter>,
+    schema: Schema,
+    options: FileWriterOptions,
+) -> Result<Writer> {
+    warn_unstable_format();
+    Writer::try_new(object_writer, schema, options)
+}
+
+/// Create a v2.3 writer with explicit compression tuning.
+pub fn create_writer_with_compression(
+    object_writer: Box<dyn ObjectWriter>,
+    schema: Schema,
+    options: FileWriterOptions,
+    compression: CompressionParams,
+) -> Result<Writer> {
+    warn_unstable_format();
+    Writer::try_new_with_compression(object_writer, schema, options, compression)
+}
+
+/// Create a v2.3 writer whose schema is inferred from the first batch.
+pub fn create_lazy_writer(
+    object_writer: Box<dyn ObjectWriter>,
+    options: FileWriterOptions,
+) -> Writer {
+    warn_unstable_format();
+    Writer::new_lazy(object_writer, options)
+}
+
+/// Create a lazy v2.3 writer with explicit compression tuning.
+pub fn create_lazy_writer_with_compression(
+    object_writer: Box<dyn ObjectWriter>,
+    options: FileWriterOptions,
+    compression: CompressionParams,
+) -> Writer {
+    warn_unstable_format();
+    Writer::new_lazy_with_compression(object_writer, options, compression)
+}
+
+/// Encode a self-described v2.3 batch.
+pub fn encode_self_described_batch(batch: &EncodedBatch) -> Result<Bytes> {
+    writer::concat_lance_footer(batch, true)
+}
+
+/// Encode a mini-lance v2.3 batch.
+pub fn encode_mini_batch(batch: &EncodedBatch) -> Result<Bytes> {
+    writer::concat_lance_footer(batch, false)
 }

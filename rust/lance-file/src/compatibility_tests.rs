@@ -26,11 +26,12 @@ use tokio::io::AsyncWriteExt;
 use crate::reader::{EncodedBatchReaderExt, FileReader, FileReaderOptions};
 use crate::testing::FsFixture;
 use crate::version::{ConcreteFileVersion, LanceFileVersion};
+use crate::versions;
 use crate::versions::v1::reader::FileReader as V1Reader;
 use crate::versions::v1::writer::{
     FileWriter as V1Writer, FileWriterOptions as V1WriterOptions, NotSelfDescribing,
 };
-use crate::writer::{EncodedBatchWriteExt, FileWriter, FileWriterOptions};
+use crate::writer::{EncodedBatchWriteExt, FileWriterOptions};
 
 fn compatibility_fixture_batch() -> RecordBatch {
     let row_count = 4097;
@@ -235,22 +236,52 @@ async fn write_current_fixture(
 ) -> Vec<u8> {
     let fs = FsFixture::default();
     let object_writer = fs.object_store.create(&fs.tmp_path).await.unwrap();
-    let mut writer = FileWriter::try_new(
-        object_writer,
-        schema.clone(),
-        FileWriterOptions {
-            data_cache_bytes: Some(1),
-            max_page_bytes: Some(1024),
-            format_version: Some(version.into()),
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    for offset in (0..batch.num_rows()).step_by(1024) {
-        let slice = batch.slice(offset, (batch.num_rows() - offset).min(1024));
-        writer.write_batch(&slice).await.unwrap();
-    }
-    let summary = writer.finish().await.unwrap();
+    let options = FileWriterOptions {
+        data_cache_bytes: Some(1),
+        max_page_bytes: Some(1024),
+        ..Default::default()
+    };
+    let summary = match version {
+        ConcreteFileVersion::V1 => {
+            unreachable!("legacy fixtures use the legacy writer")
+        }
+        ConcreteFileVersion::V2_0 => {
+            let mut writer =
+                versions::v2_0::create_writer(object_writer, schema.clone(), options).unwrap();
+            for offset in (0..batch.num_rows()).step_by(1024) {
+                let slice = batch.slice(offset, (batch.num_rows() - offset).min(1024));
+                writer.write_batch(&slice).await.unwrap();
+            }
+            writer.finish().await.unwrap()
+        }
+        ConcreteFileVersion::V2_1 => {
+            let mut writer =
+                versions::v2_1::create_writer(object_writer, schema.clone(), options).unwrap();
+            for offset in (0..batch.num_rows()).step_by(1024) {
+                let slice = batch.slice(offset, (batch.num_rows() - offset).min(1024));
+                writer.write_batch(&slice).await.unwrap();
+            }
+            writer.finish().await.unwrap()
+        }
+        ConcreteFileVersion::V2_2 => {
+            let mut writer =
+                versions::v2_2::create_writer(object_writer, schema.clone(), options).unwrap();
+            for offset in (0..batch.num_rows()).step_by(1024) {
+                let slice = batch.slice(offset, (batch.num_rows() - offset).min(1024));
+                writer.write_batch(&slice).await.unwrap();
+            }
+            writer.finish().await.unwrap()
+        }
+        ConcreteFileVersion::V2_3 => {
+            let mut writer =
+                versions::v2_3::create_writer(object_writer, schema.clone(), options).unwrap();
+            for offset in (0..batch.num_rows()).step_by(1024) {
+                let slice = batch.slice(offset, (batch.num_rows() - offset).min(1024));
+                writer.write_batch(&slice).await.unwrap();
+            }
+            writer.finish().await.unwrap()
+        }
+    };
     fs.object_store
         .open(&fs.tmp_path)
         .await

@@ -40,6 +40,8 @@ use crate::format::pbfile::DirectEncoding;
 use crate::version::{ConcreteFileVersion, LanceFileVersion};
 use crate::versions;
 
+pub(crate) mod structural;
+
 /// Pages buffers are aligned to 64 bytes
 pub(crate) const PAGE_BUFFER_ALIGNMENT: usize = 64;
 const PAD_BUFFER: [u8; PAGE_BUFFER_ALIGNMENT] = [72; PAGE_BUFFER_ALIGNMENT];
@@ -49,7 +51,7 @@ const PAD_BUFFER: [u8; PAGE_BUFFER_ALIGNMENT] = [72; PAGE_BUFFER_ALIGNMENT];
 //
 // This limit is not applied in the 2.1 writer
 const MAX_PAGE_BYTES: usize = 32 * 1024 * 1024;
-const ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES: &str = "LANCE_FILE_WRITER_MAX_PAGE_BYTES";
+pub(crate) const ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES: &str = "LANCE_FILE_WRITER_MAX_PAGE_BYTES";
 
 #[cfg(test)]
 fn encoding_strategy_with_params(
