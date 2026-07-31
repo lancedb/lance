@@ -4,10 +4,10 @@
 pub mod datatypes;
 pub mod format;
 pub(crate) mod io;
-pub mod previous;
 pub mod reader;
 pub mod testing;
 pub mod version;
+pub mod versions;
 pub mod writer;
 
 #[cfg(test)]

@@ -15,24 +15,23 @@ use bytes::Bytes;
 use futures::TryStreamExt;
 use lance_core::cache::LanceCache;
 use lance_core::datatypes::Schema as LanceSchema;
-use lance_encoding::decoder::{DecoderPlugins, FilterExpression, decode_batch};
-use lance_encoding::encoder::{
-    EncodedBatch, EncodingOptions, default_encoding_strategy, encode_batch,
-};
+use lance_encoding::decoder::{DecoderPlugins, EncodedBatchLayout, FilterExpression, decode_batch};
+use lance_encoding::encoder::{EncodedBatch, EncodingOptions, encode_batch};
 use lance_io::ReadBatchParams;
 use lance_io::traits::Writer;
 use lance_io::utils::CachedFileSize;
 use rstest::rstest;
 use tokio::io::AsyncWriteExt;
 
-use crate::previous::reader::FileReader as V1Reader;
-use crate::previous::writer::{
-    FileWriter as V1Writer, FileWriterOptions as V1WriterOptions, NotSelfDescribing,
-};
 use crate::reader::{EncodedBatchReaderExt, FileReader, FileReaderOptions};
 use crate::testing::FsFixture;
-use crate::version::ConcreteFileVersion;
-use crate::writer::{EncodedBatchWriteExt, FileWriter, FileWriterOptions};
+use crate::version::{ConcreteFileVersion, LanceFileVersion};
+use crate::versions;
+use crate::versions::v1::reader::FileReader as V1Reader;
+use crate::versions::v1::writer::{
+    FileWriter as V1Writer, FileWriterOptions as V1WriterOptions, NotSelfDescribing,
+};
+use crate::writer::{EncodedBatchWriteExt, FileWriterOptions};
 
 fn compatibility_fixture_batch() -> RecordBatch {
     let row_count = 4097;
@@ -237,22 +236,52 @@ async fn write_current_fixture(
 ) -> Vec<u8> {
     let fs = FsFixture::default();
     let object_writer = fs.object_store.create(&fs.tmp_path).await.unwrap();
-    let mut writer = FileWriter::try_new(
-        object_writer,
-        schema.clone(),
-        FileWriterOptions {
-            data_cache_bytes: Some(1),
-            max_page_bytes: Some(1024),
-            format_version: Some(version.into()),
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    for offset in (0..batch.num_rows()).step_by(1024) {
-        let slice = batch.slice(offset, (batch.num_rows() - offset).min(1024));
-        writer.write_batch(&slice).await.unwrap();
-    }
-    let summary = writer.finish().await.unwrap();
+    let options = FileWriterOptions {
+        data_cache_bytes: Some(1),
+        max_page_bytes: Some(1024),
+        ..Default::default()
+    };
+    let summary = match version {
+        ConcreteFileVersion::V1 => {
+            unreachable!("legacy fixtures use the legacy writer")
+        }
+        ConcreteFileVersion::V2_0 => {
+            let mut writer =
+                versions::v2_0::create_writer(object_writer, schema.clone(), options).unwrap();
+            for offset in (0..batch.num_rows()).step_by(1024) {
+                let slice = batch.slice(offset, (batch.num_rows() - offset).min(1024));
+                writer.write_batch(&slice).await.unwrap();
+            }
+            writer.finish().await.unwrap()
+        }
+        ConcreteFileVersion::V2_1 => {
+            let mut writer =
+                versions::v2_1::create_writer(object_writer, schema.clone(), options).unwrap();
+            for offset in (0..batch.num_rows()).step_by(1024) {
+                let slice = batch.slice(offset, (batch.num_rows() - offset).min(1024));
+                writer.write_batch(&slice).await.unwrap();
+            }
+            writer.finish().await.unwrap()
+        }
+        ConcreteFileVersion::V2_2 => {
+            let mut writer =
+                versions::v2_2::create_writer(object_writer, schema.clone(), options).unwrap();
+            for offset in (0..batch.num_rows()).step_by(1024) {
+                let slice = batch.slice(offset, (batch.num_rows() - offset).min(1024));
+                writer.write_batch(&slice).await.unwrap();
+            }
+            writer.finish().await.unwrap()
+        }
+        ConcreteFileVersion::V2_3 => {
+            let mut writer =
+                versions::v2_3::create_writer(object_writer, schema.clone(), options).unwrap();
+            for offset in (0..batch.num_rows()).step_by(1024) {
+                let slice = batch.slice(offset, (batch.num_rows() - offset).min(1024));
+                writer.write_batch(&slice).await.unwrap();
+            }
+            writer.finish().await.unwrap()
+        }
+    };
     fs.object_store
         .open(&fs.tmp_path)
         .await
@@ -264,15 +293,14 @@ async fn write_current_fixture(
 }
 
 async fn write_v2_0_embedded_fixtures(batch: &RecordBatch, schema: &LanceSchema) -> (Bytes, Bytes) {
-    let version = ConcreteFileVersion::V2_0.into();
+    let version = LanceFileVersion::from(ConcreteFileVersion::V2_0);
     let options = EncodingOptions {
         cache_bytes_per_column: 1,
         max_page_bytes: 1024,
         keep_original_array: true,
         buffer_alignment: 64,
-        version,
     };
-    let encoding_strategy = default_encoding_strategy(version);
+    let encoding_strategy = crate::versions::v2_0::encoding_strategy();
     let encoded_batch = encode_batch(
         batch,
         Arc::new(schema.clone()),
@@ -394,7 +422,7 @@ async fn v2_0_embedded_writer_and_reader_are_wire_compatible() {
     assert_eq!(footer_version(expected_self_described), expected_footer);
     assert_eq!(footer_version(expected_mini), expected_footer);
 
-    let version = ConcreteFileVersion::V2_0.into();
+    let version = LanceFileVersion::from(ConcreteFileVersion::V2_0);
     let self_described =
         EncodedBatch::try_from_self_described_lance(Bytes::from_static(expected_self_described))
             .unwrap();
@@ -403,7 +431,7 @@ async fn v2_0_embedded_writer_and_reader_are_wire_compatible() {
         &FilterExpression::no_filter(),
         Arc::<DecoderPlugins>::default(),
         false,
-        version,
+        EncodedBatchLayout::Array,
         None,
     )
     .await
@@ -418,7 +446,7 @@ async fn v2_0_embedded_writer_and_reader_are_wire_compatible() {
         &FilterExpression::no_filter(),
         Arc::<DecoderPlugins>::default(),
         false,
-        version,
+        EncodedBatchLayout::Array,
         None,
     )
     .await

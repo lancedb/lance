@@ -3986,10 +3986,10 @@ impl Scanner {
                     .with_fts_document_granularity(document_granularity),
             )
             .await?;
-        let target_fragments = self
+        let target_fragments: &[Fragment] = self
             .fragments
-            .clone()
-            .unwrap_or_else(|| self.dataset.fragments().to_vec());
+            .as_deref()
+            .unwrap_or_else(|| self.dataset.fragments());
         let flat_query = MatchQuery::new(query.terms.clone())
             .with_column(Some(column.clone()))
             .with_operator(Operator::And)
@@ -4003,7 +4003,7 @@ impl Scanner {
                     .fts_stale_frags_and_fresh_segments(
                         &column,
                         document_granularity,
-                        &target_fragments,
+                        target_fragments,
                     )
                     .await?;
                 let flat_fragments: Vec<Fragment> = {
@@ -4118,7 +4118,7 @@ impl Scanner {
                 }
                 let flat_phrase_plan = self
                     .plan_flat_match_query(
-                        target_fragments,
+                        target_fragments.to_vec(),
                         &flat_query,
                         params,
                         filter_plan,
@@ -4164,10 +4164,10 @@ impl Scanner {
             .await?;
 
         // Get target fragments
-        let target_fragments = self
+        let target_fragments: &[Fragment] = self
             .fragments
-            .clone()
-            .unwrap_or_else(|| self.dataset.fragments().to_vec());
+            .as_deref()
+            .unwrap_or_else(|| self.dataset.fragments());
 
         let (match_plan, flat_match_plan) = match &index {
             Some(index) => {
@@ -4181,7 +4181,7 @@ impl Scanner {
                     .fts_stale_frags_and_fresh_segments(
                         &column,
                         document_granularity,
-                        &target_fragments,
+                        target_fragments,
                     )
                     .await?;
 
@@ -4289,7 +4289,7 @@ impl Scanner {
                 // No index: flat search all target fragments
                 let flat_match_plan = self
                     .plan_flat_match_query(
-                        target_fragments.clone(),
+                        target_fragments.to_vec(),
                         query,
                         params,
                         filter_plan,

@@ -634,28 +634,15 @@ impl<'a> CreateIndexBuilder<'a> {
         } else {
             vec![]
         };
-        let transaction = if uses_segment_commit_path(self.index_type, self.params) {
-            let dataset_version = new_idx.dataset_version;
-            TransactionBuilder::new(
-                dataset_version,
-                Operation::CreateIndex {
-                    new_indices: vec![new_idx],
-                    removed_indices,
-                },
-            )
-            .transaction_properties(self.transaction_properties.clone())
-            .build()
-        } else {
-            TransactionBuilder::new(
-                new_idx.dataset_version,
-                Operation::CreateIndex {
-                    new_indices: vec![new_idx],
-                    removed_indices,
-                },
-            )
-            .transaction_properties(self.transaction_properties.clone())
-            .build()
-        };
+        let transaction = TransactionBuilder::new(
+            new_idx.dataset_version,
+            Operation::CreateIndex {
+                new_indices: vec![new_idx],
+                removed_indices,
+            },
+        )
+        .transaction_properties(self.transaction_properties.clone())
+        .build();
 
         self.dataset
             .apply_commit(transaction, &Default::default(), &Default::default())
@@ -889,20 +876,6 @@ impl<'a> CreateIndexBuilder<'a> {
     }
 }
 
-fn is_btree_scalar_params(params: &dyn IndexParams) -> bool {
-    params
-        .as_any()
-        .downcast_ref::<ScalarIndexParams>()
-        .is_some_and(|p| p.index_type.eq_ignore_ascii_case("btree"))
-}
-
-fn is_ngram_scalar_params(params: &dyn IndexParams) -> bool {
-    params
-        .as_any()
-        .downcast_ref::<ScalarIndexParams>()
-        .is_some_and(|params| params.index_type.eq_ignore_ascii_case("ngram"))
-}
-
 fn is_builtin_vector_index(index_type: IndexType, params: &dyn IndexParams) -> bool {
     params.index_name() == LANCE_VECTOR_INDEX
         && matches!(
@@ -995,38 +968,6 @@ fn ensure_index_uuid_allowed(
     }
 
     Ok(())
-}
-
-fn uses_segment_commit_path(index_type: IndexType, params: &dyn IndexParams) -> bool {
-    let params_family = params.index_name();
-
-    if params_family == LANCE_VECTOR_INDEX
-        && matches!(
-            index_type,
-            IndexType::Vector
-                | IndexType::IvfPq
-                | IndexType::IvfSq
-                | IndexType::IvfFlat
-                | IndexType::IvfRq
-                | IndexType::IvfHnswFlat
-                | IndexType::IvfHnswPq
-                | IndexType::IvfHnswSq
-        )
-        && params.as_any().is::<VectorIndexParams>()
-    {
-        return true;
-    }
-
-    if params_family == LANCE_SCALAR_INDEX {
-        match index_type {
-            IndexType::BTree | IndexType::NGram => return true,
-            IndexType::Scalar if is_btree_scalar_params(params) => return true,
-            IndexType::Scalar if is_ngram_scalar_params(params) => return true,
-            _ => {}
-        }
-    }
-
-    false
 }
 
 impl<'a> IntoFuture for CreateIndexBuilder<'a> {
@@ -3549,7 +3490,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_create_index_ivf_rq_preserves_index_version_on_segment_commit_path() {
+    async fn test_create_index_ivf_rq_preserves_index_version() {
         let tmpdir = TempStrDir::default();
         let dataset_uri = format!("file://{}", tmpdir.as_str());
 
