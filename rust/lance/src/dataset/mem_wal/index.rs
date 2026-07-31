@@ -291,10 +291,10 @@ impl MemIndexKind {
     /// Suffix of the protobuf details message identifying this kind on a base
     /// table index.
     ///
-    /// A suffix rather than a whole type url on purpose: the same details
-    /// message appears under several prefixes across dataset versions
-    /// (`/lance.table.`, the legacy `/lance.index.pb.`, and the
-    /// `type.googleapis.com/` form), and all of them must resolve.
+    /// A suffix rather than a whole type url on purpose: the prefix varies
+    /// across dataset versions (`/lance.table.`, `/lance.index.pb.`, and the
+    /// `type.googleapis.com/` form MemWAL flush once wrote), and every form
+    /// has to keep resolving.
     pub const fn details_suffix(self) -> &'static str {
         match self {
             Self::BTree => "BTreeIndexDetails",
@@ -1267,24 +1267,19 @@ mod tests {
     /// unmaintainable index out of `maintained_indexes`, where it would
     /// otherwise fail every memtable claim and leave the table unwritable.
     ///
-    /// The same details message ships under several prefixes depending on when
-    /// the index was written, so each supported kind is checked under all of
-    /// them: matching is on the suffix precisely so old datasets still resolve.
+    /// Matching is on the message-name suffix, not the whole url, because the
+    /// prefix varies with how and when the index was written: `Any::from_msg`
+    /// emits the package (`/lance.table.`, `/lance.index.pb.`), while MemWAL
+    /// flush used to hand-write a `type.googleapis.com/` url, so existing
+    /// datasets still carry that form.
     #[rstest]
     #[case::btree("/lance.table.BTreeIndexDetails", Some(MemIndexKind::BTree))]
-    #[case::btree_legacy("/lance.index.pb.BTreeIndexDetails", Some(MemIndexKind::BTree))]
-    #[case::btree_any(
-        "type.googleapis.com/lance.table.BTreeIndexDetails",
-        Some(MemIndexKind::BTree)
-    )]
     #[case::fts("/lance.table.InvertedIndexDetails", Some(MemIndexKind::Fts))]
     #[case::fts_legacy("/lance.index.pb.InvertedIndexDetails", Some(MemIndexKind::Fts))]
-    #[case::fts_any(
-        "type.googleapis.com/lance.index.InvertedIndexDetails",
-        Some(MemIndexKind::Fts)
-    )]
     #[case::vector("/lance.index.pb.VectorIndexDetails", Some(MemIndexKind::Hnsw))]
-    #[case::vector_any(
+    // Written by MemWAL flush before it switched to `Any::from_msg`; flushed
+    // generations in existing datasets still have it.
+    #[case::vector_legacy_flush(
         "type.googleapis.com/lance.index.VectorIndexDetails",
         Some(MemIndexKind::Hnsw)
     )]
