@@ -6088,6 +6088,7 @@ mod tests {
             file_minor_version: 1,
             file_size_bytes: CachedFileSize::unknown(),
             base_id: None,
+            blob_bytes: Arc::from([]),
         };
 
         let full_struct =

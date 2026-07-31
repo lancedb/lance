@@ -571,6 +571,7 @@ mod tests {
                 file_minor_version: minor_version,
                 file_size_bytes: CachedFileSize::new(100),
                 base_id: None,
+                blob_bytes: Arc::from([]),
             }],
             overlays: vec![],
             deletion_file: None,

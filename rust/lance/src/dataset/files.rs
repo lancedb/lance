@@ -1026,6 +1026,7 @@ mod tests {
             file_minor_version: 0,
             file_size_bytes: CachedFileSize::unknown(),
             base_id,
+            blob_bytes: Arc::from([]),
         };
 
         let fragment = Fragment {

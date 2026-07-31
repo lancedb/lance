@@ -445,6 +445,21 @@ message DataFile {
   // The base path index of the data file. Used when the file is imported or referred from another dataset.
   // Lance use it as key of the base_paths field in Manifest to determine the actual base path of the data file.
   optional uint32 base_id = 7;
+
+  // Blob payload bytes stored by this data file for each field in `fields`,
+  // outside the field's regular column pages. This covers blob v2 payloads
+  // written inline (out-of-line buffers inside this file) and payloads spilled
+  // to packed or dedicated sidecar `.blob` files. Bytes of external blobs
+  // (foreign URIs not owned by Lance) are never included.
+  //
+  // Recording the sizes here allows reporting of blob storage sizes without
+  // extra IO, mirroring `IndexFile.size_bytes`.
+  //
+  // When present, there must be one entry per entry in `fields` (zero for
+  // non-blob fields). When empty, blob payload sizes were not recorded —
+  // either the file was written before this field existed or the writer could
+  // not know them (e.g. externally created data files).
+  repeated uint64 blob_bytes = 8;
 } // DataFile
 
 // An overlay file supplies new values for a subset of (row offset, field) cells

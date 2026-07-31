@@ -54,13 +54,21 @@ pub struct DataFile {
 
     /// The base path of the datafile, when the datafile is outside the dataset.
     pub base_id: Option<u32>,
+
+    /// Blob v2 payload bytes stored for each field in `fields`, outside the
+    /// field's regular column pages (inline out-of-line buffers in this file
+    /// plus packed/dedicated sidecar `.blob` files). External blob bytes are
+    /// never included. Empty when not recorded: files written before this
+    /// field existed, or data files whose sidecar sizes the writer could not
+    /// know. When non-empty, has exactly one entry per entry in `fields`.
+    pub blob_bytes: Arc<[u64]>,
 }
 
 // Custom Serialize: convert Arc<[i32]> to slice for transparent JSON output
 impl Serialize for DataFile {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut s = serializer.serialize_struct("DataFile", 7)?;
+        let mut s = serializer.serialize_struct("DataFile", 8)?;
         s.serialize_field("path", &self.path)?;
         s.serialize_field("fields", self.fields.as_ref())?;
         s.serialize_field("column_indices", self.column_indices.as_ref())?;
@@ -68,6 +76,7 @@ impl Serialize for DataFile {
         s.serialize_field("file_minor_version", &self.file_minor_version)?;
         s.serialize_field("file_size_bytes", &self.file_size_bytes)?;
         s.serialize_field("base_id", &self.base_id)?;
+        s.serialize_field("blob_bytes", self.blob_bytes.as_ref())?;
         s.end()
     }
 }
@@ -87,6 +96,8 @@ impl<'de> Deserialize<'de> for DataFile {
             file_minor_version: u32,
             file_size_bytes: CachedFileSize,
             base_id: Option<u32>,
+            #[serde(default)]
+            blob_bytes: Vec<u64>,
         }
 
         let helper = DataFileHelper::deserialize(deserializer)?;
@@ -98,6 +109,7 @@ impl<'de> Deserialize<'de> for DataFile {
             file_minor_version: helper.file_minor_version,
             file_size_bytes: helper.file_size_bytes,
             base_id: helper.base_id,
+            blob_bytes: Arc::from(helper.blob_bytes),
         })
     }
 }
@@ -121,7 +133,16 @@ impl DataFile {
             file_minor_version,
             file_size_bytes: file_size_bytes.into(),
             base_id,
+            blob_bytes: Arc::from([]),
         }
+    }
+
+    /// Record blob v2 payload bytes per field in `fields`. Pass an empty vec
+    /// (or don't call) when sizes are unknown; when non-empty, `blob_bytes`
+    /// must have one entry per entry in `fields`.
+    pub fn with_blob_bytes(mut self, blob_bytes: Vec<u64>) -> Self {
+        self.blob_bytes = Arc::from(blob_bytes);
+        self
     }
 
     /// Create a new `DataFile` whose fields and column indices will be set later.
@@ -135,6 +156,7 @@ impl DataFile {
             file_minor_version,
             file_size_bytes: Default::default(),
             base_id: None,
+            blob_bytes: Arc::from([]),
         }
     }
 
@@ -196,6 +218,16 @@ impl DataFile {
                 "contained fewer column_indices than fields",
             ));
         }
+        if !self.blob_bytes.is_empty() && self.blob_bytes.len() != self.fields.len() {
+            return Err(Error::corrupt_file(
+                base_path.clone().join(self.path.clone()),
+                format!(
+                    "contained {} blob_bytes entries for {} fields",
+                    self.blob_bytes.len(),
+                    self.fields.len()
+                ),
+            ));
+        }
         Ok(())
     }
 }
@@ -210,6 +242,7 @@ impl From<&DataFile> for pb::DataFile {
             file_minor_version: df.file_minor_version,
             file_size_bytes: df.file_size_bytes.get().map_or(0, |v| v.get()),
             base_id: df.base_id,
+            blob_bytes: df.blob_bytes.to_vec(),
         }
     }
 }
@@ -226,6 +259,7 @@ impl TryFrom<pb::DataFile> for DataFile {
             file_minor_version: proto.file_minor_version,
             file_size_bytes: CachedFileSize::new(proto.file_size_bytes),
             base_id: proto.base_id,
+            blob_bytes: Arc::from(proto.blob_bytes),
         })
     }
 }
@@ -245,6 +279,9 @@ pub struct DataFileFieldInterner {
     fields: InternCache<i32>,
     column_indices: InternCache<i32>,
     inline_bytes: InternCache<u8>,
+    // Non-empty blob byte tallies rarely repeat across files, but the common
+    // empty case collapses to a single shared allocation.
+    blob_bytes: InternCache<u64>,
 }
 
 /// A cache that uses linear scan for small sizes and HashMap for large.
@@ -347,6 +384,7 @@ impl DataFileFieldInterner {
             file_minor_version: proto.file_minor_version,
             file_size_bytes: CachedFileSize::new(proto.file_size_bytes),
             base_id: proto.base_id,
+            blob_bytes: self.blob_bytes.intern(proto.blob_bytes),
         })
     }
 
@@ -968,9 +1006,9 @@ mod tests {
             json!({
                 "id": 123,
                 "files":[
-                    {"path": "foobar.lance", "fields": [0], "column_indices": [], 
+                    {"path": "foobar.lance", "fields": [0], "column_indices": [],
                      "file_major_version": MAJOR_VERSION, "file_minor_version": MINOR_VERSION,
-                     "file_size_bytes": null, "base_id": null }
+                     "file_size_bytes": null, "base_id": null, "blob_bytes": [] }
                 ],
                 "deletion_file": {"read_version": 123, "id": 456, "file_type": "array",
                                   "num_deleted_rows": 10, "base_id": null},
@@ -979,6 +1017,35 @@ mod tests {
 
         let frag2 = Fragment::from_json(&json).unwrap();
         assert_eq!(fragment, frag2);
+    }
+
+    #[test]
+    fn data_file_blob_bytes_roundtrip_and_validate() {
+        let data_file = DataFile::new(
+            "foo.lance",
+            vec![1, 2, 3],
+            vec![0, -1, 1],
+            ConcreteFileVersion::V2_2,
+            None,
+            None,
+        )
+        .with_blob_bytes(vec![0, 42, 0]);
+
+        let proto = pb::DataFile::from(&data_file);
+        assert_eq!(proto.blob_bytes, vec![0, 42, 0]);
+        let from_proto = DataFile::try_from(proto).unwrap();
+        assert_eq!(from_proto, data_file);
+
+        let base_path = Path::from("base");
+        data_file.validate(&base_path).unwrap();
+
+        // Old writers never recorded blob bytes; an empty tally must validate.
+        let unknown = from_proto.with_blob_bytes(vec![]);
+        unknown.validate(&base_path).unwrap();
+
+        // A recorded tally must line up with `fields` entry for entry.
+        let misaligned = data_file.with_blob_bytes(vec![42]);
+        assert!(misaligned.validate(&base_path).is_err());
     }
 
     #[test]
@@ -992,6 +1059,7 @@ mod tests {
             file_minor_version: MINOR_VERSION as u32,
             file_size_bytes: Default::default(),
             base_id: None,
+            blob_bytes: Arc::from([]),
         };
 
         let base_path = Path::from("base");

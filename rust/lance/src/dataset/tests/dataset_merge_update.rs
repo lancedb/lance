@@ -877,6 +877,7 @@ async fn test_datafile_partial_replacement() {
         file_minor_version: minor,
         file_size_bytes: CachedFileSize::unknown(),
         base_id: None,
+        blob_bytes: Arc::from([]),
     };
 
     let dataset = Dataset::commit(
@@ -938,6 +939,7 @@ async fn test_datafile_partial_replacement() {
         file_minor_version: minor,
         file_size_bytes: CachedFileSize::unknown(),
         base_id: None,
+        blob_bytes: Arc::from([]),
     };
 
     let dataset = Dataset::commit(
@@ -1037,6 +1039,7 @@ async fn test_datafile_replacement_error() {
         file_minor_version: 0,
         file_size_bytes: CachedFileSize::unknown(),
         base_id: None,
+        blob_bytes: Arc::from([]),
     };
 
     let new_data_file = DataFile {

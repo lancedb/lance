@@ -4387,6 +4387,7 @@ mod tests {
             file_minor_version: 0,
             file_size_bytes: CachedFileSize::new(1000),
             base_id: None,
+            blob_bytes: Arc::from([]),
         });
 
         // Add a data file with all fields tombstoned
@@ -4398,6 +4399,7 @@ mod tests {
             file_minor_version: 0,
             file_size_bytes: CachedFileSize::new(500),
             base_id: None,
+            blob_bytes: Arc::from([]),
         });
 
         // Add a data file with mixed tombstoned and valid fields
@@ -4409,6 +4411,7 @@ mod tests {
             file_minor_version: 0,
             file_size_bytes: CachedFileSize::new(750),
             base_id: None,
+            blob_bytes: Arc::from([]),
         });
 
         // Add another fully tombstoned file
@@ -4420,6 +4423,7 @@ mod tests {
             file_minor_version: 0,
             file_size_bytes: CachedFileSize::new(250),
             base_id: None,
+            blob_bytes: Arc::from([]),
         });
 
         let mut fragments = vec![fragment];

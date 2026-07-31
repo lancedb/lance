@@ -987,6 +987,93 @@ pub async fn preprocess_blob_batches(
     Ok(out)
 }
 
+/// Returns true when `field` is, or contains, a blob v2 field.
+pub(super) fn field_contains_blob_v2(field: &LanceField) -> bool {
+    field.is_blob_v2() || field.children.iter().any(field_contains_blob_v2)
+}
+
+/// Accumulate the blob v2 payload bytes carried by `array` into `tally`,
+/// keyed by the owning blob field's id.
+///
+/// `array` must hold prepared blob descriptors (the shape the encoder sees on
+/// the write path): inline rows carry their payload in the `data` child while
+/// packed and dedicated rows record their payload length in `blob_size`.
+/// External rows reference storage Lance does not own and are not counted.
+pub(super) fn accumulate_blob_payload_bytes(
+    field: &LanceField,
+    array: &dyn Array,
+    tally: &mut HashMap<i32, u64>,
+) -> Result<()> {
+    if field.is_blob_v2() {
+        let missing_child = |child: &str| {
+            Error::invalid_input(format!(
+                "Blob v2 field '{}' reached the writer without a prepared descriptor \
+                 '{}' child (array type {:?})",
+                field.name,
+                child,
+                array.data_type(),
+            ))
+        };
+        let structs = array.as_struct_opt().ok_or_else(|| missing_child("kind"))?;
+        let kinds = structs
+            .column_by_name("kind")
+            .and_then(|c| c.as_primitive_opt::<UInt8Type>())
+            .ok_or_else(|| missing_child("kind"))?;
+        let sizes = structs
+            .column_by_name("blob_size")
+            .and_then(|c| c.as_primitive_opt::<UInt64Type>())
+            .ok_or_else(|| missing_child("blob_size"))?;
+        let data = structs
+            .column_by_name("data")
+            .and_then(|c| c.as_binary_opt::<i64>())
+            .ok_or_else(|| missing_child("data"))?;
+        let mut total: u64 = 0;
+        for i in 0..structs.len() {
+            if structs.is_null(i) || kinds.is_null(i) {
+                continue;
+            }
+            match BlobKind::try_from(kinds.value(i))? {
+                BlobKind::Inline => {
+                    if data.is_valid(i) {
+                        total += data.value_length(i) as u64;
+                    }
+                }
+                BlobKind::Packed | BlobKind::Dedicated => {
+                    if sizes.is_valid(i) {
+                        total += sizes.value(i);
+                    }
+                }
+                BlobKind::External => {}
+            }
+        }
+        *tally.entry(field.id).or_insert(0) += total;
+        return Ok(());
+    }
+
+    match array.data_type() {
+        ArrowDataType::Struct(_) => {
+            let structs = array.as_struct();
+            for child in &field.children {
+                if let Some(child_array) = structs.column_by_name(&child.name) {
+                    accumulate_blob_payload_bytes(child, child_array, tally)?;
+                }
+            }
+        }
+        ArrowDataType::List(_) => {
+            if let Some(child) = field.children.first() {
+                accumulate_blob_payload_bytes(child, array.as_list::<i32>().values(), tally)?;
+            }
+        }
+        ArrowDataType::LargeList(_) => {
+            if let Some(child) = field.children.first() {
+                accumulate_blob_payload_bytes(child, array.as_list::<i64>().values(), tally)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// Mutable state for a [`BlobFile`] cursor.
 ///
 /// The cursor is logical to the blob slice, not the backing object. Once closed,
