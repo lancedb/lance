@@ -14,7 +14,9 @@ use lance_arrow::{
 use lance_core::datatypes::{
     NullabilityComparison, OnMissing, OnTypeMismatch, SchemaCompareOptions,
 };
-use lance_core::utils::tracing::{AUDIT_MODE_CREATE, AUDIT_TYPE_DATA, TRACE_FILE_AUDIT};
+use lance_core::utils::tracing::{
+    AUDIT_MODE_CREATE, AUDIT_MODE_DELETE, AUDIT_TYPE_DATA, TRACE_FILE_AUDIT,
+};
 use lance_core::{Error, Result, datatypes::Schema};
 use lance_datafusion::chunker::{break_stream, chunk_stream};
 use lance_datafusion::utils::StreamingWriteSource;
@@ -840,8 +842,13 @@ pub(crate) async fn cleanup_data_fragments(
             };
 
             let path = file_dir.clone().join(file.path.as_str());
-            if let Err(e) = store.delete(&path).await {
-                log::warn!("Failed to clean up orphaned data file '{}': {}", path, e);
+            match store.delete(&path).await {
+                Ok(()) => {
+                    info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE, r#type=AUDIT_TYPE_DATA, path = file.path.as_str());
+                }
+                Err(e) => {
+                    log::warn!("Failed to clean up orphaned data file '{}': {}", path, e);
+                }
             }
 
             // Clean up any blob v2 sidecars that might exist for this data file.
