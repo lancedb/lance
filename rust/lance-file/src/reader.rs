@@ -2510,14 +2510,6 @@ mod tests {
         assert_eq!(take, vec![batch.take(&indices).unwrap()]);
     }
 
-    fn footer_version(bytes: &[u8]) -> (u16, u16) {
-        let version_start = bytes.len() - 8;
-        (
-            u16::from_le_bytes([bytes[version_start], bytes[version_start + 1]]),
-            u16::from_le_bytes([bytes[version_start + 2], bytes[version_start + 3]]),
-        )
-    }
-
     async fn create_some_file(fs: &FsFixture, version: ConcreteFileVersion) -> WrittenFile {
         let location_type = DataType::Struct(Fields::from(vec![
             Field::new("x", DataType::Float64, true),
@@ -2757,7 +2749,7 @@ mod tests {
         let encoded_batch = encode_batch(
             &data,
             lance_schema.clone(),
-            &encoding_strategy,
+            encoding_strategy.as_ref(),
             &encoding_options,
         )
         .await
