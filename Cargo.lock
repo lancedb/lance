@@ -4907,6 +4907,7 @@ dependencies = [
  "async-trait",
  "aws-config",
  "aws-credential-types",
+ "axum",
  "byteorder",
  "bytes",
  "chrono",

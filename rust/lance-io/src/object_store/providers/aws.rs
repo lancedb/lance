@@ -19,7 +19,7 @@ use object_store::{
     ClientOptions, CredentialProvider, Result as ObjectStoreResult, RetryConfig,
     StaticCredentialProvider,
     aws::{
-        AmazonS3Builder, AmazonS3ConfigKey, AwsCredential as ObjectStoreAwsCredential,
+        AmazonS3, AmazonS3Builder, AmazonS3ConfigKey, AwsCredential as ObjectStoreAwsCredential,
         AwsCredentialProvider,
     },
 };
@@ -30,7 +30,8 @@ use crate::object_store::{
     DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
     ObjectStoreParams, ObjectStoreProvider, StorageOptions, StorageOptionsAccessor,
     dynamic_credentials::{NamespaceCredentialsProvider, build_dynamic_credential_provider},
-    throttle::{AimdThrottleConfig, AimdThrottledStore},
+    read_dir::{native::NativeDirLister, opendal::OpendalDirLister},
+    throttle::{AimdThrottleConfig, with_throttling},
 };
 use lance_core::error::{Error, Result};
 
@@ -44,7 +45,7 @@ impl AwsStoreProvider {
         params: &ObjectStoreParams,
         storage_options: &StorageOptions,
         is_s3_express: bool,
-    ) -> Result<Arc<dyn OSObjectStore>> {
+    ) -> Result<Arc<AmazonS3>> {
         // Use a low retry count since the AIMD throttle layer handles
         // throttle recovery with its own retry loop.
         let retry_config = RetryConfig {
@@ -102,14 +103,14 @@ impl AwsStoreProvider {
             );
         }
 
-        Ok(Arc::new(builder.build()?) as Arc<dyn OSObjectStore>)
+        Ok(Arc::new(builder.build()?))
     }
 
-    async fn build_opendal_s3_store(
+    fn build_opendal_s3_operator(
         &self,
         base_path: &Url,
         storage_options: &StorageOptions,
-    ) -> Result<Arc<dyn OSObjectStore>> {
+    ) -> Result<Operator> {
         let bucket = base_path
             .host_str()
             .ok_or_else(|| Error::invalid_input("S3 URL must contain bucket name"))?
@@ -131,7 +132,7 @@ impl AwsStoreProvider {
         let operator = Operator::from_iter::<S3>(config_map)
             .map_err(|e| Error::invalid_input(format!("Failed to create S3 operator: {:?}", e)))?;
 
-        Ok(Arc::new(OpendalStore::new(operator)) as Arc<dyn OSObjectStore>)
+        Ok(operator)
     }
 }
 
@@ -163,21 +164,30 @@ impl ObjectStoreProvider for AwsStoreProvider {
             .map(|endpoint| endpoint.contains("r2.cloudflarestorage.com"))
             .unwrap_or(false);
 
-        let inner = if use_opendal {
+        let (inner, paginated_lister) = if use_opendal {
             // Use OpenDAL implementation
-            self.build_opendal_s3_store(&base_path, &storage_options)
-                .await?
+            let operator = self.build_opendal_s3_operator(&base_path, &storage_options)?;
+            (
+                Arc::new(OpendalStore::new(operator.clone())) as Arc<dyn OSObjectStore>,
+                OpendalDirLister::for_operator(operator),
+            )
         } else {
             // Use default Amazon S3 implementation
-            self.build_amazon_s3_store(&mut base_path, params, &storage_options, is_s3_express)
-                .await?
+            let store = self
+                .build_amazon_s3_store(&mut base_path, params, &storage_options, is_s3_express)
+                .await?;
+            (
+                store.clone() as Arc<dyn OSObjectStore>,
+                Some(NativeDirLister::for_store(store)),
+            )
         };
+        // S3 Express ignores `start-after` and does not list in key order, so a paginated
+        // listing there would restart at the beginning of the prefix on every page. Applied to
+        // both stores above: OpenDAL's S3 service advertises `start_after` whatever bucket it
+        // is pointed at, so it cannot tell an Express bucket apart on its own.
+        let paginated_lister = paginated_lister.filter(|_| !is_s3_express);
         let throttle_config = AimdThrottleConfig::from_storage_options(params.storage_options())?;
-        let inner = if throttle_config.is_disabled() {
-            inner
-        } else {
-            Arc::new(AimdThrottledStore::new(inner, throttle_config)?) as Arc<dyn OSObjectStore>
-        };
+        let (inner, paginated_lister) = with_throttling(throttle_config, inner, paginated_lister)?;
 
         Ok(ObjectStore {
             inner,
@@ -191,6 +201,7 @@ impl ObjectStoreProvider for AwsStoreProvider {
             io_tracker: Default::default(),
             store_prefix: self
                 .calculate_object_store_prefix(&base_path, params.storage_options())?,
+            paginated_lister,
         })
     }
 }
@@ -628,6 +639,33 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(store.scheme, "s3");
+    }
+
+    /// S3 Express ignores `start-after` and does not list in key order, so neither store may
+    /// install a cursor lister — OpenDAL's S3 service advertises `start_after` for whatever
+    /// bucket it is pointed at, so it cannot rule an Express bucket out on its own.
+    #[rstest::rstest]
+    #[case::native("false")]
+    #[case::opendal("true")]
+    #[tokio::test]
+    async fn test_s3_express_is_not_paginated(#[case] use_opendal: &str) {
+        let provider = AwsStoreProvider;
+        // Express bucket names carry their availability zone, which the S3 client validates.
+        let url = Url::parse("s3://test-bucket--use1-az4--x-s3/path").unwrap();
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([
+                    ("use_opendal".to_string(), use_opendal.to_string()),
+                    ("region".to_string(), "us-west-2".to_string()),
+                ]),
+            ))),
+            ..Default::default()
+        };
+
+        let store = provider.new_store(url, &params).await.unwrap();
+
+        assert!(!store.list_is_lexically_ordered);
+        assert!(store.paginated_lister.is_none());
     }
 
     #[derive(Debug)]
