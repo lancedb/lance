@@ -39,7 +39,8 @@ use crate::index::scalar::inverted::{load_segment_details, load_segments};
 use crate::{Dataset, index::DatasetIndexInternalExt};
 use lance_index::metrics::{
     AND_CANDIDATES_PRUNED_BEFORE_RETURN_METRIC, AND_CANDIDATES_SEEN_METRIC, AND_FULL_SCORES_METRIC,
-    FREQS_COLLECTED_METRIC, MetricsCollector,
+    FREQS_COLLECTED_METRIC, FTS_CANDIDATES_SCORED_METRIC, FTS_CANDIDATES_VISITED_METRIC,
+    FTS_PHRASE_POSITION_CHECKS_METRIC, FTS_POSTING_BLOCKS_DECODED_METRIC, MetricsCollector,
 };
 use lance_index::scalar::inverted::builder::ScoredDoc;
 use lance_index::scalar::inverted::builder::document_input;
@@ -137,11 +138,15 @@ async fn search_segments(
 
     while let Some((doc_ids, scores)) = searches.try_next().await? {
         for (row_id, score) in doc_ids.into_iter().zip(scores) {
+            let candidate = ScoredDoc::new(row_id, score);
             if candidates.len() < limit {
-                candidates.push(std::cmp::Reverse(ScoredDoc::new(row_id, score)));
-            } else if candidates.peek().unwrap().0.score.0 < score {
+                candidates.push(std::cmp::Reverse(candidate));
+            } else if candidates
+                .peek()
+                .is_some_and(|current| candidate.cmp(&current.0).is_gt())
+            {
                 candidates.pop();
-                candidates.push(std::cmp::Reverse(ScoredDoc::new(row_id, score)));
+                candidates.push(std::cmp::Reverse(candidate));
             }
         }
     }
@@ -151,6 +156,15 @@ async fn search_segments(
         .into_iter()
         .map(|std::cmp::Reverse(doc)| (doc.row_id, doc.score.0))
         .unzip())
+}
+
+fn compare_scored_rows(
+    (left_row_id, left_score): &(u64, f32),
+    (right_row_id, right_score): &(u64, f32),
+) -> std::cmp::Ordering {
+    right_score
+        .total_cmp(left_score)
+        .then_with(|| left_row_id.cmp(right_row_id))
 }
 
 /// Fall back to the default simple tokenizer when no on-disk FTS segment exists.
@@ -266,6 +280,10 @@ pub struct FtsIndexMetrics {
     and_candidates_pruned_before_return: Count,
     and_full_scores: Count,
     freqs_collected: Count,
+    fts_candidates_visited: Count,
+    fts_candidates_scored: Count,
+    fts_posting_blocks_decoded: Count,
+    fts_phrase_position_checks: Count,
     /// Wall time (ms) of the exec-local `build_global_bm25_scorer`
     /// fallback; zero when a preset base scorer was injected.
     scorer_build_ms: Gauge,
@@ -283,6 +301,12 @@ impl FtsIndexMetrics {
                 .new_count(AND_CANDIDATES_PRUNED_BEFORE_RETURN_METRIC, partition),
             and_full_scores: metrics.new_count(AND_FULL_SCORES_METRIC, partition),
             freqs_collected: metrics.new_count(FREQS_COLLECTED_METRIC, partition),
+            fts_candidates_visited: metrics.new_count(FTS_CANDIDATES_VISITED_METRIC, partition),
+            fts_candidates_scored: metrics.new_count(FTS_CANDIDATES_SCORED_METRIC, partition),
+            fts_posting_blocks_decoded: metrics
+                .new_count(FTS_POSTING_BLOCKS_DECODED_METRIC, partition),
+            fts_phrase_position_checks: metrics
+                .new_count(FTS_PHRASE_POSITION_CHECKS_METRIC, partition),
             scorer_build_ms: metrics.new_gauge("scorer_build_ms", partition),
             segment_bind_duration: metrics.new_time(FTS_SEGMENT_BIND_DURATION_METRIC, partition),
             baseline_metrics: BaselineMetrics::new(metrics, partition),
@@ -333,6 +357,22 @@ impl MetricsCollector for FtsIndexMetrics {
 
     fn record_freqs_collected(&self, num_collections: usize) {
         self.freqs_collected.add(num_collections);
+    }
+
+    fn record_fts_candidates_visited(&self, num_candidates: usize) {
+        self.fts_candidates_visited.add(num_candidates);
+    }
+
+    fn record_fts_candidates_scored(&self, num_candidates: usize) {
+        self.fts_candidates_scored.add(num_candidates);
+    }
+
+    fn record_fts_posting_blocks_decoded(&self, num_blocks: usize) {
+        self.fts_posting_blocks_decoded.add(num_blocks);
+    }
+
+    fn record_fts_phrase_position_checks(&self, num_checks: usize) {
+        self.fts_phrase_position_checks.add(num_checks);
     }
 }
 
@@ -1263,6 +1303,10 @@ impl ExecutionPlan for FlatMatchQueryExec {
         })
         .try_flatten()
         .map(move |batch| {
+            if let Ok(batch) = &batch {
+                metrics_clone.record_fts_candidates_visited(batch.num_rows());
+                metrics_clone.record_fts_candidates_scored(batch.num_rows());
+            }
             // record_poll records output_rows, output_bytes, and output_batches
             // on the shared BaselineMetrics — same pattern DataFusion's own
             // FilterExec uses inside its hand-written poll_next.
@@ -1790,7 +1834,7 @@ impl ExecutionPlan for BoostQueryExec {
 
             let (doc_ids, scores): (Vec<_>, Vec<_>) = res
                 .into_iter()
-                .sorted_unstable_by(|(_, a), (_, b)| b.total_cmp(a))
+                .sorted_unstable_by(compare_scored_rows)
                 .take(params.limit.unwrap_or(usize::MAX))
                 .unzip();
             metrics.baseline_metrics.record_output(doc_ids.len());
@@ -2126,7 +2170,7 @@ impl ExecutionPlan for BooleanQueryExec {
             let _timer = elapsed_time.timer();
             let (row_ids, scores): (Vec<_>, Vec<_>) = res
                 .into_iter()
-                .sorted_unstable_by(|(_, a), (_, b)| b.total_cmp(a))
+                .sorted_unstable_by(compare_scored_rows)
                 .take(params.limit.unwrap_or(usize::MAX))
                 .unzip();
             metrics.baseline_metrics.record_output(row_ids.len());

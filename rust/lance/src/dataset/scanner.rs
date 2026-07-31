@@ -129,6 +129,26 @@ use lance_datafusion::substrait::parse_substrait;
 /// `LANCE_DEFAULT_BATCH_SIZE` specify one.
 pub const BATCH_SIZE_FALLBACK: usize = 8192;
 
+fn fts_score_row_id_ordering(schema: &ArrowSchema) -> Result<LexOrdering> {
+    LexOrdering::new(vec![
+        PhysicalSortExpr {
+            expr: expressions::col(SCORE_COL, schema)?,
+            options: SortOptions {
+                descending: true,
+                nulls_first: false,
+            },
+        },
+        PhysicalSortExpr {
+            expr: expressions::col(ROW_ID, schema)?,
+            options: SortOptions {
+                descending: false,
+                nulls_first: false,
+            },
+        },
+    ])
+    .ok_or_else(|| Error::internal("FTS score ordering must not be empty".to_string()))
+}
+
 /// Parse an environment variable as a specific type, logging a warning on parse failure.
 fn parse_env_var<T: std::str::FromStr>(env_var_name: &str, default_val: &str) -> Option<T>
 where
@@ -3471,17 +3491,12 @@ impl Scanner {
                     fts_node,
                     schema,
                 )?);
-                let sort_expr = PhysicalSortExpr {
-                    expr: expressions::col(SCORE_COL, fts_node.schema().as_ref())?,
-                    options: SortOptions {
-                        descending: true,
-                        nulls_first: false,
-                    },
-                };
-
                 Arc::new(
-                    SortExec::new([sort_expr].into(), fts_node)
-                        .with_fetch(self.limit.map(|l| l as usize)),
+                    SortExec::new(
+                        fts_score_row_id_ordering(fts_node.schema().as_ref())?,
+                        fts_node,
+                    )
+                    .with_fetch(self.limit.map(|l| l as usize)),
                 )
             }
             FtsQuery::Boolean(query) => {
@@ -3724,14 +3739,13 @@ impl Scanner {
                     match_plan,
                     Partitioning::RoundRobinBatch(1),
                 )?);
-                let sort_expr = PhysicalSortExpr {
-                    expr: expressions::col(SCORE_COL, match_plan.schema().as_ref())?,
-                    options: SortOptions {
-                        descending: true,
-                        nulls_first: false,
-                    },
-                };
-                Arc::new(SortExec::new([sort_expr].into(), match_plan).with_fetch(params.limit))
+                Arc::new(
+                    SortExec::new(
+                        fts_score_row_id_ordering(match_plan.schema().as_ref())?,
+                        match_plan,
+                    )
+                    .with_fetch(params.limit),
+                )
             }
             (Some(match_plan), None) => match_plan,
             (None, Some(flat_match_plan)) => flat_match_plan,

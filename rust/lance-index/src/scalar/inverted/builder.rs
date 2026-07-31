@@ -1762,7 +1762,12 @@ impl PartialOrd for ScoredDoc {
 
 impl Ord for ScoredDoc {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.score.cmp(&other.score)
+        self.score
+            .cmp(&other.score)
+            // Smaller row ids win score ties. Reverse the row-id comparison so
+            // `BinaryHeap<Reverse<ScoredDoc>>` exposes the worst (largest)
+            // tied row id for replacement.
+            .then_with(|| other.row_id.cmp(&self.row_id))
     }
 }
 

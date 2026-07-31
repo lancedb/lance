@@ -20,6 +20,7 @@ fn create_datafusion_context() -> SessionContext {
     ctx
 }
 
+mod fts_compound;
 mod inverted;
 mod primitives;
 mod vectors;

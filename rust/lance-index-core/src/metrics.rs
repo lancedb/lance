@@ -7,6 +7,14 @@ pub const AND_CANDIDATES_SEEN_METRIC: &str = "and_candidates_seen";
 pub const AND_CANDIDATES_PRUNED_BEFORE_RETURN_METRIC: &str = "and_candidates_pruned_before_return";
 pub const AND_FULL_SCORES_METRIC: &str = "and_full_scores";
 pub const FREQS_COLLECTED_METRIC: &str = "freqs_collected";
+/// Metric name for documents admitted by the FTS candidate generator.
+pub const FTS_CANDIDATES_VISITED_METRIC: &str = "fts_candidates_visited";
+/// Metric name for FTS candidates whose complete score was computed.
+pub const FTS_CANDIDATES_SCORED_METRIC: &str = "fts_candidates_scored";
+/// Metric name for compressed FTS posting blocks decoded by a query.
+pub const FTS_POSTING_BLOCKS_DECODED_METRIC: &str = "fts_posting_blocks_decoded";
+/// Metric name for candidate documents checked against phrase positions.
+pub const FTS_PHRASE_POSITION_CHECKS_METRIC: &str = "fts_phrase_position_checks";
 
 /// A trait used by the index to report metrics
 ///
@@ -85,6 +93,18 @@ pub trait MetricsCollector: Send + Sync {
 
     fn record_freqs_collected(&self, _num_collections: usize) {}
 
+    /// Record documents admitted by the FTS candidate generator.
+    fn record_fts_candidates_visited(&self, _num_candidates: usize) {}
+
+    /// Record FTS candidates whose complete score was computed.
+    fn record_fts_candidates_scored(&self, _num_candidates: usize) {}
+
+    /// Record compressed FTS posting blocks decoded while evaluating a query.
+    fn record_fts_posting_blocks_decoded(&self, _num_blocks: usize) {}
+
+    /// Record candidate documents checked against phrase positions.
+    fn record_fts_phrase_position_checks(&self, _num_checks: usize) {}
+
     /// Returns an optional sink for recording exact I/O statistics (bytes read,
     /// IOPS, and requests) performed on behalf of this collector.
     ///
@@ -119,6 +139,10 @@ pub struct LocalMetricsCollector {
     // [`Self::index_cache_hits`] / [`Self::index_cache_misses`].
     pub(crate) index_cache_hits: AtomicUsize,
     pub(crate) index_cache_misses: AtomicUsize,
+    pub(crate) fts_candidates_visited: AtomicUsize,
+    pub(crate) fts_candidates_scored: AtomicUsize,
+    pub(crate) fts_posting_blocks_decoded: AtomicUsize,
+    pub(crate) fts_phrase_position_checks: AtomicUsize,
 }
 
 impl LocalMetricsCollector {
@@ -128,6 +152,14 @@ impl LocalMetricsCollector {
         other.record_comparisons(self.comparisons.load(Ordering::Relaxed));
         other.record_index_cache_hits(self.index_cache_hits.load(Ordering::Relaxed));
         other.record_index_cache_misses(self.index_cache_misses.load(Ordering::Relaxed));
+        other.record_fts_candidates_visited(self.fts_candidates_visited.load(Ordering::Relaxed));
+        other.record_fts_candidates_scored(self.fts_candidates_scored.load(Ordering::Relaxed));
+        other.record_fts_posting_blocks_decoded(
+            self.fts_posting_blocks_decoded.load(Ordering::Relaxed),
+        );
+        other.record_fts_phrase_position_checks(
+            self.fts_phrase_position_checks.load(Ordering::Relaxed),
+        );
     }
 
     /// Cumulative index cache hits recorded so far.
@@ -138,6 +170,26 @@ impl LocalMetricsCollector {
     /// Cumulative index cache misses recorded so far.
     pub fn index_cache_misses(&self) -> usize {
         self.index_cache_misses.load(Ordering::Relaxed)
+    }
+
+    /// Cumulative FTS candidates admitted by candidate generation.
+    pub fn fts_candidates_visited(&self) -> usize {
+        self.fts_candidates_visited.load(Ordering::Relaxed)
+    }
+
+    /// Cumulative FTS candidates whose complete score was computed.
+    pub fn fts_candidates_scored(&self) -> usize {
+        self.fts_candidates_scored.load(Ordering::Relaxed)
+    }
+
+    /// Cumulative compressed FTS posting blocks decoded.
+    pub fn fts_posting_blocks_decoded(&self) -> usize {
+        self.fts_posting_blocks_decoded.load(Ordering::Relaxed)
+    }
+
+    /// Cumulative candidate documents checked against phrase positions.
+    pub fn fts_phrase_position_checks(&self) -> usize {
+        self.fts_phrase_position_checks.load(Ordering::Relaxed)
     }
 }
 
@@ -163,6 +215,26 @@ impl MetricsCollector for LocalMetricsCollector {
         self.index_cache_misses
             .fetch_add(num_misses, Ordering::Relaxed);
     }
+
+    fn record_fts_candidates_visited(&self, num_candidates: usize) {
+        self.fts_candidates_visited
+            .fetch_add(num_candidates, Ordering::Relaxed);
+    }
+
+    fn record_fts_candidates_scored(&self, num_candidates: usize) {
+        self.fts_candidates_scored
+            .fetch_add(num_candidates, Ordering::Relaxed);
+    }
+
+    fn record_fts_posting_blocks_decoded(&self, num_blocks: usize) {
+        self.fts_posting_blocks_decoded
+            .fetch_add(num_blocks, Ordering::Relaxed);
+    }
+
+    fn record_fts_phrase_position_checks(&self, num_checks: usize) {
+        self.fts_phrase_position_checks
+            .fetch_add(num_checks, Ordering::Relaxed);
+    }
 }
 
 #[cfg(test)]
@@ -175,6 +247,10 @@ mod tests {
         comparisons: AtomicUsize,
         hits: AtomicUsize,
         misses: AtomicUsize,
+        candidates_visited: AtomicUsize,
+        candidates_scored: AtomicUsize,
+        posting_blocks_decoded: AtomicUsize,
+        phrase_position_checks: AtomicUsize,
     }
 
     impl MetricsCollector for SumSink {
@@ -193,10 +269,22 @@ mod tests {
         fn record_index_cache_misses(&self, n: usize) {
             self.misses.fetch_add(n, Ordering::Relaxed);
         }
+        fn record_fts_candidates_visited(&self, n: usize) {
+            self.candidates_visited.fetch_add(n, Ordering::Relaxed);
+        }
+        fn record_fts_candidates_scored(&self, n: usize) {
+            self.candidates_scored.fetch_add(n, Ordering::Relaxed);
+        }
+        fn record_fts_posting_blocks_decoded(&self, n: usize) {
+            self.posting_blocks_decoded.fetch_add(n, Ordering::Relaxed);
+        }
+        fn record_fts_phrase_position_checks(&self, n: usize) {
+            self.phrase_position_checks.fetch_add(n, Ordering::Relaxed);
+        }
     }
 
     #[test]
-    fn local_metrics_collector_forwards_cache_counts() {
+    fn local_metrics_collector_forwards_counts() {
         let local = LocalMetricsCollector::default();
         local.record_index_cache_hit();
         local.record_index_cache_hit();
@@ -204,6 +292,10 @@ mod tests {
         local.record_part_load();
         local.record_index_load();
         local.record_comparisons(5);
+        local.record_fts_candidates_visited(7);
+        local.record_fts_candidates_scored(6);
+        local.record_fts_posting_blocks_decoded(4);
+        local.record_fts_phrase_position_checks(3);
 
         let sink = SumSink {
             parts: AtomicUsize::new(0),
@@ -211,6 +303,10 @@ mod tests {
             comparisons: AtomicUsize::new(0),
             hits: AtomicUsize::new(0),
             misses: AtomicUsize::new(0),
+            candidates_visited: AtomicUsize::new(0),
+            candidates_scored: AtomicUsize::new(0),
+            posting_blocks_decoded: AtomicUsize::new(0),
+            phrase_position_checks: AtomicUsize::new(0),
         };
         local.dump_into(&sink);
 
@@ -219,16 +315,24 @@ mod tests {
         assert_eq!(sink.comparisons.load(Ordering::Relaxed), 5);
         assert_eq!(sink.hits.load(Ordering::Relaxed), 2);
         assert_eq!(sink.misses.load(Ordering::Relaxed), 3);
+        assert_eq!(sink.candidates_visited.load(Ordering::Relaxed), 7);
+        assert_eq!(sink.candidates_scored.load(Ordering::Relaxed), 6);
+        assert_eq!(sink.posting_blocks_decoded.load(Ordering::Relaxed), 4);
+        assert_eq!(sink.phrase_position_checks.load(Ordering::Relaxed), 3);
     }
 
     #[test]
-    fn no_op_metrics_collector_ignores_cache_counts() {
-        // Ensures existing implementors that do not override cache-count methods
+    fn no_op_metrics_collector_ignores_counts() {
+        // Ensures existing implementors that do not override count methods
         // remain sound (default impl is a no-op).
         let collector = NoOpMetricsCollector;
         collector.record_index_cache_hit();
         collector.record_index_cache_miss();
         collector.record_index_cache_hits(10);
         collector.record_index_cache_misses(20);
+        collector.record_fts_candidates_visited(10);
+        collector.record_fts_candidates_scored(10);
+        collector.record_fts_posting_blocks_decoded(10);
+        collector.record_fts_phrase_position_checks(10);
     }
 }

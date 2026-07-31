@@ -235,6 +235,11 @@ name = "fts_search"
 harness = false
 
 [[bench]]
+name = "compound_fts"
+path = "benches/compound_fts/main.rs"
+harness = false
+
+[[bench]]
 name = "vector_throughput"
 harness = false
 

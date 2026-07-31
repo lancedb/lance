@@ -308,7 +308,7 @@ struct ModernSearchRequest<'a> {
 }
 
 /// Typed identity for one modern candidate after partition-local scoring.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct PartitionDocId {
     partition_ordinal: u32,
     doc_id: DocId,
@@ -331,7 +331,7 @@ impl PartitionDocId {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ScoredPartitionDoc {
     document: PartitionDocId,
     score: OrderedFloat,
@@ -346,14 +346,6 @@ impl ScoredPartitionDoc {
     }
 }
 
-impl PartialEq for ScoredPartitionDoc {
-    fn eq(&self, other: &Self) -> bool {
-        self.score == other.score
-    }
-}
-
-impl Eq for ScoredPartitionDoc {}
-
 impl PartialOrd for ScoredPartitionDoc {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
@@ -362,7 +354,9 @@ impl PartialOrd for ScoredPartitionDoc {
 
 impl Ord for ScoredPartitionDoc {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.score.cmp(&other.score)
+        self.score
+            .cmp(&other.score)
+            .then_with(|| other.document.cmp(&self.document))
     }
 }
 
@@ -387,14 +381,15 @@ fn push_scored_key(
     key: u64,
     score: f32,
 ) {
+    let candidate = ScoredDoc::new(key, score);
     if candidates.len() < limit {
-        candidates.push(Reverse(ScoredDoc::new(key, score)));
+        candidates.push(Reverse(candidate));
     } else if candidates
         .peek()
-        .is_some_and(|candidate| candidate.0.score.0 < score)
+        .is_some_and(|current| candidate.cmp(&current.0).is_gt())
     {
         candidates.pop();
-        candidates.push(Reverse(ScoredDoc::new(key, score)));
+        candidates.push(Reverse(candidate));
     }
 }
 
@@ -404,14 +399,15 @@ fn push_scored_partition_doc(
     document: PartitionDocId,
     score: f32,
 ) {
+    let candidate = ScoredPartitionDoc::new(document, score);
     if candidates.len() < limit {
-        candidates.push(Reverse(ScoredPartitionDoc::new(document, score)));
+        candidates.push(Reverse(candidate));
     } else if candidates
         .peek()
-        .is_some_and(|candidate| candidate.0.score.0 < score)
+        .is_some_and(|current| candidate.cmp(&current.0).is_gt())
     {
         candidates.pop();
-        candidates.push(Reverse(ScoredPartitionDoc::new(document, score)));
+        candidates.push(Reverse(candidate));
     }
 }
 

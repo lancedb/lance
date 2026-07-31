@@ -64,6 +64,10 @@ use crate::{
     },
 };
 
+/// Key used in [`ExecutionSummaryCounts::all_counts`] for rows emitted by all
+/// execution-plan nodes.
+pub const OUTPUT_ROWS_METRIC: &str = "output_rows";
+
 /// An source execution node created from an existing stream
 ///
 /// It can only be used once, and will return the stream.  After that the node
@@ -575,6 +579,12 @@ impl ExecutionSummaryCounts {
 
 pub fn collect_execution_metrics(node: &dyn ExecutionPlan, counts: &mut ExecutionSummaryCounts) {
     if let Some(metrics) = node.metrics() {
+        if let Some(output_rows) = metrics.output_rows() {
+            *counts
+                .all_counts
+                .entry(OUTPUT_ROWS_METRIC.to_string())
+                .or_insert(0) += output_rows;
+        }
         for (metric_name, count) in metrics.iter_counts() {
             match metric_name.as_ref() {
                 IOPS_METRIC => counts.iops += count.value(),
