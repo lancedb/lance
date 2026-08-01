@@ -49,8 +49,7 @@ impl GcsStoreProvider {
         }
 
         let operator = Operator::from_iter::<Gcs>(config_map)
-            .map_err(|e| Error::invalid_input(format!("Failed to create GCS operator: {:?}", e)))?
-            .finish();
+            .map_err(|e| Error::invalid_input(format!("Failed to create GCS operator: {:?}", e)))?;
 
         Ok(Arc::new(OpendalStore::new(operator)) as Arc<dyn OSObjectStore>)
     }
