@@ -52,7 +52,7 @@ use lance_index::scalar::inverted::query::{
 use lance_index::scalar::inverted::tokenizer::document_tokenizer::TextTokenizer;
 use lance_index::scalar::inverted::{
     FTS_SCHEMA, InvertedIndex, MemBM25Scorer, SCORE_COL, build_global_bm25_scorer, compound_search,
-    flat_bm25_search_stream_with_metrics_and_operator,
+    compound_search_with_base_scorer, flat_bm25_search_stream_with_metrics_and_operator,
 };
 use lance_index::{prefilter::PreFilter, scalar::inverted::query::BooleanQuery};
 use lance_tokenizer::{SimpleTokenizer, TextAnalyzer};
@@ -252,6 +252,10 @@ impl CompoundQueryExec {
         }
     }
 
+    /// Override locally computed BM25 statistics with a corpus-wide scorer.
+    ///
+    /// The scorer must cover every token in every query leaf, including fuzzy
+    /// expansions. Execution returns an error when any required token is absent.
     pub fn with_base_scorer(mut self, scorer: Arc<MemBM25Scorer>) -> Self {
         self.base_scorer = Some(scorer);
         self
@@ -415,15 +419,22 @@ impl ExecutionPlan for CompoundQueryExec {
                     .sum::<usize>()
                     .saturating_mul(count_fts_leaves(&query)),
             );
-            let (row_ids, scores) = compound_search(
-                &indices,
-                &query,
-                &params,
-                prefilter,
-                metrics.clone(),
-                base_scorer,
-            )
-            .await?;
+            let (row_ids, scores) = match base_scorer {
+                Some(base_scorer) => {
+                    compound_search_with_base_scorer(
+                        &indices,
+                        &query,
+                        &params,
+                        prefilter,
+                        metrics.clone(),
+                        base_scorer,
+                    )
+                    .await?
+                }
+                None => {
+                    compound_search(&indices, &query, &params, prefilter, metrics.clone()).await?
+                }
+            };
             metrics.baseline_metrics.record_output(row_ids.len());
             Ok::<_, DataFusionError>(RecordBatch::try_new(
                 FTS_SCHEMA.clone(),
@@ -2495,9 +2506,9 @@ mod tests {
     };
 
     use super::{
-        BoolSlot, BoostQueryExec, FTS_SEGMENT_BIND_DURATION_METRIC, FlatMatchFilterExec,
-        FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec, build_boolean_query_children,
-        open_fts_segments,
+        BoolSlot, BoostQueryExec, CompoundQueryExec, FTS_SEGMENT_BIND_DURATION_METRIC,
+        FlatMatchFilterExec, FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec,
+        build_boolean_query_children, open_fts_segments,
     };
     use crate::io::exec::utils::IndexMetrics;
     use datafusion::physical_plan::empty::EmptyExec;
@@ -3477,6 +3488,124 @@ mod tests {
             out.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
             out
         }
+    }
+
+    #[tokio::test]
+    async fn test_compound_query_exec_validates_base_scorer() {
+        let (dataset, segments, _) = create_segment_selection_fixture().await;
+        let search_params = FtsSearchParams::default().with_limit(Some(10));
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        let metrics = IndexMetrics::new(&metrics_set, 0);
+        let indices = open_fts_segments(&dataset, "text", &segments, &metrics)
+            .await
+            .unwrap();
+
+        let query: FtsQuery = BooleanQuery::new([
+            (
+                Occur::Should,
+                MatchQuery::new("quick".to_string())
+                    .with_column(Some("text".to_string()))
+                    .into(),
+            ),
+            (
+                Occur::Should,
+                MatchQuery::new("brown".to_string())
+                    .with_column(Some("text".to_string()))
+                    .into(),
+            ),
+        ])
+        .into();
+
+        let baseline = CompoundQueryExec::new_with_segments(
+            dataset.clone(),
+            query.clone(),
+            search_params.clone(),
+            PreFilterSource::None,
+            segments.clone(),
+        );
+        let baseline_results = execute_results(&baseline).await.unwrap();
+
+        let mut tokenizer = indices[0].tokenizer();
+        let complete_tokens = collect_query_tokens("quick brown", &mut tokenizer);
+        let complete_scorer = Arc::new(
+            build_global_bm25_scorer(&indices, &complete_tokens, &search_params, None)
+                .await
+                .unwrap(),
+        );
+        let complete_override = CompoundQueryExec::new_with_segments(
+            dataset.clone(),
+            query.clone(),
+            search_params.clone(),
+            PreFilterSource::None,
+            segments.clone(),
+        )
+        .with_base_scorer(complete_scorer);
+        assert_eq!(
+            execute_results(&complete_override).await.unwrap(),
+            baseline_results
+        );
+
+        let mut tokenizer = indices[0].tokenizer();
+        let incomplete_tokens = collect_query_tokens("quick", &mut tokenizer);
+        let incomplete_scorer = Arc::new(
+            build_global_bm25_scorer(&indices, &incomplete_tokens, &search_params, None)
+                .await
+                .unwrap(),
+        );
+        let incomplete_override = CompoundQueryExec::new_with_segments(
+            dataset.clone(),
+            query,
+            search_params.clone(),
+            PreFilterSource::None,
+            segments.clone(),
+        )
+        .with_base_scorer(incomplete_scorer);
+
+        let error = execute_results(&incomplete_override).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected BM25 scorer is missing compound FTS token 'brown'"),
+            "unexpected incomplete-scorer error: {error}"
+        );
+
+        let mut tokenizer = indices[0].tokenizer();
+        let brown_tokens = collect_query_tokens("brown", &mut tokenizer);
+        let scorer_without_fuzzy_expansion = Arc::new(
+            build_global_bm25_scorer(&indices, &brown_tokens, &search_params, None)
+                .await
+                .unwrap(),
+        );
+        let fuzzy_query = BooleanQuery::new([
+            (
+                Occur::Should,
+                MatchQuery::new("quik".to_string())
+                    .with_column(Some("text".to_string()))
+                    .with_fuzziness(Some(1))
+                    .into(),
+            ),
+            (
+                Occur::Should,
+                MatchQuery::new("brown".to_string())
+                    .with_column(Some("text".to_string()))
+                    .into(),
+            ),
+        ]);
+        let fuzzy_override = CompoundQueryExec::new_with_segments(
+            dataset,
+            fuzzy_query.into(),
+            search_params,
+            PreFilterSource::None,
+            segments,
+        )
+        .with_base_scorer(scorer_without_fuzzy_expansion);
+        let error = execute_results(&fuzzy_override).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected BM25 scorer is missing compound FTS token 'quick'"),
+            "unexpected fuzzy-scorer error: {error}"
+        );
     }
 
     fn empty_fts_child() -> Arc<dyn ExecutionPlan> {

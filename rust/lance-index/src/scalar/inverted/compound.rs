@@ -1459,6 +1459,17 @@ fn expanded_leaf_tokens(
     Ok(expanded)
 }
 
+fn validate_injected_scorer_tokens(scorer: &MemBM25Scorer, tokens: &Tokens) -> Result<()> {
+    for token in tokens {
+        if !scorer.token_docs.contains_key(token) {
+            return Err(Error::invalid_input(format!(
+                "injected BM25 scorer is missing compound FTS token '{token}'"
+            )));
+        }
+    }
+    Ok(())
+}
+
 async fn prepare_compound_query(
     indices: &[Arc<InvertedIndex>],
     query: &FtsQuery,
@@ -1484,8 +1495,6 @@ async fn prepare_compound_query(
     for leaf in leaf_queries {
         let effective_params = leaf.effective_params(params);
         let tokens = tokenize_leaf(first_index, &leaf, &effective_params);
-        // A preset scorer carries corpus-wide stats keyed by the full
-        // query token set, which covers every leaf's tokens.
         let scorer = match &base_scorer {
             Some(scorer) => scorer.clone(),
             None => Arc::new(
@@ -1495,12 +1504,12 @@ async fn prepare_compound_query(
         };
         let mut tokens_by_segment = Vec::with_capacity(indices.len());
         for index in indices {
-            tokens_by_segment.push(Arc::new(expanded_leaf_tokens(
-                index,
-                &tokens,
-                &effective_params,
-                leaf.operator(),
-            )?));
+            let expanded_tokens =
+                expanded_leaf_tokens(index, &tokens, &effective_params, leaf.operator())?;
+            if base_scorer.is_some() {
+                validate_injected_scorer_tokens(&scorer, &expanded_tokens)?;
+            }
+            tokens_by_segment.push(Arc::new(expanded_tokens));
         }
         leaves.push(PreparedLeaf {
             tokens_by_segment,
@@ -1787,6 +1796,40 @@ async fn resolve_compound_rows(
 /// candidates, including every kth-score tie, are resolved to row addresses
 /// before the final row-id tie-break is applied.
 pub async fn compound_search(
+    indices: &[Arc<InvertedIndex>],
+    query: &FtsQuery,
+    params: &FtsSearchParams,
+    prefilter: Arc<dyn PreFilter>,
+    metrics: Arc<dyn MetricsCollector>,
+) -> Result<(Vec<u64>, Vec<f32>)> {
+    compound_search_impl(indices, query, params, prefilter, metrics, None).await
+}
+
+/// Search one-column compound FTS with caller-supplied corpus-wide BM25 statistics.
+///
+/// The scorer must contain an entry for every token used by every query leaf,
+/// including terms produced by fuzzy expansion. An incomplete scorer is rejected
+/// instead of treating missing token statistics as zero.
+pub async fn compound_search_with_base_scorer(
+    indices: &[Arc<InvertedIndex>],
+    query: &FtsQuery,
+    params: &FtsSearchParams,
+    prefilter: Arc<dyn PreFilter>,
+    metrics: Arc<dyn MetricsCollector>,
+    base_scorer: Arc<MemBM25Scorer>,
+) -> Result<(Vec<u64>, Vec<f32>)> {
+    compound_search_impl(
+        indices,
+        query,
+        params,
+        prefilter,
+        metrics,
+        Some(base_scorer),
+    )
+    .await
+}
+
+async fn compound_search_impl(
     indices: &[Arc<InvertedIndex>],
     query: &FtsQuery,
     params: &FtsSearchParams,
