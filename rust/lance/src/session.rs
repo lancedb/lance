@@ -21,6 +21,17 @@ pub(crate) mod caches;
 pub mod index_caches;
 pub(crate) mod index_extension;
 
+/// Cache selection for one session cache tier.
+#[derive(Clone, Debug)]
+pub enum CacheSpec {
+    /// Use the Lance-level default capacity for the tier.
+    Default,
+    /// Use the default in-memory backend with this capacity.
+    Size(usize),
+    /// Use an already constructed backend.
+    Backend(Arc<dyn CacheBackend>),
+}
+
 /// A user session holds the runtime state for a [`crate::Dataset`]
 ///
 /// A session will be created automatically when a Dataset is opened.  However, you
@@ -165,6 +176,64 @@ impl Session {
         &*self.spill_store
     }
 
+    /// Create a session with custom backends for both caches.
+    ///
+    /// Each [`CacheSpec`] controls one tier. [`CacheSpec::Default`] uses that
+    /// tier's Lance-level default capacity, [`CacheSpec::Size`] uses the
+    /// default in-memory backend with an explicit capacity, and
+    /// [`CacheSpec::Backend`] uses a caller-provided backend. This keeps size
+    /// and backend selection mutually exclusive.
+    ///
+    /// This is the recommended constructor when a caller has already resolved
+    /// backend selection through
+    /// [`build_from_config`](lance_core::cache::build_from_config) or
+    /// [`build_from_uri`](lance_core::cache::build_from_uri) — the resulting
+    /// `Arc<dyn CacheBackend>` can be plugged in for either or both caches.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use lance::session::{CacheSpec, Session};
+    /// # use lance_core::cache::build_from_uri;
+    /// # fn example() -> lance_core::Result<()> {
+    /// let index_backend = build_from_uri("moka://?capacity=1048576")?;
+    /// let session = Session::with_cache_backends(
+    ///     CacheSpec::Backend(index_backend),
+    ///     CacheSpec::Default,
+    ///     Default::default(),
+    /// );
+    /// # let _ = session;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_cache_backends(
+        index_cache: CacheSpec,
+        metadata_cache: CacheSpec,
+        store_registry: Arc<ObjectStoreRegistry>,
+    ) -> Self {
+        let index_cache = Self::build_cache(index_cache, DEFAULT_INDEX_CACHE_SIZE);
+        let metadata_cache = Self::build_cache(metadata_cache, DEFAULT_METADATA_CACHE_SIZE);
+        Self {
+            index_cache: GlobalIndexCache(index_cache),
+            metadata_cache: GlobalMetadataCache(metadata_cache),
+            index_extensions: HashMap::new(),
+            store_registry,
+            spill_store: Arc::new(LocalSpillStore::default()),
+        }
+    }
+
+    fn build_cache(spec: CacheSpec, default_size: usize) -> LanceCache {
+        match spec {
+            CacheSpec::Default => {
+                LanceCache::with_backend(Arc::new(QuickCacheBackend::with_capacity(default_size)))
+            }
+            CacheSpec::Size(size) => {
+                LanceCache::with_backend(Arc::new(QuickCacheBackend::with_capacity(size)))
+            }
+            CacheSpec::Backend(backend) => LanceCache::with_backend(backend),
+        }
+    }
+
     /// Register a new index extension.
     ///
     /// A name can only be registered once per type of index extension.
@@ -262,10 +331,23 @@ impl Default for Session {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lance_core::cache::UnsizedCacheKey;
+    use lance_core::cache::{CacheKey, UnsizedCacheKey};
     use lance_index::vector::VectorIndex;
     use std::borrow::Cow;
     use tokio::io::AsyncWriteExt;
+
+    struct TestKey(&'static str);
+    impl CacheKey for TestKey {
+        type ValueType = Vec<i32>;
+
+        fn key(&self) -> Cow<'_, str> {
+            Cow::Borrowed(self.0)
+        }
+
+        fn type_name() -> &'static str {
+            "Test"
+        }
+    }
 
     struct TestUnsizedKey(&'static str);
     impl UnsizedCacheKey for TestUnsizedKey {
@@ -288,6 +370,74 @@ mod tests {
                 .get_unsized_with_key(&TestUnsizedKey("abc"))
                 .await
                 .is_none()
+        );
+    }
+
+    /// `with_cache_backends` should honor whichever tier the caller
+    /// provided a backend for and fall back to that tier's default on the
+    /// other tier.
+    #[tokio::test]
+    async fn test_with_cache_backends_uses_provided_and_default() {
+        use lance_core::cache::build_from_uri;
+
+        let index_backend = build_from_uri("moka://?capacity=1048576").unwrap();
+        let session = Session::with_cache_backends(
+            CacheSpec::Backend(index_backend),
+            CacheSpec::Default,
+            Default::default(),
+        );
+
+        let value = Arc::new(vec![1, 2, 3]);
+        session
+            .index_cache
+            .insert_with_key(&TestKey("injected-index-backend"), value.clone())
+            .await;
+        assert_eq!(
+            session
+                .index_cache
+                .get_with_key(&TestKey("injected-index-backend"))
+                .await
+                .as_deref(),
+            Some(value.as_ref())
+        );
+        // Metadata cache fell back to a size-based default. We can only
+        // sanity-check that the session was constructed without panicking.
+        let stats = session.metadata_cache.0.stats().await;
+        assert_eq!(stats.num_entries, 0);
+    }
+
+    #[tokio::test]
+    async fn test_with_cache_backends_uses_explicit_size() {
+        let session = Session::with_cache_backends(
+            CacheSpec::Size(0),
+            CacheSpec::Size(2048),
+            Default::default(),
+        );
+
+        session
+            .index_cache
+            .insert_with_key(&TestKey("disabled-index-cache"), Arc::new(vec![1, 2, 3]))
+            .await;
+        assert!(
+            session
+                .index_cache
+                .get_with_key(&TestKey("disabled-index-cache"))
+                .await
+                .is_none()
+        );
+
+        session
+            .metadata_cache
+            .0
+            .insert_with_key(&TestKey("metadata-cache"), Arc::new(vec![4, 5, 6]))
+            .await;
+        assert!(
+            session
+                .metadata_cache
+                .0
+                .get_with_key(&TestKey("metadata-cache"))
+                .await
+                .is_some()
         );
     }
 

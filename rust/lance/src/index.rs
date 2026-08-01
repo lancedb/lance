@@ -634,6 +634,15 @@ fn segment_has_zonemap_details(segment: &IndexMetadata) -> bool {
         .is_some_and(|details| details.type_url.ends_with("ZoneMapIndexDetails"))
 }
 
+/// True when the index reports matches as physical row addresses rather than row ids
+/// (`ScalarIndex::results_are_row_addresses`).
+///
+/// Such an index cannot follow its data through a rewrite: the addresses it stores
+/// name fragments and offsets, and neither kind supports remap.
+pub(crate) fn index_results_are_row_addrs(index: &IndexMetadata) -> bool {
+    segment_has_zonemap_details(index) || segment_has_bloomfilter_details(index)
+}
+
 fn segment_has_fmindex_details(segment: &IndexMetadata) -> bool {
     segment
         .index_details

@@ -52,6 +52,7 @@ impl ScoredRow<u64> {
 
 /// Conservative score bounds for a document range.
 ///
+/// The lower bound is needed by signed compositions such as [`BoostScorer`].
 /// Arithmetic widens both sides by one representable `f32` so nested
 /// operations cannot round an upper bound below an exact score.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -115,6 +116,21 @@ impl ScoreBounds {
         Self {
             lower: next_down(self.lower + other.lower),
             upper: next_up(self.upper + other.upper),
+        }
+    }
+
+    fn subtract_scaled(self, other: Self, factor: f32) -> Self {
+        let penalty = other.scale_non_negative(factor);
+        if !self.lower.is_finite()
+            || !self.upper.is_finite()
+            || !penalty.lower.is_finite()
+            || !penalty.upper.is_finite()
+        {
+            return Self::UNBOUNDED;
+        }
+        Self {
+            lower: next_down(self.lower - penalty.upper),
+            upper: next_up(self.upper - penalty.lower),
         }
     }
 }
@@ -188,6 +204,10 @@ pub(super) trait ComposableScorer: Send {
     fn match_cost(&self) -> Option<f32> {
         None
     }
+
+    fn scores_non_negative(&self) -> bool {
+        false
+    }
 }
 
 type BoxScorer<'a> = Box<dyn ComposableScorer + 'a>;
@@ -197,6 +217,11 @@ enum CompoundScorerPlan {
     Leaf {
         index: usize,
         boost: f32,
+    },
+    Boost {
+        positive: Box<Self>,
+        negative: Box<Self>,
+        negative_boost: f32,
     },
     MultiMatch(Vec<Self>),
     Boolean {
@@ -222,6 +247,11 @@ impl CompoundScorerPlan {
                 *num_leaves += 1;
                 Ok(Self::Leaf { index, boost: 1.0 })
             }
+            FtsQuery::Boost(query) => Ok(Self::Boost {
+                positive: Box::new(Self::from_query(&query.positive, num_leaves)?),
+                negative: Box::new(Self::from_query(&query.negative, num_leaves)?),
+                negative_boost: query.negative_boost,
+            }),
             FtsQuery::MultiMatch(query) => Ok(Self::MultiMatch(
                 query
                     .match_queries
@@ -246,9 +276,6 @@ impl CompoundScorerPlan {
                     .map(|query| Self::from_query(query, num_leaves))
                     .collect::<Result<Vec<_>>>()?,
             }),
-            FtsQuery::Boost(_) => Err(Error::not_supported(
-                "posting-backed compound FTS does not support BoostQuery yet",
-            )),
         }
     }
 
@@ -265,6 +292,15 @@ impl CompoundScorerPlan {
                     })?;
                 Ok(Box::new(ScaleScorer::try_new(leaf, *boost)?))
             }
+            Self::Boost {
+                positive,
+                negative,
+                negative_boost,
+            } => Ok(Box::new(BoostScorer::try_new(
+                positive.build(leaves)?,
+                negative.build(leaves)?,
+                *negative_boost,
+            )?)),
             Self::MultiMatch(children) => Ok(Box::new(DisjunctionScorer::try_new(
                 children
                     .iter()
@@ -340,6 +376,10 @@ impl<D: WandDocuments + Sync> ComposableScorer for WandCursor<'_, D> {
     fn match_cost(&self) -> Option<f32> {
         self.match_cost()
     }
+
+    fn scores_non_negative(&self) -> bool {
+        true
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -359,6 +399,7 @@ struct MaterializedScorer {
     index: Option<usize>,
     shallow: Option<ShallowRange>,
     min_competitive_score: f32,
+    scores_non_negative: bool,
 }
 
 #[cfg(test)]
@@ -373,12 +414,14 @@ impl MaterializedScorer {
                 )));
             }
         }
+        let scores_non_negative = rows.iter().all(|row| row.score >= 0.0);
         Ok(Self {
             rows,
             block_size: DEFAULT_BLOCK_SIZE,
             index: None,
             shallow: None,
             min_competitive_score: f32::NEG_INFINITY,
+            scores_non_negative,
         })
     }
 
@@ -500,6 +543,10 @@ impl ComposableScorer for MaterializedScorer {
             self.min_competitive_score = min_score;
         }
         Ok(())
+    }
+
+    fn scores_non_negative(&self) -> bool {
+        self.scores_non_negative
     }
 }
 
@@ -778,6 +825,10 @@ impl ComposableScorer for EmptyScorer {
     fn set_min_competitive_score(&mut self, _min_score: f32) -> Result<()> {
         Ok(())
     }
+
+    fn scores_non_negative(&self) -> bool {
+        true
+    }
 }
 
 struct ScaleScorer<'a> {
@@ -846,6 +897,10 @@ impl ComposableScorer for ScaleScorer<'_> {
 
     fn match_cost(&self) -> Option<f32> {
         self.child.match_cost()
+    }
+
+    fn scores_non_negative(&self) -> bool {
+        self.child.scores_non_negative()
     }
 }
 
@@ -1045,6 +1100,12 @@ impl ComposableScorer for DisjunctionScorer<'_> {
             .filter_map(|child| child.match_cost())
             .reduce(|left, right| left + right)
     }
+
+    fn scores_non_negative(&self) -> bool {
+        self.children
+            .iter()
+            .all(|child| child.scores_non_negative())
+    }
 }
 
 /// Intersection scorer preserving the existing Boolean MUST score contract:
@@ -1185,6 +1246,130 @@ impl ComposableScorer for RequiredConjunctionScorer<'_> {
             .iter()
             .filter_map(|child| child.match_cost())
             .reduce(|left, right| left + right)
+    }
+
+    fn scores_non_negative(&self) -> bool {
+        self.children[0].scores_non_negative()
+    }
+}
+
+/// Positive-driven Boost scorer with signed conservative bounds.
+pub(super) struct BoostScorer<'a> {
+    positive: BoxScorer<'a>,
+    negative: BoxScorer<'a>,
+    negative_boost: f32,
+    negative_matches_doc: Option<u64>,
+    negative_matches: bool,
+}
+
+impl<'a> BoostScorer<'a> {
+    pub(super) fn try_new(
+        positive: BoxScorer<'a>,
+        negative: BoxScorer<'a>,
+        negative_boost: f32,
+    ) -> Result<Self> {
+        if !negative_boost.is_finite() || negative_boost < 0.0 {
+            return Err(Error::invalid_input(format!(
+                "BoostQuery negative_boost must be finite and non-negative, got {negative_boost}"
+            )));
+        }
+        Ok(Self {
+            positive,
+            negative,
+            negative_boost,
+            negative_matches_doc: None,
+            negative_matches: false,
+        })
+    }
+
+    fn reset_confirmation(&mut self) {
+        self.negative_matches_doc = None;
+        self.negative_matches = false;
+    }
+
+    fn confirm_negative(&mut self) -> Result<bool> {
+        let Some(current) = self.positive.doc() else {
+            return Ok(false);
+        };
+        if self.negative_matches_doc == Some(current) {
+            return Ok(self.negative_matches);
+        }
+        self.negative_matches =
+            self.negative.advance(current)? == Some(current) && self.negative.matches()?;
+        self.negative_matches_doc = Some(current);
+        Ok(self.negative_matches)
+    }
+}
+
+impl ComposableScorer for BoostScorer<'_> {
+    fn doc(&self) -> Option<u64> {
+        self.positive.doc()
+    }
+
+    fn document_key(&self) -> Option<u64> {
+        self.positive.document_key()
+    }
+
+    fn next(&mut self) -> Result<Option<u64>> {
+        self.reset_confirmation();
+        self.positive.next()
+    }
+
+    fn advance(&mut self, target: u64) -> Result<Option<u64>> {
+        self.reset_confirmation();
+        self.positive.advance(target)
+    }
+
+    fn cost(&self) -> usize {
+        self.positive.cost()
+    }
+
+    fn score(&mut self) -> Result<f32> {
+        let positive = self.positive.score()?;
+        let score = if self.confirm_negative()? {
+            positive - self.negative_boost * self.negative.score()?
+        } else {
+            positive
+        };
+        checked_score(score, "BoostQuery scorer")
+    }
+
+    fn advance_shallow(&mut self, target: u64) -> Result<u64> {
+        let mut up_to = self.positive.advance_shallow(target)?;
+        if self.negative.doc().is_none_or(|doc| doc < target) {
+            self.negative.advance(target)?;
+        }
+        if let Some(doc) = self.negative.doc() {
+            up_to = up_to.min(self.negative.advance_shallow(target.max(doc))?);
+        }
+        Ok(up_to)
+    }
+
+    fn score_bounds(&mut self, up_to: u64) -> Result<ScoreBounds> {
+        let positive = self.positive.score_bounds(up_to)?;
+        let negative = if self.negative.doc().is_some_and(|doc| doc <= up_to) {
+            self.negative.score_bounds(up_to)?.include_zero()
+        } else {
+            ScoreBounds::ZERO
+        };
+        Ok(positive.subtract_scaled(negative, self.negative_boost))
+    }
+
+    fn set_min_competitive_score(&mut self, min_score: f32) -> Result<()> {
+        // With a non-negative negative scorer, Boost can only demote the
+        // positive score, so the parent's floor is safe for the positive side.
+        if self.negative.scores_non_negative() {
+            self.positive.set_min_competitive_score(min_score)?;
+        }
+        Ok(())
+    }
+
+    fn matches(&mut self) -> Result<bool> {
+        self.positive.matches()
+    }
+
+    fn match_cost(&self) -> Option<f32> {
+        self.positive.match_cost()
     }
 }
 
@@ -1346,6 +1531,14 @@ impl ComposableScorer for BooleanScorer<'_> {
     fn matches(&mut self) -> Result<bool> {
         Ok(self.current.is_some())
     }
+
+    fn scores_non_negative(&self) -> bool {
+        self.driver.scores_non_negative()
+            && self
+                .optional
+                .as_ref()
+                .is_none_or(|optional| optional.scores_non_negative())
+    }
 }
 
 #[derive(Clone)]
@@ -1390,6 +1583,10 @@ fn collect_leaf_queries(query: &FtsQuery, leaves: &mut Vec<LeafQuery>) -> Result
     match query {
         FtsQuery::Match(query) => leaves.push(LeafQuery::Match(query.clone())),
         FtsQuery::Phrase(query) => leaves.push(LeafQuery::Phrase(query.clone())),
+        FtsQuery::Boost(query) => {
+            collect_leaf_queries(&query.positive, leaves)?;
+            collect_leaf_queries(&query.negative, leaves)?;
+        }
         FtsQuery::MultiMatch(query) => {
             leaves.extend(query.match_queries.iter().cloned().map(LeafQuery::Match));
         }
@@ -1402,11 +1599,6 @@ fn collect_leaf_queries(query: &FtsQuery, leaves: &mut Vec<LeafQuery>) -> Result
             {
                 collect_leaf_queries(child, leaves)?;
             }
-        }
-        FtsQuery::Boost(_) => {
-            return Err(Error::not_supported(
-                "posting-backed compound FTS does not support BoostQuery yet",
-            ));
         }
     }
     Ok(())
@@ -1854,6 +2046,35 @@ mod tests {
     }
 
     #[test]
+    fn score_bounds_are_conservative_under_nested_sum_and_boost() {
+        let should = DisjunctionScorer::try_new(
+            vec![
+                materialized(&[(0, 0.1), (2, 2.0)]),
+                materialized(&[(0, 0.2)]),
+            ],
+            DisjunctionScore::Sum,
+        )
+        .unwrap();
+        let negative = materialized(&[(0, 0.3), (2, 5.0)]);
+        let mut scorer = BoostScorer::try_new(Box::new(should), negative, 0.5).unwrap();
+
+        assert_eq!(scorer.next().unwrap(), Some(0));
+        let up_to = scorer.advance_shallow(0).unwrap();
+        let bounds = scorer.score_bounds(up_to).unwrap();
+        let first_score = scorer.score().unwrap();
+        assert!(bounds.lower <= first_score);
+        assert!(bounds.upper >= first_score);
+
+        assert_eq!(scorer.next().unwrap(), Some(2));
+        let second_score = scorer.score().unwrap();
+        assert!(second_score.is_sign_negative());
+        let up_to = scorer.advance_shallow(2).unwrap();
+        let bounds = scorer.score_bounds(up_to).unwrap();
+        assert!(bounds.lower <= second_score);
+        assert!(bounds.upper >= second_score);
+    }
+
+    #[test]
     fn collector_propagates_threshold_across_partitions_and_keeps_ties() {
         let mut collector = TopKCollector::new(2);
         let mut first = MaterializedScorer::try_new(rows(&[(8, 9.0), (4, 10.0), (3, 9.0)]))
@@ -1925,6 +2146,10 @@ mod tests {
             Ok(self
                 .doc()
                 .is_some_and(|doc| self.accepted.binary_search(&doc).is_ok()))
+        }
+
+        fn scores_non_negative(&self) -> bool {
+            true
         }
     }
 

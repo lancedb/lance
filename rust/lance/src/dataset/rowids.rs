@@ -94,20 +94,22 @@ pub async fn get_row_id_index(
 /// deletions are tracked by the deletion vector and do not compact the sequence,
 /// so a physical offset indexes the sequence directly (see [`RowIdIndex`], which
 /// maps ids to `start_address + position` and filters deletions separately).
-/// Addresses that point at deleted rows have no live counterpart and are dropped,
-/// which is correct: those rows are not part of the answer.
+/// Addresses that no longer have a live counterpart are dropped, which is correct:
+/// those rows are not part of the answer. That covers both a deleted row and a
+/// whole fragment that a maintenance operation replaced — an address-domain index
+/// is not remapped by compaction or `update` (neither the zone map nor the bloom
+/// filter index supports remap), so its results outlive the fragments they address.
+/// The replacement fragments are absent from the index's fragment bitmap, so the
+/// scanner routes them to a full scan and no match is lost.
 pub(crate) async fn translate_addr_treemap_to_row_ids(
     dataset: &Dataset,
     addrs: &RowAddrTreeMap,
 ) -> Result<RowAddrTreeMap> {
     let mut row_ids = RowAddrTreeMap::new();
     for (fragment_id, selection) in addrs.iter() {
-        let file_fragment = dataset.get_fragment(*fragment_id as usize).ok_or_else(|| {
-            Error::internal(format!(
-                "fragment {fragment_id} referenced by an address-domain index result \
-                 was not found in the dataset"
-            ))
-        })?;
+        let Some(file_fragment) = dataset.get_fragment(*fragment_id as usize) else {
+            continue;
+        };
         let sequence = load_row_id_sequence(dataset, file_fragment.metadata()).await?;
 
         match selection {

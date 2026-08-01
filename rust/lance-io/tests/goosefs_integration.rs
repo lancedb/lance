@@ -25,7 +25,7 @@ fn get_operator() -> Operator {
     cfg.insert("master_addr".to_string(), addr);
     cfg.insert("root".to_string(), "/lance-test/opendal".to_string());
     cfg.insert("auth_type".to_string(), auth_type);
-    Operator::from_iter::<GooseFs>(cfg).unwrap().finish()
+    Operator::from_iter::<GooseFs>(cfg).unwrap()
 }
 
 // ============================================================

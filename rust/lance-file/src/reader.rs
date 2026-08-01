@@ -2750,7 +2750,9 @@ mod tests {
         ReaderProjection, validate_field_length, verify_uniform_lengths,
     };
     use crate::testing::{FsFixture, WrittenFile, test_cache, write_lance_file};
-    use crate::writer::{EncodedBatchWriteExt, FileWriter, FileWriterOptions};
+    use crate::version::ConcreteFileVersion;
+    use crate::versions;
+    use crate::writer::FileWriterOptions;
     use lance_encoding::decoder::DecoderConfig;
 
     fn footer_version(bytes: &[u8]) -> (u16, u16) {
@@ -2806,10 +2808,8 @@ mod tests {
         write_lance_file(
             input,
             &fs,
-            FileWriterOptions {
-                format_version: Some(LanceFileVersion::V2_3),
-                ..Default::default()
-            },
+            ConcreteFileVersion::V2_3,
+            FileWriterOptions::default(),
         )
         .await;
 
@@ -2910,10 +2910,8 @@ mod tests {
         write_lance_file(
             reader,
             fs,
-            FileWriterOptions {
-                format_version: Some(version),
-                ..Default::default()
-            },
+            ConcreteFileVersion::from(version),
+            FileWriterOptions::default(),
         )
         .await
     }
@@ -2928,10 +2926,8 @@ mod tests {
         write_lance_file(
             reader,
             fs,
-            FileWriterOptions {
-                format_version: Some(LanceFileVersion::V2_1),
-                ..Default::default()
-            },
+            ConcreteFileVersion::V2_1,
+            FileWriterOptions::default(),
         )
         .await
     }
@@ -2951,10 +2947,8 @@ mod tests {
         write_lance_file(
             reader,
             fs,
-            FileWriterOptions {
-                format_version: Some(LanceFileVersion::V2_1),
-                ..Default::default()
-            },
+            ConcreteFileVersion::V2_1,
+            FileWriterOptions::default(),
         )
         .await
     }
@@ -2982,10 +2976,8 @@ mod tests {
         write_lance_file(
             reader,
             fs,
-            FileWriterOptions {
-                format_version: Some(LanceFileVersion::V2_1),
-                ..Default::default()
-            },
+            ConcreteFileVersion::V2_1,
+            FileWriterOptions::default(),
         )
         .await
     }
@@ -3143,7 +3135,11 @@ mod tests {
         .unwrap();
 
         // Test self described
-        let bytes = encoded_batch.try_to_self_described_lance(version).unwrap();
+        let bytes = versions::encode_self_described_batch(
+            ConcreteFileVersion::from(version),
+            &encoded_batch,
+        )
+        .unwrap();
         assert_eq!(footer_version(&bytes), (2, 0));
 
         let decoded_batch = EncodedBatch::try_from_self_described_lance(bytes).unwrap();
@@ -3162,7 +3158,8 @@ mod tests {
         assert_eq!(data, decoded);
 
         // Test mini
-        let bytes = encoded_batch.try_to_mini_lance(version).unwrap();
+        let bytes = versions::encode_mini_batch(ConcreteFileVersion::from(version), &encoded_batch)
+            .unwrap();
         assert_eq!(footer_version(&bytes), (2, 0));
         let decoded_batch =
             EncodedBatch::try_from_mini_lance(bytes, lance_schema.as_ref(), LanceFileVersion::V2_0)
@@ -3778,14 +3775,11 @@ mod tests {
         let lance_schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
 
         let fs = FsFixture::default();
-        let options = FileWriterOptions {
-            format_version: Some(LanceFileVersion::V2_1),
-            ..Default::default()
-        };
-        let mut writer = FileWriter::try_new(
+        let mut writer = versions::create_writer(
+            ConcreteFileVersion::V2_1,
             fs.object_store.create(&fs.tmp_path).await.unwrap(),
             lance_schema.clone(),
-            options,
+            FileWriterOptions::default(),
         )
         .unwrap();
         // "a" has 5 rows, "c" has 1 -- an unequal-length file.
@@ -4176,7 +4170,8 @@ mod tests {
             )]))
             .unwrap();
 
-        let mut file_writer = FileWriter::try_new(
+        let mut file_writer = versions::create_writer(
+            ConcreteFileVersion::V2_1,
             fs.object_store.create(&fs.tmp_path).await.unwrap(),
             lance_schema,
             FileWriterOptions::default(),

@@ -433,6 +433,7 @@ impl FtsQueryNode for PhraseQuery {
 pub struct BoostQuery {
     pub positive: Box<FtsQuery>,
     pub negative: Box<FtsQuery>,
+    /// Finite, non-negative multiplier subtracted from the positive score.
     #[serde(default = "BoostQuery::default_negative_boost")]
     pub negative_boost: f32,
 }

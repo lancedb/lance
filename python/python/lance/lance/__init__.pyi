@@ -284,6 +284,23 @@ class LanceColumnStatistics:
     size_bytes: int
 
 class _Session:
+    def __init__(
+        self,
+        index_cache_size_bytes: Optional[int] = None,
+        metadata_cache_size_bytes: Optional[int] = None,
+        index_cache_backend: Optional[str | Dict[str, Any]] = None,
+        metadata_cache_backend: Optional[str | Dict[str, Any]] = None,
+    ) -> None:
+        """Create a Lance session.
+
+        Cache backends may be backend URI strings such as
+        ``"moka://?capacity=1048576"`` or dictionaries such as
+        ``{"kind": "moka", "options": {"capacity": "1048576"}}``.
+        ``index_cache_backend`` is mutually exclusive with
+        ``index_cache_size_bytes``. ``metadata_cache_backend`` is mutually
+        exclusive with ``metadata_cache_size_bytes``.
+        """
+        ...
     def size_bytes(self) -> int: ...
     def index_cache_size_bytes(self) -> int: ...
 

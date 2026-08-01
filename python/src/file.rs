@@ -29,7 +29,7 @@ use lance_file::reader::{
     ReaderProjection,
 };
 use lance_file::writer::{FileWriter, FileWriterOptions};
-use lance_file::{LanceEncodingsIo, version::LanceFileVersion};
+use lance_file::{LanceEncodingsIo, version::LanceFileVersion, versions as file_versions};
 use lance_io::object_store::{LanceNamespaceStorageOptionsProvider, ObjectStoreParams};
 use lance_io::{
     ReadBatchParams,
@@ -295,21 +295,24 @@ impl LanceFileWriter {
         max_page_bytes: Option<u64>,
     ) -> PyResult<Self> {
         let object_writer = object_store.create(&path).await.infer_error()?;
+        let version = version
+            .map(|value| value.parse::<LanceFileVersion>())
+            .transpose()
+            .infer_error()?
+            .unwrap_or_default()
+            .resolve()
+            .into();
         let options = FileWriterOptions {
             data_cache_bytes,
             keep_original_array,
             max_page_bytes,
-            format_version: version
-                .map(|v| v.parse::<LanceFileVersion>())
-                .transpose()
-                .infer_error()?,
-            ..Default::default()
         };
         let inner = if let Some(schema) = schema {
             let lance_schema = lance_core::datatypes::Schema::try_from(&schema.0).infer_error()?;
-            FileWriter::try_new(object_writer, lance_schema, options).infer_error()
+            file_versions::create_writer(version, object_writer, lance_schema, options)
+                .infer_error()
         } else {
-            Ok(FileWriter::new_lazy(object_writer, options))
+            file_versions::create_lazy_writer(version, object_writer, options).infer_error()
         }?;
         Ok(Self {
             inner: Arc::new(Mutex::new(Box::new(inner))),

@@ -14,7 +14,9 @@ use lance_arrow::{
 use lance_core::datatypes::{
     NullabilityComparison, OnMissing, OnTypeMismatch, SchemaCompareOptions,
 };
-use lance_core::utils::tracing::{AUDIT_MODE_CREATE, AUDIT_TYPE_DATA, TRACE_FILE_AUDIT};
+use lance_core::utils::tracing::{
+    AUDIT_MODE_CREATE, AUDIT_MODE_DELETE, AUDIT_TYPE_DATA, TRACE_FILE_AUDIT,
+};
 use lance_core::{Error, Result, datatypes::Schema};
 use lance_datafusion::chunker::{break_stream, chunk_stream};
 use lance_datafusion::utils::StreamingWriteSource;
@@ -840,8 +842,13 @@ pub(crate) async fn cleanup_data_fragments(
             };
 
             let path = file_dir.clone().join(file.path.as_str());
-            if let Err(e) = store.delete(&path).await {
-                log::warn!("Failed to clean up orphaned data file '{}': {}", path, e);
+            match store.delete(&path).await {
+                Ok(()) => {
+                    info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE, r#type=AUDIT_TYPE_DATA, path = file.path.as_str());
+                }
+                Err(e) => {
+                    log::warn!("Failed to clean up orphaned data file '{}': {}", path, e);
+                }
             }
 
             // Clean up any blob v2 sidecars that might exist for this data file.
@@ -1508,6 +1515,7 @@ where
 
 struct V2WriterAdapter {
     writer: current_writer::FileWriter,
+    version: ConcreteFileVersion,
     path: String,
     base_id: Option<u32>,
     preprocessor: Option<BlobPreprocessor>,
@@ -1550,13 +1558,12 @@ impl GenericWriter for V2WriterAdapter {
             .iter()
             .map(|(_, column_index)| *column_index as i32)
             .collect::<Vec<_>>();
-        let file_version = ConcreteFileVersion::from(self.writer.version());
         let write_summary = self.writer.finish().await?;
         let data_file = DataFile::new(
             std::mem::take(&mut self.path),
             field_ids,
             column_indices,
-            file_version,
+            self.version,
             NonZero::new(write_summary.size_bytes),
             self.base_id,
         );
@@ -1680,13 +1687,12 @@ async fn open_writer_with_options(
     } else {
         let writer = object_store.create(&full_path).await?;
         let enable_blob_v2 = storage_version >= LanceFileVersion::V2_2;
-        let file_writer = current_writer::FileWriter::try_new(
+        let version = ConcreteFileVersion::from(storage_version);
+        let file_writer = lance_file::versions::create_writer(
+            version,
             writer,
             schema.clone(),
-            FileWriterOptions {
-                format_version: Some(storage_version),
-                ..Default::default()
-            },
+            FileWriterOptions::default(),
         )?;
         let preprocessor = if enable_blob_v2 {
             Some(BlobPreprocessor::new(
@@ -1706,6 +1712,7 @@ async fn open_writer_with_options(
         };
         let writer_adapter = V2WriterAdapter {
             writer: file_writer,
+            version,
             path: filename,
             base_id,
             preprocessor,

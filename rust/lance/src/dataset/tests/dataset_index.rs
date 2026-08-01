@@ -1086,7 +1086,10 @@ async fn test_same_column_compound_scorer_is_exact_and_bounded() {
     };
     let query: FtsQuery = BooleanQuery::new([
         (Occur::Must, match_query("common")),
-        (Occur::Should, match_query("tie")),
+        (
+            Occur::Should,
+            BoostQuery::new(match_query("tie"), match_query("filler"), Some(0.5)).into(),
+        ),
         (
             Occur::Should,
             PhraseQuery::new("common tie".to_owned())

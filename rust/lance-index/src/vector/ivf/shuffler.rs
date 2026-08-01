@@ -34,6 +34,8 @@ use lance_core::{Error, ROW_ID, Result, datatypes::Schema};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_encoding::version::LanceFileVersion;
 use lance_file::reader::{FileReader as Lancev2FileReader, FileReaderOptions};
+use lance_file::version::ConcreteFileVersion;
+use lance_file::versions;
 use lance_file::versions::v1::reader::FileReader as V1FileReader;
 use lance_file::versions::v1::writer::FileWriter as V1FileWriter;
 use lance_file::writer::FileWriterOptions;
@@ -805,13 +807,11 @@ impl IvfShuffler {
                         true,
                     )]));
                     let lance_schema = Schema::try_from(sorted_file_schema.as_ref())?;
-                    let mut file_writer = lance_file::writer::FileWriter::try_new(
+                    let mut file_writer = versions::create_writer(
+                        ConcreteFileVersion::from(this.format_version),
                         writer,
                         lance_schema,
-                        FileWriterOptions {
-                            format_version: Some(this.format_version),
-                            ..Default::default()
-                        },
+                        FileWriterOptions::default(),
                     )?;
 
                     for partition_and_idx in shuffled.into_iter().enumerate() {
