@@ -194,8 +194,11 @@ async fn test_diag_lance_io_write_modes() {
 
     // Best-effort cleanup of leftover test files. object_store_opendal maps
     // relative paths to the GooseFS root, so prior runs leave files at /
-    // even when the ObjectStore URI uses a per-run subdirectory.
-    for name in ["test_file.txt", "test_create.txt", "test_create_race.txt"].iter() {
+    // even when the ObjectStore URI uses a per-run subdirectory. The
+    // concurrent exactly-one-winner race now lives in its own
+    // `test_diag_concurrent_put_create_exactly_one_winner` test, which
+    // uses a per-run filename so it does not share state with this test.
+    for name in ["test_file.txt", "test_create.txt"].iter() {
         let p = object_store::path::Path::parse(name).unwrap();
         let _ = object_store.inner.delete(&p).await;
     }
@@ -272,14 +275,95 @@ async fn test_diag_lance_io_write_modes() {
     );
     eprintln!("[DIAG] PutMode::Create conflict correctly rejected! ✅");
 
-    // Test 2.5: concurrent PutMode::Create on a fresh, cleaned-up path —
-    // this is the property that makes ConditionalPutCommitHandler safe
-    // under concurrent manifest commits. Two writers must race on the
-    // same path and exactly one must win; the stored bytes must match
-    // the winner's payload.
-    let race_path = object_store::path::Path::parse("test_create_race.txt").unwrap();
-    // Best-effort cleanup of leftovers from a previous run.
-    let _ = object_store.inner.delete(&race_path).await;
+    // Test 3: rename_if_not_exists
+    eprintln!("[DIAG] Testing rename_if_not_exists...");
+    let tmp_path = object_store::path::Path::parse("_tmp_rename.txt").unwrap();
+    let dest_path = object_store::path::Path::parse("renamed.txt").unwrap();
+    match object_store
+        .inner
+        .put(&tmp_path, bytes::Bytes::from("rename me!").into())
+        .await
+    {
+        Ok(_) => {
+            eprintln!("[DIAG] Tmp file written ✅");
+            match object_store
+                .inner
+                .rename_if_not_exists(&tmp_path, &dest_path)
+                .await
+            {
+                Ok(_) => eprintln!("[DIAG] rename_if_not_exists succeeded! ✅"),
+                Err(e) => eprintln!("[DIAG] rename_if_not_exists FAILED: {:?}", e),
+            }
+        }
+        Err(e) => eprintln!("[DIAG] Tmp file write FAILED: {:?}", e),
+    }
+
+    eprintln!("[DIAG] lance-io direct write test complete ✅");
+}
+
+/// Concurrency regression: two `PutMode::Create` writers racing on the
+/// same fresh path must produce exactly one winner, and the stored bytes
+/// must match the winner's payload byte-for-byte. This is the property
+/// that makes `ConditionalPutCommitHandler` safe under concurrent
+/// manifest commits: every writer either commits its manifest or observes
+/// the loser's precondition failure and retries against a fresh version.
+///
+/// Split out of `test_diag_lance_io_write_modes` so the race assertions
+/// cannot be silently skipped — the basic-write `return` on error in the
+/// diagnostic test no longer covers the race, and the race is now a
+/// first-class ignored test with its own setup/teardown invariants:
+///
+/// 1. **Per-run path.** The race filename embeds a nanosecond timestamp so
+///    concurrent or back-to-back runs in the same process never share
+///    state. `object_store_opendal` maps the relative filename to the
+///    GooseFS root regardless of the ObjectStore URI path, so a
+///    per-run URI subdirectory would not isolate runs on its own.
+/// 2. **Explicit pre-cleanup.** A leftover from a prior crashed run is
+///    expected (`NotFound` is the only accepted pre-cleanup error); any
+///    other error fails the test rather than being silently ignored.
+/// 3. **Strict setup.** Every setup step uses `expect` so a transient
+///    `ObjectStore` construction or filename-parse error is surfaced
+///    rather than logged and skipped.
+/// 4. **Post-cleanup.** The winning path is removed on success; cleanup
+///    must report `Ok` or `NotFound`.
+///
+/// Requires a live GooseFS cluster.
+#[tokio::test]
+#[ignore = "Requires GooseFS cluster"]
+async fn test_diag_concurrent_put_create_exactly_one_winner() {
+    let addr = std::env::var("GOOSEFS_MASTER_ADDR").unwrap_or_else(|_| "127.0.0.1:9200".into());
+    // Nanosecond timestamp gives effectively unique filenames even for
+    // back-to-back runs in the same process. The race path is *not* put
+    // under the per-run URI subdirectory because `object_store_opendal`
+    // ignores the URL path when resolving relative keys.
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let race_filename = format!("test_create_race_{}.txt", ts);
+    let root = format!("goosefs://{}/lance-test", addr);
+    eprintln!(
+        "[DIAG] Creating ObjectStore at: {} (race path: {})",
+        root, race_filename
+    );
+
+    let params = ObjectStoreParams::default();
+    let registry = Arc::new(ObjectStoreRegistry::default());
+    let (object_store, _path) = ObjectStore::from_uri_and_params(registry.clone(), &root, &params)
+        .await
+        .expect("Failed to create ObjectStore");
+
+    let race_path = object_store::path::Path::parse(&race_filename).unwrap();
+
+    // Pre-flight cleanup: the race path is per-run, so a leftover can
+    // only come from a prior run that crashed before its post-cleanup
+    // completed. `Ok` and `NotFound` are both expected; any other error
+    // is a setup failure that would otherwise silently skip the race.
+    match object_store.inner.delete(&race_path).await {
+        Ok(_) => {}
+        Err(object_store::Error::NotFound { .. }) => {}
+        Err(e) => panic!("pre-cleanup of race path {race_filename} failed: {e:?}"),
+    }
 
     let store_a = object_store.clone();
     let store_b = object_store.clone();
@@ -385,28 +469,17 @@ async fn test_diag_lance_io_write_modes() {
         stored.len()
     );
 
-    // Test 3: rename_if_not_exists
-    eprintln!("[DIAG] Testing rename_if_not_exists...");
-    let tmp_path = object_store::path::Path::parse("_tmp_rename.txt").unwrap();
-    let dest_path = object_store::path::Path::parse("renamed.txt").unwrap();
-    match object_store
-        .inner
-        .put(&tmp_path, bytes::Bytes::from("rename me!").into())
-        .await
-    {
-        Ok(_) => {
-            eprintln!("[DIAG] Tmp file written ✅");
-            match object_store
-                .inner
-                .rename_if_not_exists(&tmp_path, &dest_path)
-                .await
-            {
-                Ok(_) => eprintln!("[DIAG] rename_if_not_exists succeeded! ✅"),
-                Err(e) => eprintln!("[DIAG] rename_if_not_exists FAILED: {:?}", e),
-            }
+    // Post-flight cleanup: must succeed. `NotFound` after a winning write
+    // would mean the file never actually persisted, contradicting the
+    // assertion above, so we surface it as a failure rather than masking
+    // a real regression.
+    match object_store.inner.delete(&race_path).await {
+        Ok(_) => {}
+        Err(object_store::Error::NotFound { .. }) => {
+            panic!(
+                "post-cleanup of race path {race_filename} reported NotFound after a winning write"
+            )
         }
-        Err(e) => eprintln!("[DIAG] Tmp file write FAILED: {:?}", e),
+        Err(e) => panic!("post-cleanup of race path {race_filename} failed: {e:?}"),
     }
-
-    eprintln!("[DIAG] lance-io direct write test complete ✅");
 }
