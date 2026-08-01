@@ -24,6 +24,7 @@ from _commit_conformance import (
     DatasetState,
     OperationResult,
     assert_history_conforms,
+    assert_results_match_visible_intents,
     assert_successful_result_is_visible,
     base_state,
     check_dataset_in_fresh_process,
@@ -363,6 +364,9 @@ def test_foreign_writer_cannot_corrupt_visible_versions(
             assert "success" in {result_a.status, result_b.status}
             assert_successful_result_is_visible(result_a, health, operation, "a")
             assert_successful_result_is_visible(result_b, health, operation, "b")
+            assert_results_match_visible_intents(
+                (result_a, result_b), health, operation
+            )
         finally:
             stop_operation(writer_a)
             stop_operation(writer_b)
@@ -908,6 +912,36 @@ def test_final_state_oracle_rejects_partial_and_duplicate_states() -> None:
         assert_history_conforms(
             compaction_retry,
             operation_history_contract("compaction", latest="after"),
+        )
+
+    compacted = state_after_operation("compaction")
+    concurrent_compaction = health_for([before, before, compacted, compacted])
+    concurrent_compaction["transactions"]["1"]["operation"] = "Overwrite"
+    concurrent_compaction["transactions"]["2"]["operation"] = "BaseOperation"
+    concurrent_compaction["transactions"]["3"]["operation"] = "Rewrite"
+    concurrent_compaction["transactions"]["4"]["operation"] = "BaseOperation"
+    assert_history_conforms(
+        concurrent_compaction, foreign_writer_history_contract("compaction")
+    )
+    compaction_result = OperationResult(
+        status="success",
+        returncode=0,
+        error_type=None,
+        error_message=None,
+        committed_version=3,
+        transaction_uuid="transaction-3",
+        stdout="",
+        stderr="",
+    )
+    assert_results_match_visible_intents(
+        (compaction_result,), concurrent_compaction, "compaction"
+    )
+
+    duplicate_rewrite = json.loads(json.dumps(concurrent_compaction))
+    duplicate_rewrite["transactions"]["4"]["operation"] = "Rewrite"
+    with pytest.raises(AssertionError, match="visible commit intents"):
+        assert_results_match_visible_intents(
+            (compaction_result,), duplicate_rewrite, "compaction"
         )
 
 

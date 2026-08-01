@@ -69,6 +69,13 @@ OPERATION_CONTRACTS: Mapping[CommitOperation, OperationContract] = {
     "create_index": OperationContract(),
 }
 
+TRANSACTION_OPERATIONS: Mapping[CommitOperation, str] = {
+    "append": "Append",
+    "compaction": "Rewrite",
+    "add_columns": "Merge",
+    "create_index": "CreateIndex",
+}
+
 
 class DatasetState(TypedDict):
     rows: list[dict[str, int]]
@@ -551,11 +558,13 @@ def operation_history_contract(
 def foreign_writer_history_contract(operation: CommitOperation) -> HistoryContract:
     states = combined_foreign_writer_states(operation)
     if operation == "compaction":
-        # Each writer may reserve fragment IDs before one rewrite wins.
+        # Each writer may reserve fragment IDs before one rewrite wins. A losing
+        # writer can commit its reservation after the winning rewrite without
+        # applying a second rewrite.
         return HistoryContract(
             nodes=(
                 HistoryNode("before", states[0], max_versions=3),
-                HistoryNode("after", states[1]),
+                HistoryNode("after", states[1], max_versions=2),
             ),
             transitions=frozenset({("before", "after")}),
             latest_nodes=frozenset({"after"}),
@@ -687,12 +696,7 @@ def assert_successful_result_is_visible(
         "successful operation does not own its reported visible version: "
         f"result={result}, transaction={transaction}"
     )
-    expected_transaction_operation = {
-        "append": "Append",
-        "compaction": "Rewrite",
-        "add_columns": "Project",
-        "create_index": "CreateIndex",
-    }[operation]
+    expected_transaction_operation = TRANSACTION_OPERATIONS[operation]
     assert transaction["operation"] == expected_transaction_operation, (
         "successful operation reported a version committed by a different intent: "
         f"expected={expected_transaction_operation}, transaction={transaction}"
@@ -721,3 +725,34 @@ def assert_successful_result_is_visible(
             "successful create-index effect is absent at version "
             f"{result.committed_version}"
         )
+
+
+def assert_results_match_visible_intents(
+    results: tuple[OperationResult, ...],
+    health: DatasetHealth,
+    operation: CommitOperation,
+) -> None:
+    """Match every unambiguous writer result to exactly one visible intent."""
+    successful_results = [result for result in results if result.status == "success"]
+    returned_transactions: set[tuple[int, str]] = set()
+    for result in successful_results:
+        assert result.committed_version is not None, result
+        assert result.transaction_uuid is not None, result
+        returned_transactions.add((result.committed_version, result.transaction_uuid))
+    assert len(returned_transactions) == len(successful_results), (
+        "distinct successful writers reported the same transaction: "
+        f"{successful_results}"
+    )
+
+    expected_operation = TRANSACTION_OPERATIONS[operation]
+    visible_transactions = {
+        (version, transaction["uuid"])
+        for version in health["versions"]
+        if (transaction := health["transactions"][str(version)])["operation"]
+        == expected_operation
+    }
+    assert returned_transactions == visible_transactions, (
+        "unambiguous writer results do not match visible commit intents: "
+        f"returned={sorted(returned_transactions)}, "
+        f"visible={sorted(visible_transactions)}"
+    )
