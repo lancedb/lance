@@ -22,7 +22,7 @@ use std::sync::Arc;
 use arrow_schema::{DataType, Field};
 use async_trait::async_trait;
 pub use builder::InvertedIndexBuilder;
-pub use compound::compound_search;
+pub use compound::{compound_search, compound_search_with_base_scorer};
 use datafusion::execution::SendableRecordBatchStream;
 pub use index::*;
 use lance_core::{Result, cache::LanceCache};
