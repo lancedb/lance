@@ -3,7 +3,7 @@
 
 //! Feature flags
 
-use crate::format::Manifest;
+use crate::format::{IndexMetadata, Manifest};
 use lance_core::{Error, Result};
 
 /// Fragments may contain deletion files, which record the tombstones of
@@ -39,23 +39,79 @@ pub const FLAG_UNSTABLE_DATA_OVERLAY_FILES: u64 = 64;
 /// invalidating the catch-up position recorded for that index, leaving a stale
 /// position behind. Both must refuse the table.
 pub const FLAG_MEM_WAL_INDEX_CATCHUP: u64 = 128;
+/// An index co-locates ("covers") extra columns beyond its key column
+/// (`IndexMetadata.included_fields`). A writer that does not understand this should not
+/// commit: it would drop the unknown `included_fields` metadata (prost discards the
+/// unknown proto field) while the index files retain those physical columns, leaving
+/// storage that emits columns the manifest no longer declares.
+///
+/// Writer-only, and deliberately so: a reader that ignores `included_fields` simply falls
+/// back to a base-table take, which is correct.
+///
+/// Best-effort, not a guarantee. Released clients enforce writer flags only on the insert
+/// path (`can_write_dataset` has a single call site), so a pre-feature client's delete,
+/// update, or raw `CommitBuilder` commit still lands and re-serializes the index section
+/// through its older prost type -- dropping `included_fields` and clearing this bit. The
+/// result is a covered index silently degraded to an ordinary one, which costs the take
+/// elision but stays correct: undeclared covering columns in storage are dropped on read
+/// rather than surfaced (see `test_undeclared_storage_covering_is_dropped_not_fatal`).
+/// Fencing that hole would require the reader bit, which would lock pre-feature clients
+/// out of covered datasets entirely for what is only a read-side optimization.
+pub const FLAG_COVERED_INDEX_METADATA: u64 = 256;
 /// The first bit that is unknown as a feature flag
-pub const FLAG_UNKNOWN: u64 = 256;
+pub const FLAG_UNKNOWN: u64 = 512;
 
 // This build only understands flags below the unknown boundary, so a bit
 // allocated at or above it would be refused by the very readers meant to use it.
 const _: () = assert!(FLAG_MEM_WAL_INDEX_CATCHUP < FLAG_UNKNOWN);
+const _: () = assert!(FLAG_COVERED_INDEX_METADATA < FLAG_UNKNOWN);
+// The two features must not share a bit: mem-wal catch-up is a reader+writer fence
+// while covering is writer-only, so a shared bit would make each feature's datasets
+// unreadable to the other.
+const _: () = assert!(FLAG_MEM_WAL_INDEX_CATCHUP != FLAG_COVERED_INDEX_METADATA);
 
 /// Environment variable that opts a release build into reading and writing data
 /// overlay files before the feature is generally released.
 pub const ENABLE_UNSTABLE_DATA_OVERLAY_FILES_ENV: &str = "LANCE_ENABLE_UNSTABLE_DATA_OVERLAY_FILES";
 
-/// Set the reader and writer feature flags in the manifest based on the contents of the manifest.
-pub fn apply_feature_flags(
-    manifest: &mut Manifest,
-    enable_stable_row_id: bool,
-    disable_transaction_file: bool,
-) -> Result<()> {
+/// Whether a manifest commit must carry [`FLAG_COVERED_INDEX_METADATA`]: either the
+/// manifest is already fenced (the flag words are reset on every
+/// [`apply_feature_flags`], so an existing fence must be preserved) or one of the
+/// indices being committed declares covering (`included_fields`) columns. `indices` is
+/// the index list accompanying the commit; `None` when the commit does not rewrite the
+/// index section.
+pub fn manifest_has_covered_index(manifest: &Manifest, indices: Option<&[IndexMetadata]>) -> bool {
+    manifest.writer_feature_flags & FLAG_COVERED_INDEX_METADATA != 0
+        || indices.is_some_and(|indices| indices.iter().any(|i| !i.included_fields.is_empty()))
+}
+
+/// Caller-supplied inputs for [`apply_feature_flags`] -- the flag conditions that
+/// cannot be derived from the manifest's contents alone. `Default` (all `false`) matches
+/// the behavior of a plain commit with no special features requested.
+#[derive(Debug, Clone, Default)]
+pub struct FeatureFlagsConfig {
+    /// Require stable row ids: every fragment must carry a row-id index, and both
+    /// reader and writer flags are fenced. Row-id metadata already present on the
+    /// fragments forces the fence regardless of this input.
+    pub enable_stable_row_id: bool,
+    /// The transaction is embedded inline in the manifest instead of a separate
+    /// `_transactions/` file; fences writers that would expect the file.
+    pub disable_transaction_file: bool,
+    /// The commit carries an index with covering (`included_fields`) columns; fences
+    /// writers that would silently drop the unknown metadata. Derive it with
+    /// [`manifest_has_covered_index`] when re-applying flags to an existing manifest.
+    pub has_covered_index: bool,
+}
+
+/// Set the reader and writer feature flags in the manifest based on the contents of the
+/// manifest plus the caller-supplied conditions in `config`. Resets both flag words
+/// first, so every condition must be re-supplied on each call.
+pub fn apply_feature_flags(manifest: &mut Manifest, config: &FeatureFlagsConfig) -> Result<()> {
+    let &FeatureFlagsConfig {
+        enable_stable_row_id,
+        disable_transaction_file,
+        has_covered_index,
+    } = config;
     // Carried across the reset. This bit is not derivable from the manifest --
     // it depends on the `__lance_mem_wal` index details, which a manifest only
     // points at -- and this function runs twice per commit: once in
@@ -137,6 +193,13 @@ pub fn apply_feature_flags(
     manifest.reader_feature_flags |= mem_wal_index_catchup;
     manifest.writer_feature_flags |= mem_wal_index_catchup;
 
+    // Fence writers that predate the feature, so they do not silently drop a covered
+    // index's `included_fields` metadata. Writer-only, and best-effort: released clients
+    // check writer flags on insert alone, so non-insert commit paths still get through --
+    // see FLAG_COVERED_INDEX_METADATA for why that is acceptable.
+    if has_covered_index {
+        manifest.writer_feature_flags |= FLAG_COVERED_INDEX_METADATA;
+    }
     Ok(())
 }
 
@@ -300,7 +363,7 @@ mod tests {
             DataStorageFormat::default(),
             HashMap::new(),
         );
-        apply_feature_flags(&mut manifest, false, false).unwrap();
+        apply_feature_flags(&mut manifest, &FeatureFlagsConfig::default()).unwrap();
         assert_ne!(
             manifest.reader_feature_flags & FLAG_UNSTABLE_DATA_OVERLAY_FILES,
             0
@@ -309,6 +372,115 @@ mod tests {
             manifest.writer_feature_flags & FLAG_UNSTABLE_DATA_OVERLAY_FILES,
             0
         );
+    }
+
+    #[test]
+    fn test_manifest_has_covered_index() {
+        use crate::format::{DataStorageFormat, Fragment, IndexMetadata};
+        use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
+        use lance_core::datatypes::Schema;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let mut manifest = Manifest::new(
+            schema,
+            Arc::new(vec![Fragment::new(0)]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        let mut index = IndexMetadata {
+            uuid: uuid::Uuid::new_v4(),
+            fields: vec![0],
+            name: "idx".to_string(),
+            dataset_version: 1,
+            fragment_bitmap: None,
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+            included_fields: Vec::new(),
+        };
+
+        // No fence yet and no covering declarations.
+        assert!(!manifest_has_covered_index(&manifest, None));
+        assert!(!manifest_has_covered_index(
+            &manifest,
+            Some(std::slice::from_ref(&index))
+        ));
+
+        // An index declaring covering columns requires the fence.
+        index.included_fields = vec![2];
+        assert!(manifest_has_covered_index(
+            &manifest,
+            Some(std::slice::from_ref(&index))
+        ));
+
+        // A manifest already fenced stays fenced even when this commit carries no
+        // index list (the flag words are reset on every apply).
+        manifest.writer_feature_flags |= FLAG_COVERED_INDEX_METADATA;
+        assert!(manifest_has_covered_index(&manifest, None));
+    }
+
+    #[test]
+    fn test_apply_feature_flags_sets_covered_index_flag() {
+        use crate::format::{DataStorageFormat, Fragment};
+        use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
+        use lance_core::datatypes::Schema;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let mut manifest = Manifest::new(
+            schema,
+            Arc::new(vec![Fragment::new(0)]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+
+        // No covered index: flag not set.
+        apply_feature_flags(&mut manifest, &FeatureFlagsConfig::default()).unwrap();
+        assert_eq!(
+            manifest.writer_feature_flags & FLAG_COVERED_INDEX_METADATA,
+            0
+        );
+
+        // Covered index present: writer flag set, reader flag NOT set (a reader that
+        // ignores `included_fields` falls back to a base-table take, which is correct).
+        apply_feature_flags(
+            &mut manifest,
+            &FeatureFlagsConfig {
+                has_covered_index: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_ne!(
+            manifest.writer_feature_flags & FLAG_COVERED_INDEX_METADATA,
+            0
+        );
+        assert_eq!(
+            manifest.reader_feature_flags & FLAG_COVERED_INDEX_METADATA,
+            0
+        );
+
+        // This build understands the flag, so it can still write the dataset...
+        assert!(can_write_dataset(manifest.writer_feature_flags));
+        // ...but an older writer, whose supported set predates this flag (FLAG_UNKNOWN
+        // was 256), treats it as unknown and refuses -- fencing the metadata-dropping bug.
+        let old_supported = 255u64;
+        assert_ne!(FLAG_COVERED_INDEX_METADATA & !old_supported, 0);
     }
 
     #[test]
@@ -358,7 +530,7 @@ mod tests {
             DataStorageFormat::default(),
             HashMap::new(), // Empty base_paths
         );
-        apply_feature_flags(&mut normal_manifest, false, false).unwrap();
+        apply_feature_flags(&mut normal_manifest, &FeatureFlagsConfig::default()).unwrap();
         assert_eq!(normal_manifest.reader_feature_flags & FLAG_BASE_PATHS, 0);
         assert_eq!(normal_manifest.writer_feature_flags & FLAG_BASE_PATHS, 0);
         // Test 2: Dataset with base_paths (shallow clone or multi-base) should have FLAG_BASE_PATHS
@@ -378,7 +550,7 @@ mod tests {
             DataStorageFormat::default(),
             base_paths,
         );
-        apply_feature_flags(&mut multi_base_manifest, false, false).unwrap();
+        apply_feature_flags(&mut multi_base_manifest, &FeatureFlagsConfig::default()).unwrap();
         assert_ne!(
             multi_base_manifest.reader_feature_flags & FLAG_BASE_PATHS,
             0
@@ -440,7 +612,7 @@ mod tests {
         manifest.reader_feature_flags = FLAG_MEM_WAL_INDEX_CATCHUP;
         manifest.writer_feature_flags = FLAG_MEM_WAL_INDEX_CATCHUP;
 
-        apply_feature_flags(&mut manifest, false, false).unwrap();
+        apply_feature_flags(&mut manifest, &FeatureFlagsConfig::default()).unwrap();
 
         assert_ne!(
             manifest.reader_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP,
@@ -458,7 +630,7 @@ mod tests {
         let mut manifest = empty_manifest();
         manifest.reader_feature_flags = FLAG_MEM_WAL_INDEX_CATCHUP;
 
-        apply_feature_flags(&mut manifest, false, false).unwrap();
+        apply_feature_flags(&mut manifest, &FeatureFlagsConfig::default()).unwrap();
 
         assert_eq!(
             manifest.reader_feature_flags & FLAG_MEM_WAL_INDEX_CATCHUP,

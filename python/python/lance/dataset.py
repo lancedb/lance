@@ -5767,6 +5767,8 @@ class Index:
     base_id: Optional[int] = None
     files: Optional[List["IndexFile"]] = None
     index_details: Optional[Tuple[str, bytes]] = None
+    included_fields: Optional[List[int]] = None
+    """Field ids this index covers (stores inline) beyond its indexed key column."""
 
 
 class IndexInformation(TypedDict):

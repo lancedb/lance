@@ -1050,6 +1050,7 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            included_fields: Vec::new(),
         };
         let details =
             normalize_inverted_details(&metadata, InvertedIndexDetails::default()).unwrap();
@@ -1073,6 +1074,7 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            included_fields: Vec::new(),
         };
         let details = InvertedIndexDetails::try_from(&InvertedIndexParams::default()).unwrap();
 

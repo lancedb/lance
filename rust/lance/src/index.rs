@@ -299,6 +299,7 @@ pub(crate) async fn build_index_metadata_from_segments(
                 created_at: Some(chrono::Utc::now()),
                 base_id: None,
                 files: None,
+                included_fields: Vec::new(),
             };
             crate::index::scalar::inverted::finalize_segment_files_if_needed(dataset, &metadata)
                 .await?;
@@ -319,6 +320,7 @@ pub(crate) async fn build_index_metadata_from_segments(
             created_at: Some(chrono::Utc::now()),
             base_id: None,
             files: Some(files),
+            included_fields: Vec::new(),
         })
     }))
     .buffered(dataset.object_store.io_parallelism())
@@ -2164,6 +2166,7 @@ impl DatasetIndexExt for Dataset {
                 created_at: Some(chrono::Utc::now()),
                 base_id: None, // New merged index file locates in the cloned dataset.
                 files: Some(res.files),
+                included_fields: Vec::new(),
             };
             removed_indices.extend(res.removed_indices.iter().map(|&idx| idx.clone()));
             new_indices.push(new_idx);
@@ -3451,6 +3454,7 @@ mod tests {
                 path: INDEX_FILE_NAME.to_string(),
                 size_bytes: payload.len() as u64,
             }]),
+            included_fields: Vec::new(),
         }
     }
 
@@ -5420,6 +5424,7 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            included_fields: Vec::new(),
         };
 
         let desc = IndexDescriptionImpl::try_new(vec![metadata], &dataset)
@@ -5460,6 +5465,7 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            included_fields: Vec::new(),
         };
 
         let desc = IndexDescriptionImpl::try_new(vec![metadata], &dataset)
@@ -7874,6 +7880,7 @@ mod tests {
             created_at: Some(chrono::Utc::now()),
             base_id: None,
             files: seg0.files.clone(),
+            included_fields: Vec::new(),
         };
 
         let err = dataset

@@ -128,7 +128,7 @@ use lance_core::box_error;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_namespace::models::{DeclareTableRequest, DescribeTableRequest};
 use lance_table::feature_flags::{
-    apply_feature_flags, can_read_dataset, validate_mem_wal_index_catchup_flags,
+    FeatureFlagsConfig, apply_feature_flags, can_read_dataset, validate_mem_wal_index_catchup_flags,
 };
 use lance_table::io::deletion::{DELETIONS_DIR, relative_deletion_file_path};
 pub use schema_evolution::{
@@ -3906,10 +3906,18 @@ pub(crate) async fn write_manifest_file(
         // Preserve it here so this second apply_feature_flags call does not clear it
         // when config.use_stable_row_ids is false (the ManifestWriteConfig default).
         let use_stable_row_ids = config.use_stable_row_ids || manifest.uses_stable_row_ids();
+        // Like FLAG_STABLE_ROW_IDS, preserve the covered-index flag build_manifest may
+        // have already set (this second call resets the flag words), and also detect it
+        // from the indices passed here.
+        let has_covered_index =
+            lance_table::feature_flags::manifest_has_covered_index(manifest, indices.as_deref());
         apply_feature_flags(
             manifest,
-            use_stable_row_ids,
-            config.disable_transaction_file,
+            &FeatureFlagsConfig {
+                enable_stable_row_id: use_stable_row_ids,
+                disable_transaction_file: config.disable_transaction_file,
+                has_covered_index,
+            },
         )?;
     }
 

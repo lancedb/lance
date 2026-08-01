@@ -16,7 +16,9 @@ package org.lance.index;
 import com.google.common.base.MoreObjects;
 
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
@@ -38,6 +40,7 @@ public class Index {
   private final Integer baseId;
   private final Long sizeBytes;
   private final IndexType indexType;
+  private final List<Integer> includedFields;
 
   private Index(
       UUID uuid,
@@ -50,7 +53,8 @@ public class Index {
       Instant createdAt,
       Integer baseId,
       Long sizeBytes,
-      IndexType indexType) {
+      IndexType indexType,
+      List<Integer> includedFields) {
     this.uuid = uuid;
     this.fields = fields;
     this.name = name;
@@ -62,6 +66,14 @@ public class Index {
     this.baseId = baseId;
     this.sizeBytes = sizeBytes;
     this.indexType = indexType;
+    // Empty (not null) when the index has no covering columns, so the JNI round-trip
+    // never sees a null list. Defensively copied and unmodifiable, matching
+    // VectorIndexParams.includeColumns: later mutation of the caller's list must not
+    // change this value object.
+    this.includedFields =
+        includedFields == null
+            ? Collections.emptyList()
+            : Collections.unmodifiableList(new ArrayList<>(includedFields));
   }
 
   public UUID uuid() {
@@ -145,6 +157,17 @@ public class Index {
     return indexType;
   }
 
+  /**
+   * Get the field ids this index covers ("included" columns) beyond its key column, so a covered
+   * query can be answered from the index without a take from the base table. Empty for indexes
+   * without covering columns.
+   *
+   * @return the covered field IDs
+   */
+  public List<Integer> includedFields() {
+    return includedFields;
+  }
+
   @Override
   public boolean equals(Object o) {
     if (this == o) return true;
@@ -160,7 +183,8 @@ public class Index {
         && Objects.equals(createdAt, index.createdAt)
         && Objects.equals(baseId, index.baseId)
         && Objects.equals(sizeBytes, index.sizeBytes)
-        && indexType == index.indexType;
+        && indexType == index.indexType
+        && Objects.equals(includedFields, index.includedFields);
   }
 
   @Override
@@ -176,7 +200,8 @@ public class Index {
             baseId,
             sizeBytes,
             fragments,
-            indexType);
+            indexType,
+            includedFields);
     result = 31 * result + Arrays.hashCode(indexDetails);
     return result;
   }
@@ -193,6 +218,7 @@ public class Index {
         .add("createdAt", createdAt)
         .add("baseId", baseId)
         .add("sizeBytes", sizeBytes)
+        .add("includedFields", includedFields)
         .toString();
   }
 
@@ -218,6 +244,7 @@ public class Index {
     private Integer baseId;
     private Long sizeBytes;
     private IndexType indexType;
+    private List<Integer> includedFields;
 
     private Builder() {}
 
@@ -276,6 +303,11 @@ public class Index {
       return this;
     }
 
+    public Builder includedFields(List<Integer> includedFields) {
+      this.includedFields = includedFields;
+      return this;
+    }
+
     public Index build() {
       return new Index(
           uuid,
@@ -288,7 +320,8 @@ public class Index {
           createdAt,
           baseId,
           sizeBytes,
-          indexType);
+          indexType,
+          includedFields);
     }
   }
 }

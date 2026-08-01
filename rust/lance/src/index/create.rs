@@ -611,6 +611,7 @@ impl<'a> CreateIndexBuilder<'a> {
             created_at: Some(chrono::Utc::now()),
             base_id: None,
             files: Some(index_files_to_table(created_index.files)),
+included_fields: Vec::new(),
         })
         }
         .boxed()
@@ -765,6 +766,7 @@ impl<'a> CreateIndexBuilder<'a> {
                 created_at: Some(chrono::Utc::now()),
                 base_id: None,
                 files: Some(index_files_to_table(created_index.files)),
+                included_fields: Vec::new(),
             };
             let segments = vec![metadata.into_index_segment()?];
             let new_indices =
@@ -834,6 +836,7 @@ impl<'a> CreateIndexBuilder<'a> {
                 created_at: Some(chrono::Utc::now()),
                 base_id: None,
                 files: Some(index_files_to_table(created_index.files)),
+                included_fields: Vec::new(),
             });
         }
 

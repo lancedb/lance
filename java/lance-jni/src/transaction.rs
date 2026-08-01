@@ -204,6 +204,12 @@ impl FromJObjectWithEnv<IndexMetadata> for JObject<'_> {
             })?;
         let base_id = env.get_optional_u32_from_method(self, "baseId")?;
 
+        // Covered ("included") columns, mirroring `fields` (empty when absent).
+        let included_fields: Vec<i32> =
+            import_vec_from_method(env, self, "includedFields", |env, field_id| {
+                field_id.extract_object(env)
+            })?;
+
         Ok(IndexMetadata {
             uuid,
             fields,
@@ -215,6 +221,7 @@ impl FromJObjectWithEnv<IndexMetadata> for JObject<'_> {
             created_at,
             base_id,
             files: None,
+            included_fields,
         })
     }
 }

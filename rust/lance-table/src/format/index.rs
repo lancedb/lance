@@ -77,6 +77,12 @@ pub struct IndexMetadata {
     /// This is None if the file sizes are unknown. This happens for indices created
     /// before this field was added.
     pub files: Option<Vec<IndexFile>>,
+
+    /// Columns co-located ("included") in the index alongside its key `fields`,
+    /// so a query covered by them can be answered from the index without a take
+    /// from the base table. These are `Field.id`s, same as `fields`. Empty for
+    /// indexes without covering columns.
+    pub included_fields: Vec<i32>,
 }
 
 impl IndexMetadata {
@@ -179,6 +185,7 @@ impl TryFrom<pb::IndexMetadata> for IndexMetadata {
             }),
             base_id: proto.base_id,
             files,
+            included_fields: proto.included_fields,
         })
     }
 }
@@ -223,6 +230,7 @@ impl From<&IndexMetadata> for pb::IndexMetadata {
             created_at: idx.created_at.map(|dt| dt.timestamp_millis() as u64),
             base_id: idx.base_id,
             files,
+            included_fields: idx.included_fields.clone(),
         }
     }
 }
@@ -327,6 +335,7 @@ mod tests {
                     path: "index.idx".to_string(),
                     size_bytes: 1024,
                 }]),
+                included_fields: vec![1],
             },
             IndexMetadata {
                 uuid: Uuid::new_v4(),
@@ -339,6 +348,7 @@ mod tests {
                 created_at: None,
                 base_id: Some(7),
                 files: None,
+                included_fields: Vec::new(),
             },
         ];
 

@@ -22,6 +22,32 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
+/// `getattr` that treats only a missing attribute as absent. Any exception raised
+/// during attribute access -- e.g. a property whose deferred load fails -- must
+/// propagate rather than be coerced to a default. This includes an `AttributeError`
+/// raised INSIDE a property getter (the classic `getattr`/`hasattr` masking pitfall):
+/// when the attribute is defined on the object's type, an `AttributeError` cannot
+/// mean "absent", so it propagates too.
+fn getattr_optional<'py>(
+    ob: &Bound<'py, PyAny>,
+    name: &str,
+) -> PyResult<Option<Bound<'py, PyAny>>> {
+    match ob.getattr(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(err) if err.is_instance_of::<pyo3::exceptions::PyAttributeError>(ob.py()) => {
+            // Looking the name up on the TYPE returns a descriptor (e.g. the property
+            // object) without invoking the instance getter, so this is side-effect
+            // free even for raising properties.
+            if ob.get_type().hasattr(name)? {
+                Err(err)
+            } else {
+                Ok(None)
+            }
+        }
+        Err(err) => Err(err),
+    }
+}
+
 // IndexFile bindings
 impl FromPyObject<'_, '_> for PyLance<IndexFile> {
     type Error = PyErr;
@@ -87,11 +113,22 @@ impl FromPyObject<'_, '_> for PyLance<IndexMetadata> {
             .getattr("files")?
             .extract::<Option<Vec<PyLance<IndexFile>>>>()?
             .map(|v| v.into_iter().map(|f| f.0).collect());
-        let index_details = match ob.getattr("index_details") {
-            Ok(details) => details
+        let index_details = match getattr_optional(&ob, "index_details")? {
+            Some(details) => details
                 .extract::<Option<(String, Vec<u8>)>>()?
                 .map(|(type_url, value)| Arc::new(prost_types::Any { type_url, value })),
-            Err(_) => None,
+            None => None,
+        };
+
+        // Covering columns are optional: tolerate objects that predate the field (a missing
+        // attribute), and treat an explicit `None` as empty. But a *malformed* value (a
+        // non-integer or an out-of-range element) or an access that *raises* must
+        // propagate -- silently coercing it to an empty list would drop the covered
+        // declaration and its writer fence while the index files still carry the payload
+        // columns. Mirrors `index_details` above.
+        let included_fields: Vec<i32> = match getattr_optional(&ob, "included_fields")? {
+            Some(value) => value.extract::<Option<Vec<i32>>>()?.unwrap_or_default(),
+            None => Vec::new(),
         };
 
         Ok(Self(IndexMetadata {
@@ -105,6 +142,7 @@ impl FromPyObject<'_, '_> for PyLance<IndexMetadata> {
             created_at,
             base_id,
             files,
+            included_fields,
         }))
     }
 }
@@ -147,6 +185,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&IndexMetadata> {
             .index_details
             .as_ref()
             .map(|details| (details.type_url.clone(), details.value.clone()));
+        let included_fields = self.0.included_fields.clone();
 
         let cls = namespace
             .getattr("Index")
@@ -162,6 +201,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&IndexMetadata> {
             base_id,
             files,
             index_details,
+            included_fields,
         ))
     }
 }

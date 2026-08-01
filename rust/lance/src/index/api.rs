@@ -27,6 +27,9 @@ pub struct IndexSegment {
     fragment_bitmap: RoaringBitmap,
     /// Field IDs whose physical values are encoded in this segment.
     fields: Vec<i32>,
+    /// Covering ("included") field IDs whose values are materialized in this
+    /// segment's storage (empty for a non-covering index).
+    included_fields: Vec<i32>,
     /// Metadata specific to the index type.
     index_details: Arc<prost_types::Any>,
     /// The on-disk index version for this segment.
@@ -53,10 +56,24 @@ impl IndexSegment {
             uuid,
             fragment_bitmap: fragment_bitmap.into_iter().collect(),
             fields: fields.into_iter().collect(),
+            included_fields: Vec::new(),
             index_details,
             index_version,
             dataset_version,
         }
+    }
+
+    /// Declare the covering ("included") field IDs materialized in this segment's
+    /// storage. Must be carried through commit so the manifest keeps advertising the
+    /// covered columns the segment's files physically contain.
+    pub fn with_included_fields<G: IntoIterator<Item = i32>>(mut self, included_fields: G) -> Self {
+        self.included_fields = included_fields.into_iter().collect();
+        self
+    }
+
+    /// Return the covering ("included") field IDs materialized in this segment.
+    pub fn included_fields(&self) -> &[i32] {
+        &self.included_fields
     }
 
     /// Return the UUID of this segment.
@@ -93,7 +110,8 @@ impl IndexSegment {
         self.dataset_version
     }
 
-    /// Consume the segment and return its component parts.
+    /// Consume the segment and return its component parts. Covering columns are read
+    /// separately via [`IndexSegment::included_fields`] to keep this tuple narrow.
     pub fn into_parts(
         self,
     ) -> (
@@ -149,7 +167,8 @@ impl IntoIndexSegment for IndexMetadata {
             index_details,
             self.index_version,
             self.dataset_version,
-        ))
+        )
+        .with_included_fields(self.included_fields))
     }
 }
 
@@ -354,6 +373,7 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            included_fields: Vec::new(),
         };
 
         let segment = metadata.into_index_segment().unwrap();

@@ -275,11 +275,21 @@ pub struct VectorIndexParams {
     /// Keys use reverse-DNS namespacing (e.g., "lance.ivf.max_iters").
     /// Populated by the build path and merged into VectorIndexDetails at creation time.
     pub runtime_hints: HashMap<String, String>,
+
+    /// Columns to co-locate ("include") in the index storage alongside the row id
+    /// and the quantization code. Empty by default.
+    pub include_columns: Vec<String>,
 }
 
 impl VectorIndexParams {
     pub fn version(&mut self, version: IndexFileVersion) -> &mut Self {
         self.version = version;
+        self
+    }
+
+    /// Set the columns to co-locate ("include") in the index storage.
+    pub fn include_columns(&mut self, columns: Vec<String>) -> &mut Self {
+        self.include_columns = columns;
         self
     }
 
@@ -297,6 +307,7 @@ impl VectorIndexParams {
             version: IndexFileVersion::V3,
             skip_transpose: false,
             runtime_hints: HashMap::new(),
+            include_columns: Vec::new(),
         }
     }
 
@@ -308,6 +319,7 @@ impl VectorIndexParams {
             version: IndexFileVersion::V3,
             skip_transpose: false,
             runtime_hints: HashMap::new(),
+            include_columns: Vec::new(),
         }
     }
 
@@ -343,6 +355,7 @@ impl VectorIndexParams {
             version: IndexFileVersion::V3,
             skip_transpose: false,
             runtime_hints: HashMap::new(),
+            include_columns: Vec::new(),
         }
     }
 
@@ -370,6 +383,7 @@ impl VectorIndexParams {
             version: IndexFileVersion::V3,
             skip_transpose: false,
             runtime_hints: HashMap::new(),
+            include_columns: Vec::new(),
         }
     }
 
@@ -386,6 +400,7 @@ impl VectorIndexParams {
             version: IndexFileVersion::V3,
             skip_transpose: false,
             runtime_hints: HashMap::new(),
+            include_columns: Vec::new(),
         }
     }
 
@@ -401,6 +416,7 @@ impl VectorIndexParams {
             version: IndexFileVersion::V3,
             skip_transpose: false,
             runtime_hints: HashMap::new(),
+            include_columns: Vec::new(),
         }
     }
 
@@ -416,6 +432,7 @@ impl VectorIndexParams {
             version: IndexFileVersion::V3,
             skip_transpose: false,
             runtime_hints: HashMap::new(),
+            include_columns: Vec::new(),
         }
     }
 
@@ -431,6 +448,7 @@ impl VectorIndexParams {
             version: IndexFileVersion::V3,
             skip_transpose: false,
             runtime_hints: HashMap::new(),
+            include_columns: Vec::new(),
         }
     }
 
@@ -453,6 +471,7 @@ impl VectorIndexParams {
             version: IndexFileVersion::V3,
             skip_transpose: false,
             runtime_hints: HashMap::new(),
+            include_columns: Vec::new(),
         }
     }
 
@@ -475,6 +494,7 @@ impl VectorIndexParams {
             version: IndexFileVersion::V3,
             skip_transpose: false,
             runtime_hints: HashMap::new(),
+            include_columns: Vec::new(),
         }
     }
 
@@ -1954,6 +1974,7 @@ pub async fn initialize_vector_index(
         created_at: Some(chrono::Utc::now()),
         base_id: None,
         files: Some(summary.files),
+        included_fields: Vec::new(),
     };
 
     let transaction = Transaction::new(

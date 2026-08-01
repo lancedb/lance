@@ -569,6 +569,7 @@ mod test {
             created_at: None,
             base_id: None,
             files: None,
+            included_fields: Vec::new(),
         };
         let prefilter = DatasetPreFilter::new(Arc::new(dataset), &[index], None);
 

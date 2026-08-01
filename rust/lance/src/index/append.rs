@@ -1416,6 +1416,7 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            included_fields: Vec::new(),
         };
         let frag_reuse_index = FragReuseIndex {
             uuid: Uuid::new_v4(),

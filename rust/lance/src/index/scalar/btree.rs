@@ -162,5 +162,6 @@ pub(crate) async fn merge_segments(
         created_at: Some(chrono::Utc::now()),
         base_id: None,
         files: Some(index_files_to_table(created_index.files)),
+        included_fields: Vec::new(),
     })
 }

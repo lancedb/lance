@@ -276,7 +276,7 @@ message IndexMetadata {
   // - When Lance APIs refer to indexes they will use the type URL of the index details as the
   //   identifier for the index type.  If a user provides a simple string identifier like
   //   "btree" then it will be converted to "/lance.table.BTreeIndexDetails"
-  // - Type URLs comparisons are case-insensitive.  Thereform an index must have a unique type
+  // - Type URLs comparisons are case-insensitive.  Therefore an index must have a unique type
   //   URL ignoring case.
   google.protobuf.Any index_details = 6;
 
@@ -298,6 +298,12 @@ message IndexMetadata {
   // of index sizes without extra IO.
   // If this is empty, the index files sizes are unknown.
   repeated IndexFile files = 10;
+
+  // Columns co-located ("included") in the index alongside its key columns, so
+  // a query covered by them can be answered from the index without a take from
+  // the base table. These refer to file.Field.id, same as `fields`. Empty for
+  // indexes without covering columns.
+  repeated int32 included_fields = 11;
 }
 
 // Metadata about a single file within an index segment.

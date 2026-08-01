@@ -785,6 +785,7 @@ impl MemTableFlusher {
                 created_at: None,
                 base_id: None,
                 files: None,
+                included_fields: Vec::new(),
             };
             created_indexes.push(index_meta);
 
@@ -1115,6 +1116,14 @@ impl MemTableFlusher {
             created_at: Some(chrono::Utc::now()),
             index_version: 1,
             files: None,
+            // MemWAL flush does not build *covering* ("included") segments: include_columns
+            // is not threaded through the HNSW/SQ flush build, so there is nothing to carry
+            // here. An empty covering set is correct regardless -- covered queries fetch the
+            // projected columns for a non-covering segment's rows via the normal take. This
+            // only needs a real covering set if MemWAL is later extended to build covering
+            // segments (a perf optimization), which also requires threading include_columns
+            // through the flush build, not just populating this field.
+            included_fields: Vec::new(),
         };
 
         Ok(Some(index_meta))

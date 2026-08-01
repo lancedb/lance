@@ -934,6 +934,7 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            included_fields: Vec::new(),
         };
 
         let metric = metric_type_from_index_metadata(&index);
@@ -956,6 +957,7 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            included_fields: Vec::new(),
         };
 
         let metric = metric_type_from_index_metadata(&index);
@@ -976,6 +978,7 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            included_fields: Vec::new(),
         };
 
         let metric = metric_type_from_index_metadata(&index);
@@ -1013,6 +1016,7 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            included_fields: Vec::new(),
         }
     }
 
@@ -1099,6 +1103,7 @@ mod tests {
                 created_at: None,
                 base_id: None,
                 files: None,
+                included_fields: Vec::new(),
             };
 
             let metric = metric_type_from_index_metadata(&index);

@@ -181,6 +181,209 @@ def test_commit_index_with_files(dataset_with_index, test_table, tmp_path):
     assert files_by_path["auxiliary.bin"] == 2048
 
 
+def test_commit_index_with_included_fields(dataset_with_index, test_table, tmp_path):
+    """Test that included_fields (covering columns) round-trip through the Python
+    transaction bindings."""
+    from lance.dataset import Index
+
+    original_desc = dataset_with_index.describe_indices()[0]
+    index_id = original_desc.segments[0].uuid
+
+    dataset_without_index = lance.write_dataset(
+        test_table, tmp_path / "dataset_without_index"
+    )
+    src_index_dir = Path(dataset_with_index.uri) / "_indices" / index_id
+    dest_index_dir = Path(dataset_without_index.uri) / "_indices" / index_id
+    shutil.copytree(src_index_dir, dest_index_dir)
+
+    meta_id = _get_field_id_by_name(dataset_without_index.lance_schema, "meta")
+    price_id = _get_field_id_by_name(dataset_without_index.lance_schema, "price")
+
+    # Declare "price" as a covering (included) column on the index.
+    index = Index(
+        uuid=index_id,
+        name="meta_idx",
+        fields=[meta_id],
+        dataset_version=dataset_without_index.version,
+        fragment_ids=set(
+            [f.fragment_id for f in dataset_without_index.get_fragments()]
+        ),
+        index_version=0,
+        included_fields=[price_id],
+    )
+
+    create_index_op = lance.LanceOperation.CreateIndex(
+        new_indices=[index],
+        removed_indices=[],
+    )
+    dataset_without_index = lance.LanceDataset.commit(
+        dataset_without_index.uri,
+        create_index_op,
+        read_version=dataset_without_index.version,
+    )
+
+    # Read back the transaction to verify the covering columns were stored.
+    transaction = dataset_without_index.get_transactions(1)[0]
+    committed_index = transaction.operation.new_indices[0]
+    assert committed_index.included_fields == [price_id]
+
+
+def test_commit_index_rejects_malformed_included_fields(
+    dataset_with_index, test_table, tmp_path
+):
+    """A malformed included_fields value must propagate an error, not be silently
+    coerced to an empty covering set -- otherwise the covered declaration and its
+    writer fence are dropped while the index files still carry payload columns."""
+    from lance.dataset import Index
+
+    original_desc = dataset_with_index.describe_indices()[0]
+    index_id = original_desc.segments[0].uuid
+
+    dataset_without_index = lance.write_dataset(
+        test_table, tmp_path / "dataset_without_index"
+    )
+    src_index_dir = Path(dataset_with_index.uri) / "_indices" / index_id
+    dest_index_dir = Path(dataset_without_index.uri) / "_indices" / index_id
+    shutil.copytree(src_index_dir, dest_index_dir)
+
+    meta_id = _get_field_id_by_name(dataset_without_index.lance_schema, "meta")
+
+    # 2**40 is a valid Python int but overflows the i32 field-id type.
+    index = Index(
+        uuid=index_id,
+        name="meta_idx",
+        fields=[meta_id],
+        dataset_version=dataset_without_index.version,
+        fragment_ids=set(
+            [f.fragment_id for f in dataset_without_index.get_fragments()]
+        ),
+        index_version=0,
+        included_fields=[2**40],
+    )
+    create_index_op = lance.LanceOperation.CreateIndex(
+        new_indices=[index],
+        removed_indices=[],
+    )
+    with pytest.raises((OverflowError, ValueError, TypeError)):
+        lance.LanceDataset.commit(
+            dataset_without_index.uri,
+            create_index_op,
+            read_version=dataset_without_index.version,
+        )
+
+
+def test_commit_index_propagates_raising_included_fields(
+    dataset_with_index, test_table, tmp_path
+):
+    """An `included_fields` access that raises (e.g. a lazy proxy whose deferred
+    load fails) must propagate the error. Swallowing it would commit an empty
+    covering set while the index files still carry the payload columns."""
+
+    class RaisingIndex:
+        def __init__(self, uuid, name, fields, dataset_version, fragment_ids):
+            self.uuid = uuid
+            self.name = name
+            self.fields = fields
+            self.dataset_version = dataset_version
+            self.fragment_ids = fragment_ids
+            self.index_version = 0
+            self.created_at = None
+            self.base_id = None
+            self.files = None
+
+        @property
+        def included_fields(self):
+            raise RuntimeError("deferred covering-column load failed")
+
+    original_desc = dataset_with_index.describe_indices()[0]
+    index_id = original_desc.segments[0].uuid
+
+    dataset_without_index = lance.write_dataset(
+        test_table, tmp_path / "dataset_without_index"
+    )
+    src_index_dir = Path(dataset_with_index.uri) / "_indices" / index_id
+    dest_index_dir = Path(dataset_without_index.uri) / "_indices" / index_id
+    shutil.copytree(src_index_dir, dest_index_dir)
+
+    meta_id = _get_field_id_by_name(dataset_without_index.lance_schema, "meta")
+    index = RaisingIndex(
+        uuid=index_id,
+        name="meta_idx",
+        fields=[meta_id],
+        dataset_version=dataset_without_index.version,
+        fragment_ids=set(
+            [f.fragment_id for f in dataset_without_index.get_fragments()]
+        ),
+    )
+    create_index_op = lance.LanceOperation.CreateIndex(
+        new_indices=[index],
+        removed_indices=[],
+    )
+    with pytest.raises(RuntimeError, match="deferred covering-column load failed"):
+        lance.LanceDataset.commit(
+            dataset_without_index.uri,
+            create_index_op,
+            read_version=dataset_without_index.version,
+        )
+
+
+def test_commit_index_propagates_getter_attribute_error(
+    dataset_with_index, test_table, tmp_path
+):
+    """An AttributeError raised INSIDE an `included_fields` property getter (e.g. a
+    lazy proxy whose backing attribute is unset) must propagate -- it is not the same
+    as the attribute being absent, and swallowing it would commit an empty covering
+    set while the index files keep the payload columns."""
+
+    class LazyIndex:
+        def __init__(self, uuid, name, fields, dataset_version, fragment_ids):
+            self.uuid = uuid
+            self.name = name
+            self.fields = fields
+            self.dataset_version = dataset_version
+            self.fragment_ids = fragment_ids
+            self.index_version = 0
+            self.created_at = None
+            self.base_id = None
+            self.files = None
+
+        @property
+        def included_fields(self):
+            # `_inner` is never set: the getter itself raises AttributeError.
+            return self._inner.included_fields
+
+    original_desc = dataset_with_index.describe_indices()[0]
+    index_id = original_desc.segments[0].uuid
+
+    dataset_without_index = lance.write_dataset(
+        test_table, tmp_path / "dataset_without_index"
+    )
+    src_index_dir = Path(dataset_with_index.uri) / "_indices" / index_id
+    dest_index_dir = Path(dataset_without_index.uri) / "_indices" / index_id
+    shutil.copytree(src_index_dir, dest_index_dir)
+
+    meta_id = _get_field_id_by_name(dataset_without_index.lance_schema, "meta")
+    index = LazyIndex(
+        uuid=index_id,
+        name="meta_idx",
+        fields=[meta_id],
+        dataset_version=dataset_without_index.version,
+        fragment_ids=set(
+            [f.fragment_id for f in dataset_without_index.get_fragments()]
+        ),
+    )
+    create_index_op = lance.LanceOperation.CreateIndex(
+        new_indices=[index],
+        removed_indices=[],
+    )
+    with pytest.raises(AttributeError, match="_inner"):
+        lance.LanceDataset.commit(
+            dataset_without_index.uri,
+            create_index_op,
+            read_version=dataset_without_index.version,
+        )
+
+
 def test_commit_index_with_index_details(dataset_with_index, test_table, tmp_path):
     """Test that index_details round-trip through Python transaction bindings."""
     from lance.dataset import Index

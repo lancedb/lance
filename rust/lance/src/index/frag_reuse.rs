@@ -174,5 +174,6 @@ pub(crate) async fn build_frag_reuse_index_metadata(
         base_id: None,
         // Fragment reuse index is inline (no files)
         files: None,
+        included_fields: Vec::new(),
     })
 }

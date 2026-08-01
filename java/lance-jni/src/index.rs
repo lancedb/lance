@@ -140,10 +140,26 @@ impl IntoJava for &IndexMetadata {
         // Determine index type from index_details type_url
         let index_type = determine_index_type(env, &self.index_details)?;
 
+        // Covered ("included") columns, mirroring `fields`.
+        let included_fields = {
+            let array_list = env.new_object("java/util/ArrayList", "()V", &[])?;
+            for field in &self.included_fields {
+                let field_obj =
+                    env.new_object("java/lang/Integer", "(I)V", &[JValue::Int(*field)])?;
+                env.call_method(
+                    &array_list,
+                    "add",
+                    "(Ljava/lang/Object;)Z",
+                    &[JValue::Object(&field_obj)],
+                )?;
+            }
+            array_list
+        };
+
         // Create Index object
         Ok(env.new_object(
             "org/lance/index/Index",
-            "(Ljava/util/UUID;Ljava/util/List;Ljava/lang/String;JLjava/util/List;[BILjava/time/Instant;Ljava/lang/Integer;Ljava/lang/Long;Lorg/lance/index/IndexType;)V",
+            "(Ljava/util/UUID;Ljava/util/List;Ljava/lang/String;JLjava/util/List;[BILjava/time/Instant;Ljava/lang/Integer;Ljava/lang/Long;Lorg/lance/index/IndexType;Ljava/util/List;)V",
             &[
                 JValue::Object(&uuid),
                 JValue::Object(&fields),
@@ -156,6 +172,7 @@ impl IntoJava for &IndexMetadata {
                 JValue::Object(&base_id),
                 JValue::Object(&size_bytes),
                 JValue::Object(&index_type),
+                JValue::Object(&included_fields),
             ],
         )?)
     }

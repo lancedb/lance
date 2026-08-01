@@ -144,6 +144,7 @@ pub(crate) fn new_mem_wal_index_meta(
         base_id: None,
         // Memory WAL index is inline (no files)
         files: None,
+        included_fields: Vec::new(),
     })
 }
 
@@ -655,6 +656,7 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            included_fields: Vec::new(),
         }
     }
 

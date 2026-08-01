@@ -2431,6 +2431,7 @@ pub(crate) async fn merge_segments_with_progress(
         created_at: Some(chrono::Utc::now()),
         base_id: None,
         files: Some(files),
+        included_fields: Vec::new(),
         ..merged_segment
     };
     Ok(merged_segment)
@@ -5418,6 +5419,7 @@ mod tests {
             created_at: Some(chrono::Utc::now()),
             base_id: None,
             files: None,
+            included_fields: Vec::new(),
         };
 
         // We need to commit this index to the dataset so that it can be found
@@ -5457,6 +5459,7 @@ mod tests {
             created_at: None, // Test index, not setting timestamp
             base_id: None,
             files: None,
+            included_fields: Vec::new(),
         };
 
         let prefilter = Arc::new(DatasetPreFilter::new(dataset.clone(), &[index_meta], None));
@@ -5516,6 +5519,7 @@ mod tests {
             created_at: Some(chrono::Utc::now()),
             base_id: None,
             files: None,
+            included_fields: Vec::new(),
         };
 
         // We need to commit this new index to the dataset so it can be found

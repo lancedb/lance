@@ -32,7 +32,7 @@ use lance_index::mem_wal::{CompactedSsTable, IndexCatchupProgress, MEM_WAL_INDEX
 use lance_index::{frag_reuse::FRAG_REUSE_INDEX_NAME, is_system_index};
 use lance_io::object_store::ObjectStore;
 use lance_table::feature_flags::{
-    FLAG_MEM_WAL_INDEX_CATCHUP, FLAG_STABLE_ROW_IDS, apply_feature_flags,
+    FLAG_MEM_WAL_INDEX_CATCHUP, FLAG_STABLE_ROW_IDS, FeatureFlagsConfig, apply_feature_flags,
     inherit_mem_wal_index_catchup, validate_mem_wal_index_catchup_flags,
 };
 use lance_table::rowids::read_row_ids;
@@ -3032,10 +3032,16 @@ impl Transaction {
                 .map(|m| m.uses_stable_row_ids())
                 .unwrap_or(false);
             let use_stable_row_ids = config.use_stable_row_ids || inherited;
+            let has_covered_index = final_indices
+                .iter()
+                .any(|index| !index.included_fields.is_empty());
             apply_feature_flags(
                 &mut manifest,
-                use_stable_row_ids,
-                config.disable_transaction_file,
+                &FeatureFlagsConfig {
+                    enable_stable_row_id: use_stable_row_ids,
+                    disable_transaction_file: config.disable_transaction_file,
+                    has_covered_index,
+                },
             )?;
         }
         // Carried from the manifest this one is derived from. `new_from_previous`
@@ -4878,6 +4884,7 @@ mod tests {
             created_at: Some(Utc::now()),
             base_id: None,
             files: None,
+            included_fields: Vec::new(),
         }
     }
 
@@ -5474,6 +5481,7 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            included_fields: Vec::new(),
         }
     }
 
@@ -5496,6 +5504,7 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            included_fields: Vec::new(),
         }
     }
 
@@ -8048,6 +8057,7 @@ mod tests {
                 created_at: None,
                 base_id: None,
                 files: None,
+                included_fields: Vec::new(),
             }
         }
 

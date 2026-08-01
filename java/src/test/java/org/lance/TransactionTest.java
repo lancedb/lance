@@ -73,6 +73,14 @@ public class TransactionTest {
         assertTrue(
             op.getRemovedIndices().isEmpty(), "removedIndices should be empty for CreateIndex");
         assertEquals("btree_id_index", (op.getNewIndices().get(0).name()));
+        // Covering columns round-trip from Rust: a plain btree index covers nothing, so
+        // the list is present (never null) and empty.
+        assertNotNull(
+            op.getNewIndices().get(0).includedFields(),
+            "includedFields should be present (empty), not null");
+        assertTrue(
+            op.getNewIndices().get(0).includedFields().isEmpty(),
+            "a non-covering index should report no included fields");
       }
     }
   }

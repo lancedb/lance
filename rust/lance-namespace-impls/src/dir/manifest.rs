@@ -55,7 +55,7 @@ use lance_namespace::models::{
     TableExistsRequest,
 };
 use lance_namespace::schema::arrow_schema_to_json;
-use lance_table::feature_flags::apply_feature_flags;
+use lance_table::feature_flags::{FeatureFlagsConfig, apply_feature_flags};
 use lance_table::format::{Fragment, IndexMetadata, Manifest};
 use lance_table::io::commit::{
     CommitError, CommitHandler, commit_handler_from_url, write_manifest_file_to_path,
@@ -1282,6 +1282,7 @@ impl ManifestNamespace {
             created_at: None,
             base_id: None,
             files: Some(index_files_to_table(trained_index.created_index.files)),
+            included_fields: Vec::new(),
         })
     }
 
@@ -1838,7 +1839,16 @@ impl ManifestNamespace {
         indices: Option<Vec<IndexMetadata>>,
         transaction: Transaction,
     ) -> std::result::Result<(), CommitError> {
-        apply_feature_flags(manifest, false, false).map_err(CommitError::from)?;
+        let has_covered_index =
+            lance_table::feature_flags::manifest_has_covered_index(manifest, indices.as_deref());
+        apply_feature_flags(
+            manifest,
+            &FeatureFlagsConfig {
+                has_covered_index,
+                ..Default::default()
+            },
+        )
+        .map_err(CommitError::from)?;
         let timestamp_nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())

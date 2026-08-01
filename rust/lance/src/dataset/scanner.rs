@@ -13714,6 +13714,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
                     version: crate::index::vector::IndexFileVersion::Legacy,
                     skip_transpose: false,
                     runtime_hints: Default::default(),
+                    include_columns: Vec::new(),
                 },
                 false,
             )
