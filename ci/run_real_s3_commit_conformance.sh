@@ -88,7 +88,8 @@ fi
 # NAT redirect disappears, so signed plaintext cannot escape to real S3.
 printf '127.0.0.1 %s %s\n' "${s3_host}" "${hosts_marker}" | sudo tee -a /etc/hosts >/dev/null
 sudo iptables -t nat -N "${nat_chain}"
-sudo iptables -t nat -A "${nat_chain}" -j REDIRECT --to-ports "${proxy_port}"
+sudo iptables -t nat -A "${nat_chain}" \
+  -p tcp -j REDIRECT --to-ports "${proxy_port}"
 sudo iptables -t nat -I OUTPUT 1 \
   -p tcp -d 127.0.0.1/32 --dport 80 \
   -m owner --uid-owner "${test_user_id}" -j "${nat_chain}"
