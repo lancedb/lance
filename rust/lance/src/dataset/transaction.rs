@@ -2504,6 +2504,7 @@ impl Transaction {
                     &mut final_indices,
                     updated_fragments,
                     fields_modified,
+                    &schema,
                 );
 
                 let mut new_fragments =
@@ -2648,7 +2649,7 @@ impl Transaction {
                 // base data. Any index older than one of those overlays was built on
                 // the pre-overlay values, so drop the rewritten fragment from its
                 // coverage to keep it from serving stale values.
-                Self::prune_overlay_stale_fields_from_indices(&mut final_indices, groups);
+                Self::prune_overlay_stale_fields_from_indices(&mut final_indices, groups, &schema);
 
                 if let Some(frag_reuse_index) = frag_reuse_index {
                     final_indices.retain(|idx| idx.name != frag_reuse_index.name);
@@ -2674,6 +2675,45 @@ impl Transaction {
                         && !new_uuids.contains(&existing_index.uuid)
                 });
                 final_indices.extend(new_indices.clone());
+                // All delta segments of one logical index (same name) must declare
+                // the same covering columns: the covered read path derives its
+                // output schema from one delta but executes all of them, so
+                // committing a mixed set would fail every query on the index.
+                // Scoped to names this operation adds, so a commit untouched by
+                // covering cannot be blocked by pre-existing state.
+                for new_index in new_indices {
+                    // A declared covering field must resolve to a TOP-LEVEL field of
+                    // the schema being committed: the read path resolves the id to its
+                    // bare name, so a nested id (e.g. a struct child) would silently
+                    // bind to a same-named top-level column, and a nonexistent id
+                    // fails every later query at planning time ("index metadata and
+                    // schema are inconsistent"). Reject at the commit boundary.
+                    for id in &new_index.included_fields {
+                        if !schema.fields.iter().any(|field| field.id == *id) {
+                            return Err(Error::invalid_input(format!(
+                                "CreateIndex: index '{}' (segment {}) declares covering \
+                                 field id {}, which is not a top-level field of the \
+                                 schema (covering columns must be top-level)",
+                                new_index.name, new_index.uuid, id
+                            )));
+                        }
+                    }
+                    if let Some(conflict) = final_indices.iter().find(|idx| {
+                        idx.name == new_index.name
+                            && idx.included_fields != new_index.included_fields
+                    }) {
+                        return Err(Error::invalid_input(format!(
+                            "CreateIndex: delta segment {} of index '{}' declares covering \
+                             fields {:?}, but delta segment {} declares {:?}; all segments of \
+                             one index must declare the same covering columns",
+                            new_index.uuid,
+                            new_index.name,
+                            new_index.included_fields,
+                            conflict.uuid,
+                            conflict.included_fields
+                        )));
+                    }
+                }
             }
             Operation::ReserveFragments { .. } | Operation::UpdateConfig { .. } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
@@ -2710,6 +2750,18 @@ impl Transaction {
                 }
                 final_fragments.extend(merged_fragments);
 
+                // `add_columns` commits as a Merge; growing a *covered* field's subtree
+                // (e.g. an AllNulls child under a covered struct, which writes no data file
+                // and so is invisible to the file-path-keyed prune below) would leave the
+                // index emitting the old payload schema while covered queries declare the
+                // new one. Reject at the commit boundary, mirroring the Project guard.
+                Self::reject_covered_field_subtree_change(
+                    &final_indices,
+                    current_manifest.map(|m| &m.schema),
+                    &schema,
+                    "add_columns (Merge)",
+                )?;
+
                 // A Merge can rewrite a column's data file in place; the field stays
                 // in the schema, so the index is retained -- prune its now-stale
                 // entries for the rewritten fragments.
@@ -2717,6 +2769,7 @@ impl Transaction {
                     &mut final_indices,
                     existing_fragments,
                     fragments,
+                    &schema,
                 );
 
                 // Some fields that have indices may have been removed, so we should
@@ -2739,6 +2792,16 @@ impl Transaction {
                             .any(|field_id| remaining_field_ids.contains(field_id))
                     });
                 }
+
+                // A Project that drops or renames a *covered* field would leave dangling
+                // index metadata whose storage still emits the column -- reject it before
+                // dropping/retaining any indices.
+                Self::reject_covered_field_subtree_change(
+                    &final_indices,
+                    current_manifest.map(|m| &m.schema),
+                    &schema,
+                    "Project",
+                )?;
 
                 // Some fields that have indices may have been removed, so we should
                 // remove those indices as well.
@@ -2892,6 +2955,7 @@ impl Transaction {
                     &mut final_indices,
                     &modified_fragments,
                     &replaced_fields,
+                    &schema,
                 );
             }
             Operation::DataOverlay { groups } => {
@@ -3297,9 +3361,21 @@ impl Transaction {
             if index_results_are_row_addrs(index) {
                 continue;
             }
-            let index_covers_modified_field = index.fields.iter().any(|field_id| {
-                value_updated_field_set.contains(&u32::try_from(*field_id).unwrap())
-            });
+            // Covering (`included_fields`) values are materialized in the index
+            // storage just like the indexed `fields`, so a rewrite of either
+            // makes this fragment's entries stale. Reusing them would serve the
+            // pre-update value, so treat both as "modified field" here.
+            //
+            // Expand to the leaf subtree, exactly as every sibling prune does:
+            // `included_fields` can only ever hold TOP-LEVEL ids (index creation
+            // resolves whole columns and rejects dotted names), while the caller
+            // may report the individual leaves it rewrote. Comparing raw ids would
+            // miss a covered struct whose child was rewritten and wrongly extend
+            // this index's bitmap onto the moved fragment, serving the pre-update
+            // subfield value from index storage.
+            let index_covers_modified_field = Self::index_dependent_field_ids(index, schema)
+                .iter()
+                .any(|field_id| value_updated_field_set.contains(field_id));
             if index_covers_modified_field {
                 continue;
             }
@@ -3342,11 +3418,51 @@ impl Transaction {
     }
 
     /// If an operation modifies one or more fields in a fragment then we need to remove
-    /// that fragment from any indices that cover one of the modified fields.
+    /// that fragment from any indices that cover one of the modified fields — whether as
+    /// an indexed key field (`fields`) or as a covering/"included" field
+    /// (`included_fields`, whose values are materialized in the index storage and would
+    /// otherwise be served stale).
+    /// The full set of leaf field ids an index depends on: its indexed key fields plus
+    /// every covered (included) field expanded to its whole subtree. `included_fields`
+    /// records the parent struct id, but a modified/overlaid data file lists leaf ids, so
+    /// a change to a covered struct's subfield must still count as touching the index.
+    /// Leaf field ids an index depends on: its indexed key fields plus every covered
+    /// ("included") field expanded to its whole subtree. Returned as raw `i32` (the field
+    /// id space of `DataFile.fields` / overlay fields), so a change to a leaf subfield of
+    /// a covered *struct* -- whose `included_fields` records only the parent id -- is
+    /// recognized. Shared by the freshness prunes and the conflict-rebase checks.
+    pub(crate) fn index_dependent_leaf_ids(index: &IndexMetadata, schema: &Schema) -> HashSet<i32> {
+        let mut ids: HashSet<i32> = HashSet::new();
+        for &id in index.fields.iter().chain(index.included_fields.iter()) {
+            match schema.field_by_id(id) {
+                Some(field) => crate::index::collect_subtree_field_ids(field, &mut ids),
+                None => {
+                    ids.insert(id);
+                }
+            }
+        }
+        ids
+    }
+
+    fn index_dependent_field_ids(index: &IndexMetadata, schema: &Schema) -> HashSet<u32> {
+        Self::index_dependent_leaf_ids(index, schema)
+            .into_iter()
+            .filter_map(|id| u32::try_from(id).ok())
+            .collect()
+    }
+
+    /// Drop `updated_fragments` from the coverage of any index that depends on a field
+    /// listed in `fields_modified`. Covered struct fields are expanded to their leaf
+    /// subtree: `included_fields` records the parent struct id while a modified data
+    /// file lists leaf ids, so exact-id matching would miss an update to a covered
+    /// struct's subfield and serve its stale value from the index. Every caller must
+    /// therefore supply the schema (the conflict-rebase path captures it at the read
+    /// version).
     pub(crate) fn prune_updated_fields_from_indices(
         indices: &mut [IndexMetadata],
         updated_fragments: &[Fragment],
         fields_modified: &[u32],
+        schema: &Schema,
     ) {
         if fields_modified.is_empty() {
             return;
@@ -3354,14 +3470,12 @@ impl Transaction {
 
         // If we modified any fields in the fragments then we need to remove those fragments
         // from the index if the index covers one of those modified fields.
-        let fields_modified_set = fields_modified.iter().collect::<HashSet<_>>();
+        let fields_modified_set = fields_modified.iter().copied().collect::<HashSet<u32>>();
         for index in indices.iter_mut() {
-            if index
-                .fields
+            let touches_index = Self::index_dependent_field_ids(index, schema)
                 .iter()
-                .any(|field_id| fields_modified_set.contains(&u32::try_from(*field_id).unwrap()))
-                && let Some(fragment_bitmap) = &mut index.fragment_bitmap
-            {
+                .any(|field_id| fields_modified_set.contains(field_id));
+            if touches_index && let Some(fragment_bitmap) = &mut index.fragment_bitmap {
                 for fragment_id in updated_fragments.iter().map(|f| f.id as u32) {
                     fragment_bitmap.remove(fragment_id);
                 }
@@ -3371,7 +3485,7 @@ impl Transaction {
 
     /// Map each (non-tombstoned) field id in a fragment to the path of the data
     /// file that backs it.
-    fn fragment_field_paths(frag: &Fragment) -> HashMap<i32, &str> {
+    pub(crate) fn fragment_field_paths(frag: &Fragment) -> HashMap<i32, &str> {
         let mut map = HashMap::new();
         for file in &frag.files {
             for &field_id in file.fields.iter() {
@@ -3393,6 +3507,7 @@ impl Transaction {
         indices: &mut [IndexMetadata],
         prev_fragments: &[Fragment],
         new_fragments: &[Fragment],
+        schema: &Schema,
     ) {
         let prev_by_id: HashMap<u64, &Fragment> =
             prev_fragments.iter().map(|f| (f.id, f)).collect();
@@ -3419,6 +3534,7 @@ impl Transaction {
                 indices,
                 std::slice::from_ref(new_frag),
                 &changed,
+                schema,
             );
         }
     }
@@ -3433,17 +3549,18 @@ impl Transaction {
     fn prune_overlay_stale_fields_from_indices(
         indices: &mut [IndexMetadata],
         groups: &[RewriteGroup],
+        schema: &Schema,
     ) {
         for group in groups {
             // field id -> newest overlay committed_version supplying that field
-            let mut overlaid_field_versions: HashMap<i32, u64> = HashMap::new();
+            let mut overlaid_field_versions: HashMap<u32, u64> = HashMap::new();
             for old_frag in &group.old_fragments {
                 for overlay in &old_frag.overlays {
                     for &field_id in overlay.data_file.fields.iter() {
-                        if field_id < 0 {
-                            // Tombstoned (obsolete) overlay field: supplies nothing.
+                        // Tombstoned (obsolete) overlay fields (< 0) supply nothing.
+                        let Ok(field_id) = u32::try_from(field_id) else {
                             continue;
-                        }
+                        };
                         let entry = overlaid_field_versions.entry(field_id).or_insert(0);
                         *entry = (*entry).max(overlay.committed_version);
                     }
@@ -3459,11 +3576,20 @@ impl Transaction {
                 .map(|f| f.id as u32)
                 .collect::<Vec<_>>();
             for index in indices.iter_mut() {
-                let is_stale = index.fields.iter().any(|field_id| {
-                    overlaid_field_versions
-                        .get(field_id)
-                        .is_some_and(|&overlay_version| overlay_version > index.dataset_version)
-                });
+                // A covered (included) field an overlay supplied makes the index just as
+                // stale as an indexed field would -- the index storage still holds the
+                // pre-overlay copy of that column. Expand covered structs to their leaf
+                // subtree, since the overlay lists leaf ids.
+                let is_stale =
+                    Self::index_dependent_field_ids(index, schema)
+                        .iter()
+                        .any(|field_id| {
+                            overlaid_field_versions
+                                .get(field_id)
+                                .is_some_and(|&overlay_version| {
+                                    overlay_version > index.dataset_version
+                                })
+                        });
                 if is_stale && let Some(fragment_bitmap) = &mut index.fragment_bitmap {
                     for new_id in &new_fragment_ids {
                         fragment_bitmap.remove(*new_id);
@@ -3481,6 +3607,76 @@ impl Transaction {
                 // Keep file if it has at least one non-tombstoned field
                 file.fields.iter().any(|&field_id| field_id != -2)
             });
+        }
+    }
+
+    /// Reject a commit that would drop, rename, retype, or otherwise change the subtree of
+    /// a field an index *covers* (an "included" column). A covered field's physical payload
+    /// schema is fixed at index build time; `retain_relevant_indices` only drops indices
+    /// whose *key* fields leave the schema, so an index whose key survives but whose covered
+    /// column's subtree changed would keep emitting the old payload schema while covered ANN
+    /// queries declare the new one. This fires for two commit operations:
+    /// - `Project`, which can drop/rename/retype a covered field (public drop/alter APIs
+    ///   preflight this, but a raw `Operation::Project` reaches `build_manifest` directly);
+    /// - `Merge` (how `add_columns` commits), which can grow a covered *struct* by adding a
+    ///   child -- even an AllNulls, metadata-only child that writes no data file, so the
+    ///   file-path-keyed coverage prune never sees it.
+    ///
+    /// `old_schema` is the pre-commit schema (needed to detect renames/retypes/child-adds,
+    /// which keep the covered field's id). `op` names the operation for the error message.
+    fn reject_covered_field_subtree_change(
+        indices: &[IndexMetadata],
+        old_schema: Option<&Schema>,
+        new_schema: &Schema,
+        op: &str,
+    ) -> Result<()> {
+        let new_ids: HashSet<i32> = new_schema.fields_pre_order().map(|f| f.id).collect();
+        for index in indices {
+            // Only indices that survive the commit (their key fields all remain) can be
+            // left with dangling covering metadata; a fully-projected-away index is dropped
+            // by `retain_relevant_indices`.
+            if !index.fields.iter().all(|id| new_ids.contains(id)) {
+                continue;
+            }
+            for &covered_id in &index.included_fields {
+                let changed = match old_schema {
+                    Some(old) => Self::covered_field_subtree_changed(old, new_schema, covered_id),
+                    // Without the pre-commit schema we can only detect a drop.
+                    None => new_schema.field_by_id(covered_id).is_none(),
+                };
+                if changed {
+                    return Err(Error::invalid_input(format!(
+                        "{op} would drop or alter covered (included) field id {covered_id} \
+                         (its subtree changed), still used by index '{}'. Drop the index with \
+                         drop_index() before changing the column.",
+                        index.name
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether a covered ("included") field's subtree differs between `old_schema` and
+    /// `new_schema` -- dropped, renamed, retyped, a nullability flip, or any child change.
+    /// Such a change means the index's stored physical payload no longer matches the
+    /// schema a query declares. `data_type()` is recursive for structs, so it also covers
+    /// a child's name/type/nullability change.
+    pub(crate) fn covered_field_subtree_changed(
+        old_schema: &Schema,
+        new_schema: &Schema,
+        covered_id: i32,
+    ) -> bool {
+        let Some(old) = old_schema.field_by_id(covered_id) else {
+            return false;
+        };
+        match new_schema.field_by_id(covered_id) {
+            None => true,
+            Some(new) => {
+                old.name != new.name
+                    || old.nullable != new.nullable
+                    || old.data_type() != new.data_type()
+            }
         }
     }
 
@@ -4888,6 +5084,94 @@ mod tests {
         }
     }
 
+    /// A stable-row-id `RewriteRows` update that modifies ONLY a covering
+    /// (included) column must not re-extend a covered index's fragment
+    /// coverage onto the moved fragment: the index still holds the pre-update
+    /// materialized value, so reusing it would serve a stale covered result.
+    /// The modified field is in `included_fields`, not `fields`.
+    ///
+    /// Both spellings of "the covering column changed" must be caught. `included_fields`
+    /// only ever holds TOP-LEVEL ids (index creation resolves whole columns and rejects
+    /// dotted names), but the caller may report either the covered struct's own id or the
+    /// leaf ids it actually rewrote -- `Operation::Update` is public, so
+    /// `fields_for_preserving_frag_bitmap` is caller-supplied and unvalidated. Comparing raw
+    /// ids catches only the first spelling and silently serves stale subfield values for the
+    /// second.
+    #[test]
+    fn test_pure_rewrite_preserves_covering_index_coverage() {
+        use arrow_schema::Fields as ArrowFields;
+
+        // meta{a} => ids 0 (struct) and 1 (leaf); vector => id 2.
+        let arrow = ArrowSchema::new(vec![
+            ArrowField::new(
+                "meta",
+                DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                    "a",
+                    DataType::Int32,
+                    true,
+                )])),
+                true,
+            ),
+            ArrowField::new("vector", DataType::Int32, true),
+        ]);
+        let schema = LanceSchema::try_from(&arrow).unwrap();
+        let meta_id = schema.field("meta").unwrap().id;
+        let leaf_id = schema.field("meta.a").unwrap().id;
+        let vector_id = schema.field("vector").unwrap().id;
+
+        // Returns (covered index re-extended?, plain index re-extended?).
+        let run = |modified: &[u32]| {
+            let mut covering = sample_index_metadata("covering");
+            covering.fields = vec![vector_id];
+            covering.included_fields = vec![meta_id]; // top-level, as creation guarantees
+            covering.fragment_bitmap = Some([0].into_iter().collect());
+
+            let mut plain = sample_index_metadata("plain");
+            plain.fields = vec![vector_id];
+            plain.included_fields = vec![];
+            plain.fragment_bitmap = Some([0].into_iter().collect());
+
+            let mut indices = vec![covering, plain];
+            let overlaid: HashMap<u32, &Fragment> = HashMap::new();
+            Transaction::register_pure_rewrite_rows_update_frags_in_indices(
+                &mut indices,
+                &[1], // new fragment holding the moved rows
+                &[0], // original fragment (covered by both indices)
+                modified,
+                &overlaid,
+                &schema,
+            )
+            .unwrap();
+            (
+                indices[0].fragment_bitmap.as_ref().unwrap().contains(1),
+                indices[1].fragment_bitmap.as_ref().unwrap().contains(1),
+            )
+        };
+
+        for (label, modified) in [
+            (
+                "covered struct reported by its own id",
+                vec![meta_id as u32],
+            ),
+            (
+                "covered struct reported by its leaf id",
+                vec![leaf_id as u32],
+            ),
+        ] {
+            let (covered_extended, plain_extended) = run(&modified);
+            assert!(
+                !covered_extended,
+                "covered index must not re-extend coverage onto a fragment whose covering \
+                 column was rewritten ({label})"
+            );
+            assert!(
+                plain_extended,
+                "index that neither indexes nor covers the modified field still reuses its \
+                 entries ({label})"
+            );
+        }
+    }
+
     #[test]
     fn test_rewrite_fragments() {
         let existing_fragments: Vec<Fragment> = (0..10).map(Fragment::new).collect();
@@ -5091,6 +5375,192 @@ mod tests {
                 .iter()
                 .any(|idx| idx.uuid == second_index.uuid)
         );
+    }
+
+    /// A raw CreateIndex commit whose new index declares a covering field id missing
+    /// from the schema must be rejected at the commit boundary -- otherwise every later
+    /// query on the index fails at planning time with an inconsistent-metadata error.
+    #[test]
+    fn test_create_index_build_manifest_rejects_unresolvable_covered_field() {
+        let manifest = sample_manifest();
+        let mut covered = sample_index_metadata("vector_idx");
+        covered.included_fields = vec![9999];
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![covered],
+                removed_indices: vec![],
+            },
+            None,
+        );
+        let err = transaction
+            .build_manifest(
+                Some(&manifest),
+                vec![],
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("9999"),
+            "an unresolvable covered field id must be rejected at commit: {err}"
+        );
+    }
+
+    /// A covering declaration must reference a TOP-LEVEL field: `included_fields`
+    /// resolution on the read path goes id -> name -> arrow field by bare name, so a
+    /// nested field id (e.g. a struct child) would silently bind to a same-named
+    /// top-level column instead of erroring. The create path rejects dotted names;
+    /// raw commits must reject nested ids for the same reason.
+    #[test]
+    fn test_create_index_build_manifest_rejects_nested_covered_field() {
+        use arrow_schema::Fields as ArrowFields;
+
+        let arrow = ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new(
+                "s",
+                DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                    "id",
+                    DataType::Int64,
+                    true,
+                )])),
+                true,
+            ),
+        ]);
+        let schema = LanceSchema::try_from(&arrow).unwrap();
+        let nested_id = schema.field("s.id").unwrap().id;
+        let manifest = Manifest::new(
+            schema,
+            Arc::new(vec![Fragment::new(0)]),
+            DataStorageFormat::new(ConcreteFileVersion::V2_0),
+            HashMap::new(),
+        );
+
+        let mut covered = sample_index_metadata("vector_idx");
+        covered.included_fields = vec![nested_id];
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![covered],
+                removed_indices: vec![],
+            },
+            None,
+        );
+        let err = transaction
+            .build_manifest(
+                Some(&manifest),
+                vec![],
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("top-level"),
+            "a nested covered field id must be rejected at commit: {err}"
+        );
+    }
+
+    /// All delta segments of one logical index must declare the same covering columns:
+    /// the covered read path derives its output schema from one delta but executes all
+    /// of them, so a mixed set fails every query on the index at execution time.
+    #[test]
+    fn test_create_index_build_manifest_rejects_mixed_covering_deltas() {
+        let manifest = sample_manifest();
+        let mut covered = sample_index_metadata("vector_idx");
+        covered.included_fields = vec![0];
+        let plain = sample_index_metadata("vector_idx");
+
+        // Adding a non-covered delta to an existing covered index is rejected.
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![plain.clone()],
+                removed_indices: vec![],
+            },
+            None,
+        );
+        let err = transaction
+            .build_manifest(
+                Some(&manifest),
+                vec![covered.clone()],
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("covering"),
+            "mixed covering across deltas must be rejected: {err}"
+        );
+
+        // A mixed covering set within one commit's own new segments is rejected too.
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![covered.clone(), plain.clone()],
+                removed_indices: vec![],
+            },
+            None,
+        );
+        let err = transaction
+            .build_manifest(
+                Some(&manifest),
+                vec![],
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("covering"),
+            "mixed covering within one commit must be rejected: {err}"
+        );
+
+        // Removing the disagreeing delta in the same commit leaves a homogeneous
+        // final state, which is fine.
+        let mut covered2 = sample_index_metadata("vector_idx");
+        covered2.included_fields = vec![0];
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![covered2],
+                removed_indices: vec![plain.clone()],
+            },
+            None,
+        );
+        let (_, final_indices) = transaction
+            .build_manifest(
+                Some(&manifest),
+                vec![covered.clone(), plain],
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap();
+        assert_eq!(final_indices.len(), 2);
+        assert!(
+            final_indices
+                .iter()
+                .all(|idx| idx.included_fields == vec![0]),
+            "the homogeneous replacement set should commit"
+        );
+
+        // An index with a different name is unaffected.
+        let other = sample_index_metadata("other_idx");
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![other],
+                removed_indices: vec![],
+            },
+            None,
+        );
+        transaction
+            .build_manifest(
+                Some(&manifest),
+                vec![covered],
+                "txn",
+                &ManifestWriteConfig::default(),
+            )
+            .unwrap();
     }
 
     #[test]
@@ -7754,6 +8224,11 @@ mod tests {
 
         // Post-remap state: every index already covers the new fragment (7).
         let covering = || Some(RoaringBitmap::from_iter([7u32]));
+        // Indexes an un-overlaid field (3) but *covers* the overlaid field 1 as an
+        // included column; built (v2) before the overlay, so its stored copy of
+        // field 1 is stale and the rewritten fragment must be dropped.
+        let mut covered_stale = create_test_index("covered_stale", 3, 2, covering(), false);
+        covered_stale.included_fields = vec![1];
         let mut indices = vec![
             // Stale: covers the overlaid field 1, built (v2) before the overlay.
             create_test_index("stale", 1, 2, covering(), false),
@@ -7762,9 +8237,16 @@ mod tests {
             create_test_index("fresh", 1, 5, covering(), false),
             // Unrelated: covers field 2, which the overlay never touched.
             create_test_index("unrelated", 2, 2, covering(), false),
+            covered_stale,
         ];
 
-        Transaction::prune_overlay_stale_fields_from_indices(&mut indices, &groups);
+        // Flat field ids with no struct nesting: an empty schema makes subtree
+        // expansion a no-op (each id maps to itself), exercising the id-level logic.
+        Transaction::prune_overlay_stale_fields_from_indices(
+            &mut indices,
+            &groups,
+            &LanceSchema::default(),
+        );
 
         assert!(
             !indices[0].fragment_bitmap.as_ref().unwrap().contains(7),
@@ -7777,6 +8259,201 @@ mod tests {
         assert!(
             indices[2].fragment_bitmap.as_ref().unwrap().contains(7),
             "an index on an un-overlaid field is unaffected"
+        );
+        assert!(
+            !indices[3].fragment_bitmap.as_ref().unwrap().contains(7),
+            "an index whose *covered* field was overlaid is stale too"
+        );
+    }
+
+    /// `included_fields` records a covered struct's parent id, but a modified data file
+    /// lists leaf ids. Schema-aware pruning must expand the covered struct to its subtree
+    /// so an update to a subfield still invalidates the fragment's coverage.
+    #[test]
+    fn test_prune_updated_fields_expands_covered_struct_subtree() {
+        use arrow_schema::Fields as ArrowFields;
+
+        let arrow = ArrowSchema::new(vec![
+            ArrowField::new(
+                "s",
+                DataType::Struct(ArrowFields::from(vec![
+                    ArrowField::new("a", DataType::Int32, true),
+                    ArrowField::new("b", DataType::Int32, true),
+                ])),
+                true,
+            ),
+            ArrowField::new("x", DataType::Int32, true),
+        ]);
+        let schema = LanceSchema::try_from(&arrow).unwrap();
+        let s_id = schema.field("s").unwrap().id;
+        let a_id = u32::try_from(schema.field("s.a").unwrap().id).unwrap();
+        let x_id = schema.field("x").unwrap().id;
+
+        // Index keyed on scalar `x`, covering the whole struct `s`, over fragment 0.
+        let mut idx = create_test_index(
+            "cov",
+            x_id,
+            1,
+            Some(RoaringBitmap::from_iter([0u32])),
+            false,
+        );
+        idx.included_fields = vec![s_id];
+
+        // Updating leaf `s.a` prunes the covered struct's fragment: the subtree
+        // expansion bridges the parent-id-vs-leaf-id mismatch that exact-id matching
+        // would miss.
+        let mut indices = vec![idx];
+        Transaction::prune_updated_fields_from_indices(
+            &mut indices,
+            &[Fragment::new(0)],
+            &[a_id],
+            &schema,
+        );
+        assert!(
+            !indices[0].fragment_bitmap.as_ref().unwrap().contains(0),
+            "updating a covered struct's subfield must drop the fragment from coverage"
+        );
+    }
+
+    /// A Project that drops or renames a covered (included) column must be rejected at
+    /// the commit boundary, even when the index's key column survives.
+    #[test]
+    fn test_reject_projected_covered_fields() {
+        let arrow = ArrowSchema::new(vec![
+            ArrowField::new("vec", DataType::Int32, false),
+            ArrowField::new("meta", DataType::Utf8, true),
+            ArrowField::new("other", DataType::Int32, true),
+        ]);
+        let old_schema = LanceSchema::try_from(&arrow).unwrap();
+        let vec_id = old_schema.field("vec").unwrap().id;
+        let meta_id = old_schema.field("meta").unwrap().id;
+
+        // Index keyed on `vec`, covering `meta`.
+        let mut idx = create_test_index(
+            "cov",
+            vec_id,
+            1,
+            Some(RoaringBitmap::from_iter([0u32])),
+            true,
+        );
+        idx.included_fields = vec![meta_id];
+        let indices = vec![idx];
+
+        // Keeping every field -> Ok.
+        assert!(
+            Transaction::reject_covered_field_subtree_change(
+                &indices,
+                Some(&old_schema),
+                &old_schema,
+                "Project"
+            )
+            .is_ok()
+        );
+
+        // Dropping the covered `meta` while keeping the key -> rejected.
+        let dropped = old_schema.project(&["vec", "other"]).unwrap();
+        let err = Transaction::reject_covered_field_subtree_change(
+            &indices,
+            Some(&old_schema),
+            &dropped,
+            "Project",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("drop or alter covered"),
+            "expected a covered-subtree rejection, got: {err}"
+        );
+
+        // Dropping the key too (the index would be dropped) -> not our concern.
+        let drop_all = old_schema.project(&["other"]).unwrap();
+        assert!(
+            Transaction::reject_covered_field_subtree_change(
+                &indices,
+                Some(&old_schema),
+                &drop_all,
+                "Project"
+            )
+            .is_ok()
+        );
+
+        // Renaming the covered field (id stays, name changes) -> rejected.
+        let mut renamed = old_schema.clone();
+        renamed.field_by_id_mut(meta_id).unwrap().name = "meta_renamed".to_string();
+        assert!(
+            Transaction::reject_covered_field_subtree_change(
+                &indices,
+                Some(&old_schema),
+                &renamed,
+                "Project"
+            )
+            .is_err(),
+            "renaming a covered field must be rejected"
+        );
+
+        // Flipping the covered field's nullability (id + name stay) -> rejected.
+        let mut retyped_null = old_schema.clone();
+        retyped_null.field_by_id_mut(meta_id).unwrap().nullable = false;
+        assert!(
+            Transaction::reject_covered_field_subtree_change(
+                &indices,
+                Some(&old_schema),
+                &retyped_null,
+                "Project"
+            )
+            .is_err(),
+            "a covered field nullability change must be rejected"
+        );
+    }
+
+    /// Growing a covered *struct*'s subtree (adding a child) is what `add_columns`/Merge
+    /// does; the covered field id is unchanged but its `data_type()` differs, so the commit
+    /// boundary must reject it just like the Project drop/alter cases above.
+    #[test]
+    fn test_reject_covered_struct_child_add() {
+        let child = ArrowField::new("a", DataType::Int32, false);
+        let arrow = ArrowSchema::new(vec![
+            ArrowField::new("vec", DataType::Int32, false),
+            ArrowField::new("meta", DataType::Struct(vec![child.clone()].into()), true),
+        ]);
+        let old_schema = LanceSchema::try_from(&arrow).unwrap();
+        let vec_id = old_schema.field("vec").unwrap().id;
+        let meta_id = old_schema.field("meta").unwrap().id;
+
+        let mut idx = create_test_index(
+            "cov",
+            vec_id,
+            1,
+            Some(RoaringBitmap::from_iter([0u32])),
+            true,
+        );
+        idx.included_fields = vec![meta_id]; // covers the struct's parent id
+        let indices = vec![idx];
+
+        // New schema grows `meta` with a second child -> the struct's data_type changes.
+        let grown_arrow = ArrowSchema::new(vec![
+            ArrowField::new("vec", DataType::Int32, false),
+            ArrowField::new(
+                "meta",
+                DataType::Struct(vec![child, ArrowField::new("b", DataType::Int32, true)].into()),
+                true,
+            ),
+        ]);
+        // Preorder id assignment gives `meta` the same id (1) in both schemas, so the
+        // covered id resolves to the struct on each side and only its data_type differs.
+        let grown = LanceSchema::try_from(&grown_arrow).unwrap();
+        assert_eq!(grown.field("meta").unwrap().id, meta_id);
+
+        let err = Transaction::reject_covered_field_subtree_change(
+            &indices,
+            Some(&old_schema),
+            &grown,
+            "add_columns (Merge)",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("drop or alter covered")
+                && err.to_string().contains("add_columns"),
+            "expected a covered-struct-growth rejection, got: {err}"
         );
     }
 

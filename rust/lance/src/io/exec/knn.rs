@@ -1423,6 +1423,21 @@ impl ANNIvfSubIndexExec {
             .first()
             .map(|idx| idx.included_fields.clone())
             .unwrap_or_default();
+        // This exec declares one output schema but executes every delta segment,
+        // each emitting covering columns from its own storage -- so all deltas
+        // must agree on the covering set. The commit boundary enforces this; the
+        // check here defends against already-committed inconsistent metadata,
+        // failing with a clear error instead of a downstream schema mismatch.
+        if let Some(mismatch) = indices
+            .iter()
+            .find(|idx| idx.included_fields != included_ids)
+        {
+            return Err(Error::index(format!(
+                "ANNIvfSubIndexExec: delta segments of index '{}' disagree on covering fields \
+                 ({:?} vs {:?}); the index metadata is inconsistent -- rebuild the index",
+                mismatch.name, included_ids, mismatch.included_fields
+            )));
+        }
         if !included_ids.is_empty() {
             let lance_schema = dataset.schema();
             for id in &included_ids {
@@ -1962,11 +1977,22 @@ impl ANNIvfSubIndexExec {
 
         // Fetch the covering columns (the fields after `[_distance, _rowid]`) from the
         // base table for the missing rows; the take is bounded by `not_found.len()`.
-        let covered_names: Vec<String> = output_schema
-            .fields()
-            .iter()
-            .skip(2)
-            .map(|field| field.name().clone())
+        // Ask for `_rowid` alongside them: the take resolves ids with
+        // `MissingRowPolicy::Ignore` and silently returns FEWER rows than requested when an
+        // id no longer maps (a row deleted since the prefilter was built, or a prefilter that
+        // still lists a tombstoned row). Rebuilding the batch from `not_found` would then pair
+        // N distance/rowid values with < N covering values and fail with "all columns in a
+        // record batch must have the same length". Carrying `_rowid` through lets the batch be
+        // rebuilt from the rows the take actually returned, which is what the non-covered path
+        // does when its `TakeExec` drops the same ids.
+        let covered_names: Vec<String> = std::iter::once(ROW_ID.to_string())
+            .chain(
+                output_schema
+                    .fields()
+                    .iter()
+                    .skip(2)
+                    .map(|field| field.name().clone()),
+            )
             .collect();
         let projection = ProjectionRequest::from_columns(covered_names, dataset.schema());
         // `not_found` holds row ids (the `_rowid` space): stable logical ids on a
@@ -1975,16 +2001,28 @@ impl ANNIvfSubIndexExec {
         // identity (id == address) when it does not, so it is correct in both cases --
         // unlike `try_new_from_addresses`, which would misread a stable id as
         // `frag = id >> 32, offset = id` and take the wrong physical row (or error).
-        let covered = TakeBuilder::try_new_from_ids(dataset, not_found.clone(), projection)?
+        let covered = TakeBuilder::try_new_from_ids(dataset, not_found, projection)?
             .execute()
             .await?;
 
-        let n = not_found.len();
+        // Realign on what came back, not on what was asked for.
+        let returned_ids = covered
+            .column_by_name(ROW_ID)
+            .ok_or_else(|| {
+                DataFusionError::Internal(format!(
+                    "covered recovery take did not return the requested {ROW_ID} column"
+                ))
+            })?
+            .clone();
+        let n = covered.num_rows();
+        if n == 0 {
+            return Ok(None);
+        }
         let mut columns: Vec<ArrayRef> = vec![
             Arc::new(Float32Array::from_value(f32::INFINITY, n)),
-            Arc::new(UInt64Array::from(not_found)),
+            returned_ids,
         ];
-        columns.extend(covered.columns().iter().cloned());
+        columns.extend(covered.columns().iter().skip(1).cloned());
         let batch = RecordBatch::try_new(output_schema, columns)
             .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
         Ok(Some(batch))
@@ -2141,11 +2179,13 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
         // Covered null-vector recovery: track which row ids the search emits, then after
         // it finishes emit any prefilter-matched rows that had no index entry, with their
         // covering columns taken from the base table (see `covered_not_found_batch`).
-        // Tracking is skipped when recovery provably cannot emit anything: without a
-        // prefilter source there is no allow-list, so `covered_not_found_batch` always
-        // returns `None` -- the per-batch lock and inserts would be pure overhead on
-        // the covered hot path.
-        let track_emitted = has_covered && !matches!(self.prefilter_source, PreFilterSource::None);
+        // This must NOT be gated on `prefilter_source`: `DatasetPreFilter` builds a bounded
+        // allow-list from the deletion mask alone, so an unfiltered query over a dataset with
+        // deletions (or a fragment outside the index bitmap) still arms recovery. Skipping the
+        // bookkeeping there left `emitted` empty, and recovery re-emitted every live row on top
+        // of the ones the search had already returned. The cost is already confined to covered
+        // plans, and recovery itself stays gated behind `covered_recovery_armed`.
+        let track_emitted = has_covered;
         let emitted_row_ids = Arc::new(std::sync::Mutex::new(roaring::RoaringTreemap::new()));
         let emitted_for_inspect = emitted_row_ids.clone();
         let recon_prefilter = pre_filter.clone();
@@ -2153,6 +2193,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
         let recon_ds = ds.clone();
         let recon_schema = schema.clone();
         let recon_k = query.k;
+        let declared_schema = schema.clone();
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             schema,
@@ -2200,6 +2241,25 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                 // Each delta stream is split into an early and late search.  The late search
                 // will not start until the early search is complete across all deltas.
                 .try_flatten_unordered(None)
+                // The search emits covering columns read from index STORAGE, while this node
+                // declares them from the manifest (`IndexMetadata.included_fields`). The two can
+                // disagree: `FLAG_COVERED_INDEX_METADATA` is a best-effort writer fence, so a
+                // client predating it can drop the declaration while the index files keep the
+                // payload. Without narrowing, this stream mixes batch widths -- a wider search
+                // batch next to the narrower non-covered shortcut batch -- which panics inside
+                // DataFusion's TopK (`interleave_record_batch` reads every batch through the
+                // first batch's schema). Narrow to the declaration so the query degrades to a
+                // base-table take instead. Only ever narrows: the opposite desync (declared but
+                // absent from storage) fails loudly at plan time, which is the right outcome.
+                .map(move |batch| {
+                    let batch = batch?;
+                    if batch.num_columns() > declared_schema.fields().len() {
+                        return batch
+                            .project_by_schema(declared_schema.as_ref())
+                            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None));
+                    }
+                    Ok(batch)
+                })
                 .inspect_ok(move |batch| {
                     // Record emitted row ids so the reconciliation below can find the
                     // prefilter rows the search never returned (no index entry).
@@ -2666,6 +2726,72 @@ mod tests {
         assert!(
             err.to_string().contains("covering field id 9999"),
             "expected a manifest/schema inconsistency error, got: {err}"
+        );
+    }
+
+    /// The exec declares one output schema but executes every delta segment, so delta
+    /// segments that disagree on covering fields must be rejected up front with a clear
+    /// error, not fail later with a stream/plan schema mismatch. (The commit boundary
+    /// rejects new mixed sets; this defends against already-committed metadata.)
+    #[tokio::test]
+    async fn test_ann_sub_index_rejects_mixed_covering_deltas() {
+        use lance_datafusion::exec::OneShotExec;
+
+        let input = Arc::new(OneShotExec::from_batch(RecordBatch::new_empty(
+            KNN_PARTITION_SCHEMA.clone(),
+        )));
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let dataset = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new(vec![Ok(batch)], schema),
+                "memory://d2-mixed-covering-deltas",
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+        let id_field_id = dataset.schema().field("id").unwrap().id;
+
+        let covered_delta = IndexMetadata {
+            uuid: uuid::Uuid::new_v4(),
+            fields: vec![],
+            name: "vector_idx".to_string(),
+            dataset_version: 1,
+            fragment_bitmap: Some(RoaringBitmap::new()),
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+            included_fields: vec![id_field_id],
+        };
+        let plain_delta = IndexMetadata {
+            uuid: uuid::Uuid::new_v4(),
+            included_fields: Vec::new(),
+            ..covered_delta.clone()
+        };
+
+        let result = ANNIvfSubIndexExec::try_new(
+            input,
+            dataset,
+            vec![covered_delta, plain_delta],
+            base_query(),
+            PreFilterSource::None,
+        );
+        let err = result.expect_err("delta segments with mixed covering must be rejected");
+        assert!(
+            err.to_string().contains("disagree on covering fields"),
+            "expected a delta covering mismatch error, got: {err}"
         );
     }
 

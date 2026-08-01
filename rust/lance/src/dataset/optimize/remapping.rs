@@ -325,16 +325,23 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
     // does not incorporate overlays committed after the source index was built.
     // Exclude those fragments so queries scan their current values instead.
     if let Some(fragment_bitmap) = &mut bitmap_after_remap {
+        // Fields whose value this index materializes: its indexed key fields plus every
+        // covered (included) column expanded to its leaf subtree (an overlay lists leaf
+        // ids, while `included_fields` records a parent struct id).
+        let relevant_field_ids =
+            Transaction::index_dependent_leaf_ids(&curr_index_meta, dataset.schema());
         for fragment in dataset.manifest.fragments.iter() {
-            let has_newer_indexed_overlay = fragment.overlays.iter().any(|overlay| {
+            // An overlay refreshing an indexed or covered field makes the index storage
+            // stale for that fragment: it still holds the pre-overlay copy of the value.
+            let has_newer_relevant_overlay = fragment.overlays.iter().any(|overlay| {
                 overlay.committed_version > curr_index_meta.dataset_version
                     && overlay
                         .data_file
                         .fields
                         .iter()
-                        .any(|field_id| curr_index_meta.fields.contains(field_id))
+                        .any(|field_id| relevant_field_ids.contains(field_id))
             });
-            if has_newer_indexed_overlay {
+            if has_newer_relevant_overlay {
                 fragment_bitmap.remove(fragment.id as u32);
             }
         }
@@ -361,7 +368,8 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
             created_at: curr_index_meta.created_at,
             base_id: None,
             files: curr_index_meta.files.clone(),
-            included_fields: Vec::new(),
+            // Row-id remapping preserves the covering columns.
+            included_fields: curr_index_meta.included_fields.clone(),
         },
         RemapResult::Remapped(remapped_index) => IndexMetadata {
             uuid: remapped_index.new_id,
@@ -374,7 +382,8 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
             created_at: curr_index_meta.created_at,
             base_id: None,
             files: remapped_index.files,
-            included_fields: Vec::new(),
+            // Row-id remapping preserves the covering columns.
+            included_fields: curr_index_meta.included_fields.clone(),
         },
     };
 
