@@ -340,6 +340,31 @@ is `goosefs://host:port/path`, where `host:port` is the GooseFS Master address
 (default port: `9200`, may be omitted, e.g. `goosefs://10.0.0.1/path`) and
 `/path` is the filesystem path within GooseFS.
 
+Manifest commits on `goosefs://` use `ConditionalPutCommitHandler`
+(`PutMode::Create` / if-not-exists), backed by GooseFS master's atomic
+no-replace rename so concurrent writers cannot clobber each other's
+versioned manifests.
+
+!!! warning "Mixed-version writers are NOT safe"
+
+    The `if-not-exists` guarantee only holds when **every** writer for a
+    dataset routes through this new handler. A writer running an older
+    Lance release still selects `UnsafeCommitHandler` for `goosefs://`
+    and writes the version path unconditionally, which can overwrite a
+    manifest that an upgraded writer has already won. Safe concurrent
+    commits therefore require:
+
+    - all writers for the dataset run a Lance release that includes this
+      routing change, **or**
+    - writers share an external coordination boundary (e.g. a single-writer
+      queue, table-level lock, or a gateway that serializes commits) that
+      prevents the old code path from racing the new one.
+
+    When upgrading in place, quiesce all writers (drain jobs, scale
+    clients to zero, or route traffic through a writer coordinator) before
+    rolling out the new Lance version, then bring writers back on the new
+    version together.
+
 !!! note "About the dataset path"
 
     `/path` is just an arbitrary directory inside GooseFS — Lance does **not**
