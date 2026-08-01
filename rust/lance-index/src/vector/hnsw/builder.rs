@@ -1263,6 +1263,15 @@ impl IvfSubIndex for HNSW {
         .into()
     }
 
+    // `schema()` governs the on-disk index file, and readers older than v8.0.0
+    // index the distance column there unconditionally, panicking when it is
+    // absent, so it cannot be dropped from what we write. Skipping it on read
+    // costs nothing in compatibility and keeps most of the graph bytes off the
+    // wire.
+    fn read_columns() -> Option<&'static [&'static str]> {
+        Some(&[VECTOR_ID_COL, NEIGHBORS_COL])
+    }
+
     #[instrument(level = "debug", skip(self, query, storage, prefilter, _metrics))]
     fn search(
         &self,
