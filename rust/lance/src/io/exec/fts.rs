@@ -182,30 +182,66 @@ fn count_fts_leaves(query: &FtsQuery) -> usize {
 
 /// One DataFusion boundary around a posting-backed compound scorer tree.
 #[derive(Debug)]
-pub(crate) struct CompoundQueryExec {
+pub struct CompoundQueryExec {
     dataset: Arc<Dataset>,
     query: FtsQuery,
     params: FtsSearchParams,
     prefilter_source: PreFilterSource,
+    /// When set, leaf scorers use this instead of building one from the
+    /// searched segments — see [`MatchQueryExec::with_base_scorer`].
+    base_scorer: Option<Arc<MemBM25Scorer>>,
     segment_selection: FtsSegmentSelection,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
 
 impl CompoundQueryExec {
-    pub(crate) fn new_with_segments(
+    pub fn new_with_segments(
         dataset: Arc<Dataset>,
         query: FtsQuery,
         params: FtsSearchParams,
         prefilter_source: PreFilterSource,
         segments: Vec<IndexMetadata>,
     ) -> Self {
+        Self::new_inner(
+            dataset,
+            query,
+            params,
+            prefilter_source,
+            FtsSegmentSelection::ExactResolved(Arc::from(segments)),
+        )
+    }
+
+    pub fn new_with_segment_uuids(
+        dataset: Arc<Dataset>,
+        query: FtsQuery,
+        params: FtsSearchParams,
+        prefilter_source: PreFilterSource,
+        segment_uuids: Vec<Uuid>,
+    ) -> Self {
+        Self::new_inner(
+            dataset,
+            query,
+            params,
+            prefilter_source,
+            FtsSegmentSelection::exact_uuids(segment_uuids),
+        )
+    }
+
+    fn new_inner(
+        dataset: Arc<Dataset>,
+        query: FtsQuery,
+        params: FtsSearchParams,
+        prefilter_source: PreFilterSource,
+        segment_selection: FtsSegmentSelection,
+    ) -> Self {
         Self {
             dataset,
             query,
             params,
             prefilter_source,
-            segment_selection: FtsSegmentSelection::ExactResolved(Arc::from(segments)),
+            base_scorer: None,
+            segment_selection,
             properties: Arc::new(PlanProperties::new(
                 EquivalenceProperties::new(FTS_SCHEMA.clone()),
                 Partitioning::RoundRobinBatch(1),
@@ -214,6 +250,36 @@ impl CompoundQueryExec {
             )),
             metrics: ExecutionPlanMetricsSet::new(),
         }
+    }
+
+    pub fn with_base_scorer(mut self, scorer: Arc<MemBM25Scorer>) -> Self {
+        self.base_scorer = Some(scorer);
+        self
+    }
+
+    pub fn dataset(&self) -> &Arc<Dataset> {
+        &self.dataset
+    }
+
+    pub fn query(&self) -> &FtsQuery {
+        &self.query
+    }
+
+    pub fn params(&self) -> &FtsSearchParams {
+        &self.params
+    }
+
+    pub fn prefilter_source(&self) -> &PreFilterSource {
+        &self.prefilter_source
+    }
+
+    pub fn base_scorer(&self) -> Option<&Arc<MemBM25Scorer>> {
+        self.base_scorer.as_ref()
+    }
+
+    /// See [`MatchQueryExec::explicit_segment_uuids`].
+    pub fn explicit_segment_uuids(&self) -> Option<Vec<Uuid>> {
+        self.segment_selection.explicit_segment_uuids()
     }
 }
 
@@ -284,6 +350,7 @@ impl ExecutionPlan for CompoundQueryExec {
             query: self.query.clone(),
             params: self.params.clone(),
             prefilter_source,
+            base_scorer: self.base_scorer.clone(),
             segment_selection: self.segment_selection.clone(),
             properties: self.properties.clone(),
             metrics: ExecutionPlanMetricsSet::new(),
@@ -300,6 +367,7 @@ impl ExecutionPlan for CompoundQueryExec {
         let query = self.query.clone();
         let params = self.params.clone();
         let prefilter_source = self.prefilter_source.clone();
+        let base_scorer = self.base_scorer.clone();
         let segment_selection = self.segment_selection.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
 
@@ -348,7 +416,8 @@ impl ExecutionPlan for CompoundQueryExec {
                     .saturating_mul(count_fts_leaves(&query)),
             );
             let (row_ids, scores) =
-                compound_search(&indices, &query, &params, prefilter, metrics.clone()).await?;
+                compound_search(&indices, &query, &params, prefilter, metrics.clone(), base_scorer)
+                    .await?;
             metrics.baseline_metrics.record_output(row_ids.len());
             Ok::<_, DataFusionError>(RecordBatch::try_new(
                 FTS_SCHEMA.clone(),
