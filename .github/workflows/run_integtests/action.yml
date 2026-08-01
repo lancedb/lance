@@ -9,10 +9,10 @@ runs:
     shell: bash
     run: |
       pip3 install $(ls target/wheels/pylance-*.whl)[tests,ray]
-  - name: Start localstack
+  - name: Start S3-compatible services
     shell: bash
     run: |
-      docker compose -f docker-compose.yml up -d --wait
+      docker compose -f docker-compose.yml --profile commit-conformance up -d --wait
   - name: Run python tests
     shell: bash
     working-directory: python

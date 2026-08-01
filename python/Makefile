@@ -4,6 +4,8 @@ PYTHON ?=
 PYTEST_ARGS ?= -vvv -s -m "not recurring"
 KEEP_COMPOSE ?= 0
 COMPOSE_FILE ?= ../docker-compose.yml
+COMPOSE_PROFILE ?= commit-conformance
+COMMIT_CONFORMANCE_TRACE_DIR ?= target/commit-conformance-traces
 UV_SYNC = uv sync
 UV_RUN = uv run --frozen
 
@@ -35,14 +37,14 @@ build: ## Build the local Rust extension with maturin
 test: ## Run Python tests except recurring tests
 	pytest $(PYTEST_ARGS) python/tests
 
-integtest: ## Start LocalStack and run integration tests
+integtest: ## Start S3-compatible services and run integration tests
 	@if [ "$(KEEP_COMPOSE)" = "1" ]; then \
-		docker compose -f $(COMPOSE_FILE) up -d --wait && \
-		pytest --run-integration $(PYTEST_ARGS) python/tests/test_s3_ddb.py python/tests/test_namespace_integration.py; \
+		docker compose -f $(COMPOSE_FILE) --profile $(COMPOSE_PROFILE) up -d --wait && \
+		LANCE_COMMIT_CONFORMANCE_TRACE_DIR=$(COMMIT_CONFORMANCE_TRACE_DIR) pytest --run-integration $(PYTEST_ARGS) python/tests/test_s3_ddb.py python/tests/test_commit_conformance.py python/tests/test_namespace_integration.py; \
 	else \
-		trap 'docker compose -f $(COMPOSE_FILE) down -v --remove-orphans --timeout 0 >/dev/null 2>&1 || true' EXIT; \
-		docker compose -f $(COMPOSE_FILE) up -d --wait && \
-		pytest --run-integration $(PYTEST_ARGS) python/tests/test_s3_ddb.py python/tests/test_namespace_integration.py; \
+		trap 'docker compose -f $(COMPOSE_FILE) --profile $(COMPOSE_PROFILE) down -v --remove-orphans --timeout 0 >/dev/null 2>&1 || true' EXIT; \
+		docker compose -f $(COMPOSE_FILE) --profile $(COMPOSE_PROFILE) up -d --wait && \
+		LANCE_COMMIT_CONFORMANCE_TRACE_DIR=$(COMMIT_CONFORMANCE_TRACE_DIR) pytest --run-integration $(PYTEST_ARGS) python/tests/test_s3_ddb.py python/tests/test_commit_conformance.py python/tests/test_namespace_integration.py; \
 	fi
 
 doctest: ## Run Python doctests

@@ -115,7 +115,11 @@ include = [
     "python/lance/util.py",
     "python/lance/arrow.py",
     "python/tests/test_arrow.py",
+    "python/tests/_commit_conformance.py",
+    "python/tests/_commit_fault_proxy.py",
+    "python/tests/test_commit_conformance.py",
 ]
+extraPaths = ["python/tests"]
 # Dependencies like pyarrow make this difficult to enforce strictly.
 reportMissingTypeStubs = "warning"
 reportImportCycles = "error"
@@ -132,6 +136,7 @@ markers = [
     "slow",
     "torch: tests which rely on pytorch being installed",
     "recurring: marks tests as recurring tests",
+    "real_s3: tests that require the fail-closed real-AWS S3 runner",
 ]
 filterwarnings = [
     'error::FutureWarning',

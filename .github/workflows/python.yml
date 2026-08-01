@@ -18,6 +18,10 @@ on:
       - .github/workflows/build_linux_wheel/**
       - .github/workflows/build_mac_wheel/**
       - .github/workflows/run_tests/**
+      - .github/workflows/run_integtests/**
+      - .github/workflows/nightly_run.yml
+      - ci/run_real_s3_commit_conformance.sh
+      - docker-compose.yml
 
 permissions:
   contents: read
@@ -320,3 +324,11 @@ jobs:
           pip install ray[data]
           pip install torch --index-url https://download.pytorch.org/whl/cpu
       - uses: ./.github/workflows/run_integtests
+      - name: Upload commit conformance traces
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: commit-conformance-traces
+          path: python/target/commit-conformance-traces
+          if-no-files-found: ignore
+          retention-days: 7

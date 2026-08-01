@@ -267,19 +267,45 @@ sophisticated enough to represent asynchronous parallel work.
 As a result, a single instrumented async method may appear as many different
 spans in the UI.
 
-## Running S3 Integration tests
+## Running S3 integration tests
 
-The integration tests run against local minio and local dynamodb. To start the
-services, run
+The integration tests run against MinIO and LocalStack DynamoDB. The standard
+entry point starts both services, runs the integration tests, and tears the
+services down:
 
 ```shell
-docker compose up
+uv run make integtest
 ```
 
-Then you can run the tests with
+The PR commit-conformance matrix covers append, compaction, add-columns, and
+create-index through both conditional object-store and DynamoDB external
+metadata commits. Each operation is checked under lost commit responses, lost
+verification responses, and a deterministic foreign-writer race. The oracle
+checks the complete visible version history, the latest-opened version, unique
+transaction identities, and the correspondence between successful writer
+results and persisted transactions. Request traces include executable fault
+plans and are written to `target/commit-conformance-traces`.
+
+The complete fault sweep is marked `recurring` and runs nightly. To run it
+locally against already-started services:
 
 ```shell
-pytest --run-integration python/tests/test_s3_ddb.py
+uv run pytest --run-integration -m "recurring and not real_s3" \
+  python/tests/test_commit_conformance.py
+```
+
+Real S3 response-loss validation requires a Linux host with AWS credentials and
+an existing test bucket. Always use the runner: the tests refuse to send real-S3
+traffic unless it has installed the fail-closed network guard. The runner maps
+only the regional S3 hostname to loopback, redirects that loopback traffic to
+the fault proxy, and rejects it if the redirect is missing. The proxy connects
+to a pre-resolved S3 address over HTTPS while preserving TLS hostname
+verification. A lock and exact cleanup markers make concurrent or stale runs
+detectable.
+
+```shell
+LANCE_CONFORMANCE_REAL_S3_BUCKET=my-test-bucket \
+  ../ci/run_real_s3_commit_conformance.sh
 ```
 
 ## Building wheels locally
