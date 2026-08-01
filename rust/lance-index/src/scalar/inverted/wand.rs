@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::ops::Deref;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::{
@@ -22,10 +21,11 @@ use crate::metrics::MetricsCollector;
 
 use super::{
     CompressedPositionStorage,
+    documents::{DocId, DocLengths, DocVisibility},
     impact::{IMPACT_LEVEL1_BLOCKS, ImpactScoreCache, ImpactSkipData},
     index::{PositionStreamCodec, dequantize_doc_length},
     query::Operator,
-    scorer::{K1, idf},
+    scorer::{K1, MemBM25Scorer, bm25_doc_weight_with_norm, idf},
 };
 use super::{
     CompressedPostingList, DocSet, PostingList, RawDocInfo,
@@ -41,8 +41,161 @@ use super::{DocInfo, builder::BLOCK_SIZE};
 
 const TERMINATED_DOC_ID: u64 = u64::MAX;
 
-/// Top-k heap entry: (scored doc, (term, freq) pairs, doc length, posting doc id).
-type TopKHeap = BinaryHeap<Reverse<(ScoredDoc, Vec<(u32, u32)>, u32, u64)>>;
+/// Top-k heap entry: (scored doc, doc length, posting doc id, frequency slot).
+/// The (term, freq) pairs live outside the heap so heap churn moves a compact
+/// tuple instead of a `Vec`.
+type TopKHeap = BinaryHeap<Reverse<(ScoredDoc, u32, u64, u32)>>;
+
+/// Reusable (term, freq) storage for live heap candidates. Replacing the k-th
+/// result reuses its slot and retained `Vec` capacity, so memory stays bounded
+/// by the live top-k rather than every historical heap admission.
+struct FrequencySlots {
+    slots: Vec<Vec<(u32, u32)>>,
+}
+
+impl FrequencySlots {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            slots: Vec::with_capacity(capacity),
+        }
+    }
+
+    fn push(&mut self, pairs: impl Iterator<Item = (u32, u32)>) -> Result<u32> {
+        let slot = u32::try_from(self.slots.len()).map_err(|_| {
+            Error::internal(format!(
+                "FTS top-k frequency slot count {} exceeds u32::MAX",
+                self.slots.len()
+            ))
+        })?;
+        self.slots.push(pairs.collect());
+        Ok(slot)
+    }
+
+    fn replace(&mut self, slot: u32, pairs: impl Iterator<Item = (u32, u32)>) -> Result<()> {
+        let num_slots = self.slots.len();
+        let slot = self.slots.get_mut(slot as usize).ok_or_else(|| {
+            Error::internal(format!(
+                "FTS top-k frequency slot {slot} is out of bounds for {num_slots} slots"
+            ))
+        })?;
+        slot.clear();
+        slot.extend(pairs);
+        Ok(())
+    }
+
+    fn take(&mut self, slot: u32) -> Result<Vec<(u32, u32)>> {
+        let num_slots = self.slots.len();
+        self.slots
+            .get_mut(slot as usize)
+            .map(std::mem::take)
+            .ok_or_else(|| {
+                Error::internal(format!(
+                    "FTS top-k frequency slot {slot} is out of bounds for {num_slots} slots"
+                ))
+            })
+    }
+}
+
+/// Owns the top-k heap and the frequency slots referenced by its entries.
+struct TopKCollector {
+    limit: usize,
+    heap: TopKHeap,
+    frequency_slots: FrequencySlots,
+}
+
+impl TopKCollector {
+    fn new(limit: usize, initial_capacity: usize) -> Self {
+        let initial_capacity = initial_capacity.min(limit);
+        Self {
+            limit,
+            heap: BinaryHeap::with_capacity(initial_capacity),
+            frequency_slots: FrequencySlots::with_capacity(initial_capacity),
+        }
+    }
+
+    /// Insert a competitive result. When the heap is full, its evicted entry's
+    /// frequency slot is cleared and reused before the replacement is pushed.
+    fn insert(
+        &mut self,
+        doc: ScoredDoc,
+        doc_length: u32,
+        posting_doc_id: u64,
+        pairs: impl Iterator<Item = (u32, u32)>,
+    ) -> Result<bool> {
+        if self.limit == 0 {
+            return Ok(false);
+        }
+        if self.heap.len() > self.limit {
+            return Err(Error::internal(format!(
+                "FTS top-k heap length {} exceeds limit {}",
+                self.heap.len(),
+                self.limit
+            )));
+        }
+
+        let frequency_slot = if self.heap.len() == self.limit {
+            let Some(kth_score) = self.heap.peek().map(|entry| entry.0.0.score.0) else {
+                return Err(Error::internal(
+                    "FTS top-k heap is empty while its nonzero limit is reached",
+                ));
+            };
+            // Preserve the existing collector semantics for non-finite custom
+            // scorer output: only a strictly greater raw f32 replaces k-th.
+            if doc.score.0.partial_cmp(&kth_score) != Some(std::cmp::Ordering::Greater) {
+                return Ok(false);
+            }
+            let Some(Reverse((_, _, _, frequency_slot))) = self.heap.pop() else {
+                return Err(Error::internal(
+                    "FTS top-k heap entry disappeared during replacement",
+                ));
+            };
+            self.frequency_slots.replace(frequency_slot, pairs)?;
+            frequency_slot
+        } else {
+            self.frequency_slots.push(pairs)?
+        };
+
+        self.heap
+            .push(Reverse((doc, doc_length, posting_doc_id, frequency_slot)));
+        Ok(true)
+    }
+
+    fn kth_score_if_full(&self) -> Option<f32> {
+        if self.heap.len() == self.limit {
+            self.heap.peek().map(|entry| entry.0.0.score.0)
+        } else {
+            None
+        }
+    }
+
+    fn into_candidates<C>(
+        self,
+        mut to_candidate: impl FnMut(u64) -> C,
+    ) -> Result<Vec<DocCandidate<C>>> {
+        let Self {
+            heap,
+            mut frequency_slots,
+            ..
+        } = self;
+        heap.into_iter()
+            .map(
+                |Reverse((doc, doc_length, posting_doc_id, frequency_slot))| {
+                    Ok(DocCandidate {
+                        document: to_candidate(doc.row_id),
+                        posting_doc_id,
+                        freqs: frequency_slots.take(frequency_slot)?,
+                        doc_length,
+                    })
+                },
+            )
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn num_frequency_slots(&self) -> usize {
+        self.frequency_slots.slots.len()
+    }
+}
 const LINEAR_BLOCK_SKIP_LIMIT: usize = 8;
 pub static FLAT_SEARCH_PERCENT_THRESHOLD: LazyLock<u64> = LazyLock::new(|| {
     std::env::var("LANCE_FLAT_SEARCH_PERCENT_THRESHOLD")
@@ -186,6 +339,43 @@ fn scorer_upper_bound<S: Scorer + ?Sized>(query_weight: f32, scorer: &S) -> f32 
     }
 }
 
+/// Per-term data retained after same-position postings are unioned.
+#[derive(Debug)]
+pub(super) struct GroupedTermScorer {
+    query_weight: f32,
+    freqs_by_posting_doc_id: Vec<(u64, u32)>,
+}
+
+impl GroupedTermScorer {
+    pub(super) fn new(query_weight: f32, posting: &PostingList) -> Self {
+        let freqs_by_posting_doc_id = posting
+            .iter()
+            .map(|(posting_doc_id, freq, _)| (posting_doc_id, freq))
+            .collect();
+        Self {
+            query_weight,
+            freqs_by_posting_doc_id,
+        }
+    }
+
+    pub(super) fn query_weight(&self) -> f32 {
+        self.query_weight
+    }
+
+    pub(super) fn frequency(&self, posting_doc_id: u64) -> Option<u32> {
+        self.freqs_by_posting_doc_id
+            .binary_search_by_key(&posting_doc_id, |(doc_id, _)| *doc_id)
+            .ok()
+            .map(|index| self.freqs_by_posting_doc_id[index].1)
+    }
+
+    fn score<S: Scorer + ?Sized>(&self, posting_doc_id: u64, doc_length: u32, scorer: &S) -> f32 {
+        self.frequency(posting_doc_id)
+            .map(|freq| self.query_weight * scorer.doc_weight(freq, doc_length))
+            .unwrap_or_default()
+    }
+}
+
 pub struct PostingIterator {
     token: String,
     token_id: u32,
@@ -198,6 +388,12 @@ pub struct PostingIterator {
     block_idx: usize,
     current_doc: Option<DocInfo>,
     approximate_upper_bound: f32,
+    // Stored block maxima may use partition-local statistics. Queries scored
+    // with corpus-wide statistics must use a scorer-provided bound instead.
+    use_scorer_upper_bound: bool,
+    // The union posting drives iteration and pruning; these terms produce the
+    // exact score for each candidate document.
+    grouped_terms: Option<Arc<[GroupedTermScorer]>>,
     // Position cursors temporarily own this buffer and return it on drop. This
     // keeps repeated cursor creation allocation-free without lending a slice
     // out of the interior-mutable compressed state.
@@ -359,7 +555,7 @@ impl BlockMaxWindow {
             };
         }
 
-        // V3 postings score quantized doc lengths, which can be shorter than
+        // 256-document-block postings score quantized document lengths, which can be shorter than
         // the exact lengths used to bake a legacy max score. Without impacts,
         // use the score-independent BM25 ceiling instead of that stale bound.
         if list.block_size == MAX_POSTING_BLOCK_SIZE {
@@ -635,11 +831,23 @@ impl PostingIterator {
             block_idx: 0,
             current_doc: None,
             approximate_upper_bound,
+            use_scorer_upper_bound: false,
+            grouped_terms: None,
             position_scratch: RefCell::new(Some(Vec::new())),
             compressed,
         };
         posting.refresh_current_doc();
         posting
+    }
+
+    pub(super) fn with_scorer_upper_bound(mut self) -> Self {
+        self.use_scorer_upper_bound = true;
+        self
+    }
+
+    pub(super) fn with_grouped_terms(mut self, terms: Arc<[GroupedTermScorer]>) -> Self {
+        self.grouped_terms = Some(terms);
+        self
     }
 
     #[inline]
@@ -677,6 +885,9 @@ impl PostingIterator {
                     &mut compressed.block_max_window.impact_score_cache,
                 );
         }
+        if self.use_scorer_upper_bound {
+            return scorer_upper_bound(self.query_weight, scorer);
+        }
         if let PostingList::Compressed(ref list) = self.list
             && list.block_size == MAX_POSTING_BLOCK_SIZE
         {
@@ -687,7 +898,18 @@ impl PostingIterator {
 
     #[inline]
     fn score<S: Scorer + ?Sized>(&self, scorer: &S, freq: u32, doc_length: u32) -> f32 {
+        if let (Some(grouped_terms), Some(doc)) = (&self.grouped_terms, self.current_doc) {
+            return grouped_terms
+                .iter()
+                .map(|term| term.score(doc.doc_id(), doc_length, scorer))
+                .sum();
+        }
         self.query_weight * scorer.doc_weight(freq, doc_length)
+    }
+
+    #[inline]
+    fn has_grouped_terms(&self) -> bool {
+        self.grouped_terms.is_some()
     }
 
     #[inline]
@@ -994,10 +1216,16 @@ impl PostingIterator {
                 if let Some(impacts) = list.impacts.as_ref() {
                     return self.impact_level0(impacts, scorer).1;
                 }
+                if self.use_scorer_upper_bound {
+                    return scorer_upper_bound(self.query_weight, scorer);
+                }
                 if list.block_size == MAX_POSTING_BLOCK_SIZE {
                     return scorer_upper_bound(self.query_weight, scorer);
                 }
                 list.block_max_score(self.block_idx)
+            }
+            PostingList::Plain(_) if self.use_scorer_upper_bound => {
+                scorer_upper_bound(self.query_weight, scorer)
             }
             PostingList::Plain(_) => self.approximate_upper_bound,
         }
@@ -1024,6 +1252,12 @@ impl PostingIterator {
                         };
                     }
                 }
+                if self.use_scorer_upper_bound {
+                    return BlockMaxScore {
+                        score: scorer_upper_bound(self.query_weight, scorer),
+                        blocks_scanned: 0,
+                    };
+                }
                 let compressed = unsafe { &mut *self.compressed_state_ptr() };
                 compressed.block_max_window.max_score_up_to(
                     list,
@@ -1034,7 +1268,11 @@ impl PostingIterator {
                 )
             }
             PostingList::Plain(_) => BlockMaxScore {
-                score: self.approximate_upper_bound,
+                score: if self.use_scorer_upper_bound {
+                    scorer_upper_bound(self.query_weight, scorer)
+                } else {
+                    self.approximate_upper_bound
+                },
                 blocks_scanned: 0,
             },
         }
@@ -1077,13 +1315,17 @@ impl PostingIterator {
     /// first doc beyond `up_to`. This is the Lucene `nextDocsAndScores`
     /// equivalent: it walks the decompressed block arrays directly, with no
     /// per-doc heap traffic.
-    fn collect_window_scores<S: Scorer + ?Sized>(
+    // The norm cache arg tips this hot-path fn over the limit; bundling the
+    // scoring inputs isn't worth the churn here.
+    #[allow(clippy::too_many_arguments)]
+    fn collect_window_scores<S: Scorer + ?Sized, D: WandDocuments>(
         &mut self,
         window_min: u64,
         up_to: u64,
         clause_idx: usize,
-        docs: &DocSet,
+        docs: &D,
         scorer: &S,
+        norm_k: Option<(&[u8], &[f32; 256])>,
         acc: &mut WindowAccumulator,
     ) {
         if self.doc().is_some_and(|doc| doc.doc_id() < window_min) {
@@ -1113,8 +1355,16 @@ impl PostingIterator {
                             break 'blocks;
                         }
                         let freq = compressed.freqs[offset];
-                        let doc_length = docs.scoring_num_tokens(doc_id);
-                        let score = self.query_weight * scorer.doc_weight(freq, doc_length);
+                        // One byte-norm load plus a cached addend replaces
+                        // recomputing the BM25 denominator per doc.
+                        let doc_weight = match norm_k {
+                            Some((norms, cache)) => bm25_doc_weight_with_norm(
+                                freq,
+                                cache[norms[doc_id as usize] as usize],
+                            ),
+                            None => scorer.doc_weight(freq, docs.scoring_num_tokens(doc_id)),
+                        };
+                        let score = self.query_weight * doc_weight;
                         let slot = (u64::from(doc_id) - window_min) as usize;
                         acc.add(clause_idx, slot, score, freq);
                     }
@@ -1142,10 +1392,7 @@ impl PostingIterator {
                     if doc_id > up_to {
                         break;
                     }
-                    let doc_length = match &doc {
-                        DocInfo::Raw(raw) => docs.scoring_num_tokens(raw.doc_id),
-                        DocInfo::Located(located) => docs.num_tokens_by_row_id(located.row_id),
-                    };
+                    let doc_length = docs.doc_length(&doc);
                     let score = self.score(scorer, doc.frequency(), doc_length);
                     let slot = (doc_id - window_min) as usize;
                     acc.add(clause_idx, slot, score, doc.frequency());
@@ -1167,6 +1414,55 @@ impl PostingIterator {
             PostingList::Plain(ref plain) => plain.row_ids.get(self.index + 1).cloned(),
         }
     }
+
+    #[cfg(test)]
+    fn validate_modern_doc_ids(&self, num_docs: usize) -> Result<()> {
+        validate_modern_posting_doc_ids(&self.list, &self.token, num_docs)
+    }
+}
+
+/// Validate the dense-DocId boundary before any document-length lookup.
+/// Modern postings are sorted, so decoding only the final physical block is
+/// sufficient to validate their maximum DocId.
+pub(super) fn validate_modern_posting_doc_ids(
+    posting: &PostingList,
+    token: &str,
+    num_docs: usize,
+) -> Result<()> {
+    let PostingList::Compressed(list) = posting else {
+        return Err(Error::index(format!(
+            "modern FTS posting for token {token:?} uses a legacy row-address layout"
+        )));
+    };
+    if list.length == 0 {
+        return Ok(());
+    }
+    let last_block_idx = list.blocks.len().checked_sub(1).ok_or_else(|| {
+        Error::index(format!(
+            "modern FTS posting for token {token:?} has length {} but no blocks",
+            list.length
+        ))
+    })?;
+    let mut state = CompressedState::new(list.block_size);
+    state.decompress(
+        list.blocks.value(last_block_idx),
+        last_block_idx,
+        list.blocks.len(),
+        list.length,
+        list.posting_tail_codec,
+        list.block_size,
+    );
+    let max_doc_id = state.doc_ids.last().copied().ok_or_else(|| {
+        Error::index(format!(
+            "modern FTS posting for token {token:?} has an empty final block"
+        ))
+    })?;
+    if max_doc_id as usize >= num_docs {
+        return Err(Error::index(format!(
+            "modern FTS posting for token {token:?} contains DocId {max_doc_id}, outside [0, {num_docs})"
+        )));
+    }
+    Ok(())
 }
 
 /// Inner window span (in doc ids) of the bulk MAXSCORE path. Same as Lucene's
@@ -1236,25 +1532,283 @@ impl WindowAccumulator {
     }
 }
 
-/// How wand identified a candidate: either it already had the real
-/// row_id (DocSet carried row_ids), or only the partition-local
-/// doc_id (deferred-row_id path; the caller must resolve via
-/// [`super::lazy_docset::LazyDocSet::resolve_row_ids`]).
-#[derive(Debug, Clone, Copy)]
-pub enum CandidateAddr {
-    RowId(u64),
-    Pending(u32),
-}
-
 #[derive(Debug)]
-pub struct DocCandidate {
-    pub addr: CandidateAddr,
+pub struct DocCandidate<C> {
+    pub document: C,
     /// The document key used by the posting lists: doc_id for compressed
     /// postings, row_id for legacy plain postings.
     pub posting_doc_id: u64,
     /// (term_index, freq)
     pub freqs: Vec<(u32, u32)>,
     pub doc_length: u32,
+}
+
+/// Document-side contract consumed by WAND.  Implementations fix candidate
+/// identity and visibility before the CPU executor starts.
+type FlatDocuments<'a> = (usize, Box<dyn Iterator<Item = (u64, u64)> + 'a>);
+
+pub(super) trait WandDocuments {
+    type Candidate: Copy + Debug;
+
+    fn len(&self) -> usize;
+    fn scoring_norms(&self) -> Option<&[u8]>;
+    fn scoring_num_tokens(&self, doc_id: u32) -> u32;
+    fn doc_length(&self, doc: &DocInfo) -> u32;
+    fn document_key(&self, doc: &DocInfo) -> Option<u64>;
+    fn document_key_for_doc_id(&self, doc_id: u32) -> Option<u64>;
+    fn candidate_from_key(&self, key: u64) -> Self::Candidate;
+    fn flat_documents(&self) -> Option<FlatDocuments<'_>>;
+    fn flat_doc_length(&self, doc_id: u64, document_key: u64, compressed: bool) -> u32;
+}
+
+pub(super) trait ModernVisibility {
+    fn selected(&self, doc_id: DocId) -> bool;
+    fn len(&self, total_docs: usize) -> usize;
+    fn iter(&self) -> Option<Box<dyn Iterator<Item = DocId> + '_>>;
+}
+
+pub(super) struct AllModernDocuments;
+
+impl ModernVisibility for AllModernDocuments {
+    #[inline]
+    fn selected(&self, _doc_id: DocId) -> bool {
+        true
+    }
+
+    fn len(&self, total_docs: usize) -> usize {
+        total_docs
+    }
+
+    fn iter(&self) -> Option<Box<dyn Iterator<Item = DocId> + '_>> {
+        None
+    }
+}
+
+impl ModernVisibility for &DocVisibility {
+    #[inline]
+    fn selected(&self, doc_id: DocId) -> bool {
+        DocVisibility::selected(self, doc_id)
+    }
+
+    fn len(&self, total_docs: usize) -> usize {
+        DocVisibility::len(self, total_docs)
+    }
+
+    fn iter(&self) -> Option<Box<dyn Iterator<Item = DocId> + '_>> {
+        DocVisibility::iter(self)
+            .map(|doc_ids| Box::new(doc_ids) as Box<dyn Iterator<Item = DocId>>)
+    }
+}
+
+pub(super) struct ModernWandDocuments<'a, V> {
+    lengths: &'a DocLengths,
+    visibility: V,
+}
+
+impl<'a> ModernWandDocuments<'a, AllModernDocuments> {
+    pub(crate) fn all(lengths: &'a DocLengths) -> Self {
+        Self {
+            lengths,
+            visibility: AllModernDocuments,
+        }
+    }
+}
+
+impl<'a> ModernWandDocuments<'a, &'a DocVisibility> {
+    pub(crate) fn filtered(lengths: &'a DocLengths, visibility: &'a DocVisibility) -> Self {
+        Self {
+            lengths,
+            visibility,
+        }
+    }
+}
+
+impl<V: ModernVisibility> WandDocuments for ModernWandDocuments<'_, V> {
+    type Candidate = DocId;
+
+    fn len(&self) -> usize {
+        self.lengths.len()
+    }
+
+    fn scoring_norms(&self) -> Option<&[u8]> {
+        self.lengths.scoring_norms()
+    }
+
+    fn scoring_num_tokens(&self, doc_id: u32) -> u32 {
+        self.lengths.scoring(DocId::new(doc_id))
+    }
+
+    fn doc_length(&self, doc: &DocInfo) -> u32 {
+        match doc {
+            DocInfo::Raw(doc) => self.scoring_num_tokens(doc.doc_id),
+            DocInfo::Located(_) => unreachable!("modern posting lists contain dense DocIds"),
+        }
+    }
+
+    fn document_key(&self, doc: &DocInfo) -> Option<u64> {
+        match doc {
+            DocInfo::Raw(doc) if self.visibility.selected(DocId::new(doc.doc_id)) => {
+                Some(u64::from(doc.doc_id))
+            }
+            DocInfo::Raw(_) => None,
+            DocInfo::Located(_) => unreachable!("modern posting lists contain dense DocIds"),
+        }
+    }
+
+    fn document_key_for_doc_id(&self, doc_id: u32) -> Option<u64> {
+        self.visibility
+            .selected(DocId::new(doc_id))
+            .then_some(u64::from(doc_id))
+    }
+
+    fn candidate_from_key(&self, key: u64) -> Self::Candidate {
+        DocId::new(key as u32)
+    }
+
+    fn flat_documents(&self) -> Option<(usize, Box<dyn Iterator<Item = (u64, u64)> + '_>)> {
+        self.visibility.iter().map(|doc_ids| {
+            let len = self.visibility.len(self.lengths.len());
+            let docs = doc_ids.map(|doc_id| {
+                let value = u64::from(doc_id.get());
+                (value, value)
+            });
+            (len, Box::new(docs) as Box<dyn Iterator<Item = (u64, u64)>>)
+        })
+    }
+
+    fn flat_doc_length(&self, doc_id: u64, _document_key: u64, _compressed: bool) -> u32 {
+        self.scoring_num_tokens(doc_id as u32)
+    }
+}
+
+pub(super) struct LegacyWandDocuments<'a> {
+    docs: &'a DocSet,
+    mask: &'a RowAddrMask,
+}
+
+impl<'a> LegacyWandDocuments<'a> {
+    pub(crate) fn new(docs: &'a DocSet, mask: &'a RowAddrMask) -> Self {
+        Self { docs, mask }
+    }
+}
+
+impl WandDocuments for LegacyWandDocuments<'_> {
+    type Candidate = u64;
+
+    fn len(&self) -> usize {
+        self.docs.len()
+    }
+
+    fn scoring_norms(&self) -> Option<&[u8]> {
+        self.docs.scoring_norms()
+    }
+
+    fn scoring_num_tokens(&self, doc_id: u32) -> u32 {
+        self.docs.scoring_num_tokens(doc_id)
+    }
+
+    fn doc_length(&self, doc: &DocInfo) -> u32 {
+        match doc {
+            DocInfo::Raw(doc) => self.docs.scoring_num_tokens(doc.doc_id),
+            DocInfo::Located(doc) => self.docs.num_tokens_by_row_id(doc.row_id),
+        }
+    }
+
+    fn document_key(&self, doc: &DocInfo) -> Option<u64> {
+        let row_id = match doc {
+            DocInfo::Raw(doc) => self.docs.row_id(doc.doc_id),
+            DocInfo::Located(doc) => doc.row_id,
+        };
+        (row_id != RowAddress::TOMBSTONE_ROW && self.mask.selected(row_id)).then_some(row_id)
+    }
+
+    fn document_key_for_doc_id(&self, doc_id: u32) -> Option<u64> {
+        let row_id = self.docs.row_id(doc_id);
+        (row_id != RowAddress::TOMBSTONE_ROW && self.mask.selected(row_id)).then_some(row_id)
+    }
+
+    fn candidate_from_key(&self, key: u64) -> Self::Candidate {
+        key
+    }
+
+    fn flat_documents(&self) -> Option<(usize, Box<dyn Iterator<Item = (u64, u64)> + '_>)> {
+        let count = self.mask.max_len()? as usize;
+        let row_ids = self.mask.iter_addrs()?;
+        let docs = row_ids.flat_map(|row_addr| {
+            let row_id: u64 = row_addr.into();
+            self.docs
+                .doc_ids(row_id)
+                .map(move |doc_id| (doc_id, row_id))
+        });
+        Some((count, Box::new(docs)))
+    }
+
+    fn flat_doc_length(&self, doc_id: u64, document_key: u64, compressed: bool) -> u32 {
+        if compressed {
+            self.docs.scoring_num_tokens(doc_id as u32)
+        } else {
+            self.docs.num_tokens_by_row_id(document_key)
+        }
+    }
+}
+
+// Most unit tests exercise WAND in isolation with an in-memory complete
+// DocSet.  Production code must select one of the explicit modern/legacy
+// adapters above, so this convenience implementation is test-only.
+#[cfg(test)]
+impl WandDocuments for DocSet {
+    type Candidate = u64;
+
+    fn len(&self) -> usize {
+        self.len()
+    }
+
+    fn scoring_norms(&self) -> Option<&[u8]> {
+        self.scoring_norms()
+    }
+
+    fn scoring_num_tokens(&self, doc_id: u32) -> u32 {
+        self.scoring_num_tokens(doc_id)
+    }
+
+    fn doc_length(&self, doc: &DocInfo) -> u32 {
+        match doc {
+            DocInfo::Raw(doc) => self.scoring_num_tokens(doc.doc_id),
+            DocInfo::Located(doc) => self.num_tokens_by_row_id(doc.row_id),
+        }
+    }
+
+    fn document_key(&self, doc: &DocInfo) -> Option<u64> {
+        Some(match doc {
+            DocInfo::Raw(doc) if self.has_row_ids() => self.row_id(doc.doc_id),
+            DocInfo::Raw(doc) => u64::from(doc.doc_id),
+            DocInfo::Located(doc) => doc.row_id,
+        })
+    }
+
+    fn document_key_for_doc_id(&self, doc_id: u32) -> Option<u64> {
+        Some(if self.has_row_ids() {
+            self.row_id(doc_id)
+        } else {
+            u64::from(doc_id)
+        })
+    }
+
+    fn candidate_from_key(&self, key: u64) -> Self::Candidate {
+        key
+    }
+
+    fn flat_documents(&self) -> Option<(usize, Box<dyn Iterator<Item = (u64, u64)> + '_>)> {
+        None
+    }
+
+    fn flat_doc_length(&self, doc_id: u64, document_key: u64, compressed: bool) -> u32 {
+        if compressed {
+            self.scoring_num_tokens(doc_id as u32)
+        } else {
+            self.num_tokens_by_row_id(document_key)
+        }
+    }
 }
 
 struct HeadPosting {
@@ -1376,7 +1930,7 @@ impl Ord for TailPosting {
     }
 }
 
-pub struct Wand<'a, S: Scorer> {
+pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     threshold: f32, // multiple of factor and the minimum score of the top-k documents
     operator: Operator,
     num_terms: usize,
@@ -1413,7 +1967,7 @@ pub struct Wand<'a, S: Scorer> {
     bulk_and_mode_override: Option<BulkAndMode>,
     #[cfg(test)]
     bulk_and_searches: usize,
-    docs: &'a DocSet,
+    documents: &'a D,
     scorer: S,
     // Shared cross-partition top-k floor. Each partition publishes its local
     // k-th score (`atomic_store_max_f32`) and prunes against the running value
@@ -1436,11 +1990,11 @@ fn atomic_store_max_f32(slot: &AtomicU32, val: f32) {
 // we were using row id as doc id in the past, which is u64,
 // but now we are using the index as doc id, which is u32.
 // so here WAND is a generic struct that can be used for both u32 and u64 doc ids.
-impl<'a, S: Scorer> Wand<'a, S> {
+impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
     pub(crate) fn new(
         operator: Operator,
         postings: impl Iterator<Item = PostingIterator>,
-        docs: &'a DocSet,
+        documents: &'a D,
         scorer: S,
     ) -> Self {
         let mut head = BinaryHeap::new();
@@ -1480,7 +2034,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
             bulk_and_mode_override: None,
             #[cfg(test)]
             bulk_and_searches: 0,
-            docs,
+            documents,
             scorer,
             shared_threshold: None,
         }
@@ -1498,6 +2052,21 @@ impl<'a, S: Scorer> Wand<'a, S> {
     pub(crate) fn with_shared_threshold(mut self, shared: Arc<AtomicU32>) -> Self {
         self.shared_threshold = Some(shared);
         self
+    }
+
+    /// Per-search norm→BM25-denominator cache (Lucene's norm cache): the doc
+    /// byte-norm slab plus the 256 possible denominator addends. Available
+    /// when the DocSet scores quantized (256-document-block partitions) and the scorer
+    /// factors `doc_weight` as `(K1+1)*freq/(freq + addend)`. Scoring through
+    /// the cache is bit-identical to `scorer.doc_weight`, because both
+    /// evaluate the same expressions on the same quantized lengths.
+    fn norm_k_cache(&self) -> Option<(&'a [u8], Box<[f32; 256]>)> {
+        let norms = self.documents.scoring_norms()?;
+        let mut cache = Box::new([0f32; 256]);
+        for (code, slot) in cache.iter_mut().enumerate() {
+            *slot = self.scorer.doc_norm(dequantize_doc_length(code as u8))?;
+        }
+        Some((norms, cache))
     }
 
     /// Set the pruning threshold from this partition's k-th best, raised to the
@@ -1530,23 +2099,19 @@ impl<'a, S: Scorer> Wand<'a, S> {
     pub(crate) fn search(
         &mut self,
         params: &FtsSearchParams,
-        mask: Arc<RowAddrMask>,
         metrics: &dyn MetricsCollector,
-    ) -> Result<Vec<DocCandidate>> {
+    ) -> Result<Vec<DocCandidate<D::Candidate>>> {
         let limit = params.limit.unwrap_or(usize::MAX);
         if limit == 0 {
             return Ok(vec![]);
         }
 
-        match (mask.max_len(), mask.iter_addrs()) {
-            (Some(num_rows_matched), Some(row_ids))
-                if self.operator == Operator::Or
-                    && num_rows_matched * 100
-                        <= FLAT_SEARCH_PERCENT_THRESHOLD.deref() * self.docs.len() as u64 =>
-            {
-                return self.flat_search(params, row_ids, metrics);
-            }
-            _ => {}
+        if self.operator == Operator::Or
+            && let Some((num_docs_selected, documents)) = self.documents.flat_documents()
+            && num_docs_selected.saturating_mul(100)
+                <= (*FLAT_SEARCH_PERCENT_THRESHOLD as usize).saturating_mul(self.documents.len())
+        {
+            return self.flat_search(params, documents, metrics);
         }
 
         // Top-k disjunctions over compressed lists can opt into the bulk
@@ -1557,12 +2122,11 @@ impl<'a, S: Scorer> Wand<'a, S> {
             && self.operator == Operator::Or
             && params.phrase_slop.is_none()
             && !self.head.is_empty()
-            && self
-                .head
-                .iter()
-                .all(|posting| posting.posting.is_compressed())
+            && self.head.iter().all(|posting| {
+                posting.posting.is_compressed() && !posting.posting.has_grouped_terms()
+            })
         {
-            return self.maxscore_search(params, mask, metrics);
+            return self.maxscore_search(params, metrics);
         }
 
         // Top-k conjunctions (AND and phrase) over compressed lists use the
@@ -1571,7 +2135,10 @@ impl<'a, S: Scorer> Wand<'a, S> {
         // `next()` leapfrogging through boxed iterators.
         if self.operator == Operator::And
             && !self.lead.is_empty()
-            && self.lead.iter().all(|posting| posting.is_compressed())
+            && self
+                .lead
+                .iter()
+                .all(|posting| posting.is_compressed() && !posting.has_grouped_terms())
             && self
                 .bulk_and_mode_override
                 .unwrap_or_else(|| *BULK_AND_MODE)
@@ -1581,16 +2148,10 @@ impl<'a, S: Scorer> Wand<'a, S> {
             {
                 self.bulk_and_searches += 1;
             }
-            return self.and_bulk_search(params, mask, metrics);
+            return self.and_bulk_search(params, metrics);
         }
 
-        // Deferred-row_id path: when the DocSet was built without
-        // row_ids, wand emits candidates carrying just the
-        // partition-local doc_id; the outer caller resolves them to
-        // row_ids post-wand.
-        let docs_has_row_ids = self.docs.has_row_ids();
-
-        let mut candidates = BinaryHeap::with_capacity(std::cmp::min(limit, BLOCK_SIZE * 10));
+        let mut candidates = TopKCollector::new(limit, std::cmp::min(limit, BLOCK_SIZE * 10));
         let mut num_comparisons = 0;
         let mut and_search_stats = (self.operator == Operator::And).then_some(AndSearchStats {
             pruned_before_return_start: self.and_candidates_pruned_before_return,
@@ -1606,40 +2167,15 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 and_stats.candidates_seen += 1;
             }
 
-            // Either a real row_id (so we can run the mask check
-            // inline) or the doc_id widened to u64 (deferred path;
-            // the outer caller will resolve it post-wand).
             let posting_doc_id = doc.doc_id();
-            let row_id = match &doc {
-                DocInfo::Raw(doc) => {
-                    if docs_has_row_ids {
-                        self.docs.row_id(doc.doc_id)
-                    } else {
-                        doc.doc_id as u64
-                    }
+            let Some(document_key) = self.documents.document_key(&doc) else {
+                if self.operator == Operator::Or {
+                    self.push_back_leads(doc.doc_id() + 1);
                 }
-                DocInfo::Located(doc) => doc.row_id,
+                continue;
             };
-            // Skip docs the fragment-reuse remap deleted. They are tombstoned
-            // in the DocSet (slot kept so posting-list doc_ids stay aligned)
-            // and must not surface in results.
-            if docs_has_row_ids && row_id == RowAddress::TOMBSTONE_ROW {
-                if self.operator == Operator::Or {
-                    self.push_back_leads(doc.doc_id() + 1);
-                }
-                continue;
-            }
-            if docs_has_row_ids && !mask.selected(row_id) {
-                if self.operator == Operator::Or {
-                    self.push_back_leads(doc.doc_id() + 1);
-                }
-                continue;
-            }
 
-            let doc_length = match &doc {
-                DocInfo::Raw(doc) => self.docs.scoring_num_tokens(doc.doc_id),
-                DocInfo::Located(doc) => self.docs.num_tokens_by_row_id(doc.row_id),
-            };
+            let doc_length = self.documents.doc_length(&doc);
 
             let score = if self.operator == Operator::Or {
                 self.advance_all_tail(doc.doc_id(), Some(doc_length), Some(&mut score));
@@ -1663,35 +2199,18 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 self.score(doc_length)
             };
 
-            if candidates.len() < limit {
-                let freqs = self.iter_term_freqs().collect();
+            if candidates.insert(
+                ScoredDoc::new(document_key, score),
+                doc_length,
+                posting_doc_id,
+                self.iter_term_freqs(),
+            )? {
                 if let Some(and_stats) = and_search_stats.as_mut() {
                     and_stats.freqs_collected += 1;
                 }
-                candidates.push(Reverse((
-                    ScoredDoc::new(row_id, score),
-                    freqs,
-                    doc_length,
-                    posting_doc_id,
-                )));
-                if candidates.len() == limit {
-                    let kth = candidates.peek().unwrap().0.0.score.0;
+                if let Some(kth) = candidates.kth_score_if_full() {
                     self.update_threshold(kth, params.wand_factor);
                 }
-            } else if score > candidates.peek().unwrap().0.0.score.0 {
-                let freqs = self.iter_term_freqs().collect();
-                if let Some(and_stats) = and_search_stats.as_mut() {
-                    and_stats.freqs_collected += 1;
-                }
-                candidates.pop();
-                candidates.push(Reverse((
-                    ScoredDoc::new(row_id, score),
-                    freqs,
-                    doc_length,
-                    posting_doc_id,
-                )));
-                let kth = candidates.peek().unwrap().0.0.score.0;
-                self.update_threshold(kth, params.wand_factor);
             }
             if self.operator == Operator::Or {
                 self.push_back_leads(doc.doc_id() + 1);
@@ -1718,55 +2237,23 @@ impl<'a, S: Scorer> Wand<'a, S> {
             metrics.record_freqs_collected(and_stats.freqs_collected);
         }
 
-        // The heap entry's `row_id` slot is either a real row_id
-        // (DocSet had row_ids) or the doc_id widened to u64
-        // (deferred). Tag it accordingly so the caller can match
-        // rather than guess.
-        let to_addr = |row_id_slot: u64| {
-            if docs_has_row_ids {
-                CandidateAddr::RowId(row_id_slot)
-            } else {
-                CandidateAddr::Pending(row_id_slot as u32)
-            }
-        };
-        Ok(candidates
-            .into_iter()
-            .map(
-                |Reverse((doc, freqs, doc_length, posting_doc_id))| DocCandidate {
-                    addr: to_addr(doc.row_id),
-                    posting_doc_id,
-                    freqs,
-                    doc_length,
-                },
-            )
-            .collect())
+        candidates.into_candidates(|key| self.documents.candidate_from_key(key))
     }
 
     fn flat_search(
         &mut self,
         params: &FtsSearchParams,
-        row_ids: Box<dyn Iterator<Item = RowAddress> + '_>,
+        documents: Box<dyn Iterator<Item = (u64, u64)> + '_>,
         metrics: &dyn MetricsCollector,
-    ) -> Result<Vec<DocCandidate>> {
+    ) -> Result<Vec<DocCandidate<D::Candidate>>> {
         let limit = params.limit.unwrap_or(usize::MAX);
         if limit == 0 {
             return Ok(vec![]);
         }
 
-        // we need to map the row ids to doc ids, and sort them,
-        // because WAND PostingIterator can't go back to the previous doc id.
-        // A list column maps one row id to several doc ids, so expand every
-        // document the row owns — keying on a single doc id would drop matches
-        // at non-last list positions (lancedb#3352).
-        let doc_ids = row_ids
-            .flat_map(|row_addr| {
-                let row_id: u64 = row_addr.into();
-                self.docs
-                    .doc_ids(row_id)
-                    .map(move |doc_id| (doc_id, row_id))
-            })
-            .sorted_unstable()
-            .collect::<Vec<_>>();
+        // Posting iterators are forward-only, so selected DocIds are sorted
+        // before driving the sparse executor.
+        let documents = documents.sorted_unstable().collect::<Vec<_>>();
         let is_compressed = self
             .head
             .peek()
@@ -1779,8 +2266,8 @@ impl<'a, S: Scorer> Wand<'a, S> {
             .unwrap_or(false);
 
         let mut num_comparisons = 0;
-        let mut candidates = BinaryHeap::new();
-        for (doc_id, row_id) in doc_ids {
+        let mut candidates = TopKCollector::new(limit, 0);
+        for (doc_id, document_key) in documents {
             num_comparisons += 1;
             self.move_head_before_target_to_tail(doc_id);
             self.move_head_doc_to_lead(doc_id);
@@ -1810,10 +2297,9 @@ impl<'a, S: Scorer> Wand<'a, S> {
             }
 
             // score the doc
-            let doc_length = match is_compressed {
-                true => self.docs.scoring_num_tokens(doc_id as u32),
-                false => self.docs.num_tokens_by_row_id(row_id),
-            };
+            let doc_length = self
+                .documents
+                .flat_doc_length(doc_id, document_key, is_compressed);
             if self.operator == Operator::Or && !self.refine_or_candidate(doc_id, doc_length) {
                 // `flat_search` evaluates an explicit allow-list of doc ids. Unlike the
                 // regular WAND path, skipping to the next block boundary is unsafe here
@@ -1826,28 +2312,13 @@ impl<'a, S: Scorer> Wand<'a, S> {
             self.collect_tail_matches(doc_id);
             let score = self.score(doc_length);
 
-            if candidates.len() < limit {
-                let freqs = self.iter_term_freqs().collect();
-                candidates.push(Reverse((
-                    ScoredDoc::new(row_id, score),
-                    freqs,
-                    doc_length,
-                    doc_id,
-                )));
-                if candidates.len() == limit {
-                    let kth = candidates.peek().unwrap().0.0.score.0;
-                    self.update_threshold(kth, params.wand_factor);
-                }
-            } else if score > candidates.peek().unwrap().0.0.score.0 {
-                let freqs = self.iter_term_freqs().collect();
-                candidates.pop();
-                candidates.push(Reverse((
-                    ScoredDoc::new(row_id, score),
-                    freqs,
-                    doc_length,
-                    doc_id,
-                )));
-                let kth = candidates.peek().unwrap().0.0.score.0;
+            if candidates.insert(
+                ScoredDoc::new(document_key, score),
+                doc_length,
+                doc_id,
+                self.iter_term_freqs(),
+            )? && let Some(kth) = candidates.kth_score_if_full()
+            {
                 self.update_threshold(kth, params.wand_factor);
             }
 
@@ -1855,19 +2326,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
         }
         metrics.record_comparisons(num_comparisons);
 
-        // flat_search is driven by an explicit row_ids iterator, so
-        // every candidate already has a real row_id.
-        Ok(candidates
-            .into_iter()
-            .map(
-                |Reverse((doc, freqs, doc_length, posting_doc_id))| DocCandidate {
-                    addr: CandidateAddr::RowId(doc.row_id),
-                    posting_doc_id,
-                    freqs,
-                    doc_length,
-                },
-            )
-            .collect())
+        candidates.into_candidates(|key| self.documents.candidate_from_key(key))
     }
 
     /// Bulk MAXSCORE top-k disjunction, mirroring Lucene's MaxScoreBulkScorer.
@@ -1882,9 +2341,8 @@ impl<'a, S: Scorer> Wand<'a, S> {
     fn maxscore_search(
         &mut self,
         params: &FtsSearchParams,
-        mask: Arc<RowAddrMask>,
         metrics: &dyn MetricsCollector,
-    ) -> Result<Vec<DocCandidate>> {
+    ) -> Result<Vec<DocCandidate<D::Candidate>>> {
         struct MaxScoreClause {
             posting: Box<PostingIterator>,
             bound: f32,
@@ -1892,7 +2350,6 @@ impl<'a, S: Scorer> Wand<'a, S> {
         }
 
         let limit = params.limit.unwrap_or(usize::MAX);
-        let docs_has_row_ids = self.docs.has_row_ids();
         let mut clauses = std::mem::take(&mut self.head)
             .into_vec()
             .into_iter()
@@ -1905,8 +2362,11 @@ impl<'a, S: Scorer> Wand<'a, S> {
         let total_sum_upper_bound_factor = score_sum_upper_bound_factor(clauses.len());
 
         let mut acc = WindowAccumulator::new(clauses.len());
-        let mut candidates: TopKHeap =
-            BinaryHeap::with_capacity(std::cmp::min(limit, BLOCK_SIZE * 10));
+        let mut candidates = TopKCollector::new(limit, std::cmp::min(limit, BLOCK_SIZE * 10));
+        let norm_k = self.norm_k_cache();
+        let norm_k_ref = norm_k
+            .as_ref()
+            .map(|(norms, cache)| (*norms, cache.as_ref()));
         let mut num_comparisons = 0usize;
         // Adaptive minimum window size (Lucene): grow windows when they yield
         // too few candidates to amortize the per-window bound computations.
@@ -2055,8 +2515,22 @@ impl<'a, S: Scorer> Wand<'a, S> {
                         let doc = $doc;
                         let freq = $freq;
                         num_comparisons += 1;
-                        let doc_length = self.docs.scoring_num_tokens(doc as u32);
-                        let score = essential_weight * self.scorer.doc_weight(freq, doc_length);
+                        // One byte-norm load + cached addend when available;
+                        // the exact doc length is only needed at insert time.
+                        let norm_addend =
+                            norm_k_ref.map(|(norms, cache)| cache[norms[doc as usize] as usize]);
+                        let score = match norm_addend {
+                            Some(addend) => {
+                                essential_weight * bm25_doc_weight_with_norm(freq, addend)
+                            }
+                            None => {
+                                essential_weight
+                                    * self.scorer.doc_weight(
+                                        freq,
+                                        self.documents.scoring_num_tokens(doc as u32),
+                                    )
+                            }
+                        };
                         if !(self.threshold > 0.0
                             && score_sum_cannot_exceed(
                                 score,
@@ -2065,14 +2539,9 @@ impl<'a, S: Scorer> Wand<'a, S> {
                                 total_sum_upper_bound_factor,
                             ))
                         {
-                            let row_id = if docs_has_row_ids {
-                                self.docs.row_id(doc as u32)
-                            } else {
-                                doc
-                            };
-                            let masked_out = docs_has_row_ids
-                                && (row_id == RowAddress::TOMBSTONE_ROW || !mask.selected(row_id));
-                            if !masked_out {
+                            if let Some(document_key) =
+                                self.documents.document_key_for_doc_id(doc as u32)
+                            {
                                 let mut total = score;
                                 let mut rejected = false;
                                 for i in (0..non_essential.len()).rev() {
@@ -2094,8 +2563,20 @@ impl<'a, S: Scorer> Wand<'a, S> {
                                     if let Some(d) = probe.doc()
                                         && d.doc_id() == doc
                                     {
-                                        total +=
-                                            probe.score(&self.scorer, d.frequency(), doc_length);
+                                        total += match norm_addend {
+                                            Some(addend) => {
+                                                probe.query_weight
+                                                    * bm25_doc_weight_with_norm(
+                                                        d.frequency(),
+                                                        addend,
+                                                    )
+                                            }
+                                            None => probe.score(
+                                                &self.scorer,
+                                                d.frequency(),
+                                                self.documents.scoring_num_tokens(doc as u32),
+                                            ),
+                                        };
                                     }
                                 }
 
@@ -2104,35 +2585,23 @@ impl<'a, S: Scorer> Wand<'a, S> {
                                 // which drops zero-score matches (e.g. terms
                                 // with idf 0) exactly like Wand::next does.
                                 if !rejected && total > self.threshold {
-                                    let full = candidates.len() >= limit;
-                                    let beats_kth =
-                                        !full || total > candidates.peek().unwrap().0.0.score.0;
-                                    if beats_kth {
-                                        let mut freqs = Vec::with_capacity(non_essential.len() + 1);
-                                        freqs.push((essential_term, freq));
-                                        for clause in non_essential.iter() {
-                                            if let Some(d) = clause.posting.doc()
-                                                && d.doc_id() == doc
-                                            {
-                                                freqs.push((
-                                                    clause.posting.term_index(),
-                                                    d.frequency(),
-                                                ));
-                                            }
-                                        }
-                                        if full {
-                                            candidates.pop();
-                                        }
-                                        candidates.push(Reverse((
-                                            ScoredDoc::new(row_id, total),
-                                            freqs,
-                                            doc_length,
-                                            doc,
-                                        )));
-                                        if candidates.len() == limit {
-                                            let kth = candidates.peek().unwrap().0.0.score.0;
-                                            self.update_threshold(kth, params.wand_factor);
-                                        }
+                                    let doc_length = self.documents.scoring_num_tokens(doc as u32);
+                                    if candidates.insert(
+                                        ScoredDoc::new(document_key, total),
+                                        doc_length,
+                                        doc,
+                                        std::iter::once((essential_term, freq)).chain(
+                                            non_essential.iter().filter_map(|clause| {
+                                                clause.posting.doc().and_then(|d| {
+                                                    (d.doc_id() == doc).then(|| {
+                                                        (clause.posting.term_index(), d.frequency())
+                                                    })
+                                                })
+                                            }),
+                                        ),
+                                    )? && let Some(kth) = candidates.kth_score_if_full()
+                                    {
+                                        self.update_threshold(kth, params.wand_factor);
                                     }
                                 }
                             }
@@ -2224,8 +2693,9 @@ impl<'a, S: Scorer> Wand<'a, S> {
                         inner_min,
                         inner_max,
                         clause_idx,
-                        self.docs,
+                        self.documents,
                         &self.scorer,
+                        norm_k_ref,
                         &mut acc,
                     );
                 }
@@ -2258,19 +2728,18 @@ impl<'a, S: Scorer> Wand<'a, S> {
                             continue;
                         }
 
-                        let row_id = if docs_has_row_ids {
-                            self.docs.row_id(doc as u32)
-                        } else {
-                            doc
-                        };
-                        if docs_has_row_ids
-                            && (row_id == RowAddress::TOMBSTONE_ROW || !mask.selected(row_id))
-                        {
+                        let Some(document_key) = self.documents.document_key_for_doc_id(doc as u32)
+                        else {
                             acc.clear_slot(slot);
                             continue;
-                        }
+                        };
 
-                        let doc_length = self.docs.scoring_num_tokens(doc as u32);
+                        // Doc length is only needed at heap-insert time; the
+                        // non-essential completion scores go through the norm
+                        // cache when available.
+                        let norm_addend =
+                            norm_k_ref.map(|(norms, cache)| cache[norms[doc as usize] as usize]);
+                        let mut doc_length_cell: Option<u32> = None;
                         let mut rejected = false;
                         for i in (0..first_essential).rev() {
                             if self.threshold > 0.0
@@ -2291,43 +2760,44 @@ impl<'a, S: Scorer> Wand<'a, S> {
                             if let Some(d) = posting.doc()
                                 && d.doc_id() == doc
                             {
-                                score += posting.score(&self.scorer, d.frequency(), doc_length);
+                                score += match norm_addend {
+                                    Some(addend) => {
+                                        posting.query_weight
+                                            * bm25_doc_weight_with_norm(d.frequency(), addend)
+                                    }
+                                    None => {
+                                        let doc_length =
+                                            *doc_length_cell.get_or_insert_with(|| {
+                                                self.documents.scoring_num_tokens(doc as u32)
+                                            });
+                                        posting.score(&self.scorer, d.frequency(), doc_length)
+                                    }
+                                };
                             }
                         }
 
                         if !rejected && score > self.threshold {
-                            let full = candidates.len() >= limit;
-                            let beats_kth = !full || score > candidates.peek().unwrap().0.0.score.0;
-                            if beats_kth {
-                                let freqs = clauses
-                                    .iter()
-                                    .enumerate()
-                                    .filter_map(|(i, clause)| {
-                                        if i >= first_essential {
-                                            let freq = acc.clause_freq(i, slot);
-                                            (freq > 0).then(|| (clause.posting.term_index(), freq))
-                                        } else {
-                                            clause.posting.doc().and_then(|d| {
-                                                (d.doc_id() == doc).then(|| {
-                                                    (clause.posting.term_index(), d.frequency())
-                                                })
+                            let doc_length = doc_length_cell
+                                .unwrap_or_else(|| self.documents.scoring_num_tokens(doc as u32));
+                            if candidates.insert(
+                                ScoredDoc::new(document_key, score),
+                                doc_length,
+                                doc,
+                                clauses.iter().enumerate().filter_map(|(i, clause)| {
+                                    if i >= first_essential {
+                                        let freq = acc.clause_freq(i, slot);
+                                        (freq > 0).then(|| (clause.posting.term_index(), freq))
+                                    } else {
+                                        clause.posting.doc().and_then(|d| {
+                                            (d.doc_id() == doc).then(|| {
+                                                (clause.posting.term_index(), d.frequency())
                                             })
-                                        }
-                                    })
-                                    .collect::<Vec<_>>();
-                                if full {
-                                    candidates.pop();
-                                }
-                                candidates.push(Reverse((
-                                    ScoredDoc::new(row_id, score),
-                                    freqs,
-                                    doc_length,
-                                    doc,
-                                )));
-                                if candidates.len() == limit {
-                                    let kth = candidates.peek().unwrap().0.0.score.0;
-                                    self.update_threshold(kth, params.wand_factor);
-                                }
+                                        })
+                                    }
+                                }),
+                            )? && let Some(kth) = candidates.kth_score_if_full()
+                            {
+                                self.update_threshold(kth, params.wand_factor);
                             }
                         }
                         acc.clear_slot(slot);
@@ -2347,24 +2817,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
 
         metrics.record_comparisons(num_comparisons);
 
-        let to_addr = |row_id_slot: u64| {
-            if docs_has_row_ids {
-                CandidateAddr::RowId(row_id_slot)
-            } else {
-                CandidateAddr::Pending(row_id_slot as u32)
-            }
-        };
-        Ok(candidates
-            .into_iter()
-            .map(
-                |Reverse((doc, freqs, doc_length, posting_doc_id))| DocCandidate {
-                    addr: to_addr(doc.row_id),
-                    posting_doc_id,
-                    freqs,
-                    doc_length,
-                },
-            )
-            .collect())
+        candidates.into_candidates(|key| self.documents.candidate_from_key(key))
     }
 
     // calculate the score of the current document
@@ -2463,10 +2916,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 self.push_back_leads(target + 1);
                 continue;
             };
-            let doc_length = match &first_doc {
-                DocInfo::Raw(doc) => self.docs.scoring_num_tokens(doc.doc_id),
-                DocInfo::Located(doc) => self.docs.num_tokens_by_row_id(doc.row_id),
-            };
+            let doc_length = self.documents.doc_length(&first_doc);
             let mut lead_score = 0.0;
             if let Some(first_posting) = self.lead.first() {
                 lead_score += first_posting.score(&self.scorer, first_doc.frequency(), doc_length);
@@ -2545,10 +2995,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
             }
 
             let lead_doc = self.lead.first().and_then(|posting| posting.doc())?;
-            let doc_length = match &lead_doc {
-                DocInfo::Raw(doc) => self.docs.scoring_num_tokens(doc.doc_id),
-                DocInfo::Located(doc) => self.docs.num_tokens_by_row_id(doc.row_id),
-            };
+            let doc_length = self.documents.doc_length(&lead_doc);
             if self.and_candidate_cannot_beat_threshold(doc_length) {
                 self.and_candidates_pruned_before_return += 1;
                 let next_target = self.and_advance_target(doc.saturating_add(1));
@@ -2582,14 +3029,12 @@ impl<'a, S: Scorer> Wand<'a, S> {
     fn and_bulk_search(
         &mut self,
         params: &FtsSearchParams,
-        mask: Arc<RowAddrMask>,
         metrics: &dyn MetricsCollector,
-    ) -> Result<Vec<DocCandidate>> {
+    ) -> Result<Vec<DocCandidate<D::Candidate>>> {
         let limit = params.limit.unwrap_or(usize::MAX);
         if limit == 0 {
             return Ok(vec![]);
         }
-        let docs_has_row_ids = self.docs.has_row_ids();
         let num_lists = self.lead.len();
         let phrase_slop = params.phrase_slop;
 
@@ -2781,8 +3226,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
             }
         }
 
-        let mut candidates: TopKHeap =
-            BinaryHeap::with_capacity(std::cmp::min(limit, BLOCK_SIZE * 10));
+        let mut candidates = TopKCollector::new(limit, std::cmp::min(limit, BLOCK_SIZE * 10));
         let mut num_comparisons: usize = 0;
         let mut stats = AndSearchStats {
             pruned_before_return_start: self.and_candidates_pruned_before_return,
@@ -2797,7 +3241,14 @@ impl<'a, S: Scorer> Wand<'a, S> {
         let mut batch_docs: Vec<u32> = Vec::with_capacity(MAX_POSTING_BLOCK_SIZE);
         let mut batch_offs: Vec<u8> = Vec::with_capacity(MAX_POSTING_BLOCK_SIZE * num_lists);
         let mut batch_lens: Vec<u32> = Vec::with_capacity(MAX_POSTING_BLOCK_SIZE);
+        let mut batch_norms: Vec<u8> = Vec::with_capacity(MAX_POSTING_BLOCK_SIZE);
         let mut cursor_scratch: Vec<usize> = Vec::with_capacity(num_lists);
+        // Norm cache: one byte-norm load plus a cached addend replaces the
+        // per-clause BM25 denominator recompute in pass B.
+        let norm_k = self.norm_k_cache();
+        let norm_k_ref = norm_k
+            .as_ref()
+            .map(|(norms, cache)| (*norms, cache.as_ref()));
 
         // Per-window prune LUT for the merge kernels: an upper bound of the
         // first (rarest) clause's score by clamped frequency. Lead docs whose
@@ -2981,35 +3432,52 @@ impl<'a, S: Scorer> Wand<'a, S> {
                     ),
                 }
 
-                // Pass A: gather doc lengths for the whole batch up front so
-                // the loads issue back-to-back and their cache misses overlap.
-                // Quantized (V3) sets gather through the byte-norm slab: a
-                // quarter of the bytes through the cache versus the u32 vec.
+                // Pass A: gather doc norms/lengths for the whole batch up
+                // front so the loads issue back-to-back and their cache
+                // misses overlap. With the norm cache, only the byte code is
+                // gathered; the exact length decodes from a tiny LUT.
                 batch_lens.clear();
-                match self.docs.scoring_norms() {
-                    Some(norms) => {
+                batch_norms.clear();
+                match norm_k_ref {
+                    Some((norms, _)) => {
                         for &doc in batch_docs.iter() {
-                            batch_lens.push(dequantize_doc_length(norms[doc as usize]));
+                            batch_norms.push(norms[doc as usize]);
                         }
                     }
-                    None => {
-                        for &doc in batch_docs.iter() {
-                            batch_lens.push(self.docs.scoring_num_tokens(doc));
+                    None => match self.documents.scoring_norms() {
+                        Some(norms) => {
+                            for &doc in batch_docs.iter() {
+                                batch_lens.push(dequantize_doc_length(norms[doc as usize]));
+                            }
                         }
-                    }
+                        None => {
+                            for &doc in batch_docs.iter() {
+                                batch_lens.push(self.documents.scoring_num_tokens(doc));
+                            }
+                        }
+                    },
                 }
 
                 // Pass B: prune / verify / score / insert, in doc order, with
                 // exactly the classic loop's semantics.
                 for (index, &doc) in batch_docs.iter().enumerate() {
-                    let doc_length = batch_lens[index];
+                    let (norm_addend, doc_length) = match norm_k_ref {
+                        Some((_, cache)) => {
+                            let code = batch_norms[index];
+                            (Some(cache[code as usize]), dequantize_doc_length(code))
+                        }
+                        None => (None, batch_lens[index]),
+                    };
                     let offs = &batch_offs[index * num_lists..(index + 1) * num_lists];
                     if self.threshold > 0.0 && num_lists >= 2 {
-                        let first_score = self.lead[0].score(
-                            &self.scorer,
-                            unsafe { *wins[0].freqs.add(offs[0] as usize) },
-                            doc_length,
-                        );
+                        let first_freq = unsafe { *wins[0].freqs.add(offs[0] as usize) };
+                        let first_score = match norm_addend {
+                            Some(addend) => {
+                                self.lead[0].query_weight
+                                    * bm25_doc_weight_with_norm(first_freq, addend)
+                            }
+                            None => self.lead[0].score(&self.scorer, first_freq, doc_length),
+                        };
                         if first_score + others_block_max <= self.threshold {
                             self.and_candidates_pruned_before_return += 1;
                             continue;
@@ -3019,16 +3487,9 @@ impl<'a, S: Scorer> Wand<'a, S> {
                     self.and_window_stats.candidates_returned += 1;
                     num_comparisons += 1;
 
-                    let row_id = if docs_has_row_ids {
-                        self.docs.row_id(doc)
-                    } else {
-                        u64::from(doc)
-                    };
-                    if docs_has_row_ids
-                        && (row_id == RowAddress::TOMBSTONE_ROW || !mask.selected(row_id))
-                    {
+                    let Some(document_key) = self.documents.document_key_for_doc_id(doc) else {
                         continue;
-                    }
+                    };
 
                     if let Some(slop) = phrase_slop {
                         // Park every clause's iterator on this doc so
@@ -3059,37 +3520,28 @@ impl<'a, S: Scorer> Wand<'a, S> {
                     for ((win, posting), &off) in wins.iter().zip(self.lead.iter()).zip(offs.iter())
                     {
                         let freq = unsafe { *win.freqs.add(off as usize) };
-                        score += posting.score(&self.scorer, freq, doc_length);
+                        score += match norm_addend {
+                            Some(addend) => {
+                                posting.query_weight * bm25_doc_weight_with_norm(freq, addend)
+                            }
+                            None => posting.score(&self.scorer, freq, doc_length),
+                        };
                     }
 
-                    let insert = if candidates.len() < limit {
-                        true
-                    } else {
-                        score > candidates.peek().unwrap().0.0.score.0
-                    };
-                    if insert {
-                        stats.freqs_collected += 1;
-                        let freqs = wins
-                            .iter()
-                            .zip(self.lead.iter())
-                            .zip(offs.iter())
-                            .map(|((win, posting), &off)| {
+                    if candidates.insert(
+                        ScoredDoc::new(document_key, score),
+                        doc_length,
+                        u64::from(doc),
+                        wins.iter().zip(self.lead.iter()).zip(offs.iter()).map(
+                            |((win, posting), &off)| {
                                 (posting.term_index(), unsafe {
                                     *win.freqs.add(off as usize)
                                 })
-                            })
-                            .collect();
-                        if candidates.len() >= limit {
-                            candidates.pop();
-                        }
-                        candidates.push(Reverse((
-                            ScoredDoc::new(row_id, score),
-                            freqs,
-                            doc_length,
-                            u64::from(doc),
-                        )));
-                        if candidates.len() == limit {
-                            let kth = candidates.peek().unwrap().0.0.score.0;
+                            },
+                        ),
+                    )? {
+                        stats.freqs_collected += 1;
+                        if let Some(kth) = candidates.kth_score_if_full() {
                             self.update_threshold(kth, params.wand_factor);
                         }
                     }
@@ -3119,24 +3571,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
         metrics.record_and_full_scores(stats.full_scores);
         metrics.record_freqs_collected(stats.freqs_collected);
 
-        let to_addr = |row_id_slot: u64| {
-            if docs_has_row_ids {
-                CandidateAddr::RowId(row_id_slot)
-            } else {
-                CandidateAddr::Pending(row_id_slot as u32)
-            }
-        };
-        Ok(candidates
-            .into_iter()
-            .map(
-                |Reverse((doc, freqs, doc_length, posting_doc_id))| DocCandidate {
-                    addr: to_addr(doc.row_id),
-                    posting_doc_id,
-                    freqs,
-                    doc_length,
-                },
-            )
-            .collect())
+        candidates.into_candidates(|key| self.documents.candidate_from_key(key))
     }
 
     fn and_move_to_next_block(&mut self, target: u64) {
@@ -3926,6 +4361,312 @@ impl<'a> PositionCursor<'a> {
     }
 }
 
+/// Incremental posting-backed scorer used by compound FTS.
+///
+/// Unlike [`Wand::search`], this cursor does not own a top-k heap. It exposes
+/// exact candidates and conservative block bounds to the compound collector,
+/// which owns the only competitive score for the whole scorer tree.
+pub(super) struct WandCursor<'a, D: WandDocuments> {
+    wand: Wand<'a, Arc<MemBM25Scorer>, D>,
+    phrase_slop: Option<u32>,
+    wand_factor: f32,
+    cost: usize,
+    current_doc: Option<DocInfo>,
+    current_document_key: Option<u64>,
+    current_score: f32,
+    confirmation: Option<bool>,
+    shallow: Option<(u64, u64, f32)>,
+    comparisons: usize,
+    metrics_recorded: bool,
+    metrics: &'a dyn MetricsCollector,
+}
+
+impl<'a, D: WandDocuments> WandCursor<'a, D> {
+    pub(super) fn new(
+        operator: Operator,
+        postings: Vec<PostingIterator>,
+        documents: &'a D,
+        scorer: Arc<MemBM25Scorer>,
+        params: &FtsSearchParams,
+        metrics: &'a dyn MetricsCollector,
+    ) -> Self {
+        let cost = match operator {
+            Operator::And => postings.iter().map(PostingIterator::cost).min(),
+            Operator::Or => Some(
+                postings
+                    .iter()
+                    .map(PostingIterator::cost)
+                    .fold(0, usize::saturating_add),
+            ),
+        }
+        .unwrap_or_default();
+        Self {
+            wand: Wand::new(operator, postings.into_iter(), documents, scorer),
+            phrase_slop: params.phrase_slop,
+            wand_factor: params.wand_factor,
+            cost,
+            current_doc: None,
+            current_document_key: None,
+            current_score: 0.0,
+            confirmation: None,
+            shallow: None,
+            comparisons: 0,
+            metrics_recorded: false,
+            metrics,
+        }
+    }
+
+    pub(super) fn doc(&self) -> Option<u64> {
+        self.current_doc.map(|doc| doc.doc_id())
+    }
+
+    pub(super) fn document_key(&self) -> Option<u64> {
+        self.current_document_key
+    }
+
+    fn clear_current(&mut self) {
+        self.current_doc = None;
+        self.current_document_key = None;
+        self.current_score = 0.0;
+        self.confirmation = None;
+        self.shallow = None;
+    }
+
+    fn record_metrics(&mut self) {
+        if !self.metrics_recorded {
+            self.metrics.record_comparisons(self.comparisons);
+            self.metrics_recorded = true;
+        }
+    }
+
+    fn position_next(&mut self) -> Result<Option<u64>> {
+        loop {
+            let Some((doc, mut score)) = self.wand.next()? else {
+                self.clear_current();
+                self.record_metrics();
+                return Ok(None);
+            };
+            self.comparisons += 1;
+            let doc_id = doc.doc_id();
+            let Some(document_key) = self.wand.documents.document_key(&doc) else {
+                if self.wand.operator == Operator::Or {
+                    self.wand.push_back_leads(doc_id.saturating_add(1));
+                }
+                continue;
+            };
+            let doc_length = self.wand.documents.doc_length(&doc);
+            if self.wand.operator == Operator::Or {
+                self.wand
+                    .advance_all_tail(doc_id, Some(doc_length), Some(&mut score));
+            } else {
+                self.wand.advance_all_tail(doc_id, None, None);
+                score = self.wand.score(doc_length);
+            }
+            self.current_doc = Some(doc);
+            self.current_document_key = Some(document_key);
+            self.current_score = score;
+            self.confirmation = self.phrase_slop.is_none().then_some(true);
+            self.shallow = None;
+            return Ok(Some(doc_id));
+        }
+    }
+
+    pub(super) fn next(&mut self) -> Result<Option<u64>> {
+        if let Some(doc) = self.current_doc
+            && self.wand.operator == Operator::Or
+        {
+            self.wand.push_back_leads(doc.doc_id().saturating_add(1));
+        }
+        self.clear_current();
+        self.position_next()
+    }
+
+    pub(super) fn advance(&mut self, target: u64) -> Result<Option<u64>> {
+        if self.doc().is_some_and(|doc| doc >= target) {
+            return Ok(self.doc());
+        }
+        self.clear_current();
+        self.wand.seek(target);
+        self.position_next()
+    }
+
+    pub(super) fn cost(&self) -> usize {
+        self.cost
+    }
+
+    pub(super) fn current_score(&self) -> Result<f32> {
+        self.current_doc
+            .map(|_| self.current_score)
+            .ok_or_else(|| Error::internal("posting FTS scorer is not positioned on a document"))
+    }
+
+    pub(super) fn matches(&mut self) -> Result<bool> {
+        let Some(_) = self.current_doc else {
+            return Ok(false);
+        };
+        if let Some(confirmed) = self.confirmation {
+            return Ok(confirmed);
+        }
+        let phrase_slop = self.phrase_slop.ok_or_else(|| {
+            Error::internal("posting FTS scorer requires phrase slop for position confirmation")
+        })?;
+        let confirmed = self.wand.check_positions(phrase_slop as i32)?;
+        self.confirmation = Some(confirmed);
+        Ok(confirmed)
+    }
+
+    pub(super) fn match_cost(&self) -> Option<f32> {
+        self.phrase_slop.map(|_| self.wand.num_terms.max(1) as f32)
+    }
+
+    pub(super) fn advance_shallow(&mut self, target: u64) -> Result<u64> {
+        let (up_to, upper) = self.wand.compound_shallow_bound(target);
+        self.shallow = Some((target, up_to, upper));
+        Ok(up_to)
+    }
+
+    pub(super) fn score_upper_bound(&self, up_to: u64) -> Result<f32> {
+        let (target, shallow_up_to, upper) = self.shallow.ok_or_else(|| {
+            Error::internal("score bound requires advance_shallow on the posting FTS scorer")
+        })?;
+        if up_to < target || up_to > shallow_up_to {
+            return Err(Error::internal(format!(
+                "posting FTS score bound up_to={up_to} is outside shallow range [{target}, {shallow_up_to}]"
+            )));
+        }
+        Ok(upper)
+    }
+
+    pub(super) fn set_min_competitive_score(&mut self, min_score: f32) -> Result<()> {
+        if min_score.is_nan() {
+            return Err(Error::invalid_input(
+                "minimum competitive FTS score cannot be NaN",
+            ));
+        }
+        let threshold = next_down_f32(min_score) * self.wand_factor;
+        if threshold > self.wand.threshold {
+            self.wand.threshold = threshold;
+        }
+        Ok(())
+    }
+}
+
+impl<D: WandDocuments> Drop for WandCursor<'_, D> {
+    fn drop(&mut self) {
+        self.record_metrics();
+    }
+}
+
+impl<S: Scorer, D: WandDocuments> Wand<'_, S, D> {
+    fn seek(&mut self, target: u64) {
+        self.up_to = None;
+        self.and_max_score = f32::INFINITY;
+        self.and_last_doc = None;
+        if self.operator == Operator::And {
+            for posting in &mut self.lead {
+                if posting.doc().is_some_and(|doc| doc.doc_id() < target) {
+                    posting.next(target);
+                }
+            }
+            return;
+        }
+
+        let mut postings = std::mem::take(&mut self.head)
+            .into_vec()
+            .into_iter()
+            .map(|posting| posting.posting)
+            .chain(self.lead.drain(..))
+            .chain(
+                std::mem::take(&mut self.tail)
+                    .into_vec()
+                    .into_iter()
+                    .map(|posting| posting.posting),
+            )
+            .collect::<Vec<_>>();
+        self.tail_max_score = 0.0;
+        for posting in &mut postings {
+            if posting.doc().is_some_and(|doc| doc.doc_id() < target) {
+                posting.next(target);
+            }
+        }
+        self.head = postings
+            .into_iter()
+            .filter(|posting| posting.doc().is_some())
+            .map(HeadPosting::new)
+            .collect();
+    }
+
+    fn compound_shallow_bound(&mut self, target: u64) -> (u64, f32) {
+        if self.operator == Operator::Or {
+            self.update_max_scores(target);
+            return (
+                self.up_to.unwrap_or(TERMINATED_DOC_ID),
+                conservative_score_sum(
+                    self.lead
+                        .iter()
+                        .map(|posting| posting.window_max_score(self.up_to, &self.scorer))
+                        .chain(self.head.iter().map(|posting| {
+                            posting.posting.window_max_score(self.up_to, &self.scorer)
+                        }))
+                        .chain(self.tail.iter().map(|posting| posting.upper_bound)),
+                ),
+            );
+        }
+
+        let mut up_to = TERMINATED_DOC_ID;
+        for posting in &mut self.lead {
+            posting.shallow_next(target);
+            up_to = up_to.min(Self::posting_block_up_to(posting, target));
+        }
+        let upper = conservative_score_sum(
+            self.lead
+                .iter()
+                .map(|posting| posting.block_max_score(&self.scorer)),
+        );
+        (up_to, upper)
+    }
+}
+
+fn conservative_score_sum(scores: impl Iterator<Item = f32>) -> f32 {
+    let exact = scores.map(f64::from).sum::<f64>();
+    let rounded = exact as f32;
+    if f64::from(rounded) < exact {
+        next_up_f32(rounded)
+    } else {
+        rounded
+    }
+}
+
+fn next_up_f32(value: f32) -> f32 {
+    if !value.is_finite() {
+        return value;
+    }
+    if value == 0.0 {
+        return f32::from_bits(1);
+    }
+    let bits = value.to_bits();
+    if value > 0.0 {
+        f32::from_bits(bits + 1)
+    } else {
+        f32::from_bits(bits - 1)
+    }
+}
+
+fn next_down_f32(value: f32) -> f32 {
+    if !value.is_finite() {
+        return value;
+    }
+    if value == 0.0 {
+        return f32::from_bits((1_u32 << 31) | 1);
+    }
+    let bits = value.to_bits();
+    if value > 0.0 {
+        f32::from_bits(bits - 1)
+    } else {
+        f32::from_bits(bits + 1)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use arrow::buffer::ScalarBuffer;
@@ -3983,6 +4724,65 @@ mod tests {
         fn doc_weight(&self, freq: u32, _doc_tokens: u32) -> f32 {
             freq as f32
         }
+    }
+
+    struct PartialNormScorer;
+
+    impl Scorer for PartialNormScorer {
+        fn query_weight(&self, _token: &str) -> f32 {
+            1.0
+        }
+
+        fn doc_weight(&self, freq: u32, _doc_tokens: u32) -> f32 {
+            freq as f32
+        }
+
+        fn doc_norm(&self, doc_tokens: u32) -> Option<f32> {
+            (doc_tokens == 0).then_some(0.0)
+        }
+    }
+
+    #[test]
+    fn test_norm_cache_requires_all_norm_codes() {
+        let mut docs = DocSet::default();
+        docs.append(0, 1);
+        docs.set_quantized_scoring(true);
+        let wand = Wand::new(Operator::Or, std::iter::empty(), &docs, PartialNormScorer);
+
+        assert!(wand.norm_k_cache().is_none());
+    }
+
+    #[test]
+    fn test_top_k_collector_reuses_frequency_slots() -> Result<()> {
+        const LIMIT: usize = 8;
+        const NUM_DOCS: usize = 10_000;
+        let mut collector = TopKCollector::new(LIMIT, LIMIT);
+
+        for doc in 0..NUM_DOCS {
+            let num_terms = doc % 4 + 1;
+            let inserted = collector.insert(
+                ScoredDoc::new(doc as u64, doc as f32),
+                num_terms as u32,
+                doc as u64,
+                (0..num_terms).map(|term| (term as u32, doc as u32)),
+            )?;
+            assert!(inserted);
+            assert!(collector.num_frequency_slots() <= LIMIT);
+        }
+        assert_eq!(collector.num_frequency_slots(), LIMIT);
+
+        let mut candidates = collector.into_candidates(|key| key)?;
+        candidates.sort_unstable_by_key(|candidate| candidate.posting_doc_id);
+        assert_eq!(candidates.len(), LIMIT);
+        for (candidate, expected_doc) in candidates.iter().zip(NUM_DOCS - LIMIT..NUM_DOCS) {
+            assert_eq!(candidate.posting_doc_id, expected_doc as u64);
+            assert_eq!(candidate.document, expected_doc as u64);
+            let expected_freqs = (0..expected_doc % 4 + 1)
+                .map(|term| (term as u32, expected_doc as u32))
+                .collect::<Vec<_>>();
+            assert_eq!(candidate.freqs, expected_freqs);
+        }
+        Ok(())
     }
 
     #[rstest]
@@ -4357,11 +5157,7 @@ mod tests {
         params.phrase_slop = Some(0);
 
         let error = wand
-            .search(
-                &params,
-                Arc::new(RowAddrMask::default()),
-                &NoOpMetricsCollector,
-            )
+            .search(&params, &NoOpMetricsCollector)
             .expect_err("corrupt packed positions should fail the phrase search");
         let message = error.to_string();
         assert!(
@@ -4371,13 +5167,10 @@ mod tests {
         assert!(message.contains("corrupt"), "{message}");
     }
 
-    fn sorted_candidate_row_ids(candidates: Vec<DocCandidate>) -> Vec<u64> {
+    fn sorted_candidate_row_ids(candidates: Vec<DocCandidate<u64>>) -> Vec<u64> {
         let mut row_ids = candidates
             .into_iter()
-            .map(|candidate| match candidate.addr {
-                CandidateAddr::RowId(row_id) => row_id,
-                CandidateAddr::Pending(doc_id) => doc_id as u64,
-            })
+            .map(|candidate| candidate.document)
             .collect::<Vec<_>>();
         row_ids.sort_unstable();
         row_ids
@@ -4418,11 +5211,7 @@ mod tests {
         let mut wand = Wand::new(Operator::And, postings.into_iter(), &docs, bm25);
         // This should trigger the bug when the second posting list becomes empty
         let result = wand
-            .search(
-                &FtsSearchParams::default(),
-                Arc::new(RowAddrMask::default()),
-                &NoOpMetricsCollector,
-            )
+            .search(&FtsSearchParams::default(), &NoOpMetricsCollector)
             .unwrap();
         assert_eq!(result.len(), 0); // Should not panic
     }
@@ -4475,7 +5264,7 @@ mod tests {
                 let floor = shared_floor.cloned().unwrap_or_else(new_floor);
                 Wand::new(Operator::Or, postings.into_iter(), &docs, UnitScorer)
                     .with_shared_threshold(floor)
-                    .search(&params, Arc::new(RowAddrMask::default()), &metrics)
+                    .search(&params, &metrics)
                     .unwrap();
             }
             metrics.0.load(Ordering::Relaxed)
@@ -4547,11 +5336,7 @@ mod tests {
         // but the sum of block max scores is less than the threshold,
         wand.threshold = 1.5;
 
-        let result = wand.search(
-            &FtsSearchParams::default(),
-            Arc::new(RowAddrMask::default()),
-            &NoOpMetricsCollector,
-        );
+        let result = wand.search(&FtsSearchParams::default(), &NoOpMetricsCollector);
 
         assert!(result.is_ok());
     }
@@ -4599,20 +5384,8 @@ mod tests {
                     scored: scored.clone(),
                 },
             );
-            let hits = wand
-                .search(
-                    &params,
-                    Arc::new(RowAddrMask::default()),
-                    &NoOpMetricsCollector,
-                )
-                .unwrap();
-            let mut row_ids = hits
-                .iter()
-                .map(|hit| match hit.addr {
-                    CandidateAddr::RowId(r) => r,
-                    CandidateAddr::Pending(_) => panic!("row_id should be set in this path"),
-                })
-                .collect::<Vec<_>>();
+            let hits = wand.search(&params, &NoOpMetricsCollector).unwrap();
+            let mut row_ids = hits.iter().map(|hit| hit.document).collect::<Vec<_>>();
             row_ids.sort_unstable();
             (row_ids, scored.load(Ordering::Relaxed))
         };
@@ -4660,13 +5433,7 @@ mod tests {
 
         let mut wand = Wand::new(Operator::Or, postings.into_iter(), &docs, UnitScorer);
         let metrics = PanicOnAndMetrics::new();
-        let candidates = wand
-            .search(
-                &FtsSearchParams::default(),
-                Arc::new(RowAddrMask::default()),
-                &metrics,
-            )
-            .unwrap();
+        let candidates = wand.search(&FtsSearchParams::default(), &metrics).unwrap();
 
         assert_eq!(sorted_candidate_row_ids(candidates), vec![0, 1, 2, 4, 5]);
         assert!(metrics.comparisons.load(Ordering::Relaxed) > 0);
@@ -4956,7 +5723,6 @@ mod tests {
         let result = wand
             .search(
                 &FtsSearchParams::new().with_limit(Some(1)),
-                Arc::new(RowAddrMask::default()),
                 &NoOpMetricsCollector,
             )
             .unwrap();
@@ -5177,14 +5943,7 @@ mod tests {
                 &docs,
                 InverseDocLengthScorer,
             );
-            sorted_candidate_row_ids(
-                wand.search(
-                    &params,
-                    Arc::new(RowAddrMask::default()),
-                    &NoOpMetricsCollector,
-                )
-                .unwrap(),
-            )
+            sorted_candidate_row_ids(wand.search(&params, &NoOpMetricsCollector).unwrap())
         };
 
         let compressed = run(true);
@@ -5480,13 +6239,15 @@ mod tests {
         let result = wand
             .search(
                 &FtsSearchParams::new().with_limit(Some(1)),
-                Arc::new(RowAddrMask::default()),
                 &NoOpMetricsCollector,
             )
             .unwrap();
 
-        let addrs = result.into_iter().map(|doc| doc.addr).collect::<Vec<_>>();
-        assert!(matches!(addrs.as_slice(), [CandidateAddr::RowId(0)]));
+        let addrs = result
+            .into_iter()
+            .map(|doc| doc.document)
+            .collect::<Vec<_>>();
+        assert_eq!(addrs, vec![0]);
         let scored = scored.load(Ordering::Relaxed);
         // The bulk path evaluates 63 doc weights up front to fill its
         // frequency-bound prune LUT; those are bound computations, not
@@ -5535,15 +6296,14 @@ mod tests {
         );
         let metrics = CountAndSearchStats::default();
         let result = wand
-            .search(
-                &FtsSearchParams::new().with_limit(Some(1)),
-                Arc::new(RowAddrMask::default()),
-                &metrics,
-            )
+            .search(&FtsSearchParams::new().with_limit(Some(1)), &metrics)
             .unwrap();
 
-        let addrs = result.into_iter().map(|doc| doc.addr).collect::<Vec<_>>();
-        assert!(matches!(addrs.as_slice(), [CandidateAddr::RowId(0)]));
+        let addrs = result
+            .into_iter()
+            .map(|doc| doc.document)
+            .collect::<Vec<_>>();
+        assert_eq!(addrs, vec![0]);
 
         let candidates_seen = metrics.candidates_seen.load(Ordering::Relaxed);
         let candidates_pruned_before_return = metrics
@@ -5599,13 +6359,15 @@ mod tests {
         let result = wand
             .search(
                 &FtsSearchParams::new().with_limit(Some(1)),
-                Arc::new(RowAddrMask::default()),
                 &NoOpMetricsCollector,
             )
             .unwrap();
 
-        let addrs = result.into_iter().map(|doc| doc.addr).collect::<Vec<_>>();
-        assert!(matches!(addrs.as_slice(), [CandidateAddr::RowId(1)]));
+        let addrs = result
+            .into_iter()
+            .map(|doc| doc.document)
+            .collect::<Vec<_>>();
+        assert_eq!(addrs, vec![1]);
     }
 
     #[rstest]
@@ -5677,7 +6439,7 @@ mod tests {
         );
         wand.threshold = 0.5;
 
-        let selected = vec![RowAddress::from(1_u64), RowAddress::from(2_u64)];
+        let selected = vec![(1_u64, 1_u64), (2_u64, 2_u64)];
         let result = wand
             .flat_search(
                 &FtsSearchParams::default(),
@@ -5688,10 +6450,7 @@ mod tests {
 
         let matched = result
             .into_iter()
-            .map(|doc| match doc.addr {
-                CandidateAddr::RowId(r) => r,
-                CandidateAddr::Pending(_) => panic!("row_id should be set in this path"),
-            })
+            .map(|doc| doc.document)
             .collect::<Vec<_>>();
         assert_eq!(matched, vec![2]);
     }
@@ -5744,7 +6503,10 @@ mod tests {
         );
         wand.threshold = 0.5;
 
-        let selected = vec![RowAddress::from(100_u64)];
+        let selected = docs
+            .doc_ids(100)
+            .map(|doc_id| (doc_id, 100_u64))
+            .collect::<Vec<_>>();
         let result = wand
             .flat_search(
                 &FtsSearchParams::default(),
@@ -5753,13 +6515,14 @@ mod tests {
             )
             .unwrap();
 
-        // flat_search resolves the prefilter against the DocSet, so the single
-        // match comes back as a concrete RowId(100) rather than a deferred
-        // Pending addr. Asserting on the whole result avoids a never-taken
-        // match arm that would otherwise read as uncovered.
-        let addrs = result.into_iter().map(|doc| doc.addr).collect::<Vec<_>>();
+        // The legacy adapter resolves the prefilter to every owned document,
+        // while the candidate identity remains row 100.
+        let addrs = result
+            .into_iter()
+            .map(|doc| doc.document)
+            .collect::<Vec<_>>();
         assert!(
-            matches!(addrs.as_slice(), [CandidateAddr::RowId(100)]),
+            addrs.as_slice() == [100],
             "expected exactly row 100, got {addrs:?}"
         );
     }
@@ -5784,7 +6547,24 @@ mod tests {
     }
 
     #[test]
-    fn test_v3_without_impacts_uses_conservative_quantized_score_bound() {
+    fn test_modern_doc_id_validation_checks_layout_and_upper_bound() {
+        let compressed = generate_posting_list(vec![0, 4], 1.0, None, true);
+        let posting = PostingIterator::new(String::from("term"), 0, 0, compressed, 5);
+        posting
+            .validate_modern_doc_ids(5)
+            .expect("largest DocId is inside the document table");
+        let error = posting.validate_modern_doc_ids(4).unwrap_err();
+        assert!(error.to_string().contains("DocId 4"));
+        assert!(error.to_string().contains("[0, 4)"));
+
+        let plain = generate_posting_list(vec![0], 1.0, None, false);
+        let posting = PostingIterator::new(String::from("legacy"), 0, 0, plain, 1);
+        let error = posting.validate_modern_doc_ids(1).unwrap_err();
+        assert!(error.to_string().contains("legacy row-address layout"));
+    }
+
+    #[test]
+    fn test_256_document_blocks_without_impacts_use_conservative_quantized_score_bound() {
         let exact_doc_length = 300;
         let quantized_doc_length = super::super::index::dequantize_doc_length(
             super::super::index::quantize_doc_length(exact_doc_length),
@@ -5830,7 +6610,7 @@ mod tests {
     }
 
     #[test]
-    fn test_v3_without_impacts_unknown_scorer_uses_infinite_bound() {
+    fn test_256_document_blocks_without_impacts_unknown_scorer_uses_infinite_bound() {
         let doc_ids = [0_u32];
         let frequencies = [10_u32];
         let blocks = compress_posting_list_with_tail_codec_and_block_size(
@@ -6085,7 +6865,7 @@ mod tests {
             params.phrase_slop = Some(slop);
         }
 
-        let normalize = |result: Vec<DocCandidate>| {
+        let normalize = |result: Vec<DocCandidate<u64>>| {
             let mut rows = result
                 .into_iter()
                 .map(|candidate| {
@@ -6093,10 +6873,7 @@ mod tests {
                         candidate.posting_doc_id,
                         candidate.doc_length,
                         candidate.freqs,
-                        match candidate.addr {
-                            CandidateAddr::RowId(row_id) => row_id,
-                            CandidateAddr::Pending(doc_id) => u64::from(doc_id),
-                        },
+                        candidate.document,
                     )
                 })
                 .collect::<Vec<_>>();
@@ -6112,14 +6889,7 @@ mod tests {
                 UnitScorer,
             )
             .with_bulk_and_mode(mode);
-            let rows = normalize(
-                wand.search(
-                    &params,
-                    Arc::new(RowAddrMask::default()),
-                    &NoOpMetricsCollector,
-                )
-                .unwrap(),
-            );
+            let rows = normalize(wand.search(&params, &NoOpMetricsCollector).unwrap());
             let used_bulk = wand.bulk_and_searches > 0;
             (rows, used_bulk)
         };

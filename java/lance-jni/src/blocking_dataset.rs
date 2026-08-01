@@ -41,7 +41,7 @@ use lance::dataset::{
     ColumnAlteration, CommitBuilder, Dataset, NewColumnTransform, ProjectionRequest, ReadParams,
     Version, WriteParams,
 };
-use lance::index::{DatasetIndexExt, IndexSegment};
+use lance::index::{DatasetIndexExt, IndexSegment, IntoIndexSegment};
 use lance::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 use lance::io::{ObjectStore, ObjectStoreParams};
 use lance::session::Session as LanceSession;
@@ -1212,25 +1212,7 @@ fn inner_commit_existing_index_segments<'local>(
 }
 
 fn index_metadata_to_segment(metadata: &IndexMetadata) -> Result<IndexSegment> {
-    let fragment_bitmap = metadata.fragment_bitmap.clone().ok_or_else(|| {
-        Error::input_error(format!(
-            "Segment '{}' is missing fragment coverage metadata",
-            metadata.uuid
-        ))
-    })?;
-    let index_details = metadata.index_details.clone().ok_or_else(|| {
-        Error::input_error(format!(
-            "Segment '{}' is missing index details metadata",
-            metadata.uuid
-        ))
-    })?;
-
-    Ok(IndexSegment::new(
-        metadata.uuid,
-        fragment_bitmap,
-        index_details,
-        metadata.index_version,
-    ))
+    Ok(metadata.clone().into_index_segment()?)
 }
 
 #[unsafe(no_mangle)]
@@ -1464,6 +1446,47 @@ fn inner_get_fragments<'local>(
         .map(|f| f.metadata().clone())
         .collect::<Vec<Fragment>>();
     export_vec(env, &fragments)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeGetFragmentStatistics<'a>(
+    mut env: JNIEnv<'a>,
+    jdataset: JObject,
+) -> JObject<'a> {
+    ok_or_throw!(env, inner_get_fragment_statistics(&mut env, jdataset))
+}
+
+/// Returns per-fragment statistics flattened as [id0, rowCount0, dataFileNum0, id1, ...].
+///
+/// Row count semantics match Java `FragmentMetadata.getNumRows()`:
+/// physical rows minus deleted rows, with absent values treated as 0.
+/// Data file count is the number of data files in the fragment.
+fn inner_get_fragment_statistics<'local>(
+    env: &mut JNIEnv<'local>,
+    jdataset: JObject,
+) -> Result<JObject<'local>> {
+    let stats: Vec<i64> = {
+        let dataset =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
+        let fragments = dataset.inner.get_fragments();
+        let mut stats = Vec::with_capacity(fragments.len() * 3);
+        for f in fragments.iter() {
+            let meta = f.metadata();
+            let physical_rows = meta.physical_rows.unwrap_or(0) as i64;
+            let deleted_rows = meta
+                .deletion_file
+                .as_ref()
+                .and_then(|d| d.num_deleted_rows)
+                .unwrap_or(0) as i64;
+            stats.push(f.id() as i64);
+            stats.push(physical_rows - deleted_rows);
+            stats.push(meta.files.len() as i64);
+        }
+        stats
+    };
+    let jarray = env.new_long_array(stats.len() as i32)?;
+    env.set_long_array_region(&jarray, 0, &stats)?;
+    Ok(jarray.into())
 }
 
 #[unsafe(no_mangle)]

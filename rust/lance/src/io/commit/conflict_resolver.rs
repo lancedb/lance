@@ -12,7 +12,7 @@ use crate::{
 use futures::{StreamExt, TryStreamExt};
 use lance_core::{Error, Result, utils::deletion::DeletionVector};
 use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
-use lance_index::mem_wal::{MEM_WAL_INDEX_NAME, MergedGeneration};
+use lance_index::mem_wal::{CompactedSsTable, MEM_WAL_INDEX_NAME};
 use lance_select::{RowAddrTreeMap, RowSetOps};
 use lance_table::format::IndexMetadata;
 use lance_table::format::overlay::OverlayCoverage;
@@ -34,9 +34,9 @@ pub struct TransactionRebase<'a> {
     modified_fragment_ids: HashSet<u64>,
     affected_rows: Option<&'a RowAddrTreeMap>,
     conflicting_frag_reuse_indices: Vec<IndexMetadata>,
-    /// Merged generations from conflicting UpdateMemWalState transactions.
+    /// Compacted SSTables from conflicting UpdateMemWalState transactions.
     /// Used when rebasing CreateIndex of MemWalIndex.
-    conflicting_mem_wal_merged_gens: Vec<MergedGeneration>,
+    conflicting_mem_wal_compacted_sstables: Vec<CompactedSsTable>,
 }
 
 impl<'a> TransactionRebase<'a> {
@@ -62,7 +62,7 @@ impl<'a> TransactionRebase<'a> {
                 initial_fragments: HashMap::new(),
                 modified_fragment_ids: HashSet::new(),
                 conflicting_frag_reuse_indices: Vec::new(),
-                conflicting_mem_wal_merged_gens: Vec::new(),
+                conflicting_mem_wal_compacted_sstables: Vec::new(),
             }),
             Operation::Delete {
                 updated_fragments,
@@ -90,7 +90,7 @@ impl<'a> TransactionRebase<'a> {
                         modified_fragment_ids,
                         affected_rows: None,
                         conflicting_frag_reuse_indices: Vec::new(),
-                        conflicting_mem_wal_merged_gens: Vec::new(),
+                        conflicting_mem_wal_compacted_sstables: Vec::new(),
                     });
                 }
 
@@ -103,7 +103,7 @@ impl<'a> TransactionRebase<'a> {
                     initial_fragments,
                     modified_fragment_ids,
                     conflicting_frag_reuse_indices: Vec::new(),
-                    conflicting_mem_wal_merged_gens: Vec::new(),
+                    conflicting_mem_wal_compacted_sstables: Vec::new(),
                 })
             }
             Operation::Rewrite { groups, .. } => {
@@ -121,7 +121,7 @@ impl<'a> TransactionRebase<'a> {
                     initial_fragments,
                     modified_fragment_ids,
                     conflicting_frag_reuse_indices: Vec::new(),
-                    conflicting_mem_wal_merged_gens: Vec::new(),
+                    conflicting_mem_wal_compacted_sstables: Vec::new(),
                 })
             }
             Operation::DataReplacement { replacements } => {
@@ -136,7 +136,7 @@ impl<'a> TransactionRebase<'a> {
                     initial_fragments,
                     modified_fragment_ids,
                     conflicting_frag_reuse_indices: Vec::new(),
-                    conflicting_mem_wal_merged_gens: Vec::new(),
+                    conflicting_mem_wal_compacted_sstables: Vec::new(),
                 })
             }
             Operation::DataOverlay { groups } => {
@@ -151,7 +151,7 @@ impl<'a> TransactionRebase<'a> {
                     initial_fragments,
                     modified_fragment_ids,
                     conflicting_frag_reuse_indices: Vec::new(),
-                    conflicting_mem_wal_merged_gens: Vec::new(),
+                    conflicting_mem_wal_compacted_sstables: Vec::new(),
                 })
             }
             Operation::Merge { fragments, .. } => {
@@ -165,7 +165,7 @@ impl<'a> TransactionRebase<'a> {
                     initial_fragments,
                     modified_fragment_ids,
                     conflicting_frag_reuse_indices: Vec::new(),
-                    conflicting_mem_wal_merged_gens: Vec::new(),
+                    conflicting_mem_wal_compacted_sstables: Vec::new(),
                 })
             }
         }
@@ -369,7 +369,7 @@ impl<'a> TransactionRebase<'a> {
     ) -> Result<()> {
         if let Operation::Update {
             inserted_rows_filter: self_inserted_rows_filter,
-            merged_generations: self_merged_generations,
+            compacted_sstables: self_compacted_sstables,
             new_fragments: self_new_fragments,
             update_mode: self_update_mode,
             ..
@@ -556,10 +556,10 @@ impl<'a> TransactionRebase<'a> {
                     Err(self.incompatible_conflict_err(other_transaction, other_version))
                 }
                 Operation::UpdateMemWalState {
-                    merged_generations: other_merged_generations,
-                } => self.check_merged_generations_conflict(
-                    other_merged_generations,
-                    self_merged_generations,
+                    compacted_sstables: other_compacted_sstables,
+                } => self.check_compacted_sstables_conflict(
+                    other_compacted_sstables,
+                    self_compacted_sstables,
                     other_transaction,
                     other_version,
                 ),
@@ -578,7 +578,7 @@ impl<'a> TransactionRebase<'a> {
             new_indices,
             removed_indices,
             ..
-        } = &self.transaction.operation
+        } = &mut self.transaction.operation
         {
             match &other_transaction.operation {
                 Operation::Append { .. }
@@ -625,7 +625,19 @@ impl<'a> TransactionRebase<'a> {
                 }
                 // Although some of the rows we indexed may have been deleted / moved,
                 // row ids are still valid, so we allow this optimistically.
-                Operation::Delete { .. } | Operation::Update { .. } => Ok(()),
+                Operation::Delete { .. } => Ok(()),
+                Operation::Update {
+                    updated_fragments,
+                    fields_modified,
+                    ..
+                } => {
+                    Transaction::prune_updated_fields_from_indices(
+                        new_indices,
+                        updated_fragments,
+                        fields_modified,
+                    );
+                    Ok(())
+                }
                 // Merge, reserve, and project don't change row ids, so this should be fine.
                 Operation::Merge { .. } => Ok(()),
                 Operation::ReserveFragments { .. } => Ok(()),
@@ -644,6 +656,27 @@ impl<'a> TransactionRebase<'a> {
                     // triggers a CreateIndex, and it needs to add the new reuse
                     // version created by the rewrite
                     if let Some(committed_fri) = frag_reuse_index {
+                        let ngram_coverage = new_indices
+                            .iter()
+                            .filter(|idx| {
+                                idx.index_details.as_ref().is_some_and(|details| {
+                                    details.type_url.ends_with("NGramIndexDetails")
+                                })
+                            })
+                            .filter_map(|idx| idx.fragment_bitmap.as_ref())
+                            .fold(RoaringBitmap::new(), |coverage, fragments| {
+                                coverage | fragments
+                            });
+                        if groups
+                            .iter()
+                            .flat_map(|group| group.old_fragments.iter())
+                            .any(|fragment| ngram_coverage.contains(fragment.id as u32))
+                        {
+                            return Err(
+                                self.retryable_conflict_err(other_transaction, other_version)
+                            );
+                        }
+
                         if new_indices
                             .iter()
                             .any(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
@@ -704,14 +737,14 @@ impl<'a> TransactionRebase<'a> {
                     Ok(())
                 }
                 Operation::UpdateMemWalState {
-                    merged_generations: other_merged_gens,
+                    compacted_sstables: other_compacted_sstables,
                 } => {
                     // CreateIndex of MemWalIndex is compatible with UpdateMemWalState
                     // as they can be rebased on each other
                     if new_indices.iter().any(|idx| idx.name == MEM_WAL_INDEX_NAME) {
-                        // Collect merged_generations from UpdateMemWalState for rebasing
-                        self.conflicting_mem_wal_merged_gens
-                            .extend(other_merged_gens.iter().cloned());
+                        // Collect compacted_sstables from UpdateMemWalState for rebasing
+                        self.conflicting_mem_wal_compacted_sstables
+                            .extend(other_compacted_sstables.iter().cloned());
                         Ok(())
                     } else {
                         Err(self.incompatible_conflict_err(other_transaction, other_version))
@@ -1441,44 +1474,44 @@ impl<'a> TransactionRebase<'a> {
         other_version: u64,
     ) -> Result<()> {
         if let Operation::UpdateMemWalState {
-            merged_generations: self_merged_generations,
+            compacted_sstables: self_compacted_sstables,
         } = &self.transaction.operation
         {
             match &other_transaction.operation {
                 Operation::UpdateMemWalState {
-                    merged_generations: other_merged_generations,
+                    compacted_sstables: other_compacted_sstables,
                 } => {
                     // Two UpdateMemWalState transactions conflict if they're updating
-                    // the same shard's merged_generation
-                    self.check_merged_generations_conflict(
-                        other_merged_generations,
-                        self_merged_generations,
+                    // the same shard's compacted SSTable
+                    self.check_compacted_sstables_conflict(
+                        other_compacted_sstables,
+                        self_compacted_sstables,
                         other_transaction,
                         other_version,
                     )
                 }
                 Operation::Update {
-                    merged_generations: other_merged_generations,
+                    compacted_sstables: other_compacted_sstables,
                     ..
                 } => {
-                    // Update transactions with merged_generations can conflict
-                    self.check_merged_generations_conflict(
-                        other_merged_generations,
-                        self_merged_generations,
+                    // Update transactions with compacted_sstables can conflict
+                    self.check_compacted_sstables_conflict(
+                        other_compacted_sstables,
+                        self_compacted_sstables,
                         other_transaction,
                         other_version,
                     )
                 }
                 Operation::CreateIndex { new_indices, .. } => {
-                    // Check if CreateIndex has a MemWalIndex with merged_generations
+                    // Check if CreateIndex has a MemWalIndex with compacted_sstables
                     if let Some(mem_wal_idx) = new_indices
                         .iter()
                         .find(|idx| idx.name == MEM_WAL_INDEX_NAME)
                     {
                         let details = load_mem_wal_index_details(mem_wal_idx.clone())?;
-                        self.check_merged_generations_conflict(
-                            &details.merged_generations,
-                            self_merged_generations,
+                        self.check_compacted_sstables_conflict(
+                            &details.compacted_sstables,
+                            self_compacted_sstables,
                             other_transaction,
                             other_version,
                         )
@@ -1550,10 +1583,10 @@ impl<'a> TransactionRebase<'a> {
         }
     }
 
-    fn check_merged_generations_conflict(
+    fn check_compacted_sstables_conflict(
         &self,
-        committed: &[MergedGeneration],
-        to_commit: &[MergedGeneration],
+        committed: &[CompactedSsTable],
+        to_commit: &[CompactedSsTable],
         other_transaction: &Transaction,
         other_version: u64,
     ) -> Result<()> {
@@ -1562,7 +1595,8 @@ impl<'a> TransactionRebase<'a> {
             for to_commit_mg in to_commit {
                 if committed_mg.shard_id == to_commit_mg.shard_id {
                     // Same shard being updated
-                    // If committed >= to_commit, data already merged or superseded - abort without retry
+                    // If committed >= to_commit, the SSTable is already compacted
+                    // or superseded, so abort without retry.
                     // If committed < to_commit, can retry with new state
                     if committed_mg.generation >= to_commit_mg.generation {
                         return Err(
@@ -1904,7 +1938,7 @@ impl<'a> TransactionRebase<'a> {
             // Handle MEM_WAL_INDEX rebasing
             let has_mem_wal = new_indices.iter().any(|idx| idx.name == MEM_WAL_INDEX_NAME);
 
-            if has_mem_wal && !self.conflicting_mem_wal_merged_gens.is_empty() {
+            if has_mem_wal && !self.conflicting_mem_wal_compacted_sstables.is_empty() {
                 let pos = new_indices
                     .iter()
                     .position(|idx| idx.name == MEM_WAL_INDEX_NAME)
@@ -1913,19 +1947,19 @@ impl<'a> TransactionRebase<'a> {
                 let current_meta = new_indices.remove(pos);
                 let mut details = load_mem_wal_index_details(current_meta)?;
 
-                // Merge conflicting merged_generations - for each shard, keep higher generation
-                // We own self so we can consume conflicting_mem_wal_merged_gens directly
-                for new_mg in self.conflicting_mem_wal_merged_gens {
+                // Reconcile conflicting compacted_sstables by keeping each shard's higher generation.
+                // We own self so we can consume conflicting_mem_wal_compacted_sstables directly
+                for new_sstable in self.conflicting_mem_wal_compacted_sstables {
                     if let Some(existing) = details
-                        .merged_generations
+                        .compacted_sstables
                         .iter_mut()
-                        .find(|mg| mg.shard_id == new_mg.shard_id)
+                        .find(|sstable| sstable.shard_id == new_sstable.shard_id)
                     {
-                        if new_mg.generation > existing.generation {
-                            existing.generation = new_mg.generation;
+                        if new_sstable.generation > existing.generation {
+                            existing.generation = new_sstable.generation;
                         }
                     } else {
-                        details.merged_generations.push(new_mg);
+                        details.compacted_sstables.push(new_sstable);
                     }
                 }
 
@@ -2116,7 +2150,7 @@ mod tests {
     use arrow_array::{Int32Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use lance_core::Error;
-    use lance_file::version::LanceFileVersion;
+    use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
     use lance_io::assert_io_eq;
     use uuid::Uuid;
 
@@ -2214,7 +2248,7 @@ mod tests {
             removed_fragment_ids: vec![],
             new_fragments: vec![],
             fields_modified: vec![],
-            merged_generations: Vec::new(),
+            compacted_sstables: Vec::new(),
             fields_for_preserving_frag_bitmap: vec![],
             update_mode: None,
             inserted_rows_filter: None,
@@ -2227,7 +2261,7 @@ mod tests {
                 removed_fragment_ids: vec![2],
                 new_fragments: vec![],
                 fields_modified: vec![],
-                merged_generations: Vec::new(),
+                compacted_sstables: Vec::new(),
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
                 inserted_rows_filter: None,
@@ -2243,7 +2277,7 @@ mod tests {
                 updated_fragments: vec![Fragment::new(4)],
                 new_fragments: vec![],
                 fields_modified: vec![],
-                merged_generations: Vec::new(),
+                compacted_sstables: Vec::new(),
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
                 inserted_rows_filter: None,
@@ -2336,7 +2370,7 @@ mod tests {
                 "path1",
                 vec![0],
                 vec![0],
-                &LanceFileVersion::Stable,
+                ConcreteFileVersion::from(LanceFileVersion::Stable),
                 NonZero::new(10),
             )
             .with_physical_rows(3);
@@ -2346,7 +2380,7 @@ mod tests {
                 removed_fragment_ids: vec![],
                 new_fragments: vec![sample_file.clone()],
                 fields_modified: vec![],
-                merged_generations: Vec::new(),
+                compacted_sstables: Vec::new(),
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
                 inserted_rows_filter: None,
@@ -2362,7 +2396,7 @@ mod tests {
                 removed_fragment_ids: vec![],
                 new_fragments: vec![sample_file],
                 fields_modified: vec![],
-                merged_generations: Vec::new(),
+                compacted_sstables: Vec::new(),
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
                 inserted_rows_filter: None,
@@ -2479,7 +2513,7 @@ mod tests {
                 "path1",
                 vec![0],
                 vec![0],
-                &LanceFileVersion::Stable,
+                ConcreteFileVersion::from(LanceFileVersion::Stable),
                 NonZero::new(10),
             )
             .with_physical_rows(3);
@@ -2492,7 +2526,7 @@ mod tests {
                     removed_fragment_ids: vec![0],
                     new_fragments: vec![sample_file.clone()],
                     fields_modified: vec![],
-                    merged_generations: Vec::new(),
+                    compacted_sstables: Vec::new(),
                     fields_for_preserving_frag_bitmap: vec![],
                     update_mode: None,
                     inserted_rows_filter: None,
@@ -2506,7 +2540,7 @@ mod tests {
                     removed_fragment_ids: vec![],
                     new_fragments: vec![sample_file.clone()],
                     fields_modified: vec![],
-                    merged_generations: Vec::new(),
+                    compacted_sstables: Vec::new(),
                     fields_for_preserving_frag_bitmap: vec![],
                     update_mode: None,
                     inserted_rows_filter: None,
@@ -2667,7 +2701,7 @@ mod tests {
                 updated_fragments: vec![fragment0.clone()],
                 new_fragments: vec![fragment2.clone()],
                 fields_modified: vec![0],
-                merged_generations: Vec::new(),
+                compacted_sstables: Vec::new(),
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
                 inserted_rows_filter: None,
@@ -2874,7 +2908,7 @@ mod tests {
                     removed_fragment_ids: vec![],
                     new_fragments: vec![fragment2],
                     fields_modified: vec![0],
-                    merged_generations: Vec::new(),
+                    compacted_sstables: Vec::new(),
                     fields_for_preserving_frag_bitmap: vec![],
                     update_mode: None,
                     inserted_rows_filter: None,
@@ -3068,7 +3102,7 @@ mod tests {
                 modified_fragment_ids: modified_fragment_ids(operation).collect::<HashSet<_>>(),
                 affected_rows: None,
                 conflicting_frag_reuse_indices: Vec::new(),
-                conflicting_mem_wal_merged_gens: Vec::new(),
+                conflicting_mem_wal_compacted_sstables: Vec::new(),
             };
 
             for (other, expected_conflict) in other_transactions.iter().zip(expected_conflicts) {
@@ -3134,7 +3168,7 @@ mod tests {
             updated_fragments: vec![],
             new_fragments: vec![],
             fields_modified: vec![],
-            merged_generations: Vec::new(),
+            compacted_sstables: Vec::new(),
             fields_for_preserving_frag_bitmap: vec![],
             update_mode: None,
             inserted_rows_filter: None,
@@ -3153,7 +3187,7 @@ mod tests {
             updated_fragments: updated,
             new_fragments: new,
             fields_modified: vec![],
-            merged_generations: Vec::new(),
+            compacted_sstables: Vec::new(),
             fields_for_preserving_frag_bitmap: vec![],
             update_mode: Some(UpdateMode::RewriteRows),
             inserted_rows_filter: None,
@@ -3164,7 +3198,7 @@ mod tests {
             updated_fragments: updated,
             new_fragments: vec![],
             fields_modified: vec![0],
-            merged_generations: Vec::new(),
+            compacted_sstables: Vec::new(),
             fields_for_preserving_frag_bitmap: vec![],
             update_mode: Some(UpdateMode::RewriteColumns),
             inserted_rows_filter: None,
@@ -3257,7 +3291,7 @@ mod tests {
             ),
             (
                 Operation::UpdateMemWalState {
-                    merged_generations: vec![],
+                    compacted_sstables: vec![],
                 },
                 NotCompatible,
             ),
@@ -3271,7 +3305,7 @@ mod tests {
                     .collect::<HashSet<_>>(),
                 affected_rows: None,
                 conflicting_frag_reuse_indices: Vec::new(),
-                conflicting_mem_wal_merged_gens: Vec::new(),
+                conflicting_mem_wal_compacted_sstables: Vec::new(),
             };
             let other_txn = Transaction::new(0, other.clone(), None);
             let result = rebase.check_txn(&other_txn, 1);
@@ -3330,7 +3364,7 @@ mod tests {
                 modified_fragment_ids: modified_fragment_ids(&rewrite_op).collect::<HashSet<_>>(),
                 affected_rows: None,
                 conflicting_frag_reuse_indices: Vec::new(),
-                conflicting_mem_wal_merged_gens: Vec::new(),
+                conflicting_mem_wal_compacted_sstables: Vec::new(),
             };
             let other_txn = Transaction::new(0, other.clone(), None);
             let result = rebase.check_txn(&other_txn, 1);
@@ -3376,7 +3410,7 @@ mod tests {
                 updated_fragments: vec![Fragment::new(1)],
                 new_fragments,
                 fields_modified: vec![0],
-                merged_generations: Vec::new(),
+                compacted_sstables: Vec::new(),
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode,
                 inserted_rows_filter: None,
@@ -3442,7 +3476,7 @@ mod tests {
                 modified_fragment_ids: modified_fragment_ids(&update_op).collect::<HashSet<_>>(),
                 affected_rows: affected_rows.as_ref(),
                 conflicting_frag_reuse_indices: Vec::new(),
-                conflicting_mem_wal_merged_gens: Vec::new(),
+                conflicting_mem_wal_compacted_sstables: Vec::new(),
             };
             let other_txn = Transaction::new(0, other.clone(), None);
             let result = rebase.check_txn(&other_txn, 1);
@@ -3484,7 +3518,7 @@ mod tests {
                 "moved.lance",
                 vec![0],
                 vec![0],
-                &LanceFileVersion::Stable,
+                ConcreteFileVersion::from(LanceFileVersion::Stable),
                 NonZero::new(10),
             )
             .with_physical_rows(1);
@@ -3493,7 +3527,7 @@ mod tests {
             removed_fragment_ids: vec![],
             new_fragments: vec![moved_fragment],
             fields_modified: vec![],
-            merged_generations: Vec::new(),
+            compacted_sstables: Vec::new(),
             fields_for_preserving_frag_bitmap: vec![],
             update_mode: Some(UpdateMode::RewriteRows),
             inserted_rows_filter: None,
@@ -3547,6 +3581,68 @@ mod tests {
         }
     }
 
+    #[rstest::rstest]
+    #[test]
+    #[case::indexed_field_updated(0, vec![0])]
+    #[case::other_field_updated(1, vec![0, 1])]
+    fn test_create_index_rebase_prunes_updated_field_coverage(
+        #[case] field_modified: u32,
+        #[case] expected_fragment_ids: Vec<u32>,
+    ) {
+        let index = IndexMetadata {
+            uuid: Uuid::new_v4(),
+            name: "test".to_string(),
+            fields: vec![0],
+            dataset_version: 1,
+            fragment_bitmap: Some(RoaringBitmap::from_iter([0, 1])),
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+        let mut rebase = TransactionRebase {
+            transaction: Transaction::new(
+                1,
+                Operation::CreateIndex {
+                    new_indices: vec![index],
+                    removed_indices: vec![],
+                },
+                None,
+            ),
+            initial_fragments: HashMap::new(),
+            modified_fragment_ids: HashSet::new(),
+            affected_rows: None,
+            conflicting_frag_reuse_indices: Vec::new(),
+            conflicting_mem_wal_compacted_sstables: Vec::new(),
+        };
+        let update = Transaction::new(
+            1,
+            Operation::Update {
+                updated_fragments: vec![Fragment::new(1)],
+                removed_fragment_ids: vec![],
+                new_fragments: vec![],
+                fields_modified: vec![field_modified],
+                compacted_sstables: Vec::new(),
+                fields_for_preserving_frag_bitmap: vec![],
+                update_mode: Some(UpdateMode::RewriteColumns),
+                inserted_rows_filter: None,
+                updated_fragment_offsets: None,
+            },
+            None,
+        );
+
+        rebase.check_txn(&update, 2).unwrap();
+
+        let Operation::CreateIndex { new_indices, .. } = &rebase.transaction.operation else {
+            panic!("expected CreateIndex operation");
+        };
+        assert_eq!(
+            new_indices[0].fragment_bitmap.as_ref().unwrap(),
+            &RoaringBitmap::from_iter(expected_fragment_ids)
+        );
+    }
+
     #[test]
     fn test_create_index_conflicts_only_on_same_name() {
         let index0 = IndexMetadata {
@@ -3581,7 +3677,7 @@ mod tests {
             modified_fragment_ids: HashSet::new(),
             affected_rows: None,
             conflicting_frag_reuse_indices: Vec::new(),
-            conflicting_mem_wal_merged_gens: Vec::new(),
+            conflicting_mem_wal_compacted_sstables: Vec::new(),
         };
 
         let same_name = Transaction::new(
@@ -3635,7 +3731,7 @@ mod tests {
             modified_fragment_ids: HashSet::new(),
             affected_rows: None,
             conflicting_frag_reuse_indices: Vec::new(),
-            conflicting_mem_wal_merged_gens: Vec::new(),
+            conflicting_mem_wal_compacted_sstables: Vec::new(),
         };
         let different_name_result = rebase.check_txn(&different_name, 1);
         assert!(
@@ -3643,6 +3739,79 @@ mod tests {
             "Expected compatibility for different-name CreateIndex, got {:?}",
             different_name_result
         );
+    }
+
+    #[test]
+    fn test_create_ngram_index_conflicts_with_overlapping_deferred_rewrite() {
+        let ngram_index = |fragment_id| IndexMetadata {
+            uuid: Uuid::new_v4(),
+            name: "text_ngram".to_string(),
+            fields: vec![0],
+            dataset_version: 1,
+            fragment_bitmap: Some(RoaringBitmap::from_iter([fragment_id])),
+            index_details: Some(Arc::new(prost_types::Any {
+                type_url: "lance.index.NGramIndexDetails".to_string(),
+                value: Vec::new(),
+            })),
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+        let frag_reuse_index = IndexMetadata {
+            uuid: Uuid::new_v4(),
+            name: FRAG_REUSE_INDEX_NAME.to_string(),
+            fields: vec![],
+            dataset_version: 2,
+            fragment_bitmap: Some(RoaringBitmap::from_iter([2u32])),
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+        let rewrite = Transaction::new(
+            1,
+            Operation::Rewrite {
+                groups: vec![RewriteGroup {
+                    old_fragments: vec![Fragment::new(1)],
+                    new_fragments: vec![Fragment::new(2)],
+                }],
+                rewritten_indices: vec![],
+                frag_reuse_index: Some(frag_reuse_index),
+            },
+            None,
+        );
+
+        for (covered_fragment, expect_conflict) in [(1u32, true), (3u32, false)] {
+            let mut rebase = TransactionRebase {
+                transaction: Transaction::new(
+                    1,
+                    Operation::CreateIndex {
+                        new_indices: vec![ngram_index(covered_fragment)],
+                        removed_indices: vec![],
+                    },
+                    None,
+                ),
+                initial_fragments: HashMap::new(),
+                modified_fragment_ids: HashSet::new(),
+                affected_rows: None,
+                conflicting_frag_reuse_indices: Vec::new(),
+                conflicting_mem_wal_compacted_sstables: Vec::new(),
+            };
+            let result = rebase.check_txn(&rewrite, 2);
+            if expect_conflict {
+                assert!(
+                    matches!(result, Err(Error::RetryableCommitConflict { .. })),
+                    "overlapping staged NGram index should conflict, got {result:?}"
+                );
+            } else {
+                assert!(
+                    result.is_ok(),
+                    "disjoint staged NGram index should remain compatible, got {result:?}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -3833,7 +4002,7 @@ mod tests {
                 removed_fragment_ids: vec![],
                 new_fragments: vec![],
                 fields_modified: vec![],
-                merged_generations: Vec::new(),
+                compacted_sstables: Vec::new(),
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
                 inserted_rows_filter: None,
@@ -4126,7 +4295,7 @@ mod tests {
                     removed_fragment_ids: vec![],
                     new_fragments: vec![],
                     fields_modified: vec![2],
-                    merged_generations: Vec::new(),
+                    compacted_sstables: Vec::new(),
                     fields_for_preserving_frag_bitmap: vec![],
                     update_mode: Some(RewriteColumns),
                     inserted_rows_filter: None,
@@ -4145,7 +4314,7 @@ mod tests {
                     removed_fragment_ids: vec![],
                     new_fragments: vec![Fragment::new(5)],
                     fields_modified: vec![2],
-                    merged_generations: Vec::new(),
+                    compacted_sstables: Vec::new(),
                     fields_for_preserving_frag_bitmap: vec![],
                     update_mode: Some(RewriteColumns),
                     inserted_rows_filter: None,
@@ -4163,7 +4332,7 @@ mod tests {
                     removed_fragment_ids: vec![],
                     new_fragments: vec![],
                     fields_modified: vec![1],
-                    merged_generations: Vec::new(),
+                    compacted_sstables: Vec::new(),
                     fields_for_preserving_frag_bitmap: vec![],
                     update_mode: Some(RewriteColumns),
                     inserted_rows_filter: None,
@@ -4181,7 +4350,7 @@ mod tests {
                     removed_fragment_ids: vec![],
                     new_fragments: vec![Fragment::new(5)],
                     fields_modified: vec![],
-                    merged_generations: Vec::new(),
+                    compacted_sstables: Vec::new(),
                     fields_for_preserving_frag_bitmap: vec![],
                     update_mode: Some(RewriteRows),
                     inserted_rows_filter: None,
@@ -4199,7 +4368,7 @@ mod tests {
                     removed_fragment_ids: vec![0],
                     new_fragments: vec![],
                     fields_modified: vec![],
-                    merged_generations: Vec::new(),
+                    compacted_sstables: Vec::new(),
                     fields_for_preserving_frag_bitmap: vec![],
                     update_mode: None,
                     inserted_rows_filter: None,
@@ -4217,7 +4386,7 @@ mod tests {
                     removed_fragment_ids: vec![],
                     new_fragments: vec![Fragment::new(5)],
                     fields_modified: vec![],
-                    merged_generations: Vec::new(),
+                    compacted_sstables: Vec::new(),
                     fields_for_preserving_frag_bitmap: vec![],
                     update_mode: Some(RewriteRows),
                     inserted_rows_filter: None,
@@ -4273,7 +4442,7 @@ mod tests {
                 modified_fragment_ids: modified_fragment_ids(&op1).collect::<HashSet<_>>(),
                 affected_rows: None,
                 conflicting_frag_reuse_indices: Vec::new(),
-                conflicting_mem_wal_merged_gens: Vec::new(),
+                conflicting_mem_wal_compacted_sstables: Vec::new(),
             };
 
             let result = rebase.check_txn(&txn2, 1);
@@ -4309,7 +4478,7 @@ mod tests {
     }
 
     #[test]
-    fn test_merged_generations_conflict_lower_generation_fails() {
+    fn test_compacted_sstables_conflict_lower_generation_fails() {
         // Test: committed generation >= to_commit generation should be incompatible (no retry)
         let shard = Uuid::new_v4();
 
@@ -4317,7 +4486,7 @@ mod tests {
         let committed_txn = Transaction::new(
             0,
             Operation::UpdateMemWalState {
-                merged_generations: vec![MergedGeneration::new(shard, 10)],
+                compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
             },
             None,
         );
@@ -4325,7 +4494,7 @@ mod tests {
         let to_commit_txn = Transaction::new(
             0,
             Operation::UpdateMemWalState {
-                merged_generations: vec![MergedGeneration::new(shard, 5)],
+                compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
             },
             None,
         );
@@ -4336,7 +4505,7 @@ mod tests {
             modified_fragment_ids: HashSet::new(),
             affected_rows: None,
             conflicting_frag_reuse_indices: Vec::new(),
-            conflicting_mem_wal_merged_gens: Vec::new(),
+            conflicting_mem_wal_compacted_sstables: Vec::new(),
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -4348,14 +4517,14 @@ mod tests {
     }
 
     #[test]
-    fn test_merged_generations_conflict_equal_generation_fails() {
+    fn test_compacted_sstables_conflict_equal_generation_fails() {
         // Test: committed generation == to_commit generation should be incompatible (no retry)
         let shard = Uuid::new_v4();
 
         let committed_txn = Transaction::new(
             0,
             Operation::UpdateMemWalState {
-                merged_generations: vec![MergedGeneration::new(shard, 10)],
+                compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
             },
             None,
         );
@@ -4363,7 +4532,7 @@ mod tests {
         let to_commit_txn = Transaction::new(
             0,
             Operation::UpdateMemWalState {
-                merged_generations: vec![MergedGeneration::new(shard, 10)],
+                compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
             },
             None,
         );
@@ -4374,7 +4543,7 @@ mod tests {
             modified_fragment_ids: HashSet::new(),
             affected_rows: None,
             conflicting_frag_reuse_indices: Vec::new(),
-            conflicting_mem_wal_merged_gens: Vec::new(),
+            conflicting_mem_wal_compacted_sstables: Vec::new(),
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -4386,7 +4555,7 @@ mod tests {
     }
 
     #[test]
-    fn test_merged_generations_conflict_higher_generation_retryable() {
+    fn test_compacted_sstables_conflict_higher_generation_retryable() {
         // Test: committed generation < to_commit generation should be retryable
         let shard = Uuid::new_v4();
 
@@ -4394,7 +4563,7 @@ mod tests {
         let committed_txn = Transaction::new(
             0,
             Operation::UpdateMemWalState {
-                merged_generations: vec![MergedGeneration::new(shard, 5)],
+                compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
             },
             None,
         );
@@ -4402,7 +4571,7 @@ mod tests {
         let to_commit_txn = Transaction::new(
             0,
             Operation::UpdateMemWalState {
-                merged_generations: vec![MergedGeneration::new(shard, 10)],
+                compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
             },
             None,
         );
@@ -4413,7 +4582,7 @@ mod tests {
             modified_fragment_ids: HashSet::new(),
             affected_rows: None,
             conflicting_frag_reuse_indices: Vec::new(),
-            conflicting_mem_wal_merged_gens: Vec::new(),
+            conflicting_mem_wal_compacted_sstables: Vec::new(),
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -4425,7 +4594,7 @@ mod tests {
     }
 
     #[test]
-    fn test_merged_generations_different_shards_ok() {
+    fn test_compacted_sstables_different_shards_ok() {
         // Test: different shards should not conflict
         let shard1 = Uuid::new_v4();
         let shard2 = Uuid::new_v4();
@@ -4433,7 +4602,7 @@ mod tests {
         let committed_txn = Transaction::new(
             0,
             Operation::UpdateMemWalState {
-                merged_generations: vec![MergedGeneration::new(shard1, 10)],
+                compacted_sstables: vec![CompactedSsTable::new(shard1, 10)],
             },
             None,
         );
@@ -4441,7 +4610,7 @@ mod tests {
         let to_commit_txn = Transaction::new(
             0,
             Operation::UpdateMemWalState {
-                merged_generations: vec![MergedGeneration::new(shard2, 5)],
+                compacted_sstables: vec![CompactedSsTable::new(shard2, 5)],
             },
             None,
         );
@@ -4452,7 +4621,7 @@ mod tests {
             modified_fragment_ids: HashSet::new(),
             affected_rows: None,
             conflicting_frag_reuse_indices: Vec::new(),
-            conflicting_mem_wal_merged_gens: Vec::new(),
+            conflicting_mem_wal_compacted_sstables: Vec::new(),
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -4464,15 +4633,15 @@ mod tests {
     }
 
     #[test]
-    fn test_update_mem_wal_state_vs_create_index_with_merged_generations() {
+    fn test_update_mem_wal_state_vs_create_index_with_compacted_sstables() {
         use crate::index::mem_wal::new_mem_wal_index_meta;
         use lance_index::mem_wal::MemWalIndexDetails;
 
         let shard = Uuid::new_v4();
 
-        // Create a MemWalIndex with merged_generations
+        // Create a MemWalIndex with compacted_sstables
         let details = MemWalIndexDetails {
-            merged_generations: vec![MergedGeneration::new(shard, 10)],
+            compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
             ..Default::default()
         };
         let mem_wal_index = new_mem_wal_index_meta(1, details).unwrap();
@@ -4491,7 +4660,7 @@ mod tests {
         let to_commit_txn = Transaction::new(
             0,
             Operation::UpdateMemWalState {
-                merged_generations: vec![MergedGeneration::new(shard, 5)],
+                compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
             },
             None,
         );
@@ -4502,7 +4671,7 @@ mod tests {
             modified_fragment_ids: HashSet::new(),
             affected_rows: None,
             conflicting_frag_reuse_indices: Vec::new(),
-            conflicting_mem_wal_merged_gens: Vec::new(),
+            conflicting_mem_wal_compacted_sstables: Vec::new(),
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -4516,7 +4685,7 @@ mod tests {
         let to_commit_txn_higher = Transaction::new(
             0,
             Operation::UpdateMemWalState {
-                merged_generations: vec![MergedGeneration::new(shard, 15)],
+                compacted_sstables: vec![CompactedSsTable::new(shard, 15)],
             },
             None,
         );
@@ -4527,7 +4696,7 @@ mod tests {
             modified_fragment_ids: HashSet::new(),
             affected_rows: None,
             conflicting_frag_reuse_indices: Vec::new(),
-            conflicting_mem_wal_merged_gens: Vec::new(),
+            conflicting_mem_wal_compacted_sstables: Vec::new(),
         };
 
         let result_higher = rebase_higher.check_txn(&committed_txn, 1);
@@ -4545,7 +4714,7 @@ mod tests {
 
         let shard = Uuid::new_v4();
 
-        // CreateIndex with MemWalIndex (no merged_generations initially)
+        // CreateIndex with MemWalIndex (no compacted_sstables initially)
         let details = MemWalIndexDetails::default();
         let mem_wal_index = new_mem_wal_index_meta(1, details).unwrap();
 
@@ -4562,7 +4731,7 @@ mod tests {
         let committed_txn = Transaction::new(
             0,
             Operation::UpdateMemWalState {
-                merged_generations: vec![MergedGeneration::new(shard, 10)],
+                compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
             },
             None,
         );
@@ -4573,11 +4742,11 @@ mod tests {
             modified_fragment_ids: HashSet::new(),
             affected_rows: None,
             conflicting_frag_reuse_indices: Vec::new(),
-            conflicting_mem_wal_merged_gens: Vec::new(),
+            conflicting_mem_wal_compacted_sstables: Vec::new(),
         };
 
         // CreateIndex of MemWalIndex should be compatible with UpdateMemWalState
-        // and should collect the merged_generations for rebasing
+        // and should collect the compacted_sstables for rebasing
         let result = rebase.check_txn(&committed_txn, 1);
         assert!(
             result.is_ok(),
@@ -4585,10 +4754,16 @@ mod tests {
             result
         );
 
-        // Verify that merged_generations were collected
-        assert_eq!(rebase.conflicting_mem_wal_merged_gens.len(), 1);
-        assert_eq!(rebase.conflicting_mem_wal_merged_gens[0].shard_id, shard);
-        assert_eq!(rebase.conflicting_mem_wal_merged_gens[0].generation, 10);
+        // Verify that compacted_sstables were collected
+        assert_eq!(rebase.conflicting_mem_wal_compacted_sstables.len(), 1);
+        assert_eq!(
+            rebase.conflicting_mem_wal_compacted_sstables[0].shard_id,
+            shard
+        );
+        assert_eq!(
+            rebase.conflicting_mem_wal_compacted_sstables[0].generation,
+            10
+        );
     }
 
     #[tokio::test]

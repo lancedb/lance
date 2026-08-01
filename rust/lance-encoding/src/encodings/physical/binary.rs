@@ -21,7 +21,8 @@ use crate::buffer::LanceBuffer;
 use crate::data::{BlockInfo, DataBlock, VariableWidthBlock};
 use crate::encodings::logical::primitive::fullzip::{PerValueCompressor, PerValueDataBlock};
 use crate::encodings::logical::primitive::miniblock::{
-    MAX_MINIBLOCK_VALUES, MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressor,
+    MAX_MINIBLOCK_VALUES, MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressionContext,
+    MiniBlockCompressor,
 };
 use crate::format::pb21::CompressiveEncoding;
 use crate::format::pb21::compressive_encoding::Compression;
@@ -245,7 +246,11 @@ impl BinaryMiniBlockEncoder {
 }
 
 impl MiniBlockCompressor for BinaryMiniBlockEncoder {
-    fn compress(&self, data: DataBlock) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
+    fn compress(
+        &self,
+        _context: MiniBlockCompressionContext,
+        data: DataBlock,
+    ) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
         match data {
             DataBlock::VariableWidth(variable_width) => Ok(self.chunk_data(variable_width)),
             _ => Err(Error::invalid_input_source(
@@ -542,22 +547,14 @@ mod tests {
     use rstest::rstest;
     use std::{collections::HashMap, sync::Arc, vec};
 
-    use crate::{
-        testing::{
-            FnArrayGeneratorProvider, TestCases, check_basic_random,
-            check_round_trip_encoding_of_data,
-        },
-        version::LanceFileVersion,
+    use crate::testing::{
+        FnArrayGeneratorProvider, TestCases, check_basic_random, check_round_trip_encoding_of_data,
     };
 
     #[test_log::test(tokio::test)]
     async fn test_utf8_binary() {
         let field = Field::new("", DataType::Utf8, false);
-        check_specific_random(
-            field,
-            TestCases::basic().with_min_file_version(LanceFileVersion::V2_1),
-        )
-        .await;
+        check_specific_random(field, TestCases::basic().with_structural_encodings()).await;
     }
 
     #[rstest]
@@ -592,7 +589,7 @@ mod tests {
         field_metadata.insert(COMPRESSION_META_KEY.to_string(), "fsst".into());
         let field = Field::new("", data_type, true).with_metadata(field_metadata);
         // TODO (https://github.com/lance-format/lance/issues/4783)
-        let test_cases = TestCases::default().with_min_file_version(LanceFileVersion::V2_1);
+        let test_cases = TestCases::default().with_structural_encodings();
         check_specific_random(field, test_cases).await;
     }
 
@@ -610,11 +607,7 @@ mod tests {
         );
         field_metadata.insert(COMPRESSION_META_KEY.to_string(), "fsst".into());
         let field = Field::new("", data_type, true).with_metadata(field_metadata);
-        check_specific_random(
-            field,
-            TestCases::basic().with_min_file_version(LanceFileVersion::V2_1),
-        )
-        .await;
+        check_specific_random(field, TestCases::basic().with_structural_encodings()).await;
     }
 
     #[test_log::test(tokio::test)]
@@ -801,7 +794,7 @@ mod tests {
         #[values(true, false)] with_nulls: bool,
         #[values(100, 500, 35000)] dict_size: u32,
     ) {
-        let test_cases = TestCases::default().with_min_file_version(LanceFileVersion::V2_1);
+        let test_cases = TestCases::default().with_structural_encodings();
         let strings = (0..dict_size)
             .map(|i| i.to_string())
             .collect::<Vec<String>>();
@@ -829,7 +822,7 @@ mod tests {
 
         let test_cases = TestCases::default()
             .with_expected_encoding("variable")
-            .with_min_file_version(LanceFileVersion::V2_1);
+            .with_structural_encodings();
 
         // Test both automatic selection and explicit configuration
         // 1. Test automatic binary encoding selection (small strings that won't trigger FSST)

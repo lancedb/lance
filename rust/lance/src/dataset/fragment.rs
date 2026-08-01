@@ -28,20 +28,22 @@ use lance_core::datatypes::{OnMissing, OnTypeMismatch, SchemaCompareOptions};
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
-use lance_core::{Error, Result, cache::CacheKey, datatypes::Schema};
+use lance_core::{
+    Error, Result,
+    cache::{CacheKey, CacheKeySchema, KeyBuilder},
+    datatypes::Schema,
+};
 use lance_core::{
     ROW_ADDR, ROW_ADDR_FIELD, ROW_CREATED_AT_VERSION_FIELD, ROW_ID, ROW_ID_FIELD,
     ROW_LAST_UPDATED_AT_VERSION_FIELD,
 };
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_encoding::decoder::DecoderPlugins;
-use lance_file::previous::reader::{
-    FileReader as PreviousFileReader, read_batch as previous_read_batch,
-};
 use lance_file::reader::{
     CachedFileMetadata, FileMetadataIndex, FileReaderOptions, ProjectedFileReader, ReaderProjection,
 };
-use lance_file::version::LanceFileVersion;
+use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
+use lance_file::versions::v1::reader::{FileReader as V1FileReader, read_batch as v1_read_batch};
 use lance_file::{LanceEncodingsIo, determine_file_version};
 use lance_io::ReadBatchParams;
 use lance_io::scheduler::{FileScheduler, ScanScheduler, SchedulerConfig};
@@ -151,20 +153,20 @@ pub trait GenericFileReader: std::fmt::Debug + Send + Sync {
     fn is_legacy(&self) -> bool;
     // Return a reference to the legacy reader, panics if called on a v2
     // file.
-    fn as_legacy(&self) -> &PreviousFileReader {
+    fn as_legacy(&self) -> &V1FileReader {
         self.as_legacy_opt()
             .expect("legacy function called on v2 file")
     }
     // Return a reference to the legacy reader if this is a v1 reader and
     // return None otherwise
-    fn as_legacy_opt(&self) -> Option<&PreviousFileReader>;
+    fn as_legacy_opt(&self) -> Option<&V1FileReader>;
     // Return a mutable reference to the legacy reader if this is a v1 reader
     // and return None otherwise
-    fn as_legacy_opt_mut(&mut self) -> Option<&mut PreviousFileReader>;
+    fn as_legacy_opt_mut(&mut self) -> Option<&mut V1FileReader>;
 }
 
 fn ranges_to_tasks(
-    reader: &PreviousFileReader,
+    reader: &V1FileReader,
     ranges: Vec<(i32, Range<usize>)>,
     projection: Arc<Schema>,
 ) -> ReadBatchTaskStream {
@@ -175,7 +177,7 @@ fn ranges_to_tasks(
             let reader = reader.clone();
             let projection = projection.clone();
             let task = tokio::task::spawn(async move {
-                previous_read_batch(
+                v1_read_batch(
                     &reader,
                     &ReadBatchParams::Range(range.clone()),
                     &projection,
@@ -195,12 +197,12 @@ fn ranges_to_tasks(
 
 #[derive(Clone, Debug)]
 struct V1Reader {
-    reader: PreviousFileReader,
+    reader: V1FileReader,
     projection: Arc<Schema>,
 }
 
 impl V1Reader {
-    fn new(reader: PreviousFileReader, projection: Arc<Schema>) -> Self {
+    fn new(reader: V1FileReader, projection: Arc<Schema>) -> Self {
         Self { reader, projection }
     }
 }
@@ -318,11 +320,11 @@ impl GenericFileReader for V1Reader {
         true
     }
 
-    fn as_legacy_opt(&self) -> Option<&PreviousFileReader> {
+    fn as_legacy_opt(&self) -> Option<&V1FileReader> {
         Some(&self.reader)
     }
 
-    fn as_legacy_opt_mut(&mut self) -> Option<&mut PreviousFileReader> {
+    fn as_legacy_opt_mut(&mut self) -> Option<&mut V1FileReader> {
         Some(&mut self.reader)
     }
 }
@@ -533,11 +535,11 @@ mod v2_adapter {
             false
         }
 
-        fn as_legacy_opt(&self) -> Option<&PreviousFileReader> {
+        fn as_legacy_opt(&self) -> Option<&V1FileReader> {
             None
         }
 
-        fn as_legacy_opt_mut(&mut self) -> Option<&mut PreviousFileReader> {
+        fn as_legacy_opt_mut(&mut self) -> Option<&mut V1FileReader> {
             None
         }
     }
@@ -643,11 +645,11 @@ impl GenericFileReader for NullReader {
         false
     }
 
-    fn as_legacy_opt(&self) -> Option<&PreviousFileReader> {
+    fn as_legacy_opt(&self) -> Option<&V1FileReader> {
         None
     }
 
-    fn as_legacy_opt_mut(&mut self) -> Option<&mut PreviousFileReader> {
+    fn as_legacy_opt_mut(&mut self) -> Option<&mut V1FileReader> {
         None
     }
 }
@@ -838,7 +840,7 @@ impl FileFragment {
                 filename,
                 dataset.schema().field_ids(),
                 column_indices,
-                &file_version,
+                ConcreteFileVersion::from(file_version),
                 None,
             );
             Ok(frag)
@@ -1052,7 +1054,7 @@ impl FileFragment {
                         .join(data_file.path.as_str());
                     let object_store = self.dataset.object_store_for_data_file(data_file).await?;
                     let field_id_offset = Self::get_field_id_offset(data_file);
-                    let reader = PreviousFileReader::try_new_with_fragment_id(
+                    let reader = V1FileReader::try_new_with_fragment_id(
                         &object_store,
                         &path,
                         self.schema().clone(),
@@ -1126,10 +1128,7 @@ impl FileFragment {
                             }
                         }),
                 ));
-                let file_version = LanceFileVersion::try_from_major_minor(
-                    data_file.file_major_version,
-                    data_file.file_minor_version,
-                )?;
+                let file_version: LanceFileVersion = data_file.file_version()?.into();
                 let reader_projection = ReaderProjection::from_field_ids(
                     file_version,
                     schema_per_file.as_ref(),
@@ -1620,7 +1619,7 @@ impl FileFragment {
     }
 
     /// Get the file metadata for this fragment, using the cache if available.
-    async fn get_file_metadata(
+    pub async fn get_file_metadata(
         &self,
         file_scheduler: &FileScheduler,
     ) -> Result<Arc<CachedFileMetadata>> {
@@ -1637,7 +1636,7 @@ impl FileFragment {
         Ok(file_metadata)
     }
 
-    async fn get_file_metadata_index(
+    pub async fn get_file_metadata_index(
         &self,
         file_scheduler: &FileScheduler,
         known_schema: Option<(Arc<Schema>, u64)>,
@@ -2194,6 +2193,12 @@ impl CacheKey for FileMetadataCacheKey {
     fn type_name() -> &'static str {
         "FileMetadata"
     }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.dataset.fragment-file-metadata-key", 1)
+    }
+
+    fn write_key(&self, _builder: &mut KeyBuilder) {}
 }
 
 #[derive(Debug, Clone)]
@@ -2209,6 +2214,12 @@ impl CacheKey for FileMetadataIndexCacheKey {
     fn type_name() -> &'static str {
         "FileMetadataIndex"
     }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.dataset.fragment-file-metadata-index-key", 1)
+    }
+
+    fn write_key(&self, _builder: &mut KeyBuilder) {}
 }
 
 impl From<FileFragment> for Fragment {
@@ -3134,7 +3145,7 @@ mod tests {
     use lance_core::ROW_ID;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::{RowCount, array, gen_batch};
-    use lance_file::version::LanceFileVersion;
+    use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
     use lance_file::writer::FileWriterOptions;
     use lance_io::{assert_io_eq, assert_io_lt, object_store::ObjectStore};
     use pretty_assertions::assert_eq;
@@ -3228,8 +3239,8 @@ mod tests {
         };
         use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
         use lance_core::datatypes::Schema;
-        use lance_file::version::LanceFileVersion;
-        use lance_file::writer::{FileWriter, FileWriterOptions};
+        use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
+        use lance_file::writer::FileWriterOptions;
         use lance_io::utils::CachedFileSize;
         use lance_table::format::DataFile;
         use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
@@ -3298,22 +3309,20 @@ mod tests {
             let filename = format!("{name}.lance");
             let path = Path::from(format!("data/{filename}"));
             let obj_writer = dataset.object_store.create(&path).await.unwrap();
-            let mut writer = FileWriter::try_new(
+            let file_version = ConcreteFileVersion::from(version);
+            let mut writer = lance_file::versions::create_writer(
+                file_version,
                 obj_writer,
                 overlay_schema,
-                FileWriterOptions {
-                    format_version: Some(version),
-                    ..Default::default()
-                },
+                FileWriterOptions::default(),
             )
             .unwrap();
-            let (major, minor) = writer.version().to_numbers();
             for (column_index, array) in columns.into_iter().enumerate() {
                 writer.write_column(column_index, array).await.unwrap();
             }
             let summary = writer.finish().await.unwrap();
 
-            let mut data_file = DataFile::new_unstarted(filename, major, minor);
+            let mut data_file = DataFile::new_unstarted(filename, file_version);
             data_file.fields = writer
                 .field_id_to_column_indices()
                 .iter()
@@ -3748,11 +3757,11 @@ mod tests {
             // A take that hits the coverage does need the file, so it now fails with
             // a not-found error naming the missing overlay file.
             let err = frag.take(&[5], &val_only).await.unwrap_err();
-            let err = format!("{err:?}");
+            let message = format!("{err:?}");
             assert!(
-                err.contains("miss.lance") && err.to_lowercase().contains("not found"),
+                err.is_not_found() && message.contains("miss.lance"),
                 "take hitting the overlay's coverage should fail with a not-found error \
-                 for its missing file, got: {err}",
+                 for its missing file, got: {message}",
             );
         }
 
@@ -4192,11 +4201,11 @@ mod tests {
             // Projecting the overlaid `val` column does need the file, so it fails
             // with a not-found error naming the missing overlay file.
             let err = frag.take(&[0], &val_only).await.unwrap_err();
-            let err = format!("{err:?}");
+            let message = format!("{err:?}");
             assert!(
-                err.contains("valov.lance") && err.to_lowercase().contains("not found"),
+                err.is_not_found() && message.contains("valov.lance"),
                 "projecting the overlaid column should fail with a not-found error \
-                 for its missing file, got: {err}",
+                 for its missing file, got: {message}",
             );
         }
 
@@ -4873,7 +4882,7 @@ mod tests {
             updated_fragments: vec![u1.fragment],
             new_fragments: vec![],
             fields_modified: u1.fields_modified,
-            merged_generations: Vec::new(),
+            compacted_sstables: Vec::new(),
             fields_for_preserving_frag_bitmap: vec![],
             update_mode: Some(UpdateMode::RewriteColumns),
             inserted_rows_filter: None,
@@ -4954,7 +4963,7 @@ mod tests {
             updated_fragments: vec![u2.fragment],
             new_fragments: vec![],
             fields_modified: u2.fields_modified,
-            merged_generations: Vec::new(),
+            compacted_sstables: Vec::new(),
             fields_for_preserving_frag_bitmap: vec![],
             update_mode: Some(UpdateMode::RewriteColumns),
             inserted_rows_filter: None,
@@ -5720,7 +5729,7 @@ mod tests {
         .unwrap();
 
         let (object_store, base_path) = ObjectStore::from_uri(test_uri).await.unwrap();
-        let file_reader = PreviousFileReader::try_new_with_fragment_id(
+        let file_reader = V1FileReader::try_new_with_fragment_id(
             &object_store,
             &base_path
                 .clone()
@@ -5911,8 +5920,10 @@ mod tests {
         let store = ObjectStore::local();
         let file_path = dataset.data_dir().join("some_file.lance");
         let object_writer = store.create(&file_path).await.unwrap();
-        let mut file_writer =
-            lance_file::writer::FileWriter::new_lazy(object_writer, FileWriterOptions::default());
+        let mut file_writer = lance_file::versions::v2_1::create_lazy_writer(
+            object_writer,
+            FileWriterOptions::default(),
+        );
         file_writer.write_batch(&new_data).await.unwrap();
         file_writer.finish().await.unwrap();
 
@@ -5924,7 +5935,7 @@ mod tests {
             Fragment::try_infer_version(std::slice::from_ref(&frag))
                 .unwrap()
                 .unwrap(),
-            LanceFileVersion::Stable.resolve()
+            ConcreteFileVersion::from(LanceFileVersion::Stable)
         );
 
         let op = Operation::Append {

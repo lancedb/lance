@@ -1,0 +1,1976 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BinaryHeap, HashSet};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+
+use futures::{StreamExt, TryStreamExt, stream};
+use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
+use lance_core::{Error, Result};
+use lance_select::RowAddrMask;
+use lance_tokenizer::{SimpleTokenizer, TextAnalyzer};
+
+use super::{
+    InvertedIndex, build_global_bm25_scorer,
+    document_tokenizer::{DocType, JsonTokenizer, LanceTokenizer},
+    documents::{DocId, DocLengths, DocVisibility},
+    index::{DocSet, InvertedPartition},
+    query::{
+        FtsQuery, FtsSearchParams, MatchQuery, Operator, PhraseQuery, Tokens, collect_query_tokens,
+    },
+    scorer::MemBM25Scorer,
+    tokenizer::document_tokenizer::TextTokenizer,
+    wand::{
+        FLAT_SEARCH_PERCENT_THRESHOLD, LegacyWandDocuments, ModernWandDocuments, PostingIterator,
+        WandCursor, WandDocuments,
+    },
+};
+use crate::{metrics::MetricsCollector, prefilter::PreFilter};
+
+const DEFAULT_BLOCK_SIZE: usize = 128;
+
+/// One exact FTS result in a compound collector's candidate domain.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct ScoredRow<K = u64> {
+    pub row_id: K,
+    pub score: f32,
+}
+
+#[cfg(test)]
+impl ScoredRow<u64> {
+    pub(super) fn new(row_id: u64, score: f32) -> Result<Self> {
+        if !score.is_finite() {
+            return Err(Error::invalid_input(format!(
+                "FTS score for row_id={row_id} must be finite, got {score}"
+            )));
+        }
+        Ok(Self { row_id, score })
+    }
+}
+
+/// Conservative score bounds for a document range.
+///
+/// Arithmetic widens both sides by one representable `f32` so nested
+/// operations cannot round an upper bound below an exact score.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct ScoreBounds {
+    lower: f32,
+    upper: f32,
+}
+
+impl ScoreBounds {
+    const ZERO: Self = Self {
+        lower: 0.0,
+        upper: 0.0,
+    };
+    const UNBOUNDED: Self = Self {
+        lower: f32::NEG_INFINITY,
+        upper: f32::INFINITY,
+    };
+
+    #[cfg(test)]
+    fn point(score: f32) -> Result<Self> {
+        if !score.is_finite() {
+            return Err(Error::invalid_input(format!(
+                "FTS score bounds require a finite score, got {score}"
+            )));
+        }
+        Ok(Self {
+            lower: score,
+            upper: score,
+        })
+    }
+
+    fn scale_non_negative(self, factor: f32) -> Self {
+        debug_assert!(factor.is_finite() && factor >= 0.0);
+        if factor == 0.0 {
+            return Self::ZERO;
+        }
+        if !self.lower.is_finite() || !self.upper.is_finite() {
+            return Self::UNBOUNDED;
+        }
+        Self {
+            lower: next_down(self.lower * factor),
+            upper: next_up(self.upper * factor),
+        }
+    }
+
+    fn include_zero(self) -> Self {
+        Self {
+            lower: self.lower.min(0.0),
+            upper: self.upper.max(0.0),
+        }
+    }
+
+    fn add(self, other: Self) -> Self {
+        if !self.lower.is_finite()
+            || !self.upper.is_finite()
+            || !other.lower.is_finite()
+            || !other.upper.is_finite()
+        {
+            return Self::UNBOUNDED;
+        }
+        Self {
+            lower: next_down(self.lower + other.lower),
+            upper: next_up(self.upper + other.upper),
+        }
+    }
+}
+
+fn next_up(value: f32) -> f32 {
+    if !value.is_finite() {
+        return value;
+    }
+    if value == 0.0 {
+        return f32::from_bits(1);
+    }
+    let bits = value.to_bits();
+    if value > 0.0 {
+        f32::from_bits(bits + 1)
+    } else {
+        f32::from_bits(bits - 1)
+    }
+}
+
+fn next_down(value: f32) -> f32 {
+    if !value.is_finite() {
+        return value;
+    }
+    if value == 0.0 {
+        return f32::from_bits((1_u32 << 31) | 1);
+    }
+    let bits = value.to_bits();
+    if value > 0.0 {
+        f32::from_bits(bits - 1)
+    } else {
+        f32::from_bits(bits + 1)
+    }
+}
+
+fn checked_score(score: f32, context: &str) -> Result<f32> {
+    if score.is_finite() {
+        Ok(score)
+    } else {
+        Err(Error::invalid_input(format!(
+            "{context} produced a non-finite FTS score: {score}"
+        )))
+    }
+}
+
+/// Internal document-at-a-time scorer protocol for compound FTS.
+///
+/// Implementations iterate matching partition-local document ids in ascending
+/// order and expose the corresponding candidate key separately. A collector
+/// may shallow-advance independently of the exact iterator, inspect a
+/// conservative range bound, and monotonically raise the competitive score.
+/// `matches` is the optional two-phase confirmation hook: cheap approximations
+/// return a candidate from `next` / `advance` and defer expensive checks such
+/// as phrase positions until confirmation.
+pub(super) trait ComposableScorer: Send {
+    fn doc(&self) -> Option<u64>;
+    fn document_key(&self) -> Option<u64> {
+        self.doc()
+    }
+    fn next(&mut self) -> Result<Option<u64>>;
+    fn advance(&mut self, target: u64) -> Result<Option<u64>>;
+    fn cost(&self) -> usize;
+    fn score(&mut self) -> Result<f32>;
+    fn advance_shallow(&mut self, target: u64) -> Result<u64>;
+    fn score_bounds(&mut self, up_to: u64) -> Result<ScoreBounds>;
+    fn set_min_competitive_score(&mut self, min_score: f32) -> Result<()>;
+
+    fn matches(&mut self) -> Result<bool> {
+        Ok(true)
+    }
+
+    fn match_cost(&self) -> Option<f32> {
+        None
+    }
+}
+
+type BoxScorer<'a> = Box<dyn ComposableScorer + 'a>;
+
+#[derive(Debug, Clone)]
+enum CompoundScorerPlan {
+    Leaf {
+        index: usize,
+        boost: f32,
+    },
+    MultiMatch(Vec<Self>),
+    Boolean {
+        should: Vec<Self>,
+        must: Vec<Self>,
+        must_not: Vec<Self>,
+    },
+}
+
+impl CompoundScorerPlan {
+    fn from_query(query: &FtsQuery, num_leaves: &mut usize) -> Result<Self> {
+        match query {
+            FtsQuery::Match(query) => {
+                let index = *num_leaves;
+                *num_leaves += 1;
+                Ok(Self::Leaf {
+                    index,
+                    boost: query.boost,
+                })
+            }
+            FtsQuery::Phrase(_) => {
+                let index = *num_leaves;
+                *num_leaves += 1;
+                Ok(Self::Leaf { index, boost: 1.0 })
+            }
+            FtsQuery::MultiMatch(query) => Ok(Self::MultiMatch(
+                query
+                    .match_queries
+                    .iter()
+                    .map(|query| Self::from_query(&FtsQuery::Match(query.clone()), num_leaves))
+                    .collect::<Result<Vec<_>>>()?,
+            )),
+            FtsQuery::Boolean(query) => Ok(Self::Boolean {
+                should: query
+                    .should
+                    .iter()
+                    .map(|query| Self::from_query(query, num_leaves))
+                    .collect::<Result<Vec<_>>>()?,
+                must: query
+                    .must
+                    .iter()
+                    .map(|query| Self::from_query(query, num_leaves))
+                    .collect::<Result<Vec<_>>>()?,
+                must_not: query
+                    .must_not
+                    .iter()
+                    .map(|query| Self::from_query(query, num_leaves))
+                    .collect::<Result<Vec<_>>>()?,
+            }),
+            FtsQuery::Boost(_) => Err(Error::not_supported(
+                "posting-backed compound FTS does not support BoostQuery yet",
+            )),
+        }
+    }
+
+    fn build<'a>(&self, leaves: &mut [Option<BoxScorer<'a>>]) -> Result<BoxScorer<'a>> {
+        match self {
+            Self::Leaf { index, boost } => {
+                let leaf = leaves
+                    .get_mut(*index)
+                    .and_then(Option::take)
+                    .ok_or_else(|| {
+                        Error::internal(format!(
+                            "compound FTS scorer references missing leaf index {index}"
+                        ))
+                    })?;
+                Ok(Box::new(ScaleScorer::try_new(leaf, *boost)?))
+            }
+            Self::MultiMatch(children) => Ok(Box::new(DisjunctionScorer::try_new(
+                children
+                    .iter()
+                    .map(|child| child.build(leaves))
+                    .collect::<Result<Vec<_>>>()?,
+                DisjunctionScore::Max,
+            )?)),
+            Self::Boolean {
+                should,
+                must,
+                must_not,
+            } => Ok(Box::new(BooleanScorer::try_new(
+                should
+                    .iter()
+                    .map(|child| child.build(leaves))
+                    .collect::<Result<Vec<_>>>()?,
+                must.iter()
+                    .map(|child| child.build(leaves))
+                    .collect::<Result<Vec<_>>>()?,
+                must_not
+                    .iter()
+                    .map(|child| child.build(leaves))
+                    .collect::<Result<Vec<_>>>()?,
+            )?)),
+        }
+    }
+}
+
+impl<D: WandDocuments + Sync> ComposableScorer for WandCursor<'_, D> {
+    fn doc(&self) -> Option<u64> {
+        self.doc()
+    }
+
+    fn document_key(&self) -> Option<u64> {
+        self.document_key()
+    }
+
+    fn next(&mut self) -> Result<Option<u64>> {
+        self.next()
+    }
+
+    fn advance(&mut self, target: u64) -> Result<Option<u64>> {
+        self.advance(target)
+    }
+
+    fn cost(&self) -> usize {
+        self.cost()
+    }
+
+    fn score(&mut self) -> Result<f32> {
+        self.current_score()
+    }
+
+    fn advance_shallow(&mut self, target: u64) -> Result<u64> {
+        self.advance_shallow(target)
+    }
+
+    fn score_bounds(&mut self, up_to: u64) -> Result<ScoreBounds> {
+        Ok(ScoreBounds {
+            lower: 0.0,
+            upper: self.score_upper_bound(up_to)?,
+        })
+    }
+
+    fn set_min_competitive_score(&mut self, min_score: f32) -> Result<()> {
+        self.set_min_competitive_score(min_score)
+    }
+
+    fn matches(&mut self) -> Result<bool> {
+        self.matches()
+    }
+
+    fn match_cost(&self) -> Option<f32> {
+        self.match_cost()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+#[cfg(test)]
+struct ShallowRange {
+    target: u64,
+    up_to: u64,
+    start: usize,
+    end: usize,
+}
+
+/// Exact in-memory scorer used to unit-test compound nodes and the collector.
+#[cfg(test)]
+struct MaterializedScorer {
+    rows: Vec<ScoredRow>,
+    block_size: usize,
+    index: Option<usize>,
+    shallow: Option<ShallowRange>,
+    min_competitive_score: f32,
+}
+
+#[cfg(test)]
+impl MaterializedScorer {
+    fn try_new(mut rows: Vec<ScoredRow>) -> Result<Self> {
+        rows.sort_unstable_by_key(|row| row.row_id);
+        for pair in rows.windows(2) {
+            if pair[0].row_id == pair[1].row_id {
+                return Err(Error::internal(format!(
+                    "FTS leaf scorer produced duplicate row_id={}",
+                    pair[0].row_id
+                )));
+            }
+        }
+        Ok(Self {
+            rows,
+            block_size: DEFAULT_BLOCK_SIZE,
+            index: None,
+            shallow: None,
+            min_competitive_score: f32::NEG_INFINITY,
+        })
+    }
+
+    #[cfg(test)]
+    fn with_block_size(mut self, block_size: usize) -> Self {
+        assert!(block_size > 0);
+        self.block_size = block_size;
+        self
+    }
+
+    fn block_bounds(&self, start: usize, end: usize) -> Result<ScoreBounds> {
+        let Some(first) = self.rows.get(start) else {
+            return Ok(ScoreBounds::ZERO);
+        };
+        let mut bounds = ScoreBounds::point(first.score)?;
+        for row in &self.rows[start + 1..end] {
+            bounds.lower = bounds.lower.min(row.score);
+            bounds.upper = bounds.upper.max(row.score);
+        }
+        Ok(bounds)
+    }
+
+    fn position_at(&mut self, mut index: usize) -> Result<Option<u64>> {
+        while index < self.rows.len() {
+            let block_start = (index / self.block_size) * self.block_size;
+            let block_end = (block_start + self.block_size).min(self.rows.len());
+            if self.block_bounds(block_start, block_end)?.upper < self.min_competitive_score {
+                index = block_end;
+                continue;
+            }
+            self.index = Some(index);
+            self.shallow = None;
+            return Ok(Some(self.rows[index].row_id));
+        }
+        self.index = None;
+        self.shallow = None;
+        Ok(None)
+    }
+}
+
+#[cfg(test)]
+impl ComposableScorer for MaterializedScorer {
+    fn doc(&self) -> Option<u64> {
+        self.index.map(|index| self.rows[index].row_id)
+    }
+
+    fn next(&mut self) -> Result<Option<u64>> {
+        self.position_at(self.index.map_or(0, |index| index + 1))
+    }
+
+    fn advance(&mut self, target: u64) -> Result<Option<u64>> {
+        if self.doc().is_some_and(|doc| doc >= target) {
+            return Ok(self.doc());
+        }
+        let start = self.index.map_or(0, |index| index + 1);
+        let offset = self.rows[start..].partition_point(|row| row.row_id < target);
+        self.position_at(start + offset)
+    }
+
+    fn cost(&self) -> usize {
+        self.rows.len()
+    }
+
+    fn score(&mut self) -> Result<f32> {
+        self.index
+            .map(|index| self.rows[index].score)
+            .ok_or_else(|| Error::internal("FTS scorer is not positioned on a document"))
+    }
+
+    fn advance_shallow(&mut self, target: u64) -> Result<u64> {
+        let start = self.rows.partition_point(|row| row.row_id < target);
+        if start == self.rows.len() {
+            self.shallow = Some(ShallowRange {
+                target,
+                up_to: u64::MAX,
+                start,
+                end: start,
+            });
+            return Ok(u64::MAX);
+        }
+        let block_start = (start / self.block_size) * self.block_size;
+        let end = (block_start + self.block_size).min(self.rows.len());
+        let up_to = self
+            .rows
+            .get(end)
+            .map(|next| next.row_id.saturating_sub(1))
+            .unwrap_or(u64::MAX);
+        self.shallow = Some(ShallowRange {
+            target,
+            up_to,
+            start,
+            end,
+        });
+        Ok(up_to)
+    }
+
+    fn score_bounds(&mut self, up_to: u64) -> Result<ScoreBounds> {
+        let shallow = self.shallow.ok_or_else(|| {
+            Error::internal("score_bounds requires advance_shallow on the FTS scorer")
+        })?;
+        if up_to < shallow.target || up_to > shallow.up_to {
+            return Err(Error::internal(format!(
+                "FTS score bound up_to={up_to} is outside shallow range [{}, {}]",
+                shallow.target, shallow.up_to
+            )));
+        }
+        let end = shallow.start
+            + self.rows[shallow.start..shallow.end].partition_point(|row| row.row_id <= up_to);
+        self.block_bounds(shallow.start, end)
+    }
+
+    fn set_min_competitive_score(&mut self, min_score: f32) -> Result<()> {
+        if min_score.is_nan() {
+            return Err(Error::invalid_input(
+                "minimum competitive FTS score cannot be NaN",
+            ));
+        }
+        if min_score > self.min_competitive_score {
+            self.min_competitive_score = min_score;
+        }
+        Ok(())
+    }
+}
+
+/// Monotonic score-only floor shared by partition-local top-k collectors.
+///
+/// Equal-score candidates are never pruned because final ordering also uses
+/// row id. The score-only floor is therefore a safe lower bound even when
+/// partitions encounter ties in different orders.
+#[derive(Debug)]
+pub(super) struct CompetitiveScore {
+    bits: AtomicU32,
+}
+
+impl Default for CompetitiveScore {
+    fn default() -> Self {
+        Self {
+            bits: AtomicU32::new(f32::NEG_INFINITY.to_bits()),
+        }
+    }
+}
+
+impl CompetitiveScore {
+    fn get(&self) -> f32 {
+        f32::from_bits(self.bits.load(AtomicOrdering::Relaxed))
+    }
+
+    fn raise(&self, score: f32) {
+        debug_assert!(!score.is_nan());
+        let mut current = self.bits.load(AtomicOrdering::Relaxed);
+        while score > f32::from_bits(current) {
+            match self.bits.compare_exchange_weak(
+                current,
+                score.to_bits(),
+                AtomicOrdering::Relaxed,
+                AtomicOrdering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HeapRow<K>(ScoredRow<K>);
+
+impl<K: PartialEq> PartialEq for HeapRow<K> {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.row_id == other.0.row_id && self.0.score.to_bits() == other.0.score.to_bits()
+    }
+}
+
+impl<K: Eq> Eq for HeapRow<K> {}
+
+impl<K: Ord> PartialOrd for HeapRow<K> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<K: Ord> Ord for HeapRow<K> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // The worst result is the heap maximum: lower score, then higher row id.
+        other
+            .0
+            .score
+            .total_cmp(&self.0.score)
+            .then_with(|| self.0.row_id.cmp(&other.0.row_id))
+    }
+}
+
+fn compare_scored_rows<K: Ord>(left: &ScoredRow<K>, right: &ScoredRow<K>) -> Ordering {
+    right
+        .score
+        .total_cmp(&left.score)
+        .then_with(|| left.row_id.cmp(&right.row_id))
+}
+
+/// The sole owner of top-k state for a compound scorer tree.
+///
+/// The heap retains every candidate tied at the kth score. Some document keys
+/// are only resolvable to row ids asynchronously, so equal-score candidates
+/// cannot be trimmed by their temporary keys without changing the final
+/// row-id tie-break.
+pub(super) struct TopKCollector<K = u64> {
+    limit: usize,
+    heap: BinaryHeap<HeapRow<K>>,
+    competitive_score: Arc<CompetitiveScore>,
+}
+
+impl<K: Copy + Ord> TopKCollector<K> {
+    pub(super) fn new(limit: usize) -> Self {
+        Self::with_competitive_score(limit, Arc::new(CompetitiveScore::default()))
+    }
+
+    pub(super) fn with_competitive_score(
+        limit: usize,
+        competitive_score: Arc<CompetitiveScore>,
+    ) -> Self {
+        Self {
+            limit,
+            heap: BinaryHeap::with_capacity(limit.min(DEFAULT_BLOCK_SIZE)),
+            competitive_score,
+        }
+    }
+
+    fn insert(&mut self, row: ScoredRow<K>) {
+        if self.limit == 0 {
+            return;
+        }
+        if self.heap.len() < self.limit {
+            self.heap.push(HeapRow(row));
+        } else {
+            let floor = self
+                .heap
+                .peek()
+                .expect("a full top-k heap is non-empty")
+                .0
+                .score;
+            match row.score.total_cmp(&floor) {
+                Ordering::Less => {}
+                Ordering::Equal => self.heap.push(HeapRow(row)),
+                Ordering::Greater => {
+                    self.heap.push(HeapRow(row));
+                    self.prune_obsolete_score_floors();
+                }
+            }
+        }
+        if self.heap.len() >= self.limit
+            && let Some(worst) = self.heap.peek()
+        {
+            self.competitive_score.raise(worst.0.score);
+        }
+    }
+
+    fn prune_obsolete_score_floors(&mut self) {
+        while self.heap.len() > self.limit {
+            let floor = self
+                .heap
+                .peek()
+                .expect("a non-empty top-k heap has a score floor")
+                .0
+                .score;
+            let floor_count = self
+                .heap
+                .iter()
+                .filter(|row| row.0.score.total_cmp(&floor) == Ordering::Equal)
+                .count();
+            if self.heap.len() - floor_count < self.limit {
+                break;
+            }
+            self.heap
+                .retain(|row| row.0.score.total_cmp(&floor) != Ordering::Equal);
+        }
+    }
+
+    pub(super) fn collect_mapped(
+        &mut self,
+        scorer: &mut dyn ComposableScorer,
+        mut map_document: impl FnMut(u64) -> Result<K>,
+    ) -> Result<()> {
+        if self.limit == 0 {
+            return Ok(());
+        }
+        let expected = scorer.cost().min(self.limit);
+        self.heap
+            .reserve(expected.saturating_sub(self.heap.capacity()));
+
+        scorer.set_min_competitive_score(self.competitive_score.get())?;
+        let mut doc = scorer.next()?;
+        while let Some(doc_id) = doc {
+            let min_score = self.competitive_score.get();
+            scorer.set_min_competitive_score(min_score)?;
+            let up_to = scorer.advance_shallow(doc_id)?;
+            let bounds = scorer.score_bounds(up_to)?;
+            if bounds.upper < min_score {
+                doc = if up_to == u64::MAX {
+                    None
+                } else {
+                    scorer.advance(up_to + 1)?
+                };
+                continue;
+            }
+
+            if let Some(match_cost) = scorer.match_cost()
+                && (!match_cost.is_finite() || match_cost < 0.0)
+            {
+                return Err(Error::internal(format!(
+                    "FTS scorer reported invalid two-phase match cost: {match_cost}"
+                )));
+            }
+            if scorer.matches()? {
+                let score = checked_score(scorer.score()?, "compound scorer")?;
+                // A shared partition floor is already known to be globally
+                // competitive. Scores strictly below it cannot enter final top-k.
+                if score >= self.competitive_score.get() {
+                    let document_key = scorer.document_key().ok_or_else(|| {
+                        Error::internal(
+                            "compound FTS scorer did not expose its current document key",
+                        )
+                    })?;
+                    self.insert(ScoredRow {
+                        row_id: map_document(document_key)?,
+                        score,
+                    });
+                }
+            }
+            doc = scorer.next()?;
+        }
+
+        Ok(())
+    }
+
+    fn into_score_floor_rows(self) -> Vec<ScoredRow<K>> {
+        let mut rows = self.heap.into_iter().map(|row| row.0).collect::<Vec<_>>();
+        rows.sort_unstable_by(compare_scored_rows);
+        rows
+    }
+
+    #[cfg(test)]
+    fn into_rows(self) -> Vec<ScoredRow<K>> {
+        let limit = self.limit;
+        let mut rows = self.into_score_floor_rows();
+        rows.truncate(limit);
+        rows
+    }
+}
+
+impl TopKCollector<u64> {
+    #[cfg(test)]
+    fn collect(mut self, scorer: &mut dyn ComposableScorer) -> Result<Vec<ScoredRow>> {
+        self.collect_mapped(scorer, Ok)?;
+        Ok(self.into_rows())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) enum DisjunctionScore {
+    Sum,
+    Max,
+}
+
+struct EmptyScorer;
+
+impl ComposableScorer for EmptyScorer {
+    fn doc(&self) -> Option<u64> {
+        None
+    }
+
+    fn next(&mut self) -> Result<Option<u64>> {
+        Ok(None)
+    }
+
+    fn advance(&mut self, _target: u64) -> Result<Option<u64>> {
+        Ok(None)
+    }
+
+    fn cost(&self) -> usize {
+        0
+    }
+
+    fn score(&mut self) -> Result<f32> {
+        Err(Error::internal(
+            "score requested from an empty compound FTS scorer",
+        ))
+    }
+
+    fn advance_shallow(&mut self, _target: u64) -> Result<u64> {
+        Ok(u64::MAX)
+    }
+
+    fn score_bounds(&mut self, _up_to: u64) -> Result<ScoreBounds> {
+        Ok(ScoreBounds::ZERO)
+    }
+
+    fn set_min_competitive_score(&mut self, _min_score: f32) -> Result<()> {
+        Ok(())
+    }
+}
+
+struct ScaleScorer<'a> {
+    child: BoxScorer<'a>,
+    factor: f32,
+}
+
+impl<'a> ScaleScorer<'a> {
+    fn try_new(child: BoxScorer<'a>, factor: f32) -> Result<Self> {
+        if !factor.is_finite() || factor < 0.0 {
+            return Err(Error::invalid_input(format!(
+                "MatchQuery boost must be finite and non-negative, got {factor}"
+            )));
+        }
+        Ok(Self { child, factor })
+    }
+}
+
+impl ComposableScorer for ScaleScorer<'_> {
+    fn doc(&self) -> Option<u64> {
+        self.child.doc()
+    }
+
+    fn document_key(&self) -> Option<u64> {
+        self.child.document_key()
+    }
+
+    fn next(&mut self) -> Result<Option<u64>> {
+        self.child.next()
+    }
+
+    fn advance(&mut self, target: u64) -> Result<Option<u64>> {
+        self.child.advance(target)
+    }
+
+    fn cost(&self) -> usize {
+        self.child.cost()
+    }
+
+    fn score(&mut self) -> Result<f32> {
+        checked_score(self.child.score()? * self.factor, "MatchQuery boost")
+    }
+
+    fn advance_shallow(&mut self, target: u64) -> Result<u64> {
+        self.child.advance_shallow(target)
+    }
+
+    fn score_bounds(&mut self, up_to: u64) -> Result<ScoreBounds> {
+        Ok(self
+            .child
+            .score_bounds(up_to)?
+            .scale_non_negative(self.factor))
+    }
+
+    fn set_min_competitive_score(&mut self, min_score: f32) -> Result<()> {
+        if self.factor > 0.0 {
+            self.child
+                .set_min_competitive_score(next_down(min_score / self.factor))?;
+        }
+        Ok(())
+    }
+
+    fn matches(&mut self) -> Result<bool> {
+        self.child.matches()
+    }
+
+    fn match_cost(&self) -> Option<f32> {
+        self.child.match_cost()
+    }
+}
+
+/// Union scorer used for Boolean SHOULD sums and MultiMatch DisMax.
+pub(super) struct DisjunctionScorer<'a> {
+    children: Vec<BoxScorer<'a>>,
+    mode: DisjunctionScore,
+    current: Option<u64>,
+    confirmed_doc: Option<u64>,
+    confirmed: Vec<bool>,
+    min_competitive_score: f32,
+}
+
+impl<'a> DisjunctionScorer<'a> {
+    pub(super) fn try_new(children: Vec<BoxScorer<'a>>, mode: DisjunctionScore) -> Result<Self> {
+        if children.is_empty() {
+            return Err(Error::internal(
+                "FTS disjunction scorer requires at least one child",
+            ));
+        }
+        let confirmed = vec![false; children.len()];
+        Ok(Self {
+            children,
+            mode,
+            current: None,
+            confirmed_doc: None,
+            confirmed,
+            min_competitive_score: f32::NEG_INFINITY,
+        })
+    }
+
+    fn set_current_from_children(&mut self) -> Option<u64> {
+        self.current = self.children.iter().filter_map(|child| child.doc()).min();
+        self.confirmed_doc = None;
+        self.confirmed.fill(false);
+        self.current
+    }
+
+    fn ensure_confirmed(&mut self) -> Result<bool> {
+        let Some(current) = self.current else {
+            return Ok(false);
+        };
+        if self.confirmed_doc == Some(current) {
+            return Ok(self.confirmed.iter().any(|matched| *matched));
+        }
+        self.confirmed.fill(false);
+        for (matched, child) in self.confirmed.iter_mut().zip(&mut self.children) {
+            if child.doc() == Some(current) {
+                *matched = child.matches()?;
+            }
+        }
+        self.confirmed_doc = Some(current);
+        Ok(self.confirmed.iter().any(|matched| *matched))
+    }
+}
+
+impl ComposableScorer for DisjunctionScorer<'_> {
+    fn doc(&self) -> Option<u64> {
+        self.current
+    }
+
+    fn document_key(&self) -> Option<u64> {
+        let current = self.current?;
+        self.children
+            .iter()
+            .find(|child| child.doc() == Some(current))
+            .and_then(|child| child.document_key())
+    }
+
+    fn next(&mut self) -> Result<Option<u64>> {
+        match self.current {
+            None => {
+                for child in &mut self.children {
+                    child.next()?;
+                }
+            }
+            Some(current) => {
+                for child in &mut self.children {
+                    if child.doc() == Some(current) {
+                        child.next()?;
+                    }
+                }
+            }
+        }
+        Ok(self.set_current_from_children())
+    }
+
+    fn advance(&mut self, target: u64) -> Result<Option<u64>> {
+        if self.current.is_some_and(|current| current >= target) {
+            return Ok(self.current);
+        }
+        for child in &mut self.children {
+            if child.doc().is_none_or(|doc| doc < target) {
+                child.advance(target)?;
+            }
+        }
+        Ok(self.set_current_from_children())
+    }
+
+    fn cost(&self) -> usize {
+        self.children
+            .iter()
+            .map(|child| child.cost())
+            .fold(0, usize::saturating_add)
+    }
+
+    fn score(&mut self) -> Result<f32> {
+        if !self.ensure_confirmed()? {
+            return Err(Error::internal(
+                "FTS disjunction score requested for an unconfirmed document",
+            ));
+        }
+        let mut score = match self.mode {
+            DisjunctionScore::Sum => 0.0_f32,
+            DisjunctionScore::Max => f32::NEG_INFINITY,
+        };
+        for (matched, child) in self.confirmed.iter().zip(&mut self.children) {
+            if !matched {
+                continue;
+            }
+            let child_score = child.score()?;
+            score = match self.mode {
+                DisjunctionScore::Sum => score + child_score,
+                DisjunctionScore::Max => score.max(child_score),
+            };
+        }
+        checked_score(score, "FTS disjunction")
+    }
+
+    fn advance_shallow(&mut self, target: u64) -> Result<u64> {
+        let mut up_to = u64::MAX;
+        for child in &mut self.children {
+            if let Some(doc) = child.doc() {
+                up_to = up_to.min(child.advance_shallow(target.max(doc))?);
+            }
+        }
+        Ok(up_to)
+    }
+
+    fn score_bounds(&mut self, up_to: u64) -> Result<ScoreBounds> {
+        let mut bounds = match self.mode {
+            DisjunctionScore::Sum => ScoreBounds::ZERO,
+            DisjunctionScore::Max => ScoreBounds {
+                lower: f32::INFINITY,
+                upper: f32::NEG_INFINITY,
+            },
+        };
+        for child in &mut self.children {
+            let child_bounds = if child.doc().is_some_and(|doc| doc <= up_to) {
+                child.score_bounds(up_to)?
+            } else {
+                ScoreBounds::ZERO
+            };
+            bounds = match self.mode {
+                DisjunctionScore::Sum => bounds.add(child_bounds.include_zero()),
+                DisjunctionScore::Max => ScoreBounds {
+                    lower: bounds.lower.min(child_bounds.lower),
+                    upper: bounds.upper.max(child_bounds.upper),
+                },
+            };
+        }
+        if bounds.lower == f32::INFINITY {
+            Ok(ScoreBounds::ZERO)
+        } else {
+            Ok(bounds)
+        }
+    }
+
+    fn set_min_competitive_score(&mut self, min_score: f32) -> Result<()> {
+        if min_score.is_nan() {
+            return Err(Error::invalid_input(
+                "minimum competitive FTS score cannot be NaN",
+            ));
+        }
+        if min_score <= self.min_competitive_score {
+            return Ok(());
+        }
+        self.min_competitive_score = min_score;
+        // A child below a DisMax threshold cannot affect a competitive max.
+        // Sum scorers need sibling-global bounds before translating the floor,
+        // so they keep it at this node and prune from their combined block bound.
+        if matches!(self.mode, DisjunctionScore::Max) {
+            for child in &mut self.children {
+                child.set_min_competitive_score(min_score)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn matches(&mut self) -> Result<bool> {
+        self.ensure_confirmed()
+    }
+
+    fn match_cost(&self) -> Option<f32> {
+        self.children
+            .iter()
+            .filter_map(|child| child.match_cost())
+            .reduce(|left, right| left + right)
+    }
+}
+
+/// Intersection scorer preserving the existing Boolean MUST score contract:
+/// all children filter membership, while the first MUST child supplies score.
+pub(super) struct RequiredConjunctionScorer<'a> {
+    children: Vec<BoxScorer<'a>>,
+    current: Option<u64>,
+    confirmed_doc: Option<u64>,
+    confirmed: bool,
+}
+
+impl<'a> RequiredConjunctionScorer<'a> {
+    pub(super) fn try_new(children: Vec<BoxScorer<'a>>) -> Result<Self> {
+        if children.is_empty() {
+            return Err(Error::internal(
+                "FTS conjunction scorer requires at least one child",
+            ));
+        }
+        Ok(Self {
+            children,
+            current: None,
+            confirmed_doc: None,
+            confirmed: false,
+        })
+    }
+
+    fn align(&mut self, target: u64) -> Result<Option<u64>> {
+        let mut target = target;
+        loop {
+            for child in &mut self.children {
+                if child.doc().is_none_or(|doc| doc < target) {
+                    let Some(doc) = child.advance(target)? else {
+                        self.current = None;
+                        return Ok(None);
+                    };
+                    target = target.max(doc);
+                }
+            }
+            let min_doc = self.children.iter().filter_map(|child| child.doc()).min();
+            let max_doc = self.children.iter().filter_map(|child| child.doc()).max();
+            if min_doc == max_doc {
+                self.current = min_doc;
+                self.confirmed_doc = None;
+                self.confirmed = false;
+                return Ok(self.current);
+            }
+            target = max_doc.ok_or_else(|| {
+                Error::internal("FTS conjunction lost a child while aligning scorers")
+            })?;
+        }
+    }
+
+    fn ensure_confirmed(&mut self) -> Result<bool> {
+        let Some(current) = self.current else {
+            return Ok(false);
+        };
+        if self.confirmed_doc == Some(current) {
+            return Ok(self.confirmed);
+        }
+        self.confirmed = true;
+        for child in &mut self.children {
+            if !child.matches()? {
+                self.confirmed = false;
+            }
+        }
+        self.confirmed_doc = Some(current);
+        Ok(self.confirmed)
+    }
+}
+
+impl ComposableScorer for RequiredConjunctionScorer<'_> {
+    fn doc(&self) -> Option<u64> {
+        self.current
+    }
+
+    fn document_key(&self) -> Option<u64> {
+        self.children.first().and_then(|child| child.document_key())
+    }
+
+    fn next(&mut self) -> Result<Option<u64>> {
+        let target = match self.current {
+            None => 0,
+            Some(u64::MAX) => return Ok(None),
+            Some(current) => current + 1,
+        };
+        self.align(target)
+    }
+
+    fn advance(&mut self, target: u64) -> Result<Option<u64>> {
+        if self.current.is_some_and(|current| current >= target) {
+            return Ok(self.current);
+        }
+        self.align(target)
+    }
+
+    fn cost(&self) -> usize {
+        self.children
+            .iter()
+            .map(|child| child.cost())
+            .min()
+            .unwrap_or(0)
+    }
+
+    fn score(&mut self) -> Result<f32> {
+        if !self.ensure_confirmed()? {
+            return Err(Error::internal(
+                "FTS conjunction score requested for an unconfirmed document",
+            ));
+        }
+        self.children[0].score()
+    }
+
+    fn advance_shallow(&mut self, target: u64) -> Result<u64> {
+        let mut up_to = u64::MAX;
+        for child in &mut self.children {
+            let child_target = child.doc().map_or(target, |doc| target.max(doc));
+            up_to = up_to.min(child.advance_shallow(child_target)?);
+        }
+        Ok(up_to)
+    }
+
+    fn score_bounds(&mut self, up_to: u64) -> Result<ScoreBounds> {
+        self.children[0].score_bounds(up_to)
+    }
+
+    fn set_min_competitive_score(&mut self, min_score: f32) -> Result<()> {
+        // Only the first MUST child contributes score. The remaining children
+        // are exact membership filters and must never be score-pruned.
+        self.children[0].set_min_competitive_score(min_score)
+    }
+
+    fn matches(&mut self) -> Result<bool> {
+        self.ensure_confirmed()
+    }
+
+    fn match_cost(&self) -> Option<f32> {
+        self.children
+            .iter()
+            .filter_map(|child| child.match_cost())
+            .reduce(|left, right| left + right)
+    }
+}
+
+/// Boolean scorer preserving the current membership and score semantics.
+pub(super) struct BooleanScorer<'a> {
+    driver: BoxScorer<'a>,
+    optional: Option<BoxScorer<'a>>,
+    prohibited: Option<BoxScorer<'a>>,
+    current: Option<u64>,
+    optional_matches: bool,
+}
+
+impl<'a> BooleanScorer<'a> {
+    pub(super) fn try_new(
+        should: Vec<BoxScorer<'a>>,
+        must: Vec<BoxScorer<'a>>,
+        must_not: Vec<BoxScorer<'a>>,
+    ) -> Result<Self> {
+        let mut optional = if should.is_empty() {
+            None
+        } else {
+            Some(
+                Box::new(DisjunctionScorer::try_new(should, DisjunctionScore::Sum)?)
+                    as BoxScorer<'a>,
+            )
+        };
+        let driver = if must.is_empty() {
+            optional.take().ok_or_else(|| {
+                Error::invalid_input("boolean query must have at least one should/must query")
+            })?
+        } else {
+            Box::new(RequiredConjunctionScorer::try_new(must)?) as BoxScorer<'a>
+        };
+        let prohibited = if must_not.is_empty() {
+            None
+        } else {
+            Some(
+                Box::new(DisjunctionScorer::try_new(must_not, DisjunctionScore::Max)?)
+                    as BoxScorer<'a>,
+            )
+        };
+        Ok(Self {
+            driver,
+            optional,
+            prohibited,
+            current: None,
+            optional_matches: false,
+        })
+    }
+
+    fn accept_driver_doc(&mut self) -> Result<bool> {
+        let Some(current) = self.driver.doc() else {
+            return Ok(false);
+        };
+        if !self.driver.matches()? {
+            return Ok(false);
+        }
+        if let Some(prohibited) = &mut self.prohibited
+            && prohibited.advance(current)? == Some(current)
+            && prohibited.matches()?
+        {
+            return Ok(false);
+        }
+        self.optional_matches = if let Some(optional) = &mut self.optional {
+            optional.advance(current)? == Some(current) && optional.matches()?
+        } else {
+            false
+        };
+        self.current = Some(current);
+        Ok(true)
+    }
+
+    fn next_accepted(&mut self, target: Option<u64>) -> Result<Option<u64>> {
+        let mut doc = match target {
+            Some(target) => self.driver.advance(target)?,
+            None => self.driver.next()?,
+        };
+        while doc.is_some() {
+            if self.accept_driver_doc()? {
+                return Ok(self.current);
+            }
+            doc = self.driver.next()?;
+        }
+        self.current = None;
+        self.optional_matches = false;
+        Ok(None)
+    }
+}
+
+impl ComposableScorer for BooleanScorer<'_> {
+    fn doc(&self) -> Option<u64> {
+        self.current
+    }
+
+    fn document_key(&self) -> Option<u64> {
+        self.driver.document_key()
+    }
+
+    fn next(&mut self) -> Result<Option<u64>> {
+        self.next_accepted(None)
+    }
+
+    fn advance(&mut self, target: u64) -> Result<Option<u64>> {
+        if self.current.is_some_and(|current| current >= target) {
+            return Ok(self.current);
+        }
+        self.next_accepted(Some(target))
+    }
+
+    fn cost(&self) -> usize {
+        self.driver.cost()
+    }
+
+    fn score(&mut self) -> Result<f32> {
+        if self.current.is_none() {
+            return Err(Error::internal(
+                "Boolean FTS scorer is not positioned on a document",
+            ));
+        }
+        let mut score = self.driver.score()?;
+        if self.optional_matches
+            && let Some(optional) = &mut self.optional
+        {
+            score += optional.score()?;
+        }
+        checked_score(score, "BooleanQuery scorer")
+    }
+
+    fn advance_shallow(&mut self, target: u64) -> Result<u64> {
+        let mut up_to = self.driver.advance_shallow(target)?;
+        if let Some(optional) = &mut self.optional
+            && let Some(doc) = optional.doc()
+        {
+            up_to = up_to.min(optional.advance_shallow(target.max(doc))?);
+        }
+        Ok(up_to)
+    }
+
+    fn score_bounds(&mut self, up_to: u64) -> Result<ScoreBounds> {
+        let mut bounds = self.driver.score_bounds(up_to)?;
+        if let Some(optional) = &mut self.optional
+            && optional.doc().is_some_and(|doc| doc <= up_to)
+        {
+            bounds = bounds.add(optional.score_bounds(up_to)?.include_zero());
+        }
+        Ok(bounds)
+    }
+
+    fn set_min_competitive_score(&mut self, min_score: f32) -> Result<()> {
+        // When SHOULD is also present, a global sibling bound is required to
+        // translate the parent threshold safely. The combined block bound still
+        // prunes at this node. Without SHOULD, driver score is the full score.
+        if self.optional.is_none() {
+            self.driver.set_min_competitive_score(min_score)?;
+        }
+        Ok(())
+    }
+
+    fn matches(&mut self) -> Result<bool> {
+        Ok(self.current.is_some())
+    }
+}
+
+#[derive(Clone)]
+enum LeafQuery {
+    Match(MatchQuery),
+    Phrase(PhraseQuery),
+}
+
+impl LeafQuery {
+    fn terms(&self) -> &str {
+        match self {
+            Self::Match(query) => &query.terms,
+            Self::Phrase(query) => &query.terms,
+        }
+    }
+
+    fn operator(&self) -> Operator {
+        match self {
+            Self::Match(query) => query.operator,
+            Self::Phrase(_) => Operator::And,
+        }
+    }
+
+    fn effective_params(&self, params: &FtsSearchParams) -> FtsSearchParams {
+        match self {
+            Self::Match(query) => params
+                .clone()
+                .with_limit(None)
+                .with_phrase_slop(None)
+                .with_fuzziness(query.fuzziness)
+                .with_max_expansions(query.max_expansions)
+                .with_prefix_length(query.prefix_length),
+            Self::Phrase(query) => params
+                .clone()
+                .with_limit(None)
+                .with_phrase_slop(Some(query.slop)),
+        }
+    }
+}
+
+fn collect_leaf_queries(query: &FtsQuery, leaves: &mut Vec<LeafQuery>) -> Result<()> {
+    match query {
+        FtsQuery::Match(query) => leaves.push(LeafQuery::Match(query.clone())),
+        FtsQuery::Phrase(query) => leaves.push(LeafQuery::Phrase(query.clone())),
+        FtsQuery::MultiMatch(query) => {
+            leaves.extend(query.match_queries.iter().cloned().map(LeafQuery::Match));
+        }
+        FtsQuery::Boolean(query) => {
+            for child in query
+                .should
+                .iter()
+                .chain(&query.must)
+                .chain(&query.must_not)
+            {
+                collect_leaf_queries(child, leaves)?;
+            }
+        }
+        FtsQuery::Boost(_) => {
+            return Err(Error::not_supported(
+                "posting-backed compound FTS does not support BoostQuery yet",
+            ));
+        }
+    }
+    Ok(())
+}
+
+struct PreparedLeaf {
+    tokens_by_segment: Vec<Arc<Tokens>>,
+    params: Arc<FtsSearchParams>,
+    operator: Operator,
+    scorer: Arc<MemBM25Scorer>,
+}
+
+fn tokenize_leaf(index: &InvertedIndex, leaf: &LeafQuery, params: &FtsSearchParams) -> Tokens {
+    let is_fuzzy_match = matches!(leaf, LeafQuery::Match(_))
+        && matches!(params.fuzziness, Some(distance) if distance != 0);
+    let mut tokenizer = if is_fuzzy_match {
+        let analyzer = TextAnalyzer::from(SimpleTokenizer::default());
+        match index.tokenizer().doc_type() {
+            DocType::Text => Box::new(TextTokenizer::new(analyzer)) as Box<dyn LanceTokenizer>,
+            DocType::Json => Box::new(JsonTokenizer::new(analyzer)) as Box<dyn LanceTokenizer>,
+        }
+    } else {
+        index.tokenizer()
+    };
+    collect_query_tokens(leaf.terms(), &mut tokenizer)
+}
+
+fn expanded_leaf_tokens(
+    index: &InvertedIndex,
+    tokens: &Tokens,
+    params: &FtsSearchParams,
+    operator: Operator,
+) -> Result<Tokens> {
+    if !matches!(params.fuzziness, Some(distance) if distance != 0) {
+        return Ok(tokens.clone());
+    }
+    let expanded = index.expand_fuzzy_tokens(tokens, params)?;
+    if operator == Operator::And || params.phrase_slop.is_some() {
+        let surviving = (0..expanded.len())
+            .map(|index| expanded.position(index))
+            .collect::<HashSet<_>>();
+        if (0..tokens.len()).any(|index| !surviving.contains(&tokens.position(index))) {
+            return Ok(Tokens::with_positions(
+                Vec::new(),
+                Vec::new(),
+                tokens.token_type().clone(),
+            ));
+        }
+    }
+    Ok(expanded)
+}
+
+async fn prepare_compound_query(
+    indices: &[Arc<InvertedIndex>],
+    query: &FtsQuery,
+    params: &FtsSearchParams,
+    metrics: &dyn MetricsCollector,
+) -> Result<(CompoundScorerPlan, Vec<PreparedLeaf>)> {
+    let first_index = indices
+        .first()
+        .ok_or_else(|| Error::invalid_input("compound FTS requires at least one index segment"))?;
+    let mut leaf_queries = Vec::new();
+    collect_leaf_queries(query, &mut leaf_queries)?;
+    let mut num_plan_leaves = 0;
+    let plan = CompoundScorerPlan::from_query(query, &mut num_plan_leaves)?;
+    if num_plan_leaves != leaf_queries.len() {
+        return Err(Error::internal(format!(
+            "compound FTS planned {num_plan_leaves} leaves but prepared {}",
+            leaf_queries.len()
+        )));
+    }
+
+    let mut leaves = Vec::with_capacity(leaf_queries.len());
+    for leaf in leaf_queries {
+        let effective_params = leaf.effective_params(params);
+        let tokens = tokenize_leaf(first_index, &leaf, &effective_params);
+        let scorer = Arc::new(
+            build_global_bm25_scorer(indices, &tokens, &effective_params, Some(metrics)).await?,
+        );
+        let mut tokens_by_segment = Vec::with_capacity(indices.len());
+        for index in indices {
+            tokens_by_segment.push(Arc::new(expanded_leaf_tokens(
+                index,
+                &tokens,
+                &effective_params,
+                leaf.operator(),
+            )?));
+        }
+        leaves.push(PreparedLeaf {
+            tokens_by_segment,
+            params: Arc::new(effective_params),
+            operator: leaf.operator(),
+            scorer,
+        });
+    }
+    Ok((plan, leaves))
+}
+
+struct LoadedLeaf {
+    postings: Vec<PostingIterator>,
+    params: Arc<FtsSearchParams>,
+    operator: Operator,
+    scorer: Arc<MemBM25Scorer>,
+}
+
+enum LoadedDocuments {
+    Legacy(Arc<DocSet>),
+    Modern {
+        lengths: Arc<DocLengths>,
+        visibility: DocVisibility,
+    },
+}
+
+struct LoadedPartition {
+    segment_ordinal: usize,
+    partition_ordinal: usize,
+    documents: LoadedDocuments,
+    leaves: Vec<LoadedLeaf>,
+}
+
+async fn load_compound_partition(
+    segment_ordinal: usize,
+    partition_ordinal: usize,
+    partition: Arc<InvertedPartition>,
+    leaves: &[PreparedLeaf],
+    mask: Arc<RowAddrMask>,
+    metrics: Arc<dyn MetricsCollector>,
+) -> Result<Option<LoadedPartition>> {
+    let leaf_loads = leaves.iter().map(|leaf| {
+        let partition = partition.clone();
+        let tokens = leaf.tokens_by_segment[segment_ordinal].clone();
+        let params = leaf.params.clone();
+        let scorer = leaf.scorer.clone();
+        let metrics = metrics.clone();
+        let operator = leaf.operator;
+        async move {
+            let postings = if tokens.is_empty() {
+                Vec::new()
+            } else {
+                partition
+                    .load_posting_lists(
+                        tokens.as_ref(),
+                        params.as_ref(),
+                        operator,
+                        scorer.as_ref(),
+                        metrics.as_ref(),
+                        true,
+                    )
+                    .await?
+                    .postings
+            };
+            Result::Ok(LoadedLeaf {
+                postings,
+                params,
+                operator,
+                scorer,
+            })
+        }
+    });
+    let leaves = futures::future::try_join_all(leaf_loads).await?;
+
+    let documents = if let Some(docs) = partition.docs.legacy() {
+        LoadedDocuments::Legacy(docs.clone())
+    } else {
+        let documents = partition.docs.modern().cloned().ok_or_else(|| {
+            Error::internal("FTS partition contains neither legacy nor modern documents")
+        })?;
+        let materialize_selected = mask.max_len().is_some_and(|selected| {
+            u128::from(selected).saturating_mul(100)
+                <= u128::from(*FLAT_SEARCH_PERCENT_THRESHOLD)
+                    .saturating_mul(documents.len() as u128)
+        });
+        let visibility = match documents.immediate_visibility(mask.clone(), materialize_selected) {
+            Some(visibility) => visibility,
+            None => {
+                documents
+                    .visibility(mask.clone(), materialize_selected)
+                    .await?
+            }
+        };
+        if visibility.is_empty() {
+            return Ok(None);
+        }
+        let lengths = match documents.cached_lengths() {
+            Some(lengths) => lengths,
+            None => documents.lengths().await?,
+        };
+        LoadedDocuments::Modern {
+            lengths,
+            visibility,
+        }
+    };
+
+    Ok(Some(LoadedPartition {
+        segment_ordinal,
+        partition_ordinal,
+        documents,
+        leaves,
+    }))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum CompoundDocument {
+    Legacy(u64),
+    Modern {
+        segment_ordinal: u32,
+        partition_ordinal: u32,
+        doc_id: u32,
+    },
+}
+
+fn collect_partition_with_documents<D: WandDocuments + Sync>(
+    documents: &D,
+    leaves: Vec<LoadedLeaf>,
+    plan: &CompoundScorerPlan,
+    metrics: &dyn MetricsCollector,
+    collector: &mut TopKCollector<CompoundDocument>,
+    mut map_document: impl FnMut(u64) -> Result<CompoundDocument>,
+) -> Result<()> {
+    let mut leaf_scorers = leaves
+        .into_iter()
+        .map(|leaf| {
+            let scorer: BoxScorer<'_> = if leaf.postings.is_empty() {
+                Box::new(EmptyScorer)
+            } else {
+                Box::new(WandCursor::new(
+                    leaf.operator,
+                    leaf.postings,
+                    documents,
+                    leaf.scorer,
+                    leaf.params.as_ref(),
+                    metrics,
+                ))
+            };
+            Some(scorer)
+        })
+        .collect::<Vec<_>>();
+    let mut scorer = plan.build(&mut leaf_scorers)?;
+    if leaf_scorers.iter().any(Option::is_some) {
+        return Err(Error::internal(
+            "compound FTS scorer did not consume every prepared leaf",
+        ));
+    }
+    collector.collect_mapped(scorer.as_mut(), &mut map_document)
+}
+
+fn collect_loaded_partitions(
+    partitions: Vec<LoadedPartition>,
+    plan: &CompoundScorerPlan,
+    mask: &RowAddrMask,
+    metrics: &dyn MetricsCollector,
+    mut collector: TopKCollector<CompoundDocument>,
+) -> Result<TopKCollector<CompoundDocument>> {
+    for partition in partitions {
+        match partition.documents {
+            LoadedDocuments::Legacy(docs) => {
+                let documents = LegacyWandDocuments::new(docs.as_ref(), mask);
+                collect_partition_with_documents(
+                    &documents,
+                    partition.leaves,
+                    plan,
+                    metrics,
+                    &mut collector,
+                    |row_id| Ok(CompoundDocument::Legacy(row_id)),
+                )?;
+            }
+            LoadedDocuments::Modern {
+                lengths,
+                visibility,
+            } => {
+                let segment_ordinal = u32::try_from(partition.segment_ordinal).map_err(|_| {
+                    Error::index(format!(
+                        "FTS segment ordinal {} exceeds u32::MAX",
+                        partition.segment_ordinal
+                    ))
+                })?;
+                let partition_ordinal =
+                    u32::try_from(partition.partition_ordinal).map_err(|_| {
+                        Error::index(format!(
+                            "FTS partition ordinal {} exceeds u32::MAX",
+                            partition.partition_ordinal
+                        ))
+                    })?;
+                let documents = ModernWandDocuments::filtered(lengths.as_ref(), &visibility);
+                collect_partition_with_documents(
+                    &documents,
+                    partition.leaves,
+                    plan,
+                    metrics,
+                    &mut collector,
+                    |doc_id| {
+                        Ok(CompoundDocument::Modern {
+                            segment_ordinal,
+                            partition_ordinal,
+                            doc_id: u32::try_from(doc_id).map_err(|_| {
+                                Error::index(format!(
+                                    "FTS DocId {doc_id} exceeds the modern u32 domain"
+                                ))
+                            })?,
+                        })
+                    },
+                )?;
+            }
+        }
+    }
+    Ok(collector)
+}
+
+async fn resolve_compound_rows(
+    indices: &[Arc<InvertedIndex>],
+    rows: Vec<ScoredRow<CompoundDocument>>,
+    limit: usize,
+) -> Result<Vec<ScoredRow>> {
+    let mut resolved = vec![None; rows.len()];
+    let mut modern = BTreeMap::<(usize, usize), Vec<(usize, DocId)>>::new();
+    for (rank, row) in rows.iter().enumerate() {
+        match row.row_id {
+            CompoundDocument::Legacy(row_id) => resolved[rank] = Some(row_id),
+            CompoundDocument::Modern {
+                segment_ordinal,
+                partition_ordinal,
+                doc_id,
+            } => modern
+                .entry((segment_ordinal as usize, partition_ordinal as usize))
+                .or_default()
+                .push((rank, DocId::new(doc_id))),
+        }
+    }
+    for ((segment_ordinal, partition_ordinal), entries) in modern {
+        let documents = indices
+            .get(segment_ordinal)
+            .and_then(|index| index.partitions.get(partition_ordinal))
+            .and_then(|partition| partition.docs.modern())
+            .ok_or_else(|| {
+                Error::internal(format!(
+                    "missing modern FTS documents for segment {segment_ordinal}, partition {partition_ordinal}"
+                ))
+            })?;
+        let doc_ids = entries
+            .iter()
+            .map(|(_, doc_id)| *doc_id)
+            .collect::<Vec<_>>();
+        let addresses = documents.resolve_addresses(&doc_ids).await?;
+        for ((rank, _), address) in entries.into_iter().zip(addresses) {
+            resolved[rank] = Some(address);
+        }
+    }
+
+    let mut rows = rows
+        .into_iter()
+        .zip(resolved)
+        .map(|(row, row_id)| {
+            Ok(ScoredRow {
+                row_id: row_id.ok_or_else(|| {
+                    Error::internal("compound FTS candidate address was not resolved")
+                })?,
+                score: row.score,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    rows.sort_unstable_by(compare_scored_rows);
+    rows.truncate(limit);
+    Ok(rows)
+}
+
+/// Search one-column compound FTS directly over posting-backed scorers.
+///
+/// The caller must provide all committed index segments for the column and a
+/// ready prefilter. One collector owns the global top-k heap and propagates its
+/// score floor through every partition-local scorer tree. Its score-bounded
+/// candidates, including every kth-score tie, are resolved to row addresses
+/// before the final row-id tie-break is applied.
+pub async fn compound_search(
+    indices: &[Arc<InvertedIndex>],
+    query: &FtsQuery,
+    params: &FtsSearchParams,
+    prefilter: Arc<dyn PreFilter>,
+    metrics: Arc<dyn MetricsCollector>,
+) -> Result<(Vec<u64>, Vec<f32>)> {
+    let limit = params.limit.unwrap_or(usize::MAX);
+    if limit == 0 {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let (plan, leaves) = prepare_compound_query(indices, query, params, metrics.as_ref()).await?;
+    prefilter.wait_for_ready().await?;
+    let mask = prefilter.mask();
+    let mut collector = TopKCollector::new(limit);
+
+    for (segment_ordinal, index) in indices.iter().enumerate() {
+        let loads =
+            index
+                .partitions
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(partition_ordinal, partition)| {
+                    load_compound_partition(
+                        segment_ordinal,
+                        partition_ordinal,
+                        partition,
+                        &leaves,
+                        mask.clone(),
+                        metrics.clone(),
+                    )
+                });
+        let partitions = stream::iter(loads)
+            .buffer_unordered(get_num_compute_intensive_cpus().clamp(1, 32))
+            .try_collect::<Vec<_>>()
+            .await?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        let plan = plan.clone();
+        let mask = mask.clone();
+        let metrics = metrics.clone();
+        collector = spawn_cpu(move || {
+            collect_loaded_partitions(
+                partitions,
+                &plan,
+                mask.as_ref(),
+                metrics.as_ref(),
+                collector,
+            )
+        })
+        .await?;
+    }
+
+    let rows = resolve_compound_rows(indices, collector.into_score_floor_rows(), limit).await?;
+    Ok(rows.into_iter().map(|row| (row.row_id, row.score)).unzip())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rows(values: &[(u64, f32)]) -> Vec<ScoredRow> {
+        values
+            .iter()
+            .map(|(row_id, score)| ScoredRow::new(*row_id, *score).unwrap())
+            .collect()
+    }
+
+    fn materialized(values: &[(u64, f32)]) -> Box<dyn ComposableScorer> {
+        Box::new(MaterializedScorer::try_new(rows(values)).unwrap())
+    }
+
+    #[test]
+    fn collector_propagates_threshold_across_partitions_and_keeps_ties() {
+        let mut collector = TopKCollector::new(2);
+        let mut first = MaterializedScorer::try_new(rows(&[(8, 9.0), (4, 10.0), (3, 9.0)]))
+            .unwrap()
+            .with_block_size(1);
+        collector.collect_mapped(&mut first, Ok).unwrap();
+        assert_eq!(collector.competitive_score.get(), 9.0);
+
+        let mut second = MaterializedScorer::try_new(rows(&[(1, 1.0), (2, 9.0)]))
+            .unwrap()
+            .with_block_size(1);
+        collector.collect_mapped(&mut second, Ok).unwrap();
+        assert_eq!(
+            collector.into_rows(),
+            vec![
+                ScoredRow {
+                    row_id: 4,
+                    score: 10.0
+                },
+                ScoredRow {
+                    row_id: 2,
+                    score: 9.0
+                }
+            ]
+        );
+    }
+
+    struct TwoPhaseScorer {
+        inner: MaterializedScorer,
+        accepted: Vec<u64>,
+        confirmations: usize,
+    }
+
+    impl ComposableScorer for TwoPhaseScorer {
+        fn doc(&self) -> Option<u64> {
+            self.inner.doc()
+        }
+
+        fn next(&mut self) -> Result<Option<u64>> {
+            self.inner.next()
+        }
+
+        fn advance(&mut self, target: u64) -> Result<Option<u64>> {
+            self.inner.advance(target)
+        }
+
+        fn cost(&self) -> usize {
+            self.inner.cost()
+        }
+
+        fn score(&mut self) -> Result<f32> {
+            self.inner.score()
+        }
+
+        fn advance_shallow(&mut self, target: u64) -> Result<u64> {
+            self.inner.advance_shallow(target)
+        }
+
+        fn score_bounds(&mut self, up_to: u64) -> Result<ScoreBounds> {
+            self.inner.score_bounds(up_to)
+        }
+
+        fn set_min_competitive_score(&mut self, min_score: f32) -> Result<()> {
+            self.inner.set_min_competitive_score(min_score)
+        }
+
+        fn matches(&mut self) -> Result<bool> {
+            self.confirmations += 1;
+            Ok(self
+                .doc()
+                .is_some_and(|doc| self.accepted.binary_search(&doc).is_ok()))
+        }
+    }
+
+    #[test]
+    fn collector_confirms_two_phase_matches_without_a_cost_hint() {
+        let mut scorer = TwoPhaseScorer {
+            inner: MaterializedScorer::try_new(rows(&[(1, 100.0), (2, 2.0), (3, 1.0)])).unwrap(),
+            accepted: vec![2, 3],
+            confirmations: 0,
+        };
+        let results = TopKCollector::new(2).collect(&mut scorer).unwrap();
+        assert_eq!(results, rows(&[(2, 2.0), (3, 1.0)]));
+        assert_eq!(scorer.confirmations, 3);
+        assert_eq!(scorer.match_cost(), None);
+    }
+
+    #[test]
+    fn boolean_and_dismax_preserve_exact_scores_and_order() {
+        let must = vec![
+            materialized(&[(1, 3.0), (2, 2.0), (3, 1.0)]),
+            materialized(&[(1, 30.0), (3, 10.0)]),
+        ];
+        let should = vec![
+            materialized(&[(1, 0.5), (3, 4.0)]),
+            materialized(&[(3, 2.0)]),
+        ];
+        let must_not = vec![materialized(&[(1, 9.0)])];
+        let mut boolean = BooleanScorer::try_new(should, must, must_not).unwrap();
+        let results = TopKCollector::new(10).collect(&mut boolean).unwrap();
+        assert_eq!(
+            results,
+            vec![ScoredRow {
+                row_id: 3,
+                score: 7.0
+            }]
+        );
+
+        let mut dismax = DisjunctionScorer::try_new(
+            vec![
+                materialized(&[(1, 2.0), (3, 3.0)]),
+                materialized(&[(1, 4.0), (2, 4.0)]),
+            ],
+            DisjunctionScore::Max,
+        )
+        .unwrap();
+        let results = TopKCollector::new(2).collect(&mut dismax).unwrap();
+        assert_eq!(results, rows(&[(1, 4.0), (2, 4.0)]));
+    }
+}

@@ -183,9 +183,11 @@ pub async fn load_segments(dataset: &Dataset, column: &str) -> Result<Option<Vec
 /// Load and validate the shared [`InvertedIndexDetails`] across committed
 /// segments returned by [`load_segments`].
 ///
-/// All segments are required to agree on their decoded `InvertedIndexDetails`
-/// payload (analyzer, tokenizer, position settings, etc.); inconsistent
-/// segments return an error. Returns the canonical details that may be used
+/// All segments are required to agree on their semantic `InvertedIndexDetails`
+/// payload (tokenizer, position settings, etc.); inconsistent
+/// segments return an error. Details are canonicalized before comparison so
+/// legacy segments that omit default fields remain compatible with newly
+/// written text FTS segments. Returns the canonical details that may be used
 /// when constructing a tokenizer or running a query against the index.
 pub async fn load_segment_details(
     dataset: &Dataset,
@@ -201,6 +203,7 @@ pub async fn load_segment_details(
                     "failed to decode InvertedIndexDetails payload: {err}"
                 ))
             })?;
+        let details = canonicalize_inverted_index_details(details)?;
         match &expected_details {
             Some(expected) if expected != &details => {
                 return Err(Error::invalid_input(format!(
@@ -218,6 +221,13 @@ pub async fn load_segment_details(
             column
         ))
     })
+}
+
+fn canonicalize_inverted_index_details(
+    details: InvertedIndexDetails,
+) -> Result<InvertedIndexDetails> {
+    let params = InvertedIndexParams::try_from(&details)?;
+    InvertedIndexDetails::try_from(&params)
 }
 
 /// Read one segment's [`InvertedIndexParams`]
@@ -240,5 +250,17 @@ mod tests {
 
         let decoded = InvertedIndexDetails::decode(details_any.value.as_slice()).unwrap();
         assert_eq!(decoded, InvertedIndexDetails::default());
+    }
+
+    #[test]
+    fn canonicalize_inverted_details_accepts_legacy_empty_details() {
+        let legacy = InvertedIndexDetails::default();
+        let current = InvertedIndexDetails::try_from(&InvertedIndexParams::default()).unwrap();
+
+        assert_ne!(legacy, current);
+        assert_eq!(
+            canonicalize_inverted_index_details(legacy).unwrap(),
+            canonicalize_inverted_index_details(current).unwrap()
+        );
     }
 }
