@@ -257,14 +257,20 @@ def _already_generated(uri: str, expected_rows: int) -> bool:
 
     A previous benchmark run may have left extra versions behind, so the row
     count is checked at the tagged version rather than at the latest one.
+    A previous crashed run may also have left a dataset without the
+    ``merge_insert_base`` tag, in which case we treat it as not generated
+    and let the caller rebuild it.
     """
     try:
         ds = lance.dataset(uri)
     except ValueError:
         return False
-    base_version = ds.tags.get_version(BASE_TAG)
-    if base_version is None:
+    # ``get_version`` is documented to return None for missing tags but in
+    # practice raises ``ValueError`` ("Ref not found").  Check the tag list
+    # first, which is the same shape ``_tag_base`` uses for existence.
+    if BASE_TAG not in ds.tags.list():
         return False
+    base_version = ds.tags.get_version(BASE_TAG)
     return ds.checkout_version(base_version).count_rows() == expected_rows
 
 

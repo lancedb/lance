@@ -95,12 +95,16 @@ class Target:
 def _open_target(name: str) -> Iterable[Target]:
     uri = get_dataset_uri(name)
     dataset = lance.dataset(uri)
-    base_version = dataset.tags.get_version(BASE_TAG)
-    if base_version is None:
+    # ``get_version`` is documented to return None for missing tags but in
+    # practice raises ``ValueError`` ("Ref not found").  Check the tag list
+    # first so a missing tag triggers a clean ``pytest.skip`` instead of a
+    # crash.
+    if BASE_TAG not in dataset.tags.list():
         pytest.skip(
             f"Dataset {name} has no {BASE_TAG} tag; "
             "run python/ci_benchmarks/datagen/gen_all.py"
         )
+    base_version = dataset.tags.get_version(BASE_TAG)
 
     yield Target(uri=uri, dataset=dataset, base_version=base_version)
 
