@@ -3,7 +3,7 @@
 
 use crate::Error;
 use crate::JNIEnvExt;
-use crate::RT;
+use crate::block_on;
 use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET, extract_namespace_info};
 use crate::error::Result;
 use crate::traits::{
@@ -1574,7 +1574,7 @@ fn inner_commit_to_uri<'local>(
         builder = builder.with_commit_handler(commit_handler);
     }
 
-    let dataset = RT.block_on(builder.execute(transaction))?;
+    let dataset = block_on(builder.execute(transaction))?;
     let blocking_ds = BlockingDataset { inner: dataset };
     blocking_ds.into_java(env)
 }

@@ -17,7 +17,7 @@ use lance::dataset::{
 };
 
 use crate::{
-    RT,
+    block_on,
     blocking_dataset::{BlockingDataset, NATIVE_DATASET},
     traits::{
         FromJObjectWithEnv, IntoJava, export_vec, import_vec_from_method, import_vec_to_rust,
@@ -108,7 +108,7 @@ fn inner_plan_compaction<'local>(
     let plan = {
         let dataset =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        RT.block_on(plan_compaction(&dataset.inner, &compaction_options))?
+        block_on(plan_compaction(&dataset.inner, &compaction_options))?
     };
     plan.into_java(env)
 }
@@ -197,7 +197,7 @@ fn inner_commit_compaction<'local>(
     let committed_metrics = {
         let mut dataset =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        RT.block_on(commit_compaction(
+        block_on(commit_compaction(
             &mut dataset.inner,
             completed_tasks,
             remap_options,
@@ -296,7 +296,7 @@ fn inner_execute_task<'local>(
     let rewrite_result = {
         let dataset =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        RT.block_on(compaction_task.execute(&dataset.inner))?
+        block_on(compaction_task.execute(&dataset.inner))?
     };
     rewrite_result.into_java(env)
 }

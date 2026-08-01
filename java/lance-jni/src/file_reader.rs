@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::utils::to_rust_map;
 use crate::{
-    JNIEnvExt, RT,
+    JNIEnvExt, RT, block_on,
     error::{Error, Result},
     traits::IntoJava,
 };
@@ -53,16 +53,15 @@ impl BlockingFileReader {
         filter_expression: FilterExpression,
     ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
         let reader = self.inner.clone();
-        Ok(RT
-            .block_on(RT.spawn_blocking(move || {
-                reader.read_stream_projected_blocking(
-                    read_batch_params,
-                    batch_size,
-                    reader_projection,
-                    filter_expression,
-                )
-            }))
-            .unwrap()?)
+        Ok(block_on(RT.spawn_blocking(move || {
+            reader.read_stream_projected_blocking(
+                read_batch_params,
+                batch_size,
+                reader_projection,
+                filter_expression,
+            )
+        }))
+        .unwrap()?)
     }
 
     pub fn schema(&self) -> Result<SchemaRef> {
@@ -112,7 +111,7 @@ fn inner_open<'local>(
     let file_uri_str: String = env.get_string(&file_uri)?.into();
     let jmap = JMap::from_env(env, &storage_options_obj)?;
     let storage_options = to_rust_map(env, &jmap)?;
-    let reader = RT.block_on(async move {
+    let reader = block_on(async move {
         let object_params = ObjectStoreParams {
             storage_options_accessor: Some(Arc::new(
                 lance::io::StorageOptionsAccessor::with_static_options(storage_options),
