@@ -192,6 +192,14 @@ async fn test_diag_lance_io_write_modes() {
         .await
         .expect("Failed to create ObjectStore");
 
+    // Best-effort cleanup of leftover test files. object_store_opendal maps
+    // relative paths to the GooseFS root, so prior runs leave files at /
+    // even when the ObjectStore URI uses a per-run subdirectory.
+    for name in ["test_file.txt", "test_create.txt", "test_create_race.txt"].iter() {
+        let p = object_store::path::Path::parse(name).unwrap();
+        let _ = object_store.inner.delete(&p).await;
+    }
+
     // Test 1: Basic put + get
     let test_path = object_store::path::Path::parse("test_file.txt").unwrap();
     let test_data = bytes::Bytes::from("Hello from lance-io ObjectStore!");
@@ -263,6 +271,119 @@ async fn test_diag_lance_io_write_modes() {
         "second PutMode::Create must fail with AlreadyExists/Precondition, got: {conflict:?}"
     );
     eprintln!("[DIAG] PutMode::Create conflict correctly rejected! ✅");
+
+    // Test 2.5: concurrent PutMode::Create on a fresh, cleaned-up path —
+    // this is the property that makes ConditionalPutCommitHandler safe
+    // under concurrent manifest commits. Two writers must race on the
+    // same path and exactly one must win; the stored bytes must match
+    // the winner's payload.
+    let race_path = object_store::path::Path::parse("test_create_race.txt").unwrap();
+    // Best-effort cleanup of leftovers from a previous run.
+    let _ = object_store.inner.delete(&race_path).await;
+
+    let store_a = object_store.clone();
+    let store_b = object_store.clone();
+    let path_a = race_path.clone();
+    let path_b = race_path.clone();
+    let payload_a = bytes::Bytes::from("writer-A");
+    let payload_b = bytes::Bytes::from("writer-B");
+
+    eprintln!("[DIAG] Launching two concurrent PutMode::Create on fresh path...");
+    let fut_a = tokio::spawn(async move {
+        store_a
+            .inner
+            .put_opts(
+                &path_a,
+                payload_a.clone().into(),
+                object_store::PutOptions {
+                    mode: object_store::PutMode::Create,
+                    ..Default::default()
+                },
+            )
+            .await
+            .map(|_| payload_a)
+    });
+    let fut_b = tokio::spawn(async move {
+        store_b
+            .inner
+            .put_opts(
+                &path_b,
+                payload_b.clone().into(),
+                object_store::PutOptions {
+                    mode: object_store::PutMode::Create,
+                    ..Default::default()
+                },
+            )
+            .await
+            .map(|_| payload_b)
+    });
+    let (res_a, res_b) = tokio::join!(fut_a, fut_b);
+    let res_a = res_a.expect("writer A join");
+    let res_b = res_b.expect("writer B join");
+
+    let mut wins = 0usize;
+    let mut conflicts = 0usize;
+    let mut other_err: Option<String> = None;
+    let mut winner_payload: Option<bytes::Bytes> = None;
+    match (&res_a, &res_b) {
+        (Ok(p), Err(_)) => {
+            wins = 1;
+            conflicts = 1;
+            winner_payload = Some(p.clone());
+        }
+        (Err(_), Ok(p)) => {
+            wins = 1;
+            conflicts = 1;
+            winner_payload = Some(p.clone());
+        }
+        (Ok(_), Ok(_)) => {
+            other_err = Some("both writers reported success — if-not-exists violated".into());
+        }
+        (Err(ea), Err(eb)) => {
+            other_err = Some(format!("both writers failed: a={ea:?} b={eb:?}"));
+        }
+    }
+    for r in [&res_a, &res_b] {
+        if let Err(e) = r {
+            let s = format!("{e:?}").to_lowercase();
+            assert!(
+                s.contains("already exists")
+                    || s.contains("precondition")
+                    || s.contains("conditionnotmatch")
+                    || s.contains("if_not_exists"),
+                "loser must report AlreadyExists/Precondition, got: {e:?}"
+            );
+        }
+    }
+    assert!(
+        other_err.is_none(),
+        "exactly-one-winner violated: {}",
+        other_err.unwrap()
+    );
+    assert_eq!(wins, 1, "exactly one writer must win (got {wins})");
+    assert_eq!(
+        conflicts, 1,
+        "exactly one writer must conflict (got {conflicts})"
+    );
+
+    // Read back — stored bytes must match the winner's payload exactly.
+    let stored = object_store
+        .inner
+        .get(&race_path)
+        .await
+        .expect("get winning payload")
+        .bytes()
+        .await
+        .expect("read winning payload");
+    let expected = winner_payload.expect("winner payload recorded");
+    assert_eq!(
+        stored, expected,
+        "stored bytes must match the winner's payload"
+    );
+    eprintln!(
+        "[DIAG] concurrent exactly-one-winner ok ✅ stored={} bytes",
+        stored.len()
+    );
 
     // Test 3: rename_if_not_exists
     eprintln!("[DIAG] Testing rename_if_not_exists...");
