@@ -1464,6 +1464,7 @@ async fn prepare_compound_query(
     query: &FtsQuery,
     params: &FtsSearchParams,
     metrics: &dyn MetricsCollector,
+    base_scorer: Option<Arc<MemBM25Scorer>>,
 ) -> Result<(CompoundScorerPlan, Vec<PreparedLeaf>)> {
     let first_index = indices
         .first()
@@ -1483,9 +1484,15 @@ async fn prepare_compound_query(
     for leaf in leaf_queries {
         let effective_params = leaf.effective_params(params);
         let tokens = tokenize_leaf(first_index, &leaf, &effective_params);
-        let scorer = Arc::new(
-            build_global_bm25_scorer(indices, &tokens, &effective_params, Some(metrics)).await?,
-        );
+        // A preset scorer carries corpus-wide stats keyed by the full
+        // query token set, which covers every leaf's tokens.
+        let scorer = match &base_scorer {
+            Some(scorer) => scorer.clone(),
+            None => Arc::new(
+                build_global_bm25_scorer(indices, &tokens, &effective_params, Some(metrics))
+                    .await?,
+            ),
+        };
         let mut tokens_by_segment = Vec::with_capacity(indices.len());
         for index in indices {
             tokens_by_segment.push(Arc::new(expanded_leaf_tokens(
@@ -1785,12 +1792,14 @@ pub async fn compound_search(
     params: &FtsSearchParams,
     prefilter: Arc<dyn PreFilter>,
     metrics: Arc<dyn MetricsCollector>,
+    base_scorer: Option<Arc<MemBM25Scorer>>,
 ) -> Result<(Vec<u64>, Vec<f32>)> {
     let limit = params.limit.unwrap_or(usize::MAX);
     if limit == 0 {
         return Ok((Vec::new(), Vec::new()));
     }
-    let (plan, leaves) = prepare_compound_query(indices, query, params, metrics.as_ref()).await?;
+    let (plan, leaves) =
+        prepare_compound_query(indices, query, params, metrics.as_ref(), base_scorer).await?;
     prefilter.wait_for_ready().await?;
     let mask = prefilter.mask();
     let mut collector = TopKCollector::new(limit);
