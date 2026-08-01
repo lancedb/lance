@@ -26,7 +26,7 @@ use lance::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 use lance::table::format::{Fragment, IndexMetadata};
 use lance_core::datatypes::Field;
 use lance_core::datatypes::Schema as LanceSchema;
-use lance_file::version::LanceFileVersion;
+use lance_file::version::{LanceFileVersion, V2_FORMAT_2_0, V2_FORMAT_2_1, V2_FORMAT_2_2};
 use lance_io::object_store::{LanceNamespaceStorageOptionsProvider, StorageOptionsProvider};
 use lance_table::io::commit::CommitHandler;
 use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
@@ -594,8 +594,37 @@ pub(crate) fn convert_to_java_schema<'local>(
         .l()?)
 }
 
+/// Parse a `CommitBuilder.storageFormat` string into a [`LanceFileVersion`].
+///
+/// The canonical spellings ("2.1", "stable", ...) are the ones every other Lance
+/// binding accepts and the ones [`LanceFileVersion`]'s `Display` emits.
+///
+/// The `v`-prefixed spellings are a Java-only accident: this function originally
+/// hand-rolled its match by walking the `LanceFileVersion` variant identifiers
+/// (`V2_1` -> `"v2_1"`) instead of delegating to `FromStr`, so it accepted those
+/// identifiers and rejected the canonical "2.1". They were documented on
+/// `CommitBuilder.storageFormat` and shipped from 3.0.0, so they are translated
+/// here for compatibility. The set is deliberately frozen to what shipped —
+/// newer versions are reachable only by their canonical name.
 fn parse_storage_format(name: &str) -> Result<LanceFileVersion> {
-    name.parse::<LanceFileVersion>()
+    let requested = name.to_lowercase();
+    let canonical = match requested.as_str() {
+        "v2_0" | "v2.0" => V2_FORMAT_2_0,
+        "v2_1" | "v2.1" => V2_FORMAT_2_1,
+        "v2_2" | "v2.2" => V2_FORMAT_2_2,
+        _ => requested.as_str(),
+    };
+
+    if canonical != requested {
+        log::warn!(
+            "Storage format \"{}\" is deprecated and will be removed in a future release; use \"{}\" instead",
+            name,
+            canonical
+        );
+    }
+
+    canonical
+        .parse::<LanceFileVersion>()
         .map_err(|_| Error::input_error(format!("Unknown storage format: {}", name)))
 }
 
@@ -1849,8 +1878,10 @@ mod tests {
         }
     }
 
+    /// The `v`-prefixed spellings shipped in the `CommitBuilder.storageFormat`
+    /// Javadoc and must keep working for existing Java callers.
     #[test]
-    fn test_parse_storage_format_prefixed_aliases() {
+    fn test_parse_storage_format_deprecated_aliases() {
         let cases = [
             ("v2_0", LanceFileVersion::V2_0),
             ("v2.0", LanceFileVersion::V2_0),
@@ -1858,8 +1889,6 @@ mod tests {
             ("v2.1", LanceFileVersion::V2_1),
             ("v2_2", LanceFileVersion::V2_2),
             ("v2.2", LanceFileVersion::V2_2),
-            ("v2_3", LanceFileVersion::V2_3),
-            ("v2.3", LanceFileVersion::V2_3),
         ];
         for (input, expected) in cases {
             assert_eq!(
@@ -1869,6 +1898,15 @@ mod tests {
                 input
             );
         }
+    }
+
+    /// The alias set is frozen to what shipped, so versions added after the
+    /// aliases were deprecated are reachable only by their canonical name.
+    #[test]
+    fn test_parse_storage_format_does_not_extend_aliases_to_new_versions() {
+        assert!(parse_storage_format("v2_3").is_err());
+        assert!(parse_storage_format("v2.3").is_err());
+        assert_eq!(parse_storage_format("2.3").unwrap(), LanceFileVersion::V2_3);
     }
 
     #[test]
