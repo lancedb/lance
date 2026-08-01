@@ -932,20 +932,16 @@ impl FileFragment {
         projection: &Schema,
         read_config: FragReadConfig,
     ) -> Result<FragmentReader> {
-        // Fast path: if no data file contributes to the projection, skip
-        // scheduler setup and the template cache entirely.  Deletion vectors
-        // and row counts come from the manifest and require no file IO on
-        // modern datasets.
-        let full_schema = self.dataset.schema();
-        let any_file_needed = self.metadata.files.iter().any(|data_file| {
-            let file_schema = data_file.schema(full_schema);
-            projection
-                .intersection_ignore_types(&file_schema)
-                .map(|s| !s.fields.is_empty())
-                .unwrap_or(true) // on error, fall through to the main path
-        });
-
-        if !any_file_needed {
+        // Fast path: if the projection contains no schema fields at all (e.g. a
+        // system-column-only scan such as `project(&[ROW_ID])`), skip scheduler
+        // setup and the template cache entirely.  Deletion vectors and row counts
+        // come from the manifest and require no file IO on modern datasets.
+        //
+        // We intentionally check `projection.fields.is_empty()` rather than
+        // "no data file intersects the projection" so that schema-evolved
+        // AllNull columns — which have real field IDs but are absent from every
+        // data file — still reach the NullReader synthesis path below.
+        if projection.fields.is_empty() {
             if !read_config.has_system_cols() {
                 return Err(Error::not_found(format!(
                     "No data files found for schema: {}, fragment_id={}",
