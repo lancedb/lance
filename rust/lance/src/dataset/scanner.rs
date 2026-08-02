@@ -87,7 +87,7 @@ use crate::dataset::overlay::{
     collect_overlay_stale_frags, collect_overlay_stale_rows_for_segment, overlaid_fragments,
 };
 use crate::dataset::row_offsets_to_row_addresses;
-use crate::dataset::rowids::{row_addrs_to_row_ids, translate_addr_treemap_to_row_ids};
+use crate::dataset::rowids::{live_row_addrs_to_row_ids, translate_addr_treemap_to_row_ids};
 use crate::dataset::utils::SchemaAdapter;
 use crate::index::DatasetIndexInternalExt;
 use crate::index::scalar::inverted::{load_segment_details, load_segments};
@@ -3195,7 +3195,8 @@ impl Scanner {
     }
 
     async fn row_addrs_as_take_input(&self, row_addrs: Vec<u64>) -> Result<Arc<dyn ExecutionPlan>> {
-        let row_ids = row_addrs_to_row_ids(&self.dataset, row_addrs.into_iter().map(Some)).await?;
+        let row_ids =
+            live_row_addrs_to_row_ids(&self.dataset, row_addrs.into_iter().map(Some)).await?;
         self.row_ids_as_take_input(RowAddrTreeMap::from_iter(row_ids.into_iter().flatten()))
     }
 
@@ -13182,7 +13183,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
     }
 
     #[tokio::test]
-    async fn test_filter_row_address_with_stable_row_ids() {
+    async fn test_filter_to_take_with_stable_row_ids() {
         let ds = lance_datagen::gen_batch()
             .col("idx", array::step::<Int32Type>())
             .into_ram_dataset_with_params(
@@ -13231,6 +13232,54 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         let batch = ds
             .scan()
             .filter(&format!("{ROW_ADDR} = 5"))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(batch.num_rows(), 0);
+
+        let batch = ds
+            .scan()
+            .filter(&format!("{ROW_OFFSET} IN (5, 9)"))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(batch["idx"].as_primitive::<Int32Type>().values(), &[5, 9]);
+    }
+
+    #[tokio::test]
+    async fn test_stale_row_address_does_not_follow_stable_id_after_update() {
+        let ds = lance_datagen::gen_batch()
+            .col("idx", array::step::<Int32Type>())
+            .into_ram_dataset_with_params(
+                FragmentCount::from(2),
+                FragmentRowCount::from(3),
+                Some(WriteParams {
+                    max_rows_per_file: 3,
+                    enable_stable_row_ids: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+
+        let old_row_addr = u64::from(RowAddress::new_from_parts(0, 1));
+        let ds = crate::dataset::UpdateBuilder::new(Arc::new(ds))
+            .update_where("idx = 1")
+            .unwrap()
+            .set("idx", "101")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap()
+            .new_dataset;
+
+        let batch = ds
+            .scan()
+            .filter(&format!("{ROW_ADDR} = {old_row_addr}"))
             .unwrap()
             .try_into_batch()
             .await
