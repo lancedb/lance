@@ -61,7 +61,7 @@ pub(crate) const HNSW_LEVEL_RNG_SEED: u64 = 42;
 /// Parameters of building HNSW index
 #[derive(Debug, Clone, Serialize, Deserialize, DeepSizeOf)]
 pub struct HnswBuildParams {
-    /// max level ofm
+    /// max level of the graph
     pub max_level: u16,
 
     /// number of connections to establish while inserting new element
@@ -97,14 +97,14 @@ impl Default for HnswBuildParams {
 
 impl HnswBuildParams {
     /// The maximum level of the graph.
-    /// The default value is `8`.
+    /// The default value is `7`.
     pub fn max_level(mut self, max_level: u16) -> Self {
         self.max_level = max_level;
         self
     }
 
     /// The number of connections to establish while inserting new element
-    /// The default value is `30`.
+    /// The default value is `20`.
     pub fn num_edges(mut self, m: usize) -> Self {
         self.m = m;
         self
@@ -113,7 +113,7 @@ impl HnswBuildParams {
     /// Number of candidates to be considered when searching for the nearest neighbors
     /// during the construction of the graph.
     ///
-    /// The default value is `100`.
+    /// The default value is `150`.
     pub fn ef_construction(mut self, ef_construction: usize) -> Self {
         self.ef_construction = ef_construction;
         self
