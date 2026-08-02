@@ -361,11 +361,29 @@ impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
             ));
         }
 
+        // The value region must start past the offsets being decoded, otherwise
+        // the offset table itself aliases into the value bytes.  A lower bound
+        // (not equality) because a prefix read of the chunk legitimately leaves
+        // unrequested offsets between the requested prefix and the values.
+        let min_value_region_start = num_offsets * bytes_per_offset;
+        let value_region_overlap_error = |first: u64| {
+            Error::corrupt_file_named(
+                "binary mini-block",
+                format!(
+                    "value region starts at offset {first} which overlaps the {num_offsets} \
+                     requested offsets ({min_value_region_start} bytes)"
+                ),
+            )
+        };
+
         if self.bits_per_offset == 64 {
             let offsets_buffer = data.borrow_to_typed_slice::<u64>();
             let offsets = &offsets_buffer.as_ref()[..num_offsets];
 
             let first = offsets[0];
+            if first < min_value_region_start as u64 {
+                return Err(value_region_overlap_error(first));
+            }
             let mut previous = first;
             let mut is_monotonic = true;
             let result_offsets = offsets
@@ -393,6 +411,9 @@ impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
             let offsets = &offsets_buffer.as_ref()[..num_offsets];
 
             let first = offsets[0];
+            if (first as u64) < min_value_region_start as u64 {
+                return Err(value_region_overlap_error(first as u64));
+            }
             let mut previous = first;
             let mut is_monotonic = true;
             let result_offsets = offsets
@@ -1151,6 +1172,14 @@ mod tests {
         assert!(matches!(err, Error::CorruptFile { .. }), "{err:?}");
         assert!(err.to_string().contains("decreases"), "{err}");
 
+        // The first offset points inside the offset table, which would alias
+        // the serialized offsets into the value bytes.
+        let err = decompressor
+            .decompress(vec![chunk_u32(&[0, 21, 25, 30], b"alphabetagamma")], 3)
+            .unwrap_err();
+        assert!(matches!(err, Error::CorruptFile { .. }), "{err:?}");
+        assert!(err.to_string().contains("overlaps"), "{err}");
+
         // The chunk stores fewer offsets than the requested value count needs.
         let err = decompressor
             .decompress(vec![chunk_u32(&[8, 8], &[])], 3)
@@ -1166,18 +1195,29 @@ mod tests {
         assert!(err.to_string().contains("multiple"), "{err}");
 
         // 64-bit offsets take the same validation path.
+        fn chunk_u64(offsets: &[u64], values: &[u8]) -> LanceBuffer {
+            let mut chunk = offsets
+                .iter()
+                .flat_map(|offset| offset.to_le_bytes())
+                .collect::<Vec<u8>>();
+            chunk.extend_from_slice(values);
+            chunk.resize(chunk.len().next_multiple_of(8), 0);
+            LanceBuffer::from(chunk)
+        }
         let decompressor = BinaryMiniBlockDecompressor::new(64);
-        let mut chunk = [32u64, 37, 41, 100_000]
-            .iter()
-            .flat_map(|offset| offset.to_le_bytes())
-            .collect::<Vec<u8>>();
-        chunk.extend_from_slice(b"alphabetagamma");
-        chunk.resize(chunk.len().next_multiple_of(8), 0);
         let err = decompressor
-            .decompress(vec![LanceBuffer::from(chunk)], 3)
+            .decompress(
+                vec![chunk_u64(&[32, 37, 41, 100_000], b"alphabetagamma")],
+                3,
+            )
             .unwrap_err();
         assert!(matches!(err, Error::CorruptFile { .. }), "{err:?}");
         assert!(err.to_string().contains("out of bounds"), "{err}");
+        let err = decompressor
+            .decompress(vec![chunk_u64(&[0, 37, 41, 46], b"alphabetagamma")], 3)
+            .unwrap_err();
+        assert!(matches!(err, Error::CorruptFile { .. }), "{err:?}");
+        assert!(err.to_string().contains("overlaps"), "{err}");
 
         // A valid chunk still decodes: offsets rebase to [0, 5, 9, 14].
         let decompressor = BinaryMiniBlockDecompressor::new(32);
