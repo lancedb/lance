@@ -7448,5 +7448,4 @@ mod tests {
             );
         }
     }
->>>>>>> a778c5991 (fix(encoding): bounds-check the length prefix in VariableFullZipDecoder::unzip (#8138))
 }
