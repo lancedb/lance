@@ -24,6 +24,7 @@ the ``merge_insert_base`` tag written by ``datagen/merge_insert.py``.
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import TYPE_CHECKING, Callable, Iterable, Optional, Sequence
@@ -50,6 +51,8 @@ from ci_benchmarks.datagen.merge_insert import (
 from ci_benchmarks.datasets import get_dataset_uri
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from lance.dataset import ExecuteResult
 
 PLANS = ["v1_indexed", "v2_hash"]
@@ -768,3 +771,71 @@ def test_io_mem_upsert_streaming_source(
         )
 
     io_mem_benchmark(job, narrow.dataset, warmup=False, setup=lambda: narrow.reset())
+
+
+# ---------------------------------------------------------------------------
+# F. Regression: missing `merge_insert_base` tag
+# ---------------------------------------------------------------------------
+#
+# `ds.tags.get_version()` is documented to return None for missing tags but
+# the underlying Rust binding raises ValueError ("Ref not found"). A crashed
+# benchmark run can leave a dataset on disk without the
+# ``merge_insert_base`` tag, which used to crash ``_already_generated`` and
+# ``_open_target`` mid-startup. These tests guard against a future change
+# restoring that crash by reproducing the post-crash state with a real
+# dataset written to a temp path.
+
+
+def test_already_generated_missing_tag_triggers_regen(tmp_path: Path) -> None:
+    """A dataset without ``merge_insert_base`` must report as not-generated.
+
+    Before the fix this raised ``ValueError: Ref not found: tag merge_insert_base
+    does not exist`` and aborted datagen. The fix must return ``False`` so the
+    caller regenerates the dataset.
+    """
+    from ci_benchmarks.datagen.merge_insert import _already_generated
+
+    uri = str(tmp_path / "merge_insert_narrow")
+    table = pa.table({"id_int": [1, 2, 3], "value": [10, 20, 30]})
+    lance.write_dataset(table, uri, mode="create")
+    # Deliberately do NOT create BASE_TAG -- the post-crash state.
+
+    assert _already_generated(uri, expected_rows=3) is False
+
+
+def test_already_generated_with_tag_and_matching_rows(tmp_path: Path) -> None:
+    """Sanity: when the tag exists and the row count matches, the dataset is
+    reported as generated. Guards against a fix that breaks the happy path.
+    """
+    from ci_benchmarks.datagen.merge_insert import _already_generated
+
+    uri = str(tmp_path / "merge_insert_narrow")
+    table = pa.table({"id_int": [1, 2, 3], "value": [10, 20, 30]})
+    ds = lance.write_dataset(table, uri, mode="create")
+    ds.tags.create(BASE_TAG, ds.version)
+
+    assert _already_generated(uri, expected_rows=3) is True
+
+
+def test_open_target_missing_tag_skips(tmp_path: Path) -> None:
+    """A dataset without ``merge_insert_base`` must ``pytest.skip`` cleanly.
+
+    Before the fix this raised ``ValueError`` and crashed the benchmark
+    fixture. The fix must call ``pytest.skip`` with a message pointing at the
+    datagen script, so a missing dataset fails informatively rather than
+    abruptly.
+    """
+    from unittest import mock
+
+    uri = str(tmp_path / "merge_insert_narrow")
+    table = pa.table({"id_int": [1, 2, 3], "value": [10, 20, 30]})
+    lance.write_dataset(table, uri, mode="create")
+    # Deliberately do NOT create BASE_TAG.
+
+    # ``_open_target`` looks up ``get_dataset_uri`` as a module-level name in
+    # this test module, so patch the attribute on this module rather than the
+    # source module -- the source binding is shadowed by the local import.
+    with mock.patch.object(sys.modules[__name__], "get_dataset_uri", return_value=uri):
+        gen = _open_target("merge_insert_narrow")
+        with pytest.raises(pytest.skip.Exception, match=BASE_TAG):
+            next(gen)
