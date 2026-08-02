@@ -87,7 +87,7 @@ use crate::dataset::overlay::{
     collect_overlay_stale_frags, collect_overlay_stale_rows_for_segment, overlaid_fragments,
 };
 use crate::dataset::row_offsets_to_row_addresses;
-use crate::dataset::rowids::translate_addr_treemap_to_row_ids;
+use crate::dataset::rowids::{row_addrs_to_row_ids, translate_addr_treemap_to_row_ids};
 use crate::dataset::utils::SchemaAdapter;
 use crate::index::DatasetIndexInternalExt;
 use crate::index::scalar::inverted::{load_segment_details, load_segments};
@@ -3182,10 +3182,9 @@ impl Scanner {
         }
     }
 
-    fn u64s_as_take_input(&self, u64s: Vec<u64>) -> Result<Arc<dyn ExecutionPlan>> {
-        let row_addrs = RowAddrTreeMap::from_iter(u64s);
-        let row_addr_mask = RowAddrMask::from_allowed(row_addrs);
-        let index_result = IndexExprResult::exact(row_addr_mask);
+    fn row_ids_as_take_input(&self, row_ids: RowAddrTreeMap) -> Result<Arc<dyn ExecutionPlan>> {
+        let row_id_mask = RowAddrMask::from_allowed(row_ids);
+        let index_result = IndexExprResult::exact(row_id_mask);
         let fragments_covered = self.dataset.fragment_bitmap.as_ref().clone();
         let format = self.index_expr_result_format();
         let batch = index_result.serialize(&fragments_covered, format)?;
@@ -3195,19 +3194,26 @@ impl Scanner {
         Ok(Arc::new(OneShotExec::new(stream)))
     }
 
+    async fn row_addrs_as_take_input(&self, row_addrs: Vec<u64>) -> Result<Arc<dyn ExecutionPlan>> {
+        let row_ids = row_addrs_to_row_ids(&self.dataset, row_addrs.into_iter().map(Some)).await?;
+        self.row_ids_as_take_input(RowAddrTreeMap::from_iter(row_ids.into_iter().flatten()))
+    }
+
     async fn take_source(&self, take_op: TakeOperation) -> Result<Arc<dyn ExecutionPlan>> {
         // We generally assume that late materialization does not make sense for take operations
         // so we can just use the physical projection
         let projection = self.projection_plan.physical_projection.clone();
 
         let input = match take_op {
-            TakeOperation::RowIds(ids) => self.u64s_as_take_input(ids),
-            TakeOperation::RowAddrs(addrs) => self.u64s_as_take_input(addrs),
+            TakeOperation::RowIds(ids) => {
+                self.row_ids_as_take_input(RowAddrTreeMap::from_iter(ids))
+            }
+            TakeOperation::RowAddrs(addrs) => self.row_addrs_as_take_input(addrs).await,
             TakeOperation::RowOffsets(offsets) => {
                 let mut addrs =
                     row_offsets_to_row_addresses(&self.dataset.get_fragments(), &offsets).await?;
                 addrs.retain(|addr| *addr != RowAddress::TOMBSTONE_ROW);
-                self.u64s_as_take_input(addrs)
+                self.row_addrs_as_take_input(addrs).await
             }
         }?;
 
@@ -4710,11 +4716,7 @@ impl Scanner {
         projection: Projection,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let take_id_map = self.stale_rows_in_id_domain(stale_rows).await?;
-        let take_ids: Vec<u64> = take_id_map
-            .row_addrs()
-            .map(|it| it.map(u64::from).collect())
-            .unwrap_or_default();
-        let index_input = self.u64s_as_take_input(take_ids)?;
+        let index_input = self.row_ids_as_take_input(take_id_map)?;
         let mut read_options = FilteredReadOptions::new(projection);
         if let Some(fragments) = self.fragments.as_ref() {
             read_options = read_options.with_fragments(Arc::new(fragments.clone()));
@@ -13177,6 +13179,63 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             &[2, 3],
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn test_filter_row_address_with_stable_row_ids() {
+        let ds = lance_datagen::gen_batch()
+            .col("idx", array::step::<Int32Type>())
+            .into_ram_dataset_with_params(
+                FragmentCount::from(3),
+                FragmentRowCount::from(4),
+                Some(WriteParams {
+                    max_rows_per_file: 4,
+                    enable_stable_row_ids: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+
+        let row_addrs = [
+            (u64::from(RowAddress::new_from_parts(0, 1)), 1),
+            (u64::from(RowAddress::new_from_parts(1, 1)), 5),
+            (u64::from(RowAddress::new_from_parts(2, 1)), 9),
+        ];
+        for (row_addr, expected_idx) in row_addrs {
+            let batch = ds
+                .scan()
+                .filter(&format!("{ROW_ADDR} = {row_addr}"))
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            assert_eq!(
+                batch["idx"].as_primitive::<Int32Type>().values(),
+                &[expected_idx]
+            );
+        }
+
+        let batch = ds
+            .scan()
+            .filter(&format!(
+                "{ROW_ADDR} IN ({}, {})",
+                row_addrs[1].0, row_addrs[2].0
+            ))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(batch["idx"].as_primitive::<Int32Type>().values(), &[5, 9]);
+
+        let batch = ds
+            .scan()
+            .filter(&format!("{ROW_ADDR} = 5"))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(batch.num_rows(), 0);
     }
 
     #[tokio::test]
