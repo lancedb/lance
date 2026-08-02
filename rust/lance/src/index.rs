@@ -1988,10 +1988,9 @@ impl DatasetIndexExt for Dataset {
         if indices.is_empty() {
             return Err(Error::index_not_found(format!("name={}", index_name)));
         }
-        let column = self.schema().field_by_id(indices[0].fields[0]).unwrap();
-        let logical_index = self
-            .open_logical_vector_index(&column.name, index_name)
-            .await?;
+        let field_id = indices[0].fields[0];
+        let column = self.schema().field_path(field_id)?;
+        let logical_index = self.open_logical_vector_index(&column, index_name).await?;
         logical_index
             .as_ivf()?
             .read_partition(partition_id, with_vector)

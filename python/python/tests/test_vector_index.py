@@ -2053,6 +2053,38 @@ def test_read_partition(indexed_dataset):
         VectorIndexReader(indexed_dataset, "id_idx")
 
 
+@pytest.mark.parametrize(
+    ("field_name", "column"),
+    [
+        ("embedding", "data.embedding"),
+        ("embedding.v1", "data.`embedding.v1`"),
+    ],
+)
+def test_read_partition_nested_vector(tmp_path, field_name, column):
+    num_rows = 1024
+    dimensions = 8
+    values = np.arange(num_rows * dimensions, dtype=np.uint8)
+    vectors = pa.FixedSizeListArray.from_arrays(pa.array(values), dimensions)
+    nested = pa.StructArray.from_arrays([vectors], names=[field_name])
+    dataset = lance.write_dataset(pa.table({"data": nested}), tmp_path)
+    dataset = dataset.create_index(
+        column,
+        index_type="IVF_FLAT",
+        name="vector_idx",
+        metric="hamming",
+        num_partitions=4,
+    )
+
+    reader = VectorIndexReader(dataset, "vector_idx")
+    partitions = [
+        reader.read_partition(partition_id)
+        for partition_id in range(reader.num_partitions())
+    ]
+
+    assert all("_rowid" in partition.column_names for partition in partitions)
+    assert sum(partition.num_rows for partition in partitions) == num_rows
+
+
 def test_vector_index_with_prefilter_and_scalar_index(indexed_dataset):
     uri = indexed_dataset.uri
     new_table = create_table()
