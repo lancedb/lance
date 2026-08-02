@@ -588,20 +588,249 @@ pub struct VariableWidthBlock {
     pub block_info: BlockInfo,
 }
 
+/// Proof that a [`VariableWidthBlock`] satisfies the Arrow layout contract for
+/// its target data type (offsets buffer long enough, offsets monotonic and
+/// within the data buffer, values valid UTF-8 where required).
+///
+/// Only [`VariableWidthBlock::validate_layout`] can construct it, which ties the
+/// unchecked Arrow build below to an actual validation pass instead of a
+/// caller-controlled flag.
+struct ValidVariableWidthLayout;
+
 impl VariableWidthBlock {
-    fn into_arrow(self, data_type: DataType, validate: bool) -> Result<ArrayData> {
+    // The offsets buffer comes straight from file bytes, so an unchecked build would
+    // let a corrupt file smuggle out-of-bounds offsets into an Arrow array whose
+    // consumers then read (or crash on) memory outside the data buffer.  This
+    // boundary therefore always validates the layout, ignoring the optional
+    // `validate` flag.  Lance validates the common layouts itself (a branchless
+    // scan, measurably cheaper than Arrow's element-wise checked build) and only
+    // falls back to Arrow's checked build for the cold cases.
+    fn into_arrow(self, data_type: DataType, _validate: bool) -> Result<ArrayData> {
+        let Some(expected_bits_per_offset) = Self::expected_bits_per_offset(&data_type) else {
+            // Not an [offsets, bytes] layout we know how to prove; let Arrow
+            // check it.
+            return self.into_arrow_checked(data_type);
+        };
+        if self.bits_per_offset != expected_bits_per_offset {
+            return Err(self.layout_error(
+                &data_type,
+                format!(
+                    "expected {}-bit offsets but got {}-bit offsets",
+                    expected_bits_per_offset, self.bits_per_offset
+                ),
+            ));
+        }
+        if self.num_values == 0 {
+            // Cold path; Arrow handles the empty-offsets special cases.
+            return self.into_arrow_checked(data_type);
+        }
+        let proof = self.validate_layout(&data_type)?;
+        Ok(self.into_arrow_unchecked(data_type, proof))
+    }
+
+    /// The offset width Arrow mandates for `data_type`, or `None` if the type
+    /// does not use the `[offsets, bytes]` layout this block represents.
+    fn expected_bits_per_offset(data_type: &DataType) -> Option<u8> {
+        match data_type {
+            DataType::Binary | DataType::Utf8 => Some(32),
+            DataType::LargeBinary | DataType::LargeUtf8 => Some(64),
+            _ => None,
+        }
+    }
+
+    fn layout_error(&self, data_type: &DataType, detail: impl std::fmt::Display) -> Error {
+        Self::format_layout_error(
+            data_type,
+            detail,
+            self.num_values,
+            self.bits_per_offset,
+            self.offsets.len(),
+            self.data.len(),
+        )
+    }
+
+    fn format_layout_error(
+        data_type: &DataType,
+        detail: impl std::fmt::Display,
+        num_values: u64,
+        bits_per_offset: u8,
+        offsets_size: usize,
+        data_size: usize,
+    ) -> Error {
+        Error::corrupt_file_named(
+            "variable width data block",
+            format!(
+                "invalid variable-width layout for {}: {} (num_values: {}, bits_per_offset: {}, \
+                 offsets buffer size: {} bytes, data buffer size: {} bytes)",
+                data_type, detail, num_values, bits_per_offset, offsets_size, data_size,
+            ),
+        )
+    }
+
+    fn validate_layout(&self, data_type: &DataType) -> Result<ValidVariableWidthLayout> {
+        let bytes_per_offset = (self.bits_per_offset / 8) as u64;
+        let required_bytes = self
+            .num_values
+            .checked_add(1)
+            .and_then(|num_offsets| num_offsets.checked_mul(bytes_per_offset))
+            .ok_or_else(|| self.layout_error(data_type, "offsets buffer size overflows"))?;
+        if (self.offsets.len() as u64) < required_bytes {
+            return Err(self.layout_error(
+                data_type,
+                format!(
+                    "offsets buffer must hold at least {} offsets ({} bytes)",
+                    self.num_values + 1,
+                    required_bytes
+                ),
+            ));
+        }
+        let validate_utf8 = matches!(data_type, DataType::Utf8 | DataType::LargeUtf8);
+        match self.bits_per_offset {
+            32 => self.validate_offsets_and_values::<i32>(data_type, validate_utf8),
+            64 => self.validate_offsets_and_values::<i64>(data_type, validate_utf8),
+            other => Err(self.layout_error(
+                data_type,
+                format!("unsupported offset width: {} bits", other),
+            )),
+        }
+    }
+
+    fn validate_offsets_and_values<T: ArrowNativeType + Ord>(
+        &self,
+        data_type: &DataType,
+        validate_utf8: bool,
+    ) -> Result<ValidVariableWidthLayout> {
+        let num_offsets = self.num_values as usize + 1;
+        // Slice before borrowing: the buffer may carry padding that is not a
+        // multiple of the offset width.
+        let offsets = self
+            .offsets
+            .slice_with_length(0, num_offsets * std::mem::size_of::<T>());
+        let offsets = offsets.borrow_to_typed_slice::<T>();
+        let offsets: &[T] = offsets.as_ref();
+        let data = self.data.as_ref();
+
+        // A monotonic sequence with a non-negative first offset and an
+        // in-bounds last offset is entirely within [0, data.len()], so the hot
+        // loop only proves monotonicity; everything else is O(1) at the ends.
+        // The `&=` accumulation keeps the loop branchless so it vectorizes.
+        let mut is_monotonic = true;
+        for window in offsets.windows(2) {
+            is_monotonic &= window[0] <= window[1];
+        }
+        let first = offsets[0];
+        let last = offsets[num_offsets - 1];
+        let bounds_ok =
+            first >= T::usize_as(0) && last.to_usize().is_some_and(|last| last <= data.len());
+        if !is_monotonic || !bounds_ok {
+            return Err(self.offset_violation_error::<T>(data_type, offsets));
+        }
+
+        if validate_utf8 {
+            let (first, last) = (first.as_usize(), last.as_usize());
+            let values = std::str::from_utf8(&data[first..last])
+                .map_err(|utf8_err| self.layout_error(data_type, utf8_err))?;
+            let mut on_char_boundaries = true;
+            for &offset in offsets {
+                on_char_boundaries &= values.is_char_boundary(offset.as_usize() - first);
+            }
+            if !on_char_boundaries {
+                // Cold path: rescan to pinpoint the offending offset.
+                let position = offsets
+                    .iter()
+                    .position(|offset| !values.is_char_boundary(offset.as_usize() - first))
+                    .expect("the fast scan found a non-boundary offset");
+                return Err(self.layout_error(
+                    data_type,
+                    format!("offset at position {position} splits a UTF-8 character"),
+                ));
+            }
+        }
+
+        Ok(ValidVariableWidthLayout)
+    }
+
+    /// Cold path: pinpoint the first offending offset for the error message.
+    fn offset_violation_error<T: ArrowNativeType + Ord>(
+        &self,
+        data_type: &DataType,
+        offsets: &[T],
+    ) -> Error {
+        let data_size = self.data.len();
+        for (position, window) in offsets.windows(2).enumerate() {
+            if window[0] > window[1] {
+                return self.layout_error(
+                    data_type,
+                    format!(
+                        "non-monotonic offset at position {}: {:?} > {:?}",
+                        position, window[0], window[1]
+                    ),
+                );
+            }
+        }
+        for (position, offset) in offsets.iter().enumerate() {
+            match offset.to_usize() {
+                None => {
+                    return self.layout_error(
+                        data_type,
+                        format!("negative offset at position {}: {:?}", position, offset),
+                    );
+                }
+                Some(offset) if offset > data_size => {
+                    return self.layout_error(
+                        data_type,
+                        format!(
+                            "offset at position {} out of bounds: {} > {}",
+                            position, offset, data_size
+                        ),
+                    );
+                }
+                Some(_) => {}
+            }
+        }
+        // The fast scan only fails when one of the loops above finds the
+        // culprit; reaching here would be a bug in the fast scan itself.
+        self.layout_error(data_type, "offsets failed validation")
+    }
+
+    fn into_arrow_checked(self, data_type: DataType) -> Result<ArrayData> {
+        let num_values = self.num_values;
+        let bits_per_offset = self.bits_per_offset;
+        let offsets_size = self.offsets.len();
+        let data_size = self.data.len();
+        let builder = self.into_arrow_builder(data_type.clone());
+        builder.build().map_err(|arrow_err| {
+            Self::format_layout_error(
+                &data_type,
+                arrow_err,
+                num_values,
+                bits_per_offset,
+                offsets_size,
+                data_size,
+            )
+        })
+    }
+
+    fn into_arrow_unchecked(
+        self,
+        data_type: DataType,
+        _proof: ValidVariableWidthLayout,
+    ) -> ArrayData {
+        let builder = self.into_arrow_builder(data_type);
+        // SAFETY: `_proof` witnesses that `validate_layout` proved this block
+        // satisfies the Arrow layout contract for `data_type`.
+        unsafe { builder.build_unchecked() }
+    }
+
+    fn into_arrow_builder(self, data_type: DataType) -> ArrayDataBuilder {
+        let num_values = self.num_values;
         let data_buffer = self.data.into_buffer();
         let offsets_buffer = self.offsets.into_buffer();
-        let builder = ArrayDataBuilder::new(data_type)
+        ArrayDataBuilder::new(data_type)
             .add_buffer(offsets_buffer)
             .add_buffer(data_buffer)
-            .len(self.num_values as usize)
-            .null_count(0);
-        if validate {
-            Ok(builder.build()?)
-        } else {
-            Ok(unsafe { builder.build_unchecked() })
-        }
+            .len(num_values as usize)
+            .null_count(0)
     }
 
     fn into_buffers(self) -> Vec<LanceBuffer> {
@@ -1652,19 +1881,25 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::{
-        ArrayRef, BinaryViewArray, DictionaryArray, Int8Array, LargeBinaryArray, StringArray,
-        StringViewArray, UInt8Array, UInt16Array, make_array, new_null_array,
+        ArrayRef, BinaryArray, BinaryViewArray, DictionaryArray, Int8Array, LargeBinaryArray,
+        LargeStringArray, StringArray, StringViewArray, UInt8Array, UInt16Array, make_array,
+        new_null_array,
         types::{Int8Type, Int32Type},
     };
     use arrow_buffer::{BooleanBuffer, NullBuffer};
 
     use arrow_schema::{DataType, Field, Fields};
+    use lance_core::Error;
     use lance_datagen::{ArrayGeneratorExt, DEFAULT_SEED, RowCount, array};
     use rand::SeedableRng;
+    use rstest::rstest;
 
     use crate::buffer::LanceBuffer;
 
-    use super::{AllNullDataBlock, DataBlock};
+    use super::{
+        AllNullDataBlock, BlockInfo, DataBlock, DictionaryDataBlock, FixedWidthDataBlock,
+        VariableWidthBlock,
+    };
 
     use arrow_array::Array;
 
@@ -2078,5 +2313,185 @@ mod tests {
 
         let total_nulls_size_in_bytes = concatenated_array.nulls().unwrap().len().div_ceil(8);
         assert!(block.data_size() == (total_buffer_size + total_nulls_size_in_bytes) as u64);
+    }
+
+    #[test]
+    fn variable_width_rejects_out_of_bounds_offsets_without_optional_validation() {
+        let block = VariableWidthBlock {
+            data: LanceBuffer::copy_slice(b"alphabetagamma"),
+            offsets: LanceBuffer::reinterpret_vec(vec![0_i32, 5, 9, 100_000]),
+            bits_per_offset: 32,
+            num_values: 3,
+            block_info: BlockInfo::new(),
+        };
+
+        let error = block
+            .into_arrow(DataType::Binary, false)
+            .expect_err("out-of-bounds offsets must be rejected");
+        assert!(
+            matches!(error, Error::CorruptFile { .. }),
+            "expected CorruptFile, got: {error}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("100000") && message.contains("data buffer size: 14 bytes"),
+            "error must report the offending offset and the data buffer size: {message}"
+        );
+    }
+
+    #[rstest]
+    #[case::binary_i32_tail_out_of_bounds(
+        DataType::Binary,
+        LanceBuffer::reinterpret_vec(vec![0_i32, 5, 9, 100_000]),
+        32,
+        3,
+        b"alphabetagamma".as_slice()
+    )]
+    #[case::utf8_i32_tail_out_of_bounds(
+        DataType::Utf8,
+        LanceBuffer::reinterpret_vec(vec![0_i32, 5, 9, 100_000]),
+        32,
+        3,
+        b"alphabetagamma".as_slice()
+    )]
+    #[case::large_binary_i64_tail_out_of_bounds(
+        DataType::LargeBinary,
+        LanceBuffer::reinterpret_vec(vec![0_i64, 5, 9, 100_000]),
+        64,
+        3,
+        b"alphabetagamma".as_slice()
+    )]
+    #[case::large_utf8_i64_tail_out_of_bounds(
+        DataType::LargeUtf8,
+        LanceBuffer::reinterpret_vec(vec![0_i64, 5, 9, 100_000]),
+        64,
+        3,
+        b"alphabetagamma".as_slice()
+    )]
+    #[case::binary_negative_offset(
+        DataType::Binary,
+        LanceBuffer::reinterpret_vec(vec![0_i32, -1, 9, 14]),
+        32,
+        3,
+        b"alphabetagamma".as_slice()
+    )]
+    #[case::binary_non_monotonic_offsets(
+        DataType::Binary,
+        LanceBuffer::reinterpret_vec(vec![0_i32, 9, 5, 14]),
+        32,
+        3,
+        b"alphabetagamma".as_slice()
+    )]
+    #[case::binary_interior_offset_out_of_bounds(
+        DataType::Binary,
+        LanceBuffer::reinterpret_vec(vec![0_i32, 100_000, 100_000, 14]),
+        32,
+        3,
+        b"alphabetagamma".as_slice()
+    )]
+    #[case::binary_offsets_buffer_too_short(
+        DataType::Binary,
+        LanceBuffer::reinterpret_vec(vec![0_i32, 5, 9]),
+        32,
+        3,
+        b"alphabetagamma".as_slice()
+    )]
+    #[case::utf8_invalid_byte_sequence(
+        DataType::Utf8,
+        LanceBuffer::reinterpret_vec(vec![0_i32, 1, 2, 3]),
+        32,
+        3,
+        &[b'a', 0xFF, b'b']
+    )]
+    #[case::utf8_offset_splits_multibyte_char(
+        DataType::Utf8,
+        LanceBuffer::reinterpret_vec(vec![0_i32, 1, 2]),
+        32,
+        2,
+        "é".as_bytes()
+    )]
+    #[case::large_utf8_invalid_byte_sequence(
+        DataType::LargeUtf8,
+        LanceBuffer::reinterpret_vec(vec![0_i64, 1, 2, 3]),
+        64,
+        3,
+        &[b'a', 0xFF, b'b']
+    )]
+    fn variable_width_rejects_malformed_layout(
+        #[case] data_type: DataType,
+        #[case] offsets: LanceBuffer,
+        #[case] bits_per_offset: u8,
+        #[case] num_values: u64,
+        #[case] data: &[u8],
+    ) {
+        let block = VariableWidthBlock {
+            data: LanceBuffer::copy_slice(data),
+            offsets,
+            bits_per_offset,
+            num_values,
+            block_info: BlockInfo::new(),
+        };
+
+        // The malformed layout must be rejected regardless of the optional
+        // `validate` flag: the flag selects extra validation, not the memory
+        // safety proof required to construct an Arrow array.
+        for validate in [false, true] {
+            let error = DataBlock::VariableWidth(block.clone())
+                .into_arrow(data_type.clone(), validate)
+                .expect_err("malformed variable-width layout must be rejected");
+            assert!(
+                matches!(error, Error::CorruptFile { .. }),
+                "expected CorruptFile with validate={validate}, got: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn dictionary_rejects_malformed_variable_width_values_without_optional_validation() {
+        let values = VariableWidthBlock {
+            data: LanceBuffer::copy_slice(b"alphabetagamma"),
+            offsets: LanceBuffer::reinterpret_vec(vec![0_i32, 5, 9, 100_000]),
+            bits_per_offset: 32,
+            num_values: 3,
+            block_info: BlockInfo::new(),
+        };
+        let dictionary = DataBlock::Dictionary(DictionaryDataBlock {
+            indices: FixedWidthDataBlock {
+                data: LanceBuffer::reinterpret_vec(vec![0_i32, 1, 2]),
+                bits_per_value: 32,
+                num_values: 3,
+                block_info: BlockInfo::new(),
+            },
+            dictionary: Box::new(DataBlock::VariableWidth(values)),
+        });
+
+        let data_type = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Binary));
+        let error = dictionary
+            .into_arrow(data_type, false)
+            .expect_err("dictionary with out-of-bounds value offsets must be rejected");
+        assert!(
+            matches!(error, Error::CorruptFile { .. }),
+            "expected CorruptFile, got: {error}"
+        );
+    }
+
+    #[rstest]
+    #[case::binary(Arc::new(BinaryArray::from_vec(vec![b"alpha", b"", b"gamma"])) as ArrayRef)]
+    #[case::large_binary(
+        Arc::new(LargeBinaryArray::from_vec(vec![b"alpha", b"", b"gamma"])) as ArrayRef
+    )]
+    #[case::utf8(Arc::new(StringArray::from(vec!["héllo", "", "world"])) as ArrayRef)]
+    #[case::large_utf8(Arc::new(LargeStringArray::from(vec!["héllo", "", "world"])) as ArrayRef)]
+    fn variable_width_valid_data_survives_mandatory_validation(#[case] array: ArrayRef) {
+        let block = DataBlock::from_array(array.clone());
+        for validate in [false, true] {
+            let round_tripped = make_array(
+                block
+                    .clone()
+                    .into_arrow(array.data_type().clone(), validate)
+                    .unwrap(),
+            );
+            assert_eq!(&round_tripped, &array);
+        }
     }
 }
