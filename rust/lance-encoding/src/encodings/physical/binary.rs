@@ -454,6 +454,79 @@ impl VariablePerValueDecompressor for VariableDecoder {
 #[derive(Debug, Default)]
 pub struct BinaryBlockDecompressor {}
 
+fn validate_variable_offsets<T>(
+    offsets: &LanceBuffer,
+    num_values: u64,
+    data_len: usize,
+) -> Result<()>
+where
+    T: OffsetSizeTrait + bytemuck::Pod,
+{
+    let num_offsets = usize::try_from(num_values)
+        .ok()
+        .and_then(|num_values| num_values.checked_add(1))
+        .ok_or_else(|| {
+            Error::corrupt_file_named(
+                "variable-width block",
+                format!("number of values {num_values} cannot be represented as usize"),
+            )
+        })?;
+    let expected_offsets_len = num_offsets
+        .checked_mul(T::get_byte_width())
+        .ok_or_else(|| {
+            Error::corrupt_file_named(
+                "variable-width block",
+                format!("offset buffer size overflows for {num_values} values"),
+            )
+        })?;
+    if offsets.len() != expected_offsets_len {
+        return Err(Error::corrupt_file_named(
+            "variable-width block",
+            format!(
+                "expected {expected_offsets_len} offset bytes for {num_values} values but found {}",
+                offsets.len()
+            ),
+        ));
+    }
+
+    let offsets = offsets.borrow_to_typed_view::<T>();
+    let first_offset = offsets[0];
+    if first_offset != T::default() {
+        return Err(Error::corrupt_file_named(
+            "variable-width block",
+            format!("first offset must be 0 but found {first_offset:?}"),
+        ));
+    }
+
+    let mut previous_offset = first_offset;
+    for (index, &offset) in offsets.iter().enumerate().skip(1) {
+        if offset < previous_offset {
+            return Err(Error::corrupt_file_named(
+                "variable-width block",
+                format!(
+                    "offset {index} ({offset:?}) is smaller than the previous offset ({previous_offset:?})"
+                ),
+            ));
+        }
+        previous_offset = offset;
+    }
+
+    let final_offset = previous_offset.to_usize().ok_or_else(|| {
+        Error::corrupt_file_named(
+            "variable-width block",
+            format!("final offset {previous_offset:?} cannot be represented as usize"),
+        )
+    })?;
+    if final_offset > data_len {
+        return Err(Error::corrupt_file_named(
+            "variable-width block",
+            format!("final offset {final_offset} exceeds values buffer length {data_len}"),
+        ));
+    }
+
+    Ok(())
+}
+
 impl BlockDecompressor for BinaryBlockDecompressor {
     fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
         // In older (not quite stable) versions we stored the bits per offset as a single byte and then the num_values
@@ -519,6 +592,12 @@ impl BlockDecompressor for BinaryBlockDecompressor {
             data.len() - bytes_start_offset as usize,
         );
 
+        match bits_per_offset {
+            32 => validate_variable_offsets::<i32>(&offsets, num_values, data.len())?,
+            64 => validate_variable_offsets::<i64>(&offsets, num_values, data.len())?,
+            _ => unreachable!(),
+        }
+
         Ok(DataBlock::VariableWidth(VariableWidthBlock {
             data,
             offsets,
@@ -531,6 +610,7 @@ impl BlockDecompressor for BinaryBlockDecompressor {
 
 #[cfg(test)]
 mod tests {
+    use super::{BinaryBlockDecompressor, VariableEncoder};
     use arrow_array::{
         ArrayRef, StringArray,
         builder::{LargeStringBuilder, StringBuilder},
@@ -538,18 +618,88 @@ mod tests {
     use arrow_schema::{DataType, Field};
 
     use crate::{
+        buffer::LanceBuffer,
+        compression::{BlockCompressor, BlockDecompressor},
         constants::{
             COMPRESSION_META_KEY, STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY,
             STRUCTURAL_ENCODING_MINIBLOCK,
         },
+        data::{BlockInfo, DataBlock, VariableWidthBlock},
         testing::check_specific_random,
     };
+    use lance_core::Error;
     use rstest::rstest;
     use std::{collections::HashMap, sync::Arc, vec};
 
     use crate::testing::{
         FnArrayGeneratorProvider, TestCases, check_basic_random, check_round_trip_encoding_of_data,
     };
+
+    fn encoded_binary_block(bits_per_offset: u8) -> Vec<u8> {
+        let offsets = match bits_per_offset {
+            32 => LanceBuffer::reinterpret_vec(vec![0_i32, 5, 9, 14]),
+            64 => LanceBuffer::reinterpret_vec(vec![0_i64, 5, 9, 14]),
+            _ => unreachable!(),
+        };
+        let block = DataBlock::VariableWidth(VariableWidthBlock {
+            data: LanceBuffer::copy_slice(b"alphabetagamma"),
+            offsets,
+            bits_per_offset,
+            num_values: 3,
+            block_info: BlockInfo::new(),
+        });
+        BlockCompressor::compress(&VariableEncoder::default(), block)
+            .unwrap()
+            .as_ref()
+            .to_vec()
+    }
+
+    #[rstest]
+    #[case::i32(32, 100_000)]
+    #[case::i64(64, 15)]
+    fn test_binary_block_rejects_offset_past_values(
+        #[case] bits_per_offset: u8,
+        #[case] final_offset: u64,
+    ) {
+        let mut encoded = encoded_binary_block(bits_per_offset);
+        let bytes_per_offset = (bits_per_offset / 8) as usize;
+        let offset_start = bytes_per_offset * 2;
+        let final_offset_start = offset_start + 3 * bytes_per_offset;
+        let final_offset_bytes = final_offset.to_le_bytes();
+        encoded[final_offset_start..final_offset_start + bytes_per_offset]
+            .copy_from_slice(&final_offset_bytes[..bytes_per_offset]);
+
+        let error = BinaryBlockDecompressor::default()
+            .decompress(LanceBuffer::from(encoded), 3)
+            .unwrap_err();
+        assert!(matches!(error, Error::CorruptFile { .. }));
+        assert!(error.to_string().contains(&format!(
+            "final offset {final_offset} exceeds values buffer length 14"
+        )));
+    }
+
+    #[rstest]
+    #[case::i32(32)]
+    #[case::i64(64)]
+    fn test_binary_block_rejects_non_monotonic_offsets(#[case] bits_per_offset: u8) {
+        let mut encoded = encoded_binary_block(bits_per_offset);
+        let bytes_per_offset = (bits_per_offset / 8) as usize;
+        let offset_start = bytes_per_offset * 2;
+        let third_offset_start = offset_start + 2 * bytes_per_offset;
+        let third_offset_bytes = 4_u64.to_le_bytes();
+        encoded[third_offset_start..third_offset_start + bytes_per_offset]
+            .copy_from_slice(&third_offset_bytes[..bytes_per_offset]);
+
+        let error = BinaryBlockDecompressor::default()
+            .decompress(LanceBuffer::from(encoded), 3)
+            .unwrap_err();
+        assert!(matches!(error, Error::CorruptFile { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("offset 2 (4) is smaller than the previous offset (5)")
+        );
+    }
 
     #[test_log::test(tokio::test)]
     async fn test_utf8_binary() {
