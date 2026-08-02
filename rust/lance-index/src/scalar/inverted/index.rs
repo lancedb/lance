@@ -1337,6 +1337,32 @@ impl InvertedIndex {
         if self.corpus_stats.get().is_none() {
             self.aggregate_corpus_stats().await?;
         }
+        // For new-format indexes, aggregate_corpus_stats reads corpus stats from
+        // persisted schema metadata (O(1)) without loading doc lengths as a side
+        // effect. Pre-load lengths in parallel now for partitions that contain at
+        // least one query token, so the scoring phase gets cache hits instead of
+        // issuing sequential per-partition IO.  Partitions with no matching terms
+        // are skipped to preserve the no-load optimization for no-hit queries.
+        let io_parallelism = self.store.io_parallelism();
+        let uncached_lengths = self
+            .partitions
+            .iter()
+            .filter_map(|part| {
+                let docs = part.docs.modern()?.clone();
+                if docs.cached_lengths().is_some() {
+                    return None;
+                }
+                let has_match = (0..request.tokens.len())
+                    .any(|i| part.tokens.get(request.tokens.get_token(i)).is_some());
+                has_match.then_some(async move { docs.lengths().await.map(|_| ()) })
+            })
+            .collect::<Vec<_>>();
+        if !uncached_lengths.is_empty() {
+            stream::iter(uncached_lengths)
+                .buffer_unordered(io_parallelism)
+                .try_collect::<Vec<_>>()
+                .await?;
+        }
         let ranked = self.bm25_search_modern_candidates(request).await?;
         self.resolve_deferred_modern_candidates(ranked).await
     }
