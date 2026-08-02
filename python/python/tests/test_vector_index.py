@@ -2053,22 +2053,17 @@ def test_read_partition(indexed_dataset):
         VectorIndexReader(indexed_dataset, "id_idx")
 
 
-@pytest.mark.parametrize(
-    ("field_name", "column"),
-    [
-        ("embedding", "data.embedding"),
-        ("embedding.v1", "data.`embedding.v1`"),
-    ],
-)
-def test_read_partition_nested_vector(tmp_path, field_name, column):
+def test_read_partition_nested_vector_quoted_field(tmp_path):
     num_rows = 1024
     dimensions = 8
-    values = np.arange(num_rows * dimensions, dtype=np.uint8)
+    rng = np.random.default_rng(42)
+    values = rng.integers(0, 256, size=num_rows * dimensions, dtype=np.uint8)
     vectors = pa.FixedSizeListArray.from_arrays(pa.array(values), dimensions)
-    nested = pa.StructArray.from_arrays([vectors], names=[field_name])
+    nested = pa.StructArray.from_arrays([vectors], names=["embedding.v1"])
     dataset = lance.write_dataset(pa.table({"data": nested}), tmp_path)
+    # Match nested uint8 pHash indexes without introducing PQ training setup.
     dataset = dataset.create_index(
-        column,
+        "data.`embedding.v1`",
         index_type="IVF_FLAT",
         name="vector_idx",
         metric="hamming",
@@ -2076,13 +2071,14 @@ def test_read_partition_nested_vector(tmp_path, field_name, column):
     )
 
     reader = VectorIndexReader(dataset, "vector_idx")
-    partitions = [
-        reader.read_partition(partition_id)
-        for partition_id in range(reader.num_partitions())
-    ]
+    for with_vector in (False, True):
+        partitions = [
+            reader.read_partition(partition_id, with_vector=with_vector)
+            for partition_id in range(reader.num_partitions())
+        ]
 
-    assert all("_rowid" in partition.column_names for partition in partitions)
-    assert sum(partition.num_rows for partition in partitions) == num_rows
+        assert all("_rowid" in partition.column_names for partition in partitions)
+        assert sum(partition.num_rows for partition in partitions) == num_rows
 
 
 def test_vector_index_with_prefilter_and_scalar_index(indexed_dataset):
@@ -2303,6 +2299,14 @@ def test_nested_field_vector_index(tmp_path):
     indices = dataset.describe_indices()
     assert len(indices) == 1
     assert indices[0].field_names == ["data.embedding"]
+
+    reader = VectorIndexReader(dataset, indices[0].name)
+    for with_vector in (False, True):
+        partition_rows = sum(
+            reader.read_partition(partition_id, with_vector=with_vector).num_rows
+            for partition_id in range(reader.num_partitions())
+        )
+        assert partition_rows == num_rows
 
     # Test querying with the index
     query_vec = vectors[0]
