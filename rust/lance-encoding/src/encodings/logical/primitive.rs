@@ -2497,15 +2497,6 @@ impl VariableFullZipDecoder {
             _ => unreachable!(),
         })
     }
-        }
-        Ok(match bits_per_offset {
-            8 => data[0] as u64,
-            16 => u16::from_le_bytes(data[..2].try_into().unwrap()) as u64,
-            32 => u32::from_le_bytes(data[..4].try_into().unwrap()) as u64,
-            64 => u64::from_le_bytes(data[..8].try_into().unwrap()),
-            _ => unreachable!(),
-        })
-    }
 
     fn unzip(
         &mut self,
