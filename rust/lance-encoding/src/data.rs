@@ -1862,16 +1862,16 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::{
+        make_array, new_null_array,
+        types::{Int32Type, Int8Type},
         ArrayRef, BinaryArray, BinaryViewArray, DictionaryArray, Int8Array, LargeBinaryArray,
-        LargeStringArray, StringArray, StringViewArray, UInt8Array, UInt16Array, make_array,
-        new_null_array,
-        types::{Int8Type, Int32Type},
+        LargeStringArray, StringArray, StringViewArray, UInt16Array, UInt8Array,
     };
     use arrow_buffer::{BooleanBuffer, NullBuffer};
 
     use arrow_schema::{DataType, Field, Fields};
     use lance_core::Error;
-    use lance_datagen::{ArrayGeneratorExt, DEFAULT_SEED, RowCount, array};
+    use lance_datagen::{array, ArrayGeneratorExt, RowCount, DEFAULT_SEED};
     use rand::SeedableRng;
     use rstest::rstest;
 
