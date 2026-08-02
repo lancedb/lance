@@ -9866,9 +9866,10 @@ mod tests {
         use crate::repdef::{ControlWordParser, DefinitionInterpretation};
         use std::sync::Arc;
         Arc::new(super::FullZipDecodeDetails {
-            value_decompressor: super::PerValueDecompressor::Variable(
-                Arc::new(VariableDecoder::default()) as Arc<dyn VariablePerValueDecompressor>,
-            ),
+            value_decompressor: super::PerValueDecompressor::Variable(Arc::new(
+                VariableDecoder::default(),
+            )
+                as Arc<dyn VariablePerValueDecompressor>),
             def_meaning: vec![DefinitionInterpretation::NullableItem].into(),
             ctrl_word_parser: ControlWordParser::new(0, 0),
             max_rep: 0,
