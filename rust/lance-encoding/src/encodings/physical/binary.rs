@@ -293,52 +293,123 @@ impl BinaryMiniBlockDecompressor {
     }
 }
 
+/// Cold path: pinpoint why the chunk-relative offsets of a binary mini-block
+/// chunk failed validation.
+fn chunk_offset_violation_error<T: Copy + Into<u64>>(offsets: &[T], chunk_len: usize) -> Error {
+    let mut previous: u64 = offsets[0].into();
+    for (position, &offset) in offsets.iter().enumerate().skip(1) {
+        let offset: u64 = offset.into();
+        if offset < previous {
+            return Error::corrupt_file_named(
+                "binary mini-block",
+                format!(
+                    "value offset at position {position} decreases: {offset} < {previous} \
+                     (chunk is {chunk_len} bytes)"
+                ),
+            );
+        }
+        previous = offset;
+    }
+    Error::corrupt_file_named(
+        "binary mini-block",
+        format!("value offset {previous} is out of bounds for a chunk of {chunk_len} bytes"),
+    )
+}
+
 impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
     // decompress a MiniBlock of binary data, the num_values must be less than or equal
     // to the number of values this MiniBlock has, BinaryMiniBlock doesn't store `the number of values`
     // it has so assertion can not be done here and the caller of `decompress` must ensure
     // `num_values` <= number of values in the chunk.
+    //
+    // The chunk-relative value offsets at the front of the chunk come straight
+    // from the file and are used to slice the chunk buffer, so corrupt values
+    // must surface as a typed error instead of a panic or an out-of-bounds
+    // read.  The monotonicity check rides along the existing rebase loop (the
+    // `&=` accumulation keeps it branchless) so validation adds no extra pass.
     fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
         assert_eq!(data.len(), 1);
         let data = data.into_iter().next().unwrap();
 
+        let bytes_per_offset = self.bits_per_offset as usize / 8;
+        if !data.len().is_multiple_of(bytes_per_offset) {
+            return Err(Error::corrupt_file_named(
+                "binary mini-block",
+                format!(
+                    "chunk size {} is not a multiple of the {}-byte offset width",
+                    data.len(),
+                    bytes_per_offset
+                ),
+            ));
+        }
+        let num_offsets = (num_values as usize).checked_add(1).ok_or_else(|| {
+            Error::corrupt_file_named(
+                "binary mini-block",
+                format!("cannot decode {num_values} values from a single chunk"),
+            )
+        })?;
+        if data.len() / bytes_per_offset < num_offsets {
+            return Err(Error::corrupt_file_named(
+                "binary mini-block",
+                format!(
+                    "chunk of {} bytes holds {} offsets but decoding {} values requires {}",
+                    data.len(),
+                    data.len() / bytes_per_offset,
+                    num_values,
+                    num_offsets
+                ),
+            ));
+        }
+
         if self.bits_per_offset == 64 {
-            // offset and at least one value
-            assert!(data.len() >= 16);
-
             let offsets_buffer = data.borrow_to_typed_slice::<u64>();
-            let offsets = offsets_buffer.as_ref();
+            let offsets = &offsets_buffer.as_ref()[..num_offsets];
 
-            let result_offsets = offsets[0..(num_values + 1) as usize]
+            let first = offsets[0];
+            let mut previous = first;
+            let mut is_monotonic = true;
+            let result_offsets = offsets
                 .iter()
-                .map(|offset| offset - offsets[0])
+                .map(|&offset| {
+                    is_monotonic &= previous <= offset;
+                    previous = offset;
+                    offset.wrapping_sub(first)
+                })
                 .collect::<Vec<u64>>();
+            let last = offsets[num_offsets - 1];
+            if !is_monotonic || last as usize > data.len() {
+                return Err(chunk_offset_violation_error(offsets, data.len()));
+            }
 
             Ok(DataBlock::VariableWidth(VariableWidthBlock {
-                data: LanceBuffer::from(
-                    data[offsets[0] as usize..offsets[num_values as usize] as usize].to_vec(),
-                ),
+                data: LanceBuffer::from(data[first as usize..last as usize].to_vec()),
                 offsets: LanceBuffer::reinterpret_vec(result_offsets),
                 bits_per_offset: 64,
                 num_values,
                 block_info: BlockInfo::new(),
             }))
         } else {
-            // offset and at least one value
-            assert!(data.len() >= 8);
-
             let offsets_buffer = data.borrow_to_typed_slice::<u32>();
-            let offsets = offsets_buffer.as_ref();
+            let offsets = &offsets_buffer.as_ref()[..num_offsets];
 
-            let result_offsets = offsets[0..(num_values + 1) as usize]
+            let first = offsets[0];
+            let mut previous = first;
+            let mut is_monotonic = true;
+            let result_offsets = offsets
                 .iter()
-                .map(|offset| offset - offsets[0])
+                .map(|&offset| {
+                    is_monotonic &= previous <= offset;
+                    previous = offset;
+                    offset.wrapping_sub(first)
+                })
                 .collect::<Vec<u32>>();
+            let last = offsets[num_offsets - 1];
+            if !is_monotonic || last as usize > data.len() {
+                return Err(chunk_offset_violation_error(offsets, data.len()));
+            }
 
             Ok(DataBlock::VariableWidth(VariableWidthBlock {
-                data: LanceBuffer::from(
-                    data[offsets[0] as usize..offsets[num_values as usize] as usize].to_vec(),
-                ),
+                data: LanceBuffer::from(data[first as usize..last as usize].to_vec()),
                 offsets: LanceBuffer::reinterpret_vec(result_offsets),
                 bits_per_offset: 32,
                 num_values,
@@ -467,18 +538,48 @@ impl BlockDecompressor for BinaryBlockDecompressor {
         // never be more than 255 and it's little endian so the last 3 bytes will always be 0.  These will be the least
         // significant 3 bytes of the number of values in the old scheme.  It's pretty unlikely these are all 0 (that would
         // mean there are at least 16M values in a single page) so we'll use this to determine if the old scheme is used.
+        //
+        // The header fields and the offsets themselves come straight from the file.
+        // The structural checks below (all O(1)) reject blocks whose regions do not
+        // line up; the offset *values* are validated later, by the mandatory layout
+        // validation in `VariableWidthBlock::into_arrow`, so they are not rescanned
+        // here.
+        if data.len() < 4 {
+            return Err(Error::corrupt_file_named(
+                "variable-width block",
+                format!(
+                    "block of {} bytes is too small to hold a header",
+                    data.len()
+                ),
+            ));
+        }
         let is_old_scheme = data[1] != 0 || data[2] != 0 || data[3] != 0;
 
+        let ensure_header = |header_len: usize| {
+            if data.len() < header_len {
+                return Err(Error::corrupt_file_named(
+                    "variable-width block",
+                    format!(
+                        "block of {} bytes is too small for a {} byte header",
+                        data.len(),
+                        header_len
+                    ),
+                ));
+            }
+            Ok(())
+        };
         let (bits_per_offset, bytes_start_offset, offset_start) = if is_old_scheme {
             // Old scheme
             let bits_per_offset = data[0];
             match bits_per_offset {
                 32 => {
+                    ensure_header(9)?;
                     debug_assert_eq!(LittleEndian::read_u32(&data[1..5]), num_values as u32);
                     let bytes_start_offset = LittleEndian::read_u32(&data[5..9]);
-                    (bits_per_offset, bytes_start_offset as u64, 9)
+                    (bits_per_offset, bytes_start_offset as u64, 9_u64)
                 }
                 64 => {
+                    ensure_header(17)?;
                     debug_assert_eq!(LittleEndian::read_u64(&data[1..9]), num_values);
                     let bytes_start_offset = LittleEndian::read_u64(&data[9..17]);
                     (bits_per_offset, bytes_start_offset, 17)
@@ -494,10 +595,12 @@ impl BlockDecompressor for BinaryBlockDecompressor {
             let bits_per_offset = LittleEndian::read_u32(&data[0..4]) as u8;
             match bits_per_offset {
                 32 => {
+                    ensure_header(8)?;
                     let bytes_start_offset = LittleEndian::read_u32(&data[4..8]);
                     (bits_per_offset, bytes_start_offset as u64, 8)
                 }
                 64 => {
+                    ensure_header(16)?;
                     let bytes_start_offset = LittleEndian::read_u64(&data[8..16]);
                     (bits_per_offset, bytes_start_offset, 16)
                 }
@@ -509,9 +612,55 @@ impl BlockDecompressor for BinaryBlockDecompressor {
             }
         };
 
+        // The offsets region sits between the header and `bytes_start_offset`
+        // and must hold exactly `num_values + 1` offsets starting at zero.
+        let expected_offsets_bytes = num_values
+            .checked_add(1)
+            .and_then(|num_offsets| num_offsets.checked_mul(bits_per_offset as u64 / 8))
+            .ok_or_else(|| {
+                Error::corrupt_file_named(
+                    "variable-width block",
+                    format!("offsets region size overflows for {num_values} values"),
+                )
+            })?;
+        if bytes_start_offset < offset_start || bytes_start_offset > data.len() as u64 {
+            return Err(Error::corrupt_file_named(
+                "variable-width block",
+                format!(
+                    "bytes start offset {} is outside the block (header: {} bytes, block: {} bytes)",
+                    bytes_start_offset,
+                    offset_start,
+                    data.len()
+                ),
+            ));
+        }
+        if bytes_start_offset - offset_start != expected_offsets_bytes {
+            return Err(Error::corrupt_file_named(
+                "variable-width block",
+                format!(
+                    "expected {} offset bytes for {} values but found {}",
+                    expected_offsets_bytes,
+                    num_values,
+                    bytes_start_offset - offset_start
+                ),
+            ));
+        }
+
         // the next `bytes_start_offset - offset_start` stores the offsets.
-        let offsets =
-            data.slice_with_length(offset_start, bytes_start_offset as usize - offset_start);
+        let offsets = data.slice_with_length(
+            offset_start as usize,
+            (bytes_start_offset - offset_start) as usize,
+        );
+        let first_offset = match bits_per_offset {
+            32 => LittleEndian::read_u32(&offsets[0..4]) as u64,
+            _ => LittleEndian::read_u64(&offsets[0..8]),
+        };
+        if first_offset != 0 {
+            return Err(Error::corrupt_file_named(
+                "variable-width block",
+                format!("first offset must be 0 but found {first_offset}"),
+            ));
+        }
 
         // the rest are the binary bytes.
         let data = data.slice_with_length(
@@ -538,10 +687,12 @@ mod tests {
     use arrow_schema::{DataType, Field};
 
     use crate::{
+        buffer::LanceBuffer,
         constants::{
             COMPRESSION_META_KEY, STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY,
             STRUCTURAL_ENCODING_MINIBLOCK,
         },
+        data::{BlockInfo, DataBlock, VariableWidthBlock},
         testing::check_specific_random,
     };
     use rstest::rstest;
@@ -960,5 +1111,175 @@ mod tests {
                 panic!("Expected VariableWidth block");
             }
         }
+    }
+
+    #[test]
+    fn test_binary_miniblock_rejects_corrupt_offsets() {
+        use super::BinaryMiniBlockDecompressor;
+        use crate::compression::MiniBlockDecompressor;
+        use lance_core::Error;
+
+        // Chunk layout mirrors the on-disk format for ["alpha", "beta", "gamma"]:
+        // LE u32 offsets [16, 21, 25, 30] followed by the value bytes, padded to
+        // a multiple of 8 bytes.
+        fn chunk_u32(offsets: &[u32], values: &[u8]) -> LanceBuffer {
+            let mut chunk = offsets
+                .iter()
+                .flat_map(|offset| offset.to_le_bytes())
+                .collect::<Vec<u8>>();
+            chunk.extend_from_slice(values);
+            chunk.resize(chunk.len().next_multiple_of(8), 0);
+            LanceBuffer::from(chunk)
+        }
+
+        let decompressor = BinaryMiniBlockDecompressor::new(32);
+
+        // The tail offset points past the end of the 32-byte chunk.
+        let err = decompressor
+            .decompress(
+                vec![chunk_u32(&[16, 21, 25, 100_000], b"alphabetagamma")],
+                3,
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::CorruptFile { .. }), "{err:?}");
+        assert!(err.to_string().contains("out of bounds"), "{err}");
+
+        // Offsets go backwards, which would underflow the rebase subtraction.
+        let err = decompressor
+            .decompress(vec![chunk_u32(&[16, 25, 21, 30], b"alphabetagamma")], 3)
+            .unwrap_err();
+        assert!(matches!(err, Error::CorruptFile { .. }), "{err:?}");
+        assert!(err.to_string().contains("decreases"), "{err}");
+
+        // The chunk stores fewer offsets than the requested value count needs.
+        let err = decompressor
+            .decompress(vec![chunk_u32(&[8, 8], &[])], 3)
+            .unwrap_err();
+        assert!(matches!(err, Error::CorruptFile { .. }), "{err:?}");
+        assert!(err.to_string().contains("requires 4"), "{err}");
+
+        // The chunk size is not a multiple of the offset width.
+        let err = decompressor
+            .decompress(vec![LanceBuffer::from(vec![0u8; 10])], 1)
+            .unwrap_err();
+        assert!(matches!(err, Error::CorruptFile { .. }), "{err:?}");
+        assert!(err.to_string().contains("multiple"), "{err}");
+
+        // 64-bit offsets take the same validation path.
+        let decompressor = BinaryMiniBlockDecompressor::new(64);
+        let mut chunk = [32u64, 37, 41, 100_000]
+            .iter()
+            .flat_map(|offset| offset.to_le_bytes())
+            .collect::<Vec<u8>>();
+        chunk.extend_from_slice(b"alphabetagamma");
+        chunk.resize(chunk.len().next_multiple_of(8), 0);
+        let err = decompressor
+            .decompress(vec![LanceBuffer::from(chunk)], 3)
+            .unwrap_err();
+        assert!(matches!(err, Error::CorruptFile { .. }), "{err:?}");
+        assert!(err.to_string().contains("out of bounds"), "{err}");
+
+        // A valid chunk still decodes: offsets rebase to [0, 5, 9, 14].
+        let decompressor = BinaryMiniBlockDecompressor::new(32);
+        let block = decompressor
+            .decompress(vec![chunk_u32(&[16, 21, 25, 30], b"alphabetagamma")], 3)
+            .unwrap();
+        let DataBlock::VariableWidth(block) = block else {
+            panic!("expected a variable-width block");
+        };
+        assert_eq!(block.data.as_ref(), b"alphabetagamma");
+        assert_eq!(
+            block.offsets,
+            LanceBuffer::reinterpret_vec(vec![0_u32, 5, 9, 14])
+        );
+    }
+
+    fn encoded_binary_block(bits_per_offset: u8) -> Vec<u8> {
+        use crate::compression::BlockCompressor;
+
+        let offsets = match bits_per_offset {
+            32 => LanceBuffer::reinterpret_vec(vec![0_i32, 5, 9, 14]),
+            64 => LanceBuffer::reinterpret_vec(vec![0_i64, 5, 9, 14]),
+            _ => unreachable!(),
+        };
+        let block = DataBlock::VariableWidth(VariableWidthBlock {
+            data: LanceBuffer::copy_slice(b"alphabetagamma"),
+            offsets,
+            bits_per_offset,
+            num_values: 3,
+            block_info: BlockInfo::new(),
+        });
+        BlockCompressor::compress(&super::VariableEncoder::default(), block)
+            .unwrap()
+            .as_ref()
+            .to_vec()
+    }
+
+    /// The block decompressor only checks the block structure (all O(1)); bad
+    /// offset values inside a structurally-sound block are rejected by the
+    /// mandatory layout validation when the block is converted to Arrow.
+    #[rstest]
+    #[case::i32_tail_out_of_bounds(32, 3, 100_000, "out of bounds")]
+    #[case::i64_tail_out_of_bounds(64, 3, 15, "out of bounds")]
+    #[case::i32_non_monotonic(32, 2, 4, "non-monotonic")]
+    #[case::i64_non_monotonic(64, 2, 4, "non-monotonic")]
+    fn test_binary_block_bad_offsets_rejected_at_arrow_conversion(
+        #[case] bits_per_offset: u8,
+        #[case] mutated_offset_index: usize,
+        #[case] mutated_offset_value: u64,
+        #[case] expected_message: &str,
+    ) {
+        use crate::compression::BlockDecompressor;
+        use lance_core::Error;
+
+        let mut encoded = encoded_binary_block(bits_per_offset);
+        let bytes_per_offset = (bits_per_offset / 8) as usize;
+        // The standard scheme header is two offset-width fields.
+        let mutated_offset_start = bytes_per_offset * (2 + mutated_offset_index);
+        encoded[mutated_offset_start..mutated_offset_start + bytes_per_offset]
+            .copy_from_slice(&mutated_offset_value.to_le_bytes()[..bytes_per_offset]);
+
+        let block = super::BinaryBlockDecompressor::default()
+            .decompress(LanceBuffer::from(encoded), 3)
+            .unwrap();
+        let data_type = match bits_per_offset {
+            32 => DataType::Binary,
+            _ => DataType::LargeBinary,
+        };
+        let err = block.into_arrow(data_type, false).unwrap_err();
+        assert!(matches!(err, Error::CorruptFile { .. }), "{err:?}");
+        assert!(err.to_string().contains(expected_message), "{err}");
+    }
+
+    #[test]
+    fn test_binary_block_rejects_corrupt_structure() {
+        use crate::compression::BlockDecompressor;
+        use lance_core::Error;
+
+        let decompressor = super::BinaryBlockDecompressor::default();
+
+        // The first offset must be zero.
+        let mut encoded = encoded_binary_block(32);
+        encoded[8..12].copy_from_slice(&5_u32.to_le_bytes());
+        let err = decompressor
+            .decompress(LanceBuffer::from(encoded), 3)
+            .unwrap_err();
+        assert!(matches!(err, Error::CorruptFile { .. }), "{err:?}");
+        assert!(err.to_string().contains("first offset"), "{err}");
+
+        // The offsets region must hold exactly num_values + 1 offsets.
+        let encoded = encoded_binary_block(32);
+        let err = decompressor
+            .decompress(LanceBuffer::from(encoded), 4)
+            .unwrap_err();
+        assert!(matches!(err, Error::CorruptFile { .. }), "{err:?}");
+        assert!(err.to_string().contains("offset bytes"), "{err}");
+
+        // A block too small to hold its header is rejected, not a panic.
+        let err = decompressor
+            .decompress(LanceBuffer::from(vec![0_u8; 2]), 1)
+            .unwrap_err();
+        assert!(matches!(err, Error::CorruptFile { .. }), "{err:?}");
+        assert!(err.to_string().contains("too small"), "{err}");
     }
 }
