@@ -3069,8 +3069,10 @@ mod tests {
         write_lance_file(
             RecordBatchIterator::new(vec![Ok(batch)], schema),
             &fs,
-            ConcreteFileVersion::from(version),
-            FileWriterOptions::default(),
+            FileWriterOptions {
+                format_version: Some(version),
+                ..Default::default()
+            },
         )
         .await;
 
