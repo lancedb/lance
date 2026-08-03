@@ -14,7 +14,7 @@ use lance_index::{
     progress::{IndexBuildProgress, NoopIndexBuildProgress},
     scalar::{
         CreatedIndex, OldIndexDataFilter, ScalarIndex, index_files_to_table,
-        inverted::InvertedIndex,
+        inverted::{InvertedIndex, InvertedIndexPlugin},
         lance_format::LanceIndexStore,
         seed::{FragmentSeed, SEED_META_KEY_PREFIX},
         table_files_to_index,
@@ -1119,6 +1119,19 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     let reference_index = dataset
                         .open_scalar_index(&field_path, &reference_idx.uuid, &NoOpMetricsCollector)
                         .await?;
+                    let reference_inverted_index = reference_index
+                        .as_any()
+                        .downcast_ref::<InvertedIndex>()
+                        .ok_or_else(|| {
+                            Error::index(format!(
+                                "Append index: expected inverted index segment {}, got {:?}",
+                                reference_idx.uuid,
+                                reference_index.index_type()
+                            ))
+                        })?;
+                    let reference_list_document_mode =
+                        reference_inverted_index.list_document_mode();
+                    let reference_params = reference_inverted_index.params().clone();
                     let update_criteria = reference_index.update_criteria();
                     if update_criteria.requires_old_data {
                         let params = reference_index.derive_index_params()?;
@@ -1209,15 +1222,13 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     let new_store = LanceIndexStore::from_dataset_for_new(&dataset, &new_uuid)?;
                     let (created_index, new_dataset_version) = if selected_indices.is_empty() {
                         (
-                            super::scalar::build_scalar_index(
-                                dataset.as_ref(),
-                                column.name.as_str(),
-                                new_uuid,
-                                &reference_index.derive_index_params()?,
-                                true,
+                            InvertedIndexPlugin::train_inverted_index_with_list_document_mode(
+                                new_data_stream,
+                                &new_store,
+                                reference_params,
                                 None,
-                                Some(new_data_stream),
                                 Arc::new(NoopIndexBuildProgress),
+                                reference_list_document_mode,
                             )
                             .await?,
                             dataset.manifest.version,

@@ -735,6 +735,12 @@ impl PartitionDocuments {
         self.num_docs
     }
 
+    /// Whether this partition uses the document layout introduced after list
+    /// values switched to row-level documents.
+    pub(crate) fn has_row_document_layout(&self) -> bool {
+        self.persisted_total_tokens.is_some()
+    }
+
     #[cfg(test)]
     pub(crate) fn lengths_loaded(&self) -> bool {
         self.lengths.initialized()
@@ -771,7 +777,7 @@ impl PartitionDocuments {
         self.store.open_index_file(&self.path).await
     }
 
-    async fn row_ids_column(&self) -> Result<Arc<UInt64Array>> {
+    pub(crate) async fn row_ids_column(&self) -> Result<Arc<UInt64Array>> {
         let store = self.store.clone();
         let path = self.path.clone();
         let num_docs = self.num_docs;

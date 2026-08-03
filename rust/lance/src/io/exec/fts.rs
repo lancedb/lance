@@ -1581,7 +1581,7 @@ impl ExecutionPlan for FlatMatchQueryExec {
                             if mode == index.list_document_mode() {
                                 mode
                             } else {
-                                ListDocumentMode::Both
+                                ListDocumentMode::Ambiguous
                             }
                         },
                     );

@@ -233,10 +233,10 @@ impl InvertedIndexBuilder {
         dest_store: &dyn IndexStore,
         old_data_filter: Option<crate::scalar::OldIndexDataFilter>,
     ) -> Result<Vec<IndexFile>> {
-        self.list_document_mode = self.list_document_mode.combine(ListDocumentMode::Row);
         validate_format_version_block_size(self.format_version, self.params.block_size)?;
         let schema = new_data.schema();
         let doc_col = schema.field(0).name();
+        self.resolve_list_document_mode(schema.field(0).data_type())?;
 
         // infer lance_tokenizer based on document type
         if self.params.lance_tokenizer.is_none() {
@@ -269,10 +269,10 @@ impl InvertedIndexBuilder {
         old_segments: &[Arc<InvertedIndex>],
         old_data_filter: Option<crate::scalar::OldIndexDataFilter>,
     ) -> Result<Vec<IndexFile>> {
-        self.list_document_mode = self.list_document_mode.combine(ListDocumentMode::Row);
         validate_format_version_block_size(self.format_version, self.params.block_size)?;
         let schema = new_data.schema();
         let doc_col = schema.field(0).name();
+        self.resolve_list_document_mode(schema.field(0).data_type())?;
 
         if self.params.lance_tokenizer.is_none() {
             let field = schema.column_with_name(doc_col).expect_ok()?.1;
@@ -294,6 +294,23 @@ impl InvertedIndexBuilder {
 
         files.extend(self.write(dest_store).await?);
         Ok(files)
+    }
+
+    fn resolve_list_document_mode(&mut self, data_type: &DataType) -> Result<()> {
+        if matches!(data_type, DataType::List(_) | DataType::LargeList(_)) {
+            if self.list_document_mode == ListDocumentMode::Ambiguous {
+                return Err(Error::index(
+                    "cannot update a string-list inverted index whose historical document model is ambiguous; rebuild the index before indexing additional rows"
+                        .to_owned(),
+                ));
+            }
+        } else if self.list_document_mode == ListDocumentMode::Ambiguous {
+            // The distinction has no effect on scalar and JSON documents. Mark
+            // the rebuilt metadata with the current model instead of carrying
+            // an irrelevant ambiguity forward.
+            self.list_document_mode = ListDocumentMode::Row;
+        }
+        Ok(())
     }
 
     async fn merge_existing_segments(
@@ -395,6 +412,7 @@ impl InvertedIndexBuilder {
             format_version: self.format_version,
             fragment_mask: self.fragment_mask,
             token_set_format: self.token_set_format,
+            list_document_mode: self.list_document_mode,
             worker_memory_limit_bytes,
             block_size: self.params.block_size,
         };
@@ -572,11 +590,13 @@ impl InvertedIndexBuilder {
                 POSTING_BLOCK_SIZE_KEY.to_owned(),
                 self.params.block_size.to_string(),
             ),
-            (
-                LIST_DOCUMENT_MODE_KEY.to_owned(),
-                self.list_document_mode.to_string(),
-            ),
         ]);
+        if let Some(list_document_mode) = self.list_document_mode.persisted_value() {
+            metadata.insert(
+                LIST_DOCUMENT_MODE_KEY.to_owned(),
+                list_document_mode.to_owned(),
+            );
+        }
 
         if self.params.with_position && self.format_version.uses_shared_position_stream() {
             metadata.insert(
@@ -641,11 +661,13 @@ impl InvertedIndexBuilder {
                 POSTING_BLOCK_SIZE_KEY.to_owned(),
                 self.params.block_size.to_string(),
             ),
-            (
-                LIST_DOCUMENT_MODE_KEY.to_owned(),
-                self.list_document_mode.to_string(),
-            ),
         ]);
+        if let Some(list_document_mode) = self.list_document_mode.persisted_value() {
+            metadata.insert(
+                LIST_DOCUMENT_MODE_KEY.to_owned(),
+                list_document_mode.to_owned(),
+            );
+        }
         if self.params.with_position && self.format_version.uses_shared_position_stream() {
             metadata.insert(
                 POSITIONS_LAYOUT_KEY.to_owned(),
@@ -1266,6 +1288,7 @@ struct IndexWorker {
     total_doc_length: usize,
     fragment_mask: Option<u64>,
     token_set_format: TokenSetFormat,
+    list_document_mode: ListDocumentMode,
     token_ids: Vec<u32>,
     last_token_count: usize,
 }
@@ -1291,6 +1314,7 @@ struct IndexWorkerConfig {
     format_version: InvertedListFormatVersion,
     fragment_mask: Option<u64>,
     token_set_format: TokenSetFormat,
+    list_document_mode: ListDocumentMode,
     worker_memory_limit_bytes: u64,
     block_size: usize,
 }
@@ -1362,6 +1386,7 @@ impl IndexWorker {
             total_doc_length: 0,
             fragment_mask: config.fragment_mask,
             token_set_format: config.token_set_format,
+            list_document_mode: config.list_document_mode,
             token_ids: Vec::new(),
             last_token_count: 0,
         })
@@ -1428,8 +1453,24 @@ impl IndexWorker {
                 continue;
             };
 
-            self.process_document(*row_id, DocumentSource::StringList(doc.as_ref()))
-                .await?;
+            match self.list_document_mode {
+                ListDocumentMode::Elements => {
+                    for element in iter_str_array(doc.as_ref()).flatten() {
+                        self.process_document(*row_id, DocumentSource::Text(element))
+                            .await?;
+                    }
+                }
+                ListDocumentMode::Row => {
+                    self.process_document(*row_id, DocumentSource::StringList(doc.as_ref()))
+                        .await?;
+                }
+                ListDocumentMode::Ambiguous => {
+                    return Err(Error::index(
+                        "cannot index a string list using an ambiguous historical document model; rebuild the index before indexing additional rows"
+                            .to_owned(),
+                    ));
+                }
+            }
         }
 
         Ok(())
@@ -2157,7 +2198,7 @@ async fn merge_metadata_files(
             .get(LIST_DOCUMENT_MODE_KEY)
             .map(|value| ListDocumentMode::from_str(value))
             .transpose()?
-            .unwrap_or(ListDocumentMode::Both);
+            .unwrap_or(ListDocumentMode::Ambiguous);
         list_document_mode = Some(
             list_document_mode
                 .map(|mode: ListDocumentMode| mode.combine(part_list_document_mode))
@@ -2229,7 +2270,7 @@ async fn merge_metadata_files(
         deleted_fragments,
     )
     .with_format_version(format_version.unwrap_or(InvertedListFormatVersion::V1))
-    .with_list_document_mode(list_document_mode.unwrap_or(ListDocumentMode::Both));
+    .with_list_document_mode(list_document_mode.unwrap_or(ListDocumentMode::Ambiguous));
     progress
         .stage_start("write_merged_metadata", Some(1), "files")
         .await?;
@@ -3309,6 +3350,7 @@ mod tests {
                 format_version: InvertedListFormatVersion::V1,
                 fragment_mask: None,
                 token_set_format,
+                list_document_mode: ListDocumentMode::Row,
                 worker_memory_limit_bytes: u64::MAX,
                 block_size: params.block_size,
             },
@@ -3333,6 +3375,7 @@ mod tests {
                 format_version: InvertedListFormatVersion::V1,
                 fragment_mask: None,
                 token_set_format,
+                list_document_mode: ListDocumentMode::Row,
                 worker_memory_limit_bytes: u64::MAX,
                 block_size: params.block_size,
             },
@@ -3667,6 +3710,7 @@ mod tests {
                 format_version: InvertedListFormatVersion::V1,
                 fragment_mask: None,
                 token_set_format: TokenSetFormat::default(),
+                list_document_mode: ListDocumentMode::Row,
                 worker_memory_limit_bytes: u64::MAX,
                 block_size: InvertedIndexParams::default().block_size,
             },
@@ -3970,6 +4014,7 @@ mod tests {
                 format_version: InvertedListFormatVersion::V1,
                 fragment_mask: None,
                 token_set_format: TokenSetFormat::default(),
+                list_document_mode: ListDocumentMode::Row,
                 worker_memory_limit_bytes: u64::MAX,
                 block_size: InvertedIndexParams::default().block_size,
             },
@@ -4002,6 +4047,7 @@ mod tests {
                 format_version: InvertedListFormatVersion::V1,
                 fragment_mask: None,
                 token_set_format: TokenSetFormat::default(),
+                list_document_mode: ListDocumentMode::Row,
                 worker_memory_limit_bytes: u64::MAX,
                 block_size: InvertedIndexParams::default().block_size,
             },
@@ -4041,6 +4087,7 @@ mod tests {
                 format_version: InvertedListFormatVersion::V1,
                 fragment_mask: None,
                 token_set_format: TokenSetFormat::default(),
+                list_document_mode: ListDocumentMode::Row,
                 worker_memory_limit_bytes: u64::MAX,
                 block_size: InvertedIndexParams::default().block_size,
             },

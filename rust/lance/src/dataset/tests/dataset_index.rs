@@ -2468,7 +2468,7 @@ async fn test_fts_list_flat_search_matches_index_tokenization() {
 }
 
 #[tokio::test]
-async fn test_released_fts_list_index_uses_conservative_flat_fallback() {
+async fn test_released_fts_list_index_preserves_element_documents() {
     let test_dir = copy_test_data_to_tmp("v8.0.0/fts_list_elements").unwrap();
     let mut dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
     let schema = Arc::new(ArrowSchema::new(vec![
@@ -2502,7 +2502,21 @@ async fn test_released_fts_list_index_uses_conservative_flat_fallback() {
     );
     assert_eq!(
         nested_fts_result_ids(&dataset, FullTextSearchQuery::new("a b".to_owned())).await,
-        vec![2]
+        Vec::<u64>::new()
+    );
+
+    dataset
+        .optimize_indices(&OptimizeOptions::append())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        nested_fts_result_ids(&dataset, FullTextSearchQuery::new("a".to_owned())).await,
+        vec![1, 2]
+    );
+    assert_eq!(
+        nested_fts_result_ids(&dataset, FullTextSearchQuery::new("a b".to_owned())).await,
+        Vec::<u64>::new()
     );
 }
 
