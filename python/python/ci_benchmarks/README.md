@@ -21,15 +21,19 @@ ci_benchmarks/
 
 ## Datagen unit tests
 
-Logic under `datagen/` (for example dataset readiness checks) has unit tests in
-`datagen/test_*.py`. These run as part of the normal Python test suite
-(`make test` / PR CI) and again before dataset generation in
-`ci-benchmarks.yml`, so pure-Python regressions fail before main-only GCS
-generation.
+Logic under `datagen/` (for example dataset readiness checks) is covered by
+unit tests under `python/tests/` (e.g. `test_merge_insert_datagen.py`). Those
+run as part of the normal Python suite (`make test` / PR CI) and again before
+dataset generation in `ci-benchmarks.yml`, so pure-Python regressions fail
+before main-only GCS generation.
+
+They are intentionally **not** collected via `pytest python/ci_benchmarks/...`
+in PR CI: that path puts the source tree on `sys.path` and shadows the
+installed `lance` wheel extension.
 
 ```bash
 # from python/
-pytest python/ci_benchmarks/datagen
+pytest python/tests/test_merge_insert_datagen.py
 ```
 
 ## Running Benchmarks Locally

@@ -58,7 +58,7 @@ jobs:
       - name: Run datagen unit tests
         run: |
           source venv/bin/activate
-          pytest python/ci_benchmarks/datagen -q
+          pytest python/tests/test_merge_insert_datagen.py -q
       - name: Generate datasets
         run: |
           source venv/bin/activate
