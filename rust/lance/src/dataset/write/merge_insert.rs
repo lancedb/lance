@@ -851,16 +851,24 @@ impl PartitionStream for DeduplicatingSourcePartitionStream {
                 }
             }
 
-            skipped_duplicates
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                    current.checked_add(num_skipped)
-                })
-                .map_err(|current| {
+            let mut current = skipped_duplicates.load(Ordering::Relaxed);
+            loop {
+                let updated = current.checked_add(num_skipped).ok_or_else(|| {
                     DataFusionError::Execution(format!(
                         "source duplicate count overflow at {} with batch count {}",
                         current, num_skipped
                     ))
                 })?;
+                match skipped_duplicates.compare_exchange_weak(
+                    current,
+                    updated,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(actual) => current = actual,
+                }
+            }
 
             if num_skipped == 0 {
                 Ok(batch)
