@@ -691,6 +691,26 @@ fn check_storage_version(manifest: &mut Manifest) -> Result<()> {
     Ok(())
 }
 
+/// Reject a manifest in which two fragments share an id. Per-fragment state is
+/// keyed by fragment id — deletion file paths, cached row id sequences, row
+/// addresses — so a duplicate makes it ambiguous which rows that state describes.
+///
+/// Runs after the legacy fixups above, so a dataset that needs a rollback for some
+/// other reason is diagnosed with that first. Relies on `build_manifest` leaving
+/// the fragments sorted by id.
+fn check_fragment_ids(manifest: &Manifest) -> Result<()> {
+    if let Some(pair) = manifest.fragments.windows(2).find(|p| p[0].id == p[1].id) {
+        return Err(Error::invalid_input(format!(
+            "The commit would produce two fragments with id {}. Fragment ids must be \
+             unique. Datasets written by Lance 0.16 and earlier may already contain \
+             duplicate ids; those have to be rewritten, or rolled back to a version \
+             without the duplicate.",
+            pair[0].id
+        )));
+    }
+    Ok(())
+}
+
 fn check_column_indices(manifest: &Manifest) -> Result<()> {
     let data_storage_version = manifest.data_storage_format.lance_file_version()?;
     if data_storage_version < LanceFileVersion::V2_1 {
@@ -1116,6 +1136,7 @@ pub(crate) async fn do_commit_detached_transaction(
         fix_schema(&mut manifest)?;
         check_storage_version(&mut manifest)?;
         check_column_indices(&manifest)?;
+        check_fragment_ids(&manifest)?;
         migrate_indices(dataset, &mut indices).await?;
 
         // Try to commit the manifest
@@ -1435,6 +1456,7 @@ pub(crate) async fn commit_transaction(
 
         check_storage_version(&mut manifest)?;
         check_column_indices(&manifest)?;
+        check_fragment_ids(&manifest)?;
 
         migrate_indices(&dataset, &mut indices).await?;
 

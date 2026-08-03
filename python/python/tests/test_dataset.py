@@ -2277,8 +2277,13 @@ def test_deletion_file(tmp_path: Path):
     assert re.match(
         "_deletions/0-1-[0-9]{1,32}.arrow", new_fragment.deletion_file.path(0)
     )
-    operation = lance.LanceOperation.Overwrite(table.schema, [new_fragment])
-    dataset = lance.LanceDataset.commit(base_dir, operation)
+    # Delete, not Overwrite: the deletion file belongs to fragment 0 of this
+    # dataset, and an overwrite's fragments are newly written ones that get fresh
+    # ids, which a deletion file cannot follow.
+    operation = lance.LanceOperation.Delete([new_fragment], [], "a < 10")
+    dataset = lance.LanceDataset.commit(
+        base_dir, operation, read_version=dataset.version
+    )
     assert dataset.count_rows() == 90
 
 

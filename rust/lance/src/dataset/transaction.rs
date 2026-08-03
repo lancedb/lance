@@ -42,6 +42,7 @@ use lance_table::{
     },
     io::{
         commit::CommitHandler,
+        deletion::relative_deletion_file_path,
         manifest::{read_manifest, read_manifest_indexes},
     },
     rowids::{RowIdSequence, segment::U64Segment, version::build_version_meta, write_row_ids},
@@ -336,6 +337,13 @@ pub enum Operation {
     },
     /// Overwrite the entire dataset with the given fragments. This is also
     /// used when initially creating a table.
+    ///
+    /// The fragments are newly written ones and are assigned fresh ids at commit
+    /// time, continuing from the dataset's highest id ever used; the ids they
+    /// arrive with are ignored. A fragment carrying a deletion file therefore
+    /// belongs to the dataset being replaced and is rejected: use [`Self::Delete`]
+    /// to commit deletions, or [`Self::Merge`] to change the schema of existing
+    /// fragments.
     Overwrite {
         fragments: Vec<Fragment>,
         schema: Schema,
@@ -1852,14 +1860,14 @@ impl Transaction {
             }
         };
 
-        let mut fragment_id = if matches!(self.operation, Operation::Overwrite { .. }) {
-            0
-        } else {
-            current_manifest
-                .and_then(|m| m.max_fragment_id())
-                .map(|id| id + 1)
-                .unwrap_or(0)
-        };
+        // Fragment ids are a high water mark for the whole dataset history: an id
+        // must never name two different sets of rows, or per-fragment state keyed
+        // by id (caches, deletion files, row addresses) can be attributed to the
+        // wrong rows.
+        let mut fragment_id = current_manifest
+            .and_then(|m| m.max_fragment_id())
+            .map(|id| id + 1)
+            .unwrap_or(0);
         let mut final_fragments = Vec::new();
         let mut final_indices = current_indices;
 
@@ -2089,9 +2097,16 @@ impl Transaction {
                 }
             }
             Operation::Overwrite { fragments, .. } => {
-                let mut new_fragments =
-                    Self::fragments_with_ids(fragments.clone(), &mut fragment_id)
-                        .collect::<Vec<_>>();
+                // Every fragment in an overwrite is newly written, so all of them
+                // take fresh ids regardless of the id they arrive with. Fragments
+                // carried over from the dataset being replaced are rejected by
+                // `validate_operation`, which is what makes ignoring the incoming
+                // id safe here.
+                let mut new_fragments = fragments.clone();
+                for fragment in new_fragments.iter_mut() {
+                    fragment.id = fragment_id;
+                    fragment_id += 1;
+                }
                 if let Some(next_row_id) = &mut next_row_id {
                     Self::assign_row_ids(next_row_id, new_fragments.as_mut_slice())?;
                     // Add version metadata for all new fragments
@@ -3966,6 +3981,7 @@ pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) ->
             },
         ) => {
             // Validate here because we are going to return early.
+            overwrite_fragments_valid(fragments)?;
             schema_fragments_valid(None, schema, fragments)?;
 
             return Ok(());
@@ -3998,6 +4014,7 @@ pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) ->
             config_upsert_values: None,
             initial_bases: _,
         } => {
+            overwrite_fragments_valid(fragments)?;
             // Pass None for manifest because Overwrite replaces all fragments.
             // The old manifest's storage format is irrelevant for validating
             // the new fragments (e.g., LEGACY→STABLE transitions).
@@ -4013,6 +4030,25 @@ pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) ->
         }
         _ => Ok(()),
     }
+}
+
+// An overwrite's fragments are newly written, so they are given fresh ids at
+// commit time. A deletion file cannot come along for that ride: its path embeds
+// the fragment id, so renumbering the fragment would orphan the deletion vector
+// and silently resurrect deleted rows.
+fn overwrite_fragments_valid(fragments: &[Fragment]) -> Result<()> {
+    for fragment in fragments {
+        if let Some(deletion_file) = &fragment.deletion_file {
+            return Err(Error::invalid_input(format!(
+                "Overwrite fragments must be newly written, but fragment {} carries \
+                 deletion file {}. Use Delete to commit deletions against existing \
+                 fragments, or Merge to change their schema.",
+                fragment.id,
+                relative_deletion_file_path(fragment.id, deletion_file)
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn schema_fragments_valid(

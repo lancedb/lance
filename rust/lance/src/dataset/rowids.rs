@@ -459,6 +459,9 @@ mod test {
 
         // Overwriting should NOT reset the row id counter.
         assert_eq!(dataset.manifest().next_row_id, 2 * num_rows);
+        // Nor the fragment id counter: ids are a high water mark, so the
+        // overwritten fragment cannot alias the one it replaced.
+        assert_eq!(dataset.manifest.fragments[0].id, 1);
 
         let index = get_row_id_index(&dataset).await.unwrap().unwrap();
         assert!(index.get(0).is_none());
