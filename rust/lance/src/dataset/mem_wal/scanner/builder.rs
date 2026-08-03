@@ -57,7 +57,11 @@ struct LsmVectorQuery {
 /// operand order) or `pk IN (lit, …)` — return the literal key values. Any
 /// other shape returns `None`, so the scanner falls through to the general
 /// scan plan. Type coercion is left to the lookup path (an exact-type literal
-/// takes the fast BTree path; a coercible one falls back internally).
+/// takes the fast BTree path; a coercible one falls back internally). IN-list
+/// literals are deduplicated in first-seen order: the lookup path resolves one
+/// row per key, so a repeated literal would emit the same pk row twice (and
+/// could crowd out other keys under a LIMIT), unlike the scan path where IN
+/// is a predicate.
 fn extract_pk_point_keys(filter: &Expr, pk_col: &str) -> Option<Vec<ScalarValue>> {
     match filter {
         Expr::BinaryExpr(b) if matches!(b.op, Operator::Eq) => {
@@ -78,12 +82,18 @@ fn extract_pk_point_keys(filter: &Expr, pk_col: &str) -> Option<Vec<ScalarValue>
             if c.name != pk_col {
                 return None;
             }
-            let mut vals = Vec::with_capacity(in_list.list.len());
+            let mut vals: Vec<ScalarValue> = Vec::with_capacity(in_list.list.len());
             for e in &in_list.list {
                 let Expr::Literal(lit, _) = e else {
                     return None; // a non-literal IN element → not a point lookup
                 };
-                vals.push(lit.clone());
+                // Linear-scan dedup: IN lists are small, and ScalarValue has no
+                // Hash/Eq for all variants. Variant-wise PartialEq keeps
+                // cross-type literals (e.g. Int32 vs Int64) distinct, which the
+                // lookup path requires.
+                if !vals.contains(lit) {
+                    vals.push(lit.clone());
+                }
             }
             (!vals.is_empty()).then_some(vals)
         }
@@ -1975,6 +1985,50 @@ mod tests {
             "pk IN (..) must route"
         );
         assert_eq!(count(plan).await, 2);
+
+        // Duplicate IN literals collapse: each matching row comes back exactly
+        // once, matching the scan path where IN is a predicate (#8195).
+        let plan = scanner()
+            .filter_expr(col("id").in_list(vec![lit(1i32), lit(1i32), lit(3i32)], false))
+            .create_plan()
+            .await
+            .unwrap();
+        assert!(
+            format!("{}", displayable(plan.as_ref()).indent(true)).contains("OneShotStream"),
+            "duplicate pk IN (..) must still route"
+        );
+        assert_eq!(collect_ids(plan).await, vec![1, 3]);
+
+        // Duplicates mixed with an absent key: the present row comes back once.
+        let plan = scanner()
+            .filter_expr(col("id").in_list(vec![lit(1i32), lit(99i32), lit(1i32)], false))
+            .create_plan()
+            .await
+            .unwrap();
+        assert_eq!(collect_ids(plan).await, vec![1]);
+
+        // A NULL literal never matches (same as the scan path) and must not
+        // error or interfere with dedup of the remaining literals.
+        let plan = scanner()
+            .filter_expr(col("id").in_list(
+                vec![lit(ScalarValue::Int32(None)), lit(2i32), lit(2i32)],
+                false,
+            ))
+            .create_plan()
+            .await
+            .unwrap();
+        assert_eq!(collect_ids(plan).await, vec![2]);
+
+        // Duplicates must not crowd out distinct rows under a LIMIT:
+        // IN (1, 1, 2) LIMIT 2 yields both distinct rows, not id=1 twice.
+        let plan = scanner()
+            .filter_expr(col("id").in_list(vec![lit(1i32), lit(1i32), lit(2i32)], false))
+            .limit(Some(2), None)
+            .unwrap()
+            .create_plan()
+            .await
+            .unwrap();
+        assert_eq!(collect_ids(plan).await, vec![1, 2]);
 
         // A range filter is NOT a point lookup → falls through to the scan path.
         let plan = scanner()

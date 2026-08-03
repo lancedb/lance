@@ -1902,6 +1902,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_lookup_many_null_key_resolves_as_miss() {
+        let schema = create_pk_schema();
+        let planner = active_planner(&[create_test_batch(&schema, &[10, 20], "v")]);
+        // A NULL key probes the (empty) null positions and resolves as a miss —
+        // same as an absent key: omitted, no error, other keys still found.
+        let keys = [
+            ScalarValue::Int32(None),
+            ScalarValue::Int32(Some(10)),
+            ScalarValue::Int32(None),
+        ];
+        let batch = planner.lookup_many(&keys, None).await.unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(sorted_ids(&batch), vec![10]);
+    }
+
+    #[tokio::test]
+    async fn test_lookup_many_emits_one_row_per_requested_key() {
+        let schema = create_pk_schema();
+        let planner = active_planner(&[create_test_batch(&schema, &[10, 20], "v")]);
+        // The planner contract is per-key ("equivalent to N× lookup"): a
+        // repeated key yields the row once per occurrence. Deduplicating
+        // user-supplied IN literals is the scanner's job, at
+        // `extract_pk_point_keys` — the planner intentionally does not dedup.
+        let keys = [
+            ScalarValue::Int32(Some(20)),
+            ScalarValue::Int32(Some(10)),
+            ScalarValue::Int32(Some(20)),
+        ];
+        let batch = planner.lookup_many(&keys, None).await.unwrap();
+        assert_eq!(batch.num_rows(), 3);
+        assert_eq!(sorted_ids(&batch), vec![10, 20, 20]);
+    }
+
+    #[tokio::test]
     async fn test_lookup_many_newest_duplicate() {
         let schema = create_pk_schema();
         // id=5 written twice; the batch get must return the newest ("new_5").
