@@ -6952,6 +6952,14 @@ impl FieldEncoder for PrimitiveStructuralEncoder {
         }
     }
 
+    fn pending_bytes(&self) -> u64 {
+        self.accumulated_repdefs
+            .iter()
+            .fold(self.accumulation_queue.pending_bytes(), |bytes, repdef| {
+                bytes.saturating_add(repdef.estimated_serialized_bytes())
+            })
+    }
+
     fn num_columns(&self) -> u32 {
         1
     }

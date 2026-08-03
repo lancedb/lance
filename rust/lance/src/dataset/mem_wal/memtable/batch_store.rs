@@ -43,9 +43,8 @@ use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use arrow::array::ArrayData;
 use arrow_array::RecordBatch;
-use arrow_schema::DataType;
+use lance_arrow::memory::batch_slice_memory_size;
 
 /// A batch stored in the lock-free store.
 #[derive(Clone)]
@@ -78,54 +77,10 @@ impl StoredBatch {
 
     /// Estimate the memory size of a RecordBatch.
     ///
-    /// Sums each column's slice-aware buffer size (see
-    /// [`Self::estimate_array_size`]) plus the struct overhead, so a column that
-    /// is a zero-copy slice of a larger parent contributes only its own window
-    /// rather than the whole shared buffer.
+    /// A column that is a zero-copy slice of a larger parent contributes only
+    /// its own window rather than the whole shared buffer.
     fn estimate_batch_size(batch: &RecordBatch) -> usize {
-        batch
-            .columns()
-            .iter()
-            .map(|col| Self::estimate_array_size(&col.to_data()))
-            .sum::<usize>()
-            + std::mem::size_of::<RecordBatch>()
-    }
-
-    /// Slice-aware buffer size of a single array.
-    ///
-    /// [`ArrayData::get_slice_memory_size`] reports each buffer's own window
-    /// (not the whole shared buffer), but omits the variadic data buffers of
-    /// `Utf8View`/`BinaryView` (values > 12 bytes) while still returning `Ok`, so
-    /// [`Self::view_data_buffers_size`] adds them. Those buffers are shared across
-    /// zero-copy slices and are counted at full capacity for each slice — an
-    /// over-count in the safe direction.
-    fn estimate_array_size(data: &ArrayData) -> usize {
-        match data.get_slice_memory_size() {
-            Ok(size) => size + Self::view_data_buffers_size(data),
-            // Fall back to the full-buffer sum for layouts the slice-aware call
-            // cannot handle.
-            Err(_) => data.get_array_memory_size(),
-        }
-    }
-
-    /// Capacity of the variadic `Utf8View`/`BinaryView` data buffers that
-    /// [`ArrayData::get_slice_memory_size`] omits, summed recursively over children.
-    fn view_data_buffers_size(data: &ArrayData) -> usize {
-        let mut size = 0;
-        if matches!(data.data_type(), DataType::Utf8View | DataType::BinaryView) {
-            // buffers()[0] is the 16-byte view array that get_slice_memory_size
-            // already counts; [1..] are the data buffers it skips.
-            size += data
-                .buffers()
-                .iter()
-                .skip(1)
-                .map(|b| b.capacity())
-                .sum::<usize>();
-        }
-        for child in data.child_data() {
-            size += Self::view_data_buffers_size(child);
-        }
-        size
+        batch_slice_memory_size(batch) + std::mem::size_of::<RecordBatch>()
     }
 }
 

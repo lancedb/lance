@@ -6,7 +6,7 @@
 use arrow_array::RecordBatch;
 use arrow_schema::{ArrowError, SchemaRef};
 use futures::stream::{self, Stream, StreamExt};
-use std::{collections::VecDeque, pin::Pin};
+use std::{collections::VecDeque, pin::Pin, sync::Arc};
 
 use crate::deepcopy::deep_copy_batch_sliced;
 
@@ -27,7 +27,41 @@ where
     S: Stream<Item = Result<RecordBatch, E>>,
     E: From<ArrowError>,
 {
-    rechunk_stream_by_size_inner(input, input_schema, min_bytes, max_bytes, false)
+    rechunk_stream_by_size_inner(
+        input,
+        input_schema,
+        min_bytes,
+        max_bytes,
+        false,
+        Arc::new(RecordBatch::get_array_memory_size),
+    )
+}
+
+/// Rechunks a stream using a caller-provided batch size estimate.
+///
+/// The estimator is evaluated again for concatenated batches and is used to
+/// choose zero-copy slice boundaries. This is useful when the relevant output
+/// size includes data that Arrow's allocation size does not represent.
+pub fn rechunk_stream_by_size_with_estimator<S, E, F>(
+    input: S,
+    input_schema: SchemaRef,
+    min_bytes: usize,
+    max_bytes: usize,
+    estimate_bytes: F,
+) -> impl Stream<Item = Result<RecordBatch, E>>
+where
+    S: Stream<Item = Result<RecordBatch, E>>,
+    E: From<ArrowError>,
+    F: Fn(&RecordBatch) -> usize + Send + Sync + 'static,
+{
+    rechunk_stream_by_size_inner(
+        input,
+        input_schema,
+        min_bytes,
+        max_bytes,
+        false,
+        Arc::new(estimate_bytes),
+    )
 }
 
 /// Like [`rechunk_stream_by_size`] but deep-copies slices so that
@@ -55,7 +89,14 @@ where
     S: Stream<Item = Result<RecordBatch, E>>,
     E: From<ArrowError>,
 {
-    rechunk_stream_by_size_inner(input, input_schema, min_bytes, max_bytes, true)
+    rechunk_stream_by_size_inner(
+        input,
+        input_schema,
+        min_bytes,
+        max_bytes,
+        true,
+        Arc::new(RecordBatch::get_array_memory_size),
+    )
 }
 
 fn rechunk_stream_by_size_inner<S, E>(
@@ -64,6 +105,7 @@ fn rechunk_stream_by_size_inner<S, E>(
     min_bytes: usize,
     max_bytes: usize,
     deep_copy: bool,
+    estimate_bytes: Arc<dyn Fn(&RecordBatch) -> usize + Send + Sync>,
 ) -> impl Stream<Item = Result<RecordBatch, E>>
 where
     S: Stream<Item = Result<RecordBatch, E>>,
@@ -80,6 +122,7 @@ where
             min_bytes,
             max_bytes,
             deep_copy,
+            estimate_bytes,
         },
         |mut state| async move {
             if let Some(batch) = state.pending_slices.pop_front() {
@@ -96,7 +139,7 @@ where
             {
                 match state.input.next().await {
                     Some(Ok(batch)) => {
-                        state.acc_bytes += batch.get_array_memory_size();
+                        state.acc_bytes += (state.estimate_bytes)(&batch);
                         state.accumulated.push(batch);
                     }
                     Some(Err(e)) => return Err(e),
@@ -114,10 +157,10 @@ where
             // byte threshold, deliver it directly instead of concatenating
             // everything together (which would just get sliced back apart).
             if state.accumulated.len() > 1
-                && state.accumulated[0].get_array_memory_size() >= state.min_bytes
+                && (state.estimate_bytes)(&state.accumulated[0]) >= state.min_bytes
             {
                 let b = state.accumulated.remove(0);
-                state.acc_bytes -= b.get_array_memory_size();
+                state.acc_bytes -= (state.estimate_bytes)(&b);
                 return Ok(Some((b, state)));
             }
 
@@ -133,7 +176,13 @@ where
             state.acc_bytes = 0;
 
             // Slice the batch into ~max_bytes pieces assuming uniform row sizes.
-            let slices = slice_batch(batch, state.max_bytes, state.deep_copy).map_err(E::from)?;
+            let slices = slice_batch_with_estimator(
+                batch,
+                state.max_bytes,
+                state.deep_copy,
+                state.estimate_bytes.as_ref(),
+            )
+            .map_err(E::from)?;
             state.pending_slices = slices.into();
             let first = state.pending_slices.pop_front().unwrap();
             Ok(Some((first, state)))
@@ -152,12 +201,27 @@ where
 /// still exceeds `max_bytes` (due to non-uniform row sizes), it is
 /// recursively split until every piece is within budget or contains only a
 /// single row.
+#[cfg(test)]
 fn slice_batch(
     batch: RecordBatch,
     max_bytes: usize,
     deep_copy: bool,
 ) -> Result<Vec<RecordBatch>, ArrowError> {
-    let batch_bytes = batch.get_array_memory_size();
+    slice_batch_with_estimator(
+        batch,
+        max_bytes,
+        deep_copy,
+        &RecordBatch::get_array_memory_size,
+    )
+}
+
+fn slice_batch_with_estimator(
+    batch: RecordBatch,
+    max_bytes: usize,
+    deep_copy: bool,
+    estimate_bytes: &dyn Fn(&RecordBatch) -> usize,
+) -> Result<Vec<RecordBatch>, ArrowError> {
+    let batch_bytes = estimate_bytes(&batch);
     let num_rows = batch.num_rows();
 
     if batch_bytes <= max_bytes || num_rows <= 1 {
@@ -175,7 +239,12 @@ fn slice_batch(
             let copied = deep_copy_batch_sliced(&slice)?;
             // Recurse: the deep-copied slice has accurate sizes, so if it
             // still exceeds max_bytes we can split further.
-            result.extend(slice_batch(copied, max_bytes, true)?);
+            result.extend(slice_batch_with_estimator(
+                copied,
+                max_bytes,
+                true,
+                estimate_bytes,
+            )?);
         } else {
             result.push(slice);
         }
@@ -198,6 +267,7 @@ struct RechunkState<S> {
     min_bytes: usize,
     max_bytes: usize,
     deep_copy: bool,
+    estimate_bytes: Arc<dyn Fn(&RecordBatch) -> usize + Send + Sync>,
 }
 
 #[cfg(test)]

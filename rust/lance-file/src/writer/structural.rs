@@ -639,6 +639,12 @@ impl EncodingPipeline {
         .await
     }
 
+    pub(crate) fn pending_bytes(&self) -> u64 {
+        self.field_encoders.iter().fold(0, |bytes, encoder| {
+            bytes.saturating_add(encoder.pending_bytes())
+        })
+    }
+
     pub async fn finish_encoders(&mut self, sink: &mut StructuralFileSink) -> Result<()> {
         if self.field_encoders.is_empty() {
             return Ok(());

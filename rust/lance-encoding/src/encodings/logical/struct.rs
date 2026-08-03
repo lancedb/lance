@@ -495,6 +495,12 @@ impl FieldEncoder for StructStructuralEncoder {
             .collect::<Result<Vec<_>>>()
     }
 
+    fn pending_bytes(&self) -> u64 {
+        self.children.iter().fold(0, |bytes, child| {
+            bytes.saturating_add(child.pending_bytes())
+        })
+    }
+
     fn num_columns(&self) -> u32 {
         self.children
             .iter()
@@ -573,6 +579,12 @@ impl FieldEncoder for StructFieldEncoder {
             .map(|encoder| encoder.flush(external_buffers))
             .collect::<Result<Vec<_>>>()?;
         Ok(child_tasks.into_iter().flatten().collect::<Vec<_>>())
+    }
+
+    fn pending_bytes(&self) -> u64 {
+        self.children.iter().fold(0, |bytes, child| {
+            bytes.saturating_add(child.pending_bytes())
+        })
     }
 
     fn num_columns(&self) -> u32 {

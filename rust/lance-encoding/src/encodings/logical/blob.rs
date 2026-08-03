@@ -212,6 +212,10 @@ impl FieldEncoder for BlobStructuralEncoder {
         Ok(Self::wrap_tasks(encode_tasks, def_meaning))
     }
 
+    fn pending_bytes(&self) -> u64 {
+        self.descriptor_encoder.pending_bytes()
+    }
+
     fn finish(
         &mut self,
         external_buffers: &mut OutOfLineBuffers,
@@ -400,6 +404,10 @@ impl FieldEncoder for BlobV2StructuralEncoder {
 
     fn flush(&mut self, external_buffers: &mut OutOfLineBuffers) -> Result<Vec<EncodeTask>> {
         self.descriptor_encoder.flush(external_buffers)
+    }
+
+    fn pending_bytes(&self) -> u64 {
+        self.descriptor_encoder.pending_bytes()
     }
 
     fn finish(

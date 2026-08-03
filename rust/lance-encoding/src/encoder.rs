@@ -209,6 +209,11 @@ pub trait FieldEncoder: Send {
     /// This may be called intermittently throughout encoding but will always be called
     /// once at the end of encoding just before calling finish
     fn flush(&mut self, external_buffers: &mut OutOfLineBuffers) -> Result<Vec<EncodeTask>>;
+    /// Estimated bytes retained by this encoder that have not been emitted as
+    /// pages yet.
+    fn pending_bytes(&self) -> u64 {
+        0
+    }
     /// Finish encoding and return column metadata
     ///
     /// This is called only once, after all encode tasks have completed

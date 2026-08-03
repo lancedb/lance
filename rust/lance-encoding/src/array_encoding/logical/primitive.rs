@@ -520,6 +520,10 @@ impl FieldEncoder for PrimitiveFieldEncoder {
         }
     }
 
+    fn pending_bytes(&self) -> u64 {
+        self.accumulation_queue.pending_bytes()
+    }
+
     fn num_columns(&self) -> u32 {
         1
     }

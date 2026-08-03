@@ -5,6 +5,47 @@ use std::collections::HashSet;
 
 use arrow_array::{Array, RecordBatch};
 use arrow_data::ArrayData;
+use arrow_schema::DataType;
+
+/// Estimates the bytes referenced by one array slice.
+///
+/// Unlike [`Array::get_array_memory_size`], this counts only the current
+/// slice's buffer windows. View arrays are the exception: Arrow omits their
+/// variadic data buffers from its slice-aware result, so those shared buffers
+/// are counted at full capacity in the safe direction.
+pub fn array_slice_memory_size(array: &dyn Array) -> usize {
+    let data = array.to_data();
+    match data.get_slice_memory_size() {
+        Ok(size) => size.saturating_add(view_data_buffers_size(&data)),
+        Err(_) => data.get_array_memory_size(),
+    }
+}
+
+/// Estimates the bytes referenced by all array slices in a record batch.
+pub fn batch_slice_memory_size(batch: &RecordBatch) -> usize {
+    batch
+        .columns()
+        .iter()
+        .map(|array| array_slice_memory_size(array.as_ref()))
+        .sum()
+}
+
+fn view_data_buffers_size(data: &ArrayData) -> usize {
+    let own_buffers = if matches!(data.data_type(), DataType::Utf8View | DataType::BinaryView) {
+        // buffers()[0] contains the fixed-size views and is already included by
+        // get_slice_memory_size. The remaining buffers contain variadic data.
+        data.buffers()
+            .iter()
+            .skip(1)
+            .map(|buffer| buffer.capacity())
+            .sum()
+    } else {
+        0
+    };
+    data.child_data().iter().fold(own_buffers, |size, child| {
+        size.saturating_add(view_data_buffers_size(child))
+    })
+}
 
 /// Counts memory used by buffers of Arrow arrays and RecordBatches.
 ///

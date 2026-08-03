@@ -998,6 +998,10 @@ impl ListOffsetsEncoder {
         }
     }
 
+    fn pending_bytes(&self) -> u64 {
+        self.accumulation_queue.pending_bytes()
+    }
+
     // Get's the total number of items covered by an array of offsets (keeping in
     // mind that the first offset may not be zero)
     fn get_offset_span(array: &dyn Array) -> u64 {
@@ -1261,6 +1265,12 @@ impl FieldEncoder for ListFieldEncoder {
             .unwrap_or_default();
         let item_tasks = self.items_encoder.flush(external_buffers)?;
         Self::combine_tasks(offsets_tasks, item_tasks)
+    }
+
+    fn pending_bytes(&self) -> u64 {
+        self.offsets_encoder
+            .pending_bytes()
+            .saturating_add(self.items_encoder.pending_bytes())
     }
 
     fn num_columns(&self) -> u32 {

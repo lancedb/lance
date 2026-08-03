@@ -374,6 +374,10 @@ impl FieldEncoder for BlobFieldEncoder {
         self.description_encoder.flush(external_buffers)
     }
 
+    fn pending_bytes(&self) -> u64 {
+        self.description_encoder.pending_bytes()
+    }
+
     fn num_columns(&self) -> u32 {
         self.description_encoder.num_columns()
     }

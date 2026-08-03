@@ -5,6 +5,7 @@
 
 use arrow_array::ArrayRef;
 use lance_arrow::deepcopy::deep_copy_array;
+use lance_arrow::memory::array_slice_memory_size;
 use log::{debug, trace};
 
 #[derive(Debug)]
@@ -46,7 +47,7 @@ impl AccumulationQueue {
             self.row_number = row_number;
         }
         self.num_rows += num_rows;
-        self.current_bytes += array.get_array_memory_size() as u64;
+        self.current_bytes += array_slice_memory_size(array.as_ref()) as u64;
         if self.current_bytes > self.cache_bytes {
             debug!(
                 "Flushing column {} page of size {} bytes (unencoded)",
@@ -101,5 +102,10 @@ impl AccumulationQueue {
                 num_rows,
             ))
         }
+    }
+
+    /// Estimated bytes retained by arrays that have not been emitted yet.
+    pub fn pending_bytes(&self) -> u64 {
+        self.current_bytes
     }
 }

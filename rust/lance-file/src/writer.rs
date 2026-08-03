@@ -177,6 +177,17 @@ impl FileWriter {
         }
     }
 
+    /// Return the estimated bytes buffered by field encoders but not yet
+    /// reflected in [`Self::tell`].
+    pub fn pending_bytes(&self) -> u64 {
+        match self {
+            Self::V2_0(writer) => writer.pending_bytes(),
+            Self::V2_1(writer) => writer.pending_bytes(),
+            Self::V2_2(writer) => writer.pending_bytes(),
+            Self::V2_3(writer) => writer.pending_bytes(),
+        }
+    }
+
     /// Write one top-level column.
     pub async fn write_column(&mut self, column_index: usize, array: ArrayRef) -> Result<()> {
         match self {

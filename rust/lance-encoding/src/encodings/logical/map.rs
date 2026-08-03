@@ -76,6 +76,10 @@ impl FieldEncoder for MapStructuralEncoder {
         self.child.flush(external_buffers)
     }
 
+    fn pending_bytes(&self) -> u64 {
+        self.child.pending_bytes()
+    }
+
     fn num_columns(&self) -> u32 {
         self.child.num_columns()
     }

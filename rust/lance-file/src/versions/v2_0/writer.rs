@@ -781,6 +781,12 @@ impl Writer {
         self.write_pages(encoding_tasks).await
     }
 
+    pub(crate) fn pending_bytes(&self) -> u64 {
+        self.column_writers.iter().fold(0, |bytes, encoder| {
+            bytes.saturating_add(encoder.pending_bytes())
+        })
+    }
+
     /// Finishes writing the file
     ///
     /// This method will wait until all data has been flushed to the file.  Then it

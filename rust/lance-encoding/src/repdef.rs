@@ -1259,6 +1259,18 @@ impl RepDefBuilder {
         self.repdefs.len() == 1 && matches!(self.repdefs[0], RawRepDef::Validity(_))
     }
 
+    /// Conservative size of the repetition and definition levels this builder
+    /// can materialize when it is serialized.
+    pub(crate) fn estimated_serialized_bytes(&self) -> u64 {
+        let has_repetition = self.repdefs.iter().any(|layer| layer.max_rep() > 0);
+        let has_definition = self.repdefs.iter().any(|layer| layer.max_def() > 0);
+        let bytes_per_level = (u64::from(has_repetition) + u64::from(has_definition))
+            * std::mem::size_of::<u16>() as u64;
+        self.repdefs.iter().fold(0_u64, |bytes, layer| {
+            bytes.saturating_add((layer.num_values() as u64).saturating_mul(bytes_per_level))
+        })
+    }
+
     /// Registers a nullable validity bitmap
     pub fn add_validity_bitmap(&mut self, validity: NullBuffer) {
         self.check_validity_len(validity.len());

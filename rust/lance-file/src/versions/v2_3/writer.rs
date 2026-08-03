@@ -152,6 +152,10 @@ impl Writer {
         self.encoding.flush(&mut self.sink).await
     }
 
+    pub(crate) fn pending_bytes(&self) -> u64 {
+        self.encoding.pending_bytes()
+    }
+
     /// Finish the v2.3 file and close its object writer.
     pub async fn finish(&mut self) -> Result<FileWriteSummary> {
         // The order below is the v2.3 wire contract.
