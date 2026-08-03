@@ -36,24 +36,31 @@ pub enum Language {
 impl Language {
     fn algorithm(self) -> StemmerAlgorithm {
         match self {
-            Self::Arabic => StemmerAlgorithm::Legacy(rust_stemmers::Algorithm::Arabic),
-            Self::Danish => StemmerAlgorithm::Legacy(rust_stemmers::Algorithm::Danish),
-            Self::Dutch => StemmerAlgorithm::Legacy(rust_stemmers::Algorithm::Dutch),
-            Self::English => StemmerAlgorithm::Legacy(rust_stemmers::Algorithm::English),
-            Self::Finnish => StemmerAlgorithm::Legacy(rust_stemmers::Algorithm::Finnish),
-            Self::French => StemmerAlgorithm::Legacy(rust_stemmers::Algorithm::French),
-            Self::German => StemmerAlgorithm::Legacy(rust_stemmers::Algorithm::German),
             Self::Greek => StemmerAlgorithm::Greek,
-            Self::Hungarian => StemmerAlgorithm::Legacy(rust_stemmers::Algorithm::Hungarian),
-            Self::Italian => StemmerAlgorithm::Legacy(rust_stemmers::Algorithm::Italian),
-            Self::Norwegian => StemmerAlgorithm::Legacy(rust_stemmers::Algorithm::Norwegian),
-            Self::Portuguese => StemmerAlgorithm::Legacy(rust_stemmers::Algorithm::Portuguese),
-            Self::Romanian => StemmerAlgorithm::Legacy(rust_stemmers::Algorithm::Romanian),
-            Self::Russian => StemmerAlgorithm::Legacy(rust_stemmers::Algorithm::Russian),
-            Self::Spanish => StemmerAlgorithm::Legacy(rust_stemmers::Algorithm::Spanish),
-            Self::Swedish => StemmerAlgorithm::Legacy(rust_stemmers::Algorithm::Swedish),
-            Self::Tamil => StemmerAlgorithm::Legacy(rust_stemmers::Algorithm::Tamil),
-            Self::Turkish => StemmerAlgorithm::Legacy(rust_stemmers::Algorithm::Turkish),
+            language => StemmerAlgorithm::Legacy(language.legacy_algorithm()),
+        }
+    }
+
+    fn legacy_algorithm(self) -> rust_stemmers::Algorithm {
+        match self {
+            Self::Arabic => rust_stemmers::Algorithm::Arabic,
+            Self::Danish => rust_stemmers::Algorithm::Danish,
+            Self::Dutch => rust_stemmers::Algorithm::Dutch,
+            Self::English => rust_stemmers::Algorithm::English,
+            Self::Finnish => rust_stemmers::Algorithm::Finnish,
+            Self::French => rust_stemmers::Algorithm::French,
+            Self::German => rust_stemmers::Algorithm::German,
+            Self::Greek => rust_stemmers::Algorithm::Greek,
+            Self::Hungarian => rust_stemmers::Algorithm::Hungarian,
+            Self::Italian => rust_stemmers::Algorithm::Italian,
+            Self::Norwegian => rust_stemmers::Algorithm::Norwegian,
+            Self::Portuguese => rust_stemmers::Algorithm::Portuguese,
+            Self::Romanian => rust_stemmers::Algorithm::Romanian,
+            Self::Russian => rust_stemmers::Algorithm::Russian,
+            Self::Spanish => rust_stemmers::Algorithm::Spanish,
+            Self::Swedish => rust_stemmers::Algorithm::Swedish,
+            Self::Tamil => rust_stemmers::Algorithm::Tamil,
+            Self::Turkish => rust_stemmers::Algorithm::Turkish,
         }
     }
 }
@@ -102,6 +109,18 @@ impl Stemmer {
     pub fn new(language: Language) -> Self {
         Self {
             stemmer_algorithm: language.algorithm(),
+        }
+    }
+
+    /// Create a stemmer with the semantics used by indexes written before the
+    /// corrected Greek stemmer was introduced.
+    ///
+    /// This is only intended for reading and incrementally updating persisted
+    /// index metadata that does not identify its Greek stemmer version.
+    #[doc(hidden)]
+    pub fn new_legacy(language: Language) -> Self {
+        Self {
+            stemmer_algorithm: StemmerAlgorithm::Legacy(language.legacy_algorithm()),
         }
     }
 }
@@ -187,5 +206,23 @@ mod tests {
 
         assert!(stream.advance());
         assert_eq!(stream.token().text, "ανετ");
+    }
+
+    #[test]
+    fn test_legacy_greek_stemmer_preserves_existing_terms() {
+        let mut legacy = TextAnalyzer::builder(RawTokenizer::default())
+            .filter(Stemmer::new_legacy(Language::Greek))
+            .build();
+        let mut current = TextAnalyzer::builder(RawTokenizer::default())
+            .filter(Stemmer::new(Language::Greek))
+            .build();
+
+        let mut legacy_stream = legacy.token_stream("ίσα");
+        assert!(legacy_stream.advance());
+        assert_eq!(legacy_stream.token().text, "");
+
+        let mut current_stream = current.token_stream("ίσα");
+        assert!(current_stream.advance());
+        assert_eq!(current_stream.token().text, "ισ");
     }
 }

@@ -44,6 +44,43 @@ pub const DEFAULT_BLOCK_SIZE: usize = 128;
 pub const VALID_BLOCK_SIZES: [usize; 2] = [128, 256];
 const LANCE_FTS_FORMAT_VERSION_ENV_KEY: &str = "LANCE_FTS_FORMAT_VERSION";
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum GreekStemmerVersion {
+    Legacy,
+    Snowball3,
+}
+
+impl GreekStemmerVersion {
+    fn is_legacy(&self) -> bool {
+        matches!(self, Self::Legacy)
+    }
+
+    fn from_proto(value: Option<i32>) -> Result<Self> {
+        use pbold::inverted_index_details::GreekStemmer;
+
+        match value {
+            None => Ok(Self::Legacy),
+            Some(value) => match GreekStemmer::try_from(value) {
+                Ok(GreekStemmer::Legacy) => Ok(Self::Legacy),
+                Ok(GreekStemmer::Snowball3) => Ok(Self::Snowball3),
+                Err(_) => Err(Error::invalid_input(format!(
+                    "unknown Greek stemmer version {value}"
+                ))),
+            },
+        }
+    }
+
+    fn to_proto(self) -> Option<i32> {
+        use pbold::inverted_index_details::GreekStemmer;
+
+        match self {
+            Self::Legacy => None,
+            Self::Snowball3 => Some(GreekStemmer::Snowball3 as i32),
+        }
+    }
+}
+
 /// Tokenizer configs
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct InvertedIndexParams {
@@ -76,6 +113,13 @@ pub struct InvertedIndexParams {
     /// language for stemming and stop words
     /// this is only used when `stem` or `remove_stop_words` is true
     pub(crate) language: Language,
+
+    /// Greek stemming semantics persisted with the index vocabulary.
+    ///
+    /// Missing serialized values select [`GreekStemmerVersion::Legacy`]. New
+    /// indexes use [`GreekStemmerVersion::Snowball3`].
+    #[serde(skip_serializing_if = "GreekStemmerVersion::is_legacy")]
+    pub(crate) greek_stemmer: GreekStemmerVersion,
 
     /// If true, store the position of the term in the document
     /// This can significantly increase the size of the index
@@ -180,6 +224,7 @@ struct RawInvertedIndexParams {
     lance_tokenizer: Option<String>,
     base_tokenizer: Option<String>,
     language: Option<Language>,
+    greek_stemmer: Option<GreekStemmerVersion>,
     with_position: Option<bool>,
     #[serde(default, deserialize_with = "deserialize_explicit_option")]
     max_token_length: Option<Option<usize>>,
@@ -280,6 +325,7 @@ impl RawInvertedIndexParams {
         if let Some(language) = self.language {
             params.language = language;
         }
+        params.greek_stemmer = self.greek_stemmer.unwrap_or(GreekStemmerVersion::Legacy);
         if let Some(with_position) = self.with_position {
             params.with_position = with_position;
         }
@@ -358,6 +404,7 @@ impl TryFrom<&InvertedIndexParams> for pbold::InvertedIndexDetails {
                     index_operators: params.index_operators,
                 },
             ),
+            greek_stemmer: params.greek_stemmer.to_proto(),
         })
     }
 }
@@ -377,6 +424,7 @@ impl TryFrom<&pbold::InvertedIndexDetails> for InvertedIndexParams {
                     Some(block_size) => validate_block_size(block_size as usize)?,
                     None => LEGACY_BLOCK_SIZE,
                 },
+                greek_stemmer: GreekStemmerVersion::Legacy,
                 ..Self::default()
             };
             return Ok(params);
@@ -396,6 +444,7 @@ impl TryFrom<&pbold::InvertedIndexDetails> for InvertedIndexParams {
         } else {
             serde_json::from_str(details.language.as_str())?
         };
+        params.greek_stemmer = GreekStemmerVersion::from_proto(details.greek_stemmer)?;
         params.with_position = details.with_position;
         params.max_token_length = details.max_token_length.map(|l| l as usize);
         params.lower_case = details.lower_case;
@@ -557,6 +606,7 @@ impl InvertedIndexParams {
             lance_tokenizer: None,
             base_tokenizer,
             language,
+            greek_stemmer: GreekStemmerVersion::Snowball3,
             with_position: false,
             max_token_length: Some(40),
             lower_case: true,
@@ -917,7 +967,11 @@ impl InvertedIndexParams {
             builder = builder.filter_dynamic(LowerCaser);
         }
         if self.stem {
-            builder = builder.filter_dynamic(Stemmer::new(self.language));
+            let stemmer = match self.greek_stemmer {
+                GreekStemmerVersion::Legacy => Stemmer::new_legacy(self.language),
+                GreekStemmerVersion::Snowball3 => Stemmer::new(self.language),
+            };
+            builder = builder.filter_dynamic(stemmer);
         }
         if self.remove_stop_words {
             builder = builder.filter_dynamic(self.stop_word_filter()?);
@@ -1041,7 +1095,7 @@ pub fn language_model_home() -> Option<PathBuf> {
 mod tests {
     use crate::pbold;
 
-    use super::{InvertedIndexParams, InvertedListFormatVersion, Language};
+    use super::{GreekStemmerVersion, InvertedIndexParams, InvertedListFormatVersion, Language};
     use lance_core::Error;
     use lance_tokenizer::TokenStream;
     use rstest::rstest;
@@ -1425,6 +1479,39 @@ mod tests {
     }
 
     #[test]
+    fn test_greek_stemmer_version_metadata() {
+        let current = InvertedIndexParams::new("raw".to_string(), Language::Greek);
+        let mut json = serde_json::to_value(&current).unwrap();
+        assert_eq!(json["greek_stemmer"], "snowball3");
+
+        json.as_object_mut().unwrap().remove("greek_stemmer");
+        let legacy: InvertedIndexParams = serde_json::from_value(json).unwrap();
+        assert_eq!(legacy.greek_stemmer, GreekStemmerVersion::Legacy);
+        assert!(
+            serde_json::to_value(&legacy).unwrap()["greek_stemmer"].is_null(),
+            "legacy metadata should remain absent when rewritten"
+        );
+
+        let current_details = pbold::InvertedIndexDetails::try_from(&current).unwrap();
+        assert!(current_details.greek_stemmer.is_some());
+        assert_eq!(
+            InvertedIndexParams::try_from(&current_details)
+                .unwrap()
+                .greek_stemmer,
+            GreekStemmerVersion::Snowball3
+        );
+
+        let mut legacy_details = current_details;
+        legacy_details.greek_stemmer = None;
+        assert_eq!(
+            InvertedIndexParams::try_from(&legacy_details)
+                .unwrap()
+                .greek_stemmer,
+            GreekStemmerVersion::Legacy
+        );
+    }
+
+    #[test]
     fn test_block_size_details_conversion() {
         let params = InvertedIndexParams::default().block_size(256).unwrap();
         let details = pbold::InvertedIndexDetails::try_from(&params).unwrap();
@@ -1444,6 +1531,7 @@ mod tests {
             prefix_only: false,
             block_size: None,
             code_config: None,
+            greek_stemmer: None,
         };
         let params = InvertedIndexParams::try_from(&old_details).unwrap();
         assert_eq!(params.block_size, 128);
