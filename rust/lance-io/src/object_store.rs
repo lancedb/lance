@@ -42,6 +42,16 @@ pub(crate) mod dynamic_opendal;
 mod list_retry;
 #[cfg(feature = "metrics")]
 pub mod metrics;
+#[cfg(any(
+    feature = "aws",
+    feature = "azure",
+    feature = "gcp",
+    feature = "goosefs",
+    feature = "oss",
+    feature = "tencent",
+    feature = "tos",
+))]
+pub(crate) mod opendal_retry;
 pub mod providers;
 pub mod storage_options;
 #[cfg(test)]

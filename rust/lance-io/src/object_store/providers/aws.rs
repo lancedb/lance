@@ -10,7 +10,6 @@ use mock_instant::thread_local::{SystemTime, UNIX_EPOCH};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use object_store::ObjectStore as OSObjectStore;
-use object_store_opendal::OpendalStore;
 use opendal::{Operator, services::S3};
 
 use aws_config::default_provider::credentials::DefaultCredentialsChain;
@@ -30,6 +29,7 @@ use crate::object_store::{
     DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
     ObjectStoreParams, ObjectStoreProvider, StorageOptions, StorageOptionsAccessor,
     dynamic_credentials::{NamespaceCredentialsProvider, build_dynamic_credential_provider},
+    opendal_retry::store_with_retry,
     throttle::{AimdThrottleConfig, AimdThrottleState, AimdThrottledStore, cloud_http_connector},
 };
 use lance_core::error::{Error, Result};
@@ -126,7 +126,7 @@ impl AwsStoreProvider {
         let operator = Operator::from_iter::<S3>(config_map)
             .map_err(|e| Error::invalid_input(format!("Failed to create S3 operator: {:?}", e)))?;
 
-        Ok(Arc::new(OpendalStore::new(operator)) as Arc<dyn OSObjectStore>)
+        Ok(Arc::new(store_with_retry(operator)) as Arc<dyn OSObjectStore>)
     }
 }
 
