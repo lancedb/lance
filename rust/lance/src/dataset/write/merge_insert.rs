@@ -232,6 +232,40 @@ pub fn create_duplicate_row_error(
     ))))
 }
 
+/// Tracks non-null join keys for source rows that will be inserted.
+///
+/// NULL join keys are deliberately not tracked because merge insert uses SQL
+/// equality, where a key containing NULL does not equal another such key.
+#[derive(Debug, Default)]
+struct InsertedKeyTracker {
+    keys: HashSet<Vec<ScalarValue>>,
+}
+
+impl InsertedKeyTracker {
+    /// Returns true when the row has a new key or a key containing NULL.
+    fn insert(
+        &mut self,
+        batch: &RecordBatch,
+        row_idx: usize,
+        on_columns: &[String],
+    ) -> datafusion::common::Result<bool> {
+        let mut key = Vec::with_capacity(on_columns.len());
+        for column_name in on_columns {
+            let column = batch.column_by_name(column_name).ok_or_else(|| {
+                DataFusionError::Internal(format!(
+                    "merge insert key column '{}' not found in source batch",
+                    column_name
+                ))
+            })?;
+            if column.is_null(row_idx) {
+                return Ok(true);
+            }
+            key.push(ScalarValue::try_from_array(column, row_idx)?);
+        }
+        Ok(self.keys.insert(key))
+    }
+}
+
 /// Describes how rows should be handled when there is no matching row in the source table
 ///
 /// These are old rows which do not match any new data
@@ -321,16 +355,21 @@ pub enum WhenNotMatched {
     DoNothing,
 }
 
-/// Describes how to handle duplicate source rows that match the same target row.
+/// Describes how to handle duplicate source rows.
 ///
 /// If the source contains duplicates and `FirstSeen` behavior doesn't match your needs,
 /// sort the source data before passing it to the merge insert operation.
+/// Rows whose join keys contain NULL are not duplicates because merge insert uses SQL
+/// equality, where NULL does not equal NULL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub enum SourceDedupeBehavior {
-    /// Fail the operation if duplicates are found (default)
+    /// Fail if multiple source rows match the same target row (default)
     #[default]
     Fail,
-    /// Keep the first seen value and skip subsequent duplicates
+    /// Keep the first row for each join key and skip subsequent rows
+    ///
+    /// This applies both to rows that match a target row and to unmatched rows that
+    /// would otherwise insert the same non-null join key more than once.
     FirstSeen,
 }
 
@@ -590,10 +629,13 @@ impl MergeInsertBuilder {
         self
     }
 
-    /// Specify how to handle duplicate source rows that match the same target row.
+    /// Specify how to handle duplicate source rows.
     ///
-    /// Default is `Fail` which errors on duplicates.
-    /// Use `FirstSeen` to keep the first encountered row and skip duplicates.
+    /// Default is `Fail`, which errors when multiple source rows match one target row.
+    /// Use `FirstSeen` to keep the first encountered row for each non-null join key,
+    /// including unmatched keys that will be inserted, and skip subsequent rows.
+    /// Join keys containing NULL are not deduplicated because merge insert uses SQL
+    /// equality, where NULL does not equal NULL.
     ///
     /// If the source contains duplicates and `FirstSeen` behavior doesn't match your needs,
     /// sort the source data before passing it to the merge insert operation.
@@ -2659,6 +2701,8 @@ struct Merger {
     enable_stable_row_ids: bool,
     /// Set to track processed row IDs to detect duplicates
     processed_row_ids: Arc<Mutex<HashSet<u64>>>,
+    /// Set to track non-null keys of rows inserted by FirstSeen mode
+    processed_insert_keys: Arc<Mutex<InsertedKeyTracker>>,
 }
 
 impl Merger {
@@ -2726,6 +2770,7 @@ impl Merger {
             output_schema,
             enable_stable_row_ids,
             processed_row_ids: Arc::new(Mutex::new(HashSet::new())),
+            processed_insert_keys: Arc::new(Mutex::new(InsertedKeyTracker::default())),
         })
     }
 
@@ -2987,7 +3032,24 @@ impl Merger {
             }
         }
         if self.params.insert_not_matched {
-            let not_matched = arrow::compute::filter_record_batch(&batch, &left_only)?;
+            let mut not_matched = arrow::compute::filter_record_batch(&batch, &left_only)?;
+            if self.params.source_dedupe_behavior == SourceDedupeBehavior::FirstSeen {
+                let mut processed_insert_keys = self.processed_insert_keys.lock().unwrap();
+                let mut keep_indices = Vec::with_capacity(not_matched.num_rows());
+                for row_idx in 0..not_matched.num_rows() {
+                    if processed_insert_keys.insert(&not_matched, row_idx, &self.params.on)? {
+                        keep_indices.push(row_idx as u32);
+                    } else {
+                        merge_statistics.num_skipped_duplicates += 1;
+                    }
+                }
+                drop(processed_insert_keys);
+
+                if keep_indices.len() != not_matched.num_rows() {
+                    not_matched =
+                        take_record_batch(&not_matched, &UInt32Array::from(keep_indices))?;
+                }
+            }
             let left_cols_with_id = left_cols
                 .into_iter()
                 .chain(row_addr_col)
@@ -8793,6 +8855,95 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
             Some(&600),
             "key=5 should be inserted with value 600"
         );
+    }
+
+    #[rstest::rstest]
+    #[case::v2(false)]
+    #[case::indexed_scan(true)]
+    #[tokio::test]
+    async fn test_first_seen_dedupes_unmatched_source_rows(#[case] with_index: bool) {
+        let initial =
+            record_batch!(("id", Int32, [Some(1)]), ("value", Int32, [Some(10)])).unwrap();
+        let initial = if with_index {
+            initial
+        } else {
+            // Match the reported failure's empty-target setup on the v2 path.
+            initial.slice(0, 0)
+        };
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(initial.clone())], initial.schema()),
+            "memory://",
+            None,
+        )
+        .await
+        .unwrap();
+
+        if with_index {
+            dataset
+                .create_index(
+                    &["id"],
+                    IndexType::Scalar,
+                    None,
+                    &ScalarIndexParams::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+        }
+
+        // The duplicate non-null key is split across batches to verify that
+        // FirstSeen state spans the entire source stream. On the v2 path,
+        // also verify that NULL keys remain distinct under SQL equality.
+        let (first, second, expected_inserted) = if with_index {
+            (
+                record_batch!(("id", Int32, [Some(108)]), ("value", Int32, [Some(1)])).unwrap(),
+                record_batch!(("id", Int32, [Some(108)]), ("value", Int32, [Some(2)])).unwrap(),
+                1,
+            )
+        } else {
+            (
+                record_batch!(
+                    ("id", Int32, [Some(108), None]),
+                    ("value", Int32, [Some(1), Some(3)])
+                )
+                .unwrap(),
+                record_batch!(
+                    ("id", Int32, [Some(108), None]),
+                    ("value", Int32, [Some(2), Some(4)])
+                )
+                .unwrap(),
+                3,
+            )
+        };
+
+        let (dataset, stats) =
+            MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .source_dedupe_behavior(SourceDedupeBehavior::FirstSeen)
+                .try_build()
+                .unwrap()
+                .execute_reader(Box::new(RecordBatchIterator::new(
+                    [Ok(first.clone()), Ok(second)],
+                    first.schema(),
+                )))
+                .await
+                .unwrap();
+
+        assert_eq!(stats.num_inserted_rows, expected_inserted);
+        assert_eq!(stats.num_updated_rows, 0);
+        assert_eq!(stats.num_skipped_duplicates, 1);
+
+        let inserted = dataset
+            .scan()
+            .filter("id = 108")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(inserted.num_rows(), 1);
+        assert_eq!(inserted["value"].as_primitive::<Int32Type>().value(0), 1);
     }
 
     #[tokio::test]

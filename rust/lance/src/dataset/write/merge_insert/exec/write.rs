@@ -29,7 +29,7 @@ use crate::dataset::write::merge_insert::inserted_rows::{
     KeyExistenceFilter, KeyExistenceFilterBuilder, extract_key_value_from_batch,
 };
 use crate::dataset::write::merge_insert::{
-    MERGE_SOURCE_SENTINEL, SourceDedupeBehavior, create_duplicate_row_error,
+    InsertedKeyTracker, MERGE_SOURCE_SENTINEL, SourceDedupeBehavior, create_duplicate_row_error,
     format_key_values_on_columns, resolve_target_bases,
 };
 use crate::{
@@ -105,6 +105,8 @@ struct MergeState {
     stable_row_ids: bool,
     /// Set to track processed row IDs to detect duplicates
     processed_row_ids: HashSet<u64>,
+    /// Set to track non-null keys of rows inserted by FirstSeen mode
+    processed_insert_keys: InsertedKeyTracker,
     /// The "on" column names for merge operation
     on_columns: Vec<String>,
     /// How to handle duplicate source rows
@@ -126,6 +128,7 @@ impl MergeState {
             metrics,
             stable_row_ids,
             processed_row_ids: HashSet::new(),
+            processed_insert_keys: InsertedKeyTracker::default(),
             on_columns,
             source_dedupe_behavior,
         }
@@ -208,7 +211,15 @@ impl MergeState {
                 Ok(Some(row_idx)) // Keep this row for writing
             }
             Action::Insert => {
-                // Insert action - just insert new data
+                if self.source_dedupe_behavior == SourceDedupeBehavior::FirstSeen
+                    && !self
+                        .processed_insert_keys
+                        .insert(batch, row_idx, &self.on_columns)?
+                {
+                    self.metrics.num_skipped_duplicates.add(1);
+                    return Ok(None);
+                }
+
                 // Capture the key value for conflict detection (only for inserts, not updates)
                 if let Some(key_value) =
                     extract_key_value_from_batch(batch, row_idx, &self.on_columns)
