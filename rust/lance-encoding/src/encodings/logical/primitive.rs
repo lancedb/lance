@@ -6971,9 +6971,16 @@ impl FieldEncoder for PrimitiveStructuralEncoder {
     ) -> Result<Vec<EncodeTask>> {
         let array = self.extract_validity(array, &mut repdef, self.keep_original_array)?;
         self.accumulated_repdefs.push(repdef);
+        let pending_repdef_bytes = self
+            .accumulated_repdefs
+            .iter()
+            .fold(0_u64, |bytes, repdef| {
+                bytes.saturating_add(repdef.estimated_serialized_bytes())
+            });
 
-        if let Some((arrays, row_number, num_rows)) =
-            self.accumulation_queue.insert(array, row_number, num_rows)
+        if let Some((arrays, row_number, num_rows)) = self
+            .accumulation_queue
+            .insert_with_additional_bytes(array, row_number, num_rows, pending_repdef_bytes)
         {
             let accumulated_repdefs = std::mem::take(&mut self.accumulated_repdefs);
             Ok(self.do_flush(arrays, accumulated_repdefs, row_number, num_rows)?)

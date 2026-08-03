@@ -181,6 +181,7 @@ pub struct AccumulationQueue {
     dictionary_values: Vec<CachedDictionaryValues>,
     dictionary_run: Option<DictionaryRun>,
     current_bytes: u64,
+    current_incremental_bytes: u64,
     // Row number of the first item in buffered_arrays, reset on flush
     row_number: u64,
     // Number of top level rows represented in buffered_arrays, reset on flush
@@ -197,6 +198,7 @@ impl AccumulationQueue {
             dictionary_values: Vec::new(),
             dictionary_run: None,
             current_bytes: 0,
+            current_incremental_bytes: 0,
             column_index,
             keep_original_array,
             use_shared_dictionary_sizing: true,
@@ -219,6 +221,17 @@ impl AccumulationQueue {
         row_number: u64,
         num_rows: u64,
     ) -> Option<(Vec<ArrayRef>, u64, u64)> {
+        self.insert_with_additional_bytes(array, row_number, num_rows, 0)
+    }
+
+    /// Adds an array while including pending structural bytes in run bounds.
+    pub(crate) fn insert_with_additional_bytes(
+        &mut self,
+        array: ArrayRef,
+        row_number: u64,
+        num_rows: u64,
+        pending_additional_bytes: u64,
+    ) -> Option<(Vec<ArrayRef>, u64, u64)> {
         if self.row_number == u64::MAX {
             self.row_number = row_number;
         }
@@ -228,22 +241,32 @@ impl AccumulationQueue {
             self.find_dictionary_values(&dictionary.values, &dictionary.values_identity)
         });
         let dictionary_values = cached_values.unwrap_or(self.dictionary_values.len());
-        let inserted_bytes = if self.use_shared_dictionary_sizing {
+        let (inserted_bytes, inserted_incremental_bytes) = if self.use_shared_dictionary_sizing {
             dictionary.as_ref().map_or_else(
-                || array_slice_memory_size(array.as_ref()) as u64,
+                || {
+                    let bytes = array_slice_memory_size(array.as_ref()) as u64;
+                    (bytes, bytes)
+                },
                 |dictionary| {
-                    dictionary.incremental_bytes
-                        + if cached_values.is_some() {
-                            0
-                        } else {
-                            dictionary.shared_bytes
-                        }
+                    (
+                        dictionary.incremental_bytes
+                            + if cached_values.is_some() {
+                                0
+                            } else {
+                                dictionary.shared_bytes
+                            },
+                        dictionary.incremental_bytes,
+                    )
                 },
             )
         } else {
-            array_slice_memory_size(array.as_ref()) as u64
+            let bytes = array_slice_memory_size(array.as_ref()) as u64;
+            (bytes, bytes)
         };
         self.current_bytes = self.current_bytes.saturating_add(inserted_bytes);
+        self.current_incremental_bytes = self
+            .current_incremental_bytes
+            .saturating_add(inserted_incremental_bytes);
 
         let continues_dictionary_run = dictionary
             .as_ref()
@@ -268,7 +291,11 @@ impl AccumulationQueue {
                     || dictionary.shared_bytes > self.cache_bytes
             });
         let defer_dictionary_flush = self.use_shared_dictionary_sizing
-            && (continues_dictionary_run || starts_sliced_dictionary_run);
+            && (continues_dictionary_run || starts_sliced_dictionary_run)
+            && self
+                .current_incremental_bytes
+                .saturating_add(pending_additional_bytes)
+                <= self.cache_bytes;
 
         if self.current_bytes > self.cache_bytes && !defer_dictionary_flush {
             debug!(
@@ -286,6 +313,7 @@ impl AccumulationQueue {
             };
             self.buffered_arrays.push(array);
             self.current_bytes = 0;
+            self.current_incremental_bytes = 0;
             let row_number = self.row_number;
             self.row_number = u64::MAX;
             let num_rows = self.num_rows;
@@ -325,6 +353,7 @@ impl AccumulationQueue {
                 self.column_index, self.current_bytes
             );
             self.current_bytes = 0;
+            self.current_incremental_bytes = 0;
             let row_number = self.row_number;
             self.row_number = u64::MAX;
             let num_rows = self.num_rows;
@@ -492,9 +521,9 @@ mod tests {
         let dictionary =
             Arc::new(DictionaryArray::<Int8Type>::try_new(keys, values).unwrap()) as ArrayRef;
 
-        let slice_bytes = array_slice_memory_size(dictionary.slice(0, 10).as_ref()) as u64;
-        let mut queue = AccumulationQueue::new(slice_bytes * 2, 0, false);
         let slice_size = array_slice_memory_size_parts(dictionary.slice(0, 10).as_ref());
+        let cache_bytes = (5 * slice_size.incremental) as u64;
+        let mut queue = AccumulationQueue::new(cache_bytes, 0, false);
         for offset in (0..50).step_by(10) {
             assert!(
                 queue
@@ -544,24 +573,43 @@ mod tests {
     }
 
     #[test]
-    fn equivalent_oversized_dictionary_values_are_reused() {
-        let arrays = (0..5)
-            .map(|_| {
-                let values = Arc::new(StringArray::from(vec!["a", "b"])) as ArrayRef;
-                let keys =
-                    Int8Array::from((0..10).map(|index| (index % 2) as i8).collect::<Vec<_>>());
-                Arc::new(DictionaryArray::<Int8Type>::try_new(keys, values).unwrap()) as ArrayRef
-            })
-            .collect::<Vec<_>>();
+    fn oversized_dictionary_values_do_not_disable_the_cache_bound() {
+        let values = Arc::new(StringArray::from(vec!["x".repeat(2 * 1024)])) as ArrayRef;
+        let mut queue = AccumulationQueue::new(1024, 0, false);
+        let mut has_flushed = false;
 
-        let mut queue = AccumulationQueue::new(1, 0, false);
-        for (row_number, array) in arrays.into_iter().enumerate() {
-            assert!(queue.insert(array, (row_number * 10) as u64, 10).is_none());
+        for row_number in 0..64 {
+            let keys = Int8Array::from(vec![0_i8; 1024]);
+            let dictionary =
+                Arc::new(DictionaryArray::<Int8Type>::try_new(keys, values.clone()).unwrap())
+                    as ArrayRef;
+            if queue.insert(dictionary, row_number * 1024, 1024).is_some() {
+                has_flushed = true;
+                break;
+            }
         }
-        let (arrays, _, num_rows) = queue.flush().unwrap();
-        let copied = crate::data::DataBlock::from_arrays(&arrays, num_rows);
 
-        assert_eq!(copied.as_dictionary().unwrap().dictionary.num_values(), 2);
+        assert!(
+            has_flushed,
+            "an oversized shared dictionary retained {} bytes without ever flushing a 1024-byte cache",
+            queue.pending_bytes()
+        );
+    }
+
+    #[test]
+    fn oversized_dictionary_values_include_structural_bytes_in_the_cache_bound() {
+        let values = Arc::new(StringArray::from(vec!["x".repeat(2 * 1024)])) as ArrayRef;
+        let keys = Int8Array::from(vec![0_i8]);
+        let dictionary =
+            Arc::new(DictionaryArray::<Int8Type>::try_new(keys, values).unwrap()) as ArrayRef;
+        let mut queue = AccumulationQueue::new(1024, 0, false);
+
+        assert!(
+            queue
+                .insert_with_additional_bytes(dictionary, 0, 1, 1024)
+                .is_some(),
+            "structural bytes must stop oversized dictionary deferral"
+        );
     }
 
     #[tokio::test]
